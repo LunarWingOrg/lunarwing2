@@ -837,6 +837,9 @@ main() {
           || die "--with-lunardepth requires --lunardepth-api-key-file or explicit --lunardepth-allow-unauthenticated-gateway"
         [[ -z "$lunardepth_api_key" || "$lunardepth_allow_placeholder" != "true" ]] \
           || die "--lunardepth-api-key-file and --lunardepth-allow-unauthenticated-gateway cannot be combined: no key would be stored"
+        # Before any tenant state exists: a bad route must not leave a half-made tenant.
+        _lunardepth_validate_route "$lunardepth_base_url" "$lunardepth_model" "$lunardepth_allow_insecure" \
+          || die "--with-lunardepth: the route is not valid"
       fi
       with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url" "$with_lunardepth" "$lunardepth_model" "$lunardepth_base_url" "$lunardepth_api_key" "$lunardepth_allow_insecure" "$lunardepth_allow_placeholder"
       ;;
@@ -899,6 +902,9 @@ main() {
           || die "--with-lunardepth requires --lunardepth-base-url and --lunardepth-model before tenant creation"
         [[ -n "$lunardepth_api_key" || -n "$lunardepth_api_key_dir" || "$lunardepth_allow_placeholder" == "true" ]] \
           || die "--with-lunardepth requires --lunardepth-api-key-file, --lunardepth-api-key-dir or explicit --lunardepth-allow-unauthenticated-gateway"
+        # Before any tenant state exists: a bad route must not leave half-made tenants.
+        _lunardepth_validate_route "$lunardepth_base_url" "$lunardepth_model" "$lunardepth_allow_insecure" \
+          || die "--with-lunardepth: the route is not valid"
       fi
 
       local IFS=','

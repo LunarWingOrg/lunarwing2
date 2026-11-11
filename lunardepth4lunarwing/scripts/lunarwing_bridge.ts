@@ -273,7 +273,13 @@ class HubConnection {
         data instanceof ArrayBuffer ? Buffer.from(data).toString("utf8") : data.toString("utf8")
       this.owner.receive(this, parseEnvelope(text))
     } catch (error) {
-      this.socket.close(1008, boundedCloseReason(error))
+      // close() can itself throw on an invalid reason. An exception in this
+      // listener would end the bridge, so fall back to dropping the connection.
+      try {
+        this.socket.close(1008, boundedCloseReason(error))
+      } catch {
+        this.socket.terminate()
+      }
     }
   }
 

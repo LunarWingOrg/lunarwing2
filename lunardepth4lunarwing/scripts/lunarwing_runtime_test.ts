@@ -102,6 +102,17 @@ test("enforces the harness's history caps in the harness's unit", () => {
 test("bounds close reasons and deadline timers", () => {
   const reason = boundedCloseReason(new Error("😀".repeat(100)))
   assert.ok(Buffer.byteLength(reason, "utf8") <= 123)
+  // Every character width, cut at every offset: the result never exceeds the
+  // limit and never contains a replacement character from a split character.
+  for (const character of ["a", "é", "中", "😀"]) {
+    for (let prefix = 0; prefix < 4; prefix += 1) {
+      const bounded = boundedCloseReason(new Error("x".repeat(prefix) + character.repeat(200)))
+      assert.ok(Buffer.byteLength(bounded, "utf8") <= 123, `${character} with prefix ${prefix}`)
+      assert.ok(Buffer.byteLength(bounded, "utf8") > 123 - 4, `${character} with prefix ${prefix} is cut too early`)
+      assert.equal(bounded.includes("\uFFFD"), false)
+    }
+  }
+  assert.equal(boundedCloseReason("short"), "short")
   assert.equal(deadlineDelay(MAX_TIMEOUT_MS, 60_000), MAX_TIMER_DELAY_MS)
 })
 

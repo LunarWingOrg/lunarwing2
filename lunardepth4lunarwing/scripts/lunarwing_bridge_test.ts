@@ -197,6 +197,38 @@ test("a peer that resets during a refused upgrade does not stop the bridge", asy
   }
 })
 
+test("an unsupported frame closes its connection and not the bridge", async () => {
+  const current = await fixture()
+  try {
+    const open = async (): Promise<WebSocket> => {
+      const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: `Bearer ${TOKEN}` } })
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", () => resolve())
+        socket.once("error", reject)
+      })
+      return socket
+    }
+    const first = await open()
+    const closed = new Promise<[number, string]>(resolve => {
+      first.once("close", (code, reason) => resolve([code, reason.toString("utf8")]))
+    })
+    first.send(JSON.stringify(createEnvelope("tool_call", {})))
+    const [code, reason] = await closed
+    assert.equal(code, 1008)
+    assert.match(reason, /unsupported hub frame: tool_call/)
+    const second = await open()
+    const messages: Envelope[] = []
+    second.on("message", data => messages.push(JSON.parse(data.toString()) as Envelope))
+    second.send(JSON.stringify(createEnvelope("ping", {})))
+    await waitFor(messages, "pong")
+    second.close()
+  } finally {
+    await current.bridge.close()
+    current.runner.close()
+    rmSync(current.root, { recursive: true, force: true })
+  }
+})
+
 test("serves the daemon context and rejects grants without disconnecting", async () => {
   const current = await fixture()
   const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: `Bearer ${TOKEN}` } })

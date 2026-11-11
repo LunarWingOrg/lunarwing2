@@ -297,6 +297,33 @@ env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -I \
   grep -q 'needs full Landlock enforcement' "$TMP/floor.out"
 )
 
+# ── The in-library v18 migration refuses a colliding or out-of-range result ──
+(
+  PORTS_REGISTRY="$TMP/lib-ports.json"
+  PORTS_LOCK_HELD=true
+  # A v17 registry whose second tenant sits in slot 100: its LunarDepth block
+  # would be 53000, outside 52000-52999, and its opencode2 port is already 52000.
+  jq '.version = 17 | del(.lunardepth_range, .lunardepth_block_size)
+      | .tenants.demo |= del(.lunardepth_base, .lunardepth_ports, .workers.lunardepth)
+      | .tenants.far = {"base_port": 11000, "ports": {"gateway": 11000},
+          "opencode2_base": 52000, "opencode2_ports": {"opencode2_wss": 52000, "opencode2_health": 52001},
+          "workers": {"opencode2": true}}' "$registry" >"$PORTS_REGISTRY"
+  checksum="$(sha256sum "$PORTS_REGISTRY")"
+  if (ports_migrate_v18) >"$TMP/lib-migrate.out" 2>&1; then
+    echo "the in-library v18 migration accepted colliding LunarDepth ports" >&2
+    exit 1
+  fi
+  grep -q 'the registry is unchanged' "$TMP/lib-migrate.out"
+  [[ "$checksum" == "$(sha256sum "$PORTS_REGISTRY")" ]]
+  [[ -z "$(find "$TMP" -maxdepth 1 -name 'lib-ports.json.tmp.*' -print -quit)" ]]
+  # An ordinary registry still migrates.
+  jq '.version = 17 | del(.lunardepth_range, .lunardepth_block_size)
+      | .tenants.demo |= del(.lunardepth_base, .lunardepth_ports, .workers.lunardepth)' "$registry" >"$PORTS_REGISTRY"
+  ports_migrate_v18 >/dev/null
+  [[ "$(jq -r '.version' "$PORTS_REGISTRY")" == "18" ]]
+  [[ "$(jq -r '.tenants.demo.lunardepth_ports.lunardepth_wss' "$PORTS_REGISTRY")" == "52000" ]]
+)
+
 # ── ZP-7: no two tenants share a model-visible key ───────────────────────────
 (
   keys="$TMP/fleet-keys"

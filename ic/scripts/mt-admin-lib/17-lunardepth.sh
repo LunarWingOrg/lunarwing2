@@ -368,7 +368,10 @@ _verify_lunardepth_image_out_of_band() (
   chown -R "$nobody_uid:$nobody_gid" "$inputs" "$compiled" || return 1
   chmod 0711 "$tmp" && chmod 0700 "$inputs" "$compiled" && chmod 0600 "$archive" "$config" || return 1
   node_image='docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da'
-  "$CONTAINER_RT" run --rm --pull=never --network=host --cap-drop ALL \
+  # The Node image is pinned by digest, so fetching it when it is missing is
+  # safe. A BuildKit build keeps its base images in the build cache, not in the
+  # image store, and --pull=never then found nothing on a Docker host.
+  "$CONTAINER_RT" run --rm --pull=missing --network=host --cap-drop ALL \
     --security-opt no-new-privileges --user "$nobody_uid:$nobody_gid" \
     --env HOME=/tmp --env npm_config_cache=/tmp/npm-cache \
     --tmpfs /tmp:rw,exec,nosuid,size=512m --entrypoint /bin/bash \

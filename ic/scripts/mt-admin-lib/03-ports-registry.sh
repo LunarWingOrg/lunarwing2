@@ -409,6 +409,33 @@ ports_migrate_v18() {
         )
       )
   ' "$PORTS_REGISTRY" >"$tmp"
+  # Same checks as ic/scripts/migrate-ports-v18.sh. The lane's block is derived
+  # from the tenant's base slot, so a registry with more than 100 slots would
+  # leave the range and meet another worker's ports. Refuse, and leave the
+  # registry as it was.
+  local collisions out_of_range health_metrics_conflict
+  collisions="$(jq -r '
+    [ .tenants[]
+      | ((.ports // {}) | to_entries[] | .value),
+        ((.extended_ports // {}) | to_entries[] | .value),
+        ((.kimi_ports // {}) | to_entries[] | .value),
+        ((.voice_ports // {}) | to_entries[] | .value),
+        ((.opencode2_ports // {}) | to_entries[] | .value),
+        ((.lunardepth_ports // {}) | to_entries[] | .value)
+    ]
+    | group_by(.) | map(select(length > 1)) | length
+  ' "$tmp")" || collisions=""
+  out_of_range="$(jq -r '
+    (.lunardepth_range.start) as $lstart | (.lunardepth_range.end) as $lend
+    | [ .tenants[] | (.lunardepth_ports // {}) | to_entries[] | .value | select(. < $lstart or . > $lend) ] | length
+  ' "$tmp")" || out_of_range=""
+  health_metrics_conflict="$(jq -r '
+    ((.health_metrics_port // 0) >= .lunardepth_range.start and (.health_metrics_port // 0) <= .lunardepth_range.end) | tostring
+  ' "$tmp")" || health_metrics_conflict=""
+  if [[ "$collisions" != "0" || "$out_of_range" != "0" || "$health_metrics_conflict" != "false" ]]; then
+    rm -f -- "$tmp"
+    die "port registry v18 migration refused: LunarDepth ports would collide with existing ports or leave ${PORTS_REGISTRY}'s LunarDepth range (collisions=${collisions:-?}, outside the range=${out_of_range:-?}, health-metrics overlap=${health_metrics_conflict:-?}); the registry is unchanged. Run ic/scripts/migrate-ports-v18.sh with LUNARDEPTH_RANGE_START set to a free range."
+  fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "port registry migrated to v18 (lunardepth_wss + lunardepth_health dedicated in range 52000-52999)"

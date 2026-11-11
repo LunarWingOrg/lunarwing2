@@ -28,9 +28,21 @@ export function deadlineDelay(timeoutMs: number, marginMs: number): number {
   return Math.min(timeoutMs + marginMs, MAX_TIMER_DELAY_MS)
 }
 
+// A WebSocket close reason may be at most 123 bytes of UTF-8. Cut on a
+// character boundary: cutting the bytes and decoding again turns a split
+// character into U+FFFD, which is three bytes and can push the result past the
+// limit, and ws then throws from close().
 export function boundedCloseReason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
-  return Buffer.from(message, "utf8").subarray(0, 123).toString("utf8")
+  let reason = ""
+  let bytes = 0
+  for (const character of message) {
+    const size = Buffer.byteLength(character, "utf8")
+    if (bytes + size > 123) break
+    reason += character
+    bytes += size
+  }
+  return reason
 }
 
 export interface Envelope {
