@@ -18,7 +18,7 @@ for token in "$@"; do
   fi
   lowered="${token,,}"
   case "$lowered" in
-    web|tunnel|relay|pair|pairing|share|service|update|upgrade|self-update)
+    web|tunnel|relay|pair|pairing|share|service|update|upgrade|self-update|plugin)
       refuse "$token"
       ;;
     --host|--hostname|--bind)
