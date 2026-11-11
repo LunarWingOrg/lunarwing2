@@ -2186,9 +2186,9 @@ def worker_case_blocks(build_script: str) -> dict[str, str]:
     satisfied by the wrong lane's value (WI#303 review)."""
     blocks: dict[str, str] = {}
     for match in re.finditer(
-        r"(?ms)^    (pebble|opencode2|opencode|kimi)\)\n(.*?)^        ;;", build_script
+        r"(?ms)^    (pebble|opencode2|opencode|kimi|lunardepth)\)\n(.*?)^        ;;", build_script
     ):
-        blocks[match.group(1)] = match.group(2)
+        blocks.setdefault(match.group(1), match.group(2))
     return blocks
 
 
