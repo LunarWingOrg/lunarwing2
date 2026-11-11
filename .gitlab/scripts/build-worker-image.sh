@@ -239,6 +239,11 @@ lunardepth4lunarwing/scripts/runtime_smoke.py
 lunardepth4lunarwing/scripts/runtime_smoke_test.py
 lunardepth4lunarwing/scripts/runtime_smoke_entrypoint.sh
 lunardepth4lunarwing/scripts/dsh-exposure-guard.sh
+lunardepth4lunarwing/scripts/harden_image_modes.sh
+lunardepth4lunarwing/scripts/prepare_lockfile_deploy.py
+lunardepth4lunarwing/scripts/prepare_lockfile_deploy_test.py
+lunardepth4lunarwing/scripts/verify_deployed_closure.ts
+lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
         source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5
