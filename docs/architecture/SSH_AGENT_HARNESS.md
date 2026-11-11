@@ -113,7 +113,7 @@ gate); public types are re-exported from `lib.rs`.
 | `host` | `String` | — | hostname or IP |
 | `port` | `u16` | `22` | |
 | `user` | `String` | — | |
-| `key_type` | `SSHKeyType` | — | `ed25519` / `ecdsa` / `rsa` (serialized lowercase); built-in/WASM russh execution rejects `rsa`, while `ssh_git` delegates algorithm negotiation to agent/OpenSSH |
+| `key_type` | `SSHKeyType` | — | `ed25519` / `ecdsa` / `rsa` (serialized lowercase); every path rejects RSA key material by parsed algorithm at load time, so the label cannot bypass the policy |
 | `host_key_mode` | `HostKeyMode` | `Strict` | `Strict` / `AcceptFirst` (serialized PascalCase) |
 | `known_host_key` | `Option<String>` | `None` | pinned OpenSSH-format host public key |
 | `connect_timeout_secs` | `u64` | `10` | |
@@ -450,24 +450,23 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-38 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
+40 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
 `ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
 
 | File | Tests |
 |------|-------|
 | `ssh.rs` | 5 — hostname and secret-name helpers, bridge create/add, bridge restart + persistent pin revocation |
-| `ssh_agent.rs` | 2 — start/stop with an **empty** key map; socket parent-directory creation (permissions + cleanup) |
+| `ssh_agent.rs` | 3 — start/stop with an **empty** key map; socket parent-directory creation (permissions + cleanup); valid RSA key rejection without agent insertion |
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
 | `ssh_hostkeys.rs` | 14 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, concurrent-first-key race |
 | `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
-| `ssh_client.rs` | 3 — `append_capped` under-limit, crossing-limit, and already-full output behavior |
+| `ssh_client.rs` | 4 — `append_capped` under-limit, crossing-limit, and already-full output behavior; mislabeled valid RSA rejection before connection |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
-Notable gaps: the agent server is never tested with a **real** key (both tests
-use an empty map), and no test performs the full host-key preflight and command
-flow against a live SSH server. Persistent-pin tests exercise the encrypted
-in-memory secrets backend; normal database-backed stores share the same trait
-surface and their own CRUD coverage.
+Notable gaps: no test performs successful signing with a real key or the full
+host-key preflight and command flow against a live SSH server. Persistent-pin
+tests exercise the encrypted in-memory secrets backend; normal database-backed
+stores share the same trait surface and their own CRUD coverage.
 
 > The `config/ssh.rs` tests parse a **bare** `SshConfig`, so their TOML uses
 > top-level `[[hosts]]` (no `ssh.` prefix). Do **not** copy that shape into a
