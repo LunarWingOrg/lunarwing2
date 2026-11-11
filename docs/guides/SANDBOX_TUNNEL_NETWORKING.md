@@ -326,6 +326,10 @@ issue a replacement before upgrading, and revoke the old peer afterwards. Do
 not try to adopt the old volume by renaming it or copying salts. Later daemon
 restarts and host reboots retain the new volume and overlay identity as long as
 the instance, management URL, setup key, and persistent salt stay unchanged.
+Rolling back after that first start requires the same caution: runtime-salted
+code computes a different name again, and its stale-volume pruning can remove
+the newer volume, so another valid setup-key use and old-peer cleanup may be
+required.
 
 ## Verification
 
