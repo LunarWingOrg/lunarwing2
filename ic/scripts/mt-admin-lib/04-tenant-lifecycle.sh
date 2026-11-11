@@ -703,7 +703,8 @@ add_tenant() {
   # Rebuild when the tenant checkout's Dockerfile/snapshot digest differs; an
   # existing image with the same input label needs no build or redistribution.
   # Build/distribution failure remains non-fatal for base provisioning.
-  local sandbox_image_ok="operator-managed"
+  local sandbox_image_ok="operator-managed" sandbox_image
+  sandbox_image="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" SANDBOX_IMAGE)"
   if tenant_uses_managed_sandbox_image "$name"; then
     sandbox_image_ok="ready"
     ensure_sandbox_image_current "$name" "$SANDBOX_IMAGE_POLICY" "$(tenant_lw_root "$name")/ic" \
