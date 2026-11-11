@@ -1,4 +1,4 @@
-//! Real-Podman tunnel sidecar coverage (WI#248 and WI#592).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, and WI#602).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
@@ -20,6 +20,7 @@ use lunarwing::sandbox::{
 use secrecy::SecretString;
 
 const E2E_IMAGE: &str = "localhost/lw-tunnel-e2e:latest";
+const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
 const JOINED_PROBE: &str = "cat /etc/resolv.conf; \
      ip -o link show wg0 >/dev/null && echo LUNARWING-TUNNEL-JOIN-OK; \
      wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-UPLINK-OPEN; \
@@ -793,7 +794,10 @@ async fn netbird_volume(sidecar: &TunnelSidecar) -> Result<String, String> {
     }
 }
 
-async fn assert_netbird_restart_identity(sidecar: &TunnelSidecar) -> Result<String, String> {
+async fn assert_netbird_restart_identity(
+    sidecar: &TunnelSidecar,
+    runtime_dir: &Path,
+) -> Result<String, String> {
     let name = sidecar.container_name();
     let first_id = tunnel_container_id(name)
         .await
@@ -801,6 +805,8 @@ async fn assert_netbird_restart_identity(sidecar: &TunnelSidecar) -> Result<Stri
     let first_ip = netbird_ipv4(name).await?;
     let first_volume = netbird_volume(sidecar).await?;
     sidecar.stop().await;
+    std::fs::remove_file(runtime_dir.join(LABEL_SALT_FILE))
+        .map_err(|error| format!("could not remove the runtime label salt: {error}"))?;
     sidecar
         .ensure_started()
         .await
@@ -987,8 +993,16 @@ async fn podman_tunnel_sidecar_netbird_live() {
     let (image, management_url, setup_key) = settings.expect("NetBird live settings");
     let workdir = std::env::temp_dir().join(format!("lw-netbird-live-{}", std::process::id()));
     let primary_dir = workdir.join("primary");
+    let runtime_dir = workdir.join("runtime");
     std::fs::create_dir_all(&primary_dir).expect("primary instance dir");
-    let primary = TunnelSidecar::for_instance(
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime dir");
+    }
+    let primary = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Netbird,
@@ -999,6 +1013,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
             ..TunnelSidecarConfig::default()
         },
         &primary_dir,
+        &runtime_dir,
     );
     let peer_name = format!("{}-plain-peer", primary.container_name());
     let peer_env = write_peer_env_file(&workdir, &management_url, &setup_key)
@@ -1016,7 +1031,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
         let primary_volume = netbird_volume(&primary).await?;
         assert_eq!(
             primary_volume,
-            assert_netbird_restart_identity(&primary).await?
+            assert_netbird_restart_identity(&primary, &runtime_dir).await?
         );
         assert_netbird_reconnect(&primary).await?;
         assert_netbird_ingress_denied(&primary, &peer_name).await
