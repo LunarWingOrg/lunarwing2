@@ -1665,6 +1665,6 @@ mod tests {
         assert!(logs_contain("INFO"));
         assert!(logs_contain("Supervised mode configured"));
         assert!(logs_contain("enabled=true"));
-        assert!(logs_contain("source=both"));
+        assert!(logs_contain("source=\"both\""));
     }
 }
