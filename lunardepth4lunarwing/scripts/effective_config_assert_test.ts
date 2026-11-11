@@ -6,11 +6,42 @@ import test from "node:test"
 
 import {
   assertCompositionRows,
+  assertLaunchEnvironment,
   assertManifestHash,
   assertProfileSchema,
   EXPECTED_ROW_IDS,
   manifestSha256,
 } from "./effective_config_assert.js"
+
+const validLaunchEnvironment: NodeJS.ProcessEnv = {
+  HOME: "/home/lunardepth-home",
+  DSH_HOME: "/home/lunardepth/.dsh",
+  TMPDIR: "/tmp",
+  TMP: "/tmp",
+  TEMP: "/tmp",
+  WS_NO_BUFFER_UTIL: "1",
+  WS_NO_UTF_8_VALIDATE: "1",
+  DSH_TELEMETRY_DISABLED: "1",
+  LUNARDEPTH_WS_URL: "ws://127.0.0.1:19091/ws/agent",
+  LUNARDEPTH_LOCAL_AUTH_TOKEN: "test-only-local-token",
+  PATH: "/usr/local/bin:/usr/bin:/bin",
+}
+
+test("launch gate retains the sourced task environment", () => {
+  assertLaunchEnvironment(validLaunchEnvironment)
+  assert.throws(
+    () => assertLaunchEnvironment({ ...validLaunchEnvironment, HOME: "/home/lunardepth" }),
+    /launch environment drift: HOME/,
+  )
+  assert.throws(
+    () => assertLaunchEnvironment({ ...validLaunchEnvironment, LUNARDEPTH_LOCAL_AUTH_TOKEN: undefined }),
+    /missing the local credential/,
+  )
+  assert.throws(
+    () => assertLaunchEnvironment({ ...validLaunchEnvironment, PATH: "/usr/bin:" }),
+    /PATH contains a relative or empty entry/,
+  )
+})
 
 function manifest(directory: string, schemaVersion?: number): string {
   const path = join(directory, "package.json")

@@ -168,7 +168,32 @@ function paths() {
   }
 }
 
+export function assertLaunchEnvironment(env: NodeJS.ProcessEnv): void {
+  const expected: Record<string, string> = {
+    HOME: "/home/lunardepth-home",
+    DSH_HOME: "/home/lunardepth/.dsh",
+    TMPDIR: "/tmp",
+    TMP: "/tmp",
+    TEMP: "/tmp",
+    WS_NO_BUFFER_UTIL: "1",
+    WS_NO_UTF_8_VALIDATE: "1",
+    DSH_TELEMETRY_DISABLED: "1",
+    LUNARDEPTH_WS_URL: "ws://127.0.0.1:19091/ws/agent",
+  }
+  for (const [name, value] of Object.entries(expected)) {
+    if (env[name] !== value) throw new Error(`launch environment drift: ${name}`)
+  }
+  if (!env.LUNARDEPTH_LOCAL_AUTH_TOKEN) throw new Error("launch environment is missing the local credential")
+  for (const name of ["NODE_OPTIONS", "DSH_PERMISSION_MODE", "LUNARDEPTH_LOCAL_AUTH_TOKEN_FILE"]) {
+    if (env[name] !== undefined) throw new Error(`launch environment retains forbidden ${name}`)
+  }
+  if ((env.PATH ?? "").split(":").some(entry => !isAbsolute(entry))) {
+    throw new Error("launch environment PATH contains a relative or empty entry")
+  }
+}
+
 async function runGate(): Promise<GateState> {
+  assertLaunchEnvironment(process.env)
   const current = paths()
   const before = manifestSha256(current.manifest)
   const schema = await exportedSchemaVersion(current.closure)
