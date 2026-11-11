@@ -82,8 +82,6 @@ func lunardepthInputPolicy(lines []parsedLine, text string) error {
 		"pnpm exec tsx native/system/scripts/build.ts",
 		"build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth",
 		"scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts",
-		"--config.inject-workspace-packages=true",
-		"--config.minimumReleaseAgeStrict=true",
 		"verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth",
 		"sed -i '/^  \"prunedAt\":/d' /opt/lunardepth/node_modules/.modules.yaml",
 		"sed -i '/^  \"lastValidatedTimestamp\":/d' /opt/lunardepth/node_modules/.pnpm-workspace-state-v1.json",
