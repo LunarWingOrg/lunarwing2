@@ -109,7 +109,8 @@ with os.fdopen(fd, "w", encoding="utf-8") as handle:
     handle.write(secrets.token_hex(32))
 PY
 [[ ! -L "$TOKEN_FILE" && "$(stat -c '%u:%a' "$TOKEN_FILE")" == "10005:400" ]] || die "local token file validation failed"
-export LUNARDEPTH_LOCAL_AUTH_TOKEN="$(<"$TOKEN_FILE")"
+LUNARDEPTH_LOCAL_AUTH_TOKEN="$(<"$TOKEN_FILE")"
+export LUNARDEPTH_LOCAL_AUTH_TOKEN
 unset LUNARDEPTH_LOCAL_AUTH_TOKEN_FILE
 
 mkdir -p /run/lunarwing-shared/runner

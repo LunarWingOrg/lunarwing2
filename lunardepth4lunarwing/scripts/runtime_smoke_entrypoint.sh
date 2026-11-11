@@ -63,7 +63,8 @@ until curl -fsS --max-time 2 http://127.0.0.1:8443/ready >/dev/null 2>&1; do
 done
 
 export SMOKE_HUB_TOKEN=lunardepth-build-smoke-hub-token-0123456789abcdef
-export SMOKE_LOCAL_TOKEN="$(</run/lunardepth-state/local-auth-token)"
+SMOKE_LOCAL_TOKEN="$(</run/lunardepth-state/local-auth-token)"
+export SMOKE_LOCAL_TOKEN
 export SMOKE_LISTENER_ROLE=combined
 /usr/bin/python3 /app/scripts/runtime_smoke.py --profile remote
 /usr/bin/python3 /app/scripts/exposure_policy_assert.py --image-filesystem /

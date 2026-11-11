@@ -123,6 +123,7 @@ tenant_home() { printf '%s/home\n' "$fixture"; }
 tenant_quadlet_dir() { printf '%s/quadlets\n' "$fixture"; }
 write_kimi_runtime_env() { printf '%s/env/kimi-runtime.env\n' "$fixture"; }
 prepare_worker_workspace() { printf '%s/workspace\n' "$fixture"; }
+# shellcheck disable=SC2034  # read by the sourced LunarDepth start and task-preparation functions.
 render_lunardepth_overlay() { LUNARDEPTH_OVERLAY_FILE="$fixture/lunarwing-lane.patch.yml"; }
 worker_egress_reconcile_container() { :; }
 mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
