@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-11 (bounded tunnel recovery and sidecar DNS limitation, WI#604/WI#603)
+**Last updated:** 2026-11-11 (serialized tunnel lifecycle and atomic firewall replacement, WI#614)
 
 ---
 
@@ -435,12 +435,16 @@ The opt-in `tunnel` mode (WI#248) is separate from both the gateway's inbound
 sidecar establishes NetBird or kernel WireGuard; one-shot commands join its
 network namespace with every existing hardening flag. The sidecar name and
 NetBird state volume are instance-scoped from `LUNARWING_BASE_DIR`, and an
-ownership label prevents cross-daemon removal. Recreation is serialized per
-instance and runs join only the exact container ID returned by health/firewall
-verification. There are no published ports or host-network joins. The required
-`nftables` table has two base chains, installed after provider startup and
-verified rule by rule before every run; no healthy ID is available before that
-installation:
+ownership label prevents cross-daemon removal. Manager initialization is
+single-flight. Starts, recovery, stops, and cancelled-start cleanup share a
+fair lifecycle lock per container name across handles in one daemon; cleanup is
+queued before the next start can proceed. Runs join only the exact container ID
+returned by health/firewall verification. There are no published ports or
+host-network joins. The required `nftables` table has two base chains,
+installed after provider startup and verified rule by rule before every run; no
+healthy ID is available before that installation. A table that already verifies
+is not rewritten. Any required installation uses one `nft -f -` transaction to
+replace the complete table atomically, with no unfiltered delete/rebuild window:
 
 - `input`, policy `drop`: accepts loopback and `established,related` return
   traffic only. A sandbox process cannot bind an inbound service reachable
