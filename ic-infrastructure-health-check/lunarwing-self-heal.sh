@@ -226,6 +226,9 @@ unit_tenant() {
         lunarwing-opencode2-*)
             u="${u#lunarwing-opencode2-}"
             printf '%s' "${u%-sup}" ;;
+        lunarwing-lunardepth-*)
+            u="${u#lunarwing-lunardepth-}"
+            printf '%s' "${u%-sup}" ;;
         lunarwing-kimi-*)
             u="${u#lunarwing-kimi-}"
             printf '%s' "${u%-sup}" ;;
