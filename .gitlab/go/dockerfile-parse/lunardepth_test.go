@@ -34,7 +34,7 @@ func TestLunardepthStructuralFailures(t *testing.T) {
 		{"missing source pin", strings.Replace(valid, "da06c33b2091546dc38c61b95452ce27a4ce32d5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1), "LUNARDEPTH_REF"},
 		{"post smoke copy", valid + "COPY --from=builder /opt /ignored\n", "must not add filesystem inputs"},
 		{"unexpected shell", strings.Replace(valid, "SHELL [\"/bin/bash\", \"-o\", \"pipefail\", \"-c\"]", "SHELL [\"/bin/sh\", \"-c\"]", 1), "must pin bash pipefail"},
-		{"missing ownership assertion", strings.Replace(valid, "test -z \"$(find -L", "test -n \"$(find -L", 1), "ownership"},
+		{"missing ownership assertion", strings.Replace(valid, "test -z \"$(find -L", "test -n \"$(find -L", 1), "required input or assertion"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
