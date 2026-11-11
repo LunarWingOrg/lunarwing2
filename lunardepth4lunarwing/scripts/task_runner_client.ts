@@ -2,6 +2,7 @@ import { lstatSync } from "node:fs"
 import { connect } from "node:net"
 
 import {
+  deadlineDelay,
   DEFAULT_TIMEOUT_MS,
   isRecord,
   MAX_FRAME_BYTES,
@@ -61,7 +62,7 @@ export function delegateTaskToRunner(
     const armRunDeadline = () => {
       clearTimeout(deadline)
       const timeout = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
-      deadline = setTimeout(cancel, timeout + RUN_MARGIN_MS)
+      deadline = setTimeout(cancel, deadlineDelay(timeout, RUN_MARGIN_MS))
     }
     signal.addEventListener("abort", cancel, { once: true })
     deadline = setTimeout(() => fail(new Error("task runner handshake timed out")), 15_000)

@@ -6,8 +6,12 @@ import test from "node:test"
 
 import {
   bearerTokenMatches,
+  boundedCloseReason,
   createEnvelope,
+  deadlineDelay,
   MAX_HISTORY_MESSAGES,
+  MAX_TIMER_DELAY_MS,
+  MAX_TIMEOUT_MS,
   parseEnvelope,
   readCredentialFile,
   serializeBounded,
@@ -64,14 +68,25 @@ test("enforces history count and UTF-16 code-unit limits", () => {
     }),
     /at most 12 messages/,
   )
+  assert.equal(validateTaskRequest({
+    task_id: "job",
+    prompt: "x",
+    context: { conversation_history: [{ role: "user", content: "😀".repeat(1001) }] },
+  }).context?.conversation_history?.[0]?.content.length, 2002)
   assert.throws(
     () => validateTaskRequest({
       task_id: "job",
       prompt: "x",
-      context: { conversation_history: [{ role: "user", content: "😀".repeat(1001) }] },
+      context: { conversation_history: [{ role: "user", content: "😀".repeat(2001) }] },
     }),
-    /UTF-16 code units/,
+    /Unicode code points/,
   )
+})
+
+test("bounds close reasons and deadline timers", () => {
+  const reason = boundedCloseReason(new Error("😀".repeat(100)))
+  assert.ok(Buffer.byteLength(reason, "utf8") <= 123)
+  assert.equal(deadlineDelay(MAX_TIMEOUT_MS, 60_000), MAX_TIMER_DELAY_MS)
 })
 
 test("round-trips envelopes and compares bearer digests", () => {

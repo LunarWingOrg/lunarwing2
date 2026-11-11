@@ -5,6 +5,7 @@ import WebSocket, { WebSocketServer, type RawData } from "ws"
 import { delegateTaskToRunner } from "./task_runner_client.js"
 import {
   bearerTokenMatches,
+  boundedCloseReason,
   createEnvelope,
   errorResult,
   MAX_FRAME_BYTES,
@@ -252,7 +253,7 @@ class HubConnection {
         data instanceof ArrayBuffer ? Buffer.from(data).toString("utf8") : data.toString("utf8")
       this.owner.receive(this, parseEnvelope(text))
     } catch (error) {
-      this.socket.close(1008, error instanceof Error ? error.message.slice(0, 120) : "invalid message")
+      this.socket.close(1008, boundedCloseReason(error))
     }
   }
 

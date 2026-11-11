@@ -11,6 +11,16 @@ export const MAX_HISTORY_MESSAGE_UNITS = 2_000
 export const MAX_HISTORY_UNITS = 12_000
 export const DEFAULT_TIMEOUT_MS = 3_600_000
 export const MAX_TIMEOUT_MS = 2_147_483_647
+export const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+export function deadlineDelay(timeoutMs: number, marginMs: number): number {
+  return Math.min(timeoutMs + marginMs, MAX_TIMER_DELAY_MS)
+}
+
+export function boundedCloseReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return Buffer.from(message, "utf8").subarray(0, 123).toString("utf8")
+}
 
 export interface Envelope {
   id: string
@@ -177,13 +187,14 @@ function validateHistory(value: unknown): ConversationMessage[] | undefined {
         typeof entry.content !== "string" || Object.keys(entry).some(key => key !== "role" && key !== "content")) {
       throw new Error("conversation history entries require only role user/assistant and string content")
     }
-    if (entry.content.length > MAX_HISTORY_MESSAGE_UNITS) {
-      throw new Error(`conversation history content exceeds ${MAX_HISTORY_MESSAGE_UNITS} UTF-16 code units`)
+    const contentUnits = Array.from(entry.content).length
+    if (contentUnits > MAX_HISTORY_MESSAGE_UNITS) {
+      throw new Error(`conversation history content exceeds ${MAX_HISTORY_MESSAGE_UNITS} Unicode code points`)
     }
-    total += entry.content.length
+    total += contentUnits
     return { role: entry.role, content: entry.content }
   })
-  if (total > MAX_HISTORY_UNITS) throw new Error(`conversation history exceeds ${MAX_HISTORY_UNITS} UTF-16 code units`)
+  if (total > MAX_HISTORY_UNITS) throw new Error(`conversation history exceeds ${MAX_HISTORY_UNITS} Unicode code points`)
   return history
 }
 

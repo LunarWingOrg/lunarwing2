@@ -5,6 +5,7 @@ import WebSocket, { type RawData } from "ws"
 
 import {
   createEnvelope,
+  deadlineDelay,
   DEFAULT_TIMEOUT_MS,
   errorResult,
   isRecord,
@@ -74,7 +75,7 @@ export class LunarDepthClient {
       handshakeTimeout: 10_000,
     })
     this.socket = socket
-    const deadline = setTimeout(() => this.stop(request.task_id), (request.timeout_ms ?? DEFAULT_TIMEOUT_MS) + LOCAL_GRACE_MS)
+    const deadline = setTimeout(() => this.stop(request.task_id), deadlineDelay(request.timeout_ms ?? DEFAULT_TIMEOUT_MS, LOCAL_GRACE_MS))
     const abort = () => this.stop(request.task_id)
     signal.addEventListener("abort", abort, { once: true })
     try {
