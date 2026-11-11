@@ -158,7 +158,7 @@ build_lunardepth_worker() {
     local -a layer_args=()
     [[ "$no_cache" != "true" ]] || layer_args=(--layers=false)
     podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \
-      --network=host --format docker --timestamp "$source_date_epoch" "${identity_args[@]}" -t "$candidate_tag" "$lane_dir" \
+      --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$lane_dir" \
       || { rm -f "$iid_file"; die "LunarDepth worker image build failed"; }
   else
     DOCKER_BUILDKIT=1 docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \
