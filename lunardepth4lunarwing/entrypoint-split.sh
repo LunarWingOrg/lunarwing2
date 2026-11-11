@@ -53,7 +53,18 @@ run_task() {
   done
   /usr/local/bin/node "$APP_DIR/scripts/effective_config_assert.js" post-ready
   log "LunarDepth task harness and runner are ready"
-  wait -n "$HARNESS_PID" "$RUNNER_PID" || true
+  local gate_file=/run/lunarwing-shared/runner/lunardepth-ready.json
+  local gate_tmp
+  while kill -0 "$HARNESS_PID" 2>/dev/null && kill -0 "$RUNNER_PID" 2>/dev/null \
+    && curl -fsS --max-time 2 http://127.0.0.1:19091/ready >/dev/null 2>&1 \
+    && /usr/local/bin/node "$APP_DIR/scripts/lunardepth_task_runner.js" --healthcheck "$RUNNER_SOCKET"; do
+    gate_tmp="$gate_file.$$"
+    printf '{"ready":true,"composition":true,"sandbox":true,"task":true,"heartbeat_at":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$gate_tmp"
+    chmod 0640 "$gate_tmp"
+    mv "$gate_tmp" "$gate_file"
+    sleep 10
+  done
   die "LunarDepth task role stopped unexpectedly"
 }
 
