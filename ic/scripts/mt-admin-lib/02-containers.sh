@@ -251,7 +251,7 @@ render_container_babysitter_unit() {
   log_dir="$(tenant_lw_root "$name")/logs"
   local egress_guard="" egress_ruleset="" egress_chain="" worker_dependency=""
   case "$type" in
-    pebble|opencode|opencode2|kimi)
+    pebble|opencode|opencode2|kimi|lunardepth)
       egress_guard="$WORKER_EGRESS_GUARD"
       egress_ruleset="$(worker_egress_ruleset_path "$name")"
       egress_chain="$(worker_egress_chain "$name")"

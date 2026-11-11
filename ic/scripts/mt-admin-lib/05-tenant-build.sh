@@ -612,6 +612,7 @@ build_tenant() {
   local with_toolchains="${6:-false}"
   local require_wasm="${7:-false}"
   local with_opencode2="${8:-false}"
+  local with_lunardepth="${9:-false}"
   local repo
   repo="$(tenant_repo "$name")"
 
@@ -701,6 +702,12 @@ build_tenant() {
     build_opencode2_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
   fi
 
+  if [[ "$with_lunardepth" == "true" ]]; then
+    say ""
+    say "=== Building and verifying LunarDepth worker image ==="
+    build_lunardepth_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
+  fi
+
   # After a rebuild, the tenant will be restarted with the new binary. If the
   # tenant has LUNARWING_OWNER_ID but still has orphaned 'default'-scoped DB
   # data (e.g. upgrading from a pre-owner-id version), auto-migrate so the
@@ -744,7 +751,7 @@ upgrade_candidate_image_ref() {  # <tenant> <lane>
 # converging (run-294 TJ-10).
 _upgrade_validate_lane() {  # <lane>
   case "$1" in
-    pebble|opencode|kimi|opencode2) return 0 ;;
+    pebble|opencode|kimi|opencode2|lunardepth) return 0 ;;
     *)
       say "WARNING: ignoring unknown worker lane '$1'" >&2
       return 1
@@ -779,6 +786,7 @@ build_candidate_worker() {
     opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
     kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" "$release_ref" || rc=$? ;;
     opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
+    lunardepth) LUNARWING_WORKER_IMAGE_TAG="$tag" build_lunardepth_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
   esac
   [[ "$rc" -eq 0 ]] || return "$rc"
   _ensure_marker_dir
@@ -804,22 +812,23 @@ _worker_toolchain_profile() {  # <lane>
 
 # Build every selected lane's candidate image, recording each success. Fails at
 # the first failing lane with that lane named, leaving the tenant untouched.
-# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref]
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref] [with_lunardepth]
 build_candidate_workers() {
   local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
-  local with_pebble="${5:-false}" with_toolchains="${6:-false}" release_ref="${7:-}"
+  local with_pebble="${5:-false}" with_toolchains="${6:-false}" release_ref="${7:-}" with_lunardepth="${8:-false}"
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
   # a later failed run could "restore" a lane to an image this run never had.
   clear_promote_rollback "$name"
   local lane
-  for lane in pebble opencode kimi opencode2; do
+  for lane in pebble opencode kimi opencode2 lunardepth; do
     case "$lane" in
       pebble)    [[ "$with_pebble" == true ]] || continue ;;
       opencode)  [[ "$with_opencode" == true ]] || continue ;;
       kimi)      [[ "$with_kimi" == true ]] || continue ;;
       opencode2) [[ "$with_opencode2" == true ]] || continue ;;
+      lunardepth) [[ "$with_lunardepth" == true ]] || continue ;;
     esac
     say ""
     say "=== Building $lane worker candidate image (tenant still running) ==="
@@ -1361,14 +1370,15 @@ ensure_darkirc_release() {
     || die "DarkIRC release remained invalid after rebuild"
 }
 
-shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2> <with-pebble>
-  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}" with_pebble="${5:-false}"
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2> <with-pebble> <with-lunardepth>
+  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}" with_pebble="${5:-false}" with_lunardepth="${6:-false}"
   local name root commit dirty expected_commit="" selected_root=""
   local -a worker_paths=()
   [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
   [[ "$with_opencode2" != "true" ]] || worker_paths+=(opencode2.4lunarwing)
   [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
   [[ "$with_pebble" != "true" ]] || worker_paths+=(pebble4lunarwing)
+  [[ "$with_lunardepth" != "true" ]] || worker_paths+=(lunardepth4lunarwing)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     root="$(tenant_lw_root "$name")"
@@ -1396,6 +1406,7 @@ build_all() {
   local with_kimi="${4:-false}"
   local with_toolchains="${5:-false}"
   local with_opencode2="${6:-false}"
+  local with_lunardepth="${7:-false}"
   local names
   names="$(all_tenant_names)"
 
@@ -1405,8 +1416,8 @@ build_all() {
   fi
 
   local worker_source_root=""
-  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" || "$with_pebble" == "true" ]]; then
-    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2" "$with_pebble")"
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" || "$with_pebble" == "true" || "$with_lunardepth" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2" "$with_pebble" "$with_lunardepth")"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
@@ -1431,6 +1442,12 @@ build_all() {
     say ""
     say "=== Building opencode2 worker image ==="
     build_opencode2_worker "false" "$with_toolchains" "$worker_source_root"
+  fi
+
+  if [[ "$with_lunardepth" == "true" ]]; then
+    say ""
+    say "=== Building and verifying LunarDepth worker image ==="
+    build_lunardepth_worker "false" "$with_toolchains" "$worker_source_root"
   fi
 
   while IFS= read -r name; do
@@ -1548,8 +1565,16 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
 _archive_worker_source() {  # <tenant source root> <lane>
   local source_root="$1" lane="$2" tmp_parent tmp archive links
   local -a paths=("$lane")
-  [[ "$lane" != opencode2.4lunarwing ]] \
-    || paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
+  if [[ "$lane" == opencode2.4lunarwing ]]; then
+    paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
+    # The verifier's shared module only exists from the revision that split it
+    # out. A tenant at an older revision has a self-contained verifier, and
+    # naming a path that revision lacks makes git archive fail (ZP-4).
+    local optional_path=.gitlab/scripts/worker_candidate_config.py
+    if git -C "$LUNARWING_ROOT" cat-file -e "$WORKER_BUILD_SOURCE_REVISION:$optional_path" 2>/dev/null; then
+      paths+=("$optional_path")
+    fi
+  fi
   require_cmd tar
   tmp_parent="${LUNARWING_WORKER_BUILD_TMPDIR:-/var/tmp}"
   [[ -d "$tmp_parent" && ! -L "$tmp_parent" ]] \
@@ -1810,10 +1835,19 @@ _opencode2_snapshot_checkout() {
     cp -R --no-dereference --no-preserve=ownership -- \
       "$source" "$lane/$name" || return 1
   done
-  source="$(_opencode2_snapshot_source "$resolved_root" \
-    "$source_root/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py")" || return 1
-  cp -R --no-dereference --no-preserve=ownership -- \
-    "$source" "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" || return 1
+  for name in verify-opencode2-exposure-out-of-band.py worker_candidate_config.py; do
+    # worker_candidate_config.py exists only from the revision that split it out
+    # of the verifier (ZP-4). An older tenant revision has a self-contained
+    # verifier; a newer one that lacks the module fails at its import.
+    if [[ "$name" == worker_candidate_config.py \
+        && ! -e "$source_root/.gitlab/scripts/$name" && ! -L "$source_root/.gitlab/scripts/$name" ]]; then
+      continue
+    fi
+    source="$(_opencode2_snapshot_source "$resolved_root" \
+      "$source_root/.gitlab/scripts/$name")" || return 1
+    cp -R --no-dereference --no-preserve=ownership -- \
+      "$source" "$snapshot/.gitlab/scripts/$name" || return 1
+  done
   if [[ -n "$(find "$snapshot" ! -type f ! -type d -print -quit)" ]]; then
     echo "ERROR: checkout snapshot contains a link or special file (WI#425 out-of-band)" >&2
     return 1

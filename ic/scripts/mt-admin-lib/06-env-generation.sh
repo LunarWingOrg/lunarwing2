@@ -1186,7 +1186,7 @@ write_tenant_lunarwing_env() {
   local opencode2_model="${15:-}"
   local opencode2_base_url="${16:-}"
 
-  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port opencode2_wss_port
+  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port opencode2_wss_port lunardepth_wss_port
   path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
   http_port="$(ports_get "$name" http)"
@@ -1200,6 +1200,7 @@ write_tenant_lunarwing_env() {
   opencode_wss_port="$(ports_get "$name" opencode_wss)"
   kimi_wss_port="$(ports_get "$name" kimi_wss)"
   opencode2_wss_port="$(ports_get "$name" opencode2_wss)"
+  lunardepth_wss_port="$(ports_get "$name" lunardepth_wss)"
 
   local state_dir run_dir
   state_dir="$(tenant_state_dir "$name")"
@@ -1585,6 +1586,9 @@ KIMI_WSS_PORT=$kimi_wss_port
 
 # OpenCode 2 worker (WebSocket port for agent communication)
 OPENCODE2_WSS_PORT=$opencode2_wss_port
+
+# LunarDepth worker (explicit TensorMoon-compatible route; no inherited endpoint)
+LUNARDEPTH_WSS_PORT=$lunardepth_wss_port
 
 # Pebble worker (WebSocket port for agent communication)
 PEBBLE_WSS_PORT=$pebble_wss_port
@@ -3202,6 +3206,8 @@ patch_tenant_env() {
     || die "could not safely write the kimi external-worker config for tenant '$name'"
   ensure_external_worker_config "$name" "opencode2" "opencode2_wss" \
     || die "could not safely write the opencode2 external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "lunardepth" "lunardepth_wss" \
+    || die "could not safely write the LunarDepth external-worker config for tenant '$name'"
 }
 
 extract_host_from_url() {

@@ -123,12 +123,18 @@ tenant_home() { printf '%s/home\n' "$fixture"; }
 tenant_quadlet_dir() { printf '%s/quadlets\n' "$fixture"; }
 write_kimi_runtime_env() { printf '%s/env/kimi-runtime.env\n' "$fixture"; }
 prepare_worker_workspace() { printf '%s/workspace\n' "$fixture"; }
+# shellcheck disable=SC2034  # read by the sourced LunarDepth start and task-preparation functions.
+render_lunardepth_overlay() { LUNARDEPTH_OVERLAY_FILE="$fixture/lunarwing-lane.patch.yml"; }
+worker_egress_reconcile_container() { :; }
 mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
 env_file="$fixture/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$env_file"
 : >"$fixture/env/kimi-runtime.env"
+: >"$fixture/env/lunardepth-task.env"
+: >"$fixture/lunarwing-lane.patch.yml"
 chmod 700 "$fixture/env"
-chmod 600 "$env_file" "$fixture/env/kimi-runtime.env"
+chmod 600 "$env_file" "$fixture/env/kimi-runtime.env" "$fixture/env/lunardepth-task.env"
+chmod 444 "$fixture/lunarwing-lane.patch.yml"
 # WI#446 (run-174 LW-3): the config-hash sidecar lives in root-owned host
 # state ($CONTAINER_HASH_DIR/<tenant>/), not the tenant home; the harness
 # points it at the fixture.
@@ -195,6 +201,10 @@ base_contract() {  # <worker>: the rootless-podman base contract the lane uses
     opencode) printf '%s' "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT" ;;
     opencode2) printf '%s' "$OPENCODE2_ROOTLESS_LAUNCH_CONTRACT" ;;
     pebble) printf '%s' "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT" ;;
+    lunardepth)
+      printf '%s;overlay=%s;task-env=%s' "$LUNARDEPTH_ROOTLESS_LAUNCH_CONTRACT" \
+        "$(sha256sum "$fixture/lunarwing-lane.patch.yml" | cut -d' ' -f1)" \
+        "$(sha256sum "$fixture/env/lunardepth-task.env" | cut -d' ' -f1)" ;;
   esac
 }
 image_user_for() {  # <worker>: the lane's real image Config.User
@@ -205,6 +215,7 @@ image_user_for() {  # <worker>: the lane's real image Config.User
     opencode) printf '%s:%s' "$OPENCODE_CONTAINER_UID" "$OPENCODE_CONTAINER_GID" ;;
     opencode2) printf '%s:%s' "$OPENCODE2_CONTAINER_UID" "$OPENCODE2_CONTAINER_GID" ;;
     pebble) printf '%s:%s' "$PEBBLE_CONTAINER_UID" "$PEBBLE_CONTAINER_GID" ;;
+    lunardepth) printf '%s:%s' "$LUNARDEPTH_CONTAINER_UID" "$LUNARDEPTH_CONTAINER_GID" ;;
     *) printf '' ;;
   esac
 }
@@ -273,7 +284,7 @@ imperative_scenario() {  # <worker>
   assert_call "ctr:alice stop $container" "$worker imperative: rebuilt image stops the old container"
   assert_call "ctr:alice rm -f $container" "$worker imperative: rebuilt image removes the old container"
 }
-for worker in kimi opencode opencode2 pebble; do
+for worker in kimi opencode opencode2 pebble lunardepth; do
   imperative_scenario "$worker"
 done
 
@@ -341,18 +352,19 @@ quadlet_scenario() {  # <worker>
   "start_tenant_${worker}" alice
   assert_no_call "systemctl:alice stop ${container}.service" "$worker quadlet: hash refreshed by the recreate, next start is quiet"
 }
-for worker in kimi opencode opencode2 pebble; do
+for worker in kimi opencode opencode2 pebble lunardepth; do
   quadlet_scenario "$worker"
 done
 
 # /app stays root-owned and read-only to both non-root identities. A
 # COPY --chown would hand executable bridge code to a writable uid.
-for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing; do
+for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing lunardepth4lunarwing; do
   dockerfile="$HARNESS_REPO_ROOT/$lane/Dockerfile"
   case "$lane" in
     kimicode4lunarwing) task_uid=10002; bridge_uid=10102 ;;
     opencode4lunarwing) task_uid=10001; bridge_uid=10101 ;;
     pebble4lunarwing) task_uid=10004; bridge_uid=10104 ;;
+    lunardepth4lunarwing) task_uid=10005; bridge_uid=10105 ;;
   esac
   if [[ ! -f "$dockerfile" ]]; then
     fail "$lane Dockerfile missing (WI#400 LD-2 pin)"
@@ -396,6 +408,7 @@ image_user_refusal() {  # <worker> <stale Config.User>
     opencode) expected="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" ;;
     opencode2) expected="$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID" ;;
     pebble) expected="$PEBBLE_CONTAINER_UID:$PEBBLE_CONTAINER_GID" ;;
+    lunardepth) expected="$LUNARDEPTH_CONTAINER_UID:$LUNARDEPTH_CONTAINER_GID" ;;
   esac
   IMAGE_USER="$stale"
   display="$(sanitize_display_value "${stale:-unset}")"
@@ -416,18 +429,18 @@ image_user_refusal() {  # <worker> <stale Config.User>
   rc=$?
   set -e
   if [[ "$rc" == 3 && "$out" == *"image has user '$display', expected $expected (WI#454 task default)"* \
-      && "$out" == *"rebuild it" && "$out" != *$'\033'* && "${#out}" -lt 600 \
+      && "$out" == *"rebuild it"* && "$out" != *$'\033'* && "${#out}" -lt 600 \
       && ! -s "$unexpected" ]]; then
     pass "$INIT_SYSTEM $worker safely refuses image user '$display' with status 3"
   else
-    fail "$INIT_SYSTEM $worker unsafe/incorrect image refusal (status $rc)"
+    fail "$INIT_SYSTEM $worker unsafe/incorrect image refusal (status $rc): $out"
   fi
   IMAGE_USER="$(image_user_for "$worker")"
 }
 for refusal_init in openrc systemd; do
   use_init "$refusal_init"
   ensure_init_system
-  for worker in kimi pebble opencode opencode2; do
+  for worker in kimi pebble opencode opencode2 lunardepth; do
     for stale_user in '12345:12345' '' 'x%sy%dz' '%099999d' '\033[2J' $'\033[2J\nforged\rline' \
         "$(printf '%05000d' 0)"; do
       image_user_refusal "$worker" "$stale_user"
@@ -537,10 +550,10 @@ CONTAINER_EXISTS="true"
 
 # ── SOURCE_REVISION stamping ─────────────────────────────────────────────────
 repo="$fixture/src"
-for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing .gitlab/scripts; do
+for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing lunardepth4lunarwing .gitlab/scripts; do
   mkdir -p "$repo/$dir"
 done
-for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lunarwing; do
+for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lunarwing lunardepth4lunarwing; do
   printf 'FROM scratch\n' >"$repo/$dir/Dockerfile"
 done
 printf '#!/bin/sh\n' >"$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
@@ -553,6 +566,7 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$repo/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$HARNESS_REPO_ROOT/.gitlab/scripts/worker_candidate_config.py" \
   "$repo/.gitlab/scripts/"
 printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
 chmod 755 "$fixture/real-opencode"
@@ -708,9 +722,20 @@ LUNARWING_ROOT="$repo" build_kimi_worker false false "" "$repo"
 LUNARWING_ROOT="$repo" build_opencode_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_opencode2_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_pebble_worker false false
-for worker in kimi opencode opencode2 pebble; do
+lunardepth_verification_seen=""
+# The build checks the host kernel for the Landlock floor; this harness tests
+# the build contract, not the runner it happens to run on.
+lunardepth_landlock_floor_problem() { return 1; }
+_verify_lunardepth_image_out_of_band() {
+  [[ "$1" == "sha256:$(printf '%064d' 0)" && "$2" == "$repo" ]] || return 1
+  lunardepth_verification_seen="$1"
+}
+LUNARWING_ROOT="$repo" build_lunardepth_worker false false "$repo"
+for worker in kimi opencode opencode2 pebble lunardepth; do
   build_tag="lunarwing-worker-${worker}:latest"
-  [[ "$worker" != opencode2 ]] || build_tag="lunarwing-worker-opencode2:candidate-$$"
+  case "$worker" in
+    opencode2|lunardepth) build_tag="lunarwing-worker-${worker}:candidate-$$" ;;
+  esac
   if build_arg_seen "$build_tag" "$head"; then
     pass "build-${worker}-worker stamps SOURCE_REVISION=HEAD"
   else
@@ -720,6 +745,10 @@ done
 expected_image_id="sha256:$(printf '%064d' 0)"
 assert_call "podman:tag $expected_image_id lunarwing-worker-opencode2:latest" \
   'opencode2 promotion tags the verified immutable ID'
+assert_eq "$lunardepth_verification_seen" "$expected_image_id" \
+  'LunarDepth out-of-band verification receives the immutable image ID and clean source'
+assert_call "podman:tag $expected_image_id lunarwing-worker-lunardepth:latest" \
+  'LunarDepth promotion tags the verified immutable ID'
 printf 'FROM scratch\nLABEL fixture=2\n' >"$repo/kimicode4lunarwing/Dockerfile"
 CALLS=()
 LUNARWING_ROOT="$repo" build_kimi_worker false false "" "$repo"
@@ -733,14 +762,15 @@ workspace_identity="$(stat -c '%d:%i' -- "$fixture/workspace")"
 mkdir -p "$fixture/other-workspace"
 ln -s "$fixture/other-workspace" "$fixture/redirected-workspace"
 for launcher in kimicode4lunarwing/entrypoint-split.sh opencode4lunarwing/entrypoint-split.sh \
-    opencode2.4lunarwing/entrypoint.sh pebble4lunarwing/entrypoint.sh; do
+    opencode2.4lunarwing/entrypoint.sh pebble4lunarwing/entrypoint.sh lunardepth4lunarwing/entrypoint-split.sh; do
   for mount_path in workspace redirected-workspace; do
     output="$(env LUNARWING_ROOTFUL_WORKSPACE=1 LUNARWING_WORKSPACE_ID="$workspace_identity" \
       LUNARWING_CONTAINER_ROLE=split-task WORKSPACE_ROOT="$fixture/$mount_path" \
       KIMI_TASK_UID=59990 KIMI_BRIDGE_UID=59991 OPENCODE_TASK_UID=59990 OPENCODE_BRIDGE_UID=59991 \
-      OPENCODE2_TASK_UID=59990 PEBBLE_TASK_UID=59990 \
+      OPENCODE2_TASK_UID=59990 PEBBLE_TASK_UID=59990 LUNARDEPTH_TASK_UID=59990 LUNARDEPTH_BRIDGE_UID=59991 \
       bash "$HARNESS_REPO_ROOT/$launcher" 2>&1)" && result=0 || result=$?
     expected='split-task must run as uid'
+    [[ "$launcher" != lunardepth4lunarwing/* ]] || expected='split-task requires 10005:10005'
     [[ "$mount_path" == workspace ]] || expected='workspace mount changed identity'
     if [[ "$result" -ne 0 && "$output" == *"$expected"* ]]; then
       pass "$launcher checks $mount_path before task setup"

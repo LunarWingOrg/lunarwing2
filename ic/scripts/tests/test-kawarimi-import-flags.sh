@@ -243,6 +243,29 @@ else
   pass "build-tenant omits unselected --with-pebble"
 fi
 
+echo "=== import-tenant LunarDepth key-file flag reaches the dry-run plan ==="
+printf '%s\n' 'lunardepth-test-only-secret' >"$tmp/lunardepth-key"
+lunardepth_output="$(
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
+    --dry-run --yes --with-lunardepth \
+    --lunardepth-base-url https://tensormoon.example.test/openai/v1 \
+    --lunardepth-model tensormoon::function_name::lunarwing \
+    --lunardepth-api-key-file "$tmp/lunardepth-key" 2>&1
+)" || {
+  status=$?
+  printf '%s\n' "$lunardepth_output"
+  fail "LunarDepth import dry-run exited successfully"
+  exit "$status"
+}
+assert_contains "add-tenant carries LunarDepth selection" "$lunardepth_output" "add-tenant kawarimi"
+assert_contains "add-tenant carries LunarDepth route" "$lunardepth_output" "--with-lunardepth"
+assert_contains "add-tenant carries LunarDepth key-file path" "$lunardepth_output" "--lunardepth-api-key-file"
+assert_contains "build-tenant carries LunarDepth selection" "$lunardepth_output" "build-tenant kawarimi"
+assert_not_contains "LunarDepth key contents stay out of dry-run output" "$lunardepth_output" "lunardepth-test-only-secret"
+
 set +e
 retired_output="$(bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" --with-nanocode 2>&1)"
 retired_status=$?

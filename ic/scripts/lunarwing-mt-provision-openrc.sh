@@ -58,6 +58,13 @@ ENABLE_HEALTH=true                  # Host-global health/self-heal pipeline
 ENABLE_WEECHAT_BOOTSTRAP=true       # Generate relay.conf during add-tenants
 BUILD_WASM=true                     # Build + install WASM tools and channels
 BUILD_PEBBLE=true                   # Build pebble worker Docker image
+BUILD_LUNARDEPTH=false              # Opt-in LunarDepth; requires explicit route settings below
+LUNARDEPTH_BASE_URL="${LUNARDEPTH_BASE_URL:-}"
+LUNARDEPTH_MODEL="${LUNARDEPTH_MODEL:-}"
+LUNARDEPTH_API_KEY_FILE="${LUNARDEPTH_API_KEY_FILE:-}"   # one tenant only: the model sees this key
+LUNARDEPTH_API_KEY_DIR="${LUNARDEPTH_API_KEY_DIR:-}"     # several tenants: one <tenant>.key file each
+LUNARDEPTH_ALLOW_INSECURE_HTTP="${LUNARDEPTH_ALLOW_INSECURE_HTTP:-false}"
+LUNARDEPTH_ALLOW_PLACEHOLDER_KEY="${LUNARDEPTH_ALLOW_PLACEHOLDER_KEY:-false}"
 BUILD_DARKIRC=true                  # Build darkirc daemon binary
 BUILD_VISION=true                   # Build vision/OCR sidecar Docker image
 INSTALL_WATCHDOG=false             # Single-tenant watchdog; MT health pipeline already covers tenants
@@ -250,6 +257,21 @@ phase_1() {
   [[ "$ENABLE_HEALTH" == false ]] && flags+=(--no-health)
   [[ "$ENABLE_SSH" == false ]] && flags+=(--no-ssh)
   [[ "$ENABLE_WEECHAT_BOOTSTRAP" == false ]] && flags+=(--no-weechat-bootstrap)
+  if [[ "$BUILD_LUNARDEPTH" == true ]]; then
+    [[ -n "$LUNARDEPTH_BASE_URL" && -n "$LUNARDEPTH_MODEL" ]] \
+      || die "BUILD_LUNARDEPTH requires LUNARDEPTH_BASE_URL and LUNARDEPTH_MODEL"
+    [[ -n "$LUNARDEPTH_API_KEY_FILE" || -n "$LUNARDEPTH_API_KEY_DIR" || "$LUNARDEPTH_ALLOW_PLACEHOLDER_KEY" == "true" ]] \
+      || die "BUILD_LUNARDEPTH requires LUNARDEPTH_API_KEY_DIR (one <tenant>.key per tenant), LUNARDEPTH_API_KEY_FILE (one tenant only) or the explicit placeholder option"
+    # mt-admin refuses one key file for several tenants; say so before anything is created.
+    if [[ -n "$LUNARDEPTH_API_KEY_FILE" && "$TENANTS" == *,* ]]; then
+      die "LUNARDEPTH_API_KEY_FILE would give every tenant in '$TENANTS' the same model-visible key; set LUNARDEPTH_API_KEY_DIR instead"
+    fi
+    flags+=(--with-lunardepth --lunardepth-base-url "$LUNARDEPTH_BASE_URL" --lunardepth-model "$LUNARDEPTH_MODEL")
+    [[ -z "$LUNARDEPTH_API_KEY_FILE" ]] || flags+=(--lunardepth-api-key-file "$LUNARDEPTH_API_KEY_FILE")
+    [[ -z "$LUNARDEPTH_API_KEY_DIR" ]] || flags+=(--lunardepth-api-key-dir "$LUNARDEPTH_API_KEY_DIR")
+    [[ "$LUNARDEPTH_ALLOW_INSECURE_HTTP" != "true" ]] || flags+=(--lunardepth-allow-insecure-http)
+    [[ "$LUNARDEPTH_ALLOW_PLACEHOLDER_KEY" != "true" ]] || flags+=(--lunardepth-allow-unauthenticated-gateway)
+  fi
 
   say "adding tenants: $TENANTS"
   mt add-tenants "$TENANTS" "${flags[@]}"
@@ -285,6 +307,7 @@ phase_2() {
   local -a build_flags=()
   [[ "$BUILD_WASM" == true ]]     && build_flags+=(--with-wasm)
   [[ "$BUILD_PEBBLE" == true ]]   && build_flags+=(--with-pebble)
+  [[ "$BUILD_LUNARDEPTH" == true ]] && build_flags+=(--with-lunardepth)
 
   if [[ ${#build_flags[@]} -gt 0 ]]; then
     mt_tmux mt-build build-all "${build_flags[@]}"

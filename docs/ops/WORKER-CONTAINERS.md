@@ -8,7 +8,7 @@ See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 ## Brotli security refresh (WI#514, 2026-10-29)
 
 Master pipeline 6719's four worker scans each found CVE-2026-111497 in
-`libbrotli1`. All four Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
+`libbrotli1`. The four original Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
 `20261105T082236Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
 `1.1.0-2+deb13u1`. The validator binds every worker's snapshot to CI and
 rejects older snapshots. The three existing scan suppressions were re-checked
@@ -66,8 +66,9 @@ opencode2 exposure verifier remain the image acceptance gates.
 
 [CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518) requires an
 on-path attacker, redirect handling, and non-zero `Acquire::Retries`; APT's
-retry hard-link reuse can otherwise replace an already verified package. All
-24 worker `deb` source lines and the three `worker-kimi-ts` lines now use
+retry hard-link reuse can otherwise replace an already verified package. The
+original 24 worker `deb` source lines, LunarDepth's additional six, and the
+three `worker-kimi-ts` lines now use
 `https://snapshot.debian.org` with normal certificate verification. There is
 no `Verify-Peer=false` or plain-HTTP fallback. Both snapshot hosts were
 checked over HTTPS on 2026-11-05: each returned its pinned content after an
@@ -86,7 +87,7 @@ mt-admin builds have no outer ladder: the small bootstrap still fails fast,
 but transient fetches for all remaining packages get the fixed client's three
 bounded attempts instead of making the whole build fragile to one response.
 
-The four Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
+All five worker Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
 Bookworm security archive serves `apt_2.6.2_amd64.deb`; its Trixie security
 `InRelease` is byte-identical to the index whose package list was checked for
 APT `3.0.4`. Every builder/runtime installs `apt` alone before its other
@@ -109,9 +110,9 @@ errors close the APT behavior where failed index downloads can otherwise
 return success. The validator ties every worker snapshot ARG to CI and applies
 its robust HTTPS source parser to Kimi; `test_worker_reproducibility` enforces
 HTTPS, bootstrap-only retry suppression, version floors, and strict updates on
-all four lanes.
+all five lanes.
 
-The inventory is limited to the four worker Dockerfiles plus
+The current inventory covers five worker Dockerfiles plus
 `.gitlab/ci/validate.yml`; mt-admin renders those same lane Dockerfiles and
 has no independent mirror recipe. Independent second-host SHA-256 verification
 (WI#561 lane C) is not implemented. Rebuild every worker image and recreate
@@ -128,7 +129,7 @@ the gateway bearer remains a loudly warned last resort when the worker env
 file is unwritable. A leaked token would let a job impersonate the daemon
 toward every worker WebSocket port of that tenant.
 
-All four lanes use two non-root containers under different identities
+All five lanes use two non-root containers under different identities
 (WI#454). The bridge writes its token to a private `0400` file under its own
 home, removes the environment variable, and exports only the file pointer to
 the bridge process. The task container has neither that home nor the bridge
@@ -353,7 +354,7 @@ image's numeric uid/gid. Do not pass the bridge credential to a one-shot CLI
 container. Recreate both services after image/env changes; do not reuse old
 IPC volumes.
 
-**Host-side workspace prep (WI#453, the WI#446 closeout):** all four lane
+**Host-side workspace prep (WI#453, the WI#446 closeout):** all five lane
 workspace directories live inside the
 tenant-controlled `~/lunarwing` tree, so the historical root `mkdir -p` +
 unbounded `chown -R` is gone. `prepare_worker_workspace`
@@ -370,8 +371,8 @@ between the pre-`cd` path checks and `cd`; it then chowns only the top node
 on first creation (not `-R`, since the directory is empty), and when
 content exists, walks with `find -mindepth 1` skipping regular files with
 a link count above 1 (a tenant-planted hard link to an outside file keeps
-its owner). Every caller (quadlet render and all three imperative lanes)
-makes a refusal fatal.
+its owner). Every Quadlet renderer and imperative workspace caller makes a
+refusal fatal.
 
 The leaf-uid gate accepts exactly two owners: the tenant root's uid
 (provisioned tenant-owned by `create_tenant_user`, and what every rootless
@@ -1253,6 +1254,108 @@ v1.19.5's `generate.ts` and the committed snapshot, so the WI#531 bump left
 the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
 **Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
 
+## LunarDepth Worker (lunardepth)
+
+[LunarDepth](https://git.lunarwing.org/lunarwing/lunardepth) is an opt-in external-worker lane for the DeepSeek Harness fork. It uses the generic external-worker backend: dispatch with `create_job(mode: "lunardepth")`, not a Rust backend, extension, MCP server, skill, routine, or SSH host. The implementation contract is `docs/proposals/LUNARDEPTH_WORKER_LANE.md`; lane details and the development checks are in `lunardepth4lunarwing/README.md` and `lunardepth4lunarwing/AGENTS.md`.
+
+### Provenance and image contents
+
+The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `da06c33b2091546dc38c61b95452ce27a4ce32d5` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
+
+- compatibility/item 9: `17aef23e05cc074c8621d38d159d77d25cb348ca`;
+- TensorMoon routing: `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`.
+
+A branch, short SHA, moving tag, or substitute repository is not a valid pin. Both worker and CI build arguments carry the same values. Node is `22.23.4-bookworm-slim` at the shared `CI_NODE_IMAGE` digest, pnpm is exactly `11.7.0`, and `DEBIAN_SNAPSHOT` is the shared `20261105T082236Z` snapshot with the WI#559/561 APT controls. `pnpm install --frozen-lockfile` must leave the upstream lock byte-identical.
+
+The build runs LunarDepth's focused worker tests/typechecks and materializes the production closure with `build-exe-for-python-sdk.ts --deploy-to`. Both `@lunardepth/dsh-lunarwing-worker-app` and `@lunardepth/dsh-lunarwing-worker` must resolve from that deployed closure, not a source checkout. The runtime launches built artifacts, never `tsx`. The optional `--with-toolchains` image adds the lane's Python/C++ job toolchain, not the other lanes' Rust/Go sets. Podman 4.5+ or Docker BuildKit/buildx is required for the real entrypoint's `RUN --network=none` split-role smoke.
+
+The builder installs `musl-tools` and runs the full native build, including the static `landlock-run` launcher; the host-addon-only build is insufficient. Container `/proc` restrictions make the bwrap profile unusable in this lane, while Landlock works without added capabilities. The host kernel must support every Landlock ABI the pinned launcher uses: a `partial` probe is refused just like a missing launcher or `SANDBOX_UNAVAILABLE`. For the current pin that is Landlock ABI 5, so the build host, every CI runner that builds the image, and every tenant host need **Linux 6.10 or newer with `landlock` in the active LSM list** (`/sys/kernel/security/lsm`). `build-lunardepth-worker` and the upgrade preflight check this first and stop with that reason, before a long build or a tenant stop. Both the image smoke and live worker smoke require `full`, a workspace write, `mktemp`, and a denied escape.
+
+### Dispatch, identities, and authority domains
+
+The two containers have separate non-root identities, all capabilities dropped, and `no-new-privileges`:
+
+```text
+daemon → host-loopback bridge :<lunardepth_wss> → task-runner Unix socket → LunarDepth 127.0.0.1:19091
+         task 10005:10005; bridge 10105:10005; harness loopback only
+```
+
+Only the bridge publishes anything, and only on host loopback: under mt-admin its WebSocket listens on the tenant's `lunardepth_wss` registry port and its health endpoint (container port `8443`) is published on `lunardepth_health`. `9090` is only the image default, used by the compose file. The bridge holds the tenant hub credential only in its private role. The task receives no `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE`; its runner refuses either. A random per-boot local bearer protects the task-only harness API, whose exact `/ws/agent` upgrade uses `lunarwing-agent-v1`. Task health reports protocol `version: "1"`, not the source release; the bridge reports `lunardepth-worker-1.0.0` separately. Process existence is not readiness.
+
+Each pair runs one task at a time and explicitly refuses a second. Jobs sharing a pair also share the task uid, workspace, LunarDepth session history/logs, and local transport credential. Separate tenants or pairs are required for separate confidentiality or grant domains; scrubbing child environments does not create per-job isolation.
+
+### Explicit TensorMoon-compatible route and model key
+
+This lane never inherits `LLM_BASE_URL`, `LLM_MODEL`, TensorZero, or another worker's route. Configure a complete OpenAI-compatible API root and model explicitly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
+  --base-url https://tensormoon.example.com/openai/v1 \
+  --model tensormoon::function_name::lunarwing \
+  --api-key-file /protected/tenant-lunardepth-key
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
+```
+
+The URL excludes `/chat/completions`; the example host and function name are placeholders, not a fleet default. HTTPS is required beyond loopback. Non-loopback cleartext HTTP requires the separate `--allow-insecure-http` exception. A deliberately unauthenticated gateway requires `--allow-unauthenticated-gateway` and uses only LunarDepth's nonempty placeholder-key behavior. Omitted values and explicit exceptions survive a re-render; no inherited endpoint marker is synthesized. `export-tenant.sh` does not carry the lane's route or key: pass them again to `import-tenant.sh` (`--with-lunardepth`, `--lunardepth-base-url`, `--lunardepth-model`, `--lunardepth-api-key-file`). Clear a previous exception explicitly with `--disallow-insecure-http` or `--require-api-key`, respectively.
+
+For an existing tenant, `configure-lunardepth` runs the v18 registry migration without renumbering existing ports, allocates the lane's two ports, enables `workers.lunardepth`, and writes the generic daemon endpoint with `supports_credentials = false`. The task env file contains literal unquoted route and key values; placeholder mode and a real key are distinct choices, and `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored. Podman env-file parsing therefore cannot turn the URL or credential into a value containing quote characters.
+
+`configure-lunardepth` validates and stores the route. It does not render the effective overlay; that happens at start (below). When the worker pair is running, the command applies the new configuration at once and restarts the pair if it changed, so a unit never keeps an overlay digest that no longer matches its environment. When the pair is not running, the command says that the configuration applies at the next `start-worker <tenant> lunardepth`.
+
+`LUNARDEPTH_API_KEY` is **task-visible, including to the model**. Issue a different independently revocable key per tenant, restricted to that tenant's inference. `configure-lunardepth --api-key-file` stages it only in `lunardepth-task.env`, never in the bridge, overlay, argv, logs, health, examples, or export text. The fleet command enforces the same rule: `add-tenants --lunardepth-api-key-file` is accepted for a single tenant only, and several tenants take `--lunardepth-api-key-dir <dir>` with one `<tenant>.key` file each. Two tenants with the same key are refused before the first tenant is created. `lunarwing-mt-provision-openrc.sh` has `LUNARDEPTH_API_KEY_DIR` for this. The key is not a hidden trust boundary against a model or code running with the task's authority.
+
+### Configuration integrity and confinement
+
+The final immutable overlay names every security row's exact upstream package and an explicit `disabled` value. The complete permission row allows only `workspace-write`/`ask`, with literal `defaultPreset: workspace-write`. `danger-full-access`, `auto`, `dsh-bash-local`, `runnerCommand`, and `runnerFailureSignatures` are forbidden; a headless approval escalation is unavailable and cannot execute.
+
+Three reviewed v1 choices are deliberate:
+
+- `tool-fs-search` is disabled because its unsandboxed ripgrep could expose the model key through `/proc/<pid>/environ`. `ptc-runtime` and `workflow-ptc` are also disabled rather than leaving a second executor surface.
+- `TMPDIR`, `TMP`, and `TEMP` are all `/tmp`, allowing confined `mktemp` under both built-in runners. They cannot be redirected through home or workspace `.env` files.
+- The profile template is generated at image build by the pinned source's `initProfile`, never by a handwritten manifest. The current pin exports no `PROFILE_SCHEMA_VERSION`, so its recorded schema is `unversioned`. A future pin must export and match its declared schema.
+
+Every start removes lower configuration except the real task-owned `sessions`, `storages`, and `attachments` data directories, then regenerates the profile, home patch, and home `.env` from root-owned read-only templates. The harness gets an empty root-owned launch cwd and home, a system-only absolute `PATH`, and `WS_NO_BUFFER_UTIL=1` plus `WS_NO_UTF_8_VALIDATE=1`. HMR, runtime plugin installation/editing, and settings/config editing are disabled. Task setup is sourced into the task launcher so its `HOME`, `DSH_HOME`, model key, local token, temp paths, and security unsets actually reach the harness and runner.
+
+The effective overlay is rendered by the tenant's worker image itself. At every start mt-admin runs the image's own `render_overlay.py --stdout` on the template baked into that image, in a throw-away container with no network, no capabilities and a read-only root, and installs the bytes root-owned and mode `0444` on the host. The task container renders again from the same template and requires byte equality, so both sides always come from one image: an operator checkout at a newer revision cannot break a tenant whose image is older. The overlay changes on disk only together with the units that use it. The task cannot rely on owner UID `0` appearing correctly under rootless `keep-id`, so the launch contract passes the rendered file's SHA-256; setup requires that exact digest and mode `0444` before validating the route. Host-side root ownership, the read-only bind, and regeneration still apply. Study Notes and SSH-agent mounts are off in v1.
+
+Before readiness, the effective-composition gate requires the exact package/row allowlist and final overlay values without evaluating `!!js`, zero loader warnings, and no missing, skipped, or unresolved bundle. The profile `package.json` must be byte-identical before and after the dump and after actual readiness. The real production entrypoint must also report fresh-session `permission/preset=workspace-write`, `sandbox/mode=workspace-write`, and `approval/policy=ask`, plus full built-in bwrap/Landlock enforcement, successful workspace and `/tmp` writes, and a denied escape. `SANDBOX_UNAVAILABLE`, partial enforcement, an unconfined fallback, or model-key disclosure through an enabled reader prevents acceptance.
+
+LunarDepth's sandbox confines file effects only; it is not a network boundary. The per-tenant `lw-egress-<tenant>` nftables allowlist is the only boundary against a compromised agent. It admits the configured model endpoint and explicitly approved job hosts, not npm, DeepSeek account services, telemetry, public fetch/search, model catalogs, or update services. A missing, malformed, or unresolvable LunarDepth backend fails locally with status 4 rather than silently omitting its target.
+
+The v1 task protocol deliberately has no credential/environment grants, cron, steering, resume, LunarWing tool proxy, or follow-up `task_prompt` capability; unsupported frames are rejected rather than silently discarded. The daemon's ordinary `user_id`, string metadata, conversation history, and empty environment map are accepted. History is bounded at the harness's own caps, 50 messages, 10,000 UTF-16 code units per message and 50,000 in total; the lane overlay sets the harness to those caps and the bridge adapter enforces the same bounds, so every history the daemon sends at its default limits fits, and one above the caps gets an explicit error result, never truncation; a non-empty environment or credential grant returns an explicit error `task_result` without disconnecting. There is no tunnel, relay, pairing, public share, web UI, non-loopback harness, remote plugin, self-update, or third-party telemetry path. The root-owned `dsh` refusal wrapper is only naive-use protection: direct Node invocation can bypass it. The unpublished loopback harness, immutable configuration, host listener audits, and egress filter are the real boundaries.
+
+### Ports, rollout, and rollback
+
+Registry v18 reserves `52000–52999`, allocating `lunardepth_wss` and `lunardepth_health` in two-port blocks. `workers.lunardepth` remains false unless selected; migration does not renumber existing tenants or expose the internal `19091` listener. Both the systemd user-manager path and the OpenRC path are implemented in mt-admin. Only the OpenRC path has run on a live tenant so far; the systemd path is covered by harnesses with stubbed starts.
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-lunardepth-worker --no-cache
+sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh worker-listeners <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant> lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh stop-worker <tenant> lunardepth
+```
+
+The build produces a candidate image ID, exports and inspects that immutable image out of band, and only then tags the selected worker image. Nothing that reads the candidate runs as root: the TypeScript compile step and the verifier run as `nobody`, the verifier with an isolated interpreter and a cleared environment on a private snapshot of the lane, as the opencode2 lane does. Image ID, overlay, task environment, and split-launch contract changes recreate the pair. `build-tenant --with-lunardepth`, `build-all --with-lunardepth`, and `upgrade-tenant` use the same lane; pre-stop `build-worker-candidates --enabled --target <ref>` leaves the running tenant untouched if a candidate fails.
+
+`promote-worker-images <tenant>` records each prior image ID before promotion. `restore-worker-images <tenant>` re-tags those recorded IDs without rebuilding after a failed upgrade; retain the rollback record until the complete upgrade succeeds. Restart the pair after restoring and repeat listener/egress/smoke checks. Rollback requires matching lane scripts, mt-admin modules, units, configuration, and IPC contract. It must not rename or adopt an older writable IPC volume, erase the workspace, or print a rollback token or model key. A pruned old image cannot be restored from its record and is an explicit failure, not a claimed rollback.
+
+### Publication and version-bump checklist
+
+MR source/policy jobs do not receive publication credentials. Protected `worker-lunardepth-candidate` must produce an immutable candidate, run the real split-role smoke, export `lunardepth-rootfs.tar`, and match an uncached clean rebuild's whole-image digest. `worker-lunardepth-exposure-verify` independently validates tar ownership/modes and full image config, while `worker-lunardepth-scan` applies the CRITICAL vulnerability gate to the exact candidate digest. Manual `worker-lunardepth-promote` publishes that verified digest as `$CI_COMMIT_TAG-lunardepth`, never a rebuilt or `:latest` image. It hard-needs candidate, exposure verification, scan, `worker-exposure-policy-guard`, and the BuildKit parser guard. Local tests and an MR pipeline do not substitute for those protected or live acceptance gates.
+
+For every LunarDepth version or security-input bump:
+
+1. Review the complete upstream diff for new exposure/publication surfaces and record the disposition of tunnels, relays, pairing, sharing, web listeners, public fetch/search, telemetry, DeepSeek account routes, remote plugins/MCP, settings/HMR, and self-update. Keep WI#357 egress enforcement unchanged.
+2. Move the canonical full `LUNARDEPTH_REF`, both required ancestry checks, source version, and every CI/build inventory together. Re-run toolchain and frozen-lock gates; never accept a moving ref.
+3. Re-audit every complete overlay row, package `name`, explicit `disabled` value, permission/preset, and unsupported capability. Re-check that `tool-fs-search`, programmatic execution, and any unsandboxed model-key reader cannot expose the **task-visible model key**.
+4. **The profile template and `LUNARDEPTH_REF` move together.** Regenerate it with the pinned `initProfile`; inspect `PROFILE_SCHEMA_VERSION`, every profile writer/migration path, and the before-dump/after-dump/after-readiness hash invariant. Replace `unversioned` only when that exact pin exports the schema.
+5. Re-prove full built-in sandbox enforcement, `/tmp` and workspace writes, a denied escape, fresh-session policy events, lower-layer regeneration across two restarts, and no hostile `.env`, module, or profile-manifest persistence. Do not replace a failed real entrypoint smoke with source-only tests.
+6. Reconcile Node, pnpm, Debian snapshot, runtime/toolchain, lane input, parser, image-config, and deployment inventories. Keep the two production worker packages resolvable from the materialized closure.
+7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorMoon inference before claiming live acceptance.
+
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
@@ -1440,7 +1543,7 @@ on master 6708; the binary cause remains open, not proven fixed by those
 passes. Never mask bytes or weaken the whole-image digest contract.
 
 Master 6708 exposed a third cause: candidate and rebuild crossed UTC midnight,
-changing the account-creation layer's `/etc/shadow` last-change day. **All four
+changing the account-creation layer's `/etc/shadow` last-change day. **All five
 worker Dockerfiles now declare `ARG SOURCE_DATE_EPOCH=0` before runtime
 `useradd` and assert in the same `RUN` that the account's shadow day equals
 `SOURCE_DATE_EPOCH / 86400`.** Keep both the stage-local ARG and the assertion;
@@ -1449,12 +1552,13 @@ the source commit epoch; plain builds default to day zero. Shadow-utils encodes
 day zero as an empty last-change field; the assertion treats that as zero but
 still refuses a missing shadow entry. BuildKit's `rewrite-timestamp` normalizes
 metadata, not this file content. The regression
-suite `.gitlab/tests/test_worker_reproducibility.py` checks all four scopes,
-executes the shadow assertions with epoch-boundary/incorrect-day fixtures,
-and ties every snapshot to CI. Protected whole-image candidate/rebuild,
-scan and exposure verification on the changed tree remain required.
+suite `.gitlab/tests/test_worker_reproducibility.py` checks all five scopes and
+both task/bridge accounts, executes the shadow assertions with
+epoch-boundary/incorrect-day fixtures, and ties every snapshot to CI.
+Protected whole-image candidate/rebuild, scan and exposure verification on the
+changed tree remain required.
 
-The four `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
+All five `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
 `20261105T082236Z`: its security indexes supply patched `libbrotli1`
 `1.0.9-2+deb12u1` (Bookworm) and `1.1.0-2+deb13u1` (Trixie), fixing
 CVE-2026-111497 without a new Trivy ignore. The three existing dated ignores
@@ -2573,7 +2677,7 @@ Delivery is **at-most-once** and honest about it: the daemon's per-job control q
 
 From the agent side this is surfaced through `job_prompt`, which routes `external:`-mode jobs with a live task handle to the control channel instead of rejecting them — note that an "Always allow" approval grant on `job_prompt` now also reaches credentialed external workers, not just local sandbox jobs. From the browser side, `POST /api/jobs/{id}/prompt` routes the same way and job detail reports `can_prompt: true` only for running external jobs whose worker advertised the capability.
 
-Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn banked completed output resolves as `success` with a `[control] follow-up seq=N failed/timed out` note (without completed output the failure/timeout stands — control notes alone cannot manufacture success), so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, and pebble bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
+Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn banked completed output resolves as `success` with a `[control] follow-up seq=N failed/timed out` note (without completed output the failure/timeout stands — control notes alone cannot manufacture success), so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, pebble, and lunardepth bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
 
 `closed` seals **admission**, not consumption: already accepted prompts drain
 in FIFO order through the final `done=true` turn. Any terminal failure, timeout
@@ -2629,14 +2733,14 @@ a Mode column fed from the same field.
 
 ### Rebuilt image rollout (image-ID contract)
 
-A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
+A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`, `lunardepth`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker        # or build-<worker>-worker / build-tenant --with-<worker>
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>  # logs "config changed for lunarwing-kimi-<tenant>; force-recreating"
 ```
 
-Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all four lanes on both paths.
+Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all five lanes on both paths.
 
 mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). Standalone per-lane builds retain the live operator-checkout behavior: `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
 
@@ -2644,7 +2748,7 @@ mt-admin builds also stamp `org.opencontainers.image.revision` with the source c
 podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
 ```
 
-For all four lanes, `build-tenant`, `build-all`, and pre-stop upgrade candidate
+For all five lanes, `build-tenant`, `build-all`, and pre-stop upgrade candidate
 builds resolve the tenant checkout's HEAD as its owner and require the selected
 worker directory to be clean. That SHA is the image's `SOURCE_REVISION`, but it
 is a provenance identifier, not a trust boundary. The commit must already be an

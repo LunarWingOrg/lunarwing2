@@ -38,7 +38,7 @@ ports_registry_init() {
   else
     ports_migrate_registry_preexisted=0
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "17" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "18" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -318,6 +318,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 15 ]]; then ports_migrate_v15; fi
   if [[ "$current_version" -lt 16 ]]; then ports_migrate_v16; fi
   if [[ "$current_version" -lt 17 ]]; then ports_migrate_v17; fi
+  if [[ "$current_version" -lt 18 ]]; then ports_migrate_v18; fi
 }
 
 # v15 -> v16: allocate a host-global `health_metrics` slot for the optional
@@ -383,6 +384,61 @@ ports_migrate_v17() {
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "port registry migrated to v17 (opencode2_wss + opencode2_health dedicated in range 51000-51999)"
+}
+
+ports_migrate_v18() {
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 18
+    | .lunardepth_range = ((.lunardepth_range) // {"start": 52000, "end": 52999})
+    | .lunardepth_block_size = ((.lunardepth_block_size) // 2)
+    | ( .range.start // 10000 ) as $rstart
+    | ( .lunardepth_range.start ) as $lstart
+    | .tenants |= with_entries(
+        .value |= (
+          if .base_port then
+            ( .base_port - $rstart + $lstart ) as $lbase
+            | .lunardepth_base = ((.lunardepth_base) // $lbase)
+            | .lunardepth_ports = ((.lunardepth_ports) // {
+                lunardepth_wss: ($lbase + 0),
+                lunardepth_health: ($lbase + 1)
+              })
+            | .workers.lunardepth = ((.workers.lunardepth) // false)
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  # Same checks as ic/scripts/migrate-ports-v18.sh. The lane's block is derived
+  # from the tenant's base slot, so a registry with more than 100 slots would
+  # leave the range and meet another worker's ports. Refuse, and leave the
+  # registry as it was.
+  local collisions out_of_range health_metrics_conflict
+  collisions="$(jq -r '
+    [ .tenants[]
+      | ((.ports // {}) | to_entries[] | .value),
+        ((.extended_ports // {}) | to_entries[] | .value),
+        ((.kimi_ports // {}) | to_entries[] | .value),
+        ((.voice_ports // {}) | to_entries[] | .value),
+        ((.opencode2_ports // {}) | to_entries[] | .value),
+        ((.lunardepth_ports // {}) | to_entries[] | .value)
+    ]
+    | group_by(.) | map(select(length > 1)) | length
+  ' "$tmp")" || collisions=""
+  out_of_range="$(jq -r '
+    (.lunardepth_range.start) as $lstart | (.lunardepth_range.end) as $lend
+    | [ .tenants[] | (.lunardepth_ports // {}) | to_entries[] | .value | select(. < $lstart or . > $lend) ] | length
+  ' "$tmp")" || out_of_range=""
+  health_metrics_conflict="$(jq -r '
+    ((.health_metrics_port // 0) >= .lunardepth_range.start and (.health_metrics_port // 0) <= .lunardepth_range.end) | tostring
+  ' "$tmp")" || health_metrics_conflict=""
+  if [[ "$collisions" != "0" || "$out_of_range" != "0" || "$health_metrics_conflict" != "false" ]]; then
+    rm -f -- "$tmp"
+    die "port registry v18 migration refused: LunarDepth ports would collide with existing ports or leave ${PORTS_REGISTRY}'s LunarDepth range (collisions=${collisions:-?}, outside the range=${out_of_range:-?}, health-metrics overlap=${health_metrics_conflict:-?}); the registry is unchanged. Run ic/scripts/migrate-ports-v18.sh with LUNARDEPTH_RANGE_START set to a free range."
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v18 (lunardepth_wss + lunardepth_health dedicated in range 52000-52999)"
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -718,8 +774,9 @@ ports_allocate() {
       pebble:   (.pebble   // false),
       opencode: (.opencode // false),
       kimi:     (.kimi     // false),
-      opencode2: (.opencode2 // false)
-    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false,"opencode2":false}')"
+      opencode2: (.opencode2 // false),
+      lunardepth: (.lunardepth // false)
+    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false,"opencode2":false,"lunardepth":false}')"
   local darkirc_scope=""
   if [[ "$enable_darkirc" == true ]]; then
     darkirc_scope="${requested_darkirc_scope:-$(generate_unique_darkirc_scope_id)}"
@@ -731,10 +788,12 @@ ports_allocate() {
     | ( .kimi_range.start // 30000 ) as $kstart
     | ( .voice_range.start // 40000 ) as $vstart
     | ( .opencode2_range.start // 51000 ) as $ostart
+    | ( .lunardepth_range.start // 52000 ) as $lstart
     | ( $base - $rstart + $estart ) as $ebase
     | ( $base - $rstart + $kstart ) as $kbase
     | ( $base - $rstart + $vstart ) as $vbase
     | ( $base - $rstart + $ostart ) as $obase
+    | ( $base - $rstart + $lstart ) as $lbase
     | .tenants[$name] = {
         base_port: $base,
         user: $name,
@@ -787,6 +846,11 @@ ports_allocate() {
         opencode2_ports: {
           opencode2_wss: ($obase + 0),
           opencode2_health: ($obase + 1)
+        },
+        lunardepth_base: $lbase,
+        lunardepth_ports: {
+          lunardepth_wss: ($lbase + 0),
+          lunardepth_health: ($lbase + 1)
         }
       }
   ' "$PORTS_REGISTRY" >"$tmp"
@@ -835,7 +899,8 @@ ports_warn_block_in_use() {
         ((.extended_ports // {}) | to_entries[]),
         ((.kimi_ports // {}) | to_entries[]),
         ((.voice_ports // {}) | to_entries[]),
-        ((.opencode2_ports // {}) | to_entries[]) ]
+        ((.opencode2_ports // {}) | to_entries[]),
+        ((.lunardepth_ports // {}) | to_entries[]) ]
     | sort_by(.value)[]
     | "\(.key)\t\(.value)"' "$PORTS_REGISTRY" 2>/dev/null)
   if [[ -n "$in_use" ]]; then
@@ -866,7 +931,8 @@ ports_registry_collision_list() {  # <registry-file>
         ((.extended_ports // {}) | to_entries[] | .value),
         ((.kimi_ports // {}) | to_entries[] | .value),
         ((.voice_ports // {}) | to_entries[] | .value),
-        ((.opencode2_ports // {}) | to_entries[] | .value)
+        ((.opencode2_ports // {}) | to_entries[] | .value),
+        ((.lunardepth_ports // {}) | to_entries[] | .value)
     ] + [(.health_metrics_port // empty)]
     | map(select(type == "number"))
     | group_by(.)
@@ -1077,7 +1143,7 @@ ports_set_weechat() {
   say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
-# Mark a supported external worker (pebble|opencode|kimi|opencode2) enabled for a tenant
+# Mark a supported external worker (pebble|opencode|kimi|opencode2|lunardepth) enabled for a tenant
 # (one-directional: false -> true). Idempotent. Used by ports_allocate()'s resume
 # path so `add-tenant <existing> --with-<worker>` flips the registry, mirroring
 # ports_enable_darkirc/proxy. Ensures a .workers object exists on older tenant
@@ -1086,7 +1152,7 @@ ports_enable_worker() {
   local name="$1" worker="$2"
   require_cmd jq
     case "$worker" in
-    pebble|opencode|kimi|opencode2) ;;
+    pebble|opencode|kimi|opencode2|lunardepth) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
   # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
@@ -1125,7 +1191,7 @@ ports_set_worker_desired_running() {
   local name="$1" worker="$2" desired="$3"
   require_cmd jq
   case "$worker" in
-    pebble|opencode|kimi|opencode2) ;;
+    pebble|opencode|kimi|opencode2|lunardepth) ;;
     *) die "ports_set_worker_desired_running: unknown worker '$worker'" ;;
   esac
   case "$desired" in true|false) ;; *) die "worker desired_running must be true or false" ;; esac
@@ -1225,6 +1291,11 @@ ports_get() {
     printf '%s' "$port"
     return 0
   fi
+  port="$(jq -r ".tenants[\"$name\"].lunardepth_ports.$port_name // empty" "$PORTS_REGISTRY")"
+  if [[ -n "$port" ]]; then
+    printf '%s' "$port"
+    return 0
+  fi
   # Back-compat: pre-v9 registries had `reserved_5` where `vision_service` now
   # lives. Read either name; new tenants only ever carry `vision_service`.
   if [[ "$port_name" == "vision_service" ]]; then
@@ -1264,8 +1335,8 @@ ports_list() {
     say "no port registry found; run add-tenant first"
     return 0
   fi
-  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")\t\(.value.voice_ports.voice_service // "-")\t\(.value.voice_ports.voice_health // "-")\t\(.value.opencode2_ports.opencode2_wss // "-")\t\(.value.opencode2_ports.opencode2_health // "-")"' "$PORTS_REGISTRY" \
-    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH,VOICE_SVC,VOICE_HLTH,OC2_WSS,OC2_HLTH"
+  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")\t\(.value.voice_ports.voice_service // "-")\t\(.value.voice_ports.voice_health // "-")\t\(.value.opencode2_ports.opencode2_wss // "-")\t\(.value.opencode2_ports.opencode2_health // "-")\t\(.value.lunardepth_ports.lunardepth_wss // "-")\t\(.value.lunardepth_ports.lunardepth_health // "-")"' "$PORTS_REGISTRY" \
+    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH,VOICE_SVC,VOICE_HLTH,OC2_WSS,OC2_HLTH,LD_WSS,LD_HLTH"
 }
 
 tenant_exists_in_registry() {

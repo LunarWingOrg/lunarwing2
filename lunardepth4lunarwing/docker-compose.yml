@@ -1,0 +1,82 @@
+x-worker-base: &worker-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
+  image: lunarwing-worker-lunardepth:latest
+  working_dir: /app
+  user: "10005:10005"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  volumes:
+    - lunardepth-ipc-v2:/run/lunarwing-shared:z
+    - lunardepth-data:/home/lunardepth/.dsh:z
+    - ./workspace:/workspace:z
+    - ./lunardepth-overlay.yml:/run/lunardepth-config/lunarwing-lane.patch.yml:ro,z
+  env_file:
+    - path: ${EXTRA_ENV_FILE:-.env.secrets}
+      required: false
+  environment: &worker-env
+    LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-lunardepth}
+    LUNARDEPTH_BASE_URL: ${LUNARDEPTH_BASE_URL:?set an explicit TensorMoon-compatible API root}
+    LUNARDEPTH_MODEL: ${LUNARDEPTH_MODEL:?set an explicit TensorMoon model}
+    LUNARDEPTH_API_KEY: ${LUNARDEPTH_API_KEY:-}
+    LUNARDEPTH_ALLOW_INSECURE_HTTP: ${LUNARDEPTH_ALLOW_INSECURE_HTTP:-false}
+    LUNARDEPTH_ALLOW_PLACEHOLDER_KEY: ${LUNARDEPTH_ALLOW_PLACEHOLDER_KEY:-false}
+    WORKSPACE_ROOT: /workspace
+
+services:
+  lunardepth-task:
+    <<: *worker-base
+    command: ["--mode", "websocket"]
+    environment:
+      <<: *worker-env
+      LUNARWING_CONTAINER_ROLE: split-task
+      # The task refuses to start without the digest of the mounted overlay.
+      # README.md, "Compose", shows how to render the file and compute this.
+      LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256: ${LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256:?set to the SHA-256 of ./lunardepth-overlay.yml, see README.md}
+      AGENT_AUTH_TOKEN: ""
+      AGENT_AUTH_TOKEN_FILE: ""
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/node", "/app/scripts/lunardepth_task_runner.js", "--healthcheck", "/run/lunarwing-shared/runner/task-runner.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 180s
+    restart: unless-stopped
+
+  lunarwing-worker:
+    <<: *worker-base
+    user: "10105:10005"
+    env_file: []
+    volumes:
+      - lunardepth-ipc-v2:/run/lunarwing-shared:z
+      - ./workspace:/workspace:z
+    depends_on:
+      lunardepth-task:
+        condition: service_healthy
+    command: ["--mode", "websocket"]
+    environment:
+      LUNARWING_CONTAINER_ROLE: split-bridge
+      LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-lunardepth}
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?the tenant-scoped hub token is required}
+      WORKSPACE_ROOT: /workspace
+      WS_BIND_HOST: 0.0.0.0
+      WS_PORT: 9090
+      WS_PATH: /ws/agent
+      HEALTH_PORT: 8443
+    ports:
+      - "127.0.0.1:${HEALTH_PORT:-8443}:8443"
+      - "127.0.0.1:${WS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf --max-time 3 http://127.0.0.1:8443/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 180s
+    restart: unless-stopped
+
+volumes:
+  lunardepth-data:
+  lunardepth-ipc-v2:

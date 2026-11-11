@@ -254,6 +254,10 @@ _worker_egress_llm_targets() {
       || die "unsafe tenant env path for worker egress ($key)"
     [[ -n "$value" ]] && printf '%s\n' "$value"
   done
+  env_path="$(tenant_env_dir "$name")/lunardepth.env"
+  value="$(read_tenant_env_value "$name" "$env_path" LUNARDEPTH_BASE_URL)" \
+    || die "unsafe LunarDepth env path for worker egress"
+  [[ -z "$value" ]] || printf '%s\n' "$value"
   return 0
 }
 
@@ -356,6 +360,36 @@ worker_egress_require_pebble_backend() {
     return 4
   fi
   say "pebble model backend $host:$port is derived into $name's worker egress allowlist"
+  return 0
+}
+
+worker_egress_lunardepth_backend() {
+  local name="$1" env_path
+  env_path="$(tenant_env_dir "$name")/lunardepth.env"
+  read_tenant_env_value "$name" "$env_path" LUNARDEPTH_BASE_URL
+}
+
+worker_egress_require_lunardepth_backend() {
+  local name="$1" backend split host port subnet gateway resolved
+  worker_egress_enabled "$name" || return 0
+  backend="$(worker_egress_lunardepth_backend "$name")" || return 1
+  if [[ -z "$backend" ]]; then
+    warn_err "LunarDepth worker for '$name' has no explicit model backend; run 'configure-lunardepth $name --base-url <url> --model <model> --api-key-file <path>'"
+    return 4
+  fi
+  split="$(_worker_egress_split_target "$backend" true)" || {
+    warn_err "invalid LunarDepth model backend '$(sanitize_display_value "$backend")' for tenant '$name'"
+    return 4
+  }
+  read -r host port <<<"$split"
+  subnet="$(worker_egress_state_get "$name" SUBNET)"
+  gateway="$(_worker_egress_gateway "$subnet")"
+  resolved="$(_worker_egress_resolve_target "$backend" "$gateway" false)" || return 1
+  if [[ -z "$resolved" ]]; then
+    warn_err "LunarDepth worker for '$name' cannot resolve its model backend '$host:$port' to IPv4 from this host; fix DNS or configure a resolvable explicit endpoint"
+    return 4
+  fi
+  say "LunarDepth model backend $host:$port is derived into $name's worker egress allowlist"
   return 0
 }
 
@@ -777,7 +811,8 @@ worker_egress_audit() {
   for container in "lunarwing-pebble-$name" "lunarwing-opencode-$name" \
                    "lunarwing-opencode2-$name" "lunarwing-kimi-$name" \
                    "lunarwing-pebble-task-$name" "lunarwing-opencode-task-$name" \
-                   "lunarwing-opencode2-task-$name" "lunarwing-kimi-task-$name"; do
+                   "lunarwing-opencode2-task-$name" "lunarwing-kimi-task-$name" \
+                   "lunarwing-lunardepth-$name" "lunarwing-lunardepth-task-$name"; do
     _ctr_inspect "$name" "$container" >/dev/null 2>&1 || continue
     attached=1
     if worker_egress_container_attached "$name" "$container"; then
@@ -883,6 +918,9 @@ prepare_worker_egress() {
   # probing this function from an ignored-errexit context.
   if [[ "$worker" == pebble ]]; then
     worker_egress_require_pebble_backend "$name" || return "$?"
+  fi
+  if [[ "$worker" == lunardepth ]]; then
+    worker_egress_require_lunardepth_backend "$name" || return "$?"
   fi
   worker_egress_apply "$name" >/dev/null
   launch_text="$(worker_egress_launch_args "$name")" \

@@ -192,7 +192,8 @@ load_registry_snapshot() { # <tenant>
           ((.extended_ports // {}) | to_entries[]),
           ((.kimi_ports // {}) | to_entries[]),
           ((.voice_ports // {}) | to_entries[]),
-          ((.opencode2_ports // {}) | to_entries[]) ]
+          ((.opencode2_ports // {}) | to_entries[]),
+          ((.lunardepth_ports // {}) | to_entries[]) ]
       | .[] | select((.value | type) == "number")
       | "\(.key)\t\(.value)"
     ' "$PORTS_REGISTRY")
@@ -454,6 +455,7 @@ check_main_env() { # <lunarwing.env> <darkirc_on> <vision_external> <voice_on>
   check_port_key "$env" OPENCODE_WSS_PORT opencode_wss
   check_port_key "$env" KIMI_WSS_PORT kimi_wss
   check_port_key "$env" OPENCODE2_WSS_PORT opencode2_wss
+  check_port_key "$env" LUNARDEPTH_WSS_PORT lunardepth_wss
   check_port_key "$env" COORD_ADMIN_PORT coord_admin soft
   check_url_port "$env" XMPP_BRIDGE_URL bridge
   check_url_port "$env" RELAY_URL weechat
@@ -510,7 +512,7 @@ check_quadlets() { # <tenant>
     check_quadlet_ports "$qdir/lunarwing-vision-${name}.container" "vision quadlet" \
       "$(registry_port vision_service)" "$(registry_port vision_health)"
   fi
-  for worker in pebble opencode kimi opencode2; do
+  for worker in pebble opencode kimi opencode2 lunardepth; do
     tenant_worker_enabled "$name" "$worker" || continue
     wss="$(registry_port "${worker}_wss")"
     health="$(registry_port "${worker}_health")"

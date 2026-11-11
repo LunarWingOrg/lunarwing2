@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+scripts/node_modules/
+scripts/*.js
+scripts/__pycache__/
+__pycache__/
+workspace/*
+!workspace/.gitkeep
+*.tar
+*.log
