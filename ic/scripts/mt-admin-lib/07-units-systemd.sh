@@ -728,6 +728,7 @@ EOF
       kimi) printf 'UserNS=%s\n' "$KIMI_USERNS" ;;
       opencode2) printf 'UserNS=%s\n' "$OPENCODE2_USERNS" ;;
       pebble) printf 'UserNS=%s\n' "$PEBBLE_USERNS" ;;
+      lunardepth) printf 'UserNS=%s\n' "$LUNARDEPTH_USERNS" ;;
     esac
 
     local index key value
