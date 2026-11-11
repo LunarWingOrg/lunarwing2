@@ -1127,7 +1127,7 @@ Existing multi-tenant envs with an explicit `SANDBOX_NETWORK=none` stay on
 value set changes from `none` to `proxy-enforced` on upgrade; set `none`
 explicitly before upgrading to retain no-egress behavior.
 
-### Generic sandbox image + tenant defaults (WI#223/537)
+### Generic sandbox image + tenant defaults (WI#223/537/596)
 
 For new multi-tenant tenants, the generic sandbox's image is
 **`lunarwing-sandbox:latest`**, built from `ic/docker/sandbox.Dockerfile`
@@ -1151,21 +1151,50 @@ SANDBOX_IMAGE=lunarwing-sandbox:latest
 SANDBOX_AUTO_PULL=false
 ```
 
-`add-tenant` builds the image into the selected admin store when absent. For
-rootless Podman it distributes the image into the tenant's own store
-(`_ensure_tenant_image` semantics — a rebuilt admin image is re-distributed);
-for Docker it checks the shared store. `start-tenant` also reconciles the
-image before daemon startup, so a failed add-tenant build or distribution can
-be retried. On hosts with both CLIs, the generic shell sandbox prefers Podman
-even when mt-admin runs its worker containers with Docker; an explicit
+Every managed build carries an `org.lunarwing.sandbox.inputs` label. Its
+SHA-256 digest covers the selected checkout's `sandbox.Dockerfile` and the
+resolved `DEBIAN_SNAPSHOT` build argument. The Dockerfile's `ARG` value is the
+default; `LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT` is an explicit operator
+override and is included in the digest. `add-tenant` and `upgrade-tenant`
+default to `--sandbox-image auto`: they build when the admin image is absent,
+unlabelled, or has a different digest, and skip the build when it matches.
+`always` forces a build and `never` suppresses it. The same policy can be set
+through `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
+
+For rootless Podman, `start-tenant` distributes the admin image into the
+tenant's own store only when its image ID differs; unchanged inputs therefore
+cause neither a rebuild nor a save/load redistribution. Docker uses the shared
+store directly. On hosts with both CLIs, the generic shell sandbox prefers
+Podman even when mt-admin runs its worker containers with Docker; an explicit
 `SANDBOX_RUNTIME=docker` still chooses Docker. Provisioning uses the tenant's
 selected runtime and prepares its rootless Podman store when needed.
-Only tenants configured with this managed image are reconciled;
-an operator-selected custom image is left alone. `SANDBOX_AUTO_PULL=false` is
-deliberate: the tag exists only in local stores, so an auto-pull would fail
-against a registry that has never hosted it. Single-node hosts keep the
-in-code defaults (`auto` runtime preference, `lunarwing-worker:latest`,
-auto-pull on).
+`SANDBOX_AUTO_PULL=false` is deliberate: the tag exists only in local stores,
+so an auto-pull would fail against a registry that has never hosted it.
+Single-node hosts keep the in-code defaults (`auto` runtime preference,
+`lunarwing-worker:latest`, auto-pull on).
+
+During `upgrade-tenant`, the candidate is built from the tenant's target
+checkout while the old daemon still runs. Only a successful candidate is
+promoted to `lunarwing-sandbox:latest`, after the daemon/bridge/WASM build and
+before `start-tenant` distributes it. A failed candidate leaves the previous
+tag and image ID in place, prints a recovery command, and does **not** abort
+the daemon or worker upgrade. Promotion records the previous admin image ID
+in the same rollback record as the worker candidates; a post-promotion upgrade
+failure re-tags that ID before the previous version restarts. The record is
+cleared only after the whole upgrade succeeds. Old images can be pruned after
+that rollback window with the operator's normal dangling-image maintenance.
+
+**Shared-tag decision:** WI#596 retains `lunarwing-sandbox:latest` rather than
+introducing per-release tags. There is one such tag per runtime admin store,
+shared by every managed tenant using that runtime on the host. Upgrading one
+tenant can therefore update the image for all of them. Docker tenants use that
+shared store for subsequent sandbox commands immediately; rootless Podman
+tenants receive the new ID at their next `start-tenant`, even if their daemon
+was not upgraded. Podman and Docker admin stores remain independent. Operators
+who need a fixed image must use a custom `SANDBOX_IMAGE`; custom-image tenants
+and legacy tenants without the managed key are never rebuilt or redistributed.
+To opt an older tenant into the managed image, set the three variables in its
+`lunarwing.env` and run `upgrade-tenant`, or build manually and restart.
 
 Manual build/recovery:
 
@@ -1177,12 +1206,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
 `build-sandbox-image <name>` builds into the admin store of that tenant's
 selected sandbox runtime (the argument may be omitted for the new-tenant
 Podman-first default); `start-tenant` makes it available in the daemon's
-runtime store. If either step fails, mt-admin warns
-and the generic shell sandbox fails closed with `ImageUnavailable`; base tenant
-provisioning remains available. `upgrade-tenant` **does not** add these keys to
-existing tenants or switch their existing sandbox image. To opt in an older
-tenant, set the three variables in its `lunarwing.env`, build the image, then
-`restart-tenant <name>` so both its daemon configuration and image store update.
+runtime store. If either step fails, mt-admin warns and the generic shell
+sandbox fails closed with `ImageUnavailable`; base tenant provisioning remains
+available.
 
 The build context is `ic/docker/`, not `ic/`: the Dockerfile has no
 build-context COPY/ADD (its CA-bundle COPY comes from a digest-pinned image),
