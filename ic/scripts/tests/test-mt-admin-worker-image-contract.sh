@@ -566,6 +566,7 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$repo/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$HARNESS_REPO_ROOT/.gitlab/scripts/worker_candidate_config.py" \
   "$repo/.gitlab/scripts/"
 printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
 chmod 755 "$fixture/real-opencode"

@@ -293,6 +293,7 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/Dockerfile" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$fixture/target/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$HARNESS_REPO_ROOT/.gitlab/scripts/worker_candidate_config.py" \
   "$fixture/target/.gitlab/scripts/"
 wrapper_file="$fixture/target/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
 chmod 755 "$wrapper_file"
@@ -717,7 +718,7 @@ require_root() { :; }
 BUILD_CALL=''
 build_tenant() { BUILD_CALL="tenant:$*"; }
 main build-tenant root --with-opencode2
-if [[ "$BUILD_CALL" == 'tenant:root false false false false false false true' ]]; then
+if [[ "$BUILD_CALL" == 'tenant:root false false false false false false true false' ]]; then
   pass 'build-tenant forwards --with-opencode2'
 else
   fail "build-tenant forwarding wrong: $BUILD_CALL"
@@ -726,7 +727,7 @@ fi
 BUILD_CALL=''
 build_all() { BUILD_CALL="all:$*"; }
 main build-all --with-opencode2
-if [[ "$BUILD_CALL" == 'all:false false false false false true' ]]; then
+if [[ "$BUILD_CALL" == 'all:false false false false false true false' ]]; then
   pass 'build-all forwards --with-opencode2'
 else
   fail "build-all forwarding wrong: $BUILD_CALL"

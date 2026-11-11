@@ -378,6 +378,7 @@ start_tenant() { _start_tenant_workers "$1"; }
 start_tenant_pebble() { [[ "$startup_mode" != degraded ]] || return 4; }
 start_tenant_opencode() { :; }
 start_tenant_opencode2() { printf 'later-lane\n' >>"$events"; }
+start_tenant_lunardepth() { :; }
 tenant_worker_desired_running() { return 0; }
 ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }
 # This block enables every worker (tenant_worker_enabled returns 0), so the
@@ -385,6 +386,7 @@ ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }
 # Stub it: the floor itself is pinned by
 # test-mt-admin-upgrade-opencode2-preflight.sh and test-mt-admin-opencode2-build-network.sh.
 opencode2_builder_supported() { OPENCODE2_BUILDER_FLOOR_PROBLEM=""; return 0; }
+lunardepth_preflight() { :; }
 ports_get() { printf '19091\n'; }
 _ensure_tenant_image() { return 0; }
 _worker_launch_contract() { printf fixture-contract; }

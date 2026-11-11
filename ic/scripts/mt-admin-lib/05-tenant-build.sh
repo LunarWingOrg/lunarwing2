@@ -1566,7 +1566,10 @@ _archive_worker_source() {  # <tenant source root> <lane>
   local source_root="$1" lane="$2" tmp_parent tmp archive links
   local -a paths=("$lane")
   [[ "$lane" != opencode2.4lunarwing ]] \
-    || paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
+    || paths+=(
+      .gitlab/scripts/verify-opencode2-exposure-out-of-band.py
+      .gitlab/scripts/worker_candidate_config.py
+    )
   require_cmd tar
   tmp_parent="${LUNARWING_WORKER_BUILD_TMPDIR:-/var/tmp}"
   [[ -d "$tmp_parent" && ! -L "$tmp_parent" ]] \
@@ -1827,10 +1830,12 @@ _opencode2_snapshot_checkout() {
     cp -R --no-dereference --no-preserve=ownership -- \
       "$source" "$lane/$name" || return 1
   done
-  source="$(_opencode2_snapshot_source "$resolved_root" \
-    "$source_root/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py")" || return 1
-  cp -R --no-dereference --no-preserve=ownership -- \
-    "$source" "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" || return 1
+  for name in verify-opencode2-exposure-out-of-band.py worker_candidate_config.py; do
+    source="$(_opencode2_snapshot_source "$resolved_root" \
+      "$source_root/.gitlab/scripts/$name")" || return 1
+    cp -R --no-dereference --no-preserve=ownership -- \
+      "$source" "$snapshot/.gitlab/scripts/$name" || return 1
+  done
   if [[ -n "$(find "$snapshot" ! -type f ! -type d -print -quit)" ]]; then
     echo "ERROR: checkout snapshot contains a link or special file (WI#425 out-of-band)" >&2
     return 1
