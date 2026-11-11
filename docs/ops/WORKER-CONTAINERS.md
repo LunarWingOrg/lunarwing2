@@ -1253,6 +1253,100 @@ v1.19.5's `generate.ts` and the committed snapshot, so the WI#531 bump left
 the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
 **Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
 
+## LunarDepth Worker (lunardepth)
+
+[LunarDepth](https://git.lunarwing.org/lunarwing/lunardepth) is an opt-in external-worker lane for the DeepSeek Harness fork. It uses the generic external-worker backend: dispatch with `create_job(mode: "lunardepth")`, not a Rust backend, extension, MCP server, skill, routine, or SSH host. The implementation contract is `docs/proposals/LUNARDEPTH_WORKER_LANE.md`; lane details and the development checks are in `lunardepth4lunarwing/README.md` and `lunardepth4lunarwing/AGENTS.md`.
+
+### Provenance and image contents
+
+The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `da06c33b2091546dc38c61b95452ce27a4ce32d5` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
+
+- compatibility/item 9: `17aef23e05cc074c8621d38d159d77d25cb348ca`;
+- TensorMoon routing: `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`.
+
+A branch, short SHA, moving tag, or substitute repository is not a valid pin. Both worker and CI build arguments carry the same values. Node is `22.23.4-bookworm-slim` at the shared `CI_NODE_IMAGE` digest, pnpm is exactly `11.7.0`, and `DEBIAN_SNAPSHOT` is the shared `20261105T082236Z` snapshot with the WI#559/561 APT controls. `pnpm install --frozen-lockfile` must leave the upstream lock byte-identical.
+
+The build runs LunarDepth's focused worker tests/typechecks and materializes the production closure with `build-exe-for-python-sdk.ts --deploy-to`. Both `@lunardepth/dsh-lunarwing-worker-app` and `@lunardepth/dsh-lunarwing-worker` must resolve from that deployed closure, not a source checkout. The runtime launches built artifacts, never `tsx`. The optional `--with-toolchains` image adds the lane's Python/C++ job toolchain, not the other lanes' Rust/Go sets. Podman 4.5+ or Docker BuildKit/buildx is required for the real entrypoint's `RUN --network=none` split-role smoke.
+
+### Dispatch, identities, and authority domains
+
+The two containers have separate non-root identities, all capabilities dropped, and `no-new-privileges`:
+
+```text
+daemon → host-loopback bridge :9090 → task-runner Unix socket → LunarDepth 127.0.0.1:19091
+         task 10005:10005; bridge 10105:10005; harness loopback only
+```
+
+Only the bridge publishes WebSocket `9090` and health `8443`, both on host loopback through mt-admin. The bridge holds the tenant hub credential only in its private role. The task receives no `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE`; its runner refuses either. A random per-boot local bearer protects the task-only harness API, whose exact `/ws/agent` upgrade uses `lunarwing-agent-v1`. Task health reports protocol `version: "1"`, not the source release; the bridge reports `lunardepth-worker-1.0.0` separately. Process existence is not readiness.
+
+Each pair runs one task at a time and explicitly refuses a second. Jobs sharing a pair also share the task uid, workspace, LunarDepth session history/logs, and local transport credential. Separate tenants or pairs are required for separate confidentiality or grant domains; scrubbing child environments does not create per-job isolation.
+
+### Explicit TensorMoon-compatible route and model key
+
+This lane never inherits `LLM_BASE_URL`, `LLM_MODEL`, TensorZero, or another worker's route. Configure a complete OpenAI-compatible API root and model explicitly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
+  --base-url https://tensormoon.example.com/openai/v1 \
+  --model tensormoon::function_name::lunarwing \
+  --api-key-file /protected/tenant-lunardepth-key
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
+```
+
+The URL excludes `/chat/completions`; the example host and function name are placeholders, not a fleet default. HTTPS is required beyond loopback. Non-loopback cleartext HTTP requires the separate `--allow-insecure-http` exception. A deliberately unauthenticated gateway requires `--allow-unauthenticated-gateway` and uses only LunarDepth's nonempty placeholder-key behavior. Omitted values and explicit exceptions survive re-render and export; no inherited endpoint marker is synthesized.
+
+`LUNARDEPTH_API_KEY` is **task-visible, including to the model**. Issue a different independently revocable key per tenant, restricted to that tenant's inference. `configure-lunardepth --api-key-file` stages it only in `lunardepth-task.env`, never in the bridge, overlay, argv, logs, health, examples, or export text. The key is not a hidden trust boundary against a model or code running with the task's authority.
+
+### Configuration integrity and confinement
+
+The final immutable overlay names every security row's exact upstream package and an explicit `disabled` value. The complete permission row allows only `workspace-write`/`ask`, with literal `defaultPreset: workspace-write`. `danger-full-access`, `auto`, `dsh-bash-local`, `runnerCommand`, and `runnerFailureSignatures` are forbidden; a headless approval escalation is unavailable and cannot execute.
+
+Three reviewed v1 choices are deliberate:
+
+- `tool-fs-search` is disabled because its unsandboxed ripgrep could expose the model key through `/proc/<pid>/environ`. `ptc-runtime` and `workflow-ptc` are also disabled rather than leaving a second executor surface.
+- `TMPDIR`, `TMP`, and `TEMP` are all `/tmp`, allowing confined `mktemp` under both built-in runners. They cannot be redirected through home or workspace `.env` files.
+- The profile template is generated at image build by the pinned source's `initProfile`, never by a handwritten manifest. The current pin exports no `PROFILE_SCHEMA_VERSION`, so its recorded schema is `unversioned`. A future pin must export and match its declared schema.
+
+Every start removes lower configuration except the real task-owned `sessions`, `storages`, and `attachments` data directories, then regenerates the profile, home patch, and home `.env` from root-owned read-only templates. The harness gets an empty root-owned launch cwd and home, a system-only absolute `PATH`, and `WS_NO_BUFFER_UTIL=1` plus `WS_NO_UTF_8_VALIDATE=1`. HMR, runtime plugin installation/editing, and settings/config editing are disabled.
+
+Before readiness, the effective-composition gate requires the exact package/row allowlist and final overlay values without evaluating `!!js`, zero loader warnings, and no missing, skipped, or unresolved bundle. The profile `package.json` must be byte-identical before and after the dump and after actual readiness. The real production entrypoint must also report fresh-session `permission/preset=workspace-write`, `sandbox/mode=workspace-write`, and `approval/policy=ask`, plus full built-in bwrap/Landlock enforcement, successful workspace and `/tmp` writes, and a denied escape. `SANDBOX_UNAVAILABLE`, partial enforcement, an unconfined fallback, or model-key disclosure through an enabled reader prevents acceptance.
+
+LunarDepth's sandbox confines file effects only; it is not a network boundary. The per-tenant `lw-egress-<tenant>` nftables allowlist is the only boundary against a compromised agent. It admits the configured model endpoint and explicitly approved job hosts, not npm, DeepSeek account services, telemetry, public fetch/search, model catalogs, or update services. A missing, malformed, or unresolvable LunarDepth backend fails locally with status 4 rather than silently omitting its target.
+
+The v1 task protocol deliberately has no credential/environment grants, cron, steering, resume, metadata, LunarWing tool proxy, or follow-up `task_prompt` capability; unsupported frames are rejected rather than silently discarded. There is no tunnel, relay, pairing, public share, web UI, non-loopback harness, remote plugin, self-update, or third-party telemetry path. The root-owned `dsh` refusal wrapper is only naive-use protection: direct Node invocation can bypass it. The unpublished loopback harness, immutable configuration, host listener audits, and egress filter are the real boundaries.
+
+### Ports, rollout, and rollback
+
+Registry v18 reserves `52000–52999`, allocating `lunardepth_wss` and `lunardepth_health` in two-port blocks. `workers.lunardepth` remains false unless selected; migration does not renumber existing tenants or expose the internal `19091` listener. Both systemd user-manager and OpenRC lifecycle paths are supported through mt-admin:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-lunardepth-worker --no-cache
+sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh worker-listeners <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant> lunardepth
+sudo ic/scripts/lunarwing-mt-admin.sh stop-worker <tenant> lunardepth
+```
+
+The build produces a candidate image ID, exports and inspects that immutable image out of band, and only then tags the selected worker image. Image ID, overlay, task environment, and split-launch contract changes recreate the pair. `build-tenant --with-lunardepth`, `build-all --with-lunardepth`, and `upgrade-tenant` use the same lane; pre-stop `build-worker-candidates --enabled --target <ref>` leaves the running tenant untouched if a candidate fails.
+
+`promote-worker-images <tenant>` records each prior image ID before promotion. `restore-worker-images <tenant>` re-tags those recorded IDs without rebuilding after a failed upgrade; retain the rollback record until the complete upgrade succeeds. Restart the pair after restoring and repeat listener/egress/smoke checks. Rollback requires matching lane scripts, mt-admin modules, units, configuration, and IPC contract. It must not rename or adopt an older writable IPC volume, erase the workspace, or print a rollback token or model key. A pruned old image cannot be restored from its record and is an explicit failure, not a claimed rollback.
+
+### Publication and version-bump checklist
+
+MR source/policy jobs do not receive publication credentials. Protected `worker-lunardepth-candidate` must produce an immutable candidate, run the real split-role smoke, export `lunardepth-rootfs.tar`, and match an uncached clean rebuild's whole-image digest. `worker-lunardepth-exposure-verify` independently validates tar ownership/modes and full image config, while `worker-lunardepth-scan` applies the CRITICAL vulnerability gate to the exact candidate digest. Manual `worker-lunardepth-promote` publishes that verified digest as `$CI_COMMIT_TAG-lunardepth`, never a rebuilt or `:latest` image. It hard-needs candidate, exposure verification, scan, `worker-exposure-policy-guard`, and the BuildKit parser guard. Local tests and an MR pipeline do not substitute for those protected or live acceptance gates.
+
+For every LunarDepth version or security-input bump:
+
+1. Review the complete upstream diff for new exposure/publication surfaces and record the disposition of tunnels, relays, pairing, sharing, web listeners, public fetch/search, telemetry, DeepSeek account routes, remote plugins/MCP, settings/HMR, and self-update. Keep WI#357 egress enforcement unchanged.
+2. Move the canonical full `LUNARDEPTH_REF`, both required ancestry checks, source version, and every CI/build inventory together. Re-run toolchain and frozen-lock gates; never accept a moving ref.
+3. Re-audit every complete overlay row, package `name`, explicit `disabled` value, permission/preset, and unsupported capability. Re-check that `tool-fs-search`, programmatic execution, and any unsandboxed model-key reader cannot expose the **task-visible model key**.
+4. **The profile template and `LUNARDEPTH_REF` move together.** Regenerate it with the pinned `initProfile`; inspect `PROFILE_SCHEMA_VERSION`, every profile writer/migration path, and the before-dump/after-dump/after-readiness hash invariant. Replace `unversioned` only when that exact pin exports the schema.
+5. Re-prove full built-in sandbox enforcement, `/tmp` and workspace writes, a denied escape, fresh-session policy events, lower-layer regeneration across two restarts, and no hostile `.env`, module, or profile-manifest persistence. Do not replace a failed real entrypoint smoke with source-only tests.
+6. Reconcile Node, pnpm, Debian snapshot, runtime/toolchain, lane input, parser, image-config, and deployment inventories. Keep the two production worker packages resolvable from the materialized closure.
+7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorMoon inference before claiming live acceptance.
+
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
