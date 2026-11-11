@@ -819,7 +819,8 @@ upgrade_candidate_sandbox_image_ref() {  # <tenant>
 }
 
 build_candidate_sandbox_image() {  # <tenant> <policy> [ic source root]
-  local name="$1" policy="$2" source_root="${3:-$(tenant_lw_root "$name")/ic}"
+  local name="$1" policy="$2"
+  local source_root="${3:-$(tenant_lw_root "$name")/ic}"
   local runtime candidate_ref marker
   _ensure_marker_dir
   marker="$(tenant_candidate_sandbox_file "$name")"
