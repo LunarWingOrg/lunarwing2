@@ -28,7 +28,7 @@ def normalized(name: str) -> str:
     return "/".join(parts)
 
 
-def source_inventory(root: Path) -> dict[str, Path]:
+def source_inventory(root: Path, compiled_root: Path | None = None) -> dict[str, Path]:
     files = {
         "app/entrypoint.sh": root / "entrypoint.sh",
         "app/entrypoint-split.sh": root / "entrypoint-split.sh",
@@ -41,6 +41,7 @@ def source_inventory(root: Path) -> dict[str, Path]:
         if path.is_file():
             files[f"app/config/{path.name}"] = path
     scripts = root / "scripts"
+    compiled_scripts = compiled_root if compiled_root is not None else scripts
     for path in scripts.glob("*.py"):
         if not path.name.endswith("_test.py"):
             files[f"app/scripts/{path.name}"] = path
@@ -48,19 +49,24 @@ def source_inventory(root: Path) -> dict[str, Path]:
         files[f"app/scripts/{path.name}"] = path
     for path in scripts.glob("*.ts"):
         if not path.name.endswith("_test.ts"):
-            files[f"app/scripts/{path.with_suffix('.js').name}"] = path.with_suffix(".js")
+            files[f"app/scripts/{path.with_suffix('.js').name}"] = compiled_scripts / path.with_suffix(".js").name
     files["app/scripts/package.json"] = scripts / "package.json"
     return files
 
 
-def validate_archive(archive_path: Path, config_path: Path, lane_root: Path) -> None:
+def validate_archive(
+    archive_path: Path,
+    config_path: Path,
+    lane_root: Path,
+    compiled_root: Path | None = None,
+) -> None:
     document = json.loads(config_path.read_text(encoding="utf-8"))
     if isinstance(document, list):
         if len(document) != 1 or not isinstance(document[0], dict):
             raise ValueError("image inspect must contain exactly one image")
         document = document[0]
     validate_config(document)
-    inventory = source_inventory(lane_root)
+    inventory = source_inventory(lane_root, compiled_root)
     seen = set()
     with tarfile.open(archive_path, "r:*") as archive:
         for member in archive:
@@ -104,8 +110,10 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--lane-root", type=Path, required=True)
+    parser.add_argument("--compiled-root", type=Path)
     args = parser.parse_args()
-    validate_archive(args.archive, args.config, args.lane_root.resolve())
+    compiled_root = args.compiled_root.resolve() if args.compiled_root is not None else None
+    validate_archive(args.archive, args.config, args.lane_root.resolve(), compiled_root)
 
 
 if __name__ == "__main__":
