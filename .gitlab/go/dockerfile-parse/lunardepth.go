@@ -34,7 +34,7 @@ func checkLunardepth(src []byte) error {
 			}
 		}
 	}
-	return errors.Join(append(errs, lunardepthPolicy(lines)...))
+	return errors.Join(append(errs, lunardepthPolicy(lines)))
 }
 
 func lunardepthPolicy(lines []parsedLine) error {
