@@ -61,10 +61,10 @@ render_lunardepth_overlay() {
 
 configure_lunardepth() {
   local name="$1" model="${2:-}" base_url="${3:-}" api_key="${4:-}"
-  local allow_insecure="${5:-false}" allow_placeholder="${6:-false}"
+  local allow_insecure="${5:-preserve}" allow_placeholder="${6:-preserve}"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-  [[ -n "$model" || -n "$base_url" || -n "$api_key" || "$allow_insecure" == "true" || "$allow_placeholder" == "true" ]] \
+  [[ -n "$model" || -n "$base_url" || -n "$api_key" || "$allow_insecure" != "preserve" || "$allow_placeholder" != "preserve" ]] \
     || die "configure-lunardepth: pass --model, --base-url, --api-key-file, or an explicit exception option"
   local env_dir existing_key
   env_dir="$(tenant_env_dir "$name")"
@@ -72,8 +72,8 @@ configure_lunardepth() {
   [[ -n "$model" ]] || model="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_MODEL)"
   existing_key="$(read_tenant_env_value "$name" "$env_dir/lunardepth-task.env" LUNARDEPTH_API_KEY)"
   [[ -n "$api_key" ]] || api_key="$existing_key"
-  [[ "$allow_insecure" == "true" ]] || allow_insecure="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_ALLOW_INSECURE_HTTP)"
-  [[ "$allow_placeholder" == "true" ]] || allow_placeholder="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_ALLOW_PLACEHOLDER_KEY)"
+  [[ "$allow_insecure" != "preserve" ]] || allow_insecure="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_ALLOW_INSECURE_HTTP)"
+  [[ "$allow_placeholder" != "preserve" ]] || allow_placeholder="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_ALLOW_PLACEHOLDER_KEY)"
   allow_insecure="${allow_insecure:-false}"
   allow_placeholder="${allow_placeholder:-false}"
   [[ -n "$base_url" && -n "$model" ]] || die "configure-lunardepth: explicit base URL and model are required"
@@ -103,17 +103,17 @@ PY
   public_staged="$(mktemp)" || return 1
   task_staged="$(mktemp)" || { rm -f "$public_staged"; return 1; }
   {
-    printf 'LUNARDEPTH_BASE_URL=%s\n' "$(_quote_env_value "$base_url")"
-    printf 'LUNARDEPTH_MODEL=%s\n' "$(_quote_env_value "$model")"
+    printf 'LUNARDEPTH_BASE_URL=%s\n' "$base_url"
+    printf 'LUNARDEPTH_MODEL=%s\n' "$model"
     printf 'LUNARDEPTH_ALLOW_INSECURE_HTTP=%s\n' "$allow_insecure"
     printf 'LUNARDEPTH_ALLOW_PLACEHOLDER_KEY=%s\n' "$allow_placeholder"
   } >"$public_staged"
   {
-    printf 'LUNARDEPTH_BASE_URL=%s\n' "$(_quote_env_value "$base_url")"
-    printf 'LUNARDEPTH_MODEL=%s\n' "$(_quote_env_value "$model")"
+    printf 'LUNARDEPTH_BASE_URL=%s\n' "$base_url"
+    printf 'LUNARDEPTH_MODEL=%s\n' "$model"
     printf 'LUNARDEPTH_ALLOW_INSECURE_HTTP=%s\n' "$allow_insecure"
     printf 'LUNARDEPTH_ALLOW_PLACEHOLDER_KEY=%s\n' "$allow_placeholder"
-    [[ "$allow_placeholder" == "true" || -z "$api_key" ]] || printf 'LUNARDEPTH_API_KEY=%s\n' "$(_quote_env_value "$api_key")"
+    [[ "$allow_placeholder" == "true" || -z "$api_key" ]] || printf 'LUNARDEPTH_API_KEY=%s\n' "$api_key"
   } >"$task_staged"
   if ! write_tenant_file_atomic "$name" "$env_dir/lunardepth.env" 600 owned-parent <"$public_staged" \
       || ! write_tenant_file_atomic "$name" "$env_dir/lunardepth-task.env" 600 owned-parent <"$task_staged"; then

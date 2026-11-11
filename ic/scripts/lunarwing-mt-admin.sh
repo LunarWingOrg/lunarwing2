@@ -550,9 +550,11 @@ Commands:
     --api-key-file <path>          Stage a per-tenant revocable key only in the task env;
                                    that key is visible to the model. Omitted values survive.
     --allow-insecure-http          Allow non-loopback cleartext HTTP (separate opt-in)
+    --disallow-insecure-http       Clear a previous cleartext HTTP exception
     --allow-unauthenticated-gateway
                                    Use a nonempty placeholder for an explicitly unauthenticated
                                    gateway (separate opt-in)
+    --require-api-key              Clear the unauthenticated-gateway exception
 
   configure-worker-tools <name> <worker> <tools|none>
                                    Set the WI#324 proxied-tool grant
@@ -1734,14 +1736,16 @@ main() {
 
     configure-lunardepth)
       require_root
-      local name="" lunar_model="" lunar_base_url="" lunar_api_key="" lunar_insecure="false" lunar_placeholder="false"
+      local name="" lunar_model="" lunar_base_url="" lunar_api_key="" lunar_insecure="preserve" lunar_placeholder="preserve"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --model)    lunar_model="$2"; shift 2 ;;
           --base-url) lunar_base_url="$2"; shift 2 ;;
           --api-key-file) lunar_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
           --allow-insecure-http) lunar_insecure="true"; shift ;;
+          --disallow-insecure-http) lunar_insecure="false"; shift ;;
           --allow-unauthenticated-gateway) lunar_placeholder="true"; shift ;;
+          --require-api-key) lunar_placeholder="false"; shift ;;
           -*)         die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
