@@ -64,6 +64,7 @@ configure_lunardepth() {
   local allow_insecure="${5:-preserve}" allow_placeholder="${6:-preserve}"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ports_migrate
   [[ -n "$model" || -n "$base_url" || -n "$api_key" || "$allow_insecure" != "preserve" || "$allow_placeholder" != "preserve" ]] \
     || die "configure-lunardepth: pass --model, --base-url, --api-key-file, or an explicit exception option"
   local env_dir existing_key
@@ -122,6 +123,9 @@ PY
   fi
   rm -f "$public_staged" "$task_staged"
   render_lunardepth_overlay "$name"
+  ports_enable_worker "$name" lunardepth
+  ensure_external_worker_config "$name" lunardepth lunardepth_wss \
+    || die "could not safely write the LunarDepth external-worker config for tenant '$name'"
   say "LunarDepth configured for tenant '$name' (explicit TensorMoon-compatible route; key staged only in the task env)"
 }
 

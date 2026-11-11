@@ -54,11 +54,35 @@ fi
 [[ "$checksum" == "$(sha256sum "$registry")" ]]
 PORTS_REGISTRY="$registry" bash "$SCRIPT_DIR/migrate-ports-v18.sh" >/dev/null
 
-# The shared lifecycle dispatcher must accept the new lane as well as its
-# dedicated start_tenant_lunardepth function.
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 PORTS_REGISTRY="$registry"
+
+# An existing v17/v18 tenant must receive ports, selection, daemon config, and
+# literal (unquoted) task env values when the lane is configured.
+(
+  tenant_exists_in_registry() { return 0; }
+  tenant_env_dir() { printf '%s/env' "$TMP"; }
+  read_tenant_env_value() { [[ ! -f "$2" ]] || sed -n "s/^$3=//p" "$2"; }
+  write_tenant_file_atomic() { cat >"$2"; }
+  render_lunardepth_overlay() { LUNARDEPTH_OVERLAY_FILE="$TMP/overlay.yml"; }
+  ensure_external_worker_config() { printf '%s:%s:%s\n' "$1" "$2" "$3" >>"$TMP/configure.calls"; }
+  mkdir -p "$TMP/env"
+  : >"$TMP/configure.calls"
+  configure_lunardepth demo tensormoon::function_name::lunarwing \
+    https://tensormoon.example.test/openai/v1 '' true true
+  grep -q '^LUNARDEPTH_BASE_URL=https://tensormoon.example.test/openai/v1$' "$TMP/env/lunardepth.env"
+  [[ "$(jq -r '.tenants.demo.workers.lunardepth' "$registry")" == "true" ]]
+  [[ "$(jq -r '.tenants.demo.lunardepth_ports.lunardepth_wss' "$registry")" == "52000" ]]
+  grep -q '^demo:lunardepth:lunardepth_wss$' "$TMP/configure.calls"
+  configure_lunardepth demo '' '' test-only-key false false
+  grep -q '^LUNARDEPTH_API_KEY=test-only-key$' "$TMP/env/lunardepth-task.env"
+  grep -q '^LUNARDEPTH_ALLOW_INSECURE_HTTP=false$' "$TMP/env/lunardepth.env"
+  grep -q '^LUNARDEPTH_ALLOW_PLACEHOLDER_KEY=false$' "$TMP/env/lunardepth.env"
+)
+
+# The shared lifecycle dispatcher must accept the new lane as well as its
+# dedicated start_tenant_lunardepth function.
 [[ "$(prepare_worker_lifecycle demo lunardepth)" == "demo lunardepth" ]]
 if (prepare_worker_lifecycle demo not-a-worker) >/dev/null 2>&1; then
   echo "unknown worker unexpectedly accepted" >&2
