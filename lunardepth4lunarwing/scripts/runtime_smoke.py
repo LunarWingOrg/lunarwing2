@@ -103,7 +103,10 @@ def run_node_smoke(script: Path, url: str, token: str, task: bool) -> None:
 
 
 def listeners(role: str) -> None:
-    expected = {8443, 9090} if role in {"bridge", "combined"} else set()
+    expected = {
+        int(os.environ.get("HEALTH_PORT", "8443")),
+        int(os.environ.get("WS_PORT", "9090")),
+    } if role in {"bridge", "combined"} else set()
     findings = []
     for name in ("tcp", "tcp6"):
         path = Path("/proc/net") / name
@@ -167,14 +170,19 @@ def credential(direct_name: str, file_name: str, default_path: str) -> str:
     return value
 
 
+def bridge_ws_url() -> str:
+    default = f"ws://127.0.0.1:{os.environ.get('WS_PORT', '9090')}/ws/agent"
+    return os.environ.get("SMOKE_BRIDGE_WS_URL", default)
+
+
 def bridge_smoke(script: Path, token: str, run_task: bool) -> None:
     if http_json(os.environ.get("SMOKE_BRIDGE_READY_URL", "http://127.0.0.1:8443/ready")).get("ready") is not True:
         raise ValueError("bridge is not ready")
-    if upgrade_status("ws://127.0.0.1:9090/ws/agent", "wrong", "lunarwing-agent-v1") != 401:
+    if upgrade_status(bridge_ws_url(), "wrong", "lunarwing-agent-v1") != 401:
         raise ValueError("bridge accepted a wrong token")
-    if upgrade_status("ws://127.0.0.1:9090/ws/agent", token, "ironclaw-agent-v1") != 400:
+    if upgrade_status(bridge_ws_url(), token, "ironclaw-agent-v1") != 400:
         raise ValueError("bridge accepted the legacy subprotocol")
-    run_node_smoke(script, "ws://127.0.0.1:9090/ws/agent", token, run_task)
+    run_node_smoke(script, bridge_ws_url(), token, run_task)
 
 
 def task_smoke(script: Path, token: str) -> None:
