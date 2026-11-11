@@ -211,7 +211,7 @@ start_tenant_lunardepth() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' lunarwing-worker-lunardepth:latest 2>/dev/null || true)"
   case "$image_user" in
     "$LUNARDEPTH_CONTAINER_UID"|"$LUNARDEPTH_CONTAINER_UID:$LUNARDEPTH_CONTAINER_GID") ;;
-    *) warn_err "LunarDepth image has user '$(sanitize_display_value "${image_user:-unset}")', expected $LUNARDEPTH_CONTAINER_UID:$LUNARDEPTH_CONTAINER_GID"; return 3 ;;
+    *) warn_err "LunarDepth image has user '$(sanitize_display_value "${image_user:-unset}")', expected $LUNARDEPTH_CONTAINER_UID:$LUNARDEPTH_CONTAINER_GID (WI#454 task default); rebuild it with lunardepth4lunarwing/Dockerfile"; return 3 ;;
   esac
 
   ensure_init_system
