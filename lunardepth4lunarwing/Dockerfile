@@ -56,15 +56,21 @@ RUN set -eu; \
     test "$(pnpm --version)" = "11.7.0"; \
     node /src/scripts/check-toolchain.mjs
 
+COPY scripts/prepare_lockfile_deploy.py scripts/verify_deployed_closure.ts /build/scripts/
+RUN python3 /build/scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts
+
 WORKDIR /src/deepseek-harness
 RUN set -eu; \
     before="$(sha256sum pnpm-lock.yaml)"; \
+    workspace_before="$(sha256sum pnpm-workspace.yaml)"; \
     pnpm install --frozen-lockfile; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
     pnpm exec tsx native/system/scripts/build.ts; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
     pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false; \
     pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
+    test "$workspace_before" = "$(sha256sum pnpm-workspace.yaml)"; \
+    pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth > /build/deployed-packages.sha256; \
     sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
     landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
     test -x "$landlock"; \
@@ -99,6 +105,7 @@ RUN set -eu; \
       printf 'LUNARDEPTH_MODEL_ROUTING_REF=%s\n' "$LUNARDEPTH_MODEL_ROUTING_REF"; \
       printf 'LUNARDEPTH_SOURCE_VERSION=%s\n' "$source_version"; \
       printf 'LUNARDEPTH_PROFILE_SCHEMA_VERSION=%s\n' "$schema"; \
+      printf 'LUNARDEPTH_DEPLOYED_PACKAGES_SHA256=%s\n' "$(cat /build/deployed-packages.sha256)"; \
       sha256sum /src/deepseek-harness/pnpm-lock.yaml; \
     } > /opt/lunardepth/worker-inputs.sha256; \
     find /opt/lunardepth -type d \( -name .git -o -name tests -o -name __tests__ -o -name .cache \) -prune -exec rm -rf {} +; \
