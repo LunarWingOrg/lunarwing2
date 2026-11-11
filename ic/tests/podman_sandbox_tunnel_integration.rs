@@ -1578,7 +1578,20 @@ async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String>
     sidecar
         .ensure_started()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let mut stable_checks = 0;
+    for _ in 0..60 {
+        if sidecar.ensure_healthy().await.is_ok() {
+            stable_checks += 1;
+            if stable_checks == 3 {
+                return Ok(());
+            }
+        } else {
+            stable_checks = 0;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err("NetBird did not remain ready after reconnect".into())
 }
 
 async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String> {
