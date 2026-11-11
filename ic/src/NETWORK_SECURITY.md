@@ -490,12 +490,15 @@ digest-pinned 0.82.0 OCI index; mutable references warn with auto-pull enabled.
 Every start/health check hashes the resolved local image ID so tag rotation
 recreates the sidecar. Missing `nft`, an unhealthy provider, or an
 altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
-to another tier. Manager recovery re-probes for at most 6 seconds, allows a
-fresh provider at most 20 seconds (or the lower configured timeout), and caps
-the whole attempt at 60 seconds. A failure retains its probe reason in a
-30-second back-off: subsequent commands fail immediately until one retries
-after the window. Dropped starts have an independent cleanup guard, and no
-container ID becomes joinable before the firewall verifies.
+to another tier. Cold starts keep the full configured startup timeout. Per-run
+recovery re-probes for at most 6 seconds, allows a fresh provider at most 20
+seconds (or the lower configured timeout), and caps the initial health check,
+recovery, and final verification together at 60 seconds. A failure retains its
+probe reason in a 30-second back-off: subsequent commands fail immediately
+until one retries after the window. Recovery runs in a sidecar-owned task that
+survives caller cancellation, finishes partial-start cleanup, and records the
+result before waking later callers. No container ID becomes joinable before the
+firewall verifies.
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
