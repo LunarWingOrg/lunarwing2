@@ -718,59 +718,34 @@ impl EgressPolicy {
     }
 }
 
-fn chain_header(hook: &str) -> String {
-    format!("{{ type filter hook {hook} priority 0; policy drop; }}")
+fn firewall_chain(name: &str, rules: &[String]) -> String {
+    let mut chain =
+        format!("    chain {name} {{\n        type filter hook {name} priority 0; policy drop;\n");
+    for rule in rules {
+        chain.push_str(&format!("        {rule}\n"));
+    }
+    chain.push_str("    }\n");
+    chain
 }
 
-fn firewall_install_commands(policy: &EgressPolicy, container_name: &str) -> Vec<Vec<String>> {
-    let input_header = chain_header(NFT_INPUT_CHAIN);
-    let output_header = chain_header(NFT_OUTPUT_CHAIN);
-    let input_rules = EgressPolicy::input_rules();
-    let output_rules = policy.output_rules();
-    let mut commands: Vec<Vec<&str>> = vec![
-        vec!["delete", "table", "inet", NFT_TABLE],
-        vec!["add", "table", "inet", NFT_TABLE],
-        vec![
-            "add",
-            "chain",
-            "inet",
-            NFT_TABLE,
-            NFT_INPUT_CHAIN,
-            input_header.as_str(),
-        ],
-    ];
-    for rule in &input_rules {
-        commands.push(vec![
-            "add",
-            "rule",
-            "inet",
-            NFT_TABLE,
-            NFT_INPUT_CHAIN,
-            rule.as_str(),
-        ]);
-    }
-    commands.push(vec![
-        "add",
-        "chain",
-        "inet",
-        NFT_TABLE,
-        NFT_OUTPUT_CHAIN,
-        output_header.as_str(),
-    ]);
-    for rule in &output_rules {
-        commands.push(vec![
-            "add",
-            "rule",
-            "inet",
-            NFT_TABLE,
-            NFT_OUTPUT_CHAIN,
-            rule.as_str(),
-        ]);
-    }
-    commands
-        .iter()
-        .map(|args| nft_exec_args(args, container_name))
-        .collect()
+fn firewall_ruleset(policy: &EgressPolicy) -> String {
+    let mut ruleset = format!(
+        "add table inet {NFT_TABLE}\ndelete table inet {NFT_TABLE}\ntable inet {NFT_TABLE} {{\n"
+    );
+    ruleset.push_str(&firewall_chain(
+        NFT_INPUT_CHAIN,
+        &EgressPolicy::input_rules(),
+    ));
+    ruleset.push_str(&firewall_chain(NFT_OUTPUT_CHAIN, &policy.output_rules()));
+    ruleset.push_str("}\n");
+    ruleset
+}
+
+fn firewall_install_command(policy: &EgressPolicy, container_name: &str) -> (Vec<String>, String) {
+    (
+        nft_exec_args(&["-f", "-"], container_name),
+        firewall_ruleset(policy),
+    )
 }
 
 fn firewall_list_args(container_name: &str) -> Vec<String> {
@@ -1681,20 +1656,19 @@ impl TunnelSidecar {
 
     async fn install_egress_firewall(&self) -> Result<()> {
         let policy = self.egress_policy(true).await?;
-        for (index, args) in firewall_install_commands(&policy, &self.container_name)
-            .iter()
-            .enumerate()
-        {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let output = self.output_probe(&refs).await.map_err(|_| {
-                self.unavailable("failed to execute nftables in the tunnel sidecar")
-            })?;
-            // The first command deletes a previous table and may not find one.
-            if index > 0 && !output.status.success() {
-                return Err(self.unavailable(
-                    "egress firewall setup failed; the sidecar image must provide nftables",
-                ));
-            }
+        if self.verify_egress_firewall(&policy).await.is_ok() {
+            return Ok(());
+        }
+        let (args, ruleset) = firewall_install_command(&policy, &self.container_name);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self
+            .output_probe_with_stdin(&refs, Some(ruleset.as_bytes()))
+            .await
+            .map_err(|_| self.unavailable("failed to execute nftables in the tunnel sidecar"))?;
+        if !output.status.success() {
+            return Err(self.unavailable(
+                "egress firewall setup failed; the sidecar image must provide nftables",
+            ));
         }
         self.verify_egress_firewall(&policy).await
     }
@@ -2953,34 +2927,35 @@ mod tests {
     }
 
     #[test]
-    fn firewall_install_covers_both_directions() {
-        let commands = firewall_install_commands(&policy(), "tunnel-test");
-        let joined = commands
-            .iter()
-            .map(|command| command.join(" "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains(
-            "add chain inet lunarwing_sandbox_egress input { type filter hook input priority 0; policy drop; }"
-        ));
-        assert!(joined.contains(
-            "add chain inet lunarwing_sandbox_egress output { type filter hook output priority 0; policy drop; }"
-        ));
-        assert!(joined.contains("input iifname \"lo\" accept"));
-        assert!(joined.contains("input ct state established,related accept"));
-        assert!(joined.contains("output oifname \"lo\" accept"));
-        assert!(joined.contains("output oifname \"wg0\" accept"));
-        assert!(joined.contains("output oifname \"wt0\" accept"));
-        assert!(joined.contains("output ip daddr 169.254.1.1 udp dport 53 accept"));
-        assert!(joined.contains("output ip daddr 9.9.9.9 tcp dport 53 accept"));
-        assert!(joined.contains("output ip daddr 169.254.0.0/16 drop"));
-        assert!(joined.contains("output meta mark 0x4c57 accept"));
-        // Nothing lets unmarked uplink traffic out: no established/related
-        // shortcut and no bare accept in the output chain.
-        assert!(!joined.contains("output ct state"));
-        assert!(!joined.contains("output accept"));
-        // The DNS allowance precedes the link-local drop (pasta's forwarder
-        // lives in 169.254.0.0/16); the mark accept comes last.
+    fn firewall_install_is_one_atomic_transaction_covering_both_directions() {
+        let (args, ruleset) = firewall_install_command(&policy(), "tunnel-test");
+        assert_eq!(args.join(" "), "exec tunnel-test nft -f -");
+        assert_eq!(ruleset.matches("add table inet").count(), 1);
+        assert_eq!(ruleset.matches("delete table inet").count(), 1);
+        assert!(!ruleset.contains("add rule"));
+        let add = ruleset.find("add table inet").unwrap();
+        let delete = ruleset.find("delete table inet").unwrap();
+        let definition = ruleset
+            .find("table inet lunarwing_sandbox_egress {")
+            .unwrap();
+        assert!(add < delete && delete < definition, "{ruleset}");
+        for expected in [
+            "chain input {\n        type filter hook input priority 0; policy drop;",
+            "chain output {\n        type filter hook output priority 0; policy drop;",
+            "iifname \"lo\" accept",
+            "ct state established,related accept",
+            "oifname \"lo\" accept",
+            "oifname \"wg0\" accept",
+            "oifname \"wt0\" accept",
+            "ip daddr 169.254.1.1 udp dport 53 accept",
+            "ip daddr 9.9.9.9 tcp dport 53 accept",
+            "ip daddr 169.254.0.0/16 drop",
+            "meta mark 0x4c57 accept",
+        ] {
+            assert!(ruleset.contains(expected), "missing {expected}: {ruleset}");
+        }
+        assert!(!ruleset.contains("output ct state"));
+        assert!(!ruleset.contains("output accept"));
         let rules = policy().output_rules();
         let dns = rules
             .iter()
@@ -2992,8 +2967,6 @@ mod tests {
             .position(|r| r.starts_with("meta mark"))
             .unwrap();
         assert!(dns < drop && drop < mark);
-        // delete table, add table, two chain headers, 2 input + output rules.
-        assert_eq!(commands.len(), 4 + 2 + rules.len());
     }
 
     #[test]
