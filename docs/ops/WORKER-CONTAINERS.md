@@ -1156,10 +1156,11 @@ SHA-256 digest covers the selected checkout's `sandbox.Dockerfile` and the
 resolved `DEBIAN_SNAPSHOT` build argument. The Dockerfile's `ARG` value is the
 default; `LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT` is an explicit operator
 override and is included in the digest. `add-tenant` and `upgrade-tenant`
-default to `--sandbox-image auto`: they build when the admin image is absent,
-unlabelled, or has a different digest, and skip the build when it matches.
-`always` forces a build and `never` suppresses it. The same policy can be set
-through `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
+default to `auto`: they build when the admin image is absent, unlabelled, or
+has a different digest, and skip the build when it matches. `always` forces a
+build and `never` suppresses it. Set the policy on an upgrade with
+`--sandbox-image`, or on either command through
+`LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
 
 For rootless Podman, `start-tenant` distributes the admin image into the
 tenant's own store only when its image ID differs; unchanged inputs therefore
