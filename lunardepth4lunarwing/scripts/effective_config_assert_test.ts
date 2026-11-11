@@ -52,11 +52,16 @@ test("manifest hashes detect a launcher rewrite and name package.json", () => {
 })
 
 test("composition accepts only the exact row inventory and applied security patches", () => {
-  const rows = [...EXPECTED_ROW_IDS].map(id => ({ id, name: "@lunardepth/dsh-test", disabled: false, config: {} }))
   const permission = {
     presets: { "workspace-write": { sandbox: "workspace-write", approval: "ask" } },
     defaultPreset: "workspace-write",
   }
+  const rows = [...EXPECTED_ROW_IDS].map(id => ({
+    id,
+    name: "@lunardepth/dsh-test",
+    disabled: false,
+    config: id === "permission" ? permission : {},
+  }))
   assertCompositionRows(rows, [{ id: "permission", name: "@lunardepth/dsh-test", disabled: false, config: permission }])
   assert.throws(
     () => assertCompositionRows(rows, [{ id: "permission", name: "@lunardepth/dsh-test", disabled: true }]),
