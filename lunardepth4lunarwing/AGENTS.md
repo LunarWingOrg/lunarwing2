@@ -32,6 +32,8 @@ Node is `22.23.4-bookworm-slim` at the same digest as `CI_NODE_IMAGE`; pnpm is e
 
 The build runs the pinned toolchain guard before installation, uses `pnpm install --frozen-lockfile`, runs focused worker tests/typechecks, and deploys `dsh-python-runtime-closure` through `build-exe-for-python-sdk.ts --deploy-to`. Resolve both `@lunardepth/dsh-lunarwing-worker-app` and `@lunardepth/dsh-lunarwing-worker` from that materialized closure. The runtime invokes the built launcher, never `tsx` or a source checkout.
 
+The lane replaces the pinned script's legacy deploy block with pnpm's shared-lockfile deploy: frozen, injected workspace packages, and `minimumReleaseAgeStrict=true`. The exact-block transformation must fail on source drift. `pnpm-workspace.yaml` must stay byte-identical, including `minimumReleaseAgeExclude`; `verify_deployed_closure.ts` rejects every installed external `name@version` absent from the source lockfile and records the sorted inventory hash in `worker-inputs.sha256`. `harden_image_modes.sh` clears inherited write/set-ID bits with five-digit modes before the final closure assertion.
+
 `ARG SOURCE_DATE_EPOCH=0` precedes account creation and its shadow-day assertion. Remove source metadata, caches, development dependencies, smoke state, and writable application/template files. Candidate and uncached clean-rebuild whole-image digests must match; the protected candidate, out-of-band verification, CRITICAL scan, and manual promotion are mandatory.
 
 ## Testing
