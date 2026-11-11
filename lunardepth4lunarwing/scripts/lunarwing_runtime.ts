@@ -61,9 +61,6 @@ export interface WsState {
   port: number
   path: string
   connections: number
-  composition_ready: boolean
-  sandbox_ready: boolean
-  task_ready: boolean
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
