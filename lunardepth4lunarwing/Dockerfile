@@ -132,7 +132,7 @@ RUN set -eu; \
     timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
     dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 2.6.2; \
     timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
-      tini python3 git curl ca-certificates bubblewrap util-linux jq openssh-client; \
+      tini python3 git curl ca-certificates bubblewrap util-linux jq openssh-client zstd; \
     update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \

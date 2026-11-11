@@ -138,8 +138,25 @@ def listeners(role: str) -> None:
         raise ValueError("; ".join(findings))
 
 
+def read_session(path: Path) -> str:
+    if path.name.endswith(".zstd"):
+        result = subprocess.run(
+            ["/usr/bin/zstd", "-dc", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.stdout
+    return path.read_text(encoding="utf-8")
+
+
 def assert_fresh_policy(dsh_home: Path) -> None:
-    files = sorted(dsh_home.glob("sessions/**/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+    files = sorted(
+        [*dsh_home.glob("sessions/**/*.jsonl"), *dsh_home.glob("sessions/**/*.jsonl.zstd")],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     wanted = {
         "permission/preset": ("preset", "workspace-write"),
         "sandbox/mode": ("mode", "workspace-write"),
@@ -147,7 +164,7 @@ def assert_fresh_policy(dsh_home: Path) -> None:
     }
     for path in files:
         found = set()
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in read_session(path).splitlines():
             try:
                 event = json.loads(line)
             except ValueError:

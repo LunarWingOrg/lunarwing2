@@ -41,6 +41,22 @@ class RuntimeSmokeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no fresh task session"):
                 MODULE.assert_fresh_policy(home)
 
+    def test_fresh_policy_reads_compressed_v4_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            session = home / "sessions" / "test.session.v4.jsonl.zstd"
+            session.parent.mkdir(parents=True)
+            session.write_bytes(b"compressed fixture")
+            events = [
+                {"type": "permission/preset", "data": {"preset": "workspace-write"}},
+                {"type": "sandbox/mode", "data": {"mode": "workspace-write"}},
+                {"type": "approval/policy", "data": {"policy": "ask"}},
+            ]
+            text = "\n".join(json.dumps(event) for event in events)
+            with mock.patch.object(MODULE.subprocess, "run", return_value=mock.Mock(stdout=text)) as decompress:
+                MODULE.assert_fresh_policy(home)
+            self.assertEqual(decompress.call_args.args[0][:2], ["/usr/bin/zstd", "-dc"])
+
     def test_bridge_smoke_uses_the_registry_port(self):
         with mock.patch.dict(os.environ, {"WS_PORT": "52000"}):
             self.assertEqual(MODULE.bridge_ws_url(), "ws://127.0.0.1:52000/ws/agent")
