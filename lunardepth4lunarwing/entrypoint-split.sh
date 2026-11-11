@@ -29,7 +29,10 @@ run_task() {
   [[ "$(id -u)" == "10005" && "$(id -g)" == "10005" ]] || die "split-task requires 10005:10005"
   [[ -z "${AGENT_AUTH_TOKEN:-}" && -z "${AGENT_AUTH_TOKEN_FILE:-}" ]] || die "hub credentials must not reach the task"
   unset AGENT_AUTH_TOKEN AGENT_AUTH_TOKEN_FILE LUNARDEPTH_TASK_UID LUNARDEPTH_TASK_GID
-  "$APP_DIR/entrypoint-task-setup.sh"
+  . "$APP_DIR/entrypoint-task-setup.sh"
+  [[ "$HOME" == "/home/lunardepth-home" && "$DSH_HOME" == "/home/lunardepth/.dsh" ]] \
+    || die "task setup did not preserve the required HOME and DSH_HOME"
+  [[ -n "${LUNARDEPTH_LOCAL_AUTH_TOKEN:-}" ]] || die "task setup did not preserve the local credential"
   cd /run/lunardepth-launch
   /usr/local/bin/node "$APP_DIR/scripts/effective_config_assert.js" gate
   /usr/local/bin/node "$APP_DIR/scripts/sandbox_smoke.js"
