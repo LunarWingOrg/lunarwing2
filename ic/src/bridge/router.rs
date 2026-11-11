@@ -3762,10 +3762,15 @@ fn append_channel_constraint(context: &mut Option<String>, constraint: &str) {
     });
 }
 
-fn foreground_thread_config(max_iterations: usize, shared_conversation: bool) -> ThreadConfig {
+fn foreground_thread_config(
+    max_iterations: usize,
+    shared_conversation: bool,
+    supervised_mode: bool,
+) -> ThreadConfig {
     ThreadConfig {
         max_iterations,
         shared_conversation,
+        supervised_mode,
         ..Default::default()
     }
 }
@@ -3968,6 +3973,7 @@ async fn handle_with_engine_inner(
         let mut config = foreground_thread_config(
             agent.max_tool_iterations(),
             message.is_shared_conversation(),
+            agent.supervised_mode(),
         );
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
@@ -3991,16 +3997,6 @@ async fn handle_with_engine_inner(
             .and_then(|policy| policy.instruction_for_scope(&policy_scope))
         {
             append_channel_constraint(&mut config.channel_context, instruction);
-        }
-        // Supervised mode: opt-in via env (set by --supervised CLI flag or
-        // explicit config). Forces every tool action through human approval
-        // regardless of the tool's normal tier.
-        if std::env::var("AGENT_SUPERVISED_MODE")
-            .ok()
-            .filter(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .is_some()
-        {
-            config.supervised_mode = true;
         }
         config
     };
@@ -6799,10 +6795,68 @@ pub(crate) mod tests {
 
     #[test]
     fn foreground_thread_config_uses_resolved_agent_iteration_limit() {
-        let config = foreground_thread_config(979, true);
+        let config = foreground_thread_config(979, true, false);
 
         assert_eq!(config.max_iterations, 979);
         assert!(config.shared_conversation);
+        assert!(!config.supervised_mode);
+    }
+
+    #[test]
+    fn supervised_cli_flag_flows_into_foreground_thread_config() {
+        use clap::Parser;
+
+        struct AgentOverrideReset;
+        impl Drop for AgentOverrideReset {
+            fn drop(&mut self) {
+                crate::config::set_supervised_cli_override(false);
+                crate::config::set_runtime_env("AGENT_SUPERVISED_MODE", "");
+                crate::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "");
+            }
+        }
+
+        let _environment = crate::config::helpers::lock_env();
+        let _reset = AgentOverrideReset;
+        // SAFETY: the crate-wide environment mutex is held for this test.
+        unsafe { std::env::remove_var("AGENT_SUPERVISED_MODE") };
+        crate::config::set_runtime_env("AGENT_SUPERVISED_MODE", "");
+        crate::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "");
+
+        let cli = crate::cli::Cli::try_parse_from(["lunarwing", "--supervised"])
+            .expect("parse supervised CLI");
+        cli.apply_agent_overrides();
+        let agent_config =
+            crate::config::AgentConfig::resolve(&crate::settings::Settings::default())
+                .expect("resolve CLI-only agent config");
+        let config = foreground_thread_config(
+            agent_config.max_tool_iterations,
+            false,
+            agent_config.supervised_mode.enabled,
+        );
+        assert!(config.supervised_mode);
+        assert_eq!(
+            agent_config.supervised_mode.source,
+            crate::config::SupervisedModeSource::Cli
+        );
+
+        // SAFETY: the crate-wide environment mutex is still held.
+        unsafe { std::env::set_var("AGENT_SUPERVISED_MODE", "false") };
+        let cli = crate::cli::Cli::try_parse_from(["lunarwing", "--supervised", "--auto-approve"])
+            .expect("parse supervised auto-approve CLI");
+        cli.apply_agent_overrides();
+        let agent_config =
+            crate::config::AgentConfig::resolve(&crate::settings::Settings::default())
+                .expect("resolve conflicting agent config");
+        let config = foreground_thread_config(
+            agent_config.max_tool_iterations,
+            false,
+            agent_config.supervised_mode.enabled,
+        );
+        assert!(agent_config.auto_approve_tools);
+        assert!(
+            config.supervised_mode,
+            "CLI supervision must beat env false"
+        );
     }
 
     pub(super) struct TestStore {
