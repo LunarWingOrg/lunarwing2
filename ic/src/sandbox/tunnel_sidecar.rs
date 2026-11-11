@@ -742,10 +742,15 @@ fn firewall_ruleset(policy: &EgressPolicy) -> String {
 }
 
 fn firewall_install_command(policy: &EgressPolicy, container_name: &str) -> (Vec<String>, String) {
-    (
-        nft_exec_args(&["-f", "-"], container_name),
-        firewall_ruleset(policy),
-    )
+    let args = vec![
+        "exec".into(),
+        "-i".into(),
+        container_name.into(),
+        "nft".into(),
+        "-f".into(),
+        "-".into(),
+    ];
+    (args, firewall_ruleset(policy))
 }
 
 fn firewall_list_args(container_name: &str) -> Vec<String> {
@@ -2929,7 +2934,7 @@ mod tests {
     #[test]
     fn firewall_install_is_one_atomic_transaction_covering_both_directions() {
         let (args, ruleset) = firewall_install_command(&policy(), "tunnel-test");
-        assert_eq!(args.join(" "), "exec tunnel-test nft -f -");
+        assert_eq!(args.join(" "), "exec -i tunnel-test nft -f -");
         assert_eq!(ruleset.matches("add table inet").count(), 1);
         assert_eq!(ruleset.matches("delete table inet").count(), 1);
         assert!(!ruleset.contains("add rule"));
