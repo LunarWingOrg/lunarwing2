@@ -369,6 +369,10 @@ impl Agent {
         self.config.auto_approve_tools
     }
 
+    pub(crate) fn supervised_mode(&self) -> bool {
+        self.config.supervised_mode.enabled
+    }
+
     /// Pending-gate expiry (WI#111): resolved from
     /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
     /// settings via `AgentConfig::resolve`, with config-layer lower and upper
