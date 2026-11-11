@@ -190,8 +190,7 @@ ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
     WS_NO_UTF_8_VALIDATE=1 \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN --network=none LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh
-RUN set -eu; \
+RUN --network=none LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh && set -eu; \
     rm -rf /tmp/lunardepth-* /run/lunardepth-state/* /run/lunarwing-shared/runner/* \
       /home/lunardepth/.dsh /home/lunardepth-bridge/.local/state /run/lunardepth-config/* /root/.cache /root/.npm; \
     install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh; \
