@@ -29,7 +29,7 @@ ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
 
-The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior.
+The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior. Clear those exceptions with `--disallow-insecure-http` and `--require-api-key`. Existing tenants receive their v18 lane ports, registry selection, and daemon endpoint during configuration; route and key values are written literally without Podman-env quotes.
 
 The model key is **task-visible, including to the model**. Issue a different, independently revocable key per tenant and restrict it to that tenant's inference. It never belongs in the bridge, overlay, argv, logs, health output, examples, or export text.
 
@@ -41,7 +41,9 @@ Three v1 choices are intentional:
 2. **All inherited temp variables are `/tmp`.** `TMPDIR`, `TMP`, and `TEMP` are pinned in the frozen launch environment. This lets `mktemp` work under both built-in runners; a task-private temp directory outside the runner's write grants would break bash tools.
 3. **The profile template is generated at image build by the pinned source.** `profile_template.ts` calls `initProfile` with the shipped `lunarwing-worker` template from `@lunardepth/dsh-app-boot`. There is no hand-written profile manifest in this lane. The current pin exports no `PROFILE_SCHEMA_VERSION`, so the recorded schema is `unversioned`.
 
-At every start, task setup removes everything under `$DSH_HOME` except the real, task-owned `sessions`, `storages`, and `attachments` directories. It recreates the complete profile, home patch, and home `.env` from root-owned templates. The harness `HOME` is a separate root-owned empty directory. `WS_NO_BUFFER_UTIL=1`, `WS_NO_UTF_8_VALIDATE=1`, and a system-only `PATH` block home-directory module planting. The launch cwd is `/run/lunardepth-launch`, an empty root-owned directory outside the workspace and temp roots.
+At every start, task setup removes everything under `$DSH_HOME` except the real, task-owned `sessions`, `storages`, and `attachments` directories. It recreates the complete profile, home patch, and home `.env` from root-owned templates. The harness `HOME` is a separate root-owned empty directory. `WS_NO_BUFFER_UTIL=1`, `WS_NO_UTF_8_VALIDATE=1`, and a system-only `PATH` block home-directory module planting. The launch cwd is `/run/lunardepth-launch`, an empty root-owned directory outside the workspace and temp roots. Setup is sourced into the launcher so these values and the local/model credentials persist into the harness and runner.
+
+The host-rendered overlay remains root-owned and read-only. Because rootless `keep-id` does not show host UID `0` as container UID `0`, the task launch contract carries the overlay's SHA-256; setup requires that exact digest and mode `0444` instead of making a rootless-owner assumption. Study Notes and SSH-agent mounts are off in v1.
 
 Before readiness, the lane:
 
@@ -54,6 +56,8 @@ Before readiness, the lane:
 - repeats composition and readiness checks on the real boot and keeps composite health dependent on fresh harness/runner heartbeats.
 
 A pin bump must regenerate the template and repeat these checks. The profile template and `LUNARDEPTH_REF` move together.
+
+The builder installs `musl-tools` and runs the full native build so the deployed closure contains `landlock-run`. Container `/proc` restrictions make bwrap unusable here; Landlock needs no added capabilities. The host kernel must probe `full`, not `partial`, for every ABI the pinned launcher uses.
 
 ## Permission and network limits
 
@@ -71,7 +75,7 @@ Use Node `22.23.4` and exactly pnpm `11.7.0`. The Debian snapshot is tied to the
 ic/scripts/lunarwing-mt-admin.sh build-lunardepth-worker --no-cache
 ic/scripts/lunarwing-mt-admin.sh worker-listeners <tenant>
 ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>
-ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant>
+ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant> lunardepth
 ```
 
 Podman 4.5+ or Docker BuildKit/buildx is required for the inline `RUN --network=none` split-role smoke. Protected candidate builds additionally require an uncached clean rebuild with the same whole-image digest, out-of-band rootfs/config verification, a CRITICAL vulnerability gate, and manual promotion of the verified digest. Local tests do not replace those protected jobs or live TensorMoon/OpenRC acceptance.
