@@ -75,6 +75,15 @@ fn runtime_overrides() -> &'static Mutex<HashMap<String, String>> {
     RUNTIME_ENV_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn runtime_env_override(key: &str) -> Option<String> {
+    runtime_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
 fn aliased_env_keys(key: &str) -> (&str, Option<&str>) {
     match key {
         "AGENT_AUTO_APPROVE_TOOLS" | "AUTO_APPROVE_TOOLS" => {
