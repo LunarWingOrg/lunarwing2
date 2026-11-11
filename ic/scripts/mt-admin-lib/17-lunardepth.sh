@@ -155,9 +155,7 @@ build_lunardepth_worker() {
   iid_file="$(mktemp "${TMPDIR:-/tmp}/lw-lunardepth-iid.XXXXXX")" || die "cannot create LunarDepth image-id file"
   local -a identity_args=(--iidfile "$iid_file")
   if [[ "$CONTAINER_RT" == "podman" ]]; then
-    local -a layer_args=()
-    [[ "$no_cache" != "true" ]] || layer_args=(--layers=false)
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \
+    podman build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \
       --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$lane_dir" \
       || { rm -f "$iid_file"; die "LunarDepth worker image build failed"; }
   else

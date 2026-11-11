@@ -59,7 +59,7 @@ test("rejects grants, cron, malformed context, and unknown fields", () => {
   )
 })
 
-test("enforces history count and UTF-16 code-unit limits", () => {
+test("enforces history count and Unicode code-point limits", () => {
   assert.throws(
     () => validateTaskRequest({
       task_id: "job",
