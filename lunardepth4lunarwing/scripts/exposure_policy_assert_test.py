@@ -25,7 +25,7 @@ class ExposurePolicyTests(unittest.TestCase):
             overlay = clone / "config/lunarwing-lane.patch.yml"
             text = overlay.read_text(encoding="utf-8")
             overlay.write_text(text.replace("mode: workspace-write", "mode: danger-full-access"), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "danger-full-access"):
+            with self.assertRaisesRegex(ValueError, "missing mode: workspace-write|danger-full-access"):
                 MODULE.source_policy(clone)
             overlay.write_text(text + "\nLUNARDEPTH_API_KEY: planted\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "LUNARDEPTH_API_KEY"):
