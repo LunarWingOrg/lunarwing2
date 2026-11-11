@@ -14,6 +14,7 @@ import {
   parseEnvelope,
   readCredentialFile,
   resultPayload,
+  serializeBounded,
   SUBPROTOCOL,
   type Envelope,
   type TaskProgress,
@@ -130,7 +131,7 @@ export class LunarDepthClient {
       if (envelope.type === "ready") {
         if (this.ready) throw new Error("LunarDepth sent ready twice")
         this.ready = true
-        this.socket?.send(JSON.stringify(createEnvelope("task_request", requestPayload(request))))
+        this.send("task_request", requestPayload(request))
         return
       }
       if (!this.ready || this.socket === undefined) throw new Error("LunarDepth sent a frame before ready")
@@ -154,7 +155,7 @@ export class LunarDepthClient {
   }
 
   private send(type: string, payload: Record<string, unknown>): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(createEnvelope(type, payload)))
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(serializeBounded(createEnvelope(type, payload)))
   }
 }
 

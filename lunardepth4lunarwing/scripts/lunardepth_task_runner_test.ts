@@ -1,13 +1,13 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
-import type { AddressInfo } from "node:net"
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
+import { createServer, type AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 import { WebSocketServer } from "ws"
 
 import { delegateTaskToRunner } from "./task_runner_client.js"
-import { createEnvelope } from "./lunarwing_runtime.js"
+import { createEnvelope, MAX_FRAME_BYTES } from "./lunarwing_runtime.js"
 import { startupRefusal, TaskRunner } from "./lunardepth_task_runner.js"
 
 const TOKEN = "test-only-local-token-0123456789abcdef0123456789abcdef"
@@ -145,6 +145,49 @@ test("turns an upstream disconnect into an explicit error", async () => {
       { task_id: "job-disconnect", prompt: "run", timeout_ms: 1000 }, () => undefined, new AbortController().signal)
     assert.equal(result.status, "error")
     assert.match(result.error ?? "", /disconnected|closed/)
+  } finally {
+    runner.close()
+    fake.server.close()
+    fixture.restore()
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test("rejects a runner socket that disappears during connect validation", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "lunardepth-workspace-"))
+  const fixture = testEnvironment(workspace)
+  const server = createServer(connection => {
+    unlinkSync(fixture.socket)
+    connection.destroy()
+  })
+  await new Promise<void>(resolve => server.listen(fixture.socket, () => resolve()))
+  try {
+    await assert.rejects(delegateTaskToRunner(fixture.socket,
+      { task_id: "job-vanished-socket", prompt: "run", timeout_ms: 1000 },
+      () => undefined, new AbortController().signal), /ENOENT|task runner path/)
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    fixture.restore()
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test("rejects an oversized serialized upstream task envelope", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "lunardepth-workspace-"))
+  const fixture = testEnvironment(workspace)
+  const fake = await upstream(() => undefined)
+  process.env.LUNARDEPTH_WS_URL = fake.url
+  const runner = new TaskRunner(workspace)
+  await runner.listen(fixture.socket)
+  try {
+    const result = await delegateTaskToRunner(fixture.socket, {
+      task_id: "job-oversized-envelope",
+      prompt: "x".repeat(MAX_FRAME_BYTES),
+      timeout_ms: 1000,
+    }, () => undefined, new AbortController().signal)
+    assert.equal(result.status, "error")
+    assert.match(result.error ?? "", /outgoing envelope exceeds the 16 MiB frame limit/)
+    assert.equal(fake.requests.length, 0)
   } finally {
     runner.close()
     fake.server.close()

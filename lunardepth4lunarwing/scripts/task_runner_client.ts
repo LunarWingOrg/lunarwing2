@@ -70,8 +70,12 @@ export function delegateTaskToRunner(
       if (!settled) fail(new Error(stopping ? "runner closed during cancellation" : "runner closed without a result"))
     })
     socket.once("connect", () => {
-      verifyRunnerSocket(path)
-      socket.write(`${JSON.stringify({ op: "run", request })}\n`)
+      try {
+        verifyRunnerSocket(path)
+        socket.write(`${JSON.stringify({ op: "run", request })}\n`)
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)))
+      }
     })
     socket.on("data", (chunk: Buffer) => {
       if (settled) return
