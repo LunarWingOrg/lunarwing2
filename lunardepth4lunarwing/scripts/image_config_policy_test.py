@@ -94,6 +94,7 @@ class ImageConfigTests(unittest.TestCase):
             script = Path(__file__).with_name("harden_image_modes.sh")
             result = subprocess.run(
                 ["bash", str(script), str(root)], capture_output=True, text=True, check=False,
+                env={"PATH": "/usr/bin:/bin"},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(nested.stat().st_mode & 0o7777, 0o555)
@@ -101,6 +102,7 @@ class ImageConfigTests(unittest.TestCase):
             payload.chmod(0o644)
             result = subprocess.run(
                 ["bash", str(script), str(root)], capture_output=True, text=True, check=False,
+                env={"PATH": "/usr/bin:/bin"},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(payload.stat().st_mode & 0o7777, 0o444)
