@@ -172,7 +172,7 @@ build_lunardepth_worker() {
 }
 
 _verify_lunardepth_image_out_of_band() (
-  local image_ref="$1" source_root="$2" tmp cid archive config _status
+  local image_ref="$1" source_root="$2" tmp cid archive config node_image _status
   tmp="$(mktemp -d /var/tmp/lw-lunardepth-oob.XXXXXX)" || return 1
   cid=''
   trap '_status=$?; [[ -z "$cid" ]] || "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$tmp"; exit "$_status"' EXIT
@@ -182,8 +182,19 @@ _verify_lunardepth_image_out_of_band() (
   config="$tmp/image-config.json"
   "$CONTAINER_RT" export --output "$archive" "$cid" || return 1
   "$CONTAINER_RT" image inspect "$image_ref" >"$config" || return 1
+  install -d -m 0700 "$tmp/scripts"
+  cp "$source_root/lunardepth4lunarwing/scripts/package.json" \
+    "$source_root/lunardepth4lunarwing/scripts/package-lock.json" \
+    "$source_root/lunardepth4lunarwing/scripts/tsconfig.json" \
+    "$source_root/lunardepth4lunarwing/scripts/"*.ts "$tmp/scripts/"
+  node_image='docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da'
+  "$CONTAINER_RT" run --rm --pull=never --network=host --cap-drop ALL \
+    --security-opt no-new-privileges --entrypoint /bin/bash \
+    --volume "$tmp/scripts:/work:rw" "$node_image" \
+    -c 'cd /work && npm ci --ignore-scripts && npx tsc -p tsconfig.json' || return 1
   python3 "$source_root/lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py" \
-    --archive "$archive" --config "$config" --lane-root "$source_root/lunardepth4lunarwing"
+    --archive "$archive" --config "$config" --lane-root "$source_root/lunardepth4lunarwing" \
+    --compiled-root "$tmp/scripts"
 )
 
 start_tenant_lunardepth() {
