@@ -157,14 +157,19 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
     - **DONE 2026-11-10 — Applejack (autonomous), branch `aj/kimi-20-20261110-1807`:** audited and updated all **54/54 Markdown documents**: 12 under `docs/architecture/`, 35 current guides, and seven archived guides. Changes were committed incrementally by document; no source, manifest, lockfile, CI, or generated artifact changed.
     - **Architecture:** refreshed Engine V2 response-cache, malformed-FINAL recovery, mission-log redaction, billed-empty retry budget, legacy steering, and drifted source anchors; documented WeeChat managed-password precedence, corrected current health registration to 21 suites, and revalidated IRC, XMPP, outbound delivery, semantic memory, SSH, harness, self-heal, and timeout-suppression contracts.
     - **Current guides:** added the required host `nftables` prerequisite to all five distribution guides and worker egress audits; fixed the MT migration example's required LLM endpoint and the worker SSH guide's obsolete Kimi socket claim; updated sandbox storage/tunnel guidance, channel/tool registry versions, OpenRC uid-0 safeguards, gateway steering, startup banner, release-test tiers, and contributor freeze/policy status. Revalidated Wingtip, voice, knowledge, migration, prompt, and operator guides against current source.
-    - **Archives:** marked obsolete migration, WeeChat, DarkIRC, REPL, secret-manager, and Codex-orchestration procedures as historical/unsupported with maintained replacements. Removed dead `.claude` links, disclosed deleted demo/tooling paths, and retained historical content without presenting it as current procedure.
-    - **Verification:** all local Markdown links and heading anchors resolve; current repository-style inline paths resolve, with illustrative and retired-demo paths explicitly disclosed; changed-file audit confirms **54/54** documents; `git diff --check` is clean. Documentation-only change, so no Cargo/Bun lane, live tenant, external endpoint, or MR pipeline was run or claimed.
+    - **Archives:** marked obsolete migration, WeeChat, DarkIRC, REPL, secret-manager, and Codex-orchestration procedures as historical/unsupported with maintained replacements. Removed dead `.claude` links, disclosed deleted demo/tooling paths, and retained historical content without presenting it as current procedure
+    - **Verification:** all local Markdown links and heading anchors resolve; current repository-style inline paths resolve, with illustrative and retired-demo paths explicitly disclosed; changed-file audit confirms **54/54** documents; `git diff --check` is clean. Documentation-only change, so no Cargo/Bun lane, live tenant, external endpoint, or MR pipeline was run or claimed
+21. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/368
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/575 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590
+23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/607
+24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/606
+25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/604 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/603
+26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/602 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/600
+27. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/599
 
 ## Phase 7 - Advanced Operator Notes
 
-21. [x] (S) Deploy the stoplight system
-22. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-23. [x] (S) RESERVED
-24. [x] (S) RESERVED
+28. [x] (S) Deploy the stoplight system
+29. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 
 ---
