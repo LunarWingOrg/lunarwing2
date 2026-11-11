@@ -69,6 +69,7 @@ WORKDIR /build
 COPY scripts/package.json scripts/package-lock.json scripts/tsconfig.json ./scripts/
 COPY scripts/*.ts ./scripts/
 COPY scripts/*.py ./scripts/
+COPY scripts/*.sh ./scripts/
 COPY config/ ./config/
 COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
 WORKDIR /build/scripts
@@ -161,7 +162,7 @@ RUN set -eu; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type d -exec chmod 0555 {} +; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type f -exec chmod 0444 {} +; \
     find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 0555 {} +; \
-    chmod 0555 /app/scripts/render_overlay.py; \
+    chmod 0555 /app/scripts/render_overlay.py /app/scripts/*.sh; \
     install -d -o root -g lunardepth -m 3770 /run/lunarwing-shared; \
     install -d -o lunardepth -g lunardepth -m 2711 /run/lunarwing-shared/runner; \
     install -d -o root -g root -m 0555 /run/lunardepth-launch /run/lunardepth-config /home/lunardepth-home; \
@@ -182,9 +183,11 @@ ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
     WS_NO_UTF_8_VALIDATE=1 \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN --network=none /app/scripts/runtime_smoke_entrypoint.sh
+RUN --network=none LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh
 RUN set -eu; \
-    rm -rf /tmp/lunardepth-* /run/lunardepth-state/* /run/lunarwing-shared/runner/* /home/lunardepth/.dsh/* /root/.cache /root/.npm; \
+    rm -rf /tmp/lunardepth-* /run/lunardepth-state/* /run/lunarwing-shared/runner/* \
+      /home/lunardepth/.dsh /home/lunardepth-bridge/.local/state /run/lunardepth-config/* /root/.cache /root/.npm; \
+    install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh; \
     find /app /opt/lunardepth /opt/lunardepth-templates -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +; \
     touch -d "@${SOURCE_DATE_EPOCH}" /usr/local /usr/local/bin/dsh
 
