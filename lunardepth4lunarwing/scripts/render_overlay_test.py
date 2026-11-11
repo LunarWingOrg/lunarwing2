@@ -3,6 +3,8 @@
 import importlib.util
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +68,36 @@ class OverlayTests(unittest.TestCase):
                     MODULE.main()
             finally:
                 os.sys.argv = original_argv
+
+    def test_stdout_mode_matches_the_installed_file_byte_for_byte(self):
+        # mt-admin runs the renderer inside the worker image with --stdout and
+        # stores the bytes; the task container then runs --check on that file.
+        # The two modes must agree exactly, in a fresh interpreter in isolated
+        # mode, which is how mt-admin starts it.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "overlay.yml"
+            script = Path(__file__).with_name("render_overlay.py")
+            args = [
+                "--template", str(self.template),
+                "--base-url", "https://example.test/openai/v1",
+                "--model", "tensormoon::tenant::lunarwing",
+            ]
+            printed = subprocess.run(
+                [sys.executable, "-I", str(script), *args, "--stdout"],
+                check=True, capture_output=True,
+            )
+            self.assertEqual(printed.stderr, b"")
+            subprocess.run([sys.executable, "-I", str(script), *args, "--output", str(output)], check=True)
+            self.assertEqual(printed.stdout, output.read_bytes())
+            staged = Path(directory) / "staged.yml"
+            staged.write_bytes(printed.stdout)
+            subprocess.run([sys.executable, "-I", str(script), *args, "--check", str(staged)], check=True)
+            both = subprocess.run(
+                [sys.executable, "-I", str(script), *args, "--stdout", "--output", str(output)],
+                capture_output=True,
+            )
+            self.assertNotEqual(both.returncode, 0)
+            self.assertEqual(both.stdout, b"")
 
 
 if __name__ == "__main__":

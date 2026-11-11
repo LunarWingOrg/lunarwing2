@@ -88,17 +88,28 @@ def main() -> None:
     parser.add_argument("--template", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--check", type=Path)
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="print the rendered overlay; mt-admin runs this inside the worker image and stores the bytes",
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--allow-insecure-http", action="store_true")
     args = parser.parse_args()
-    if (args.check is None) == (args.output is None):
-        parser.error("choose exactly one of --check or --output")
+    if sum((args.check is not None, args.output is not None, args.stdout)) != 1:
+        parser.error("choose exactly one of --check, --output or --stdout")
     template = args.template.read_text(encoding="utf-8")
     rendered = render(template, args.base_url, args.model, args.allow_insecure_http)
     if args.check is not None:
         if args.check.read_text(encoding="utf-8") != rendered:
             raise ValueError(f"effective overlay drift: {args.check}")
+        return
+    if args.stdout:
+        # Bytes, not text: --check compares against a UTF-8 file, so the host
+        # must receive exactly what write_atomic would have stored.
+        sys.stdout.buffer.write(rendered.encode("utf-8"))
+        sys.stdout.buffer.flush()
         return
     write_atomic(args.output, rendered)
 

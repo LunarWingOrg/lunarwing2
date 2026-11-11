@@ -6,10 +6,15 @@ import hashlib
 import importlib.util
 import json
 import stat
+import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 
-from image_config_policy import validate_config
+# mt-admin runs this file with `python3 -I`, which leaves the script's own
+# directory off the import path. Name it explicitly; nothing else is added.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from image_config_policy import validate_config  # noqa: E402
 
 
 def digest_bytes(value: bytes) -> str:

@@ -310,6 +310,9 @@ Commands:
     --lunardepth-model <model>     Complete tensormoon::<function>::lunarwing id
     --lunardepth-api-key-file <path>
                                    Per-tenant revocable key, staged for the task only
+                                   (add-tenants: accepted for one tenant only)
+    --lunardepth-api-key-dir <dir> add-tenants only: one <tenant>.key file per tenant,
+                                   so no two tenants share a model-visible key
     --lunardepth-allow-insecure-http
                                    Opt into non-loopback cleartext HTTP separately
     --lunardepth-allow-unauthenticated-gateway
@@ -832,13 +835,15 @@ main() {
           || die "--with-lunardepth requires --lunardepth-base-url and --lunardepth-model before tenant creation"
         [[ -n "$lunardepth_api_key" || "$lunardepth_allow_placeholder" == "true" ]] \
           || die "--with-lunardepth requires --lunardepth-api-key-file or explicit --lunardepth-allow-unauthenticated-gateway"
+        [[ -z "$lunardepth_api_key" || "$lunardepth_allow_placeholder" != "true" ]] \
+          || die "--lunardepth-api-key-file and --lunardepth-allow-unauthenticated-gateway cannot be combined: no key would be stored"
       fi
       with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url" "$with_lunardepth" "$lunardepth_model" "$lunardepth_base_url" "$lunardepth_api_key" "$lunardepth_allow_insecure" "$lunardepth_allow_placeholder"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_api_key_dir="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -857,6 +862,7 @@ main() {
           --lunardepth-model) [[ $# -ge 2 ]] || die "--lunardepth-model requires a value"; lunardepth_model="$2"; shift 2 ;;
           --lunardepth-base-url) [[ $# -ge 2 ]] || die "--lunardepth-base-url requires a value"; lunardepth_base_url="$2"; shift 2 ;;
           --lunardepth-api-key-file) lunardepth_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+          --lunardepth-api-key-dir) [[ $# -ge 2 ]] || die "--lunardepth-api-key-dir requires a value"; lunardepth_api_key_dir="$2"; shift 2 ;;
           --lunardepth-allow-insecure-http) lunardepth_allow_insecure="true"; shift ;;
           --lunardepth-allow-unauthenticated-gateway) lunardepth_allow_placeholder="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
@@ -891,22 +897,39 @@ main() {
       if [[ "$with_lunardepth" == "true" ]]; then
         [[ -n "$lunardepth_base_url" && -n "$lunardepth_model" ]] \
           || die "--with-lunardepth requires --lunardepth-base-url and --lunardepth-model before tenant creation"
-        [[ -n "$lunardepth_api_key" || "$lunardepth_allow_placeholder" == "true" ]] \
-          || die "--with-lunardepth requires --lunardepth-api-key-file or explicit --lunardepth-allow-unauthenticated-gateway"
+        [[ -n "$lunardepth_api_key" || -n "$lunardepth_api_key_dir" || "$lunardepth_allow_placeholder" == "true" ]] \
+          || die "--with-lunardepth requires --lunardepth-api-key-file, --lunardepth-api-key-dir or explicit --lunardepth-allow-unauthenticated-gateway"
       fi
 
       local IFS=','
       local names_array
       read -ra names_array <<< "$names_csv"
+      if [[ "$with_lunardepth" == "true" ]]; then
+        # Checked for the whole list before the first tenant is created: the
+        # model sees this key, so no two tenants may share one (ZP-7).
+        local -a lunardepth_names=()
+        for raw_name in "${names_array[@]}"; do
+          local checked_name
+          checked_name="$(sanitize_name "$(echo "$raw_name" | xargs)")"
+          [[ -z "$checked_name" ]] || lunardepth_names+=("$checked_name")
+        done
+        lunardepth_fleet_keys_check "$lunardepth_api_key" "$lunardepth_api_key_dir" \
+          "$lunardepth_allow_placeholder" "${lunardepth_names[@]}"
+      fi
       for raw_name in "${names_array[@]}"; do
         local sname
         sname="$(sanitize_name "$(echo "$raw_name" | xargs)")"
         [[ -n "$sname" ]] || continue
+        local tenant_lunardepth_key="$lunardepth_api_key"
+        if [[ "$with_lunardepth" == "true" && -n "$lunardepth_api_key_dir" ]]; then
+          tenant_lunardepth_key="$(lunardepth_fleet_key "$sname" "$lunardepth_api_key_dir")" \
+            || die "cannot read the LunarDepth API key for tenant '$sname'"
+        fi
         say ""
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url" "$with_lunardepth" "$lunardepth_model" "$lunardepth_base_url" "$lunardepth_api_key" "$lunardepth_allow_insecure" "$lunardepth_allow_placeholder"
+        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url" "$with_lunardepth" "$lunardepth_model" "$lunardepth_base_url" "$tenant_lunardepth_key" "$lunardepth_allow_insecure" "$lunardepth_allow_placeholder"
       done
       ;;
 

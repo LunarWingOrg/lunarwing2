@@ -1565,11 +1565,16 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
 _archive_worker_source() {  # <tenant source root> <lane>
   local source_root="$1" lane="$2" tmp_parent tmp archive links
   local -a paths=("$lane")
-  [[ "$lane" != opencode2.4lunarwing ]] \
-    || paths+=(
-      .gitlab/scripts/verify-opencode2-exposure-out-of-band.py
-      .gitlab/scripts/worker_candidate_config.py
-    )
+  if [[ "$lane" == opencode2.4lunarwing ]]; then
+    paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
+    # The verifier's shared module only exists from the revision that split it
+    # out. A tenant at an older revision has a self-contained verifier, and
+    # naming a path that revision lacks makes git archive fail (ZP-4).
+    local optional_path=.gitlab/scripts/worker_candidate_config.py
+    if git -C "$LUNARWING_ROOT" cat-file -e "$WORKER_BUILD_SOURCE_REVISION:$optional_path" 2>/dev/null; then
+      paths+=("$optional_path")
+    fi
+  fi
   require_cmd tar
   tmp_parent="${LUNARWING_WORKER_BUILD_TMPDIR:-/var/tmp}"
   [[ -d "$tmp_parent" && ! -L "$tmp_parent" ]] \
@@ -1831,6 +1836,13 @@ _opencode2_snapshot_checkout() {
       "$source" "$lane/$name" || return 1
   done
   for name in verify-opencode2-exposure-out-of-band.py worker_candidate_config.py; do
+    # worker_candidate_config.py exists only from the revision that split it out
+    # of the verifier (ZP-4). An older tenant revision has a self-contained
+    # verifier; a newer one that lacks the module fails at its import.
+    if [[ "$name" == worker_candidate_config.py \
+        && ! -e "$source_root/.gitlab/scripts/$name" && ! -L "$source_root/.gitlab/scripts/$name" ]]; then
+      continue
+    fi
     source="$(_opencode2_snapshot_source "$resolved_root" \
       "$source_root/.gitlab/scripts/$name")" || return 1
     cp -R --no-dereference --no-preserve=ownership -- \
