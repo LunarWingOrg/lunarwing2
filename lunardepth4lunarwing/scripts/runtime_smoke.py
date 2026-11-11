@@ -102,11 +102,17 @@ def run_node_smoke(script: Path, url: str, token: str, task: bool) -> None:
     subprocess.run(["/usr/local/bin/node", str(script)], env=env, check=True, timeout=75)
 
 
+def expected_listener_ports(role: str) -> set[int]:
+    if role not in {"bridge", "combined"}:
+        return set()
+    expected = {int(os.environ.get("HEALTH_PORT", "8443")), int(os.environ.get("WS_PORT", "9090"))}
+    if role == "combined":
+        expected.add(int(os.environ.get("SMOKE_MODEL_PORT", "18080")))
+    return expected
+
+
 def listeners(role: str) -> None:
-    expected = {
-        int(os.environ.get("HEALTH_PORT", "8443")),
-        int(os.environ.get("WS_PORT", "9090")),
-    } if role in {"bridge", "combined"} else set()
+    expected = expected_listener_ports(role)
     findings = []
     for name in ("tcp", "tcp6"):
         path = Path("/proc/net") / name

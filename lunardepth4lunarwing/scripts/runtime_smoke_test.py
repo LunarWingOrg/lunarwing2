@@ -47,6 +47,12 @@ class RuntimeSmokeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SMOKE_BRIDGE_WS_URL": "ws://127.0.0.1:52999/ws/agent"}):
             self.assertEqual(MODULE.bridge_ws_url(), "ws://127.0.0.1:52999/ws/agent")
 
+    def test_combined_smoke_allows_only_the_fake_model_listener(self):
+        with mock.patch.dict(os.environ, {"WS_PORT": "52000", "HEALTH_PORT": "52001", "SMOKE_MODEL_PORT": "18080"}):
+            self.assertEqual(MODULE.expected_listener_ports("combined"), {18080, 52000, 52001})
+            self.assertEqual(MODULE.expected_listener_ports("bridge"), {52000, 52001})
+            self.assertEqual(MODULE.expected_listener_ports("task"), set())
+
     def test_remote_endpoints_cannot_redirect_or_leave_loopback(self):
         MODULE.loopback_url("http://127.0.0.1:8443/ready", ("http",))
         with self.assertRaisesRegex(ValueError, "loopback"):
