@@ -71,12 +71,18 @@ class BaselineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "commit-bound"):
                 baseline.fingerprints(report)
 
-    def test_refresh_preserves_existing_and_groups_new_vendor_findings(self):
+    def test_refresh_preserves_existing_and_requires_vendor_acceptance(self):
         existing = {fingerprint("0", "old-fixture.txt")}
         vendor = fingerprint("1", "ic/vendor/example-crate/tests/fixture.txt")
         plan = baseline.plan_refresh(existing, [vendor], set(), set())
+        self.assertEqual(plan.pinned, sorted(existing))
+        self.assertEqual(plan.unclassified, {vendor})
+        self.assertFalse(plan.accepted_vendor)
+
+        plan = baseline.plan_refresh(existing, [vendor], {vendor}, set())
         self.assertEqual(plan.pinned, sorted(existing | {vendor}))
-        self.assertEqual(plan.vendor, {vendor})
+        self.assertEqual(plan.accepted_vendor, {vendor})
+        self.assertFalse(plan.unclassified)
         self.assertEqual(baseline.vendor_crate(vendor), "example-crate")
 
     def test_new_non_vendor_finding_is_not_written_without_acceptance(self):
@@ -174,17 +180,22 @@ class BaselineTests(unittest.TestCase):
             (root / "pending.ignore").write_text(f"{pending}\n", encoding="utf-8")
             status, pinned, stdout, stderr = self.run_main(root, scanned)
             self.assertEqual(status, 1)
-            self.assertEqual(pinned, existing | {vendor})
-            self.assertIn("example-crate", stdout)
+            self.assertEqual(pinned, existing)
+            self.assertNotIn("example-crate", stdout)
             self.assertIn(unclassified, stderr)
+            self.assertIn(vendor, stderr)
             self.assertIn(pending, stderr)
 
             accepted = root / "accepted.ignore"
-            accepted.write_text(f"{unclassified}\n{pending}\n", encoding="utf-8")
-            status, pinned, _, stderr = self.run_main(root, scanned, accepted)
+            accepted.write_text(
+                f"{unclassified}\n{pending}\n{vendor}\n", encoding="utf-8"
+            )
+            status, pinned, stdout, stderr = self.run_main(root, scanned, accepted)
             self.assertEqual(status, 1)
             self.assertEqual(pinned, existing | {vendor, unclassified})
             self.assertNotIn(pending, pinned)
+            self.assertIn("accepted classified vendor", stdout)
+            self.assertIn("example-crate", stdout)
             self.assertIn(f"refused although accepted: {pending}", stderr)
 
     def test_cli_status_separates_known_pending_from_new_findings(self):

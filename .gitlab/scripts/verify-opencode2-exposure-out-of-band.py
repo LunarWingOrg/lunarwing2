@@ -33,8 +33,10 @@ CHECKOUT_ENV_KEYS = (
 )
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(REPO_ROOT / ".gitlab/scripts"))
 sys.path.insert(0, str(LANE / "scripts"))
 from image_config_policy import config_failures  # noqa: E402
+from worker_candidate_config import fetch_candidate_config as shared_fetch_candidate_config  # noqa: E402
 
 
 def die(message: str) -> None:
@@ -380,25 +382,13 @@ def check_filesystem_half(
 
 
 def _fetch_candidate_config(image_ref: str, image_digest: str) -> dict:
-    registry = os.environ.get("CI_REGISTRY", "")
-    prefix = f"{registry}/" if registry else ""
-    repo = image_ref[len(prefix):].rsplit(":", 1)[0] if image_ref.startswith(prefix) else image_ref.rsplit(":", 1)[0]
-    token = registry_token(repo)
-    manifest_url = f"https://{os.environ['CI_REGISTRY']}/v2/{repo}/manifests/{image_digest}"
-    request = urllib.request.Request(
-        manifest_url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-        },
+    return shared_fetch_candidate_config(
+        image_ref,
+        image_digest,
+        token_fetcher=registry_token,
+        config_fetcher=image_config,
+        json_fetcher=_registry_json,
     )
-    manifest = _registry_json(
-        request, timeout=120, description=f"cannot fetch manifest {image_digest} from {repo}",
-    )
-    config_digest = manifest.get("config", {}).get("digest")
-    if not config_digest:
-        die(f"manifest {image_digest} carries no config digest")
-    return image_config(repo, config_digest, token)
 
 
 def _normalize_local_config(payload: object) -> dict:

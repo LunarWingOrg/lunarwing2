@@ -140,10 +140,10 @@ pub async fn connect_and_exec(
     verifier: Arc<HostKeyVerifier>,
     command: &str,
 ) -> Result<CommandResult, SshBridgeError> {
+    let key = parse_key(creds)?;
     let mut session = connect_verified(host, verifier).await?;
 
     // Authenticate with the decoded private key (Ed25519/ECDSA).
-    let key = parse_key(creds)?;
     let authenticated = session
         .authenticate_publickey(
             host.user.as_str(),
@@ -262,5 +262,29 @@ mod tests {
         append_capped(&mut buf, b"x", &mut truncated);
         assert_eq!(buf.len(), MAX_OUTPUT_BYTES);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn test_mislabeled_rsa_key_rejected_before_connect() {
+        let host = SSHHostConfig {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            user: "nobody".to_string(),
+            key_type: crate::bridge::ssh::SSHKeyType::Ed25519,
+            host_key_mode: crate::bridge::ssh::HostKeyMode::Strict,
+            known_host_key: None,
+            connect_timeout_secs: 1,
+            operation_timeout_secs: 1,
+            keepalive_interval_secs: 0,
+            keepalive_max_misses: 0,
+        };
+        let creds = crate::bridge::ssh_agent::tests::rsa_test_credentials();
+        let error = connect_and_exec(&host, &creds, Arc::new(HostKeyVerifier::new()), "true")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SshBridgeError::InvalidKeyFormat(message) if message.contains("RSA")),
+            "got {error:?}"
+        );
     }
 }

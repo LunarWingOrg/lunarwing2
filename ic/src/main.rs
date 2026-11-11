@@ -123,6 +123,14 @@ fn log_startup_banner() {
     tracing::info!("Starting LunarWing v{}", env!("CARGO_PKG_VERSION"));
 }
 
+fn log_supervised_mode(config: lunarwing::config::SupervisedModeConfig) {
+    tracing::info!(
+        enabled = config.enabled,
+        source = config.source.as_str(),
+        "Supervised mode configured"
+    );
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -339,16 +347,7 @@ async fn async_main() -> anyhow::Result<()> {
         wizard.run().await?;
     }
 
-    // CLI flag overrides for config
-    if cli.auto_approve {
-        lunarwing::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "true");
-    }
-    if cli.supervised {
-        // Supervised mode is mutually exclusive with auto-approve in spirit
-        // (auto-approve bypasses, supervised forces gating), but we don't
-        // hard-error here — supervised wins, since it's strictly stricter.
-        lunarwing::config::set_runtime_env("AGENT_SUPERVISED_MODE", "true");
-    }
+    cli.apply_agent_overrides();
 
     // Load initial config from env + disk + optional TOML (before DB is available).
     // Credentials may be missing at this point — that's fine. LlmConfig::resolve()
@@ -382,6 +381,7 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     log_startup_banner();
+    log_supervised_mode(config.agent.supervised_mode);
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);
     tracing::debug!("LLM backend: {}", config.llm.backend);
 
@@ -1652,5 +1652,19 @@ mod tests {
             "Starting LunarWing v{}",
             env!("CARGO_PKG_VERSION")
         )));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn supervised_mode_logs_resolution_at_info() {
+        super::log_supervised_mode(lunarwing::config::SupervisedModeConfig {
+            enabled: true,
+            source: lunarwing::config::SupervisedModeSource::Both,
+        });
+
+        assert!(logs_contain("INFO"));
+        assert!(logs_contain("Supervised mode configured"));
+        assert!(logs_contain("enabled=true"));
+        assert!(logs_contain("source=\"both\""));
     }
 }

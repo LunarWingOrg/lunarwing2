@@ -54,6 +54,10 @@ const SIDECAR_PIDS_LIMIT: u32 = 64;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
 const WIREGUARD_KEEPALIVE_MAX_SECS: u64 = 60;
 const MAX_WIREGUARD_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -66,6 +70,8 @@ const TUNNEL_INTERFACES: [&str; 2] = ["wg0", "wt0"];
 /// `host.containers.internal` alias (169.254.1.2 under pasta) live here.
 const LINK_LOCAL_V4: &str = "169.254.0.0/16";
 const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
+const IDENTITY_SALT_FILE: &str = "sandbox-tunnel-identity.salt";
+const IDENTITY_SALT_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunnelProvider {
@@ -406,16 +412,15 @@ fn validate_wireguard_config(
             path.display()
         )
     })?;
-    if !has_interface_private_key(&content) {
+    let parsed = parse_wireguard_config(&content)
+        .map_err(|reason| format!("invalid WireGuard config {}: {reason}", path.display()))?;
+    if !parsed.has_interface_private_key {
         return Err(format!(
             "SANDBOX_TUNNEL_WIREGUARD_CONFIG {} needs a non-empty PrivateKey in [Interface]",
             path.display()
         ));
     }
-    if wireguard_config_has_peers(&content)
-        && !canary_configured
-        && !wireguard_config_has_suitable_keepalive(&content)
-    {
+    if parsed.has_peers && !canary_configured && !parsed.has_suitable_keepalive {
         return Err(
             "peered WireGuard configs require PersistentKeepalive = 1..=60 on at least one peer, or SANDBOX_TUNNEL_WIREGUARD_CANARY"
                 .into(),
@@ -424,60 +429,113 @@ fn validate_wireguard_config(
     Ok(())
 }
 
-fn has_interface_private_key(content: &str) -> bool {
+#[derive(Debug, Default)]
+struct WireGuardConfigSummary {
+    has_interface_private_key: bool,
+    has_peers: bool,
+    has_suitable_keepalive: bool,
+}
+
+struct WireGuardPeerSummary {
+    header_line: usize,
+    has_public_key: bool,
+    keepalive: Option<u64>,
+}
+
+fn finish_wireguard_peer(
+    peer: Option<WireGuardPeerSummary>,
+    summary: &mut WireGuardConfigSummary,
+) -> std::result::Result<(), String> {
+    let Some(peer) = peer else {
+        return Ok(());
+    };
+    if !peer.has_public_key {
+        return Err(format!(
+            "[Peer] at line {} needs a non-empty PublicKey",
+            peer.header_line
+        ));
+    }
+    summary.has_peers = true;
+    summary.has_suitable_keepalive |= peer
+        .keepalive
+        .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds));
+    Ok(())
+}
+
+fn parse_wireguard_keepalive(value: &str, line: usize) -> std::result::Result<u64, String> {
+    if value == "off" {
+        return Ok(0);
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "PersistentKeepalive at line {line} must be 'off' or digits only"
+        ));
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= u16::MAX as u64)
+        .ok_or_else(|| format!("PersistentKeepalive at line {line} must be at most 65535"))
+}
+
+/// Normalize and validate the WireGuard fields that drive the health gate.
+/// Unknown wg-quick settings are left to `wg-quick`, but malformed sections and
+/// health-relevant keys are rejected with their source line rather than being
+/// mistaken for a peerless config.
+fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigSummary, String> {
+    let mut summary = WireGuardConfigSummary::default();
     let mut in_interface = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
+    let mut peer: Option<WireGuardPeerSummary> = None;
+    for (index, raw) in content.lines().enumerate() {
+        let line_number = index + 1;
+        let line: String = raw
+            .split_once('#')
+            .map_or(raw, |(before_comment, _)| before_comment)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if line.is_empty() {
+            continue;
+        }
         if line.starts_with('[') {
-            in_interface = line.eq_ignore_ascii_case("[interface]");
-            return false;
+            finish_wireguard_peer(peer.take(), &mut summary)?;
+            in_interface = line == "[interface]";
+            peer = (line == "[peer]").then_some(WireGuardPeerSummary {
+                header_line: line_number,
+                has_public_key: false,
+                keepalive: None,
+            });
+            if !in_interface && peer.is_none() {
+                return Err(format!("invalid section header at line {line_number}"));
+            }
+            continue;
         }
-        if !in_interface || line.starts_with('#') || line.starts_with(';') {
-            return false;
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("expected key = value at line {line_number}"));
+        };
+        if let Some(current_peer) = peer.as_mut() {
+            match key {
+                "publickey" => current_peer.has_public_key = !value.is_empty(),
+                "persistentkeepalive" => {
+                    current_peer.keepalive = Some(parse_wireguard_keepalive(value, line_number)?);
+                }
+                _ => {}
+            }
+        } else if in_interface {
+            if key == "privatekey" {
+                summary.has_interface_private_key = !value.is_empty();
+            } else if key == "persistentkeepalive" {
+                return Err(format!(
+                    "PersistentKeepalive at line {line_number} belongs in [Peer]"
+                ));
+            }
+        } else {
+            return Err(format!("key outside a section at line {line_number}"));
         }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("privatekey") && !value.trim().is_empty()
-        })
-    })
-}
-
-fn wireguard_config_has_peers(content: &str) -> bool {
-    let mut in_peer = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_peer = line.eq_ignore_ascii_case("[peer]");
-            return false;
-        }
-        if !in_peer || line.starts_with('#') || line.starts_with(';') {
-            return false;
-        }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("publickey") && !value.trim().is_empty()
-        })
-    })
-}
-
-fn wireguard_config_has_suitable_keepalive(content: &str) -> bool {
-    let mut in_peer = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_peer = line.eq_ignore_ascii_case("[peer]");
-            return false;
-        }
-        if !in_peer || line.starts_with('#') || line.starts_with(';') {
-            return false;
-        }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("persistentkeepalive")
-                && value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|seconds| seconds.parse::<u64>().ok())
-                    .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds))
-        })
-    })
+    }
+    finish_wireguard_peer(peer, &mut summary)?;
+    Ok(summary)
 }
 
 /// The runtime arguments that start the sidecar. `hash` is the salted config
@@ -845,26 +903,73 @@ pub(crate) fn parse_wireguard_fwmark(output: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-fn wireguard_handshake_is_recent(output: &str, now_unix: u64) -> bool {
-    output.lines().any(|line| {
-        line.split_whitespace()
-            .nth(1)
-            .and_then(|timestamp| timestamp.parse::<u64>().ok())
-            .is_some_and(|timestamp| {
-                timestamp > 0
-                    && now_unix >= timestamp
-                    && now_unix - timestamp <= WIREGUARD_HANDSHAKE_MAX_AGE_SECS
-            })
-    })
+fn wireguard_handshake_status(output: &str, now_unix: u64) -> std::result::Result<(), String> {
+    let latest = output
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|timestamp| timestamp.parse::<u64>().ok())
+        })
+        .max();
+    match latest {
+        None | Some(0) => Err("WireGuard handshake probe found no completed handshake".into()),
+        Some(timestamp) if timestamp > now_unix => {
+            Err("WireGuard handshake probe returned a future timestamp".into())
+        }
+        Some(timestamp) if now_unix - timestamp > WIREGUARD_HANDSHAKE_MAX_AGE_SECS => Err(format!(
+            "WireGuard handshake is {}s old, exceeding the {}s liveness budget",
+            now_unix - timestamp,
+            WIREGUARD_HANDSHAKE_MAX_AGE_SECS
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
+#[derive(Default)]
+struct RecoveryState {
+    last_failure: Option<RecoveryFailure>,
+}
+
+struct RecoveryFailure {
+    failed_at: tokio::time::Instant,
+    reason: String,
+}
+
+impl RecoveryState {
+    fn cached_reason(&self, now: tokio::time::Instant) -> Option<String> {
+        let failure = self.last_failure.as_ref()?;
+        let retry_at = failure.failed_at + RECOVERY_BACKOFF;
+        if now >= retry_at {
+            return None;
+        }
+        let remaining = retry_at.duration_since(now).as_secs().max(1);
+        Some(format!(
+            "previous recovery failed: {}; next attempt in {}s",
+            failure.reason, remaining
+        ))
+    }
+
+    fn record(&mut self, error: &SandboxError) {
+        if let SandboxError::TunnelUnavailable { reason } = error {
+            self.last_failure = Some(RecoveryFailure {
+                failed_at: tokio::time::Instant::now(),
+                reason: reason.clone(),
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
     cfg: TunnelSidecarConfig,
+    base_dir: PathBuf,
+    runtime_dir: Option<PathBuf>,
     container_name: String,
     instance_id: String,
-    lifecycle: tokio::sync::Mutex<()>,
+    lifecycle: std::sync::Arc<tokio::sync::Mutex<RecoveryState>>,
 }
 
 impl TunnelSidecar {
@@ -877,13 +982,38 @@ impl TunnelSidecar {
         cfg: TunnelSidecarConfig,
         base_dir: &Path,
     ) -> Self {
+        Self::for_instance_with_optional_runtime_dir(runtime, cfg, base_dir, None)
+    }
+
+    pub fn for_instance_with_runtime_dir(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+        runtime_dir: &Path,
+    ) -> Self {
+        Self::for_instance_with_optional_runtime_dir(
+            runtime,
+            cfg,
+            base_dir,
+            Some(runtime_dir.to_path_buf()),
+        )
+    }
+
+    fn for_instance_with_optional_runtime_dir(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+        runtime_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
+            base_dir: base_dir.to_path_buf(),
+            runtime_dir,
             container_name: container_name_for_instance(base_dir),
             instance_id: instance_id_for(base_dir),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(RecoveryState::default())),
         }
     }
 
@@ -891,11 +1021,18 @@ impl TunnelSidecar {
         &self.container_name
     }
 
+    fn runtime_dir(&self) -> Result<PathBuf> {
+        match &self.runtime_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => secret_dir().map_err(|reason| self.unavailable(&reason)),
+        }
+    }
+
     fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
         if self.cfg.dns.is_empty() {
             return Ok(None);
         }
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         Ok(Some(
             dir.join(format!("{}.resolv.conf", self.container_name)),
         ))
@@ -955,9 +1092,9 @@ impl TunnelSidecar {
     }
 
     fn netbird_state_volume(&self) -> Result<String> {
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
-        let salt = read_or_create_label_salt(&dir)
-            .map_err(|_| self.unavailable("could not read or create the label salt"))?;
+        let salt = read_or_create_identity_salt(&self.base_dir).map_err(|_| {
+            self.unavailable("could not read or create the persistent identity salt")
+        })?;
         Ok(self.cfg.netbird_state_volume(&self.instance_id, &salt))
     }
 
@@ -966,23 +1103,66 @@ impl TunnelSidecar {
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
-    /// and passes the health gate. A running sidecar that fails the gate (dead
-    /// provider, drifted firewall) is removed and recreated once.
+    /// and passes the health gate. Explicit lifecycle operations retain the
+    /// configured startup budget; manager runs use `recover_for_run` instead.
     pub async fn ensure_started(&self) -> Result<()> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let timeout = self.cfg.startup_timeout;
+        self.ensure_started_with_timeouts(timeout, timeout).await
+    }
+
+    /// Bounded recovery for a command path. A dropped start has its own cleanup
+    /// guard, and a failed attempt suppresses repeated container churn for 30s.
+    pub async fn recover_for_run(&self) -> Result<()> {
+        let provider_timeout = self.cfg.startup_timeout.min(RUN_PROVIDER_READY_TIMEOUT);
+        let recovery =
+            self.ensure_started_with_timeouts(RUN_RECOVERY_REPROBE_TIMEOUT, provider_timeout);
+        match tokio::time::timeout(RUN_RECOVERY_BUDGET, recovery).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = self.unavailable(
+                    "sidecar recovery exceeded the 60s per-run budget while waiting for provider health or firewall verification",
+                );
+                self.lifecycle.lock().await.record(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_started_with_timeouts(
+        &self,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> Result<()> {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
+        let mut lifecycle = self.lifecycle.lock().await;
+        if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
+            return Err(self.unavailable(&reason));
+        }
+        lifecycle.last_failure = None;
         if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
             tracing::warn!(
                 provider = self.cfg.provider.as_str(),
                 "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
             );
         }
+        let result = self.start_or_adopt(reprobe_timeout, provider_timeout).await;
+        if let Err(error) = &result {
+            lifecycle.record(error);
+        }
+        result
+    }
+
+    async fn start_or_adopt(
+        &self,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> Result<()> {
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         if self.matching_container_id(&hash).await.is_some() {
-            match self.wait_healthy().await {
+            match self.wait_healthy(reprobe_timeout).await {
                 Ok(()) => return Ok(()),
                 Err(error) => tracing::warn!(
                     container = %self.container_name,
@@ -992,25 +1172,31 @@ impl TunnelSidecar {
             }
         }
         self.remove().await;
-        self.start_fresh(&hash).await
+        self.start_fresh(&hash, provider_timeout).await
     }
 
     /// Recheck the transport and both firewall chains before every run, then
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
+        let cached = self
+            .lifecycle
+            .lock()
+            .await
+            .cached_reason(tokio::time::Instant::now());
+        if let Some(reason) = cached {
+            return Err(self.unavailable(&reason));
+        }
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         };
-        if !self.provider_probe().await {
-            return Err(self.unavailable("sidecar provider health check failed"));
-        }
+        self.provider_health().await?;
         self.check_egress_firewall().await?;
         Ok(container_id)
     }
 
-    async fn start_fresh(&self, hash: &str) -> Result<()> {
+    async fn start_fresh(&self, hash: &str, provider_timeout: Duration) -> Result<()> {
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
                 let volume = self.netbird_state_volume()?;
@@ -1028,12 +1214,58 @@ impl TunnelSidecar {
             hash,
             state_volume.as_deref(),
         );
+        let mut cleanup = SidecarStartCleanup::new(self.clone());
+        let started = match self
+            .start_detached(&args, env_file, hash, provider_timeout)
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => return Err(self.abort_start(&mut cleanup, error).await),
+        };
+        if !started {
+            cleanup.disarm();
+            return Ok(());
+        }
+        tracing::info!(
+            container = %self.container_name,
+            provider = self.cfg.provider.as_str(),
+            "Sandbox tunnel sidecar started"
+        );
+        // Provider startup finishes before the firewall goes in so bootstrap
+        // DNS and endpoint connections can use the still-open uplink.
+        if let Err(error) = self.wait_provider_ready(provider_timeout).await {
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        if let Err(error) = self.install_egress_firewall().await {
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        if self.cfg.wireguard_canary.is_some()
+            && let Err(error) = self.provider_health().await
+        {
+            let error = self.error_with_context(error, "after the egress firewall was installed");
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        cleanup.disarm();
+        tracing::info!(
+            container = %self.container_name,
+            provider = self.cfg.provider.as_str(),
+            "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
+        );
+        Ok(())
+    }
+
+    async fn start_detached(
+        &self,
+        args: &[String],
+        env_file: Option<SecretEnvFile>,
+        hash: &str,
+        provider_timeout: Duration,
+    ) -> Result<bool> {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // `remove()` ran first: it frees this unit name from a previous
-        // sidecar's helpers once the old container is gone.
         let detached_unit = self.helper_unit();
+        let start_timeout = self.cfg.startup_timeout.min(provider_timeout);
         let started = tokio::time::timeout(
-            self.cfg.startup_timeout,
+            start_timeout,
             crate::sandbox::cli_runner::output_detached_isolated(
                 self.bin,
                 &arg_refs,
@@ -1044,103 +1276,90 @@ impl TunnelSidecar {
         drop(env_file);
         let output = match started {
             Ok(Ok(output)) => output,
-            Ok(Err(_)) => {
-                self.remove().await;
-                return Err(self.unavailable("failed to execute the container runtime"));
-            }
+            Ok(Err(_)) => return Err(self.unavailable("failed to execute the container runtime")),
             Err(_) => {
-                self.remove().await;
-                return Err(self.unavailable("sidecar start exceeded the startup timeout"));
+                return Err(self.unavailable(&format!(
+                    "sidecar start exceeded the {}s runtime start budget",
+                    start_timeout.as_secs()
+                )));
             }
         };
-        if !output.status.success() {
-            // Another manager instance may have won the name race; accept its
-            // sidecar only when it matches our configuration and is healthy.
-            if self.matching_container_id(hash).await.is_some() {
-                return self.wait_healthy().await;
-            }
-            let unit_in_use =
-                crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr));
-            self.remove().await;
-            if unit_in_use {
-                return Err(self.unavailable(&format!(
-                    "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
-                )));
-            }
-            return Err(self.unavailable(
-                "container runtime rejected sidecar start; verify the image and host prerequisites",
-            ));
+        if output.status.success() {
+            return Ok(true);
         }
-        tracing::info!(
-            container = %self.container_name,
-            provider = self.cfg.provider.as_str(),
-            "Sandbox tunnel sidecar started"
-        );
-        // The provider must be up before the firewall goes in: wg-quick and
-        // the NetBird client resolve and reach their endpoints through the
-        // still-open uplink, and the WireGuard device must exist to read or
-        // set its fwmark. The manager receives no verified container ID to
-        // join until after firewall installation.
-        if let Err(error) = self.wait_provider_ready().await {
-            self.remove().await;
-            return Err(error);
+        if self.matching_container_id(hash).await.is_some() {
+            self.wait_healthy(provider_timeout).await?;
+            return Ok(false);
         }
-        if let Err(error) = self.install_egress_firewall().await {
-            self.remove().await;
-            return Err(error);
+        if crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr)) {
+            return Err(self.unavailable(&format!(
+                "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
+            )));
         }
-        if self.cfg.wireguard_canary.is_some() && !self.provider_probe().await {
-            self.remove().await;
-            return Err(
-                self.unavailable("WireGuard canary failed after the egress firewall was installed")
-            );
-        }
-        tracing::info!(
-            container = %self.container_name,
-            provider = self.cfg.provider.as_str(),
-            "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
-        );
-        Ok(())
+        Err(self.unavailable(
+            "container runtime rejected sidecar start; verify the image and host prerequisites",
+        ))
     }
 
-    async fn wait_provider_ready(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.cfg.startup_timeout;
+    async fn abort_start(
+        &self,
+        cleanup: &mut SidecarStartCleanup,
+        error: SandboxError,
+    ) -> SandboxError {
+        self.remove().await;
+        cleanup.disarm();
+        error
+    }
+
+    async fn wait_provider_ready(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.provider_probe().await {
-                return Ok(());
-            }
+            let error = match self.provider_health().await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.unavailable(&format!(
-                    "sidecar did not become healthy within {}s",
-                    self.cfg.startup_timeout.as_secs()
-                )));
+                return Err(self.error_with_context(
+                    error,
+                    &format!("provider remained unhealthy for {}s", timeout.as_secs()),
+                ));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
     }
 
-    /// Reuse path: the sidecar exists with our configuration; it must pass the
-    /// provider probe and carry exactly our firewall within the startup timeout.
-    async fn wait_healthy(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.cfg.startup_timeout;
+    async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.provider_probe().await {
-                return match self.check_egress_firewall().await {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        self.remove().await;
-                        Err(error)
-                    }
-                };
-            }
+            let error = match self.provider_health().await {
+                Ok(()) => {
+                    return match self.check_egress_firewall().await {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            self.remove().await;
+                            Err(error)
+                        }
+                    };
+                }
+                Err(error) => error,
+            };
             if tokio::time::Instant::now() >= deadline {
                 self.remove().await;
-                return Err(self.unavailable(&format!(
-                    "sidecar did not become healthy within {}s",
-                    self.cfg.startup_timeout.as_secs()
-                )));
+                return Err(self.error_with_context(
+                    error,
+                    &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
+                ));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    fn error_with_context(&self, error: SandboxError, context: &str) -> SandboxError {
+        match error {
+            SandboxError::TunnelUnavailable { reason } => {
+                self.unavailable(&format!("{reason}; {context}"))
+            }
+            other => other,
         }
     }
 
@@ -1182,15 +1401,14 @@ impl TunnelSidecar {
     fn wireguard_has_peers(&self) -> Option<bool> {
         let path = self.cfg.wireguard_config.as_deref()?;
         let content = std::fs::read_to_string(path).ok()?;
-        Some(wireguard_config_has_peers(&content))
+        Some(parse_wireguard_config(&content).ok()?.has_peers)
     }
 
-    async fn provider_probe(&self) -> bool {
+    async fn provider_health(&self) -> Result<()> {
         let has_peers = if self.cfg.provider == TunnelProvider::Wireguard {
-            let Some(has_peers) = self.wireguard_has_peers() else {
-                return false;
-            };
-            has_peers
+            self.wireguard_has_peers().ok_or_else(|| {
+                self.unavailable("WireGuard config could not be parsed for the health probe")
+            })?
         } else {
             false
         };
@@ -1205,17 +1423,35 @@ impl TunnelSidecar {
             && has_peers
             && self.cfg.wireguard_canary.is_none()
         {
-            let Ok(output) = self.output_probe(&refs).await else {
-                return false;
-            };
+            let output = self
+                .output_probe(&refs)
+                .await
+                .map_err(|_| self.unavailable("WireGuard handshake probe could not run"))?;
+            if !output.status.success() {
+                return Err(self.unavailable("WireGuard handshake probe command failed"));
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
-            return output.status.success()
-                && wireguard_handshake_is_recent(&String::from_utf8_lossy(&output.stdout), now);
+            return wireguard_handshake_status(&String::from_utf8_lossy(&output.stdout), now)
+                .map_err(|reason| self.unavailable(&reason));
         }
-        self.status_probe(&refs).await.is_some_and(|s| s.success())
+        if self.status_probe(&refs).await.is_some_and(|s| s.success()) {
+            return Ok(());
+        }
+        let reason = match self.cfg.provider {
+            TunnelProvider::Netbird => "netbird status --check startup probe failed".to_string(),
+            TunnelProvider::Wireguard if self.cfg.wireguard_canary.is_some() => format!(
+                "WireGuard canary probe to {} failed",
+                self.cfg
+                    .wireguard_canary
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| "the configured address".to_string())
+            ),
+            TunnelProvider::Wireguard => "WireGuard wg0 interface probe failed".to_string(),
+        };
+        Err(self.unavailable(&reason))
     }
 
     /// The uplink allowance for the running sidecar. `set_wireguard_mark`
@@ -1403,7 +1639,7 @@ impl TunnelSidecar {
     async fn current_hash(&self) -> Result<String> {
         self.ensure_image_available().await?;
         let image_id = self.resolve_image_id().await?;
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         let salt = read_or_create_label_salt(&dir)
             .map_err(|_| self.unavailable("could not read or create the label salt"))?;
         Ok(self.cfg.config_hash(&salt, &image_id))
@@ -1539,7 +1775,7 @@ impl TunnelSidecar {
         let contents = SecretString::from(format!(
             "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n"
         ));
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         SecretEnvFile::write(&dir, &contents)
             .map(Some)
             .map_err(|_| self.unavailable("failed to stage the NetBird credential file"))
@@ -1608,6 +1844,77 @@ fn secret_dir() -> std::result::Result<PathBuf, String> {
     Err("the sandbox tunnel sidecar requires a Linux container runtime".into())
 }
 
+fn read_or_create_identity_salt(base_dir: &Path) -> std::io::Result<Vec<u8>> {
+    let path = base_dir.join(IDENTITY_SALT_FILE);
+    match read_identity_salt(&path) {
+        Ok(salt) => Ok(salt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_identity_salt(&path),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "identity salt must be a regular, non-symlink file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "identity salt must not be accessible by group or other users",
+            ));
+        }
+    }
+    let salt = std::fs::read(path)?;
+    if salt.len() != IDENTITY_SALT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "identity salt must contain exactly 32 bytes",
+        ));
+    }
+    Ok(salt)
+}
+
+fn create_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut salt = Vec::with_capacity(IDENTITY_SALT_BYTES);
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let written = (|| -> std::io::Result<()> {
+                file.write_all(&salt)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                file.sync_all()
+            })();
+            if let Err(error) = written {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(salt)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_identity_salt(path),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_or_create_label_salt(dir: &Path) -> std::io::Result<Vec<u8>> {
     let path = dir.join(LABEL_SALT_FILE);
     match std::fs::read(&path) {
@@ -1635,6 +1942,37 @@ fn read_or_create_label_salt(dir: &Path) -> std::io::Result<Vec<u8>> {
         // Another daemon instance created it first: use theirs.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read(&path),
         Err(error) => Err(error),
+    }
+}
+
+struct SidecarStartCleanup {
+    sidecar: Option<TunnelSidecar>,
+}
+
+impl SidecarStartCleanup {
+    fn new(sidecar: TunnelSidecar) -> Self {
+        Self {
+            sidecar: Some(sidecar),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.sidecar = None;
+    }
+}
+
+impl Drop for SidecarStartCleanup {
+    fn drop(&mut self) {
+        let Some(sidecar) = self.sidecar.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn(async move { sidecar.remove().await })),
+            Err(_) => tracing::error!(
+                container = %sidecar.container_name,
+                "Cancelled tunnel start could not schedule sidecar cleanup without a Tokio runtime"
+            ),
+        }
     }
 }
 
@@ -1926,6 +2264,80 @@ mod tests {
     }
 
     #[test]
+    fn netbird_volume_survives_runtime_directory_replacement() {
+        let workdir =
+            std::env::temp_dir().join(format!("lw-tunnel-reboot-{}", uuid::Uuid::new_v4()));
+        let base_dir = workdir.join("state");
+        let first_runtime = workdir.join("runtime-first");
+        let second_runtime = workdir.join("runtime-second");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::create_dir_all(&first_runtime).unwrap();
+        std::fs::create_dir_all(&second_runtime).unwrap();
+        let first = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base_dir,
+            &first_runtime,
+        );
+        let second = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base_dir,
+            &second_runtime,
+        );
+        let volume = first.netbird_state_volume().unwrap();
+        assert_eq!(volume, second.netbird_state_volume().unwrap());
+        assert!(base_dir.join(IDENTITY_SALT_FILE).is_file());
+        assert!(!first_runtime.join(IDENTITY_SALT_FILE).exists());
+        assert!(!second_runtime.join(IDENTITY_SALT_FILE).exists());
+        std::fs::remove_dir_all(&first_runtime).unwrap();
+        assert_eq!(volume, first.netbird_state_volume().unwrap());
+        std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_salt_is_owner_only_and_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lw-tunnel-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = read_or_create_identity_salt(&dir).unwrap();
+        assert_eq!(first.len(), IDENTITY_SALT_BYTES);
+        let mode = std::fs::metadata(dir.join(IDENTITY_SALT_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(read_or_create_identity_salt(&dir).unwrap(), first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_salt_refuses_symlinks_and_group_access() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir =
+            std::env::temp_dir().join(format!("lw-tunnel-identity-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(IDENTITY_SALT_FILE);
+        let target = dir.join("identity-target");
+        std::fs::write(&target, vec![7; IDENTITY_SALT_BYTES]).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_or_create_identity_salt(&dir).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![8; IDENTITY_SALT_BYTES]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_or_create_identity_salt(&dir).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_or_create_identity_salt(&dir).unwrap(),
+            vec![8; IDENTITY_SALT_BYTES]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn netbird_validation_is_strict_without_leaking_values() {
         assert!(netbird_cfg().validate().is_ok());
         for url in [
@@ -2051,6 +2463,86 @@ mod tests {
     }
 
     #[test]
+    fn wireguard_parser_matches_wg_section_and_keepalive_rules() {
+        let interface = "[Interface]\nPrivateKey = private\n";
+        let valid = [
+            (
+                "commented header",
+                "[Peer] # office\nPublicKey = public\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "spaced header",
+                "[ Peer ]\nPublicKey = public\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "crlf and uppercase",
+                "[PEER]\r\nPublicKey = public\r\nPersistentKeepalive = 25\r\n",
+                true,
+            ),
+            (
+                "second peer",
+                "[Peer]\nPublicKey = first\n[Peer]\nPublicKey = second\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "inline comment",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 25 # seconds\n",
+                true,
+            ),
+            (
+                "whitespace forms 600",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 6 0 0\n",
+                false,
+            ),
+            (
+                "last value disables",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 25\nPersistentKeepalive = 0\n",
+                false,
+            ),
+            (
+                "off",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = off\n",
+                false,
+            ),
+        ];
+        for (label, peer, suitable) in valid {
+            let parsed = parse_wireguard_config(&format!("{interface}{peer}")).unwrap();
+            assert!(parsed.has_interface_private_key, "{label}");
+            assert!(parsed.has_peers, "{label}");
+            assert_eq!(parsed.has_suitable_keepalive, suitable, "{label}");
+        }
+
+        let invalid = [
+            (
+                "plus sign",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = +25\n",
+            ),
+            (
+                "above u16",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 65536\n",
+            ),
+            ("semicolon comment", "[Peer]\nPublicKey = public\n; text\n"),
+            (
+                "decorated semicolon header",
+                "[Peer]; text\nPublicKey = public\n",
+            ),
+            (
+                "interface keepalive",
+                "PersistentKeepalive = 25\n[Peer]\nPublicKey = public\n",
+            ),
+            ("missing public key", "[Peer]\nPersistentKeepalive = 25\n"),
+        ];
+        for (label, suffix) in invalid {
+            let error = parse_wireguard_config(&format!("{interface}{suffix}"))
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains("line"), "{label}: {error}");
+        }
+    }
+
+    #[test]
     fn health_probe_matches_provider_and_wireguard_peers() {
         assert_eq!(
             build_health_args_for(TunnelProvider::Netbird, "tunnel-test", false, None).join(" "),
@@ -2074,21 +2566,48 @@ mod tests {
             .join(" "),
             "exec tunnel-test ping -c 1 -W 2 10.231.0.1"
         );
-        assert!(wireguard_config_has_peers(
-            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
-        ));
-        assert!(!wireguard_config_has_peers(
-            "[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n"
-        ));
-        assert!(wireguard_handshake_is_recent("peer-a 1000\n", 1180));
-        assert!(wireguard_handshake_is_recent(
-            "peer-a 0\npeer-b 999\n",
-            1000
-        ));
-        assert!(!wireguard_handshake_is_recent("peer-a 0\n", 1000));
-        assert!(!wireguard_handshake_is_recent("peer-a 819\n", 1000));
-        assert!(!wireguard_handshake_is_recent("peer-a 1001\n", 1000));
-        assert!(!wireguard_handshake_is_recent("garbage\n", 1000));
+        assert!(
+            parse_wireguard_config(
+                "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
+            )
+            .unwrap()
+            .has_peers
+        );
+        assert!(
+            !parse_wireguard_config("[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n")
+                .unwrap()
+                .has_peers
+        );
+        assert!(wireguard_handshake_status("peer-a 1000\n", 1180).is_ok());
+        assert!(wireguard_handshake_status("peer-a 0\npeer-b 999\n", 1000).is_ok());
+        assert!(wireguard_handshake_status("peer-a 0\n", 1000).is_err());
+        let stale = wireguard_handshake_status("peer-a 819\n", 1000).unwrap_err();
+        assert!(stale.contains("181s old"), "{stale}");
+        assert!(stale.contains("180s liveness budget"), "{stale}");
+        assert!(wireguard_handshake_status("peer-a 1001\n", 1000).is_err());
+        assert!(wireguard_handshake_status("garbage\n", 1000).is_err());
+    }
+
+    #[test]
+    fn recovery_backoff_preserves_the_probe_reason_and_expires() {
+        let mut state = RecoveryState::default();
+        state.record(&SandboxError::TunnelUnavailable {
+            reason: "WireGuard handshake is 181s old".into(),
+        });
+        let failed_at = state.last_failure.as_ref().unwrap().failed_at;
+        let cached = state.cached_reason(failed_at).unwrap();
+        assert!(
+            cached.contains("WireGuard handshake is 181s old"),
+            "{cached}"
+        );
+        assert!(cached.contains("next attempt in 30s"), "{cached}");
+        assert!(state.cached_reason(failed_at + RECOVERY_BACKOFF).is_none());
+
+        let mut config_state = RecoveryState::default();
+        config_state.record(&SandboxError::Config {
+            reason: "invalid configuration".into(),
+        });
+        assert!(config_state.cached_reason(failed_at).is_none());
     }
 
     #[test]

@@ -44,7 +44,7 @@ and how to enable it.
 | Filesystem writes | worker's own FS | `ssh_git` only, confined to `<base_dir>/ssh-git/` | none (one-shot exec) |
 | Host-key verification | worker's own `known_hosts` | **`HostKeyVerifier`** (live) | `HostKeyVerifier` (live, host-side) |
 | Approval | per the job/tool policy | `ssh`: prompt with explicit **Always** option; `ssh_git`: every call | **Every call** |
-| Key algorithms | anything the worker's ssh supports | `ssh`: Ed25519/ECDSA (RSA rejected); `ssh_git`: whatever the loaded agent key and OpenSSH negotiate | Ed25519/ECDSA (RSA rejected host-side) |
+| Key algorithms | Ed25519/ECDSA (RSA rejected when the daemon loads the key) | Ed25519/ECDSA (RSA rejected by the shared decoder) | Ed25519/ECDSA (RSA rejected host-side) |
 | Enable | `mt-admin` bind-mounts the socket | on when `[[ssh.hosts]]` + secrets store exist | build the guest wasm + grant the `ssh` capability |
 | Best for | heavy/long jobs, strong isolation | quick remote command / git ops, no container | capability-scoped per-tool host allowlist; WASM extensibility |
 
@@ -133,8 +133,9 @@ client (the first live use of the client half — the harness otherwise only use
   AcceptFirst, byte-exact comparison of the wire key). AcceptFirst stores the
   algorithm and wire key in the tenant's encrypted pin set before accepting the
   handshake.
-- **Key algorithms:** **Ed25519 and ECDSA only.** RSA is rejected up front
-  (RSA key support is not implemented; only Ed25519 and ECDSA are accepted).
+- **Key algorithms:** **Ed25519 and ECDSA only.** The shared decoder rejects
+  RSA by parsed algorithm before connecting; the vulnerable RSA implementation
+  is not compiled because LunarWing disables russh's optional `rsa` feature.
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
   capped at 1 MiB each (`truncated` flag).
 - **Approval:** first call prompts with **Approve**, **Always**, and **Deny**.
@@ -184,16 +185,19 @@ key). Keys never leave the agent.
 - **Safety extras:** env-scrubbed subprocess (no gateway secrets leak to git),
   `GIT_TERMINAL_PROMPT=0`, `pull --ff-only`, **force-push (`+ref`) blocked**,
   option-injection guards, 64 KiB output cap, timeout + child kill.
-- **Key algorithms:** unlike the russh command path, `ssh_git` does not inspect
-  `SSHHostConfig.key_type` or reject RSA. Authentication is delegated to the
-  loaded agent key and the host's OpenSSH binary, so the algorithms actually
-  usable depend on that pair's negotiation and policy.
+- **Key algorithms:** **Ed25519 and ECDSA only**, as in the russh command path.
+  `ssh_git` does not inspect `SSHHostConfig.key_type`, but the shared agent
+  decoder rejects RSA by parsed algorithm before any identity can be loaded.
+  OpenSSH therefore never receives an RSA identity from this harness.
 - **Approval:** every invocation requires approval; no **Always** option.
 
 **When to use.** Any git operation over SSH from a chat turn, without a worker.
 
-> **Known limitation:** the built-in `ssh` command tool rejects configured RSA
-> keys and accepts only Ed25519/ECDSA. `ssh_git` has no corresponding RSA guard.
+> **RSA policy (WI#368):** the built-in and WASM command tools retain their
+> declared-key-type fail-fast guard, while the shared parsed-algorithm check is
+> authoritative for every mechanism, including worker mode and `ssh_git`.
+> Mislabeled RSA key material is rejected, and russh's RSA implementation is
+> compiled out.
 
 ---
 

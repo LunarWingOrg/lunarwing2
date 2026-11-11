@@ -108,7 +108,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         script_dir = self.root / ".gitlab" / "scripts"
         script_dir.mkdir(parents=True)
         shutil.copy(SCRIPT, script_dir / SCRIPT.name)
-        # The guard drives the lane's own checker; both lanes travel.
+        # The guard drives each lane's own checker; every selected lane travels.
         shutil.copytree(
             ROOT / "opencode2.4lunarwing",
             self.root / "opencode2.4lunarwing",
@@ -118,6 +118,11 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             ROOT / "opencode4lunarwing",
             self.root / "opencode4lunarwing",
             ignore=shutil.ignore_patterns("kimi-cli", "node_modules", "__pycache__"),
+        )
+        shutil.copytree(
+            ROOT / "lunardepth4lunarwing",
+            self.root / "lunardepth4lunarwing",
+            ignore=shutil.ignore_patterns("node_modules", "__pycache__", "*.pyc", "*.js"),
         )
         (self.root / "opencode2.4lunarwing" / "Dockerfile").write_text(
             "".join(DOCKERFILE_LINES), encoding="utf-8"

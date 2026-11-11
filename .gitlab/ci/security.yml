@@ -86,6 +86,7 @@ worker-buildkit-parser-policy-guard:
     - test -z "$(gofmt -l main.go main_test.go)"
     - go test ./...
     - go run . ../../../opencode2.4lunarwing/Dockerfile
+    - go run . ../../../lunardepth4lunarwing/Dockerfile
 
 secret-detection:
   extends: .gitleaks-job

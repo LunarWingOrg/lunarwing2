@@ -504,35 +504,60 @@ new multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537),
 while an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is
 preserved.
 
+NetBird uses the default runtime DNS path while the custom-DNS reconnect
+investigation in WI#603 remains open:
+
 ```bash
 SANDBOX_NETWORK=tunnel
-SANDBOX_TUNNEL_PROVIDER=netbird                      # netbird (default) | wireguard
+SANDBOX_TUNNEL_PROVIDER=netbird
 SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird@sha256:<64-hex-digest>  # nft + provider tools
-SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53       # optional joined-run tunnel resolvers; disables direct uplink DNS
 SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://netbird.example.com
-SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>           # secret
-SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/<tenant>/wg0.conf  # wireguard: mode 0600
-SANDBOX_TUNNEL_WIREGUARD_CANARY=10.231.0.1     # optional ICMP overlay health probe
+SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>  # secret
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 ```
 
-Custom DNS is mounted only into joined runs; the sidecar retains runtime DNS
-for provider bootstrap and hostname endpoints. DNS/canary addresses reject
-loopback, link-local, broadcast, unspecified, and multicast values. Peered
-WireGuard configs need `PersistentKeepalive = 1..=60` on at least one peer or
-an overlay canary, which is re-probed after firewall installation.
+WireGuard can instead use overlay resolvers for joined runs and an optional
+WireGuard-only canary:
+
+```bash
+SANDBOX_NETWORK=tunnel
+SANDBOX_TUNNEL_PROVIDER=wireguard
+SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-wireguard@sha256:<64-hex-digest>
+SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/<tenant>/wg0.conf  # mode 0600
+SANDBOX_TUNNEL_WIREGUARD_CANARY=10.231.0.1
+SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53  # joined-run resolvers; disables direct uplink DNS
+SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
+```
+
+Custom DNS is mounted only into joined runs. The sidecar retains its runtime
+resolver file for bootstrap, but the firewall also blocks its own post-start
+lookups when custom DNS is set. NetBird reconnects by hostname are therefore
+expected to fail with that setting; do not combine them until WI#603 records a
+live result and a fix or explicit unsupported-combination enforcement.
+DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
+multicast values. Peered WireGuard configs need
+`PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
+is re-probed after firewall installation. Manager recovery uses a 6-second
+re-probe, at most 20 seconds for fresh provider readiness (or a lower configured
+timeout), a 60-second total budget, and a 30-second failure back-off.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in
 keeps starting. With the multi-tenant default `SANDBOX_AUTO_PULL=false` the
-sidecar image must already be in the tenant's container store (build it into
-the store the same way as the sandbox image). Prefer digest-pinned references;
+sidecar image must already be in the tenant's container store; use the
+provider-specific manual build/load path in the operator guide (there is no
+dedicated mt-admin tunnel-image build step). Prefer digest-pinned references;
 mutable references warn with auto-pull enabled. LunarWing also hashes the
 resolved local image ID so tag rotation cannot reuse stale credentials or
-network state. Sidecar names and NetBird volumes are instance-scoped, and the
-NetBird identity volume changes only with its management URL or setup key, not
-with image or DNS changes. NetBird live interoperability and local-DNS
-forwarding remain unvalidated in WI#600. Operator guide:
+network state. Sidecar names and NetBird volumes are instance-scoped. The
+NetBird identity hash uses a persistent 32-byte mode-`0600` salt at
+`<tenant-state>/sandbox-tunnel-identity.salt`, not the runtime-directory label
+salt, so host reboots, image changes, and DNS changes retain the peer;
+management URL or setup-key rotation changes it. The first start after the
+WI#602 fix re-enrols once under a new persistent-salt volume name and prunes the
+old instance-scoped volume, so plan one valid setup-key use and revoke the old
+peer. NetBird live interoperability and local-DNS forwarding remain unvalidated
+in WI#600. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior

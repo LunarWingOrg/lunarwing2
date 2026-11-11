@@ -39,11 +39,17 @@ is the one uplink channel open to joined commands. A recursive resolver can
 carry query-based exfiltration even though arbitrary uplink connections are
 dropped. Setting `SANDBOX_TUNNEL_DNS` installs overlay resolvers only in joined
 runs and removes every direct uplink DNS accept. The sidecar itself keeps its
-runtime resolvers so hostname endpoints and NetBird management/signal/relay
-hosts still resolve before the tunnel exists. NetBird's local DNS listener and
-whether its marked upstream forwarding leaves another path have not been
-measured live; that residual and all live NetBird interoperability validation
-remain explicitly open in WI#600. A skipped NetBird test is not a pass.
+runtime resolver file so hostname endpoints and NetBird management/signal/relay
+hosts resolve during bootstrap, before the firewall is installed. Once that
+firewall is in, however, the sidecar's own new lookups are dropped too: its
+resolver sockets are unmarked and no uplink port-53 rule remains. NetBird with
+`SANDBOX_TUNNEL_DNS` is therefore untested and expected to lose name resolution
+for management, signal, relay, or STUN reconnects. WI#603 keeps that live
+reconnect measurement and any fix open; use default runtime DNS for NetBird
+until it is resolved. NetBird's local DNS listener and whether its marked
+upstream forwarding leaves another path have not been measured live either;
+that residual and all other live NetBird interoperability validation remain
+explicitly open in WI#600. A skipped NetBird test is not a pass.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 one network namespace and its loopback. A listener one command opens on
@@ -68,9 +74,19 @@ keep TLS, tokens, mTLS and NetBird ACLs/WireGuard peer policy in force.
   instead of pulling a mutable tag.
 - The daemon validates configuration at startup and checks the provider and
   both firewall chains, rule by rule, before every command. A failure returns
-  `[sandbox:sandbox_unavailable]`; it never falls back to another network
-  mode. A sidecar that died or drifted is recreated once before the command is
-  refused.
+  `[sandbox:sandbox_unavailable]`; it never falls back to another network mode.
+  A sidecar that died or drifted gets one bounded recovery attempt.
+
+Manager cold starts and per-command recovery re-probe an existing sidecar for
+at most **6 seconds**, wait at most **20 seconds** for a fresh provider (or the
+configured startup timeout when lower), and cap the complete recovery at **60
+seconds**. These bounds keep the failure below the default 120-second shell
+timeout under normal runtime probe bounds. The error names the failed handshake,
+canary, `netbird status`, or firewall probe. A failed recovery is cached for
+**30 seconds**: commands inside that window return the original reason and the
+time until the next attempt immediately, without more container churn. After
+the window, one command tries again. Explicit lifecycle calls to
+`ensure_started()` retain the full configured startup budget instead.
 
 The sidecar runs with all capabilities dropped except `NET_ADMIN`,
 `no-new-privileges`, a read-only root filesystem, memory/process limits, no
@@ -147,11 +163,15 @@ Do not print the env file or tenant env file while debugging.
 
 Peer identity and the client config live in a named volume
 (`lunarwing-sandbox-tunnel-<instance>-netbird-<identity-hash>`). The salted
-identity hash covers only the instance, management URL, and setup key, so a
-daemon restart, image change, or DNS change reuses the enrolled peer instead of
-spending another setup key. Rotating the key or URL enrols a fresh peer and
-prunes only this instance's previous volume; revoke the old peer in NetBird
-afterwards.
+identity hash covers only the instance, management URL, and setup key. Its
+32-byte identity salt is a regular, non-symlink mode-`0600` file at
+`$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt`, separate from the ephemeral
+label salt in the runtime directory. A daemon restart, host reboot, empty
+runtime directory, image change, or DNS change therefore reuses the enrolled
+peer instead of spending another setup key. Rotating the key or URL enrols a
+fresh peer and prunes only this instance's previous volume; revoke the old peer
+in NetBird afterwards. If the identity salt cannot be read or created, the
+tunnel fails closed rather than falling back to a runtime or temporary path.
 
 The uplink allowance relies on NetBird's advanced routing: every socket the
 client opens is expected to carry its control-plane mark (`0x1bd00`), and that
@@ -207,15 +227,24 @@ The host kernel's WireGuard module must already be loaded (normally automatic).
 Interface creation happens in the sidecar's user-namespace-owned netns, without
 host capabilities or host route changes. A peerless config is ready when `wg0`
 exists (the lifecycle e2e shape). With peers, readiness requires a nonzero
-WireGuard handshake no more than 180 seconds old, so an un-handshaked interface
-fails fast instead of letting every command time out. Without a canary, a peered
-config is valid only when at least one peer sets `PersistentKeepalive` from 1
-through 60 seconds; this guarantees initial and continuing liveness traffic.
-Alternatively set `SANDBOX_TUNNEL_WIREGUARD_CANARY` to an ICMP-reachable overlay
-address. Its probe generates handshake traffic and is repeated after the egress
-firewall is installed, so a response through the host uplink cannot make the
-sidecar healthy. Application-level reachability still depends on routes and
-services.
+WireGuard handshake no more than 180 seconds old. An un-handshaked or stale peer
+returns `sandbox_unavailable` within the bounded recovery described above, and
+later commands inside the 30-second back-off fail immediately instead of timing
+out. Without a canary, a peered config is valid only when at least one peer sets
+`PersistentKeepalive` from 1 through 60 seconds; this requests periodic
+handshakes but cannot guarantee that the remote peer answers. Alternatively set
+`SANDBOX_TUNNEL_WIREGUARD_CANARY` to an ICMP-reachable overlay address. Its
+probe generates handshake traffic and is repeated after the egress firewall is
+installed, so a response through the host uplink cannot make the sidecar
+healthy. Application-level reachability still depends on routes and services.
+
+For these health-relevant fields, LunarWing follows `wg` parsing: `#` starts a
+comment, whitespace is removed, and section names are case-insensitive, so
+`[Peer] # office` and `[ Peer ]` both count as peers. `PersistentKeepalive`
+accepts `off` or digits only from 0 through 65535, and the last value in each
+peer wins; the health-gate requirement remains 1–60 on at least one peer.
+Semicolons are not comments. Malformed sections and health-relevant values are
+rejected with a line number rather than silently degrading to a peerless probe.
 
 After `wg-quick up` the daemon reads the device fwmark: a config that set none
 gets `0x4c57`; a full-route config keeps the mark wg-quick assigned (its
@@ -248,7 +277,7 @@ commands resolve names through the sidecar's runtime resolvers over the uplink
 (port 53 only).
 
 Setting `SANDBOX_TUNNEL_DNS` does **not** pass `--dns` to the sidecar: provider
-bootstrap and hostname endpoints continue using runtime DNS. Instead, LunarWing
+bootstrap and hostname endpoints initially use runtime DNS. Instead, LunarWing
 atomically installs a non-secret mode-`0644` resolver file in its private
 runtime directory. Every joined run mounts it at `/etc/resolv.conf` with `ro,z`
 because Podman and Docker reject `--dns` together with `--network container`;
@@ -256,7 +285,11 @@ the shared SELinux label is safe for concurrent runs and the mode works with
 all supported keep-id mappings. The file is refreshed on start and every health
 check and removed by `SandboxManager::shutdown()`. All direct uplink DNS rules
 are removed; use resolvers reachable through `wg0`, including for joined-run
-name resolution after reconnection.
+name resolution after reconnection. Those rules also deny the sidecar's own
+post-bootstrap lookups. Stock `wg-quick` resolves its endpoint once at start,
+but any later re-resolve script is affected, and NetBird reconnects by hostname
+are expected to fail. The NetBird case remains an open WI#603 live measurement,
+not a supported combination.
 
 ## Rotation and lifecycle
 
@@ -291,8 +324,11 @@ adoption on the next start; do not claim or rely on automatic daemon-exit
 cleanup. Remove the instance container explicitly when that is not wanted. A
 crash, provider health failure, configuration mismatch, missing `nft`, or
 altered firewall blocks subsequent sandbox commands rather than reopening
-another egress path; the next command recreates a dead or drifted sidecar once,
-and refuses to run if that fails.
+another egress path. The next eligible command performs the bounded recovery
+described above, unless a 30-second failure back-off is still active. A start
+whose caller is cancelled retains an independent cleanup task that removes the
+partial sidecar even though the original start future was dropped; no container
+ID becomes joinable before the complete firewall verifies.
 
 ### Upgrade from the pre-WI#592 fixed name
 
@@ -310,6 +346,22 @@ podman volume rm <legacy-volume-name>
 
 The new instance-scoped names do not match that legacy volume prefix. Keep the
 new peer's state volume unless deliberate re-enrollment is required.
+
+### One-time NetBird re-enrolment for the WI#602 identity-salt fix
+
+Releases before WI#602 derived the peer-volume name with a salt in the runtime
+directory, so a reboot changed the name and lost the enrolled identity. The
+first NetBird sidecar start after upgrading to the persistent identity salt
+computes a new volume name once and prunes the previous instance-scoped volume.
+It therefore re-enrols once: use a reusable setup key that is still valid, or
+issue a replacement before upgrading, and revoke the old peer afterwards. Do
+not try to adopt the old volume by renaming it or copying salts. Later daemon
+restarts and host reboots retain the new volume and overlay identity as long as
+the instance, management URL, setup key, and persistent salt stay unchanged.
+Rolling back after that first start requires the same caution: runtime-salted
+code computes a different name again, and its stale-volume pruning can remove
+the newer volume, so another valid setup-key use and old-peer cleanup may be
+required.
 
 ## Verification
 
@@ -349,9 +401,13 @@ new peer's state volume unless deliberate re-enrollment is required.
    after independent input/output tamper cases, image-ID rotation with a clean
    firewall, distinct instance names, and helper-unit cleanup. Custom DNS checks
    the resolver-file marker, read-only mount, and refusal of queries to the old
-   uplink resolver. A peered hostname-endpoint case proves bootstrap DNS works,
-   then requires the unreachable peer to fail the handshake gate. The peerless
-   config still does not test peer encryption or NetBird's control plane.
+   uplink resolver. A peered localhost-endpoint case proves the sidecar retains
+   its runtime resolver file and `wg-quick` configures the endpoint; localhost
+   comes from `/etc/hosts`, so this is not an external-DNS assertion. A separate
+   manager-level dead-peer case uses a decorated `[Peer]` header and checks the
+   bounded first failure, sub-second cached failure, retry after back-off, and
+   cleanup after a cancelled start. The peerless config still does not test peer
+   encryption or NetBird's control plane.
 5. The NetBird lane requires an isolated throwaway management deployment, one
    dedicated reusable setup key, and an image containing NetBird, `nft`, `nc`,
    and `wget`. The lane starts its own plain second peer with that key. Store
@@ -368,8 +424,10 @@ new peer's state volume unless deliberate re-enrollment is required.
    ```
 
    It checks startup and detailed peer connectivity, a real joined run with
-   `wt0`, exactly one `0x1bd00` mark accept, management reconnect, stable peer
-   IP/state volume across recreation, and ingress refusal. The ingress check
+   `wt0`, exactly one `0x1bd00` mark accept, management reconnect, and ingress
+   refusal. Its identity check stops the sidecar, deletes the runtime-directory
+   label salt to model a reboot, and requires the same peer IP and state volume
+   after recreation. The ingress check
    proves the listener is reachable over loopback before and after the peer
    attempt, so a dead listener cannot masquerade as a firewall pass. The lane
    never runs without all three gates and provider settings; a skip is not a

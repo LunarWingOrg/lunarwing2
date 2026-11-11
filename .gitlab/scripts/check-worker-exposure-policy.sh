@@ -8,6 +8,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 lane="$repo_root/opencode2.4lunarwing"
 v1_lane="$repo_root/opencode4lunarwing"
+lunardepth_lane="$repo_root/lunardepth4lunarwing"
 
 failed=0
 fail() { echo "ERROR: $*" >&2; failed=1; }
@@ -18,6 +19,12 @@ python3 "$lane/scripts/exposure_policy_assert_test.py" || failed=1
 python3 "$lane/scripts/image_config_policy_test.py" || failed=1
 python3 "$lane/scripts/compile_out_remote_tunnel_test.py" || failed=1
 python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
+python3 "$lunardepth_lane/scripts/exposure_policy_assert.py" --source "$lunardepth_lane" || failed=1
+python3 "$lunardepth_lane/scripts/exposure_policy_assert_test.py" || failed=1
+python3 "$lunardepth_lane/scripts/image_config_policy_test.py" || failed=1
+python3 "$lunardepth_lane/scripts/render_overlay_test.py" || failed=1
+python3 "$lunardepth_lane/scripts/runtime_smoke_test.py" || failed=1
+python3 "$lunardepth_lane/scripts/verify_exposure_out_of_band_test.py" || failed=1
 
 # The bridge session ruleset must deny the self-exposure subcommands; the
 # denies must come after the allow-all shell rule to win under findLast.

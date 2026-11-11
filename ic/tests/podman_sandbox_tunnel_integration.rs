@@ -1,4 +1,4 @@
-//! Real-Podman tunnel sidecar coverage (WI#248 and WI#592).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, and WI#602).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
@@ -14,12 +14,14 @@ use std::time::Duration;
 use lunarwing::sandbox::cli_runner::{CliRunner, ExecParams};
 use lunarwing::sandbox::config::ResourceLimits;
 use lunarwing::sandbox::{
-    ContainerRuntime, SandboxNetworkMode, SandboxPolicy, SandboxRuntime, TunnelProvider,
-    TunnelRunConfig, TunnelSidecar, TunnelSidecarConfig,
+    ContainerRuntime, SandboxConfig, SandboxError, SandboxManager, SandboxNetworkMode,
+    SandboxPolicy, SandboxRuntime, TenantLogsMode, TunnelProvider, TunnelRunConfig, TunnelSidecar,
+    TunnelSidecarConfig,
 };
 use secrecy::SecretString;
 
 const E2E_IMAGE: &str = "localhost/lw-tunnel-e2e:latest";
+const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
 const JOINED_PROBE: &str = "cat /etc/resolv.conf; \
      ip -o link show wg0 >/dev/null && echo LUNARWING-TUNNEL-JOIN-OK; \
      wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-UPLINK-OPEN; \
@@ -134,6 +136,49 @@ async fn tunnel_container_id(name: &str) -> Option<String> {
         .ok()?;
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !id.is_empty()).then_some(id)
+}
+
+async fn assert_no_unfiltered_sidecar(name: &str) -> Result<(), String> {
+    if tunnel_container_id(name).await.is_none() {
+        return Ok(());
+    }
+    let listed = podman_success(&[
+        "exec",
+        name,
+        "nft",
+        "list",
+        "table",
+        "inet",
+        "lunarwing_sandbox_egress",
+    ])
+    .await;
+    listed.map_err(|_| format!("sidecar {name} is running without its firewall"))
+}
+
+async fn wait_container_absent(name: &str) -> Result<(), String> {
+    for _ in 0..75 {
+        if tunnel_container_id(name).await.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!(
+        "sidecar {name} remained after cancelled-start cleanup"
+    ))
+}
+
+async fn manager_command_error(
+    manager: &SandboxManager,
+    workdir: &Path,
+) -> Result<(SandboxError, Duration), String> {
+    let started = std::time::Instant::now();
+    match manager.execute("true", workdir, HashMap::new()).await {
+        Ok(output) => Err(format!(
+            "dead peer unexpectedly ran the command: {}{}",
+            output.stdout, output.stderr
+        )),
+        Err(error) => Ok((error, started.elapsed())),
+    }
 }
 
 async fn assert_detached_helper_stopped(container_name: &str) {
@@ -638,6 +683,166 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
     assert!(!String::from_utf8_lossy(&resolver_conf.stdout).contains("10.231.99.53"));
 }
 
+async fn assert_cancelled_start_cleans_up(
+    config: TunnelSidecarConfig,
+    instance_dir: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(instance_dir).map_err(|error| error.to_string())?;
+    let sidecar = TunnelSidecar::for_instance(ContainerRuntime::Podman, config, instance_dir);
+    let name = sidecar.container_name().to_string();
+    let task_sidecar = sidecar.clone();
+    let start = tokio::spawn(async move { task_sidecar.recover_for_run().await });
+    let mut appeared = false;
+    for _ in 0..75 {
+        if start.is_finished() {
+            break;
+        }
+        if tunnel_container_id(&name).await.is_some() {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if !appeared {
+        let outcome = start.await;
+        sidecar.stop().await;
+        return Err(format!(
+            "sidecar did not appear before its start ended: {outcome:?}"
+        ));
+    }
+    start.abort();
+    let _ = start.await;
+    let cleaned = wait_container_absent(&name).await;
+    sidecar.stop().await;
+    cleaned?;
+    assert_no_unfiltered_sidecar(&name).await
+}
+
+#[tokio::test]
+async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let image = tunnel_image().await.expect("WireGuard-capable image");
+    let private_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a WireGuard key");
+    let peer_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a peer key");
+    let workdir =
+        std::env::temp_dir().join(format!("lw-tunnel-dead-manager-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("workdir");
+    let config = workdir.join("wg0.conf");
+    std::fs::write(
+        &config,
+        format!(
+            "[Interface]\nPrivateKey = {private_key}\nAddress = 10.231.99.1/32\n\
+             [ Peer ] # office\nPublicKey = {peer_key}\nEndpoint = localhost:51820\n\
+             AllowedIPs = 10.231.99.2/32\nPersistentKeepalive = 25\n"
+        ),
+    )
+    .expect("write peered config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+    }
+    let instance_dir = workdir.join("instance");
+    let workspace = workdir.join("workspace");
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&instance_dir).expect("instance dir");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+    }
+    let previous_base_dir = std::env::var_os("LUNARWING_BASE_DIR");
+    let previous_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    // SAFETY: this gated binary runs its live tests serially; no other thread
+    // reads these process-wide overrides while the manager is constructed.
+    unsafe {
+        std::env::set_var("LUNARWING_BASE_DIR", &instance_dir);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+    }
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(image.clone()),
+        wireguard_config: Some(config),
+        startup_timeout: Duration::from_secs(90),
+        ..TunnelSidecarConfig::default()
+    };
+    let name = TunnelSidecar::for_instance(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &instance_dir,
+    )
+    .container_name()
+    .to_string();
+    let manager = SandboxManager::new(SandboxConfig {
+        image,
+        runtime: SandboxRuntime::Podman,
+        network: SandboxNetworkMode::Tunnel,
+        tunnel: Some(tunnel_config.clone()),
+        protected_paths: Vec::new(),
+        tenant_logs: TenantLogsMode::Off,
+        ..SandboxConfig::default()
+    });
+    let result = async {
+        let (first, first_elapsed) = manager_command_error(&manager, &workspace).await?;
+        if first.kind() != "sandbox_unavailable" || !first.to_string().contains("handshake") {
+            return Err(format!("first failure missed the handshake gate: {first}"));
+        }
+        if first_elapsed >= Duration::from_secs(90) {
+            return Err(format!(
+                "first failure exceeded the bounded recovery: {first_elapsed:?}"
+            ));
+        }
+        assert_no_unfiltered_sidecar(&name).await?;
+
+        let (second, second_elapsed) = manager_command_error(&manager, &workspace).await?;
+        if second_elapsed >= Duration::from_secs(1) {
+            return Err(format!("cached failure took too long: {second_elapsed:?}"));
+        }
+        if !second.to_string().contains("previous recovery failed") {
+            return Err(format!("second failure did not use the back-off: {second}"));
+        }
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let (third, third_elapsed) = manager_command_error(&manager, &workspace).await?;
+        if third_elapsed < Duration::from_secs(1)
+            || third.to_string().contains("previous recovery failed")
+        {
+            return Err(format!("post-back-off command did not retry: {third}"));
+        }
+        assert_no_unfiltered_sidecar(&name).await?;
+        assert_cancelled_start_cleans_up(tunnel_config, &workdir.join("cancelled")).await
+    }
+    .await;
+    manager.shutdown().await;
+    // SAFETY: restoration uses the same serial-live-test boundary as the
+    // overrides above, and runs before later Podman cases.
+    unsafe {
+        if let Some(value) = previous_base_dir {
+            std::env::set_var("LUNARWING_BASE_DIR", value);
+        } else {
+            std::env::remove_var("LUNARWING_BASE_DIR");
+        }
+        if let Some(value) = previous_runtime_dir {
+            std::env::set_var("XDG_RUNTIME_DIR", value);
+        } else {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&workdir);
+    result.expect("dead-peer manager recovery, back-off, retry, and cancelled-start cleanup");
+}
+
 fn required_env(name: &str) -> Result<String, String> {
     std::env::var(name)
         .ok()
@@ -793,7 +998,10 @@ async fn netbird_volume(sidecar: &TunnelSidecar) -> Result<String, String> {
     }
 }
 
-async fn assert_netbird_restart_identity(sidecar: &TunnelSidecar) -> Result<String, String> {
+async fn assert_netbird_restart_identity(
+    sidecar: &TunnelSidecar,
+    runtime_dir: &Path,
+) -> Result<String, String> {
     let name = sidecar.container_name();
     let first_id = tunnel_container_id(name)
         .await
@@ -801,6 +1009,8 @@ async fn assert_netbird_restart_identity(sidecar: &TunnelSidecar) -> Result<Stri
     let first_ip = netbird_ipv4(name).await?;
     let first_volume = netbird_volume(sidecar).await?;
     sidecar.stop().await;
+    std::fs::remove_file(runtime_dir.join(LABEL_SALT_FILE))
+        .map_err(|error| format!("could not remove the runtime label salt: {error}"))?;
     sidecar
         .ensure_started()
         .await
@@ -987,8 +1197,16 @@ async fn podman_tunnel_sidecar_netbird_live() {
     let (image, management_url, setup_key) = settings.expect("NetBird live settings");
     let workdir = std::env::temp_dir().join(format!("lw-netbird-live-{}", std::process::id()));
     let primary_dir = workdir.join("primary");
+    let runtime_dir = workdir.join("runtime");
     std::fs::create_dir_all(&primary_dir).expect("primary instance dir");
-    let primary = TunnelSidecar::for_instance(
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime dir");
+    }
+    let primary = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Netbird,
@@ -999,6 +1217,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
             ..TunnelSidecarConfig::default()
         },
         &primary_dir,
+        &runtime_dir,
     );
     let peer_name = format!("{}-plain-peer", primary.container_name());
     let peer_env = write_peer_env_file(&workdir, &management_url, &setup_key)
@@ -1016,7 +1235,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
         let primary_volume = netbird_volume(&primary).await?;
         assert_eq!(
             primary_volume,
-            assert_netbird_restart_identity(&primary).await?
+            assert_netbird_restart_identity(&primary, &runtime_dir).await?
         );
         assert_netbird_reconnect(&primary).await?;
         assert_netbird_ingress_denied(&primary, &peer_name).await

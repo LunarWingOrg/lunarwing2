@@ -734,17 +734,24 @@ python3 .gitlab/scripts/refresh-secret-history-baseline.py
 
 The helper requires branch, tag, and merge-request refs, performs a fully
 redacted scan without either ignore file, and validates every fingerprint. It
-starts from the committed baseline and preserves every existing pin. New vendor
-pins are added automatically and printed with their exact fingerprints grouped
-by crate; review that crate-grouped list against the refresh-vendor diff before
-committing it. Never suppress new vendor churn by adding a path or rule
+starts from the committed baseline and preserves every existing pin. Every new
+fingerprint, including one under `ic/vendor/`, is printed and left unpinned
+unless an explicit `--accept <file>` names its exact commit-bound fingerprint.
+Record each classified disposition in WI#575 before supplying that acceptance
+file, then rerun the same command with `--accept`. Accepted vendor additions are
+printed with their exact fingerprints grouped by crate for comparison with the
+refresh-vendor diff. Never suppress new vendor churn by adding a path or rule
 exclusion.
 
-A new non-vendor fingerprint is printed and left unpinned unless an explicit
-`--accept <file>` names its exact commit-bound fingerprint. Record its classified
-disposition in WI#575 before supplying that acceptance file. Unclassified rows
-make the helper exit non-zero; safe vendor and explicitly accepted additions are
-still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
+Automatic vendor-path acceptance is deliberately forbidden. Comparing a file
+with its crate's `.cargo-checksum.json` cannot establish upstream provenance:
+a sanctioned in-place patch updates both the source and that metadata. Requiring
+classified acceptance for every new row avoids either silently pinning a newly
+introduced vendor credential or adding an upstream-tarball network dependency to
+the refresh path.
+
+Unclassified rows make the helper exit non-zero; explicitly accepted additions
+are still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
 external disposition. The helper refuses those rows even when `--accept` names
 them; remove a pending row only after its evidence is recorded in WI#575 and its
 exact baseline pin is deliberate.

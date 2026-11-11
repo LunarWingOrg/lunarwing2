@@ -241,7 +241,7 @@ tenant_writer_services() {
     printf '%s\n' "lunarwing-vision-${name}"
   fi
   local worker task_container
-  for worker in pebble opencode kimi opencode2; do
+  for worker in pebble opencode kimi opencode2 lunardepth; do
     task_container="$(worker_task_container_name "$worker" "$name")"
     if tenant_worker_enabled "$name" "$worker"; then
       printf '%s\n' "lunarwing-${worker}-${name}" "$task_container"
@@ -261,7 +261,7 @@ tenant_writer_services() {
 
 tenant_writer_containers() {
   local name="$1" worker
-  for worker in pebble opencode kimi opencode2; do
+  for worker in pebble opencode kimi opencode2 lunardepth; do
     printf 'lunarwing-%s-%s\n' "$worker" "$name"
     worker_task_container_name "$worker" "$name"
   done
@@ -316,7 +316,7 @@ stop_tenant_writers() {
     done < <(tenant_writer_services "$name")
   fi
 
-  for worker in pebble opencode kimi opencode2; do
+  for worker in pebble opencode kimi opencode2 lunardepth; do
     container="$(worker_task_container_name "$worker" "$name")"
     if tenant_worker_enabled "$name" "$worker" \
         || { [[ "$INIT_SYSTEM" == openrc ]] \
@@ -540,6 +540,12 @@ add_tenant() {
   local with_opencode2="${26:-false}"
   local opencode2_model="${27:-}"
   local opencode2_base_url="${28:-}"
+  local with_lunardepth="${29:-false}"
+  local lunardepth_model="${30:-}"
+  local lunardepth_base_url="${31:-}"
+  local lunardepth_api_key="${32:-}"
+  local lunardepth_allow_insecure="${33:-false}"
+  local lunardepth_allow_placeholder="${34:-false}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -551,8 +557,8 @@ add_tenant() {
   # unit and could mask a real outage as `skipped`), so forbid such names at the
   # source. (weechat-* also covers weechat-adapter-*.)
   case "$name" in
-    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|opencode2-*|weechat-*)
-      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/weechat-/weechat-adapter-); choose another name" ;;
+    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|opencode2-*|lunardepth-*|weechat-*)
+      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/lunardepth-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
   # WI#330: never render an unreachable built-in endpoint; require a real one.
@@ -574,8 +580,8 @@ add_tenant() {
 
   ports_registry_init
   local base_port workers_json
-  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s,"opencode2":%s}' \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2")"
+  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s,"opencode2":%s,"lunardepth":%s}' \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$with_lunardepth")"
   base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json" "$darkirc_scope_override")"
   say ""
 
@@ -624,6 +630,13 @@ add_tenant() {
     || die "could not safely write the kimi external-worker config for tenant '$name'"
   ensure_external_worker_config "$name" "opencode2" "opencode2_wss" \
     || die "could not safely write the opencode2 external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "lunardepth" "lunardepth_wss" \
+    || die "could not safely write the LunarDepth external-worker config for tenant '$name'"
+  if [[ "$with_lunardepth" == "true" ]]; then
+    configure_lunardepth "$name" "$lunardepth_model" "$lunardepth_base_url" "$lunardepth_api_key" \
+      "$lunardepth_allow_insecure" "$lunardepth_allow_placeholder" \
+      || die "could not configure the explicit LunarDepth route for tenant '$name'"
+  fi
 
   # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
   # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
@@ -751,11 +764,12 @@ add_tenant() {
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
   say "  opencode2_wss:    $(ports_get "$name" opencode2_wss)"
+  say "  lunardepth_wss:   $(ports_get "$name" lunardepth_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
-  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi '; [[ "$with_opencode2" == "true" ]] && printf 'opencode2 ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi/--with-opencode2 to select)" )"
+  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi '; [[ "$with_opencode2" == "true" ]] && printf 'opencode2 '; [[ "$with_lunardepth" == "true" ]] && printf 'lunardepth ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi/--with-opencode2/--with-lunardepth to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say "  study mcp:        $study_mcp_bootstrap_ok"
@@ -1096,7 +1110,7 @@ start_tenant() {
 _record_not_attempted_workers() {
   local name="$1" failed="$2" _w after_failed=false
   TENANT_START_NOT_ATTEMPTED_WORKERS=()
-  for _w in pebble opencode kimi opencode2; do
+  for _w in pebble opencode kimi opencode2 lunardepth; do
     if [[ "$after_failed" == false ]]; then
       [[ "$_w" != "$failed" ]] || after_failed=true
       continue
@@ -1129,7 +1143,7 @@ _start_tenant_workers() {
   # host image happens to exist — regardless of what this tenant chose — because
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
-  for _w in pebble opencode kimi opencode2; do
+  for _w in pebble opencode kimi opencode2 lunardepth; do
     if tenant_worker_enabled "$name" "$_w" \
         && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
       ( set -e; "start_tenant_${_w}" "$name" )
@@ -1188,6 +1202,7 @@ stop_tenant() {
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
   stop_tenant_opencode2 "$name"
+  stop_tenant_lunardepth "$name"
   stop_tenant_postgres "$name"
 
   # WI#133/#134: stopping must be verified, not assumed. On OpenRC a container
@@ -1234,6 +1249,9 @@ stop_tenant_for_upgrade() {
   if tenant_worker_enabled "$name" opencode2; then
     opencode2_builder_supported \
       || die "$OPENCODE2_BUILDER_FLOOR_PROBLEM; tenant '$name' was not stopped"
+  fi
+  if tenant_worker_enabled "$name" lunardepth; then
+    lunardepth_preflight "$name" || die "LunarDepth preflight failed; tenant '$name' was not stopped"
   fi
 
   if tenant_darkirc_enabled "$name"; then
@@ -1415,6 +1433,7 @@ _worker_image_refs() {
     pebble lunarwing-worker-pebble:latest \
     opencode lunarwing-worker-opencode:latest \
     opencode2 lunarwing-worker-opencode2:latest \
+    lunardepth lunarwing-worker-lunardepth:latest \
     kimi lunarwing-worker-kimi:latest
 }
 
@@ -1670,13 +1689,13 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.
-upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref>
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth>
   local name="$1" lw_root="$2" previous_commit="$3"
-  local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8"
+  local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8" lunardepth="${9:-false}"
   local rc=0 caller_errexit=false
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" )
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" )
   rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   [[ "$rc" -eq 0 ]] && return 0
@@ -1830,6 +1849,9 @@ upgrade_tenant_locked() {
     opencode2_builder_supported \
       || die "$OPENCODE2_BUILDER_FLOOR_PROBLEM; tenant '$name' was not stopped"
   fi
+  if tenant_worker_enabled "$name" lunardepth; then
+    lunardepth_preflight "$name" || die "LunarDepth preflight failed; tenant '$name' was not stopped"
+  fi
 
   local with_opencode="false"
   if tenant_worker_enabled "$name" opencode; then
@@ -1846,6 +1868,10 @@ upgrade_tenant_locked() {
   local with_pebble="false"
   if tenant_worker_enabled "$name" pebble; then
     with_pebble="true"
+  fi
+  local with_lunardepth="false"
+  if tenant_worker_enabled "$name" lunardepth; then
+    with_lunardepth="true"
   fi
 
   # WI#527 (run-287 SX-2): check out the target and build every selected worker
@@ -1869,7 +1895,7 @@ upgrade_tenant_locked() {
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
   # The candidate builds only read the checkout; the build lock guards the
@@ -2147,6 +2173,15 @@ status_tenant() {
     say "OpenCode 2 worker: stopped ($opencode2_container)"
   else
     say "OpenCode 2 worker: not created"
+  fi
+
+  local lunardepth_container="lunarwing-lunardepth-$name"
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$lunardepth_container" 2>/dev/null | grep -q true; then
+    say "LunarDepth worker: running ($lunardepth_container, WSS port $(ports_get "$name" lunardepth_wss))"
+  elif _ctr_inspect "$name" "$lunardepth_container" &>/dev/null; then
+    say "LunarDepth worker: stopped ($lunardepth_container)"
+  else
+    say "LunarDepth worker: not created"
   fi
 
   local kimi_container="lunarwing-kimi-$name"
@@ -2440,6 +2475,8 @@ doctor() {
   _check "opencode worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
   _check "opencode2 worker dir exists" test -d "$LUNARWING_ROOT/opencode2.4lunarwing"
   _check "opencode2 worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode2.4lunarwing/Dockerfile"
+  _check "LunarDepth worker dir exists" test -d "$LUNARWING_ROOT/lunardepth4lunarwing"
+  _check "LunarDepth worker Dockerfile exists" test -f "$LUNARWING_ROOT/lunardepth4lunarwing/Dockerfile"
   _check "kimi worker dir exists" test -d "$LUNARWING_ROOT/kimicode4lunarwing"
   _check "kimi worker Dockerfile exists" test -f "$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
 

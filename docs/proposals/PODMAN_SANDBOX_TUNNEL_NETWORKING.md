@@ -91,9 +91,15 @@ rule by rule with the expected policy. Missing `nft`, an altered or missing
 chain, an extra accept (with or without a comment), or a changed policy fails
 closed. Without custom DNS, the runtime resolvers remain a low-bandwidth,
 query-based exfiltration channel; `SANDBOX_TUNNEL_DNS` removes that direct
-channel. NetBird's local DNS listener could still forward upstream on marked
-sockets; that provider-specific residual and all live NetBird interoperability
-validation remain open in WI#600 rather than being claimed closed here.
+channel for both joiners and the sidecar itself. Bootstrap DNS still works, but
+post-start sidecar lookups have no unmarked uplink path. NetBird with custom
+joined-run DNS is therefore expected to lose hostname reconnects; WI#603 keeps
+the required live measurement and the choice among static control-plane hosts,
+sidecar-only cgroup DNS, or an enforced unsupported combination open. Until
+that investigation finishes, NetBird uses default runtime DNS. Its local DNS
+listener could also forward upstream on marked sockets; that provider-specific
+residual and all other live NetBird interoperability validation remain open in
+WI#600 rather than being claimed closed here.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -119,10 +125,13 @@ not application auth.
   readiness is `wg0` presence; with peers it is a nonzero handshake at most 180
   seconds old, or a successful `SANDBOX_TUNNEL_WIREGUARD_CANARY` ICMP probe
   through the overlay. Peered configs without a canary require at least one
-  `PersistentKeepalive` of 1–60 seconds. DNS and canary validation rejects
-  loopback, link-local, broadcast, unspecified, and multicast addresses, and the
-  canary is re-probed after firewall installation. Probes, start, and cleanup
-  are bounded.
+  `PersistentKeepalive` of 1–60 seconds. Config parsing normalizes comments,
+  whitespace, and section case like `wg`; decorated peer headers cannot bypass
+  this gate, and the last digits-only keepalive in each peer wins. Malformed
+  health-relevant lines fail with their line number. DNS and canary validation
+  rejects loopback, link-local, broadcast, unspecified, and multicast addresses,
+  and the canary is re-probed after firewall installation. Probes, start, and
+  cleanup are bounded.
 - On systemd hosts the detached `run -d` client uses a deterministic
   `lunarwing-tunnel-<instance>` transient service with `KillMode=process` so its
   pasta helper outlives the client. The unit stays loaded while a helper lives
@@ -133,20 +142,33 @@ not application auth.
   whose client has already exited. Helpers of a container that still exists
   are never signalled. Foreground workload cleanup is unchanged.
 - `SandboxManager` health-gates initialization and calls `ensure_healthy()`
-  before every container run, joining only the returned verified ID. Provider
-  failure, a dead sidecar, hash drift, or firewall drift returns
-  `SandboxError::TunnelUnavailable`, mapped to the stable
-  `[sandbox:sandbox_unavailable]` envelope, after one bounded attempt to recreate
-  the sidecar. There is no fallback to `proxy`, `proxy-enforced`, direct egress,
-  or host execution.
+  before every container run, joining only the returned verified ID. It retains
+  the sidecar handle after a failed cold start so later commands share the same
+  recovery state. Recovery re-probes an existing sidecar for at most 6 seconds,
+  gives a fresh provider at most 20 seconds (or the lower configured timeout),
+  and wraps the complete attempt in a 60-second budget. The returned
+  `SandboxError::TunnelUnavailable`, mapped to `[sandbox:sandbox_unavailable]`,
+  names the failed provider or firewall probe and is cached for 30 seconds.
+  Calls inside that window return the reason and next-attempt delay immediately;
+  after it, one call retries. A drop guard owns partial-start cleanup when the
+  caller disappears, so cancellation cannot strand a labelled sidecar without
+  its firewall. Explicit lifecycle `ensure_started()` retains the full startup
+  budget. There is no fallback to `proxy`, `proxy-enforced`, direct egress, or
+  host execution.
 - The configuration label is a salted SHA-256 over provider, image reference,
   resolved image ID, DNS, canary, management URL, setup key, WireGuard path and
   file contents; the salt is a random 0600 file in the private runtime
   directory, so the label is not a plain digest of key material.
   Credential/content/image rotation recreates the sidecar.
 - NetBird's peer identity volume uses a separate salted hash of only instance,
-  management URL, and setup key. Image and DNS changes retain the peer; URL/key
-  rotation enrols a fresh peer and prunes only that instance's previous volume.
+  management URL, and setup key. Its 32-byte identity salt is created
+  atomically as a regular, non-symlink mode-0600 file at
+  `<base>/sandbox-tunnel-identity.salt`; read/create failure is unavailable,
+  with no runtime-directory fallback. Image, DNS, runtime-directory, and host
+  reboot changes retain the peer; URL/key rotation enrols a fresh peer and
+  prunes only that instance's previous volume. Moving from the old runtime salt
+  computes a new name once, so upgrade requires one deliberate re-enrolment and
+  old-peer revocation rather than guessing how to adopt the old volume.
 - `SandboxManager::shutdown()` removes only the sidecar carrying this instance's
   ownership label (podman `rm -f -t`, Docker `stop` then `rm -f`). The normal
   daemon exit path does not call it, so docs do not claim automatic exit

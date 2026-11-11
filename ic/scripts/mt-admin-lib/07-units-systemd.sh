@@ -446,7 +446,7 @@ EOF
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
   case "$worker" in
-    pebble|opencode|kimi|opencode2) ;;
+    pebble|opencode|kimi|opencode2|lunardepth) ;;
     *) die "unsupported external worker '$worker'" ;;
   esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
@@ -460,7 +460,7 @@ render_worker_quadlet() {
   tenant_env_path="$env_dir/lunarwing.env"
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
-  if [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
+  if [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]]; then
     # WI#453: same tenant-side create/verify/tighten contract as pebble below
     # — no root mkdir/chown through the tenant-controlled ~/lunarwing chain.
     # The || die keeps a refusal fatal under suppressed errexit (subshell call).
@@ -476,7 +476,7 @@ render_worker_quadlet() {
   [[ "$worker" != "kimi" ]] || runtime_env_path="$(write_kimi_runtime_env "$name")"
   [[ -z "$runtime_env_path" ]] \
     || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"
-  [[ "$worker" != "kimi" ]] || health_path="ready"
+  [[ "$worker" != "kimi" && "$worker" != "lunardepth" ]] || health_path="ready"
   tenant_mkdir_p "$name" "$qdir" \
     || die "could not safely create $qdir as tenant '$name'"
 
@@ -586,7 +586,6 @@ PublishPort=127.0.0.1:${wss_port}:${wss_port}
 Volume=${workspace_dir}:/workspace:z
 Volume=$(worker_ipc_volume_name "$worker" "$name"):/run/lunarwing-shared:z
 Environment=LUNARWING_CONTAINER_ROLE=split-bridge
-Environment=LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy
 Environment=LUNARWING_WORKER_ID=worker-${worker}-${name}
 Environment=WS_PORT=${wss_port}
 Environment=HEALTH_PORT=${health_port}
@@ -594,6 +593,7 @@ Environment=WS_BIND_HOST=0.0.0.0
 Environment=WS_PATH=/ws/agent
 PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL
 EOF
+    [[ "$worker" == "lunardepth" ]] || printf 'Environment=LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy\n'
     local egress_mapping
     while IFS= read -r egress_mapping; do
       [[ -n "$egress_mapping" ]] && printf 'AddHost=%s\n' "$egress_mapping"
@@ -604,6 +604,8 @@ EOF
       printf 'UserNS=%s\n' "$KIMI_USERNS"
     elif [[ "$worker" == "opencode2" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
+    elif [[ "$worker" == "lunardepth" ]]; then
+      printf 'UserNS=%s\n' "$LUNARDEPTH_USERNS"
     elif [[ "$worker" == "pebble" ]]; then
       printf 'UserNS=%s\n' "$PEBBLE_USERNS"
     fi
@@ -644,7 +646,7 @@ EOF
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
-    [[ "$worker" == "opencode" || "$worker" == "kimi" || "$worker" == "opencode2" ]] && printf 'Exec=--mode websocket\n'
+    [[ "$worker" == "opencode" || "$worker" == "kimi" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
 HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
 HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
@@ -726,6 +728,7 @@ EOF
       kimi) printf 'UserNS=%s\n' "$KIMI_USERNS" ;;
       opencode2) printf 'UserNS=%s\n' "$OPENCODE2_USERNS" ;;
       pebble) printf 'UserNS=%s\n' "$PEBBLE_USERNS" ;;
+      lunardepth) printf 'UserNS=%s\n' "$LUNARDEPTH_USERNS" ;;
     esac
 
     local index key value
@@ -1176,7 +1179,7 @@ stop_tenant_systemd() {
   local uid state rc stop_failed=false
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-opencode2-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-opencode2-${name}.service" "lunarwing-lunardepth-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
     rc=0
     state="$(_systemctl_user "$name" is-active "$svc" 2>/dev/null)" || rc=$?
     case "$state" in
@@ -1224,6 +1227,8 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-opencode-task-${name}.container" \
         "$qdir/lunarwing-opencode2-${name}.container" \
         "$qdir/lunarwing-opencode2-task-${name}.container" \
+        "$qdir/lunarwing-lunardepth-${name}.container" \
+        "$qdir/lunarwing-lunardepth-task-${name}.container" \
         "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-kimi-task-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container" \
@@ -1232,7 +1237,7 @@ uninstall_tenant_systemd() {
     # Retirement preserves stopped Nanocode containers for rollback and manual
     # recovery. Supported workers remain disposable because their state lives
     # in bind-mounted workspaces.
-    for w in pebble opencode kimi opencode2; do
+    for w in pebble opencode kimi opencode2 lunardepth; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$(worker_task_container_name "$w" "$name")" >/dev/null 2>&1 || true
       _ctr "$name" volume rm "$(worker_ipc_volume_name "$w" "$name")" >/dev/null 2>&1 || true

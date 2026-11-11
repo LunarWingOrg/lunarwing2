@@ -25,10 +25,11 @@ ignore = [
     # docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (2026-10-16), which
     # supersedes the closed WI#331/WI#409 records for those entries.
     # Clearing work that outlived WI#331 was split into follow-ups cited
-    # per entry: WI#367 (libsignal-protocol off failure/rental/atty),
-    # WI#368 (rsa policy / upstream tracking), and WI#418 (libsql legacy
-    # chain). Re-verify each exposure note at every release per the
-    # protocol in the WI#418 decision record. Historical decision record:
+    # per entry: WI#367 (libsignal-protocol off failure/rental/atty) and
+    # WI#418 (libsql legacy chain). WI#368's rsa acceptance was cleared
+    # 2026-11-11 by disabling russh's optional rsa feature. Re-verify each
+    # exposure note at every release per the protocol in the WI#418 decision
+    # record. Historical decision record:
     # docs/ops/v2.1.6.0_WI331_ADVISORY_CLEARING.md. Audit trails:
     # docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md (v2.1.6.0),
     # docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md (v2.1.5.0).
@@ -100,30 +101,6 @@ ignore = [
     # Clearing owner: WI#367 (split out of WI#331).
     { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep (XMPP OMEMO), every feature set; failure 0.1.8 is the final release; clearing owner WI#367, decision record WI#331 (re-verified 2026-10-10)" },
     { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain and exposure as RUSTSEC-2019-0036; clearing owner WI#367, decision record WI#331 (re-verified 2026-10-10)" },
-
-    # rsa Marvin timing side channel via russh -> rsa 0.10.0-rc.18.
-    # Re-verified 2026-11-09: the advisory now declares patched = [">= 0.10.0"];
-    # rsa 0.10.0 stable is published and not yanked, but the locked rc.18
-    # prerelease remains affected. Newest russh 0.65.1 still requests
-    # rsa =0.10.0-rc.18 as an optional dep, so a russh bump does not clear
-    # the advisory. The tree pins russh 0.62.7 with the same exact RSA pin.
-    # Clearing requires an upstream russh release that adopts patched RSA,
-    # a reviewed vendored backport, or a LunarWing policy change (reject RSA
-    # key material by parsed algorithm, drop the russh/rsa feature — only
-    # russh and ssh-key pull rsa in).
-    # EXPOSURE (corrected per MR !1505 review CP-3): compiled into every
-    # feature set because LunarWing itself enables the russh "rsa" feature
-    # (ic/Cargo.toml). The built-in ssh tool refuses RSA by declared
-    # key-type label only, and the label check is bypassable. The live
-    # path is the tenant SSH agent: ic/src/bridge/ssh.rs loads every
-    # configured host key into SshAgentServer with no algorithm filter,
-    # ssh_agent.rs auto-confirms signing requests, the socket is mode
-    # 0o666, and lunarwing-mt-admin.sh mounts it into the (untrusted)
-    # opencode/opencode2/pebble worker containers. Signing is unblinded
-    # (rng = None) — unlimited chosen-message RSA signatures with local
-    # timing for any tenant that configures an RSA host key.
-    # Clearing owner: WI#368 (split out of WI#331).
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; patched >=0.10.0 (re-verified 2026-11-09), stable 0.10.0 published and not yanked; locked rc.18 remains affected; russh 0.62.7 in tree; newest 0.65.1 still pins rsa =0.10.0-rc.18; exposure: tenant SSH agent (auto-confirm, 0o666) mounted into untrusted worker containers signs with RSA host keys; LunarWing-enabled russh/rsa feature, every feature set; clearing owner WI#368, decision record WI#331" },
 
     # h2 empty DATA frames — low severity. The patched 0.4.20 is locked; the
     # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)
