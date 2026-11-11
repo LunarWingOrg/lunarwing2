@@ -42,14 +42,13 @@ runs and removes every direct uplink DNS accept. The sidecar itself keeps its
 runtime resolver file so hostname endpoints and NetBird management/signal/relay
 hosts resolve during bootstrap, before the firewall is installed. Once that
 firewall is in, however, the sidecar's own new lookups are dropped too: its
-resolver sockets are unmarked and no uplink port-53 rule remains. NetBird with
-`SANDBOX_TUNNEL_DNS` is therefore untested and expected to lose name resolution
-for management, signal, relay, or STUN reconnects. WI#603 keeps that live
-reconnect measurement and any fix open; use default runtime DNS for NetBird
-until it is resolved. NetBird's local DNS listener and whether its marked
-upstream forwarding leaves another path have not been measured live either;
-that residual and all other live NetBird interoperability validation remain
-explicitly open in WI#600. A skipped NetBird test is not a pass.
+resolver sockets are unmarked and no uplink port-53 rule remains. The WI#600
+live NetBird 0.82.0 run confirmed that its local resolver listens on the
+sidecar's overlay IP but upstream writes are unmarked: the lookup returns
+`SERVFAIL` with `operation not permitted` in the client log, and no upstream
+query reaches the uplink. Custom NetBird DNS is therefore unsupported; WI#603
+owns the reconnect investigation and any fix. Use default runtime DNS for
+NetBird. A skipped NetBird test is not a pass.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 one network namespace and its loopback. A listener one command opens on
@@ -100,11 +99,13 @@ rewritten. When installation is needed, one `nft -f -` invocation replaces the
 complete table atomically, eliminating the former delete-to-rebuild interval in
 which a joined command could have used the uplink without its egress filter.
 
-The sidecar runs with all capabilities dropped except `NET_ADMIN`,
+The sidecar runs with all capabilities dropped except `NET_ADMIN`; NetBird
+also receives `NET_RAW` for its raw sockets and `NET_BIND_SERVICE` for its
+local resolver on port 53. It never receives `SYS_ADMIN`. All sidecars use
 `no-new-privileges`, a read-only root filesystem, memory/process limits, no
 published ports, and no host networking. Joined commands retain their existing
 capability drop, non-root user/keep-id mapping, read-only root, mount masks,
-resource limits, and cleanup.
+resource limits, and cleanup; they receive none of the sidecar additions.
 
 ## Configuration
 
@@ -185,22 +186,26 @@ fresh peer and prunes only this instance's previous volume; revoke the old peer
 in NetBird afterwards. If the identity salt cannot be read or created, the
 tunnel fails closed rather than falling back to a runtime or temporary path.
 
-The uplink allowance relies on NetBird's advanced routing: every socket the
-client opens is expected to carry its control-plane mark (`0x1bd00`), and that
-mark is what the sidecar's `output` chain lets onto the uplink. Do not set
-`NB_USE_LEGACY_ROUTING`, `NB_SKIP_SOCKET_MARK` or `NB_DISABLE_CUSTOM_ROUTING` in
-the sidecar image or environment; if the client logs "falling back to legacy
-routing", the firewall blocks its management connection and the health gate
-fails closed.
+The uplink allowance relies on NetBird's advanced routing: its control-plane
+and WireGuard sockets carry the `0x1bd00` mark, which the sidecar's `output`
+chain lets onto the uplink. Do not set `NB_USE_LEGACY_ROUTING`,
+`NB_SKIP_SOCKET_MARK` or `NB_DISABLE_CUSTOM_ROUTING` in the sidecar image or
+environment; if the client logs "falling back to legacy routing", the firewall
+blocks its management connection and the health gate fails closed. LunarWing
+sets `NB_DISABLE_FIREWALL=true` because NetBird 0.82.0's interface allower
+otherwise inserts an `iifname "wt0" accept` into LunarWing's own input chain and
+reapplies it through a netlink monitor. Advanced routing remains enabled, while
+LunarWing's exact input/output chains are the only packet filter.
 
 Readiness requires `netbird status --check startup` to succeed (management and
-signal connected, plus relay availability when relays are configured). Optional
-NetBird features that require `SYS_ADMIN` or other extra capabilities are not
-enabled implicitly; use a configuration supported with `NET_ADMIN` only. This
-code path and its gated test lane have not yet been run against a real NetBird
-management/signal/relay deployment; WI#600 tracks that validation and the local
-DNS-forwarding measurement. Until then, NetBird interoperability is unproven,
-not claimed as live-tested.
+signal connected, plus relay availability when relays are configured). NetBird
+0.82.0 needs `NET_ADMIN`, `NET_RAW`, and `NET_BIND_SERVICE`; `SYS_ADMIN` is not
+granted for optional eBPF features. WI#600 live validation on 2026-11-11 proved
+management/signal/relay/STUN readiness, peer connectivity and HTTP, public-IP
+and metadata denial, management restart with post-reconnect execution, stable
+identity across runtime-salt replacement, and peer-initiated ingress refusal.
+The custom-DNS forwarding check failed closed as described above and remains
+unsupported in WI#603; no CI or public-cloud run is claimed.
 
 Use restrictive NetBird ACLs for defense-in-depth even though the local input
 firewall drops inbound connections. Do not reuse the gateway-exposure NetBird
@@ -442,17 +447,30 @@ required.
    ```
 
    It checks startup and detailed peer connectivity, a real joined run with
-   `wt0`, exactly one `0x1bd00` mark accept, management reconnect, and ingress
-   refusal. Its identity check stops the sidecar, deletes the runtime-directory
-   label salt to model a reboot, and requires the same peer IP and state volume
-   after recreation. The ingress check
-   proves the listener is reachable over loopback before and after the peer
-   attempt, so a dead listener cannot masquerade as a firewall pass. The lane
-   never runs without all three gates and provider settings; a skip is not a
-   live-validation pass. No live NetBird run has been performed for this item.
-   WI#600 owns that run, the local-DNS/uplink-capture check, teardown evidence,
-   and any future podman-capable CI job with protected masked credentials;
-   neither provider lane currently runs in CI.
+   `wt0`, peer-hosted HTTP, exactly one `0x1bd00` mark accept, public-IP and
+   metadata denial, management reconnect, and ingress refusal with a proven-live
+   loopback listener. Its identity check stops the sidecar, deletes the
+   runtime-directory label salt to model a reboot, and requires the same peer IP
+   and state volume after recreation. To restart the throwaway management
+   deployment instead of only reconnecting the client, set
+   `LUNARWING_E2E_NETBIRD_SERVER_CONTAINER` to a space-separated server/proxy
+   list; the lane requires stable health and another joined command afterward.
+
+   With the same settings, run `podman_tunnel_sidecar_netbird_custom_dns_live`
+   for the WI#603 measurement. Configure a non-primary nameserver group matching
+   `example.com` and forwarding to `1.1.1.1:53` for the `All` group first. The
+   test learns the sidecar's overlay resolver IP, recreates with custom DNS,
+   verifies identity and the absence of uplink DNS rules, and currently requires
+   `SERVFAIL`: NetBird's upstream write is unmarked and blocked. An unexpected
+   successful lookup fails the test and requires a deliberate WI#603 contract
+   update.
+
+   The lane never runs without all three gates and provider settings; a skip is
+   not a live-validation pass. WI#600's 2026-11-11 local run passed the main and
+   custom-DNS lanes against NetBird 0.82.0 and used an uplink `tcpdump` to check
+   for forbidden destinations. Any podman-capable CI job with protected masked
+   credentials remains future work; neither provider lane currently runs in CI,
+   and no public-cloud run is claimed.
 6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
    sandbox to an allowed private service. Then run a temporary high-port
    listener in the sandbox and attempt to connect from another overlay peer:
