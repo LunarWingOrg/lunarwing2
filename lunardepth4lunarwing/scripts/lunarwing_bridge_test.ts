@@ -87,6 +87,7 @@ test("requires bearer authentication before the WebSocket upgrade", async () => 
   const current = await fixture()
   try {
     const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: "Bearer wrong" } })
+    socket.on("error", () => undefined)
     const response = await new Promise<number>(resolve => {
       socket.once("unexpected-response", (_request, incoming) => resolve(incoming.statusCode ?? 0))
     })
