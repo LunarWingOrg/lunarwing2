@@ -13,11 +13,13 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKERS = {
-    "opencode2.4lunarwing": "opencode2",
-    "opencode4lunarwing": "opencode",
-    "kimicode4lunarwing": "kimi",
-    "pebble4lunarwing": "pebbletask",
+    "opencode2.4lunarwing": ("opencode2", "opencode2-bridge"),
+    "opencode4lunarwing": ("opencode", "opencode-bridge"),
+    "kimicode4lunarwing": ("kimi", "kimi-bridge"),
+    "pebble4lunarwing": ("pebbletask", "pebble-bridge"),
+    "lunardepth4lunarwing": ("lunardepth", "lunardepth-bridge"),
 }
+ACCOUNTS = [(lane, account) for lane, accounts in WORKERS.items() for account in accounts]
 
 
 def instructions(text):
@@ -45,7 +47,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 self.assertEqual(accounts, 1)
 
     def test_shadow_day_assertion_gates_the_account_creation_layer(self):
-        for lane, account in WORKERS.items():
+        for lane, account in ACCOUNTS:
             with self.subTest(lane=lane):
                 runs = [
                     instruction
@@ -81,7 +83,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
         )
 
     def test_shadow_checks_use_the_epoch_day_on_both_sides_of_midnight(self):
-        for lane, account in WORKERS.items():
+        for lane, account in ACCOUNTS:
             for epoch in (0, 172799, 172800):
                 with self.subTest(lane=lane, epoch=epoch):
                     result = self.shadow_check(lane, account, epoch, epoch // 86400)
@@ -89,7 +91,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
 
     def test_shadow_checks_accept_empty_only_in_epoch_day_zero(self):
-        for lane, account in WORKERS.items():
+        for lane, account in ACCOUNTS:
             for epoch in (0, 1, 86399, 86400):
                 with self.subTest(lane=lane, epoch=epoch):
                     result = self.shadow_check(lane, account, epoch, "")
@@ -98,7 +100,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
 
     def test_shadow_checks_refuse_wall_clock_days_and_missing_accounts(self):
         today = (datetime.date.today() - datetime.date(1970, 1, 1)).days
-        for lane, account in WORKERS.items():
+        for lane, account in ACCOUNTS:
             for day in (today, 2, None):
                 with self.subTest(lane=lane, day=day):
                     result = self.shadow_check(lane, account, 172799, day)
