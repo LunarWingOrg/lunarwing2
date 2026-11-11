@@ -114,8 +114,10 @@ _lunardepth_render_in_image() {  # <tenant>; uses the values resolved by _lunard
   local -a args=(--template /app/config/lunarwing-lane.patch.yml --stdout
     --base-url "$LUNARDEPTH_BASE_URL_RESOLVED" --model "$LUNARDEPTH_MODEL_RESOLVED")
   [[ "$LUNARDEPTH_ALLOW_INSECURE_RESOLVED" != "true" ]] || args+=(--allow-insecure-http)
+  # --no-healthcheck: the image defines one, and a one-shot container must not
+  # ask the init system for a health timer (OpenRC hosts have none).
   _ctr "$name" run --rm --pull=never --network none --read-only --cap-drop ALL \
-    --security-opt no-new-privileges --entrypoint /usr/bin/python3 \
+    --security-opt no-new-privileges --no-healthcheck --entrypoint /usr/bin/python3 \
     lunarwing-worker-lunardepth:latest -I /app/scripts/render_overlay.py "${args[@]}"
 }
 

@@ -202,7 +202,7 @@ diff -u "$expected" "$calls"
   _ctr() { shift; printf '%s\n' "$@" >"$TMP/render.args"; printf 'rendered-overlay\n'; }
   _lunardepth_route demo
   [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
-  for expected in run --rm --pull=never none --read-only ALL no-new-privileges /usr/bin/python3 \
+  for expected in run --rm --pull=never none --read-only ALL no-new-privileges --no-healthcheck /usr/bin/python3 \
       lunarwing-worker-lunardepth:latest -I /app/scripts/render_overlay.py \
       /app/config/lunarwing-lane.patch.yml --stdout tensormoon::other_function::lunarwing; do
     grep -qx -- "$expected" "$TMP/render.args" || { echo "render container lacks: $expected" >&2; exit 1; }
