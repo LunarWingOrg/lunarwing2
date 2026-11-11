@@ -2770,8 +2770,10 @@ mod tests {
     async fn recovery_completion_is_recorded_before_waiters_are_notified() {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let mut waiting = receiver.clone();
-        let mut state = RecoveryState::default();
-        state.active = Some(receiver);
+        let mut state = RecoveryState {
+            active: Some(receiver),
+            ..RecoveryState::default()
+        };
         let result = Err(RecoveryError::Unavailable {
             reason: "dead peer".into(),
         });
