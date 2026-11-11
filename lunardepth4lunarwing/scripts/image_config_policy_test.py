@@ -63,6 +63,23 @@ class ImageConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "healthcheck"):
             MODULE.validate_config(document)
 
+    def test_runtime_paths_and_shell_are_pinned(self):
+        document = copy.deepcopy(valid_config())
+        document["Config"]["Shell"] = MODULE.EXPECTED_SHELL
+        MODULE.validate_config(document)
+        for key in ("LUNARDEPTH_CLOSURE_ROOT", "LUNARDEPTH_TEMPLATE_ROOT", "LUNARWING_APP_DIR"):
+            document = copy.deepcopy(valid_config())
+            document["Config"]["Env"] = [
+                entry if not entry.startswith(f"{key}=") else f"{key}=/tmp/redirected"
+                for entry in document["Config"]["Env"]
+            ]
+            with self.assertRaisesRegex(ValueError, "runtime path metadata"):
+                MODULE.validate_config(document)
+        document = copy.deepcopy(valid_config())
+        document["Config"]["Shell"] = ["/bin/sh", "-c"]
+        with self.assertRaisesRegex(ValueError, "image Shell"):
+            MODULE.validate_config(document)
+
 
 if __name__ == "__main__":
     unittest.main()
