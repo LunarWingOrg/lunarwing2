@@ -180,7 +180,7 @@ Items 3, 4, 17, 25 and 26 cover the sandbox theme; items 5, 6 and 24 cover Lunar
 These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Each work item carries the evidence, the fix and its acceptance boxes; the specs below only say how the item fits with the others.
 
 21. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/368 (RUSTSEC-2023-0071, the `rsa` Marvin advisory accepted in `ic/deny.toml`)
-    - **Spec: scope.** Take one of the three options in the work item. Item 2's audit found that `rsa` 0.10.0 is now marked patched while `russh` 0.65.1 still pins `=0.10.0-rc.18`, so first check whether a newer `russh` has dropped that pin.
+    - **Spec: scope.** Take one of the three options in the work item. Item 2's audit found that `rsa` 0.10.0 is now marked patched while `russh` 0.65.1 still pins `=0.10.0-rc.18`, so first check whether a newer `russh` has dropped that pin
     - **Spec: if a bump is possible.** Go through `ic/scripts/refresh-vendor.sh`, remove the `ic/deny.toml` ignore, and keep every advisory gate green.
     - **Spec: if it is not.** Either an enforced RSA policy in the ssh tool, with tests, or a re-justified acceptance with a named owner and a re-check date. Do not widen the acceptance. Low priority: no RSA SSH keys are in use.
     - **IMPLEMENTATION DONE / GATE BLOCKED — SweetieBot (autonomous), 2026-11-11:** re-checked the live crates.io index: russh 0.65.1 remains newest and still pins `rsa =0.10.0-rc.18`, so no clearing upgrade exists. Chose option 1: removed LunarWing's `russh/rsa` feature, pruned `rsa`/`pkcs1`/`crypto-primes` from both locks through Cargo and from `ic/vendor/` through `refresh-vendor.sh --prune-removed`, and removed RUSTSEC-2023-0071 from `ic/deny.toml` (13 → 12 acceptances; vendor 1,150 → 1,147 dirs).
@@ -235,72 +235,69 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
     - **Spec: needs a GitLab instance administrator.** An agent account cannot run the lookup, and must never test the historical value by authenticating with it. An agent that picks this item up can only record BLOCKED
     - **Spec: afterwards.** Once the result is recorded in WI#575, remove the row from `.gitlab/gitleaks-history-pending` and add its exact pin, or revoke the token if the lookup finds one. That unblocks items 18 and 22
     - **Spec: deadline.** Before the `v2.2.0.0` tag or any rc tag: `secret-history` is blocking now and fails on the pending row.
-    - **BLOCKED 2026-11-11 — SweetieBot (autonomous), branch `sweetiebot/kimi-27-20261111-1205`:** WI#599, WI#590 and confidential WI#575 still contain no administrator token-information result. The available SweetieBot GitLab account is an agent account, not the required instance administrator. No historical value was extracted, submitted to the token-information API, or used for authentication.
-    - **BLOCKED BY / RECOMMEND:** a GitLab instance administrator must perform the WI#599 lookup and record its result in WI#575. Only then may the follow-up agent revoke a discovered token or add the justified exact pin and remove the pending row. `.gitlab/gitleaks-history-pending` is unchanged, items 18 and 22 remain blocked, and this checkbox intentionally remains unchecked.
+    - **BLOCKED 2026-11-11 — SweetieBot (autonomous), branch `sweetiebot/kimi-27-20261111-1205`:** WI#599, WI#590 and confidential WI#575 still contain no administrator token-information result. The available SweetieBot GitLab account is an agent account, not the required instance administrator. No historical value was extracted, submitted to the token-information API, or used for authentication
+    - **BLOCKED BY / RECOMMEND:** a GitLab instance administrator must perform the WI#599 lookup and record its result in WI#575. Only then may the follow-up agent revoke a discovered token or add the justified exact pin and remove the pending row. `.gitlab/gitleaks-history-pending` is unchanged, items 18 and 22 remain blocked, and this checkbox intentionally remains unchecked
 
-## Phase 8 - Advanced Operator Notes
+## Phase 8 - Work items that had no goals line (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
-28. [x] (S) Deploy the stoplight system for IRC
-29. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-30. [x] (S) unassigned work items assign them
-31. [x] (S) RESERVED
-32. [x] (S) RESERVED
-33. [x] (S) RESERVED
-34. [x] (S) RESERVED
-35. [x] (S) RESERVED
-36. [x] (S) RESERVED
-37. [x] (S) RESERVED
-38. [x] (S) RESERVED
-39. [x] (S) RESERVED
-40. [x] (S) RESERVED
-41. [x] (S) RESERVED
-42. [x] (S) RESERVED
-
-
-## Phase 9 - Work items that had no goals line (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
-
-These twelve work items were open without a goals line on 2026-11-11. Nine were filed that day, most of them from reviews and CI; three are older. Each work item carries the evidence, the fix and its acceptance boxes; the specs below only say how the item fits with the others. Items 31 to 42 stay reserved.
-
-43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/614 (sandbox tunnel: two first commands at once start two sidecars, and the firewall is reinstalled under a running command; Medium, security)
+28. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/614 (sandbox tunnel: two first commands at once start two sidecars, and the firewall is reinstalled under a running command; Medium, security)
     - **Spec: scope.** The fix steps in the work item: one start at a time in the manager, one lifecycle lock per container name, the firewall replaced in a single `nft -f` transaction, and no reinstall of a table that already verifies. Unit tests with a counting fake runtime.
     - **Spec: fits with item 25.** WI#604's open point ZN-6 (cleanup by name, outside the lock) needs the same lock. Take it along, and say on WI#604 which of its points this MR closed.
     - **Spec: care.** This is the sandbox's egress control. Run clippy with and without `--all-features`. The gated tunnel e2e needs a live rootless podman: record exactly what ran and what did not.
-44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/596 (`upgrade-tenant` never rebuilds the managed sandbox image; Medium)
+29. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/596 (`upgrade-tenant` never rebuilds the managed sandbox image; Medium)
     - **Spec: scope.** `upgrade-tenant` must bring a changed `ic/docker/sandbox.Dockerfile` to the tenant: rebuild when the inputs changed, do nothing when they did not, and leave the tenant on its previous image when the build fails. All three are acceptance points.
     - **Spec: one decision.** The image tag is shared by every managed tenant on the host. Accept that and document it, or move to one tag per release: the work item gives both options (point 6). Record the choice on the work item.
     - **Spec: both init systems.** systemd and OpenRC, through `ic/scripts/lunarwing-mt-admin.sh` only. Extend `ic/scripts/tests/test-mt-admin-sandbox-image.sh` and the upgrade harnesses, as the work item lists. Run a changed harness once in the image of CI's `shell-harnesses` job, as root, before the push: a pass on a developer host is not enough.
-45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/610 (`satellite-advisory-sweep` and `rustix`: what is left after the `pebble/Cargo.lock` fix; Medium)
+30. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/610 (`satellite-advisory-sweep` and `rustix`: what is left after the `pebble/Cargo.lock` fix; Medium)
     - **Spec: state.** Part 1 is on the target (`1700ba8d6`): `pebble/Cargo.lock` has `rustix` 1.1.6, and the sweep is green.
     - **Spec: scope.** What the work item still lists: `rustix` 1.1.6 in `pebble4lunarwing/upstream/Cargo.lock`, with `rustix` and `fd-lock` in `ALLOWED_PACKAGES` and a new `PEBBLE_LOCK_SHA256`; the sweep prints the whole output of a failing root; and a decision on an advisory check for the override lock.
     - **Spec: proof.** `ci-config` checks the digest and the allowlist on the MR. The locked Pebble build runs on protected refs only, so the first proof of the override is the master pipeline after the merge.
-46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/618 (secret history: the baseline helper at a vendor bump; Low)
+31. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/618 (secret history: the baseline helper at a vendor bump; Low)
     - **Spec: scope.** ZH-1 to ZH-4 in the work item: group unclassified vendor rows by crate and rule and write a draft accept file; one history scan for the two-step flow; a reminder in `ic/scripts/refresh-vendor.sh` and `AGENTS.md`; a scheduled `secret-history` run, or the reason why not; a durable place for dispositions.
     - **Spec: confidentiality and order.** WI#575 is confidential: copy nothing from it into a file, a commit message or a public note. Do not pin or remove a pending row before item 27 has a result.
-47. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/615 (sandbox tunnel: a half-written identity salt file keeps the tunnel down; Low)
+32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/615 (sandbox tunnel: a half-written identity salt file keeps the tunnel down; Low)
     - **Spec: scope.** Write the salt to a temporary file, sync it and link it to the final name, so that the final name never holds a partial file. Open once without following symlinks and check on the handle. Name the file and the reason in the error. A damaged file stays refused: say in the guide how to recover and what it costs.
     - **Spec: builds on item 26** (!2353, `22b42f580`). The three identity tests must still pass.
-48. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/616 (ssh tools: a server with only an RSA host key fails as `WrongServerSig`; Low)
+33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/616 (ssh tools: a server with only an RSA host key fails as `WrongServerSig`; Low)
     - **Spec: scope.** Stop offering RSA host key algorithms in the client configuration, map the negotiation failure to an error that names the host key type, and say in both SSH documents and in the release notes that RSA host keys are not supported.
     - **Spec: builds on item 21** (!2356, `9a69e8675`). `rsa` stays out of `ic/Cargo.lock`, and the advisory gates stay green. Low priority: no RSA SSH keys are in use.
-49. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/613 (`lunarwing service install`: no root refusal on systemd and launchd; Low)
+34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/613 (`lunarwing service install`: no root refusal on systemd and launchd; Low)
     - **Spec: scope.** One shared check for every install path: as root the installer stops unless `LUNARWING_ALLOW_ROOT_SERVICE=1`, on systemd and launchd as it already does on OpenRC. The setup wizard must not offer an install that would be refused. Decide the primary-gid-0 case for OpenRC.
     - **Spec: both init systems stay first-class.** The OpenRC behaviour must not change except for the gid decision. Update `ic/src/setup/README.md` in the same MR.
-50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/617 (supervised mode: no test covers the last hop to the foreground thread; Low)
+35. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/617 (supervised mode: no test covers the last hop to the foreground thread; Low)
     - **Spec: scope.** A test that fails if the router passes anything but the resolved supervised-mode value to the foreground thread, or a builder that reads the value itself. The tests must leave the process environment and the CLI flag as they found them.
     - **Spec: two decisions.** The work item carries two proposals left open on WI#607: an audit of other readers that use the bare environment, and a start-up warning for an override that nobody reads. Record a decision on each: done, a follow-up item, or declined with the reason.
     - **Spec: care.** This is the approval control. Run clippy with and without `--all-features`.
-51. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/597 (Study Notes staleness sweep flags the same notes every day)
+36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/597 (Study Notes staleness sweep flags the same notes every day)
     - **Spec: read note 15369 first.** It says the mechanism in the work item is not the cause and gives another: a note that is already stale is flagged again on every sweep, and nothing retires it.
     - **Spec: scope.** Part of the fix belongs to the Study Notes MCP repository, not to this one. Fix what belongs here, and record on the work item what is left for the other repository. If nothing here has to change, say so there and recommend closing.
-52. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/612 (process tool: the test for the service-mode environment scrub cannot pass on any host; Low)
+37. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/612 (process tool: the test for the service-mode environment scrub cannot pass on any host; Low)
     - **Spec: scope.** In `service_mode_workload_gets_exact_allowlisted_environment`, call `prepare_service()` before the stdio set-up and run `env` directly, not `sh -c env`. Give `podman_works_from_transient_service` the same order. Do not loosen the exact comparison.
     - **Spec: where it runs.** CI has no systemd user manager and skips the test. Make the result visible: a variable that turns the skip into a failure plus a line in the testing guide, or a CI job with a user manager.
-53. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/595 (empty-stream retry budget counts the first attempt; Low)
+38. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/595 (empty-stream retry budget counts the first attempt; Low)
     - **Spec: scope.** Choose what happens to a billed-empty first attempt at or above the budget. Implement it, or decline it on the work item with the reason, and state it in `docs/proposals/ENGINE_LLM_STREAMING.md`. YH-3 and YH-4 are addressed or declined in the same change. Tests go in `ic/src/llm/retry.rs`.
-54. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/609 (worker upstream upgrades: kimi-code 2.5.3 and opencode v2.2.7)
+39. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/609 (worker upstream upgrades: kimi-code 2.5.3 and opencode v2.2.7)
     - **Spec: timing.** Wait 24 hours after an upstream release before a lane switches to it. Both releases in the work item are from 2026-11-10, so that wait is over. Check first whether a newer stable has appeared since; if one has, the wait starts again for that release.
-    - **Spec: scope.** Both lanes in the work item. Re-verify every lane gate against the new upstream source; WI#582 is the worked example. Record that opencode v1 was checked again and is current.
-    - **Spec: proof.** `worker-exposure-policy-guard` and the MR pipeline on the MR; the protected candidate and scan jobs only after the merge.
+    - **Spec: scope.** Both lanes in the work item. Re-verify every lane gate against the new upstream source; WI#582 is the worked example. Record that opencode v1 was checked again and is current
+    - **Spec: proof.** `worker-exposure-policy-guard` and the MR pipeline on the MR; the protected candidate and scan jobs only after the merge
+
+## Phase 9 - Advanced Operator Notes
+
+40. [x] (S) Deploy the stoplight system for IRC
+41. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+42. [x] (S) RESERVED
+43. [x] (S) RESERVED
+44. [x] (S) RESERVED
+45. [x] (S) RESERVED
+46. [x] (S) RESERVED
+47. [x] (S) RESERVED
+48. [x] (S) RESERVED
+49. [x] (S) RESERVED
+50. [x] (S) RESERVED
+51. [x] (S) RESERVED
+52. [x] (S) RESERVED
+53. [x] (S) RESERVED
+54. [x] (S) RESERVED
 
 
 ---
