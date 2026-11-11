@@ -598,6 +598,7 @@ pub(crate) fn build_sidecar_args(
         TunnelProvider::Netbird => {
             args.extend([
                 "--cap-add=NET_RAW".into(),
+                "--cap-add=NET_BIND_SERVICE".into(),
                 "--device".into(),
                 "/dev/net/tun".into(),
             ]);
@@ -2325,6 +2326,7 @@ mod tests {
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
         assert!(joined.contains("--cap-add=NET_RAW"));
+        assert!(joined.contains("--cap-add=NET_BIND_SERVICE"));
         assert!(!joined.contains("SYS_ADMIN"));
         assert!(!joined.contains("--privileged"));
         assert!(!joined.contains("--publish"));
