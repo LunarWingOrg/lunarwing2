@@ -1607,11 +1607,36 @@ async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String>
     Ok(())
 }
 
+async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
+    podman_success(&[
+        "exec",
+        "-d",
+        peer,
+        "sh",
+        "-c",
+        "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nLUNARWING-NETBIRD-OK\\n' | nc -l -p 8080; done",
+    ])
+    .await?;
+    for _ in 0..30 {
+        if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err("the plain-peer HTTP listener never became ready".into())
+}
+
 async fn assert_netbird_joined_run(
     sidecar: &TunnelSidecar,
     image: &str,
     workdir: &Path,
+    peer: &str,
 ) -> Result<(), String> {
+    let peer_ip = netbird_ipv4(peer).await?;
+    start_netbird_http_server(peer).await?;
     let container_id = sidecar
         .ensure_healthy()
         .await
@@ -1623,11 +1648,18 @@ async fn assert_netbird_joined_run(
         timeout: Duration::from_secs(120),
         ..ResourceLimits::default()
     };
+    let command = format!(
+        "cat /proc/net/dev; \
+         wget -qO- -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
+         && echo LUNARWING-NETBIRD-OVERLAY-OK; \
+         wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
+         && echo LUNARWING-NETBIRD-UPLINK-OPEN; \
+         wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
+         && echo LUNARWING-NETBIRD-METADATA-OPEN; true"
+    );
     let output = runner
         .execute(ExecParams {
-            command: "cat /proc/net/dev; \
-                 wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
-                 && echo LUNARWING-NETBIRD-UPLINK-OPEN; true",
+            command: &command,
             working_dir: workdir,
             policy: SandboxPolicy::ReadOnly,
             limits: &limits,
@@ -1646,7 +1678,14 @@ async fn assert_netbird_joined_run(
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
     assert!(output.stdout.contains("wt0"), "joined run has no wt0");
+    assert!(
+        output.stdout.contains("LUNARWING-NETBIRD-OVERLAY-OK"),
+        "peer HTTP fetch failed: {}{}",
+        output.stdout,
+        output.stderr
+    );
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-UPLINK-OPEN"));
+    assert!(!output.stdout.contains("LUNARWING-NETBIRD-METADATA-OPEN"));
     Ok(())
 }
 
@@ -1770,7 +1809,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
         start_plain_netbird_peer(&image, &peer_name, &peer_env).await?;
         assert_netbird_peers_connected(primary.container_name(), &peer_name).await?;
         assert_netbird_mark_rule(&primary).await?;
-        assert_netbird_joined_run(&primary, &image, &workdir).await?;
+        assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
         let primary_volume = netbird_volume(&primary).await?;
         assert_eq!(
             primary_volume,
