@@ -1036,6 +1036,9 @@ if $WITH_LUNARDEPTH; then
     || die "--with-lunardepth requires --lunardepth-base-url and --lunardepth-model"
   [[ -n "$LUNARDEPTH_API_KEY" || "$LUNARDEPTH_ALLOW_PLACEHOLDER" == "true" ]] \
     || die "--with-lunardepth requires --lunardepth-api-key-file or explicit --lunardepth-allow-unauthenticated-gateway"
+  # mt-admin refuses the pair; say so here, before the import has done any work.
+  [[ -z "$LUNARDEPTH_API_KEY" || "$LUNARDEPTH_ALLOW_PLACEHOLDER" != "true" ]] \
+    || die "--lunardepth-api-key-file and --lunardepth-allow-unauthenticated-gateway cannot be combined: no key would be stored"
 fi
 
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"
