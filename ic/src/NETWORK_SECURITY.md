@@ -490,8 +490,14 @@ fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
 read-only with a private SELinux label. Key material never enters argv, joiner
 filesystems/environments, or LunarWing log/error text; the configuration label
 on the container is a salted digest. NetBird's peer identity volume uses a
-separate salted hash of instance, management URL, and setup key only, so image
-or DNS changes do not spend another setup key. After a removal, and only once
+separate salted hash of instance, management URL, and setup key only. Its
+32-byte identity salt is a regular, non-symlink mode-0600 file at
+`<base>/sandbox-tunnel-identity.salt`, inside the base directory already masked
+from sandbox mounts; it is independent of the ephemeral runtime label salt.
+Host reboots, runtime-directory replacement, image changes, and DNS changes do
+not spend another setup key. Upgrading from the former runtime-salted volume
+name causes one deliberate re-enrolment; subsequent URL/key rotation alone
+changes the identity. After a removal, and only once
 the runtime reports the container gone, the deterministic transient helper unit
 is freed: helpers get up to three seconds to exit, and leftovers are signalled
 with `systemctl --user kill` (SIGTERM, then SIGKILL). Ordinary daemon exit does
