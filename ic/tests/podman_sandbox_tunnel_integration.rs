@@ -1857,7 +1857,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
     result.expect("live NetBird connectivity, joined-run, reconnect, identity, and ingress checks");
 }
 
-async fn assert_netbird_custom_dns_joined_run(
+async fn assert_netbird_custom_dns_fails_closed(
     sidecar: &TunnelSidecar,
     image: &str,
     workdir: &Path,
@@ -1880,7 +1880,7 @@ async fn assert_netbird_custom_dns_joined_run(
     let output = runner
         .execute(ExecParams {
             command: "cat /etc/resolv.conf; \
-                 nslookup www.example.com >/dev/null 2>&1 \
+                 nslookup www.example.com 2>&1 \
                  && echo LUNARWING-NETBIRD-CUSTOM-DNS-OK; true",
             working_dir: workdir,
             policy: SandboxPolicy::ReadOnly,
@@ -1900,8 +1900,14 @@ async fn assert_netbird_custom_dns_joined_run(
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
     assert!(
-        output.stdout.contains("LUNARWING-NETBIRD-CUSTOM-DNS-OK"),
-        "custom NetBird DNS lookup failed: {}{}",
+        !output.stdout.contains("LUNARWING-NETBIRD-CUSTOM-DNS-OK"),
+        "custom NetBird DNS unexpectedly resolved; update the WI#603 contract: {}{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("SERVFAIL"),
+        "NetBird did not return its expected upstream-blocked SERVFAIL: {}{}",
         output.stdout,
         output.stderr
     );
@@ -1993,11 +1999,11 @@ async fn podman_tunnel_sidecar_netbird_custom_dns_live() {
             !listing.contains("dport 53"),
             "custom DNS retained an uplink resolver rule:\n{listing}"
         );
-        assert_netbird_custom_dns_joined_run(&primary, &image, &workdir, resolver).await
+        assert_netbird_custom_dns_fails_closed(&primary, &image, &workdir, resolver).await
     }
     .await;
     primary.stop().await;
     remove_netbird_volumes(&volume_prefix).await;
     let _ = std::fs::remove_dir_all(&workdir);
-    result.expect("live NetBird custom-DNS resolution and identity checks");
+    result.expect("live NetBird custom-DNS fail-closed and identity checks");
 }
