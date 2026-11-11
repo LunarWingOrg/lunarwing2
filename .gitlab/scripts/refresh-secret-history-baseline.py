@@ -23,7 +23,7 @@ HEADER = """# WI#590 / WI#575: reviewed Gitleaks v8.30.1 historical findings.
 @dataclasses.dataclass(frozen=True)
 class RefreshPlan:
     pinned: list[str]
-    vendor: set[str]
+    accepted_vendor: set[str]
     accepted: set[str]
     unclassified: set[str]
     pending: set[str]
@@ -107,19 +107,17 @@ def plan_refresh(
         raise ValueError("a pending fingerprint is already present in the baseline")
     candidates = set(scanned) - existing
     blocked = candidates & pending
-    vendor = {
+    approved = (candidates - blocked) & accepted
+    accepted_vendor = {
         fingerprint
-        for fingerprint in candidates - blocked
+        for fingerprint in approved
         if fingerprint_path(fingerprint).startswith("ic/vendor/")
     }
-    non_vendor = candidates - blocked - vendor
-    approved = non_vendor & accepted
-    unclassified = non_vendor - accepted
     return RefreshPlan(
-        pinned=sorted(existing | vendor | approved),
-        vendor=vendor,
-        accepted=approved,
-        unclassified=unclassified,
+        pinned=sorted(existing | approved),
+        accepted_vendor=accepted_vendor,
+        accepted=approved - accepted_vendor,
+        unclassified=candidates - blocked - accepted,
         pending=blocked,
         refused=blocked & accepted,
     )
@@ -177,16 +175,18 @@ def scan(repo: pathlib.Path, command: list[str]) -> list[str]:
 
 def print_refresh(plan: RefreshPlan, output: pathlib.Path) -> None:
     print(f"wrote {len(plan.pinned)} exact historical fingerprints to {output}")
-    for crate in sorted({vendor_crate(fingerprint) for fingerprint in plan.vendor}):
-        print(f"new vendor fingerprints for {crate}:")
+    for crate in sorted({vendor_crate(fingerprint) for fingerprint in plan.accepted_vendor}):
+        print(f"accepted classified vendor fingerprints for {crate}:")
         for fingerprint in sorted(
-            fingerprint for fingerprint in plan.vendor if vendor_crate(fingerprint) == crate
+            fingerprint
+            for fingerprint in plan.accepted_vendor
+            if vendor_crate(fingerprint) == crate
         ):
             print(f"  {fingerprint}")
     for fingerprint in sorted(plan.accepted):
         print(f"accepted classified non-vendor fingerprint: {fingerprint}")
     for fingerprint in sorted(plan.unclassified):
-        print(f"unclassified non-vendor fingerprint not pinned: {fingerprint}", file=sys.stderr)
+        print(f"unclassified fingerprint not pinned: {fingerprint}", file=sys.stderr)
     for fingerprint in sorted(plan.pending - plan.refused):
         print(f"pending fingerprint left unpinned: {fingerprint}", file=sys.stderr)
     for fingerprint in sorted(plan.refused):
