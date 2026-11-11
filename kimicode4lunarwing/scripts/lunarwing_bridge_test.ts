@@ -12,14 +12,35 @@ import { SUBPROTOCOL } from "./lunarwing_runtime.js"
 import { TaskRunner } from "./task_runner.js"
 
 const bridgePath = fileURLToPath(new URL("./lunarwing_bridge.js", import.meta.url))
+const WAIT_TIMEOUT_MS = 10_000
+
+async function withTimeout<T>(wait: Promise<T>, description: string, timeoutMs = WAIT_TIMEOUT_MS): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      wait,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
 
 async function freePort(): Promise<number> {
   const server = createServer()
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  await withTimeout(
+    new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)),
+    "the ephemeral port listener",
+  )
   const address = server.address()
   assert.ok(address && typeof address !== "string")
   const port = address.port
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  await withTimeout(
+    new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+    "the ephemeral port listener to close",
+  )
   return port
 }
 
@@ -66,7 +87,7 @@ async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> 
       const escalate = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS)
       escalate.unref()
       try {
-        await exited
+        await withTimeout(exited, "the bridge process to exit", KILL_GRACE_MS + WAIT_TIMEOUT_MS)
       } finally {
         clearTimeout(escalate)
       }
@@ -79,7 +100,7 @@ async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> 
 }
 
 async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+  await withTimeout(new Promise<void>((resolve, reject) => {
     let output = ""
     child.stdout.on("data", (chunk: Buffer) => {
       output += chunk.toString("utf8")
@@ -87,17 +108,33 @@ async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<
     })
     child.once("exit", (code) => reject(new Error(`bridge exited before listening: ${code}`)))
     child.once("error", reject)
-  })
+  }), "the bridge listening announcement")
 }
 
 async function connect(port: number, token: string): Promise<WebSocket> {
-  return await new Promise<WebSocket>((resolve, reject) => {
+  return await withTimeout(new Promise<WebSocket>((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/agent`, SUBPROTOCOL, {
       headers: { Authorization: `Bearer ${token}` },
     })
     ws.once("open", () => resolve(ws))
     ws.once("error", reject)
-  })
+  }), `WebSocket open on port ${port}`)
+}
+
+async function connectWithFirstMessage(
+  port: number,
+  token: string,
+): Promise<{ ws: WebSocket; firstMessage: Promise<Record<string, unknown>> }> {
+  return await withTimeout(new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/agent`, SUBPROTOCOL, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    const firstMessage = new Promise<Record<string, unknown>>((resolveMessage) => {
+      ws.once("message", (data) => resolveMessage(JSON.parse(data.toString())))
+    })
+    ws.once("open", () => resolve({ ws, firstMessage }))
+    ws.once("error", reject)
+  }), `WebSocket open on port ${port}`)
 }
 
 test("bridge requires token and rejects wrong bearer before upgrade", async () => {
@@ -106,11 +143,8 @@ test("bridge requires token and rejects wrong bearer before upgrade", async () =
   try {
     await waitForListening(child)
     await assert.rejects(connect(port, "wrong-token"), /401/)
-    const ws = await connect(port, "correct-token")
-    const ready = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      ws.once("message", (data) => resolve(JSON.parse(data.toString())))
-      ws.once("error", reject)
-    })
+    const { ws, firstMessage } = await connectWithFirstMessage(port, "correct-token")
+    const ready = await withTimeout(firstMessage, "the bridge ready message")
     assert.equal(ready.type, "ready")
     ws.close()
   } finally {
@@ -120,10 +154,10 @@ test("bridge requires token and rejects wrong bearer before upgrade", async () =
 
 test("bridge server mode refuses empty auth token", async () => {
   const child = startBridge(await freePort(), "")
-  const code = await new Promise<number | null>((resolve, reject) => {
+  const code = await withTimeout(new Promise<number | null>((resolve, reject) => {
     child.once("exit", resolve)
     child.once("error", reject)
-  })
+  }), "the bridge to reject an empty auth token")
   assert.notEqual(code, 0)
 })
 
