@@ -188,15 +188,20 @@ export class BridgeServer {
     if (this.closing) return
     this.closing = true
     this.active?.controller.abort()
-    for (const connection of this.connections) connection.close()
-    this.webSockets.close()
+    await Promise.all([...this.connections].map(connection => connection.close()))
+    await new Promise<void>(resolve => this.webSockets.close(() => resolve()))
     await new Promise<void>(resolve => this.http.close(() => resolve()))
     this.publishState()
   }
 }
 
 class HubConnection {
+  readonly closed: Promise<void>
+  private resolveClosed: (() => void) | undefined
+
   constructor(private readonly socket: WebSocket, private readonly owner: BridgeServer) {
+    this.closed = new Promise<void>(resolve => { this.resolveClosed = resolve })
+    socket.once("close", () => this.resolveClosed?.())
     socket.on("message", (data, isBinary) => this.receive(data, isBinary))
     socket.on("error", () => socket.terminate())
     this.send("ready", {
@@ -234,8 +239,9 @@ class HubConnection {
     }
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.socket.close(1001, "worker shutting down")
+    await this.closed
   }
 }
 
