@@ -4,31 +4,35 @@ Supervised mode is LunarWing's human-in-the-loop setting for tool execution. Whe
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** `AGENT_SUPERVISED_MODE`
-in the daemon's process environment is the working switch: the bridge router
-reads it when it creates a foreground thread. The `--supervised` CLI flag does
-**not** enable supervised mode at this revision (see below). Where it applies,
-supervised mode takes precedence over global auto-approval.
+**Revalidated against source 2026-11-11 (v2.2.0.0).** The `--supervised` CLI
+flag and `AGENT_SUPERVISED_MODE` are resolved once at startup; either source can
+enable supervised mode. Where it applies, supervised mode takes precedence over
+global auto-approval.
 
 ## Enable It
 
-Set the value in the daemon's process environment:
+Start the daemon with the CLI flag:
+
+```bash
+lunarwing --supervised
+```
+
+Alternatively, set the value in the daemon's environment:
 
 ```bash
 AGENT_SUPERVISED_MODE=true lunarwing
 ```
 
-`true`, `1`, `yes` and `on` are accepted. For a service, set it in the service
-environment so it persists across restarts. A `.env` file in the daemon's
-working directory or in the LunarWing base directory also works, because both
-are loaded into the process environment at startup.
+The case-insensitive truthy spellings are `true`, `1`, `yes` and `on`; `false`,
+`0`, `no` and `off` explicitly disable the environment contribution. Values are
+trimmed before parsing. Any other non-empty value is a startup error naming
+`AGENT_SUPERVISED_MODE`, never a silent disable. `--supervised` still enables
+supervision when the environment contains a false value.
 
-> **Known defect: `lunarwing --supervised` has no effect.** The flag stores an
-> in-process configuration override (`set_runtime_env` in `ic/src/main.rs`), but
-> the bridge router reads the process environment (`std::env::var` in
-> `ic/src/bridge/router.rs`), and nothing copies the override there. A daemon
-> started with only the flag is not supervised, and it logs no warning. Use the
-> environment variable until the flag is fixed.
+For a service, set the environment value in the service definition so it
+persists across restarts. A `.env` file in the daemon's working directory or in
+the LunarWing base directory also works. Startup logs whether supervision is on
+and whether the CLI, environment, or both enabled it.
 
 ## Scope
 
@@ -42,7 +46,7 @@ are loaded into the process environment at startup.
 
 ## Behavior
 
-- New Engine V2 foreground thread configuration is marked `supervised_mode` when `AGENT_SUPERVISED_MODE` is `true`, `1`, `yes` or `on` in the process environment.
+- New Engine V2 foreground thread configuration is marked `supervised_mode` when the startup-resolved CLI or environment setting enables supervision.
 - Every tool action such a thread proposes is sent through the approval path, including tools whose normal policy would not require approval.
 - Supervised mode takes precedence over global auto-approve behavior.
 - Approving an action authorizes that resolved action; it does not disable supervised mode for later actions.

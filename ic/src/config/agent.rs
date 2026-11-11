@@ -1,8 +1,44 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::config::helpers::{parse_bool_env, parse_option_env, parse_optional_env};
+use crate::config::helpers::{
+    parse_bool_env, parse_option_env, parse_optional_env, runtime_env_override,
+};
 use crate::error::ConfigError;
 use crate::settings::Settings;
+
+const SUPERVISED_MODE_ENV_KEY: &str = "AGENT_SUPERVISED_MODE";
+static CLI_SUPERVISED_MODE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SupervisedModeSource {
+    #[default]
+    Disabled,
+    Cli,
+    Environment,
+    Both,
+}
+
+impl SupervisedModeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Cli => "cli",
+            Self::Environment => "env",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupervisedModeConfig {
+    pub enabled: bool,
+    pub source: SupervisedModeSource,
+}
+
+pub(crate) fn set_supervised_cli_override(enabled: bool) {
+    CLI_SUPERVISED_MODE.store(enabled, Ordering::Relaxed);
+}
 
 /// Agent behavior configuration.
 #[derive(Debug, Clone)]
@@ -31,6 +67,8 @@ pub struct AgentConfig {
     pub max_tool_iterations: usize,
     /// When true, skip tool approval checks entirely. For benchmarks/CI.
     pub auto_approve_tools: bool,
+    /// Resolve once at startup; CLI supervision wins over either false env layer.
+    pub supervised_mode: SupervisedModeConfig,
     /// Default timezone for new sessions (IANA name, e.g. "America/New_York").
     pub default_timezone: String,
     /// Maximum tokens per job (0 = unlimited).
@@ -211,6 +249,7 @@ impl AgentConfig {
             max_actions_per_hour: None,
             max_tool_iterations: 10,
             auto_approve_tools: true,
+            supervised_mode: SupervisedModeConfig::default(),
             default_timezone: "UTC".to_string(),
             max_tokens_per_job: 0,
             handle_message_timeout: Duration::from_secs(
@@ -271,6 +310,7 @@ impl AgentConfig {
                 "AGENT_AUTO_APPROVE_TOOLS",
                 settings.agent.auto_approve_tools,
             )?,
+            supervised_mode: supervised_mode_requested()?,
             default_timezone: {
                 let tz: String = parse_optional_env(
                     "DEFAULT_TIMEZONE",
@@ -325,6 +365,65 @@ impl AgentConfig {
             },
         })
     }
+}
+
+fn parse_supervised_mode_value(value: &str) -> Result<Option<bool>, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(ConfigError::InvalidValue {
+            key: SUPERVISED_MODE_ENV_KEY.into(),
+            message: "expected one of 1, true, yes, on, 0, false, no, or off".into(),
+        }),
+    }
+}
+
+fn resolve_supervised_mode_sources(
+    cli_requested: bool,
+    runtime_value: Option<&str>,
+    environment_value: Option<&str>,
+) -> Result<SupervisedModeConfig, ConfigError> {
+    let runtime_enabled = runtime_value
+        .map(parse_supervised_mode_value)
+        .transpose()?
+        .flatten()
+        .unwrap_or(false);
+    let process_enabled = environment_value
+        .map(parse_supervised_mode_value)
+        .transpose()?
+        .flatten()
+        .unwrap_or(false);
+    let environment_enabled = runtime_enabled || process_enabled;
+    let source = match (cli_requested, environment_enabled) {
+        (false, false) => SupervisedModeSource::Disabled,
+        (true, false) => SupervisedModeSource::Cli,
+        (false, true) => SupervisedModeSource::Environment,
+        (true, true) => SupervisedModeSource::Both,
+    };
+    Ok(SupervisedModeConfig {
+        enabled: cli_requested || environment_enabled,
+        source,
+    })
+}
+
+fn supervised_mode_requested() -> Result<SupervisedModeConfig, ConfigError> {
+    let runtime_value = runtime_env_override(SUPERVISED_MODE_ENV_KEY);
+    let environment_value = match std::env::var(SUPERVISED_MODE_ENV_KEY) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidValue {
+                key: SUPERVISED_MODE_ENV_KEY.into(),
+                message: "must contain valid Unicode".into(),
+            });
+        }
+    };
+    resolve_supervised_mode_sources(
+        CLI_SUPERVISED_MODE.load(Ordering::Relaxed),
+        runtime_value.as_deref(),
+        environment_value.as_deref(),
+    )
 }
 
 /// Diagnose misspelled agent settings without treating unrelated service or
@@ -383,6 +482,70 @@ mod tests {
             ),
             "AgentConfig::for_testing drifted from the production handle_message_timeout default"
         );
+    }
+
+    #[test]
+    fn supervised_mode_resolver_combines_sources_and_cli_wins() {
+        let cli_only = resolve_supervised_mode_sources(true, None, None).expect("CLI only");
+        assert!(cli_only.enabled);
+        assert_eq!(cli_only.source, SupervisedModeSource::Cli);
+
+        let override_only =
+            resolve_supervised_mode_sources(false, Some("true"), None).expect("override only");
+        assert!(override_only.enabled);
+        assert_eq!(override_only.source, SupervisedModeSource::Environment);
+
+        let environment_only =
+            resolve_supervised_mode_sources(false, None, Some("on")).expect("environment only");
+        assert!(environment_only.enabled);
+        assert_eq!(environment_only.source, SupervisedModeSource::Environment);
+
+        let both = resolve_supervised_mode_sources(true, None, Some("true")).expect("both");
+        assert!(both.enabled);
+        assert_eq!(both.source, SupervisedModeSource::Both);
+
+        for (runtime, environment) in [(Some("false"), None), (None, Some("false"))] {
+            let resolved =
+                resolve_supervised_mode_sources(true, runtime, environment).expect("false env");
+            assert!(resolved.enabled, "CLI must outrank a false environment");
+            assert_eq!(resolved.source, SupervisedModeSource::Cli);
+        }
+    }
+
+    #[test]
+    fn supervised_mode_resolver_accepts_trimmed_boolean_spellings() {
+        for value in ["1", "true", "yes", "on", " TRUE ", "On"] {
+            for (runtime, environment) in [(Some(value), None), (None, Some(value))] {
+                assert!(
+                    resolve_supervised_mode_sources(false, runtime, environment)
+                        .expect("truthy value")
+                        .enabled,
+                    "{value:?} must enable supervision"
+                );
+            }
+        }
+        for value in ["0", "false", "no", "off", " FALSE ", ""] {
+            for (runtime, environment) in [(Some(value), None), (None, Some(value))] {
+                assert!(
+                    !resolve_supervised_mode_sources(false, runtime, environment)
+                        .expect("falsey value")
+                        .enabled,
+                    "{value:?} must not enable supervision"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supervised_mode_resolver_rejects_unrecognized_values() {
+        for (runtime, environment) in [(Some("enabled"), None), (None, Some("y"))] {
+            let error = resolve_supervised_mode_sources(true, runtime, environment)
+                .expect_err("invalid values must fail even when CLI supervision is on");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidValue { key, .. } if key == SUPERVISED_MODE_ENV_KEY
+            ));
+        }
     }
 
     #[test]

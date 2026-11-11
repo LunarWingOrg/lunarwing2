@@ -100,7 +100,7 @@ shared-conversation restrictions, and supervised mode still apply. Unknown
 `AGENT_*` / `AUTO_APPROVE_*` keys produce a warning containing only the key name,
 so a misspelled approval setting does not silently look enabled.
 
-Supervised mode (`AGENT_SUPERVISED_MODE=true` in the daemon's process environment) takes precedence and gates every tool action of an Engine V2 foreground thread. The `--supervised` CLI flag has no effect at this revision; see `docs/guides/human-delay-mode.md` for the defect and the scope.
+Supervised mode (`lunarwing --supervised` or `AGENT_SUPERVISED_MODE=true` in the daemon's environment) takes precedence and gates every tool action of an Engine V2 foreground thread. The CLI flag still enables supervision when the environment contains a false value; see `docs/guides/human-delay-mode.md` for parsing and scope.
 
 ## Recommended Profiles
 
