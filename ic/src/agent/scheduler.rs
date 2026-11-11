@@ -802,6 +802,7 @@ mod tests {
             max_actions_per_hour: None,
             max_tool_iterations: 10,
             auto_approve_tools: true,
+            supervised_mode: crate::config::SupervisedModeConfig::default(),
             default_timezone: "UTC".to_string(),
             max_tokens_per_job,
             // WI#380: derive from the production settings default so this
