@@ -56,19 +56,24 @@ RUN set -eu; \
     test "$(pnpm --version)" = "11.7.0"; \
     node /src/scripts/check-toolchain.mjs
 
-COPY scripts/prepare_lockfile_deploy.py scripts/verify_deployed_closure.ts /build/scripts/
+COPY scripts/prepare_lockfile_deploy.py /build/scripts/
 RUN python3 /build/scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts
 
 WORKDIR /src/deepseek-harness
 RUN set -eu; \
     before="$(sha256sum pnpm-lock.yaml)"; \
-    workspace_before="$(sha256sum pnpm-workspace.yaml)"; \
     pnpm install --frozen-lockfile; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
     pnpm exec tsx native/system/scripts/build.ts; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
-    pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false; \
+    pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false
+
+COPY scripts/deploy_build_approval.py scripts/verify_deployed_closure.ts /build/scripts/
+RUN set -eu; \
+    workspace_before="$(sha256sum pnpm-workspace.yaml)"; \
+    python3 /build/scripts/deploy_build_approval.py add pnpm-workspace.yaml /src/deepseek-harness; \
     pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
+    python3 /build/scripts/deploy_build_approval.py remove pnpm-workspace.yaml /src/deepseek-harness; \
     test "$workspace_before" = "$(sha256sum pnpm-workspace.yaml)"; \
     pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth > /build/deployed-packages.sha256; \
     sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
