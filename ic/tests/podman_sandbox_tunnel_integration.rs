@@ -1565,11 +1565,11 @@ async fn assert_netbird_restart_identity(
 
 async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String> {
     let name = sidecar.container_name();
-    if let Some(server) = std::env::var("LUNARWING_E2E_NETBIRD_SERVER_CONTAINER")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        podman_success(&["restart", &server]).await?;
+    let servers = std::env::var("LUNARWING_E2E_NETBIRD_SERVER_CONTAINER").unwrap_or_default();
+    let mut restart = vec!["restart"];
+    restart.extend(servers.split_whitespace());
+    if restart.len() > 1 {
+        podman_success(&restart).await?;
     } else {
         podman_success(&["exec", name, "netbird", "down"]).await?;
         podman_success(&["exec", name, "netbird", "up"]).await?;
