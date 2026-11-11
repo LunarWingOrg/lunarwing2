@@ -166,10 +166,9 @@ RUN set -eu; \
       ! -name 'smoke_test.ts' ! -name 'smoke_test.js' ! -name 'smoke_test.py' -delete; \
     rm -f /app/scripts/tsconfig.json /app/scripts/package-lock.json; \
     rm -rf /app/scripts/__pycache__; \
-    find /app /opt/lunardepth /opt/lunardepth-templates -type d -exec chmod 0555 {} +; \
-    find /app /opt/lunardepth /opt/lunardepth-templates -type f -exec chmod 0444 {} +; \
-    find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 0555 {} +; \
-    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+    /bin/bash /app/scripts/harden_image_modes.sh /app /opt/lunardepth /opt/lunardepth-templates; \
+    find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 00555 {} +; \
+    chmod 00555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
       /app/scripts/render_overlay.py /app/scripts/*.sh /usr/local/bin/dsh; \
     test -x /app/entrypoint.sh; \
     test -x /app/entrypoint-split.sh; \
@@ -178,7 +177,7 @@ RUN set -eu; \
     install -d -o lunardepth -g lunardepth -m 2711 /run/lunarwing-shared/runner; \
     install -d -o root -g root -m 0555 /run/lunardepth-launch /run/lunardepth-config /home/lunardepth-home; \
     install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh /run/lunardepth-state /workspace; \
-    test -z "$(find -L /app /opt/lunardepth /opt/lunardepth-templates \( ! -uid 0 -o -perm /222 \) -print)"
+    test -z "$(find -L /app /opt/lunardepth /opt/lunardepth-templates \( ! -uid 0 -o -perm /6222 \) -print)"
 
 ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
     LUNARDEPTH_IMAGE_VERSION="0.2.1-alpha.1" \
