@@ -28,7 +28,7 @@ RUN set -eu; \
     timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
     dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 2.6.2; \
     timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
-      git python3 make g++ ca-certificates bubblewrap util-linux; \
+      git python3 make g++ musl-tools ca-certificates bubblewrap util-linux; \
     update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -60,10 +60,13 @@ RUN set -eu; \
     before="$(sha256sum pnpm-lock.yaml)"; \
     pnpm install --frozen-lockfile; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
-    pnpm run build:native-system; \
+    pnpm exec tsx native/system/scripts/build.ts; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
     pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false; \
-    pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth
+    pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
+    landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
+    test -x "$landlock"; \
+    "$landlock" --probe | grep -q 'fully enforced'
 
 WORKDIR /build
 COPY scripts/package.json scripts/package-lock.json scripts/tsconfig.json ./scripts/
@@ -72,6 +75,7 @@ COPY scripts/*.py ./scripts/
 COPY scripts/*.sh ./scripts/
 COPY config/ ./config/
 COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY AGENTS.md README.md Dockerfile docker-compose.yml .env.example ./
 WORKDIR /build/scripts
 RUN set -eu; \
     npm ci --ignore-scripts; \
@@ -158,11 +162,14 @@ COPY scripts/dsh-exposure-guard.sh /usr/local/bin/dsh
 RUN set -eu; \
     rm -f /app/scripts/*_test.ts /app/scripts/*_test.js /app/scripts/*_test.py /app/scripts/tsconfig.json /app/scripts/package-lock.json; \
     rm -rf /app/scripts/__pycache__; \
-    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py /usr/local/bin/dsh; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type d -exec chmod 0555 {} +; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type f -exec chmod 0444 {} +; \
     find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 0555 {} +; \
-    chmod 0555 /app/scripts/render_overlay.py /app/scripts/*.sh; \
+    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+      /app/scripts/render_overlay.py /app/scripts/*.sh /usr/local/bin/dsh; \
+    test -x /app/entrypoint.sh; \
+    test -x /app/entrypoint-split.sh; \
+    test -x /app/entrypoint-task-setup.sh; \
     install -d -o root -g lunardepth -m 3770 /run/lunarwing-shared; \
     install -d -o lunardepth -g lunardepth -m 2711 /run/lunarwing-shared/runner; \
     install -d -o root -g root -m 0555 /run/lunardepth-launch /run/lunardepth-config /home/lunardepth-home; \
