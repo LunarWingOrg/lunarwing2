@@ -31,7 +31,8 @@ its firewall is ready.
 lunarwing-sandbox-tunnel-<instance> (daemon-owned, long-lived)
   NetBird `up` or `wg-quick up`
   own netns, no published ports, no host networking
-  CAP_DROP=ALL + CAP_NET_ADMIN, no-new-privileges, read-only rootfs
+  CAP_DROP=ALL + CAP_NET_ADMIN (+ NET_RAW/NET_BIND_SERVICE for NetBird)
+  no-new-privileges, read-only rootfs
   nft input policy=drop; loopback + established/related return traffic only
                          │ shares network namespace only
 lunarwing-sandbox-<uuid> (one command)
@@ -92,14 +93,18 @@ chain, an extra accept (with or without a comment), or a changed policy fails
 closed. Without custom DNS, the runtime resolvers remain a low-bandwidth,
 query-based exfiltration channel; `SANDBOX_TUNNEL_DNS` removes that direct
 channel for both joiners and the sidecar itself. Bootstrap DNS still works, but
-post-start sidecar lookups have no unmarked uplink path. NetBird with custom
-joined-run DNS is therefore expected to lose hostname reconnects; WI#603 keeps
-the required live measurement and the choice among static control-plane hosts,
-sidecar-only cgroup DNS, or an enforced unsupported combination open. Until
-that investigation finishes, NetBird uses default runtime DNS. Its local DNS
-listener could also forward upstream on marked sockets; that provider-specific
-residual and all other live NetBird interoperability validation remain open in
-WI#600 rather than being claimed closed here.
+post-start sidecar lookups have no unmarked uplink path. NetBird's own firewall
+is disabled with `NB_DISABLE_FIREWALL=true`: its 0.82.0 interface allower would
+otherwise insert and continually reapply an `iifname "wt0" accept` in this exact
+input chain. Advanced routing and its socket marks remain active.
+
+The WI#600 live run measured NetBird's local resolver on the sidecar's overlay
+IP. Its upstream writes are unmarked and fail with `operation not permitted`,
+so the joined lookup returns `SERVFAIL` and no query reaches the uplink. Custom
+NetBird DNS is unsupported; WI#603 retains the reconnect investigation and the
+choice among static control-plane hosts, sidecar-only cgroup DNS, or explicit
+unsupported-combination enforcement. Default runtime DNS remains the supported
+configuration.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -204,7 +209,7 @@ receive the setup key or private key.
 |------|---------|-------------|
 | `none` (default off Linux) | no egress | kernel `--network none` |
 | `proxy-enforced` (WI#537 Linux default) | public web through domain allowlist | network-none + Unix relay + public-only proxy; no credential injection |
-| `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs plus default runtime DNS; NetBird live interoperability remains unvalidated in WI#600 |
+| `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs plus default runtime DNS; core NetBird 0.82.0 behavior is live-validated, custom DNS fails closed in WI#603 |
 | `proxy` (legacy) | public web through env-var proxy | advisory only |
 
 A full-route WireGuard config (`AllowedIPs = 0.0.0.0/0`, plus IPv6 where used) or
@@ -212,7 +217,8 @@ NetBird default route sends all outbound traffic through the overlay. A split
 tunnel reaches only its overlay CIDRs: the sidecar's pasta/slirp uplink is
 closed to joined commands by the output chain in both cases, except by default
 for DNS to the runtime resolvers. `SANDBOX_TUNNEL_DNS` removes that direct
-exception; NetBird local-DNS forwarding remains a WI#600 measurement.
+exception, and the WI#600 run confirmed that NetBird's unmarked upstream DNS
+writes fail closed rather than leaking queries.
 Neither shape is equivalent to the public-only proxy
 allowlist; what is reachable is decided by the tunnel's routes and the overlay's
 ACLs, never by the host's network position.
@@ -232,9 +238,11 @@ provide `nft` and the provider health tools.
 - NetBird: the default is NetBird 0.82.0 at OCI index digest
   `sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965`.
   The image needs an upstream-compatible `netbird` entrypoint, `/dev/net/tun`,
-  `NET_ADMIN`, and an HTTPS management URL. Only `NET_ADMIN` is added; images
-  requiring `SYS_ADMIN`/other capabilities for optional eBPF features are not
-  silently granted them and fail their health gate instead.
+  and an HTTPS management URL. `NET_ADMIN` supports advanced routing,
+  `NET_RAW` its raw sockets, and `NET_BIND_SERVICE` its local resolver on port
+  53; all three and only those additions are granted. `SYS_ADMIN` and other
+  capabilities for optional eBPF features are not silently granted and fail
+  their health gate instead.
 - WireGuard: `wg-quick`, `wg`, `ip`, `/bin/sh`, and `sleep`; `ping` is also
   required when the optional canary is configured, and `DNS =` needs
   `openresolv`. The host kernel's WireGuard module must already be loaded. The
@@ -276,9 +284,15 @@ The separately gated NetBird lane requires all three podman/tunnel/NetBird
 gates, `LUNARWING_E2E_NETBIRD_IMAGE`,
 `LUNARWING_E2E_NETBIRD_MANAGEMENT_URL`, and
 `LUNARWING_E2E_NETBIRD_SETUP_KEY_FILE`. It starts a plain second peer from the
-same reusable key and checks detailed peer connectivity, a joined run, the exact
-mark rule, startup health, management reconnect, stable peer identity, and
-ingress refusal with a proven-live listener. Revoke the throwaway peers after
-the run. No live NetBird run or CI execution is claimed here: WI#600 owns the
-live evidence, local-DNS uplink capture, teardown, and any future podman-capable
-CI job. A skip without external settings is not a live-validation pass.
+same reusable key and checks detailed peer connectivity, peer-hosted HTTP and
+public-IP/metadata denial, the exact mark rule, startup health, management
+restart with a post-reconnect joined run, stable peer identity, and ingress
+refusal with a proven-live listener. The custom-DNS lane learns the sidecar's
+overlay resolver IP and requires the measured upstream-blocked `SERVFAIL`.
+
+WI#600's 2026-11-11 live run passed both lanes against NetBird 0.82.0 and used
+uplink packet captures to distinguish control-plane, DNS and encrypted peer UDP
+from forbidden destinations. Throwaway peers and credentials must be revoked
+and removed afterward. Any future podman-capable CI job remains open; a skip
+without external settings is not a live-validation pass, and no public-cloud or
+CI execution is claimed.
