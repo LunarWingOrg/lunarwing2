@@ -153,7 +153,7 @@ export class BridgeServer {
     let result: TaskResult
     try {
       result = await delegateTaskToRunner(this.options.runnerSocket, request,
-        progress => active.connection.send("task_progress", progress), active.controller.signal)
+        progress => active.connection.send("task_progress", { ...progress }), active.controller.signal)
       if (active.cancelRequested && result.status === "error") result = { ...result, status: "cancelled" }
     } catch (error) {
       result = errorResult(request.task_id, error, active.cancelRequested ? "cancelled" : "error")
