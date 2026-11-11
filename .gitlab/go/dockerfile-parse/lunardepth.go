@@ -81,6 +81,7 @@ func lunardepthInputPolicy(lines []parsedLine, text string) error {
 		"grep -q 'tensormoon' /src/deepseek-harness/packages/bundle/base/cordis.patch.yml",
 		"pnpm exec tsx native/system/scripts/build.ts",
 		"build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth",
+		"sed -i '/^  \"prunedAt\":/d' /opt/lunardepth/node_modules/.modules.yaml",
 		"profile_template.js /opt/lunardepth /opt/lunardepth-templates",
 		"test -x /app/entrypoint-task-setup.sh",
 		"test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /222 \\) -print)\"",

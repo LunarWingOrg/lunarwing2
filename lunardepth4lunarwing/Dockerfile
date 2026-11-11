@@ -65,6 +65,7 @@ RUN set -eu; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
     pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false; \
     pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
+    sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
     landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
     test -x "$landlock"; \
     "$landlock" --probe | grep -q 'fully enforced'

@@ -143,7 +143,10 @@ build_lunardepth_worker() {
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
   [[ -d "$lane_dir" ]] || die "LunarDepth worker dir not found at $lane_dir"
   opencode2_builder_supported || die "${OPENCODE2_BUILDER_FLOOR_PROBLEM/opencode2/LunarDepth}"
-  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
+  local source_date_epoch
+  source_date_epoch="$(git -C "$LUNARWING_ROOT" show -s --format=%ct "$source_revision" 2>/dev/null || printf '0')"
+  [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || die "invalid LunarDepth source commit timestamp"
+  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision" --build-arg "SOURCE_DATE_EPOCH=$source_date_epoch")
   local -a cache_args=() toolchain_args=()
   [[ "$no_cache" != "true" ]] || cache_args=(--no-cache)
   [[ "$with_toolchains" != "true" ]] || toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
@@ -155,7 +158,7 @@ build_lunardepth_worker() {
     local -a layer_args=()
     [[ "$no_cache" != "true" ]] || layer_args=(--layers=false)
     podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \
-      --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$lane_dir" \
+      --network=host --format docker --timestamp "$source_date_epoch" "${identity_args[@]}" -t "$candidate_tag" "$lane_dir" \
       || { rm -f "$iid_file"; die "LunarDepth worker image build failed"; }
   else
     DOCKER_BUILDKIT=1 docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" \

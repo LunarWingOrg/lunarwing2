@@ -51,6 +51,7 @@ def source_policy(root: Path) -> None:
         "LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
         "LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned", "DEBIAN_SNAPSHOT=20261105T082236Z",
         "build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth", "profile_template.js",
+        "sed -i '/^  \"prunedAt\":/d' /opt/lunardepth/node_modules/.modules.yaml",
         "musl-tools", "pnpm exec tsx native/system/scripts/build.ts", "--probe | grep -q 'fully enforced'",
         "RUN --network=none set -eu", "USER 10005:10005",
     ], "Dockerfile")
