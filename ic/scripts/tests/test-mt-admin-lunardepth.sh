@@ -42,12 +42,7 @@ checksum="$(sha256sum "$registry")"
 PORTS_REGISTRY="$registry" bash "$SCRIPT_DIR/migrate-ports-v18.sh" >/dev/null
 [[ "$checksum" == "$(sha256sum "$registry")" ]]
 
-checksum="$(sha256sum "$registry")"
-if LUNARDEPTH_RANGE_START=10000 PORTS_REGISTRY="$registry" bash "$SCRIPT_DIR/migrate-ports-v18.sh" >/dev/null 2>&1; then
-  echo "collision migration unexpectedly succeeded" >&2
-  exit 1
-fi
-# v18 is already current, so the start override is deliberately a no-op. Force a fresh v17 candidate.
+# Force a fresh v17 candidate whose custom range collides with existing assignments.
 jq '.version = 17 | del(.lunardepth_range, .lunardepth_block_size) | .tenants.demo |= del(.lunardepth_base, .lunardepth_ports)' "$registry" >"$TMP/v17.json"
 cp "$TMP/v17.json" "$registry"
 checksum="$(sha256sum "$registry")"
