@@ -1,4 +1,4 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#602, and WI#604).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#602, WI#604, and WI#614).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
@@ -569,6 +569,121 @@ async fn exercise_sidecar(
         recreate_and_verify(sidecar, &clean_id, dns.is_empty()).await?;
     }
     Ok(())
+}
+
+fn complete_firewall_listing(listing: &str) -> bool {
+    let required = [
+        "chain input {",
+        "type filter hook input priority",
+        "ct state established,related accept",
+        "chain output {",
+        "type filter hook output priority",
+        "oifname \"wg0\" accept",
+        "ip daddr 169.254.0.0/16 drop",
+        "dport 53",
+    ];
+    let has_mark = [
+        "meta mark 0x00004c57 accept",
+        "mark 0x00004c57 accept",
+        "meta mark 0x4c57 accept",
+        "mark 0x4c57 accept",
+    ]
+    .into_iter()
+    .any(|mark| listing.contains(mark));
+    required.iter().all(|line| listing.contains(line))
+        && listing.matches("policy drop;").count() == 2
+        && has_mark
+}
+
+async fn monitor_stable_firewall(
+    name: &str,
+    done: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut verified: Option<String> = None;
+    loop {
+        if *done.borrow() {
+            return verified
+                .map(|_| ())
+                .ok_or_else(|| "no complete firewall listing was observed".into());
+        }
+        let output = podman_output(&[
+            "exec",
+            name,
+            "nft",
+            "list",
+            "table",
+            "inet",
+            "lunarwing_sandbox_egress",
+        ])
+        .await?;
+        if output.status.success() {
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !complete_firewall_listing(&listing) {
+                return Err(format!("partial firewall observed:\n{listing}"));
+            }
+            if verified
+                .as_ref()
+                .is_some_and(|previous| previous != &listing)
+            {
+                return Err("an already verified firewall was rewritten".into());
+            }
+            verified = Some(listing);
+        } else if verified.is_some() {
+            return Err("a verified firewall disappeared during concurrent starts".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let image = tunnel_image().await.expect("WireGuard-capable image");
+    let private_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a WireGuard key");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-race-{}", std::process::id()));
+    let config = write_wireguard_config(&workdir, &private_key);
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(image.clone()),
+        wireguard_config: Some(config),
+        startup_timeout: Duration::from_secs(60),
+        ..TunnelSidecarConfig::default()
+    };
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &workdir,
+        &runtime_dir,
+    );
+    let name = sidecar.container_name().to_string();
+    let manager = std::sync::Arc::new(manager_with_sidecar(&image, &tunnel_config, sidecar));
+    let (done, monitor_done) = tokio::sync::watch::channel(false);
+    let monitor_name = name.clone();
+    let monitor =
+        tokio::spawn(async move { monitor_stable_firewall(&monitor_name, monitor_done).await });
+
+    let first = manager.execute("sleep 3; echo FIRST", &workdir, HashMap::new());
+    let second = manager.execute("echo SECOND", &workdir, HashMap::new());
+    let (first, second) = tokio::join!(first, second);
+    let _ = done.send(true);
+    let monitored = monitor.await.expect("firewall monitor task");
+    manager.shutdown().await;
+    assert_detached_helper_stopped(&name).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+
+    let first = first.expect("first concurrent sandbox command");
+    let second = second.expect("second concurrent sandbox command");
+    assert_eq!(first.exit_code, 0, "{}{}", first.stdout, first.stderr);
+    assert_eq!(second.exit_code, 0, "{}{}", second.stdout, second.stderr);
+    assert!(first.stdout.contains("FIRST"));
+    assert!(second.stdout.contains("SECOND"));
+    monitored.expect("firewall stayed complete and unchanged during concurrent first commands");
 }
 
 #[tokio::test]
