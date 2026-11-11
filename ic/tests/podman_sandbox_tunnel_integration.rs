@@ -1411,7 +1411,10 @@ fn write_peer_env_file(workdir: &Path, url: &str, key: &str) -> Result<PathBuf, 
         .map_err(|error| format!("could not create the peer env file: {error}"))?;
     std::io::Write::write_all(
         &mut file,
-        format!("NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n").as_bytes(),
+        format!(
+            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\nNB_DISABLE_FIREWALL=true\n"
+        )
+        .as_bytes(),
     )
     .map_err(|error| format!("could not write the peer env file: {error}"))?;
     Ok(path)
