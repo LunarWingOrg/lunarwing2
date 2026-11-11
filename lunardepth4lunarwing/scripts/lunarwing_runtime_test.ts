@@ -29,10 +29,12 @@ test("accepts a bounded task with supported context", () => {
 })
 
 test("rejects grants, environment, metadata, cron, and unknown fields", () => {
-  for (const [key, value] of [["credentials", {}], ["credential_grants", []], ["metadata", {}]]) {
+  const taskFields: Array<[string, unknown]> = [["credentials", {}], ["credential_grants", []], ["metadata", {}]]
+  for (const [key, value] of taskFields) {
     assert.throws(() => validateTaskRequest({ task_id: "job", prompt: "x", [key]: value }), /unsupported task field/)
   }
-  for (const [key, value] of [["environment", {}], ["metadata", {}], ["cron_tick", null], ["user_id", "u"]]) {
+  const contextFields: Array<[string, unknown]> = [["environment", {}], ["metadata", {}], ["cron_tick", null], ["user_id", "u"]]
+  for (const [key, value] of contextFields) {
     assert.throws(
       () => validateTaskRequest({ task_id: "job", prompt: "x", context: { [key]: value } }),
       /unsupported task context field/,
