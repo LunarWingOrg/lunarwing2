@@ -498,6 +498,11 @@ fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigS
         if line.is_empty() {
             continue;
         }
+        if line.starts_with(';') {
+            return Err(format!(
+                "semicolon comments are not accepted at line {line_number}"
+            ));
+        }
         if line.starts_with('[') {
             finish_wireguard_peer(peer.take(), &mut summary)?;
             in_interface = line == "[interface]";
@@ -2400,10 +2405,14 @@ mod tests {
         let config = dir.join("wg0.conf");
         std::fs::write(
             &config,
-            "[Peer]\nPrivateKey = wrong-section\n[Interface]\nAddress = 10.0.0.2/32\n",
+            "[Peer]\nPublicKey = public\nPrivateKey = wrong-section\n[Interface]\nAddress = 10.0.0.2/32\n",
         )
         .unwrap();
-        assert!(wireguard_cfg(Some(config.clone())).validate().is_err());
+        let error = wireguard_cfg(Some(config.clone())).validate().unwrap_err();
+        assert!(
+            error.contains("needs a non-empty PrivateKey in [Interface]"),
+            "{error}"
+        );
         std::fs::write(
             &config,
             "[Interface]\nPrivateKey = abcdefg\nAddress = 10.0.0.2/32\n",
@@ -2518,27 +2527,44 @@ mod tests {
             (
                 "plus sign",
                 "[Peer]\nPublicKey = public\nPersistentKeepalive = +25\n",
+                "digits only",
             ),
             (
                 "above u16",
                 "[Peer]\nPublicKey = public\nPersistentKeepalive = 65536\n",
+                "at most 65535",
             ),
-            ("semicolon comment", "[Peer]\nPublicKey = public\n; text\n"),
+            (
+                "semicolon comment",
+                "[Peer]\nPublicKey = public\n; text\n",
+                "semicolon comments are not accepted at line 5",
+            ),
+            (
+                "semicolon key value",
+                "[Peer]\nPublicKey = public\n; AllowedIPs = 10.0.0.0/24\n",
+                "semicolon comments are not accepted at line 5",
+            ),
             (
                 "decorated semicolon header",
                 "[Peer]; text\nPublicKey = public\n",
+                "invalid section header at line 3",
             ),
             (
                 "interface keepalive",
                 "PersistentKeepalive = 25\n[Peer]\nPublicKey = public\n",
+                "belongs in [Peer]",
             ),
-            ("missing public key", "[Peer]\nPersistentKeepalive = 25\n"),
+            (
+                "missing public key",
+                "[Peer]\nPersistentKeepalive = 25\n",
+                "[Peer] at line 3 needs a non-empty PublicKey",
+            ),
         ];
-        for (label, suffix) in invalid {
+        for (label, suffix, expected) in invalid {
             let error = parse_wireguard_config(&format!("{interface}{suffix}"))
                 .expect_err(label)
                 .to_string();
-            assert!(error.contains("line"), "{label}: {error}");
+            assert!(error.contains(expected), "{label}: {error}");
         }
     }
 
