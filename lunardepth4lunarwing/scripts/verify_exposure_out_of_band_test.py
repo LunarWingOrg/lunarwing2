@@ -68,6 +68,25 @@ class OutOfBandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "writable"):
             validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
 
+    def test_vendor_tests_are_allowed_but_lane_test_residue_fails(self):
+        with tarfile.open(self.archive_path, "a") as archive:
+            info = tarfile.TarInfo("usr/local/lib/node_modules/npm/node_modules/node-gyp/gyp/pylib/gyp/MSVSSettings_test.py")
+            data = b"base-image fixture"
+            info.size = len(data)
+            info.mode = 0o444
+            info.uid = info.gid = 0
+            archive.addfile(info, io.BytesIO(data))
+        validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+        with tarfile.open(self.archive_path, "a") as archive:
+            info = tarfile.TarInfo("app/scripts/planted_test.js")
+            data = b"lane test residue"
+            info.size = len(data)
+            info.mode = 0o444
+            info.uid = info.gid = 0
+            archive.addfile(info, io.BytesIO(data))
+        with self.assertRaisesRegex(ValueError, "test/package-manager residue"):
+            validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
     def test_smoke_secret_and_checkout_drift_fail(self):
         with tarfile.open(self.archive_path, "a") as archive:
             for name in ("run/lunardepth-state/local-auth-token", "app/entrypoint.sh"):

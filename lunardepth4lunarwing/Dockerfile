@@ -161,7 +161,9 @@ COPY --from=builder /build/entrypoint.sh /build/entrypoint-split.sh /build/entry
 COPY config/ ./config/
 COPY scripts/dsh-exposure-guard.sh /usr/local/bin/dsh
 RUN set -eu; \
-    rm -f /app/scripts/*_test.ts /app/scripts/*_test.js /app/scripts/*_test.py /app/scripts/tsconfig.json /app/scripts/package-lock.json; \
+    find /app/scripts -maxdepth 1 -type f \( -name '*_test.ts' -o -name '*_test.js' -o -name '*_test.py' \) \
+      ! -name 'smoke_test.ts' ! -name 'smoke_test.js' ! -name 'smoke_test.py' -delete; \
+    rm -f /app/scripts/tsconfig.json /app/scripts/package-lock.json; \
     rm -rf /app/scripts/__pycache__; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type d -exec chmod 0555 {} +; \
     find /app /opt/lunardepth /opt/lunardepth-templates -type f -exec chmod 0444 {} +; \
@@ -191,7 +193,8 @@ ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
     WS_NO_UTF_8_VALIDATE=1 \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN --network=none LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh && set -eu; \
+RUN --network=none set -eu; \
+    LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh; \
     rm -rf /tmp/lunardepth-* /run/lunardepth-state/* /run/lunarwing-shared/runner/* \
       /home/lunardepth/.dsh /home/lunardepth-bridge/.local/state /run/lunardepth-config/* /root/.cache /root/.npm; \
     install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh; \

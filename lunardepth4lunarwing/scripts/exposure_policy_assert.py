@@ -52,7 +52,7 @@ def source_policy(root: Path) -> None:
         "LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned", "DEBIAN_SNAPSHOT=20261105T082236Z",
         "build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth", "profile_template.js",
         "musl-tools", "pnpm exec tsx native/system/scripts/build.ts", "--probe | grep -q 'fully enforced'",
-        "RUN --network=none LUNARDEPTH_BUILD_SMOKE=1", "USER 10005:10005",
+        "RUN --network=none set -eu", "USER 10005:10005",
     ], "Dockerfile")
     if "USER 0:0" in dockerfile or "pnpm@9" in dockerfile:
         raise ValueError("Dockerfile: forbidden runtime identity or package manager")

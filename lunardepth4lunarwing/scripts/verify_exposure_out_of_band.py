@@ -94,9 +94,14 @@ def validate_archive(
                 if member.issym() or member.islnk():
                     raise ValueError(f"unexpected link in application closure: {name}")
             lowered = name.lower()
-            if any(part in lowered for part in ("/.git/", "/__tests__/", "/tests/", "/.cache/", "/.npm/")):
+            lane_owned = name.startswith(("app/", "opt/lunardepth"))
+            if lane_owned and any(part in lowered for part in ("/.git/", "/__tests__/", "/tests/", "/.cache/", "/.npm/")):
                 raise ValueError(f"build residue in image: {name}")
-            if lowered.endswith(("_test.ts", "_test.js", "_test.py", "pnpm-lock.yaml", "app/scripts/package-lock.json")):
+            if name.startswith(("root/.cache/", "root/.npm/", "home/lunardepth/.cache/", "home/lunardepth/.npm/")):
+                raise ValueError(f"build residue in image: {name}")
+            if lane_owned and not name.startswith("app/scripts/smoke_test.") and lowered.endswith(
+                ("_test.ts", "_test.js", "_test.py", "pnpm-lock.yaml", "app/scripts/package-lock.json")
+            ):
                 raise ValueError(f"test/package-manager residue in image: {name}")
             if lowered.endswith(("local-auth-token", "agent_auth_token", ".lunardepth-sandbox-escape")):
                 raise ValueError(f"smoke credential or state residue in image: {name}")

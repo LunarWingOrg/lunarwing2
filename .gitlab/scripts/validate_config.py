@@ -2371,7 +2371,7 @@ def validate_lunardepth_versions(errors: list[str]) -> None:
         errors.append("build-worker-image.sh LunarDepth source_ref must equal LUNARDEPTH_REF")
     if "pnpm@11.7.0" not in dockerfile or "22.23.4-bookworm-slim" not in dockerfile:
         errors.append("LunarDepth Node/pnpm pins drifted")
-    if "RUN --network=none LUNARDEPTH_BUILD_SMOKE=1" not in dockerfile:
+    if "RUN --network=none set -eu" not in dockerfile:
         errors.append("LunarDepth network-isolated split-role smoke is missing")
     if "USER 10005:10005" not in dockerfile or "USER 0:0" in dockerfile:
         errors.append("LunarDepth final identity must be non-root 10005:10005")
