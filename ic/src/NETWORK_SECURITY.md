@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-09 (enforced sandbox egress default and Python image suite, WI#537)
+**Last updated:** 2026-11-11 (bounded tunnel recovery and sidecar DNS limitation, WI#604/WI#603)
 
 ---
 
@@ -459,9 +459,13 @@ recursive DNS can carry query-based exfiltration even though other uplink,
 host-loopback, LAN, and metadata connections are unreachable.
 `SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay resolver files
 `ro,z` into joined runs only and removes every direct uplink DNS accept. The
-sidecar retains runtime DNS to resolve provider endpoints during bootstrap.
-NetBird's local DNS listener may have its own marked upstream path; that and
-live provider interoperability are WI#600 measurements, not claimed closed.
+sidecar retains its runtime resolver file for bootstrap, but the same chain
+drops its own unmarked post-start lookups too. NetBird with this setting is
+untested and expected to lose management/signal/relay/STUN name resolution on
+reconnect; WI#603 keeps the live measurement and any fix open, so default
+runtime DNS is required for NetBird until then. Its local DNS listener may also
+have a marked upstream path; that and other live provider interoperability are
+WI#600 measurements, not claimed closed.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -476,14 +480,22 @@ configuration hash and both chains before each execution. Peerless WireGuard
 requires `wg0`; peered WireGuard requires a nonzero handshake no more than 180
 seconds old or a successful operator-configured overlay canary. Without a
 canary, at least one peer must configure `PersistentKeepalive` from 1 through
-60 seconds. DNS/canary validation rejects loopback, link-local, broadcast,
-unspecified, and multicast addresses, and the canary is re-probed after the
-firewall is installed. NetBird's default image is the digest-pinned 0.82.0 OCI
-index; mutable references warn with auto-pull enabled. Every start/health check
-hashes the resolved local image ID so tag rotation recreates the sidecar.
-Missing `nft`, an unhealthy provider, or an altered/missing chain returns
-`[sandbox:sandbox_unavailable]` without degrading to another tier; a dead or
-drifted sidecar is removed and recreated once before the run is refused.
+60 seconds. Health-relevant parsing follows `wg`: comments and whitespace are
+normalized, decorated `[Peer]` headers count, digits-only keepalives use the
+last value in each peer, and malformed values fail with a line number rather
+than degrading to a peerless probe. DNS/canary validation rejects loopback,
+link-local, broadcast, unspecified, and multicast addresses, and the canary is
+re-probed after the firewall is installed. NetBird's default image is the
+digest-pinned 0.82.0 OCI index; mutable references warn with auto-pull enabled.
+Every start/health check hashes the resolved local image ID so tag rotation
+recreates the sidecar. Missing `nft`, an unhealthy provider, or an
+altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
+to another tier. Manager recovery re-probes for at most 6 seconds, allows a
+fresh provider at most 20 seconds (or the lower configured timeout), and caps
+the whole attempt at 60 seconds. A failure retains its probe reason in a
+30-second back-off: subsequent commands fail immediately until one retries
+after the window. Dropped starts have an independent cleanup guard, and no
+container ID becomes joinable before the firewall verifies.
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
