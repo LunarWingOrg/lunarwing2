@@ -1430,6 +1430,8 @@ async fn start_plain_netbird_peer(image: &str, name: &str, env_file: &Path) -> R
         "ALL",
         "--cap-add",
         "NET_ADMIN",
+        "--cap-add",
+        "NET_RAW",
         "--security-opt=no-new-privileges",
         "--read-only",
         "--tmpfs",
