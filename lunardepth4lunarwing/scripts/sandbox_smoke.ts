@@ -1,4 +1,4 @@
-import { spawnSync, type SpawnSyncReturns } from "node:child_process"
+import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { createRequire } from "node:module"
 import { basename, join } from "node:path"
@@ -100,8 +100,11 @@ async function main(): Promise<void> {
   const escape = await runProbe(current, 'printf denied > /home/lunardepth/.lunardepth-sandbox-escape', workspace)
   requireDenied(escape, "outside-workspace write")
   if (existsSync(escapePath)) throw new Error("outside-workspace write reached the host")
-  const previousKey = process.env.LUNARDEPTH_API_KEY
-  process.env.LUNARDEPTH_API_KEY = "lunardepth-proc-smoke-only-not-a-secret"
+  const marker = "lunardepth-proc-smoke-only-not-a-secret"
+  const helper = spawn("/bin/sleep", ["30"], {
+    env: { PATH: "/usr/bin:/bin", LUNARDEPTH_API_KEY: marker },
+    stdio: "ignore",
+  })
   let procDenied = false
   try {
     const proc = await runProbe(current,
@@ -109,10 +112,9 @@ async function main(): Promise<void> {
       workspace)
     procDenied = proc.result.status !== 0
   } finally {
-    if (previousKey === undefined) delete process.env.LUNARDEPTH_API_KEY
-    else process.env.LUNARDEPTH_API_KEY = previousKey
+    helper.kill()
   }
-  if (!procDenied) throw new Error("a confined bash call read the harness model credential")
+  if (!procDenied) throw new Error("a confined bash call read a real process credential")
   writeFileSync(statePath, JSON.stringify({
     ready: true,
     runner,
