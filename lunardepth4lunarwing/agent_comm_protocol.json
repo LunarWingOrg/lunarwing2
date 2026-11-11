@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12",
+  "version": "1.0.0",
+  "description": "LunarDepth split external-worker protocol",
+  "subprotocol": "lunarwing-agent-v1",
+  "supports_credentials": false,
+  "task_prompt": false,
+  "tool_proxy": false,
+  "environment_injection": false,
+  "task_resume": false,
+  "cron": false,
+  "connection": {
+    "daemon_to_bridge": "ws://127.0.0.1:<lunardepth_wss>/ws/agent",
+    "bridge_to_runner": "unix:///run/lunarwing-shared/runner/task-runner.sock",
+    "runner_to_harness": "ws://127.0.0.1:19091/ws/agent",
+    "bridge_health": "http://127.0.0.1:<lunardepth_health>/ready",
+    "auth": "bearer",
+    "hub_token_env": "AGENT_AUTH_TOKEN",
+    "local_token_env": "LUNARDEPTH_LOCAL_AUTH_TOKEN"
+  },
+  "envelope": {
+    "required_fields": ["id", "type", "timestamp", "payload"],
+    "max_bytes": 16777216,
+    "text_only": true
+  },
+  "inbound": ["task_request", "cancel", "ping"],
+  "outbound": ["ready", "pong", "task_progress", "task_result"],
+  "ready": {
+    "mode": "websocket",
+    "version": "lunardepth-worker-1.0.0",
+    "capabilities": []
+  },
+  "task_request": {
+    "fields": ["task_id", "prompt", "timeout_ms", "context"],
+    "context_fields": ["project_dir", "conversation_history"],
+    "default_timeout_ms": 3600000,
+    "max_timeout_ms": 2147483647,
+    "sequential_per_pair": true
+  },
+  "task_progress": {
+    "max_delta_bytes": 65536,
+    "done": false
+  },
+  "task_result": {
+    "statuses": ["success", "error", "cancelled", "timed_out"],
+    "max_output_bytes": 15728640,
+    "exactly_one": true,
+    "partial_output_on_cancel_or_timeout": true
+  },
+  "conversation_history": {
+    "roles": ["user", "assistant"],
+    "max_messages": 12,
+    "max_utf16_code_units_per_message": 2000,
+    "max_utf16_code_units_total": 12000,
+    "untrusted_reference_only": true
+  },
+  "unsupported": ["task_prompt", "tool_call", "tool_list", "tool_result", "tool_catalog", "environment", "credentials", "metadata", "cron_tick", "task_resume", "ironclaw-agent-v1"]
+}
