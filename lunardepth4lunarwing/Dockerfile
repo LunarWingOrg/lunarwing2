@@ -75,7 +75,8 @@ RUN set -eu; \
     pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
     python3 /build/scripts/deploy_build_approval.py remove pnpm-workspace.yaml /src/deepseek-harness; \
     test "$workspace_before" = "$(sha256sum pnpm-workspace.yaml)"; \
-    pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth > /build/deployed-packages.sha256; \
+    pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth | tail -n 1 > /build/deployed-packages.sha256; \
+    grep -Eq '^[0-9a-f]{64}$' /build/deployed-packages.sha256; \
     sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
     landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
     test -x "$landlock"; \
