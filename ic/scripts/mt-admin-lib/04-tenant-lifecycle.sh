@@ -1659,7 +1659,6 @@ cleanup_candidate_workers() {  # <name>
     : >"$(tenant_candidate_lanes_file "$name")"
   else
     printf '%s\n' "${kept[@]}" >"$(tenant_candidate_lanes_file "$name")"
-    rc=1
   fi
   return "$rc"
 }
