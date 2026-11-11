@@ -18,7 +18,20 @@ fi
 umask 0027
 export WORKSPACE_ROOT LUNARDEPTH_RUNNER_SOCKET="$RUNNER_SOCKET" LUNARDEPTH_RUNNER_STATE_FILE="$RUNNER_STATE_FILE"
 
+# A stop signal is the normal end of a role. It is logged as such and ends with
+# status 0; only a role that stops by itself is an error. The EXIT trap of the
+# role still cleans up its children.
+request_stop() {
+  log "LunarDepth ${ROLE#split-} role stopping on request"
+  exit 0
+}
+
+# Consecutive failed health probes the task role tolerates before it gives up.
+# One slow answer under a CPU-heavy job must not end the task.
+HEALTH_PROBE_MAX_MISSES=3
+
 stop_task() {
+  [[ -z "${PAUSE_PID:-}" ]] || kill "$PAUSE_PID" 2>/dev/null || true
   [[ -z "${HARNESS_PID:-}" ]] || kill "$HARNESS_PID" 2>/dev/null || true
   [[ -z "${RUNNER_PID:-}" ]] || kill "$RUNNER_PID" 2>/dev/null || true
   [[ -z "${HARNESS_PID:-}" ]] || wait "$HARNESS_PID" 2>/dev/null || true
@@ -44,7 +57,8 @@ run_task() {
   HARNESS_PID=$!
   /usr/local/bin/node "$APP_DIR/scripts/lunardepth_task_runner.js" "$RUNNER_SOCKET" &
   RUNNER_PID=$!
-  trap stop_task EXIT INT TERM
+  trap stop_task EXIT
+  trap request_stop INT TERM
 
   local attempt=0
   until curl -fsS --max-time 2 http://127.0.0.1:19091/ready >/dev/null 2>&1; do
@@ -57,16 +71,32 @@ run_task() {
   /usr/local/bin/node "$APP_DIR/scripts/effective_config_assert.js" post-ready
   log "LunarDepth task harness and runner are ready"
   local gate_file=/run/lunarwing-shared/runner/lunardepth-ready.json
-  local gate_tmp
-  while kill -0 "$HARNESS_PID" 2>/dev/null && kill -0 "$RUNNER_PID" 2>/dev/null \
-    && curl -fsS --max-time 2 http://127.0.0.1:19091/ready >/dev/null 2>&1 \
-    && /usr/local/bin/node "$APP_DIR/scripts/lunardepth_task_runner.js" --healthcheck "$RUNNER_SOCKET"; do
-    gate_tmp="$gate_file.$$"
-    printf '{"ready":true,"composition":true,"sandbox":true,"task":true,"heartbeat_at":"%s"}\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$gate_tmp"
-    chmod 0640 "$gate_tmp"
-    mv "$gate_tmp" "$gate_file"
-    sleep 10
+  local gate_tmp misses=0 pause
+  # A dead process ends the role at once. A failed probe is counted: the
+  # heartbeat is not refreshed while probes fail, so the bridge's health gate
+  # still turns unready on its own clock.
+  while kill -0 "$HARNESS_PID" 2>/dev/null && kill -0 "$RUNNER_PID" 2>/dev/null; do
+    if curl -fsS --max-time 2 http://127.0.0.1:19091/ready >/dev/null 2>&1 \
+        && /usr/local/bin/node "$APP_DIR/scripts/lunardepth_task_runner.js" --healthcheck "$RUNNER_SOCKET"; then
+      misses=0
+      gate_tmp="$gate_file.$$"
+      printf '{"ready":true,"composition":true,"sandbox":true,"task":true,"heartbeat_at":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$gate_tmp"
+      chmod 0640 "$gate_tmp"
+      mv "$gate_tmp" "$gate_file"
+      pause=10
+    else
+      misses=$((misses + 1))
+      [[ "$misses" -lt "$HEALTH_PROBE_MAX_MISSES" ]] \
+        || die "LunarDepth task role failed $HEALTH_PROBE_MAX_MISSES health probes in a row"
+      log "WARNING: LunarDepth task health probe failed ($misses of $HEALTH_PROBE_MAX_MISSES); retrying"
+      pause=2
+    fi
+    # Wait in the background so that a stop signal is handled at once and not
+    # after the pause.
+    sleep "$pause" &
+    PAUSE_PID=$!
+    wait "$PAUSE_PID" || true
   done
   die "LunarDepth task role stopped unexpectedly"
 }
@@ -108,7 +138,8 @@ run_bridge() {
   HEALTH_PID=$!
   /usr/local/bin/node "$APP_DIR/scripts/lunarwing_bridge.js" &
   BRIDGE_PID=$!
-  trap stop_bridge EXIT INT TERM
+  trap stop_bridge EXIT
+  trap request_stop INT TERM
   log "LunarDepth non-root bridge started"
   wait -n "$BRIDGE_PID" "$HEALTH_PID" || true
   die "LunarDepth bridge role stopped unexpectedly"

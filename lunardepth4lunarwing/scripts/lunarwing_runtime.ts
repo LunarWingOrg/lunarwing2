@@ -6,9 +6,20 @@ export const WORKER_VERSION = "lunardepth-worker-1.0.0"
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024
 export const MAX_OUTPUT_BYTES = 15 * 1024 * 1024
 export const MAX_PROGRESS_BYTES = 64 * 1024
-export const MAX_HISTORY_MESSAGES = 12
-export const MAX_HISTORY_MESSAGE_UNITS = 2_000
-export const MAX_HISTORY_UNITS = 12_000
+// The LunarDepth harness's own hard caps for supplied history (its
+// lunarwing-worker package: 50 messages, 10,000 and 50,000 "chars", which it
+// counts as UTF-16 code units). config/lunarwing-lane.patch.yml sets the
+// harness to these caps, and this adapter enforces the same three bounds in
+// the same unit, so the two accept exactly the same histories.
+//
+// The daemon's defaults (12 messages, 2,000 and 12,000 code points) always fit:
+// a code point is at most two units. A daemon raised to its own ceilings (50,
+// 10,000, 50,000 code points) fits too unless the text is mostly outside the
+// Basic Multilingual Plane; such a history gets an error result here, with the
+// limit named, and is never truncated.
+export const MAX_HISTORY_MESSAGES = 50
+export const MAX_HISTORY_MESSAGE_UNITS = 10_000
+export const MAX_HISTORY_UNITS = 50_000
 export const DEFAULT_TIMEOUT_MS = 3_600_000
 export const MAX_TIMEOUT_MS = 2_147_483_647
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -187,14 +198,14 @@ function validateHistory(value: unknown): ConversationMessage[] | undefined {
         typeof entry.content !== "string" || Object.keys(entry).some(key => key !== "role" && key !== "content")) {
       throw new Error("conversation history entries require only role user/assistant and string content")
     }
-    const contentUnits = Array.from(entry.content).length
+    const contentUnits = entry.content.length
     if (contentUnits > MAX_HISTORY_MESSAGE_UNITS) {
-      throw new Error(`conversation history content exceeds ${MAX_HISTORY_MESSAGE_UNITS} Unicode code points`)
+      throw new Error(`conversation history content exceeds ${MAX_HISTORY_MESSAGE_UNITS} UTF-16 code units`)
     }
     total += contentUnits
     return { role: entry.role, content: entry.content }
   })
-  if (total > MAX_HISTORY_UNITS) throw new Error(`conversation history exceeds ${MAX_HISTORY_UNITS} Unicode code points`)
+  if (total > MAX_HISTORY_UNITS) throw new Error(`conversation history exceeds ${MAX_HISTORY_UNITS} UTF-16 code units`)
   return history
 }
 

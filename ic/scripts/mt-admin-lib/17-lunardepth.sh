@@ -244,11 +244,45 @@ configure_lunardepth() {
   fi
 }
 
+# The pinned launcher reports "fully enforced" only from Landlock ABI 5, which
+# Linux 6.10 introduced, and the lane refuses partial enforcement: the image
+# build probes it and so does every task start. Checked here first, so a host
+# below the floor is told why before a long build or a tenant stop. Only a
+# definite negative counts; an unreadable LSM list is not a refusal.
+LUNARDEPTH_LSM_FILE="${LUNARDEPTH_LSM_FILE:-/sys/kernel/security/lsm}"
+
+lunardepth_landlock_floor_problem() {  # prints the reason and returns 0 when the host is below the floor
+  local release lsm
+  release="$(uname -r)"
+  if [[ "$release" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    if (( 10#${BASH_REMATCH[1]} < 6 || (10#${BASH_REMATCH[1]} == 6 && 10#${BASH_REMATCH[2]} < 10) )); then
+      printf 'kernel %s is older than Linux 6.10 (Landlock ABI 5)' "$release"
+      return 0
+    fi
+  fi
+  if [[ -r "$LUNARDEPTH_LSM_FILE" ]]; then
+    lsm="$(<"$LUNARDEPTH_LSM_FILE")"
+    if [[ ",$lsm," != *,landlock,* ]]; then
+      printf 'landlock is not in the active LSM list (%s)' "$LUNARDEPTH_LSM_FILE"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_lunardepth_require_landlock_floor() {
+  local problem
+  if problem="$(lunardepth_landlock_floor_problem)"; then
+    die "LunarDepth needs full Landlock enforcement on this host: $problem"
+  fi
+}
+
 lunardepth_preflight() {
   local name="$1"
   # Validate only. The installed overlay must not change while the tenant still
   # runs the image it was rendered by.
   _lunardepth_route "$name"
+  _lunardepth_require_landlock_floor
   opencode2_builder_supported || die "${OPENCODE2_BUILDER_FLOOR_PROBLEM/opencode2/LunarDepth}"
 }
 
@@ -260,6 +294,7 @@ build_lunardepth_worker() {
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
   [[ -d "$lane_dir" ]] || die "LunarDepth worker dir not found at $lane_dir"
   opencode2_builder_supported || die "${OPENCODE2_BUILDER_FLOOR_PROBLEM/opencode2/LunarDepth}"
+  _lunardepth_require_landlock_floor
   local source_date_epoch
   source_date_epoch="$(git -C "$LUNARWING_ROOT" show -s --format=%ct "$source_revision" 2>/dev/null || printf '0')"
   [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || die "invalid LunarDepth source commit timestamp"

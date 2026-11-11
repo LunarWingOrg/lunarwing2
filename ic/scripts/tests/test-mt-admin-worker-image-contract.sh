@@ -723,6 +723,9 @@ LUNARWING_ROOT="$repo" build_opencode_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_opencode2_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_pebble_worker false false
 lunardepth_verification_seen=""
+# The build checks the host kernel for the Landlock floor; this harness tests
+# the build contract, not the runner it happens to run on.
+lunardepth_landlock_floor_problem() { return 1; }
 _verify_lunardepth_image_out_of_band() {
   [[ "$1" == "sha256:$(printf '%064d' 0)" && "$2" == "$repo" ]] || return 1
   lunardepth_verification_seen="$1"

@@ -122,6 +122,7 @@ refute() {
   [[ "$before_env" == "$(sha256sum "$TMP/env/lunardepth.env" "$TMP/env/lunardepth-task.env")" ]]
   # The upgrade preflight validates the stored route and renders nothing.
   opencode2_builder_supported() { return 0; }
+  lunardepth_landlock_floor_problem() { return 1; }
   lunardepth_preflight demo
 )
 
@@ -265,6 +266,36 @@ diff -u "$expected" "$calls"
 # is not on the import path.
 env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -I \
   "$SCRIPT_DIR/../../lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py" --help >/dev/null
+
+# ── Kernel floor: full Landlock enforcement needs ABI 5, Linux 6.10 ──────────
+(
+  printf 'capability,landlock,yama\n' >"$TMP/lsm-with"
+  printf 'capability,yama,bpf\n' >"$TMP/lsm-without"
+  LUNARDEPTH_LSM_FILE="$TMP/lsm-with"
+  # The function under test has a local named "release"; the fake must not use that name.
+  uname() { printf '%s\n' "$fake_kernel"; }
+  for fake_kernel in 6.10.0 6.18.54-2-lts 7.0.1 10.2.0-rc1; do
+    refute lunardepth_landlock_floor_problem
+  done
+  for fake_kernel in 6.9.12-arch1 6.1.0-18-amd64 5.15.0-91-generic 4.19.0; do
+    [[ "$(lunardepth_landlock_floor_problem)" == *"older than Linux 6.10"* ]]
+  done
+  uname() { printf '6.18.54-2-lts\n'; }
+  LUNARDEPTH_LSM_FILE="$TMP/lsm-without"
+  [[ "$(lunardepth_landlock_floor_problem)" == *"not in the active LSM list"* ]]
+  # An unreadable list is unknown, not a refusal.
+  LUNARDEPTH_LSM_FILE="$TMP/no-such-file"
+  refute lunardepth_landlock_floor_problem
+  # The preflight stops with the reason.
+  LUNARDEPTH_LSM_FILE="$TMP/lsm-without"
+  _lunardepth_route() { :; }
+  opencode2_builder_supported() { return 0; }
+  if (lunardepth_preflight demo) >"$TMP/floor.out" 2>&1; then
+    echo "the preflight passed on a host without landlock" >&2
+    exit 1
+  fi
+  grep -q 'needs full Landlock enforcement' "$TMP/floor.out"
+)
 
 # ── ZP-7: no two tenants share a model-visible key ───────────────────────────
 (

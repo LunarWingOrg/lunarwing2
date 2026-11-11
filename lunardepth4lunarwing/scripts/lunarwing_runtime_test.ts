@@ -9,7 +9,9 @@ import {
   boundedCloseReason,
   createEnvelope,
   deadlineDelay,
+  MAX_HISTORY_MESSAGE_UNITS,
   MAX_HISTORY_MESSAGES,
+  MAX_HISTORY_UNITS,
   MAX_TIMER_DELAY_MS,
   MAX_TIMEOUT_MS,
   parseEnvelope,
@@ -59,27 +61,41 @@ test("rejects grants, cron, malformed context, and unknown fields", () => {
   )
 })
 
-test("enforces history count and Unicode code-point limits", () => {
-  assert.throws(
-    () => validateTaskRequest({
-      task_id: "job",
-      prompt: "x",
-      context: { conversation_history: Array.from({ length: MAX_HISTORY_MESSAGES + 1 }, () => ({ role: "user", content: "x" })) },
-    }),
-    /at most 12 messages/,
-  )
-  assert.equal(validateTaskRequest({
+test("enforces the harness's history caps in the harness's unit", () => {
+  // 50 messages, 10,000 and 50,000 UTF-16 code units: the caps of the LunarDepth
+  // harness, which the lane overlay configures. Every history a daemon sends at
+  // its default limits (12 messages, 2,000 and 12,000 code points) fits.
+  assert.equal(MAX_HISTORY_MESSAGES, 50)
+  assert.equal(MAX_HISTORY_MESSAGE_UNITS, 10_000)
+  assert.equal(MAX_HISTORY_UNITS, 50_000)
+  const request = (history: { role: string; content: string }[]) => validateTaskRequest({
     task_id: "job",
     prompt: "x",
-    context: { conversation_history: [{ role: "user", content: "😀".repeat(1001) }] },
-  }).context?.conversation_history?.[0]?.content.length, 2002)
+    context: { conversation_history: history },
+  })
+  const repeatMessage = (count: number, content: string) => Array.from({ length: count }, () => ({ role: "user", content }))
+
+  assert.throws(() => request(repeatMessage(MAX_HISTORY_MESSAGES + 1, "x")), /at most 50 messages/)
+  assert.equal(request(repeatMessage(MAX_HISTORY_MESSAGES, "x")).context?.conversation_history?.length, MAX_HISTORY_MESSAGES)
+
+  // The daemon's default worst case: 12 messages that share 12,000 code points,
+  // all outside the Basic Multilingual Plane, so two units each.
+  assert.equal(request(repeatMessage(12, "😀".repeat(1_000))).context?.conversation_history?.length, 12)
+  // One message at the daemon's default per-message bound, again all two-unit characters.
+  assert.equal(request([{ role: "user", content: "😀".repeat(2_000) }]).context?.conversation_history?.[0]?.content.length, 4_000)
+  // More than the daemon's defaults, within the caps.
+  assert.equal(request(repeatMessage(30, "y".repeat(1_500))).context?.conversation_history?.length, 30)
+
+  // Units, not code points: 5,000 two-unit characters are exactly the per-message cap.
+  assert.equal(request([{ role: "user", content: "😀".repeat(5_000) }]).context?.conversation_history?.length, 1)
+  assert.throws(() => request([{ role: "user", content: "😀".repeat(5_001) }]), /exceeds 10000 UTF-16 code units/)
+  assert.throws(() => request([{ role: "user", content: "x".repeat(MAX_HISTORY_MESSAGE_UNITS + 1) }]), /exceeds 10000 UTF-16 code units/)
+
+  const fullMessage = "z".repeat(MAX_HISTORY_MESSAGE_UNITS)
+  assert.equal(request(repeatMessage(MAX_HISTORY_UNITS / MAX_HISTORY_MESSAGE_UNITS, fullMessage)).context?.conversation_history?.length, 5)
   assert.throws(
-    () => validateTaskRequest({
-      task_id: "job",
-      prompt: "x",
-      context: { conversation_history: [{ role: "user", content: "😀".repeat(2001) }] },
-    }),
-    /Unicode code points/,
+    () => request([...repeatMessage(MAX_HISTORY_UNITS / MAX_HISTORY_MESSAGE_UNITS, fullMessage), { role: "assistant", content: "z" }]),
+    /exceeds 50000 UTF-16 code units/,
   )
 })
 

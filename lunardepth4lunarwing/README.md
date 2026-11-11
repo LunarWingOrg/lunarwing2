@@ -29,9 +29,11 @@ ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
 
-The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior. Clear those exceptions with `--disallow-insecure-http` and `--require-api-key`. Existing tenants receive their v18 lane ports, registry selection, and daemon endpoint during configuration; route and key values are written literally without Podman-env quotes.
+The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior. Clear those exceptions with `--disallow-insecure-http` and `--require-api-key`. Existing tenants receive their v18 lane ports, registry selection, and daemon endpoint during configuration; route and key values are written literally without Podman-env quotes. `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored.
 
-The model key is **task-visible, including to the model**. Issue a different, independently revocable key per tenant and restrict it to that tenant's inference. It never belongs in the bridge, overlay, argv, logs, health output, examples, or export text.
+`configure-lunardepth` validates and stores the route; it needs no image. If the worker pair is running it applies the change at once and restarts the pair when it changed. Otherwise the configuration applies at the next `start-worker`.
+
+The model key is **task-visible, including to the model**. Issue a different, independently revocable key per tenant and restrict it to that tenant's inference. It never belongs in the bridge, overlay, argv, logs, health output, examples, or export text. `add-tenants` therefore accepts `--lunardepth-api-key-file` for one tenant only; several tenants take `--lunardepth-api-key-dir <dir>` with one `<tenant>.key` file each.
 
 ## Configuration integrity
 
@@ -43,7 +45,7 @@ Three v1 choices are intentional:
 
 At every start, task setup removes everything under `$DSH_HOME` except the real, task-owned `sessions`, `storages`, and `attachments` directories. It recreates the complete profile, home patch, and home `.env` from root-owned templates. The harness `HOME` is a separate root-owned empty directory. `WS_NO_BUFFER_UTIL=1`, `WS_NO_UTF_8_VALIDATE=1`, and a system-only `PATH` block home-directory module planting. The launch cwd is `/run/lunardepth-launch`, an empty root-owned directory outside the workspace and temp roots. Setup is sourced into the launcher so these values and the local/model credentials persist into the harness and runner.
 
-The host-rendered overlay remains root-owned and read-only. Because rootless `keep-id` does not show host UID `0` as container UID `0`, the task launch contract carries the overlay's SHA-256; setup requires that exact digest and mode `0444` instead of making a rootless-owner assumption. Study Notes and SSH-agent mounts are off in v1.
+The effective overlay is rendered by the worker image itself: at every start mt-admin runs `render_overlay.py --stdout` from the tenant's image in a throw-away container (no network, no capabilities, read-only root) and installs the bytes root-owned and read-only. The task then renders again from the same baked template and requires byte equality, so the two sides cannot come from different revisions. Because rootless `keep-id` does not show host UID `0` as container UID `0`, the task launch contract carries the overlay's SHA-256; setup requires that exact digest and mode `0444` instead of making a rootless-owner assumption. Study Notes and SSH-agent mounts are off in v1.
 
 Before readiness, the lane:
 
@@ -78,7 +80,24 @@ ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>
 ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant> lunardepth
 ```
 
-Podman 4.5+ or Docker BuildKit/buildx is required for the inline `RUN --network=none` split-role smoke. Protected candidate builds additionally require an uncached clean rebuild with the same whole-image digest, out-of-band rootfs/config verification, a CRITICAL vulnerability gate, and manual promotion of the verified digest. Local tests do not replace those protected jobs or live TensorMoon/OpenRC acceptance.
+Podman 4.5+ or Docker BuildKit/buildx is required for the inline `RUN --network=none` split-role smoke. The build host, the CI runners that build the image and every tenant host need Linux 6.10 or newer with `landlock` in the active LSM list: the pinned launcher reports `fully enforced` only from Landlock ABI 5, and a partial probe is refused. mt-admin checks this before a build and in the upgrade preflight. Protected candidate builds additionally require an uncached clean rebuild with the same whole-image digest, out-of-band rootfs/config verification, a CRITICAL vulnerability gate, and manual promotion of the verified digest. Local tests do not replace those protected jobs or live TensorMoon/OpenRC acceptance.
+
+### Compose
+
+`docker-compose.yml` is for a single development pair. It needs the same two inputs mt-admin produces: the effective overlay and its digest. Let the image render its own overlay:
+
+```sh
+docker compose build
+docker run --rm --network none --read-only --cap-drop ALL --entrypoint /usr/bin/python3 \
+  lunarwing-worker-lunardepth:latest -I /app/scripts/render_overlay.py \
+  --template /app/config/lunarwing-lane.patch.yml --stdout \
+  --base-url "$LUNARDEPTH_BASE_URL" --model "$LUNARDEPTH_MODEL" > lunardepth-overlay.yml
+chmod 0444 lunardepth-overlay.yml
+export LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256="$(sha256sum lunardepth-overlay.yml | cut -d' ' -f1)"
+docker compose up -d
+```
+
+Render again and export the new digest whenever the route, the model or the image changes. Without the digest the task refuses to start.
 
 For development checks:
 

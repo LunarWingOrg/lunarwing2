@@ -32,7 +32,13 @@
   },
   "task_request": {
     "fields": ["task_id", "prompt", "timeout_ms", "context"],
-    "context_fields": ["project_dir", "conversation_history"],
+    "context_fields": ["project_dir", "conversation_history", "user_id", "metadata", "environment"],
+    "context_field_rules": {
+      "user_id": "accepted, not forwarded to the task",
+      "metadata": "string-to-string object; accepted, not forwarded to the task",
+      "environment": "must be an empty object; a non-empty one is a per-job grant and gets an error result",
+      "cron_tick": "refused with an error result"
+    },
     "default_timeout_ms": 3600000,
     "max_timeout_ms": 2147483647,
     "sequential_per_pair": true
@@ -49,10 +55,13 @@
   },
   "conversation_history": {
     "roles": ["user", "assistant"],
-    "max_messages": 12,
-    "max_utf16_code_units_per_message": 2000,
-    "max_utf16_code_units_total": 12000,
+    "max_messages": 50,
+    "max_utf16_code_units_per_message": 10000,
+    "max_utf16_code_units_total": 50000,
+    "limits_source": "the LunarDepth harness's own caps, set in config/lunarwing-lane.patch.yml and enforced in the same unit by the adapter",
+    "daemon_defaults": "12 messages, 2000 and 12000 Unicode code points; they always fit",
+    "over_limit": "error result, not truncation",
     "untrusted_reference_only": true
   },
-  "unsupported": ["task_prompt", "tool_call", "tool_list", "tool_result", "tool_catalog", "environment", "credentials", "metadata", "cron_tick", "task_resume", "ironclaw-agent-v1"]
+  "unsupported": ["task_prompt", "tool_call", "tool_list", "tool_result", "tool_catalog", "non-empty environment", "credentials", "cron_tick", "task_resume", "ironclaw-agent-v1"]
 }

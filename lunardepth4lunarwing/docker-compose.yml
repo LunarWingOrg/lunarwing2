@@ -33,6 +33,9 @@ services:
     environment:
       <<: *worker-env
       LUNARWING_CONTAINER_ROLE: split-task
+      # The task refuses to start without the digest of the mounted overlay.
+      # README.md, "Compose", shows how to render the file and compute this.
+      LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256: ${LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256:?set to the SHA-256 of ./lunardepth-overlay.yml, see README.md}
       AGENT_AUTH_TOKEN: ""
       AGENT_AUTH_TOKEN_FILE: ""
     healthcheck:

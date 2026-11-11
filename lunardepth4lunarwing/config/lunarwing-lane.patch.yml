@@ -13,9 +13,9 @@
     maxFrameBytes: 16777216
     maxOutputBytes: 15728640
     maxProgressBytes: 65536
-    maxContextMessages: 12
-    maxContextCharsPerMessage: 2000
-    maxContextTotalChars: 12000
+    maxContextMessages: 50
+    maxContextCharsPerMessage: 10000
+    maxContextTotalChars: 50000
     shutdownTimeoutMs: 10000
 
 - id: llm-pi-ai
