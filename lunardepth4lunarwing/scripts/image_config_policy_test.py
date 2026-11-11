@@ -2,6 +2,8 @@
 
 import copy
 import importlib.util
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -79,6 +81,29 @@ class ImageConfigTests(unittest.TestCase):
         document["Config"]["Shell"] = ["/bin/sh", "-c"]
         with self.assertRaisesRegex(ValueError, "image Shell"):
             MODULE.validate_config(document)
+
+    def test_hardening_clears_inherited_setid_and_write_bits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "closure"
+            nested = root / "config"
+            nested.mkdir(parents=True)
+            payload = nested / "settings.json"
+            payload.write_text("{}\n", encoding="utf-8")
+            nested.chmod(0o2755)
+            payload.chmod(0o4755)
+            script = Path(__file__).with_name("harden_image_modes.sh")
+            result = subprocess.run(
+                ["bash", str(script), str(root)], capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(nested.stat().st_mode & 0o7777, 0o555)
+            self.assertEqual(payload.stat().st_mode & 0o7777, 0o444)
+            payload.chmod(0o644)
+            result = subprocess.run(
+                ["bash", str(script), str(root)], capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(payload.stat().st_mode & 0o7777, 0o444)
 
 
 if __name__ == "__main__":
