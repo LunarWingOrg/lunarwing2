@@ -92,6 +92,14 @@ short shell command or stopping it does not cancel the attempt, its cleanup, or
 recording of its result. Later callers await that same attempt and then use its
 recorded back-off.
 
+Within one daemon, manager initialization is single-flight. Sidecar starts,
+recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
+keyed by container name, so independently constructed handles cannot remove or
+recreate each other's active sidecar. An already correct firewall table is not
+rewritten. When installation is needed, one `nft -f -` invocation replaces the
+complete table atomically, eliminating the former delete-to-rebuild interval in
+which a joined command could have used the uplink without its egress filter.
+
 The sidecar runs with all capabilities dropped except `NET_ADMIN`,
 `no-new-privileges`, a read-only root filesystem, memory/process limits, no
 published ports, and no host networking. Joined commands retain their existing
