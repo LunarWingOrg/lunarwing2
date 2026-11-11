@@ -192,13 +192,13 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
     - **Spec: live evidence.** WI#600 needs a throwaway NetBird management server and a reusable setup key. Without one, do not claim live validation: record the gap and leave WI#600 open.
     - **Spec: secrets.** Setup keys go through files. Never put one in argv, a log or this trail.
 27. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/599 (administrator token-information check on the one pending `gitlab-pat` row)
-    - **Spec: needs a GitLab instance administrator.** An agent account cannot run the lookup, and must never test the historical value by authenticating with it. An agent that picks this item up can only record BLOCKED.
-    - **Spec: afterwards.** Once the result is recorded in WI#575, remove the row from `.gitlab/gitleaks-history-pending` and add its exact pin, or revoke the token if the lookup finds one. That unblocks items 18 and 22.
+    - **Spec: needs a GitLab instance administrator.** An agent account cannot run the lookup, and must never test the historical value by authenticating with it. An agent that picks this item up can only record BLOCKED
+    - **Spec: afterwards.** Once the result is recorded in WI#575, remove the row from `.gitlab/gitleaks-history-pending` and add its exact pin, or revoke the token if the lookup finds one. That unblocks items 18 and 22
     - **Spec: deadline.** Before the `v2.2.0.0` tag or any rc tag: `secret-history` is blocking now and fails on the pending row.
 
 ## Phase 8 - Advanced Operator Notes
 
-28. [x] (S) Deploy the stoplight system
+28. [x] (S) Deploy the stoplight system for IRC
 29. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 
 ---
