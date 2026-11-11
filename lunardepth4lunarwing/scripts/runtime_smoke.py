@@ -156,30 +156,55 @@ def assert_fresh_policy(dsh_home: Path) -> None:
     raise ValueError("no fresh task session has the required permission/sandbox/approval events")
 
 
-def remote(args) -> None:
-    script = Path(__file__).with_name("smoke_test.js")
-    hub_token = os.environ["SMOKE_HUB_TOKEN"]
-    local_token = os.environ["SMOKE_LOCAL_TOKEN"]
-    bridge_url = os.environ.get("SMOKE_BRIDGE_READY_URL", "http://127.0.0.1:8443/ready")
-    task_url = os.environ.get("SMOKE_TASK_READY_URL", "http://127.0.0.1:19091/ready")
-    if http_json(bridge_url).get("ready") is not True or http_json(task_url).get("ready") is not True:
-        raise ValueError("worker is not ready")
-    if http_json(os.environ.get("SMOKE_TASK_HEALTH_URL", "http://127.0.0.1:19091/health")).get("version") != "1":
-        raise ValueError("task health does not report protocol version 1")
+def credential(direct_name: str, file_name: str, default_path: str) -> str:
+    direct = os.environ.get(direct_name)
+    if direct:
+        return direct
+    path = os.environ.get(file_name, default_path)
+    value = Path(path).read_text(encoding="utf-8")
+    if len(value) < 32 or any(ord(character) <= 32 or ord(character) == 127 for character in value):
+        raise ValueError("invalid smoke credential file")
+    return value
+
+
+def bridge_smoke(script: Path, token: str, run_task: bool) -> None:
+    if http_json(os.environ.get("SMOKE_BRIDGE_READY_URL", "http://127.0.0.1:8443/ready")).get("ready") is not True:
+        raise ValueError("bridge is not ready")
     if upgrade_status("ws://127.0.0.1:9090/ws/agent", "wrong", "lunarwing-agent-v1") != 401:
         raise ValueError("bridge accepted a wrong token")
+    if upgrade_status("ws://127.0.0.1:9090/ws/agent", token, "ironclaw-agent-v1") != 400:
+        raise ValueError("bridge accepted the legacy subprotocol")
+    run_node_smoke(script, "ws://127.0.0.1:9090/ws/agent", token, run_task)
+
+
+def task_smoke(script: Path, token: str) -> None:
+    if http_json(os.environ.get("SMOKE_TASK_READY_URL", "http://127.0.0.1:19091/ready")).get("ready") is not True:
+        raise ValueError("task harness is not ready")
+    if http_json(os.environ.get("SMOKE_TASK_HEALTH_URL", "http://127.0.0.1:19091/health")).get("version") != "1":
+        raise ValueError("task health does not report protocol version 1")
     if upgrade_status("ws://127.0.0.1:19091/ws/agent", "wrong", "lunarwing-agent-v1") != 401:
         raise ValueError("harness accepted a wrong token")
-    if upgrade_status("ws://127.0.0.1:9090/ws/agent", hub_token, "ironclaw-agent-v1") != 400:
-        raise ValueError("bridge accepted the legacy subprotocol")
-    if upgrade_status("ws://127.0.0.1:19091/ws/agent", local_token, "ironclaw-agent-v1") != 400:
+    if upgrade_status("ws://127.0.0.1:19091/ws/agent", token, "ironclaw-agent-v1") != 400:
         raise ValueError("harness accepted the legacy subprotocol")
-    run_node_smoke(script, "ws://127.0.0.1:19091/ws/agent", local_token, False)
-    run_node_smoke(script, "ws://127.0.0.1:9090/ws/agent", hub_token, True)
-    listeners(os.environ.get("SMOKE_LISTENER_ROLE", "combined"))
-    assert_fresh_policy(Path(os.environ.get("DSH_HOME", "/home/lunardepth/.dsh")))
+    run_node_smoke(script, "ws://127.0.0.1:19091/ws/agent", token, False)
     if os.environ.get("SMOKE_RUN_SANDBOX") == "1":
         subprocess.run(["/usr/local/bin/node", str(Path(__file__).with_name("sandbox_smoke.js"))], check=True, timeout=60)
+
+
+def remote(args) -> None:
+    script = Path(__file__).with_name("smoke_test.js")
+    role = os.environ.get("SMOKE_ROLE", "combined")
+    if role in {"bridge", "combined"}:
+        hub_token = credential("SMOKE_HUB_TOKEN", "SMOKE_HUB_TOKEN_FILE", "/home/lunardepth-bridge/.local/state/lunarwing/agent_auth_token")
+        bridge_smoke(script, hub_token, role == "combined" or os.environ.get("SMOKE_RUN_TASK") == "1")
+    if role in {"task", "combined"}:
+        local_token = credential("SMOKE_LOCAL_TOKEN", "SMOKE_LOCAL_TOKEN_FILE", "/run/lunardepth-state/local-auth-token")
+        task_smoke(script, local_token)
+    if role not in {"bridge", "task", "combined"}:
+        raise ValueError(f"unknown smoke role {role}")
+    listeners(os.environ.get("SMOKE_LISTENER_ROLE", role))
+    if role == "combined":
+        assert_fresh_policy(Path(os.environ.get("DSH_HOME", "/home/lunardepth/.dsh")))
 
 
 def main() -> None:
