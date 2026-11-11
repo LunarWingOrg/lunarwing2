@@ -408,16 +408,15 @@ fn validate_wireguard_config(
             path.display()
         )
     })?;
-    if !has_interface_private_key(&content) {
+    let parsed = parse_wireguard_config(&content)
+        .map_err(|reason| format!("invalid WireGuard config {}: {reason}", path.display()))?;
+    if !parsed.has_interface_private_key {
         return Err(format!(
             "SANDBOX_TUNNEL_WIREGUARD_CONFIG {} needs a non-empty PrivateKey in [Interface]",
             path.display()
         ));
     }
-    if wireguard_config_has_peers(&content)
-        && !canary_configured
-        && !wireguard_config_has_suitable_keepalive(&content)
-    {
+    if parsed.has_peers && !canary_configured && !parsed.has_suitable_keepalive {
         return Err(
             "peered WireGuard configs require PersistentKeepalive = 1..=60 on at least one peer, or SANDBOX_TUNNEL_WIREGUARD_CANARY"
                 .into(),
@@ -426,60 +425,113 @@ fn validate_wireguard_config(
     Ok(())
 }
 
-fn has_interface_private_key(content: &str) -> bool {
+#[derive(Debug, Default)]
+struct WireGuardConfigSummary {
+    has_interface_private_key: bool,
+    has_peers: bool,
+    has_suitable_keepalive: bool,
+}
+
+struct WireGuardPeerSummary {
+    header_line: usize,
+    has_public_key: bool,
+    keepalive: Option<u64>,
+}
+
+fn finish_wireguard_peer(
+    peer: Option<WireGuardPeerSummary>,
+    summary: &mut WireGuardConfigSummary,
+) -> std::result::Result<(), String> {
+    let Some(peer) = peer else {
+        return Ok(());
+    };
+    if !peer.has_public_key {
+        return Err(format!(
+            "[Peer] at line {} needs a non-empty PublicKey",
+            peer.header_line
+        ));
+    }
+    summary.has_peers = true;
+    summary.has_suitable_keepalive |= peer
+        .keepalive
+        .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds));
+    Ok(())
+}
+
+fn parse_wireguard_keepalive(value: &str, line: usize) -> std::result::Result<u64, String> {
+    if value == "off" {
+        return Ok(0);
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "PersistentKeepalive at line {line} must be 'off' or digits only"
+        ));
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= u16::MAX as u64)
+        .ok_or_else(|| format!("PersistentKeepalive at line {line} must be at most 65535"))
+}
+
+/// Normalize and validate the WireGuard fields that drive the health gate.
+/// Unknown wg-quick settings are left to `wg-quick`, but malformed sections and
+/// health-relevant keys are rejected with their source line rather than being
+/// mistaken for a peerless config.
+fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigSummary, String> {
+    let mut summary = WireGuardConfigSummary::default();
     let mut in_interface = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
+    let mut peer: Option<WireGuardPeerSummary> = None;
+    for (index, raw) in content.lines().enumerate() {
+        let line_number = index + 1;
+        let line: String = raw
+            .split_once('#')
+            .map_or(raw, |(before_comment, _)| before_comment)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if line.is_empty() {
+            continue;
+        }
         if line.starts_with('[') {
-            in_interface = line.eq_ignore_ascii_case("[interface]");
-            return false;
+            finish_wireguard_peer(peer.take(), &mut summary)?;
+            in_interface = line == "[interface]";
+            peer = (line == "[peer]").then_some(WireGuardPeerSummary {
+                header_line: line_number,
+                has_public_key: false,
+                keepalive: None,
+            });
+            if !in_interface && peer.is_none() {
+                return Err(format!("invalid section header at line {line_number}"));
+            }
+            continue;
         }
-        if !in_interface || line.starts_with('#') || line.starts_with(';') {
-            return false;
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("expected key = value at line {line_number}"));
+        };
+        if let Some(current_peer) = peer.as_mut() {
+            match key {
+                "publickey" => current_peer.has_public_key = !value.is_empty(),
+                "persistentkeepalive" => {
+                    current_peer.keepalive = Some(parse_wireguard_keepalive(value, line_number)?);
+                }
+                _ => {}
+            }
+        } else if in_interface {
+            if key == "privatekey" {
+                summary.has_interface_private_key = !value.is_empty();
+            } else if key == "persistentkeepalive" {
+                return Err(format!(
+                    "PersistentKeepalive at line {line_number} belongs in [Peer]"
+                ));
+            }
+        } else {
+            return Err(format!("key outside a section at line {line_number}"));
         }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("privatekey") && !value.trim().is_empty()
-        })
-    })
-}
-
-fn wireguard_config_has_peers(content: &str) -> bool {
-    let mut in_peer = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_peer = line.eq_ignore_ascii_case("[peer]");
-            return false;
-        }
-        if !in_peer || line.starts_with('#') || line.starts_with(';') {
-            return false;
-        }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("publickey") && !value.trim().is_empty()
-        })
-    })
-}
-
-fn wireguard_config_has_suitable_keepalive(content: &str) -> bool {
-    let mut in_peer = false;
-    content.lines().any(|raw| {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_peer = line.eq_ignore_ascii_case("[peer]");
-            return false;
-        }
-        if !in_peer || line.starts_with('#') || line.starts_with(';') {
-            return false;
-        }
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("persistentkeepalive")
-                && value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|seconds| seconds.parse::<u64>().ok())
-                    .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds))
-        })
-    })
+    }
+    finish_wireguard_peer(peer, &mut summary)?;
+    Ok(summary)
 }
 
 /// The runtime arguments that start the sidecar. `hash` is the salted config
@@ -1218,7 +1270,7 @@ impl TunnelSidecar {
     fn wireguard_has_peers(&self) -> Option<bool> {
         let path = self.cfg.wireguard_config.as_deref()?;
         let content = std::fs::read_to_string(path).ok()?;
-        Some(wireguard_config_has_peers(&content))
+        Some(parse_wireguard_config(&content).ok()?.has_peers)
     }
 
     async fn provider_probe(&self) -> bool {
@@ -2232,6 +2284,86 @@ mod tests {
     }
 
     #[test]
+    fn wireguard_parser_matches_wg_section_and_keepalive_rules() {
+        let interface = "[Interface]\nPrivateKey = private\n";
+        let valid = [
+            (
+                "commented header",
+                "[Peer] # office\nPublicKey = public\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "spaced header",
+                "[ Peer ]\nPublicKey = public\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "crlf and uppercase",
+                "[PEER]\r\nPublicKey = public\r\nPersistentKeepalive = 25\r\n",
+                true,
+            ),
+            (
+                "second peer",
+                "[Peer]\nPublicKey = first\n[Peer]\nPublicKey = second\nPersistentKeepalive = 25\n",
+                true,
+            ),
+            (
+                "inline comment",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 25 # seconds\n",
+                true,
+            ),
+            (
+                "whitespace forms 600",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 6 0 0\n",
+                false,
+            ),
+            (
+                "last value disables",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 25\nPersistentKeepalive = 0\n",
+                false,
+            ),
+            (
+                "off",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = off\n",
+                false,
+            ),
+        ];
+        for (label, peer, suitable) in valid {
+            let parsed = parse_wireguard_config(&format!("{interface}{peer}")).unwrap();
+            assert!(parsed.has_interface_private_key, "{label}");
+            assert!(parsed.has_peers, "{label}");
+            assert_eq!(parsed.has_suitable_keepalive, suitable, "{label}");
+        }
+
+        let invalid = [
+            (
+                "plus sign",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = +25\n",
+            ),
+            (
+                "above u16",
+                "[Peer]\nPublicKey = public\nPersistentKeepalive = 65536\n",
+            ),
+            ("semicolon comment", "[Peer]\nPublicKey = public\n; text\n"),
+            (
+                "decorated semicolon header",
+                "[Peer]; text\nPublicKey = public\n",
+            ),
+            (
+                "interface keepalive",
+                "PersistentKeepalive = 25\n[Peer]\nPublicKey = public\n",
+            ),
+            ("missing public key", "[Peer]\nPersistentKeepalive = 25\n"),
+        ];
+        for (label, suffix) in invalid {
+            let error = parse_wireguard_config(&format!("{interface}{suffix}"))
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains("line"), "{label}: {error}");
+        }
+    }
+
+    #[test]
     fn health_probe_matches_provider_and_wireguard_peers() {
         assert_eq!(
             build_health_args_for(TunnelProvider::Netbird, "tunnel-test", false, None).join(" "),
@@ -2255,12 +2387,18 @@ mod tests {
             .join(" "),
             "exec tunnel-test ping -c 1 -W 2 10.231.0.1"
         );
-        assert!(wireguard_config_has_peers(
-            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
-        ));
-        assert!(!wireguard_config_has_peers(
-            "[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n"
-        ));
+        assert!(
+            parse_wireguard_config(
+                "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
+            )
+            .unwrap()
+            .has_peers
+        );
+        assert!(
+            !parse_wireguard_config("[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n")
+                .unwrap()
+                .has_peers
+        );
         assert!(wireguard_handshake_is_recent("peer-a 1000\n", 1180));
         assert!(wireguard_handshake_is_recent(
             "peer-a 0\npeer-b 999\n",
