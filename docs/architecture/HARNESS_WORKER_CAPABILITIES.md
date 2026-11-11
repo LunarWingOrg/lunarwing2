@@ -1,6 +1,6 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-11-01 for v2.1.8.0.
+Status: implemented; source revalidated 2026-11-10 for v2.2.0.0.
 Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
 `job_manager.rs` and HTTP completion handling in `api.rs`.
 

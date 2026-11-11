@@ -1,14 +1,16 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
 **Audit date:** 2026-08-03; ported and hardened on v2.0.5.0, 2026-08-05.
-**Status:** Historical audit, with source/registration update for v2.1.8.0 on 2026-11-01.
+**Status:** Historical audit, with source/registration update for v2.2.0.0 on 2026-11-10.
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Current coverage (v2.1.8.0)
+## Current coverage (v2.2.0.0)
 
-`ic-infrastructure-health-check/tests/run-all.sh` registers **20 suites**, adding
-`worker-egress` to the previous 19. Run `bash tests/run-all.sh --list` from that
+`ic-infrastructure-health-check/tests/run-all.sh` registers **21 suites**. The
+current ordered list adds `worker-egress` (WI#424) and `disk` (WI#586) to the 19
+suites documented before those healthpoints; `gateway` was already registered
+and is included in the total. Run `bash tests/run-all.sh --list` from that
 directory for the authoritative ordered list. The original **435/435** assertion
 result below is historical evidence, not a result for the current release.
 
@@ -19,7 +21,9 @@ It reports missing enforcement as critical; it does not repair firewall policy
 or dispatch commands to an agent. Podman rootless rules are observed in the
 tenant's rootless network namespace; Docker recursive DNS remains unverified.
 The health audit never sources an operator checkout as root. Its mock suite is
-`tests/test-health-worker-egress.sh`.
+`tests/test-health-worker-egress.sh`. WI#563/WI#586 add the monitor-only `disk`
+suite and per-filesystem block/inode capacity alerts; disk monitoring never
+deletes data or restarts services.
 
 Current deployment ownership and init routing are described in
 [SELF_HEAL_DEPLOYMENT_WIRING.md](SELF_HEAL_DEPLOYMENT_WIRING.md). The dated

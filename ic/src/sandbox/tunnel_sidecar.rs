@@ -10,8 +10,10 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it, and DNS to the resolvers the runtime gave
-//!   the sidecar. Link-local IPv4 (the cloud metadata service and podman's
+//!   mark the provider sets on it and, by default, DNS to the resolvers the
+//!   runtime gave the sidecar. `SANDBOX_TUNNEL_DNS` moves DNS to resolvers
+//!   reachable through the tunnel and removes the uplink DNS allowance.
+//!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
 //! Joined commands have no `NET_ADMIN`, cannot set socket marks, and therefore
@@ -31,9 +33,11 @@ use sha2::{Digest, Sha256};
 use crate::sandbox::cli_runner::ContainerRuntime;
 use crate::sandbox::error::{Result, SandboxError};
 
+/// Prefix of the daemon-instance-specific sidecar name.
 pub const SANDBOX_TUNNEL_CONTAINER: &str = "lunarwing-sandbox-tunnel";
 pub const SANDBOX_TUNNEL_CONTAINER_LABEL: &str = "lunarwing.sandbox-tunnel";
 pub const SANDBOX_TUNNEL_HASH_LABEL: &str = "lunarwing.sandbox-tunnel-hash";
+pub const SANDBOX_TUNNEL_INSTANCE_LABEL: &str = "lunarwing.sandbox-tunnel-instance";
 
 /// fwmark the sidecar sets on a WireGuard device whose config left it `off`
 /// (ASCII "LW"). wg-quick's own full-route fwmark (the routing table number)
@@ -50,6 +54,8 @@ const SIDECAR_PIDS_LIMIT: u32 = 64;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
+const WIREGUARD_KEEPALIVE_MAX_SECS: u64 = 60;
 const MAX_WIREGUARD_CONFIG_BYTES: u64 = 1024 * 1024;
 const NFT_TABLE: &str = "lunarwing_sandbox_egress";
 const NFT_INPUT_CHAIN: &str = "input";
@@ -60,7 +66,6 @@ const TUNNEL_INTERFACES: [&str; 2] = ["wg0", "wt0"];
 /// `host.containers.internal` alias (169.254.1.2 under pasta) live here.
 const LINK_LOCAL_V4: &str = "169.254.0.0/16";
 const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
-const NETBIRD_STATE_VOLUME_PREFIX: &str = "lunarwing-sandbox-tunnel-netbird-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunnelProvider {
@@ -79,7 +84,11 @@ impl TunnelProvider {
 
     pub fn default_image(self) -> &'static str {
         match self {
-            Self::Netbird => "docker.io/netbirdio/netbird:latest",
+            // NetBird 0.82.0, OCI multi-architecture index. Keep the version in
+            // this comment and the digest in sync when upgrading the client.
+            Self::Netbird => {
+                "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
+            }
             Self::Wireguard => "localhost/lunarwing-tunnel-wireguard:latest",
         }
     }
@@ -114,6 +123,11 @@ pub struct TunnelSidecarConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
+    /// Optional resolver addresses reachable through the tunnel. When nonempty,
+    /// joined runs use them and no DNS traffic is allowed onto the uplink.
+    pub dns: Vec<IpAddr>,
+    /// Optional ICMP canary reachable only through WireGuard.
+    pub wireguard_canary: Option<IpAddr>,
     pub startup_timeout: Duration,
     /// Mirrors `SANDBOX_AUTO_PULL`: when false the sidecar image must already
     /// be present in the local store, otherwise the start fails closed instead
@@ -129,6 +143,8 @@ impl Default for TunnelSidecarConfig {
             netbird_management_url: None,
             netbird_setup_key: None,
             wireguard_config: None,
+            dns: Vec::new(),
+            wireguard_canary: None,
             startup_timeout: Duration::from_secs(90),
             auto_pull_image: true,
         }
@@ -145,13 +161,19 @@ impl TunnelSidecarConfig {
     /// A stable drift marker, never an authentication value. The salt is a
     /// random per-user secret kept in the private runtime directory, so the
     /// label published on the container is not a plain digest of the setup key
-    /// or of the WireGuard private key. WireGuard file contents are included so
-    /// rotating a private key recreates the sidecar.
-    pub fn config_hash(&self, salt: &[u8]) -> String {
+    /// or of the WireGuard private key. WireGuard file contents and the resolved
+    /// image ID are included so credential or image rotation recreates the sidecar.
+    pub fn config_hash(&self, salt: &[u8], image_id: &str) -> String {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, salt);
         hash_field(&mut hasher, self.provider.as_str().as_bytes());
         hash_field(&mut hasher, self.image().as_bytes());
+        hash_field(&mut hasher, image_id.as_bytes());
+        for resolver in &self.dns {
+            hash_field(&mut hasher, resolver.to_string().as_bytes());
+        }
+        let canary = self.wireguard_canary.map(|address| address.to_string());
+        hash_optional(&mut hasher, canary.as_deref());
         hash_optional(&mut hasher, self.netbird_management_url.as_deref());
         hash_optional(
             &mut hasher,
@@ -173,18 +195,58 @@ impl TunnelSidecarConfig {
     }
 
     /// Named volume holding NetBird's peer identity and config across sidecar
-    /// restarts, keyed by the config hash so a rotated setup key enrols a fresh
-    /// peer and the previous volume is pruned.
-    pub fn netbird_state_volume(&self, hash: &str) -> String {
+    /// restarts. Only instance, management URL, or setup-key rotation enrols a
+    /// fresh peer; image, DNS, canary, and WireGuard changes retain the volume.
+    pub fn netbird_state_volume(&self, instance_id: &str, salt: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, salt);
+        hash_field(&mut hasher, instance_id.as_bytes());
+        hash_optional(&mut hasher, self.netbird_management_url.as_deref());
+        hash_optional(
+            &mut hasher,
+            self.netbird_setup_key
+                .as_ref()
+                .map(|key| key.expose_secret()),
+        );
+        let identity = format!("{:x}", hasher.finalize());
         format!(
-            "{NETBIRD_STATE_VOLUME_PREFIX}{}",
-            hash.get(..16).unwrap_or(hash)
+            "{SANDBOX_TUNNEL_CONTAINER}-{instance_id}-netbird-{}",
+            identity.get(..16).unwrap_or(&identity)
         )
     }
 
+    fn uplink_resolvers(&self, resolv_conf: &str) -> Vec<IpAddr> {
+        if self.dns.is_empty() {
+            parse_resolvers(resolv_conf)
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.image().trim().is_empty() {
-            return Err("SANDBOX_TUNNEL_IMAGE must not be empty".into());
+        validate_image_reference(self.image())?;
+        if self
+            .dns
+            .iter()
+            .any(|address| !valid_tunnel_address(address))
+        {
+            return Err(
+                "SANDBOX_TUNNEL_DNS rejects loopback, link-local, broadcast, unspecified, and multicast addresses"
+                    .into(),
+            );
+        }
+        if self
+            .wireguard_canary
+            .as_ref()
+            .is_some_and(|address| !valid_tunnel_address(address))
+        {
+            return Err(
+                "SANDBOX_TUNNEL_WIREGUARD_CANARY rejects loopback, link-local, broadcast, unspecified, and multicast addresses"
+                    .into(),
+            );
+        }
+        if self.provider != TunnelProvider::Wireguard && self.wireguard_canary.is_some() {
+            return Err("SANDBOX_TUNNEL_WIREGUARD_CANARY requires the wireguard provider".into());
         }
         match self.provider {
             TunnelProvider::Netbird => self.validate_netbird(),
@@ -193,7 +255,7 @@ impl TunnelSidecarConfig {
                     "SANDBOX_TUNNEL_WIREGUARD_CONFIG is required for the wireguard provider"
                         .to_string()
                 })?;
-                validate_wireguard_config(path)
+                validate_wireguard_config(path, self.wireguard_canary.is_some())
             }
         }?;
         if self.startup_timeout.is_zero() {
@@ -234,6 +296,65 @@ impl TunnelSidecarConfig {
     }
 }
 
+fn valid_tunnel_address(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_broadcast()
+                && !address.is_multicast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_unicast_link_local()
+                && !address.is_multicast()
+        }
+    }
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_image_reference(image: &str) -> std::result::Result<(), String> {
+    if image.is_empty() || image.trim() != image {
+        return Err(
+            "SANDBOX_TUNNEL_IMAGE must not be empty or surround the reference with whitespace"
+                .into(),
+        );
+    }
+    if let Some((name, digest)) = image.split_once('@') {
+        let valid_digest = digest.strip_prefix("sha256:").is_some_and(valid_sha256_hex);
+        if name.is_empty() || !valid_digest {
+            return Err(
+                "SANDBOX_TUNNEL_IMAGE digest references must use image@sha256:<64 hex characters>"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_image_id(output: &str) -> Option<&str> {
+    let id = output.trim();
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    valid_sha256_hex(hex).then_some(id)
+}
+
+fn instance_id_for(base_dir: &Path) -> String {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(base_dir.to_string_lossy().as_bytes())
+    );
+    digest[..16].to_string()
+}
+
+pub fn container_name_for_instance(base_dir: &Path) -> String {
+    format!("{SANDBOX_TUNNEL_CONTAINER}-{}", instance_id_for(base_dir))
+}
+
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -249,7 +370,10 @@ fn hash_optional(hasher: &mut Sha256, value: Option<&str>) {
     }
 }
 
-fn validate_wireguard_config(path: &Path) -> std::result::Result<(), String> {
+fn validate_wireguard_config(
+    path: &Path,
+    canary_configured: bool,
+) -> std::result::Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         format!(
             "SANDBOX_TUNNEL_WIREGUARD_CONFIG {} is unreadable: {error}",
@@ -288,6 +412,15 @@ fn validate_wireguard_config(path: &Path) -> std::result::Result<(), String> {
             path.display()
         ));
     }
+    if wireguard_config_has_peers(&content)
+        && !canary_configured
+        && !wireguard_config_has_suitable_keepalive(&content)
+    {
+        return Err(
+            "peered WireGuard configs require PersistentKeepalive = 1..=60 on at least one peer, or SANDBOX_TUNNEL_WIREGUARD_CANARY"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -308,12 +441,53 @@ fn has_interface_private_key(content: &str) -> bool {
     })
 }
 
+fn wireguard_config_has_peers(content: &str) -> bool {
+    let mut in_peer = false;
+    content.lines().any(|raw| {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_peer = line.eq_ignore_ascii_case("[peer]");
+            return false;
+        }
+        if !in_peer || line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("publickey") && !value.trim().is_empty()
+        })
+    })
+}
+
+fn wireguard_config_has_suitable_keepalive(content: &str) -> bool {
+    let mut in_peer = false;
+    content.lines().any(|raw| {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_peer = line.eq_ignore_ascii_case("[peer]");
+            return false;
+        }
+        if !in_peer || line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("persistentkeepalive")
+                && value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|seconds| seconds.parse::<u64>().ok())
+                    .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds))
+        })
+    })
+}
+
 /// The runtime arguments that start the sidecar. `hash` is the salted config
 /// hash published as a label; `netbird_state_volume` is the named volume that
 /// keeps NetBird's peer identity across restarts.
 pub(crate) fn build_sidecar_args(
     cfg: &TunnelSidecarConfig,
     secret_env_file: Option<&Path>,
+    container_name: &str,
+    instance_id: &str,
     hash: &str,
     netbird_state_volume: Option<&str>,
 ) -> Vec<String> {
@@ -322,13 +496,15 @@ pub(crate) fn build_sidecar_args(
         "-d".into(),
         "--rm".into(),
         "--name".into(),
-        SANDBOX_TUNNEL_CONTAINER.into(),
+        container_name.into(),
         "--label".into(),
         format!(
             "{}={}",
             SANDBOX_TUNNEL_CONTAINER_LABEL,
             cfg.provider.as_str()
         ),
+        "--label".into(),
+        format!("{SANDBOX_TUNNEL_INSTANCE_LABEL}={instance_id}"),
         "--label".into(),
         format!("{SANDBOX_TUNNEL_HASH_LABEL}={hash}"),
         "--cap-drop=ALL".into(),
@@ -355,7 +531,6 @@ pub(crate) fn build_sidecar_args(
         "--tmpfs".into(),
         "/run:size=16m".into(),
     ];
-
     match cfg.provider {
         TunnelProvider::Netbird => {
             args.extend(["--device".into(), "/dev/net/tun".into()]);
@@ -388,29 +563,55 @@ pub(crate) fn build_sidecar_args(
     args
 }
 
-fn build_health_args_for(provider: TunnelProvider) -> Vec<String> {
-    let probe: &[&str] = match provider {
-        TunnelProvider::Netbird => &["netbird", "status", "--check", "startup"],
-        TunnelProvider::Wireguard => &["ip", "link", "show", "wg0"],
+fn build_health_args_for(
+    provider: TunnelProvider,
+    container_name: &str,
+    wireguard_has_peers: bool,
+    wireguard_canary: Option<IpAddr>,
+) -> Vec<String> {
+    let probe: Vec<String> = match provider {
+        TunnelProvider::Netbird => ["netbird", "status", "--check", "startup"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        TunnelProvider::Wireguard => match (wireguard_has_peers, wireguard_canary) {
+            (_, Some(address)) => vec![
+                "ping".into(),
+                "-c".into(),
+                "1".into(),
+                "-W".into(),
+                "2".into(),
+                address.to_string(),
+            ],
+            (true, None) => ["wg", "show", "wg0", "latest-handshakes"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            (false, None) => ["ip", "link", "show", "wg0"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        },
     };
-    exec_args(probe)
+    let refs: Vec<&str> = probe.iter().map(String::as_str).collect();
+    exec_args(&refs, container_name)
 }
 
-fn exec_args(command: &[&str]) -> Vec<String> {
-    let mut args = vec!["exec".into(), SANDBOX_TUNNEL_CONTAINER.into()];
+fn exec_args(command: &[&str], container_name: &str) -> Vec<String> {
+    let mut args = vec!["exec".into(), container_name.into()];
     args.extend(command.iter().map(|arg| (*arg).into()));
     args
 }
 
-fn nft_exec_args(nft_args: &[&str]) -> Vec<String> {
-    let mut args = vec!["exec".into(), SANDBOX_TUNNEL_CONTAINER.into(), "nft".into()];
+fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
+    let mut args = vec!["exec".into(), container_name.into(), "nft".into()];
     args.extend(nft_args.iter().map(|arg| (*arg).into()));
     args
 }
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
-/// own control traffic (by socket mark) and DNS to the runtime-assigned
-/// resolvers. Everything else leaves through the tunnel interface or is dropped.
+/// own control traffic (by socket mark) and, unless custom tunnel DNS is set,
+/// DNS to the runtime-assigned resolvers. Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     pub tunnel_mark: u32,
@@ -458,7 +659,7 @@ fn chain_header(hook: &str) -> String {
     format!("{{ type filter hook {hook} priority 0; policy drop; }}")
 }
 
-fn firewall_install_commands(policy: &EgressPolicy) -> Vec<Vec<String>> {
+fn firewall_install_commands(policy: &EgressPolicy, container_name: &str) -> Vec<Vec<String>> {
     let input_header = chain_header(NFT_INPUT_CHAIN);
     let output_header = chain_header(NFT_OUTPUT_CHAIN);
     let input_rules = EgressPolicy::input_rules();
@@ -503,17 +704,19 @@ fn firewall_install_commands(policy: &EgressPolicy) -> Vec<Vec<String>> {
             rule.as_str(),
         ]);
     }
-    commands.iter().map(|args| nft_exec_args(args)).collect()
+    commands
+        .iter()
+        .map(|args| nft_exec_args(args, container_name))
+        .collect()
 }
 
-fn firewall_list_args() -> Vec<String> {
-    nft_exec_args(&["list", "table", "inet", NFT_TABLE])
+fn firewall_list_args(container_name: &str) -> Vec<String> {
+    nft_exec_args(&["list", "table", "inet", NFT_TABLE], container_name)
 }
 
 /// Canonical form of one listed nft line: whitespace collapsed, the trailing
-/// `# handle N` and any `comment "…"` removed, marks printed as `0x<hex>` (nft
-/// prints `0x00004c57` for a mark given as `0x4c57`) and the named priority
-/// `filter` mapped back to `0`.
+/// `# handle N` and any `comment "…"` removed, `mark` normalized to `meta mark`,
+/// marks printed as `0x<hex>`, and named priority `filter` mapped back to `0`.
 fn canonical_nft_line(line: &str) -> String {
     let no_handle = line.split(" # handle ").next().unwrap_or(line);
     let no_comment = no_handle.split(" comment \"").next().unwrap_or(no_handle);
@@ -525,10 +728,14 @@ fn canonical_nft_line(line: &str) -> String {
         } else {
             ";"
         };
-        if let Some(hex) = trimmed.strip_prefix("0x")
+        if token == "mark" && out.is_empty() {
+            out.extend(["meta".to_string(), "mark".to_string()]);
+        } else if let Some(hex) = trimmed.strip_prefix("0x")
             && let Ok(value) = u32::from_str_radix(hex, 16)
         {
             out.push(format!("0x{value:x}{suffix}"));
+        } else if token == "domain" && out.last().map(String::as_str) == Some("dport") {
+            out.push("53".to_string());
         } else if token == "filter;" && out.last().map(String::as_str) == Some("priority") {
             out.push("0;".to_string());
         } else {
@@ -638,34 +845,147 @@ pub(crate) fn parse_wireguard_fwmark(output: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
+fn wireguard_handshake_is_recent(output: &str, now_unix: u64) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|timestamp| timestamp.parse::<u64>().ok())
+            .is_some_and(|timestamp| {
+                timestamp > 0
+                    && now_unix >= timestamp
+                    && now_unix - timestamp <= WIREGUARD_HANDSHAKE_MAX_AGE_SECS
+            })
+    })
+}
+
 pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
     cfg: TunnelSidecarConfig,
+    container_name: String,
+    instance_id: String,
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl TunnelSidecar {
     pub fn new(runtime: ContainerRuntime, cfg: TunnelSidecarConfig) -> Self {
+        Self::for_instance(runtime, cfg, &crate::bootstrap::lunarwing_base_dir())
+    }
+
+    pub fn for_instance(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+    ) -> Self {
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
+            container_name: container_name_for_instance(base_dir),
+            instance_id: instance_id_for(base_dir),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+
+    fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
+        if self.cfg.dns.is_empty() {
+            return Ok(None);
+        }
+        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        Ok(Some(
+            dir.join(format!("{}.resolv.conf", self.container_name)),
+        ))
+    }
+
+    /// Materialize the per-instance resolver file joined containers mount
+    /// read-only because runtimes reject `--dns` with `--network container`.
+    pub fn tunnel_resolv_conf(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = self.resolv_conf_path()? else {
+            return Ok(None);
+        };
+        let contents = std::iter::once("# lunarwing-tunnel-dns\n".to_string())
+            .chain(
+                self.cfg
+                    .dns
+                    .iter()
+                    .map(|resolver| format!("nameserver {resolver}\n")),
+            )
+            .collect::<String>();
+        let temp_path = path.with_file_name(format!(
+            ".{}.{}",
+            path.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|_| self.unavailable("could not create the tunnel resolver file"))?;
+        if file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(self.unavailable("could not write the tunnel resolver file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644)).is_err()
+            {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(self.unavailable("could not set tunnel resolver permissions"));
+            }
+        }
+        std::fs::rename(&temp_path, &path)
+            .map_err(|_| self.unavailable("could not install the tunnel resolver file"))?;
+        Ok(Some(path))
+    }
+
+    fn netbird_state_volume(&self) -> Result<String> {
+        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let salt = read_or_create_label_salt(&dir)
+            .map_err(|_| self.unavailable("could not read or create the label salt"))?;
+        Ok(self.cfg.netbird_state_volume(&self.instance_id, &salt))
+    }
+
+    fn netbird_state_volume_prefix(&self) -> String {
+        format!("{SANDBOX_TUNNEL_CONTAINER}-{}-netbird-", self.instance_id)
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
     /// and passes the health gate. A running sidecar that fails the gate (dead
     /// provider, drifted firewall) is removed and recreated once.
     pub async fn ensure_started(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
-        let hash = self.label_hash()?;
-        if self.reuse_if_matching(&hash).await {
+        if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
+            tracing::warn!(
+                provider = self.cfg.provider.as_str(),
+                "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
+            );
+        }
+        let _ = self.tunnel_resolv_conf()?;
+        let hash = self.current_hash().await?;
+        if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy().await {
                 Ok(()) => return Ok(()),
                 Err(error) => tracing::warn!(
-                    container = SANDBOX_TUNNEL_CONTAINER,
+                    container = %self.container_name,
                     error = %error,
                     "Sandbox tunnel sidecar failed its health gate; recreating"
                 ),
@@ -675,23 +995,25 @@ impl TunnelSidecar {
         self.start_fresh(&hash).await
     }
 
-    /// Recheck the transport and both firewall chains before every run.
-    pub async fn ensure_healthy(&self) -> Result<()> {
-        let hash = self.label_hash()?;
-        if !self.reuse_if_matching(&hash).await {
+    /// Recheck the transport and both firewall chains before every run, then
+    /// return the exact container ID whose namespace was verified.
+    pub async fn ensure_healthy(&self) -> Result<String> {
+        let _ = self.tunnel_resolv_conf()?;
+        let hash = self.current_hash().await?;
+        let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
-        }
+        };
         if !self.provider_probe().await {
             return Err(self.unavailable("sidecar provider health check failed"));
         }
-        self.check_egress_firewall().await
+        self.check_egress_firewall().await?;
+        Ok(container_id)
     }
 
     async fn start_fresh(&self, hash: &str) -> Result<()> {
-        self.ensure_image_available().await?;
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
-                let volume = self.cfg.netbird_state_volume(hash);
+                let volume = self.netbird_state_volume()?;
                 self.prune_stale_netbird_volumes(&volume).await;
                 Some(volume)
             }
@@ -701,13 +1023,22 @@ impl TunnelSidecar {
         let args = build_sidecar_args(
             &self.cfg,
             env_file.as_ref().map(SecretEnvFile::as_path),
+            &self.container_name,
+            &self.instance_id,
             hash,
             state_volume.as_deref(),
         );
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // `remove()` ran first: it frees this unit name from a previous
+        // sidecar's helpers once the old container is gone.
+        let detached_unit = self.helper_unit();
         let started = tokio::time::timeout(
             self.cfg.startup_timeout,
-            crate::sandbox::cli_runner::output_isolated(self.bin, &arg_refs),
+            crate::sandbox::cli_runner::output_detached_isolated(
+                self.bin,
+                &arg_refs,
+                &detached_unit,
+            ),
         )
         .await;
         drop(env_file);
@@ -725,24 +1056,31 @@ impl TunnelSidecar {
         if !output.status.success() {
             // Another manager instance may have won the name race; accept its
             // sidecar only when it matches our configuration and is healthy.
-            if self.reuse_if_matching(hash).await {
+            if self.matching_container_id(hash).await.is_some() {
                 return self.wait_healthy().await;
             }
+            let unit_in_use =
+                crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr));
             self.remove().await;
+            if unit_in_use {
+                return Err(self.unavailable(&format!(
+                    "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
+                )));
+            }
             return Err(self.unavailable(
                 "container runtime rejected sidecar start; verify the image and host prerequisites",
             ));
         }
         tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
+            container = %self.container_name,
             provider = self.cfg.provider.as_str(),
             "Sandbox tunnel sidecar started"
         );
         // The provider must be up before the firewall goes in: wg-quick and
         // the NetBird client resolve and reach their endpoints through the
         // still-open uplink, and the WireGuard device must exist to read or
-        // set its fwmark. No joiner exists yet, so nothing shares the
-        // namespace during this window.
+        // set its fwmark. The manager receives no verified container ID to
+        // join until after firewall installation.
         if let Err(error) = self.wait_provider_ready().await {
             self.remove().await;
             return Err(error);
@@ -751,8 +1089,14 @@ impl TunnelSidecar {
             self.remove().await;
             return Err(error);
         }
+        if self.cfg.wireguard_canary.is_some() && !self.provider_probe().await {
+            self.remove().await;
+            return Err(
+                self.unavailable("WireGuard canary failed after the egress firewall was installed")
+            );
+        }
         tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
+            container = %self.container_name,
             provider = self.cfg.provider.as_str(),
             "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
         );
@@ -800,38 +1144,77 @@ impl TunnelSidecar {
         }
     }
 
-    async fn reuse_if_matching(&self, hash: &str) -> bool {
-        let Some((running, label)) = self.inspect().await else {
-            return false;
-        };
-        running && label.as_deref() == Some(hash)
+    async fn matching_container_id(&self, hash: &str) -> Option<String> {
+        let (id, running, label, instance) = self.inspect().await?;
+        (running
+            && label.as_deref() == Some(hash)
+            && instance.as_deref() == Some(&self.instance_id))
+        .then_some(id)
     }
 
-    async fn inspect(&self) -> Option<(bool, Option<String>)> {
+    async fn inspect(&self) -> Option<(String, bool, Option<String>, Option<String>)> {
         let format = format!(
-            "{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}"
+            "{{{{.Id}}}}|{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_INSTANCE_LABEL}\"}}}}"
         );
         let output = self
-            .output_probe(&["inspect", "--format", &format, SANDBOX_TUNNEL_CONTAINER])
+            .output_probe(&["inspect", "--format", &format, &self.container_name])
             .await
             .ok()?;
         if !output.status.success() {
             return None;
         }
         let text = String::from_utf8_lossy(&output.stdout);
-        let mut parts = text.trim().splitn(2, '|');
+        let mut parts = text.trim().splitn(4, '|');
+        let id = parts.next()?.trim();
+        parse_image_id(id)?;
         let running = parts.next()? == "true";
-        let hash = parts
-            .next()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_string);
-        Some((running, hash))
+        let label = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let hash = label(parts.next());
+        let instance = label(parts.next());
+        Some((id.to_string(), running, hash, instance))
+    }
+
+    fn wireguard_has_peers(&self) -> Option<bool> {
+        let path = self.cfg.wireguard_config.as_deref()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        Some(wireguard_config_has_peers(&content))
     }
 
     async fn provider_probe(&self) -> bool {
-        let args = build_health_args_for(self.cfg.provider);
+        let has_peers = if self.cfg.provider == TunnelProvider::Wireguard {
+            let Some(has_peers) = self.wireguard_has_peers() else {
+                return false;
+            };
+            has_peers
+        } else {
+            false
+        };
+        let args = build_health_args_for(
+            self.cfg.provider,
+            &self.container_name,
+            has_peers,
+            self.cfg.wireguard_canary,
+        );
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if self.cfg.provider == TunnelProvider::Wireguard
+            && has_peers
+            && self.cfg.wireguard_canary.is_none()
+        {
+            let Ok(output) = self.output_probe(&refs).await else {
+                return false;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            return output.status.success()
+                && wireguard_handshake_is_recent(&String::from_utf8_lossy(&output.stdout), now);
+        }
         self.status_probe(&refs).await.is_some_and(|s| s.success())
     }
 
@@ -843,7 +1226,7 @@ impl TunnelSidecar {
             TunnelProvider::Netbird => NETBIRD_CONTROL_PLANE_MARK,
             TunnelProvider::Wireguard => self.wireguard_fwmark(set_wireguard_mark).await?,
         };
-        let cat = exec_args(&["cat", "/etc/resolv.conf"]);
+        let cat = exec_args(&["cat", "/etc/resolv.conf"], &self.container_name);
         let cat_refs: Vec<&str> = cat.iter().map(String::as_str).collect();
         let resolv = self
             .output_probe(&cat_refs)
@@ -854,12 +1237,14 @@ impl TunnelSidecar {
         }
         Ok(EgressPolicy {
             tunnel_mark,
-            resolvers: parse_resolvers(&String::from_utf8_lossy(&resolv.stdout)),
+            resolvers: self
+                .cfg
+                .uplink_resolvers(&String::from_utf8_lossy(&resolv.stdout)),
         })
     }
 
     async fn wireguard_fwmark(&self, set_if_off: bool) -> Result<u32> {
-        let show = exec_args(&["wg", "show", "wg0", "fwmark"]);
+        let show = exec_args(&["wg", "show", "wg0", "fwmark"], &self.container_name);
         let show_refs: Vec<&str> = show.iter().map(String::as_str).collect();
         let output = self
             .output_probe(&show_refs)
@@ -875,7 +1260,7 @@ impl TunnelSidecar {
             return Err(self.unavailable("WireGuard device carries no fwmark"));
         }
         let mark = format!("0x{LUNARWING_TUNNEL_FWMARK:x}");
-        let set = exec_args(&["wg", "set", "wg0", "fwmark", &mark]);
+        let set = exec_args(&["wg", "set", "wg0", "fwmark", &mark], &self.container_name);
         let set_refs: Vec<&str> = set.iter().map(String::as_str).collect();
         match self.status_probe(&set_refs).await {
             Some(status) if status.success() => Ok(LUNARWING_TUNNEL_FWMARK),
@@ -885,7 +1270,10 @@ impl TunnelSidecar {
 
     async fn install_egress_firewall(&self) -> Result<()> {
         let policy = self.egress_policy(true).await?;
-        for (index, args) in firewall_install_commands(&policy).iter().enumerate() {
+        for (index, args) in firewall_install_commands(&policy, &self.container_name)
+            .iter()
+            .enumerate()
+        {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let output = self.output_probe(&refs).await.map_err(|_| {
                 self.unavailable("failed to execute nftables in the tunnel sidecar")
@@ -906,7 +1294,7 @@ impl TunnelSidecar {
     }
 
     async fn verify_egress_firewall(&self, policy: &EgressPolicy) -> Result<()> {
-        let args = firewall_list_args();
+        let args = firewall_list_args(&self.container_name);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self
             .output_probe(&refs)
@@ -919,7 +1307,7 @@ impl TunnelSidecar {
         let listing = String::from_utf8_lossy(&output.stdout);
         firewall_matches(&listing, policy).map_err(|reason| {
             tracing::warn!(
-                container = SANDBOX_TUNNEL_CONTAINER,
+                container = %self.container_name,
                 reason = %reason,
                 "Sandbox tunnel firewall does not match the expected policy"
             );
@@ -928,18 +1316,42 @@ impl TunnelSidecar {
     }
 
     async fn ensure_image_available(&self) -> Result<()> {
-        if self.cfg.auto_pull_image {
+        if self
+            .status_probe(&["image", "inspect", self.cfg.image()])
+            .await
+            .is_some_and(|status| status.success())
+        {
             return Ok(());
         }
-        match self
-            .status_probe(&["image", "exists", self.cfg.image()])
-            .await
-        {
-            Some(status) if status.success() => Ok(()),
-            _ => Err(self.unavailable(
+        if !self.cfg.auto_pull_image {
+            return Err(self.unavailable(
                 "sidecar image is not present locally and SANDBOX_AUTO_PULL is false",
-            )),
+            ));
         }
+        let pulled = tokio::time::timeout(
+            self.cfg.startup_timeout,
+            crate::sandbox::cli_runner::output_isolated(self.bin, &["pull", self.cfg.image()]),
+        )
+        .await;
+        match pulled {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(_)) => Err(self.unavailable("could not pull the sidecar image")),
+            Ok(Err(_)) => Err(self.unavailable("failed to execute the image pull")),
+            Err(_) => Err(self.unavailable("sidecar image pull exceeded the startup timeout")),
+        }
+    }
+
+    async fn resolve_image_id(&self) -> Result<String> {
+        let output = self
+            .output_probe(&["image", "inspect", "--format", "{{.Id}}", self.cfg.image()])
+            .await
+            .map_err(|_| self.unavailable("could not inspect the sidecar image"))?;
+        if !output.status.success() {
+            return Err(self.unavailable("could not inspect the sidecar image"));
+        }
+        parse_image_id(&String::from_utf8_lossy(&output.stdout))
+            .map(str::to_string)
+            .ok_or_else(|| self.unavailable("the runtime returned an invalid sidecar image ID"))
     }
 
     /// Remove NetBird state volumes left by earlier configurations (a rotated
@@ -955,8 +1367,9 @@ impl TunnelSidecar {
             return;
         }
         let listing = String::from_utf8_lossy(&output.stdout);
+        let prefix = self.netbird_state_volume_prefix();
         for name in listing.lines().map(str::trim) {
-            if name.starts_with(NETBIRD_STATE_VOLUME_PREFIX) && name != keep {
+            if name.starts_with(&prefix) && name != keep {
                 let _ = self.status_probe(&["volume", "rm", name]).await;
             }
         }
@@ -987,42 +1400,122 @@ impl TunnelSidecar {
         }
     }
 
-    fn label_hash(&self) -> Result<String> {
+    async fn current_hash(&self) -> Result<String> {
+        self.ensure_image_available().await?;
+        let image_id = self.resolve_image_id().await?;
         let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
         let salt = read_or_create_label_salt(&dir)
             .map_err(|_| self.unavailable("could not read or create the label salt"))?;
-        Ok(self.cfg.config_hash(&salt))
+        Ok(self.cfg.config_hash(&salt, &image_id))
     }
 
-    /// Kill-and-remove the sidecar at once (`podman rm -f -t 0`; Docker's
-    /// `rm -f` has no timeout flag and kills immediately).
+    /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
+        self.release_network_helper().await;
     }
 
-    /// Stop the sidecar gracefully, then remove it.
+    /// Stop the sidecar gracefully, then remove it if this instance owns it.
     pub async fn stop(&self) {
-        let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10)).await;
-        tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
-            "Sandbox tunnel sidecar stopped"
-        );
+        if tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10))
+            .await
+            .ok()
+            == Some(true)
+        {
+            tracing::info!(
+                container = %self.container_name,
+                "Sandbox tunnel sidecar stopped"
+            );
+        }
+        self.release_network_helper().await;
+        if let Ok(Some(path)) = self.resolv_conf_path() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
-    async fn remove_with_grace(&self, grace_secs: u32) {
-        for args in removal_commands(self.runtime, grace_secs) {
+    /// Transient unit of the detached `run -d` client. In systemd service
+    /// mode the runtime's network helpers (pasta, conmon) stay in its cgroup.
+    fn helper_unit(&self) -> String {
+        format!("lunarwing-tunnel-{}", self.instance_id)
+    }
+
+    /// Free the helper unit's name once the sidecar container is gone.
+    ///
+    /// The unit stays loaded while a helper lives, and the next start reuses
+    /// its name. The helpers must keep running for as long as the container
+    /// does, so nothing is signalled unless the runtime positively reports
+    /// that no container has the sidecar's name.
+    async fn release_network_helper(&self) {
+        let spawner = crate::tools::process::workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            return;
+        }
+        if self.container_absent().await != Some(true) {
+            tracing::debug!(
+                container = %self.container_name,
+                "Sidecar container is present or its state is unknown; leaving its helper unit alone"
+            );
+            return;
+        }
+        let unit = format!("{}.service", self.helper_unit());
+        let released = tokio::time::timeout(
+            CLEANUP_TIMEOUT,
+            crate::tools::process::release_detached_workload_unit(&unit, spawner.xdg_runtime_dir()),
+        )
+        .await
+        .unwrap_or(false);
+        if !released {
+            tracing::warn!(
+                unit = %unit,
+                "Sandbox tunnel helper unit is still loaded after cleanup; the next sidecar start may fail"
+            );
+        }
+    }
+
+    /// `Some(true)` only when the runtime positively reports that no
+    /// container has the sidecar's name; `None` when the probe itself failed.
+    async fn container_absent(&self) -> Option<bool> {
+        let output = self
+            .output_probe(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                &self.container_name,
+            ])
+            .await
+            .ok()?;
+        container_absent_from_inspect(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    async fn remove_with_grace(&self, grace_secs: u32) -> bool {
+        let owned = self.inspect().await.is_some_and(|(_, _, _, instance)| {
+            instance.as_deref() == Some(self.instance_id.as_str())
+        });
+        if !owned {
+            tracing::debug!(
+                container = %self.container_name,
+                "Not removing a sidecar without this instance's ownership label"
+            );
+            return false;
+        }
+        for args in removal_commands(self.runtime, grace_secs, &self.container_name) {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Some(status) =
                 crate::sandbox::cli_runner::run_status_isolated(self.bin, &refs).await
                 && !status.success()
             {
                 tracing::debug!(
-                    container = SANDBOX_TUNNEL_CONTAINER,
+                    container = %self.container_name,
                     command = refs.join(" "),
                     "Sandbox tunnel sidecar removal command returned non-zero"
                 );
             }
         }
+        true
     }
 
     fn write_secret_env_file(&self) -> Result<Option<SecretEnvFile>> {
@@ -1053,9 +1546,26 @@ impl TunnelSidecar {
     }
 }
 
+/// Read a failed `container inspect`: only a "no such container" answer
+/// proves absence. Any other failure (runtime down, timeout, storage lock)
+/// leaves the state unknown.
+fn container_absent_from_inspect(success: bool, stderr: &str) -> Option<bool> {
+    if success {
+        return Some(false);
+    }
+    stderr
+        .to_ascii_lowercase()
+        .contains("no such container")
+        .then_some(true)
+}
+
 /// Runtime-specific removal: podman's `rm` takes `-t`, Docker's does not, so
 /// Docker stops first when a grace period is wanted.
-fn removal_commands(runtime: ContainerRuntime, grace_secs: u32) -> Vec<Vec<String>> {
+fn removal_commands(
+    runtime: ContainerRuntime,
+    grace_secs: u32,
+    container_name: &str,
+) -> Vec<Vec<String>> {
     let grace = grace_secs.to_string();
     let to_strings = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
     match runtime {
@@ -1064,19 +1574,14 @@ fn removal_commands(runtime: ContainerRuntime, grace_secs: u32) -> Vec<Vec<Strin
             "-f",
             "-t",
             grace.as_str(),
-            SANDBOX_TUNNEL_CONTAINER,
+            container_name,
         ])],
         ContainerRuntime::Docker => {
             let mut commands = Vec::new();
             if grace_secs > 0 {
-                commands.push(to_strings(&[
-                    "stop",
-                    "-t",
-                    grace.as_str(),
-                    SANDBOX_TUNNEL_CONTAINER,
-                ]));
+                commands.push(to_strings(&["stop", "-t", grace.as_str(), container_name]));
             }
-            commands.push(to_strings(&["rm", "-f", SANDBOX_TUNNEL_CONTAINER]));
+            commands.push(to_strings(&["rm", "-f", container_name]));
             commands
         }
     }
@@ -1173,6 +1678,7 @@ mod tests {
     use super::*;
 
     const SALT: &[u8] = b"test-salt";
+    const IMAGE_ID: &str = "sha256:image-one";
 
     fn netbird_cfg() -> TunnelSidecarConfig {
         TunnelSidecarConfig {
@@ -1235,7 +1741,7 @@ mod tests {
         assert!("openvpn".parse::<TunnelProvider>().is_err());
         assert_eq!(
             TunnelProvider::Netbird.default_image(),
-            "docker.io/netbirdio/netbird:latest"
+            "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
         );
         assert_eq!(
             TunnelProvider::Wireguard.default_image(),
@@ -1253,15 +1759,19 @@ mod tests {
         let args = build_sidecar_args(
             &cfg,
             Some(Path::new("/run/user/1000/lw-env")),
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
             "abc123",
-            Some("lunarwing-sandbox-tunnel-netbird-abc123"),
+            Some("lunarwing-sandbox-tunnel-test-instance-netbird-abc123"),
         );
         let joined = args.join("\n");
         assert!(!joined.contains("setup-key-1"));
         assert!(!joined.contains("netbird.example.com"));
         assert!(joined.contains("--env-file\n/run/user/1000/lw-env"));
         assert!(joined.contains("--device\n/dev/net/tun"));
-        assert!(joined.contains("-v\nlunarwing-sandbox-tunnel-netbird-abc123:/var/lib/netbird"));
+        assert!(joined.contains(
+            "-v\nlunarwing-sandbox-tunnel-test-instance-netbird-abc123:/var/lib/netbird"
+        ));
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
@@ -1271,7 +1781,9 @@ mod tests {
         // The image entrypoint runs `netbird up` itself; no dead argument.
         assert_eq!(
             args.last().map(String::as_str),
-            Some("docker.io/netbirdio/netbird:latest")
+            Some(
+                "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
+            )
         );
     }
 
@@ -1280,6 +1792,8 @@ mod tests {
         let args = build_sidecar_args(
             &wireguard_cfg(Some(PathBuf::from("/etc/lunarwing/wg0.conf"))),
             None,
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
             "abc123",
             None,
         );
@@ -1298,7 +1812,15 @@ mod tests {
     #[test]
     fn sidecar_preserves_hardening_and_separate_label_namespace() {
         let cfg = netbird_cfg();
-        let joined = build_sidecar_args(&cfg, None, "deadbeef", None).join(" ");
+        let joined = build_sidecar_args(
+            &cfg,
+            None,
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
+            "deadbeef",
+            None,
+        )
+        .join(" ");
         for flag in [
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -1312,44 +1834,95 @@ mod tests {
             assert!(joined.contains(flag), "missing {flag}: {joined}");
         }
         assert!(joined.contains(&format!("{SANDBOX_TUNNEL_CONTAINER_LABEL}=netbird")));
+        assert!(joined.contains(&format!("{SANDBOX_TUNNEL_INSTANCE_LABEL}=test-instance")));
         assert!(joined.contains(&format!("{SANDBOX_TUNNEL_HASH_LABEL}=deadbeef")));
         assert!(!joined.contains("lunarwing.sandbox="));
     }
 
     #[test]
-    fn config_hash_is_salted_and_covers_rotation_and_wireguard_contents() {
+    fn container_names_and_netbird_volumes_are_instance_scoped() {
+        let first = container_name_for_instance(Path::new("/srv/one/state"));
+        let second = container_name_for_instance(Path::new("/srv/two/state"));
+        assert_ne!(first, second);
+        assert!(first.starts_with("lunarwing-sandbox-tunnel-"));
+        assert_eq!(
+            first,
+            container_name_for_instance(Path::new("/srv/one/state"))
+        );
+        let cfg = netbird_cfg();
+        let first_volume = cfg.netbird_state_volume("first-instance", SALT);
+        let second_volume = cfg.netbird_state_volume("second-instance", SALT);
+        assert_ne!(first_volume, second_volume);
+        assert!(first_volume.starts_with("lunarwing-sandbox-tunnel-first-instance-netbird-"));
+    }
+
+    #[test]
+    fn config_hash_is_salted_and_covers_rotation_image_and_wireguard_contents() {
         let base = netbird_cfg();
         let rotated = TunnelSidecarConfig {
             netbird_setup_key: Some(SecretString::from("setup-key-2")),
             ..base.clone()
         };
-        assert_ne!(base.config_hash(SALT), rotated.config_hash(SALT));
-        assert_eq!(base.config_hash(SALT), netbird_cfg().config_hash(SALT));
-        assert_ne!(base.config_hash(SALT), base.config_hash(b"other-salt"));
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            rotated.config_hash(SALT, IMAGE_ID)
+        );
+        assert_eq!(
+            base.config_hash(SALT, IMAGE_ID),
+            netbird_cfg().config_hash(SALT, IMAGE_ID)
+        );
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            base.config_hash(b"other-salt", IMAGE_ID)
+        );
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            base.config_hash(SALT, "sha256:image-two")
+        );
         // The published label is not a plain digest of the key material.
         let plain = format!("{:x}", Sha256::digest(b"setup-key-1"));
-        assert_ne!(base.config_hash(SALT), plain);
+        assert_ne!(base.config_hash(SALT, IMAGE_ID), plain);
 
         let dir = std::env::temp_dir().join(format!("lw-tunnel-hash-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wg0.conf");
         std::fs::write(&path, "[Interface]\nPrivateKey = first\n").unwrap();
-        let first = wireguard_cfg(Some(path.clone())).config_hash(SALT);
+        let first = wireguard_cfg(Some(path.clone())).config_hash(SALT, IMAGE_ID);
         std::fs::write(&path, "[Interface]\nPrivateKey = second\n").unwrap();
-        let second = wireguard_cfg(Some(path)).config_hash(SALT);
+        let second = wireguard_cfg(Some(path)).config_hash(SALT, IMAGE_ID);
         assert_ne!(first, second);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn netbird_state_volume_is_keyed_by_hash() {
+    fn netbird_state_volume_tracks_only_peer_identity() {
         let cfg = netbird_cfg();
-        let volume = cfg.netbird_state_volume("0123456789abcdef0123456789abcdef");
-        assert_eq!(volume, "lunarwing-sandbox-tunnel-netbird-0123456789abcdef");
-        assert_ne!(
+        let volume = cfg.netbird_state_volume("test-instance", SALT);
+        assert!(volume.starts_with("lunarwing-sandbox-tunnel-test-instance-netbird-"));
+        let runtime_change = TunnelSidecarConfig {
+            image: Some("localhost/netbird:rotated".into()),
+            dns: vec!["100.100.0.53".parse().unwrap()],
+            ..cfg.clone()
+        };
+        assert_eq!(
             volume,
-            cfg.netbird_state_volume("fedcba9876543210fedcba9876543210")
+            runtime_change.netbird_state_volume("test-instance", SALT)
         );
+        for identity_change in [
+            TunnelSidecarConfig {
+                netbird_management_url: Some("https://other.example.com".into()),
+                ..cfg.clone()
+            },
+            TunnelSidecarConfig {
+                netbird_setup_key: Some(SecretString::from("setup-key-2")),
+                ..cfg.clone()
+            },
+        ] {
+            assert_ne!(
+                volume,
+                identity_change.netbird_state_volume("test-instance", SALT)
+            );
+        }
     }
 
     #[test]
@@ -1375,6 +1948,36 @@ mod tests {
             ..netbird_cfg()
         };
         assert!(missing.validate().unwrap_err().contains("SETUP_KEY"));
+    }
+
+    #[test]
+    fn image_digest_references_and_runtime_ids_are_validated() {
+        assert!(netbird_cfg().validate().is_ok());
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned = TunnelSidecarConfig {
+            image: Some(format!("registry.example/netbird@{digest}")),
+            ..netbird_cfg()
+        };
+        assert!(pinned.validate().is_ok());
+        assert_eq!(parse_image_id(&digest), Some(digest.as_str()));
+        assert_eq!(
+            parse_image_id(&"b".repeat(64)),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        for invalid in [
+            "",
+            " netbird:latest",
+            "netbird@sha256:abc",
+            "netbird@sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let cfg = TunnelSidecarConfig {
+                image: Some(invalid.into()),
+                ..netbird_cfg()
+            };
+            assert!(cfg.validate().is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(parse_image_id("not-an-image-id"), None);
     }
 
     #[test]
@@ -1406,20 +2009,149 @@ mod tests {
     }
 
     #[test]
-    fn health_probe_matches_provider() {
+    fn peered_wireguard_requires_keepalive_or_canary() {
+        let dir =
+            std::env::temp_dir().join(format!("lw-tunnel-keepalive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("wg0.conf");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&config, "").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let validate = |keepalive: Option<&str>, canary: bool| {
+            let keepalive = keepalive
+                .map(|value| format!("PersistentKeepalive = {value}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &config,
+                format!(
+                    "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n{keepalive}"
+                ),
+            )
+            .unwrap();
+            TunnelSidecarConfig {
+                provider: TunnelProvider::Wireguard,
+                wireguard_config: Some(config.clone()),
+                wireguard_canary: canary.then(|| "10.231.0.1".parse().unwrap()),
+                ..TunnelSidecarConfig::default()
+            }
+            .validate()
+        };
+        for invalid in [None, Some("0"), Some("61")] {
+            let error = validate(invalid, false).unwrap_err();
+            assert!(error.contains("PersistentKeepalive"), "{error}");
+        }
+        for valid in [Some("1"), Some("25 # seconds"), Some("60")] {
+            assert!(validate(valid, false).is_ok());
+        }
+        assert!(validate(None, true).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn health_probe_matches_provider_and_wireguard_peers() {
         assert_eq!(
-            build_health_args_for(TunnelProvider::Netbird).join(" "),
-            "exec lunarwing-sandbox-tunnel netbird status --check startup"
+            build_health_args_for(TunnelProvider::Netbird, "tunnel-test", false, None).join(" "),
+            "exec tunnel-test netbird status --check startup"
         );
         assert_eq!(
-            build_health_args_for(TunnelProvider::Wireguard).join(" "),
-            "exec lunarwing-sandbox-tunnel ip link show wg0"
+            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test", false, None).join(" "),
+            "exec tunnel-test ip link show wg0"
         );
+        assert_eq!(
+            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test", true, None).join(" "),
+            "exec tunnel-test wg show wg0 latest-handshakes"
+        );
+        assert_eq!(
+            build_health_args_for(
+                TunnelProvider::Wireguard,
+                "tunnel-test",
+                true,
+                Some("10.231.0.1".parse().unwrap()),
+            )
+            .join(" "),
+            "exec tunnel-test ping -c 1 -W 2 10.231.0.1"
+        );
+        assert!(wireguard_config_has_peers(
+            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
+        ));
+        assert!(!wireguard_config_has_peers(
+            "[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n"
+        ));
+        assert!(wireguard_handshake_is_recent("peer-a 1000\n", 1180));
+        assert!(wireguard_handshake_is_recent(
+            "peer-a 0\npeer-b 999\n",
+            1000
+        ));
+        assert!(!wireguard_handshake_is_recent("peer-a 0\n", 1000));
+        assert!(!wireguard_handshake_is_recent("peer-a 819\n", 1000));
+        assert!(!wireguard_handshake_is_recent("peer-a 1001\n", 1000));
+        assert!(!wireguard_handshake_is_recent("garbage\n", 1000));
+    }
+
+    #[test]
+    fn custom_dns_skips_sidecar_and_closes_uplink_dns() {
+        let cfg = TunnelSidecarConfig {
+            dns: vec!["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()],
+            ..netbird_cfg()
+        };
+        let args = build_sidecar_args(&cfg, None, "tunnel-test", "test-instance", "deadbeef", None)
+            .join(" ");
+        assert!(!args.contains("--dns"));
+        assert!(cfg.uplink_resolvers("nameserver 169.254.1.1\n").is_empty());
+        assert_eq!(
+            netbird_cfg().uplink_resolvers("nameserver 169.254.1.1\n"),
+            vec!["169.254.1.1".parse::<IpAddr>().unwrap()]
+        );
+        let invalid = TunnelSidecarConfig {
+            dns: vec!["0.0.0.0".parse().unwrap()],
+            ..netbird_cfg()
+        };
+        assert!(invalid.validate().is_err());
+        let misplaced_canary = TunnelSidecarConfig {
+            wireguard_canary: Some("10.0.0.1".parse().unwrap()),
+            ..netbird_cfg()
+        };
+        assert!(misplaced_canary.validate().is_err());
+    }
+
+    #[test]
+    fn tunnel_addresses_reject_local_and_non_unicast_destinations() {
+        for invalid in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let address: IpAddr = invalid.parse().unwrap();
+            assert!(!valid_tunnel_address(&address), "accepted {address}");
+            let dns = TunnelSidecarConfig {
+                dns: vec![address],
+                ..netbird_cfg()
+            };
+            assert!(dns.validate().is_err(), "DNS accepted {address}");
+            let canary = TunnelSidecarConfig {
+                provider: TunnelProvider::Wireguard,
+                wireguard_canary: Some(address),
+                ..TunnelSidecarConfig::default()
+            };
+            assert!(canary.validate().is_err(), "canary accepted {address}");
+        }
+        for valid in ["100.100.0.53", "10.231.0.1", "fd00::53"] {
+            assert!(valid_tunnel_address(&valid.parse().unwrap()));
+        }
     }
 
     #[test]
     fn firewall_install_covers_both_directions() {
-        let commands = firewall_install_commands(&policy());
+        let commands = firewall_install_commands(&policy(), "tunnel-test");
         let joined = commands
             .iter()
             .map(|command| command.join(" "))
@@ -1569,6 +2301,14 @@ mod tests {
             "meta mark 0x4c57 accept"
         );
         assert_eq!(
+            canonical_nft_line("mark 0x00004c57 accept"),
+            "meta mark 0x4c57 accept"
+        );
+        assert_eq!(
+            canonical_nft_line("ip daddr 169.254.1.1 udp dport domain accept"),
+            "ip daddr 169.254.1.1 udp dport 53 accept"
+        );
+        assert_eq!(
             canonical_nft_line("type filter hook output priority filter; policy drop;"),
             "type filter hook output priority 0; policy drop;"
         );
@@ -1596,21 +2336,48 @@ mod tests {
         assert_eq!(parse_wireguard_fwmark("garbage"), None);
     }
 
+    /// WI#601: the helper unit may be signalled only when the runtime says
+    /// the container does not exist. A failed probe proves nothing.
+    #[test]
+    fn helper_unit_cleanup_requires_a_positively_absent_container() {
+        assert_eq!(container_absent_from_inspect(true, ""), Some(false));
+        assert_eq!(
+            container_absent_from_inspect(false, "Error: no such container \"tunnel-test\"\n"),
+            Some(true)
+        );
+        assert_eq!(
+            container_absent_from_inspect(
+                false,
+                "Error response from daemon: No such container: tunnel-test\n"
+            ),
+            Some(true)
+        );
+        for stderr in [
+            "",
+            "Error: has dependent containers which must be removed before it\n",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n",
+            "Failed to start transient service unit: Connection refused\n",
+        ] {
+            assert_eq!(
+                container_absent_from_inspect(false, stderr),
+                None,
+                "{stderr}"
+            );
+        }
+    }
+
     #[test]
     fn removal_commands_match_the_runtime() {
-        let podman = removal_commands(ContainerRuntime::Podman, 10);
+        let podman = removal_commands(ContainerRuntime::Podman, 10, "tunnel-test");
         assert_eq!(podman.len(), 1);
-        assert_eq!(podman[0].join(" "), "rm -f -t 10 lunarwing-sandbox-tunnel");
-        let docker_stop = removal_commands(ContainerRuntime::Docker, 10);
+        assert_eq!(podman[0].join(" "), "rm -f -t 10 tunnel-test");
+        let docker_stop = removal_commands(ContainerRuntime::Docker, 10, "tunnel-test");
         assert_eq!(docker_stop.len(), 2);
-        assert_eq!(
-            docker_stop[0].join(" "),
-            "stop -t 10 lunarwing-sandbox-tunnel"
-        );
-        assert_eq!(docker_stop[1].join(" "), "rm -f lunarwing-sandbox-tunnel");
-        let docker_kill = removal_commands(ContainerRuntime::Docker, 0);
+        assert_eq!(docker_stop[0].join(" "), "stop -t 10 tunnel-test");
+        assert_eq!(docker_stop[1].join(" "), "rm -f tunnel-test");
+        let docker_kill = removal_commands(ContainerRuntime::Docker, 0, "tunnel-test");
         assert_eq!(docker_kill.len(), 1);
-        assert_eq!(docker_kill[0].join(" "), "rm -f lunarwing-sandbox-tunnel");
+        assert_eq!(docker_kill[0].join(" "), "rm -f tunnel-test");
         assert!(docker_kill.iter().all(|c| !c.iter().any(|a| a == "-t")));
     }
 

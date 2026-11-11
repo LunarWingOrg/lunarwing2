@@ -8,11 +8,13 @@ operator-managed.
 This integration targets self-hosted NetBird. It does not require NetBird Cloud
 or a LunarWing-side management API token.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** `netbird expose`
-process management, `TUNNEL_NETBIRD_NAME_PREFIX`/`TUNNEL_NETBIRD_CUSTOM_DOMAIN`
-env knobs, and the V24 legacy-provider scrub migration were re-checked against
-`ic/src/tunnel/`, `ic/src/config/tunnel.rs`, and `ic/migrations/`; no changes
-were needed.
+**Revalidated against source 2026-11-10 (v2.2.0.0).** `netbird expose`
+process management, `TUNNEL_NETBIRD_NAME_PREFIX`/`TUNNEL_NETBIRD_CUSTOM_DOMAIN`,
+and the V24 legacy-provider scrub match `ic/src/tunnel/`, `ic/src/config/tunnel.rs`,
+and `ic/migrations/`. This is inbound daemon/gateway exposure. The opt-in,
+egress-only sandbox sidecar is documented separately in
+[`SANDBOX_TUNNEL_NETWORKING.md`](SANDBOX_TUNNEL_NETWORKING.md); never reuse this
+guide's peer or setup key for that boundary.
 
 ## Scope
 
@@ -67,13 +69,20 @@ LunarWing never calls either init system directly.
 Enroll host outside LunarWing:
 
 ```bash
+umask 077
+${EDITOR:-vi} /root/netbird-setup-key    # one line: the setup key
 netbird up \
   --management-url https://netbird.example.com \
-  --setup-key '<setup-key>'
+  --setup-key-file /root/netbird-setup-key
+rm -f /root/netbird-setup-key
 ```
 
 Protect setup key as a secret. Do not place it in LunarWing settings or service
-environment. Confirm peer readiness:
+environment. Do not pass it as `--setup-key '<setup-key>'` on a shared host:
+command-line arguments are visible in the process list to every local account,
+tenant accounts included, unless `/proc` is mounted with `hidepid`.
+`--setup-key-file` exists in current NetBird clients (0.75.0 has it); check
+`netbird up --help` on older ones. Confirm peer readiness:
 
 ```bash
 netbird status --check startup

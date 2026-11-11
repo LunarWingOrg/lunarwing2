@@ -1,10 +1,10 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-01 for v2.1.8.0.
+**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-10 for v2.2.0.0.
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (v2.1.8.0)
+## Current State (v2.2.0.0)
 
 `ic/src/agent/agent_loop.rs::supervise_message()` creates one
 `Arc<AtomicBool>` per scheduled inbound message and passes it to
@@ -209,6 +209,7 @@ spawned work:
 - **2026-10-14 (v2.1.6.0):** re-verified symbol anchors again (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1330`) — no scope change; defer decision stands
 - **2026-10-29 (v2.1.7.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1331`; `process_user_input` and `process_approval` still live in `thread_ops.rs`) — no scope change; defer decision stands
 - **2026-11-01 (v2.1.8.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1331`; `process_user_input` and `process_approval` symbols unchanged) — no scope change; defer decision stands
+- **2026-11-10 (v2.2.0.0):** re-verified the same symbol-based boundaries (`HARD_KILL_GRACE_SECS` remains 30; the suppression flag remains per supervised message; legacy input, approval, and Engine V2 behavior retain their existing ownership) — no scope change; defer decision stands
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---

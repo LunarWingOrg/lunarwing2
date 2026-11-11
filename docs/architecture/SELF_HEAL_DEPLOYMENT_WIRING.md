@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Created:** 2026-06-13. **Source revalidated:** 2026-11-08, v2.1.9.0.
+**Created:** 2026-06-13. **Source revalidated:** 2026-11-10, v2.2.0.0.
 **Status:** Reference — documents current behavior, not a proposal.
 **Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
 [multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),

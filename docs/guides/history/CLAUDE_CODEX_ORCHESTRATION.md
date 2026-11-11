@@ -1,5 +1,15 @@
 # Claude Code → Codex Parallel Feature Orchestration
 
+> **ARCHIVED CONCEPTUAL WORKFLOW (reviewed 2026-11-10).** The `.claude/`
+> skills, helper scripts, and demo artifacts referenced below are no longer in
+> the repository. This is not a supported agent setup or an instruction to
+> install that tooling; its branch, PR, and validation examples are historical.
+> The durable lesson is worktree isolation and independent verification. Current
+> contributors must use the root [`AGENTS.md`](../../../AGENTS.md),
+> [`CODE-CONTRIBUTION-POLICY.md`](../CODE-CONTRIBUTION-POLICY.md),
+> [`AI-CODE-CONTRIBUTION-POLICY.md`](../AI-CODE-CONTRIBUTION-POLICY.md), and
+> [`TESTING_GUIDE.md`](../TESTING_GUIDE.md).
+
 How to develop **multiple unrelated features at once** in the LunarWing monorepo by letting **Claude Code orchestrate** and **OpenAI Codex implement** inside isolated git worktrees.
 
 This is **Pattern A**: Claude is the boss; Codex is a scoped worker process.
@@ -10,18 +20,11 @@ This is **Pattern A**: Claude is the boss; Codex is a scoped worker process.
 | Implementer | Codex CLI (`codex exec`) | Write code inside one feature worktree |
 | Isolation | `git worktree` + `feat/<slug>` | Parallel features without fighting one checkout |
 
-**Related files (in-repo):**
-
-| Path | Purpose |
-|------|---------|
-| [`.claude/skills/codex-impl/`](../../.claude/skills/codex-impl/) | `/codex-impl` skill — single feature |
-| [`.claude/skills/features-parallel/`](../../.claude/skills/features-parallel/) | `/features-parallel` skill — many features |
-| [`.claude/scripts/feature-worktree.sh`](../../.claude/scripts/feature-worktree.sh) | Create/reuse `.worktrees/<slug>` |
-| [`.claude/scripts/feature-status.sh`](../../.claude/scripts/feature-status.sh) | Status / changed-file summary |
-| [`.claude/skills/codex-impl/scripts/run-codex.sh`](../../.claude/skills/codex-impl/scripts/run-codex.sh) | Non-interactive Codex wrapper |
-| [`.claude/README-codex-orchestration.md`](../../.claude/README-codex-orchestration.md) | Short pointer / defaults |
-
-Also respect root agent rules: [`AGENTS.md`](../../AGENTS.md), [`AI-CODE-CONTRIBUTION-POLICY.md`](AI-CODE-CONTRIBUTION-POLICY.md).
+**Retired tooling:** `.claude/skills/codex-impl/`,
+`.claude/skills/features-parallel/`, `.claude/scripts/feature-worktree.sh`,
+`.claude/scripts/feature-status.sh`, and the Codex wrapper/defaults formerly
+documented here have been removed. Do not treat their commands below as files
+available in the current checkout.
 
 ---
 
@@ -88,18 +91,20 @@ git rev-parse --show-toplevel
 
 ### Repo location
 
-Run everything from the **LunarWing monorepo root** (the directory that contains `ic/`, `docs/`, `AGENTS.md`, and `.claude/`).
+The historical workflow ran from the **LunarWing monorepo root**, which then
+contained `ic/`, `docs/`, `AGENTS.md`, and `.claude/`. The current checkout has
+no such `.claude/` tree; the archive banner above is the compatibility boundary.
 
 ```bash
 cd /path/to/LunarWing
-ls .claude/skills/codex-impl .claude/scripts
+ls ic docs AGENTS.md
 ```
 
 ### Claude session tips
 
 - Start Claude with cwd = repo root.
 - Prefer **acceptEdits** or Manual permission mode for this workflow. **Auto mode** can block Bash if its safety classifier is unavailable.
-- Project skills load from `.claude/skills/` automatically.
+- At the time of this workflow, project skills loaded from `.claude/skills/` automatically; that directory is now removed.
 
 ### LunarWing build constraints (verification)
 
@@ -107,7 +112,7 @@ When verifying Rust changes, follow `AGENTS.md`:
 
 ```bash
 # From ic/ — preferred compile check (NOT full debug builds)
-taskset -c 0-5 cargo check -j6
+taskset -c 0-11 cargo check -j12
 ```
 
 Do **not** use full debug `cargo build` for routine verification on constrained hosts.
@@ -287,7 +292,7 @@ git -C .worktrees/my-feature diff --name-only HEAD
 
 # Targeted compile (example)
 cd .worktrees/my-feature/ic
-taskset -c 0-5 cargo check -j6 -p <crate>
+taskset -c 0-11 cargo check -j12 -p <crate>
 ```
 
 ### 6. Commit on the feature branch only
@@ -481,7 +486,7 @@ Each worktree is large. Remove finished ones promptly; avoid unbounded parallel 
 
 ### Cargo builds melt the machine
 
-Use `taskset -c 0-5 cargo check -j6` per `AGENTS.md`. Never default to full debug builds for verification.
+Use `taskset -c 0-11 cargo check -j12` per `AGENTS.md`. Never default to full debug builds for verification.
 
 ---
 
@@ -491,7 +496,7 @@ Use `taskset -c 0-5 cargo check -j6` per `AGENTS.md`. Never default to full debu
 - `CODEX_BYPASS_APPROVALS=1` disables Codex’s own approval and sandbox — only for environments that are already isolated.
 - Do not put secrets into `.codex-prompt.md` (even though it is gitignored, logs may capture it).
 - Review feature-branch diffs before merging into the integration line.
-- Follow [`AI-CODE-CONTRIBUTION-POLICY.md`](AI-CODE-CONTRIBUTION-POLICY.md) for AI-authored contributions.
+- Follow [`AI-CODE-CONTRIBUTION-POLICY.md`](../AI-CODE-CONTRIBUTION-POLICY.md) for AI-authored contributions.
 
 ---
 
@@ -574,8 +579,10 @@ Parallel unrelated features on one dirty tree thrash each other. Worktrees give 
 
 ## See also
 
-- [`.claude/README-codex-orchestration.md`](../../.claude/README-codex-orchestration.md) — short defaults  
-- [`AGENTS.md`](../../AGENTS.md) — agent coding contract  
-- [`TESTING_GUIDE.md`](TESTING_GUIDE.md) — pre-release testing  
-- [`AI-CODE-CONTRIBUTION-POLICY.md`](AI-CODE-CONTRIBUTION-POLICY.md) — AI contribution policy  
-- [`ENABLING_DEV_TOOLS.md`](ENABLING_DEV_TOOLS.md) — tenant-side dev tools (product runtime; separate from this host-side orchestration)  
+- [`AGENTS.md`](../../../AGENTS.md) — current agent coding contract
+- [`TESTING_GUIDE.md`](../TESTING_GUIDE.md) — pre-release testing
+- [`AI-CODE-CONTRIBUTION-POLICY.md`](../AI-CODE-CONTRIBUTION-POLICY.md) — AI contribution policy
+- [`ENABLING_DEV_TOOLS.md`](../ENABLING_DEV_TOOLS.md) — tenant-side dev tools (product runtime; separate from this host-side orchestration)
+
+The removed `.claude/README-codex-orchestration.md` was this guide's historical
+short-defaults pointer; it is intentionally not linked as a current file.

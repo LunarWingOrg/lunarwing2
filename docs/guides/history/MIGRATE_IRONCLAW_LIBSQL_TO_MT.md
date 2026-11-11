@@ -1,9 +1,16 @@
 # Migrating an IronClaw libSQL Instance to a Multi-Tenant LunarWing Setup
 
-This guide covers migrating an existing single-instance IronClaw installation that uses libSQL (SQLite) as its database backend into a production multi-tenant LunarWing deployment with PostgreSQL.
+> **ARCHIVED / DO NOT EXECUTE (reviewed 2026-11-10).** This is the historical
+> V18-era procedure, not a supported migration path. Its fixed table list, SQL
+> snippets, constraint handling, ports, and connection examples predate current
+> owner-scope, extension, reflex, document-version, approval-policy, and runtime
+> semantics. Use [`../MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](../MIGRATE_IRONCLAW_LIBSQL_TO_MT.md)
+> for the current fresh-tenant or commissioned-ETL choices. For PostgreSQL and
+> single-instance sources, use [`../MIGRATE_IRONCLAW_TO_MT.md`](../MIGRATE_IRONCLAW_TO_MT.md)
+> and [`../MIGRATE_IRONCLAW_TO_LUNARWING.md`](../MIGRATE_IRONCLAW_TO_LUNARWING.md).
+> The text below is retained only as historical evidence.
 
-For PostgreSQL-to-PostgreSQL migration, see `MIGRATE_IRONCLAW_TO_MT.md`.
-For single-instance (non-MT) migration, see `MIGRATE_IRONCLAW_TO_LUNARWING.md`.
+This guide covers migrating an existing single-instance IronClaw installation that uses libSQL (SQLite) as its database backend into a production multi-tenant LunarWing deployment with PostgreSQL.
 
 ## Prerequisites
 

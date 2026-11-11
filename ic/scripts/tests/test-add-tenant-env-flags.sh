@@ -258,9 +258,11 @@ LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-state
 LW2STUDYMCP_ALLOW_WRITE=1
 SANDBOX_TUNNEL_PROVIDER=wireguard
 SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-wireguard:v3
+SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53
 SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://nb.example.test
 SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=fixture-setup-key-not-real
 SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/fixture-tenant/wg0.conf
+SANDBOX_TUNNEL_WIREGUARD_CANARY=100.100.0.1
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=45
 EOF
 # Now re-run WITHOUT the new flags (pass empty for slots 9-11) — file exists.
@@ -316,16 +318,20 @@ assert_eq "rerun preserves SANDBOX_TENANT_LOGS" "$(envval SANDBOX_TENANT_LOGS)" 
 assert_eq "rerun preserves SANDBOX_TUNNEL_PROVIDER" "$(envval SANDBOX_TUNNEL_PROVIDER)" "wireguard"
 assert_eq "rerun preserves SANDBOX_TUNNEL_IMAGE" \
   "$(envval SANDBOX_TUNNEL_IMAGE)" "localhost/lunarwing-tunnel-wireguard:v3"
+assert_eq "rerun preserves SANDBOX_TUNNEL_DNS" \
+  "$(envval SANDBOX_TUNNEL_DNS)" "100.100.0.53,fd00::53"
 assert_eq "rerun preserves SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL" \
   "$(envval SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL)" "https://nb.example.test"
 assert_eq "rerun preserves SANDBOX_TUNNEL_NETBIRD_SETUP_KEY" \
   "$(envval SANDBOX_TUNNEL_NETBIRD_SETUP_KEY)" "fixture-setup-key-not-real"
 assert_eq "rerun preserves SANDBOX_TUNNEL_WIREGUARD_CONFIG" \
   "$(envval SANDBOX_TUNNEL_WIREGUARD_CONFIG)" "/etc/lunarwing/tenants/fixture-tenant/wg0.conf"
+assert_eq "rerun preserves SANDBOX_TUNNEL_WIREGUARD_CANARY" \
+  "$(envval SANDBOX_TUNNEL_WIREGUARD_CANARY)" "100.100.0.1"
 assert_eq "rerun preserves SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS" \
   "$(envval SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS)" "45"
 assert_eq "tunnel knobs are rendered once each" \
-  "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "6"
+  "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "8"
 
 echo "=== live reasoning opt-in preservation tests ==="
 for reasoning_setting in 1 false 0; do

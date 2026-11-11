@@ -1,0 +1,4 @@
+# WI#590 / WI#575: findings that must not be baselined yet.
+# Remove a row only after its classified disposition is recorded in WI#575.
+# The refresh helper rejects these fingerprints even when --accept names them.
+59b4247c2a7984ccd52126e894df98251c10f030:docs/ops/AGENT_GOALS_2.1.6.0.md:gitlab-pat:1270

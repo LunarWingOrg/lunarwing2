@@ -458,8 +458,8 @@ host's concurrent builds before retrying manually.
   exact pull-only Rust caches, and only `cargo-metadata` with
   `artifacts: false` — blocking both checkout-overwriting artifacts and
   higher-precedence dotenv variables from upstream jobs (MR !1688, IU-1).
-  `secret-history` is the marked, deliberate exception while
-  historical findings are triaged. Three limits of the YAML validator
+  `secret-history` has a separate blocking full-history contract; it is not an
+  advisory gate. Three limits of the YAML validator
   remain, by design: it cannot see repo files the pinned scripts still
   honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
   `package.json` `test` script in the worker script directories stay trust
@@ -685,9 +685,9 @@ host's concurrent builds before retrying manually.
 - Rust jobs have no project-wide resource lock. Worker promotion retains its
   per-worker resource groups to serialize registry publication.
 
-Known false-positive Gitleaks findings are listed by exact fingerprint in
-`/.gitleaksignore`. Broad path or rule exclusions are forbidden. The
-`secret-detection` job first scans the non-vendor tree with the default rules,
+Known current-tree Gitleaks findings are listed by exact `path:rule:line`
+fingerprint in `/.gitleaksignore`. Broad path or rule exclusions are forbidden.
+The `secret-detection` job first scans the non-vendor tree with the default rules,
 then scans `ic/vendor/` with `.gitlab/gitleaks-vendor.toml`. That second pass
 disables only `generic-api-key`, `pkcs12-file`, and `private-key`, whose pinned
 third-party fixtures otherwise produce thousands of findings; every other
@@ -696,9 +696,68 @@ not path allowlists. Review a fresh scan with the pinned Gitleaks image before
 changing the disabled-rule set. The second pass therefore does not detect a new
 PEM private key, PKCS#12 bundle, or generic API token in existing vendor
 content: review refresh-vendor diffs and `LUNARWING-PATCH.md` edits for those
-shapes. Vendor refreshes can also change fingerprint line numbers or remove
-old crate directories; rerun the scan and re-pin exact fingerprints rather
-than broadening a path exclusion. Worker-image
+shapes.
+
+`secret-history` is a blocking schedule/protected-release-tag job. It sets
+`GIT_DEPTH: "0"` and refuses a shallow checkout before invoking Gitleaks. Its
+`--log-opts="--all"` scan covers HEAD and every branch, remote-branch, tag, and
+other ref present in the runner checkout: the schedule target's fetched refs or
+the protected tag's fetched refs, rather than only commits reachable from HEAD.
+The committed baseline is generated from a superset of those refs—a full mirror
+with all branches, tags, and `refs/merge-requests/*`.
+
+Historical suppressions live separately in
+`.gitlab/gitleaks-history-ignore` and must be exact
+`commit:path:rule:line` fingerprints. The scanner uses a temporary worktree view
+without the current-tree `/.gitleaksignore`, so a path-only current-tree pin
+cannot suppress the same secret introduced by a new commit. The baseline stores
+no secret values or matched content. `test-secret-history.sh` runs first in the
+same pinned Gitleaks image and proves that unchanged history passes, a new
+synthetic finding fails, a baselined finding repeated at the same path and line
+in a new commit fails, a shallow checkout fails closed, a path-only ignore is
+rejected before scanning, and a baseline that pins a pending finding, or a
+missing pending-findings file, is refused before scanning. Test secrets are constructed at runtime and scanner
+output is checked for complete redaction. The blocking
+`secret-history-regression` job runs this harness on merge-request pipelines so
+scanner or isolation regressions cannot first appear on a release tag.
+
+After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
+the history baseline from a non-shallow full mirror. Fetch the complete ref
+superset, then run `.gitlab/scripts/refresh-secret-history-baseline.py` with
+Gitleaks v8.30.1 on `PATH` (or set `GITLEAKS_BIN`):
+
+```bash
+git fetch origin '+refs/heads/*:refs/remotes/origin/*' \
+  '+refs/tags/*:refs/tags/*' '+refs/merge-requests/*:refs/merge-requests/*'
+python3 .gitlab/scripts/refresh-secret-history-baseline.py
+```
+
+The helper requires branch, tag, and merge-request refs, performs a fully
+redacted scan without either ignore file, and validates every fingerprint. It
+starts from the committed baseline and preserves every existing pin. New vendor
+pins are added automatically and printed with their exact fingerprints grouped
+by crate; review that crate-grouped list against the refresh-vendor diff before
+committing it. Never suppress new vendor churn by adding a path or rule
+exclusion.
+
+A new non-vendor fingerprint is printed and left unpinned unless an explicit
+`--accept <file>` names its exact commit-bound fingerprint. Record its classified
+disposition in WI#575 before supplying that acceptance file. Unclassified rows
+make the helper exit non-zero; safe vendor and explicitly accepted additions are
+still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
+external disposition. The helper refuses those rows even when `--accept` names
+them; remove a pending row only after its evidence is recorded in WI#575 and its
+exact baseline pin is deliberate.
+
+The helper's exit status is 1 when a new unclassified finding was left unpinned,
+or when `--accept` named a pending row and was refused. A pending row that is
+merely still in history is reported on stderr and does not change the status, so
+status 0 means "nothing new". The pending list is enforced in two more places,
+because a hand edit of the baseline bypasses the helper:
+`scan-secret-history.sh` exits 2 before scanning when the baseline pins a
+pending row or the pending file is missing, and
+`test_secret_history_baseline.py` asserts on every merge request that the two
+committed files share no fingerprint. Worker-image
 CRITICAL findings that Debian has not fixed for the pinned toolchain
 dependencies are listed by exact CVE with a rationale comment and an expiry
 date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
@@ -722,16 +781,14 @@ shape and any expiry more than six months out.
 
 ## Observational jobs
 
-These run with `allow_failure: true`:
+This runs with `allow_failure: true`:
 
 - `rust-msrv-check`: becomes blocking once the declared MSRV (1.96.1) is confirmed
   green, closing the plan §15.5 reconciliation.
-- `secret-history`: runs on schedules and protected release-tag pipelines;
-  becomes blocking after the historical findings tracked in WI#575 are reviewed.
 
-Formerly observational, now blocking (goals 2.1.1.0 item 23): `rust-clippy-all`
-(clean all-features baseline landed) and `architecture-boundaries` (changed-line
-hard-violation ratchet; the script reserves its exit code for regressions).
+Formerly observational, now blocking: `rust-clippy-all` and
+`architecture-boundaries` (goals 2.1.1.0 item 23), plus `secret-history`
+(WI#590; exact historical baseline and real-scanner regressions landed).
 
 Each job names its owner and removal condition in `.gitlab/ci/*.yml`. Do not add
 new permanent `allow_failure` jobs.
@@ -869,6 +926,33 @@ rejected entries, and skips missing binaries without downloading. This
 protects telemetry even if an earlier bootstrap step fails before the normal
 sccache verification runs (IZ-1).
 
+Both tool installers try the project's generic package registry before GitHub.
+Maintainers must publish the exact upstream archives as package
+`lunarwing-ci-tools`, after verifying them against the checked-in SHA256 pins,
+and protect that package name with a Maintainer-only push rule: sccache 0.17.0
+uses version `0.17.0` and file
+`sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz`; ShellCheck 0.11.0 uses
+version `0.11.0` and file `shellcheck-v0.11.0.linux.x86_64.tar.xz`. CI builds the
+URL from `CI_API_V4_URL` and `CI_PROJECT_ID`. Registry and GitHub downloads are
+anonymous, so redirects never forward a CI job token. Each source retries only
+transient failures and refused connections five times with a five-second delay;
+permanent HTTP errors such as a missing registry archive's 404 fall through
+immediately. Every attempt is bounded by a 15-second connect timeout and a
+300-second total, so a source that drops packets costs about two minutes before
+the next source is tried, not a quarter of an hour. Every downloaded archive must match its checked-in SHA256. A tool
+bump must publish the new archive and update both pins in the same change.
+
+If every sccache source is unreachable, the installer exits 75 (`EX_TEMPFAIL`)
+and both Rust templates source `disable-sccache.sh`, print a warning, unset
+`RUSTC_WRAPPER` and every exported `SCCACHE_*` variable, and continue without
+the optional compiler cache. Checksum mismatches and all other installation
+failures remain fatal. A total ShellCheck download outage also remains fatal
+and names the registry URL: ShellCheck is a correctness gate and must never
+silently fall back to the older distro package.
+`ic/scripts/tests/test-ci-tool-downloads.sh` covers source order, token and
+retry and time-bound policy, checksum rejection, and the exact Rust template's outage and
+integrity-failure paths with stubbed downloads.
+
 **Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
 compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits
 writes only from `rust-cache-refresh` on protected default-branch pushes;
@@ -995,9 +1079,9 @@ Open **Build > Pipeline schedules > New schedule**:
 - Variables: none.
 - Owner: a maintained service/operator account, not a departing individual.
 
-Run it once manually. Confirm `rust-clippy-all` and `architecture-boundaries`
-appear as blocking jobs and `rust-msrv-check` and `secret-history` as
-observational jobs. This schedule must not receive production secrets or use
+Run it once manually. Confirm `rust-clippy-all`, `architecture-boundaries`, and
+`secret-history` appear as blocking jobs and only `rust-msrv-check` remains
+observational. This schedule must not receive production secrets or use
 deployment runners.
 
 ### 6. Activation evidence

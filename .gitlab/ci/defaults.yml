@@ -83,7 +83,7 @@ variables:
   before_script:
     - df -h "$CI_PROJECT_DIR"
     - bash .gitlab/scripts/bootstrap-rust.sh
-    - bash .gitlab/scripts/bootstrap-sccache.sh
+    - bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }
   after_script:
     - df -h "$CI_PROJECT_DIR"
     - du -sh "$CI_PROJECT_DIR/ic/target" "$SCCACHE_DIR" 2>/dev/null || true
@@ -118,7 +118,7 @@ variables:
   before_script:
     - df -h "$CI_PROJECT_DIR"
     - bash .gitlab/scripts/bootstrap-msrv.sh
-    - bash .gitlab/scripts/bootstrap-sccache.sh
+    - bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }
     - mv ic/rust-toolchain.toml ic/rust-toolchain.toml.disabled
   after_script:
     - df -h "$CI_PROJECT_DIR"

@@ -400,8 +400,40 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
         {"if": FULL_VALIDATION_RULES[-1]},
         {"when": "never"},
     ]
-    if merged.get("secret-history", {}).get("rules") != expected_history_rules:
+    history_job = merged.get("secret-history", {})
+    if history_job.get("rules") != expected_history_rules:
         errors.append("secret-history must run only for schedules and protected release tags")
+    expected_history_shape = {
+        "extends": ".gitleaks-job",
+        "stage": "security",
+        "needs": [],
+        "variables": {"GIT_DEPTH": "0"},
+        "rules": expected_history_rules,
+        "script": [
+            "bash .gitlab/tests/test-secret-history.sh",
+            "bash .gitlab/scripts/scan-secret-history.sh",
+        ],
+    }
+    if history_job != expected_history_shape:
+        errors.append("secret-history job shape differs from its blocking full-history contract")
+    if resolve_extends(history_job, merged).get("allow_failure"):
+        errors.append("secret-history must not allow failure")
+
+    history_regression = merged.get("secret-history-regression", {})
+    expected_regression_shape = {
+        "extends": ".gitleaks-job",
+        "stage": "security",
+        "needs": [],
+        "rules": [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            {"when": "never"},
+        ],
+        "script": ["bash .gitlab/tests/test-secret-history.sh"],
+    }
+    if history_regression != expected_regression_shape:
+        errors.append("secret-history-regression must run the real-scanner harness only for MRs")
+    if resolve_extends(history_regression, merged).get("allow_failure"):
+        errors.append("secret-history-regression must not allow failure")
 
 
 def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
@@ -809,7 +841,7 @@ ADVISORY_GATE_SCRIPTS = {
 ADVISORY_GATE_BEFORE_SCRIPT = [
     'df -h "$CI_PROJECT_DIR"',
     "bash .gitlab/scripts/bootstrap-rust.sh",
-    "bash .gitlab/scripts/bootstrap-sccache.sh",
+    'bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }',
 ]
 ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
     "after_script", "before_script", "cache", "image", "needs", "rules",
@@ -855,11 +887,10 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
     rules may carry only `if` (plus the final `when: never`), so the
     equality check cannot inherit a hollowed-out template. The resolved
     tags must be exactly ['$CI_RUST_RUNNER_TAG'] (IF-2): a retagged gate
-    runs on an unpinned runner. secret-history is deliberately
-    allow_failure while historical findings are triaged and is NOT in this
-    set — making another gate optional must stay as visible as that marked
-    exception. Any non-false allow_failure value (including the exit_codes
-    hash form) counts.
+    runs on an unpinned runner. secret-history has a separate blocking
+    contract in validate_release_gates and is not an advisory gate. Any
+    non-false allow_failure value (including the exit_codes hash form)
+    counts.
 
     MR !1665 review IF-2: the EXPECTED_RUNNER_TAGS pin in
     validate_lane_environment_routes covers only the merged top-level
@@ -1611,7 +1642,7 @@ PEBBLE_RUST_LANE_EFFECTIVE_KEYS = PEBBLE_RUST_LANE_JOB_KEYS | frozenset({
 PEBBLE_RUST_LANE_BEFORE_SCRIPT = (
     'df -h "$CI_PROJECT_DIR"',
     "bash .gitlab/scripts/bootstrap-rust.sh",
-    "bash .gitlab/scripts/bootstrap-sccache.sh",
+    'bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }',
 )
 PEBBLE_RUST_LANE_SCRIPT = (
     "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "

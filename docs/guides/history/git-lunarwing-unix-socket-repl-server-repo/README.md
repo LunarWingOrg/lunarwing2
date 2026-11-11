@@ -1,7 +1,14 @@
 # git-lunarwing-unix-socket-repl-server-repo
 
-> Renamed from `git-ironclaw-unix-socket-repl-server-repo` in LunarWing 1.1.9. The external
-> remote URLs below still point at the original upstream repository name.
+> **ARCHIVED GITLAB TEMPLATE (reviewed 2026-11-10).** The old remote URLs and
+> generic checklist below are not maintained setup instructions. Use the
+> [current REPL server source](../../../../git-lunarwing-unix-socket-repl-server-repo/)
+> and [client source](../../../../git-lunarwing-unix-socket-client-repo/), and
+> the maintained [Wingtip guide](../../WINGTIP_GUIDE.md) for the current gateway
+> and protocol-1 socket contracts.
+>
+> Renamed from `git-ironclaw-unix-socket-repl-server-repo` in LunarWing 1.1.9.
+> External URLs below still name that original upstream repository.
 
 
 

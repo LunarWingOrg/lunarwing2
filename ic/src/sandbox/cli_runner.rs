@@ -16,6 +16,7 @@
 //! `ContainerJobManager`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -291,6 +292,16 @@ impl Drop for EmptyMaskFile {
     }
 }
 
+/// Instance-specific namespace and optional overlay resolvers for one joined run.
+#[derive(Debug, Clone, Copy)]
+pub struct TunnelRunConfig<'a> {
+    pub container_id: &'a str,
+    pub dns: &'a [IpAddr],
+    /// World-readable resolver file mounted when `dns` is nonempty so every
+    /// keep-id mode can read it. Runtimes reject `--dns` with `--network container`.
+    pub resolv_conf: Option<&'a Path>,
+}
+
 /// Inputs to [`build_run_args`]. Kept as a struct so the arg construction
 /// stays a pure function (unit-testable without any runtime installed).
 pub(crate) struct RunSpec<'a> {
@@ -310,6 +321,7 @@ pub(crate) struct RunSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    pub tunnel: Option<TunnelRunConfig<'a>>,
     /// Host directory holding the per-execution proxy relay socket
     /// (proxy-enforced mode only). Bind-mounted read-only at
     /// `/run/lunarwing-proxy`.
@@ -483,10 +495,26 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         }
         SandboxNetworkMode::Tunnel => {
             args.push("--network".into());
-            args.push(format!(
-                "container:{}",
-                crate::sandbox::tunnel_sidecar::SANDBOX_TUNNEL_CONTAINER
-            ));
+            if let Some(tunnel) = spec.tunnel {
+                let resolver_ready = tunnel.dns.is_empty() || tunnel.resolv_conf.is_some();
+                if resolver_ready {
+                    args.push(format!("container:{}", tunnel.container_id));
+                } else {
+                    args.push("container:".into());
+                }
+                if !tunnel.dns.is_empty()
+                    && let Some(path) = tunnel.resolv_conf
+                {
+                    args.extend([
+                        "-v".into(),
+                        format!("{}:/etc/resolv.conf:ro,z", path.display()),
+                    ]);
+                }
+            } else {
+                // An incomplete direct call must be rejected by the runtime,
+                // never fall back to another daemon's legacy shared sidecar.
+                args.push("container:".into());
+            }
         }
     }
 
@@ -669,6 +697,7 @@ pub struct ExecParams<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    pub tunnel: Option<TunnelRunConfig<'a>>,
     /// Directories that must never be readable inside the mount (WI#205).
     pub protected_paths: &'a [std::path::PathBuf],
     /// Whether the daemon's scrubbed log copy may be bound at `/tenant-logs`
@@ -801,6 +830,7 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            tunnel,
             protected_paths,
             tenant_logs,
         } = params;
@@ -890,6 +920,7 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            tunnel,
             proxy_dir: proxy_dir_ref,
             pids_limit: default_pids_limit(),
             masked: &masked_destinations,
@@ -1221,6 +1252,30 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
     })
 }
 
+const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+fn container_runtime_path(inherited: &str) -> String {
+    let missing = ["/usr/local/sbin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .filter(|directory| !inherited.split(':').any(|part| part == *directory))
+        .collect::<Vec<_>>();
+    let mut path = missing.join(":");
+    if !path.is_empty() && !inherited.is_empty() {
+        path.push(':');
+    }
+    path.push_str(inherited);
+    path
+}
+
+fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
+    // systemd's default service PATH omits sbin, where Gentoo installs pasta.
+    // Preserve custom runtime locations and add missing system sbin directories
+    // before prepare_service so rootless Podman works in service mode.
+    let inherited =
+        std::env::var("PATH").unwrap_or_else(|_| DEFAULT_CONTAINER_RUNTIME_PATH.to_string());
+    cmd.env("PATH", container_runtime_path(&inherited));
+}
+
 /// Run a quick status probe through the workload spawner (WI#181: container
 /// lifecycle probes must execute in the same manager-forked context as `run` —
 /// the hardened daemon's context breaks podman's rootless user-namespace
@@ -1231,6 +1286,7 @@ pub(crate) async fn run_status_isolated(
 ) -> Option<std::process::ExitStatus> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
     let spec = spawner.prepare_service(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1254,7 +1310,33 @@ pub(crate) async fn output_isolated(
 ) -> std::io::Result<std::process::Output> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
     let spec = spawner.prepare_service(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn()?;
+    let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+        &child,
+        spec.as_ref(),
+        spawner.xdg_runtime_dir(),
+    );
+    let output = child.wait_with_output().await;
+    guard.disarm();
+    output
+}
+
+/// Capture a detached container client's output while allowing its runtime
+/// network helpers to outlive the client (long-lived sidecar startup only).
+pub(crate) async fn output_detached_isolated(
+    bin: &str,
+    args: &[&str],
+    unit_name: &str,
+) -> std::io::Result<std::process::Output> {
+    let spawner = crate::tools::process::workload_spawner().await;
+    let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
+    let spec = spawner.prepare_detached_service_with_unit(&mut cmd, Some(unit_name));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1361,6 +1443,7 @@ mod tests {
             env: &EMPTY_ENV,
             network,
             proxy_port,
+            tunnel: None,
             proxy_dir: None,
             pids_limit: 256,
             masked: &[],
@@ -1666,15 +1749,25 @@ mod tests {
             (ContainerRuntime::Podman, KeepIdMode::UidPinned),
             (ContainerRuntime::Docker, KeepIdMode::Off),
         ] {
-            let args = build_run_args(&spec(
-                runtime,
-                keep_id,
-                SandboxPolicy::ReadOnly,
-                SandboxNetworkMode::Tunnel,
-                0,
-            ));
+            let dns = ["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()];
+            let args = build_run_args(&RunSpec {
+                tunnel: Some(TunnelRunConfig {
+                    container_id: "lunarwing-sandbox-tunnel-instance",
+                    dns: &dns,
+                    resolv_conf: Some(Path::new("/run/user/1000/tunnel.resolv.conf")),
+                }),
+                ..spec(
+                    runtime,
+                    keep_id,
+                    SandboxPolicy::ReadOnly,
+                    SandboxNetworkMode::Tunnel,
+                    0,
+                )
+            });
             let joined = args.join(" ");
-            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel"));
+            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
+            assert!(joined.contains("/run/user/1000/tunnel.resolv.conf:/etc/resolv.conf:ro,z"));
+            assert!(!joined.contains("--dns"));
             for flag in [
                 "--cap-drop=ALL",
                 "--cap-add=CHOWN",
@@ -1692,6 +1785,45 @@ mod tests {
             assert!(!joined.contains("--add-host"));
             assert_eq!(args.last().map(String::as_str), Some("echo hi"));
         }
+    }
+
+    #[test]
+    fn tunnel_mode_without_instance_config_cannot_join_legacy_name() {
+        let args = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::UidPinned,
+            SandboxPolicy::ReadOnly,
+            SandboxNetworkMode::Tunnel,
+            0,
+        ));
+        let network = args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(args[network + 1], "container:");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| { arg == "container:lunarwing-sandbox-tunnel" })
+        );
+    }
+
+    #[test]
+    fn custom_tunnel_dns_requires_a_resolver_file() {
+        let dns = ["100.100.0.53".parse().unwrap()];
+        let args = build_run_args(&RunSpec {
+            tunnel: Some(TunnelRunConfig {
+                container_id: "lunarwing-sandbox-tunnel-instance",
+                dns: &dns,
+                resolv_conf: None,
+            }),
+            ..spec(
+                ContainerRuntime::Podman,
+                KeepIdMode::UidPinned,
+                SandboxPolicy::ReadOnly,
+                SandboxNetworkMode::Tunnel,
+                0,
+            )
+        });
+        let network = args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(args[network + 1], "container:");
     }
 
     #[test]
@@ -2051,6 +2183,34 @@ mod tests {
     /// that `run` uses: a daemon-forked podman call breaks rootless
     /// user-namespace joins under the hardened unit, which would make
     /// `SandboxManager::initialize()` fail on an existing image.
+    #[test]
+    fn isolated_container_path_includes_sbin() {
+        let spawner = crate::tools::process::WorkloadSpawner::direct();
+        let mut cmd = spawner.command("podman", &["--help"]);
+        apply_container_runtime_path(&mut cmd);
+        let path = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "PATH" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("container runtime PATH");
+        for directory in ["/usr/sbin", "/sbin"] {
+            assert!(path.split(':').any(|part| part == directory));
+        }
+        let custom = container_runtime_path("/custom/bin:/usr/sbin");
+        assert_eq!(custom, "/usr/local/sbin:/sbin:/custom/bin:/usr/sbin");
+        assert_eq!(custom.matches("/usr/sbin").count(), 1);
+        assert_eq!(
+            container_runtime_path("/usr/local/sbin:/usr/sbin:/sbin"),
+            "/usr/local/sbin:/usr/sbin:/sbin"
+        );
+    }
+
     #[tokio::test]
     async fn image_exists_through_isolated_context() {
         let spawner = crate::tools::process::workload_spawner().await;
@@ -2123,6 +2283,7 @@ mod tests {
             env: &HashMap::new(),
             network: SandboxNetworkMode::None,
             proxy_port: 0,
+            tunnel: None,
             protected_paths: &[],
             tenant_logs: false,
         };
