@@ -596,7 +596,11 @@ pub(crate) fn build_sidecar_args(
     ];
     match cfg.provider {
         TunnelProvider::Netbird => {
-            args.extend(["--device".into(), "/dev/net/tun".into()]);
+            args.extend([
+                "--cap-add=NET_RAW".into(),
+                "--device".into(),
+                "/dev/net/tun".into(),
+            ]);
             if let Some(volume) = netbird_state_volume {
                 args.extend(["-v".into(), format!("{volume}:/var/lib/netbird")]);
             }
@@ -2319,6 +2323,7 @@ mod tests {
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
+        assert!(joined.contains("--cap-add=NET_RAW"));
         assert!(!joined.contains("SYS_ADMIN"));
         assert!(!joined.contains("--privileged"));
         assert!(!joined.contains("--publish"));
