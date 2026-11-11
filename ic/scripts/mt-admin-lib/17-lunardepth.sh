@@ -171,7 +171,7 @@ build_lunardepth_worker() {
   _worker_build_context_finish
 }
 
-_verify_lunardepth_image_out_of_band() {
+_verify_lunardepth_image_out_of_band() (
   local image_ref="$1" source_root="$2" tmp cid archive config
   tmp="$(mktemp -d /var/tmp/lw-lunardepth-oob.XXXXXX)" || return 1
   cid=''
@@ -184,7 +184,7 @@ _verify_lunardepth_image_out_of_band() {
   "$CONTAINER_RT" image inspect "$image_ref" >"$config" || return 1
   python3 "$source_root/lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py" \
     --archive "$archive" --config "$config" --lane-root "$source_root/lunardepth4lunarwing"
-}
+)
 
 start_tenant_lunardepth() {
   local name="$1" launch_contract="no-ssh-agent;non-root-split-v1;lunardepth-ipc-v2"
