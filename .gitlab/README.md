@@ -706,6 +706,14 @@ the protected tag's fetched refs, rather than only commits reachable from HEAD.
 The committed baseline is generated from a superset of those refs—a full mirror
 with all branches, tags, and `refs/merge-requests/*`.
 
+A weekly schedule on a protected branch is recommended so a missing pin is found
+before a release tag. Pipeline schedules are GitLab project settings, not
+version-controlled job definitions, and this repository change does not create
+or modify one; that remains a project-operator action under **CI/CD > Schedules**.
+No scheduled run is claimed here. Protected release tags remain the only
+automatic trigger guaranteed by the committed YAML until an operator adds and
+verifies that weekly schedule.
+
 Historical suppressions live separately in
 `.gitlab/gitleaks-history-ignore` and must be exact
 `commit:path:rule:line` fingerprints. The scanner uses a temporary worktree view
@@ -716,32 +724,58 @@ same pinned Gitleaks image and proves that unchanged history passes, a new
 synthetic finding fails, a baselined finding repeated at the same path and line
 in a new commit fails, a shallow checkout fails closed, a path-only ignore is
 rejected before scanning, and a baseline that pins a pending finding, or a
-missing pending-findings file, is refused before scanning. Test secrets are constructed at runtime and scanner
-output is checked for complete redaction. The blocking
-`secret-history-regression` job runs this harness on merge-request pipelines so
-scanner or isolation regressions cannot first appear on a release tag.
+missing pending-findings file, is refused before scanning. Test secrets are
+constructed at runtime and scanner output is checked for complete redaction. The
+blocking `secret-history-regression` job runs this harness on merge-request
+pipelines so scanner or isolation regressions cannot first appear on a release
+tag.
 
 After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
 the history baseline from a non-shallow full mirror. Fetch the complete ref
-superset, then run `.gitlab/scripts/refresh-secret-history-baseline.py` with
-Gitleaks v8.30.1 on `PATH` (or set `GITLEAKS_BIN`):
+superset, then use the draft/review/accept flow with Gitleaks v8.30.1 on `PATH`
+(or set `GITLEAKS_BIN`):
 
 ```bash
 git fetch origin '+refs/heads/*:refs/remotes/origin/*' \
   '+refs/tags/*:refs/tags/*' '+refs/merge-requests/*:refs/merge-requests/*'
-python3 .gitlab/scripts/refresh-secret-history-baseline.py
+draft="$(git rev-parse --absolute-git-dir)/secret-history-accept.ignore"
+python3 .gitlab/scripts/refresh-secret-history-baseline.py --draft-accept "$draft"
+# Add every approved row's disposition to
+# .gitlab/gitleaks-history-dispositions.md, and delete every unapproved row.
+${EDITOR:-vi} "$draft"
+python3 .gitlab/scripts/refresh-secret-history-baseline.py --accept "$draft"
 ```
 
+The first command's non-zero status is expected when it finds unclassified rows.
 The helper requires branch, tag, and merge-request refs, performs a fully
-redacted scan without either ignore file, and validates every fingerprint. It
-starts from the committed baseline and preserves every existing pin. Every new
-fingerprint, including one under `ic/vendor/`, is printed and left unpinned
-unless an explicit `--accept <file>` names its exact commit-bound fingerprint.
-Record each classified disposition in WI#575 before supplying that acceptance
-file, then rerun the same command with `--accept`. Accepted vendor additions are
-printed with their exact fingerprints grouped by crate for comparison with the
-refresh-vendor diff. Never suppress new vendor churn by adding a path or rule
-exclusion.
+redacted scan without either ignore file, and validates every fingerprint.
+Unclassified vendor rows are printed with counts grouped by crate and rule;
+non-vendor rows remain separate. `--draft-accept` writes all and only the
+unclassified rows in acceptance-file format, excluding pending rows, so the
+reviewer edits a draft instead of copying terminal output. The draft and cache
+are local mode-0600 files and contain no secret values or matched content.
+
+The first run saves the redacted fingerprint list. In a non-bare checkout the
+default cache is `.git/secret-history-baseline-cache.json`; for a bare mirror it
+is adjacent to the mirror as `<mirror-name>.secret-history-cache.json`. The
+second run reuses that list and says so when HEAD, every ref name/object ID, the
+scanner command, and Gitleaks v8.30.1 are unchanged. Thus the documented
+review/accept flow needs one history scan. Changing any ref or the scanner
+command forces a fresh scan; refs changing during a scan abort it. Use
+`--no-cache` to force a fresh scan without reading or writing the cache, or
+`--cache <file>` to choose another local cache path.
+
+The helper starts from the committed baseline and preserves every existing pin.
+Old pins are deliberately not auto-pruned as the mirror's refs change, because
+old refs can return. Every new fingerprint, including one under `ic/vendor/`, is
+left unpinned unless an explicit `--accept <file>` names its exact commit-bound
+fingerprint. Record each newly accepted row in
+`.gitlab/gitleaks-history-dispositions.md`, the durable non-confidential
+disposition log, before supplying that file. Do not copy confidential findings
+out of WI#575 into the log. Accepted vendor additions are printed by crate and
+rule for comparison with the refresh-vendor diff. An accepted entry that matches
+no scanned row produces a warning. Never suppress new vendor churn by adding a
+path or rule exclusion.
 
 Automatic vendor-path acceptance is deliberately forbidden. Comparing a file
 with its crate's `.cargo-checksum.json` cannot establish upstream provenance:
@@ -753,8 +787,8 @@ the refresh path.
 Unclassified rows make the helper exit non-zero; explicitly accepted additions
 are still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
 external disposition. The helper refuses those rows even when `--accept` names
-them; remove a pending row only after its evidence is recorded in WI#575 and its
-exact baseline pin is deliberate.
+them; remove a pending row only after its required evidence is recorded in the
+confidential triage and its exact baseline pin is deliberate.
 
 The helper's exit status is 1 when a new unclassified finding was left unpinned,
 or when `--accept` named a pending row and was refused. A pending row that is
