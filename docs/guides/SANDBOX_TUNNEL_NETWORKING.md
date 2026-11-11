@@ -77,16 +77,20 @@ keep TLS, tokens, mTLS and NetBird ACLs/WireGuard peer policy in force.
   `[sandbox:sandbox_unavailable]`; it never falls back to another network mode.
   A sidecar that died or drifted gets one bounded recovery attempt.
 
-Manager cold starts and per-command recovery re-probe an existing sidecar for
-at most **6 seconds**, wait at most **20 seconds** for a fresh provider (or the
-configured startup timeout when lower), and cap the complete recovery at **60
-seconds**. These bounds keep the failure below the default 120-second shell
-timeout under normal runtime probe bounds. The error names the failed handshake,
-canary, `netbird status`, or firewall probe. A failed recovery is cached for
-**30 seconds**: commands inside that window return the original reason and the
-time until the next attempt immediately, without more container churn. After
-the window, one command tries again. Explicit lifecycle calls to
-`ensure_started()` retain the full configured startup budget instead.
+A manager cold start keeps the full configured startup timeout for runtime and
+provider readiness. Per-command recovery instead re-probes an existing sidecar
+for at most **6 seconds**, waits at most **20 seconds** for a fresh provider (or
+the configured startup timeout when lower), and caps the initial health check,
+recovery, and final verification together at **60 seconds**. The per-run error
+says when the 20-second provider cap is below the configured startup timeout and
+names the failed image, runtime, handshake, canary, `netbird status`, or firewall
+probe. A failed recovery is cached for **30 seconds**: commands inside that
+window return the original reason and the time until the next attempt
+immediately, without more container churn. After the window, one command tries
+again. Recovery is owned by the sidecar rather than the caller: cancelling a
+short shell command or stopping it does not cancel the attempt, its cleanup, or
+recording of its result. Later callers await that same attempt and then use its
+recorded back-off.
 
 The sidecar runs with all capabilities dropped except `NET_ADMIN`,
 `no-new-privileges`, a read-only root filesystem, memory/process limits, no
@@ -325,10 +329,10 @@ cleanup. Remove the instance container explicitly when that is not wanted. A
 crash, provider health failure, configuration mismatch, missing `nft`, or
 altered firewall blocks subsequent sandbox commands rather than reopening
 another egress path. The next eligible command performs the bounded recovery
-described above, unless a 30-second failure back-off is still active. A start
-whose caller is cancelled retains an independent cleanup task that removes the
-partial sidecar even though the original start future was dropped; no container
-ID becomes joinable before the complete firewall verifies.
+described above, unless a 30-second failure back-off is still active. Cancelling
+the caller does not cancel the sidecar-owned recovery task: it still removes a
+partial sidecar on failure and records the result for later commands. No
+container ID becomes joinable before the complete firewall verifies.
 
 ### Upgrade from the pre-WI#592 fixed name
 
@@ -406,8 +410,11 @@ required.
    comes from `/etc/hosts`, so this is not an external-DNS assertion. A separate
    manager-level dead-peer case uses a decorated `[Peer]` header and checks the
    bounded first failure, sub-second cached failure, retry after back-off, and
-   cleanup after a cancelled start. The peerless config still does not test peer
-   encryption or NetBird's control plane.
+   cleanup plus a recorded failure after caller cancellation. A delayed-provider
+   image takes about 25 seconds to become ready and proves that a cold start can
+   use a longer configured budget than the 20-second per-run recovery cap. The
+   peerless config still does not test peer encryption or NetBird's control
+   plane.
 5. The NetBird lane requires an isolated throwaway management deployment, one
    dedicated reusable setup key, and an image containing NetBird, `nft`, `nc`,
    and `wget`. The lane starts its own plain second peer with that key. Store
