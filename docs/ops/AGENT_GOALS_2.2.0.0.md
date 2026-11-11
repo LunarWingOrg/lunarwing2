@@ -200,6 +200,8 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
     - **Spec: needs a GitLab instance administrator.** An agent account cannot run the lookup, and must never test the historical value by authenticating with it. An agent that picks this item up can only record BLOCKED
     - **Spec: afterwards.** Once the result is recorded in WI#575, remove the row from `.gitlab/gitleaks-history-pending` and add its exact pin, or revoke the token if the lookup finds one. That unblocks items 18 and 22
     - **Spec: deadline.** Before the `v2.2.0.0` tag or any rc tag: `secret-history` is blocking now and fails on the pending row.
+    - **BLOCKED 2026-11-11 — SweetieBot (autonomous), branch `sweetiebot/kimi-27-20261111-1205`:** WI#599, WI#590 and confidential WI#575 still contain no administrator token-information result. The available SweetieBot GitLab account is an agent account, not the required instance administrator. No historical value was extracted, submitted to the token-information API, or used for authentication.
+    - **BLOCKED BY / RECOMMEND:** a GitLab instance administrator must perform the WI#599 lookup and record its result in WI#575. Only then may the follow-up agent revoke a discovered token or add the justified exact pin and remove the pending row. `.gitlab/gitleaks-history-pending` is unchanged, items 18 and 22 remain blocked, and this checkbox intentionally remains unchecked.
 
 ## Phase 8 - Advanced Operator Notes
 
