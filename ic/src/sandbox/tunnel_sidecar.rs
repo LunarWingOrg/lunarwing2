@@ -54,6 +54,10 @@ const SIDECAR_PIDS_LIMIT: u32 = 64;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
 const WIREGUARD_KEEPALIVE_MAX_SECS: u64 = 60;
 const MAX_WIREGUARD_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -899,19 +903,64 @@ pub(crate) fn parse_wireguard_fwmark(output: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-fn wireguard_handshake_is_recent(output: &str, now_unix: u64) -> bool {
-    output.lines().any(|line| {
-        line.split_whitespace()
-            .nth(1)
-            .and_then(|timestamp| timestamp.parse::<u64>().ok())
-            .is_some_and(|timestamp| {
-                timestamp > 0
-                    && now_unix >= timestamp
-                    && now_unix - timestamp <= WIREGUARD_HANDSHAKE_MAX_AGE_SECS
-            })
-    })
+fn wireguard_handshake_status(output: &str, now_unix: u64) -> std::result::Result<(), String> {
+    let latest = output
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|timestamp| timestamp.parse::<u64>().ok())
+        })
+        .max();
+    match latest {
+        None | Some(0) => Err("WireGuard handshake probe found no completed handshake".into()),
+        Some(timestamp) if timestamp > now_unix => {
+            Err("WireGuard handshake probe returned a future timestamp".into())
+        }
+        Some(timestamp) if now_unix - timestamp > WIREGUARD_HANDSHAKE_MAX_AGE_SECS => Err(format!(
+            "WireGuard handshake is {}s old, exceeding the {}s liveness budget",
+            now_unix - timestamp,
+            WIREGUARD_HANDSHAKE_MAX_AGE_SECS
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
+#[derive(Default)]
+struct RecoveryState {
+    last_failure: Option<RecoveryFailure>,
+}
+
+struct RecoveryFailure {
+    failed_at: tokio::time::Instant,
+    reason: String,
+}
+
+impl RecoveryState {
+    fn cached_reason(&self, now: tokio::time::Instant) -> Option<String> {
+        let failure = self.last_failure.as_ref()?;
+        let retry_at = failure.failed_at + RECOVERY_BACKOFF;
+        if now >= retry_at {
+            return None;
+        }
+        let remaining = retry_at.duration_since(now).as_secs().max(1);
+        Some(format!(
+            "previous recovery failed: {}; next attempt in {}s",
+            failure.reason, remaining
+        ))
+    }
+
+    fn record(&mut self, error: &SandboxError) {
+        if let SandboxError::TunnelUnavailable { reason } = error {
+            self.last_failure = Some(RecoveryFailure {
+                failed_at: tokio::time::Instant::now(),
+                reason: reason.clone(),
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
@@ -920,7 +969,7 @@ pub struct TunnelSidecar {
     runtime_dir: Option<PathBuf>,
     container_name: String,
     instance_id: String,
-    lifecycle: tokio::sync::Mutex<()>,
+    lifecycle: std::sync::Arc<tokio::sync::Mutex<RecoveryState>>,
 }
 
 impl TunnelSidecar {
@@ -964,7 +1013,7 @@ impl TunnelSidecar {
             runtime_dir,
             container_name: container_name_for_instance(base_dir),
             instance_id: instance_id_for(base_dir),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(RecoveryState::default())),
         }
     }
 
@@ -1054,23 +1103,66 @@ impl TunnelSidecar {
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
-    /// and passes the health gate. A running sidecar that fails the gate (dead
-    /// provider, drifted firewall) is removed and recreated once.
+    /// and passes the health gate. Explicit lifecycle operations retain the
+    /// configured startup budget; manager runs use `recover_for_run` instead.
     pub async fn ensure_started(&self) -> Result<()> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let timeout = self.cfg.startup_timeout;
+        self.ensure_started_with_timeouts(timeout, timeout).await
+    }
+
+    /// Bounded recovery for a command path. A dropped start has its own cleanup
+    /// guard, and a failed attempt suppresses repeated container churn for 30s.
+    pub async fn recover_for_run(&self) -> Result<()> {
+        let provider_timeout = self.cfg.startup_timeout.min(RUN_PROVIDER_READY_TIMEOUT);
+        let recovery =
+            self.ensure_started_with_timeouts(RUN_RECOVERY_REPROBE_TIMEOUT, provider_timeout);
+        match tokio::time::timeout(RUN_RECOVERY_BUDGET, recovery).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = self.unavailable(
+                    "sidecar recovery exceeded the 60s per-run budget while waiting for provider health or firewall verification",
+                );
+                self.lifecycle.lock().await.record(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_started_with_timeouts(
+        &self,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> Result<()> {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
+        let mut lifecycle = self.lifecycle.lock().await;
+        if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
+            return Err(self.unavailable(&reason));
+        }
+        lifecycle.last_failure = None;
         if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
             tracing::warn!(
                 provider = self.cfg.provider.as_str(),
                 "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
             );
         }
+        let result = self.start_or_adopt(reprobe_timeout, provider_timeout).await;
+        if let Err(error) = &result {
+            lifecycle.record(error);
+        }
+        result
+    }
+
+    async fn start_or_adopt(
+        &self,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> Result<()> {
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         if self.matching_container_id(&hash).await.is_some() {
-            match self.wait_healthy().await {
+            match self.wait_healthy(reprobe_timeout).await {
                 Ok(()) => return Ok(()),
                 Err(error) => tracing::warn!(
                     container = %self.container_name,
@@ -1080,25 +1172,31 @@ impl TunnelSidecar {
             }
         }
         self.remove().await;
-        self.start_fresh(&hash).await
+        self.start_fresh(&hash, provider_timeout).await
     }
 
     /// Recheck the transport and both firewall chains before every run, then
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
+        let cached = self
+            .lifecycle
+            .lock()
+            .await
+            .cached_reason(tokio::time::Instant::now());
+        if let Some(reason) = cached {
+            return Err(self.unavailable(&reason));
+        }
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         };
-        if !self.provider_probe().await {
-            return Err(self.unavailable("sidecar provider health check failed"));
-        }
+        self.provider_health().await?;
         self.check_egress_firewall().await?;
         Ok(container_id)
     }
 
-    async fn start_fresh(&self, hash: &str) -> Result<()> {
+    async fn start_fresh(&self, hash: &str, provider_timeout: Duration) -> Result<()> {
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
                 let volume = self.netbird_state_volume()?;
@@ -1116,12 +1214,58 @@ impl TunnelSidecar {
             hash,
             state_volume.as_deref(),
         );
+        let mut cleanup = SidecarStartCleanup::new(self.clone());
+        let started = match self
+            .start_detached(&args, env_file, hash, provider_timeout)
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => return Err(self.abort_start(&mut cleanup, error).await),
+        };
+        if !started {
+            cleanup.disarm();
+            return Ok(());
+        }
+        tracing::info!(
+            container = %self.container_name,
+            provider = self.cfg.provider.as_str(),
+            "Sandbox tunnel sidecar started"
+        );
+        // Provider startup finishes before the firewall goes in so bootstrap
+        // DNS and endpoint connections can use the still-open uplink.
+        if let Err(error) = self.wait_provider_ready(provider_timeout).await {
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        if let Err(error) = self.install_egress_firewall().await {
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        if self.cfg.wireguard_canary.is_some()
+            && let Err(error) = self.provider_health().await
+        {
+            let error = self.error_with_context(error, "after the egress firewall was installed");
+            return Err(self.abort_start(&mut cleanup, error).await);
+        }
+        cleanup.disarm();
+        tracing::info!(
+            container = %self.container_name,
+            provider = self.cfg.provider.as_str(),
+            "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
+        );
+        Ok(())
+    }
+
+    async fn start_detached(
+        &self,
+        args: &[String],
+        env_file: Option<SecretEnvFile>,
+        hash: &str,
+        provider_timeout: Duration,
+    ) -> Result<bool> {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // `remove()` ran first: it frees this unit name from a previous
-        // sidecar's helpers once the old container is gone.
         let detached_unit = self.helper_unit();
+        let start_timeout = self.cfg.startup_timeout.min(provider_timeout);
         let started = tokio::time::timeout(
-            self.cfg.startup_timeout,
+            start_timeout,
             crate::sandbox::cli_runner::output_detached_isolated(
                 self.bin,
                 &arg_refs,
@@ -1132,103 +1276,90 @@ impl TunnelSidecar {
         drop(env_file);
         let output = match started {
             Ok(Ok(output)) => output,
-            Ok(Err(_)) => {
-                self.remove().await;
-                return Err(self.unavailable("failed to execute the container runtime"));
-            }
+            Ok(Err(_)) => return Err(self.unavailable("failed to execute the container runtime")),
             Err(_) => {
-                self.remove().await;
-                return Err(self.unavailable("sidecar start exceeded the startup timeout"));
+                return Err(self.unavailable(&format!(
+                    "sidecar start exceeded the {}s runtime start budget",
+                    start_timeout.as_secs()
+                )));
             }
         };
-        if !output.status.success() {
-            // Another manager instance may have won the name race; accept its
-            // sidecar only when it matches our configuration and is healthy.
-            if self.matching_container_id(hash).await.is_some() {
-                return self.wait_healthy().await;
-            }
-            let unit_in_use =
-                crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr));
-            self.remove().await;
-            if unit_in_use {
-                return Err(self.unavailable(&format!(
-                    "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
-                )));
-            }
-            return Err(self.unavailable(
-                "container runtime rejected sidecar start; verify the image and host prerequisites",
-            ));
+        if output.status.success() {
+            return Ok(true);
         }
-        tracing::info!(
-            container = %self.container_name,
-            provider = self.cfg.provider.as_str(),
-            "Sandbox tunnel sidecar started"
-        );
-        // The provider must be up before the firewall goes in: wg-quick and
-        // the NetBird client resolve and reach their endpoints through the
-        // still-open uplink, and the WireGuard device must exist to read or
-        // set its fwmark. The manager receives no verified container ID to
-        // join until after firewall installation.
-        if let Err(error) = self.wait_provider_ready().await {
-            self.remove().await;
-            return Err(error);
+        if self.matching_container_id(hash).await.is_some() {
+            self.wait_healthy(provider_timeout).await?;
+            return Ok(false);
         }
-        if let Err(error) = self.install_egress_firewall().await {
-            self.remove().await;
-            return Err(error);
+        if crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr)) {
+            return Err(self.unavailable(&format!(
+                "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
+            )));
         }
-        if self.cfg.wireguard_canary.is_some() && !self.provider_probe().await {
-            self.remove().await;
-            return Err(
-                self.unavailable("WireGuard canary failed after the egress firewall was installed")
-            );
-        }
-        tracing::info!(
-            container = %self.container_name,
-            provider = self.cfg.provider.as_str(),
-            "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
-        );
-        Ok(())
+        Err(self.unavailable(
+            "container runtime rejected sidecar start; verify the image and host prerequisites",
+        ))
     }
 
-    async fn wait_provider_ready(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.cfg.startup_timeout;
+    async fn abort_start(
+        &self,
+        cleanup: &mut SidecarStartCleanup,
+        error: SandboxError,
+    ) -> SandboxError {
+        self.remove().await;
+        cleanup.disarm();
+        error
+    }
+
+    async fn wait_provider_ready(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.provider_probe().await {
-                return Ok(());
-            }
+            let error = match self.provider_health().await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.unavailable(&format!(
-                    "sidecar did not become healthy within {}s",
-                    self.cfg.startup_timeout.as_secs()
-                )));
+                return Err(self.error_with_context(
+                    error,
+                    &format!("provider remained unhealthy for {}s", timeout.as_secs()),
+                ));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
     }
 
-    /// Reuse path: the sidecar exists with our configuration; it must pass the
-    /// provider probe and carry exactly our firewall within the startup timeout.
-    async fn wait_healthy(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.cfg.startup_timeout;
+    async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.provider_probe().await {
-                return match self.check_egress_firewall().await {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        self.remove().await;
-                        Err(error)
-                    }
-                };
-            }
+            let error = match self.provider_health().await {
+                Ok(()) => {
+                    return match self.check_egress_firewall().await {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            self.remove().await;
+                            Err(error)
+                        }
+                    };
+                }
+                Err(error) => error,
+            };
             if tokio::time::Instant::now() >= deadline {
                 self.remove().await;
-                return Err(self.unavailable(&format!(
-                    "sidecar did not become healthy within {}s",
-                    self.cfg.startup_timeout.as_secs()
-                )));
+                return Err(self.error_with_context(
+                    error,
+                    &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
+                ));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    fn error_with_context(&self, error: SandboxError, context: &str) -> SandboxError {
+        match error {
+            SandboxError::TunnelUnavailable { reason } => {
+                self.unavailable(&format!("{reason}; {context}"))
+            }
+            other => other,
         }
     }
 
@@ -1273,12 +1404,11 @@ impl TunnelSidecar {
         Some(parse_wireguard_config(&content).ok()?.has_peers)
     }
 
-    async fn provider_probe(&self) -> bool {
+    async fn provider_health(&self) -> Result<()> {
         let has_peers = if self.cfg.provider == TunnelProvider::Wireguard {
-            let Some(has_peers) = self.wireguard_has_peers() else {
-                return false;
-            };
-            has_peers
+            self.wireguard_has_peers().ok_or_else(|| {
+                self.unavailable("WireGuard config could not be parsed for the health probe")
+            })?
         } else {
             false
         };
@@ -1293,17 +1423,35 @@ impl TunnelSidecar {
             && has_peers
             && self.cfg.wireguard_canary.is_none()
         {
-            let Ok(output) = self.output_probe(&refs).await else {
-                return false;
-            };
+            let output = self
+                .output_probe(&refs)
+                .await
+                .map_err(|_| self.unavailable("WireGuard handshake probe could not run"))?;
+            if !output.status.success() {
+                return Err(self.unavailable("WireGuard handshake probe command failed"));
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
-            return output.status.success()
-                && wireguard_handshake_is_recent(&String::from_utf8_lossy(&output.stdout), now);
+            return wireguard_handshake_status(&String::from_utf8_lossy(&output.stdout), now)
+                .map_err(|reason| self.unavailable(&reason));
         }
-        self.status_probe(&refs).await.is_some_and(|s| s.success())
+        if self.status_probe(&refs).await.is_some_and(|s| s.success()) {
+            return Ok(());
+        }
+        let reason = match self.cfg.provider {
+            TunnelProvider::Netbird => "netbird status --check startup probe failed".to_string(),
+            TunnelProvider::Wireguard if self.cfg.wireguard_canary.is_some() => format!(
+                "WireGuard canary probe to {} failed",
+                self.cfg
+                    .wireguard_canary
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| "the configured address".to_string())
+            ),
+            TunnelProvider::Wireguard => "WireGuard wg0 interface probe failed".to_string(),
+        };
+        Err(self.unavailable(&reason))
     }
 
     /// The uplink allowance for the running sidecar. `set_wireguard_mark`
@@ -1794,6 +1942,37 @@ fn read_or_create_label_salt(dir: &Path) -> std::io::Result<Vec<u8>> {
         // Another daemon instance created it first: use theirs.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read(&path),
         Err(error) => Err(error),
+    }
+}
+
+struct SidecarStartCleanup {
+    sidecar: Option<TunnelSidecar>,
+}
+
+impl SidecarStartCleanup {
+    fn new(sidecar: TunnelSidecar) -> Self {
+        Self {
+            sidecar: Some(sidecar),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.sidecar = None;
+    }
+}
+
+impl Drop for SidecarStartCleanup {
+    fn drop(&mut self) {
+        let Some(sidecar) = self.sidecar.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn(async move { sidecar.remove().await })),
+            Err(_) => tracing::error!(
+                container = %sidecar.container_name,
+                "Cancelled tunnel start could not schedule sidecar cleanup without a Tokio runtime"
+            ),
+        }
     }
 }
 
@@ -2399,15 +2578,36 @@ mod tests {
                 .unwrap()
                 .has_peers
         );
-        assert!(wireguard_handshake_is_recent("peer-a 1000\n", 1180));
-        assert!(wireguard_handshake_is_recent(
-            "peer-a 0\npeer-b 999\n",
-            1000
-        ));
-        assert!(!wireguard_handshake_is_recent("peer-a 0\n", 1000));
-        assert!(!wireguard_handshake_is_recent("peer-a 819\n", 1000));
-        assert!(!wireguard_handshake_is_recent("peer-a 1001\n", 1000));
-        assert!(!wireguard_handshake_is_recent("garbage\n", 1000));
+        assert!(wireguard_handshake_status("peer-a 1000\n", 1180).is_ok());
+        assert!(wireguard_handshake_status("peer-a 0\npeer-b 999\n", 1000).is_ok());
+        assert!(wireguard_handshake_status("peer-a 0\n", 1000).is_err());
+        let stale = wireguard_handshake_status("peer-a 819\n", 1000).unwrap_err();
+        assert!(stale.contains("181s old"), "{stale}");
+        assert!(stale.contains("180s liveness budget"), "{stale}");
+        assert!(wireguard_handshake_status("peer-a 1001\n", 1000).is_err());
+        assert!(wireguard_handshake_status("garbage\n", 1000).is_err());
+    }
+
+    #[test]
+    fn recovery_backoff_preserves_the_probe_reason_and_expires() {
+        let mut state = RecoveryState::default();
+        state.record(&SandboxError::TunnelUnavailable {
+            reason: "WireGuard handshake is 181s old".into(),
+        });
+        let failed_at = state.last_failure.as_ref().unwrap().failed_at;
+        let cached = state.cached_reason(failed_at).unwrap();
+        assert!(
+            cached.contains("WireGuard handshake is 181s old"),
+            "{cached}"
+        );
+        assert!(cached.contains("next attempt in 30s"), "{cached}");
+        assert!(state.cached_reason(failed_at + RECOVERY_BACKOFF).is_none());
+
+        let mut config_state = RecoveryState::default();
+        config_state.record(&SandboxError::Config {
+            reason: "invalid configuration".into(),
+        });
+        assert!(config_state.cached_reason(failed_at).is_none());
     }
 
     #[test]
