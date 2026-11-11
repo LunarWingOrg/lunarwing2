@@ -351,7 +351,7 @@ export async function runnerHealthcheck(path: string): Promise<number> {
     socket.once("data", data => {
       clearTimeout(timer)
       try {
-        const value: unknown = JSON.parse(data.toString("utf8").split("\n")[0])
+        const value: unknown = JSON.parse(data.toString("utf8").split("\n")[0] ?? "")
         finish(isRecord(value) && value.ok === true && value.op === "pong" ? 0 : 1)
       } catch {
         finish(1)
