@@ -149,11 +149,10 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        // Tunnel sidecar (WI#248): health-gated start before any run can
-        // join its namespace. `ensure_started` fails closed — a tunnel that
-        // cannot come up makes the sandbox unavailable rather than degrading
-        // to another egress mode.
-        if self.config.network == SandboxNetworkMode::Tunnel {
+        // Tunnel sidecar (WI#248): health-gated start before any run can join
+        // its namespace. Keep the handle after a failed start so its back-off
+        // also covers later commands; no run can join without a healthy gate.
+        let tunnel_start = if self.config.network == SandboxNetworkMode::Tunnel {
             let tunnel_cfg = self
                 .config
                 .tunnel
@@ -174,9 +173,12 @@ impl SandboxManager {
                     })?,
                 tunnel_cfg,
             );
-            sidecar.ensure_started().await?;
+            let startup = sidecar.recover_for_run().await;
             *self.tunnel.write().await = Some(sidecar);
-        }
+            Some(startup)
+        } else {
+            None
+        };
 
         // Start the network proxy for the proxy-backed egress modes —
         // advisory and enforced both need the validating proxy. The tunnel
@@ -197,6 +199,9 @@ impl SandboxManager {
 
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(startup) = tunnel_start {
+            startup?;
+        }
 
         // Resolve the runtime name before the macro: the read guard's await
         // inside `tracing::info!` field position would make the future !Send.
@@ -345,7 +350,7 @@ impl SandboxManager {
                         error = %error,
                         "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
                     );
-                    sidecar.ensure_started().await?;
+                    sidecar.recover_for_run().await?;
                     sidecar.ensure_healthy().await?
                 }
             };
