@@ -12,8 +12,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / ".gitlab/scripts"))
 sys.path.insert(0, str(REPO_ROOT / "lunardepth4lunarwing/scripts"))
 
-from verify_opencode2_exposure_out_of_band import _fetch_candidate_config  # noqa: E402
 from verify_exposure_out_of_band import validate_archive  # noqa: E402
+from worker_candidate_config import fetch_candidate_config  # noqa: E402
+
+
+def _load_candidate_fetcher():
+    return fetch_candidate_config
 
 
 def main() -> None:
@@ -21,7 +25,7 @@ def main() -> None:
     image_digest = os.environ.get("WORKER_IMAGE_DIGEST", "")
     if not image_ref or not image_digest:
         raise RuntimeError("WORKER_IMAGE_REF and WORKER_IMAGE_DIGEST are required")
-    config = _fetch_candidate_config(image_ref, image_digest)
+    config = _load_candidate_fetcher()(image_ref, image_digest)
     with tempfile.TemporaryDirectory(prefix="lunardepth-oob-") as directory:
         config_path = pathlib.Path(directory) / "image-config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")

@@ -522,6 +522,19 @@ class FilesystemExportTests(unittest.TestCase):
         self.assertIn("local export", stdout.getvalue())
 
 
+class LunarDepthWrapperTests(unittest.TestCase):
+    def test_wrapper_loads_the_shared_candidate_fetcher(self):
+        path = ROOT / ".gitlab" / "scripts" / "verify-lunardepth-exposure-out-of-band.py"
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("image_config_policy", None)
+            spec = importlib.util.spec_from_file_location("verify_lunardepth_wrapper_test", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            fetcher = module._load_candidate_fetcher()
+            self.assertTrue(callable(fetcher))
+            self.assertEqual(fetcher.__name__, "fetch_candidate_config")
+
+
 class MainWiringTests(unittest.TestCase):
     def setUp(self):
         self.module = load_verify_module()

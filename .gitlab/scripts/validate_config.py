@@ -494,9 +494,14 @@ def validate_lunardepth_exposure_verify(merged: dict, errors: list[str]) -> None
     if not isinstance(job, dict):
         errors.append("worker-lunardepth-exposure-verify is missing")
         return
-    expected_image = image_name(merged.get(".worker-promotion", {}).get("image"))
+    expected_image = (
+        "docker.io/library/node:22.23.4-bookworm-slim@sha256:"
+        "4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da"
+    )
     if image_name(job.get("image")) != expected_image:
-        errors.append("worker-lunardepth-exposure-verify must use the promotion's pinned image")
+        errors.append("worker-lunardepth-exposure-verify must use the pinned Node image")
+    if not isinstance(job.get("image"), dict) or job["image"].get("entrypoint") != [""]:
+        errors.append("worker-lunardepth-exposure-verify must clear the Node image entrypoint")
     if job.get("tags") != ["container-build"]:
         errors.append("worker-lunardepth-exposure-verify must use the container-build runner")
     if job.get("interruptible") is not False or job.get("retry") != 0:
@@ -506,10 +511,29 @@ def validate_lunardepth_exposure_verify(merged: dict, errors: list[str]) -> None
     rules = job.get("rules")
     if not isinstance(rules, list) or len(rules) != 3 or rules[-1] != {"when": "never"}:
         errors.append("worker-lunardepth-exposure-verify needs two protected rules and a final never")
+    else:
+        for rule, marker in zip(rules[:2], ("CI_COMMIT_TAG", "CI_COMMIT_BRANCH"), strict=True):
+            if (
+                rule.get("when") != "on_success"
+                or rule.get("allow_failure") is not False
+                or marker not in str(rule.get("if", ""))
+                or 'CI_COMMIT_REF_PROTECTED == "true"' not in str(rule.get("if", ""))
+                or 'CI_PIPELINE_SOURCE == "push"' not in str(rule.get("if", ""))
+            ):
+                errors.append(f"worker-lunardepth-exposure-verify has an unsafe {marker} rule")
     if job.get("needs") != [{"job": "worker-lunardepth-candidate", "artifacts": True}]:
         errors.append("worker-lunardepth-exposure-verify must download its exact candidate artifacts")
     expected_script = [
         "set -a; . ./worker-image.env; set +a",
+        "mkdir -p /etc/ssl/certs\n"
+        "node -e 'require(\"fs\").writeFileSync(\"/etc/ssl/certs/ca-certificates.crt\", "
+        "require(\"tls\").rootCertificates.join(\"\\n\") + \"\\n\")'\n"
+        "rm -f /etc/apt/sources.list.d/debian.sources\n"
+        "printf '%s\\n' \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" "
+        "\"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" "
+        "\"deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" "
+        "> /etc/apt/sources.list\n"
+        "sh .gitlab/scripts/ci-apt-with-retry.sh ca-certificates python3\n",
         "cd lunardepth4lunarwing/scripts",
         "npm ci --ignore-scripts",
         "npx tsc -p tsconfig.json",
@@ -518,13 +542,16 @@ def validate_lunardepth_exposure_verify(merged: dict, errors: list[str]) -> None
         "python3 .gitlab/scripts/verify-lunardepth-exposure-out-of-band.py",
     ]
     script = job.get("script")
-    if not isinstance(script, list) or len(script) != 8 or "lunardepth-rootfs.tar" not in script[0] or script[1:] != expected_script:
+    if not isinstance(script, list) or len(script) != 9 or "lunardepth-rootfs.tar" not in script[0] or script[1:] != expected_script:
         errors.append("worker-lunardepth-exposure-verify script drifted from its pinned checks")
     candidate = merged.get("worker-lunardepth-candidate", {}).get("artifacts", {})
     if "lunardepth-rootfs.tar" not in candidate.get("paths", []):
         errors.append("worker-lunardepth-candidate must publish lunardepth-rootfs.tar")
     if candidate.get("reports", {}).get("dotenv") != "worker-image.env":
         errors.append("worker-lunardepth-candidate must retain its dotenv artifact")
+    promotion_needs = merged.get("worker-lunardepth-promote", {}).get("needs", [])
+    if {"job": "worker-lunardepth-exposure-verify", "artifacts": False} not in promotion_needs:
+        errors.append("worker-lunardepth-promote must hard-need the non-optional verify job")
 
 
 def validate_worker_publication(merged: dict, errors: list[str]) -> None:
