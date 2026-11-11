@@ -392,7 +392,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Dockerfile missing or unreadable (WI#425 GZ-2): %v\n", err)
 		os.Exit(1)
 	}
-	if err := check(src); err != nil {
+	if strings.Contains(os.Args[1], "lunardepth4lunarwing/") {
+		err = checkLunardepth(src)
+	} else {
+		err = check(src)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "exposure policy (BuildKit parser): %v\n", err)
 		os.Exit(1)
 	}
