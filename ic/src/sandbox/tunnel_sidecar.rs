@@ -66,6 +66,8 @@ const TUNNEL_INTERFACES: [&str; 2] = ["wg0", "wt0"];
 /// `host.containers.internal` alias (169.254.1.2 under pasta) live here.
 const LINK_LOCAL_V4: &str = "169.254.0.0/16";
 const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
+const IDENTITY_SALT_FILE: &str = "sandbox-tunnel-identity.salt";
+const IDENTITY_SALT_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunnelProvider {
@@ -862,6 +864,8 @@ pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
     cfg: TunnelSidecarConfig,
+    base_dir: PathBuf,
+    runtime_dir: Option<PathBuf>,
     container_name: String,
     instance_id: String,
     lifecycle: tokio::sync::Mutex<()>,
@@ -877,10 +881,35 @@ impl TunnelSidecar {
         cfg: TunnelSidecarConfig,
         base_dir: &Path,
     ) -> Self {
+        Self::for_instance_with_optional_runtime_dir(runtime, cfg, base_dir, None)
+    }
+
+    pub fn for_instance_with_runtime_dir(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+        runtime_dir: &Path,
+    ) -> Self {
+        Self::for_instance_with_optional_runtime_dir(
+            runtime,
+            cfg,
+            base_dir,
+            Some(runtime_dir.to_path_buf()),
+        )
+    }
+
+    fn for_instance_with_optional_runtime_dir(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+        runtime_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
+            base_dir: base_dir.to_path_buf(),
+            runtime_dir,
             container_name: container_name_for_instance(base_dir),
             instance_id: instance_id_for(base_dir),
             lifecycle: tokio::sync::Mutex::new(()),
@@ -891,11 +920,18 @@ impl TunnelSidecar {
         &self.container_name
     }
 
+    fn runtime_dir(&self) -> Result<PathBuf> {
+        match &self.runtime_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => secret_dir().map_err(|reason| self.unavailable(&reason)),
+        }
+    }
+
     fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
         if self.cfg.dns.is_empty() {
             return Ok(None);
         }
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         Ok(Some(
             dir.join(format!("{}.resolv.conf", self.container_name)),
         ))
@@ -955,9 +991,9 @@ impl TunnelSidecar {
     }
 
     fn netbird_state_volume(&self) -> Result<String> {
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
-        let salt = read_or_create_label_salt(&dir)
-            .map_err(|_| self.unavailable("could not read or create the label salt"))?;
+        let salt = read_or_create_identity_salt(&self.base_dir).map_err(|_| {
+            self.unavailable("could not read or create the persistent identity salt")
+        })?;
         Ok(self.cfg.netbird_state_volume(&self.instance_id, &salt))
     }
 
@@ -1403,7 +1439,7 @@ impl TunnelSidecar {
     async fn current_hash(&self) -> Result<String> {
         self.ensure_image_available().await?;
         let image_id = self.resolve_image_id().await?;
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         let salt = read_or_create_label_salt(&dir)
             .map_err(|_| self.unavailable("could not read or create the label salt"))?;
         Ok(self.cfg.config_hash(&salt, &image_id))
@@ -1539,7 +1575,7 @@ impl TunnelSidecar {
         let contents = SecretString::from(format!(
             "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n"
         ));
-        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let dir = self.runtime_dir()?;
         SecretEnvFile::write(&dir, &contents)
             .map(Some)
             .map_err(|_| self.unavailable("failed to stage the NetBird credential file"))
@@ -1606,6 +1642,77 @@ fn secret_dir() -> std::result::Result<PathBuf, String> {
 #[cfg(not(target_os = "linux"))]
 fn secret_dir() -> std::result::Result<PathBuf, String> {
     Err("the sandbox tunnel sidecar requires a Linux container runtime".into())
+}
+
+fn read_or_create_identity_salt(base_dir: &Path) -> std::io::Result<Vec<u8>> {
+    let path = base_dir.join(IDENTITY_SALT_FILE);
+    match read_identity_salt(&path) {
+        Ok(salt) => Ok(salt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_identity_salt(&path),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "identity salt must be a regular, non-symlink file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "identity salt must not be accessible by group or other users",
+            ));
+        }
+    }
+    let salt = std::fs::read(path)?;
+    if salt.len() != IDENTITY_SALT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "identity salt must contain exactly 32 bytes",
+        ));
+    }
+    Ok(salt)
+}
+
+fn create_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut salt = Vec::with_capacity(IDENTITY_SALT_BYTES);
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let written = (|| -> std::io::Result<()> {
+                file.write_all(&salt)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                file.sync_all()
+            })();
+            if let Err(error) = written {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(salt)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_identity_salt(path),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_or_create_label_salt(dir: &Path) -> std::io::Result<Vec<u8>> {
@@ -1923,6 +2030,80 @@ mod tests {
                 identity_change.netbird_state_volume("test-instance", SALT)
             );
         }
+    }
+
+    #[test]
+    fn netbird_volume_survives_runtime_directory_replacement() {
+        let workdir =
+            std::env::temp_dir().join(format!("lw-tunnel-reboot-{}", uuid::Uuid::new_v4()));
+        let base_dir = workdir.join("state");
+        let first_runtime = workdir.join("runtime-first");
+        let second_runtime = workdir.join("runtime-second");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::create_dir_all(&first_runtime).unwrap();
+        std::fs::create_dir_all(&second_runtime).unwrap();
+        let first = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base_dir,
+            &first_runtime,
+        );
+        let second = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base_dir,
+            &second_runtime,
+        );
+        let volume = first.netbird_state_volume().unwrap();
+        assert_eq!(volume, second.netbird_state_volume().unwrap());
+        assert!(base_dir.join(IDENTITY_SALT_FILE).is_file());
+        assert!(!first_runtime.join(IDENTITY_SALT_FILE).exists());
+        assert!(!second_runtime.join(IDENTITY_SALT_FILE).exists());
+        std::fs::remove_dir_all(&first_runtime).unwrap();
+        assert_eq!(volume, first.netbird_state_volume().unwrap());
+        std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_salt_is_owner_only_and_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lw-tunnel-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = read_or_create_identity_salt(&dir).unwrap();
+        assert_eq!(first.len(), IDENTITY_SALT_BYTES);
+        let mode = std::fs::metadata(dir.join(IDENTITY_SALT_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(read_or_create_identity_salt(&dir).unwrap(), first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_salt_refuses_symlinks_and_group_access() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir =
+            std::env::temp_dir().join(format!("lw-tunnel-identity-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(IDENTITY_SALT_FILE);
+        let target = dir.join("identity-target");
+        std::fs::write(&target, vec![7; IDENTITY_SALT_BYTES]).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_or_create_identity_salt(&dir).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![8; IDENTITY_SALT_BYTES]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_or_create_identity_salt(&dir).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_or_create_identity_salt(&dir).unwrap(),
+            vec![8; IDENTITY_SALT_BYTES]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
