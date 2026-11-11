@@ -147,11 +147,15 @@ Do not print the env file or tenant env file while debugging.
 
 Peer identity and the client config live in a named volume
 (`lunarwing-sandbox-tunnel-<instance>-netbird-<identity-hash>`). The salted
-identity hash covers only the instance, management URL, and setup key, so a
-daemon restart, image change, or DNS change reuses the enrolled peer instead of
-spending another setup key. Rotating the key or URL enrols a fresh peer and
-prunes only this instance's previous volume; revoke the old peer in NetBird
-afterwards.
+identity hash covers only the instance, management URL, and setup key. Its
+32-byte identity salt is a regular, non-symlink mode-`0600` file at
+`$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt`, separate from the ephemeral
+label salt in the runtime directory. A daemon restart, host reboot, empty
+runtime directory, image change, or DNS change therefore reuses the enrolled
+peer instead of spending another setup key. Rotating the key or URL enrols a
+fresh peer and prunes only this instance's previous volume; revoke the old peer
+in NetBird afterwards. If the identity salt cannot be read or created, the
+tunnel fails closed rather than falling back to a runtime or temporary path.
 
 The uplink allowance relies on NetBird's advanced routing: every socket the
 client opens is expected to carry its control-plane mark (`0x1bd00`), and that
@@ -311,6 +315,18 @@ podman volume rm <legacy-volume-name>
 The new instance-scoped names do not match that legacy volume prefix. Keep the
 new peer's state volume unless deliberate re-enrollment is required.
 
+### One-time NetBird re-enrolment for the WI#602 identity-salt fix
+
+Releases before WI#602 derived the peer-volume name with a salt in the runtime
+directory, so a reboot changed the name and lost the enrolled identity. The
+first NetBird sidecar start after upgrading to the persistent identity salt
+computes a new volume name once and prunes the previous instance-scoped volume.
+It therefore re-enrols once: use a reusable setup key that is still valid, or
+issue a replacement before upgrading, and revoke the old peer afterwards. Do
+not try to adopt the old volume by renaming it or copying salts. Later daemon
+restarts and host reboots retain the new volume and overlay identity as long as
+the instance, management URL, setup key, and persistent salt stay unchanged.
+
 ## Verification
 
 1. Start the tenant and check that the daemon logs sidecar started/healthy,
@@ -368,8 +384,10 @@ new peer's state volume unless deliberate re-enrollment is required.
    ```
 
    It checks startup and detailed peer connectivity, a real joined run with
-   `wt0`, exactly one `0x1bd00` mark accept, management reconnect, stable peer
-   IP/state volume across recreation, and ingress refusal. The ingress check
+   `wt0`, exactly one `0x1bd00` mark accept, management reconnect, and ingress
+   refusal. Its identity check stops the sidecar, deletes the runtime-directory
+   label salt to model a reboot, and requires the same peer IP and state volume
+   after recreation. The ingress check
    proves the listener is reachable over loopback before and after the peer
    attempt, so a dead listener cannot masquerade as a firewall pass. The lane
    never runs without all three gates and provider settings; a skip is not a
