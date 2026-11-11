@@ -1565,8 +1565,15 @@ async fn assert_netbird_restart_identity(
 
 async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String> {
     let name = sidecar.container_name();
-    podman_success(&["exec", name, "netbird", "down"]).await?;
-    podman_success(&["exec", name, "netbird", "up"]).await?;
+    if let Some(server) = std::env::var("LUNARWING_E2E_NETBIRD_SERVER_CONTAINER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        podman_success(&["restart", &server]).await?;
+    } else {
+        podman_success(&["exec", name, "netbird", "down"]).await?;
+        podman_success(&["exec", name, "netbird", "up"]).await?;
+    }
     wait_netbird_ready(name).await?;
     sidecar
         .ensure_started()
@@ -1608,6 +1615,12 @@ async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String>
 }
 
 async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
+    if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
     podman_success(&[
         "exec",
         "-d",
@@ -1816,6 +1829,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
             assert_netbird_restart_identity(&primary, &runtime_dir).await?
         );
         assert_netbird_reconnect(&primary).await?;
+        assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
         assert_netbird_ingress_denied(&primary, &peer_name).await
     }
     .await;
