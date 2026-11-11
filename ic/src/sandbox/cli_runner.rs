@@ -705,6 +705,43 @@ pub struct ExecParams<'a> {
     pub tenant_logs: bool,
 }
 
+#[cfg(test)]
+type RuntimeOutputFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<std::process::Output>> + Send + 'static>,
+>;
+
+#[cfg(test)]
+type RuntimeHandler =
+    dyn Fn(Vec<String>, Option<Vec<u8>>) -> RuntimeOutputFuture + Send + Sync + 'static;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestRuntime {
+    handler: std::sync::Arc<RuntimeHandler>,
+}
+
+#[cfg(test)]
+impl TestRuntime {
+    pub(crate) fn new<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(Vec<String>, Option<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::io::Result<std::process::Output>> + Send + 'static,
+    {
+        Self {
+            handler: std::sync::Arc::new(move |args, stdin| Box::pin(handler(args, stdin))),
+        }
+    }
+
+    pub(crate) async fn output(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        let args = args.iter().map(|arg| (*arg).to_string()).collect();
+        (self.handler)(args, stdin.map(<[u8]>::to_vec)).await
+    }
+}
+
 /// Runs sandboxed commands via the podman/docker CLI.
 pub struct CliRunner {
     runtime: ContainerRuntime,
@@ -719,6 +756,8 @@ pub struct CliRunner {
     /// copy under this runtime's uid mapping (WI#287).
     tenant_logs_readable: bool,
     image: String,
+    #[cfg(test)]
+    test_runtime: Option<TestRuntime>,
 }
 
 impl CliRunner {
@@ -752,6 +791,8 @@ impl CliRunner {
                 user: user_for(runtime, docker_rootless),
                 tenant_logs_readable,
                 image,
+                #[cfg(test)]
+                test_runtime: None,
             });
         }
         Err(SandboxError::RuntimeNotAvailable {
@@ -759,14 +800,41 @@ impl CliRunner {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime: ContainerRuntime,
+        image: String,
+        test_runtime: TestRuntime,
+    ) -> Self {
+        let keep_id = keep_id_mode_for(runtime, Some((5, 0)));
+        Self {
+            runtime,
+            keep_id,
+            docker_rootless: false,
+            user: user_for(runtime, false),
+            tenant_logs_readable: daemon_owned_mounts_readable(runtime, keep_id, current_euid()),
+            image,
+            test_runtime: Some(test_runtime),
+        }
+    }
+
     /// Runtime this runner drives.
     pub fn runtime(&self) -> ContainerRuntime {
         self.runtime
     }
 
+    async fn runtime_output(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime.output(args, None).await;
+        }
+        output_isolated(self.runtime.binary(), args).await
+    }
+
     /// Check whether the sandbox image exists in the local store.
     pub async fn image_exists(&self) -> Result<bool> {
-        let output = output_isolated(self.runtime.binary(), &["image", "inspect", &self.image])
+        let output = self
+            .runtime_output(&["image", "inspect", &self.image])
             .await
             .map_err(|e| SandboxError::RuntimeNotAvailable {
                 reason: format!("failed to spawn image inspect: {e}"),
@@ -781,7 +849,8 @@ impl CliRunner {
     /// Pull the sandbox image from its registry.
     pub async fn pull_image(&self) -> Result<()> {
         tracing::info!("Pulling sandbox image: {}", self.image);
-        let output = output_isolated(self.runtime.binary(), &["pull", &self.image])
+        let output = self
+            .runtime_output(&["pull", &self.image])
             .await
             .map_err(|e| SandboxError::ImageUnavailable {
                 image: self.image.clone(),
@@ -1308,19 +1377,49 @@ pub(crate) async fn output_isolated(
     bin: &str,
     args: &[&str],
 ) -> std::io::Result<std::process::Output> {
+    output_isolated_inner(bin, args, None).await
+}
+
+/// Feed a small ruleset to a command without placing its contents in argv.
+pub(crate) async fn output_isolated_with_stdin(
+    bin: &str,
+    args: &[&str],
+    stdin: &[u8],
+) -> std::io::Result<std::process::Output> {
+    output_isolated_inner(bin, args, Some(stdin)).await
+}
+
+async fn output_isolated_inner(
+    bin: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     apply_container_runtime_path(&mut cmd);
     let spec = spawner.prepare_service(&mut cmd);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = cmd.spawn()?;
+    cmd.stdin(if stdin.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
     let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
         &child,
         spec.as_ref(),
         spawner.xdg_runtime_dir(),
     );
+    if let Some(input) = stdin {
+        let mut pipe = child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "child stdin was not piped")
+        })?;
+        pipe.write_all(input).await?;
+        drop(pipe);
+    }
     let output = child.wait_with_output().await;
     guard.disarm();
     output
