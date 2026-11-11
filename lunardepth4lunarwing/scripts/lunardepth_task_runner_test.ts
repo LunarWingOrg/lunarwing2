@@ -30,13 +30,16 @@ function testEnvironment(workspace: string): { root: string; socket: string; res
   }
 }
 
-async function upstream(onTask: (socket: import("ws").WebSocket, payload: Record<string, unknown>) => void) {
+async function upstream(
+  onTask: (socket: import("ws").WebSocket, payload: Record<string, unknown>) => void,
+  sendReady = true,
+) {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: "/ws/agent" })
   await new Promise<void>(resolve => server.once("listening", resolve))
   const requests: Record<string, unknown>[] = []
   server.on("connection", (socket, request) => {
     assert.equal(request.headers.authorization, `Bearer ${TOKEN}`)
-    socket.send(JSON.stringify(createEnvelope("ready", { version: "1", capabilities: [] })))
+    if (sendReady) socket.send(JSON.stringify(createEnvelope("ready", { version: "1", capabilities: [] })))
     socket.on("message", data => {
       const envelope = JSON.parse(data.toString()) as { type: string; payload: Record<string, unknown> }
       if (envelope.type === "task_request") {
@@ -133,10 +136,37 @@ test("forwards cancellation and preserves upstream partial output", async () => 
   }
 })
 
-test("turns an upstream disconnect into an explicit error", async () => {
+test("cancels while the upstream handshake is still waiting for ready", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "lunardepth-workspace-"))
   const fixture = testEnvironment(workspace)
-  const fake = await upstream(socket => socket.close())
+  const fake = await upstream(() => undefined, false)
+  process.env.LUNARDEPTH_WS_URL = fake.url
+  const runner = new TaskRunner(workspace)
+  await runner.listen(fixture.socket)
+  const controller = new AbortController()
+  try {
+    const pending = delegateTaskToRunner(fixture.socket,
+      { task_id: "job-handshake-cancel", prompt: "wait", timeout_ms: 60_000 },
+      () => undefined, controller.signal)
+    setTimeout(() => controller.abort(), 25)
+    const result = await pending
+    assert.equal(result.status, "cancelled")
+    assert.equal(fake.requests.length, 0)
+  } finally {
+    runner.close()
+    fake.server.close()
+    fixture.restore()
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test("turns an upstream disconnect into an explicit error with committed output", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "lunardepth-workspace-"))
+  const fixture = testEnvironment(workspace)
+  const fake = await upstream((socket, payload) => {
+    socket.send(JSON.stringify(createEnvelope("task_progress", { task_id: payload.task_id, delta: "partial", done: false })))
+    socket.close()
+  })
   process.env.LUNARDEPTH_WS_URL = fake.url
   const runner = new TaskRunner(workspace)
   await runner.listen(fixture.socket)
@@ -144,6 +174,7 @@ test("turns an upstream disconnect into an explicit error", async () => {
     const result = await delegateTaskToRunner(fixture.socket,
       { task_id: "job-disconnect", prompt: "run", timeout_ms: 1000 }, () => undefined, new AbortController().signal)
     assert.equal(result.status, "error")
+    assert.equal(result.output, "partial")
     assert.match(result.error ?? "", /disconnected|closed/)
   } finally {
     runner.close()

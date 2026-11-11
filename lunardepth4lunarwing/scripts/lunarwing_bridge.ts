@@ -182,12 +182,15 @@ export class BridgeServer {
 
   private async runTask(active: ActiveTask, request: TaskRequest): Promise<void> {
     let result: TaskResult
+    let committed = ""
     try {
-      result = await delegateTaskToRunner(this.options.runnerSocket, request,
-        progress => active.connection.send("task_progress", { ...progress }), active.controller.signal)
+      result = await delegateTaskToRunner(this.options.runnerSocket, request, progress => {
+        committed += progress.delta
+        active.connection.send("task_progress", { ...progress })
+      }, active.controller.signal)
       if (active.cancelRequested && result.status === "error") result = { ...result, status: "cancelled" }
     } catch (error) {
-      result = errorResult(request.task_id, error, active.cancelRequested ? "cancelled" : "error")
+      result = { ...errorResult(request.task_id, error, active.cancelRequested ? "cancelled" : "error"), output: committed }
     } finally {
       if (this.active === active) this.active = undefined
     }

@@ -63,8 +63,18 @@ export class LunarDepthClient {
   private ready = false
   private settled = false
   private taskId = ""
+  private committed = ""
+  private failure: TaskStatus = "error"
 
   constructor(private readonly url: string, private readonly token: string) {}
+
+  get partialOutput(): string {
+    return this.committed
+  }
+
+  get failureStatus(): TaskStatus {
+    return this.failure
+  }
 
   async execute(request: TaskRequest, signal: AbortSignal, events: UpstreamEvents): Promise<void> {
     if (signal.aborted) throw new Error("task cancelled before LunarDepth connection")
@@ -75,13 +85,23 @@ export class LunarDepthClient {
       handshakeTimeout: 10_000,
     })
     this.socket = socket
-    const deadline = setTimeout(() => this.stop(request.task_id), deadlineDelay(request.timeout_ms ?? DEFAULT_TIMEOUT_MS, LOCAL_GRACE_MS))
-    const abort = () => this.stop(request.task_id)
+    const deadline = setTimeout(
+      () => this.stop(request.task_id, "timed_out"),
+      deadlineDelay(request.timeout_ms ?? DEFAULT_TIMEOUT_MS, LOCAL_GRACE_MS),
+    )
+    const abort = () => this.stop(request.task_id, "cancelled")
     signal.addEventListener("abort", abort, { once: true })
     try {
       await new Promise<void>((resolve, reject) => {
         const eventsWithSettlement: UpstreamEvents = {
-          onProgress: events.onProgress,
+          onProgress: progress => {
+            if (Buffer.byteLength(this.committed) + Buffer.byteLength(progress.delta) > MAX_OUTPUT_BYTES) {
+              eventsWithSettlement.onError(new Error("LunarDepth partial output exceeds the final-output limit"))
+              return
+            }
+            this.committed += progress.delta
+            events.onProgress(progress)
+          },
           onResult: result => {
             if (this.finish(socket, resolve)) events.onResult(result)
           },
@@ -115,9 +135,11 @@ export class LunarDepthClient {
     return true
   }
 
-  private stop(taskId: string): void {
-    if (this.settled || this.socket?.readyState !== WebSocket.OPEN) return
-    this.send("cancel", { task_id: taskId })
+  private stop(taskId: string, status: TaskStatus): void {
+    if (this.settled) return
+    this.failure = status
+    if (this.socket?.readyState === WebSocket.OPEN && this.ready) this.send("cancel", { task_id: taskId })
+    else this.socket?.terminate()
     setTimeout(() => this.socket?.terminate(), LOCAL_GRACE_MS).unref()
   }
 
@@ -311,7 +333,12 @@ export class TaskRunner {
       await client.execute(request, controller.signal, {
         onProgress: progress => this.write(connection, { op: "progress", progress }),
         onResult: result => { terminal = result },
-        onError: error => { terminal = errorResult(request.task_id, error) },
+        onError: error => {
+          terminal = {
+            ...errorResult(request.task_id, error, client.failureStatus),
+            output: client.partialOutput,
+          }
+        },
       })
       this.write(connection, { op: "result", result: terminal ?? errorResult(request.task_id, "task ended without a result") })
       connection.end()
