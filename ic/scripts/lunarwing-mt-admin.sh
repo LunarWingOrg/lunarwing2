@@ -397,24 +397,25 @@ Commands:
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
 
-  promote-worker-images <name>     Promote this run's candidate worker images
-                                   (WI#527) to :latest; re-runnable after a
-                                   failed promotion
+  promote-worker-images <name>     Promote this run's candidate worker and managed
+                                   sandbox images to :latest; re-runnable after
+                                   a failed promotion
 
-  restore-worker-images <name>     Re-tag the :latest worker images recorded
-                                   before a promotion (rollback without a rebuild)
+  restore-worker-images <name>     Re-tag the :latest worker and sandbox images
+                                   recorded before promotion (rollback without rebuild)
 
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
-  cleanup-worker-candidates <name> Discard this run's WI#527 candidate images;
-                                   lanes whose rmi fails stay listed for retry
+  cleanup-worker-candidates <name> Discard this run's candidate worker and sandbox
+                                   images; failed removals stay listed for retry
 
-  build-worker-candidates <name>   Build selected worker images to WI#527
-                                   candidate tags without stopping the tenant
-    --enabled                      Build every lane the tenant has enabled
+  build-worker-candidates <name>   Build selected worker and managed sandbox images
+                                   to candidate tags without stopping the tenant
+    --enabled                      Build every worker lane the tenant has enabled
     --with-pebble --with-opencode --with-kimi --with-opencode2 --with-lunardepth
     --target <ref>                 Operator release ref for source provenance
+    --sandbox-image <mode>         Managed sandbox policy: auto (default), always, never
 
   last-build-stage <name>          Print the last completed build stage
                                    (daemon|bridge|wasm|none, or unknown when the
