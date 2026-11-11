@@ -1,9 +1,10 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#602, WI#604, and WI#614).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#600, WI#602, WI#604, and WI#614).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
 //! LUNARWING_E2E_NETBIRD_TESTS=1, a real management service, a reusable key
-//! file, and an image containing NetBird, nftables, and nc. Live validation is WI#600.
+//! file, and an image containing NetBird, nftables, nc, wget, ping, and nslookup.
+//! Optional settings cover management-server restart and the WI#603 DNS measurement.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
