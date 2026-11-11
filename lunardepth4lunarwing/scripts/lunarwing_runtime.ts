@@ -135,18 +135,35 @@ export function validateTaskRequest(payload: unknown): TaskRequest {
 function validateTaskContext(value: unknown): TaskContext | undefined {
   if (value === undefined) return undefined
   if (!isRecord(value)) throw new Error("context must be an object")
-  const allowed = new Set(["project_dir", "conversation_history"])
+  const allowed = new Set(["project_dir", "conversation_history", "environment", "user_id", "metadata", "cron_tick"])
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`unsupported task context field: ${key}`)
   }
   if (value.project_dir !== undefined && typeof value.project_dir !== "string") {
     throw new Error("context.project_dir must be a string")
   }
+  if (value.user_id !== undefined && typeof value.user_id !== "string") {
+    throw new Error("context.user_id must be a string")
+  }
+  validateStringMap(value.metadata, "metadata")
+  const environment = validateStringMap(value.environment, "environment")
+  if (environment !== undefined && Object.keys(environment).length > 0) {
+    throw new Error("per-job environment and credential grants are unsupported")
+  }
+  if (value.cron_tick !== undefined) throw new Error("cron dispatch is unsupported")
   const history = validateHistory(value.conversation_history)
   return {
     ...typeof value.project_dir === "string" ? { project_dir: value.project_dir } : {},
     ...history === undefined ? {} : { conversation_history: history },
   }
+}
+
+function validateStringMap(value: unknown, field: string): Record<string, string> | undefined {
+  if (value === undefined) return undefined
+  if (!isRecord(value) || Object.values(value).some(entry => typeof entry !== "string")) {
+    throw new Error(`context.${field} must be a string-to-string object`)
+  }
+  return value as Record<string, string>
 }
 
 function validateHistory(value: unknown): ConversationMessage[] | undefined {

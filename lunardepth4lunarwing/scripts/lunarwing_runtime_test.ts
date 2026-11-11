@@ -14,7 +14,7 @@ import {
   validateTaskRequest,
 } from "./lunarwing_runtime.js"
 
-test("accepts a bounded task with supported context", () => {
+test("accepts a bounded task with the daemon's serialized context", () => {
   const request = validateTaskRequest({
     task_id: "job-1",
     prompt: "inspect the workspace",
@@ -22,24 +22,37 @@ test("accepts a bounded task with supported context", () => {
     context: {
       project_dir: "/workspace/project",
       conversation_history: [{ role: "user", content: "earlier" }],
+      environment: {},
+      user_id: "user-1",
+      metadata: { origin: "daemon-test" },
     },
   })
   assert.equal(request.task_id, "job-1")
   assert.equal(request.context?.conversation_history?.length, 1)
+  assert.equal(Object.keys(request.context ?? {}).includes("environment"), false)
 })
 
-test("rejects grants, environment, metadata, cron, and unknown fields", () => {
+test("rejects grants, cron, malformed context, and unknown fields", () => {
   const taskFields: Array<[string, unknown]> = [["credentials", {}], ["credential_grants", []], ["metadata", {}]]
   for (const [key, value] of taskFields) {
     assert.throws(() => validateTaskRequest({ task_id: "job", prompt: "x", [key]: value }), /unsupported task field/)
   }
-  const contextFields: Array<[string, unknown]> = [["environment", {}], ["metadata", {}], ["cron_tick", null], ["user_id", "u"]]
-  for (const [key, value] of contextFields) {
-    assert.throws(
-      () => validateTaskRequest({ task_id: "job", prompt: "x", context: { [key]: value } }),
-      /unsupported task context field/,
-    )
-  }
+  assert.throws(
+    () => validateTaskRequest({ task_id: "job", prompt: "x", context: { environment: { KEY: "value" } } }),
+    /environment and credential grants are unsupported/,
+  )
+  assert.throws(
+    () => validateTaskRequest({ task_id: "job", prompt: "x", context: { cron_tick: null } }),
+    /cron dispatch is unsupported/,
+  )
+  assert.throws(
+    () => validateTaskRequest({ task_id: "job", prompt: "x", context: { metadata: { invalid: 1 } } }),
+    /string-to-string object/,
+  )
+  assert.throws(
+    () => validateTaskRequest({ task_id: "job", prompt: "x", context: { unknown: true } }),
+    /unsupported task context field/,
+  )
 })
 
 test("enforces history count and UTF-16 code-unit limits", () => {
