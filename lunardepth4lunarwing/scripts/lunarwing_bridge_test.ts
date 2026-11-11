@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
-import { createServer, type Server } from "node:net"
+import { connect, createServer, type Server } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -10,6 +10,31 @@ import { BridgeServer, bridgeStartupRefusal } from "./lunarwing_bridge.js"
 import { createEnvelope, type Envelope, SUBPROTOCOL } from "./lunarwing_runtime.js"
 
 const TOKEN = "test-only-hub-token-0123456789abcdef0123456789abcdef"
+
+async function rawUpgrade(port: number, path: string, authorization: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port })
+    let response = ""
+    socket.setTimeout(2_000, () => {
+      socket.destroy()
+      reject(new Error("timed out waiting for raw upgrade response"))
+    })
+    socket.on("connect", () => socket.write(
+      `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n` +
+      `Sec-WebSocket-Protocol: ${SUBPROTOCOL}\r\nAuthorization: ${authorization}\r\n\r\n`,
+    ))
+    socket.on("data", data => {
+      response += data.toString()
+      if (response.includes("\r\n\r\n")) {
+        resolve(response)
+        socket.destroy()
+      }
+    })
+    socket.on("end", () => resolve(response))
+    socket.on("error", reject)
+  })
+}
 
 interface Fixture {
   bridge: BridgeServer
@@ -66,10 +91,10 @@ async function fixture(): Promise<Fixture> {
   return { bridge, runner, root, url: `ws://127.0.0.1:${bridge.port}/ws/agent`, requests }
 }
 
-async function waitFor(messages: Envelope[], type: string): Promise<Envelope> {
+async function waitFor(messages: Envelope[], type: string, skip = 0): Promise<Envelope> {
   const deadline = Date.now() + 2_000
   while (Date.now() < deadline) {
-    const found = messages.find(message => message.type === type)
+    const found = messages.find((message, index) => index >= skip && message.type === type)
     if (found !== undefined) return found
     await new Promise(resolve => setTimeout(resolve, 5))
   }
@@ -100,7 +125,26 @@ test("requires bearer authentication before the WebSocket upgrade", async () => 
   }
 })
 
-test("serves ready, pong, progress, and one result through the real runner socket", async () => {
+test("malformed upgrade targets are rejected without stopping the bridge", async () => {
+  const current = await fixture()
+  try {
+    assert.match(await rawUpgrade(current.bridge.port, "//", `Bearer ${TOKEN}`), /^HTTP\/1\.1 400/)
+    assert.match(await rawUpgrade(current.bridge.port, "//", "Bearer wrong"), /^HTTP\/1\.1 401/)
+    const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: `Bearer ${TOKEN}` } })
+    const messages: Envelope[] = []
+    socket.on("message", data => messages.push(JSON.parse(data.toString()) as Envelope))
+    await new Promise<void>(resolve => socket.once("open", resolve))
+    socket.send(JSON.stringify(createEnvelope("ping", {})))
+    await waitFor(messages, "pong")
+    socket.close()
+  } finally {
+    await current.bridge.close()
+    current.runner.close()
+    rmSync(current.root, { recursive: true, force: true })
+  }
+})
+
+test("serves the daemon context and rejects grants without disconnecting", async () => {
   const current = await fixture()
   const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: `Bearer ${TOKEN}` } })
   const messages: Envelope[] = []
@@ -117,7 +161,13 @@ test("serves ready, pong, progress, and one result through the real runner socke
       task_id: "hub-job",
       prompt: "run",
       timeout_ms: 1000,
-      context: { project_dir: "/srv/daemon-workspace/project" },
+      context: {
+        project_dir: "/srv/daemon-workspace/project",
+        conversation_history: [],
+        environment: {},
+        user_id: "daemon-user",
+        metadata: {},
+      },
     })))
     const result = await waitFor(messages, "task_result")
     assert.equal(result.payload.status, "success")
@@ -126,6 +176,19 @@ test("serves ready, pong, progress, and one result through the real runner socke
     assert.equal(current.requests[0]?.context && typeof current.requests[0].context === "object", true)
     const context = current.requests[0]?.context as { project_dir?: string }
     assert.equal(context.project_dir, join(current.root, "project"))
+    const rejectedIndex = messages.length
+    socket.send(JSON.stringify(createEnvelope("task_request", {
+      task_id: "grant-job",
+      prompt: "run",
+      context: { environment: { API_KEY: "must-not-be-forwarded" } },
+    })))
+    const rejected = await waitFor(messages, "task_result", rejectedIndex)
+    assert.equal(rejected.payload.task_id, "grant-job")
+    assert.equal(rejected.payload.status, "error")
+    assert.match(String(rejected.payload.error), /environment and credential grants/)
+    const pongIndex = messages.length
+    socket.send(JSON.stringify(createEnvelope("ping", {})))
+    await waitFor(messages, "pong", pongIndex)
   } finally {
     socket.close()
     await current.bridge.close()

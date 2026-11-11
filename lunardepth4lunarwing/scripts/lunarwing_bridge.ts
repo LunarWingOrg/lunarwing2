@@ -50,6 +50,10 @@ export function bridgeStartupRefusal(env: NodeJS.ProcessEnv, uid: number | null)
   return null
 }
 
+function rejectUpgrade(socket: Duplex, status: string): void {
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy())
+}
+
 export class BridgeServer {
   private readonly http: HttpServer
   private readonly webSockets: WebSocketServer
@@ -86,16 +90,33 @@ export class BridgeServer {
   }
 
   private upgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
-    const pathname = new URL(request.url ?? "/", "http://bridge.invalid").pathname
-    const protocols = request.headers["sec-websocket-protocol"]
-    const offered = (Array.isArray(protocols) ? protocols.join(",") : protocols ?? "").split(",").map(value => value.trim())
     const authenticated = bearerTokenMatches(request.headers.authorization, this.options.token)
-    if (this.closing || pathname !== this.options.path || !authenticated || !offered.includes(SUBPROTOCOL)) {
-      const status = !authenticated ? "401 Unauthorized" : pathname !== this.options.path ? "404 Not Found" : "400 Bad Request"
-      socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
+    if (!authenticated) {
+      rejectUpgrade(socket, "401 Unauthorized")
       return
     }
-    this.webSockets.handleUpgrade(request, socket, head, webSocket => this.webSockets.emit("connection", webSocket))
+    if (this.closing) {
+      rejectUpgrade(socket, "400 Bad Request")
+      return
+    }
+    let pathname: string
+    try {
+      pathname = new URL(request.url ?? "/", "http://bridge.invalid").pathname
+    } catch {
+      rejectUpgrade(socket, "400 Bad Request")
+      return
+    }
+    const protocols = request.headers["sec-websocket-protocol"]
+    const offered = (Array.isArray(protocols) ? protocols.join(",") : protocols ?? "").split(",").map(value => value.trim())
+    if (pathname !== this.options.path || !offered.includes(SUBPROTOCOL)) {
+      rejectUpgrade(socket, pathname !== this.options.path ? "404 Not Found" : "400 Bad Request")
+      return
+    }
+    try {
+      this.webSockets.handleUpgrade(request, socket, head, webSocket => this.webSockets.emit("connection", webSocket))
+    } catch {
+      if (!socket.destroyed) rejectUpgrade(socket, "400 Bad Request")
+    }
   }
 
   private accept(socket: WebSocket): void {
@@ -115,7 +136,7 @@ export class BridgeServer {
         connection.send("pong", {})
         return
       case "task_request":
-        this.startTask(validateTaskRequest(envelope.payload), connection)
+        this.startTaskPayload(envelope.payload, connection)
         return
       case "cancel":
         this.cancelTask(envelope.payload.task_id, connection)
@@ -128,6 +149,15 @@ export class BridgeServer {
         throw new Error(`unsupported hub frame: ${envelope.type}`)
       default:
         return
+    }
+  }
+
+  private startTaskPayload(payload: Record<string, unknown>, connection: HubConnection): void {
+    const taskId = typeof payload.task_id === "string" ? payload.task_id : "unknown"
+    try {
+      this.startTask(validateTaskRequest(payload), connection)
+    } catch (error) {
+      connection.sendResult(errorResult(taskId, error))
     }
   }
 
