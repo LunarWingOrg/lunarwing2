@@ -2,12 +2,11 @@
 
 This runbook covers a PostgreSQL-backed, single-instance migration. LunarWing retains the IronClaw migration lineage and applies newer Refinery migrations at startup, but a forward migration is not a rollback plan. Test with a cloned database and copied state directory before touching the original instance.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The migration chain
-(`ic/migrations/`, now through V28), `LUNARWING_BASE_DIR` precedence, service
-install paths, and the `lunarwing-agent-v1`-only worker subprotocol (the
-`ironclaw-agent-v1` alias is removed) were re-checked against the current tree;
-the only change was the V27 → V28 migration-chain pointer (V28 revokes
-always-granted secret-deletion authority).
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The migration chain
+(`ic/migrations/`, currently through V28), `LUNARWING_BASE_DIR` precedence,
+service install paths, and `lunarwing-agent-v1`-only worker subprotocol match
+the current tree. V28 revokes always-granted secret-deletion authority; the
+`ironclaw-agent-v1` alias remains removed.
 
 For a multi-tenant target, use [`MIGRATE_IRONCLAW_TO_MT.md`](MIGRATE_IRONCLAW_TO_MT.md) instead.
 
@@ -47,7 +46,8 @@ taskset -c 0-11 cargo build --release -j12 --bin lunarwing
 Build the XMPP bridge or WASM extensions only when the instance uses them:
 
 ```bash
-taskset -c 0-11 cargo build --release -j12 -p xmpp-bridge
+# The bridge is excluded from the ic workspace, so `-p xmpp-bridge` matches nothing.
+taskset -c 0-11 cargo build --release -j12 --manifest-path bridges/xmpp-bridge/Cargo.toml
 scripts/build-wasm-extensions.sh
 ```
 
@@ -99,7 +99,7 @@ lunarwing service status
 
 Review the rendered service before enabling it. The committed systemd production template expects the binary at `/usr/local/bin/lunarwing`, state under `/var/lib/lunarwing`, and protected environment at `/etc/lunarwing/lunarwing.env`; adjust the deployment consistently rather than editing only `ExecStart`.
 
-For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands.
+For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands. Since v2.2.0.0 (WI#574), installation refuses both the literal `root` account and any other uid-0 alias before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set; prefer a dedicated unprivileged account and verify the resolved uid rather than relying on its name.
 
 If the watchdog is required, install the current init-appropriate assets after the main service is healthy:
 

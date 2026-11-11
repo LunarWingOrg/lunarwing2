@@ -1,6 +1,6 @@
 # IRC Sender Identity
 
-**Source revalidated 2026-11-01 for v2.1.8.0.** The source of truth is:
+**Source revalidated 2026-11-10 for v2.2.0.0.** The source of truth is:
 
 - `darkirc_channel_for_lunarwing/darkirc/src/lib.rs`: `rfc1459_casefold`,
   `darkirc_principal`, and inbound DM scope construction.

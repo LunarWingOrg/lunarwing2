@@ -3,14 +3,11 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes (`require_cmd` set: cargo, chcon, curl,
-flock, git, jq, od, passwd, python3, setpriv, sha256sum, tar, taskset,
-useradd — plus podman/docker); no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, and
-the v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` and the
-v2.1.6.0 OpenRC proxy-unit migration and worker-credential work reuse
-existing tooling; `flock` was already listed via `sys-apps/util-linux`).
+**Revalidated 2026-11-10 (v2.2.0.0).** The current mt-admin `require_cmd` set
+was re-checked: cargo, chcon, curl, flock, git, jq, nft, od, passwd, python3,
+setpriv, sha256sum, tar, taskset, and useradd, plus podman/docker. WI#424
+worker egress enforcement needs `nft` from `net-firewall/nftables`, now listed
+explicitly below. Disk health reuses existing core utilities.
 
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).
@@ -47,7 +44,7 @@ inside a cgroup v2 build scope. On OpenRC this needs **all three** of:
    degrades to nice-only (`cgroup v2 bounding unavailable ... running nice-only`):
 
    ```bash
-   echo 'sys-apps/util-linux caps' | sudo tee /etc/portage/package.use/lunarwing-mt
+   echo 'sys-apps/util-linux caps' | sudo tee -a /etc/portage/package.use/lunarwing-mt
    sudo emerge --ask --oneshot sys-apps/util-linux   # pulls sys-libs/libcap-ng
    command -v setpriv   # expect /usr/bin/setpriv
    ```
@@ -74,10 +71,13 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Th
 **Podman**:
 
 ```bash
-# Podman needs the nftables USE flag on iptables (pulled in by containers-common):
-echo 'net-firewall/iptables nftables' | sudo tee /etc/portage/package.use/lunarwing-mt
-sudo emerge app-containers/podman      # pulls containers-common, netavark, aardvark-dns,
-                                       # crun, conmon, fuse-overlayfs, passt, ...
+# Podman needs the nftables USE flag on iptables (pulled in by containers-common).
+# Append (`tee -a`): a plain `tee` would erase the util-linux `caps` flag written above.
+echo 'net-firewall/iptables nftables' | sudo tee -a /etc/portage/package.use/lunarwing-mt
+sudo emerge app-containers/podman net-firewall/nftables
+# podman pulls containers-common, netavark, aardvark-dns, crun, conmon,
+# fuse-overlayfs and passt; net-firewall/nftables supplies the separate `nft`
+# command required by mt-admin's external-worker egress enforcement.
 ```
 
 Then point Podman's unqualified image search at Docker Hub so the hardcoded
@@ -103,7 +103,8 @@ sudo emerge sys-process/fcron      # or sys-process/cronie, or sys-process/dcron
 ```
 
 `mt-admin` adds the cron daemon to the `default` runlevel automatically when it installs the
-schedule (`*/5` by default). `fcron` is preferred (supports catch-up of missed runs).
+schedule (every 15 minutes by default; `LUNARWING_MT_HEALTH_INTERVAL_MIN` changes it). `fcron`
+is preferred (supports catch-up of missed runs).
 
 ## 4. Rust build toolchain (per-tenant builds)
 
@@ -112,8 +113,11 @@ schedule (`*/5` by default). `fcron` is preferred (supports catch-up of missed r
 | `dev-util/rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + the `wasm32-wasip2` target. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
 | `sys-devel/clang` (or `llvm-core/clang`) | Provides `libclang`, needed by Rust crates that use `bindgen`/`-sys` native bindings during the build. (`gcc` is already present for the C toolchain.) |
 
-`cargo-component` + `wasm-tools` (for `build-tenant --with-wasm`) are installed **per tenant** via
-`cargo install` by `add-tenant` — not Gentoo packages.
+`add-tenant` installs `rustup`, the stable toolchain and the `wasm32-wasip2` target **per
+tenant**. It does not install `cargo-component` or `wasm-tools`: `cargo-component` is installed
+per tenant (`cargo install`) only by the `ic/scripts/create-tenant.sh` wrapper, and nothing on
+the tenant path installs `wasm-tools`. Without `wasm-tools`, `build-tenant --with-wasm` installs
+raw components and skips the optional debug-info strip. None of these are Gentoo packages.
 
 ## 5. WeeChat channel (optional — only if using WeeChat)
 
@@ -192,7 +196,7 @@ echo 'net-firewall/iptables nftables' | sudo tee /etc/portage/package.use/lunarw
 echo 'sys-apps/util-linux caps' | sudo tee -a /etc/portage/package.use/lunarwing-mt
 sudo emerge \
   app-misc/jq dev-vcs/git net-misc/curl sys-apps/util-linux \
-  app-containers/podman \
+  app-containers/podman net-firewall/nftables \
   sys-process/fcron \
   sys-devel/clang \
   net-irc/weechat app-misc/tmux \
@@ -204,8 +208,9 @@ echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
 ```
 
-`rustup`, `cargo-component`, `wasm-tools`, and the wasm32 targets are handled per-tenant by
-`add-tenant`, so they're intentionally omitted above.
+`rustup` and the `wasm32-wasip2` target are handled per-tenant by `add-tenant`, so they're
+intentionally omitted above. `cargo-component` comes from the `create-tenant.sh` wrapper, and
+`wasm-tools` is optional.
 
 ### Recommended: make `/` a shared mount (rootless podman)
 

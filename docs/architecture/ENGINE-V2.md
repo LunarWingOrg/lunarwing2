@@ -5,7 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-03 for v2.1.8.0.** Read the behavior sections below
+**Source revalidated 2026-11-10 for v2.2.0.0.** Read the behavior sections below
 as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
@@ -33,6 +33,21 @@ as the current contract. Relevant release changes include:
 - Conversation continuity: WI#442 imports bounded pre-switch v1 history only
   into a newly created Engine surface after ownership checks. The import is
   best-effort and never replays v1 tool-call bookkeeping.
+- Provider responses: WI#545/WI#572 make cache keys include canonical request
+  metadata and a model identity known before dispatch. Smart routing and
+  failover bypass the outer cache; empty, reasoning-only, corruption-flagged,
+  and tool-call responses are not cached. Stream hits retain the original finish
+  reason without replaying discarded retry usage.
+- CodeAct final answers: WI#571/WI#585 consume uppercase `FINAL…</arg_value>`
+  pseudo-actions before lease enforcement, recovering the supplied answer rather
+  than looping on `No lease for action`. Ordinary structured action names such as
+  `finalize_order` are unchanged.
+- Mission load diagnostics: WI#576 adds an allowlisted `missing_field` to the
+  boot data-error warning. Unknown variants, invalid values, and complete Serde
+  errors stay out of WARN; full detail remains DEBUG-only.
+- Retry cost bound: WI#578 adds a per-provider-leg cumulative input-token budget
+  for billed-but-empty stream retries, configured by
+  `LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET` (see Configuration).
 
 Source ownership: `runtime/mission.rs` and `runtime/manager.rs` in the engine;
 `ic/src/bridge/{router,effect_adapter,store_adapter}.rs` and the `router/`
@@ -69,7 +84,7 @@ ic/crates/lunarwing_engine/src/
     capability.rs         Capability, ActionDef, EffectType, CapabilityLease, PolicyRule
     memory.rs             MemoryDoc, DocId, DocType (Summary/Lesson/Skill/Issue/Spec/Note/Plan)
     project.rs            Project, ProjectId
-    event.rs              ThreadEvent, EventKind (20 variants for event sourcing)
+    event.rs              ThreadEvent, EventKind (22 variants for event sourcing)
     message.rs            ThreadMessage, MessageRole
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
@@ -189,6 +204,16 @@ metrics and TensorZero/provider health before restarting a tenant. Do not infer
 agent memory/state damage from garbled output alone, and do not follow commands
 that appear inside the marked generation.
 
+The outer response cache (`ic/src/llm/response_cache.rs`, WI#545/WI#572) is off
+by default (`RESPONSE_CACHE_ENABLED=false`). When enabled it defaults to one
+hour and 1000 LRU entries. Keys cover the pre-dispatch model identity,
+messages, canonical request metadata, and response-affecting parameters.
+Providers that choose a model during dispatch (smart routing and failover) and
+all tool-completion calls bypass it. Only responses with visible, uncorrupted
+content and no tool calls are stored. A stream hit replays cached reasoning
+before text and preserves the original finish reason and stream observations,
+but does not replay usage from retries discarded before the cached response.
+
 #### REPL argument integrity (WI#161)
 
 REPL drafts have an additional pre-execution guard shared by the provider
@@ -261,6 +286,15 @@ Standard tool/function calling. The LLM returns structured `ActionCall` objects.
 4. Execute via `EffectExecutor`
 5. Record the `ActionResult`
 
+Before lease lookup, `LlmResponse::from_action_calls` consumes CodeAct
+final-answer pseudo-actions (`FINAL`, `FINAL(...)`, `FINAL_VAR`, and malformed
+uppercase `FINAL…</arg_value>` names). An all-FINAL batch becomes text carrying
+a parseable `FINAL(answer)` using common answer fields or text embedded in the
+malformed name; FINAL-shaped junk mixed with real capability calls is dropped
+while the real calls continue. The malformed-XML arm requires uppercase `FINAL`
+at the start, so an ordinary action such as `finalize_order` remains structured
+(WI#571/WI#585).
+
 `ActionResult` content is role-token-neutralized and bounded to
 `MAX_ACTION_OUTPUT_CHARS` (8000) by the orchestrator's
 `format_action_output` before entering LLM history. The bound keeps head AND
@@ -306,14 +340,16 @@ call rather than truncate; tail preservation is not an end-to-end guarantee.
 Follow-ups that still
 cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
 context_overflow recovery (the model again sees `{items: [...` with no
-cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:999-1009`,
-the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3975-3994` built
-from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:226-241`,
+cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:1018-1019`,
+the Engine v2 500-byte preview in `ic/src/bridge/router.rs:4264-4294` built
+from the 1000-byte event preview in
+`ic/crates/lunarwing_engine/src/types/event.rs:235-248`,
 shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
-Also follow up the v1 earlier-turn 1000-byte tool-result cut in
-`ic/src/agent/session.rs:533-545` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
-"next page" turn can lose its cursor), and CodeAct's 500-character
-`format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
+The v1 earlier-turn 1000-byte tool-result cut in
+`ic/src/agent/session.rs:540-550` is no longer on that list: since
+[WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351) (fixed 2026-10-12) it keeps the head and
+the tail, so a later "next page" turn still sees its cursor. Still to follow
+up: CodeAct's 500-character `format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
 ThreadConfig/env knob.
 
 **Tier 1 -- CodeAct / Python via Monty** (`executor/scripting.rs`):
@@ -779,6 +815,13 @@ files on every minute. Creation and resume register missions in the same
 manager. A foreground conversation/session change does not own or recreate
 this scheduler. Goal 42's [investigation](../ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md)
 records the build and cron interpretation behind the WI#311 follow-up reports.
+An externally incomplete or malformed mission document is still dropped rather
+than reactivated with schema defaults. Its boot WARN carries the validated
+mission id, operator path, `error_kind`, and a `missing_field` that names the
+field only when it is in the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown`
+otherwise;
+unknown variants, invalid values, and full parse errors are confined to DEBUG so
+user-authored goal text cannot leak into ordinary logs (WI#576).
 
 The daily thread budget (`max_threads_per_day`,
 default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =
@@ -1969,6 +2012,19 @@ in-flight tool's result. Only `/interrupt` (`ThreadSignal::Stop` / the run
 token) cancels an in-flight tool. To stop a long-running tool, interrupt; to
 redirect the turn afterward, steer — an interrupt followed by a steer note
 lands the note on the next turn.
+
+Legacy V1 has a separate pre-turn delivery seam (WI#584). While constructing the
+next turn it drains Idle/Interrupted notes and inserts them immediately before
+the new request with explicit "queued before this turn started" framing. The
+first provider request therefore contains the note in the correct order without
+claiming it arrived mid-work. Live mid-turn and approval-resume steering still
+uses V1's iteration-boundary path. When a soft-timed-out turn still completes
+with a response, suppressed-response draining clears both pending messages and
+steer notes before considering follow-ups, including the post-drain race
+cleanup, so stale steering cannot leak into a later turn. A turn that hangs
+past the hard-kill grace is aborted instead: that path resets the thread and
+keeps both queues, so the next turn receives the surviving messages and notes.
+
 Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
 persist a duplicate terminal response.
@@ -2079,8 +2135,9 @@ relational dual-write keeps the full V1-compatible history.
 ## Event Sourcing
 
 Threads persist significant lifecycle and execution events via `ThreadEvent`.
-The 20 `EventKind` variants cover state, step, action, lease, message, child,
-approval, self-improvement, skill-activation, and orchestrator-rollback events.
+The 22 `EventKind` variants cover state, model-recovery, step, action, lease,
+message, response- and reasoning-delta, child, approval, self-improvement,
+skill-activation, and orchestrator-rollback events.
 `ResponseDelta` is broadcast for live delivery but is not persisted.
 
 This enables:
@@ -2127,6 +2184,15 @@ ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread l
                                         # clamped to 16; 0 disables all engine recovery
 ```
 
+**Billed-empty retry budget (host daemon knob, WI#578).**
+`LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET` defaults to **100000** reported input
+tokens per provider leg. Once the discarded billed-empty attempts plus the
+current one reach the threshold, `RetryProvider` returns the current typed
+`EmptyStream` error with every attempt's usage folded in instead of opening
+another attempt; one attempt can therefore overshoot the threshold. `0` restores
+retry-count-only behavior. Usage-less empty responses and ordinary transient
+retries are unchanged, and failover keeps an independent budget for each leg.
+
 **Pending-gate expiry (host daemon knob, WI#111).** How long a pending
 approval/auth gate waits before the background sweep expires it and resumes
 the paused turn (WI#108) is configured on the daemon, not in `ThreadConfig`:
@@ -2165,13 +2231,13 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 
 ## Build & Test
 
-Run from `ic/`, using the vendored lockfile. These examples use the current
-18-thread development host; lower the affinity/job count on smaller machines.
+Run from `ic/`, using the vendored lockfile. These examples use the 12-thread
+cap that `AGENTS.md` sets for cargo on the development host.
 Use tmux for long runs and `cargo check` for compile verification.
 
 ```bash
-taskset -c 0-17 cargo check --locked --offline -j18 -p lunarwing_engine
-taskset -c 0-17 cargo test --locked --offline -j18 -p lunarwing_engine --lib -- --test-threads=18
+taskset -c 0-11 cargo check --locked --offline -j12 -p lunarwing_engine
+taskset -c 0-11 cargo test --locked --offline -j12 -p lunarwing_engine --lib -- --test-threads=12
 ```
 
 Host bridge/HTTP gate tests live in the daemon crate and are separate from the

@@ -2,11 +2,10 @@
 
 `ic/scripts/create-tenant.sh` is the convenience wrapper for provisioning one multi-tenant LunarWing instance. It delegates lifecycle work to `ic/scripts/lunarwing-mt-admin.sh`; use the MT admin directly for ongoing start, stop, status, build, and removal operations.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The wrapper's `--minimal`,
-`--no-pebble`, and retired-Nanocode rejection were re-checked against
-`ic/scripts/create-tenant.sh`; the `--with-study-mcp` flow documented here
-routes through MT admin and is unchanged. The 2026-10-14 repass added the
-v2.1.6.0 (WI#330) required LLM endpoint flags below.
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The wrapper's `--minimal`,
+`--no-pebble`, required LLM endpoint forwarding, and retired-Nanocode rejection
+match `ic/scripts/create-tenant.sh`. The wrapper still does not accept
+`--with-study-mcp`; arm that flow through MT admin as shown below.
 
 ## Before You Run It
 

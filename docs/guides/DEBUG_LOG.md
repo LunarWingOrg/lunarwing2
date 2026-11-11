@@ -2,11 +2,12 @@
 
 LunarWing emits structured events through `tracing`. Do not rely on source line numbers when diagnosing a release; log locations move as the runtime changes.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Default filter
-(`lunarwing=info,tower_http=warn`), runtime level endpoints, and the
-init-agnostic MT diagnostics path were re-checked against the current tree;
-no changes were needed (the WI#287 write-time scrubbing and
-`SANDBOX_TENANT_LOGS` contract below are unchanged in v2.1.6.0).
+**Revalidated against source through 2026-11-10 (v2.2.0.0).** The default filter
+(`lunarwing=info,tower_http=warn`), runtime level endpoints, write-time
+scrubbing, `SANDBOX_TENANT_LOGS`, and init-agnostic MT diagnostics path match
+the current tree. Since v2.2.0.0 (WI#579), every daemon startup also emits
+`Starting LunarWing v<package-version>` at INFO immediately after tracing is
+initialized; use it to confirm the binary that actually started.
 
 ## Choose a Log Level
 
