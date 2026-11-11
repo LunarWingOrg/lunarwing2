@@ -196,7 +196,7 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     lunardepth)
         image_name=worker-lunardepth
-        context=.
+        context=lunardepth4lunarwing
         dockerfile_dir=lunardepth4lunarwing
         input_files='lunardepth4lunarwing/AGENTS.md
 lunardepth4lunarwing/README.md
