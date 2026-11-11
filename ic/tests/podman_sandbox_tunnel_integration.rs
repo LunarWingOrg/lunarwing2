@@ -580,8 +580,8 @@ fn complete_firewall_listing(listing: &str) -> bool {
         "type filter hook output priority",
         "oifname \"wg0\" accept",
         "ip daddr 169.254.0.0/16 drop",
-        "dport 53",
     ];
+    let has_dns = listing.contains("dport 53") || listing.contains("dport domain");
     let has_mark = [
         "meta mark 0x00004c57 accept",
         "mark 0x00004c57 accept",
@@ -593,6 +593,7 @@ fn complete_firewall_listing(listing: &str) -> bool {
     required.iter().all(|line| listing.contains(line))
         && listing.matches("policy drop;").count() == 2
         && has_mark
+        && has_dns
 }
 
 async fn monitor_stable_firewall(
