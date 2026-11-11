@@ -89,7 +89,7 @@ class OutOfBandTests(unittest.TestCase):
 
     def test_smoke_secret_and_checkout_drift_fail(self):
         with tarfile.open(self.archive_path, "a") as archive:
-            for name in ("run/lunardepth-state/local-auth-token", "app/entrypoint.sh"):
+            for name in ("run/lunardepth-state/local-auth-token", "tmp/dsh-spill-test", "tmp/lunardepth_ws_state.json", "app/entrypoint.sh"):
                 data = b"drift"
                 info = tarfile.TarInfo(name)
                 info.size = len(data)

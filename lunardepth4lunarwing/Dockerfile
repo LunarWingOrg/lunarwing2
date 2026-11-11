@@ -196,7 +196,8 @@ ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
 
 RUN --network=none set -eu; \
     LUNARDEPTH_BUILD_SMOKE=1 /app/scripts/runtime_smoke_entrypoint.sh; \
-    rm -rf /tmp/lunardepth-* /run/lunardepth-state/* /run/lunarwing-shared/runner/* \
+    rm -rf /tmp/lunardepth-* /tmp/dsh-spill-* /tmp/lunardepth_ws_state.json \
+      /run/lunardepth-state/* /run/lunarwing-shared/runner/* \
       /home/lunardepth/.dsh /home/lunardepth-bridge/.local/state /run/lunardepth-config/* /root/.cache /root/.npm; \
     install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh; \
     find /app /opt/lunardepth /opt/lunardepth-templates -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +; \

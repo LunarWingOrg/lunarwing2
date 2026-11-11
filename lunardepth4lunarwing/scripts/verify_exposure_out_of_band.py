@@ -105,6 +105,8 @@ def validate_archive(
                 raise ValueError(f"test/package-manager residue in image: {name}")
             if lowered.endswith(("local-auth-token", "agent_auth_token", ".lunardepth-sandbox-escape")):
                 raise ValueError(f"smoke credential or state residue in image: {name}")
+            if name == "tmp/lunardepth_ws_state.json" or name.startswith("tmp/dsh-spill-"):
+                raise ValueError(f"smoke credential or state residue in image: {name}")
     missing = sorted(set(inventory) - seen)
     if missing:
         raise ValueError(f"missing or divergent lane inputs: {', '.join(missing)}")
