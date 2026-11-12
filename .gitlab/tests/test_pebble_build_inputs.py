@@ -309,7 +309,11 @@ class WorkerSourceProvenanceTests(unittest.TestCase):
         wrapper = (ROOT / "ic/scripts/upgrade-tenant.sh").read_text(encoding="utf-8")
         dispatcher = (ROOT / "ic/scripts/lunarwing-mt-admin.sh").read_text(encoding="utf-8")
         self.assertIn('"$with_opencode2" "$checkout_ref"', lifecycle)
-        self.assertIn('cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF")', wrapper)
+        self.assertIn(
+            'cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" '
+            '--sandbox-image "$SANDBOX_IMAGE_POLICY")',
+            wrapper,
+        )
         self.assertIn('"$cand_pebble" "false" "$cand_target"', dispatcher)
 
 

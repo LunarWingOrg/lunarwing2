@@ -699,18 +699,17 @@ add_tenant() {
   fi
   say ""
 
-  # WI#223 applies only to tenants with the mt-admin-managed sandbox image.
-  # Preserve existing custom images; do not build or distribute the default
-  # tag for tenants that opted into another image. A failed build is non-fatal
-  # for base provisioning; start-tenant can retry distribution after a manual
-  # `build-sandbox-image` recovery.
+  # WI#223/596 applies only to tenants with the mt-admin-managed sandbox image.
+  # Rebuild when the committed Dockerfile/snapshot digest differs; an existing
+  # image with the same input label needs no build or redistribution. The build
+  # context comes from the operator checkout, never the tenant-writable tree.
+  # Build/distribution failure remains non-fatal for base provisioning.
   local sandbox_image_ok="operator-managed" sandbox_image
   sandbox_image="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" SANDBOX_IMAGE)"
   if tenant_uses_managed_sandbox_image "$name"; then
     sandbox_image_ok="ready"
-    if ! "$(sandbox_container_runtime "$name")" image inspect "$SANDBOX_IMAGE_TAG" &>/dev/null; then
-      build_sandbox_image "$name" || sandbox_image_ok="needs recovery"
-    fi
+    ( ensure_sandbox_image_current_from_tenant "$name" "$SANDBOX_IMAGE_POLICY" ) \
+      || sandbox_image_ok="needs recovery"
     if ! ensure_tenant_sandbox_image "$name"; then
       sandbox_image_ok="needs recovery"
       say "WARNING: sandbox image $SANDBOX_IMAGE_TAG is unavailable for '$name'. Recovery: sudo $0 build-sandbox-image $name; sudo $0 start-tenant $name" >&2
@@ -1637,13 +1636,14 @@ _upgrade_checkout() {  # <name> <lw_root> <ref-name> <commit> <create-branch:tru
   fi
 }
 
-# Discard this run's candidate worker images. Best effort: a stale candidate
-# never affects the running lanes, which still point at :latest.
+# Discard this run's candidate worker and managed sandbox images. Best effort:
+# a stale candidate never affects the running lanes, which still use :latest.
 cleanup_candidate_workers() {  # <name>
-  local name="$1" lane candidate_ref
+  local name="$1" lane candidate_ref rc=0
   local -a lanes=() kept=()
+  cleanup_candidate_sandbox_image "$name" || rc=1
   mapfile -t lanes < <(upgrade_candidate_lanes "$name")
-  [[ "${#lanes[@]}" -gt 0 ]] || return 0
+  if [[ "${#lanes[@]}" -eq 0 ]]; then return "$rc"; fi
   if [[ -n "${CONTAINER_RT:-}" && -n "$(command -v "$CONTAINER_RT" 2>/dev/null)" ]]; then
     for lane in "${lanes[@]}"; do
       _upgrade_validate_lane "$lane" || continue
@@ -1661,6 +1661,7 @@ cleanup_candidate_workers() {  # <name>
   else
     printf '%s\n' "${kept[@]}" >"$(tenant_candidate_lanes_file "$name")"
   fi
+  return "$rc"
 }
 
 # WI#527 (run-300 TO-1): run a candidate-build or promote verb under the tenant
@@ -1689,13 +1690,14 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.
-upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth>
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth> [sandbox_policy]
   local name="$1" lw_root="$2" previous_commit="$3"
   local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8" lunardepth="${9:-false}"
+  local sandbox_policy="${10:-$SANDBOX_IMAGE_POLICY}"
   local rc=0 caller_errexit=false
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" )
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" "$sandbox_policy" )
   rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   [[ "$rc" -eq 0 ]] && return 0
@@ -1729,9 +1731,9 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   if [[ "$stage_state" == none ]]; then
     say "" >&2
     say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
-    # TD-4: restore any already-promoted worker :latest tags before restarting.
+    # TD-4: restore any already-promoted worker/sandbox :latest tags before restarting.
     restore_promoted_workers "$name" \
-      || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
+      || say "WARNING: could not restore every worker/sandbox :latest tag; see the warnings above" >&2
     set +e
     ( start_tenant "$name" )
     rc=$?
@@ -1745,10 +1747,10 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
 
   say "" >&2
   say "upgrade aborted: $cause; the new daemon was built$stage_note, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
-  # TD-4: restore old worker :latest tags before rebuilding the previous daemon
-  # so a "restored" report never leaves new worker images beside the old daemon.
+  # TD-4: restore old worker/sandbox :latest tags before rebuilding the previous
+  # daemon so a "restored" report never leaves new images beside the old daemon.
   restore_promoted_workers "$name" \
-    || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
+    || say "WARNING: could not restore every worker/sandbox :latest tag; see the warnings above" >&2
   set +e
   (
     set -e
@@ -1773,9 +1775,11 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
 
 upgrade_tenant_locked() {
   local name="$1" target="$2" source_repo="$3" do_backup="$4" do_render="$5"
+  local sandbox_policy="${6:-$SANDBOX_IMAGE_POLICY}"
   local lw_root repo
   lw_root="$(tenant_lw_root "$name")"
   repo="$(tenant_repo "$name")"
+  validate_sandbox_image_policy "$sandbox_policy"
 
   [[ -d "$lw_root/.git" ]] || die "no git checkout at $lw_root; run add-tenant first"
 
@@ -1895,11 +1899,12 @@ upgrade_tenant_locked() {
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" "$sandbox_policy" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
-  # The candidate builds only read the checkout; the build lock guards the
-  # checkout/build sequence, which is over. Release it before build_tenant,
+  # Candidate builds read the tenant revision as its owner and build from
+  # operator archives; the build lock guards that checkout/build sequence.
+  # Release it before build_tenant,
   # which takes it again for the daemon build (a nested flock would deadlock).
   flock -u "$build_lock_fd" || die "failed to release build lock after candidate build"
   exec {build_lock_fd}>&-
@@ -1931,15 +1936,15 @@ upgrade_tenant_locked() {
   rm -f "$build_log"
 
   # Promote only after the daemon binary exists, so the new daemon and the new
-  # worker images switch together. A promote failure is recoverable by re-running
-  # `$0 promote-worker-images <name>`.
+  # worker/sandbox images switch together. A promote failure is recoverable by
+  # re-running `$0 promote-worker-images <name>`.
   # TD-3: run in a subshell so die() exits the subshell, not this process; the
   # || branch can then converge the tenant instead of leaving it stopped.
   local promote_rc=0
   ( set -e; promote_candidate_workers "$name" ) || promote_rc=$?
   if [[ "$promote_rc" -ne 0 ]]; then
     upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
-      "worker image promotion failed (exit $promote_rc)"
+      "worker/sandbox image promotion failed (exit $promote_rc)"
   fi
 
   local post_rc=0
