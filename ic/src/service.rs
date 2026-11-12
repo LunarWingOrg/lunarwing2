@@ -182,13 +182,29 @@ fn install() -> Result<()> {
     }
 }
 
+fn install_user_service_with_root_policy<F>(
+    manager: ServiceManager,
+    effective_root: bool,
+    allow_root: bool,
+    install: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    ensure_root_service_allowed(manager, effective_root, allow_root, None)?;
+    install()
+}
+
 fn install_macos() -> Result<()> {
-    ensure_root_service_allowed(
+    install_user_service_with_root_policy(
         ServiceManager::Launchd,
         is_effective_root(),
         root_service_allowed(),
-        None,
-    )?;
+        install_macos_after_root_check,
+    )
+}
+
+fn install_macos_after_root_check() -> Result<()> {
     let file = macos_plist_path()?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -252,12 +268,15 @@ fn macos_plist_content(exe: &str, stdout: &str, stderr: &str) -> String {
 }
 
 fn install_linux_systemd_user() -> Result<()> {
-    ensure_root_service_allowed(
+    install_user_service_with_root_policy(
         ServiceManager::SystemdUser,
         is_effective_root(),
         root_service_allowed(),
-        None,
-    )?;
+        install_linux_systemd_user_after_root_check,
+    )
+}
+
+fn install_linux_systemd_user_after_root_check() -> Result<()> {
     let file = linux_unit_path()?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1332,6 +1351,26 @@ mod tests {
             assert!(ensure_root_service_allowed(manager, true, true, None).is_ok());
             assert!(ensure_root_service_allowed(manager, false, false, None).is_ok());
         }
+    }
+
+    #[test]
+    fn systemd_root_refusal_prevents_install_side_effects() {
+        let calls = std::cell::Cell::new(0);
+        let err =
+            install_user_service_with_root_policy(ServiceManager::SystemdUser, true, false, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .expect_err("root install should stop before the install operation");
+        assert!(err.to_string().contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+        assert_eq!(calls.get(), 0);
+
+        install_user_service_with_root_policy(ServiceManager::SystemdUser, true, true, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect("explicit opt-in should reach the install operation");
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
