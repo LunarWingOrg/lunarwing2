@@ -63,7 +63,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.19.5 (proven) | v2.2.6 (beta in practice) |
+| Pin | v1.19.5 (proven) | v2.2.7 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -75,8 +75,8 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.6 pin
-is `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.7 pin
+is `fedc6f208aa2bd54c1019227214568083f6380ad` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
