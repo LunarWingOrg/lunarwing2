@@ -56,6 +56,9 @@ RUN set -eu; \
     test "$(pnpm --version)" = "11.7.0"; \
     node /src/scripts/check-toolchain.mjs
 
+COPY scripts/prepare_lockfile_deploy.py /build/scripts/
+RUN python3 /build/scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts
+
 WORKDIR /src/deepseek-harness
 RUN set -eu; \
     before="$(sha256sum pnpm-lock.yaml)"; \
@@ -63,9 +66,19 @@ RUN set -eu; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
     pnpm exec tsx native/system/scripts/build.ts; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
-    pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false; \
+    pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false
+
+COPY scripts/deploy_build_approval.py scripts/verify_deployed_closure.ts /build/scripts/
+RUN set -eu; \
+    workspace_before="$(sha256sum pnpm-workspace.yaml)"; \
+    python3 /build/scripts/deploy_build_approval.py add pnpm-workspace.yaml /src/deepseek-harness; \
     pnpm exec tsx scripts/build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth; \
+    python3 /build/scripts/deploy_build_approval.py remove pnpm-workspace.yaml /src/deepseek-harness; \
+    test "$workspace_before" = "$(sha256sum pnpm-workspace.yaml)"; \
+    pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth | tail -n 1 > /build/deployed-packages.sha256; \
+    grep -Eq '^[0-9a-f]{64}$' /build/deployed-packages.sha256; \
     sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
+    sed -i '/^  "lastValidatedTimestamp":/d' /opt/lunardepth/node_modules/.pnpm-workspace-state-v1.json; \
     landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
     test -x "$landlock"; \
     "$landlock" --probe | grep -q 'fully enforced'
@@ -99,6 +112,7 @@ RUN set -eu; \
       printf 'LUNARDEPTH_MODEL_ROUTING_REF=%s\n' "$LUNARDEPTH_MODEL_ROUTING_REF"; \
       printf 'LUNARDEPTH_SOURCE_VERSION=%s\n' "$source_version"; \
       printf 'LUNARDEPTH_PROFILE_SCHEMA_VERSION=%s\n' "$schema"; \
+      printf 'LUNARDEPTH_DEPLOYED_PACKAGES_SHA256=%s\n' "$(cat /build/deployed-packages.sha256)"; \
       sha256sum /src/deepseek-harness/pnpm-lock.yaml; \
     } > /opt/lunardepth/worker-inputs.sha256; \
     find /opt/lunardepth -type d \( -name .git -o -name tests -o -name __tests__ -o -name .cache \) -prune -exec rm -rf {} +; \
@@ -166,10 +180,9 @@ RUN set -eu; \
       ! -name 'smoke_test.ts' ! -name 'smoke_test.js' ! -name 'smoke_test.py' -delete; \
     rm -f /app/scripts/tsconfig.json /app/scripts/package-lock.json; \
     rm -rf /app/scripts/__pycache__; \
-    find /app /opt/lunardepth /opt/lunardepth-templates -type d -exec chmod 0555 {} +; \
-    find /app /opt/lunardepth /opt/lunardepth-templates -type f -exec chmod 0444 {} +; \
-    find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 0555 {} +; \
-    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+    /bin/bash /app/scripts/harden_image_modes.sh /app /opt/lunardepth /opt/lunardepth-templates; \
+    find /opt/lunardepth -type f -path '*/bin/*' -exec chmod 00555 {} +; \
+    chmod 00555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
       /app/scripts/render_overlay.py /app/scripts/*.sh /usr/local/bin/dsh; \
     test -x /app/entrypoint.sh; \
     test -x /app/entrypoint-split.sh; \
@@ -178,7 +191,7 @@ RUN set -eu; \
     install -d -o lunardepth -g lunardepth -m 2711 /run/lunarwing-shared/runner; \
     install -d -o root -g root -m 0555 /run/lunardepth-launch /run/lunardepth-config /home/lunardepth-home; \
     install -d -o lunardepth -g lunardepth -m 0700 /home/lunardepth/.dsh /run/lunardepth-state /workspace; \
-    test -z "$(find -L /app /opt/lunardepth /opt/lunardepth-templates \( ! -uid 0 -o -perm /222 \) -print)"
+    test -z "$(find -L /app /opt/lunardepth /opt/lunardepth-templates \( ! -uid 0 -o -perm /6222 \) -print)"
 
 ENV LUNARDEPTH_IMAGE_REVISION="${LUNARDEPTH_REF}" \
     LUNARDEPTH_IMAGE_VERSION="0.2.1-alpha.1" \
