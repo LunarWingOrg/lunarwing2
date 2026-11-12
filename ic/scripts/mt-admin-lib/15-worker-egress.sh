@@ -694,7 +694,8 @@ worker_egress_stop_keeper() {
 worker_egress_assert_detached() {
   local name="$1" network attached
   network="$(worker_egress_network_name "$name")"
-  attached="$(_ctr "$name" ps --all --filter "network=$network" --format '{{.Names}}' 2>/dev/null)" \
+  attached="$(_ctr "$name" ps --all --filter "network=$network" \
+    --filter 'label!=lunarwing.purpose=worker-egress-keeper' --format '{{.Names}}' 2>/dev/null)" \
     || { printf 'worker-egress: cannot verify attachments on %s; refusing teardown\n' "$network" >&2; return 1; }
   if [[ -n "$attached" ]]; then
     printf 'worker-egress: containers still attached to %s; refusing teardown: %s\n' \
@@ -705,19 +706,18 @@ worker_egress_assert_detached() {
 
 # Tenant removal must not leave the egress network, the rendered state or the
 # live chains behind for a later tenant of the same name to inherit (OQ-6).
-# Deleting the chains while any container remains attached would silently give
-# that container an accept-all path. Keep the rules and state for a retry unless
-# the namespace keeper is gone, no attachments remain, and the network is removed.
+# Check before releasing the keeper so an attachment refusal preserves both the
+# rootless namespace and its chains. Once clear, flush before dropping them.
 worker_egress_teardown() {
   local name="$1" network conf ruleset hosts network_rm_out
   _worker_egress_validate_name "$name"
-  worker_egress_stop_keeper "$name" || return 1
   worker_egress_assert_detached "$name" || return 1
-  worker_egress_flush "$name" || return 1
+  worker_egress_flush "$name"
+  worker_egress_stop_keeper "$name" || return 1
   network="$(worker_egress_network_name "$name")"
   network_rm_out="$(_ctr "$name" network rm "$network" 2>&1)" || {
     case "${network_rm_out,,}" in
-      *"network not found"*|*"no such network"*|*"unable to find network with name or id"*) ;;
+      *"network not found"*|*"network "*" not found"*|*"no such network"*|*"unable to find network with name or id"*) ;;
       *)
         printf 'worker-egress: cannot remove network %s: %s\n' \
           "$network" "${network_rm_out//$'\n'/ }" >&2
