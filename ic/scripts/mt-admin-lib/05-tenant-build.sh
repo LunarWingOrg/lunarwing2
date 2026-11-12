@@ -521,6 +521,10 @@ tenant_candidate_lanes_file() {
   printf '%s' "${LUNARWING_MT_CANDIDATE_LANES_FILE:-$(_tenant_marker_dir)/$1-candidate-lanes}"
 }
 
+tenant_candidate_sandbox_file() {
+  printf '%s' "${LUNARWING_MT_CANDIDATE_SANDBOX_FILE:-$(_tenant_marker_dir)/$1-candidate-sandbox}"
+}
+
 # Ensure the root-owned marker directory exists and is safe (root:root 0700).
 # Callers must run as root; the dir is shared with the lifecycle lock path.
 # run-294 TJ-4: same hardened sequence as the lifecycle lock directory in
@@ -810,14 +814,70 @@ _worker_toolchain_profile() {  # <lane>
   return 0
 }
 
+upgrade_candidate_sandbox_image_ref() {  # <tenant>
+  printf 'lunarwing-sandbox:%s' "$(_upgrade_candidate_tag_suffix "$1")"
+}
+
+_prepare_sandbox_image_source() {  # <tenant> [release ref]
+  local source_root
+  source_root="$(tenant_lw_root "$1")"
+  _prepare_worker_build_source "$source_root" ic/docker "${2:-}" sandbox.Dockerfile
+  SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$WORKER_BUILD_SOURCE_ROOT/ic"
+  [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
+}
+
+ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref]
+  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}" release_ref="${3:-}"
+  local rc=0
+  validate_sandbox_image_policy "$policy"
+  tenant_uses_managed_sandbox_image "$name" || return 0
+  [[ "$policy" != never ]] || return 0
+  _prepare_sandbox_image_source "$name" "$release_ref"
+  ensure_sandbox_image_current "$name" "$policy" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT" || rc=$?
+  _worker_build_context_finish || return 1
+  return "$rc"
+}
+
+build_candidate_sandbox_image() {  # <tenant> <policy> [release ref]
+  local name="$1" policy="$2" release_ref="${3:-}"
+  local runtime candidate_ref marker build_rc=0
+  _ensure_marker_dir
+  marker="$(tenant_candidate_sandbox_file "$name")"
+  : >"$marker"
+  validate_sandbox_image_policy "$policy"
+  tenant_uses_managed_sandbox_image "$name" || return 0
+  [[ "$policy" != never ]] || return 0
+  _prepare_sandbox_image_source "$name" "$release_ref"
+  if [[ "$policy" == auto ]] \
+      && ! sandbox_image_build_required "$name" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT"; then
+    say "sandbox image $SANDBOX_IMAGE_TAG already matches its Dockerfile and Debian snapshot"
+    _worker_build_context_finish
+    return 0
+  fi
+  runtime="$(sandbox_container_runtime "$name")" || return 1
+  candidate_ref="$(upgrade_candidate_sandbox_image_ref "$name")"
+  say ""
+  say "=== Building managed sandbox candidate image (tenant still running) ==="
+  build_sandbox_image "$name" "$candidate_ref" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT" || build_rc=$?
+  _worker_build_context_finish || return 1
+  if [[ "$build_rc" -ne 0 ]]; then
+    "$runtime" rmi "$candidate_ref" >/dev/null 2>&1 || true
+    return "$build_rc"
+  fi
+  printf '%s\n' "$runtime" >"$marker"
+}
+
 # Build every selected lane's candidate image, recording each success. Fails at
-# the first failing lane with that lane named, leaving the tenant untouched.
-# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref] [with_lunardepth]
+# the first failing worker lane with that lane named, leaving the tenant untouched.
+# A sandbox candidate failure is non-fatal and leaves :latest untouched.
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref] [with_lunardepth] [sandbox_policy]
 build_candidate_workers() {
   local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
   local with_pebble="${5:-false}" with_toolchains="${6:-false}" release_ref="${7:-}" with_lunardepth="${8:-false}"
+  local sandbox_policy="${9:-$SANDBOX_IMAGE_POLICY}"
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
+  : >"$(tenant_candidate_sandbox_file "$name")"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
   # a later failed run could "restore" a lane to an image this run never had.
   clear_promote_rollback "$name"
@@ -835,6 +895,10 @@ build_candidate_workers() {
     build_candidate_worker "$name" "$lane" "$with_toolchains" "$release_ref" \
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
   done
+  if ! ( build_candidate_sandbox_image "$name" "$sandbox_policy" "$release_ref" ); then
+    say "WARNING: managed sandbox candidate failed; keeping the previous $SANDBOX_IMAGE_TAG and continuing the upgrade. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
+  fi
+  return 0
 }
 
 # Promote every recorded candidate lane to :latest. Idempotent and re-runnable.
@@ -874,17 +938,57 @@ _promote_rollback_record() {  # <name> <lane> <old_id>
     || printf '%s\t%s\n' "$lane" "$old_id" >>"$file"
 }
 
+promote_candidate_sandbox_image() {  # <tenant>
+  local name="$1" marker runtime candidate_ref candidate_id old_id
+  marker="$(tenant_candidate_sandbox_file "$name")"
+  runtime="$(cat "$marker" 2>/dev/null || true)"
+  [[ -n "$runtime" ]] || return 0
+  [[ "$runtime" == podman || "$runtime" == docker ]] \
+    || die "candidate sandbox marker for '$name' names an invalid runtime"
+  candidate_ref="$(upgrade_candidate_sandbox_image_ref "$name")"
+  candidate_id="$("$runtime" image inspect --format '{{.Id}}' "$candidate_ref" 2>/dev/null || true)"
+  [[ -n "$candidate_id" ]] || die "candidate image $candidate_ref is missing; cannot promote the sandbox"
+  old_id="$("$runtime" image inspect --format '{{.Id}}' "$SANDBOX_IMAGE_TAG" 2>/dev/null || true)"
+  if [[ "$old_id" == "$candidate_id" ]]; then
+    say "$SANDBOX_IMAGE_TAG already at sandbox candidate, skipping"
+  else
+    [[ -z "$old_id" ]] || _promote_rollback_record "$name" sandbox "$old_id"
+    "$runtime" tag "$candidate_ref" "$SANDBOX_IMAGE_TAG" \
+      || die "cannot promote $candidate_ref to $SANDBOX_IMAGE_TAG"
+    say "promoted $SANDBOX_IMAGE_TAG"
+  fi
+  rm -f "$marker"
+  "$runtime" rmi "$candidate_ref" >/dev/null 2>&1 || true
+}
+
+cleanup_candidate_sandbox_image() {  # <tenant>
+  local name="$1" marker runtime candidate_ref
+  marker="$(tenant_candidate_sandbox_file "$name")"
+  runtime="$(cat "$marker" 2>/dev/null || true)"
+  [[ -n "$runtime" ]] || return 0
+  [[ "$runtime" == podman || "$runtime" == docker ]] || return 1
+  candidate_ref="$(upgrade_candidate_sandbox_image_ref "$name")"
+  "$runtime" rmi "$candidate_ref" >/dev/null 2>&1 || return 1
+  rm -f "$marker"
+}
+
 restore_promoted_workers() {  # <name> — re-tag the pre-promotion :latest ids
-  local name="$1" file lane old_id latest_ref rc=0
+  local name="$1" file lane old_id latest_ref runtime rc=0
   file="$(_promote_rollback_file "$name")"
   [[ -r "$file" ]] || return 0
   while IFS=$'\t' read -r lane old_id; do
     [[ -n "$lane" && -n "$old_id" ]] || continue
-    if ! _upgrade_validate_lane "$lane"; then rc=1; continue; fi
-    latest_ref="$(worker_image_ref "$lane" latest)"
+    if [[ "$lane" == sandbox ]]; then
+      runtime="$(sandbox_container_runtime "$name")" || { rc=1; continue; }
+      latest_ref="$SANDBOX_IMAGE_TAG"
+    else
+      if ! _upgrade_validate_lane "$lane"; then rc=1; continue; fi
+      runtime="$CONTAINER_RT"
+      latest_ref="$(worker_image_ref "$lane" latest)"
+    fi
     # TD-10: only claim a rollback when the re-tag actually succeeded (a pruned
     # old image must not be reported as restored).
-    if "$CONTAINER_RT" tag "$old_id" "$latest_ref" >/dev/null 2>&1; then
+    if "$runtime" tag "$old_id" "$latest_ref" >/dev/null 2>&1; then
       say "rolled back $latest_ref to $old_id"
     else
       say "WARNING: could not roll back $latest_ref to $old_id (old image may be pruned)" >&2
@@ -899,6 +1003,7 @@ promote_candidate_workers() {  # <tenant>
   local name="$1" lane candidate_ref latest_ref old_id candidate_id
   local lanes_file rollback_file
   local -a lanes=()
+  promote_candidate_sandbox_image "$name"
   lanes_file="$(tenant_candidate_lanes_file "$name")"
   mapfile -t lanes < <(upgrade_candidate_lanes "$name")
   if [[ "${#lanes[@]}" -eq 0 ]]; then
@@ -1562,8 +1667,9 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   WORKER_BUILD_SOURCE_REVISION="$revision"
 }
 
-_archive_worker_source() {  # <tenant source root> <lane>
-  local source_root="$1" lane="$2" tmp_parent tmp archive links
+_archive_worker_source() {  # <tenant source root> <lane> [Dockerfile name]
+  local source_root="$1" lane="$2" dockerfile_name="${3:-Dockerfile}"
+  local tmp_parent tmp archive links
   local -a paths=("$lane")
   if [[ "$lane" == opencode2.4lunarwing ]]; then
     paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
@@ -1596,14 +1702,14 @@ _archive_worker_source() {  # <tenant source root> <lane>
   links="$(find "$tmp" -type f -links +1 -print -quit)" \
     || { rm -rf -- "$tmp"; die "cannot validate worker source archive links"; }
   [[ -z "$links" ]] || { rm -rf -- "$tmp"; die "worker source archive contains a hard link"; }
-  [[ -f "$tmp/$lane/Dockerfile" && ! -L "$tmp/$lane/Dockerfile" ]] \
-    || { rm -rf -- "$tmp"; die "archived worker source has no regular $lane/Dockerfile"; }
+  [[ -f "$tmp/$lane/$dockerfile_name" && ! -L "$tmp/$lane/$dockerfile_name" ]] \
+    || { rm -rf -- "$tmp"; die "archived worker source has no regular $lane/$dockerfile_name"; }
   WORKER_BUILD_SOURCE_ROOT="$tmp"
   WORKER_BUILD_ARCHIVE_ROOT="$tmp"
 }
 
-_prepare_worker_build_source() {  # <source root> <lane> [release ref]
-  local source_root="$1" lane="$2" release_ref="${3:-}"
+_prepare_worker_build_source() {  # <source root> <lane> [release ref] [Dockerfile name]
+  local source_root="$1" lane="$2" release_ref="${3:-}" dockerfile_name="${4:-Dockerfile}"
   WORKER_BUILD_SOURCE_ROOT="$source_root"
   WORKER_BUILD_ARCHIVE_ROOT=""
   if [[ "$source_root" == "$LUNARWING_ROOT" ]]; then
@@ -1611,7 +1717,7 @@ _prepare_worker_build_source() {  # <source root> <lane> [release ref]
     return 0
   fi
   _worker_source_provenance "$source_root" "$lane" "$release_ref"
-  _archive_worker_source "$source_root" "$lane"
+  _archive_worker_source "$source_root" "$lane" "$dockerfile_name"
 }
 
 _cleanup_worker_build_context() {  # <archive root>
