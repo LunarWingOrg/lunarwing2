@@ -205,9 +205,10 @@ by a directory sync. The final name therefore never exposes a partially written
 salt, and concurrent creators converge on one complete file.
 
 A damaged existing salt is still refused rather than silently replaced. To
-recover from a truncated or corrupt salt, stop the daemon or tenant and delete
-only `$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt` as the daemon's user,
-then restart it. This deliberately creates a new peer identity: the next start
+recover from a truncated or corrupt salt, stop the daemon or tenant, remove the
+instance's NetBird sidecar container so it cannot be adopted, and delete only
+`$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt` as the daemon's user before
+restarting it. This deliberately creates a new peer identity: the next start
 uses a new state volume and re-enrols once, so a valid reusable or replacement
 setup key is required and the overlay address can change. The previous
 instance-scoped volume is pruned; revoke the old peer in NetBird after recovery.
