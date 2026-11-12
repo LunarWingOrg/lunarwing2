@@ -163,13 +163,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar
 ```
 
-Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the managed generic sandbox image (from `ic/docker/sandbox.Dockerfile`, including the WI#537 pinned Python development suite) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
+Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the managed generic sandbox image (from `ic/docker/sandbox.Dockerfile`, including the WI#537 pinned Python development suite) into the admin store and distributes it into a rootless tenant's store automatically. It compares the image's input label with the Dockerfile and resolved Debian snapshot, so an existing but stale tag is rebuilt while an unchanged one is reused. If provisioning failed or the image was later removed, rebuild and redistribute it explicitly (the optional tenant name selects that tenant's configured runtime):
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image [tenant]
 ```
 
-`start-tenant` also reconciles a missing tenant-side sandbox image as a safety net. See [`../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md`](../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md) for the three-store diagnosis when sandboxed shell executions fail after an upgrade.
+`start-tenant` reconciles the tenant-side image before daemon startup and skips distribution when the admin and tenant image IDs match. `upgrade-tenant` uses the same digest gate and builds a candidate before stopping the tenant. A changed candidate is promoted only after a successful build; a failed candidate leaves the previous image active, warns with a recovery command, and does not abort the rest of the upgrade. The default is `--sandbox-image auto`; use `always` to force a candidate or `never` to leave the admin image untouched. Custom-image and legacy tenants are not changed.
+
+For both add and upgrade, mt-admin verifies the tenant revision as the tenant user, then archives `ic/docker/` from the operator checkout at that revision into a private root-owned directory. The digest and build use only that archive. A dirty, unknown, or off-release tenant source is refused without replacing the current image; root never builds the tenant-writable working tree.
+
+The managed `latest` tag is shared per runtime admin store. One tenant's upgrade can therefore update every managed Docker tenant on that host; other rootless Podman tenants receive the new image at their next `start-tenant`. Use a custom `SANDBOX_IMAGE` when a tenant must stay on a fixed image. See [`../ops/WORKER-CONTAINERS.md`](../ops/WORKER-CONTAINERS.md) for rollback and shared-tag details and [`../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md`](../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md) for image-store diagnosis.
 
 On Podman hosts, the **admin-store image build** uses `--network=host` so its Debian package installation can resolve DNS even where Podman's default build bridge cannot. This applies only to the trusted, repository-owned Dockerfile during image construction; it does not change tenant sandbox execution networking (`SANDBOX_NETWORK`) or the Docker fallback build.
 
@@ -331,7 +335,12 @@ sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant ruffles /absolute/path/back
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
 ```
 
-Use `upgrade-tenant` only with a reviewed target ref and a clean tenant checkout. Run it in `tmux`; it performs backup, fetch/checkout, build, service rendering, environment reconciliation, and restart under lifecycle locking. Every tenant cargo build runs `ic/scripts/vendor-artifact-guard.sh` first, which cleans vendored crates that were patched in place since the tenant's last build (cargo never re-checks vendored sources). The first guarded upgrade of an existing tenant therefore rebuilds rig-core once.
+Use `upgrade-tenant` only with a reviewed target ref and a clean tenant checkout. Run it in `tmux`; it performs backup, fetch/checkout, build, service rendering, environment reconciliation, and restart under lifecycle locking. The default `--sandbox-image auto` also refreshes a managed sandbox image only when its Dockerfile/snapshot digest changed; `always` forces a build and `never` skips it. Every tenant cargo build runs `ic/scripts/vendor-artifact-guard.sh` first, which cleans vendored crates that were patched in place since the tenant's last build (cargo never re-checks vendored sources). The first guarded upgrade of an existing tenant therefore rebuilds rig-core once.
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant ruffles \
+  --target <reviewed-ref> --sandbox-image auto
+```
 
 Removing a tenant without `--purge` retains recoverable data according to MT admin policy. `--purge` is irreversible:
 
