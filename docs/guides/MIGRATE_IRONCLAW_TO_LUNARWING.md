@@ -99,7 +99,9 @@ lunarwing service status
 
 Review the rendered service before enabling it. The committed systemd production template expects the binary at `/usr/local/bin/lunarwing`, state under `/var/lib/lunarwing`, and protected environment at `/etc/lunarwing/lunarwing.env`; adjust the deployment consistently rather than editing only `ExecStart`.
 
-For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands. Since v2.2.0.0 (WI#574), installation refuses both the literal `root` account and any other uid-0 alias before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set; prefer a dedicated unprivileged account and verify the resolved uid rather than relying on its name.
+For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands.
+
+Every service installer refuses a root daemon before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set (WI#574/WI#613). On systemd and launchd, run the installer as the intended unprivileged service account without `sudo`. On OpenRC, run it through `sudo` from that account; the resolved runtime identity must have both a non-zero uid and a non-zero primary gid. Prefer a dedicated unprivileged account and verify the resolved identity rather than relying on its name. The setup wizard does not offer an install that these checks would refuse.
 
 If the watchdog is required, install the current init-appropriate assets after the main service is healthy:
 

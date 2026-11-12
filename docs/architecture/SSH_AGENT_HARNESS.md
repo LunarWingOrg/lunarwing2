@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built; source revalidated 2026-11-10 for v2.2.0.0.
+**Status:** As-built; source revalidated 2026-11-12 for v2.2.0.0.
 The bridge/config implementation is unchanged since the socket-directory mount
 fix. Source symbols below define the contract; historical dependency versions
 and static test counts are not deployment health evidence.
@@ -350,6 +350,16 @@ PascalCase (`"Strict"`) — clients must match the casing.
   an ephemeral OpenSSH `known_hosts`. A pin mismatch, storage failure, or
   malformed persisted pin set fails closed; worker mode relies on its own client
   and container-local `known_hosts`.
+- **Host-key algorithms.** Built-in/WASM russh execution and `ssh_git`'s
+  AcceptFirst learning preflight offer only Ed25519 and ECDSA host key
+  algorithms. RSA host keys are not supported on those paths. An RSA-only server
+  fails during negotiation with an error that names the RSA host key instead of
+  surfacing `WrongServerSig`; use an Ed25519 or ECDSA host key. Host key
+  certificates are not offered either, and a server that presents one is
+  refused: pins are plain host keys and no certificate authority is configured.
+  Existing encrypted `ssh-rsa` pins are retained but produce a load-time warning
+  because they cannot authenticate a russh connection. Worker-mode OpenSSH and
+  `ssh_git`'s post-pin OpenSSH transport retain their own algorithm policies.
 
 ### Hardening notes / current sharp edges
 
@@ -387,7 +397,7 @@ PascalCase (`"Strict"`) — clients must match the casing.
   than the alias/host-policy checks applied by built-in tools.
 - **`russh::keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
   spawning/managing an external agent and keeps the live signing keystore in the
-  daemon. (`russh` 0.62; `russh-keys` is now a module within the `russh` crate,
+  daemon. (`russh` 0.65; `russh-keys` is now a module within the `russh` crate,
   not a separate dependency.)
 - **Run-dir socket, not `/tmp`.** Required because the daemon runs with
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
@@ -450,7 +460,7 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-40 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
+44 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
 `ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
 
 | File | Tests |
@@ -458,15 +468,17 @@ Known limitations / follow-ups:
 | `ssh.rs` | 5 — hostname and secret-name helpers, bridge create/add, bridge restart + persistent pin revocation |
 | `ssh_agent.rs` | 3 — start/stop with an **empty** key map; socket parent-directory creation (permissions + cleanup); valid RSA key rejection without agent insertion |
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
-| `ssh_hostkeys.rs` | 14 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, concurrent-first-key race |
+| `ssh_hostkeys.rs` | 15 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, legacy RSA pin warning, concurrent-first-key race |
 | `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
-| `ssh_client.rs` | 4 — `append_capped` under-limit, crossing-limit, and already-full output behavior; mislabeled valid RSA rejection before connection |
+| `ssh_client.rs` | 7 — output caps; mislabeled RSA client-key rejection; non-RSA host-key offers; RSA-only and mixed negotiation-error mapping |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
 Notable gaps: no test performs successful signing with a real key or the full
-host-key preflight and command flow against a live SSH server. Persistent-pin
-tests exercise the encrypted in-memory secrets backend; normal database-backed
-stores share the same trait surface and their own CRUD coverage.
+host-key preflight and command flow against a live SSH server. RSA-only handling
+is covered deterministically at the advertised-algorithm and negotiation-error
+boundary without reintroducing the RSA crate or standing up an RSA-only server.
+Persistent-pin tests exercise the encrypted in-memory secrets backend; normal
+database-backed stores share the same trait surface and their own CRUD coverage.
 
 > The `config/ssh.rs` tests parse a **bare** `SshConfig`, so their TOML uses
 > top-level `[[hosts]]` (no `ssh.` prefix). Do **not** copy that shape into a

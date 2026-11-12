@@ -10,21 +10,82 @@
 //! Credentials are decoded from the encrypted secrets store (via
 //! [`crate::bridge::ssh_agent::parse_key`]); keys never leave the daemon process.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client::{self, Handle, Handler};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::{PublicKey, PublicKeyBase64};
-use russh::{ChannelMsg, Disconnect};
+use russh::keys::{Algorithm, EcdsaCurve, PublicKeyBase64, PublicKeyOrCertificate};
+use russh::{AlgorithmKind, ChannelMsg, Disconnect};
 
 use crate::bridge::ssh::{SSHCredentials, SSHHostConfig, SshBridgeError};
 use crate::bridge::ssh_agent::parse_key;
-use crate::bridge::ssh_hostkeys::HostKeyVerifier;
+use crate::bridge::ssh_hostkeys::{HostKeyVerifier, is_rsa_host_key_algorithm};
 
 /// Maximum bytes captured per stream (stdout / stderr). Output beyond this is
 /// dropped and the result is flagged `truncated` to avoid unbounded buffering.
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+const HOST_KEY_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::Ed25519,
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP256,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP384,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP521,
+    },
+];
+
+fn client_config() -> client::Config {
+    let mut config = client::Config::default();
+    config.preferred.key = Cow::Borrowed(HOST_KEY_ALGORITHMS);
+    config
+}
+
+fn map_connect_error(error: russh::Error) -> SshBridgeError {
+    if let russh::Error::NoCommonAlgo {
+        kind: AlgorithmKind::Key,
+        theirs,
+        ..
+    } = &error
+        && !theirs.is_empty()
+        && theirs
+            .iter()
+            .all(|algorithm| is_rsa_host_key_algorithm(algorithm))
+    {
+        return SshBridgeError::ConnectionRefused(
+            "the server offers only an RSA host key, which this build does not support (use Ed25519 or ECDSA host keys)"
+                .to_string(),
+        );
+    }
+    SshBridgeError::ConnectionRefused(error.to_string())
+}
+
+/// Key type and raw SSH wire blob of the host key the server presented.
+///
+/// `public_key_bytes()` yields the same representation `HostKeyVerifier`
+/// compares against (it byte-compares, not fingerprint strings, so no
+/// base64-padding mismatch). The client never offers a host key certificate
+/// algorithm (`Preferred::host_key_certificates` stays empty) and pins are
+/// plain host keys, so a certificate is refused instead of being trusted
+/// without a configured authority.
+fn presented_host_key(
+    presented: &PublicKeyOrCertificate,
+) -> Result<(String, Vec<u8>), SshBridgeError> {
+    match presented {
+        PublicKeyOrCertificate::PublicKey { key, .. } => {
+            Ok((key.algorithm().to_string(), key.public_key_bytes()))
+        }
+        PublicKeyOrCertificate::Certificate(_) => Err(SshBridgeError::ConnectionRefused(
+            "the server presented a host key certificate, which this build does not support (use a plain Ed25519 or ECDSA host key)"
+                .to_string(),
+        )),
+    }
+}
 
 /// Result of a remote command execution.
 #[derive(Debug)]
@@ -51,18 +112,23 @@ impl Handler for ClientHandler {
 
     fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        // `public_key_bytes()` yields the raw SSH wire blob — the same
-        // representation `HostKeyVerifier` compares against (it byte-compares,
-        // not fingerprint strings, so no base64-padding mismatch).
-        let key_bytes = server_public_key.public_key_bytes();
-        let key_type = server_public_key.algorithm().to_string();
+        let presented = presented_host_key(server_public_key);
         let verifier = Arc::clone(&self.verifier);
         let host = self.host.clone();
         let reject_reason = Arc::clone(&self.reject_reason);
 
         async move {
+            let (key_type, key_bytes) = match presented {
+                Ok(presented) => presented,
+                Err(e) => {
+                    if let Ok(mut slot) = reject_reason.lock() {
+                        *slot = Some(e);
+                    }
+                    return Ok(false);
+                }
+            };
             match verifier
                 .verify_from_config_with_key_type(&host, &key_type, &key_bytes)
                 .await
@@ -95,7 +161,7 @@ async fn connect_verified(
     let connect_res = tokio::time::timeout(
         Duration::from_secs(connect_secs),
         client::connect(
-            Arc::new(client::Config::default()),
+            Arc::new(client_config()),
             (host.host.as_str(), host.port),
             handler,
         ),
@@ -108,7 +174,7 @@ async fn connect_verified(
             if let Some(reason) = reject_reason.lock().ok().and_then(|mut slot| slot.take()) {
                 Err(reason)
             } else {
-                Err(SshBridgeError::ConnectionRefused(error.to_string()))
+                Err(map_connect_error(error))
             }
         }
         Ok(Ok(session)) => Ok(session),
@@ -236,6 +302,58 @@ fn append_capped(buf: &mut Vec<u8>, data: &[u8], truncated: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_common_key_error(theirs: &[&str]) -> russh::Error {
+        russh::Error::NoCommonAlgo {
+            kind: AlgorithmKind::Key,
+            ours: vec!["ssh-ed25519".to_string()],
+            theirs: theirs
+                .iter()
+                .map(|algorithm| (*algorithm).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn client_config_offers_only_default_non_rsa_host_key_algorithms() {
+        let expected = russh::Preferred::DEFAULT
+            .key
+            .iter()
+            .filter(|algorithm| !matches!(algorithm, Algorithm::Rsa { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(expected.contains(&Algorithm::Ed25519));
+
+        let config = client_config();
+        assert_eq!(config.preferred.key.as_ref(), expected.as_slice());
+        assert!(
+            config
+                .preferred
+                .key
+                .iter()
+                .all(|algorithm| !matches!(algorithm, Algorithm::Rsa { .. }))
+        );
+    }
+
+    #[test]
+    fn rsa_only_negotiation_failure_names_host_key_type() {
+        let error = no_common_key_error(&["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]);
+        let mapped = map_connect_error(error);
+        assert!(
+            matches!(&mapped, SshBridgeError::ConnectionRefused(message) if message.contains("only an RSA host key") && message.contains("Ed25519 or ECDSA")),
+            "got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_host_key_negotiation_failure_keeps_original_error() {
+        let error = no_common_key_error(&["ecdsa-sha2-nistp256", "ssh-rsa"]);
+        let mapped = map_connect_error(error);
+        assert!(
+            matches!(&mapped, SshBridgeError::ConnectionRefused(message) if message.contains("No common Key algorithm") && !message.contains("only an RSA host key")),
+            "got {mapped:?}"
+        );
+    }
 
     #[test]
     fn test_append_capped_under_limit() {

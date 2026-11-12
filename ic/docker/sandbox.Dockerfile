@@ -9,17 +9,20 @@
 # Manual build from the repository root (mt-admin builds in the admin store):
 #   podman build -t lunarwing-sandbox:latest -f ic/docker/sandbox.Dockerfile ic/docker/
 #
-# mt-admin builds this image for every new tenant (WI#223) and writes
+# mt-admin builds this image for managed tenants (WI#223/596) and writes
 # SANDBOX_IMAGE=lunarwing-sandbox:latest + SANDBOX_AUTO_PULL=false into the
 # tenant env; manual build is available via
-# `sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image`. The in-code
-# default for single-node hosts remains `lunarwing-worker:latest`. Auto-pull
-# only works for registry-hosted images — local images like this must be built
-# (or shipped via `podman save | podman load`) into each tenant store; mt-admin
-# distributes it into each rootless tenant store on add-tenant. The build
-# context is ic/docker/ (not ic/): this Dockerfile has no build-context
-# COPY/ADD, and ic/ carries the vendor/ tree that must stay in-context for
-# Dockerfile.worker.
+# `sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image`. Builds carry an
+# input digest label over this file and DEBIAN_SNAPSHOT. add-tenant reuses a
+# matching image, while upgrade-tenant builds a changed image as a candidate
+# before promoting and distributing it. Tenant-driven builds archive ic/docker/
+# from the operator checkout at the verified revision, never from the tenant's
+# writable working tree. The in-code default for single-node hosts remains
+# `lunarwing-worker:latest`. Auto-pull only works for registry-hosted images —
+# local images like this must be built (or shipped via `podman save | podman
+# load`) into each tenant store. The build context is ic/docker/ (not ic/): this
+# Dockerfile has no build-context COPY/ADD, and ic/ carries the vendor/ tree
+# that must stay in-context for Dockerfile.worker.
 
 ARG DEBIAN_SNAPSHOT=20261105T082236Z
 

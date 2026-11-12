@@ -119,10 +119,29 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 - Align the env with WI#223's design: `SANDBOX_AUTO_PULL=false` for tenants on
   the managed image. With `true`, a missing runtime image may trigger a futile
   registry pull (or a non-interactive short-name prompt) instead of recovering.
-- After `upgrade-tenant` (or host image-store maintenance), check the
-  selected runtime store and exercise a sandboxed shell call. Rebuild the
-  admin image when a future distribution/update needs it; an existing tenant
-  image alone is sufficient to run until then.
+- Current `add-tenant` and `upgrade-tenant` compare the admin image's
+  `org.lunarwing.sandbox.inputs` label with the target Dockerfile and resolved
+  Debian snapshot. Both default to the `auto` policy and rebuild only when
+  those inputs changed; unchanged inputs cause no rebuild or redistribution.
+  Upgrade also accepts `--sandbox-image auto|always|never`; either path accepts
+  `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
+- Tenant-driven builds archive `ic/docker/` from the operator checkout at the
+  verified target revision. A dirty, unknown, or off-release tenant checkout is
+  refused without replacing the current image; root never reads the tenant's
+  working-tree Dockerfile as build input.
+- An upgrade builds a candidate before stopping the tenant. If its build or
+  source verification fails, the previous `latest` image stays active and the
+  rest of the upgrade continues. Read the mt-admin warning and use the recovery
+  commands above; do not assume a successful daemon upgrade proves the sandbox
+  candidate built.
+- After `upgrade-tenant` (or host image-store maintenance), check the selected
+  runtime store and exercise a sandboxed shell call. An existing tenant image
+  alone is sufficient to run, but a missing admin image must be rebuilt before
+  a new or updated image can be distributed.
+- The managed tag is shared per runtime admin store. Promoting it during one
+  tenant's upgrade changes subsequent Docker sandbox commands host-wide and
+  updates other rootless Podman tenants at their next `start-tenant`. If this
+  is undesirable, pin that tenant to a custom `SANDBOX_IMAGE` instead.
 
 ---
 

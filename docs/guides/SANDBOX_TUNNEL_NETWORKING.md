@@ -19,7 +19,7 @@ unchanged, and mt-admin preserves every operator-set tier on re-render.
 |---|---|---|
 | `none` (default off Linux) | no network | kernel-enforced `--network none` |
 | `proxy-enforced` (Linux default) | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy; no credential injection |
-| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and, by default, DNS to the sidecar's resolvers on the uplink; `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes that direct uplink allowance |
+| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and, by default, DNS to the sidecar's resolvers on the uplink; WireGuard `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes that direct uplink allowance; NetBird rejects the setting |
 | `proxy` | legacy public HTTP(S) | advisory env-var proxy; direct bypass remains possible |
 
 What a sandboxed command can reach in `tunnel` mode is exactly what the tunnel
@@ -37,18 +37,18 @@ direction.
 **Residual DNS channel:** by default, UDP/TCP port 53 to the runtime resolvers
 is the one uplink channel open to joined commands. A recursive resolver can
 carry query-based exfiltration even though arbitrary uplink connections are
-dropped. Setting `SANDBOX_TUNNEL_DNS` installs overlay resolvers only in joined
-runs and removes every direct uplink DNS accept. The sidecar itself keeps its
-runtime resolver file so hostname endpoints and NetBird management/signal/relay
-hosts resolve during bootstrap, before the firewall is installed. Once that
-firewall is in, however, the sidecar's own new lookups are dropped too: its
-resolver sockets are unmarked and no uplink port-53 rule remains. The WI#600
-live NetBird 0.82.0 run confirmed that its local resolver listens on the
-sidecar's overlay IP but upstream writes are unmarked: the lookup returns
-`SERVFAIL` with `operation not permitted` in the client log, and no upstream
-query reaches the uplink. Custom NetBird DNS is therefore unsupported; WI#603
-owns the reconnect investigation and any fix. Use default runtime DNS for
-NetBird. A skipped NetBird test is not a pass.
+dropped. For WireGuard, setting `SANDBOX_TUNNEL_DNS` installs overlay resolvers
+only in joined runs and removes every direct uplink DNS accept. The sidecar
+keeps its runtime resolver file so hostname endpoints resolve during bootstrap,
+before the firewall is installed. Once that firewall is in, the sidecar's own
+new lookups are dropped too: its resolver sockets are unmarked and no uplink
+port-53 rule remains. The WI#600 live NetBird 0.82.0 run confirmed the same
+limitation for NetBird's local resolver: upstream writes were unmarked, the
+lookup returned `SERVFAIL` with `operation not permitted` in the client log,
+and no upstream query reached the uplink. WI#603 therefore chose explicit
+unsupported-combination enforcement: validation rejects `SANDBOX_TUNNEL_DNS`
+with NetBird before any container-runtime call. Leave it unset to use runtime
+DNS with NetBird. A skipped NetBird test is not a pass.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 one network namespace and its loopback. A listener one command opens on
@@ -76,28 +76,42 @@ keep TLS, tokens, mTLS and NetBird ACLs/WireGuard peer policy in force.
   `[sandbox:sandbox_unavailable]`; it never falls back to another network mode.
   A sidecar that died or drifted gets one bounded recovery attempt.
 
-A manager cold start keeps the full configured startup timeout for runtime and
-provider readiness. Per-command recovery instead re-probes an existing sidecar
-for at most **6 seconds**, waits at most **20 seconds** for a fresh provider (or
-the configured startup timeout when lower), and caps the initial health check,
-recovery, and final verification together at **60 seconds**. The per-run error
-says when the 20-second provider cap is below the configured startup timeout and
-names the failed image, runtime, handshake, canary, `netbird status`, or firewall
-probe. A failed recovery is cached for **30 seconds**: commands inside that
-window return the original reason and the time until the next attempt
-immediately, without more container churn. After the window, one command tries
-again. Recovery is owned by the sidecar rather than the caller: cancelling a
-short shell command or stopping it does not cancel the attempt, its cleanup, or
-recording of its result. Later callers await that same attempt and then use its
-recorded back-off.
+A manager cold start re-probes an existing sidecar for at most **6 seconds**,
+then retains the full configured startup timeout for a fresh provider. Image
+pull, runtime start, and provider readiness have separate configured/probe
+bounds rather than one cold-start wall-clock cap. With the default 90-second
+setting those three phases alone can take 270 seconds, plus the 6-second
+re-probe and bounded inspection, firewall, and cleanup probes. A shell caller
+can time out first; the sidecar-owned attempt still finishes and records its
+result.
+
+Per-command recovery instead re-probes an existing sidecar for at most **6
+seconds**, waits at most **20 seconds** for a fresh provider (or the configured
+startup timeout when lower), and caps the initial health check, recovery, and
+final verification together at **60 seconds**. The per-run error names the
+failed image, runtime, handshake, canary, `netbird status`, or firewall probe.
+If a provider needs longer than the 20-second cap after recreation, the error
+and this contract require a daemon restart so the cold-start budget applies. A
+failed recovery is cached for **30 seconds**: commands inside that window return
+the original reason and the time until the next attempt immediately, without
+more container churn. After the window, one command tries again. Recovery is
+owned by the sidecar rather than the caller: cancelling a short shell command or
+stopping it does not cancel the attempt, its cleanup, or recording of its
+result. Later callers await that same attempt and then use its recorded
+back-off. If the task ends without publishing a result, the closed channel is
+also converted into a recorded failure instead of wedging later commands.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
 keyed by container name, so independently constructed handles cannot remove or
-recreate each other's active sidecar. An already correct firewall table is not
-rewritten. When installation is needed, one `nft -f -` invocation replaces the
-complete table atomically, eliminating the former delete-to-rebuild interval in
-which a joined command could have used the uplink without its egress filter.
+recreate each other's active sidecar. Shutdown marks the shared state stopping,
+waits up to 15 seconds for active recovery and another 15 seconds for the
+lifecycle lock, and checks before and after a start so a late sidecar is
+removed. A later explicit cold start clears the stop request and its cached
+failure. An already correct firewall table is not rewritten. When installation
+is needed, one `nft -f -` invocation replaces the complete table atomically,
+eliminating the former delete-to-rebuild interval in which a joined command
+could have used the uplink without its egress filter.
 
 The sidecar runs with all capabilities dropped except `NET_ADMIN`; NetBird
 also receives `NET_RAW` for its raw sockets and `NET_BIND_SERVICE` for its
@@ -113,7 +127,7 @@ resource limits, and cleanup; they receive none of the sidecar additions.
 SANDBOX_NETWORK=tunnel
 SANDBOX_TUNNEL_PROVIDER=netbird          # netbird (default) | wireguard
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero
-# Optional comma-separated IPv4/IPv6 resolvers reachable through the tunnel:
+# WireGuard-only overlay resolvers (rejected with NetBird):
 # SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53
 ```
 
@@ -204,8 +218,9 @@ granted for optional eBPF features. WI#600 live validation on 2026-11-11 proved
 management/signal/relay/STUN readiness, peer connectivity and HTTP, public-IP
 and metadata denial, management restart with post-reconnect execution, stable
 identity across runtime-salt replacement, and peer-initiated ingress refusal.
-The custom-DNS forwarding check failed closed as described above and remains
-unsupported in WI#603; no CI or public-cloud run is claimed.
+The custom-DNS forwarding check failed closed as described above. WI#603 now
+rejects that configuration during validation; no CI or public-cloud run is
+claimed.
 
 Use restrictive NetBird ACLs for defense-in-depth even though the local input
 firewall drops inbound connections. Do not reuse the gateway-exposure NetBird
@@ -304,9 +319,8 @@ check and removed by `SandboxManager::shutdown()`. All direct uplink DNS rules
 are removed; use resolvers reachable through `wg0`, including for joined-run
 name resolution after reconnection. Those rules also deny the sidecar's own
 post-bootstrap lookups. Stock `wg-quick` resolves its endpoint once at start,
-but any later re-resolve script is affected, and NetBird reconnects by hostname
-are expected to fail. The NetBird case remains an open WI#603 live measurement,
-not a supported combination.
+but any later re-resolve script is affected. NetBird rejects this setting during
+validation rather than attempting hostname reconnects without a resolver path.
 
 ## Rotation and lifecycle
 
@@ -326,8 +340,10 @@ run joins the exact container ID that passed health and firewall verification;
 if recreation removes that ID first, the run fails instead of joining a new,
 not-yet-filtered namespace.
 
-`SandboxManager::shutdown()` removes only its own sidecar. On systemd hosts it
-then frees the deterministic `lunarwing-tunnel-<instance>` transient helper
+`SandboxManager::shutdown()` marks active recovery stopping and performs the
+bounded waits described above before removing only its own sidecar; start checks
+remove a late container even if those waits expire. On systemd hosts it then
+frees the deterministic `lunarwing-tunnel-<instance>` transient helper
 unit: once the runtime reports the container gone, it waits up to three seconds
 for pasta and conmon to exit, and sends anything still in the unit SIGTERM and
 then SIGKILL (`systemctl --user kill`). It never signals the helpers of a
@@ -456,21 +472,18 @@ required.
    `LUNARWING_E2E_NETBIRD_SERVER_CONTAINER` to a space-separated server/proxy
    list; the lane requires stable health and another joined command afterward.
 
-   With the same settings, run `podman_tunnel_sidecar_netbird_custom_dns_live`
-   for the WI#603 measurement. Configure a non-primary nameserver group matching
-   `example.com` and forwarding to `1.1.1.1:53` for the `All` group first. The
-   test learns the sidecar's overlay resolver IP, recreates with custom DNS,
-   verifies identity and the absence of uplink DNS rules, and currently requires
-   `SERVFAIL`: NetBird's upstream write is unmarked and blocked. An unexpected
-   successful lookup fails the test and requires a deliberate WI#603 contract
-   update.
+   WI#603's deterministic unit regression rejects custom NetBird DNS before a
+   runtime call. The former live measurement case was removed with that gate;
+   its recorded `SERVFAIL` result is historical evidence, not a configuration
+   that new runs should reproduce.
 
    The lane never runs without all three gates and provider settings; a skip is
-   not a live-validation pass. WI#600's 2026-11-11 local run passed the main and
-   custom-DNS lanes against NetBird 0.82.0 and used an uplink `tcpdump` to check
-   for forbidden destinations. Any podman-capable CI job with protected masked
-   credentials remains future work; neither provider lane currently runs in CI,
-   and no public-cloud run is claimed.
+   not a live-validation pass. WI#600's 2026-11-11 local run passed the main
+   lane against NetBird 0.82.0, captured the custom-DNS failure that led to the
+   WI#603 rejection, and used an uplink `tcpdump` to check for forbidden
+   destinations. Any podman-capable CI job with protected masked credentials
+   remains future work; neither provider lane currently runs in CI, and no
+   public-cloud run is claimed.
 6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
    sandbox to an allowed private service. Then run a temporary high-port
    listener in the sandbox and attempt to connect from another overlay peer:
@@ -480,13 +493,14 @@ required.
 
 | Symptom | Check |
 |---|---|
-| `[sandbox:config]` at startup | provider name, required env values, HTTPS management URL, WireGuard file type/mode/`PrivateKey`, nonzero timeout, peer keepalive of 1–60 seconds or a canary, and non-local unicast DNS/canary addresses |
+| `[sandbox:config]` at startup | provider name, required env values, HTTPS management URL, WireGuard file type/mode/`PrivateKey`, nonzero timeout, peer keepalive of 1–60 seconds or a canary, non-local unicast DNS/canary addresses, and no `SANDBOX_TUNNEL_DNS` with NetBird |
 | `sandbox_unavailable` mentioning `nftables` | install `nft` in the sidecar image; do not switch to direct/host networking |
 | `sandbox_unavailable` mentioning the image | `SANDBOX_AUTO_PULL=false` and the image is not in the tenant's store; build or load it there |
 | `sandbox_unavailable` mentioning the runtime directory | `XDG_RUNTIME_DIR` is unset or not owned by the daemon user; the credential file and label salt are never placed in a shared `/tmp` |
 | sidecar start rejected | image/entrypoint, rootless runtime, `/dev/net/tun` for NetBird, kernel WireGuard module, supported sysctls |
 | NetBird never becomes ready | management URL and setup-key validity, signal/relay reachability, image version's `status --check startup` support |
 | NetBird connects, then loses management after a while | the client fell back to legacy routing (no socket marks): check its log and remove `NB_USE_LEGACY_ROUTING` / `NB_SKIP_SOCKET_MARK` |
-| names do not resolve in the sandbox | with default DNS, check the sidecar's runtime resolvers; with `SANDBOX_TUNNEL_DNS`, check the joined run's mounted file and overlay resolver reachability |
+| a fresh provider exceeds the 20-second per-run cap | restart the daemon so recreation uses the full cold-start budget; investigate why the provider is slow |
+| names do not resolve in the sandbox | with default DNS, check the sidecar's runtime resolvers; with WireGuard custom DNS, check the joined run's mounted file and overlay resolver reachability |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |

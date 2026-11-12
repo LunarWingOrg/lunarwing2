@@ -37,6 +37,7 @@
 #     --target <rev|tag>   git ref to upgrade the tenant clone to (default v1.1.4)
 #     --keep-rootful       Runbook B: stay rootful, reuse existing PG (no migrate)
 #     --with-pebble        also (re)build the pebble worker
+#     --sandbox-image <mode> managed sandbox rebuild: auto (default), always, never
 #     --skip-build         dry-run planning only; live upgrades require a fresh WASM build
 #     --prune-old-root     (standalone) delete the orphaned v1.1.0 root-store PG
 #                          container AFTER the tenant is migrated + verified
@@ -53,6 +54,7 @@ DRY_RUN=false
 AUTO_YES=false
 FORCE=false
 PRUNE_OLD_ROOT=false
+SANDBOX_IMAGE_POLICY="${LUNARWING_MT_SANDBOX_IMAGE_POLICY:-auto}"
 TENANT=""
 ORIGINAL_ARGS=("$@")
 
@@ -64,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --with-pebble)    WITH_PEBBLE=true; shift ;;
     --skip-build)     SKIP_BUILD=true; shift ;;
     --prune-old-root) PRUNE_OLD_ROOT=true; shift ;;
+    --sandbox-image)  SANDBOX_IMAGE_POLICY="$2"; shift 2 ;;
+    --sandbox-image=*) SANDBOX_IMAGE_POLICY="${1#*=}"; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
     --yes|-y)         AUTO_YES=true; shift ;;
     --force)          FORCE=true; shift ;;
@@ -71,6 +75,11 @@ while [[ $# -gt 0 ]]; do
     *)                TENANT="$1"; shift ;;
   esac
 done
+case "$SANDBOX_IMAGE_POLICY" in
+  auto|always|never) ;;
+  *) printf 'invalid --sandbox-image policy: %s (use auto, always, or never)\n' "$SANDBOX_IMAGE_POLICY" >&2; exit 2 ;;
+esac
+export LUNARWING_MT_SANDBOX_IMAGE_POLICY="$SANDBOX_IMAGE_POLICY"
 
 say()    { printf '%s\n' "$*"; }
 die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -414,7 +423,7 @@ else
   # as an explicit opt-in for a pebble lane the registry does not list.
   # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
   # so the running tenant's clone is exactly as it was.
-  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF")
+  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" --sandbox-image "$SANDBOX_IMAGE_POLICY")
   $WITH_PEBBLE && cand_args+=(--with-pebble)
   cand_rc=0
   set +e

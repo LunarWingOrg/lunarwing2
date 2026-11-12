@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built; source revalidated 2026-11-10 for v2.2.0.0. Worker socket
+**Status:** As-built; source revalidated 2026-11-12 for v2.2.0.0. Worker socket
 mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
 units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
 `ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
@@ -115,7 +115,7 @@ and `ic/src/tools/builtin/ssh_git.rs` (the tools).
 
 ### 2a. The `ssh` tool — run a remote command
 
-Runs a single command on a configured host using the in-process **russh 0.62**
+Runs a single command on a configured host using the in-process **russh 0.65**
 client (the first live use of the client half — the harness otherwise only used
 `russh::keys` agent server).
 
@@ -133,9 +133,16 @@ client (the first live use of the client half — the harness otherwise only use
   AcceptFirst, byte-exact comparison of the wire key). AcceptFirst stores the
   algorithm and wire key in the tenant's encrypted pin set before accepting the
   handshake.
-- **Key algorithms:** **Ed25519 and ECDSA only.** The shared decoder rejects
-  RSA by parsed algorithm before connecting; the vulnerable RSA implementation
-  is not compiled because LunarWing disables russh's optional `rsa` feature.
+- **Private-key algorithms:** **Ed25519 and ECDSA only.** The shared decoder
+  rejects RSA by parsed algorithm before connecting; the vulnerable RSA
+  implementation is not compiled because LunarWing disables russh's optional
+  `rsa` feature.
+- **Host-key algorithms:** **Ed25519 and ECDSA only.** The client does not offer
+  RSA host key algorithms during negotiation. An RSA-only server therefore fails
+  before host-key verification or authentication with an error that explicitly
+  names the unsupported RSA host key, rather than the misleading
+  `WrongServerSig`. Use an Ed25519 or ECDSA host key. Host key certificates
+  are not offered, and a server that presents one is refused.
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
   capped at 1 MiB each (`truncated` flag).
 - **Approval:** first call prompts with **Approve**, **Always**, and **Deny**.
@@ -171,7 +178,11 @@ key). Keys never leave the agent.
   completes a russh key-exchange-only preflight, persists the presented key,
   then launches Git with `StrictHostKeyChecking=yes` against that exact key. A
   Strict host with no known key is refused. This extra connection occurs only
-  while learning the first pin.
+  while learning the first pin. That russh preflight offers only Ed25519 and
+  ECDSA host key algorithms: RSA host keys are not supported there, and an
+  RSA-only server receives the explicit unsupported-host-key error. Once a pin
+  has been materialized, the subsequent Git connection uses OpenSSH's own
+  algorithm policy to enforce it.
 - **Hermetic SSH config:** invokes `ssh -F /dev/null`, so it ignores the host's
   `/etc/ssh/ssh_config` (and its `ssh_config.d/*` includes) and the user's
   `~/.ssh/config` — everything it needs comes from `[[ssh.hosts]]` + the agent
@@ -185,19 +196,25 @@ key). Keys never leave the agent.
 - **Safety extras:** env-scrubbed subprocess (no gateway secrets leak to git),
   `GIT_TERMINAL_PROMPT=0`, `pull --ff-only`, **force-push (`+ref`) blocked**,
   option-injection guards, 64 KiB output cap, timeout + child kill.
-- **Key algorithms:** **Ed25519 and ECDSA only**, as in the russh command path.
-  `ssh_git` does not inspect `SSHHostConfig.key_type`, but the shared agent
+- **Private-key algorithms:** **Ed25519 and ECDSA only**, as in the russh command
+  path. `ssh_git` does not inspect `SSHHostConfig.key_type`, but the shared agent
   decoder rejects RSA by parsed algorithm before any identity can be loaded.
   OpenSSH therefore never receives an RSA identity from this harness.
 - **Approval:** every invocation requires approval; no **Always** option.
 
 **When to use.** Any git operation over SSH from a chat turn, without a worker.
 
-> **RSA policy (WI#368):** the built-in and WASM command tools retain their
-> declared-key-type fail-fast guard, while the shared parsed-algorithm check is
-> authoritative for every mechanism, including worker mode and `ssh_git`.
-> Mislabeled RSA key material is rejected, and russh's RSA implementation is
-> compiled out.
+> **RSA policy (WI#368, WI#616):** the built-in and WASM command tools retain
+> their declared-key-type fail-fast guard, while the shared parsed-algorithm
+> check is authoritative for every mechanism, including worker mode and
+> `ssh_git`. Mislabeled RSA key material is rejected, and russh's RSA
+> implementation is compiled out. The russh client shared by built-in `ssh`,
+> WASM `ssh`, and `ssh_git`'s pin-learning preflight offers only Ed25519 and
+> ECDSA host key algorithms; RSA host keys are not supported on those paths.
+> Existing encrypted `ssh-rsa` pins are retained rather than silently deleted,
+> but loading them logs a warning because they cannot authenticate a russh
+> connection; replace them with Ed25519 or ECDSA pins. Worker-mode OpenSSH and
+> `ssh_git`'s post-pin OpenSSH transport retain their own algorithm policies.
 
 ---
 

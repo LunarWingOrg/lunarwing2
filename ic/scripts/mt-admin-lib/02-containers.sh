@@ -381,11 +381,51 @@ build_vision_sidecar_image() {
 
 SANDBOX_IMAGE_TAG=lunarwing-sandbox:latest
 SANDBOX_DOCKERFILE="$REPO_ROOT/docker/sandbox.Dockerfile"
+SANDBOX_IMAGE_INPUT_LABEL=org.lunarwing.sandbox.inputs
+SANDBOX_IMAGE_POLICY="${LUNARWING_MT_SANDBOX_IMAGE_POLICY:-auto}"
 
 tenant_uses_managed_sandbox_image() {  # <tenant>
   local env_path
   env_path="$(tenant_env_dir "$1")/lunarwing.env"
   [[ "$(_env_existing "$env_path" SANDBOX_IMAGE)" == "$SANDBOX_IMAGE_TAG" ]]
+}
+
+validate_sandbox_image_policy() {
+  case "${1:-$SANDBOX_IMAGE_POLICY}" in
+    auto|always|never) return 0 ;;
+    *) die "invalid sandbox image policy '${1:-}' (expected auto, always, or never)" ;;
+  esac
+}
+
+sandbox_debian_snapshot() {  # [ic source root]
+  local dockerfile="${1:-$REPO_ROOT}/docker/sandbox.Dockerfile" snapshot
+  snapshot="${LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT:-}"
+  if [[ -z "$snapshot" ]]; then
+    snapshot="$(sed -n 's/^ARG DEBIAN_SNAPSHOT=//p' "$dockerfile" | head -n 1)"
+  fi
+  [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || return 1
+  printf '%s' "$snapshot"
+}
+
+sandbox_image_input_digest() {  # [ic source root]
+  local source_root="${1:-$REPO_ROOT}" dockerfile snapshot
+  dockerfile="$source_root/docker/sandbox.Dockerfile"
+  [[ -f "$dockerfile" ]] || return 1
+  snapshot="$(sandbox_debian_snapshot "$source_root")" || return 1
+  {
+    printf 'lunarwing-sandbox-inputs-v1\0DEBIAN_SNAPSHOT=%s\0' "$snapshot"
+    cat "$dockerfile"
+  } | sha256sum | awk '{print $1}'
+}
+
+sandbox_image_build_required() {  # <tenant> [ic source root]
+  local name="$1" expected runtime current
+  expected="$(sandbox_image_input_digest "${2:-$REPO_ROOT}")" || return 0
+  runtime="$(sandbox_container_runtime "$name")" || return 0
+  current="$("$runtime" image inspect \
+    --format "{{ index .Config.Labels \"$SANDBOX_IMAGE_INPUT_LABEL\" }}" \
+    "$SANDBOX_IMAGE_TAG" 2>/dev/null || true)"
+  [[ "$current" != "$expected" ]]
 }
 
 # Match CliRunner::detect's probe order: Podman first for auto/podman, Docker
@@ -424,20 +464,39 @@ tenant_sandbox_rootless_prereqs_ready() {  # <tenant>
 # rather than ic/: ic/ carries the 1.3G vendor/ tree (which must stay in-context
 # for Dockerfile.worker's offline cargo build and so cannot be dockerignored),
 # and podman stages the whole context before starting.
-build_sandbox_image() {
-  [[ -f "$SANDBOX_DOCKERFILE" ]] \
-    || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
-  local runtime
-  runtime="$(sandbox_container_runtime "${1:-}")" || return 1
+build_sandbox_image() {  # [tenant] [output ref] [ic source root]
+  local name="${1:-}" output_ref="${2:-$SANDBOX_IMAGE_TAG}" source_root="${3:-$REPO_ROOT}"
+  local dockerfile="$source_root/docker/sandbox.Dockerfile" runtime snapshot digest
+  [[ -f "$dockerfile" ]] \
+    || { say "WARNING: $dockerfile missing; cannot build sandbox image"; return 1; }
+  runtime="$(sandbox_container_runtime "$name")" || return 1
+  snapshot="$(sandbox_debian_snapshot "$source_root")" \
+    || { say "WARNING: invalid DEBIAN_SNAPSHOT in $dockerfile; cannot build sandbox image"; return 1; }
+  digest="$(sandbox_image_input_digest "$source_root")" \
+    || { say "WARNING: cannot digest sandbox image inputs from $dockerfile"; return 1; }
   # On hosts whose Podman bridge cannot reach the host DNS resolver, apt in
   # the locally built sandbox image cannot resolve snapshot.debian.org. Match
   # the worker image builders: host networking is build-only, not sandbox runtime.
   local -a network_args=()
   [[ "$runtime" != podman ]] || network_args=(--network=host)
-  "$runtime" build "${network_args[@]}" -t "$SANDBOX_IMAGE_TAG" \
-    -f "$SANDBOX_DOCKERFILE" "$REPO_ROOT/docker" >/dev/null \
-    || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
-  say "sandbox image built: $SANDBOX_IMAGE_TAG"
+  "$runtime" build "${network_args[@]}" \
+    --build-arg "DEBIAN_SNAPSHOT=$snapshot" \
+    --label "$SANDBOX_IMAGE_INPUT_LABEL=$digest" \
+    -t "$output_ref" -f "$dockerfile" "$source_root/docker" >/dev/null \
+    || { say "WARNING: sandbox image build failed for $output_ref (run 'build-sandbox-image ${name:-}' to retry); the current image was not replaced"; return 1; }
+  say "sandbox image built: $output_ref (inputs $digest)"
+}
+
+ensure_sandbox_image_current() {  # <tenant> [policy] [ic source root]
+  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}" source_root="${3:-$REPO_ROOT}"
+  validate_sandbox_image_policy "$policy"
+  tenant_uses_managed_sandbox_image "$name" || return 0
+  [[ "$policy" != never ]] || return 0
+  if [[ "$policy" == auto ]] && ! sandbox_image_build_required "$name" "$source_root"; then
+    say "sandbox image $SANDBOX_IMAGE_TAG already matches its Dockerfile and Debian snapshot"
+    return 0
+  fi
+  build_sandbox_image "$name" "$SANDBOX_IMAGE_TAG" "$source_root"
 }
 
 # Make the sandbox image available to the tenant that will run the daemon's

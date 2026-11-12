@@ -52,6 +52,13 @@ const PERSISTED_HOST_KEYS_SECRET: &str = "__lunarwing_ssh_known_hosts_v1";
 const PERSISTED_HOST_KEYS_PROVIDER: &str = "lunarwing:ssh-hostkeys";
 const PERSISTED_HOST_KEYS_VERSION: u8 = 1;
 
+pub(crate) fn is_rsa_host_key_algorithm(key_type: &str) -> bool {
+    let base = key_type
+        .strip_suffix("-cert-v01@openssh.com")
+        .unwrap_or(key_type);
+    matches!(base, "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512")
+}
+
 /// SSH host key verifier — manages known_hosts per tenant.
 pub struct HostKeyVerifier {
     /// Known hosts (`hostname:port` -> stored public key).
@@ -83,7 +90,7 @@ struct PersistedHostKey {
 pub struct StoredHostKey {
     /// The public key data (in the format received from the server)
     pub public_key: Vec<u8>,
-    /// Key type (ssh-ed25519, ecdsa-sha2-nistp256, ssh-rsa)
+    /// Key type (ssh-ed25519 or ecdsa-sha2-*; RSA host keys are unsupported)
     pub key_type: String,
     /// Fingerprint (SHA256 base64)
     pub fingerprint: String,
@@ -127,6 +134,13 @@ impl HostKeyPersistence {
                 return Err(SshBridgeError::HostKeyPersistence(format!(
                     "persisted host key for {host} is empty"
                 )));
+            }
+            if is_rsa_host_key_algorithm(&persisted_key.key_type) {
+                warn!(
+                    host = %host,
+                    key_type = %persisted_key.key_type,
+                    "Persisted RSA host key pin is retained but unusable; RSA host keys are not supported (use Ed25519 or ECDSA)"
+                );
             }
             hosts.insert(
                 host,
@@ -851,6 +865,45 @@ mod tests {
 
         let result = HostKeyVerifier::new_persistent("tenant-a".into(), store).await;
         assert!(matches!(result, Err(SshBridgeError::HostKeyPersistence(_))));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn legacy_rsa_pin_is_retained_with_load_warning() {
+        let store = test_store();
+        let persisted = PersistedKnownHosts {
+            version: PERSISTED_HOST_KEYS_VERSION,
+            hosts: HashMap::from([(
+                "legacy.example.com:22".to_string(),
+                PersistedHostKey {
+                    public_key: BASE64.encode(b"legacy RSA host key"),
+                    key_type: "ssh-rsa".to_string(),
+                },
+            )]),
+        };
+        store
+            .create(
+                "tenant-a",
+                CreateSecretParams::new(
+                    PERSISTED_HOST_KEYS_SECRET,
+                    serde_json::to_string(&persisted).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let verifier = HostKeyVerifier::new_persistent("tenant-a".into(), store)
+            .await
+            .unwrap();
+        let retained = verifier
+            .get_host_key("legacy.example.com", 22)
+            .await
+            .unwrap();
+        assert_eq!(retained.key_type, "ssh-rsa");
+        assert!(logs_contain(
+            "Persisted RSA host key pin is retained but unusable"
+        ));
+        assert!(logs_contain("legacy.example.com"));
     }
 
     #[tokio::test]
