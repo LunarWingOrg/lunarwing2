@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use russh::client::{self, Handle, Handler};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::{Algorithm, EcdsaCurve, PublicKey, PublicKeyBase64};
+use russh::keys::{Algorithm, EcdsaCurve, PublicKeyBase64, PublicKeyOrCertificate};
 use russh::{AlgorithmKind, ChannelMsg, Disconnect};
 
 use crate::bridge::ssh::{SSHCredentials, SSHHostConfig, SshBridgeError};
@@ -65,6 +65,28 @@ fn map_connect_error(error: russh::Error) -> SshBridgeError {
     SshBridgeError::ConnectionRefused(error.to_string())
 }
 
+/// Key type and raw SSH wire blob of the host key the server presented.
+///
+/// `public_key_bytes()` yields the same representation `HostKeyVerifier`
+/// compares against (it byte-compares, not fingerprint strings, so no
+/// base64-padding mismatch). The client never offers a host key certificate
+/// algorithm (`Preferred::host_key_certificates` stays empty) and pins are
+/// plain host keys, so a certificate is refused instead of being trusted
+/// without a configured authority.
+fn presented_host_key(
+    presented: &PublicKeyOrCertificate,
+) -> Result<(String, Vec<u8>), SshBridgeError> {
+    match presented {
+        PublicKeyOrCertificate::PublicKey { key, .. } => {
+            Ok((key.algorithm().to_string(), key.public_key_bytes()))
+        }
+        PublicKeyOrCertificate::Certificate(_) => Err(SshBridgeError::ConnectionRefused(
+            "the server presented a host key certificate, which this build does not support (use a plain Ed25519 or ECDSA host key)"
+                .to_string(),
+        )),
+    }
+}
+
 /// Result of a remote command execution.
 #[derive(Debug)]
 pub struct CommandResult {
@@ -90,18 +112,23 @@ impl Handler for ClientHandler {
 
     fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        // `public_key_bytes()` yields the raw SSH wire blob — the same
-        // representation `HostKeyVerifier` compares against (it byte-compares,
-        // not fingerprint strings, so no base64-padding mismatch).
-        let key_bytes = server_public_key.public_key_bytes();
-        let key_type = server_public_key.algorithm().to_string();
+        let presented = presented_host_key(server_public_key);
         let verifier = Arc::clone(&self.verifier);
         let host = self.host.clone();
         let reject_reason = Arc::clone(&self.reject_reason);
 
         async move {
+            let (key_type, key_bytes) = match presented {
+                Ok(presented) => presented,
+                Err(e) => {
+                    if let Ok(mut slot) = reject_reason.lock() {
+                        *slot = Some(e);
+                    }
+                    return Ok(false);
+                }
+            };
             match verifier
                 .verify_from_config_with_key_type(&host, &key_type, &key_bytes)
                 .await

@@ -354,9 +354,11 @@ PascalCase (`"Strict"`) — clients must match the casing.
   AcceptFirst learning preflight offer only Ed25519 and ECDSA host key
   algorithms. RSA host keys are not supported on those paths. An RSA-only server
   fails during negotiation with an error that names the RSA host key instead of
-  surfacing `WrongServerSig`; use an Ed25519 or ECDSA host key. Existing
-  encrypted `ssh-rsa` pins are retained but produce a load-time warning because
-  they cannot authenticate a russh connection. Worker-mode OpenSSH and
+  surfacing `WrongServerSig`; use an Ed25519 or ECDSA host key. Host key
+  certificates are not offered either, and a server that presents one is
+  refused: pins are plain host keys and no certificate authority is configured.
+  Existing encrypted `ssh-rsa` pins are retained but produce a load-time warning
+  because they cannot authenticate a russh connection. Worker-mode OpenSSH and
   `ssh_git`'s post-pin OpenSSH transport retain their own algorithm policies.
 
 ### Hardening notes / current sharp edges
@@ -395,7 +397,7 @@ PascalCase (`"Strict"`) — clients must match the casing.
   than the alias/host-policy checks applied by built-in tools.
 - **`russh::keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
   spawning/managing an external agent and keeps the live signing keystore in the
-  daemon. (`russh` 0.62; `russh-keys` is now a module within the `russh` crate,
+  daemon. (`russh` 0.65; `russh-keys` is now a module within the `russh` crate,
   not a separate dependency.)
 - **Run-dir socket, not `/tmp`.** Required because the daemon runs with
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
