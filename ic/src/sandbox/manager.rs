@@ -108,7 +108,8 @@ impl SandboxManager {
         }
     }
 
-    /// Create with an instance-scoped tunnel sidecar for deterministic integration tests.
+    /// Test-only injection seam. Production must use `new`, which keeps the
+    /// sidecar configuration identical to the manager's tunnel configuration.
     #[doc(hidden)]
     pub fn new_with_tunnel_sidecar(config: SandboxConfig, sidecar: TunnelSidecar) -> Self {
         let mut manager = Self::new(config);
