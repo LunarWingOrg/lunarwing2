@@ -203,7 +203,10 @@ async fn exercise_refusals(config: &LiveConfig) {
     .unwrap_err();
     match &mismatch {
         SshBridgeError::ConnectionRefused(message) => {
-            assert!(message.contains("Host key verification failed"), "{message}");
+            assert!(
+                message.contains("Host key verification failed"),
+                "{message}"
+            );
         }
         other => panic!("expected ConnectionRefused, got {other:?}"),
     }
