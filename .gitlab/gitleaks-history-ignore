@@ -878,8 +878,10 @@
 54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1
 54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/src/helpers.rs:private-key:286
 587ab6618737b0650fc488e4b40c01375366185a:docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:167
+59b4247c2a7984ccd52126e894df98251c10f030:docs/ops/AGENT_GOALS_2.1.6.0.md:gitlab-pat:1270
 5b12a1d8b28a069b6edcc14435c1ab1c7aa4ebef:ic/scripts/tests/test-darkirc-adapter-secret-upload.sh:generic-api-key:32
 66a0c9be9160727a70e188ea696097e30919d4b6:ic/crates/lunarwing_safety/src/lib.rs:private-key:922
+68d8b44ec03ec0e6a2095ce47840ba389eb4242f:lunardepth4lunarwing/scripts/lunarwing_bridge_test.ts:generic-api-key:24
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/aws-lc-rs/.cargo-checksum.json:generic-api-key:1
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/aws-lc-sys/.cargo-checksum.json:generic-api-key:1
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1
