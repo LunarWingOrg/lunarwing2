@@ -172,7 +172,12 @@ async fn connect_verified(
         Err(_) => Err(SshBridgeError::ConnectionTimeout(connect_secs)),
         Ok(Err(error)) => {
             if let Some(reason) = reject_reason.lock().ok().and_then(|mut slot| slot.take()) {
-                Err(reason)
+                Err(match reason {
+                    mismatch @ SshBridgeError::HostKeyMismatch { .. } => {
+                        SshBridgeError::ConnectionRefused(mismatch.to_string())
+                    }
+                    other => other,
+                })
             } else {
                 Err(map_connect_error(error))
             }
