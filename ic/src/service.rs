@@ -1062,10 +1062,9 @@ fn ensure_openrc_service_uid(user: &str, uid: nix::unistd::Uid, allow_root: bool
 
 #[cfg(unix)]
 fn ensure_openrc_service_gid(user: &str, gid: nix::unistd::Gid, allow_root: bool) -> Result<()> {
-    let detail = gid
-        .is_root()
-        .then(|| format!("service user '{user}' has primary gid 0"));
-    ensure_root_service_allowed(ServiceManager::OpenRc, gid.is_root(), allow_root, detail)
+    let is_root = gid.as_raw() == 0;
+    let detail = is_root.then(|| format!("service user '{user}' has primary gid 0"));
+    ensure_root_service_allowed(ServiceManager::OpenRc, is_root, allow_root, detail)
 }
 
 #[cfg(unix)]
