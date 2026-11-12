@@ -349,7 +349,8 @@ async fn gate_waiting_join_is_silent_and_preserves_the_thread() {
         .late_result(
             &mut rig.events,
             Duration::from_millis(1),
-            Duration::from_millis(1),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
         )
         .await
         .unwrap();
