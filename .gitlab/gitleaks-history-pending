@@ -1,4 +1,8 @@
 # WI#590 / WI#575: findings that must not be baselined yet.
 # Remove a row only after its classified disposition is recorded in WI#575.
 # The refresh helper rejects these fingerprints even when --accept names them.
-59b4247c2a7984ccd52126e894df98251c10f030:docs/ops/AGENT_GOALS_2.1.6.0.md:gitlab-pat:1270
+#
+# No rows are pending. The last one, the gitlab-pat example at 59b4247c2, was
+# settled on 2026-11-12 by WI#599's administrator token-information lookup
+# (HTTP 404: not a token on this instance) and is now pinned in
+# .gitlab/gitleaks-history-ignore.
