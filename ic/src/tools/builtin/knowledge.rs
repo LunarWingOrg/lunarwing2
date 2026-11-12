@@ -702,9 +702,7 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
         None => chrono::Utc::now(),
         Some(value) => chrono::DateTime::parse_from_rfc3339(&value)
             .map_err(|_| {
-                ToolError::InvalidParameters(
-                    "studied_at must be an RFC 3339 timestamp".to_string(),
-                )
+                ToolError::InvalidParameters("studied_at must be an RFC 3339 timestamp".to_string())
             })?
             .with_timezone(&chrono::Utc),
     };

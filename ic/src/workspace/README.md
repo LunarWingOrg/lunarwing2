@@ -380,17 +380,23 @@ Seven native tools (see `src/tools/builtin/knowledge.rs`):
 - **`knowledge_list_topics`** — topic coverage survey: per-topic version
   counts, scopes, agents, statuses, and tags; optional substring `filter`.
 - **`knowledge_submit_note`** — validated write (slug/topic/title/content
-  limits, confidence 0-1, RFC 3339 `studied_at`, `stale_after_days` defaulting
-  to the canonical 90 days, `status_reason`); `replace=true` updates the
+  limits, confidence 0-1, RFC 3339 `studied_at` defaulting to now,
+  `stale_after_days` defaulting to the canonical 90 days, `status_reason`);
+  `replace=true` updates the
   caller's own agent version only (other agents' versions live at different
   paths). `status=superseded` requires `superseded_by`.
 - **`knowledge_update_status`** — metadata-only lifecycle update; only provided
   fields change, explicit null clears nullable fields, and leaving `superseded`
-  without an explicit `superseded_by` clears it. Content changes go through
+  without an explicit `superseded_by` clears it. Moving a note to
+  `stale`/`needs-verification` with no timestamp and none recorded stamps
+  `studied_at` now, so a batch flip cannot mint the NULL rows that used to
+  re-flag forever (WI#597). Content changes go through
   `knowledge_submit_note` with `replace=true`.
-- **`knowledge_list_stale`** — notes needing verification by status, age
-  (`max_age_days`, falling back to the note's own `stale_after_days`), or
-  `repository_commit` mismatch.
+- **`knowledge_list_stale`** — notes needing verification by age
+  (`max_age_days`, falling back to the note's own `stale_after_days`) or
+  `repository_commit` mismatch. A recorded `stale`/`needs-verification` status
+  is not a reason by itself, and superseded notes are never listed: re-study
+  (`active` plus a fresh `studied_at`) or supersede to retire a flag.
 - **`knowledge_stats`** — totals, distinct topics, per-status and per-scope counts.
 
 Scopes: reads span the caller's private scope plus the shared herd scope
