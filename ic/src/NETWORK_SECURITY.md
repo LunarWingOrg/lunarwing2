@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-11 (serialized tunnel lifecycle and atomic firewall replacement, WI#614)
+**Last updated:** 2026-11-12 (independent tunnel health-check and recovery budgets, WI#639)
 
 ---
 
