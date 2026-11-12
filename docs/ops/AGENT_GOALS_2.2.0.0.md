@@ -319,9 +319,9 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 
 ## Phase 9 - Advanced Operator Notes
 
-40. [x] (S) Deploy the stoplight system for IRC
-41. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-42. [x] (S) RESERVED
+40. [x] (H) Deploy the stoplight system for IRC
+41. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+42. [x] (H) go over work item stuff
 43. [x] (S) RESERVED
 44. [x] (S) RESERVED
 45. [x] (S) RESERVED
