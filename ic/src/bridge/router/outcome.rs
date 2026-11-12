@@ -232,7 +232,9 @@ impl TurnCompletion {
                 &engine_status_metadata(&self.message, &self.thread_id.to_string()),
             ),
         ).await;
-        let result = self.late_result(events, budget, stop_grace).await;
+        let result = self
+            .late_result(events, budget, stop_grace, stop_grace)
+            .await;
         if !self
             .state
             .thread_manager
@@ -287,25 +289,33 @@ impl TurnCompletion {
         events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
         budget: Duration,
         stop_grace: Duration,
+        post_stop_grace: Duration,
     ) -> Result<Option<String>, Error> {
         let timed_out = !self.wait(events, budget).await;
         if timed_out {
             tracing::warn!(thread_id = %self.thread_id, "Late turn budget exhausted; stopping thread");
-            let stopped = tokio::time::timeout(stop_grace, async {
-                self.state
-                    .thread_manager
-                    .stop_thread_for_run(self.thread_id, self.run_started_at, &self.message.user_id)
-                    .await
-                    .map_err(|error| engine_err("stop late thread", error))?;
-                Ok::<_, Error>(self.wait(events, stop_grace).await)
-            })
-            .await;
-            if !matches!(stopped, Ok(Ok(true))) {
-                // Never remove a still-running handle just to join it. Keep it
-                // addressable by /interrupt if cancellation itself is stuck.
+            // Leave the handle addressable by /interrupt on either timeout; joining
+            // could otherwise remove a still-running thread.
+            tokio::time::timeout(
+                stop_grace,
+                self.state.thread_manager.stop_thread_for_run(
+                    self.thread_id,
+                    self.run_started_at,
+                    &self.message.user_id,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                engine_err(
+                    "late turn timeout",
+                    "stop request did not complete within its grace period",
+                )
+            })?
+            .map_err(|error| engine_err("stop late thread", error))?;
+            if !self.wait(events, post_stop_grace).await {
                 return Err(engine_err(
                     "late turn timeout",
-                    "thread did not stop within its grace period",
+                    "stop succeeded but the post-stop wait did not complete within its grace period",
                 ));
             }
         }
