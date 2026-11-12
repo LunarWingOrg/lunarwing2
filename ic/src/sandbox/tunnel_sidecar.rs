@@ -1356,7 +1356,8 @@ impl TunnelSidecar {
                     .as_ref()
                     .is_some_and(|active| active.same_channel(&receiver))
                 {
-                    lifecycle.complete(&error);
+                    lifecycle.active = None;
+                    lifecycle.record(&error);
                 }
                 Err(error.into_sandbox())
             }
