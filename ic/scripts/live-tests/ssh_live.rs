@@ -323,13 +323,21 @@ async fn git_stdout(config: &LiveConfig, repo: &Path, args: &[&str]) -> String {
 }
 
 async fn exercise_ssh_git(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) {
+    let verifier = bridge.read().await.host_key_verifier();
+    assert!(
+        verifier
+            .get_host_key(TOFU_HOST, config.port)
+            .await
+            .is_none(),
+        "ssh_git preflight requires an unpinned AcceptFirst host"
+    );
     let tool = SshGitTool::new(bridge, config.work_dir.clone());
     let ctx = JobContext::new("ssh-git-live", "live SSH git test");
     let cloned = tool
         .execute(
             serde_json::json!({
                 "operation": "clone",
-                "host": STRICT_HOST,
+                "host": TOFU_HOST,
                 "repo": config.bare_repo,
                 "path": "clone",
             }),
@@ -340,6 +348,13 @@ async fn exercise_ssh_git(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) {
         .result;
     assert_eq!(cloned["exit_code"], 0);
     assert_eq!(cloned["success"], true);
+    assert!(
+        verifier
+            .get_host_key(TOFU_HOST, config.port)
+            .await
+            .is_some(),
+        "ssh_git preflight must persist the AcceptFirst host key"
+    );
 
     let initial = git_stdout(config, &config.seed_repo, &["rev-parse", "HEAD"]).await;
     git_stdout(
@@ -356,7 +371,7 @@ async fn exercise_ssh_git(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) {
         .execute(
             serde_json::json!({
                 "operation": "fetch",
-                "host": STRICT_HOST,
+                "host": TOFU_HOST,
                 "path": "clone",
             }),
             &ctx,
@@ -377,8 +392,8 @@ async fn exercise_ssh_git(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) {
 async fn live_ssh_tool_end_to_end() {
     let config = LiveConfig::load();
     let bridge = live_bridge(&config).await;
+    exercise_ssh_git(Arc::clone(&bridge), &config).await;
     exercise_ssh_tool(Arc::clone(&bridge), &config).await;
     exercise_refusals(&config).await;
     exercise_agent(&config).await;
-    exercise_ssh_git(bridge, &config).await;
 }
