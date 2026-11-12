@@ -300,6 +300,16 @@ task unit is harmless, but failure to stop a loaded unit propagates.
 inspect both roles. Both are attached to the tenant egress network and
 verified after start; the item-114 namespace keeper remains in force.
 
+`remove-tenant` uses the same per-lane stop order with and without `--purge`.
+It then removes every supported bridge/task container and IPC volume, every
+OpenRC unit/runlevel link, and the systemd Quadlets. Systemd stops task services
+and reloads the user manager before container deletion, so `Restart=on-failure`
+cannot resurrect a task into teardown. Egress teardown removes the namespace
+keeper and refuses to flush while the runtime reports any attachment to the
+tenant network. Stop, inspection, container/volume removal, attachment-query,
+and network-removal failures abort the command; they are not warnings. A refused
+teardown leaves the filter and rendered state in place for repair and retry.
+
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
 symlinks only during host preparation is insufficient: the runtime can
