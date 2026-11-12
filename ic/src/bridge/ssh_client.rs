@@ -355,6 +355,39 @@ mod tests {
         );
     }
 
+    // Public test material only: a throwaway Ed25519 host key and a host
+    // certificate for it. The private keys of both the host and the signing
+    // authority were discarded when the fixture was generated.
+    const HOST_ED25519_OPENSSH: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF3FmAjkaEyp/3WAchHG1OYyRH1hSdWDe94cqAeHBroX lunarwing-test-host";
+    const HOST_CERTIFICATE_OPENSSH: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIHjQiLHhOemXSPUbuEnOPQUheNrF1kIZUfooBul8F1IgAAAAIF3FmAjkaEyp/3WAchHG1OYyRH1hSdWDe94cqAeHBroXAAAAAAAAAAAAAAACAAAAE2x1bmFyd2luZy10ZXN0LWhvc3QAAAAYAAAAFHRlc3QuZXhhbXBsZS5pbnZhbGlkAAAAAGlVuQAAAAAAfCRfAAAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgLAj7dc1CEW2O1O69e25jc7KhcaShawvTmfdey9KTrQoAAABTAAAAC3NzaC1lZDI1NTE5AAAAQE4V2VgJhnPCnDIitXbHfRUEcaQuUgqDxTpqv3vzwspNrgKIsEYEWYztDCNWWQoiXq4dPPdiRKryBI5pT6nv2gw= lunarwing-test-host";
+
+    #[test]
+    fn plain_host_key_yields_its_type_and_wire_blob() {
+        let key = russh::keys::PublicKey::from_openssh(HOST_ED25519_OPENSSH).unwrap();
+        let (key_type, key_bytes) = presented_host_key(&PublicKeyOrCertificate::PublicKey {
+            key: key.clone(),
+            hash_alg: None,
+        })
+        .unwrap();
+        assert_eq!(key_type, "ssh-ed25519");
+        assert_eq!(key_bytes, key.public_key_bytes());
+    }
+
+    #[test]
+    fn host_key_certificate_is_refused() {
+        let certificate = russh::keys::Certificate::from_openssh(HOST_CERTIFICATE_OPENSSH).unwrap();
+        let refused = presented_host_key(&PublicKeyOrCertificate::Certificate(certificate));
+        assert!(
+            matches!(&refused, Err(SshBridgeError::ConnectionRefused(message)) if message.contains("host key certificate")),
+            "got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn client_config_offers_no_host_key_certificate_algorithm() {
+        assert!(client_config().preferred.host_key_certificates.is_empty());
+    }
+
     #[test]
     fn test_append_capped_under_limit() {
         let mut buf = Vec::new();
