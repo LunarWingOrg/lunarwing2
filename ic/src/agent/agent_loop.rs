@@ -360,17 +360,12 @@ impl Agent {
         &self.deps.owner_id
     }
 
-    /// Resolved foreground iteration limit shared by both execution engines.
-    pub(crate) fn max_tool_iterations(&self) -> usize {
-        self.config.max_tool_iterations
+    pub(crate) fn config(&self) -> &AgentConfig {
+        &self.config
     }
 
     pub(crate) fn auto_approve_tools(&self) -> bool {
         self.config.auto_approve_tools
-    }
-
-    pub(crate) fn supervised_mode(&self) -> bool {
-        self.config.supervised_mode.enabled
     }
 
     /// Pending-gate expiry (WI#111): resolved from
