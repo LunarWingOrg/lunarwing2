@@ -1487,10 +1487,10 @@ mod tests {
             return;
         }
         let mut cmd = spawner.command("podman", &["ps"]);
+        let spec = spawner.prepare_service(&mut cmd);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let spec = spawner.prepare_service(&mut cmd);
         let child = cmd.spawn().expect("spawn podman via service");
         let mut guard =
             ProcessTreeGuard::for_service(&child, spec.as_ref(), spawner.xdg_runtime_dir());
@@ -1579,17 +1579,21 @@ mod tests {
     async fn service_mode_workload_gets_exact_allowlisted_environment() {
         let spawner = workload_spawner().await;
         if !spawner.uses_systemd_services() {
+            assert!(
+                std::env::var_os("LUNARWING_REQUIRE_SYSTEMD_TESTS").is_none(),
+                "LUNARWING_REQUIRE_SYSTEMD_TESTS is set, but systemd user transient services are unavailable"
+            );
             eprintln!("skipping: systemd user transient services unavailable");
             return;
         }
-        let mut cmd = spawner.command("sh", &["-c", "env"]);
+        let mut cmd = spawner.command("env", &[]);
         cmd.env_clear();
         cmd.env("PATH", "/usr/bin:/bin");
         cmd.env("LW2_TEST_SAFE", "safe-value");
+        let spec = spawner.prepare_service(&mut cmd);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let spec = spawner.prepare_service(&mut cmd);
         let child = cmd.spawn().expect("spawn env dump via service");
         let mut guard =
             ProcessTreeGuard::for_service(&child, spec.as_ref(), spawner.xdg_runtime_dir());
