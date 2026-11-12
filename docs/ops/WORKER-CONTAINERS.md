@@ -1958,6 +1958,105 @@ CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
 
+### v2.2.7 bump — WI#609, item 39 (2026-11-12)
+
+**Review reconciliation and pins:** `git ls-remote` resolves lightweight
+v2.2.7 directly to `fedc6f208aa2bd54c1019227214568083f6380ad`, the newest
+`v2.*` tag, and the fresh clone's HEAD matches. Its 24-hour settling window
+(ended 2026-11-11 10:37Z) had passed. npm reports `@moonshot-ai/kimi-code`
+`latest` as **2.6.0**, published **2026-11-12 10:11Z** — inside its own
+24-hour window at the time of this work — so the kimi lane takes **2.5.3**
+(2026-11-10 13:12Z, window passed); 2.6.0 is the next bump, not this one.
+Dockerfile defaults, the CI case blocks, the Kimi manifest and its lock moved
+together. Regenerating the lock with
+`npm install --package-lock-only --ignore-scripts` changed only the three
+version fields and the dependency record: the tarball is
+`https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.5.3.tgz`
+with integrity
+`sha512-NdBttZiktZhKdH1tu/25A+Il1MxO1RTE1gAdZDmogoCT4g8L7k3pcLeJpwy7PNJvHo9CF8fDJiaZ9nsIPn+Gag==`.
+Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
+The v1.19.5 pin was re-checked the same day: `v1.19.5` is still the newest
+`v1.*` tag and resolves to `810c0eba1a7348036f8bdf61e6632d0c36c6876c`, the
+committed pin — no v1 change.
+
+**Kimi 2.5.3 verification:**
+
+- The new steering surface (`POST /api/v1/sessions/{session_id}/steer`) and
+  the Web UI / Windows MCP fixes are outside this subprocess lane: it uses
+  print mode only (`-p <prompt> --output-format stream-json`, pinned by the
+  argv regression) and starts no kimi server, so no new instruction channel
+  exists. The four real 2.5.3 contract cases pass against the installed CLI
+  in the pinned Node shape: headless invocation accepted with the
+  `system.version` / `turn.step.retrying` meta stream unchanged, `--yolo`
+  rejected alongside `-p`, baked `[[hooks]]` PreToolUse guard accepted, and
+  the MCP NDJSON initialize/tools-list handshake with parent-env pass-through.
+  The WI#206 fail-closed hook is unchanged.
+- `engines.node` (`>=22.19.0`) and the runtime dependencies (`ws`, `qrcode`,
+  `chokidar`) are identical to 2.5.2, so the pinned Node 22 base still
+  satisfies the CLI.
+
+**Gate re-verification on the fresh v2.2.7 clone:**
+
+- compile-out: `packages/cli/src/services/remote-tunnel.ts` keeps its path and
+  exact `run`/`ensure`/`hostname` importer surface; the real tree stubs
+  cleanly (exit 0), and after stubbing no scanned source under
+  `packages/{cli,server,schema,core}/src` retains an `@opentunnel` specifier.
+  `@opentunnel/client` remains declared but unimported. The diff from v2.2.6
+  adds no tunnel, pairing, share or relay file under
+  `packages/{cli,server,schema}/src`; the one matching path
+  (`commands/handlers/auth/shared.ts`) is credential plumbing.
+- reproducible build: `packages/cli/script/build.ts` retains the pinned
+  `--single` / `bytecode: true` / `splitting: true` anchors and
+  `prepare_reproducible_build.py` exits 0. Bun 1.4.4 and the
+  content-equivalent photon repair are unchanged, so the retired fixer stays
+  removed.
+- SDK surface: the generated client keeps all 6 bridge methods
+  (`session.create/prompt/interrupt`, top-level `permission.reply` beside
+  `permission.request.*`, `event.subscribe`, top-level `message.list`); both
+  known-stale paths stay absent (`session.message` exposes only `get`, and
+  `session.form.reply` is not `session.permission.reply`), and all 8 bridge
+  event names remain literals of the generated `V2Event` union — the
+  `sdk_surface_assert.ts` event gate run against the real v2.2.7
+  `generated/types.ts` exits 0. The typecheck compiler pin is unchanged:
+  `@typescript/native` is still `npm:typescript@7.1.0-beta` with `bin/tsc`.
+- SDK timing change (listed as breaking): the bridge calls none of
+  `agent.list`, `integration.list`, `usage.limits`, `vcs.init`, `rpc.call` or
+  `artifact.*` (grep over every non-test `scripts/*.ts`), so the removal of
+  their up-to-five-second startup wait is a no-op for this lane.
+- prompt cache warming: the `opencode.warming` plugin requires an explicit
+  top-level `warming` setting or a model/provider `cache.warming`; neither is
+  present in `config/opencode2.json`, so `Decision.Off()` applies and the lane
+  sends no background keep-alive requests. Nothing was turned off to get
+  there; `warming` is unset in the lane config. `interval: "auto"` only
+  refines timing when an operator enables warming.
+- shell output format: the new `Exit code: N` / timeout tail is produced in
+  `packages/core/src/shell/result.ts` as tool-output text. The executor reads
+  assistant messages (`message.list`) and event types, never the textual tail
+  of a shell result, and no fixture in
+  `scripts/opencode_task_executor_test.ts` matches the old tail.
+- `@opencode/ai`: the lane imports only `@opencode/client/promise`; the
+  removed `ImageResponse.image` cannot reach it.
+- no new opt-ins: `OPENCODE_FLAGS` stays unset; no MCP `pool: true`,
+  `experimental.all_flags`, `experimental.codemode_vm`, or `websearch.use`
+  entry is added. MCP login, Copilot routing, Console policy loading and
+  `opencode auth logout` changes are unused by the lane; the every-token
+  wrapper and boot-time `service.json` reset remain the exposure controls.
+
+**Local gate results (`taskset -c 0-17`):** opencode2 Python suites
+compile-out **10/10**, reproducible build **3/3**, exposure policy **68/68**,
+image config **11/11**, entrypoint config **11/11**, runtime smoke **50/50**;
+lane Bun suites executor, result, path, SDK surface + negative test, tool
+proxy, tool plugin, bridge and task runner **7/7** pass. The kimi real-CLI
+contract lane **4/4** passes against the installed 2.5.3 binary.
+
+**Not performed locally:** no full Kimi/OpenCode2 image build
+(`mt-admin build-kimi-worker` / `build-opencode2-worker`) and therefore no
+in-image `opencode --version`/binary marker scan, candidate-vs-clean-rebuild
+digest comparison, protected `worker-*-candidate`/scan jobs, or
+`worker-exposure-policy-guard` CI job run on this branch. Those remain the
+protected pipeline's gates after push/merge. No tenant rollout or live-model
+dispatch was performed.
+
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 
 **Review reconciliation and pins:** this re-attempt combines approved !2277
