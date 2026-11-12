@@ -1731,9 +1731,9 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   if [[ "$stage_state" == none ]]; then
     say "" >&2
     say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
-    # TD-4: restore any already-promoted worker :latest tags before restarting.
+    # TD-4: restore any already-promoted worker/sandbox :latest tags before restarting.
     restore_promoted_workers "$name" \
-      || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
+      || say "WARNING: could not restore every worker/sandbox :latest tag; see the warnings above" >&2
     set +e
     ( start_tenant "$name" )
     rc=$?
@@ -1747,10 +1747,10 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
 
   say "" >&2
   say "upgrade aborted: $cause; the new daemon was built$stage_note, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
-  # TD-4: restore old worker :latest tags before rebuilding the previous daemon
-  # so a "restored" report never leaves new worker images beside the old daemon.
+  # TD-4: restore old worker/sandbox :latest tags before rebuilding the previous
+  # daemon so a "restored" report never leaves new images beside the old daemon.
   restore_promoted_workers "$name" \
-    || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
+    || say "WARNING: could not restore every worker/sandbox :latest tag; see the warnings above" >&2
   set +e
   (
     set -e
@@ -1902,8 +1902,9 @@ upgrade_tenant_locked() {
     "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" "$sandbox_policy" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
-  # The candidate builds only read the checkout; the build lock guards the
-  # checkout/build sequence, which is over. Release it before build_tenant,
+  # Candidate builds read the tenant revision as its owner and build from
+  # operator archives; the build lock guards that checkout/build sequence.
+  # Release it before build_tenant,
   # which takes it again for the daemon build (a nested flock would deadlock).
   flock -u "$build_lock_fd" || die "failed to release build lock after candidate build"
   exec {build_lock_fd}>&-
@@ -1935,15 +1936,15 @@ upgrade_tenant_locked() {
   rm -f "$build_log"
 
   # Promote only after the daemon binary exists, so the new daemon and the new
-  # worker images switch together. A promote failure is recoverable by re-running
-  # `$0 promote-worker-images <name>`.
+  # worker/sandbox images switch together. A promote failure is recoverable by
+  # re-running `$0 promote-worker-images <name>`.
   # TD-3: run in a subshell so die() exits the subshell, not this process; the
   # || branch can then converge the tenant instead of leaving it stopped.
   local promote_rc=0
   ( set -e; promote_candidate_workers "$name" ) || promote_rc=$?
   if [[ "$promote_rc" -ne 0 ]]; then
     upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
-      "worker image promotion failed (exit $promote_rc)"
+      "worker/sandbox image promotion failed (exit $promote_rc)"
   fi
 
   local post_rc=0
