@@ -359,7 +359,7 @@ lw2studymcp surface:
 | `knowledge_list_topics` | Summarize topic coverage, versions, scopes, agents, statuses, and tags |
 | `knowledge_submit_note` | Validate and write a new note or replace the caller's own version |
 | `knowledge_update_status` | Patch lifecycle/provenance metadata without changing note content |
-| `knowledge_list_stale` | Find status-, age-, or source-commit-stale notes |
+| `knowledge_list_stale` | Find age- or source-commit-stale notes (an already-recorded stale status is not re-reported) |
 | `knowledge_stats` | Count documents, topics, statuses, and scopes |
 
 Reads default to the caller's private scope plus the `shared` herd scope and can

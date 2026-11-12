@@ -695,17 +695,18 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
             Some(confidence as f32)
         }
     };
+    // Parity with the canonical lw2studymcp store: a submission that omits
+    // studied_at is stamped now() rather than minting a NULL timestamp that
+    // would silently age from the document's update time (WI#597).
     let studied_at = match optional_string(params, "studied_at")? {
-        None => None,
-        Some(value) => Some(
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .map_err(|_| {
-                    ToolError::InvalidParameters(
-                        "studied_at must be an RFC 3339 timestamp".to_string(),
-                    )
-                })?
-                .with_timezone(&chrono::Utc),
-        ),
+        None => chrono::Utc::now(),
+        Some(value) => chrono::DateTime::parse_from_rfc3339(&value)
+            .map_err(|_| {
+                ToolError::InvalidParameters(
+                    "studied_at must be an RFC 3339 timestamp".to_string(),
+                )
+            })?
+            .with_timezone(&chrono::Utc),
     };
     let source_commit = optional_string(params, "source_commit")?;
     if let Some(ref commit) = source_commit
@@ -736,7 +737,7 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
             title: title.to_string(),
             status,
             confidence,
-            studied_at,
+            studied_at: Some(studied_at),
             source_commit,
             tags: optional_tags(params)?,
             superseded_by,
@@ -813,7 +814,7 @@ impl Tool for KnowledgeSubmitNoteTool {
                 },
                 "studied_at": {
                     "type": "string",
-                    "description": "RFC 3339 verification timestamp."
+                    "description": "RFC 3339 verification timestamp (default: now)."
                 },
                 "source_commit": {
                     "type": "string",
@@ -908,7 +909,11 @@ impl Tool for KnowledgeSubmitNoteTool {
 
 // ── knowledge_list_stale ───────────────────────────────────────────
 
-/// List notes needing verification by status, age, or source commit.
+/// List notes needing verification by age or source commit.
+///
+/// A stored `stale`/`needs-verification` status alone does not list a note:
+/// the decision is already recorded, and re-reporting it would keep it
+/// flagged on every sweep with nothing left to age out (WI#597).
 pub struct KnowledgeListStaleTool {
     resolver: Arc<dyn WorkspaceResolver>,
 }
@@ -927,13 +932,15 @@ impl Tool for KnowledgeListStaleTool {
     }
 
     fn description(&self) -> &str {
-        "List study notes needing verification: status stale/needs-verification, studied \
+        "List study notes whose age or source commit says they need re-verification: studied \
          older than max_age_days (or the note's own stale_after_days when no explicit limit \
-         is passed), or recorded against a different source commit. Pass the \
-         current repository commit when freshness materially affects your task. \
-         Coordination-origin wire notes are flagged untrusted in the output; pass \
-         include_coordination=false to exclude those unverified cross-tenant claims from \
-         routine sweeps that auto-process flagged notes."
+         is passed), or recorded against a different source commit. A note already marked \
+         stale/needs-verification is not listed for its status alone — that decision is \
+         already recorded; re-study it (status active with a fresh studied_at) or supersede \
+         it to retire it. Pass the current repository commit when freshness materially \
+         affects your task. Coordination-origin wire notes are flagged untrusted in the \
+         output; pass include_coordination=false to exclude those unverified cross-tenant \
+         claims from routine sweeps that auto-process flagged notes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1195,6 +1202,12 @@ fn parse_status_update(params: &serde_json::Value) -> Result<StatusUpdate, ToolE
 /// Merge a parsed update into existing metadata (canonical store semantics):
 /// only provided fields change, superseded notes must name their replacement,
 /// and leaving superseded without an explicit superseded_by clears it.
+///
+/// Moving a note into `stale`/`needs-verification` without an explicit
+/// timestamp and with nothing recorded yet stamps `studied_at` now(), so a
+/// batch flip cannot mint the NULL rows that keep re-flagging forever
+/// (WI#597). An existing timestamp is left alone, so re-marking a note does
+/// not reset its age clock, and an explicit null still clears it.
 fn apply_status_update(
     meta: &mut KnowledgeNoteMeta,
     update: StatusUpdate,
@@ -1204,7 +1217,11 @@ fn apply_status_update(
     if let MetadataPatch::Set(tags) = update.tags {
         meta.tags = tags;
     }
+    let studied_at_absent = matches!(&update.studied_at, MetadataPatch::Absent);
     apply_patch(update.studied_at, &mut meta.studied_at);
+    if studied_at_absent && meta.studied_at.is_none() && meta.status.is_unverified() {
+        meta.studied_at = Some(chrono::Utc::now());
+    }
     apply_patch(update.source_commit, &mut meta.source_commit);
     if let Some(days) = update.stale_after_days {
         meta.stale_after_days = Some(days);
@@ -1245,10 +1262,11 @@ impl Tool for KnowledgeUpdateStatusTool {
         "Update a study note's lifecycle and verification metadata — status, confidence, tags, \
          studied timestamp, source commit, staleness threshold, status reason, supersession — \
          without changing its content. Only provided fields change; explicit null clears \
-         nullable fields. Moving to 'superseded' requires superseded_by; moving away from \
-         'superseded' clears superseded_by unless provided. Content changes require \
-         knowledge_submit_note with replace=true on your own agent's version. Targets your \
-         private scope unless scope='shared'."
+         nullable fields. Moving to stale/needs-verification with no timestamp and none \
+         recorded stamps studied_at now() so the note can age out. Moving to 'superseded' \
+         requires superseded_by; moving away from 'superseded' clears superseded_by unless \
+         provided. Content changes require knowledge_submit_note with replace=true on your \
+         own agent's version. Targets your private scope unless scope='shared'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1281,7 +1299,7 @@ impl Tool for KnowledgeUpdateStatusTool {
                 },
                 "studied_at": {
                     "type": ["string", "null"],
-                    "description": "RFC 3339 verification timestamp; null clears."
+                    "description": "RFC 3339 verification timestamp; null clears. When moving to stale/needs-verification, omission stamps now() if none is recorded."
                 },
                 "source_commit": {
                     "type": ["string", "null"],
@@ -1512,26 +1530,59 @@ mod tests {
     #[test]
     fn stale_selection_can_exclude_coordination_notes() {
         let now = chrono::Utc::now();
-        let wire = KnowledgeNoteRow {
+        // Both rows are genuinely aged, so both are flagged on their own
+        // merits (status alone no longer flags — see WI#597).
+        let aged = now - chrono::Duration::days(60);
+        let mut wire_row = KnowledgeNoteRow {
             scope: "shared".to_string(),
             path: note_path("coord-alice-0123456789abcdef01234567", "wire-topic"),
-            updated_at: now,
+            updated_at: aged,
             meta: sample_meta(&[COORDINATION_TAG]),
         };
-        let local = KnowledgeNoteRow {
+        wire_row.meta.stale_after_days = Some(30);
+        let mut local_row = KnowledgeNoteRow {
             scope: "shared".to_string(),
             path: note_path("kimi-1", "local-topic"),
-            updated_at: now,
+            updated_at: aged,
             meta: sample_meta(&["memory"]),
         };
-        let rows = vec![wire, local];
+        local_row.meta.stale_after_days = Some(30);
+        let rows = vec![wire_row, local_row];
 
-        // sample_meta is needs-verification, so both rows are flagged.
         let all = select_stale_rows(&rows, true, None, None, 10);
         assert_eq!(all.len(), 2);
         let without_wire = select_stale_rows(&rows, false, None, None, 10);
         assert_eq!(without_wire.len(), 1);
         assert_eq!(without_wire[0].meta.tags, vec!["memory".to_string()]);
+    }
+
+    #[test]
+    fn stale_selection_ignores_bare_status() {
+        let now = chrono::Utc::now();
+        // sample_meta is needs-verification with a fresh updated_at: the
+        // already-recorded decision must not re-flag it on every sweep.
+        let row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "local-topic"),
+            updated_at: now,
+            meta: sample_meta(&["memory"]),
+        };
+        let rows = [row];
+        assert!(select_stale_rows(&rows, true, None, None, 10).is_empty());
+        // Age still flags it.
+        let mut aged_row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "aged-topic"),
+            updated_at: now - chrono::Duration::days(60),
+            meta: sample_meta(&["memory"]),
+        };
+        aged_row.meta.stale_after_days = Some(30);
+        let aged_rows = [aged_row];
+        assert_eq!(
+            select_stale_rows(&aged_rows, true, None, None, 10).len(),
+            1,
+            "age past the note's own threshold flags it"
+        );
     }
 
     struct UnusedResolver;
@@ -1624,6 +1675,25 @@ mod tests {
         );
         assert_eq!(parsed.meta.status_reason, None);
         assert_eq!(parsed.meta.superseded_by, None);
+        // Omitting studied_at stamps now() instead of storing NULL (WI#597).
+        assert!(
+            parsed.meta.studied_at.is_some(),
+            "submission defaults studied_at to now"
+        );
+        // An explicit timestamp is honoured verbatim.
+        let explicit = serde_json::json!({
+            "agent": "kimi-1", "topic": "t", "title": "x", "content": "y",
+            "studied_at": "2026-08-06T10:00:00Z"
+        });
+        let parsed = validate_submission(&explicit).unwrap();
+        assert_eq!(
+            parsed.meta.studied_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-06T10:00:00Z")
+                    .expect("literal timestamp parses")
+                    .with_timezone(&chrono::Utc)
+            )
+        );
     }
 
     #[test]
@@ -1721,6 +1791,37 @@ mod tests {
 
         // status is required.
         assert!(parse_status_update(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn status_update_stamps_studied_at_for_unverified_status() {
+        // Flipping a note into an unverified status with no timestamp and
+        // none recorded stamps now(), so a batch flip cannot mint a NULL row
+        // that later re-flags forever (WI#597).
+        let mut meta = sample_meta(&["memory"]);
+        assert_eq!(meta.studied_at, None);
+        let update = parse_status_update(&serde_json::json!({"status": "stale"})).unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        let stamped = meta.studied_at.expect("stamped on flip to stale");
+
+        // An existing timestamp is preserved: re-marking must not reset the
+        // note's age clock.
+        let update =
+            parse_status_update(&serde_json::json!({"status": "needs-verification"})).unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.studied_at, Some(stamped));
+
+        // Explicit null is a deliberate clear and stays cleared.
+        let update =
+            parse_status_update(&serde_json::json!({"status": "stale", "studied_at": null}))
+                .unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.studied_at, None);
+
+        // Returning to active does not fabricate a verification time.
+        let update = parse_status_update(&serde_json::json!({"status": "active"})).unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.studied_at, None);
     }
 
     #[test]

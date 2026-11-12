@@ -58,7 +58,10 @@ only when the user requested recording or maintaining shared notes.
   for findings verified against current source in this session.
 - Include `source_commit`, `confidence`, and lowercase `tags` when known.
 - `stale_after_days` sets a per-note staleness threshold (default 90 days);
-  `status_reason` records why a lifecycle status was chosen.
+  `status_reason` records why a lifecycle status was chosen. `studied_at`
+  defaults to now on submit, and moving a note to `stale`/`needs-verification`
+  with no timestamp and none recorded stamps now, so notes never sit on an
+  unset verification time that could only age from the document update.
 - Adjust lifecycle later with `knowledge_update_status` — metadata only
   (status, confidence, tags, studied timestamp, source commit, staleness
   threshold, status reason, supersession). Content changes always go through
@@ -77,8 +80,11 @@ only when the user requested recording or maintaining shared notes.
   path; no external MCP required).
 - `knowledge_update_status`: Metadata-only lifecycle updates on an existing
   note version; `superseded` requires `superseded_by`.
-- `knowledge_list_stale`: Notes needing verification by status, age (explicit
-  limit or the note's own `stale_after_days`), or source commit.
+- `knowledge_list_stale`: Notes needing verification by age (explicit
+  limit or the note's own `stale_after_days`) or source commit. An
+  already-recorded `stale`/`needs-verification` status is not re-reported on
+  its own; re-study the note (`knowledge_update_status` with `active` and a
+  fresh `studied_at`) or supersede it to retire it.
 - `knowledge_stats`: Store totals, lifecycle status counts, per-scope counts.
 
 ## Search patterns
