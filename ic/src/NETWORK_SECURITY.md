@@ -401,7 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default off Linux) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (Linux default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
-| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; custom joined-run DNS removes direct uplink DNS rules | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. Core NetBird 0.82.0 interoperability is live-validated in WI#600; custom DNS fails closed in WI#603 |
+| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; WireGuard custom joined-run DNS removes direct uplink DNS rules, NetBird custom DNS is rejected | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. Core NetBird 0.82.0 interoperability is live-validated in WI#600; WI#603 rejects custom DNS before runtime |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#537, v2.2.0.0):** on Linux the in-code default and new
@@ -461,15 +461,16 @@ replace the complete table atomically, with no unfiltered delete/rebuild window:
 The default runtime-resolver DNS allowance is the one residual uplink channel:
 recursive DNS can carry query-based exfiltration even though other uplink,
 host-loopback, LAN, and metadata connections are unreachable.
-`SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay resolver files
-`ro,z` into joined runs only and removes every direct uplink DNS accept. The
-sidecar retains its runtime resolver file for bootstrap, but the same chain
-drops its own unmarked post-start lookups too. The WI#600 live run confirmed
-that NetBird's local resolver listens on the sidecar's overlay IP but its
-upstream writes are unmarked: joined lookups return `SERVFAIL`, the client log
-reports `operation not permitted`, and no query reaches the uplink. Custom
-NetBird DNS is therefore unsupported; WI#603 retains the reconnect investigation
-and any fix, so default runtime DNS is required for NetBird.
+For WireGuard, `SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay
+resolver files `ro,z` into joined runs only and removes every direct uplink DNS
+accept. The sidecar retains its runtime resolver file for bootstrap, but the
+same chain drops its own unmarked post-start lookups too. The WI#600 live run
+confirmed that NetBird's local resolver listens on the sidecar's overlay IP but
+its upstream writes are unmarked: joined lookups returned `SERVFAIL`, the client
+log reported `operation not permitted`, and no query reached the uplink. WI#603
+therefore rejects `SANDBOX_TUNNEL_DNS` with NetBird during configuration
+validation, before any runtime call; default runtime DNS is required for
+NetBird.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -499,14 +500,21 @@ advanced-routing socket marks remain active.
 Every start/health check hashes the resolved local image ID so tag rotation
 recreates the sidecar. Missing `nft`, an unhealthy provider, or an
 altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
-to another tier. Cold starts keep the full configured startup timeout. Per-run
-recovery re-probes for at most 6 seconds, allows a fresh provider at most 20
-seconds (or the lower configured timeout), and caps the initial health check,
-recovery, and final verification together at 60 seconds. A failure retains its
-probe reason in a 30-second back-off: subsequent commands fail immediately
-until one retries after the window. Recovery runs in a sidecar-owned task that
-survives caller cancellation, finishes partial-start cleanup, and records the
-result before waking later callers. No container ID becomes joinable before the
+to another tier. Cold starts re-probe an existing sidecar for at most 6 seconds
+and keep the full configured startup timeout for a fresh provider; image pull,
+runtime start, and provider readiness have separate bounds rather than one cold
+wall-clock cap. Per-run recovery uses the same 6-second re-probe, allows a fresh
+provider at most 20 seconds (or the lower configured timeout), and caps the
+initial health check, recovery, and final verification together at 60 seconds.
+A provider that needs longer after recreation requires a daemon restart. A
+failure retains its probe reason in a 30-second back-off: subsequent commands
+fail immediately until one retries after the window. Recovery runs in a
+sidecar-owned task that survives caller cancellation, finishes partial-start
+cleanup, and records the result before waking later callers. A result channel
+that closes without completion also records a failure matched to its own
+attempt. Shutdown marks recovery stopping, uses bounded waits, and checks
+before/after starts to remove late containers; an explicit cold start can later
+clear the stop and cached failure. No container ID becomes joinable before the
 firewall verifies.
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
@@ -518,8 +526,8 @@ separate salted hash of instance, management URL, and setup key only. Its
 32-byte identity salt is a regular, non-symlink mode-0600 file at
 `<base>/sandbox-tunnel-identity.salt`, inside the base directory already masked
 from sandbox mounts; it is independent of the ephemeral runtime label salt.
-Host reboots, runtime-directory replacement, image changes, and DNS changes do
-not spend another setup key. Upgrading from the former runtime-salted volume
+Host reboots, runtime-directory replacement, and image changes do not spend
+another setup key. Upgrading from the former runtime-salted volume
 name causes one deliberate re-enrolment; subsequent URL/key rotation alone
 changes the identity. After a removal, and only once
 the runtime reports the container gone, the deterministic transient helper unit
