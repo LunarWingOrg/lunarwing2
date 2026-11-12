@@ -278,6 +278,8 @@ async fn exercise_agent(config: &LiveConfig) {
         .env("SSH_AUTH_SOCK", &socket)
         .args(["-F", "/dev/null", "-T", "-p"])
         .arg(config.port.to_string())
+        .arg("-i")
+        .arg(config.client_key.with_extension("pub"))
         .args([
             "-o",
             "IdentitiesOnly=yes",
