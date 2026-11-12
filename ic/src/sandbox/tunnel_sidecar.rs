@@ -241,6 +241,12 @@ impl TunnelSidecarConfig {
                     .into(),
             );
         }
+        if self.provider == TunnelProvider::Netbird && !self.dns.is_empty() {
+            return Err(
+                "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+                    .into(),
+            );
+        }
         if self
             .wireguard_canary
             .as_ref()
@@ -2882,10 +2888,30 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_skips_sidecar_and_closes_uplink_dns() {
+    fn netbird_custom_dns_is_rejected_without_leaking_credentials() {
+        assert!(netbird_cfg().validate().is_ok());
+        let cfg = TunnelSidecarConfig {
+            dns: vec!["100.100.0.53".parse().unwrap()],
+            ..netbird_cfg()
+        };
+        let error = cfg.validate().unwrap_err();
+        assert_eq!(
+            error,
+            "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+        );
+        assert!(!error.contains("setup-key-1"));
+        let misplaced_canary = TunnelSidecarConfig {
+            wireguard_canary: Some("10.0.0.1".parse().unwrap()),
+            ..netbird_cfg()
+        };
+        assert!(misplaced_canary.validate().is_err());
+    }
+
+    #[test]
+    fn wireguard_custom_dns_skips_sidecar_and_closes_uplink_dns() {
         let cfg = TunnelSidecarConfig {
             dns: vec!["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()],
-            ..netbird_cfg()
+            ..wireguard_cfg(None)
         };
         let args = build_sidecar_args(&cfg, None, "tunnel-test", "test-instance", "deadbeef", None)
             .join(" ");
@@ -2897,14 +2923,9 @@ mod tests {
         );
         let invalid = TunnelSidecarConfig {
             dns: vec!["0.0.0.0".parse().unwrap()],
-            ..netbird_cfg()
+            ..wireguard_cfg(None)
         };
         assert!(invalid.validate().is_err());
-        let misplaced_canary = TunnelSidecarConfig {
-            wireguard_canary: Some("10.0.0.1".parse().unwrap()),
-            ..netbird_cfg()
-        };
-        assert!(misplaced_canary.validate().is_err());
     }
 
     #[test]
@@ -2924,7 +2945,7 @@ mod tests {
             assert!(!valid_tunnel_address(&address), "accepted {address}");
             let dns = TunnelSidecarConfig {
                 dns: vec![address],
-                ..netbird_cfg()
+                ..wireguard_cfg(None)
             };
             assert!(dns.validate().is_err(), "DNS accepted {address}");
             let canary = TunnelSidecarConfig {
