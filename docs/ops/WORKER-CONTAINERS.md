@@ -1996,7 +1996,9 @@ committed pin — no v1 change.
   event names remain literals of the generated `V2Event` union — the
   `sdk_surface_assert.ts` event gate run against the real v2.2.7
   `generated/types.ts` exits 0. The typecheck compiler pin is unchanged:
-  `@typescript/native` is still `npm:typescript@7.1.0-beta` with `bin/tsc`.
+  `@typescript/native` is still `npm:typescript@7.1.0-beta` with `bin/tsc`, and
+  `tsc --noEmit -p scripts/tsconfig.sdk-surface.json` against the v2.2.7
+  checkout (mapped through the committed `paths`) exits 0.
 - SDK timing change (listed as breaking): the bridge calls none of
   `agent.list`, `integration.list`, `usage.limits`, `vcs.init`, `rpc.call` or
   `artifact.*` (grep over every non-test `scripts/*.ts`), so the removal of
