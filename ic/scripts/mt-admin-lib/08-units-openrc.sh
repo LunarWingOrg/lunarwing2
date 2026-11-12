@@ -1567,8 +1567,8 @@ stop_tenant_openrc() {
   # Container babysitters must stop before their containers or they immediately respawn them.
   for worker in nanocode pebble opencode kimi opencode2 lunardepth vision voice; do
     _openrc_stop_service_if_installed "lunarwing-${worker}-${name}-sup" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-${worker}-task-${name}-sup" || stop_failed=true
   done
-  _openrc_stop_service_if_installed "lunarwing-lunardepth-task-${name}-sup" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-vision-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-voice-${name}" || stop_failed=true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
