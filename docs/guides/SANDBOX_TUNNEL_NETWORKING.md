@@ -19,7 +19,7 @@ unchanged, and mt-admin preserves every operator-set tier on re-render.
 |---|---|---|
 | `none` (default off Linux) | no network | kernel-enforced `--network none` |
 | `proxy-enforced` (Linux default) | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy; no credential injection |
-| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and, by default, DNS to the sidecar's resolvers on the uplink; `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes that direct uplink allowance |
+| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and, by default, DNS to the sidecar's resolvers on the uplink; WireGuard `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes that direct uplink allowance; NetBird rejects the setting |
 | `proxy` | legacy public HTTP(S) | advisory env-var proxy; direct bypass remains possible |
 
 What a sandboxed command can reach in `tunnel` mode is exactly what the tunnel
