@@ -183,20 +183,24 @@ a truly fresh workspace, and the agent clears it once onboarding completes.
 The full 9-step wizard remains available via `lunarwing onboard`.
 
 After a successful full or quick onboarding run, the wizard offers optional
-background-service installation:
+background-service installation when the resolved identity is permitted:
 - macOS: launchd
 - Linux with systemd: user unit under `~/.config/systemd/user/`
 - Linux with OpenRC: system service under `/etc/init.d/` (requires root; the
   wizard prints the exact `sudo` command when needed)
 
+Every installer refuses a root daemon before writing service files unless
+`LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set. systemd and launchd run the
+daemon as the invoking user, so run their installers as the intended service
+account without `sudo`; a direct-root invocation is refused. The wizard does
+not offer an installation that these checks would refuse.
+
 OpenRC installation derives the daemon's runtime user from `SUDO_USER`, then
-`USER`, and resolves that account's actual primary group. It refuses a uid-0
-runtime identity before writing service files. Run the installer through `sudo`
-from the intended non-root service account; a direct-root or provisioning
-environment that deliberately requires a root daemon must opt in explicitly
-with `LUNARWING_ALLOW_ROOT_SERVICE=1`. An unknown service user or unresolvable
-primary group also aborts installation rather than generating an invalid
-service configuration.
+`USER`, and resolves that account's actual primary group. Run the installer
+through `sudo` from the intended non-root service account. A uid-0 runtime
+identity or primary gid 0 requires the same explicit opt-in. An unknown service
+user or unresolvable primary group also aborts installation rather than
+generating an invalid service configuration.
 
 The watchdog installer follows the same service-manager split:
 
