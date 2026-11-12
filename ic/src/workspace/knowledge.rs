@@ -243,21 +243,26 @@ impl KnowledgeNoteMeta {
 
     /// Whether this note needs verification given age/commit criteria.
     ///
-    /// A note is stale when its status is `stale`/`needs-verification`, when
-    /// it was studied more than the effective age limit ago (falling back to
-    /// `updated_at` when no studied timestamp is recorded), or when its
-    /// source commit differs from `repository_commit`. The effective age
-    /// limit is the caller's `max_age_days` when given, otherwise the note's
-    /// own `stale_after_days` threshold (canonical lw2studymcp semantics).
+    /// Age drift and source-commit drift decide the flag; a stored
+    /// `stale`/`needs-verification` status does not on its own. That status
+    /// records a decision already taken, so reporting it again would keep an
+    /// already-retired note in every sweep with nothing left to age out
+    /// (WI#597). Re-studying the note (`active` with a fresh `studied_at`) or
+    /// superseding it clears the flag; a note that is still aged stays
+    /// flagged until one of those happens.
+    ///
+    /// A note needs verification when it was studied more than the effective
+    /// age limit ago (falling back to `updated_at` when no studied timestamp
+    /// is recorded), or when its source commit differs from
+    /// `repository_commit`. The effective age limit is the caller's
+    /// `max_age_days` when given, otherwise the note's own
+    /// `stale_after_days` threshold (canonical lw2studymcp semantics).
     pub fn needs_verification(
         &self,
         updated_at: DateTime<Utc>,
         max_age_days: Option<i64>,
         repository_commit: Option<&str>,
     ) -> bool {
-        if self.status.is_unverified() {
-            return true;
-        }
         let age_limit_days = max_age_days.or_else(|| self.stale_after_days.map(i64::from));
         if let Some(days) = age_limit_days {
             let studied = self.studied_at.unwrap_or(updated_at);
@@ -727,9 +732,13 @@ mod tests {
         meta.studied_at = Some(now);
         // Active, fresh, matching commit.
         assert!(!meta.needs_verification(now, Some(30), Some("abc123")));
-        // Status alone triggers.
+        // Status alone does not flag: the decision is already recorded, and
+        // re-reporting it would keep the note in every sweep forever.
         meta.status = KnowledgeStatus::NeedsVerification;
-        assert!(meta.needs_verification(now, None, None));
+        assert!(!meta.needs_verification(now, None, None));
+        assert!(!meta.needs_verification(now, Some(30), Some("abc123")));
+        // ...but age and commit drift still do, whatever the status.
+        assert!(meta.needs_verification(now, Some(30), Some("other")));
         meta.status = KnowledgeStatus::Active;
         // Commit mismatch triggers.
         assert!(meta.needs_verification(now, None, Some("other")));
@@ -742,6 +751,11 @@ mod tests {
         assert!(!meta.needs_verification(now, Some(120), None));
         // No studied_at falls back to updated_at.
         meta.studied_at = None;
+        assert!(meta.needs_verification(now - chrono::Duration::days(90), Some(30), None));
+        // A stale note flipped with no timestamp ages out of the sweep once
+        // updated_at is younger than the threshold (the WI#597 batch flip).
+        meta.status = KnowledgeStatus::Stale;
+        assert!(!meta.needs_verification(now, Some(30), None));
         assert!(meta.needs_verification(now - chrono::Duration::days(90), Some(30), None));
     }
 
