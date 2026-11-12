@@ -201,6 +201,10 @@ So the reliable sequence for a brand-new key is: **upload → restart daemon**.
 
 ## Verifying it works
 
+### Disposable loopback handshake test
+
+Run `ic/scripts/live-tests/ssh-live.sh` as an unprivileged user on a Linux host with OpenSSH, Git, Python 3, Cargo, and `taskset`. The opt-in harness generates throwaway keys and repositories, starts plain and certificate-only `sshd` listeners on loopback, and removes them all on exit. It drives the real `ssh` tool, host-key refusal paths, agent listing/signing, and `ssh_git` clone/fetch; it does not read or modify tenant SSH configuration, `~/.ssh`, or a running daemon.
+
 ### From the host: check the API
 
 ```bash
