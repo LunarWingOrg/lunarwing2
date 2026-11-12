@@ -249,7 +249,8 @@ impl KnowledgeNoteMeta {
     /// already-retired note in every sweep with nothing left to age out
     /// (WI#597). Re-studying the note (`active` with a fresh `studied_at`) or
     /// superseding it clears the flag; a note that is still aged stays
-    /// flagged until one of those happens.
+    /// flagged until one of those happens. Superseded notes are retired and
+    /// never flagged, matching the canonical store's sweep.
     ///
     /// A note needs verification when it was studied more than the effective
     /// age limit ago (falling back to `updated_at` when no studied timestamp
@@ -263,6 +264,9 @@ impl KnowledgeNoteMeta {
         max_age_days: Option<i64>,
         repository_commit: Option<&str>,
     ) -> bool {
+        if self.status == KnowledgeStatus::Superseded {
+            return false;
+        }
         let age_limit_days = max_age_days.or_else(|| self.stale_after_days.map(i64::from));
         if let Some(days) = age_limit_days {
             let studied = self.studied_at.unwrap_or(updated_at);
@@ -757,6 +761,14 @@ mod tests {
         meta.status = KnowledgeStatus::Stale;
         assert!(!meta.needs_verification(now, Some(30), None));
         assert!(meta.needs_verification(now - chrono::Duration::days(90), Some(30), None));
+        // Superseded notes are retired: neither age nor commit drift flags
+        // them, matching the canonical store's stale sweep.
+        meta.status = KnowledgeStatus::Superseded;
+        assert!(!meta.needs_verification(
+            now - chrono::Duration::days(400),
+            Some(30),
+            Some("other")
+        ));
     }
 
     #[test]
