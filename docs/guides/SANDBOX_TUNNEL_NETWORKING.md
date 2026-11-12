@@ -85,21 +85,26 @@ re-probe and bounded inspection, firewall, and cleanup probes. A shell caller
 can time out first; the sidecar-owned attempt still finishes and records its
 result.
 
-Per-command recovery instead re-probes an existing sidecar for at most **6
-seconds**, waits at most **20 seconds** for a fresh provider (or the configured
-startup timeout when lower), and caps the initial health check, recovery, and
-final verification together at **60 seconds**. The per-run error names the
-failed image, runtime, handshake, canary, `netbird status`, or firewall probe.
-If a provider needs longer than the 20-second cap after recreation, the error
-and this contract require a daemon restart so the cold-start budget applies. A
-failed recovery is cached for **30 seconds**: commands inside that window return
-the original reason and the time until the next attempt immediately, without
-more container churn. After the window, one command tries again. Recovery is
-owned by the sidecar rather than the caller: cancelling a short shell command or
-stopping it does not cancel the attempt, its cleanup, or recording of its
-result. Later callers await that same attempt and then use its recorded
-back-off. If the task ends without publishing a result, the closed channel is
-also converted into a recorded failure instead of wedging later commands.
+Each per-command health-verification chain has its own **65-second ceiling**,
+separate from recovery's **60-second budget**. The health ceiling bounds the
+seven sequential probes below their aggregate 70 seconds of individual
+10-second deadlines, without rejecting a slow but successful chain merely for
+crossing 60 seconds. Recovery re-probes an existing sidecar for at most **6
+seconds** and waits at most **20 seconds** for a fresh provider (or the
+configured startup timeout when lower); the final verification has another
+65-second health ceiling. The per-run error names the failed image, runtime,
+handshake, canary, `netbird status`, or firewall probe. A health-check timeout
+never claims that recovery ran, and only an actual failed recovery is cached
+for **30 seconds**: commands inside that window return the original reason and
+the time until the next attempt immediately, without more container churn.
+After the window, one command tries again. If a provider needs longer than the
+20-second cap after recreation, the error and this contract require a daemon
+restart so the cold-start budget applies. Recovery is owned by the sidecar
+rather than the caller: cancelling a short shell command or stopping it does
+not cancel the attempt, its cleanup, or recording of its result. Later callers
+await that same attempt and then use its recorded back-off. If the task ends
+without publishing a result, the closed channel is also converted into a
+recorded failure instead of wedging later commands.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
