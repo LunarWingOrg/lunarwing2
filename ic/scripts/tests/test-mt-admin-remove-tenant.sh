@@ -89,7 +89,7 @@ _ctr() {
   local name="$1"
   shift
   record "${FAKE_RUNTIME}:$name $*"
-  local command="${1:-}" container path
+  local command="${1:-}" container path network_filter exclude_keeper
   case "$command" in
     container)
       shift
@@ -134,10 +134,31 @@ _ctr() {
       ;;
     ps)
       [[ "$PS_FAIL" != true ]] || return 1
+      shift
+      network_filter=""
+      exclude_keeper=false
+      while (($# > 0)); do
+        case "$1" in
+          --all) shift ;;
+          --filter)
+            case "${2:-}" in
+              network=*) network_filter="${2#network=}" ;;
+              'label!=lunarwing.purpose=worker-egress-keeper') exclude_keeper=true ;;
+              *) return 1 ;;
+            esac
+            shift 2
+            ;;
+          --format) shift 2 ;;
+          *) return 1 ;;
+        esac
+      done
+      [[ "$network_filter" == "lw-egress-alpha" ]] || return 1
       for path in "$RUNTIME_DIR"/containers/*; do
         [[ -f "$path" ]] && printf '%s\n' "${path##*/}"
       done
-      [[ ! -f "$RUNTIME_DIR/keeper" ]] || printf 'lw-egress-keeper-alpha-infra\n'
+      if [[ "$exclude_keeper" != true && -f "$RUNTIME_DIR/keeper" ]]; then
+        printf '0123456789ab-infra\n'
+      fi
       ;;
     pod)
       case "${2:-}" in
@@ -152,6 +173,10 @@ _ctr() {
     network)
       [[ "${2:-}" == rm ]] || return 1
       command rm -f -- "$RUNTIME_DIR/network"
+      if [[ "$NETWORK_RM_MISSING" == true ]]; then
+        printf 'network lw-egress-%s not found\n' "$name" >&2
+        return 1
+      fi
       ;;
     *) return 0 ;;
   esac
@@ -161,6 +186,9 @@ worker_egress_nft() {
   local name="$1"
   shift
   record "nft:$name $*"
+  case " $* " in
+    *" flush chain "*|*" delete chain "*) command rm -f -- "$RUNTIME_DIR/chains" ;;
+  esac
 }
 
 seed_unit() {
@@ -195,6 +223,7 @@ setup_case() {
   FAIL_VOLUME=""
   ALLOW_FAILED_STOP=false
   PS_FAIL=false
+  NETWORK_RM_MISSING=false
   mkdir -p "$RUNTIME_DIR/containers" "$RUNTIME_DIR/volumes" \
     "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" \
     "$OPENRC_RUNLEVELS_DIR/default" "$OPENRC_RUNLEVELS_DIR/custom" \
@@ -205,6 +234,7 @@ setup_case() {
   : >"$WORKER_EGRESS_DIR/alpha.hosts"
   : >"$RUNTIME_DIR/network"
   : >"$RUNTIME_DIR/keeper"
+  : >"$RUNTIME_DIR/chains"
 
   for lane in "${WORKER_LANES[@]}"; do
     printf 'running\n' >"$(_container_file "lunarwing-${lane}-alpha")"
@@ -261,11 +291,11 @@ assert_no_container_left() {
       return
     fi
   done
-  [[ ! -e "$RUNTIME_DIR/keeper" && ! -e "$RUNTIME_DIR/network" ]] || {
-    fail "$INIT_SYSTEM left the keeper or egress network"
+  [[ ! -e "$RUNTIME_DIR/keeper" && ! -e "$RUNTIME_DIR/network" && ! -e "$RUNTIME_DIR/chains" ]] || {
+    fail "$INIT_SYSTEM left the keeper, chains, or egress network"
     return
   }
-  pass "$INIT_SYSTEM removed every worker, IPC volume, keeper, and network"
+  pass "$INIT_SYSTEM removed every worker, IPC volume, keeper, chain, and network"
 }
 
 assert_removals_before_flush() {
@@ -284,6 +314,21 @@ assert_removals_before_flush() {
   pass "$INIT_SYSTEM removes both roles of every lane before the first nft flush"
 }
 
+assert_teardown_order() {
+  local ps_line flush_line keeper_line network_line
+  ps_line="$(line_of 'podman:alpha ps --all --filter network=lw-egress-alpha')"
+  flush_line="$(line_of 'nft:alpha flush chain')"
+  keeper_line="$(line_of 'podman:alpha pod rm -f lw-egress-keeper-alpha')"
+  network_line="$(line_of 'podman:alpha network rm lw-egress-alpha')"
+  if [[ -z "$ps_line" || -z "$flush_line" || -z "$keeper_line" || -z "$network_line" ]]; then
+    fail "$INIT_SYSTEM skipped a required egress teardown step"
+  elif ((ps_line < flush_line && flush_line < keeper_line && keeper_line < network_line)); then
+    pass "$INIT_SYSTEM checks, flushes, removes the keeper, then removes the network"
+  else
+    fail "$INIT_SYSTEM egress teardown order is unsafe"
+  fi
+}
+
 run_success_case() {
   local init="$1" purge="$2" rc=0 lane unit_line reload_line first_rm
   setup_case "$init" "$purge"
@@ -294,6 +339,7 @@ run_success_case() {
   fi
   pass "$init purge=$purge remove-tenant succeeds"
   assert_removals_before_flush
+  assert_teardown_order
   assert_no_container_left
   assert_no_unit_left
   for lane in "${WORKER_LANES[@]}"; do
@@ -338,6 +384,7 @@ run_remove_failure_case() {
   local init="$1" rc=0
   setup_case "$init" false
   FAIL_RM_CONTAINER="lunarwing-opencode2-task-alpha"
+  ALLOW_FAILED_STOP=true
   (remove_tenant alpha false) >"$CASE_DIR/remove.out" 2>&1 || rc=$?
   [[ "$rc" -ne 0 ]] || fail "$init removal succeeded despite a container removal failure"
   if grep -q 'nft:alpha flush chain' "$CALL_LOG"; then
@@ -345,7 +392,33 @@ run_remove_failure_case() {
   else
     pass "$init container removal failure aborts before any nft flush"
   fi
+  if grep -Fq "ERROR: failed to stop and remove tenant container $FAIL_RM_CONTAINER" "$CASE_DIR/remove.out"; then
+    pass "$init propagates the container rm failure before attachment checking"
+  else
+    fail "$init did not propagate the container rm failure itself"
+  fi
   [[ -f "$(_container_file "$FAIL_RM_CONTAINER")" ]] || fail "$init lost the failed-container fixture"
+}
+
+run_volume_failure_case() {
+  local rc=0
+  setup_case openrc false
+  FAIL_VOLUME="lunarwing-kimi-alpha-ipc-v2"
+  (remove_tenant alpha false) >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail 'removal succeeded despite a volume removal failure'
+  if grep -q 'nft:alpha flush chain' "$CALL_LOG"; then
+    fail 'egress was flushed after a volume removal failure'
+  else
+    pass 'volume removal failure aborts before any nft flush'
+  fi
+  if grep -Fq "ERROR: failed to remove worker IPC volume $FAIL_VOLUME" "$CASE_DIR/remove.out"; then
+    pass 'volume rm failure is propagated before egress teardown'
+  else
+    fail 'volume rm failure was not propagated'
+  fi
+  [[ -f "$(_volume_file "$FAIL_VOLUME")" ]] || fail 'failed-volume fixture was discarded'
+  [[ -f "$RUNTIME_DIR/keeper" && -f "$RUNTIME_DIR/chains" && -f "$RUNTIME_DIR/network" ]] \
+    || fail 'volume failure did not preserve the live egress fixture'
 }
 
 run_attached_teardown_refusal() {
@@ -359,23 +432,28 @@ run_attached_teardown_refusal() {
   else
     pass "egress teardown refuses attachments/query_failure=$query_failure before flushing"
   fi
-  [[ -f "$WORKER_EGRESS_DIR/alpha.conf" && -f "$RUNTIME_DIR/network" ]] \
-    || fail "refused teardown discarded state needed for retry"
+  if [[ -f "$WORKER_EGRESS_DIR/alpha.conf" && -f "$RUNTIME_DIR/network" \
+    && -f "$RUNTIME_DIR/keeper" && -f "$RUNTIME_DIR/chains" ]]; then
+    pass "refusal query_failure=$query_failure preserves keeper, chains, network, and rendered state"
+  else
+    fail "refused teardown discarded state needed for retry"
+  fi
 }
 
 run_rootful_docker_case() {
-  local rc=0
+  local missing_network="$1" rc=0
   setup_case openrc false
   FAKE_RUNTIME=docker
   CONTAINER_RT=docker
   MT_ROOTLESS=false
+  NETWORK_RM_MISSING="$missing_network"
   command rm -f -- "$RUNTIME_DIR/keeper"
   (remove_tenant alpha false) >"$CASE_DIR/remove.out" 2>&1 || rc=$?
   [[ "$rc" -eq 0 ]] || {
     fail "rootful Docker remove-tenant failed: $(command cat "$CASE_DIR/remove.out")"
     return
   }
-  pass 'rootful Docker remove-tenant succeeds without a namespace keeper'
+  pass "rootful Docker remove-tenant succeeds with missing_network=$missing_network"
   assert_removals_before_flush
   assert_no_container_left
   assert_no_unit_left
@@ -387,7 +465,9 @@ for init in openrc systemd; do
   run_stop_failure_case "$init"
   run_remove_failure_case "$init"
 done
-run_rootful_docker_case
+run_volume_failure_case
+run_rootful_docker_case false
+run_rootful_docker_case true
 run_attached_teardown_refusal false
 run_attached_teardown_refusal true
 
