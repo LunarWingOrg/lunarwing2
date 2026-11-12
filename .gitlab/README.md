@@ -637,7 +637,10 @@ host's concurrent builds before retrying manually.
   `.gitlab/scripts/check-satellite-advisories.sh`, which discovers every
   tracked `Cargo.lock` via `git ls-files` and applies the pinned cargo-deny
   `check advisories bans` with the shared `ic/deny.toml` policy to each manifest
-  root (licenses/sources stay owned by the ic workspace gate), and
+  root (licenses/sources stay owned by the ic workspace gate); the
+  manifest-less Pebble override lock is covered by its digest/allowlist delta
+  gate (`pebble4lunarwing/scripts/verify_upstream_lock.py`), and an advisory
+  scan for that lock itself is tracked in WI#626;
   `lockfile-only-advisory-guard` runs
   `.gitlab/scripts/check-lockfile-only-advisories.sh` for pins cargo-deny
   cannot see (per-entry `absent`/`no-dev` modes; an entry whose crate leaves

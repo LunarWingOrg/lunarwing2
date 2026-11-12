@@ -67,12 +67,15 @@ RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
 # MSRV; only its version/checksum lines change.
 # 2026-11-02: pulldown-cmark 0.13.5 -> 0.13.6 (RUSTSEC-2026-0433, quadratic
 # parsing of nested image wikilinks with the same enabled option).
+# 2026-11-11 (WI#610): rustix 1.1.4 -> 1.1.6 (RUSTSEC-2026-0486, unsound
+# xattr functions with a zero-length buffer; affected >= 1.0.0, < 1.1.6),
+# which also re-points fd-lock's rustix edge.
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=47ab4b8dd909778c6dd6b5f15e2e0c6289240ecc7ecf5c116ef7395209d93ce4
+ARG PEBBLE_LOCK_SHA256=3068ae5e90b5959e6617e651bee33e0807b1a6f13b222588b05ce290734d688a
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
