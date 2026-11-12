@@ -1331,6 +1331,11 @@ write_tenant_lunarwing_env() {
   local cb_threshold cb_recovery
   cb_threshold="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
   cb_recovery="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
+  # Preserve same-provider retry controls, including an explicit zero.
+  local llm_max_retries llm_empty_retry_budget
+  llm_max_retries="$(_env_existing "$env_snapshot" LLM_MAX_RETRIES)"; llm_max_retries="${llm_max_retries:-3}"
+  llm_empty_retry_budget="$(_env_existing "$env_snapshot" LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET)"
+  llm_empty_retry_budget="${llm_empty_retry_budget:-100000}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   # Run-166 LF-3: a refusal must be fatal — an empty password rendered into
@@ -1510,6 +1515,9 @@ ALLOW_PRIVATE_IPS=1
 # handle_message envelope (see src/app.rs). Tunables; preserved on re-render.
 LLM_TURN_BUDGET_SECS=$llm_turn_budget
 LLM_REQUEST_TIMEOUT_SECS=$llm_request_timeout
+# Same-provider retry count and billed-empty input-token threshold per leg/call.
+LLM_MAX_RETRIES=$llm_max_retries
+LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET=$llm_empty_retry_budget
 # Circuit breaker: fast-fail once the LLM backend is degraded, then auto-probe
 # to recover. Guards against a sick gateway amplifying transient blips into
 # tenant-wide slowness. Backend-agnostic (wraps whatever provider is built).
