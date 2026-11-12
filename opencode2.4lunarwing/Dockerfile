@@ -48,8 +48,8 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 
 WORKDIR /build/opencode
 # The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
-# used to apply at the v2.1.2 pin is retired: v2.2.6 carries that whitespace
-# repair as a content-equivalent backport, so the fixer is redundant.
+# used to apply at the v2.1.2 pin is retired: v2.2.6 and v2.2.7 carry that
+# whitespace repair as a content-equivalent backport, so the fixer is redundant.
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 # WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
