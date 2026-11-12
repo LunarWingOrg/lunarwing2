@@ -1249,8 +1249,14 @@ impl TunnelSidecar {
             .map_err(|reason| SandboxError::Config { reason })?;
         let receiver = {
             let mut lifecycle = self.lifecycle.state.lock().await;
-            if lifecycle.stopping && !restart_stopped {
-                return Err(self.unavailable("sidecar is stopped"));
+            if lifecycle.stopping {
+                if !restart_stopped {
+                    return Err(self.unavailable("sidecar is stopped"));
+                }
+                if lifecycle.active.is_none() {
+                    lifecycle.stopping = false;
+                    lifecycle.last_failure = None;
+                }
             }
             if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
                 return Err(self.unavailable(&reason));
