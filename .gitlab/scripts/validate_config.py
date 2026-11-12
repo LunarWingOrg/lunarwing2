@@ -1254,7 +1254,9 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
 
     MR !1371 review: the audit's "every committed lockfile is clean" claim
     was produced by an uncommitted evaluator. The committed sweep script
-    plus this wiring assertion make the claim a CI gate instead.
+    plus this wiring assertion make the claim a CI gate instead. WI#626
+    extends that gate to the manifest-less Pebble override through cargo-audit,
+    using cargo-deny's existing advisory checkout without another fetch.
     """
     job = merged.get("satellite-advisory-sweep", {})
     script = job.get("script", []) if isinstance(job, dict) else []
@@ -1279,6 +1281,12 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
         "ic/deny.toml",
         "--workspace --all-features",
         "check advisories bans",
+        "pebble4lunarwing/upstream/Cargo.lock",
+        '"$audit_bin" audit',
+        '--file "$repo_root/$override_lock"',
+        '--db "$db_dir"',
+        "--no-fetch --stale",
+        "-D unsound -D yanked",
     )
     for fragment in required_fragments:
         if fragment not in text:
