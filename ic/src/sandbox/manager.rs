@@ -1224,7 +1224,8 @@ mod tests {
             async move { sidecar.recover_for_run().await }
         });
         cold.abort();
-        assert!(cold.await.expect("cold-start task").is_cancelled());
+        let join_error = cold.await.expect_err("cold-start task was aborted");
+        assert!(join_error.is_cancelled());
         let stopping = tokio::spawn({
             let sidecar = second.clone();
             async move { sidecar.stop().await }
