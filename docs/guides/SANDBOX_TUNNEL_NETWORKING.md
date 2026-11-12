@@ -199,6 +199,19 @@ peer instead of spending another setup key. Rotating the key or URL enrols a
 fresh peer and prunes only this instance's previous volume; revoke the old peer
 in NetBird afterwards. If the identity salt cannot be read or created, the
 tunnel fails closed rather than falling back to a runtime or temporary path.
+New salts are written and synced under a unique temporary name in the same
+directory, published to the final name with a no-replace hard link, and followed
+by a directory sync. The final name therefore never exposes a partially written
+salt, and concurrent creators converge on one complete file.
+
+A damaged existing salt is still refused rather than silently replaced. To
+recover from a truncated or corrupt salt, stop the daemon or tenant, remove the
+instance's NetBird sidecar container so it cannot be adopted, and delete only
+`$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt` as the daemon's user before
+restarting it. This deliberately creates a new peer identity: the next start
+uses a new state volume and re-enrols once, so a valid reusable or replacement
+setup key is required and the overlay address can change. The previous
+instance-scoped volume is pruned; revoke the old peer in NetBird after recovery.
 
 The uplink allowance relies on NetBird's advanced routing: its control-plane
 and WireGuard sockets carry the `0x1bd00` mark, which the sidecar's `output`
