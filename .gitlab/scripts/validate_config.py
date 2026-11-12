@@ -906,6 +906,7 @@ ADVISORY_GATE_SCRIPTS = {
     ],
     "satellite-advisory-sweep": [
         "bash .gitlab/scripts/install-cargo-deny.sh",
+        "bash .gitlab/scripts/install-cargo-audit.sh",
         "bash .gitlab/scripts/check-satellite-advisories.sh",
     ],
     "lockfile-only-advisory-guard": [
