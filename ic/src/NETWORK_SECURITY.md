@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-11 (serialized tunnel lifecycle and atomic firewall replacement, WI#614)
+**Last updated:** 2026-11-12 (independent tunnel health-check and recovery budgets, WI#639)
 
 ---
 
@@ -503,19 +503,22 @@ altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
 to another tier. Cold starts re-probe an existing sidecar for at most 6 seconds
 and keep the full configured startup timeout for a fresh provider; image pull,
 runtime start, and provider readiness have separate bounds rather than one cold
-wall-clock cap. Per-run recovery uses the same 6-second re-probe, allows a fresh
-provider at most 20 seconds (or the lower configured timeout), and caps the
-initial health check, recovery, and final verification together at 60 seconds.
-A provider that needs longer after recreation requires a daemon restart. A
-failure retains its probe reason in a 30-second back-off: subsequent commands
-fail immediately until one retries after the window. Recovery runs in a
-sidecar-owned task that survives caller cancellation, finishes partial-start
-cleanup, and records the result before waking later callers. A result channel
-that closes without completion also records a failure matched to its own
-attempt. Shutdown marks recovery stopping, uses bounded waits, and checks
-before/after starts to remove late containers; an explicit cold start can later
-clear the stop and cached failure. No container ID becomes joinable before the
-firewall verifies.
+wall-clock cap. Each per-run health-verification chain has an independent
+65-second ceiling, below the seven probes' aggregate 70 seconds of individual
+10-second deadlines. Per-run recovery uses the same 6-second re-probe, allows a
+fresh provider at most 20 seconds (or the lower configured timeout), and retains
+its own 60-second budget; final verification has another 65-second health
+ceiling. A provider that needs longer after recreation requires a daemon
+restart. Only an actual recovery failure retains its probe reason in a
+30-second back-off: subsequent commands fail immediately until one retries
+after the window. A slow health check neither records a recovery failure nor
+claims that recovery ran when it did not. Recovery runs in a sidecar-owned task
+that survives caller cancellation, finishes partial-start cleanup, and records
+the result before waking later callers. A result channel that closes without
+completion also records a failure matched to its own attempt. Shutdown marks
+recovery stopping, uses bounded waits, and checks before/after starts to remove
+late containers; an explicit cold start can later clear the stop and cached
+failure. No container ID becomes joinable before the firewall verifies.
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted

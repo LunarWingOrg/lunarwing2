@@ -164,17 +164,21 @@ not application auth.
   provider readiness have separate bounds rather than one cold wall-clock cap.
   Per-command recovery gives a fresh provider at most 20 seconds (or the lower
   configured timeout). A provider that needs longer after recreation requires
-  a daemon restart, which the returned error names. The initial health check,
-  recovery, and final verification share one 60-second budget, including image
-  and runtime probes. The returned `SandboxError::TunnelUnavailable`, mapped to
-  `[sandbox:sandbox_unavailable]`, names the failed probe and is cached for 30
-  seconds. Calls inside that window return the reason and next-attempt delay
-  immediately; after it, one call retries. Recovery runs in a sidecar-owned
-  task whose completion is shared through a watch channel. Caller cancellation
-  only drops that caller's wait: the task still cleans up a partial start,
-  records its result, and wakes any later waiters. A channel that closes without
-  a result is matched to its own attempt and recorded as a failure, so a dead
-  task cannot block later recovery or let a stale waiter clear a new attempt.
+  a daemon restart, which the returned error names. Initial and final health
+  verification each have a 65-second ceiling, below the seven probes' aggregate
+  70 seconds of individual 10-second deadlines; recovery has its own 60-second
+  budget, including image and runtime probes. A slow health check does not
+  record a recovery failure or blame a recovery that never started. The returned
+  `SandboxError::TunnelUnavailable`, mapped to
+  `[sandbox:sandbox_unavailable]`, names the failed probe. Only an actual failed
+  recovery is cached for 30 seconds. Calls inside that window return the reason
+  and next-attempt delay immediately; after it, one call retries. Recovery runs
+  in a sidecar-owned task whose completion is shared through a watch channel.
+  Caller cancellation only drops that caller's wait: the task still cleans up a
+  partial start, records its result, and wakes any later waiters. A channel that
+  closes without a result is matched to its own attempt and recorded as a
+  failure, so a dead task cannot block later recovery or let a stale waiter
+  clear a new attempt.
   There is no fallback to `proxy`, `proxy-enforced`, direct egress, or host
   execution.
 - An already verified firewall table is left unchanged. A required installation

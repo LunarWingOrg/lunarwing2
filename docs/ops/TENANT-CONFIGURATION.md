@@ -541,13 +541,16 @@ multicast values. Peered WireGuard configs need
 is re-probed after firewall installation. Cold starts use a 6-second adoption
 re-probe and retain the configured `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget
 for a fresh provider; image pull and runtime start have separate bounds.
-Per-command recovery uses the same 6-second re-probe, at most 20 seconds for
-fresh provider readiness (or a lower configured timeout), one 60-second budget
-across health checks and recovery, and a 30-second failure back-off. A provider
-that needs longer after recreation requires a daemon restart. The sidecar-owned
-attempt still finishes and records its result when the calling command is
-cancelled or its result channel closes. Shutdown signals active recovery, uses
-bounded waits, removes late starts, and permits a later explicit cold start.
+Each per-command health-verification chain has a 65-second ceiling, separate
+from recovery's 60-second budget. Recovery uses the same 6-second re-probe and
+at most 20 seconds for fresh provider readiness (or a lower configured
+timeout). Only an actual failed recovery starts the 30-second failure back-off;
+a slow health check does not record or blame a recovery that never ran. A
+provider that needs longer after recreation requires a daemon restart. The
+sidecar-owned attempt still finishes and records its result when the calling
+command is cancelled or its result channel closes. Shutdown signals active
+recovery, uses bounded waits, removes late starts, and permits a later explicit
+cold start.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in
