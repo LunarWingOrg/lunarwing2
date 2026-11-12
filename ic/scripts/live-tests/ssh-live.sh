@@ -96,6 +96,7 @@ write_sshd_config() {
     printf 'PrintMotd no\n'
     printf 'PrintLastLog no\n'
     printf 'UseDNS no\n'
+    printf 'SetEnv HOME=%s/home BASH_ENV=/dev/null ENV=/dev/null\n' "$WORK_DIR"
     printf 'LogLevel VERBOSE\n'
   } >"$config"
 }
@@ -130,6 +131,7 @@ PY
   fi
 }
 
+mkdir -p -- "$WORK_DIR/home"
 write_sshd_config "$WORK_DIR/plain-sshd_config" "$SSH_PORT" "$WORK_DIR/plain.pid" no
 write_sshd_config "$WORK_DIR/cert-sshd_config" "$CERT_PORT" "$WORK_DIR/cert.pid" yes
 "$SSHD" -t -f "$WORK_DIR/plain-sshd_config"
