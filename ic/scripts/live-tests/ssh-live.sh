@@ -19,7 +19,9 @@ cleanup() {
   for pid in "${SSHD_PIDS[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
-  if [[ -n "$WORK_DIR" ]]; then
+  if [[ -n "$WORK_DIR" && "${LUNARWING_SSH_LIVE_KEEP:-0}" == 1 ]]; then
+    printf 'Retained disposable artifacts at %s\n' "$WORK_DIR" >&2
+  elif [[ -n "$WORK_DIR" ]]; then
     rm -rf -- "$WORK_DIR"
   fi
 }
