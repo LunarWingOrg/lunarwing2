@@ -12,12 +12,12 @@
 #
 # Scope includes advisories and bans (WI#418 IS-1): the ID-keyed ignores
 # require the same version/parent restrictions in every manifest root.
-# Licenses/sources policy stays with the ic workspace gate. The manifest-less
-# pebble4lunarwing/upstream lock is skipped here; its reviewed override delta
-# is gated by
-# pebble4lunarwing/scripts/verify_upstream_lock.py. cargo-deny cannot audit a
-# lock without a manifest, so the override's own advisory scan is a tracked
-# follow-up (WI#626), not part of this sweep.
+# Licenses/sources policy stays with the ic workspace gate. cargo-deny cannot
+# audit the manifest-less pebble4lunarwing/upstream lock, so WI#626 scans that
+# file directly with pinned cargo-audit after the manifest roots. It reuses
+# cargo-deny's advisory checkout with no second fetch and denies unsound and
+# yanked findings. verify_upstream_lock.py still independently gates the
+# reviewed override digest and package delta.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
