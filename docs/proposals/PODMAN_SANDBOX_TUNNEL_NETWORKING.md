@@ -62,12 +62,13 @@ and installs an `inet lunarwing_sandbox_egress` table with two base chains:
   IPv6 neighbour discovery; by default, DNS (`udp`/`tcp` 53) to the resolvers
   in the sidecar's `/etc/resolv.conf`; an explicit drop of `169.254.0.0/16`;
   and, last, packets carrying the provider's socket mark. Everything else is
-  dropped. `SANDBOX_TUNNEL_DNS` is deliberately **not** passed to the provider:
-  it needs runtime DNS to resolve hostname endpoints and management hosts before
-  the tunnel exists. Instead, a non-secret mode-`0644` resolver file is
+  dropped. WireGuard's optional `SANDBOX_TUNNEL_DNS` is deliberately **not**
+  passed to the provider: it needs runtime DNS to resolve hostname endpoints
+  before the tunnel exists. Instead, a non-secret mode-`0644` resolver file is
   atomically installed and mounted `ro,z` into joined runs only (runtimes reject
   `--dns` with `--network container`), and every direct uplink DNS rule is
-  removed. The configured resolvers must be reachable through the tunnel.
+  removed. The configured resolvers must be reachable through `wg0`. NetBird
+  rejects this setting during validation, before any runtime call.
 
 The mark is how the tunnel's own control plane keeps using the uplink without
 an address allowlist that would have to track management, signal, relay and
@@ -100,11 +101,16 @@ input chain. Advanced routing and its socket marks remain active.
 
 The WI#600 live run measured NetBird's local resolver on the sidecar's overlay
 IP. Its upstream writes are unmarked and fail with `operation not permitted`,
-so the joined lookup returns `SERVFAIL` and no query reaches the uplink. Custom
-NetBird DNS is unsupported; WI#603 retains the reconnect investigation and the
-choice among static control-plane hosts, sidecar-only cgroup DNS, or explicit
-unsupported-combination enforcement. Default runtime DNS remains the supported
-configuration.
+so the joined lookup returns `SERVFAIL` and no query reaches the uplink. WI#603
+therefore selects explicit unsupported-combination enforcement:
+`TunnelSidecarConfig::validate()` rejects nonempty `SANDBOX_TUNNEL_DNS` with
+NetBird before image inspection or container start. Static control-plane hosts
+cannot cover signal, relay, and STUN names learned later or address changes;
+NetBird does not mark resolver sockets; and a new sidecar-only cgroup DNS
+exception would add kernel/nft/runtime assumptions without improving the
+joined-run boundary. Default runtime DNS is the only supported NetBird mode.
+WireGuard custom DNS is unchanged and still leaves joined runs with no uplink
+DNS path.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -152,10 +158,13 @@ not application auth.
   the same recovery state. Independently constructed handles for the same
   container name also share recovery state and a fair lifecycle operation lock.
   Starts, recovery, stops, and cancelled-start cleanup therefore exclude each
-  other, with stale cleanup queued before the next start. Cold starts retain
-  the full configured startup budget. Per-command recovery re-probes an
-  existing sidecar for at most 6 seconds and gives a fresh provider at most 20
-  seconds (or the lower configured timeout). The initial health check,
+  other, with stale cleanup queued before the next start. Cold starts use the
+  same 6-second adoption re-probe as per-command recovery, then give a fresh
+  provider the full configured startup budget; image pull, runtime start, and
+  provider readiness have separate bounds rather than one cold wall-clock cap.
+  Per-command recovery gives a fresh provider at most 20 seconds (or the lower
+  configured timeout). A provider that needs longer after recreation requires
+  a daemon restart, which the returned error names. The initial health check,
   recovery, and final verification share one 60-second budget, including image
   and runtime probes. The returned `SandboxError::TunnelUnavailable`, mapped to
   `[sandbox:sandbox_unavailable]`, names the failed probe and is cached for 30
@@ -163,8 +172,11 @@ not application auth.
   immediately; after it, one call retries. Recovery runs in a sidecar-owned
   task whose completion is shared through a watch channel. Caller cancellation
   only drops that caller's wait: the task still cleans up a partial start,
-  records its result, and wakes any later waiters. There is no fallback to
-  `proxy`, `proxy-enforced`, direct egress, or host execution.
+  records its result, and wakes any later waiters. A channel that closes without
+  a result is matched to its own attempt and recorded as a failure, so a dead
+  task cannot block later recovery or let a stale waiter clear a new attempt.
+  There is no fallback to `proxy`, `proxy-enforced`, direct egress, or host
+  execution.
 - An already verified firewall table is left unchanged. A required installation
   sends `add table`, `delete table`, and the complete replacement definition to
   one `nft -f -` invocation, so netlink applies it atomically rather than
@@ -183,10 +195,15 @@ not application auth.
   prunes only that instance's previous volume. Moving from the old runtime salt
   computes a new name once, so upgrade requires one deliberate re-enrolment and
   old-peer revocation rather than guessing how to adopt the old volume.
-- `SandboxManager::shutdown()` removes only the sidecar carrying this instance's
-  ownership label (podman `rm -f -t`, Docker `stop` then `rm -f`). The normal
-  daemon exit path does not call it, so docs do not claim automatic exit
-  cleanup. The operator guide records manual removal of the legacy fixed-name
+- `SandboxManager::shutdown()` marks shared recovery stopping, waits up to 15
+  seconds for the active result and another 15 seconds for the lifecycle lock,
+  then removes only the sidecar carrying this instance's ownership label
+  (podman `rm -f -t`, Docker `stop` then `rm -f`). Recovery checks stopping
+  before and after a start and removes a late container even after the wait
+  expires. An explicit later cold start clears the stop and its cached failure;
+  ordinary per-run recovery refuses a stopped handle. The normal daemon exit
+  path does not call shutdown, so docs do not claim automatic exit cleanup. The
+  operator guide records manual removal of the legacy fixed-name
   container/volumes and revocation of its old peer on upgrade.
 
 ### Credential handling
@@ -209,16 +226,17 @@ receive the setup key or private key.
 |------|---------|-------------|
 | `none` (default off Linux) | no egress | kernel `--network none` |
 | `proxy-enforced` (WI#537 Linux default) | public web through domain allowlist | network-none + Unix relay + public-only proxy; no credential injection |
-| `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs plus default runtime DNS; core NetBird 0.82.0 behavior is live-validated, custom DNS fails closed in WI#603 |
+| `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs plus default runtime DNS; core NetBird 0.82.0 behavior is live-validated, NetBird custom DNS is rejected, WireGuard custom DNS closes uplink DNS |
 | `proxy` (legacy) | public web through env-var proxy | advisory only |
 
 A full-route WireGuard config (`AllowedIPs = 0.0.0.0/0`, plus IPv6 where used) or
 NetBird default route sends all outbound traffic through the overlay. A split
 tunnel reaches only its overlay CIDRs: the sidecar's pasta/slirp uplink is
 closed to joined commands by the output chain in both cases, except by default
-for DNS to the runtime resolvers. `SANDBOX_TUNNEL_DNS` removes that direct
-exception, and the WI#600 run confirmed that NetBird's unmarked upstream DNS
-writes fail closed rather than leaking queries.
+for DNS to the runtime resolvers. WireGuard `SANDBOX_TUNNEL_DNS` removes that
+direct exception. The WI#600 run confirmed that NetBird's unmarked upstream DNS
+writes failed closed rather than leaking queries, leading to WI#603's explicit
+rejection of that provider/setting combination.
 Neither shape is equivalent to the public-only proxy
 allowlist; what is reachable is decided by the tunnel's routes and the overlay's
 ACLs, never by the host's network position.
@@ -272,13 +290,16 @@ preserves operator-set network values on re-render. The tunnel does not change
 WI#537's Linux `proxy-enforced` default. Upgrades from the fixed-name sidecar use
 the operator guide's manual legacy-container/volume and peer-revocation steps.
 Unit tests pin argument construction, secret exclusion, address/keepalive
-validation, image/digest parsing, instance naming, peer-identity stability,
-handshake age, firewall shape, and error taxonomy. The double-gated
-`ic/tests/podman_sandbox_tunnel_integration.rs` WireGuard lane uses real rootless
-Podman to verify start, verified-ID joins, stable reuse, distinct instances,
-independent tamper/image-rotation cases, resolver provenance and read-only
-mounts, old-resolver refusal, hostname-endpoint bootstrap, handshake failure,
-and detached-helper cleanup.
+validation, NetBird custom-DNS rejection, image/digest parsing, instance naming,
+peer-identity stability, handshake age, firewall shape, and error taxonomy.
+Fake-runtime concurrency tests cover one shared start across handles, caller
+cancellation, a waiter with a different budget, shutdown interruption, and
+explicit restart; channel units cover abandoned and stale recovery completion.
+The double-gated `ic/tests/podman_sandbox_tunnel_integration.rs` WireGuard lane
+uses real rootless Podman to verify start, verified-ID joins, stable reuse,
+distinct instances, independent tamper/image-rotation cases, resolver provenance
+and read-only mounts, old-resolver refusal, hostname-endpoint bootstrap,
+handshake failure, and detached-helper cleanup.
 
 The separately gated NetBird lane requires all three podman/tunnel/NetBird
 gates, `LUNARWING_E2E_NETBIRD_IMAGE`,
@@ -287,12 +308,13 @@ gates, `LUNARWING_E2E_NETBIRD_IMAGE`,
 same reusable key and checks detailed peer connectivity, peer-hosted HTTP and
 public-IP/metadata denial, the exact mark rule, startup health, management
 restart with a post-reconnect joined run, stable peer identity, and ingress
-refusal with a proven-live listener. The custom-DNS lane learns the sidecar's
-overlay resolver IP and requires the measured upstream-blocked `SERVFAIL`.
+refusal with a proven-live listener. WI#603's validation gate replaces the old
+custom-DNS live case, which must no longer start the forbidden configuration.
 
-WI#600's 2026-11-11 live run passed both lanes against NetBird 0.82.0 and used
-uplink packet captures to distinguish control-plane, DNS and encrypted peer UDP
-from forbidden destinations. Throwaway peers and credentials must be revoked
-and removed afterward. Any future podman-capable CI job remains open; a skip
-without external settings is not a live-validation pass, and no public-cloud or
-CI execution is claimed.
+WI#600's 2026-11-11 live run passed the main lane against NetBird 0.82.0 and
+captured the custom-DNS `SERVFAIL` used for the WI#603 decision. Uplink packet
+captures distinguished control-plane, DNS and encrypted peer UDP from forbidden
+destinations. Throwaway peers and credentials must be revoked and removed
+afterward. Any future podman-capable CI job remains open; a skip without
+external settings is not a live-validation pass, and no public-cloud or CI
+execution is claimed.
