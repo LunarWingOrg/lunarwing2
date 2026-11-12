@@ -77,7 +77,7 @@ write_sshd_config() {
     printf 'PidFile %s\n' "$pid_file"
     printf 'AuthorizedKeysFile %s/authorized_keys\n' "$WORK_DIR"
     printf 'AuthorizedKeysCommand none\n'
-    printf 'StrictModes yes\n'
+    printf 'StrictModes no\n'
     printf 'PubkeyAuthentication yes\n'
     printf 'AuthenticationMethods publickey\n'
     printf 'PasswordAuthentication no\n'
