@@ -434,6 +434,26 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         result = self.run_guard(self.root, without_git=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def assert_compile_out_failure(self, result):
+        self.assertEqual(result.returncode, 1)
+        if "worker exposure policy guard: ok" not in result.stdout:
+            self.fail(
+                "the guard's own tests failed before the Dockerfile check:\n"
+                + result.stderr[-4000:]
+            )
+        self.assertIn("compile-out", result.stderr)
+
+    def test_nested_guard_failure_has_a_concise_diagnostic(self):
+        result = subprocess.CompletedProcess(
+            ["guard"], 1, stdout="", stderr="x" * 5000 + "\nnested test failed",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.assert_compile_out_failure(result)
+        message = str(caught.exception)
+        self.assertIn("the guard's own tests failed before the Dockerfile check", message)
+        self.assertIn("nested test failed", message)
+        self.assertLess(len(message), 4100)
+
     def test_dockerfile_compile_out_must_precede_builder_build(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()
@@ -450,8 +470,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             with self.subTest(name=name):
                 dockerfile.write_text(mutated, encoding="utf-8")
                 result = self.run_guard(self.root)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("compile-out", result.stderr)
+                self.assert_compile_out_failure(result)
 
     def test_dockerfile_compile_out_requires_exact_source_copy(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
