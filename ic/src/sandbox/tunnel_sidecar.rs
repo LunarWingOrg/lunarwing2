@@ -958,6 +958,7 @@ impl RecoveryError {
 struct RecoveryState {
     last_failure: Option<RecoveryFailure>,
     active: Option<tokio::sync::watch::Receiver<RecoveryCompletion>>,
+    stopping: bool,
 }
 
 struct RecoveryFailure {
@@ -1184,11 +1185,12 @@ impl TunnelSidecar {
         format!("{SANDBOX_TUNNEL_CONTAINER}-{}-netbird-", self.instance_id)
     }
 
-    /// Start the sidecar, or adopt a running one that carries our config hash
-    /// and passes the health gate. Cold starts retain the configured budget.
+    /// Start the sidecar, or briefly re-probe a running one that carries our
+    /// config hash. A fresh provider retains the full configured start budget.
     pub async fn ensure_started(&self) -> Result<()> {
         let timeout = self.cfg.startup_timeout;
-        self.start_recovery(timeout, timeout, None).await
+        self.start_recovery(RUN_RECOVERY_REPROBE_TIMEOUT, timeout, None, true)
+            .await
     }
 
     /// Bounded recovery for a command path. The sidecar owns the attempt, so a
@@ -1199,6 +1201,7 @@ impl TunnelSidecar {
             RUN_RECOVERY_REPROBE_TIMEOUT,
             provider_timeout,
             Some(RUN_RECOVERY_BUDGET),
+            false,
         )
         .await
     }
@@ -1239,18 +1242,23 @@ impl TunnelSidecar {
         reprobe_timeout: Duration,
         provider_timeout: Duration,
         budget: Option<Duration>,
+        restart_stopped: bool,
     ) -> Result<()> {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
         let receiver = {
             let mut lifecycle = self.lifecycle.state.lock().await;
+            if lifecycle.stopping && !restart_stopped {
+                return Err(self.unavailable("sidecar is stopped"));
+            }
             if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
                 return Err(self.unavailable(&reason));
             }
             if let Some(active) = &lifecycle.active {
                 active.clone()
             } else {
+                lifecycle.stopping = false;
                 lifecycle.last_failure = None;
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 lifecycle.active = Some(receiver.clone());
@@ -1280,21 +1288,44 @@ impl TunnelSidecar {
             // queued by the dropped attempt is therefore ahead of the next start
             // in this fair mutex's queue, never behind it.
             let _operation = sidecar.lifecycle.operation.lock().await;
-            let attempt = sidecar.start_or_adopt(reprobe_timeout, provider_timeout);
-            let result = match budget {
-                Some(budget) => match tokio::time::timeout(budget, attempt).await {
-                    Ok(result) => result,
-                    Err(_) => Err(sidecar.unavailable(&format!(
-                        "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
-                        budget.as_secs()
-                    ))),
-                },
-                None => attempt.await,
-            };
-            let result = result.map_err(|error| RecoveryError::from_sandbox(&error));
+            let result = sidecar
+                .perform_recovery(reprobe_timeout, provider_timeout, budget)
+                .await
+                .map_err(|error| RecoveryError::from_sandbox(&error));
             sidecar.lifecycle.state.lock().await.complete(&result);
             sender.send_replace(Some(result));
         }));
+    }
+
+    async fn perform_recovery(
+        &self,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+        budget: Option<Duration>,
+    ) -> Result<()> {
+        if self.recovery_stop_requested().await {
+            return Err(self.unavailable("sidecar recovery interrupted by shutdown"));
+        }
+        let attempt = self.start_or_adopt(reprobe_timeout, provider_timeout);
+        let result = match budget {
+            Some(budget) => match tokio::time::timeout(budget, attempt).await {
+                Ok(result) => result,
+                Err(_) => Err(self.unavailable(&format!(
+                    "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
+                    budget.as_secs()
+                ))),
+            },
+            None => attempt.await,
+        };
+        if self.recovery_stop_requested().await {
+            self.remove_unlocked().await;
+            return Err(self.unavailable("sidecar recovery interrupted by shutdown"));
+        }
+        result
+    }
+
+    pub(crate) async fn recovery_stop_requested(&self) -> bool {
+        self.lifecycle.state.lock().await.stopping
     }
 
     async fn await_recovery(
@@ -1309,7 +1340,20 @@ impl TunnelSidecar {
         match completion {
             Some(Ok(())) => Ok(()),
             Some(Err(error)) => Err(error.into_sandbox()),
-            None => Err(self.unavailable("sidecar recovery ended without a result")),
+            None => {
+                let error = RecoveryError::from_sandbox(&self.unavailable(
+                    "sidecar recovery task ended without a result; a later command may retry",
+                ));
+                let mut lifecycle = self.lifecycle.state.lock().await;
+                if lifecycle
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.same_channel(&receiver))
+                {
+                    lifecycle.complete(&error);
+                }
+                Err(error.into_sandbox())
+            }
         }
     }
 
@@ -1337,13 +1381,17 @@ impl TunnelSidecar {
     /// Recheck the transport and both firewall chains before every run, then
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
-        let (cached, recovering) = {
+        let (cached, recovering, stopping) = {
             let lifecycle = self.lifecycle.state.lock().await;
             (
                 lifecycle.cached_reason(tokio::time::Instant::now()),
                 lifecycle.active.is_some(),
+                lifecycle.stopping,
             )
         };
+        if stopping {
+            return Err(self.unavailable("sidecar is stopped"));
+        }
         if let Some(reason) = cached {
             return Err(self.unavailable(&reason));
         }
@@ -1389,6 +1437,10 @@ impl TunnelSidecar {
         if !started {
             cleanup.disarm();
             return Ok(());
+        }
+        if self.recovery_stop_requested().await {
+            let error = self.unavailable("sidecar start interrupted by shutdown");
+            return Err(self.abort_start(&mut cleanup, error).await);
         }
         tracing::info!(
             container = %self.container_name,
@@ -1481,7 +1533,7 @@ impl TunnelSidecar {
             if tokio::time::Instant::now() >= deadline {
                 let context = if timeout < self.cfg.startup_timeout {
                     format!(
-                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s",
+                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s; a provider that needs longer after recreation requires a daemon restart",
                         timeout.as_secs(),
                         self.cfg.startup_timeout.as_secs()
                     )
@@ -1866,8 +1918,21 @@ impl TunnelSidecar {
 
     /// Stop the sidecar gracefully, then remove it if this instance owns it.
     pub async fn stop(&self) {
-        let _operation = self.lifecycle.operation.lock().await;
-        self.stop_unlocked().await;
+        let active = {
+            let mut lifecycle = self.lifecycle.state.lock().await;
+            lifecycle.stopping = true;
+            lifecycle.active.clone()
+        };
+        if let Some(receiver) = active {
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.await_recovery(receiver)).await;
+        }
+        match tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.operation.lock()).await {
+            Ok(_operation) => self.stop_unlocked().await,
+            Err(_) => tracing::warn!(
+                container = %self.container_name,
+                "Sidecar recovery exceeded the shutdown wait; its stop check will remove any late start"
+            ),
+        }
     }
 
     async fn stop_unlocked(&self) {
@@ -2885,6 +2950,63 @@ mod tests {
             completed,
             Some(Err(RecoveryError::Unavailable { reason })) if reason == "dead peer"
         ));
+    }
+
+    fn recovery_test_sidecar(label: &str) -> TunnelSidecar {
+        let base = std::env::temp_dir().join(format!(
+            "lw-tunnel-recovery-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        TunnelSidecar::for_instance(ContainerRuntime::Podman, netbird_cfg(), &base)
+    }
+
+    #[tokio::test]
+    async fn abandoned_recovery_is_recorded_and_can_be_retried() {
+        let sidecar = recovery_test_sidecar("abandoned");
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        sidecar.lifecycle.state.lock().await.active = Some(receiver.clone());
+        drop(sender);
+
+        let error = sidecar.await_recovery(receiver).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ended without a result"),
+            "{error}"
+        );
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(lifecycle.active.is_none());
+        assert!(
+            lifecycle
+                .cached_reason(tokio::time::Instant::now())
+                .is_some_and(|reason| reason.contains("ended without a result"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_waiter_does_not_clear_a_new_attempt() {
+        let sidecar = recovery_test_sidecar("stale-waiter");
+        let (sender, stale) = tokio::sync::watch::channel(None);
+        let (_replacement_sender, replacement) = tokio::sync::watch::channel(None);
+        sidecar.lifecycle.state.lock().await.active = Some(replacement);
+        drop(sender);
+
+        let error = sidecar.await_recovery(stale).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ended without a result"),
+            "{error}"
+        );
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(lifecycle.active.is_some());
+        assert!(lifecycle.last_failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_sidecar_refuses_per_run_recovery_without_runtime_calls() {
+        let sidecar = recovery_test_sidecar("stopped");
+        sidecar.lifecycle.state.lock().await.stopping = true;
+
+        let error = sidecar.recover_for_run().await.unwrap_err();
+        assert!(error.to_string().contains("sidecar is stopped"), "{error}");
+        assert!(sidecar.lifecycle.state.lock().await.active.is_none());
     }
 
     #[test]
