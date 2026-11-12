@@ -31,7 +31,11 @@ id() {
 }
 ensure_init_system() { :; }
 require_safe_openrc_proxy_units() { return 0; }
-ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=true; }
+ensure_container_runtime() {
+  CONTAINER_RT="$FAKE_RUNTIME"
+  MT_ROOTLESS=true
+  [[ "$FAKE_RUNTIME" != docker ]] || MT_ROOTLESS=false
+}
 podman_supports_quadlet() { return 0; }
 tenant_darkirc_enabled() { return 1; }
 tenant_vision_external() { return 1; }
@@ -84,7 +88,7 @@ _volume_file() { printf '%s/volumes/%s\n' "$RUNTIME_DIR" "$1"; }
 _ctr() {
   local name="$1"
   shift
-  record "podman:$name $*"
+  record "${FAKE_RUNTIME}:$name $*"
   local command="${1:-}" container path
   case "$command" in
     container)
@@ -182,7 +186,8 @@ setup_case() {
   CONTAINER_HASH_DIR="$CASE_DIR/hashes"
   WORKER_EGRESS_DIR="$CASE_DIR/egress"
   INIT_SYSTEM="$init"
-  CONTAINER_RT=podman
+  FAKE_RUNTIME=podman
+  CONTAINER_RT="$FAKE_RUNTIME"
   MT_ROOTLESS=true
   SYSTEMCTL_STOP_FAIL=""
   RC_STOP_FAIL=""
@@ -269,7 +274,7 @@ assert_removals_before_flush() {
   [[ -n "$flush_line" ]] || { fail "$INIT_SYSTEM never flushed the empty tenant chains"; return; }
   for lane in "${WORKER_LANES[@]}"; do
     for container in "lunarwing-${lane}-alpha" "lunarwing-${lane}-task-alpha"; do
-      rm_line="$(line_of "podman:alpha rm -f $container")"
+      rm_line="$(line_of "${FAKE_RUNTIME}:alpha rm -f $container")"
       if [[ -z "$rm_line" || "$rm_line" -ge "$flush_line" ]]; then
         fail "$INIT_SYSTEM removed $container after the first nft flush"
         return
@@ -302,7 +307,7 @@ run_success_case() {
   done
   if [[ "$init" == systemd ]]; then
     reload_line="$(line_of 'systemctl:alpha daemon-reload')"
-    first_rm="$(line_of 'podman:alpha rm -f lunarwing-pebble-alpha')"
+    first_rm="$(line_of "${FAKE_RUNTIME}:alpha rm -f lunarwing-pebble-alpha")"
     if [[ -n "$reload_line" && -n "$first_rm" && "$reload_line" -lt "$first_rm" ]]; then
       pass 'systemd forgets Quadlets before removing their containers'
     else
@@ -358,12 +363,31 @@ run_attached_teardown_refusal() {
     || fail "refused teardown discarded state needed for retry"
 }
 
+run_rootful_docker_case() {
+  local rc=0
+  setup_case openrc false
+  FAKE_RUNTIME=docker
+  CONTAINER_RT=docker
+  MT_ROOTLESS=false
+  command rm -f -- "$RUNTIME_DIR/keeper"
+  (remove_tenant alpha false) >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] || {
+    fail "rootful Docker remove-tenant failed: $(command cat "$CASE_DIR/remove.out")"
+    return
+  }
+  pass 'rootful Docker remove-tenant succeeds without a namespace keeper'
+  assert_removals_before_flush
+  assert_no_container_left
+  assert_no_unit_left
+}
+
 for init in openrc systemd; do
   run_success_case "$init" false
   run_success_case "$init" true
   run_stop_failure_case "$init"
   run_remove_failure_case "$init"
 done
+run_rootful_docker_case
 run_attached_teardown_refusal false
 run_attached_teardown_refusal true
 
