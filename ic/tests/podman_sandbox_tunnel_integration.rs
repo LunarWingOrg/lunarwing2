@@ -1,9 +1,10 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#602, WI#604, and WI#614).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#600, WI#602, WI#604, and WI#614).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
 //! LUNARWING_E2E_NETBIRD_TESTS=1, a real management service, a reusable key
-//! file, and an image containing NetBird, nftables, and nc. Live validation is WI#600.
+//! file, and an image containing NetBird, nftables, nc, wget, ping, and nslookup.
+//! Optional settings cover management-server restart and the WI#603 DNS measurement.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -1411,7 +1412,10 @@ fn write_peer_env_file(workdir: &Path, url: &str, key: &str) -> Result<PathBuf, 
         .map_err(|error| format!("could not create the peer env file: {error}"))?;
     std::io::Write::write_all(
         &mut file,
-        format!("NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n").as_bytes(),
+        format!(
+            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\nNB_DISABLE_FIREWALL=true\n"
+        )
+        .as_bytes(),
     )
     .map_err(|error| format!("could not write the peer env file: {error}"))?;
     Ok(path)
@@ -1430,6 +1434,10 @@ async fn start_plain_netbird_peer(image: &str, name: &str, env_file: &Path) -> R
         "ALL",
         "--cap-add",
         "NET_ADMIN",
+        "--cap-add",
+        "NET_RAW",
+        "--cap-add",
+        "NET_BIND_SERVICE",
         "--security-opt=no-new-privileges",
         "--read-only",
         "--tmpfs",
@@ -1486,6 +1494,28 @@ async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(),
     for _ in 0..30 {
         let primary_ip = netbird_ipv4(primary).await?;
         let peer_ip = netbird_ipv4(peer).await?;
+        let _ = podman_success(&[
+            "exec",
+            primary,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            &peer_ip.to_string(),
+        ])
+        .await;
+        let _ = podman_success(&[
+            "exec",
+            peer,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            &primary_ip.to_string(),
+        ])
+        .await;
         let primary_status = netbird_status_detail(primary).await?;
         let peer_status = netbird_status_detail(peer).await?;
         if status_has_connected_peer(&primary_status, peer_ip)
@@ -1538,13 +1568,33 @@ async fn assert_netbird_restart_identity(
 
 async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String> {
     let name = sidecar.container_name();
-    podman_success(&["exec", name, "netbird", "down"]).await?;
-    podman_success(&["exec", name, "netbird", "up"]).await?;
+    let servers = std::env::var("LUNARWING_E2E_NETBIRD_SERVER_CONTAINER").unwrap_or_default();
+    let mut restart = vec!["restart"];
+    restart.extend(servers.split_whitespace());
+    if restart.len() > 1 {
+        podman_success(&restart).await?;
+    } else {
+        podman_success(&["exec", name, "netbird", "down"]).await?;
+        podman_success(&["exec", name, "netbird", "up"]).await?;
+    }
     wait_netbird_ready(name).await?;
     sidecar
         .ensure_started()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let mut stable_checks = 0;
+    for _ in 0..60 {
+        if sidecar.ensure_healthy().await.is_ok() {
+            stable_checks += 1;
+            if stable_checks == 3 {
+                return Ok(());
+            }
+        } else {
+            stable_checks = 0;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err("NetBird did not remain ready after reconnect".into())
 }
 
 async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String> {
@@ -1580,11 +1630,42 @@ async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String>
     Ok(())
 }
 
+async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
+    if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    podman_success(&[
+        "exec",
+        "-d",
+        peer,
+        "sh",
+        "-c",
+        "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nLUNARWING-NETBIRD-OK\\n' | nc -l -p 8080; done",
+    ])
+    .await?;
+    for _ in 0..30 {
+        if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err("the plain-peer HTTP listener never became ready".into())
+}
+
 async fn assert_netbird_joined_run(
     sidecar: &TunnelSidecar,
     image: &str,
     workdir: &Path,
+    peer: &str,
 ) -> Result<(), String> {
+    let peer_ip = netbird_ipv4(peer).await?;
+    start_netbird_http_server(peer).await?;
     let container_id = sidecar
         .ensure_healthy()
         .await
@@ -1596,11 +1677,18 @@ async fn assert_netbird_joined_run(
         timeout: Duration::from_secs(120),
         ..ResourceLimits::default()
     };
+    let command = format!(
+        "cat /proc/net/dev; \
+         wget -qO- -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
+         && echo LUNARWING-NETBIRD-OVERLAY-OK; \
+         wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
+         && echo LUNARWING-NETBIRD-UPLINK-OPEN; \
+         wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
+         && echo LUNARWING-NETBIRD-METADATA-OPEN; true"
+    );
     let output = runner
         .execute(ExecParams {
-            command: "cat /proc/net/dev; \
-                 wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
-                 && echo LUNARWING-NETBIRD-UPLINK-OPEN; true",
+            command: &command,
             working_dir: workdir,
             policy: SandboxPolicy::ReadOnly,
             limits: &limits,
@@ -1619,7 +1707,14 @@ async fn assert_netbird_joined_run(
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
     assert!(output.stdout.contains("wt0"), "joined run has no wt0");
+    assert!(
+        output.stdout.contains("LUNARWING-NETBIRD-OVERLAY-OK"),
+        "peer HTTP fetch failed: {}{}",
+        output.stdout,
+        output.stderr
+    );
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-UPLINK-OPEN"));
+    assert!(!output.stdout.contains("LUNARWING-NETBIRD-METADATA-OPEN"));
     Ok(())
 }
 
@@ -1743,13 +1838,14 @@ async fn podman_tunnel_sidecar_netbird_live() {
         start_plain_netbird_peer(&image, &peer_name, &peer_env).await?;
         assert_netbird_peers_connected(primary.container_name(), &peer_name).await?;
         assert_netbird_mark_rule(&primary).await?;
-        assert_netbird_joined_run(&primary, &image, &workdir).await?;
+        assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
         let primary_volume = netbird_volume(&primary).await?;
         assert_eq!(
             primary_volume,
             assert_netbird_restart_identity(&primary, &runtime_dir).await?
         );
         assert_netbird_reconnect(&primary).await?;
+        assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
         assert_netbird_ingress_denied(&primary, &peer_name).await
     }
     .await;
@@ -1760,4 +1856,155 @@ async fn podman_tunnel_sidecar_netbird_live() {
     let _ = std::fs::remove_file(peer_env);
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("live NetBird connectivity, joined-run, reconnect, identity, and ingress checks");
+}
+
+async fn assert_netbird_custom_dns_fails_closed(
+    sidecar: &TunnelSidecar,
+    image: &str,
+    workdir: &Path,
+    resolver: IpAddr,
+) -> Result<(), String> {
+    let container_id = sidecar
+        .ensure_healthy()
+        .await
+        .map_err(|error| error.to_string())?;
+    let resolv_conf = sidecar
+        .tunnel_resolv_conf()
+        .map_err(|error| error.to_string())?;
+    let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    let limits = ResourceLimits {
+        timeout: Duration::from_secs(120),
+        ..ResourceLimits::default()
+    };
+    let output = runner
+        .execute(ExecParams {
+            command: "cat /etc/resolv.conf; \
+                 nslookup www.example.com 2>&1 \
+                 && echo LUNARWING-NETBIRD-CUSTOM-DNS-OK; true",
+            working_dir: workdir,
+            policy: SandboxPolicy::ReadOnly,
+            limits: &limits,
+            env: &HashMap::new(),
+            network: SandboxNetworkMode::Tunnel,
+            proxy_port: 0,
+            tunnel: Some(TunnelRunConfig {
+                container_id: &container_id,
+                dns: &[resolver],
+                resolv_conf: resolv_conf.as_deref(),
+            }),
+            protected_paths: &[],
+            tenant_logs: false,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        !output.stdout.contains("LUNARWING-NETBIRD-CUSTOM-DNS-OK"),
+        "custom NetBird DNS unexpectedly resolved; update the WI#603 contract: {}{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("SERVFAIL"),
+        "NetBird did not return its expected upstream-blocked SERVFAIL: {}{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains(&format!("nameserver {resolver}")),
+        "joined run used the wrong resolver: {}",
+        output.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn podman_tunnel_sidecar_netbird_custom_dns_live() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS")
+        || !gate_open("LUNARWING_E2E_TUNNEL_TESTS")
+        || !gate_open("LUNARWING_E2E_NETBIRD_TESTS")
+    {
+        eprintln!("skipping: set podman, tunnel, and NetBird e2e gates to 1");
+        return;
+    }
+    let settings: Result<(String, String, String), String> = (|| {
+        Ok((
+            required_env("LUNARWING_E2E_NETBIRD_IMAGE")?,
+            required_env("LUNARWING_E2E_NETBIRD_MANAGEMENT_URL")?,
+            required_netbird_setup_key()?,
+        ))
+    })();
+    let (image, management_url, setup_key) = settings.expect("NetBird live settings");
+    let workdir = std::env::temp_dir().join(format!("lw-netbird-dns-live-{}", std::process::id()));
+    let primary_dir = workdir.join("primary");
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&primary_dir).expect("primary instance dir");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime dir");
+    }
+    let mut config = TunnelSidecarConfig {
+        provider: TunnelProvider::Netbird,
+        image: Some(image.clone()),
+        netbird_management_url: Some(management_url.clone()),
+        netbird_setup_key: Some(SecretString::from(setup_key.clone())),
+        startup_timeout: Duration::from_secs(120),
+        ..TunnelSidecarConfig::default()
+    };
+    let primary = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        config.clone(),
+        &primary_dir,
+        &runtime_dir,
+    );
+    let volume_prefix = format!("{}-netbird-", primary.container_name());
+    let result = async {
+        primary
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        let resolver = netbird_ipv4(primary.container_name()).await?;
+        let first_volume = netbird_volume(&primary).await?;
+        primary.stop().await;
+        config.dns = vec![resolver];
+        let primary = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config.clone(),
+            &primary_dir,
+            &runtime_dir,
+        );
+        primary
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(resolver, netbird_ipv4(primary.container_name()).await?);
+        assert_eq!(first_volume, netbird_volume(&primary).await?);
+        assert_netbird_mark_rule(&primary).await?;
+        let rules = podman_output(&[
+            "exec",
+            primary.container_name(),
+            "nft",
+            "list",
+            "table",
+            "inet",
+            "lunarwing_sandbox_egress",
+        ])
+        .await?;
+        let listing = String::from_utf8_lossy(&rules.stdout);
+        assert!(
+            !listing.contains("dport 53"),
+            "custom DNS retained an uplink resolver rule:\n{listing}"
+        );
+        assert_netbird_custom_dns_fails_closed(&primary, &image, &workdir, resolver).await
+    }
+    .await;
+    primary.stop().await;
+    remove_netbird_volumes(&volume_prefix).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result.expect("live NetBird custom-DNS fail-closed and identity checks");
 }

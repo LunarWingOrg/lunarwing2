@@ -401,7 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default off Linux) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (Linux default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
-| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; custom joined-run DNS removes direct uplink DNS rules | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. NetBird live interoperability and local-DNS forwarding remain unvalidated in WI#600 |
+| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; custom joined-run DNS removes direct uplink DNS rules | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. Core NetBird 0.82.0 interoperability is live-validated in WI#600; custom DNS fails closed in WI#603 |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#537, v2.2.0.0):** on Linux the in-code default and new
@@ -464,12 +464,12 @@ host-loopback, LAN, and metadata connections are unreachable.
 `SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay resolver files
 `ro,z` into joined runs only and removes every direct uplink DNS accept. The
 sidecar retains its runtime resolver file for bootstrap, but the same chain
-drops its own unmarked post-start lookups too. NetBird with this setting is
-untested and expected to lose management/signal/relay/STUN name resolution on
-reconnect; WI#603 keeps the live measurement and any fix open, so default
-runtime DNS is required for NetBird until then. Its local DNS listener may also
-have a marked upstream path; that and other live provider interoperability are
-WI#600 measurements, not claimed closed.
+drops its own unmarked post-start lookups too. The WI#600 live run confirmed
+that NetBird's local resolver listens on the sidecar's overlay IP but its
+upstream writes are unmarked: joined lookups return `SERVFAIL`, the client log
+reports `operation not permitted`, and no query reaches the uplink. Custom
+NetBird DNS is therefore unsupported; WI#603 retains the reconnect investigation
+and any fix, so default runtime DNS is required for NetBird.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -491,6 +491,11 @@ than degrading to a peerless probe. DNS/canary validation rejects loopback,
 link-local, broadcast, unspecified, and multicast addresses, and the canary is
 re-probed after the firewall is installed. NetBird's default image is the
 digest-pinned 0.82.0 OCI index; mutable references warn with auto-pull enabled.
+The NetBird sidecar adds only `NET_ADMIN`, `NET_RAW`, and `NET_BIND_SERVICE`,
+never `SYS_ADMIN`; joined commands receive none of them.
+`NB_DISABLE_FIREWALL=true` prevents NetBird's interface allower from inserting
+and reapplying its own `wt0` accept in LunarWing's verified input chain, while
+advanced-routing socket marks remain active.
 Every start/health check hashes the resolved local image ID so tag rotation
 recreates the sidecar. Missing `nft`, an unhealthy provider, or an
 altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading

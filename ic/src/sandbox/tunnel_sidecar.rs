@@ -596,7 +596,12 @@ pub(crate) fn build_sidecar_args(
     ];
     match cfg.provider {
         TunnelProvider::Netbird => {
-            args.extend(["--device".into(), "/dev/net/tun".into()]);
+            args.extend([
+                "--cap-add=NET_RAW".into(),
+                "--cap-add=NET_BIND_SERVICE".into(),
+                "--device".into(),
+                "/dev/net/tun".into(),
+            ]);
             if let Some(volume) = netbird_state_volume {
                 args.extend(["-v".into(), format!("{volume}:/var/lib/netbird")]);
             }
@@ -1977,9 +1982,10 @@ impl TunnelSidecar {
             .unwrap_or_default();
         crate::tracing_fmt::register_log_secret(key);
         // NB_LOG_FILE=console: the image default also names a file under
-        // /var/log, which the read-only rootfs cannot hold.
+        // /var/log, which the read-only rootfs cannot hold. NetBird's own
+        // firewall would insert wt0 accepts into LunarWing's exact chains.
         let contents = SecretString::from(format!(
-            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n"
+            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\nNB_DISABLE_FIREWALL=true\n"
         ));
         let dir = self.runtime_dir()?;
         SecretEnvFile::write(&dir, &contents)
@@ -2319,6 +2325,8 @@ mod tests {
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
+        assert!(joined.contains("--cap-add=NET_RAW"));
+        assert!(joined.contains("--cap-add=NET_BIND_SERVICE"));
         assert!(!joined.contains("SYS_ADMIN"));
         assert!(!joined.contains("--privileged"));
         assert!(!joined.contains("--publish"));

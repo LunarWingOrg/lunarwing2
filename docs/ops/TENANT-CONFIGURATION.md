@@ -531,9 +531,10 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 
 Custom DNS is mounted only into joined runs. The sidecar retains its runtime
 resolver file for bootstrap, but the firewall also blocks its own post-start
-lookups when custom DNS is set. NetBird reconnects by hostname are therefore
-expected to fail with that setting; do not combine them until WI#603 records a
-live result and a fix or explicit unsupported-combination enforcement.
+lookups when custom DNS is set. The WI#600 live run confirmed that NetBird's
+upstream DNS writes are unmarked and blocked, returning `SERVFAIL`; do not use
+that combination. WI#603 retains the reconnect investigation and any fix or
+explicit unsupported-combination enforcement.
 DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
 multicast values. Peered WireGuard configs need
 `PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
@@ -559,8 +560,9 @@ salt, so host reboots, image changes, and DNS changes retain the peer;
 management URL or setup-key rotation changes it. The first start after the
 WI#602 fix re-enrols once under a new persistent-salt volume name and prunes the
 old instance-scoped volume, so plan one valid setup-key use and revoke the old
-peer. NetBird live interoperability and local-DNS forwarding remain unvalidated
-in WI#600. Operator guide:
+peer. WI#600 validated core NetBird 0.82.0 interoperability on 2026-11-11;
+custom DNS remains unsupported after its upstream writes failed closed. Operator
+guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior
