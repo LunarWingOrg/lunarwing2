@@ -307,3 +307,4 @@ PYEOF
 echo "refresh-vendor: cargo-deny advisories gate (unvendored context)" >&2
 bash ../.gitlab/scripts/cargo-deny-check.sh
 echo "refresh-vendor: OK - review the $VENDOR_DIR/ diff, then commit" >&2
+echo "refresh-vendor: next refresh the secret-history baseline with .gitlab/scripts/refresh-secret-history-baseline.py (see .gitlab/README.md)" >&2

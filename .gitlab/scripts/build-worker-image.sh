@@ -239,6 +239,13 @@ lunardepth4lunarwing/scripts/runtime_smoke.py
 lunardepth4lunarwing/scripts/runtime_smoke_test.py
 lunardepth4lunarwing/scripts/runtime_smoke_entrypoint.sh
 lunardepth4lunarwing/scripts/dsh-exposure-guard.sh
+lunardepth4lunarwing/scripts/deploy_build_approval.py
+lunardepth4lunarwing/scripts/deploy_build_approval_test.py
+lunardepth4lunarwing/scripts/harden_image_modes.sh
+lunardepth4lunarwing/scripts/prepare_lockfile_deploy.py
+lunardepth4lunarwing/scripts/prepare_lockfile_deploy_test.py
+lunardepth4lunarwing/scripts/verify_deployed_closure.ts
+lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
         source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5
@@ -419,6 +426,48 @@ build_image_with_retry() {
     done
 }
 
+# Download and compare only the first differing layer pair. Diagnosis remains
+# best-effort: registry or archive failures cannot hide the digest mismatch.
+print_first_layer_file_diff() {
+    _file_token=$1
+    _file_repo=$2
+    _file_candidate=$3
+    _file_rebuild=$4
+    _file_tmp=$5
+    if [ -z "$_file_candidate" ] || [ -z "$_file_rebuild" ]; then
+        return 0
+    fi
+    echo "INFO: fetching the first differing layer pair for a per-file comparison (best effort)" >&2
+    if ! wget -q -T 120 -O "$_file_tmp/candidate-layer.tar.gz" \
+        --header "Authorization: Bearer ${_file_token}" \
+        "https://${CI_REGISTRY}/v2/${_file_repo}/blobs/${_file_candidate}"; then
+        echo "WARN: could not fetch the candidate layer — per-file diagnosis unavailable" >&2
+        return 0
+    fi
+    if ! wget -q -T 120 -O "$_file_tmp/rebuild-layer.tar.gz" \
+        --header "Authorization: Bearer ${_file_token}" \
+        "https://${CI_REGISTRY}/v2/${_file_repo}/blobs/${_file_rebuild}"; then
+        echo "WARN: could not fetch the rebuild layer — per-file diagnosis unavailable" >&2
+        return 0
+    fi
+    if ! mkdir -p "$_file_tmp/candidate-root" "$_file_tmp/rebuild-root" ||
+        ! tar -xzf "$_file_tmp/candidate-layer.tar.gz" -C "$_file_tmp/candidate-root" ||
+        ! tar -xzf "$_file_tmp/rebuild-layer.tar.gz" -C "$_file_tmp/rebuild-root"; then
+        echo "WARN: could not unpack the differing layers — per-file diagnosis unavailable" >&2
+        return 0
+    fi
+    if ! (cd "$_file_tmp/candidate-root" && find . -type f -exec sha256sum {} + | sort -k 2,2) \
+        >"$_file_tmp/candidate-files"; then
+        return 0
+    fi
+    if ! (cd "$_file_tmp/rebuild-root" && find . -type f -exec sha256sum {} + | sort -k 2,2) \
+        >"$_file_tmp/rebuild-files"; then
+        return 0
+    fi
+    echo "INFO: first differing layer file hashes (at most 200 diff lines)" >&2
+    diff -u "$_file_tmp/candidate-files" "$_file_tmp/rebuild-files" | sed -n '1,200p' >&2 || true
+}
+
 # Best-effort layer-level diagnosis for a candidate/rebuild digest mismatch
 # (work item #177): fetch both manifests from the project registry with the
 # job's registry credentials, then report whether the divergence is in the
@@ -487,6 +536,17 @@ print_reproducibility_diagnosis() {
     else
         echo "INFO: layer digest diff follows (hunk headers are 1-based layer indexes, counting from the first image layer)" >&2
         diff -u "$_diag_tmp/candidate-layers" "$_diag_tmp/rebuild-layers" >&2 || true
+        _diag_index=1
+        while [ "$_diag_index" -le "$_diag_cand_layers" ] && [ "$_diag_index" -le "$_diag_rebuild_layers" ]; do
+            _diag_cand_layer=$(sed -n "${_diag_index}p" "$_diag_tmp/candidate-layers")
+            _diag_rebuild_layer=$(sed -n "${_diag_index}p" "$_diag_tmp/rebuild-layers")
+            if [ "$_diag_cand_layer" != "$_diag_rebuild_layer" ]; then
+                print_first_layer_file_diff "$_diag_token" "$_diag_repo" \
+                    "$_diag_cand_layer" "$_diag_rebuild_layer" "$_diag_tmp"
+                break
+            fi
+            _diag_index=$((_diag_index + 1))
+        done
     fi
     rm -rf "$_diag_tmp"
     return 0

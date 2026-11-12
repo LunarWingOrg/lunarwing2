@@ -73,6 +73,8 @@ No tunnel, relay, pairing, public sharing, web UI, remote plugin installation, s
 
 Use Node `22.23.4` and exactly pnpm `11.7.0`. The Debian snapshot is tied to the other workers. The build checks the source SHA and both ancestry markers, runs the source toolchain guard before installation, preserves the pnpm lock byte-for-byte, runs focused worker tests/typechecks, and materializes `dsh-python-runtime-closure` through `build-exe-for-python-sdk.ts --deploy-to`.
 
+The pinned script's legacy live-registry deploy is replaced by an exact-block, build-time transformation to pnpm's shared-lockfile deploy with frozen resolution, injected workspace packages, and strict release-age enforcement. The source `pnpm-workspace.yaml`, including `minimumReleaseAgeExclude`, must remain unchanged. After deployment, every installed external `name@version` must occur in `pnpm-lock.yaml`; workspace packages are checked against its importer manifests. The sorted inventory's SHA-256 is recorded as `LUNARDEPTH_DEPLOYED_PACKAGES_SHA256` in `worker-inputs.sha256`. Image hardening clears inherited write and set-ID bits before the final mode assertion.
+
 ```sh
 ic/scripts/lunarwing-mt-admin.sh build-lunardepth-worker --no-cache
 ic/scripts/lunarwing-mt-admin.sh worker-listeners <tenant>

@@ -498,6 +498,11 @@ fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigS
         if line.is_empty() {
             continue;
         }
+        if line.starts_with(';') {
+            return Err(format!(
+                "semicolon comments are not accepted at line {line_number}"
+            ));
+        }
         if line.starts_with('[') {
             finish_wireguard_peer(peer.take(), &mut summary)?;
             in_interface = line == "[interface]";
@@ -591,7 +596,12 @@ pub(crate) fn build_sidecar_args(
     ];
     match cfg.provider {
         TunnelProvider::Netbird => {
-            args.extend(["--device".into(), "/dev/net/tun".into()]);
+            args.extend([
+                "--cap-add=NET_RAW".into(),
+                "--cap-add=NET_BIND_SERVICE".into(),
+                "--device".into(),
+                "/dev/net/tun".into(),
+            ]);
             if let Some(volume) = netbird_state_volume {
                 args.extend(["-v".into(), format!("{volume}:/var/lib/netbird")]);
             }
@@ -713,59 +723,39 @@ impl EgressPolicy {
     }
 }
 
-fn chain_header(hook: &str) -> String {
-    format!("{{ type filter hook {hook} priority 0; policy drop; }}")
+fn firewall_chain(name: &str, rules: &[String]) -> String {
+    let mut chain =
+        format!("    chain {name} {{\n        type filter hook {name} priority 0; policy drop;\n");
+    for rule in rules {
+        chain.push_str(&format!("        {rule}\n"));
+    }
+    chain.push_str("    }\n");
+    chain
 }
 
-fn firewall_install_commands(policy: &EgressPolicy, container_name: &str) -> Vec<Vec<String>> {
-    let input_header = chain_header(NFT_INPUT_CHAIN);
-    let output_header = chain_header(NFT_OUTPUT_CHAIN);
-    let input_rules = EgressPolicy::input_rules();
-    let output_rules = policy.output_rules();
-    let mut commands: Vec<Vec<&str>> = vec![
-        vec!["delete", "table", "inet", NFT_TABLE],
-        vec!["add", "table", "inet", NFT_TABLE],
-        vec![
-            "add",
-            "chain",
-            "inet",
-            NFT_TABLE,
-            NFT_INPUT_CHAIN,
-            input_header.as_str(),
-        ],
+fn firewall_ruleset(policy: &EgressPolicy) -> String {
+    let mut ruleset = format!(
+        "add table inet {NFT_TABLE}\ndelete table inet {NFT_TABLE}\ntable inet {NFT_TABLE} {{\n"
+    );
+    ruleset.push_str(&firewall_chain(
+        NFT_INPUT_CHAIN,
+        &EgressPolicy::input_rules(),
+    ));
+    ruleset.push_str(&firewall_chain(NFT_OUTPUT_CHAIN, &policy.output_rules()));
+    ruleset.push_str("}\n");
+    ruleset
+}
+
+fn firewall_install_command(policy: &EgressPolicy, container_name: &str) -> (Vec<String>, String) {
+    let args = vec![
+        "exec".into(),
+        "-i".into(),
+        container_name.into(),
+        "nft".into(),
+        "-f".into(),
+        "-".into(),
     ];
-    for rule in &input_rules {
-        commands.push(vec![
-            "add",
-            "rule",
-            "inet",
-            NFT_TABLE,
-            NFT_INPUT_CHAIN,
-            rule.as_str(),
-        ]);
-    }
-    commands.push(vec![
-        "add",
-        "chain",
-        "inet",
-        NFT_TABLE,
-        NFT_OUTPUT_CHAIN,
-        output_header.as_str(),
-    ]);
-    for rule in &output_rules {
-        commands.push(vec![
-            "add",
-            "rule",
-            "inet",
-            NFT_TABLE,
-            NFT_OUTPUT_CHAIN,
-            rule.as_str(),
-        ]);
-    }
-    commands
-        .iter()
-        .map(|args| nft_exec_args(args, container_name))
-        .collect()
+    (args, firewall_ruleset(policy))
 }
 
 fn firewall_list_args(container_name: &str) -> Vec<String> {
@@ -926,9 +916,42 @@ fn wireguard_handshake_status(output: &str, now_unix: u64) -> std::result::Resul
     }
 }
 
+type RecoveryResult = std::result::Result<(), RecoveryError>;
+type RecoveryCompletion = Option<RecoveryResult>;
+
+#[derive(Clone, Debug)]
+enum RecoveryError {
+    Config { reason: String },
+    Unavailable { reason: String },
+}
+
+impl RecoveryError {
+    fn from_sandbox(error: &SandboxError) -> Self {
+        match error {
+            SandboxError::Config { reason } => Self::Config {
+                reason: reason.clone(),
+            },
+            SandboxError::TunnelUnavailable { reason } => Self::Unavailable {
+                reason: reason.clone(),
+            },
+            other => Self::Unavailable {
+                reason: other.to_string(),
+            },
+        }
+    }
+
+    fn into_sandbox(self) -> SandboxError {
+        match self {
+            Self::Config { reason } => SandboxError::Config { reason },
+            Self::Unavailable { reason } => SandboxError::TunnelUnavailable { reason },
+        }
+    }
+}
+
 #[derive(Default)]
 struct RecoveryState {
     last_failure: Option<RecoveryFailure>,
+    active: Option<tokio::sync::watch::Receiver<RecoveryCompletion>>,
 }
 
 struct RecoveryFailure {
@@ -950,14 +973,52 @@ impl RecoveryState {
         ))
     }
 
-    fn record(&mut self, error: &SandboxError) {
-        if let SandboxError::TunnelUnavailable { reason } = error {
+    fn record(&mut self, error: &RecoveryError) {
+        if let RecoveryError::Unavailable { reason } = error {
             self.last_failure = Some(RecoveryFailure {
                 failed_at: tokio::time::Instant::now(),
                 reason: reason.clone(),
             });
         }
     }
+
+    fn complete(&mut self, result: &RecoveryResult) {
+        self.active = None;
+        match result {
+            Ok(()) => self.last_failure = None,
+            Err(error) => self.record(error),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TunnelLifecycle {
+    state: tokio::sync::Mutex<RecoveryState>,
+    operation: tokio::sync::Mutex<()>,
+}
+
+static TUNNEL_LIFECYCLES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<TunnelLifecycle>>>,
+> = std::sync::OnceLock::new();
+
+fn lifecycle_for_container(container_name: &str) -> std::sync::Arc<TunnelLifecycle> {
+    let registry =
+        TUNNEL_LIFECYCLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lifecycle) = registry
+        .get(container_name)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return lifecycle;
+    }
+    let lifecycle = std::sync::Arc::new(TunnelLifecycle::default());
+    registry.insert(
+        container_name.to_string(),
+        std::sync::Arc::downgrade(&lifecycle),
+    );
+    lifecycle
 }
 
 #[derive(Clone)]
@@ -969,7 +1030,9 @@ pub struct TunnelSidecar {
     runtime_dir: Option<PathBuf>,
     container_name: String,
     instance_id: String,
-    lifecycle: std::sync::Arc<tokio::sync::Mutex<RecoveryState>>,
+    lifecycle: std::sync::Arc<TunnelLifecycle>,
+    #[cfg(test)]
+    test_runtime: Option<crate::sandbox::cli_runner::TestRuntime>,
 }
 
 impl TunnelSidecar {
@@ -1005,16 +1068,29 @@ impl TunnelSidecar {
         base_dir: &Path,
         runtime_dir: Option<PathBuf>,
     ) -> Self {
+        let container_name = container_name_for_instance(base_dir);
+        let lifecycle = lifecycle_for_container(&container_name);
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
             base_dir: base_dir.to_path_buf(),
             runtime_dir,
-            container_name: container_name_for_instance(base_dir),
+            container_name,
             instance_id: instance_id_for(base_dir),
-            lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(RecoveryState::default())),
+            lifecycle,
+            #[cfg(test)]
+            test_runtime: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_runtime(
+        mut self,
+        runtime: crate::sandbox::cli_runner::TestRuntime,
+    ) -> Self {
+        self.test_runtime = Some(runtime);
+        self
     }
 
     pub fn container_name(&self) -> &str {
@@ -1103,55 +1179,132 @@ impl TunnelSidecar {
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
-    /// and passes the health gate. Explicit lifecycle operations retain the
-    /// configured startup budget; manager runs use `recover_for_run` instead.
+    /// and passes the health gate. Cold starts retain the configured budget.
     pub async fn ensure_started(&self) -> Result<()> {
         let timeout = self.cfg.startup_timeout;
-        self.ensure_started_with_timeouts(timeout, timeout).await
+        self.start_recovery(timeout, timeout, None).await
     }
 
-    /// Bounded recovery for a command path. A dropped start has its own cleanup
-    /// guard, and a failed attempt suppresses repeated container churn for 30s.
+    /// Bounded recovery for a command path. The sidecar owns the attempt, so a
+    /// cancelled caller cannot cancel its cleanup or lose the failure back-off.
     pub async fn recover_for_run(&self) -> Result<()> {
         let provider_timeout = self.cfg.startup_timeout.min(RUN_PROVIDER_READY_TIMEOUT);
-        let recovery =
-            self.ensure_started_with_timeouts(RUN_RECOVERY_REPROBE_TIMEOUT, provider_timeout);
-        match tokio::time::timeout(RUN_RECOVERY_BUDGET, recovery).await {
+        self.start_recovery(
+            RUN_RECOVERY_REPROBE_TIMEOUT,
+            provider_timeout,
+            Some(RUN_RECOVERY_BUDGET),
+        )
+        .await
+    }
+
+    /// Bound the initial health check, any recovery, and the final verification
+    /// together so image and runtime probes cannot add a second budget.
+    pub async fn container_for_run(&self) -> Result<String> {
+        let attempt = async {
+            match self.ensure_healthy().await {
+                Ok(container_id) => Ok(container_id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
+                    );
+                    self.recover_for_run().await?;
+                    self.ensure_healthy().await
+                }
+            }
+        };
+        match tokio::time::timeout(RUN_RECOVERY_BUDGET, attempt).await {
             Ok(result) => result,
             Err(_) => {
-                let error = self.unavailable(
-                    "sidecar recovery exceeded the 60s per-run budget while waiting for provider health or firewall verification",
-                );
-                self.lifecycle.lock().await.record(&error);
-                Err(error)
+                let error = RecoveryError::Unavailable {
+                    reason: format!(
+                        "{} sidecar: health check and recovery exceeded the 60s per-run budget during image, runtime, provider, or firewall probes",
+                        self.cfg.provider.as_str()
+                    ),
+                };
+                self.lifecycle.state.lock().await.record(&error);
+                Err(error.into_sandbox())
             }
         }
     }
 
-    async fn ensure_started_with_timeouts(
+    async fn start_recovery(
         &self,
         reprobe_timeout: Duration,
         provider_timeout: Duration,
+        budget: Option<Duration>,
     ) -> Result<()> {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
-        let mut lifecycle = self.lifecycle.lock().await;
-        if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
-            return Err(self.unavailable(&reason));
-        }
-        lifecycle.last_failure = None;
+        let receiver = {
+            let mut lifecycle = self.lifecycle.state.lock().await;
+            if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
+                return Err(self.unavailable(&reason));
+            }
+            if let Some(active) = &lifecycle.active {
+                active.clone()
+            } else {
+                lifecycle.last_failure = None;
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                lifecycle.active = Some(receiver.clone());
+                self.spawn_recovery(sender, reprobe_timeout, provider_timeout, budget);
+                receiver
+            }
+        };
+        self.await_recovery(receiver).await
+    }
+
+    fn spawn_recovery(
+        &self,
+        sender: tokio::sync::watch::Sender<RecoveryCompletion>,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+        budget: Option<Duration>,
+    ) {
         if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
             tracing::warn!(
                 provider = self.cfg.provider.as_str(),
                 "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
             );
         }
-        let result = self.start_or_adopt(reprobe_timeout, provider_timeout).await;
-        if let Err(error) = &result {
-            lifecycle.record(error);
+        let sidecar = self.clone();
+        drop(tokio::spawn(async move {
+            // Keep the operation lock through completion. A cancellation cleanup
+            // queued by the dropped attempt is therefore ahead of the next start
+            // in this fair mutex's queue, never behind it.
+            let _operation = sidecar.lifecycle.operation.lock().await;
+            let attempt = sidecar.start_or_adopt(reprobe_timeout, provider_timeout);
+            let result = match budget {
+                Some(budget) => match tokio::time::timeout(budget, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(sidecar.unavailable(&format!(
+                        "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
+                        budget.as_secs()
+                    ))),
+                },
+                None => attempt.await,
+            };
+            let result = result.map_err(|error| RecoveryError::from_sandbox(&error));
+            sidecar.lifecycle.state.lock().await.complete(&result);
+            sender.send_replace(Some(result));
+        }));
+    }
+
+    async fn await_recovery(
+        &self,
+        mut receiver: tokio::sync::watch::Receiver<RecoveryCompletion>,
+    ) -> Result<()> {
+        let completion = receiver
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.as_ref().cloned());
+        match completion {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(error.into_sandbox()),
+            None => Err(self.unavailable("sidecar recovery ended without a result")),
         }
-        result
     }
 
     async fn start_or_adopt(
@@ -1171,20 +1324,25 @@ impl TunnelSidecar {
                 ),
             }
         }
-        self.remove().await;
+        self.remove_unlocked().await;
         self.start_fresh(&hash, provider_timeout).await
     }
 
     /// Recheck the transport and both firewall chains before every run, then
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
-        let cached = self
-            .lifecycle
-            .lock()
-            .await
-            .cached_reason(tokio::time::Instant::now());
+        let (cached, recovering) = {
+            let lifecycle = self.lifecycle.state.lock().await;
+            (
+                lifecycle.cached_reason(tokio::time::Instant::now()),
+                lifecycle.active.is_some(),
+            )
+        };
         if let Some(reason) = cached {
             return Err(self.unavailable(&reason));
+        }
+        if recovering {
+            return Err(self.unavailable("sidecar recovery is in progress"));
         }
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
@@ -1266,11 +1424,7 @@ impl TunnelSidecar {
         let start_timeout = self.cfg.startup_timeout.min(provider_timeout);
         let started = tokio::time::timeout(
             start_timeout,
-            crate::sandbox::cli_runner::output_detached_isolated(
-                self.bin,
-                &arg_refs,
-                &detached_unit,
-            ),
+            self.runtime_detached(&arg_refs, &detached_unit),
         )
         .await;
         drop(env_file);
@@ -1306,7 +1460,7 @@ impl TunnelSidecar {
         cleanup: &mut SidecarStartCleanup,
         error: SandboxError,
     ) -> SandboxError {
-        self.remove().await;
+        self.remove_unlocked().await;
         cleanup.disarm();
         error
     }
@@ -1319,10 +1473,16 @@ impl TunnelSidecar {
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.error_with_context(
-                    error,
-                    &format!("provider remained unhealthy for {}s", timeout.as_secs()),
-                ));
+                let context = if timeout < self.cfg.startup_timeout {
+                    format!(
+                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s",
+                        timeout.as_secs(),
+                        self.cfg.startup_timeout.as_secs()
+                    )
+                } else {
+                    format!("provider remained unhealthy for {}s", timeout.as_secs())
+                };
+                return Err(self.error_with_context(error, &context));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
@@ -1336,7 +1496,7 @@ impl TunnelSidecar {
                     return match self.check_egress_firewall().await {
                         Ok(()) => Ok(()),
                         Err(error) => {
-                            self.remove().await;
+                            self.remove_unlocked().await;
                             Err(error)
                         }
                     };
@@ -1344,7 +1504,7 @@ impl TunnelSidecar {
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
-                self.remove().await;
+                self.remove_unlocked().await;
                 return Err(self.error_with_context(
                     error,
                     &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
@@ -1506,20 +1666,19 @@ impl TunnelSidecar {
 
     async fn install_egress_firewall(&self) -> Result<()> {
         let policy = self.egress_policy(true).await?;
-        for (index, args) in firewall_install_commands(&policy, &self.container_name)
-            .iter()
-            .enumerate()
-        {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let output = self.output_probe(&refs).await.map_err(|_| {
-                self.unavailable("failed to execute nftables in the tunnel sidecar")
-            })?;
-            // The first command deletes a previous table and may not find one.
-            if index > 0 && !output.status.success() {
-                return Err(self.unavailable(
-                    "egress firewall setup failed; the sidecar image must provide nftables",
-                ));
-            }
+        if self.verify_egress_firewall(&policy).await.is_ok() {
+            return Ok(());
+        }
+        let (args, ruleset) = firewall_install_command(&policy, &self.container_name);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self
+            .output_probe_with_stdin(&refs, Some(ruleset.as_bytes()))
+            .await
+            .map_err(|_| self.unavailable("failed to execute nftables in the tunnel sidecar"))?;
+        if !output.status.success() {
+            return Err(self.unavailable(
+                "egress firewall setup failed; the sidecar image must provide nftables",
+            ));
         }
         self.verify_egress_firewall(&policy).await
     }
@@ -1566,7 +1725,7 @@ impl TunnelSidecar {
         }
         let pulled = tokio::time::timeout(
             self.cfg.startup_timeout,
-            crate::sandbox::cli_runner::output_isolated(self.bin, &["pull", self.cfg.image()]),
+            self.runtime_output(&["pull", self.cfg.image()], None),
         )
         .await;
         match pulled {
@@ -1611,23 +1770,66 @@ impl TunnelSidecar {
         }
     }
 
+    async fn runtime_status(&self, args: &[&str]) -> Option<std::process::ExitStatus> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime
+                .output(args, None)
+                .await
+                .ok()
+                .map(|output| output.status);
+        }
+        crate::sandbox::cli_runner::run_status_isolated(self.bin, args).await
+    }
+
+    async fn runtime_output(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime.output(args, stdin).await;
+        }
+        match stdin {
+            Some(input) => {
+                crate::sandbox::cli_runner::output_isolated_with_stdin(self.bin, args, input).await
+            }
+            None => crate::sandbox::cli_runner::output_isolated(self.bin, args).await,
+        }
+    }
+
+    async fn runtime_detached(
+        &self,
+        args: &[&str],
+        unit_name: &str,
+    ) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime.output(args, None).await;
+        }
+        crate::sandbox::cli_runner::output_detached_isolated(self.bin, args, unit_name).await
+    }
+
     async fn status_probe(&self, args: &[&str]) -> Option<std::process::ExitStatus> {
-        tokio::time::timeout(
-            PROBE_TIMEOUT,
-            crate::sandbox::cli_runner::run_status_isolated(self.bin, args),
-        )
-        .await
-        .ok()
-        .flatten()
+        tokio::time::timeout(PROBE_TIMEOUT, self.runtime_status(args))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn output_probe(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        tokio::time::timeout(
-            PROBE_TIMEOUT,
-            crate::sandbox::cli_runner::output_isolated(self.bin, args),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
+        self.output_probe_with_stdin(args, None).await
+    }
+
+    async fn output_probe_with_stdin(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        tokio::time::timeout(PROBE_TIMEOUT, self.runtime_output(args, stdin))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
     }
 
     fn unavailable(&self, detail: &str) -> SandboxError {
@@ -1647,12 +1849,22 @@ impl TunnelSidecar {
 
     /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
+        let _operation = self.lifecycle.operation.lock().await;
+        self.remove_unlocked().await;
+    }
+
+    async fn remove_unlocked(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
         self.release_network_helper().await;
     }
 
     /// Stop the sidecar gracefully, then remove it if this instance owns it.
     pub async fn stop(&self) {
+        let _operation = self.lifecycle.operation.lock().await;
+        self.stop_unlocked().await;
+    }
+
+    async fn stop_unlocked(&self) {
         if tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10))
             .await
             .ok()
@@ -1740,8 +1952,7 @@ impl TunnelSidecar {
         }
         for args in removal_commands(self.runtime, grace_secs, &self.container_name) {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Some(status) =
-                crate::sandbox::cli_runner::run_status_isolated(self.bin, &refs).await
+            if let Some(status) = self.runtime_status(&refs).await
                 && !status.success()
             {
                 tracing::debug!(
@@ -1771,9 +1982,10 @@ impl TunnelSidecar {
             .unwrap_or_default();
         crate::tracing_fmt::register_log_secret(key);
         // NB_LOG_FILE=console: the image default also names a file under
-        // /var/log, which the read-only rootfs cannot hold.
+        // /var/log, which the read-only rootfs cannot hold. NetBird's own
+        // firewall would insert wt0 accepts into LunarWing's exact chains.
         let contents = SecretString::from(format!(
-            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n"
+            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\nNB_DISABLE_FIREWALL=true\n"
         ));
         let dir = self.runtime_dir()?;
         SecretEnvFile::write(&dir, &contents)
@@ -2113,6 +2325,8 @@ mod tests {
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
+        assert!(joined.contains("--cap-add=NET_RAW"));
+        assert!(joined.contains("--cap-add=NET_BIND_SERVICE"));
         assert!(!joined.contains("SYS_ADMIN"));
         assert!(!joined.contains("--privileged"));
         assert!(!joined.contains("--publish"));
@@ -2400,10 +2614,19 @@ mod tests {
         let config = dir.join("wg0.conf");
         std::fs::write(
             &config,
-            "[Peer]\nPrivateKey = wrong-section\n[Interface]\nAddress = 10.0.0.2/32\n",
+            "[Peer]\nPublicKey = public\nPrivateKey = wrong-section\n[Interface]\nAddress = 10.0.0.2/32\n",
         )
         .unwrap();
-        assert!(wireguard_cfg(Some(config.clone())).validate().is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let error = wireguard_cfg(Some(config.clone())).validate().unwrap_err();
+        assert!(
+            error.contains("needs a non-empty PrivateKey in [Interface]"),
+            "{error}"
+        );
         std::fs::write(
             &config,
             "[Interface]\nPrivateKey = abcdefg\nAddress = 10.0.0.2/32\n",
@@ -2518,27 +2741,44 @@ mod tests {
             (
                 "plus sign",
                 "[Peer]\nPublicKey = public\nPersistentKeepalive = +25\n",
+                "digits only",
             ),
             (
                 "above u16",
                 "[Peer]\nPublicKey = public\nPersistentKeepalive = 65536\n",
+                "at most 65535",
             ),
-            ("semicolon comment", "[Peer]\nPublicKey = public\n; text\n"),
+            (
+                "semicolon comment",
+                "[Peer]\nPublicKey = public\n; text\n",
+                "semicolon comments are not accepted at line 5",
+            ),
+            (
+                "semicolon key value",
+                "[Peer]\nPublicKey = public\n; AllowedIPs = 10.0.0.0/24\n",
+                "semicolon comments are not accepted at line 5",
+            ),
             (
                 "decorated semicolon header",
                 "[Peer]; text\nPublicKey = public\n",
+                "invalid section header at line 3",
             ),
             (
                 "interface keepalive",
                 "PersistentKeepalive = 25\n[Peer]\nPublicKey = public\n",
+                "belongs in [Peer]",
             ),
-            ("missing public key", "[Peer]\nPersistentKeepalive = 25\n"),
+            (
+                "missing public key",
+                "[Peer]\nPersistentKeepalive = 25\n",
+                "[Peer] at line 3 needs a non-empty PublicKey",
+            ),
         ];
-        for (label, suffix) in invalid {
+        for (label, suffix, expected) in invalid {
             let error = parse_wireguard_config(&format!("{interface}{suffix}"))
                 .expect_err(label)
                 .to_string();
-            assert!(error.contains("line"), "{label}: {error}");
+            assert!(error.contains(expected), "{label}: {error}");
         }
     }
 
@@ -2591,7 +2831,7 @@ mod tests {
     #[test]
     fn recovery_backoff_preserves_the_probe_reason_and_expires() {
         let mut state = RecoveryState::default();
-        state.record(&SandboxError::TunnelUnavailable {
+        state.record(&RecoveryError::Unavailable {
             reason: "WireGuard handshake is 181s old".into(),
         });
         let failed_at = state.last_failure.as_ref().unwrap().failed_at;
@@ -2604,10 +2844,41 @@ mod tests {
         assert!(state.cached_reason(failed_at + RECOVERY_BACKOFF).is_none());
 
         let mut config_state = RecoveryState::default();
-        config_state.record(&SandboxError::Config {
+        config_state.record(&RecoveryError::Config {
             reason: "invalid configuration".into(),
         });
         assert!(config_state.cached_reason(failed_at).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_completion_is_recorded_before_waiters_are_notified() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let mut waiting = receiver.clone();
+        let mut state = RecoveryState {
+            active: Some(receiver),
+            ..RecoveryState::default()
+        };
+        let result = Err(RecoveryError::Unavailable {
+            reason: "dead peer".into(),
+        });
+
+        state.complete(&result);
+        assert!(state.active.is_none());
+        assert!(
+            state
+                .cached_reason(tokio::time::Instant::now())
+                .is_some_and(|reason| reason.contains("dead peer"))
+        );
+        sender.send_replace(Some(result));
+        let completed = waiting
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.as_ref().cloned());
+        assert!(matches!(
+            completed,
+            Some(Err(RecoveryError::Unavailable { reason })) if reason == "dead peer"
+        ));
     }
 
     #[test]
@@ -2669,34 +2940,35 @@ mod tests {
     }
 
     #[test]
-    fn firewall_install_covers_both_directions() {
-        let commands = firewall_install_commands(&policy(), "tunnel-test");
-        let joined = commands
-            .iter()
-            .map(|command| command.join(" "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains(
-            "add chain inet lunarwing_sandbox_egress input { type filter hook input priority 0; policy drop; }"
-        ));
-        assert!(joined.contains(
-            "add chain inet lunarwing_sandbox_egress output { type filter hook output priority 0; policy drop; }"
-        ));
-        assert!(joined.contains("input iifname \"lo\" accept"));
-        assert!(joined.contains("input ct state established,related accept"));
-        assert!(joined.contains("output oifname \"lo\" accept"));
-        assert!(joined.contains("output oifname \"wg0\" accept"));
-        assert!(joined.contains("output oifname \"wt0\" accept"));
-        assert!(joined.contains("output ip daddr 169.254.1.1 udp dport 53 accept"));
-        assert!(joined.contains("output ip daddr 9.9.9.9 tcp dport 53 accept"));
-        assert!(joined.contains("output ip daddr 169.254.0.0/16 drop"));
-        assert!(joined.contains("output meta mark 0x4c57 accept"));
-        // Nothing lets unmarked uplink traffic out: no established/related
-        // shortcut and no bare accept in the output chain.
-        assert!(!joined.contains("output ct state"));
-        assert!(!joined.contains("output accept"));
-        // The DNS allowance precedes the link-local drop (pasta's forwarder
-        // lives in 169.254.0.0/16); the mark accept comes last.
+    fn firewall_install_is_one_atomic_transaction_covering_both_directions() {
+        let (args, ruleset) = firewall_install_command(&policy(), "tunnel-test");
+        assert_eq!(args.join(" "), "exec -i tunnel-test nft -f -");
+        assert_eq!(ruleset.matches("add table inet").count(), 1);
+        assert_eq!(ruleset.matches("delete table inet").count(), 1);
+        assert!(!ruleset.contains("add rule"));
+        let add = ruleset.find("add table inet").unwrap();
+        let delete = ruleset.find("delete table inet").unwrap();
+        let definition = ruleset
+            .find("table inet lunarwing_sandbox_egress {")
+            .unwrap();
+        assert!(add < delete && delete < definition, "{ruleset}");
+        for expected in [
+            "chain input {\n        type filter hook input priority 0; policy drop;",
+            "chain output {\n        type filter hook output priority 0; policy drop;",
+            "iifname \"lo\" accept",
+            "ct state established,related accept",
+            "oifname \"lo\" accept",
+            "oifname \"wg0\" accept",
+            "oifname \"wt0\" accept",
+            "ip daddr 169.254.1.1 udp dport 53 accept",
+            "ip daddr 9.9.9.9 tcp dport 53 accept",
+            "ip daddr 169.254.0.0/16 drop",
+            "meta mark 0x4c57 accept",
+        ] {
+            assert!(ruleset.contains(expected), "missing {expected}: {ruleset}");
+        }
+        assert!(!ruleset.contains("output ct state"));
+        assert!(!ruleset.contains("output accept"));
         let rules = policy().output_rules();
         let dns = rules
             .iter()
@@ -2708,8 +2980,6 @@ mod tests {
             .position(|r| r.starts_with("meta mark"))
             .unwrap();
         assert!(dns < drop && drop < mark);
-        // delete table, add table, two chain headers, 2 input + output rules.
-        assert_eq!(commands.len(), 4 + 2 + rules.len());
     }
 
     #[test]

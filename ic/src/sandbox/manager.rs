@@ -87,7 +87,10 @@ pub struct SandboxManager {
     /// Tunnel sidecar handle when `network` is `Tunnel` (WI#248); stopped
     /// on shutdown.
     tunnel: RwLock<Option<TunnelSidecar>>,
+    initialization: tokio::sync::Mutex<()>,
     initialized: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_runner: Option<Arc<CliRunner>>,
 }
 
 impl SandboxManager {
@@ -98,8 +101,19 @@ impl SandboxManager {
             proxy: Arc::new(RwLock::new(None)),
             runner: Arc::new(RwLock::new(None)),
             tunnel: RwLock::new(None),
+            initialization: tokio::sync::Mutex::new(()),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_runner: None,
         }
+    }
+
+    /// Create with an instance-scoped tunnel sidecar for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn new_with_tunnel_sidecar(config: SandboxConfig, sidecar: TunnelSidecar) -> Self {
+        let mut manager = Self::new(config);
+        manager.tunnel = RwLock::new(Some(sidecar));
+        manager
     }
 
     /// Create with default configuration.
@@ -118,8 +132,22 @@ impl SandboxManager {
             .is_ok()
     }
 
+    async fn runner_for_initialize(&self) -> Result<Arc<CliRunner>> {
+        #[cfg(test)]
+        if let Some(runner) = &self.test_runner {
+            return Ok(runner.clone());
+        }
+        Ok(Arc::new(
+            CliRunner::detect(self.config.runtime, self.config.image.clone()).await?,
+        ))
+    }
+
     /// Initialize the sandbox (detect runtime CLI, verify image, start proxy).
     pub async fn initialize(&self) -> Result<()> {
+        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _initialization = self.initialization.lock().await;
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
@@ -131,8 +159,7 @@ impl SandboxManager {
         }
 
         // Detect the runtime CLI (podman preferred, docker fallback)
-        let runner =
-            Arc::new(CliRunner::detect(self.config.runtime, self.config.image.clone()).await?);
+        let runner = self.runner_for_initialize().await?;
 
         // Check for / pull the image. Inspection failures are not absence:
         // rootless podman can fail here when its storage filesystem is full.
@@ -149,36 +176,7 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        // Tunnel sidecar (WI#248): health-gated start before any run can join
-        // its namespace. Keep the handle after a failed start so its back-off
-        // also covers later commands; no run can join without a healthy gate.
-        let tunnel_start = if self.config.network == SandboxNetworkMode::Tunnel {
-            let tunnel_cfg = self
-                .config
-                .tunnel
-                .clone()
-                .ok_or_else(|| SandboxError::Config {
-                    reason: "SANDBOX_NETWORK=tunnel requires SANDBOX_TUNNEL_* settings \
-                         (see docs/guides/SANDBOX_TUNNEL_NETWORKING.md)"
-                        .to_string(),
-                })?;
-            let sidecar = TunnelSidecar::new(
-                self.runner
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|r| r.runtime())
-                    .ok_or_else(|| SandboxError::RuntimeNotAvailable {
-                        reason: "container runtime not initialized".to_string(),
-                    })?,
-                tunnel_cfg,
-            );
-            let startup = sidecar.recover_for_run().await;
-            *self.tunnel.write().await = Some(sidecar);
-            Some(startup)
-        } else {
-            None
-        };
+        let tunnel_start = self.initialize_tunnel().await;
 
         // Start the network proxy for the proxy-backed egress modes —
         // advisory and enforced both need the validating proxy. The tunnel
@@ -199,9 +197,7 @@ impl SandboxManager {
 
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(startup) = tunnel_start {
-            startup?;
-        }
+        tunnel_start?;
 
         // Resolve the runtime name before the macro: the read guard's await
         // inside `tracing::info!` field position would make the future !Send.
@@ -216,8 +212,46 @@ impl SandboxManager {
         Ok(())
     }
 
+    async fn initialize_tunnel(&self) -> Result<()> {
+        if self.config.network != SandboxNetworkMode::Tunnel {
+            return Ok(());
+        }
+        let sidecar = {
+            let mut tunnel = self.tunnel.write().await;
+            match tunnel.as_ref() {
+                Some(sidecar) => sidecar.clone(),
+                None => {
+                    let config =
+                        self.config
+                            .tunnel
+                            .clone()
+                            .ok_or_else(|| SandboxError::Config {
+                                reason:
+                                    "SANDBOX_NETWORK=tunnel requires SANDBOX_TUNNEL_* settings \
+                                 (see docs/guides/SANDBOX_TUNNEL_NETWORKING.md)"
+                                        .to_string(),
+                            })?;
+                    let runtime = self
+                        .runner
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|runner| runner.runtime())
+                        .ok_or_else(|| SandboxError::RuntimeNotAvailable {
+                            reason: "container runtime not initialized".to_string(),
+                        })?;
+                    let sidecar = TunnelSidecar::new(runtime, config);
+                    *tunnel = Some(sidecar.clone());
+                    sidecar
+                }
+            }
+        };
+        sidecar.ensure_started().await
+    }
+
     /// Shutdown the sandbox (stop proxy and tunnel sidecar, clean up).
     pub async fn shutdown(&self) {
+        let _initialization = self.initialization.lock().await;
         if let Some(proxy) = self.proxy.write().await.take() {
             proxy.stop().await;
         }
@@ -343,17 +377,7 @@ impl SandboxManager {
             // Join only the exact container ID that passed inspection. If a
             // concurrent recreation removes it, this run fails instead of
             // joining a new namespace before its firewall is installed.
-            let container_id = match sidecar.ensure_healthy().await {
-                Ok(id) => id,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
-                    );
-                    sidecar.recover_for_run().await?;
-                    sidecar.ensure_healthy().await?
-                }
-            };
+            let container_id = sidecar.container_for_run().await?;
             let dns = self
                 .config
                 .tunnel
@@ -910,6 +934,235 @@ mod tests {
             !output.stdout.contains("LUNARWING_TEST_141_SECRET"),
             "non-allowlisted daemon env must be scrubbed"
         );
+    }
+
+    #[cfg(unix)]
+    use crate::sandbox::cli_runner::{ContainerRuntime, TestRuntime};
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct CountingRuntimeState {
+        started: bool,
+        hash: String,
+        instance: String,
+        listing: Option<String>,
+        runs: usize,
+        installs: usize,
+        removals: usize,
+        live_removals: usize,
+        unexpected: Vec<Vec<String>>,
+    }
+
+    #[cfg(unix)]
+    type SharedRuntimeState = std::sync::Arc<std::sync::Mutex<CountingRuntimeState>>;
+
+    #[cfg(unix)]
+    fn lock_runtime_state(
+        state: &SharedRuntimeState,
+    ) -> std::sync::MutexGuard<'_, CountingRuntimeState> {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(unix)]
+    fn fake_output(success: bool, stdout: String, stderr: String) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.into_bytes(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn sidecar_label(args: &[String], label: &str) -> String {
+        args.windows(2)
+            .find_map(|pair| {
+                let value = pair[1].strip_prefix(label)?;
+                (pair[0] == "--label").then(|| value.trim_start_matches('=').to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    async fn run_fake_sidecar(state: &SharedRuntimeState, args: &[String]) -> std::process::Output {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut state = lock_runtime_state(state);
+        state.runs += 1;
+        state.started = true;
+        state.hash = sidecar_label(args, "lunarwing.sandbox-tunnel-hash");
+        state.instance = sidecar_label(args, "lunarwing.sandbox-tunnel-instance");
+        state.listing = None;
+        fake_output(true, String::new(), String::new())
+    }
+
+    #[cfg(unix)]
+    fn inspect_fake_sidecar(state: &CountingRuntimeState) -> std::process::Output {
+        let id = "2".repeat(64);
+        let stdout = if state.started {
+            format!("{id}|true|{}|{}\n", state.hash, state.instance)
+        } else {
+            format!("{id}|true|foreign|foreign\n")
+        };
+        fake_output(true, stdout, String::new())
+    }
+
+    #[cfg(unix)]
+    fn exec_fake_sidecar(
+        state: &mut CountingRuntimeState,
+        args: &[String],
+        stdin: Option<Vec<u8>>,
+    ) -> std::process::Output {
+        let interactive = args.get(1).map(String::as_str) == Some("-i");
+        let command_index = if interactive { 3 } else { 2 };
+        match args.get(command_index).map(String::as_str) {
+            Some("netbird") => fake_output(state.started, String::new(), String::new()),
+            Some("cat") => fake_output(true, "nameserver 9.9.9.9\n".into(), String::new()),
+            Some("nft") if args.get(command_index + 1).map(String::as_str) == Some("-f") => {
+                state.installs += 1;
+                let script = stdin.and_then(|input| String::from_utf8(input).ok());
+                let valid = interactive
+                    && script.as_ref().is_some_and(|script| {
+                        script.starts_with(
+                            "add table inet lunarwing_sandbox_egress\ndelete table inet lunarwing_sandbox_egress\n",
+                        ) && script.contains("chain input {")
+                            && script.contains("chain output {")
+                    });
+                if valid {
+                    state.listing =
+                        script.map(|script| script.lines().skip(2).collect::<Vec<_>>().join("\n"));
+                    fake_output(true, String::new(), String::new())
+                } else {
+                    state.unexpected.push(args.to_vec());
+                    fake_output(false, String::new(), "invalid ruleset".into())
+                }
+            }
+            Some("nft") => match &state.listing {
+                Some(listing) if state.started => fake_output(true, listing.clone(), String::new()),
+                _ => fake_output(false, String::new(), "table absent".into()),
+            },
+            _ => {
+                state.unexpected.push(args.to_vec());
+                fake_output(false, String::new(), "unexpected exec".into())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn counting_runtime(state: SharedRuntimeState) -> TestRuntime {
+        TestRuntime::new(move |args, stdin| {
+            let state = state.clone();
+            async move {
+                if args.first().map(String::as_str) == Some("run") {
+                    return Ok(run_fake_sidecar(&state, &args).await);
+                }
+                let mut state = lock_runtime_state(&state);
+                let output = match args.first().map(String::as_str) {
+                    Some("image") if args.iter().any(|arg| arg == "--format") => {
+                        fake_output(true, format!("sha256:{}\n", "1".repeat(64)), String::new())
+                    }
+                    Some("image") | Some("volume") => {
+                        fake_output(true, String::new(), String::new())
+                    }
+                    Some("inspect") => inspect_fake_sidecar(&state),
+                    Some("container") => {
+                        fake_output(true, format!("{}\n", "2".repeat(64)), String::new())
+                    }
+                    Some("exec") => exec_fake_sidecar(&mut state, &args, stdin),
+                    Some("rm") => {
+                        state.removals += 1;
+                        if state.started && state.listing.is_some() {
+                            state.live_removals += 1;
+                        }
+                        state.started = false;
+                        state.listing = None;
+                        fake_output(true, String::new(), String::new())
+                    }
+                    _ => {
+                        state.unexpected.push(args.clone());
+                        fake_output(false, String::new(), "unexpected runtime call".into())
+                    }
+                };
+                Ok(output)
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn counting_manager(
+        config: SandboxConfig,
+        sidecar: TunnelSidecar,
+        runtime: TestRuntime,
+    ) -> SandboxManager {
+        let mut manager = SandboxManager::new_with_tunnel_sidecar(config, sidecar);
+        manager.test_runner = Some(Arc::new(CliRunner::for_test(
+            ContainerRuntime::Podman,
+            "localhost/sandbox-test:latest".into(),
+            runtime,
+        )));
+        manager
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initialize_starts_one_sidecar_and_installs_firewall_once() {
+        let state = SharedRuntimeState::default();
+        let runtime = counting_runtime(state.clone());
+        let workdir = std::env::temp_dir().join(format!("lw-tunnel-init-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = workdir.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let tunnel_config = TunnelSidecarConfig {
+            auto_pull_image: false,
+            startup_timeout: Duration::from_secs(2),
+            netbird_management_url: Some("https://netbird.example.com".into()),
+            netbird_setup_key: Some(secrecy::SecretString::from("test-setup-key")),
+            ..TunnelSidecarConfig::default()
+        };
+        let config = SandboxConfig {
+            image: "localhost/sandbox-test:latest".into(),
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel_config.clone()),
+            auto_pull_image: false,
+            protected_paths: Vec::new(),
+            tenant_logs: crate::sandbox::config::TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        };
+        let managers: Vec<Arc<SandboxManager>> = (0..2)
+            .map(|_| {
+                let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+                    ContainerRuntime::Podman,
+                    tunnel_config.clone(),
+                    &workdir,
+                    &runtime_dir,
+                )
+                .with_test_runtime(runtime.clone());
+                Arc::new(counting_manager(config.clone(), sidecar, runtime.clone()))
+            })
+            .collect();
+
+        let starts = (0..8).map(|index| {
+            let manager = managers[index % managers.len()].clone();
+            tokio::spawn(async move { manager.initialize().await })
+        });
+        for result in futures::future::join_all(starts).await {
+            result
+                .expect("initialization task")
+                .expect("initialization");
+        }
+
+        {
+            let state = lock_runtime_state(&state);
+            assert_eq!(state.runs, 1, "concurrent starts ran the sidecar twice");
+            assert_eq!(state.installs, 1, "firewall was installed more than once");
+            assert_eq!(state.removals, 0, "a start removed a live container");
+            assert_eq!(state.live_removals, 0);
+            assert!(state.unexpected.is_empty(), "{:?}", state.unexpected);
+        }
+        for manager in &managers {
+            manager.shutdown().await;
+        }
+        std::fs::remove_dir_all(workdir).unwrap();
     }
 
     #[test]

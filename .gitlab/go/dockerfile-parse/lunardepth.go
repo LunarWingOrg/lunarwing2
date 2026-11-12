@@ -81,10 +81,14 @@ func lunardepthInputPolicy(lines []parsedLine, text string) error {
 		"grep -q 'tensormoon' /src/deepseek-harness/packages/bundle/base/cordis.patch.yml",
 		"pnpm exec tsx native/system/scripts/build.ts",
 		"build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth",
+		"scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts",
+		"verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth",
 		"sed -i '/^  \"prunedAt\":/d' /opt/lunardepth/node_modules/.modules.yaml",
+		"sed -i '/^  \"lastValidatedTimestamp\":/d' /opt/lunardepth/node_modules/.pnpm-workspace-state-v1.json",
 		"profile_template.js /opt/lunardepth /opt/lunardepth-templates",
 		"test -x /app/entrypoint-task-setup.sh",
-		"test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /222 \\) -print)\"",
+		"/bin/bash /app/scripts/harden_image_modes.sh /app /opt/lunardepth /opt/lunardepth-templates",
+		"test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /6222 \\) -print)\"",
 	}
 	for _, fragment := range required {
 		if !strings.Contains(text, fragment) {
