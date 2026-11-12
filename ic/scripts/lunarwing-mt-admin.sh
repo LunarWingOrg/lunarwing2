@@ -397,24 +397,25 @@ Commands:
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
 
-  promote-worker-images <name>     Promote this run's candidate worker images
-                                   (WI#527) to :latest; re-runnable after a
-                                   failed promotion
+  promote-worker-images <name>     Promote this run's candidate worker and managed
+                                   sandbox images to :latest; re-runnable after
+                                   a failed promotion
 
-  restore-worker-images <name>     Re-tag the :latest worker images recorded
-                                   before a promotion (rollback without a rebuild)
+  restore-worker-images <name>     Re-tag the :latest worker and sandbox images
+                                   recorded before promotion (rollback without rebuild)
 
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
-  cleanup-worker-candidates <name> Discard this run's WI#527 candidate images;
-                                   lanes whose rmi fails stay listed for retry
+  cleanup-worker-candidates <name> Discard this run's candidate worker and sandbox
+                                   images; failed removals stay listed for retry
 
-  build-worker-candidates <name>   Build selected worker images to WI#527
-                                   candidate tags without stopping the tenant
-    --enabled                      Build every lane the tenant has enabled
+  build-worker-candidates <name>   Build selected worker and managed sandbox images
+                                   to candidate tags without stopping the tenant
+    --enabled                      Build every worker lane the tenant has enabled
     --with-pebble --with-opencode --with-kimi --with-opencode2 --with-lunardepth
     --target <ref>                 Operator release ref for source provenance
+    --sandbox-image <mode>         Managed sandbox policy: auto (default), always, never
 
   last-build-stage <name>          Print the last completed build stage
                                    (daemon|bridge|wasm|none, or unknown when the
@@ -504,6 +505,8 @@ Commands:
     --skip-render                  Keep other unit files; OpenRC proxy neutralization
                                    is mandatory (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
+    --sandbox-image <mode>         Managed sandbox image rebuild policy:
+                                   auto (only changed inputs; default), always, never
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
   psql <name> [psql args...]      Run psql inside the tenant's own PostgreSQL
                                   container (init/runtime-agnostic, via _ctr).
@@ -1170,7 +1173,7 @@ main() {
       # calls this before its stop so a lane build failure cannot strand it.
       require_root
       local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false" cand_lunardepth="false"
-      local cand_all_enabled="false" cand_target=""
+      local cand_all_enabled="false" cand_target="" cand_sandbox_policy="$SANDBOX_IMAGE_POLICY"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --enabled)        cand_all_enabled="true"; shift ;;
@@ -1181,6 +1184,8 @@ main() {
           --with-lunardepth) cand_lunardepth="true"; shift ;;
           --target)         cand_target="$2"; shift 2 ;;
           --target=*)       cand_target="${1#*=}"; shift ;;
+          --sandbox-image)  cand_sandbox_policy="$2"; shift 2 ;;
+          --sandbox-image=*) cand_sandbox_policy="${1#*=}"; shift ;;
           -*)               die "unknown flag: $1" ;;
           *)
             if [[ -z "$cand_name" ]]; then cand_name="$1"; shift
@@ -1189,8 +1194,9 @@ main() {
             ;;
         esac
       done
-      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--target <ref>]"
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--target <ref>] [--sandbox-image auto|always|never]"
       cand_name="$(sanitize_name "$cand_name")"
+      validate_sandbox_image_policy "$cand_sandbox_policy"
       ports_registry_init
       tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
       # run-300 TO-5: let mt-admin decide which lanes this tenant has enabled, so
@@ -1208,7 +1214,7 @@ main() {
       # same tenant (they share the candidate tag). run-300 TO-1: inside the
       # upgrade wrapper that run's inherited lock is used, not re-acquired.
       with_tenant_upgrade_lock "$cand_name" \
-        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false" "$cand_target" "$cand_lunardepth"
+        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false" "$cand_target" "$cand_lunardepth" "$cand_sandbox_policy"
       ;;
 
     last-build-stage)
@@ -1526,12 +1532,15 @@ main() {
     upgrade-tenant)
       require_root
       local name="" target="" source_repo="" do_backup="true" do_render="true"
+      local sandbox_policy="$SANDBOX_IMAGE_POLICY"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --target)      target="$2"; shift 2 ;;
           --source-repo) source_repo="$2"; shift 2 ;;
           --no-backup)   do_backup="false"; shift ;;
           --skip-render) do_render="false"; shift ;;
+          --sandbox-image) sandbox_policy="$2"; shift 2 ;;
+          --sandbox-image=*) sandbox_policy="${1#*=}"; shift ;;
           -*)            die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1540,12 +1549,13 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: upgrade-tenant <name> --target <ref> [--source-repo <path>] [--no-backup] [--skip-render]"
+      [[ -n "$name" ]] || die "usage: upgrade-tenant <name> --target <ref> [--source-repo <path>] [--no-backup] [--skip-render] [--sandbox-image auto|always|never]"
       [[ -n "$target" ]] || die "upgrade-tenant requires an explicit --target <ref> (no implicit default)"
       name="$(sanitize_name "$name")"
+      validate_sandbox_image_policy "$sandbox_policy"
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-      upgrade_tenant "$name" "$target" "$source_repo" "$do_backup" "$do_render"
+      upgrade_tenant "$name" "$target" "$source_repo" "$do_backup" "$do_render" "$sandbox_policy"
       ;;
 
     rotate-pg-password)
