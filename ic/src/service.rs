@@ -104,9 +104,39 @@ pub fn setup_service_offer() -> Result<Option<SetupServiceOffer>> {
     }
 
     let manager = detected_service_manager()?;
+    setup_service_offer_with_identity(
+        manager,
+        is_effective_root(),
+        root_service_allowed(),
+        current_service_identity,
+    )
+}
+
+fn setup_service_offer_with_identity<F>(
+    manager: ServiceManager,
+    effective_root: bool,
+    allow_root: bool,
+    openrc_identity: F,
+) -> Result<Option<SetupServiceOffer>>
+where
+    F: FnOnce() -> Result<(String, String)>,
+{
+    match manager {
+        ServiceManager::Launchd | ServiceManager::SystemdUser => {
+            if ensure_root_service_allowed(manager, effective_root, allow_root, None).is_err() {
+                return Ok(None);
+            }
+        }
+        ServiceManager::OpenRc => {
+            if openrc_identity().is_err() {
+                return Ok(None);
+            }
+        }
+    }
+
     let can_install_now = match manager {
         ServiceManager::Launchd | ServiceManager::SystemdUser => true,
-        ServiceManager::OpenRc => is_effective_root(),
+        ServiceManager::OpenRc => effective_root,
     };
     let install_command = if can_install_now || manager != ServiceManager::OpenRc {
         None
@@ -153,6 +183,12 @@ fn install() -> Result<()> {
 }
 
 fn install_macos() -> Result<()> {
+    ensure_root_service_allowed(
+        ServiceManager::Launchd,
+        is_effective_root(),
+        root_service_allowed(),
+        None,
+    )?;
     let file = macos_plist_path()?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -216,6 +252,12 @@ fn macos_plist_content(exe: &str, stdout: &str, stderr: &str) -> String {
 }
 
 fn install_linux_systemd_user() -> Result<()> {
+    ensure_root_service_allowed(
+        ServiceManager::SystemdUser,
+        is_effective_root(),
+        root_service_allowed(),
+        None,
+    )?;
     let file = linux_unit_path()?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -979,41 +1021,51 @@ fn root_service_allowed() -> bool {
     std::env::var("LUNARWING_ALLOW_ROOT_SERVICE").is_ok_and(|value| value.trim() == "1")
 }
 
-fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
-    if user.trim() != "root" {
+fn ensure_root_service_allowed(
+    manager: ServiceManager,
+    runs_as_root: bool,
+    allow_root: bool,
+    detail: Option<String>,
+) -> Result<()> {
+    if !runs_as_root || allow_root {
         return Ok(());
     }
 
-    ensure_openrc_root_allowed(allow_root)
+    let detail = detail.map_or_else(String::new, |reason| format!(": {reason}"));
+    let guidance = match manager {
+        ServiceManager::OpenRc => "Run the installer through sudo from a non-root service account",
+        ServiceManager::Launchd | ServiceManager::SystemdUser => {
+            "Run the installer as the intended service account without sudo"
+        }
+    };
+    bail!(
+        "Refusing to configure the {} service to run as root{detail}. {guidance}, or set \
+         LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon.",
+        manager.display_name()
+    )
+}
+
+fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
+    ensure_root_service_allowed(
+        ServiceManager::OpenRc,
+        user.trim() == "root",
+        allow_root,
+        None,
+    )
 }
 
 #[cfg(unix)]
 fn ensure_openrc_service_uid(user: &str, uid: nix::unistd::Uid, allow_root: bool) -> Result<()> {
-    if !uid.is_root() {
-        return Ok(());
-    }
-
-    if user.trim() != "root" && !allow_root {
-        bail!(
-            "Refusing to configure the OpenRC service to run as root: service user '{user}' has \
-             uid 0. Run the installer through sudo from a non-root service account, or set \
-             LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon."
-        )
-    }
-
-    ensure_openrc_root_allowed(allow_root)
+    let detail = (user.trim() != "root").then(|| format!("service user '{user}' has uid 0"));
+    ensure_root_service_allowed(ServiceManager::OpenRc, uid.is_root(), allow_root, detail)
 }
 
-fn ensure_openrc_root_allowed(allow_root: bool) -> Result<()> {
-    if allow_root {
-        return Ok(());
-    }
-
-    bail!(
-        "Refusing to configure the OpenRC service to run as root. \
-         Run the installer through sudo from a non-root service account, or set \
-         LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon."
-    )
+#[cfg(unix)]
+fn ensure_openrc_service_gid(user: &str, gid: nix::unistd::Gid, allow_root: bool) -> Result<()> {
+    let detail = gid
+        .is_root()
+        .then(|| format!("service user '{user}' has primary gid 0"));
+    ensure_root_service_allowed(ServiceManager::OpenRc, gid.is_root(), allow_root, detail)
 }
 
 #[cfg(unix)]
@@ -1022,6 +1074,7 @@ fn current_primary_group(user: &str, allow_root: bool) -> Result<String> {
         .with_context(|| format!("failed to look up service user '{user}'"))?
         .with_context(|| format!("service user '{user}' does not exist"))?;
     ensure_openrc_service_uid(user, account.uid, allow_root)?;
+    ensure_openrc_service_gid(user, account.gid, allow_root)?;
     let group = nix::unistd::Group::from_gid(account.gid)
         .with_context(|| format!("failed to look up primary group for service user '{user}'"))?
         .with_context(|| format!("primary group for service user '{user}' does not exist"))?;
@@ -1270,6 +1323,46 @@ mod tests {
     }
 
     #[test]
+    fn user_service_root_install_requires_explicit_opt_in() {
+        for manager in [ServiceManager::SystemdUser, ServiceManager::Launchd] {
+            let err = ensure_root_service_allowed(manager, true, false, None)
+                .expect_err("a root user-service install should be refused");
+            assert!(err.to_string().contains(manager.display_name()));
+            assert!(err.to_string().contains("without sudo"));
+            assert!(err.to_string().contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+            assert!(ensure_root_service_allowed(manager, true, true, None).is_ok());
+            assert!(ensure_root_service_allowed(manager, false, false, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn root_refusal_suppresses_user_service_setup_offer() {
+        for manager in [ServiceManager::SystemdUser, ServiceManager::Launchd] {
+            let offer = setup_service_offer_with_identity(manager, true, false, || {
+                unreachable!("OpenRC identity lookup must not run for user services")
+            })
+            .expect("root refusal should be represented as no offer");
+            assert!(offer.is_none());
+
+            let offer = setup_service_offer_with_identity(manager, true, true, || {
+                unreachable!("OpenRC identity lookup must not run for user services")
+            })
+            .expect("explicit opt-in should be representable")
+            .expect("explicit opt-in should retain the offer");
+            assert!(offer.can_install_now);
+        }
+    }
+
+    #[test]
+    fn openrc_identity_refusal_suppresses_setup_offer() {
+        let offer = setup_service_offer_with_identity(ServiceManager::OpenRc, true, false, || {
+            bail!("root service identity refused")
+        })
+        .expect("OpenRC refusal should be represented as no offer");
+        assert!(offer.is_none());
+    }
+
+    #[test]
     fn openrc_root_service_requires_explicit_opt_in() {
         let err = ensure_openrc_service_identity(" root ", false)
             .expect_err("root service identity should be refused");
@@ -1291,6 +1384,25 @@ mod tests {
         assert!(ensure_openrc_service_uid("toor", nix::unistd::Uid::from_raw(0), true).is_ok());
         assert!(
             ensure_openrc_service_uid("lunarwing", nix::unistd::Uid::from_raw(1000), false).is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openrc_primary_gid_zero_requires_explicit_opt_in() {
+        let err = ensure_openrc_service_gid("lunarwing", nix::unistd::Gid::from_raw(0), false)
+            .expect_err("a primary gid-0 service identity should be refused");
+        assert!(err.to_string().contains("run as root"));
+        assert!(
+            err.to_string()
+                .contains("service user 'lunarwing' has primary gid 0")
+        );
+        assert!(err.to_string().contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+        assert!(
+            ensure_openrc_service_gid("lunarwing", nix::unistd::Gid::from_raw(0), true).is_ok()
+        );
+        assert!(
+            ensure_openrc_service_gid("lunarwing", nix::unistd::Gid::from_raw(1000), false).is_ok()
         );
     }
 
