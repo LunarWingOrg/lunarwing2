@@ -814,10 +814,22 @@ remove_tenant() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     stop_tenant_systemd "$name" || die "stop failed; refusing removal of '$name'"
-    uninstall_tenant_systemd "$name"
   else
     stop_tenant_openrc "$name" || die "stop failed; refusing removal of '$name'"
-    uninstall_tenant_openrc "$name" || die "unit removal failed for '$name'"
+  fi
+
+  # Match stop-tenant's per-lane order. Both worker roles and their supervisors
+  # must be down before unit/container deletion and, critically, before the
+  # egress allowlist is touched. This runs for purge and non-purge removals.
+  local worker
+  for worker in vision voice pebble opencode kimi opencode2 lunardepth; do
+    "stop_tenant_${worker}" "$name" \
+      || die "failed to stop $worker resources; refusing removal of '$name'"
+  done
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    uninstall_tenant_systemd "$name" || die "unit/container removal failed for '$name'"
+  else
+    uninstall_tenant_openrc "$name" || die "unit/container removal failed for '$name'"
   fi
   say ""
 
