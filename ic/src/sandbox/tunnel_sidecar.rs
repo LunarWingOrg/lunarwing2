@@ -11,8 +11,9 @@
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
 //!   mark the provider sets on it and, by default, DNS to the resolvers the
-//!   runtime gave the sidecar. `SANDBOX_TUNNEL_DNS` moves DNS to resolvers
-//!   reachable through the tunnel and removes the uplink DNS allowance.
+//!   runtime gave the sidecar. For WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to
+//!   resolvers reachable through the tunnel and removes the uplink allowance;
+//!   NetBird rejects that setting during configuration validation (WI#603).
 //!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
@@ -129,8 +130,9 @@ pub struct TunnelSidecarConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
-    /// Optional resolver addresses reachable through the tunnel. When nonempty,
-    /// joined runs use them and no DNS traffic is allowed onto the uplink.
+    /// Optional resolver addresses reachable through WireGuard. When nonempty,
+    /// joined runs use them and no DNS traffic is allowed onto the uplink;
+    /// validation rejects nonempty values with NetBird (WI#603).
     pub dns: Vec<IpAddr>,
     /// Optional ICMP canary reachable only through WireGuard.
     pub wireguard_canary: Option<IpAddr>,
@@ -202,7 +204,7 @@ impl TunnelSidecarConfig {
 
     /// Named volume holding NetBird's peer identity and config across sidecar
     /// restarts. Only instance, management URL, or setup-key rotation enrols a
-    /// fresh peer; image, DNS, canary, and WireGuard changes retain the volume.
+    /// fresh peer; image changes retain the volume.
     pub fn netbird_state_volume(&self, instance_id: &str, salt: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, salt);
