@@ -165,8 +165,8 @@ pub struct RetryConfig {
     /// Maximum number of retry attempts (not counting the initial attempt).
     /// Default: 3.
     pub max_retries: u32,
-    /// Stop retrying billed-but-empty streams once their cumulative reported
-    /// input tokens reach this budget. Zero disables the budget.
+    /// After the first billed-empty attempt, stop retrying once cumulative
+    /// reported input tokens reach this budget. Zero disables the budget.
     pub empty_stream_retry_input_token_budget: u32,
 }
 
@@ -222,11 +222,10 @@ impl RetryProvider {
         discarded: Option<TokenUsage>,
         error: &LlmError,
     ) -> Option<u32> {
+        let discarded = discarded?;
         let budget = self.config.empty_stream_retry_input_token_budget;
         let usage = empty_stream_usage(error)?;
-        let total = discarded
-            .map_or(0, |usage| usage.input_tokens)
-            .saturating_add(usage.input_tokens);
+        let total = discarded.input_tokens.saturating_add(usage.input_tokens);
         (budget > 0 && total >= budget).then_some(total)
     }
 
@@ -1099,6 +1098,74 @@ mod tests {
                 }),
                 ..
             }) if provider == "scripted"
+        ));
+        assert_eq!(inner.plain_calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_billed_empty_above_budget_gets_one_retry() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream_with_usage("unknown", 141_655, 2_246),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(3));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("first billed-empty attempt should be retried")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
+        ));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Ok(LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                attempts: 1,
+                reason: StreamFailureReason::Empty,
+                discarded_usage: Some(TokenUsage {
+                    input_tokens: 141_655,
+                    output_tokens: 2_246,
+                    ..
+                }),
+                ..
+            }))
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_billed_empty_above_budget_stops_with_folded_usage() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream_with_usage("unknown", 141_655, 2_246),
+                billed_empty_stream_with_usage("unknown", 141_655, 2_246),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(3));
+
+        let result = retry.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                usage: Some(TokenUsage {
+                    input_tokens: 283_310,
+                    output_tokens: 4_492,
+                    ..
+                }),
+                ..
+            })
         ));
         assert_eq!(inner.plain_calls(), 2);
     }

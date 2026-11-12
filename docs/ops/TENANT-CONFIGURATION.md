@@ -103,6 +103,29 @@ LLM_API_KEY=your-key
 LLM_MODEL=your-model-name
 ```
 
+### Retry and billed-empty token limits
+
+Configure same-provider retries and the billed-empty input-token threshold in
+`lunarwing.env`:
+
+```bash
+LLM_MAX_RETRIES=3
+LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET=100000
+```
+
+`LLM_MAX_RETRIES` is the maximum number of retries after the initial attempt;
+`0` disables these retries. The billed-empty threshold defaults to `100000`
+reported input tokens. With retries enabled, the first transient billed-empty
+attempt always receives one retry, even if it reaches the threshold by itself.
+Subsequent billed-empty attempts stop once their cumulative reported input
+tokens reach the threshold. Set the threshold to `0` to disable only this token
+limit.
+
+Both controls apply per provider leg and per call. Each failover leg and each
+engine or agent recovery request starts a fresh retry sequence and token
+budget; neither control is a per-turn bound. mt-admin preserves operator-set
+values for both variables across full tenant env re-renders.
+
 ### Optional response cache
 
 Response caching is disabled by default. Enable it in `lunarwing.env` with
