@@ -791,7 +791,11 @@ Unclassified rows make the helper exit non-zero; explicitly accepted additions
 are still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
 external disposition. The helper refuses those rows even when `--accept` names
 them; remove a pending row only after its required evidence is recorded in the
-confidential triage and its exact baseline pin is deliberate.
+confidential triage and its exact baseline pin is deliberate. The list is empty
+as of 2026-11-12: its last row, the `gitlab-pat`-shaped example at `59b4247c2`,
+was settled by an instance administrator (WI#599: `POST /api/v4/admin/token`
+returned 404, so it is not a token on this host) before its exact pin was added.
+Keep the file even when empty; the scanner refuses a missing pending list.
 
 The helper's exit status is 1 when a new unclassified finding was left unpinned,
 or when `--accept` named a pending row and was refused. A pending row that is
