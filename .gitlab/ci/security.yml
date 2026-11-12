@@ -23,6 +23,7 @@ satellite-advisory-sweep:
       artifacts: false
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
+    - bash .gitlab/scripts/install-cargo-audit.sh
     - bash .gitlab/scripts/check-satellite-advisories.sh
 
 # cargo-deny filters crates that are pinned in Cargo.lock but never resolved
