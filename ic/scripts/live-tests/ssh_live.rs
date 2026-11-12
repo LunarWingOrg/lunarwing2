@@ -186,6 +186,8 @@ async fn exercise_ssh_tool(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) 
 }
 
 async fn exercise_refusals(config: &LiveConfig) {
+    // Wrong pins keep their specific HostKeyMismatch type. Certificate-only negotiation
+    // returns ConnectionRefused; ssh_client.rs unit-tests the callback refusal branch.
     let wrong_pin = config.host(
         STRICT_HOST,
         config.port,
