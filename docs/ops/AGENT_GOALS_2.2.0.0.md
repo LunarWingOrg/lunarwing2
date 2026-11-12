@@ -357,20 +357,20 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 42. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/633 (study triage: a config test leaves its fixture secret in the daemon log scrubber for the rest of the test binary; Medium-Low as filed, latent)
     - **Spec: scope.** `runtime_overrides_for_secret_names_are_scrubbed_from_daemon_logs` in `ic/src/config/helpers.rs` must leave the process-wide scrubber as it found it. The work item gives two shapes: a removal function on `LogScrubber`, or a scoped guard for tests. In the same test, assert that the value is scrubbed while it is registered and no longer scrubbed after the clean-up.
     - **Spec: care.** The scrubber is a secret-handling guarantee. If `LogScrubber` gets a removal function, no production code may call it: say on the work item how that is kept, for example by a guard type or a test-only feature.
-    - **Spec: siblings.** The work item's scan of twelve static-holding sites found no other irreversible case. Check that at the current head and record the result on the work item.
+    - **Spec: siblings.** The work item's scan of twelve static-holding sites found no other irreversible case. Check that at the current head and record the result on the work item
 43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/639 (study triage, sandbox tunnel: a slow but healthy probe chain can exceed the 60 s per-run budget and then fails every command for 30 s; Medium-Low as filed)
     - **Spec: scope.** Both parts of the fix in the work item: the healthy probe chain gets its own smaller ceiling, and a lifecycle failure is recorded only when a recovery attempt really ran. The error must not blame a recovery that never started. The test the work item asks for: probes that are slow and succeed must give `Ok` from `container_for_run`, with no recorded failure.
     - **Spec: builds on item 25** (!2378, `e6f2c00b3`). That merge changed `ic/src/sandbox/tunnel_sidecar.rs` after the work item's line numbers were taken, so locate the code again. WI#643 is in the same file: keep the two apart, and say on WI#643 if this change closes one of its points.
-    - **Spec: care.** The join gate must not move: no run gets a container before provider health and both firewall chains verify. Use paused time in the test, not real waits of seconds: wall-clock budgets on a loaded runner produced WI#627 and WI#628. Run clippy with and without `--all-features`.
+    - **Spec: care.** The join gate must not move: no run gets a container before provider health and both firewall chains verify. Use paused time in the test, not real waits of seconds: wall-clock budgets on a loaded runner produced WI#627 and WI#628. Run clippy with and without `--all-features`
+44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/627
 
 ## Phase 9 - Advanced Operator Notes
 
-44. [x] (H) Deploy the stoplight system for IRC
-45. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-46. [x] (H) go over work item stuff
-47. [x] (H) FIRST REL NOTES DRAFT after remove crap copy
-48. [x] (H) clean scratch on wt
-49. [x] (S) RESERVED
+45. [x] (H) Deploy the stoplight system for IRC
+46. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+47. [x] (H) go over work item stuff
+48. [x] (H) FIRST REL NOTES DRAFT after remove crap copy
+49. [x] (H) clean scratch on wt
 50. [x] (S) RESERVED
 51. [x] (S) RESERVED
 52. [x] (S) RESERVED
@@ -380,6 +380,7 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 56. [x] (S) RESERVED
 57. [x] (S) RESERVED
 58. [x] (S) RESERVED
+59. [x] (S) RESERVED
 
 
 ---
