@@ -63,6 +63,7 @@ pub struct SandboxTunnelModeConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
+    /// WireGuard-only joined-run resolvers; NetBird validation rejects these.
     pub dns: Vec<IpAddr>,
     pub wireguard_canary: Option<IpAddr>,
     pub startup_timeout_secs: Option<u64>,
