@@ -537,9 +537,12 @@ live result and a fix or explicit unsupported-combination enforcement.
 DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
 multicast values. Peered WireGuard configs need
 `PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
-is re-probed after firewall installation. Manager recovery uses a 6-second
-re-probe, at most 20 seconds for fresh provider readiness (or a lower configured
-timeout), a 60-second total budget, and a 30-second failure back-off.
+is re-probed after firewall installation. Cold starts retain the configured
+`SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget. Per-command recovery uses a
+6-second re-probe, at most 20 seconds for fresh provider readiness (or a lower
+configured timeout), one 60-second budget across health checks and recovery, and
+a 30-second failure back-off. The sidecar-owned attempt still finishes and
+records its result when the calling command is cancelled.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in

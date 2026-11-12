@@ -141,20 +141,29 @@ not application auth.
   SIGKILL) for leftovers. `stop` is not used, because it does nothing to a unit
   whose client has already exited. Helpers of a container that still exists
   are never signalled. Foreground workload cleanup is unchanged.
-- `SandboxManager` health-gates initialization and calls `ensure_healthy()`
-  before every container run, joining only the returned verified ID. It retains
-  the sidecar handle after a failed cold start so later commands share the same
-  recovery state. Recovery re-probes an existing sidecar for at most 6 seconds,
-  gives a fresh provider at most 20 seconds (or the lower configured timeout),
-  and wraps the complete attempt in a 60-second budget. The returned
-  `SandboxError::TunnelUnavailable`, mapped to `[sandbox:sandbox_unavailable]`,
-  names the failed provider or firewall probe and is cached for 30 seconds.
-  Calls inside that window return the reason and next-attempt delay immediately;
-  after it, one call retries. A drop guard owns partial-start cleanup when the
-  caller disappears, so cancellation cannot strand a labelled sidecar without
-  its firewall. Explicit lifecycle `ensure_started()` retains the full startup
-  budget. There is no fallback to `proxy`, `proxy-enforced`, direct egress, or
-  host execution.
+- `SandboxManager` serializes initialization, health-gates it, and joins only
+  the verified container ID returned for a run. It creates one instance handle
+  and retains it after a failed or cancelled cold start so later commands share
+  the same recovery state. Independently constructed handles for the same
+  container name also share recovery state and a fair lifecycle operation lock.
+  Starts, recovery, stops, and cancelled-start cleanup therefore exclude each
+  other, with stale cleanup queued before the next start. Cold starts retain
+  the full configured startup budget. Per-command recovery re-probes an
+  existing sidecar for at most 6 seconds and gives a fresh provider at most 20
+  seconds (or the lower configured timeout). The initial health check,
+  recovery, and final verification share one 60-second budget, including image
+  and runtime probes. The returned `SandboxError::TunnelUnavailable`, mapped to
+  `[sandbox:sandbox_unavailable]`, names the failed probe and is cached for 30
+  seconds. Calls inside that window return the reason and next-attempt delay
+  immediately; after it, one call retries. Recovery runs in a sidecar-owned
+  task whose completion is shared through a watch channel. Caller cancellation
+  only drops that caller's wait: the task still cleans up a partial start,
+  records its result, and wakes any later waiters. There is no fallback to
+  `proxy`, `proxy-enforced`, direct egress, or host execution.
+- An already verified firewall table is left unchanged. A required installation
+  sends `add table`, `delete table`, and the complete replacement definition to
+  one `nft -f -` invocation, so netlink applies it atomically rather than
+  exposing a running command to an unfiltered delete/rebuild interval.
 - The configuration label is a salted SHA-256 over provider, image reference,
   resolved image ID, DNS, canary, management URL, setup key, WireGuard path and
   file contents; the salt is a random 0600 file in the private runtime

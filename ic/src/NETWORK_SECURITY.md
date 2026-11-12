@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-11 (bounded tunnel recovery and sidecar DNS limitation, WI#604/WI#603)
+**Last updated:** 2026-11-11 (serialized tunnel lifecycle and atomic firewall replacement, WI#614)
 
 ---
 
@@ -435,12 +435,16 @@ The opt-in `tunnel` mode (WI#248) is separate from both the gateway's inbound
 sidecar establishes NetBird or kernel WireGuard; one-shot commands join its
 network namespace with every existing hardening flag. The sidecar name and
 NetBird state volume are instance-scoped from `LUNARWING_BASE_DIR`, and an
-ownership label prevents cross-daemon removal. Recreation is serialized per
-instance and runs join only the exact container ID returned by health/firewall
-verification. There are no published ports or host-network joins. The required
-`nftables` table has two base chains, installed after provider startup and
-verified rule by rule before every run; no healthy ID is available before that
-installation:
+ownership label prevents cross-daemon removal. Manager initialization is
+single-flight. Starts, recovery, stops, and cancelled-start cleanup share a
+fair lifecycle lock per container name across handles in one daemon; cleanup is
+queued before the next start can proceed. Runs join only the exact container ID
+returned by health/firewall verification. There are no published ports or
+host-network joins. The required `nftables` table has two base chains,
+installed after provider startup and verified rule by rule before every run; no
+healthy ID is available before that installation. A table that already verifies
+is not rewritten. Any required installation uses one `nft -f -` transaction to
+replace the complete table atomically, with no unfiltered delete/rebuild window:
 
 - `input`, policy `drop`: accepts loopback and `established,related` return
   traffic only. A sandbox process cannot bind an inbound service reachable
@@ -490,12 +494,15 @@ digest-pinned 0.82.0 OCI index; mutable references warn with auto-pull enabled.
 Every start/health check hashes the resolved local image ID so tag rotation
 recreates the sidecar. Missing `nft`, an unhealthy provider, or an
 altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
-to another tier. Manager recovery re-probes for at most 6 seconds, allows a
-fresh provider at most 20 seconds (or the lower configured timeout), and caps
-the whole attempt at 60 seconds. A failure retains its probe reason in a
-30-second back-off: subsequent commands fail immediately until one retries
-after the window. Dropped starts have an independent cleanup guard, and no
-container ID becomes joinable before the firewall verifies.
+to another tier. Cold starts keep the full configured startup timeout. Per-run
+recovery re-probes for at most 6 seconds, allows a fresh provider at most 20
+seconds (or the lower configured timeout), and caps the initial health check,
+recovery, and final verification together at 60 seconds. A failure retains its
+probe reason in a 30-second back-off: subsequent commands fail immediately
+until one retries after the window. Recovery runs in a sidecar-owned task that
+survives caller cancellation, finishes partial-start cleanup, and records the
+result before waking later callers. No container ID becomes joinable before the
+firewall verifies.
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted

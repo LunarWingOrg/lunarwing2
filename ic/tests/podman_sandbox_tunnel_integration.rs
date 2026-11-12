@@ -1,4 +1,4 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, and WI#602).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#602, WI#604, and WI#614).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
@@ -113,6 +113,25 @@ async fn generate_wg_private_key(image: &str) -> Option<String> {
     (output.status.success() && !key.is_empty()).then_some(key)
 }
 
+async fn generate_wg_keypair(image: &str) -> Option<(String, String)> {
+    let output = podman_output(&[
+        "run",
+        "--rm",
+        image,
+        "sh",
+        "-c",
+        "key=$(wg genkey); pub=$(printf %s \"$key\" | wg pubkey); printf '%s\\n%s\\n' \"$pub\" \"$key\"",
+    ])
+    .await
+    .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let public = lines.next()?.trim().to_string();
+    let private = lines.next()?.trim().to_string();
+    (output.status.success() && !public.is_empty() && !private.is_empty())
+        .then_some((private, public))
+}
+
 fn write_wireguard_config(workdir: &Path, private_key: &str) -> PathBuf {
     std::fs::create_dir_all(workdir).expect("workdir");
     let config = workdir.join("wg0.conf");
@@ -128,6 +147,18 @@ fn write_wireguard_config(workdir: &Path, private_key: &str) -> PathBuf {
             .expect("chmod 600");
     }
     config
+}
+
+fn private_runtime_dir(workdir: &Path) -> PathBuf {
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+    }
+    runtime_dir
 }
 
 async fn tunnel_container_id(name: &str) -> Option<String> {
@@ -156,7 +187,7 @@ async fn assert_no_unfiltered_sidecar(name: &str) -> Result<(), String> {
 }
 
 async fn wait_container_absent(name: &str) -> Result<(), String> {
-    for _ in 0..75 {
+    for _ in 0..225 {
         if tunnel_container_id(name).await.is_none() {
             return Ok(());
         }
@@ -179,6 +210,25 @@ async fn manager_command_error(
         )),
         Err(error) => Ok((error, started.elapsed())),
     }
+}
+
+fn manager_with_sidecar(
+    image: &str,
+    config: &TunnelSidecarConfig,
+    sidecar: TunnelSidecar,
+) -> SandboxManager {
+    SandboxManager::new_with_tunnel_sidecar(
+        SandboxConfig {
+            image: image.to_string(),
+            runtime: SandboxRuntime::Podman,
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(config.clone()),
+            protected_paths: Vec::new(),
+            tenant_logs: TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        },
+        sidecar,
+    )
 }
 
 async fn assert_detached_helper_stopped(container_name: &str) {
@@ -521,6 +571,122 @@ async fn exercise_sidecar(
     Ok(())
 }
 
+fn complete_firewall_listing(listing: &str) -> bool {
+    let required = [
+        "chain input {",
+        "type filter hook input priority",
+        "ct state established,related accept",
+        "chain output {",
+        "type filter hook output priority",
+        "oifname \"wg0\" accept",
+        "ip daddr 169.254.0.0/16 drop",
+    ];
+    let has_dns = listing.contains("dport 53") || listing.contains("dport domain");
+    let has_mark = [
+        "meta mark 0x00004c57 accept",
+        "mark 0x00004c57 accept",
+        "meta mark 0x4c57 accept",
+        "mark 0x4c57 accept",
+    ]
+    .into_iter()
+    .any(|mark| listing.contains(mark));
+    required.iter().all(|line| listing.contains(line))
+        && listing.matches("policy drop;").count() == 2
+        && has_mark
+        && has_dns
+}
+
+async fn monitor_stable_firewall(
+    name: &str,
+    done: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut verified: Option<String> = None;
+    loop {
+        if *done.borrow() {
+            return verified
+                .map(|_| ())
+                .ok_or_else(|| "no complete firewall listing was observed".into());
+        }
+        let output = podman_output(&[
+            "exec",
+            name,
+            "nft",
+            "list",
+            "table",
+            "inet",
+            "lunarwing_sandbox_egress",
+        ])
+        .await?;
+        if output.status.success() {
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !complete_firewall_listing(&listing) {
+                return Err(format!("partial firewall observed:\n{listing}"));
+            }
+            if verified
+                .as_ref()
+                .is_some_and(|previous| previous != &listing)
+            {
+                return Err("an already verified firewall was rewritten".into());
+            }
+            verified = Some(listing);
+        } else if verified.is_some() {
+            return Err("a verified firewall disappeared during concurrent starts".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let image = tunnel_image().await.expect("WireGuard-capable image");
+    let private_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a WireGuard key");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-race-{}", std::process::id()));
+    let config = write_wireguard_config(&workdir, &private_key);
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(image.clone()),
+        wireguard_config: Some(config),
+        startup_timeout: Duration::from_secs(60),
+        ..TunnelSidecarConfig::default()
+    };
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &workdir,
+        &runtime_dir,
+    );
+    let name = sidecar.container_name().to_string();
+    let manager = std::sync::Arc::new(manager_with_sidecar(&image, &tunnel_config, sidecar));
+    let (done, monitor_done) = tokio::sync::watch::channel(false);
+    let monitor_name = name.clone();
+    let monitor =
+        tokio::spawn(async move { monitor_stable_firewall(&monitor_name, monitor_done).await });
+
+    let first = manager.execute("sleep 3; echo FIRST", &workdir, HashMap::new());
+    let second = manager.execute("echo SECOND", &workdir, HashMap::new());
+    let (first, second) = tokio::join!(first, second);
+    let _ = done.send(true);
+    let monitored = monitor.await.expect("firewall monitor task");
+    manager.shutdown().await;
+    assert_detached_helper_stopped(&name).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+
+    let first = first.expect("first concurrent sandbox command");
+    let second = second.expect("second concurrent sandbox command");
+    assert_eq!(first.exit_code, 0, "{}{}", first.stdout, first.stderr);
+    assert_eq!(second.exit_code, 0, "{}{}", second.stdout, second.stderr);
+    assert!(first.stdout.contains("FIRST"));
+    assert!(second.stdout.contains("SECOND"));
+    monitored.expect("firewall stayed complete and unchanged during concurrent first commands");
+}
+
 #[tokio::test]
 async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
     if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
@@ -540,10 +706,20 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
         startup_timeout: Duration::from_secs(60),
         ..TunnelSidecarConfig::default()
     };
-    let sidecar =
-        TunnelSidecar::for_instance(ContainerRuntime::Podman, tunnel_config.clone(), &workdir);
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &workdir,
+        &runtime_dir,
+    );
     let other_dir = workdir.join("other-instance");
-    let other = TunnelSidecar::for_instance(ContainerRuntime::Podman, tunnel_config, &other_dir);
+    let other = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config,
+        &other_dir,
+        &runtime_dir,
+    );
     assert_ne!(sidecar.container_name(), other.container_name());
     let result = async {
         other
@@ -591,7 +767,8 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
     let workdir = std::env::temp_dir().join(format!("lw-tunnel-dns-{}", std::process::id()));
     let config = write_wireguard_config(&workdir, &private_key);
     let dns = vec!["10.231.99.53".parse().unwrap()];
-    let sidecar = TunnelSidecar::for_instance(
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
@@ -602,6 +779,7 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
             ..TunnelSidecarConfig::default()
         },
         &workdir,
+        &runtime_dir,
     );
     let result = exercise_sidecar(&sidecar, &image, &workdir, &dns).await;
     sidecar.stop().await;
@@ -640,7 +818,8 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 600");
     }
-    let sidecar = TunnelSidecar::for_instance(
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
@@ -651,6 +830,7 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
             ..TunnelSidecarConfig::default()
         },
         &workdir,
+        &runtime_dir,
     );
     let name = sidecar.container_name().to_string();
     let start = tokio::spawn(async move { sidecar.ensure_started().await });
@@ -687,8 +867,20 @@ async fn assert_cancelled_start_cleans_up(
     config: TunnelSidecarConfig,
     instance_dir: &Path,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(instance_dir).map_err(|error| error.to_string())?;
-    let sidecar = TunnelSidecar::for_instance(ContainerRuntime::Podman, config, instance_dir);
+    let runtime_dir = instance_dir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        config,
+        instance_dir,
+        &runtime_dir,
+    );
     let name = sidecar.container_name().to_string();
     let task_sidecar = sidecar.clone();
     let start = tokio::spawn(async move { task_sidecar.recover_for_run().await });
@@ -713,8 +905,19 @@ async fn assert_cancelled_start_cleans_up(
     start.abort();
     let _ = start.await;
     let cleaned = wait_container_absent(&name).await;
+    let cached_started = std::time::Instant::now();
+    let cached = sidecar.recover_for_run().await;
+    let cached_elapsed = cached_started.elapsed();
     sidecar.stop().await;
     cleaned?;
+    let cached = cached.expect_err("the cancelled recovery must retain its failure");
+    if cached_elapsed >= Duration::from_secs(1)
+        || !cached.to_string().contains("previous recovery failed")
+    {
+        return Err(format!(
+            "cancelled recovery did not use its recorded back-off ({cached_elapsed:?}): {cached}"
+        ));
+    }
     assert_no_unfiltered_sidecar(&name).await
 }
 
@@ -762,43 +965,38 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
         std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
             .expect("chmod 700");
     }
-    let previous_base_dir = std::env::var_os("LUNARWING_BASE_DIR");
-    let previous_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-    // SAFETY: this gated binary runs its live tests serially; no other thread
-    // reads these process-wide overrides while the manager is constructed.
-    unsafe {
-        std::env::set_var("LUNARWING_BASE_DIR", &instance_dir);
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-    }
     let tunnel_config = TunnelSidecarConfig {
         provider: TunnelProvider::Wireguard,
         image: Some(image.clone()),
         wireguard_config: Some(config),
-        startup_timeout: Duration::from_secs(90),
+        startup_timeout: Duration::from_secs(20),
         ..TunnelSidecarConfig::default()
     };
-    let name = TunnelSidecar::for_instance(
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         tunnel_config.clone(),
         &instance_dir,
-    )
-    .container_name()
-    .to_string();
-    let manager = SandboxManager::new(SandboxConfig {
-        image,
-        runtime: SandboxRuntime::Podman,
-        network: SandboxNetworkMode::Tunnel,
-        tunnel: Some(tunnel_config.clone()),
-        protected_paths: Vec::new(),
-        tenant_logs: TenantLogsMode::Off,
-        ..SandboxConfig::default()
-    });
+        &runtime_dir,
+    );
+    let name = sidecar.container_name().to_string();
+    let manager = SandboxManager::new_with_tunnel_sidecar(
+        SandboxConfig {
+            image,
+            runtime: SandboxRuntime::Podman,
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel_config.clone()),
+            protected_paths: Vec::new(),
+            tenant_logs: TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        },
+        sidecar,
+    );
     let result = async {
         let (first, first_elapsed) = manager_command_error(&manager, &workspace).await?;
         if first.kind() != "sandbox_unavailable" || !first.to_string().contains("handshake") {
             return Err(format!("first failure missed the handshake gate: {first}"));
         }
-        if first_elapsed >= Duration::from_secs(90) {
+        if first_elapsed >= Duration::from_secs(60) {
             return Err(format!(
                 "first failure exceeded the bounded recovery: {first_elapsed:?}"
             ));
@@ -825,22 +1023,336 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
     }
     .await;
     manager.shutdown().await;
-    // SAFETY: restoration uses the same serial-live-test boundary as the
-    // overrides above, and runs before later Podman cases.
-    unsafe {
-        if let Some(value) = previous_base_dir {
-            std::env::set_var("LUNARWING_BASE_DIR", value);
-        } else {
-            std::env::remove_var("LUNARWING_BASE_DIR");
-        }
-        if let Some(value) = previous_runtime_dir {
-            std::env::set_var("XDG_RUNTIME_DIR", value);
-        } else {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-    }
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("dead-peer manager recovery, back-off, retry, and cancelled-start cleanup");
+}
+
+async fn build_delayed_tunnel_image(base: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("lw-tunnel-slow-image-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let image = format!("localhost/lw-tunnel-slow-e2e:{}", std::process::id());
+    let containerfile = format!(
+        "FROM {base}\n\
+         RUN WG_QUICK=\"$(command -v wg-quick)\" && \\\n\
+             mv \"$WG_QUICK\" /usr/local/bin/wg-quick-real && \\\n\
+             printf '#!/bin/sh\\nsleep 25\\nexec /usr/local/bin/wg-quick-real \"$@\"\\n' > \"$WG_QUICK\" && \\\n\
+             chmod 0755 \"$WG_QUICK\"\n"
+    );
+    std::fs::write(dir.join("Containerfile"), containerfile).map_err(|error| error.to_string())?;
+    let result = podman_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|()| image)
+}
+
+#[tokio::test]
+async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let sandbox_image = tunnel_image().await.expect("WireGuard-capable image");
+    let delayed_image = build_delayed_tunnel_image(&sandbox_image)
+        .await
+        .expect("build delayed provider image");
+    let private_key = generate_wg_private_key(&sandbox_image)
+        .await
+        .expect("generate a WireGuard key");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-slow-start-{}", std::process::id()));
+    let instance_dir = workdir.join("instance");
+    let workspace = workdir.join("workspace");
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&instance_dir).expect("instance dir");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+    }
+    let config = write_wireguard_config(&workdir, &private_key);
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(delayed_image.clone()),
+        wireguard_config: Some(config),
+        startup_timeout: Duration::from_secs(35),
+        ..TunnelSidecarConfig::default()
+    };
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &instance_dir,
+        &runtime_dir,
+    );
+    let manager = SandboxManager::new_with_tunnel_sidecar(
+        SandboxConfig {
+            image: sandbox_image,
+            runtime: SandboxRuntime::Podman,
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel_config),
+            protected_paths: Vec::new(),
+            tenant_logs: TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        },
+        sidecar,
+    );
+    let started = std::time::Instant::now();
+    let result = manager.execute("true", &workspace, HashMap::new()).await;
+    let elapsed = started.elapsed();
+    manager.shutdown().await;
+    let _ = podman_success(&["image", "rm", "-f", &delayed_image]).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    let output = result.expect("a provider taking about 25 seconds must start");
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        elapsed >= Duration::from_secs(20),
+        "the delayed provider did not exercise the old 20s cap: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "cold start did not retain its configured 35s budget: {elapsed:?}"
+    );
+}
+
+struct TestPeerConfig<'a> {
+    private_key: &'a str,
+    address: &'a str,
+    peer_public_key: &'a str,
+    peer_address: &'a str,
+    endpoint: Option<&'a str>,
+    listen_port: Option<u16>,
+}
+
+fn write_test_peer_config(path: &Path, config: &TestPeerConfig<'_>) {
+    let endpoint = config
+        .endpoint
+        .map(|value| format!("Endpoint = {value}\n"))
+        .unwrap_or_default();
+    let listen = config
+        .listen_port
+        .map(|port| format!("ListenPort = {port}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        path,
+        format!(
+            "[Interface]\nPrivateKey = {}\nAddress = {}\n{listen}\n\
+             [Peer]\nPublicKey = {}\n{endpoint}AllowedIPs = {}\nPersistentKeepalive = 1\n",
+            config.private_key, config.address, config.peer_public_key, config.peer_address
+        ),
+    )
+    .expect("write peer config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    }
+}
+
+async fn build_dual_peer_image(base: &str, peer_config: &Path) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("lw-tunnel-dual-image-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let image = format!("localhost/lw-tunnel-dual-e2e:{}", std::process::id());
+    std::fs::copy(peer_config, dir.join("wg1.conf")).map_err(|error| error.to_string())?;
+    let wrapper = "#!/bin/sh\nset -eu\n\
+         if [ \"${1:-}\" = up ] && [ \"${2:-}\" = /etc/wireguard/wg0.conf ]; then\n\
+             /usr/local/bin/wg-quick-real up /etc/wireguard/wg0.conf\n\
+             sleep 10\n\
+             if [ ! -e /tmp/lunarwing-peer-disabled ]; then\n\
+                 /usr/local/bin/wg-quick-real up /etc/wireguard/wg1.conf\n\
+             fi\n\
+             exit 0\n\
+         fi\n\
+         exec /usr/local/bin/wg-quick-real \"$@\"\n";
+    std::fs::write(dir.join("wg-quick"), wrapper).map_err(|error| error.to_string())?;
+    let containerfile = format!(
+        "FROM {base}\n\
+         COPY wg1.conf /etc/wireguard/wg1.conf\n\
+         COPY wg-quick /usr/local/bin/lunarwing-wg-quick\n\
+         RUN WG_QUICK=\"$(command -v wg-quick)\" && \\\n\
+             mv \"$WG_QUICK\" /usr/local/bin/wg-quick-real && \\\n\
+             cp /usr/local/bin/lunarwing-wg-quick \"$WG_QUICK\" && \\\n\
+             chmod 0755 \"$WG_QUICK\" && chmod 0600 /etc/wireguard/wg1.conf\n"
+    );
+    std::fs::write(dir.join("Containerfile"), containerfile).map_err(|error| error.to_string())?;
+    let result = podman_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|()| image)
+}
+
+async fn disable_recreated_peer(
+    name: &str,
+    previous_id: &str,
+    peer_public: &str,
+) -> Result<(), String> {
+    for _ in 0..300 {
+        if tunnel_container_id(name)
+            .await
+            .is_some_and(|id| id != previous_id)
+            && podman_success(&["exec", name, "touch", "/tmp/lunarwing-peer-disabled"])
+                .await
+                .is_ok()
+            && podman_success(&[
+                "exec",
+                name,
+                "wg",
+                "set",
+                "wg0",
+                "peer",
+                peer_public,
+                "endpoint",
+                "127.0.0.1:9",
+            ])
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("could not disable the recreated sidecar's peer".into())
+}
+
+async fn wait_for_stale_handshake(sidecar: &TunnelSidecar) -> Result<(), String> {
+    for _ in 0..100 {
+        match sidecar.ensure_healthy().await {
+            Ok(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+            Err(error) if error.to_string().contains("liveness budget") => return Ok(()),
+            Err(error) => return Err(format!("unexpected health failure: {error}")),
+        }
+    }
+    Err("the dead peer's handshake did not age out".into())
+}
+
+fn write_live_peer_configs(
+    workdir: &Path,
+    primary_private: &str,
+    primary_public: &str,
+    peer_private: &str,
+    peer_public: &str,
+) -> (PathBuf, PathBuf) {
+    let primary_config = workdir.join("wg0.conf");
+    let peer_config = workdir.join("peer.conf");
+    write_test_peer_config(
+        &primary_config,
+        &TestPeerConfig {
+            private_key: primary_private,
+            address: "10.231.100.1/32",
+            peer_public_key: peer_public,
+            peer_address: "10.231.100.2/32",
+            endpoint: Some("127.0.0.1:51821"),
+            listen_port: Some(51820),
+        },
+    );
+    write_test_peer_config(
+        &peer_config,
+        &TestPeerConfig {
+            private_key: peer_private,
+            address: "10.231.100.2/32",
+            peer_public_key: primary_public,
+            peer_address: "10.231.100.1/32",
+            endpoint: Some("127.0.0.1:51820"),
+            listen_port: Some(51821),
+        },
+    );
+    (primary_config, peer_config)
+}
+
+#[tokio::test]
+async fn podman_tunnel_healthy_peer_death_uses_bounded_reprobe() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let image = tunnel_image().await.expect("WireGuard-capable image");
+    let (primary_private, primary_public) =
+        generate_wg_keypair(&image).await.expect("primary keypair");
+    let (peer_private, peer_public) = generate_wg_keypair(&image).await.expect("peer keypair");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-live-peer-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("workdir");
+    let (primary_config, peer_config) = write_live_peer_configs(
+        &workdir,
+        &primary_private,
+        &primary_public,
+        &peer_private,
+        &peer_public,
+    );
+    let dual_image = build_dual_peer_image(&image, &peer_config)
+        .await
+        .expect("build dual-peer image");
+    let runtime_dir = private_runtime_dir(&workdir);
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(dual_image.clone()),
+        wireguard_config: Some(primary_config),
+        startup_timeout: Duration::from_secs(45),
+        ..TunnelSidecarConfig::default()
+    };
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &workdir,
+        &runtime_dir,
+    );
+    let name = sidecar.container_name().to_string();
+    let result = async {
+        sidecar
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        let previous_id = sidecar
+            .ensure_healthy()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = manager_with_sidecar(&image, &tunnel_config, sidecar.clone());
+        let output = manager
+            .execute("true", &workdir, HashMap::new())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+
+        podman_success(&["exec", &name, "wg-quick", "down", "/etc/wireguard/wg1.conf"]).await?;
+        podman_success(&[
+            "exec",
+            &name,
+            "wg",
+            "set",
+            "wg0",
+            "peer",
+            &peer_public,
+            "endpoint",
+            "127.0.0.1:9",
+        ])
+        .await?;
+        wait_for_stale_handshake(&sidecar).await?;
+        let command = manager_command_error(&manager, &workdir);
+        let disable = disable_recreated_peer(&name, &previous_id, &peer_public);
+        let (command, disabled) = tokio::join!(command, disable);
+        disabled?;
+        let (first, elapsed) = command.map_err(|error| format!("post-death recovery: {error}"))?;
+        if elapsed < Duration::from_secs(6) || elapsed >= Duration::from_secs(60) {
+            return Err(format!(
+                "recovery did not exercise the bounded re-probe: {elapsed:?}"
+            ));
+        }
+        if !first.to_string().contains("20s per-run cap") {
+            return Err(format!("recovery missed the fresh-provider cap: {first}"));
+        }
+        assert_no_unfiltered_sidecar(&name).await?;
+        let (_, cached_elapsed) = manager_command_error(&manager, &workdir)
+            .await
+            .map_err(|error| format!("cached peer-death command: {error}"))?;
+        if cached_elapsed >= Duration::from_secs(1) {
+            return Err(format!(
+                "cached peer-death failure took too long: {cached_elapsed:?}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    sidecar.stop().await;
+    let _ = podman_success(&["image", "rm", "-f", &dual_image]).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result.expect("a real handshake followed by peer death must fail through bounded recovery");
 }
 
 fn required_env(name: &str) -> Result<String, String> {
