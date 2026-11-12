@@ -1178,7 +1178,7 @@ impl TunnelSidecar {
 
     fn netbird_state_volume(&self) -> Result<String> {
         let salt = read_or_create_identity_salt(&self.base_dir).map_err(|error| {
-            self.unavailable(format!(
+            self.unavailable(&format!(
                 "could not read or create the persistent identity salt: {error}"
             ))
         })?;
