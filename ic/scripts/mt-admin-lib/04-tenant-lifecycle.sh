@@ -814,10 +814,22 @@ remove_tenant() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     stop_tenant_systemd "$name" || die "stop failed; refusing removal of '$name'"
-    uninstall_tenant_systemd "$name"
   else
     stop_tenant_openrc "$name" || die "stop failed; refusing removal of '$name'"
-    uninstall_tenant_openrc "$name" || die "unit removal failed for '$name'"
+  fi
+
+  # Match stop-tenant's per-lane order. Both worker roles and their supervisors
+  # must be down before unit/container deletion and, critically, before the
+  # egress allowlist is touched. This runs for purge and non-purge removals.
+  local worker
+  for worker in vision voice pebble opencode kimi opencode2 lunardepth; do
+    "stop_tenant_${worker}" "$name" \
+      || die "failed to stop $worker resources; refusing removal of '$name'"
+  done
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    uninstall_tenant_systemd "$name" || die "unit/container removal failed for '$name'"
+  else
+    uninstall_tenant_openrc "$name" || die "unit/container removal failed for '$name'"
   fi
   say ""
 
@@ -833,8 +845,11 @@ remove_tenant() {
   # WI#424 (run-226 OQ-6): drop the tenant's egress network, rendered state and
   # live chains while the tenant account still exists (the rootless netns and
   # rootless network are owned by it). Only when this tenant ever had egress.
+  # WI#638: teardown itself refuses to flush with attachments; never downgrade
+  # that refusal to a warning and report the tenant removed while workers remain.
   if [[ -n "$(worker_egress_state_get "$name" SUBNET)" ]]; then
-    worker_egress_teardown "$name" || say "WARNING: worker egress teardown incomplete for '$name'" >&2
+    worker_egress_teardown "$name" \
+      || die "worker egress teardown failed for '$name'; removal aborted"
     say ""
   fi
 

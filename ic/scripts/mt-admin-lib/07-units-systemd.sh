@@ -1176,10 +1176,21 @@ start_tenant_systemd() {
 
 stop_tenant_systemd() {
   local name="$1"
-  local uid state rc stop_failed=false
+  local uid state rc stop_failed=false worker
   uid="$(id -u "$name" 2>/dev/null)" || return 0
+  local -a services=(
+    "lunarwing-${name}.service" "xmpp-bridge-${name}.service"
+    "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service"
+    "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service"
+    "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service"
+  )
+  for worker in pebble opencode opencode2 lunardepth kimi; do
+    services+=("$(worker_task_container_name "$worker" "$name").service")
+    services+=("lunarwing-${worker}-${name}.service")
+  done
+  services+=("lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service")
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-opencode2-${name}.service" "lunarwing-lunardepth-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "${services[@]}"; do
     rc=0
     state="$(_systemctl_user "$name" is-active "$svc" 2>/dev/null)" || rc=$?
     case "$state" in
@@ -1234,19 +1245,13 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-vision-${name}.container" \
         "$qdir/lunarwing-voice-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
-    # Retirement preserves stopped Nanocode containers for rollback and manual
-    # recovery. Supported workers remain disposable because their state lives
-    # in bind-mounted workspaces.
-    for w in pebble opencode kimi opencode2 lunardepth; do
-      _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
-      _ctr "$name" rm -f "$(worker_task_container_name "$w" "$name")" >/dev/null 2>&1 || true
-      _ctr "$name" volume rm "$(worker_ipc_volume_name "$w" "$name")" >/dev/null 2>&1 || true
-    done
-    _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
-    _ctr "$name" rm -f "lunarwing-voice-${name}" >/dev/null 2>&1 || true
+    # The generated task units have Restart=on-failure. Forget every removed
+    # Quadlet before deleting its container so systemd cannot resurrect it into
+    # the egress teardown window.
+    _systemctl_user "$name" daemon-reload || return 1
+    remove_tenant_worker_containers "$name" || return 1
   fi
 
-  _systemctl_user "$name" daemon-reload 2>/dev/null || true
   say "uninstalled systemd units for $name"
 }
 

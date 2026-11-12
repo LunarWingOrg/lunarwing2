@@ -3044,6 +3044,43 @@ stop_tenant_pebble() {
   stop_worker_task_container "$name" pebble
 }
 
+_remove_tenant_container() {
+  local name="$1" container="$2" inspect_out rc=0
+  inspect_out="$(_ctr_inspect "$name" "$container" 2>&1)" || rc=$?
+  if ((rc != 0)); then
+    if _worker_inspect_absent "$container" "$inspect_out"; then
+      return 0
+    fi
+    say "ERROR: cannot inspect tenant container $container before removal: ${inspect_out//$'\n'/ }" >&2
+    return 1
+  fi
+  _ctr "$name" rm -f "$container" >/dev/null 2>&1 \
+    || { say "ERROR: failed to stop and remove tenant container $container" >&2; return 1; }
+}
+
+remove_tenant_worker_containers() {
+  local name="$1" worker container volume volumes
+  ensure_container_runtime
+  for worker in pebble opencode kimi opencode2 lunardepth; do
+    _remove_tenant_container "$name" "lunarwing-${worker}-${name}" || return 1
+    container="$(worker_task_container_name "$worker" "$name")"
+    _remove_tenant_container "$name" "$container" || return 1
+  done
+  for worker in vision voice; do
+    _remove_tenant_container "$name" "lunarwing-${worker}-${name}" || return 1
+  done
+
+  volumes="$(_ctr "$name" volume ls --format '{{.Name}}' 2>/dev/null)" \
+    || { say "ERROR: cannot list worker IPC volumes for tenant '$name'" >&2; return 1; }
+  for worker in pebble opencode kimi opencode2 lunardepth; do
+    volume="$(worker_ipc_volume_name "$worker" "$name")"
+    if grep -Fqx -- "$volume" <<<"$volumes"; then
+      _ctr "$name" volume rm "$volume" >/dev/null 2>&1 \
+        || { say "ERROR: failed to remove worker IPC volume $volume" >&2; return 1; }
+    fi
+  done
+}
+
 require_worker_name() {
   case "${1:-}" in
     nanocode) die "Nanocode worker is retired" ;;
