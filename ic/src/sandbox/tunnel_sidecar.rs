@@ -2956,6 +2956,107 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    fn successful_runtime_output(stdout: String) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn slow_healthy_runtime(
+        hash: String,
+        instance: String,
+        image_id: String,
+        listing: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::sandbox::cli_runner::TestRuntime {
+        crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            let hash = hash.clone();
+            let instance = instance.clone();
+            let image_id = image_id.clone();
+            let listing = listing.clone();
+            let calls = calls.clone();
+            let container_id = "2".repeat(64);
+            async move {
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let stdout = match args.first().map(String::as_str) {
+                    Some("image") if args.iter().any(|arg| arg == "--format") => {
+                        format!("{image_id}\n")
+                    }
+                    Some("image") => String::new(),
+                    Some("inspect") => {
+                        format!("{container_id}|true|{hash}|{instance}\n")
+                    }
+                    Some("exec") => match args.get(2).map(String::as_str) {
+                        Some("ip") => String::new(),
+                        Some("wg") => "0x4c57\n".into(),
+                        Some("cat") => "nameserver 9.9.9.9\n".into(),
+                        Some("nft") => listing,
+                        other => panic!("unexpected sidecar exec: {other:?}"),
+                    },
+                    other => panic!("unexpected runtime call: {other:?}"),
+                };
+                Ok(successful_runtime_output(stdout))
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn slow_successful_health_probes_do_not_record_recovery_failure() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-slow-health-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let salt = [42_u8; 32];
+        std::fs::write(runtime_dir.join(LABEL_SALT_FILE), salt).unwrap();
+        let config_path = base.join("wg0.conf");
+        std::fs::write(&config_path, "[Interface]\nPrivateKey = private\n").unwrap();
+        let config = TunnelSidecarConfig {
+            provider: TunnelProvider::Wireguard,
+            wireguard_config: Some(config_path),
+            auto_pull_image: false,
+            ..TunnelSidecarConfig::default()
+        };
+        let image_id = format!("sha256:{}", "1".repeat(64));
+        let hash = config.config_hash(&salt, &image_id);
+        let instance = instance_id_for(&base);
+        let listing = listing_for(&EgressPolicy {
+            tunnel_mark: LUNARWING_TUNNEL_FWMARK,
+            resolvers: vec!["9.9.9.9".parse().unwrap()],
+        });
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = slow_healthy_runtime(hash, instance, image_id, listing, calls.clone());
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let started = tokio::time::Instant::now();
+        let container_id = sidecar.container_for_run().await.unwrap();
+        assert_eq!(container_id, "2".repeat(64));
+        assert_eq!(started.elapsed(), Duration::from_secs(63));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(lifecycle.active.is_none());
+        assert!(lifecycle.last_failure.is_none());
+        assert!(
+            lifecycle
+                .cached_reason(tokio::time::Instant::now())
+                .is_none()
+        );
+        drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     fn recovery_test_sidecar(label: &str) -> TunnelSidecar {
         let base = std::env::temp_dir().join(format!(
             "lw-tunnel-recovery-{label}-{}",
