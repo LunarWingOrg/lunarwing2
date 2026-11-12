@@ -123,6 +123,9 @@ build_candidate_workers() {
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
     printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
   done
+  if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}"; then
+    printf 'sandbox-failed\n' >>"$cand_events"
+  fi
 }
 upgrade_candidate_lanes() {
   local file
@@ -131,7 +134,14 @@ upgrade_candidate_lanes() {
   grep -v '^[[:space:]]*$' "$file" 2>/dev/null || true
 }
 cleanup_candidate_workers() { : >"$(tenant_candidate_lanes_file "$1")"; }
-promote_candidate_workers() { printf 'promote\n' >>"$promote_events"; : >"$(tenant_candidate_lanes_file "$1")"; }
+promote_candidate_workers() {
+  printf 'promote\n' >>"$promote_events"
+  if [[ -s "$(tenant_candidate_sandbox_file "$1")" ]]; then
+    printf 'sandbox-promote\n' >>"$events"
+    : >"$(tenant_candidate_sandbox_file "$1")"
+  fi
+  : >"$(tenant_candidate_lanes_file "$1")"
+}
 ensure_container_runtime() { :; }
 
 # ── 1. a failing pre-stop kimi lane leaves the RUNNING tenant untouched ──────
@@ -188,6 +198,57 @@ elif ! grep -qx 'promote' "$promote_events"; then
 else
   pass 'candidates build pre-stop and promotion runs after the daemon build'
 fi
+
+# ── 2b. managed sandbox candidates share the pre-stop/post-build train ──────
+REAL_TENANT_USES_SANDBOX="$(declare -f tenant_uses_managed_sandbox_image)"
+REAL_SANDBOX_BUILD_REQUIRED="$(declare -f sandbox_image_build_required)"
+REAL_SANDBOX_RUNTIME="$(declare -f sandbox_container_runtime)"
+REAL_SANDBOX_BUILD="$(declare -f build_sandbox_image)"
+REAL_SANDBOX_PREPARE="$(declare -f _prepare_sandbox_image_source)"
+tenant_uses_managed_sandbox_image() { return 0; }
+sandbox_image_build_required() { return 0; }
+sandbox_container_runtime() { printf 'podman'; }
+_prepare_sandbox_image_source() {
+  printf '%s\n' "${2:-}" >"$fixture/sandbox-release-ref"
+  # shellcheck disable=SC2034  # consumed by build_candidate_sandbox_image
+  SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$fixture_repo/ic"
+}
+build_sandbox_image() {
+  printf 'sandbox-build\n' >>"$events"
+  [[ "${SANDBOX_CANDIDATE_FAIL:-false}" != true ]]
+}
+podman() { return 0; }
+render_all_openrc_proxy_units() { :; }
+SANDBOX_CANDIDATE_FAIL=false
+for init in openrc systemd; do
+  INIT_SYSTEM="$init"
+  : >"$events"; : >"$cand_events"; : >"$promote_events"
+  capture run_upgrade
+  if [[ "$rc" -eq 0 && "$(cat "$events")" == $'sandbox-build\nstop\nbuild\nsandbox-promote\nstart' \
+      && "$(cat "$fixture/sandbox-release-ref")" == "$target" ]]; then
+    pass "$init sandbox candidate builds before stop and promotes after the daemon build"
+  else
+    fail "$init sandbox candidate ordering failed (rc=$rc): $output; events: $(cat "$events")"
+  fi
+done
+INIT_SYSTEM=systemd
+SANDBOX_CANDIDATE_FAIL=true
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade
+if [[ "$rc" -eq 0 && "$(cat "$events")" == $'sandbox-build\nstop\nbuild\nstart' ]] \
+    && grep -qx 'sandbox-failed' "$cand_events" \
+    && ! grep -qx 'sandbox-promote' "$events"; then
+  pass 'failed sandbox candidate is non-fatal and is never promoted'
+else
+  fail "failed sandbox candidate stranded or promoted the tenant (rc=$rc): $output"
+fi
+SANDBOX_CANDIDATE_FAIL=false
+eval "$REAL_TENANT_USES_SANDBOX"
+eval "$REAL_SANDBOX_BUILD_REQUIRED"
+eval "$REAL_SANDBOX_RUNTIME"
+eval "$REAL_SANDBOX_BUILD"
+eval "$REAL_SANDBOX_PREPARE"
+unset -f podman
 
 # ── 3. post-stop build failure BEFORE the daemon stage: restart in place ─────
 # The new daemon was not built, so the previous binary is still on disk and an
