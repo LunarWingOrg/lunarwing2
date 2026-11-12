@@ -175,7 +175,7 @@ impl Tool for SshTool {
     fn rate_limit_config(&self) -> Option<ToolRateLimitConfig> { Some(ToolRateLimitConfig::new(30, 300)) }
 }
 ```
-Error mapping mirrors `ShellTool::execute_command` (`shell.rs:773-822`): map `SshBridgeError::{ConnectionTimeout}` → `ToolError::Timeout`, `{AuthenticationFailed,HostKeyMismatch,UnknownHostKey}` → `ToolError::NotAuthorized`, else `ToolError::ExecutionFailed`.
+Error mapping mirrors `ShellTool::execute_command` (`shell.rs:773-822`): map `SshBridgeError::{ConnectionTimeout}` → `ToolError::Timeout`, `{AuthenticationFailed,UnknownHostKey}` → `ToolError::NotAuthorized`, else `ToolError::ExecutionFailed`. The host-key store retains its precise `HostKeyMismatch` error, but the live client connect path wraps a mismatched pin in `ConnectionRefused` with the expected and actual fingerprints; `ssh` and `ssh_git` therefore surface that refusal as `ToolError::ExecutionFailed`.
 
 **Changed: `ic/src/tools/builtin/mod.rs`** — `mod ssh;` + `pub use ssh::SshTool;` (alongside `pub use shell::ShellTool;`).
 
