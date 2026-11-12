@@ -186,8 +186,7 @@ async fn exercise_ssh_tool(bridge: Arc<RwLock<SSHBridge>>, config: &LiveConfig) 
 }
 
 async fn exercise_refusals(config: &LiveConfig) {
-    // Wrong pins keep their specific HostKeyMismatch type. Certificate-only negotiation
-    // returns ConnectionRefused; ssh_client.rs unit-tests the callback refusal branch.
+    // ssh_client.rs unit-tests the certificate callback refusal branch separately.
     let wrong_pin = config.host(
         STRICT_HOST,
         config.port,
@@ -202,15 +201,12 @@ async fn exercise_refusals(config: &LiveConfig) {
     )
     .await
     .unwrap_err();
-    assert!(
-        matches!(&mismatch, SshBridgeError::HostKeyMismatch { .. }),
-        "got {mismatch:?}"
-    );
-    assert!(
-        mismatch
-            .to_string()
-            .contains("Host key verification failed")
-    );
+    match &mismatch {
+        SshBridgeError::ConnectionRefused(message) => {
+            assert!(message.contains("Host key verification failed"), "{message}");
+        }
+        other => panic!("expected ConnectionRefused, got {other:?}"),
+    }
 
     let certificate = config.host(
         STRICT_HOST,
