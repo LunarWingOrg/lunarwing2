@@ -77,6 +77,7 @@ write_sshd_config() {
     printf 'PidFile %s\n' "$pid_file"
     printf 'AuthorizedKeysFile %s/authorized_keys\n' "$WORK_DIR"
     printf 'AuthorizedKeysCommand none\n'
+    # StrictModes rejects the world-writable /tmp ancestor of this disposable key file.
     printf 'StrictModes no\n'
     printf 'PubkeyAuthentication yes\n'
     printf 'AuthenticationMethods publickey\n'
