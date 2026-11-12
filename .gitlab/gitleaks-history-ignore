@@ -874,6 +874,8 @@
 4b98f57b8752d4082d5267e3e30c12d4b119f22b:projects/ocr-sidecar/src/main.rs:generic-api-key:2006
 4eca1d6cd8bce27a320a301ee670995630328529:ic/crates/lunarwing_safety/src/lib.rs:private-key:922
 529a2584d6347e01079d6f92bd60f6d6937011b0:ic/vendor/rustls/.cargo-checksum.json:generic-api-key:1
+54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1
+54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/src/helpers.rs:private-key:286
 587ab6618737b0650fc488e4b40c01375366185a:docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:167
 5b12a1d8b28a069b6edcc14435c1ab1c7aa4ebef:ic/scripts/tests/test-darkirc-adapter-secret-upload.sh:generic-api-key:32
 66a0c9be9160727a70e188ea696097e30919d4b6:ic/crates/lunarwing_safety/src/lib.rs:private-key:922
