@@ -108,7 +108,8 @@ impl SandboxManager {
         }
     }
 
-    /// Create with an instance-scoped tunnel sidecar for deterministic integration tests.
+    /// Test-only injection seam. Production must use `new`, which keeps the
+    /// sidecar configuration identical to the manager's tunnel configuration.
     #[doc(hidden)]
     pub fn new_with_tunnel_sidecar(config: SandboxConfig, sidecar: TunnelSidecar) -> Self {
         let mut manager = Self::new(config);
@@ -1162,6 +1163,108 @@ mod tests {
         for manager in &managers {
             manager.shutdown().await;
         }
+        std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn gated_counting_runtime(
+        state: SharedRuntimeState,
+        run_started: std::sync::Arc<tokio::sync::Notify>,
+        release_run: std::sync::Arc<tokio::sync::Notify>,
+    ) -> TestRuntime {
+        let base = counting_runtime(state);
+        TestRuntime::new(move |args, stdin| {
+            let base = base.clone();
+            let run_started = run_started.clone();
+            let release_run = release_run.clone();
+            async move {
+                if args.first().map(String::as_str) == Some("run") {
+                    run_started.notify_one();
+                    release_run.notified().await;
+                }
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                base.output(&refs, stdin.as_deref()).await
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_recovery_survives_cancellation_and_coordinates_shutdown() {
+        let state = SharedRuntimeState::default();
+        let run_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_run = std::sync::Arc::new(tokio::sync::Notify::new());
+        let runtime =
+            gated_counting_runtime(state.clone(), run_started.clone(), release_run.clone());
+        let workdir = std::env::temp_dir().join(format!("lw-tunnel-stop-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = workdir.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let config = TunnelSidecarConfig {
+            auto_pull_image: false,
+            startup_timeout: Duration::from_secs(2),
+            netbird_management_url: Some("https://netbird.example.com".into()),
+            netbird_setup_key: Some(secrecy::SecretString::from("test-setup-key")),
+            ..TunnelSidecarConfig::default()
+        };
+        let new_sidecar = || {
+            TunnelSidecar::for_instance_with_runtime_dir(
+                ContainerRuntime::Podman,
+                config.clone(),
+                &workdir,
+                &runtime_dir,
+            )
+            .with_test_runtime(runtime.clone())
+        };
+        let first = new_sidecar();
+        let second = new_sidecar();
+
+        let cold = tokio::spawn(async move { first.ensure_started().await });
+        run_started.notified().await;
+        let waiter = tokio::spawn({
+            let sidecar = second.clone();
+            async move { sidecar.recover_for_run().await }
+        });
+        cold.abort();
+        let join_error = cold.await.expect_err("cold-start task was aborted");
+        assert!(join_error.is_cancelled());
+        let stopping = tokio::spawn({
+            let sidecar = second.clone();
+            async move { sidecar.stop().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !second.recovery_stop_requested().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown flag");
+        release_run.notify_one();
+        stopping.await.expect("shutdown task");
+        let error = waiter.await.expect("recovery waiter").unwrap_err();
+        let reason = error.to_string();
+        assert!(
+            reason.contains("stopped") || reason.contains("shutdown"),
+            "{reason}"
+        );
+        {
+            let state = lock_runtime_state(&state);
+            assert_eq!(state.runs, 1);
+            assert_eq!(state.installs, 0);
+            assert!(!state.started);
+            assert!(state.removals > 0);
+            assert!(state.unexpected.is_empty(), "{:?}", state.unexpected);
+        }
+
+        release_run.notify_one();
+        second.ensure_started().await.expect("explicit restart");
+        {
+            let state = lock_runtime_state(&state);
+            assert_eq!(state.runs, 2);
+            assert_eq!(state.installs, 1);
+            assert!(state.started);
+        }
+        second.stop().await;
+        assert!(!lock_runtime_state(&state).started);
         std::fs::remove_dir_all(workdir).unwrap();
     }
 

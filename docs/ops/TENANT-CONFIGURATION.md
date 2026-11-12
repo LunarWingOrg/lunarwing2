@@ -504,8 +504,8 @@ new multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537),
 while an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is
 preserved.
 
-NetBird uses the default runtime DNS path while the custom-DNS reconnect
-investigation in WI#603 remains open:
+NetBird requires the default runtime DNS path. WI#603 rejects
+`SANDBOX_TUNNEL_DNS` with this provider before any container-runtime call:
 
 ```bash
 SANDBOX_NETWORK=tunnel
@@ -529,21 +529,25 @@ SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53  # joined-run resolvers; disables direc
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 ```
 
-Custom DNS is mounted only into joined runs. The sidecar retains its runtime
-resolver file for bootstrap, but the firewall also blocks its own post-start
-lookups when custom DNS is set. The WI#600 live run confirmed that NetBird's
-upstream DNS writes are unmarked and blocked, returning `SERVFAIL`; do not use
-that combination. WI#603 retains the reconnect investigation and any fix or
-explicit unsupported-combination enforcement.
+WireGuard custom DNS is mounted only into joined runs. The sidecar retains its
+runtime resolver file for bootstrap, but the firewall also blocks its own
+post-start lookups when custom DNS is set. The WI#600 live run confirmed that
+NetBird's upstream DNS writes were unmarked and blocked, returning `SERVFAIL`.
+WI#603 therefore rejects that provider/setting combination during validation;
+leave `SANDBOX_TUNNEL_DNS` unset for NetBird.
 DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
 multicast values. Peered WireGuard configs need
 `PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
-is re-probed after firewall installation. Cold starts retain the configured
-`SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget. Per-command recovery uses a
-6-second re-probe, at most 20 seconds for fresh provider readiness (or a lower
-configured timeout), one 60-second budget across health checks and recovery, and
-a 30-second failure back-off. The sidecar-owned attempt still finishes and
-records its result when the calling command is cancelled.
+is re-probed after firewall installation. Cold starts use a 6-second adoption
+re-probe and retain the configured `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget
+for a fresh provider; image pull and runtime start have separate bounds.
+Per-command recovery uses the same 6-second re-probe, at most 20 seconds for
+fresh provider readiness (or a lower configured timeout), one 60-second budget
+across health checks and recovery, and a 30-second failure back-off. A provider
+that needs longer after recreation requires a daemon restart. The sidecar-owned
+attempt still finishes and records its result when the calling command is
+cancelled or its result channel closes. Shutdown signals active recovery, uses
+bounded waits, removes late starts, and permits a later explicit cold start.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in
@@ -556,13 +560,12 @@ resolved local image ID so tag rotation cannot reuse stale credentials or
 network state. Sidecar names and NetBird volumes are instance-scoped. The
 NetBird identity hash uses a persistent 32-byte mode-`0600` salt at
 `<tenant-state>/sandbox-tunnel-identity.salt`, not the runtime-directory label
-salt, so host reboots, image changes, and DNS changes retain the peer;
-management URL or setup-key rotation changes it. The first start after the
-WI#602 fix re-enrols once under a new persistent-salt volume name and prunes the
-old instance-scoped volume, so plan one valid setup-key use and revoke the old
-peer. WI#600 validated core NetBird 0.82.0 interoperability on 2026-11-11;
-custom DNS remains unsupported after its upstream writes failed closed. Operator
-guide:
+salt, so host reboots and image changes retain the peer; management URL or
+setup-key rotation changes it. The first start after the WI#602 fix re-enrols
+once under a new persistent-salt volume name and prunes the old instance-scoped
+volume, so plan one valid setup-key use and revoke the old peer. WI#600
+validated core NetBird 0.82.0 interoperability on 2026-11-11; WI#603 rejects
+custom DNS after its upstream writes failed closed. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior

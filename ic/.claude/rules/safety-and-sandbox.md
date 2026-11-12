@@ -50,9 +50,10 @@ runtime or image is unavailable, commands error with a structured
   sidecar `nftables` chains drop new inbound flows (never an inbound listener)
   and non-tunnel egress, except for marked provider traffic and, by default, DNS
   to runtime resolvers. That default DNS is a residual uplink/exfiltration
-  channel. `SANDBOX_TUNNEL_DNS` mounts overlay resolvers into joined runs only
-  and removes direct uplink DNS; provider bootstrap keeps runtime DNS. NetBird
-  local-DNS forwarding and live interoperability remain unvalidated (WI#600).
+  channel. WireGuard `SANDBOX_TUNNEL_DNS` mounts overlay resolvers into joined
+  runs only and removes direct uplink DNS; provider bootstrap keeps runtime DNS.
+  NetBird rejects that setting (WI#603); core interoperability is live-validated
+  (WI#600).
   Link-local IPv4 (cloud metadata, host alias) is dropped. Provider health and
   both chains are rechecked rule by rule before every run; failures return
   `[sandbox:sandbox_unavailable]` and never degrade. NetBird setup keys use an

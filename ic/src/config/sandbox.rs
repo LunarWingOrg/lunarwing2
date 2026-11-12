@@ -63,6 +63,7 @@ pub struct SandboxTunnelModeConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
+    /// WireGuard-only joined-run resolvers; NetBird validation rejects these.
     pub dns: Vec<IpAddr>,
     pub wireguard_canary: Option<IpAddr>,
     pub startup_timeout_secs: Option<u64>,
@@ -1131,7 +1132,6 @@ mod tests {
                 "https://nb.example.com",
             );
             std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
-            std::env::set_var("SANDBOX_TUNNEL_DNS", "100.100.0.53, fd00::53");
         }
         let config = SandboxModeConfig::resolve(&crate::settings::Settings::default())
             .expect("valid tunnel config")
@@ -1143,13 +1143,31 @@ mod tests {
             tunnel.image(),
             "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
         );
-        assert_eq!(
-            tunnel.dns,
-            vec![
-                "100.100.0.53".parse::<IpAddr>().unwrap(),
-                "fd00::53".parse::<IpAddr>().unwrap()
-            ]
+        assert!(tunnel.dns.is_empty());
+    }
+
+    #[test]
+    fn tunnel_netbird_custom_dns_fails_resolve_without_leaking_the_key() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_NETWORK", "tunnel");
+            std::env::set_var(
+                "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
+                "https://nb.example.com",
+            );
+            std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
+            std::env::set_var("SANDBOX_TUNNEL_DNS", "100.100.0.53,fd00::53");
+        }
+        let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect_err("NetBird custom DNS must be rejected")
+            .to_string();
+        assert!(
+            error.contains("SANDBOX_TUNNEL_DNS is unsupported"),
+            "{error}"
         );
+        assert!(!error.contains("key-1"), "{error}");
     }
 
     #[test]
