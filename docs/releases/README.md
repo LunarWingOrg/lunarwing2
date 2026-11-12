@@ -1,7 +1,7 @@
 # Release Notes
 
-The current release-notes draft is [v2.1.9.0 — Kaitei (海底)](../../RELEASE-v2.1.9.0.md)
-at the repository root.
+The current release-notes draft is
+[v2.2.0.0 — Shinkai (深海)](RELEASE-v2.2.0.0.md).
 
 ## Released versions
 
