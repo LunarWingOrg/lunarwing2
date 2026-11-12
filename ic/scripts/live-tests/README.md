@@ -10,6 +10,8 @@ ic/scripts/live-tests/ssh-live.sh
 
 It generates temporary Ed25519 credentials, starts a plain sshd and a certificate-only sshd, and invokes the ignored `ssh_live.rs` test through Cargo. The test covers `SshTool::execute()` output and exit-status contracts, Strict and AcceptFirst verification, a wrong-pin mismatch, certificate-only negotiation refusal, `ssh-add -l`, confirm-constrained agent signing through OpenSSH, and `SshGitTool` clone/fetch against a temporary bare repository. All listeners, keys, sockets, and repositories are removed on exit. It requires Linux, OpenSSH, Git, Python 3, Cargo, and `taskset`; it does not use tenant state or `~/.ssh`.
 
+For debugging, set `LUNARWING_SSH_LIVE_KEEP=1` to retain the disposable directory, including sshd logs. Delete that directory after inspection.
+
 ## DarkIRC Stage A H3 Live Validation
 
 `darkirc-stage-a-h3.sh` is destructive host validation, not CI test. It restarts two disposable DarkIRC-enabled tenants and installs one deferred Stage A contact on each tenant.
