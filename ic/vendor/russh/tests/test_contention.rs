@@ -1,21 +1,18 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-
 use rand::Rng;
+use russh::Channel;
+use russh::client::{self, ChannelOpenHandle, Msg, Session};
+use russh::keys::PublicKeyOrCertificate;
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::{
-    Channel,
-    client::{self, ChannelOpenHandle, Msg, Session},
-    server::{self, Auth, Server as _},
-};
+use russh::server::{self, Auth, Server as _};
 use ssh_key::PrivateKey;
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
-use tokio::{
-    io::AsyncReadExt,
-    net::{TcpListener, TcpStream},
-    time::timeout,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 
 static DATA_SIZE: usize = 20_000_000;
 static THREADS: usize = 16;
@@ -128,7 +125,7 @@ impl russh::server::Handler for Server {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
@@ -167,7 +164,7 @@ impl russh::client::Handler for Client {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::PublicKey,
+        _key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }

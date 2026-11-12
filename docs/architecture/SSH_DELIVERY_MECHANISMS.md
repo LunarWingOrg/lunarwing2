@@ -115,7 +115,7 @@ and `ic/src/tools/builtin/ssh_git.rs` (the tools).
 
 ### 2a. The `ssh` tool — run a remote command
 
-Runs a single command on a configured host using the in-process **russh 0.62**
+Runs a single command on a configured host using the in-process **russh 0.65**
 client (the first live use of the client half — the harness otherwise only used
 `russh::keys` agent server).
 
@@ -141,7 +141,8 @@ client (the first live use of the client half — the harness otherwise only use
   RSA host key algorithms during negotiation. An RSA-only server therefore fails
   before host-key verification or authentication with an error that explicitly
   names the unsupported RSA host key, rather than the misleading
-  `WrongServerSig`. Use an Ed25519 or ECDSA host key.
+  `WrongServerSig`. Use an Ed25519 or ECDSA host key. Host key certificates
+  are not offered, and a server that presents one is refused.
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
   capped at 1 MiB each (`truncated` flag).
 - **Approval:** first call prompts with **Approve**, **Always**, and **Deny**.
