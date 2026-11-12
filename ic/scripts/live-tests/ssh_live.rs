@@ -121,7 +121,7 @@ async fn live_bridge(config: &LiveConfig) -> Arc<RwLock<SSHBridge>> {
         (STRICT_HOST.to_string(), config.credentials()),
         (TOFU_HOST.to_string(), config.credentials()),
     ]);
-    let agent = SshAgentServer::start(config.work_dir.join("agent.sock"), agent_keys)
+    let agent = SshAgentServer::start(config.work_dir.join("agent/ssh-agent.sock"), agent_keys)
         .await
         .unwrap();
     let private_key = parse_key(&config.credentials()).unwrap();
@@ -258,7 +258,7 @@ fn assert_success(output: &Output) {
 }
 
 async fn exercise_agent(config: &LiveConfig) {
-    let socket = config.work_dir.join("agent.sock");
+    let socket = config.work_dir.join("agent/ssh-agent.sock");
     let listed = scrubbed_command("ssh-add", &config.work_dir)
         .env("SSH_AUTH_SOCK", &socket)
         .arg("-l")
