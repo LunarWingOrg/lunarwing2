@@ -308,8 +308,9 @@ cannot resurrect a task into teardown. Stop, inspection, container/volume
 removal, attachment-query, keeper-removal, and network-removal failures abort
 the command; they are not warnings.
 
-Egress teardown checks attachments before changing any state, excluding only
-infra containers with the namespace-keeper label. An attachment or query refusal
+Egress teardown checks attachments before changing any state, excluding
+containers with the namespace-keeper label (the managed keeper's infra container).
+An attachment or query refusal
 therefore leaves the running rootless keeper and its namespace, both live
 chains, the egress network, and the rendered state intact for repair and retry
 (rootful runtimes have no keeper). Once clear, teardown flushes the chains,
