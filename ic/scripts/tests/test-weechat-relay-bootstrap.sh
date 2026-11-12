@@ -999,17 +999,16 @@ ensure_external_worker_config() { :; }
 retire_tenant_nanocode() { :; }
 ensure_container_runtime() { :; }
 build_vision_sidecar_image() { :; }
-# WI#223: the sandbox image step must be stubbed too — the real
-# build_sandbox_image runs podman build against this checkout. The admin-store
-# presence probe goes through "$CONTAINER_RT image inspect"; shadow podman with
-# a recording function so the harness is deterministic regardless of whether
-# the host store happens to hold lunarwing-sandbox:latest.
+# WI#223/596: stub the tenant-driven digest/archive/build boundary; the real
+# helper builds an image from the operator checkout. Its dedicated sandbox
+# harness covers the digest and provenance behavior, while this fixture checks
+# only add_tenant ordering and non-fatal recovery.
 podman() {
   echo "podman-inspect" >>"$call_order_log"
   [[ "${1:-}" == "image" ]] || return 0
-  return 1   # image absent -> add_tenant must call build_sandbox_image
+  return 1
 }
-build_sandbox_image() {
+ensure_sandbox_image_current_from_tenant() {
   echo "sandbox-image-built" >>"$call_order_log"
   [[ "${sandbox_build_fail_mode:-}" != "true" ]]
 }
