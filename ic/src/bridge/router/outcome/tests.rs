@@ -416,6 +416,163 @@ async fn late_budget_expiry_on_a_run_that_is_no_longer_running_is_a_stop_miss() 
     assert_eq!(saved.state, lunarwing_engine::ThreadState::Waiting);
 }
 
+async fn wait_for_run_end(rig: &Rig) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rig
+            .turn
+            .state
+            .thread_manager
+            .is_run_running(rig.turn.thread_id, rig.turn.run_started_at)
+            .await
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run must finish within five seconds");
+}
+
+async fn agent_history(rig: &Rig) -> Vec<String> {
+    rig.turn
+        .state
+        .conversation_manager
+        .get_conversation(rig.turn.conversation_id)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.sender, lunarwing_engine::EntrySender::Agent { .. }))
+        .map(|entry| entry.content.clone())
+        .collect()
+}
+
+/// WI#673: this is the completed-run counterpart of the no-run miss test above.
+/// Returning `Ok(None)` without joining cannot satisfy the text or history assertions.
+#[tokio::test]
+async fn late_stop_miss_joins_a_real_completed_result() {
+    let mut rig = Rig::new(Some("finished after detach"), None).await;
+    rig.llm.release.notify_one();
+    wait_for_run_end(&rig).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.turn.late_result_after_budget(
+            &mut rig.events,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .expect("stop miss must join the finished run")
+    .unwrap();
+
+    assert_eq!(result.as_deref(), Some("finished after detach"));
+    assert_eq!(
+        agent_history(&rig).await,
+        vec!["finished after detach".to_string()]
+    );
+}
+
+/// `stop_late_thread` drains before it returns, so its caller cannot join the
+/// run before the final pending tool status has reached the channel.
+#[tokio::test]
+async fn late_stop_miss_forwards_pending_events_before_join() {
+    let mut rig = Rig::new(Some("finished"), None).await;
+    rig.llm.release.notify_one();
+    wait_for_run_end(&rig).await;
+    let (event_tx, mut events) = broadcast::channel(8);
+    event_tx
+        .send(lunarwing_engine::ThreadEvent::new(
+            rig.turn.thread_id,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "last-call".into(),
+                duration_ms: 1,
+                params_summary: None,
+                result_preview: Some("done".into()),
+            },
+        ))
+        .unwrap();
+
+    let stopped = rig
+        .turn
+        .stop_late_thread(&mut events, Duration::from_secs(2), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    assert!(!stopped);
+    assert!(rig.statuses.lock().unwrap().iter().any(|status| {
+        matches!(
+            status,
+            StatusUpdate::ToolCompleted { name, success: true, .. } if name == "shell"
+        )
+    }));
+}
+
+/// WI#673: once a user's interrupt has unregistered the run, the watchdog stop
+/// is a miss and the join keeps `Stopped` silent instead of rewriting it as a
+/// time-limit failure. An accepted watchdog stop before unregistration remains
+/// a landed stop with the time-limit outcome; this test pins only the miss case.
+#[tokio::test]
+async fn late_stop_miss_after_user_interrupt_keeps_stopped_outcome() {
+    let mut rig = Rig::new(Some("never released"), None).await;
+    rig.turn
+        .state
+        .thread_manager
+        .stop_thread(rig.turn.thread_id, "alice")
+        .await
+        .unwrap();
+    wait_for_run_end(&rig).await;
+
+    let result = rig
+        .turn
+        .late_result_after_budget(
+            &mut rig.events,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_deref(), Some(""));
+    assert!(agent_history(&rig).await.is_empty());
+    assert!(rig.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn late_stop_request_timeout_has_its_own_error() {
+    let mut rig = Rig::new(Some("unused"), None).await;
+
+    let error = rig
+        .turn
+        .stop_late_thread(&mut rig.events, Duration::ZERO, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("stop request did not complete"));
+    rig.llm.release.notify_one();
+    wait_for_run_end(&rig).await;
+}
+
+#[tokio::test]
+async fn late_post_stop_wait_timeout_has_its_own_error() {
+    let mut rig = Rig::new(Some("never released"), None).await;
+
+    let error = rig
+        .turn
+        .stop_late_thread(&mut rig.events, Duration::from_secs(2), Duration::ZERO)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("stop succeeded but the post-stop wait did not complete")
+    );
+    wait_for_run_end(&rig).await;
+}
+
 /// Only "nothing to stop" is a miss. Any other refusal of the stop request
 /// still fails the late turn.
 #[tokio::test]
