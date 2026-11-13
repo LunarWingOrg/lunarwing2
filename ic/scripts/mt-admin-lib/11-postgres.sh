@@ -409,8 +409,39 @@ _pg_replace_container_for_refresh() {
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
       _openrc_service "lunarwing-pg-${name}" start || return 1
       _openrc_service "lunarwing-pg-${name}-sup" start \
-        || say "WARNING: optional PostgreSQL supervisor for '$name' did not start; inspect it after refresh" >&2
+        || say "WARNING: optional PostgreSQL supervisor for '$name' did not start; check it after refresh" >&2
     fi
+  fi
+}
+
+_pg_refresh_version_allowed() {
+  local name="$1" server_version="$2"
+  [[ "$server_version" =~ ^[0-9]{6}$ ]] || return 1
+  if (( 10#$server_version >= 160016 )); then return 0; fi
+  if [[ "$server_version" == 16* && "${LUNARWING_MT_PG_ALLOW_UNPATCHED:-}" == "$name" ]]; then
+    say "WARNING: explicit unpatched PostgreSQL rollback allowed for '$name' ($server_version)" >&2
+    return 0
+  fi
+  say "PostgreSQL server_version_num=$server_version is below security floor 160016" >&2
+  return 1
+}
+
+_pg_check_refresh_image_version() {
+  local name="$1" version_output major minor
+  # Use the pulled image in the tenant's store, not a possibly different host
+  # binary. No tenant data/secrets are mounted and the image entrypoint is bypassed.
+  version_output="$(_ctr "$name" run --rm --pull=never --network none --read-only \
+    --cap-drop ALL --security-opt no-new-privileges --no-healthcheck \
+    --entrypoint postgres "$PG_IMAGE" --version)" || return 1
+  # PostgreSQL 10+ encodes major*10000 + minor. Reject unrecognized/prerelease
+  # output and bound both components before shell arithmetic.
+  if [[ "$version_output" =~ ^postgres[[:space:]]+\(PostgreSQL\)[[:space:]]+([1-9][0-9])\.([0-9]{1,4})([[:space:]].*)?$ ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    _pg_refresh_version_allowed "$name" "$((10#$major * 10000 + 10#$minor))"
+  else
+    say "could not parse PostgreSQL image version for '$name'" >&2
+    return 1
   fi
 }
 
@@ -427,14 +458,8 @@ _pg_wait_for_refresh_health() {
         server_version="$(_ctr "$name" exec "$container_name" \
           psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
           'SHOW server_version_num' 2>/dev/null)" || return 1
-        [[ "$server_version" =~ ^[0-9]{6}$ ]] || return 1
-        if (( 10#$server_version >= 160016 )); then return 0; fi
-        if [[ "$server_version" == 16* && "${LUNARWING_MT_PG_ALLOW_UNPATCHED:-}" == "$name" ]]; then
-          say "WARNING: explicit unpatched PostgreSQL rollback allowed for '$name' ($server_version)" >&2
-          return 0
-        fi
-        say "PostgreSQL server_version_num=$server_version is below security floor 160016" >&2
-        return 1
+        _pg_refresh_version_allowed "$name" "$server_version"
+        return $?
       fi
     fi
     attempts=$((attempts + 1))
@@ -476,6 +501,8 @@ refresh_tenant_postgres_image() {
   if ! _ctr "$name" pull "$PG_IMAGE"; then
     die "PostgreSQL image pull failed for '$name'; no service was stopped"
   fi
+  _pg_check_refresh_image_version "$name" \
+    || die "PostgreSQL image version preflight failed for '$name'; no service was stopped"
   activity="$(_pg_daemon_activity "$name")"
   [[ "$activity" != unknown ]] \
     || die "cannot determine whether the '$name' daemon is running; refresh refused before stop"

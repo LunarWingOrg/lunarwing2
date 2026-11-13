@@ -116,6 +116,17 @@ run_refresh() {
           if [[ "$FIXTURE_VOLUME" == true ]]; then printf "lunarwing-pg-alice\n"; return 0; fi
           return 1 ;;
         pull) [[ "$FIXTURE_PULL_OK" == true ]] || return 1 ;;
+        run)
+          case "$FIXTURE_CASE" in
+            image-probe-failure) printf "postgres (PostgreSQL) 16.16\n"; return 1 ;;
+            image-bad-version) printf "postgres (PostgreSQL) 16rc1\n" ;;
+            image-empty-version) : ;;
+            image-old-version|rollback|wrong-rollback) printf "postgres (PostgreSQL) 16.15\n" ;;
+            image-rollback-other-major) printf "postgres (PostgreSQL) 15.15\n" ;;
+            image-newer-minor) printf "postgres (PostgreSQL) 16.17\n" ;;
+            *) printf "postgres (PostgreSQL) 16.16 (Debian 16.16-1.pgdg12+1)\n" ;;
+          esac
+          return 0 ;;
         rm) rm -f "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running" ;;
         exec)
           [[ "$FIXTURE_HEALTH_OK" == true ]] || return 1
@@ -127,6 +138,8 @@ run_refresh() {
           elif [[ "$*" == *"SHOW server_version_num"* ]]; then
             case "$FIXTURE_CASE" in
               old-version|rollback|wrong-rollback) printf "160015\n" ;;
+              gate-rollback-other-major) printf "150015\n" ;;
+              image-newer-minor) printf "160017\n" ;;
               bad-version) printf "unknown\n" ;;
               *) printf "160016\n" ;;
             esac
@@ -140,7 +153,7 @@ run_refresh() {
     if [[ "$FIXTURE_DAEMON" == active ]]; then touch "$FIXTURE_ROOT/state/daemon-active"; fi
     touch "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running"
     case "$FIXTURE_CASE" in
-      rollback) export LUNARWING_MT_PG_ALLOW_UNPATCHED=alice ;;
+      rollback|image-rollback-other-major|gate-rollback-other-major) export LUNARWING_MT_PG_ALLOW_UNPATCHED=alice ;;
       wrong-rollback) export LUNARWING_MT_PG_ALLOW_UNPATCHED=bob ;;
     esac
     case "$FIXTURE_CASE" in
@@ -202,6 +215,9 @@ assert_output() {
 run_refresh systemd active true true true
 assert_rc "systemd refresh succeeds" zero
 assert_order "systemd pulls before stopping daemon" "pull docker.io/pgvector" "stop lunarwing-alice.service"
+assert_order "systemd checks pulled image version before stopping daemon" "--entrypoint postgres" "stop lunarwing-alice.service"
+assert_order "image version probe runs after pull" "pull docker.io/pgvector" "--entrypoint postgres"
+assert_log "preflight runs the pulled image without network or host data" "run --rm --pull=never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --no-healthcheck --entrypoint postgres docker.io/pgvector/pgvector:pg16@sha256:reviewed --version" present
 assert_order "systemd removes old container before starting replacement" "rm -f lunarwing-pg-alice" "start lunarwing-pg-alice.service"
 assert_order "systemd restarts daemon after replacement" "start lunarwing-pg-alice.service" "start lunarwing-alice.service"
 assert_order "systemd renders before reload" "render-quadlet:alice:docker.io/pgvector" "daemon-reload"
@@ -219,6 +235,7 @@ assert_log "refresh never deletes data volume" "volume rm" absent
 
 run_refresh openrc active true true true
 assert_rc "OpenRC refresh succeeds" zero
+assert_order "OpenRC checks pulled image version before stopping daemon" "--entrypoint postgres" "lunarwing-alice stop"
 assert_order "OpenRC supervisor stops before container removal" "lunarwing-pg-alice-sup stop" "rm -f lunarwing-pg-alice"
 assert_order "OpenRC recreates before restarting supervisor" "pg-create" "lunarwing-pg-alice-sup start"
 assert_order "OpenRC database service restarts before supervisor" "lunarwing-pg-alice start" "lunarwing-pg-alice-sup start"
@@ -228,6 +245,7 @@ run_refresh systemd active true false true
 assert_rc "pull failure is fatal" nonzero
 assert_log "pull failure does not stop daemon" "stop lunarwing-alice.service" absent
 assert_log "pull failure does not remove container" "rm -f lunarwing-pg-alice" absent
+assert_log "failed pull never runs an image version probe" "--entrypoint postgres" absent
 assert_output "pull failure explains fail-closed behavior" "no service was stopped"
 
 run_refresh systemd active false true true
@@ -258,6 +276,9 @@ for init in systemd openrc; do
       assert_log "$init $fault leaves daemon stopped" "start lunarwing-alice.service" absent
       assert_log "$init $fault leaves OpenRC daemon stopped" "lunarwing-alice start" absent
     fi
+    if [[ "$fault" == old-version || "$fault" == bad-version ]]; then
+      assert_log "$init $fault still checks the running server after swap" "SHOW server_version_num" present
+    fi
   done
 done
 run_refresh openrc active true true true not-running
@@ -278,6 +299,27 @@ assert_rc "tenant-scoped unpatched rollback is explicit" zero
 assert_output "unpatched rollback warns" "explicit unpatched PostgreSQL rollback"
 run_refresh systemd active true true true wrong-rollback
 assert_rc "another tenant cannot enable unpatched rollback" nonzero
+assert_log "another tenant's acknowledgement refuses before stopping the daemon" "stop lunarwing-alice.service" absent
+for init in systemd openrc; do
+  for fault in image-old-version image-bad-version image-empty-version image-probe-failure image-rollback-other-major; do
+    run_refresh "$init" active true true true "$fault"
+    assert_rc "$init refuses $fault before downtime" nonzero
+    assert_output "$init $fault explains no downtime" "image version preflight failed"
+    assert_log "$init $fault never stops the systemd daemon" "stop lunarwing-alice.service" absent
+    assert_log "$init $fault never stops the OpenRC daemon" "lunarwing-alice stop" absent
+    assert_log "$init $fault never stops PostgreSQL" "pg-stop" absent
+    assert_log "$init $fault never stops the OpenRC database service" "lunarwing-pg-alice stop" absent
+    assert_log "$init $fault never removes the old container" "rm -f lunarwing-pg-alice" absent
+    assert_log "$init $fault never rewrites the Quadlet" "render-quadlet" absent
+  done
+  run_refresh "$init" active true true true gate-rollback-other-major
+  assert_rc "$init post-swap gate refuses another major even with acknowledgement" nonzero
+  assert_log "$init other-major case reaches the second version check" "SHOW server_version_num" present
+  assert_log "$init other-major gate leaves the systemd daemon stopped" "start lunarwing-alice.service" absent
+  assert_log "$init other-major gate leaves the OpenRC daemon stopped" "lunarwing-alice start" absent
+done
+run_refresh systemd active true true true image-newer-minor
+assert_rc "newer PostgreSQL minor versions pass both version checks" zero
 run_refresh systemd active true true true status
 assert_rc "pg-image-status dispatcher succeeds" zero
 assert_order "status checks root before readonly registry" "root-check" "registry-readonly"

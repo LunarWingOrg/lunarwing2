@@ -52,10 +52,17 @@ if (render_pg_quadlet alice) >"$fixture/output" 2>&1; then
 else
   printf 'PASS: ambiguous existing image fails closed\n'
 fi
+if grep -Fq 'refresh-pg-image alice to rewrite it with the configured image after preflight checks' "$fixture/output"; then
+  printf 'PASS: malformed unit diagnostic gives the guarded recovery command\n'
+else
+  printf 'FAIL: malformed unit diagnostic lacks the recovery command\n'; failures=$((failures + 1))
+fi
 printf 'Image=%s\nImage=%s\n' "$old_image" "$PG_IMAGE" >"$quadlet"
 if (render_pg_quadlet alice) >"$fixture/output" 2>&1; then
   printf 'FAIL: multiple existing images must fail closed\n'; failures=$((failures + 1))
 else
   printf 'PASS: multiple existing images fail closed\n'
 fi
+render_pg_quadlet alice "$PG_IMAGE"
+assert_image 'explicit refresh render repairs a malformed unit' "$PG_IMAGE"
 [[ "$failures" -eq 0 ]]

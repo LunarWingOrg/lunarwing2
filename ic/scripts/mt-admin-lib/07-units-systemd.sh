@@ -401,7 +401,7 @@ render_pg_quadlet() {
       image="$(sed -n 's/^Image=//p' "$pg_snapshot")"
       rm -f -- "$pg_snapshot"
       [[ -n "$image" && "$image" != *[$'\r\n\t ']* ]] \
-        || die "existing PostgreSQL Quadlet has no unambiguous Image=; inspect it before refreshing '$name'"
+        || die "existing PostgreSQL Quadlet has no unambiguous Image=; run: $0 refresh-pg-image $name to rewrite it with the configured image after preflight checks"
     else
       image="$PG_IMAGE"
     fi
