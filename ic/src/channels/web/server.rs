@@ -3441,9 +3441,7 @@ async fn gateway_status_handler(
         skills_max_context_tokens: state.active_config.skills_max_context_tokens,
         channel_health,
         channel_config_errors,
-        workload_isolation: crate::tools::process::workload_spawner()
-            .await
-            .isolation_mode(),
+        workload_isolation: crate::tools::process::workload_isolation_mode().await,
     })
 }
 
