@@ -367,6 +367,75 @@ async fn gate_waiting_join_is_silent_and_preserves_the_thread() {
     assert_eq!(saved.state, lunarwing_engine::ThreadState::Waiting);
 }
 
+/// WI#627: the late budget can run out just as the run ends or pauses at a
+/// gate. The stop request then finds nothing to stop. That is a miss, not a
+/// failure: the turn is joined and gives the same result as on the path where
+/// the wait won the race. The budget cannot force this from outside (the wait
+/// returns at its first tick for a run that is not registered), so the test
+/// enters the branch directly.
+#[tokio::test]
+async fn late_budget_expiry_on_a_run_that_is_no_longer_running_is_a_stop_miss() {
+    let mut rig = Rig::new(None, None).await;
+    assert!(
+        !rig.turn
+            .state
+            .thread_manager
+            .is_run_running(rig.turn.thread_id, rig.turn.run_started_at)
+            .await
+    );
+    let stopped = rig
+        .turn
+        .stop_late_thread(
+            &mut rig.events,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("a stop request that finds no running thread is not an error");
+    assert!(!stopped);
+
+    let result = rig
+        .turn
+        .late_result_after_budget(
+            &mut rig.events,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert!(rig.replies.lock().unwrap().is_empty());
+    let saved = rig
+        .turn
+        .state
+        .store
+        .load_thread(rig.turn.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.state, lunarwing_engine::ThreadState::Waiting);
+}
+
+/// Only "nothing to stop" is a miss. Any other refusal of the stop request
+/// still fails the late turn.
+#[tokio::test]
+async fn late_stop_refused_for_another_reason_still_fails() {
+    let mut rig = Rig::new(None, None).await;
+    rig.turn.message.user_id = "mallory".into();
+    let error = rig
+        .turn
+        .stop_late_thread(
+            &mut rig.events,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("stop late thread"), "{text}");
+    assert!(!text.contains("not found"), "{text}");
+}
+
 #[tokio::test]
 async fn late_response_transforms_history_and_preserves_reply_route() {
     Rig::new(Some("raw answer"), Some(Policy::Modify))
