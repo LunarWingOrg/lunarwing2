@@ -1554,27 +1554,53 @@ impl TunnelSidecar {
 
     async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut cleanup = SidecarStartCleanup::new(self.clone());
+        let result = self.wait_healthy_until(deadline, timeout).await;
+        if result.is_err() {
+            self.remove_unlocked().await;
+        }
+        cleanup.disarm();
+        result
+    }
+
+    async fn wait_healthy_until(
+        &self,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<()> {
         loop {
-            let error = match self.provider_health().await {
-                Ok(()) => {
-                    return match self.check_egress_firewall().await {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            self.remove_unlocked().await;
-                            Err(error)
-                        }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.health_timeout_error(timeout, None));
+            }
+            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+                Ok(Ok(())) => {
+                    return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(self.health_timeout_error(timeout, None)),
                     };
                 }
-                Err(error) => error,
+                Ok(Err(error)) => error,
+                Err(_) => return Err(self.health_timeout_error(timeout, None)),
             };
-            if tokio::time::Instant::now() >= deadline {
-                self.remove_unlocked().await;
-                return Err(self.error_with_context(
-                    error,
-                    &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
-                ));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.health_timeout_error(timeout, Some(error)));
+            }
+            if remaining <= HEALTH_POLL_INTERVAL {
+                tokio::time::sleep(remaining).await;
+                return Err(self.health_timeout_error(timeout, Some(error)));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    fn health_timeout_error(&self, timeout: Duration, error: Option<SandboxError>) -> SandboxError {
+        let context = format!("sidecar remained unhealthy for {}s", timeout.as_secs());
+        match error {
+            Some(error) => self.error_with_context(error, &context),
+            None => self.unavailable(&context),
         }
     }
 
@@ -1971,6 +1997,16 @@ impl TunnelSidecar {
     /// does, so nothing is signalled unless the runtime positively reports
     /// that no container has the sidecar's name.
     async fn release_network_helper(&self) {
+        // A sidecar on the test runtime has no real container and no helper
+        // unit, so there is nothing to release. Asking the workload spawner
+        // from such a test would also run its one-time probe, a real
+        // `systemd-run`, inside the test: under a paused clock the probe's
+        // timeout fires at once, which costs five virtual seconds and caches
+        // "no systemd services" for the rest of the test binary (WI#654).
+        #[cfg(test)]
+        if self.test_runtime.is_some() {
+            return;
+        }
         let spawner = crate::tools::process::workload_spawner().await;
         if !spawner.uses_systemd_services() {
             return;
@@ -3278,6 +3314,99 @@ mod tests {
                 .is_none()
         );
         drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn slow_health_fixture(
+        label: &str,
+    ) -> (
+        TunnelSidecar,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-health-{label}-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let instance = instance_id_for(&base);
+        let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let removed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let removals = removals.clone();
+            let removed = removed.clone();
+            move |args, _stdin| {
+                let instance = instance.clone();
+                let removals = removals.clone();
+                let removed = removed.clone();
+                let container_id = "2".repeat(64);
+                async move {
+                    let stdout = match args.first().map(String::as_str) {
+                        Some("exec") => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            String::new()
+                        }
+                        Some("inspect") => {
+                            format!("{container_id}|true|test-hash|{instance}\n")
+                        }
+                        Some("rm") => {
+                            removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            removed.notify_one();
+                            String::new()
+                        }
+                        Some("container") => format!("{container_id}\n"),
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    };
+                    Ok(successful_runtime_output(stdout))
+                }
+            }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+        (sidecar, base, removals, removed)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_deadline_bounds_slow_provider_and_removes_container() {
+        let (sidecar, base, removals, _removed) = slow_health_fixture("deadline");
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remained unhealthy for 6s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_health_reprobe_still_removes_container() {
+        let (sidecar, base, removals, removed) = slow_health_fixture("cancelled");
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            sidecar.wait_healthy(Duration::from_secs(60)),
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), removed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(base).unwrap();
     }
 
