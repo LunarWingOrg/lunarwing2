@@ -325,6 +325,146 @@ tenant_psql() {
   _ctr "$name" exec -i "$container_name" psql -U lunarwing -d lunarwing "$@"
 }
 
+_pg_named_volume_present() {
+  local name="$1" volume_name
+  volume_name="$(_ctr "$name" volume inspect --format '{{.Name}}' \
+    "lunarwing-pg-${name}" 2>/dev/null || true)"
+  [[ "$volume_name" == "lunarwing-pg-${name}" ]]
+}
+
+_pg_daemon_activity() {
+  local name="$1" state rc=0
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    state="$(_systemctl_user "$name" is-active "lunarwing-${name}.service" 2>/dev/null)" || rc=$?
+    case "$rc:$state" in
+      0:active) printf 'active\n' ;;
+      3:inactive|3:failed|4:inactive) printf 'stopped\n' ;;
+      *) printf 'unknown\n' ;;
+    esac
+  else
+    _openrc_service "lunarwing-${name}" status >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0) printf 'active\n' ;;
+      3) printf 'stopped\n' ;;
+      *) printf 'unknown\n' ;;
+    esac
+  fi
+}
+
+_pg_stop_daemon_for_refresh() {
+  local name="$1" activity="$2"
+  [[ "$activity" == active ]] || return 0
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    _systemctl_user "$name" stop "lunarwing-${name}.service" || return 1
+  else
+    _openrc_service "lunarwing-${name}" stop || return 1
+  fi
+  [[ "$(_pg_daemon_activity "$name")" == stopped ]]
+}
+
+_pg_start_daemon_after_refresh() {
+  local name="$1" activity="$2"
+  [[ "$activity" == active ]] || return 0
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    _systemctl_user "$name" start "lunarwing-${name}.service" || return 1
+  else
+    _openrc_service "lunarwing-${name}" start || return 1
+  fi
+  [[ "$(_pg_daemon_activity "$name")" == active ]]
+}
+
+_pg_replace_container_for_refresh() {
+  local name="$1" container_name="lunarwing-pg-$1" quadlet=false
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    quadlet=true
+    render_pg_quadlet "$name" || return 1
+    _systemctl_user "$name" daemon-reload || return 1
+    stop_tenant_postgres "$name" || return 1
+  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _openrc_stop_service_if_installed "lunarwing-pg-${name}-sup" || return 1
+    _openrc_stop_service_if_installed "lunarwing-pg-${name}" || return 1
+  else
+    stop_tenant_postgres "$name" || return 1
+  fi
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
+    _ctr "$name" rm -f "$container_name" >/dev/null || return 1
+  fi
+  if [[ "$quadlet" == true ]]; then
+    _systemctl_user "$name" start "${container_name}.service" >/dev/null || return 1
+  else
+    start_tenant_postgres "$name" || return 1
+    _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null \
+      | grep -q true || return 1
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+      _openrc_service "lunarwing-pg-${name}" start || return 1
+      _openrc_service "lunarwing-pg-${name}-sup" start || return 1
+    fi
+  fi
+}
+
+_pg_wait_for_refresh_health() {
+  local name="$1" container_name="lunarwing-pg-$1" attempts=0 vector_version
+  while (( attempts < 120 )); do
+    if _ctr "$name" exec "$container_name" pg_isready -U lunarwing -q 2>/dev/null; then
+      vector_version="$(_ctr "$name" exec "$container_name" \
+        psql -U lunarwing -d lunarwing -Atc \
+        "SELECT extversion FROM pg_extension WHERE extname = 'vector'" 2>/dev/null || true)"
+      [[ -n "$vector_version" ]] && return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  return 1
+}
+
+tenant_postgres_image_status() {
+  local name="$1" container_name image_ref=missing image_id=missing version=unavailable present=true
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+  container_name="lunarwing-pg-$name"
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
+    image_ref="$(_ctr_inspect "$name" -f '{{.Config.Image}}' "$container_name" 2>/dev/null || printf 'unknown')"
+    image_id="$(_ctr_inspect "$name" -f '{{.Image}}' "$container_name" 2>/dev/null || printf 'unknown')"
+    version="$(_ctr "$name" exec "$container_name" psql -U lunarwing -d lunarwing -Atc \
+      'SELECT version()' 2>/dev/null || printf 'unavailable')"
+  else
+    present=false
+  fi
+  printf 'tenant=%s\nimage_reference=%s\nimage_id=%s\nserver_version=%s\n' \
+    "$name" "$image_ref" "$image_id" "$version"
+  [[ "$present" == true ]]
+}
+
+refresh_tenant_postgres_image() {
+  local name="$1" activity
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+  ensure_init_system
+  _pg_named_volume_present "$name" \
+    || die "PostgreSQL refresh requires the named volume lunarwing-pg-${name}; migrate legacy container-local data first"
+  tenant_postgres_image_status "$name" || true
+  if ! _ctr "$name" pull "$PG_IMAGE"; then
+    die "PostgreSQL image pull failed for '$name'; no service was stopped"
+  fi
+  activity="$(_pg_daemon_activity "$name")"
+  [[ "$activity" != unknown ]] \
+    || die "cannot determine whether the '$name' daemon is running; refresh refused before stop"
+  _pg_stop_daemon_for_refresh "$name" "$activity" \
+    || die "failed to stop the '$name' daemon; PostgreSQL refresh refused"
+  if ! _pg_replace_container_for_refresh "$name"; then
+    die "PostgreSQL container replacement failed for '$name'; data volume retained and daemon left stopped"
+  fi
+  if ! _pg_wait_for_refresh_health "$name"; then
+    die "replacement PostgreSQL for '$name' failed readiness/pgvector checks; data volume retained and daemon left stopped"
+  fi
+  _pg_start_daemon_after_refresh "$name" "$activity" \
+    || die "PostgreSQL is healthy but the '$name' daemon did not return to its prior active state"
+  say "PostgreSQL image refreshed for '$name' (named data volume retained)."
+  tenant_postgres_image_status "$name"
+}
+
 # ── PostgreSQL backup / restore ──────────────────────────────────────────────
 
 # pg_dump a tenant's database to a timestamped custom-format file under
