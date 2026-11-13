@@ -49,7 +49,8 @@ slow first probe therefore does not disable services for the daemon lifetime.
 The probe runs on a blocking thread with a five-second wall-clock deadline and
 kills and reaps its child on timeout. Authenticated `GET /api/gateway/status`
 reports the active mode as `workload_isolation: "systemd-service"` or
-`"process-group"`.
+`"process-group"`, or `"unprobed"` before the first workload. Reading status
+does not itself start a probe.
 
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
