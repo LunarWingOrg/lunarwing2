@@ -844,3 +844,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "../../scripts/live-tests/ssh_live.rs"]
+mod ssh_live_tests;
