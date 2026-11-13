@@ -138,8 +138,9 @@ WEECHAT_BOOTSTRAP_OPT_OUT=false   # set true by --no-weechat-bootstrap
 # depending on the host's unqualified-search-registries: docker silently defaults
 # short names to docker.io, but rootless podman errors ("short-name ... did not
 # resolve to an alias and no unqualified-search registries are defined"). Override
-# for a local mirror via LUNARWING_MT_PG_IMAGE.
-PG_IMAGE="${LUNARWING_MT_PG_IMAGE:-docker.io/pgvector/pgvector:pg16}"
+# for a local mirror via LUNARWING_MT_PG_IMAGE. The default is the reviewed
+# 2026-11-12 PostgreSQL 16.16 / pgvector 0.8.7 OCI index.
+PG_IMAGE="${LUNARWING_MT_PG_IMAGE:-docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f}"
 
 # ── Per-tenant PostgreSQL backups ────────────────────────────────────────────
 # pg_dump each tenant's DB (custom -Fc format) to $BACKUP_DIR/<tenant>/. Keep the
