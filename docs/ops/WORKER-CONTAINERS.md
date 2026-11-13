@@ -308,9 +308,13 @@ cannot resurrect a task into teardown. Stop, inspection, container/volume
 removal, attachment-query, keeper-removal, and network-removal failures abort
 the command; they are not warnings.
 
-Egress teardown checks attachments before changing any state, excluding
-containers with the namespace-keeper label (the managed keeper's infra container).
-An attachment or query refusal
+Egress teardown checks attachments before changing any state. The only
+container it does not count is the managed keeper's own infra container,
+which it identifies by the ID the keeper pod reports. A container that merely
+carries the keeper's label counts as attached, and so does the infra container
+of a foreign pod with the keeper's name. The query uses the network filter
+alone, so it is the same call on Podman and on Docker.
+An attachment refusal, a failed query, or a keeper that cannot be identified
 therefore leaves the running rootless keeper and its namespace, both live
 chains, the egress network, and the rendered state intact for repair and retry
 (rootful runtimes have no keeper). Once clear, teardown flushes the chains,

@@ -85,11 +85,18 @@ rc-update() {
 _container_file() { printf '%s/containers/%s\n' "$RUNTIME_DIR" "$1"; }
 _volume_file() { printf '%s/volumes/%s\n' "$RUNTIME_DIR" "$1"; }
 
+# The fake runtime lists containers as "<full id> <name>". The keeper's infra
+# container has a fixed ID, which `pod inspect` also reports; every other
+# container gets an ID made from its name.
+KEEPER_INFRA_ID="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+KEEPER_INFRA_NAME="0123456789ab-infra"
+_fake_container_id() { printf 'c0ffee%058d' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
+
 _ctr() {
   local name="$1"
   shift
   record "${FAKE_RUNTIME}:$name $*"
-  local command="${1:-}" container path network_filter exclude_keeper
+  local command="${1:-}" container path network_filter format
   case "$command" in
     container)
       shift
@@ -136,36 +143,48 @@ _ctr() {
       [[ "$PS_FAIL" != true ]] || return 1
       shift
       network_filter=""
-      exclude_keeper=false
+      format=""
       while (($# > 0)); do
         case "$1" in
-          --all) shift ;;
+          --all|--no-trunc) shift ;;
           --filter)
             case "${2:-}" in
               network=*) network_filter="${2#network=}" ;;
-              'label!=lunarwing.purpose=worker-egress-keeper') exclude_keeper=true ;;
-              *) return 1 ;;
+              # `ps` on Docker knows no negated filter, and no Podman older
+              # than the `label!=` filter does either. The check must not
+              # depend on one (WI#650 review, ABA-1).
+              *)
+                printf 'Error: invalid filter %s\n' "${2%%=*}" >&2
+                return 1
+                ;;
             esac
             shift 2
             ;;
-          --format) shift 2 ;;
+          --format) format="${2:-}"; shift 2 ;;
           *) return 1 ;;
         esac
       done
       [[ "$network_filter" == "lw-egress-alpha" ]] || return 1
+      [[ "$format" == '{{.ID}} {{.Names}}' ]] || return 1
       for path in "$RUNTIME_DIR"/containers/*; do
-        [[ -f "$path" ]] && printf '%s\n' "${path##*/}"
+        [[ -f "$path" ]] && printf '%s %s\n' "$(_fake_container_id "${path##*/}")" "${path##*/}"
       done
-      if [[ "$exclude_keeper" != true && -f "$RUNTIME_DIR/keeper" ]]; then
-        printf '0123456789ab-infra\n'
+      # The keeper's infra container is on the network like any other; the
+      # runtime does not hide it. Dropping it is the caller's job.
+      if [[ -f "$RUNTIME_DIR/keeper" ]]; then
+        printf '%s %s\n' "$KEEPER_INFRA_ID" "$KEEPER_INFRA_NAME"
       fi
       ;;
     pod)
       case "${2:-}" in
         exists) [[ -f "$RUNTIME_DIR/keeper" ]] ;;
         inspect)
-          [[ -f "$RUNTIME_DIR/keeper" ]] || return 1
-          printf 'worker-egress-keeper\n'
+          [[ -f "$RUNTIME_DIR/keeper" && "$POD_INSPECT_FAIL" != true ]] || return 1
+          case "${4:-}" in
+            '{{index .Labels "lunarwing.purpose"}}') printf '%s\n' "$KEEPER_PURPOSE" ;;
+            '{{.InfraContainerID}}') printf '%s\n' "$KEEPER_INFRA_ID" ;;
+            *) return 1 ;;
+          esac
           ;;
         rm) command rm -f -- "$RUNTIME_DIR/keeper" ;;
       esac
@@ -223,6 +242,8 @@ setup_case() {
   FAIL_VOLUME=""
   ALLOW_FAILED_STOP=false
   PS_FAIL=false
+  POD_INSPECT_FAIL=false
+  KEEPER_PURPOSE=worker-egress-keeper
   NETWORK_RM_MISSING=false
   mkdir -p "$RUNTIME_DIR/containers" "$RUNTIME_DIR/volumes" \
     "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" \
@@ -316,7 +337,7 @@ assert_removals_before_flush() {
 
 assert_teardown_order() {
   local ps_line flush_line keeper_line network_line
-  ps_line="$(line_of 'podman:alpha ps --all --filter network=lw-egress-alpha')"
+  ps_line="$(line_of 'podman:alpha ps --all --no-trunc --filter network=lw-egress-alpha --format')"
   flush_line="$(line_of 'nft:alpha flush chain')"
   keeper_line="$(line_of 'podman:alpha pod rm -f lw-egress-keeper-alpha')"
   network_line="$(line_of 'podman:alpha network rm lw-egress-alpha')"
@@ -440,6 +461,45 @@ run_attached_teardown_refusal() {
   fi
 }
 
+# After every worker is gone, exactly one container may stay on the egress
+# network: the keeper's own infra container, known by its ID. Each of these
+# leaves something else there, or makes the keeper unidentifiable, and the
+# teardown must refuse before it flushes anything (WI#650 review, ABA-1/ABA-2).
+run_keeper_identity_case() {
+  local label="$1" expect="$2" rc=0 path
+  setup_case openrc false
+  for path in "$RUNTIME_DIR"/containers/*; do command rm -f -- "$path"; done
+  case "$label" in
+    keeper-only) ;;
+    lookalike)
+      # Same name as the keeper's infra container, as a container that copied
+      # the keeper's label would look to a label filter. Another ID.
+      printf 'running\n' >"$(_container_file "$KEEPER_INFRA_NAME")"
+      ;;
+    foreign-pod) KEEPER_PURPOSE=something-else ;;
+    inspect-fails) POD_INSPECT_FAIL=true ;;
+  esac
+  (worker_egress_teardown alpha) >"$CASE_DIR/teardown.out" 2>&1 || rc=$?
+  if [[ "$expect" == success ]]; then
+    if [[ "$rc" -eq 0 && ! -e "$RUNTIME_DIR/keeper" && ! -e "$RUNTIME_DIR/network" ]]; then
+      pass "egress teardown with $label succeeds and removes keeper and network"
+    else
+      fail "egress teardown with $label failed: $(command cat "$CASE_DIR/teardown.out")"
+    fi
+    return
+  fi
+  [[ "$rc" -ne 0 ]] || fail "egress teardown succeeded with $label"
+  if grep -q 'nft:alpha flush chain' "$CALL_LOG"; then
+    fail "egress teardown flushed with $label"
+  elif grep -Fq "$expect" "$CASE_DIR/teardown.out"; then
+    pass "egress teardown refuses $label before flushing: $expect"
+  else
+    fail "egress teardown with $label gave the wrong reason: $(command cat "$CASE_DIR/teardown.out")"
+  fi
+  [[ -f "$RUNTIME_DIR/keeper" && -f "$RUNTIME_DIR/chains" && -f "$RUNTIME_DIR/network" ]] \
+    || fail "refused teardown with $label discarded live egress state"
+}
+
 run_rootful_docker_case() {
   local missing_network="$1" rc=0
   setup_case openrc false
@@ -470,6 +530,10 @@ run_rootful_docker_case false
 run_rootful_docker_case true
 run_attached_teardown_refusal false
 run_attached_teardown_refusal true
+run_keeper_identity_case keeper-only success
+run_keeper_identity_case lookalike "refusing teardown: $KEEPER_INFRA_NAME"
+run_keeper_identity_case foreign-pod "refusing teardown: $KEEPER_INFRA_NAME"
+run_keeper_identity_case inspect-fails 'cannot identify the namespace keeper'
 
 if ((failures > 0)); then
   printf '\n%d failure(s)\n' "$failures" >&2
