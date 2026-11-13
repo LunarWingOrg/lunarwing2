@@ -378,6 +378,50 @@ class ExposurePolicyAssertTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, label)
                 self.assertIn("launch the real binary nowhere else", result.stderr)
 
+    def test_wrapper_with_operators_continuing_into_the_pin_fails(self) -> None:
+        # ABH-2: a line that ends in &&, ||, | or () continues into the pin,
+        # so the "last two code lines" check alone is not enough.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        for label, prefix in (
+            ("&&", '[ "${1:-}" != "--version" ] &&\n'),
+            ("||", '[ -r "$HOME/.config/opencode/rc" ] ||\n'),
+            ("pipe", "true |\n"),
+            ("function call", "setup_env()\n"),
+        ):
+            with self.subTest(label=label):
+                wrapper.write_text(text.replace(pin + launch, prefix + pin + launch), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn("shell operator that continues into it", result.stderr)
+
+    def test_wrapper_with_dot_sourcing_mid_line_fails(self) -> None:
+        # ABH-2: `[ ! -r "$f" ] || . "$f"` sources a file mid-line; the dot
+        # rule must not only look at line starts.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        wrapper.write_text(
+            text.replace(pin + launch, '[ ! -r "$HOME/.rc" ] || . "$HOME/.rc"\n' + pin + launch),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("dot-sourcing", result.stderr)
+
+    def test_wrapper_code_edit_outside_the_named_rules_fails_the_digest(self) -> None:
+        # ABH-2's better guard: any code edit, even one the shape checks do
+        # not name, changes the reviewed digest and fails here.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        wrapper.write_text(text.replace("exit 77", "exit 99"), encoding="utf-8")
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("differ from the reviewed digest", result.stderr)
+
     def test_comments_around_the_flag_pin_do_not_fail(self) -> None:
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")

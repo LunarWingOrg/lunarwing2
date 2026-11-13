@@ -82,6 +82,10 @@ RUN python3 /build/prepare_reproducible_build.py script/build.ts
 # remote-tunnel.ts is replaced with a refusing stub. If upstream
 # moves/renames the module or extends its
 # export surface the build fails instead of silently shipping the tunnel.
+# The same script also trips the WI#609 flag-pin anchor: it compares the
+# flag registry and resolver against the reviewed v2.2.7 digests, requires
+# the two-statement Console watch gate, and counts the watch-wiring names —
+# a text tripwire, not a proof (bump checklist item 7 has the re-read).
 RUN python3 /build/compile_out_remote_tunnel.py /build/opencode
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).

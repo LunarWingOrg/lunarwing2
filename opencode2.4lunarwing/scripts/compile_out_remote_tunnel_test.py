@@ -73,27 +73,79 @@ CONSOLE_PLUGIN = "packages/core/src/plugin/provider/opencode.ts"
 # The lines of the three upstream files at v2.2.7 that the anchor reads, with
 # their original line breaks.
 REGISTRY_SOURCE = '''\
+export * as ConfigFlag from "./flag.js"
+
+/** The `OPENCODE_FLAGS` entry that turns every flag on, as in `all,-media_blob`. It is not a flag key. */
 export const wildcard = "all"
 
+/**
+ * Every feature flag, by key, with what it turns on. A flag is on in local and dev builds and off in released ones;
+ * `experimental.<key>` in config and `OPENCODE_FLAGS` override that, and `OPENCODE_FLAGS=all` or
+ * `experimental.all_flags: true` turn every flag on. Read one with Core's `Flag.enabled("<key>")`.
+ */
 export const registry = {
   todo: "Enable the experimental todowrite tool.",
   background_compaction:
-    "Enable experimental background compaction.",
-  media_blob: "Store new session media once.",
+    "Enable experimental background compaction: summarize the conversation in the background as it nears the compaction threshold, so automatic compaction does not wait for the summary. Background summaries that are never used still cost tokens.",
+  media_blob: "Store new session media once in a deduplicated blob table instead of inline in every message row.",
   schedules: "Enable experimental scheduled tasks that wake a session with a prompt.",
   artifacts: "Enable experimental artifacts backed by pluggable providers.",
-  codemode_vm: "Run the Code Mode execute tool on the experimental bytecode VM.",
+  codemode_vm: "Run the Code Mode execute tool on the experimental bytecode VM instead of the legacy interpreter.",
   console_watches:
-    "Watch Slack threads, GitHub pull requests and wake sessions when they change.",
+    "Watch Slack threads, GitHub pull requests, issues, commits and Actions runs, and the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.",
 } as const satisfies Record<string, string>
 export type Key = keyof typeof registry
 '''
+
 RESOLVER_SOURCE = '''\
+export * as Flag from "./flag.js"
+
+import { Context, Effect, Layer, Record } from "effect"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { ConfigFlag } from "@opencode/schema/config/flag"
+import type { Document, Entry } from "@opencode/schema/config"
+import { App } from "./app.js"
+import { Config } from "./config.js"
+
+export type Key = ConfigFlag.Key
+
+export interface State {
+  readonly enabled: boolean
+  /** Where `enabled` came from, highest priority first. */
+  readonly source: "env" | "config" | "default"
+}
+
+export interface Interface {
+  readonly resolve: (entries: readonly Entry[]) => Record<Key, State>
+  readonly all: Effect.Effect<Record<Key, State>>
+  readonly enabled: (key: Key) => Effect.Effect<boolean>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/Flag") {}
+
+/**
+ * `OPENCODE_FLAGS`, a comma-separated list such as `schedules,-media_blob`; a leading `-` turns a flag off, and
+ * `all` turns every flag on unless the same list opts one out, as in `all,-media_blob`.
+ */
 export const Overrides = Context.Reference<string | undefined>("@opencode/Flag/Overrides", {
   defaultValue: () => process.env.OPENCODE_FLAGS,
 })
+
+// Any other channel, such as a release or a branch preview build, keeps flags off so none turns on by accident.
 const onByDefault = (channel: string) => channel === "local" || channel === "dev"
-export function resolve(input) {
+
+/**
+ * Resolves every flag: `OPENCODE_FLAGS` (`-key`, then `all`), then `experimental.<key>` from the highest-priority
+ * document that sets `experimental` (the same document every other `experimental` setting reads), then `all_flags: true`
+ * from the highest-priority document that sets `all_flags`, so a global switch survives a project's own `experimental`
+ * block, then on for local and dev builds. `all_flags: false` falls through rather than turning flags off.
+ * A remote kill switch belongs above `OPENCODE_FLAGS` here.
+ */
+export function resolve(input: {
+  readonly entries: readonly Entry[]
+  readonly channel: string
+  readonly overrides?: string
+}) {
   const env = new Map(
     (input.overrides ?? "")
       .split(",")
@@ -102,6 +154,11 @@ export function resolve(input) {
       .map((item): [string, boolean] => (item.startsWith("-") ? [item.slice(1), false] : [item, true])),
   )
   const all = env.get(ConfigFlag.wildcard) === true
+  const experimental = Config.latest(input.entries, "experimental")
+  const allFlags =
+    input.entries.findLast(
+      (entry): entry is Document => entry.type === "document" && entry.info.experimental?.all_flags !== undefined,
+    )?.info.experimental?.all_flags === true
   return Record.map(ConfigFlag.registry, (_, key): State => {
     const override = env.get(key) ?? (all ? true : undefined)
     const configured = experimental?.[key] ?? (allFlags ? true : undefined)
@@ -114,11 +171,56 @@ export function resolve(input) {
     return { enabled, source }
   })
 }
+
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const app = yield* App.Service
+    const config = yield* Config.Service
+    const overrides = yield* Overrides
+    const resolveEntries = (entries: readonly Entry[]) => resolve({ entries, channel: app.channel, overrides })
+    const all = Effect.gen(function* () {
+      return resolveEntries(yield* config.entries())
+    })
+    return Service.of({
+      resolve: resolveEntries,
+      all,
+      enabled: (key) => Effect.map(all, (flags) => flags[key].enabled),
+    })
+  }),
+)
+
+export const testLayer = (
+  entries: Entry[] = [],
+  options?: { readonly app?: Partial<App.Info>; readonly overrides?: string },
+) =>
+  Layer.fresh(layer).pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        App.layer(options?.app),
+        Config.testLayer(entries),
+        Layer.succeed(Overrides, options?.overrides),
+      ),
+    ),
+  )
+
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [App.node, Config.node],
+})
+
+/** Every flag with its value and where it came from, read from the location's Config on each call. */
+export const all = Service.use((flags) => flags.all)
+
+export const enabled = (key: Key) => Service.use((flags) => flags.enabled(key))
 '''
+
 PLUGIN_SOURCE = '''\
       yield* syncInstructionsAndSkills(next, allowed)
       const watching = allowed && next.remote?.watches === true && (yield* flags.enabled("console_watches"))
       yield* syncWatches(watching ? next.connection : undefined)
+      const provider = OpencodeWatches.layer()
 '''
 
 
@@ -131,7 +233,10 @@ def write_flag_files(root: pathlib.Path) -> None:
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         (root / relative).write_text(source, encoding="utf-8")
     watches = root / "packages/core/src/plugin/provider/opencode-watches.ts"
-    watches.write_text('const namespace = "console_watch"\n', encoding="utf-8")
+    watches.write_text(
+        'export const OpencodeWatches = {}\nconst namespace = "console_watch"\n',
+        encoding="utf-8",
+    )
 
 
 def run_guard(root: pathlib.Path) -> subprocess.CompletedProcess[str]:
@@ -281,7 +386,7 @@ class FlagPinAnchorTests(unittest.TestCase):
     def test_pinned_shape_passes_and_the_tunnel_is_still_stubbed(self) -> None:
         result = run_guard(self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("flag pin anchored (7 reviewed flags", result.stdout)
+        self.assertIn("flag pin anchor text unchanged", result.stdout)
         self.assertIn(STUB_MARK, (self.root / MODULE).read_text(encoding="utf-8"))
 
     def test_pin_without_any_flag_surface_passes(self) -> None:
@@ -297,18 +402,20 @@ class FlagPinAnchorTests(unittest.TestCase):
         # name an unknown flag, which the resolver ignores without a word.
         self.edit(
             FLAG_REGISTRY,
-            '  console_watches:\n    "Watch Slack threads, GitHub pull requests and wake sessions when they change.",\n',
+            '  console_watches:\n'
+            '    "Watch Slack threads, GitHub pull requests, issues, commits and Actions runs, and '
+            "the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.\",\n",
             "",
         )
-        self.assert_fails("'console_watches' flag is gone", "pin does nothing")
+        self.assert_fails("differs from the reviewed v2.2.7 text", "may predate the flag")
 
     def test_new_flag_fails_until_reviewed(self) -> None:
         self.edit(FLAG_REGISTRY, "  todo:", '  remote_control: "Let a hosted service drive the session.",\n  todo:')
-        self.assert_fails("registry changed", "remote_control")
+        self.assert_fails("differs from the reviewed v2.2.7 text", "remote_control")
 
     def test_removed_other_flag_fails_until_reviewed(self) -> None:
         self.edit(FLAG_REGISTRY, '  schedules: "Enable experimental scheduled tasks that wake a session with a prompt.",\n', "")
-        self.assert_fails("registry changed", "schedules")
+        self.assert_fails("differs from the reviewed v2.2.7 text", "schedules")
 
     def test_reshaped_registry_fails_closed(self) -> None:
         self.edit(FLAG_REGISTRY, "export const registry = {", "export const registry: Registry = {")
@@ -330,51 +437,30 @@ class FlagPinAnchorTests(unittest.TestCase):
         self.assert_fails("no longer starts the watches on flags.enabled")
 
     def test_resolver_drift_fails_closed(self) -> None:
-        for label, old, new, expected in (
+        # The resolver file is whole-file digest-pinned, so ANY edit to it —
+        # precedence, a kill switch above the override, a renamed variable —
+        # fails the anchor, even one that keeps the old fragments intact.
+        for label, old, new in (
             (
                 "config consulted before the override",
-                'override !== undefined\n        ? [override, "env"]\n        : configured !== undefined\n'
-                '          ? [configured, "config"]',
-                'configured !== undefined\n        ? [configured, "config"]\n        : override !== undefined\n'
-                '          ? [override, "env"]',
-                "the override wins over config and the default",
+                "override !== undefined",
+                "configured !== undefined",
             ),
             (
                 "a kill switch above the override",
-                "      override !== undefined\n",
-                "      remote !== undefined\n        ? [remote, \"remote\"]\n        : override !== undefined\n",
-                "the override wins over config and the default",
+                "      override !== undefined",
+                "      remote !== undefined",
             ),
-            (
-                "no opt-out syntax",
-                '(item.startsWith("-") ? [item.slice(1), false] : [item, true])',
-                "[item, true]",
-                'a leading "-" turns a flag off',
-            ),
-            (
-                "another variable",
-                "process.env.OPENCODE_FLAGS",
-                "process.env.OPENCODE_FEATURES",
-                "OPENCODE_FLAGS is the override source",
-            ),
-            (
-                "override not looked up per key",
-                "const override = env.get(key) ?? (all ? true : undefined)",
-                "const override = all ? true : undefined",
-                "the override is looked up per key",
-            ),
-            (
-                "the result changed after it was resolved",
-                "return { enabled, source }",
-                "return { enabled: enabled || forced.has(key), source }",
-                "the resolved value is returned unchanged",
-            ),
+            ("no opt-out syntax", 'startsWith("-")', "true"),
+            ("another variable", "process.env.OPENCODE_FLAGS", "process.env.OPENCODE_FEATURES"),
+            ("override not looked up per key", "env.get(key) ??", "all ?"),
+            ("the result changed after it was resolved", "return { enabled, source }", "return { enabled }"),
         ):
             with self.subTest(label=label):
                 (self.root / MODULE).write_text(REAL_MODULE, encoding="utf-8")
                 (self.root / FLAG_RESOLVER).write_text(RESOLVER_SOURCE, encoding="utf-8")
                 self.edit(FLAG_RESOLVER, old, new)
-                self.assert_fails("changed how flags resolve", expected)
+                self.assert_fails("differs from the reviewed v2.2.7 text")
 
     def test_moved_flag_files_fail_closed(self) -> None:
         for relative in (FLAG_REGISTRY, FLAG_RESOLVER, CONSOLE_PLUGIN):
@@ -383,6 +469,81 @@ class FlagPinAnchorTests(unittest.TestCase):
                 write_flag_files(self.root)
                 (self.root / relative).unlink()
                 self.assert_fails("is gone", relative)
+
+    def test_reworded_registry_description_fails_closed(self) -> None:
+        # A reworded description changes no key but does change the digest:
+        # the anchor is a text tripwire and fails on any difference.
+        self.edit(
+            FLAG_REGISTRY,
+            "Store new session media once in a deduplicated blob table",
+            "Store media once in a table",
+        )
+        self.assert_fails("differs from the reviewed v2.2.7 text")
+
+    def test_watching_computed_but_unused_fails_closed(self) -> None:
+        # `watching` is computed and then ignored: the flag no longer decides
+        # whether the watches start, even though the text mentions both.
+        self.edit(
+            CONSOLE_PLUGIN,
+            "yield* syncWatches(watching ? next.connection : undefined)",
+            "yield* syncWatches(next.connection)",
+        )
+        self.assert_fails("no longer starts the watches on flags.enabled")
+
+    def test_second_sync_watches_call_fails_closed(self) -> None:
+        # A second, unconditional call site would start the watches without
+        # the flag, beside the gated one.
+        plugin = self.root / CONSOLE_PLUGIN
+        plugin.write_text(
+            plugin.read_text(encoding="utf-8") + "      yield* syncWatches(next.connection)\n",
+            encoding="utf-8",
+        )
+        self.assert_fails("no longer starts the watches on flags.enabled")
+
+    def test_new_opencode_watches_file_fails_closed(self) -> None:
+        # A new file that names the watches wiring means a new starter or
+        # wiring point the review did not see.
+        path = self.root / "packages/core/src/plugin/provider/second-watches.ts"
+        path.write_text("export const OpencodeWatches = 1\n", encoding="utf-8")
+        self.assert_fails("the files that name the watch wiring changed", "OpencodeWatches")
+
+    def test_new_flag_overrides_provider_fails_closed(self) -> None:
+        # A new provider of Flag.Overrides would sit above the environment
+        # default and take the meaning out of the wrapper's pin.
+        path = self.root / "packages/core/src/plugin/provider/overrides.ts"
+        path.write_text(
+            'import { Flag } from "@opencode/flag"\nexport const kill = Flag.Overrides\n',
+            encoding="utf-8",
+        )
+        self.assert_fails("the files that name the watch wiring changed", "Flag.Overrides")
+
+    def test_flag_files_moved_with_a_hidden_watch_surface_fails_closed(self) -> None:
+        # The early pass must not fire when the watch code still exists but
+        # has moved outside packages/*/src: the whole-tree scan sees it.
+        for relative in (FLAG_REGISTRY, FLAG_RESOLVER, CONSOLE_PLUGIN):
+            (self.root / relative).unlink()
+        (self.root / "packages/core/src/plugin/provider/opencode-watches.ts").unlink()
+        moved = self.root / "packages/legacy/plugin.ts"
+        moved.parent.mkdir(parents=True)
+        moved.write_text('const watch = flags.enabled("console_watches")\n', encoding="utf-8")
+        self.assert_fails("is gone")
+
+    def test_older_pin_registry_diagnosis_is_hedged(self) -> None:
+        # A registry without console_watches could be an older pin (the flag
+        # never existed) or a shipped feature; the diagnosis must not claim
+        # "always on".
+        self.edit(
+            FLAG_REGISTRY,
+            '  console_watches:\n'
+            '    "Watch Slack threads, GitHub pull requests, issues, commits and Actions runs, and '
+            "the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.\",\n",
+            "",
+        )
+        result = run_guard(self.root)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("differs from the reviewed v2.2.7 text", result.stderr)
+        self.assertIn("may predate the flag", result.stderr)
+        self.assertNotIn("always on", result.stderr)
 
 
 if __name__ == "__main__":

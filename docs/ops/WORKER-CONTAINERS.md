@@ -1040,20 +1040,27 @@ Enforced controls (opencode2 lane unless noted):
    is ignored without a word, and upstream ships a feature by deleting its
    flag. The builder stage therefore anchors the pin
    (`scripts/compile_out_remote_tunnel.py`, `check_flag_pin_anchor`) and
-   fails the image when the registry
-   (`packages/schema/src/config/flag.ts`) differs from the reviewed list,
-   when `packages/core/src/plugin/provider/opencode.ts` no longer starts the
-   watches on `flags.enabled("console_watches")`, or when
-   `packages/core/src/flag.ts` stops resolving `OPENCODE_FLAGS` first, with
-   a leading `-` meaning off. When it fails on a bump, do not edit the
-   anchor to make it pass: answer in the bump entry, for every new or
-   removed flag, what it turns on and whether the lane takes it; if
-   `console_watches` is gone, whether the watches are now always on, which
-   needs a new decision; and whether anything now resolves above the
-   variable. Then update `REVIEWED_FLAGS` and the anchors in the same
-   commit. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
-   these guards cover the *shipped binary*; against a compromised agent
-   only control 1 makes the crossing safe (see the gate record above).
+   fails the image when the whole-file digests of the registry
+   (`packages/schema/src/config/flag.ts`) and the resolver
+   (`packages/core/src/flag.ts`) differ from the reviewed v2.2.7 text, when
+   `packages/core/src/plugin/provider/opencode.ts` no longer computes
+   `watching` from `flags.enabled("console_watches")` and starts the watches
+   from it as its only call site, or when the count of scanned files naming
+   `OpencodeWatches` (2) or `Flag.Overrides` (0) changes. That anchor is a
+   text tripwire, necessary and not sufficient: on EVERY bump, whether or
+   not it fires, re-read the flag code by hand and grep the pinned source
+   for new `syncWatches` call sites, new files naming `OpencodeWatches` or
+   `Flag.Overrides`, and new `OPENCODE_FLAGS` readers, then answer in the
+   bump entry: for every new or removed flag, what it turns on and whether
+   the lane takes it; whether `console_watches` still gates the watches (a
+   removed flag may mean the feature shipped and the watches are now always
+   on, or that the pin predates the flag — decide which); and whether
+   anything now resolves above the variable. Then update `REVIEWED_FLAGS`,
+   the digests and the anchors in the same commit. Do not edit the anchor to
+   make it pass without that review. For opencode2 bumps past v2.0.24 the
+   compile-out guard (8) plus these guards cover the *shipped binary*;
+   against a compromised agent only control 1 makes the crossing safe (see
+   the gate record above).
    **Photon-node repair retirement:** when a new OpenCode pin carries the
    `61845b0` whitespace repair in content (a backport; the tag need not
    contain the commit), `fix_photon_patch_context.py` deliberately fails with
@@ -1579,7 +1586,7 @@ cd opencode2.4lunarwing
 # Recompute it after any wrapper edit:
 #   sha256sum scripts/opencode-exposure-guard.sh
 DOCKER_BUILDKIT=1 docker build \
-  --build-arg LUNARWING_WRAPPER_SHA256=f1e847dd85ad73e947f7e7cd9174810a08c258ac572543b38042e55a99b7ed8d \
+  --build-arg LUNARWING_WRAPPER_SHA256=e349e842ba843e068fe4b14d1c63e3d87ea33c8a4079710b18e0bc483a5a9a2e \
   -t lunarwing-worker-opencode2:latest .
 
 # Select the worker per tenant, then build the shared image via mt-admin
@@ -2114,11 +2121,14 @@ dispatch was performed.
   through a hosted third party. LunarWing allows one channel only: daemon job
   dispatch, the bridge, and the agent API on loopback.
 - **The flag is not the whole Console channel.** The same plugin already
-  fetches Console-authored instructions and skills for a worker with a
-  credential, flag or no flag (`opencode.ts:265-275`, synced at `:336`,
-  one line before the flag is read). v2.2.6 has that as the workspace
-  Library, so it is older than this bump. The pin below covers the event
-  watches only. The rest is WI#665.
+  delivers more than the watches for a worker with a credential, flag or no
+  flag: Console-authored instructions and skills, and the Console's config
+  document merge, whose allow-listed keys are `providers`, `mcp`, `policies`
+  and `websearch` (`packages/core/src/config/integration.ts:32-37`), merged
+  before the flag is read (`opencode.ts:318-335`, flag at `:337`). v2.2.6
+  has the instructions and skills as the workspace Library, so that part is
+  older than this bump. The pin below covers the event watches only. The
+  rest is WI#665.
 - **What must hold to start the watches**
   (`packages/core/src/plugin/provider/opencode.ts:337`): the flag is on, the
   worker has a credential of the `opencode` integration, and Console's
@@ -2148,16 +2158,26 @@ dispatch was performed.
   `:74`), and with the flag off the watches stay dormant even when Console
   advertises them (`packages/core/test/plugin/provider-opencode-watches.test.ts:273`).
   The inherited value is replaced, so `OPENCODE_FLAGS=all` from a caller does
-  not survive either. Three build checks hold it in place.
-  `exposure_policy_assert.py` requires the pin and the `exec` to be the last
-  two code lines of the wrapper, unindented, and refuses any other code line
-  that launches the binary, names the variable, or uses `alias`, `eval`,
-  `source` or a here-document; a fast path for one subcommand or an opt-out
-  knob fails the build. It also fails when the lane config sets
-  `experimental.console_watches` or `experimental.all_flags`. And the
-  builder stage anchors the pin against the pinned upstream source
-  (checklist item 7): the image does not build when the flag is gone from
-  the registry, no longer gates the watches, or no longer resolves first.
+  not survive either. Three build checks hold it in place, and each is a
+  TEXT TRIPWIRE, necessary and not sufficient:
+  - `exposure_policy_assert.py` requires the pin and the `exec` to be the
+    last two code lines of the wrapper, unindented; refuses any other code
+    line that launches the binary, names the variable, uses `alias`, `eval`,
+    `source`, dot-sourcing or a here-document, or ends in a shell operator
+    (`&&`, `||`, `|`, `()`, `\`) that continues into the pin; and requires
+    the wrapper's code lines to match a reviewed SHA-256 digest, so any code
+    edit — a fast path, an opt-out knob, an operator line — fails the build
+    until the checker is reviewed in the same commit. It also fails when the
+    lane config sets `experimental.console_watches` or
+    `experimental.all_flags`.
+  - The builder stage compares the whole `packages/schema/src/config/flag.ts`
+    and `packages/core/src/flag.ts` against the reviewed v2.2.7 digests,
+    requires the two-statement watch gate (`const watching = …` and its
+    `syncWatches(watching …)` use as the only call site), and counts the
+    scanned files that name `OpencodeWatches` (2) and `Flag.Overrides` (0).
+    A drift fails the image with the drift named, but a green anchor proves
+    only that the text is the same as the review read — the per-bump human
+    re-read (checklist item 7) remains the decision.
 - **What the pin is not.** Like the wrapper as a whole it guards against use
   by mistake, and it has these edges:
   - A task that starts the real binary by its path, or with
@@ -2187,7 +2207,7 @@ dispatch was performed.
   - Exposure policy suite **75/75** (68 before the decision), on the host
     and inside the image under dash. It starts the wrapper in every mode of
     `entrypoint.sh` (`serve`, `run`, `acp`), with a leading global flag and
-    with a server-backed command, against six inherited values.
+    with a server-backed command, against seven inherited values.
   - Compile-out suite **20/20** (10 before): ten new cases for the anchor.
   - One scratch mutant per rule, all caught: nine for the wrapper and
     config checks, eight for the anchor. The wrapper shapes that passed the
@@ -2196,7 +2216,7 @@ dispatch was performed.
   - The anchor passes on the real v2.2.7 source, in a scratch tree and in
     the builder stage of the image build.
   - A full local OpenCode2 image build (rootless Podman,
-    `--network=host --format docker`, wrapper anchor `f1e847dd…ed8d`)
+    `--network=host --format docker`, wrapper anchor `e349e842…a9a2e`)
     completed: builder gates, every in-image suite, the started-entrypoint
     smoke **5/5** with the server started through the pinned wrapper, and
     the final `--image-filesystem` assertion. In the built image, as uid
@@ -2208,8 +2228,9 @@ dispatch was performed.
   upstream code and its tests named above. The `service.json` path and the
   Console Library were read in the source, not run. No candidate-vs-clean-rebuild
   comparison, scan or protected job ran. v2.3.0's source was not reviewed for
-  this bump because that release is still in its waiting window; the anchor
-  will say at that bump whether the pin still holds.
+  this bump because that release is still in its waiting window; at that bump
+  the anchor only reports whether its text is unchanged — it does not prove
+  the pin holds, and the per-bump re-read (checklist item 7) is what decides.
 
 **2026-11-13 re-attempt verification (SweetieBot):** the upgrade and all
 AAV/ABE review fixes were ported onto target `c48a4f7d3` and re-run there.
@@ -2240,6 +2261,29 @@ AAV/ABE review fixes were ported onto target `c48a4f7d3` and re-run there.
   candidate, clean-rebuild digest comparison, scan or promotion ran. No live
   Console connection, tenant rollout or live-model dispatch was attempted.
   The local guard and image builds do not substitute for those gates.
+
+- **!2417 run-429 follow-up (ABH-1 High, ABH-2/ABH-3 Medium, ABH-4/ABH-5
+  Low, ABH-6, ABN-1):** the anchor is now honest and tighter. The builder
+  stage pins the whole-file SHA-256 of `packages/core/src/flag.ts` and
+  `packages/schema/src/config/flag.ts` (verified against the real v2.2.7
+  checkout at `fedc6f208`), anchors the watch gate as the two-statement
+  block with its `syncWatches(watching …)` use as the only call site, and
+  counts scanned files naming `OpencodeWatches` (2) and `Flag.Overrides`
+  (0); the success line is now only "flag pin anchor text unchanged", and
+  the early pass is fail-closed when the watch code still exists anywhere in
+  the tree. The wrapper check now refuses a line before the pin ending in
+  `&&`, `||`, `|`, `()` or `\`, refuses dot-sourcing wherever it appears, and
+  requires the wrapper's code lines to match a reviewed SHA-256 digest, so a
+  conditional pin or an opt-out knob fails the build; the wrapper comment
+  and this entry name all six things a Console credential delivers with the
+  flag off (instructions, skills, providers, MCP servers, policies,
+  web-search selection). Checklist item 7 restores the per-bump human
+  re-read — grep the pinned source for new `syncWatches` call sites, new
+  files naming `OpencodeWatches` or `Flag.Overrides`, and new
+  `OPENCODE_FLAGS` readers — because the anchor is a text tripwire, not a
+  proof. Suites: exposure policy **78/78**, compile-out **27/27**; the
+  anchor and every new mutant were also run against the real v2.2.7 tree.
+  The wrapper comment edit changes the wrapper anchor to `e349e842…a9a2e`.
 
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 

@@ -86,9 +86,14 @@ FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", "console_watches")
 WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="-console_watches"'
 WRAPPER_EXEC = 'exec "$REAL_OPENCODE" "$@"'
 REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
+# SHA-256 over the wrapper's code lines (comments and blank lines stripped),
+# so ANY code edit — including one the shape checks below do not name — needs
+# a review of this checker in the same commit (WI#609 ABH-2).
+WRAPPER_CODE_DIGEST = "cc551f2668957ba4c1354b79dd3723b7f3b8b97246f9f18ac7ca78481830ba0d"
 # Shell features that can make the wrapper's tail unreachable or change what
-# its last two lines mean. The wrapper needs none of them.
-WRAPPER_FORBIDDEN_RE = re.compile(r"\b(alias|eval|source)\b|<<|^\.\s")
+# its last two lines mean. The wrapper needs none of them. Dot-sourcing is
+# refused wherever it appears, not only at a line start.
+WRAPPER_FORBIDDEN_RE = re.compile(r"\b(alias|eval|source)\b|<<|(^|[;&|\s])\.\s")
 
 failures: list[str] = []
 
@@ -293,16 +298,17 @@ def check_wrapper(lane: pathlib.Path) -> None:
              "scan every argv token, not only $1")
     else:
         check("wrapper scans every argv token (service/pair/--service/--hostname)")
-    # WI#609 AAV-1 / ABE-3: the pin only holds if every start of the real
-    # binary passes through it. This is a shape check on a reviewed file, so
-    # it is strict about the text instead of clever about the shell: the last
-    # two code lines are the pin and the exec, unindented (not inside a block
-    # or a function), and nothing else in the code launches the binary, names
-    # the variable, or uses a feature that could skip or redefine the tail.
-    # A second launch path, such as a fast path for one subcommand or an
-    # opt-out knob, fails here even when it looks harmless. It does not
-    # defend against a hostile edit (an unbalanced quote can still swallow
-    # the tail); the behaviour tests and the review cover the committed file.
+    # WI#609 AAV-1 / ABE-3 / ABH-2: the pin only holds if every start of the
+    # real binary passes through it. This is a shape check on a reviewed
+    # file, strict about the text instead of clever about the shell: the
+    # last two code lines are the pin and the exec, unindented (not inside a
+    # block or a function); nothing else in the code launches the binary,
+    # names the variable, or uses a feature that could skip or redefine the
+    # tail; and no line before the pin ends in a shell operator that
+    # continues into it. On top of the named rules the whole code body must
+    # match its reviewed digest, so any code edit fails until this checker is
+    # reviewed in the same commit. The behaviour tests and the review cover
+    # the committed file.
     raw_code = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
     code = [line.strip() for line in raw_code]
 
@@ -313,7 +319,7 @@ def check_wrapper(lane: pathlib.Path) -> None:
     if raw_code[-2:] != [WRAPPER_FLAG_PIN, WRAPPER_EXEC]:
         problems.append("the last two code lines are not the unindented pin and exec")
     if sum(1 for line in code if re.search(r"\bexec\b", line)) != 1:
-        problems.append("more than one code line uses exec")
+        problems.append("the number of code lines using exec is not exactly one")
     if lines_with("REAL_OPENCODE") != 2:
         problems.append("REAL_OPENCODE is used outside its assignment and the final exec")
     if lines_with(REAL_BINARY_PATH) != 1:
@@ -321,15 +327,23 @@ def check_wrapper(lane: pathlib.Path) -> None:
     if lines_with("OPENCODE_FLAGS") != 1:
         problems.append("another code line names OPENCODE_FLAGS")
     if any(WRAPPER_FORBIDDEN_RE.search(line) for line in code):
-        problems.append("alias, eval, source or a here-document is used")
+        problems.append("alias, eval, source, dot-sourcing or a here-document is used")
     if len(code) >= 3 and code[-3].endswith("\\"):
         problems.append("the line before the pin ends in a continuation")
+    if len(code) >= 3 and code[-3].endswith(("&&", "||", "|", "()")):
+        problems.append("the line before the pin ends in a shell operator that continues into it")
     if problems:
         fail(f"{wrapper} must end with exactly {WRAPPER_FLAG_PIN!r} then {WRAPPER_EXEC!r} and "
              f"launch the real binary nowhere else: {problems} — the Console event watches "
              "stay off (WI#609 AAV-1)")
-    else:
-        check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
+        return
+    digest = hashlib.sha256("\n".join(code).encode()).hexdigest()
+    if digest != WRAPPER_CODE_DIGEST:
+        fail(f"{wrapper} code lines differ from the reviewed digest ({digest[:12]}…) — any "
+             "wrapper code edit must be reviewed and WRAPPER_CODE_DIGEST updated in the same "
+             "commit (WI#609 ABH-2)")
+        return
+    check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
 
 
 def check_binary(binary: pathlib.Path) -> None:

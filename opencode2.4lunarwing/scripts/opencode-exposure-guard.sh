@@ -46,18 +46,21 @@
 # opt-ins, so OPENCODE_FLAGS=all must not survive. An operator's own
 # `-<key>` entries are dropped with it; the wrapper owns this variable.
 #
-# What this does not cover: the pin gates the event watches only, not the
-# instructions and skills a worker with a Console credential also takes from
-# the Console (WI#665). Children the real binary spawns inherit the value,
-# except a managed service started from a service.json that carries its own
-# `env` map; the refusal of `opencode service` above and the entrypoint's
-# boot-time reset of that file are the controls for that path. The builder
-# stage fails the image when upstream stops gating the watches on this flag
-# or changes the precedence (scripts/compile_out_remote_tunnel.py).
+# What this does not cover: the pin gates the event watches only, not what a
+# worker with a Console credential also takes from the Console with the flag
+# off — Console-authored instructions, skills, providers, remote MCP servers,
+# policies and the web-search selection (WI#665). Children the real binary
+# spawns inherit the value, except a managed service started from a
+# service.json that carries its own `env` map; the refusal of
+# `opencode service` above and the entrypoint's boot-time reset of that file
+# are the controls for that path. The builder stage fails the image when the
+# reviewed text behind this pin stops holding
+# (scripts/compile_out_remote_tunnel.py) — a text tripwire, not a proof.
 #
 # exposure_policy_assert.py requires the two lines at the end of this file to
-# stay exactly as they are, unindented and last, and REAL_OPENCODE, exec and
-# OPENCODE_FLAGS to appear in no other code line.
+# stay exactly as they are, unindented and last; REAL_OPENCODE (apart from its
+# own assignment), exec and OPENCODE_FLAGS in no other code line; and the
+# whole code body to match its reviewed digest.
 set -eu
 
 REAL_OPENCODE="${LUNARWING_REAL_OPENCODE:-/usr/local/lib/opencode2/opencode}"

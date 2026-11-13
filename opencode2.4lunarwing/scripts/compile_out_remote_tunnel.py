@@ -31,14 +31,12 @@ watches, a remote steering channel, behind the flag `console_watches`, and the
 lane's wrapper starts every opencode with OPENCODE_FLAGS=-console_watches.
 That pin is only as good as the pinned upstream source: an unknown entry in
 OPENCODE_FLAGS is ignored without a word, and upstream ships a feature by
-deleting its flag. So the build fails unless
-
-- the flag registry is exactly the reviewed list below (a new flag, or a
-  removed one, needs a decision in the bump entry first);
-- the Console plugin still starts the watches only when
-  flags.enabled("console_watches") holds;
-- the flag resolver still reads OPENCODE_FLAGS, still turns a flag off for a
-  leading "-", and still lets that override win over config and the default.
+deleting its flag. The anchor is a TEXT TRIPWIRE, necessary and not
+sufficient: it fails the build when the reviewed text no longer holds — the
+whole-file digests of the two flag files, the two-statement watch gate in the
+Console plugin, and the counts of files naming the watch wiring — but it does
+not prove that the pin still holds. The per-bump human re-read of the flag
+code (bump checklist item 7) remains the decision.
 
 A pin that predates the flags has none of these files and no reference to
 them: log and pass, as for the tunnel.
@@ -48,7 +46,9 @@ usage: compile_out_remote_tunnel.py [upstream repo root]
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -100,7 +100,7 @@ export const hostname = (_route: string) => Effect.succeed(undefined as string |
 FLAG_REGISTRY = pathlib.Path("packages/schema/src/config/flag.ts")
 FLAG_RESOLVER = pathlib.Path("packages/core/src/flag.ts")
 CONSOLE_PLUGIN = pathlib.Path("packages/core/src/plugin/provider/opencode.ts")
-# Any of these in the scanned sources means the pin has a flag or Console
+# Any of these anywhere in the checkout means the pin has a flag or Console
 # watch surface, so the three files above must be where and what we expect.
 FLAG_SURFACE_MARKERS = ("OPENCODE_FLAGS", "console_watch")
 PINNED_OFF_FLAG = "console_watches"
@@ -118,25 +118,30 @@ REVIEWED_FLAGS = (
 )
 REGISTRY_BLOCK_RE = re.compile(r"export const registry = \{(.*?)\n\} as const", re.S)
 REGISTRY_KEY_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_]*):", re.M)
-# The one expression that starts the watches, on one line.
-WATCH_GATE_RE = re.compile(r"^.*\bconst watching\b.*flags\.enabled\(\"console_watches\"\).*$", re.M)
-# Whitespace-normalized fragments of the resolver. Together they say: the
-# override comes from OPENCODE_FLAGS, "-key" means off, the override is
-# consulted before config and before the channel default, and the result is
-# returned as resolved. The precedence fragment starts at the assignment, so
-# a layer put in front of the override (upstream reserves a place for a
-# remote kill switch there) breaks it too.
-RESOLVER_ANCHORS = (
-    ("OPENCODE_FLAGS is the override source", "defaultValue: () => process.env.OPENCODE_FLAGS"),
-    ('a leading "-" turns a flag off', '(item.startsWith("-") ? [item.slice(1), false] : [item, true])'),
-    ("the override is looked up per key", "const override = env.get(key) ?? (all ? true : undefined)"),
-    (
-        "the override wins over config and the default",
-        'const [enabled, source]: [boolean, State["source"]] = override !== undefined ? [override, "env"] '
-        ': configured !== undefined ? [configured, "config"] : [onByDefault(input.channel), "default"]',
-    ),
-    ("the resolved value is returned unchanged", "return { enabled, source }"),
+# THIS ANCHOR IS A TEXT TRIPWIRE, NECESSARY AND NOT SUFFICIENT. It fails the
+# build when the pinned source no longer holds the exact text this review
+# read: the whole-file digests of the two flag files below, the
+# two-statement watch gate, and the counts of files that name the watch
+# wiring. It does not prove the pin holds; the per-bump human re-read of the
+# flag code (bump checklist item 7) remains the decision. Success means
+# "anchor text unchanged", nothing more.
+FLAG_FILE_DIGESTS = {
+    "packages/core/src/flag.ts": "0656ecfb6ef72ef3947eb64e4d82cc8cb2b891e424181df4f6bdf1bf894e395d",
+    "packages/schema/src/config/flag.ts": "331addb3e50e742c4059b6051474e64cbe927820424a6a1c61afd65564ba530e",
+}
+# The gate in the Console plugin: the first line computes `watching` from the
+# flag; the second line is its only use.
+WATCH_GATE_LINES = (
+    'const watching = allowed && next.remote?.watches === true && (yield* flags.enabled("console_watches"))',
+    "yield* syncWatches(watching ? next.connection : undefined)",
 )
+# Counts of scanned files that name the watch wiring at v2.2.7: the plugin
+# definition plus its one consumer name `OpencodeWatches`, and no scanned
+# file uses the `Flag.Overrides` access form (the resolver's own
+# "@opencode/Flag/Overrides" reference string is pinned by its digest). A new
+# watches starter or overrides provider defeats the wrapper's pin, so any
+# count drift fails the build.
+WATCH_FILE_COUNTS = {"OpencodeWatches": 2, "Flag.Overrides": 0}
 
 
 def fail(message: str) -> "SystemExit":
@@ -144,14 +149,54 @@ def fail(message: str) -> "SystemExit":
     return SystemExit(1)
 
 
+def _flag_surface_files(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every text-ish file in the checkout, skipping dependency trees. The
+    early-pass decision needs the whole tree: a Console plugin moved out of
+    packages/*/src must not hide a live watch surface."""
+    paths: list[pathlib.Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in ("node_modules", ".git"))
+        for filename in filenames:
+            if filename.endswith((".ts", ".tsx", ".js", ".mjs", ".cjs", ".json")):
+                paths.append(pathlib.Path(directory) / filename)
+    return paths
+
+
+def _registry_diagnosis(path: pathlib.Path) -> str:
+    """A human-readable hint about WHY the registry differs, for the bump
+    entry. It is a hint, not a verdict: the digest mismatch above is the
+    failure."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "the flag registry could not be read"
+    block = REGISTRY_BLOCK_RE.search(text)
+    if block is None:
+        return "the flag registry no longer declares 'export const registry = {…} as const'"
+    registry = sorted(REGISTRY_KEY_RE.findall(block.group(1)))
+    added = sorted(set(registry) - set(REVIEWED_FLAGS))
+    removed = sorted(set(REVIEWED_FLAGS) - set(registry))
+    if PINNED_OFF_FLAG in removed:
+        return (
+            f"registry keys: new: {added or 'none'}, gone: {removed} — "
+            "this pin may predate the flag, or upstream may have shipped the feature; "
+            "decide which in the bump entry"
+        )
+    return f"registry keys: new: {added or 'none'}, gone: {removed or 'none'}"
+
+
 def check_flag_pin_anchor(root: pathlib.Path, sources: dict[pathlib.Path, str]) -> None:
-    """Fail the build when the wrapper's -console_watches pin stops meaning
-    what the lane relies on (see the module docstring)."""
+    """Tripwire for the wrapper's OPENCODE_FLAGS pin (see the module docstring):
+    fail the build when the reviewed text of the flag files, the watch gate or
+    the name counts no longer holds."""
     files = {name: root / name for name in (FLAG_REGISTRY, FLAG_RESOLVER, CONSOLE_PLUGIN)}
     surface = sorted(
         str(path.relative_to(root))
-        for path, text in sources.items()
-        if any(marker in text for marker in FLAG_SURFACE_MARKERS)
+        for path in _flag_surface_files(root)
+        if any(
+            marker in path.read_text(encoding="utf-8", errors="replace")
+            for marker in FLAG_SURFACE_MARKERS
+        )
     )
     if not surface and not any(path.is_file() for path in files.values()):
         print("compile_out_remote_tunnel: pin has no feature-flag surface; no flag pin to anchor")
@@ -164,42 +209,49 @@ def check_flag_pin_anchor(root: pathlib.Path, sources: dict[pathlib.Path, str]) 
             "the wrapper's OPENCODE_FLAGS pin is unverified, update this anchor before bumping"
         )
 
-    block = REGISTRY_BLOCK_RE.search(files[FLAG_REGISTRY].read_text(encoding="utf-8"))
-    if block is None:
-        raise fail(f"{FLAG_REGISTRY} no longer declares 'export const registry = {{…}} as const'")
-    registry = sorted(REGISTRY_KEY_RE.findall(block.group(1)))
-    added = sorted(set(registry) - set(REVIEWED_FLAGS))
-    removed = sorted(set(REVIEWED_FLAGS) - set(registry))
-    if PINNED_OFF_FLAG in removed:
+    for relative, expected in FLAG_FILE_DIGESTS.items():
+        actual = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        if actual != expected:
+            raise fail(
+                f"{relative} differs from the reviewed v2.2.7 text — the wrapper's "
+                "OPENCODE_FLAGS pin is unverified for this source; re-read the flag code and "
+                f"update this anchor in the same commit (checklist item 7). "
+                f"{_registry_diagnosis(files[FLAG_REGISTRY])}"
+            )
+
+    plugin_lines = [
+        line.strip()
+        for line in files[CONSOLE_PLUGIN].read_text(encoding="utf-8").splitlines()
+    ]
+    gated_calls = [line for line in plugin_lines if "syncWatches(watching" in line]
+    all_calls = [line for line in plugin_lines if "syncWatches(" in line]
+    if (
+        WATCH_GATE_LINES not in list(zip(plugin_lines, plugin_lines[1:]))
+        or len(gated_calls) != 1
+        or len(all_calls) != 1
+    ):
         raise fail(
-            f"the '{PINNED_OFF_FLAG}' flag is gone from {FLAG_REGISTRY} — upstream ships a "
-            "feature by deleting its flag, so the Console event watches may now be always on "
-            "and the wrapper's pin does nothing; this bump needs a new decision (WI#609)"
-        )
-    if added or removed:
-        raise fail(
-            f"the feature-flag registry changed (new: {added or 'none'}, gone: {removed or 'none'}) — "
-            "record a decision for each in the bump entry, then update REVIEWED_FLAGS"
+            f"{CONSOLE_PLUGIN} no longer starts the watches on flags.enabled(\"{PINNED_OFF_FLAG}\") "
+            "as its only call site — the wrapper's pin may not gate the Console event watches "
+            "any more (WI#609)"
         )
 
-    if WATCH_GATE_RE.search(files[CONSOLE_PLUGIN].read_text(encoding="utf-8")) is None:
+    drifted_counts = {
+        name: sum(1 for text in sources.values() if name in text)
+        for name, expected in WATCH_FILE_COUNTS.items()
+        if sum(1 for text in sources.values() if name in text) != expected
+    }
+    if drifted_counts:
         raise fail(
-            f"{CONSOLE_PLUGIN} no longer starts the watches on flags.enabled(\"{PINNED_OFF_FLAG}\") — "
-            "the wrapper's pin may not gate the Console event watches any more (WI#609)"
+            "the files that name the watch wiring changed — "
+            + "; ".join(
+                f"{name}: {count} file(s), reviewed {WATCH_FILE_COUNTS[name]}"
+                for name, count in drifted_counts.items()
+            )
+            + " — a new watches starter or overrides provider defeats the wrapper's pin (WI#609)"
         )
 
-    resolver = " ".join(files[FLAG_RESOLVER].read_text(encoding="utf-8").split())
-    drifted = [what for what, fragment in RESOLVER_ANCHORS if fragment not in resolver]
-    if drifted:
-        raise fail(
-            f"{FLAG_RESOLVER} changed how flags resolve ({drifted}) — the wrapper's "
-            "OPENCODE_FLAGS=-console_watches pin depends on it; re-read the resolver and "
-            "update this anchor (WI#609)"
-        )
-    print(
-        f"compile_out_remote_tunnel: flag pin anchored ({len(registry)} reviewed flags; "
-        f"'{PINNED_OFF_FLAG}' gates the Console watches; OPENCODE_FLAGS resolves first)"
-    )
+    print("compile_out_remote_tunnel: flag pin anchor text unchanged")
 
 
 def scan_sources(root: pathlib.Path) -> dict[pathlib.Path, str]:
