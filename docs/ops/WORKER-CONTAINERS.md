@@ -1988,22 +1988,27 @@ pre-upgrade state with the prior image if rollback is needed.
 
 ### v2.2.7 bump — WI#609, item 39 (2026-11-12)
 
-**Review reconciliation and pins:** `git ls-remote` resolves lightweight
-v2.2.7 directly to `fedc6f208aa2bd54c1019227214568083f6380ad`, the newest
-`v2.*` tag, and the fresh clone's HEAD matches. Its 24-hour settling window
-(ended 2026-11-11 10:37Z) had passed. npm reports `@moonshot-ai/kimi-code`
-`latest` as **2.6.0**, published **2026-11-12 10:11Z** — inside its own
-24-hour window at the time of this work — so the kimi lane takes **2.5.3**
-(2026-11-10 13:12Z, window passed); 2.6.0 is the next bump, not this one.
-Dockerfile defaults, the CI case blocks, the Kimi manifest and its lock moved
-together. Regenerating the lock with
+**Review reconciliation and pins:** in the original 2026-11-12 pass,
+`git ls-remote` resolved lightweight v2.2.7 directly to
+`fedc6f208aa2bd54c1019227214568083f6380ad`, then the newest `v2.*` tag, and
+the fresh clone's HEAD matched. Its 24-hour settling window (ended
+2026-11-11 10:37Z) had passed. npm reported `@moonshot-ai/kimi-code` `latest`
+as **2.6.0**, published **2026-11-12 10:11Z** — inside its own 24-hour window
+at that pass — so the kimi lane took **2.5.3** (2026-11-10 13:12Z, window
+passed). Dockerfile defaults, the CI case blocks, the Kimi manifest and its
+lock moved together. Regenerating the lock with
 `npm install --package-lock-only --ignore-scripts` changed only the three
 version fields and the dependency record: the tarball is
 `https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.5.3.tgz`
 with integrity
 `sha512-NdBttZiktZhKdH1tu/25A+Il1MxO1RTE1gAdZDmogoCT4g8L7k3pcLeJpwy7PNJvHo9CF8fDJiaZ9nsIPn+Gag==`.
 Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
-The v1.19.5 pin was re-checked the same day: `v1.19.5` is still the newest
+
+**2026-11-13 re-attempt recheck (20:36Z):** v2.3.0 is now the newest `v2.*`
+tag at `a6b15d33daf6ab7d35569f6d711fdb630b9f04e7`, published 08:55Z, and
+npm `latest` is 2.6.2, published 17:28Z. Both are still inside their own
+24-hour waiting windows, so this re-attempt keeps the reviewed v2.2.7 and
+2.5.3 targets. The v1.19.5 pin was re-checked again: it is still the newest
 `v1.*` tag and resolves to `810c0eba1a7348036f8bdf61e6632d0c36c6876c`, the
 committed pin — no v1 change.
 
@@ -2082,14 +2087,14 @@ lane Bun suites executor, result, path, SDK surface + negative test, tool
 proxy, tool plugin, bridge and task runner **7/7** pass. The kimi real-CLI
 contract lane **4/4** passes against the installed 2.5.3 binary.
 
-**Not performed locally:** no full Kimi/OpenCode2 image build
+**Not performed in the first local pass:** no full Kimi/OpenCode2 image build
 (`mt-admin build-kimi-worker` / `build-opencode2-worker`) and therefore no
 in-image `opencode --version`/binary marker scan, candidate-vs-clean-rebuild
 digest comparison, protected `worker-*-candidate`/scan jobs, or
-`worker-exposure-policy-guard` CI job run on this branch. Those remain the
-protected pipeline's gates after push/merge. No tenant rollout or live-model
-dispatch was performed. (For OpenCode2 the local image build was done later,
-with the change below.)
+`worker-exposure-policy-guard` CI job run on that branch. Later passes built
+both images; see the OpenCode2 review evidence below and the 2026-11-13
+re-attempt evidence at the end of this entry. No tenant rollout or live-model
+dispatch was performed.
 
 **Console event watches (review finding AAV-1 on !2398; maintainer's decision
 2026-11-13: take v2.2.7, record the surface, pin it off):**
@@ -2202,8 +2207,39 @@ with the change below.)
   observed the flag keeping a live Console connection down; that rests on the
   upstream code and its tests named above. The `service.json` path and the
   Console Library were read in the source, not run. No candidate-vs-clean-rebuild
-  comparison, scan or protected job ran. v2.3.0 (published 2026-11-13) was
-  not read; the anchor will say at that bump whether the pin still holds.
+  comparison, scan or protected job ran. v2.3.0's source was not reviewed for
+  this bump because that release is still in its waiting window; the anchor
+  will say at that bump whether the pin still holds.
+
+**2026-11-13 re-attempt verification (SweetieBot):** the upgrade and all
+AAV/ABE review fixes were ported onto target `c48a4f7d3` and re-run there.
+
+- The lock regenerated with zero drift. Host Kimi compilation and its suite
+  passed **180 tests with six intentional skips**; the four real-CLI cases
+  were not skipped in the image. The rootless Podman Kimi build completed all
+  **35 steps** with **183 passes, three intentional skips and zero failures**,
+  including all four contracts against the locked 2.5.3 CLI. The image reports
+  `kimi --version` and `KIMI_CODE_IMAGE_VERSION` as **2.5.3** (image ID
+  `1434f0b642eba060a259c40d18afefdb405635e4cf28ec7b2b784ad9e5194911`).
+- The rootless Podman OpenCode2 build completed all **49 steps**, including
+  the fresh-v2.2.7 compile-out/flag anchors, SDK typecheck, every in-image
+  Bun/Python suite (**75** exposure, **20** compile-out, **11** entrypoint and
+  **50** runtime-smoke regressions), started-entrypoint smoke **5/5**, binary
+  marker scan and final filesystem assertion. It reports `opencode v2.2.7`
+  (image ID `600a2c6583c64cdac0f279c45717857c1cd17d971642321e16f129692e2983d9`).
+  The independent exported-rootfs/full-image-config verifier and all **45**
+  out-of-band regressions also passed.
+- The local `check-worker-exposure-policy.sh` guard, goal-1 CI **286/286**,
+  worker build args **16/16**, reproducibility **7/7**, Kimi image-mode tests,
+  relevant mt-admin Kimi/OpenCode2/image-contract/startup/egress harnesses,
+  eight CI YAML validations, Bash syntax, pinned ShellCheck 0.11.0 and
+  `git diff --check` passed. Both builds used mt-admin's rootless Podman
+  network/format/build-arg shape under goal-specific tags, not the root-only
+  mt-admin commands, and changed no tenant image or container.
+- **Still CI/deployment acceptance:** no exact-head MR pipeline or protected
+  candidate, clean-rebuild digest comparison, scan or promotion ran. No live
+  Console connection, tenant rollout or live-model dispatch was attempted.
+  The local guard and image builds do not substitute for those gates.
 
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 
