@@ -1517,11 +1517,15 @@ mod tests {
             return;
         }
         let mut cmd = spawner.command("sleep", &["317"]);
+        let spec = spawner.prepare_service(&mut cmd).expect("service spec");
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let spec = spawner.prepare_service(&mut cmd).expect("service spec");
         let unit = spec.unit_name();
+        let _cleanup = SynchronousUnitCleanup {
+            unit: unit.clone(),
+            xdg_runtime_dir: spawner.xdg_runtime_dir().map(str::to_string),
+        };
         let child = cmd.spawn().expect("spawn sleep via service");
         let guard = ProcessTreeGuard::for_service(&child, Some(&spec), spawner.xdg_runtime_dir());
 
@@ -1529,7 +1533,7 @@ mod tests {
         // the guard and the child drop without any explicit stop call.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if unit_exists(&unit).await {
+            if unit_exists(&unit, spawner.xdg_runtime_dir()).await {
                 break;
             }
             assert!(
@@ -1545,7 +1549,7 @@ mod tests {
         // owns) without the caller awaiting anything beyond this check.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if !unit_exists(&unit).await {
+            if !unit_exists(&unit, spawner.xdg_runtime_dir()).await {
                 break;
             }
             assert!(
@@ -1591,6 +1595,9 @@ mod tests {
         cmd.env("PATH", "/usr/bin:/bin");
         cmd.env("LW2_TEST_SAFE", "safe-value");
         let spec = spawner.prepare_service(&mut cmd);
+        if let Some(dir) = spawner.xdg_runtime_dir() {
+            cmd.env("XDG_RUNTIME_DIR", dir);
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1600,7 +1607,11 @@ mod tests {
         let out = child.wait_with_output().await.expect("wait");
         guard.disarm();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "env dump failed: {stdout}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "env dump failed: stdout: {stdout}\nstderr: {stderr}"
+        );
         // The unit's environment must be exactly the allowlisted set: any
         // manager-inherited variable appearing here means UnsetEnvironment
         // did not apply.
@@ -1625,12 +1636,30 @@ mod tests {
         );
     }
 
+    struct SynchronousUnitCleanup {
+        unit: String,
+        xdg_runtime_dir: Option<String>,
+    }
+
+    impl Drop for SynchronousUnitCleanup {
+        fn drop(&mut self) {
+            let mut stop = std::process::Command::new("systemctl");
+            stop.arg("--user").arg("stop").arg(&self.unit);
+            if let Some(dir) = &self.xdg_runtime_dir {
+                stop.env("XDG_RUNTIME_DIR", dir);
+            }
+            let _ = stop
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     /// Whether a transient unit is still known to the user manager.
-    async fn unit_exists(unit: &str) -> bool {
-        let mut probe = Command::new("systemctl");
-        probe.args(["--user", "--quiet", "is-active", unit]);
+    async fn unit_exists(unit: &str, xdg_runtime_dir: Option<&str>) -> bool {
+        let mut probe = user_systemctl(&["--quiet", "is-active", unit], xdg_runtime_dir);
         probe
-            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         // is-active exits 0 for active, 3 for inactive; a non-zero exit with
