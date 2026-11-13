@@ -257,6 +257,9 @@ class SatelliteAdvisorySweepTests(unittest.TestCase):
             '--db "$db_dir"',
             "--no-fetch --stale",
             "-D unsound -D yanked",
+            "expected exactly one advisory database",
+            "couldn't check if the package is yanked",
+            "couldn't open crates.io index",
         )
         for fragment in fragments:
             with self.subTest(fragment=fragment):
@@ -329,12 +332,20 @@ esac
 
     CARGO_AUDIT_STUB = """#!/bin/sh
 printf '%s\\n' "$*" > "$AUDIT_ARGS"
-if [ "${AUDIT_MODE:-clean}" = "fail" ]; then
-    echo 'error[unsound]: xattr functions mark unwritten bytes as initialized'
-    echo 'ID: RUSTSEC-2026-0486'
-    echo 'crate: rustix 1.1.4'
-    exit 1
-fi
+case "${AUDIT_MODE:-clean}" in
+    fail)
+        echo 'error[unsound]: xattr functions mark unwritten bytes as initialized'
+        echo 'ID: RUSTSEC-2026-0486'
+        echo 'crate: rustix 1.1.4'
+        exit 1
+        ;;
+    unknown-yank)
+        echo "error: couldn't check if the package is yanked: not found: No such crate in crates.io index: tinyvec_macros"
+        ;;
+    no-index)
+        echo "warning: couldn't open crates.io index"
+        ;;
+esac
 echo 'advisories ok'
 """
 
@@ -367,6 +378,7 @@ echo 'advisories ok'
         result = self.run_sweep()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"OK   {self.OVERRIDE} (cargo-audit)", result.stdout)
+        self.assertIn("yank status best-effort from the cached crates.io index; 0 crate check(s) inconclusive", result.stdout)
         self.assertIn("advisory-db commit: 0123456789abcdef", result.stdout)
         args = self.audit_args.read_text(encoding="utf-8")
         self.assertIn(f"audit --file {self.root}/{self.OVERRIDE}", args)
@@ -374,6 +386,27 @@ echo 'advisories ok'
         self.assertIn("--no-fetch --stale", args)
         self.assertIn("-D unsound -D yanked", args)
         self.assertNotIn("--ignore", args)
+
+    def test_inconclusive_yank_check_is_counted_in_status_line(self):
+        result = self.run_sweep(mode="unknown-yank")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("tinyvec_macros", output)
+        self.assertIn(
+            f"OK   {self.OVERRIDE} (cargo-audit); yank status best-effort from the cached crates.io index; "
+            "1 crate check(s) inconclusive",
+            result.stdout,
+        )
+
+    def test_unavailable_index_is_not_reported_as_a_complete_yank_check(self):
+        result = self.run_sweep(mode="no-index")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn(
+            "yank status unavailable: could not open the cached crates.io index; no crates checked for yanks",
+            result.stdout,
+        )
+        self.assertNotIn("0 crate check(s) inconclusive", result.stdout)
 
     def test_advisory_failure_names_id_and_crate(self):
         result = self.run_sweep(mode="fail")
@@ -387,6 +420,15 @@ echo 'advisories ok'
         result = self.run_sweep(cargo_home=self.base / "empty-cargo")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("left no advisory database", result.stderr)
+        self.assertFalse(self.audit_args.exists())
+
+    def test_multiple_shared_dbs_fail_before_audit(self):
+        (self.cargo_home / "advisory-dbs/advisory-db-old").mkdir()
+        result = self.run_sweep()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("expected exactly one advisory database", result.stderr)
+        self.assertIn("found 2", result.stderr)
+        self.assertIn(str(self.db_dir), result.stderr)
         self.assertFalse(self.audit_args.exists())
 
 
