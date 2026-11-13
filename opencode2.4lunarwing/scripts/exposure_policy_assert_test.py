@@ -246,6 +246,60 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("opencode-exposure-guard.sh", result.stderr)
 
+    def test_console_watches_opt_in_in_config_fails(self) -> None:
+        # WI#609 AAV-1: either key turns the Console event watches flag on.
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (
+            {"console_watches": True},
+            {"all_flags": True},
+            {"console_watches": "true"},
+            {"all_flags": None},
+            {"todo": False, "console_watches": True},
+        ):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must not set experimental flags", result.stderr)
+
+    def test_unrelated_or_explicitly_off_experimental_settings_pass(self) -> None:
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (
+            {},
+            {"console_watches": False, "all_flags": False},
+            {"todo": True},
+        ):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("leaves the Console event watches flag off", result.stdout)
+
+    def test_wrapper_without_a_live_flag_pin_fails(self) -> None:
+        # WI#609 AAV-1: the pin has to be a statement, and the last word on
+        # OPENCODE_FLAGS before the real binary starts.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        self.assertEqual(text.count(pin + launch), 1)
+        for label, replacement in (
+            ("removed", launch),
+            ("only a comment", "# " + pin + launch),
+            ("after the exec", launch + "\n" + pin),
+            ("unset again", pin + "unset OPENCODE_FLAGS\n" + launch),
+            ("overwritten", pin + 'OPENCODE_FLAGS="all"\n' + launch),
+            ("a different flag", 'export OPENCODE_FLAGS="-schedules"\n' + launch),
+            ("turned on", 'export OPENCODE_FLAGS="console_watches"\n' + launch),
+        ):
+            with self.subTest(label=label):
+                wrapper.write_text(text.replace(pin + launch, replacement), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("as the last OPENCODE_FLAGS statement", result.stderr)
+
     def test_binary_marker_fails(self) -> None:
         binary = self.root / "opencode"
         binary.write_bytes(b"\x7fELF fake build embedding https://opentunnel.xyz relay")
@@ -383,6 +437,54 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
             self.assertEqual(result.stdout.strip(), " ".join(form))
+
+    def test_console_watches_flag_is_forced_off_for_the_real_binary(self) -> None:
+        # WI#609 AAV-1: whatever OPENCODE_FLAGS the caller holds, the real
+        # binary starts with exactly "-console_watches" and its argv intact.
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = pathlib.Path(temporary) / "opencode"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "printf 'flags=%s\\n' \"${OPENCODE_FLAGS-<unset>}\"\n"
+                "printf 'arg=%s\\n' \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            for inherited in (None, "", "all", "console_watches", "schedules,console_watches",
+                              "-console_watches,console_watches"):
+                for form in (("serve", "--port", "4096", "--hostname", "127.0.0.1"), ("run", "x")):
+                    with self.subTest(inherited=inherited, form=form):
+                        env = dict(os.environ)
+                        env["LUNARWING_REAL_OPENCODE"] = str(fake)
+                        env.pop("OPENCODE_FLAGS", None)
+                        if inherited is not None:
+                            env["OPENCODE_FLAGS"] = inherited
+                        result = subprocess.run(
+                            ["sh", str(WRAPPER), *form],
+                            capture_output=True, text=True, env=env, timeout=60,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(
+                            result.stdout.splitlines(),
+                            ["flags=-console_watches", *(f"arg={arg}" for arg in form)],
+                        )
+
+    def test_refusals_come_before_the_real_binary_and_its_environment(self) -> None:
+        # The pin sits right before the exec, so a refused command still
+        # never reaches the real binary.
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "ran"
+            fake = pathlib.Path(temporary) / "opencode"
+            fake.write_text(f"#!/bin/sh\n: > '{marker}'\n", encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ)
+            env["LUNARWING_REAL_OPENCODE"] = str(fake)
+            result = subprocess.run(
+                ["sh", str(WRAPPER), "pair", "--remote", "--yes"],
+                capture_output=True, text=True, env=env, timeout=60,
+            )
+            self.assertEqual(result.returncode, 77)
+            self.assertFalse(marker.exists())
 
 
 class ImageFilesystemDependencyTests(unittest.TestCase):
