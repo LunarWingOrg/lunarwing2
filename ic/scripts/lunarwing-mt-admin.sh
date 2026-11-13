@@ -484,6 +484,9 @@ Commands:
                                   No-op when the podman probe is healthy.
   start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
   stop-pg <name>                  Stop only the tenant's PostgreSQL
+  refresh-pg-image <name>         Pull the configured image, recreate PostgreSQL on its
+                                  existing named volume, health-gate, and restore daemon state
+  pg-image-status <name>          Print container image reference/ID and SELECT version()
   start-worker <name> <worker>    Start one enabled external worker
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
@@ -1505,6 +1508,22 @@ main() {
       _pg_only_name="$(sanitize_name "$1")"
       tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
       stop_tenant_postgres "$_pg_only_name"
+      ;;
+
+    refresh-pg-image)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: refresh-pg-image <name>"
+      ports_registry_init
+      _pg_only_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_pg_only_name" \
+        refresh_tenant_postgres_image "$_pg_only_name"
+      ;;
+
+    pg-image-status)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: pg-image-status <name>"
+      ports_registry_require_readonly
+      tenant_postgres_image_status "$1"
       ;;
 
     start-worker|stop-worker|restart-worker|kill-worker)
