@@ -553,6 +553,7 @@ async fn late_stop_request_timeout_has_its_own_error() {
 
 #[tokio::test]
 async fn late_post_stop_wait_timeout_has_its_own_error() {
+    // `wait` returns false only when its post-stop grace expires.
     let error = TurnCompletion::require_late_stop_settled(std::future::ready(false))
         .await
         .unwrap_err();
