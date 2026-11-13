@@ -691,16 +691,74 @@ worker_egress_stop_keeper() {
     || { printf 'worker-egress: cannot remove rootless namespace keeper %s\n' "$keeper" >&2; return 1; }
 }
 
+# The one container that may stay on a tenant's egress network until the
+# teardown is the infra container of its rootless namespace keeper. Print that
+# container's full ID, or nothing when there is no keeper to exempt: rootful
+# runtimes have none. The ID comes from the keeper pod itself, as in the
+# guard's validate_keeper, so a container that merely carries the keeper's
+# label is still counted as attached, and a foreign pod of the keeper's name
+# exempts nothing. Returns 1 when a keeper exists but cannot be identified.
+_worker_egress_keeper_infra_id() {
+  local name="$1" keeper purpose infra
+  [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
+  keeper="lw-egress-keeper-$name"
+  _ctr "$name" pod exists "$keeper" || return 0
+  purpose="$(
+    _ctr "$name" pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper" 2>/dev/null
+  )" || return 1
+  [[ "$purpose" == worker-egress-keeper ]] || return 0
+  infra="$(_ctr "$name" pod inspect --format '{{.InfraContainerID}}' "$keeper" 2>/dev/null)" || return 1
+  [[ -n "$infra" ]] || return 1
+  printf '%s\n' "$infra"
+}
+
+# The attachment query uses the network filter alone and drops the keeper by
+# ID in the shell. A negated label filter would do it in one call on Podman,
+# but Docker's `ps` rejects `label!=`, and then every teardown on a rootful
+# Docker host would refuse.
+worker_egress_assert_detached() {
+  local name="$1" network keeper_infra listed id cname attached=""
+  network="$(worker_egress_network_name "$name")"
+  ensure_container_runtime
+  keeper_infra="$(_worker_egress_keeper_infra_id "$name")" || {
+    printf 'worker-egress: cannot identify the namespace keeper of %s; refusing teardown\n' "$network" >&2
+    return 1
+  }
+  listed="$(_ctr "$name" ps --all --no-trunc --filter "network=$network" \
+    --format '{{.ID}} {{.Names}}' 2>/dev/null)" \
+    || { printf 'worker-egress: cannot verify attachments on %s; refusing teardown\n' "$network" >&2; return 1; }
+  while read -r id cname; do
+    [[ -n "$id" ]] || continue
+    [[ -z "$keeper_infra" || "$id" != "$keeper_infra" ]] || continue
+    attached+="${attached:+, }${cname:-$id}"
+  done <<<"$listed"
+  if [[ -n "$attached" ]]; then
+    printf 'worker-egress: containers still attached to %s; refusing teardown: %s\n' \
+      "$network" "$attached" >&2
+    return 1
+  fi
+}
+
 # Tenant removal must not leave the egress network, the rendered state or the
 # live chains behind for a later tenant of the same name to inherit (OQ-6).
-# Every step is best-effort: the tenant account may already be gone.
+# Check before releasing the keeper so an attachment refusal preserves both the
+# rootless namespace and its chains. Once clear, flush before dropping them.
 worker_egress_teardown() {
-  local name="$1" network conf ruleset hosts
+  local name="$1" network conf ruleset hosts network_rm_out
   _worker_egress_validate_name "$name"
-  worker_egress_flush "$name" || true
-  worker_egress_stop_keeper "$name" || true
+  worker_egress_assert_detached "$name" || return 1
+  worker_egress_flush "$name"
+  worker_egress_stop_keeper "$name" || return 1
   network="$(worker_egress_network_name "$name")"
-  _ctr "$name" network rm "$network" >/dev/null 2>&1 || true
+  network_rm_out="$(_ctr "$name" network rm "$network" 2>&1)" || {
+    case "${network_rm_out,,}" in
+      *"network not found"*|*"network "*" not found"*|*"no such network"*|*"unable to find network with name or id"*) ;;
+      *)
+        printf 'worker-egress: cannot remove network %s: %s\n' \
+          "$network" "${network_rm_out//$'\n'/ }" >&2
+        return 1 ;;
+    esac
+  }
   _worker_egress_lock
   conf="$(worker_egress_conf_path "$name")"
   ruleset="$(worker_egress_ruleset_path "$name")"

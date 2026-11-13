@@ -85,21 +85,26 @@ re-probe and bounded inspection, firewall, and cleanup probes. A shell caller
 can time out first; the sidecar-owned attempt still finishes and records its
 result.
 
-Per-command recovery instead re-probes an existing sidecar for at most **6
-seconds**, waits at most **20 seconds** for a fresh provider (or the configured
-startup timeout when lower), and caps the initial health check, recovery, and
-final verification together at **60 seconds**. The per-run error names the
-failed image, runtime, handshake, canary, `netbird status`, or firewall probe.
-If a provider needs longer than the 20-second cap after recreation, the error
-and this contract require a daemon restart so the cold-start budget applies. A
-failed recovery is cached for **30 seconds**: commands inside that window return
-the original reason and the time until the next attempt immediately, without
-more container churn. After the window, one command tries again. Recovery is
-owned by the sidecar rather than the caller: cancelling a short shell command or
-stopping it does not cancel the attempt, its cleanup, or recording of its
-result. Later callers await that same attempt and then use its recorded
-back-off. If the task ends without publishing a result, the closed channel is
-also converted into a recorded failure instead of wedging later commands.
+Each per-command health-verification chain has its own **65-second ceiling**,
+separate from recovery's **60-second budget**. The health ceiling bounds the
+seven sequential probes below their aggregate 70 seconds of individual
+10-second deadlines, without rejecting a slow but successful chain merely for
+crossing 60 seconds. Recovery re-probes an existing sidecar for at most **6
+seconds** and waits at most **20 seconds** for a fresh provider (or the
+configured startup timeout when lower); the final verification has another
+65-second health ceiling. The per-run error names the failed image, runtime,
+handshake, canary, `netbird status`, or firewall probe. A health-check timeout
+never claims that recovery ran, and only an actual failed recovery is cached
+for **30 seconds**: commands inside that window return the original reason and
+the time until the next attempt immediately, without more container churn.
+After the window, one command tries again. If a provider needs longer than the
+20-second cap after recreation, the error and this contract require a daemon
+restart so the cold-start budget applies. Recovery is owned by the sidecar
+rather than the caller: cancelling a short shell command or stopping it does
+not cancel the attempt, its cleanup, or recording of its result. Later callers
+await that same attempt and then use its recorded back-off. If the task ends
+without publishing a result, the closed channel is also converted into a
+recorded failure instead of wedging later commands.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
@@ -199,6 +204,19 @@ peer instead of spending another setup key. Rotating the key or URL enrols a
 fresh peer and prunes only this instance's previous volume; revoke the old peer
 in NetBird afterwards. If the identity salt cannot be read or created, the
 tunnel fails closed rather than falling back to a runtime or temporary path.
+New salts are written and synced under a unique temporary name in the same
+directory, published to the final name with a no-replace hard link, and followed
+by a directory sync. The final name therefore never exposes a partially written
+salt, and concurrent creators converge on one complete file.
+
+A damaged existing salt is still refused rather than silently replaced. To
+recover from a truncated or corrupt salt, stop the daemon or tenant, remove the
+instance's NetBird sidecar container so it cannot be adopted, and delete only
+`$LUNARWING_BASE_DIR/sandbox-tunnel-identity.salt` as the daemon's user before
+restarting it. This deliberately creates a new peer identity: the next start
+uses a new state volume and re-enrols once, so a valid reusable or replacement
+setup key is required and the overlay address can change. The previous
+instance-scoped volume is pruned; revoke the old peer in NetBird after recovery.
 
 The uplink allowance relies on NetBird's advanced routing: its control-plane
 and WireGuard sockets carry the `0x1bd00` mark, which the sidecar's `output`

@@ -246,7 +246,22 @@ class SatelliteAdvisorySweepTests(unittest.TestCase):
 
     def test_wrapper_losing_guards_is_rejected(self):
         contract = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/check-satellite-advisories.sh"]}}
-        for fragment in ("ls-files", "ic/deny.toml", "--workspace --all-features", "check advisories bans"):
+        fragments = (
+            "ls-files",
+            "ic/deny.toml",
+            "--workspace --all-features",
+            "check advisories bans",
+            "pebble4lunarwing/upstream/Cargo.lock",
+            '"$audit_bin" audit',
+            '--file "$repo_root/$override_lock"',
+            '--db "$db_dir"',
+            "--no-fetch --stale",
+            "-D unsound -D yanked",
+            "expected exactly one advisory database",
+            "couldn't check if the package is yanked",
+            "couldn't open crates.io index",
+        )
+        for fragment in fragments:
             with self.subTest(fragment=fragment):
                 text = SWEEP.read_text(encoding="utf-8")
                 self.assertIn(fragment, text)
@@ -258,6 +273,163 @@ class SatelliteAdvisorySweepTests(unittest.TestCase):
 
     def test_sweep_is_a_full_validation_job(self):
         self.assertIn("satellite-advisory-sweep", config.FULL_VALIDATION_JOBS)
+
+    def test_ci_installs_cargo_audit_before_the_sweep(self):
+        self.assertEqual(
+            config.ADVISORY_GATE_SCRIPTS["satellite-advisory-sweep"],
+            [
+                "bash .gitlab/scripts/install-cargo-deny.sh",
+                "bash .gitlab/scripts/install-cargo-audit.sh",
+                "bash .gitlab/scripts/check-satellite-advisories.sh",
+            ],
+        )
+
+
+class PebbleOverrideAuditTests(unittest.TestCase):
+    """WI#626: the manifest-less override uses the existing DB and fails closed."""
+
+    OVERRIDE = "pebble4lunarwing/upstream/Cargo.lock"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = pathlib.Path(temporary.name)
+        self.root = self.base / "repo"
+        self.root.mkdir()
+        self.stub_bin = self.base / "bin"
+        self.stub_bin.mkdir()
+        self.cargo_home = self.base / "cargo"
+        self.db_dir = self.cargo_home / "advisory-dbs/advisory-db-test"
+        self.db_dir.mkdir(parents=True)
+        self.audit_args = self.base / "audit-args"
+        lock = self.root / self.OVERRIDE
+        lock.parent.mkdir(parents=True)
+        lock.write_text("# test lockfile\n", encoding="utf-8")
+        self._stub("git", self.GIT_STUB)
+        self._stub("taskset", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self._stub("cargo-audit", self.CARGO_AUDIT_STUB)
+
+    GIT_STUB = """#!/bin/sh
+case " $* " in
+    *" rev-parse --show-toplevel "*)
+        printf '%s\\n' "$FAKE_ROOT"
+        ;;
+    *" ls-files "*)
+        printf '%s\\n' 'pebble4lunarwing/upstream/Cargo.lock'
+        ;;
+    *" rev-parse HEAD "*)
+        printf '%s\\n' '0123456789abcdef0123456789abcdef01234567'
+        ;;
+    *" log -1 --format=%cs "*)
+        printf '%s\\n' '2026-11-12'
+        ;;
+    *)
+        echo "unexpected git invocation: $*" >&2
+        exit 2
+        ;;
+esac
+"""
+
+    CARGO_AUDIT_STUB = """#!/bin/sh
+printf '%s\\n' "$*" > "$AUDIT_ARGS"
+case "${AUDIT_MODE:-clean}" in
+    fail)
+        echo 'error[unsound]: xattr functions mark unwritten bytes as initialized'
+        echo 'ID: RUSTSEC-2026-0486'
+        echo 'crate: rustix 1.1.4'
+        exit 1
+        ;;
+    unknown-yank)
+        echo "error: couldn't check if the package is yanked: not found: No such crate in crates.io index: tinyvec_macros"
+        ;;
+    no-index)
+        echo "warning: couldn't open crates.io index"
+        ;;
+esac
+echo 'advisories ok'
+"""
+
+    def _stub(self, name, text):
+        path = self.stub_bin / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_sweep(self, mode="clean", cargo_home=None):
+        env = dict(os.environ)
+        env.update(
+            {
+                "PATH": f"{self.stub_bin}:{os.environ['PATH']}",
+                "FAKE_ROOT": str(self.root),
+                "AUDIT_ARGS": str(self.audit_args),
+                "AUDIT_MODE": mode,
+                "CARGO_HOME": str(cargo_home or self.cargo_home),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(SWEEP)],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_clean_override_uses_shared_db_without_fetching(self):
+        result = self.run_sweep()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"OK   {self.OVERRIDE} (cargo-audit)", result.stdout)
+        self.assertIn("yank status best-effort from the cached crates.io index; 0 crate check(s) inconclusive", result.stdout)
+        self.assertIn("advisory-db commit: 0123456789abcdef", result.stdout)
+        args = self.audit_args.read_text(encoding="utf-8")
+        self.assertIn(f"audit --file {self.root}/{self.OVERRIDE}", args)
+        self.assertIn(f"--db {self.db_dir}", args)
+        self.assertIn("--no-fetch --stale", args)
+        self.assertIn("-D unsound -D yanked", args)
+        self.assertNotIn("--ignore", args)
+
+    def test_inconclusive_yank_check_is_counted_in_status_line(self):
+        result = self.run_sweep(mode="unknown-yank")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("tinyvec_macros", output)
+        self.assertIn(
+            f"OK   {self.OVERRIDE} (cargo-audit); yank status best-effort from the cached crates.io index; "
+            "1 crate check(s) inconclusive",
+            result.stdout,
+        )
+
+    def test_unavailable_index_is_not_reported_as_a_complete_yank_check(self):
+        result = self.run_sweep(mode="no-index")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn(
+            "yank status unavailable: could not open the cached crates.io index; no crates checked for yanks",
+            result.stdout,
+        )
+        self.assertNotIn("0 crate check(s) inconclusive", result.stdout)
+
+    def test_advisory_failure_names_id_and_crate(self):
+        result = self.run_sweep(mode="fail")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn(f"FAIL {self.OVERRIDE} (cargo-audit)", output)
+        self.assertIn("RUSTSEC-2026-0486", output)
+        self.assertIn("rustix 1.1.4", output)
+
+    def test_missing_shared_db_fails_before_audit(self):
+        result = self.run_sweep(cargo_home=self.base / "empty-cargo")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("left no advisory database", result.stderr)
+        self.assertFalse(self.audit_args.exists())
+
+    def test_multiple_shared_dbs_fail_before_audit(self):
+        (self.cargo_home / "advisory-dbs/advisory-db-old").mkdir()
+        result = self.run_sweep()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("expected exactly one advisory database", result.stderr)
+        self.assertIn("found 2", result.stderr)
+        self.assertIn(str(self.db_dir), result.stderr)
+        self.assertFalse(self.audit_args.exists())
 
 
 if __name__ == "__main__":

@@ -637,10 +637,27 @@ host's concurrent builds before retrying manually.
   `.gitlab/scripts/check-satellite-advisories.sh`, which discovers every
   tracked `Cargo.lock` via `git ls-files` and applies the pinned cargo-deny
   `check advisories bans` with the shared `ic/deny.toml` policy to each manifest
-  root (licenses/sources stay owned by the ic workspace gate); the
-  manifest-less Pebble override lock is covered by its digest/allowlist delta
-  gate (`pebble4lunarwing/scripts/verify_upstream_lock.py`), and an advisory
-  scan for that lock itself is tracked in WI#626;
+  root (licenses/sources stay owned by the ic workspace gate). WI#626 also
+  covers the manifest-less Pebble override lock in that same job: the pinned,
+  SHA-256-verified cargo-audit 0.23.0 installer runs before the sweep, then
+  `cargo-audit --file pebble4lunarwing/upstream/Cargo.lock` reads cargo-deny's
+  exact advisory checkout with `--no-fetch --stale`. Vulnerability and unsound
+  findings deny. Yanked-crate denial is best effort: without a fetch,
+  cargo-audit can consult only the runner's existing crates.io index cache. A
+  cached yanked version fails; each `couldn't check if the package is yanked`
+  diagnostic is counted in the override's OK/FAIL status line. If the index
+  cannot be opened, that line says no crates were checked for yanks instead of
+  claiming a clean yank scan. The job requires exactly one `advisory-db-*`
+  checkout and fails on zero or multiple directories rather than guessing;
+  cargo-audit failures also fail the job. cargo-audit does not read
+  `ic/deny.toml`, and there are no override-specific advisory acceptances
+  today. To accept one, add an explicit `--ignore RUSTSEC-YYYY-NNNN` only to the
+  override audit in `.gitlab/scripts/check-satellite-advisories.sh`, with an
+  adjacent comment recording the reason and clearing owner `WI#N`, and update
+  the argument-list tests and validator in the same change; an acceptance only
+  in `ic/deny.toml` does not cover the override.
+  `pebble4lunarwing/scripts/verify_upstream_lock.py` still independently gates
+  the override's digest and allowlisted package delta;
   `lockfile-only-advisory-guard` runs
   `.gitlab/scripts/check-lockfile-only-advisories.sh` for pins cargo-deny
   cannot see (per-entry `absent`/`no-dev` modes; an entry whose crate leaves
@@ -791,7 +808,11 @@ Unclassified rows make the helper exit non-zero; explicitly accepted additions
 are still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
 external disposition. The helper refuses those rows even when `--accept` names
 them; remove a pending row only after its required evidence is recorded in the
-confidential triage and its exact baseline pin is deliberate.
+confidential triage and its exact baseline pin is deliberate. The list is empty
+as of 2026-11-12: its last row, the `gitlab-pat`-shaped example at `59b4247c2`,
+was settled by an instance administrator (WI#599: `POST /api/v4/admin/token`
+returned 404, so it is not a token on this host) before its exact pin was added.
+Keep the file even when empty; the scanner refuses a missing pending list.
 
 The helper's exit status is 1 when a new unclassified finding was left unpinned,
 or when `--accept` named a pending row and was refused. A pending row that is

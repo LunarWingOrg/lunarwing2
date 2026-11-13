@@ -36,8 +36,8 @@ pub struct SupervisedModeConfig {
     pub source: SupervisedModeSource,
 }
 
-pub(crate) fn set_supervised_cli_override(enabled: bool) {
-    CLI_SUPERVISED_MODE.store(enabled, Ordering::Relaxed);
+pub(crate) fn set_supervised_cli_override(enabled: bool) -> bool {
+    CLI_SUPERVISED_MODE.swap(enabled, Ordering::Relaxed)
 }
 
 /// Agent behavior configuration.

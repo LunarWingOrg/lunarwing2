@@ -861,6 +861,7 @@
 3f9bb7e8679684484343f6481a6b953c9eda2127:ic/vendor/zbus/.cargo-checksum.json:generic-api-key:1
 3f9bb7e8679684484343f6481a6b953c9eda2127:ic/vendor/zstd-sys/zstd/lib/common/xxhash.h:generic-api-key:4913
 3f9bb7e8679684484343f6481a6b953c9eda2127:ic/vendor/zstd-sys/zstd/lib/common/xxhash.h:generic-api-key:4962
+4247229478e0092f219654ab1dff0e977379a815:ic/scripts/lunarwing-mt-admin.sh:generic-api-key:846
 4443b56d47417ce37cac6eb0e41ddaa67eecd7be:ic/src/orchestrator/api.rs:generic-api-key:921
 4634e0efb041ba0cded6c373a6d674081f7dce89:opencode4lunarwing/Dockerfile:generic-api-key:16
 4736a7814bd014426490d6ff88b4100f786e11b7:docs/ops/AGENT_GOALS_2.1.6.0.md:generic-api-key:465
@@ -874,9 +875,13 @@
 4b98f57b8752d4082d5267e3e30c12d4b119f22b:projects/ocr-sidecar/src/main.rs:generic-api-key:2006
 4eca1d6cd8bce27a320a301ee670995630328529:ic/crates/lunarwing_safety/src/lib.rs:private-key:922
 529a2584d6347e01079d6f92bd60f6d6937011b0:ic/vendor/rustls/.cargo-checksum.json:generic-api-key:1
+54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1
+54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/src/helpers.rs:private-key:286
 587ab6618737b0650fc488e4b40c01375366185a:docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:167
+59b4247c2a7984ccd52126e894df98251c10f030:docs/ops/AGENT_GOALS_2.1.6.0.md:gitlab-pat:1270
 5b12a1d8b28a069b6edcc14435c1ab1c7aa4ebef:ic/scripts/tests/test-darkirc-adapter-secret-upload.sh:generic-api-key:32
 66a0c9be9160727a70e188ea696097e30919d4b6:ic/crates/lunarwing_safety/src/lib.rs:private-key:922
+68d8b44ec03ec0e6a2095ce47840ba389eb4242f:lunardepth4lunarwing/scripts/lunarwing_bridge_test.ts:generic-api-key:24
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/aws-lc-rs/.cargo-checksum.json:generic-api-key:1
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/aws-lc-sys/.cargo-checksum.json:generic-api-key:1
 7154611c868684bf30142411abe2d7985ffa9ec4:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1
@@ -1869,6 +1874,7 @@ df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/monty/.cargo-checksum.json:ge
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/ruff_python_ast/.cargo-checksum.json:generic-api-key:1
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/ruff_python_parser/.cargo-checksum.json:generic-api-key:1
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/ruff_python_trivia/.cargo-checksum.json:generic-api-key:1
+f690d36382f77e7133f8e72bfcb4931517b2a44b:lunardepth4lunarwing/scripts/lunarwing_bridge_test.ts:generic-api-key:24
 fb548a6685e69d9096f0ab3b2806387ac7bdfe31:ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:31
 fb548a6685e69d9096f0ab3b2806387ac7bdfe31:ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:32
 fe0af632a12d5139ebc3bc4bd980c53f785433cb:ic/vendor/blake2-0.11.0-rc.6/.cargo-checksum.json:generic-api-key:1

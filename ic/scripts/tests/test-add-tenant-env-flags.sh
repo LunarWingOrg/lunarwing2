@@ -333,6 +333,19 @@ assert_eq "rerun preserves SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS" \
 assert_eq "tunnel knobs are rendered once each" \
   "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "8"
 
+echo "=== LLM retry env preservation tests ==="
+assert_eq "default LLM_MAX_RETRIES" "$(envval LLM_MAX_RETRIES)" "3"
+assert_eq "default billed-empty input-token budget" \
+  "$(envval LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET)" "100000"
+sed -i \
+  -e 's/^LLM_MAX_RETRIES=.*/LLM_MAX_RETRIES=7/' \
+  -e 's/^LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET=.*/LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET=0/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves LLM_MAX_RETRIES" "$(envval LLM_MAX_RETRIES)" "7"
+assert_eq "rerun preserves disabled billed-empty input-token budget" \
+  "$(envval LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET)" "0"
+
 echo "=== live reasoning opt-in preservation tests ==="
 for reasoning_setting in 1 false 0; do
   sed -i "s/^ENGINE_V2_STREAM_REASONING=.*/ENGINE_V2_STREAM_REASONING=$reasoning_setting/" \

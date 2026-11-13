@@ -103,6 +103,29 @@ LLM_API_KEY=your-key
 LLM_MODEL=your-model-name
 ```
 
+### Retry and billed-empty token limits
+
+Configure same-provider retries and the billed-empty input-token threshold in
+`lunarwing.env`:
+
+```bash
+LLM_MAX_RETRIES=3
+LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET=100000
+```
+
+`LLM_MAX_RETRIES` is the maximum number of retries after the initial attempt;
+`0` disables these retries. The billed-empty threshold defaults to `100000`
+reported input tokens. With retries enabled, the first transient billed-empty
+attempt always receives one retry, even if it reaches the threshold by itself.
+Subsequent billed-empty attempts stop once their cumulative reported input
+tokens reach the threshold. Set the threshold to `0` to disable only this token
+limit.
+
+Both controls apply per provider leg and per call. Each failover leg and each
+engine or agent recovery request starts a fresh retry sequence and token
+budget; neither control is a per-turn bound. mt-admin preserves operator-set
+values for both variables across full tenant env re-renders.
+
 ### Optional response cache
 
 Response caching is disabled by default. Enable it in `lunarwing.env` with
@@ -541,13 +564,16 @@ multicast values. Peered WireGuard configs need
 is re-probed after firewall installation. Cold starts use a 6-second adoption
 re-probe and retain the configured `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget
 for a fresh provider; image pull and runtime start have separate bounds.
-Per-command recovery uses the same 6-second re-probe, at most 20 seconds for
-fresh provider readiness (or a lower configured timeout), one 60-second budget
-across health checks and recovery, and a 30-second failure back-off. A provider
-that needs longer after recreation requires a daemon restart. The sidecar-owned
-attempt still finishes and records its result when the calling command is
-cancelled or its result channel closes. Shutdown signals active recovery, uses
-bounded waits, removes late starts, and permits a later explicit cold start.
+Each per-command health-verification chain has a 65-second ceiling, separate
+from recovery's 60-second budget. Recovery uses the same 6-second re-probe and
+at most 20 seconds for fresh provider readiness (or a lower configured
+timeout). Only an actual failed recovery starts the 30-second failure back-off;
+a slow health check does not record or blame a recovery that never ran. A
+provider that needs longer after recreation requires a daemon restart. The
+sidecar-owned attempt still finishes and records its result when the calling
+command is cancelled or its result channel closes. Shutdown signals active
+recovery, uses bounded waits, removes late starts, and permits a later explicit
+cold start.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in

@@ -300,6 +300,31 @@ task unit is harmless, but failure to stop a loaded unit propagates.
 inspect both roles. Both are attached to the tenant egress network and
 verified after start; the item-114 namespace keeper remains in force.
 
+`remove-tenant` uses the same per-lane stop order with and without `--purge`.
+It then removes every supported bridge/task container and IPC volume, every
+OpenRC unit/runlevel link, and the systemd Quadlets. Systemd stops task services
+and reloads the user manager before container deletion, so `Restart=on-failure`
+cannot resurrect a task into teardown. Stop, inspection, container/volume
+removal, attachment-query, keeper-removal, and network-removal failures abort
+the command; they are not warnings.
+
+Egress teardown checks attachments before changing any state. The only
+container it does not count is the managed keeper's own infra container,
+which it identifies by the ID the keeper pod reports. A container that merely
+carries the keeper's label counts as attached, and so does the infra container
+of a foreign pod with the keeper's name. The query uses the network filter
+alone, so it is the same call on Podman and on Docker.
+An attachment refusal, a failed query, or a keeper that cannot be identified
+therefore leaves the running rootless keeper and its namespace, both live
+chains, the egress network, and the rendered state intact for repair and retry
+(rootful runtimes have no keeper). Once clear, teardown flushes the chains,
+removes the keeper, removes the network, and deletes the rendered state, in that
+order. A keeper- or network-removal failure occurs after the flush: rendered
+state still remains for retry, but the live chains have already been deleted.
+At any egress refusal the tenant units, supported containers, and IPC volumes
+are already removed, its ports are deallocated, and with `--purge` its database
+is reset. Remove the unexpected attachment and rerun `remove-tenant` to finish.
+
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
 symlinks only during host preparation is insufficient: the runtime can

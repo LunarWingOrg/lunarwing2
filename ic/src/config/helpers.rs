@@ -609,16 +609,20 @@ mod tests {
     /// WI#287 review S4: every value of the secrets-store overlay is a secret
     /// that is not in the process environment, so the overlay registers it
     /// with the daemon log scrubber (both the single and the merge path).
+    ///
+    /// WI#633: the scrubber is process-wide and add-only, so the fixtures are
+    /// unregistered again; this test leaves it as it found it.
     #[test]
     fn injected_secrets_are_scrubbed_from_daemon_logs() {
         let single = format!("inj-{}", "Zk9".repeat(5));
         let merged = format!("mrg-{}", "Hb6".repeat(5));
+        let scrubber = crate::tracing_fmt::daemon_log_scrubber();
         crate::config::inject_single_var("LUNARWING_WI287_TEST_INJECTED_API_KEY", &single);
         crate::config::merge_injected_vars(HashMap::from([(
             "LUNARWING_WI287_TEST_MERGED_API_KEY".to_string(),
             merged.clone(),
         )]));
-        let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+        let scrubbed = scrubber
             .scrub(&format!("x {single} y {merged} z"))
             .into_owned();
         crate::config::inject_single_var("LUNARWING_WI287_TEST_INJECTED_API_KEY", "");
@@ -626,24 +630,53 @@ mod tests {
         assert!(!scrubbed.contains(&single), "{scrubbed}");
         assert!(!scrubbed.contains(&merged), "{scrubbed}");
         assert!(scrubbed.ends_with(" z"), "{scrubbed}");
+
+        assert!(
+            scrubber.remove_secret(&single),
+            "fixture secret was not registered"
+        );
+        assert!(
+            scrubber.remove_secret(&merged),
+            "fixture secret was not registered"
+        );
+        let cleaned = scrubber
+            .scrub(&format!("x {single} y {merged} z"))
+            .into_owned();
+        assert!(cleaned.contains(&single), "still scrubbed: {cleaned}");
+        assert!(cleaned.contains(&merged), "still scrubbed: {cleaned}");
     }
 
     /// WI#287 review S4: a secret-named runtime override (the interactive
     /// LunarWing Cloud login stores its key here) is scrubbed; values of other
     /// overrides stay visible.
+    ///
+    /// WI#633: `set_runtime_env` only empties the overlay, and the scrubber is
+    /// add-only, so the fixture is unregistered explicitly; this test leaves
+    /// the process-wide scrubber as it found it.
     #[test]
     fn runtime_overrides_for_secret_names_are_scrubbed_from_daemon_logs() {
         let secret = format!("rt-{}", "Wv8".repeat(5));
         let plain = format!("mode-{}", "plain".repeat(3));
+        let scrubber = crate::tracing_fmt::daemon_log_scrubber();
         set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_API_KEY", &secret);
         set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_MODE", &plain);
-        let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+        let scrubbed = scrubber
             .scrub(&format!("a {secret} b {plain} c"))
             .into_owned();
         set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_API_KEY", "");
         set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_MODE", "");
         assert!(!scrubbed.contains(&secret), "{scrubbed}");
         assert!(scrubbed.contains(&plain), "{scrubbed}");
+
+        assert!(
+            scrubber.remove_secret(&secret),
+            "fixture secret was not registered"
+        );
+        let cleaned = scrubber
+            .scrub(&format!("a {secret} b {plain} c"))
+            .into_owned();
+        assert!(cleaned.contains(&secret), "still scrubbed: {cleaned}");
+        assert!(cleaned.contains(&plain), "{cleaned}");
     }
 
     // --- lock_env poison recovery (regression for env mutex cascade) ---

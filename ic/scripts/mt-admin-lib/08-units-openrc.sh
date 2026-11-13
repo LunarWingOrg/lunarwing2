@@ -1567,8 +1567,8 @@ stop_tenant_openrc() {
   # Container babysitters must stop before their containers or they immediately respawn them.
   for worker in nanocode pebble opencode kimi opencode2 lunardepth vision voice; do
     _openrc_stop_service_if_installed "lunarwing-${worker}-${name}-sup" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-${worker}-task-${name}-sup" || stop_failed=true
   done
-  _openrc_stop_service_if_installed "lunarwing-lunardepth-task-${name}-sup" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-vision-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-voice-${name}" || stop_failed=true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
@@ -1621,9 +1621,22 @@ cleanup_legacy_weechat_openrc() {
 }
 
 uninstall_tenant_openrc() {
-  local name="$1" svc failed=false
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-opencode2-${name}-sup" "lunarwing-lunardepth-${name}" "lunarwing-lunardepth-${name}-sup" "lunarwing-lunardepth-task-${name}" "lunarwing-lunardepth-task-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
+  local name="$1" svc worker failed=false
+  local -a services=(
+    "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}"
+    "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"
+    "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
+    "lunarwing-pg-${name}" "lunarwing-pg-${name}-sup"
+  )
+  for worker in nanocode pebble opencode opencode2 lunardepth kimi vision voice; do
+    services+=(
+      "lunarwing-${worker}-${name}" "lunarwing-${worker}-${name}-sup"
+      "lunarwing-${worker}-task-${name}" "lunarwing-${worker}-task-${name}-sup"
+    )
+  done
+  for svc in "${services[@]}"; do
     _openrc_update del "$svc" default 2>/dev/null || true
+    openrc_service_remove_runlevels "$svc" || failed=true
     # rm failures must reach the caller's '|| die': previously the trailing
     # say always returned 0, making that guard dead code (EQ-8).
     rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc" || failed=true
@@ -1632,6 +1645,7 @@ uninstall_tenant_openrc() {
     say "failed to remove one or more OpenRC unit files for $name" >&2
     return 1
   fi
+  remove_tenant_worker_containers "$name" || return 1
   say "uninstalled OpenRC services for $name"
 }
 

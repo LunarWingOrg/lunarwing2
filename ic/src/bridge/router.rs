@@ -3763,14 +3763,13 @@ fn append_channel_constraint(context: &mut Option<String>, constraint: &str) {
 }
 
 fn foreground_thread_config(
-    max_iterations: usize,
+    agent_config: &crate::config::AgentConfig,
     shared_conversation: bool,
-    supervised_mode: bool,
 ) -> ThreadConfig {
     ThreadConfig {
-        max_iterations,
+        max_iterations: agent_config.max_tool_iterations,
         shared_conversation,
-        supervised_mode,
+        supervised_mode: agent_config.supervised_mode.enabled,
         ..Default::default()
     }
 }
@@ -3970,11 +3969,7 @@ async fn handle_with_engine_inner(
         resolve_user_project(&state.store, &message.user_id, state.default_project_id).await?;
 
     let thread_config = {
-        let mut config = foreground_thread_config(
-            agent.max_tool_iterations(),
-            message.is_shared_conversation(),
-            agent.supervised_mode(),
-        );
+        let mut config = foreground_thread_config(agent.config(), message.is_shared_conversation());
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
         }
@@ -6793,9 +6788,57 @@ pub(crate) mod tests {
         );
     }
 
+    struct AgentConfigReset {
+        cli_supervised: bool,
+        runtime_values: [(&'static str, Option<String>); 3],
+    }
+
+    impl AgentConfigReset {
+        const KEYS: [&'static str; 3] = [
+            "AGENT_SUPERVISED_MODE",
+            "AGENT_AUTO_APPROVE_TOOLS",
+            "AGENT_MAX_TOOL_ITERATIONS",
+        ];
+
+        fn new() -> Self {
+            let cli_supervised = crate::config::set_supervised_cli_override(false);
+            let runtime_values =
+                Self::KEYS.map(|key| (key, crate::config::helpers::runtime_env_override(key)));
+            Self {
+                cli_supervised,
+                runtime_values,
+            }
+        }
+
+        fn clear_process_and_runtime() {
+            for key in Self::KEYS {
+                crate::config::set_runtime_env(key, "");
+                // SAFETY: callers hold the crate-wide environment mutex.
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+    }
+
+    impl Drop for AgentConfigReset {
+        fn drop(&mut self) {
+            crate::config::set_supervised_cli_override(self.cli_supervised);
+            for (key, value) in &self.runtime_values {
+                crate::config::set_runtime_env(key, value.as_deref().unwrap_or(""));
+            }
+        }
+    }
+
     #[test]
-    fn foreground_thread_config_uses_resolved_agent_iteration_limit() {
-        let config = foreground_thread_config(979, true, false);
+    fn foreground_thread_config_uses_resolved_agent_config() {
+        let _environment = crate::config::helpers::lock_env();
+        let _reset = AgentConfigReset::new();
+        AgentConfigReset::clear_process_and_runtime();
+        let mut settings = crate::settings::Settings::default();
+        settings.agent.max_tool_iterations = 979;
+        let agent_config =
+            crate::config::AgentConfig::resolve(&settings).expect("resolve agent config");
+
+        let config = foreground_thread_config(&agent_config, true);
 
         assert_eq!(config.max_iterations, 979);
         assert!(config.shared_conversation);
@@ -6806,21 +6849,9 @@ pub(crate) mod tests {
     fn supervised_cli_flag_flows_into_foreground_thread_config() {
         use clap::Parser;
 
-        struct AgentOverrideReset;
-        impl Drop for AgentOverrideReset {
-            fn drop(&mut self) {
-                crate::config::set_supervised_cli_override(false);
-                crate::config::set_runtime_env("AGENT_SUPERVISED_MODE", "");
-                crate::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "");
-            }
-        }
-
         let _environment = crate::config::helpers::lock_env();
-        let _reset = AgentOverrideReset;
-        // SAFETY: the crate-wide environment mutex is held for this test.
-        unsafe { std::env::remove_var("AGENT_SUPERVISED_MODE") };
-        crate::config::set_runtime_env("AGENT_SUPERVISED_MODE", "");
-        crate::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "");
+        let _reset = AgentConfigReset::new();
+        AgentConfigReset::clear_process_and_runtime();
 
         let cli = crate::cli::Cli::try_parse_from(["lunarwing", "--supervised"])
             .expect("parse supervised CLI");
@@ -6828,11 +6859,7 @@ pub(crate) mod tests {
         let agent_config =
             crate::config::AgentConfig::resolve(&crate::settings::Settings::default())
                 .expect("resolve CLI-only agent config");
-        let config = foreground_thread_config(
-            agent_config.max_tool_iterations,
-            false,
-            agent_config.supervised_mode.enabled,
-        );
+        let config = foreground_thread_config(&agent_config, false);
         assert!(config.supervised_mode);
         assert_eq!(
             agent_config.supervised_mode.source,
@@ -6847,16 +6874,20 @@ pub(crate) mod tests {
         let agent_config =
             crate::config::AgentConfig::resolve(&crate::settings::Settings::default())
                 .expect("resolve conflicting agent config");
-        let config = foreground_thread_config(
-            agent_config.max_tool_iterations,
-            false,
-            agent_config.supervised_mode.enabled,
-        );
+        let config = foreground_thread_config(&agent_config, false);
         assert!(agent_config.auto_approve_tools);
         assert!(
             config.supervised_mode,
             "CLI supervision must beat env false"
         );
+
+        AgentConfigReset::clear_process_and_runtime();
+        let cli = crate::cli::Cli::try_parse_from(["lunarwing"]).expect("parse default CLI");
+        cli.apply_agent_overrides();
+        let agent_config =
+            crate::config::AgentConfig::resolve(&crate::settings::Settings::default())
+                .expect("resolve default agent config");
+        assert!(!foreground_thread_config(&agent_config, false).supervised_mode);
     }
 
     pub(super) struct TestStore {

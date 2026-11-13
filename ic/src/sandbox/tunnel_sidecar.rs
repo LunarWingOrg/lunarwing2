@@ -57,6 +57,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const RUN_HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(65);
 const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
 const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
@@ -1177,8 +1178,10 @@ impl TunnelSidecar {
     }
 
     fn netbird_state_volume(&self) -> Result<String> {
-        let salt = read_or_create_identity_salt(&self.base_dir).map_err(|_| {
-            self.unavailable("could not read or create the persistent identity salt")
+        let salt = read_or_create_identity_salt(&self.base_dir).map_err(|error| {
+            self.unavailable(&format!(
+                "could not read or create the persistent identity salt: {error}"
+            ))
         })?;
         Ok(self.cfg.netbird_state_volume(&self.instance_id, &salt))
     }
@@ -1208,34 +1211,28 @@ impl TunnelSidecar {
         .await
     }
 
-    /// Bound the initial health check, any recovery, and the final verification
-    /// together so image and runtime probes cannot add a second budget.
+    /// Health verification has its own ceiling, separate from recovery's budget.
     pub async fn container_for_run(&self) -> Result<String> {
-        let attempt = async {
-            match self.ensure_healthy().await {
-                Ok(container_id) => Ok(container_id),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
-                    );
-                    self.recover_for_run().await?;
-                    self.ensure_healthy().await
-                }
+        match self.ensure_healthy_for_run().await {
+            Ok(container_id) => Ok(container_id),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
+                );
+                self.recover_for_run().await?;
+                self.ensure_healthy_for_run().await
             }
-        };
-        match tokio::time::timeout(RUN_RECOVERY_BUDGET, attempt).await {
+        }
+    }
+
+    async fn ensure_healthy_for_run(&self) -> Result<String> {
+        match tokio::time::timeout(RUN_HEALTH_CHECK_BUDGET, self.ensure_healthy()).await {
             Ok(result) => result,
-            Err(_) => {
-                let error = RecoveryError::Unavailable {
-                    reason: format!(
-                        "{} sidecar: health check and recovery exceeded the 60s per-run budget during image, runtime, provider, or firewall probes",
-                        self.cfg.provider.as_str()
-                    ),
-                };
-                self.lifecycle.state.lock().await.record(&error);
-                Err(error.into_sandbox())
-            }
+            Err(_) => Err(self.unavailable(&format!(
+                "health check exceeded the {}s health-check budget during image, runtime, provider, or firewall probes",
+                RUN_HEALTH_CHECK_BUDGET.as_secs()
+            ))),
         }
     }
 
@@ -1557,27 +1554,53 @@ impl TunnelSidecar {
 
     async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut cleanup = SidecarStartCleanup::new(self.clone());
+        let result = self.wait_healthy_until(deadline, timeout).await;
+        if result.is_err() {
+            self.remove_unlocked().await;
+        }
+        cleanup.disarm();
+        result
+    }
+
+    async fn wait_healthy_until(
+        &self,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<()> {
         loop {
-            let error = match self.provider_health().await {
-                Ok(()) => {
-                    return match self.check_egress_firewall().await {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            self.remove_unlocked().await;
-                            Err(error)
-                        }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.health_timeout_error(timeout, None));
+            }
+            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+                Ok(Ok(())) => {
+                    return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(self.health_timeout_error(timeout, None)),
                     };
                 }
-                Err(error) => error,
+                Ok(Err(error)) => error,
+                Err(_) => return Err(self.health_timeout_error(timeout, None)),
             };
-            if tokio::time::Instant::now() >= deadline {
-                self.remove_unlocked().await;
-                return Err(self.error_with_context(
-                    error,
-                    &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
-                ));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.health_timeout_error(timeout, Some(error)));
+            }
+            if remaining <= HEALTH_POLL_INTERVAL {
+                tokio::time::sleep(remaining).await;
+                return Err(self.health_timeout_error(timeout, Some(error)));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    fn health_timeout_error(&self, timeout: Duration, error: Option<SandboxError>) -> SandboxError {
+        let context = format!("sidecar remained unhealthy for {}s", timeout.as_secs());
+        match error {
+            Some(error) => self.error_with_context(error, &context),
+            None => self.unavailable(&context),
         }
     }
 
@@ -1974,6 +1997,16 @@ impl TunnelSidecar {
     /// does, so nothing is signalled unless the runtime positively reports
     /// that no container has the sidecar's name.
     async fn release_network_helper(&self) {
+        // A sidecar on the test runtime has no real container and no helper
+        // unit, so there is nothing to release. Asking the workload spawner
+        // from such a test would also run its one-time probe, a real
+        // `systemd-run`, inside the test: under a paused clock the probe's
+        // timeout fires at once, which costs five virtual seconds and caches
+        // "no systemd services" for the rest of the test binary (WI#654).
+        #[cfg(test)]
+        if self.test_runtime.is_some() {
+            return;
+        }
         let spawner = crate::tools::process::workload_spawner().await;
         if !spawner.uses_systemd_services() {
             return;
@@ -2146,28 +2179,61 @@ fn read_or_create_identity_salt(base_dir: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn read_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(std::io::Error::new(
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| identity_salt_io_error(path, "could not be opened", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| identity_salt_io_error(path, "could not be inspected", error))?;
+    if !metadata.is_file() {
+        return Err(identity_salt_error(
+            path,
             std::io::ErrorKind::PermissionDenied,
-            "identity salt must be a regular, non-symlink file",
+            "must be a regular file",
         ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(std::io::Error::new(
+            return Err(identity_salt_error(
+                path,
                 std::io::ErrorKind::PermissionDenied,
-                "identity salt must not be accessible by group or other users",
+                "must not be accessible by group or other users",
             ));
         }
     }
-    let salt = std::fs::read(path)?;
-    if salt.len() != IDENTITY_SALT_BYTES {
-        return Err(std::io::Error::new(
+    if metadata.len() != IDENTITY_SALT_BYTES as u64 {
+        return Err(identity_salt_error(
+            path,
             std::io::ErrorKind::InvalidData,
-            "identity salt must contain exactly 32 bytes",
+            format!(
+                "must contain exactly {IDENTITY_SALT_BYTES} bytes (found {})",
+                metadata.len()
+            ),
+        ));
+    }
+    let mut salt = Vec::with_capacity(IDENTITY_SALT_BYTES);
+    file.take((IDENTITY_SALT_BYTES + 1) as u64)
+        .read_to_end(&mut salt)
+        .map_err(|error| identity_salt_io_error(path, "could not be read", error))?;
+    if salt.len() != IDENTITY_SALT_BYTES {
+        return Err(identity_salt_error(
+            path,
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "must contain exactly {IDENTITY_SALT_BYTES} bytes (found {})",
+                salt.len()
+            ),
         ));
     }
     Ok(salt)
@@ -2177,34 +2243,108 @@ fn create_identity_salt(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut salt = Vec::with_capacity(IDENTITY_SALT_BYTES);
     salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
     salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    create_identity_salt_with_writer(path, salt, |file, bytes| file.write_all(bytes))
+}
+
+fn create_identity_salt_with_writer(
+    path: &Path,
+    salt: Vec<u8>,
+    write_salt: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<Vec<u8>> {
+    let parent = path.parent().ok_or_else(|| {
+        identity_salt_error(
+            path,
+            std::io::ErrorKind::InvalidInput,
+            "must have a parent directory",
+        )
+    })?;
+    let temp_path = parent.join(format!(
+        ".{IDENTITY_SALT_FILE}.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    write_identity_salt_temp(&temp_path, &salt, write_salt)?;
+    match publish_identity_salt(&temp_path, path) {
+        Ok(()) => Ok(salt),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_identity_salt(path),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_identity_salt_temp(
+    path: &Path,
+    salt: &[u8],
+    write_salt: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    match options.open(path) {
-        Ok(mut file) => {
-            let written = (|| -> std::io::Result<()> {
-                file.write_all(&salt)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                file.sync_all()
-            })();
-            if let Err(error) = written {
-                drop(file);
-                let _ = std::fs::remove_file(path);
-                return Err(error);
-            }
-            Ok(salt)
+    let mut file = options
+        .open(path)
+        .map_err(|error| identity_salt_io_error(path, "could not be opened for writing", error))?;
+    let written = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_identity_salt(path),
-        Err(error) => Err(error),
+        write_salt(&mut file, salt)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(identity_salt_io_error(
+            path,
+            "could not be written and synced",
+            error,
+        ));
     }
+    Ok(())
+}
+
+fn publish_identity_salt(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    let linked = std::fs::hard_link(temp_path, path)
+        .map_err(|error| identity_salt_io_error(path, "could not be published", error));
+    let removed = std::fs::remove_file(temp_path).map_err(|error| {
+        identity_salt_io_error(temp_path, "could not be removed after publication", error)
+    });
+    linked?;
+    removed?;
+    let parent = path.parent().ok_or_else(|| {
+        identity_salt_error(
+            path,
+            std::io::ErrorKind::InvalidInput,
+            "must have a parent directory",
+        )
+    })?;
+    let directory = std::fs::File::open(parent).map_err(|error| {
+        identity_salt_io_error(
+            path,
+            "parent directory could not be opened for syncing",
+            error,
+        )
+    })?;
+    directory.sync_all().map_err(|error| {
+        identity_salt_io_error(path, "parent directory could not be synced", error)
+    })
+}
+
+fn identity_salt_io_error(path: &Path, action: &str, error: std::io::Error) -> std::io::Error {
+    identity_salt_error(path, error.kind(), format!("{action}: {error}"))
+}
+
+fn identity_salt_error(
+    path: &Path,
+    kind: std::io::ErrorKind,
+    reason: impl std::fmt::Display,
+) -> std::io::Error {
+    std::io::Error::new(kind, format!("identity salt `{}` {reason}", path.display()))
 }
 
 fn read_or_create_label_salt(dir: &Path) -> std::io::Result<Vec<u8>> {
@@ -2632,6 +2772,121 @@ mod tests {
     }
 
     #[test]
+    fn identity_salt_refuses_damaged_files_and_names_the_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "lw-tunnel-identity-damaged-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(IDENTITY_SALT_FILE);
+        let path_text = path.display().to_string();
+        for len in [0, IDENTITY_SALT_BYTES - 1] {
+            let damaged = vec![9; len];
+            std::fs::write(&path, &damaged).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let error = read_or_create_identity_salt(&dir).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.contains(&path_text), "{message}");
+            assert!(message.contains("exactly 32 bytes"), "{message}");
+
+            let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+                ContainerRuntime::Podman,
+                netbird_cfg(),
+                &dir,
+                &dir,
+            );
+            let operator_error = sidecar.netbird_state_volume().unwrap_err().to_string();
+            assert!(operator_error.contains(&path_text), "{operator_error}");
+            assert!(
+                operator_error.contains("exactly 32 bytes"),
+                "{operator_error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn identity_salt_failed_write_leaves_no_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lw-tunnel-identity-write-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(IDENTITY_SALT_FILE);
+        let error =
+            create_identity_salt_with_writer(&path, vec![5; IDENTITY_SALT_BYTES], |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected identity-salt write failure",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert!(error.to_string().contains("injected identity-salt"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn identity_salt_concurrent_creators_share_complete_salt() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lw-tunnel-identity-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(IDENTITY_SALT_FILE);
+        let barrier = std::sync::Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                create_identity_salt_with_writer(
+                    &path,
+                    vec![3; IDENTITY_SALT_BYTES],
+                    |file, bytes| {
+                        barrier.wait();
+                        file.write_all(bytes)
+                    },
+                )
+            });
+            let second = scope.spawn(|| {
+                create_identity_salt_with_writer(
+                    &path,
+                    vec![4; IDENTITY_SALT_BYTES],
+                    |file, bytes| {
+                        barrier.wait();
+                        file.write_all(bytes)
+                    },
+                )
+            });
+            barrier.wait();
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(first, second);
+        assert_eq!(first.len(), IDENTITY_SALT_BYTES);
+        assert!(first == vec![3; IDENTITY_SALT_BYTES] || first == vec![4; IDENTITY_SALT_BYTES]);
+        assert_eq!(read_or_create_identity_salt(&dir).unwrap(), first);
+        let entries = std::fs::read_dir(&dir)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), path);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn netbird_validation_is_strict_without_leaking_values() {
         assert!(netbird_cfg().validate().is_ok());
         for url in [
@@ -2959,6 +3214,200 @@ mod tests {
             completed,
             Some(Err(RecoveryError::Unavailable { reason })) if reason == "dead peer"
         ));
+    }
+
+    #[cfg(unix)]
+    fn successful_runtime_output(stdout: String) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn slow_healthy_runtime(
+        hash: String,
+        instance: String,
+        image_id: String,
+        listing: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::sandbox::cli_runner::TestRuntime {
+        crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            let hash = hash.clone();
+            let instance = instance.clone();
+            let image_id = image_id.clone();
+            let listing = listing.clone();
+            let calls = calls.clone();
+            let container_id = "2".repeat(64);
+            async move {
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let stdout = match args.first().map(String::as_str) {
+                    Some("image") if args.iter().any(|arg| arg == "--format") => {
+                        format!("{image_id}\n")
+                    }
+                    Some("image") => String::new(),
+                    Some("inspect") => {
+                        format!("{container_id}|true|{hash}|{instance}\n")
+                    }
+                    Some("exec") => match args.get(2).map(String::as_str) {
+                        Some("ip") => String::new(),
+                        Some("wg") => "0x4c57\n".into(),
+                        Some("cat") => "nameserver 9.9.9.9\n".into(),
+                        Some("nft") => listing,
+                        other => panic!("unexpected sidecar exec: {other:?}"),
+                    },
+                    other => panic!("unexpected runtime call: {other:?}"),
+                };
+                Ok(successful_runtime_output(stdout))
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn slow_successful_health_probes_do_not_record_recovery_failure() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-slow-health-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let salt = [42_u8; 32];
+        std::fs::write(runtime_dir.join(LABEL_SALT_FILE), salt).unwrap();
+        let config_path = base.join("wg0.conf");
+        std::fs::write(&config_path, "[Interface]\nPrivateKey = private\n").unwrap();
+        let config = TunnelSidecarConfig {
+            provider: TunnelProvider::Wireguard,
+            wireguard_config: Some(config_path),
+            auto_pull_image: false,
+            ..TunnelSidecarConfig::default()
+        };
+        let image_id = format!("sha256:{}", "1".repeat(64));
+        let hash = config.config_hash(&salt, &image_id);
+        let instance = instance_id_for(&base);
+        let listing = listing_for(&EgressPolicy {
+            tunnel_mark: LUNARWING_TUNNEL_FWMARK,
+            resolvers: vec!["9.9.9.9".parse().unwrap()],
+        });
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = slow_healthy_runtime(hash, instance, image_id, listing, calls.clone());
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let started = tokio::time::Instant::now();
+        let container_id = sidecar.container_for_run().await.unwrap();
+        assert_eq!(container_id, "2".repeat(64));
+        assert_eq!(started.elapsed(), Duration::from_secs(63));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(lifecycle.active.is_none());
+        assert!(lifecycle.last_failure.is_none());
+        assert!(
+            lifecycle
+                .cached_reason(tokio::time::Instant::now())
+                .is_none()
+        );
+        drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn slow_health_fixture(
+        label: &str,
+    ) -> (
+        TunnelSidecar,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-health-{label}-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let instance = instance_id_for(&base);
+        let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let removed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let removals = removals.clone();
+            let removed = removed.clone();
+            move |args, _stdin| {
+                let instance = instance.clone();
+                let removals = removals.clone();
+                let removed = removed.clone();
+                let container_id = "2".repeat(64);
+                async move {
+                    let stdout = match args.first().map(String::as_str) {
+                        Some("exec") => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            String::new()
+                        }
+                        Some("inspect") => {
+                            format!("{container_id}|true|test-hash|{instance}\n")
+                        }
+                        Some("rm") => {
+                            removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            removed.notify_one();
+                            String::new()
+                        }
+                        Some("container") => format!("{container_id}\n"),
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    };
+                    Ok(successful_runtime_output(stdout))
+                }
+            }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+        (sidecar, base, removals, removed)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_deadline_bounds_slow_provider_and_removes_container() {
+        let (sidecar, base, removals, _removed) = slow_health_fixture("deadline");
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remained unhealthy for 6s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_health_reprobe_still_removes_container() {
+        let (sidecar, base, removals, removed) = slow_health_fixture("cancelled");
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            sidecar.wait_healthy(Duration::from_secs(60)),
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), removed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     fn recovery_test_sidecar(label: &str) -> TunnelSidecar {

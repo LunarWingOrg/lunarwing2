@@ -22,6 +22,11 @@
 //!   later through [`LogScrubber::add_secret`] (the daemon registers the
 //!   gateway token and the secrets-store overlay this way).
 //!
+//! Known values are otherwise add-only. `LogScrubber::remove_secret` exists
+//! only for tests (the `test-support` feature, never enabled for a shipped
+//! build), so a test that registers a fixture can leave a shared scrubber as
+//! it found it (WI#633).
+//!
 //! Every occurrence of every known value is found, overlapping ones
 //! included, and all ranges (known values and shapes, in the original
 //! record's coordinates) are merged before one masking pass. Overlapping or
@@ -129,6 +134,50 @@ impl LogScrubber {
             matcher: Some(Arc::new(matcher)),
         };
         added
+    }
+
+    /// Forget a known secret value again (WI#633): the test-only counterpart
+    /// of [`Self::add_secret`], so a test that registered a fixture with a
+    /// shared scrubber leaves it as it found it. Returns whether the value
+    /// was registered and is now removed.
+    ///
+    /// Production code must never call this — forgetting a secret weakens the
+    /// logger's guarantee. The method exists only under `cfg(test)` and the
+    /// `test-support` feature, and only test builds of dependent crates
+    /// enable that feature (`ic/Cargo.toml` puts it on the dev-dependency
+    /// entry), so a shipped binary has no removal path to call. If the
+    /// matcher cannot be rebuilt, the previous matcher and values stay in
+    /// place: the value being removed remains scrubbed instead of exposed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn remove_secret(&self, secret: &str) -> bool {
+        let _adding = self.adding.lock().unwrap_or_else(PoisonError::into_inner);
+        let secret = secret.trim();
+        let mut values = self
+            .known
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values
+            .clone();
+        let before = values.len();
+        values.retain(|value| value != secret);
+        if values.len() == before {
+            return false;
+        }
+        let matcher = if values.is_empty() {
+            None
+        } else {
+            // Standard match semantics are required for overlapping search.
+            let Ok(matcher) = AhoCorasick::builder()
+                .match_kind(MatchKind::Standard)
+                .build(&values)
+            else {
+                return false;
+            };
+            Some(Arc::new(matcher))
+        };
+        *self.known.write().unwrap_or_else(PoisonError::into_inner) =
+            KnownSecrets { values, matcher };
+        true
     }
 
     /// Scrub one log record. Never emits tracing events, so it is safe to
@@ -399,6 +448,41 @@ mod tests {
         assert!(!scrubbed.contains("PzPz"), "{scrubbed}");
         assert!(!scrubbed.contains("KqKq"), "{scrubbed}");
         assert!(scrubbed.ends_with(" end"), "{scrubbed}");
+    }
+
+    /// WI#633: a removed value is no longer scrubbed, while the values that
+    /// stayed registered are still masked.
+    #[test]
+    fn removed_secrets_stop_being_scrubbed() {
+        let kept = "Kp".repeat(7);
+        let removed = "Rv".repeat(7);
+        let scrubber = LogScrubber::new(&[kept.as_str(), removed.as_str()]);
+        let registered = scrubber.scrub(&format!("a {removed} b")).into_owned();
+        assert!(!registered.contains(&removed), "{registered}");
+
+        assert!(scrubber.remove_secret(&removed));
+        assert!(
+            !scrubber.remove_secret(&removed),
+            "second removal must be a no-op"
+        );
+
+        let record = format!("a {removed} b {kept} c");
+        let scrubbed = scrubber.scrub(&record).into_owned();
+        assert!(scrubbed.contains(&removed), "{scrubbed}");
+        assert!(!scrubbed.contains(&kept), "{scrubbed}");
+        assert!(scrubbed.ends_with(" c"), "{scrubbed}");
+    }
+
+    /// WI#633: removing the last known value leaves a scrubber that matches
+    /// nothing instead of failing closed on every record.
+    #[test]
+    fn removing_the_last_secret_clears_the_matcher() {
+        let secret = "Ls".repeat(7);
+        let scrubber = LogScrubber::new(&[secret.as_str()]);
+        assert!(scrubber.remove_secret(&secret));
+        let record = format!("x {secret} y");
+        assert_eq!(scrubber.scrub(&record).into_owned(), record);
+        assert!(!scrubber.remove_secret("never-registered-value"));
     }
 
     /// WI#287 review S5: a registered secret that extends a shorter one must

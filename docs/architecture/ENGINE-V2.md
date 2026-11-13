@@ -2184,14 +2184,17 @@ ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread l
                                         # clamped to 16; 0 disables all engine recovery
 ```
 
-**Billed-empty retry budget (host daemon knob, WI#578).**
+**Billed-empty retry budget (host daemon knob, WI#578/WI#595).**
 `LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET` defaults to **100000** reported input
-tokens per provider leg. Once the discarded billed-empty attempts plus the
-current one reach the threshold, `RetryProvider` returns the current typed
-`EmptyStream` error with every attempt's usage folded in instead of opening
-another attempt; one attempt can therefore overshoot the threshold. `0` restores
-retry-count-only behavior. Usage-less empty responses and ordinary transient
-retries are unchanged, and failover keeps an independent budget for each leg.
+tokens per provider leg and call. With retries enabled, the first transient
+billed-empty attempt always gets one retry, even when it reaches the threshold.
+After that, once the discarded billed-empty attempts plus the current one reach
+the threshold, `RetryProvider` returns the current typed `EmptyStream` error
+with every attempt's usage folded in instead of opening another attempt; one
+attempt can therefore overshoot the threshold. `0` restores retry-count-only
+behavior. Usage-less empty responses and ordinary transient retries are
+unchanged. Every failover leg and engine or agent recovery re-issue starts a
+fresh budget, so this is not a per-turn bound.
 
 **Pending-gate expiry (host daemon knob, WI#111).** How long a pending
 approval/auth gate waits before the background sweep expires it and resumes
