@@ -168,11 +168,22 @@ fn gateway_auth_token_is_scrubbed_from_daemon_logs() {
         ..gateway_config()
     };
     let _gateway = GatewayChannel::new(config, "gateway-sender".to_string());
-    let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+    let scrubber = crate::tracing_fmt::daemon_log_scrubber();
+    let scrubbed = scrubber
         .scrub(&format!("auth ok token={token} for alice"))
         .into_owned();
     assert!(!scrubbed.contains(&token), "{scrubbed}");
     assert!(scrubbed.contains("for alice"), "{scrubbed}");
+    // WI#633: the scrubber is process-wide, so the fixture does not outlive
+    // this test.
+    assert!(
+        scrubber.remove_secret(&token),
+        "fixture token was not registered"
+    );
+    let cleaned = scrubber
+        .scrub(&format!("auth ok token={token} for alice"))
+        .into_owned();
+    assert!(cleaned.contains(&token), "still scrubbed: {cleaned}");
 }
 
 #[test]
