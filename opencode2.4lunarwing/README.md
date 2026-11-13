@@ -80,7 +80,9 @@ is `fedc6f208aa2bd54c1019227214568083f6380ad` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
-stays disabled. The lane config's `update: "disable"` pin is not honored by
+stays disabled. The wrapper also starts the binary with
+`OPENCODE_FLAGS=-console_watches`, which keeps v2.2.7's Console event
+watches off whatever the environment or a workspace config says. The lane config's `update: "disable"` pin is not honored by
 the updater itself (it reads only the global config dir), so the image
 also carries `OPENCODE_DISABLE_AUTOUPDATE=1` to silence the background
 check. See `docs/ops/WORKER-CONTAINERS.md` for the bump review, verification
