@@ -107,6 +107,25 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("must be a boolean", result.stderr)
 
+    def assert_split_console_credential_refused(self, role: str) -> None:
+        credential = "fixture-console-credential"
+        result = self.run_boot(
+            LUNARWING_CONTAINER_ROLE=role,
+            OPENCODE2_TASK_UID=str(self.identity.get("user", os.geteuid())),
+            OPENCODE_API_KEY=credential,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("OPENCODE_API_KEY is present; refusing startup", result.stderr)
+        self.assertIn("LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1", result.stderr)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+        self.assertFalse(self.target.exists(), "refusal must precede task configuration")
+
+    def test_split_task_console_credential_requires_opt_in(self) -> None:
+        self.assert_split_console_credential_refused("split-task")
+
+    def test_split_bridge_console_credential_requires_opt_in(self) -> None:
+        self.assert_split_console_credential_refused("split-bridge")
+
     def test_managed_overrides_work_on_first_boot_and_restart(self) -> None:
         service = self.home / ".config/opencode/service.json"
         overrides = {

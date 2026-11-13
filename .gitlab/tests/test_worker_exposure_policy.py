@@ -151,9 +151,10 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             # sleep/env/timeout: the opencode2 CLI-mode entrypoint cases exec the
             # full entrypoint (health-server settle, credential scrub, run
             # deadline; WI#582), and all three are coreutils in the image too.
+            # id: WI#665 split-task coverage exercises the real task-UID check.
             for tool in ("bash", "sh", "python3", "grep", "dirname", "cp", "mkdir",
                          "chmod", "rm", "ln", "date", "readlink", "sleep", "env",
-                         "timeout"):
+                         "timeout", "id"):
                 target = shutil.which(tool)
                 if target is None:
                     raise AssertionError(f"required tool {tool!r} not found")

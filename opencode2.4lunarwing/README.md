@@ -91,14 +91,23 @@ follow-ups.
 
 The upstream `opencode` integration can fetch a hosted Console Library of
 instructions and skills when it has both a Console credential and egress to
-`opencode.ai`. Its bundled catalog names `OPENCODE_API_KEY`; the
-`console_watches` flag does not gate this Library. The lane therefore refuses
+`opencode.ai`. At the pinned v2.2.6, its bundled catalog names
+`OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
-spellings are accepted). The opt-in acknowledges the credential and egress
-risk; it does not authorize Console-authored instructions or skills. Startup
-messages name the variable but never print its value. The tenant egress
-allowlist remains the boundary against a compromised worker.
+spellings are accepted). With a usable credential and allowed egress, this
+opt-in enables the Library surface too: no shipped setting separately withholds
+Console-authored instructions or skills. Startup messages name the variable but
+never print its value.
+
+This startup gate covers only the environment variable. Upstream prefers saved
+credentials, including credentials saved by `opencode auth login` during a
+session; they bypass this gate and may survive container restarts. The tenant
+egress allowlist remains the boundary against a compromised worker. WI#665's
+root-owned managed-policy evaluation and image enforcement are still pending;
+this change does not claim that Console content is blocked after opt-in or login.
+See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
+for the conditions and remaining work.
 
 ## Do not configure both lanes on one tenant during the transition
 
