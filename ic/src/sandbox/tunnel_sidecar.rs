@@ -1997,6 +1997,16 @@ impl TunnelSidecar {
     /// does, so nothing is signalled unless the runtime positively reports
     /// that no container has the sidecar's name.
     async fn release_network_helper(&self) {
+        // A sidecar on the test runtime has no real container and no helper
+        // unit, so there is nothing to release. Asking the workload spawner
+        // from such a test would also run its one-time probe, a real
+        // `systemd-run`, inside the test: under a paused clock the probe's
+        // timeout fires at once, which costs five virtual seconds and caches
+        // "no systemd services" for the rest of the test binary (WI#654).
+        #[cfg(test)]
+        if self.test_runtime.is_some() {
+            return;
+        }
         let spawner = crate::tools::process::workload_spawner().await;
         if !spawner.uses_systemd_services() {
             return;
