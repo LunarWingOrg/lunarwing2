@@ -1217,7 +1217,7 @@ class BunImageTieTests(unittest.TestCase):
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
-                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+                "services": [{"name": config.REVIEWED_PG_IMAGE}],
             },
         }
 
@@ -1307,6 +1307,37 @@ class BunImageTieTests(unittest.TestCase):
         )
         self.assertTrue(any("not pinned" in error for error in self.errors()))
 
+    def test_pgvector_service_requires_the_reviewed_tenant_image(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+        )
+        for image in (
+            "docker.io/pgvector/pgvector:pg16",
+            f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}",
+        ):
+            with self.subTest(image=image):
+                self.merged["rust-test-postgres-integration"]["services"] = [{"name": image}]
+                errors = self.errors()
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("reviewed tenant pgvector service", errors[0])
+
+    def test_mt_admin_pg_image_must_match_ci(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+        )
+        script = self.root / "lunarwing-mt-admin.sh"
+        script.write_text(
+            'PG_IMAGE="${LUNARWING_MT_PG_IMAGE:-docker.io/pgvector/pgvector:pg16@sha256:'
+            + self.OTHER_DIGEST
+            + '}"\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "MT_ADMIN_SCRIPT", script):
+            errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("mt-admin PG_IMAGE", errors[0])
+        self.assertIn("differs from the CI/reviewed pgvector image", errors[0])
+
 
 class NodeImageTieTests(unittest.TestCase):
     """WI#324 (MR !1590 review GB-2) ties CI_NODE_IMAGE to the kimi worker
@@ -1355,7 +1386,7 @@ class NodeImageTieTests(unittest.TestCase):
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
-                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+                "services": [{"name": config.REVIEWED_PG_IMAGE}],
             },
         }
 
@@ -1507,7 +1538,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
-                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+                "services": [{"name": config.REVIEWED_PG_IMAGE}],
             },
         }
 
