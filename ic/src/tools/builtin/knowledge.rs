@@ -1870,4 +1870,81 @@ mod tests {
         assert!(!list_topics.requires_sanitization());
         assert!(!update_status.requires_sanitization());
     }
+
+    #[cfg(feature = "libsql")]
+    mod libsql_integration {
+        use super::*;
+        use crate::tools::builtin::memory::FixedWorkspaceResolver;
+        use crate::workspace::Workspace;
+
+        #[tokio::test]
+        async fn daily_sweep_can_skip_status_only_repeats_through_real_tools() {
+            let (db, _dir) = crate::testing::test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("alice", db));
+            let resolver: Arc<dyn WorkspaceResolver> =
+                Arc::new(FixedWorkspaceResolver::new(Arc::clone(&workspace)));
+            let submit = KnowledgeSubmitNoteTool::new(Arc::clone(&resolver));
+            let list = KnowledgeListStaleTool::new(resolver);
+            let ctx = JobContext {
+                user_id: "alice".to_string(),
+                ..Default::default()
+            };
+            let aged = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+            for params in [
+                serde_json::json!({
+                    "agent": "kimi-1", "topic": "status-only",
+                    "title": "Already marked", "content": "Needs fresh verification.",
+                    "status": "stale", "source_commit": "current", "scope": "private"
+                }),
+                serde_json::json!({
+                    "agent": "kimi-1", "topic": "aged",
+                    "title": "Aged", "content": "Old findings need another look.",
+                    "status": "active", "studied_at": aged, "stale_after_days": 30,
+                    "source_commit": "current", "scope": "private"
+                }),
+            ] {
+                submit.execute(params, &ctx).await.expect("submit note");
+            }
+            let stored = workspace
+                .read_primary(&note_path("kimi-1", "status-only"))
+                .await
+                .expect("read submitted note");
+            let meta = KnowledgeNoteMeta::from_metadata_json(&stored.metadata)
+                .expect("submitted metadata parses");
+            assert!(meta.studied_at.is_some());
+
+            let unfiltered = list
+                .execute(
+                    serde_json::json!({"repository_commit": "current", "scope": "private"}),
+                    &ctx,
+                )
+                .await
+                .expect("default stale list");
+            assert_eq!(unfiltered.result["stale_count"], 2);
+            let notes = unfiltered.result["notes"].as_array().expect("notes array");
+            let repeat = notes
+                .iter()
+                .find(|note| note["topic"] == "status-only")
+                .expect("marked note remains visible");
+            assert_eq!(repeat["stale_reasons"], serde_json::json!(["status:stale"]));
+
+            let filtered = list
+                .execute(
+                    serde_json::json!({
+                        "repository_commit": "current", "scope": "private",
+                        "include_status_only": false
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("filtered stale list");
+            assert_eq!(filtered.result["criteria"]["include_status_only"], false);
+            assert_eq!(filtered.result["stale_count"], 1);
+            assert_eq!(filtered.result["notes"][0]["topic"], "aged");
+            assert_eq!(
+                filtered.result["notes"][0]["stale_reasons"],
+                serde_json::json!(["age-exceeded"])
+            );
+        }
+    }
 }
