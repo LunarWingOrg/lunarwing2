@@ -477,7 +477,7 @@ async fn late_stop_miss_joins_a_real_completed_result() {
 /// run before the final pending tool status has reached the channel.
 #[tokio::test]
 async fn late_stop_miss_forwards_pending_events_before_join() {
-    let mut rig = Rig::new(Some("finished"), None).await;
+    let rig = Rig::new(Some("finished"), None).await;
     rig.llm.release.notify_one();
     wait_for_run_end(&rig).await;
     let (event_tx, mut events) = broadcast::channel(8);
@@ -542,26 +542,18 @@ async fn late_stop_miss_after_user_interrupt_keeps_stopped_outcome() {
 
 #[tokio::test]
 async fn late_stop_request_timeout_has_its_own_error() {
-    let mut rig = Rig::new(Some("unused"), None).await;
+    let stop = std::future::pending::<Result<(), lunarwing_engine::EngineError>>();
 
-    let error = rig
-        .turn
-        .stop_late_thread(&mut rig.events, Duration::ZERO, Duration::from_secs(2))
+    let error = TurnCompletion::await_late_stop_request(Duration::ZERO, stop)
         .await
         .unwrap_err();
 
     assert!(error.to_string().contains("stop request did not complete"));
-    rig.llm.release.notify_one();
-    wait_for_run_end(&rig).await;
 }
 
 #[tokio::test]
 async fn late_post_stop_wait_timeout_has_its_own_error() {
-    let mut rig = Rig::new(Some("never released"), None).await;
-
-    let error = rig
-        .turn
-        .stop_late_thread(&mut rig.events, Duration::from_secs(2), Duration::ZERO)
+    let error = TurnCompletion::require_late_stop_settled(std::future::ready(false))
         .await
         .unwrap_err();
 
@@ -570,7 +562,6 @@ async fn late_post_stop_wait_timeout_has_its_own_error() {
             .to_string()
             .contains("stop succeeded but the post-stop wait did not complete")
     );
-    wait_for_run_end(&rig).await;
 }
 
 /// Only "nothing to stop" is a miss. Any other refusal of the stop request
