@@ -174,7 +174,7 @@ rust-test-postgres-integration:
       artifacts: false
   timeout: 2h
   services:
-    - name: "docker.io/pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b"
+    - name: "docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f"
       alias: postgres
   variables:
     POSTGRES_DB: lunarwing_test
