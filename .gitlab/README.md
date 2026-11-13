@@ -641,8 +641,21 @@ host's concurrent builds before retrying manually.
   covers the manifest-less Pebble override lock in that same job: the pinned,
   SHA-256-verified cargo-audit 0.23.0 installer runs before the sweep, then
   `cargo-audit --file pebble4lunarwing/upstream/Cargo.lock` reads cargo-deny's
-  exact advisory checkout with `--no-fetch --stale` and denies unsound and
-  yanked findings. A missing checkout or cargo-audit failure fails the job;
+  exact advisory checkout with `--no-fetch --stale`. Vulnerability and unsound
+  findings deny. Yanked-crate denial is best effort: without a fetch,
+  cargo-audit can consult only the runner's existing crates.io index cache. A
+  cached yanked version fails; each `couldn't check if the package is yanked`
+  diagnostic is counted in the override's OK/FAIL status line. If the index
+  cannot be opened, that line says no crates were checked for yanks instead of
+  claiming a clean yank scan. The job requires exactly one `advisory-db-*`
+  checkout and fails on zero or multiple directories rather than guessing;
+  cargo-audit failures also fail the job. cargo-audit does not read
+  `ic/deny.toml`, and there are no override-specific advisory acceptances
+  today. To accept one, add an explicit `--ignore RUSTSEC-YYYY-NNNN` only to the
+  override audit in `.gitlab/scripts/check-satellite-advisories.sh`, with an
+  adjacent comment recording the reason and clearing owner `WI#N`, and update
+  the argument-list tests and validator in the same change; an acceptance only
+  in `ic/deny.toml` does not cover the override.
   `pebble4lunarwing/scripts/verify_upstream_lock.py` still independently gates
   the override's digest and allowlisted package delta;
   `lockfile-only-advisory-guard` runs

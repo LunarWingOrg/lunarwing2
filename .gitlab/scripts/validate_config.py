@@ -1287,6 +1287,9 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
         '--db "$db_dir"',
         "--no-fetch --stale",
         "-D unsound -D yanked",
+        "expected exactly one advisory database",
+        "couldn't check if the package is yanked",
+        "couldn't open crates.io index",
     )
     for fragment in required_fragments:
         if fragment not in text:
