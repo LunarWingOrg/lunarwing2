@@ -130,10 +130,17 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   wrapper forces `OPENCODE_FLAGS=-console_watches` on every start, because
   upstream resolves that variable before every config document, a project's
   own `opencode.json` in the workspace included. Never remove or weaken that
-  line, never set `experimental.console_watches` or `experimental.all_flags`
-  in the lane config (`exposure_policy_assert.py` fails the build on either),
-  and on every bump re-check the flag registry and the precedence (checklist
-  item 7 in `docs/ops/WORKER-CONTAINERS.md`).
+  line, never add a second way for the wrapper to start the binary, and never
+  set `experimental.console_watches` or `experimental.all_flags` in the lane
+  config (`exposure_policy_assert.py` fails the build on each). The builder
+  stage anchors the pin against the pinned source
+  (`compile_out_remote_tunnel.py`): when it fails on a bump, answer the
+  questions of checklist item 7 in `docs/ops/WORKER-CONTAINERS.md` before
+  touching `REVIEWED_FLAGS`.
+- Give the worker an OpenCode Console credential (`OPENCODE_API_KEY` or a
+  Console sign-in) without the maintainer's decision: with one, the worker
+  takes Console-authored instructions and skills, and the flag pin does not
+  cover that (WI#665).
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays

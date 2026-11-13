@@ -846,7 +846,11 @@ Enforced controls (opencode2 lane unless noted):
    `OPENCODE_FLAGS=-console_watches`, replacing whatever the caller's
    environment holds: that keeps the Console event watches off, because
    upstream resolves the variable before every config document (see the
-   v2.2.7 bump entry). Children the real binary spawns inherit the value.
+   v2.2.7 bump entry). Children the real binary spawns inherit the value,
+   with one exception: a managed service started from a `service.json` that
+   carries its own `env` map gets that map laid over the environment. The
+   wrapper's refusal of `opencode service …` and the boot-time reset of that
+   file, both described next, are the controls for that path.
    Server-backed commands such as `run` and `session list` can spawn the real
    binary directly via `Service.ensure`, bypassing the wrapper. At each boot
    the entrypoint removes whatever sits at
@@ -1031,14 +1035,23 @@ Enforced controls (opencode2 lane unless noted):
    event-watch flags (see WI#665 below). Read the upstream diff under
    `packages/core/src` as well as `packages/{cli,server,schema}/src`: the
    v2.2.7 Console event watches live there and the first pass of that bump
-   missed them. **Feature flags:** compare the registry
-   (`packages/schema/src/config/flag.ts`) with the previous pin and give
-   every new key a decision in the entry. Then re-check in
-   `packages/core/src/flag.ts` (upstream's own cases are in
-   `packages/core/test/flag.test.ts`) that `OPENCODE_FLAGS` still resolves
-   before every config document and that a leading `-` still turns a flag
-   off. The wrapper's `-console_watches` pin depends on both; if either
-   changes, the pin no longer holds and the bump stops there. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
+   missed them. **Feature flags:** the wrapper's `-console_watches` pin is
+   only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
+   is ignored without a word, and upstream ships a feature by deleting its
+   flag. The builder stage therefore anchors the pin
+   (`scripts/compile_out_remote_tunnel.py`, `check_flag_pin_anchor`) and
+   fails the image when the registry
+   (`packages/schema/src/config/flag.ts`) differs from the reviewed list,
+   when `packages/core/src/plugin/provider/opencode.ts` no longer starts the
+   watches on `flags.enabled("console_watches")`, or when
+   `packages/core/src/flag.ts` stops resolving `OPENCODE_FLAGS` first, with
+   a leading `-` meaning off. When it fails on a bump, do not edit the
+   anchor to make it pass: answer in the bump entry, for every new or
+   removed flag, what it turns on and whether the lane takes it; if
+   `console_watches` is gone, whether the watches are now always on, which
+   needs a new decision; and whether anything now resolves above the
+   variable. Then update `REVIEWED_FLAGS` and the anchors in the same
+   commit. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
    **Photon-node repair retirement:** when a new OpenCode pin carries the
@@ -1566,7 +1579,7 @@ cd opencode2.4lunarwing
 # Recompute it after any wrapper edit:
 #   sha256sum scripts/opencode-exposure-guard.sh
 DOCKER_BUILDKIT=1 docker build \
-  --build-arg LUNARWING_WRAPPER_SHA256=65c5f722a0a27c0945e2216521c860dbe23ce110886832c4bf2371fbcc124655 \
+  --build-arg LUNARWING_WRAPPER_SHA256=f1e847dd85ad73e947f7e7cd9174810a08c258ac572543b38042e55a99b7ed8d \
   -t lunarwing-worker-opencode2:latest .
 
 # Select the worker per tenant, then build the shared image via mt-admin
@@ -2083,27 +2096,43 @@ with the change below.)
 
 - **What it is.** v2.2.7 adds `packages/core/src/plugin/provider/opencode-watches.ts`
   (708 lines, not in v2.2.6) behind the feature flag `console_watches`
-  (`packages/schema/src/config/flag.ts:19`). With it on, the worker holds a
-  connection to OpenCode Console, by default `https://opencode.ai/console`
+  (`packages/schema/src/config/flag.ts:19`). With it on, a worker that has
+  a Console credential holds an event connection to OpenCode Console, by
+  default `https://opencode.ai/console`
   (`packages/core/src/console-access.ts:5`). When a watched Slack thread,
   GitHub pull request, issue, commit or Actions run changes, the plugin puts
   a message into the session with `delivery: "steer"` and resumes the turn
   (`opencode-watches.ts:151`); upstream's own comment says a reply from a
   phone steers the agent (`:673`). The model also gets `console_watch` tools
-  to set such watches itself. That is an instruction channel into the worker
+  to set such watches itself, and with watches on a `git push` or
+  `gh pr create` sets one too. That is an instruction channel into the worker
   through a hosted third party. LunarWing allows one channel only: daemon job
   dispatch, the bridge, and the agent API on loopback.
-- **What must hold to start it** (`packages/core/src/plugin/provider/opencode.ts:337`):
-  the flag is on, the worker has a Console sign-in of the `opencode`
-  integration, and Console's config says the workspace has watches. The lane
-  has no Console sign-in, and the tenant's egress allowlist blocks
-  `opencode.ai` unless the operator lists it. The allowlist is the boundary.
+- **The flag is not the whole Console channel.** The same plugin already
+  fetches Console-authored instructions and skills for a worker with a
+  credential, flag or no flag (`opencode.ts:265-275`, synced at `:336`,
+  one line before the flag is read). v2.2.6 has that as the workspace
+  Library, so it is older than this bump. The pin below covers the event
+  watches only. The rest is WI#665.
+- **What must hold to start the watches**
+  (`packages/core/src/plugin/provider/opencode.ts:337`): the flag is on, the
+  worker has a credential of the `opencode` integration, and Console's
+  config says the workspace has watches. A credential needs no login: any
+  set environment variable that the integration's catalog entry names
+  counts (`packages/core/src/integration.ts:396-400`, `:699-703`), and the
+  bundled catalog names `OPENCODE_API_KEY` for the `opencode` provider. The
+  default lane sets no such variable and talks to the tenant's own LLM
+  endpoint. A tenant pointed at OpenCode's hosted models has one, and for
+  that tenant the flag is the main condition left. The tenant's egress
+  allowlist blocks `opencode.ai` unless the operator lists it. The
+  allowlist is the boundary.
 - **The flag is the weak condition.** Upstream resolves a flag from
-  `OPENCODE_FLAGS` first, then from `experimental.<key>` in the config
-  documents, then from the channel default, which is off for the `latest`
+  `OPENCODE_FLAGS` first, then from `experimental.<key>` in the
+  highest-priority config document that sets `experimental` (the blocks are
+  not merged), then from the channel default, which is off for the `latest`
   channel this lane builds (`packages/core/src/flag.ts:35-41`, `:63-70`). The
   documents include a project's own `opencode.json`, `opencode.jsonc` and
-  `.opencode` directory, found by walking up from the working directory
+  `.opencode` directory, found by walking up from the session's directory
   (`packages/core/src/config/discovery.ts:12`, `:81-82`), and the runtime copy
   of the lane config under `$WORKSPACE_ROOT/.opencode/` is writable too. So a
   file in the task-writable workspace can turn the flag on.
@@ -2114,36 +2143,67 @@ with the change below.)
   `:74`), and with the flag off the watches stay dormant even when Console
   advertises them (`packages/core/test/plugin/provider-opencode-watches.test.ts:273`).
   The inherited value is replaced, so `OPENCODE_FLAGS=all` from a caller does
-  not survive either. `exposure_policy_assert.py` fails the build when that
-  line is missing, commented out, placed after the `exec`, or followed by
-  another `OPENCODE_FLAGS` statement, and when the lane config sets
-  `experimental.console_watches` or `experimental.all_flags`.
+  not survive either. Three build checks hold it in place.
+  `exposure_policy_assert.py` requires the pin and the `exec` to be the last
+  two code lines of the wrapper, unindented, and refuses any other code line
+  that launches the binary, names the variable, or uses `alias`, `eval`,
+  `source` or a here-document; a fast path for one subcommand or an opt-out
+  knob fails the build. It also fails when the lane config sets
+  `experimental.console_watches` or `experimental.all_flags`. And the
+  builder stage anchors the pin against the pinned upstream source
+  (checklist item 7): the image does not build when the flag is gone from
+  the registry, no longer gates the watches, or no longer resolves first.
 - **What the pin is not.** Like the wrapper as a whole it guards against use
-  by mistake. A task that starts the real binary by its path with its own
-  environment gets past it; for that case the egress allowlist is the
-  control. The feature stays in the binary: it is not compiled out, unlike
-  OpenTunnel (WI#427).
+  by mistake, and it has these edges:
+  - A task that starts the real binary by its path, or with
+    `LUNARWING_REAL_OPENCODE` pointed elsewhere, gets past it.
+  - A managed service started from a `service.json` that carries
+    `env.OPENCODE_FLAGS` gets that value: upstream lays the file's `env` map
+    over the environment (`packages/client/src/service-contender.ts:23`,
+    `packages/cli/src/server-process.ts:80`). The wrapper refuses
+    `opencode service …`, and the entrypoint resets that file at boot only.
+  - The wrapper now owns the variable. An operator's own opt-outs, such as
+    `OPENCODE_FLAGS=-schedules`, are dropped with a caller's `all`, without
+    a message.
+  - Nothing checks the pin on a running server. The runtime smoke does not
+    read the server process's environment.
+  For all of these the egress allowlist is the control. The feature stays in
+  the binary: it is not compiled out, unlike OpenTunnel (WI#427).
 - **Not decided here:** the other six flags of the registry (`todo`,
   `background_compaction`, `media_blob`, `schedules`, `artifacts`,
   `codemode_vm`) are not pinned. They are off by default, and a workspace
   config can still turn them on.
-- **Verification (2026-11-13, at the change's own commit):** exposure policy
-  suite **73/73** (68 before, five new cases), on the host and again inside
-  the image under dash. Four scratch mutants are all caught: the pin removed,
-  the pin appended to the inherited value instead of replacing it, the config
-  check disabled, the wrapper check disabled. A full local OpenCode2 image
-  build (rootless Podman, `--network=host --format docker`, wrapper anchor
-  `65c5f722…4655`) completed: builder gates, every in-image suite, the
-  started-entrypoint smoke **5/5** with the server started through the pinned
-  wrapper, and the final `--image-filesystem` assertion. In the built image,
-  as uid 10003: the installed wrapper turns a caller's `OPENCODE_FLAGS=all`
-  into `-console_watches`, and `opencode --version` through it reports
-  `opencode v2.2.7`.
+- **Verification (2026-11-13).** The first version of this change was
+  re-reviewed by a second reviewer that had not seen the author's reasoning
+  (!2398 note 16159). It confirmed the pin and the precedence and found the
+  gaps that the second version closes: the anchor, the stricter wrapper
+  check, and three statements in this entry that said more than was true.
+  At the second version:
+  - Exposure policy suite **75/75** (68 before the decision), on the host
+    and inside the image under dash. It starts the wrapper in every mode of
+    `entrypoint.sh` (`serve`, `run`, `acp`), with a leading global flag and
+    with a server-backed command, against six inherited values.
+  - Compile-out suite **20/20** (10 before): ten new cases for the anchor.
+  - One scratch mutant per rule, all caught: nine for the wrapper and
+    config checks, eight for the anchor. The wrapper shapes that passed the
+    first version of the check (a fast path for other subcommands or for a
+    leading flag, an opt-out knob) are now cases of the suite.
+  - The anchor passes on the real v2.2.7 source, in a scratch tree and in
+    the builder stage of the image build.
+  - A full local OpenCode2 image build (rootless Podman,
+    `--network=host --format docker`, wrapper anchor `f1e847dd…ed8d`)
+    completed: builder gates, every in-image suite, the started-entrypoint
+    smoke **5/5** with the server started through the pinned wrapper, and
+    the final `--image-filesystem` assertion. In the built image, as uid
+    10003: the installed wrapper turns a caller's `OPENCODE_FLAGS=all` into
+    `-console_watches`, and `opencode --version` through it reports
+    `opencode v2.2.7`.
 - **Not shown:** the watches themselves were never started, so no run here
   observed the flag keeping a live Console connection down; that rests on the
-  upstream code and its tests named above. No candidate-vs-clean-rebuild
+  upstream code and its tests named above. The `service.json` path and the
+  Console Library were read in the source, not run. No candidate-vs-clean-rebuild
   comparison, scan or protected job ran. v2.3.0 (published 2026-11-13) was
-  not read.
+  not read; the anchor will say at that bump whether the pin still holds.
 
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 
