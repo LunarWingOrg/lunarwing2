@@ -1365,6 +1365,27 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn paused_clock_blocking_probe_loses_no_virtual_time() {
+        let cache = SpawnerCache::new(PROBE_RETRY_INTERVAL);
+        let started = tokio::time::Instant::now();
+        let spawner = cache
+            .spawner_with(|| async {
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let mut probe = std::process::Command::new("env");
+                    probe.arg("-0");
+                    run_probe_command(probe, PROBE_TIMEOUT)
+                })
+                .await
+                .expect("blocking probe")
+            })
+            .await;
+        assert!(spawner.uses_systemd_services());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     /// Run this test alone on a host with a systemd user manager: CI has no
     /// user bus and can only exercise the immediate, definitive fallback.
     #[cfg(target_os = "linux")]
