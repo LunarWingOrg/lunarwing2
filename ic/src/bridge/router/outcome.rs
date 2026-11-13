@@ -315,6 +315,30 @@ impl TurnCompletion {
         self.join_late(stopped).await
     }
 
+    async fn await_late_stop_request(
+        stop_grace: Duration,
+        stop: impl std::future::Future<Output = Result<(), lunarwing_engine::EngineError>>,
+    ) -> Result<Result<(), lunarwing_engine::EngineError>, Error> {
+        tokio::time::timeout(stop_grace, stop).await.map_err(|_| {
+            engine_err(
+                "late turn timeout",
+                "stop request did not complete within its grace period",
+            )
+        })
+    }
+
+    async fn require_late_stop_settled(
+        wait: impl std::future::Future<Output = bool>,
+    ) -> Result<(), Error> {
+        if wait.await {
+            return Ok(());
+        }
+        Err(engine_err(
+            "late turn timeout",
+            "stop succeeded but the post-stop wait did not complete within its grace period",
+        ))
+    }
+
     /// Stops a run whose late budget ran out. `Ok(true)`: the stop request
     /// landed and the run settled. `Ok(false)`: there was nothing to stop.
     ///
@@ -332,7 +356,7 @@ impl TurnCompletion {
         tracing::debug!(thread_id = %self.thread_id, "Late turn budget exhausted; requesting thread stop");
         // Leave the handle addressable by /interrupt on either timeout; joining
         // could otherwise remove a still-running thread.
-        let stop = tokio::time::timeout(
+        let stop = Self::await_late_stop_request(
             stop_grace,
             self.state.thread_manager.stop_thread_for_run(
                 self.thread_id,
@@ -340,13 +364,7 @@ impl TurnCompletion {
                 &self.message.user_id,
             ),
         )
-        .await
-        .map_err(|_| {
-            engine_err(
-                "late turn timeout",
-                "stop request did not complete within its grace period",
-            )
-        })?;
+        .await?;
         match stop {
             Ok(()) => {
                 tracing::warn!(thread_id = %self.thread_id, "Late turn budget exhausted; stopping thread");
@@ -363,12 +381,7 @@ impl TurnCompletion {
             }
             Err(error) => return Err(engine_err("stop late thread", error)),
         }
-        if !self.wait(events, post_stop_grace).await {
-            return Err(engine_err(
-                "late turn timeout",
-                "stop succeeded but the post-stop wait did not complete within its grace period",
-            ));
-        }
+        Self::require_late_stop_settled(self.wait(events, post_stop_grace)).await?;
         Ok(true)
     }
 
