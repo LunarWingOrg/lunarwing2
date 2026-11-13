@@ -124,6 +124,16 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   or `websearch.use` policy entries. `background_wait` is a noninteractive-run
   JSON event, not a serve `V2Event`; never treat it as task completion, and
   keep the executor deadline/interrupt regression for a wait that never ends.
+- Turn on v2.2.7's Console event watches (flag `console_watches`): they let
+  OpenCode Console, a hosted third party, steer a session, which is a second
+  instruction channel into the worker (WI#609, decision on !2398 AAV-1). The
+  wrapper forces `OPENCODE_FLAGS=-console_watches` on every start, because
+  upstream resolves that variable before every config document, a project's
+  own `opencode.json` in the workspace included. Never remove or weaken that
+  line, never set `experimental.console_watches` or `experimental.all_flags`
+  in the lane config (`exposure_policy_assert.py` fails the build on either),
+  and on every bump re-check the flag registry and the precedence (checklist
+  item 7 in `docs/ops/WORKER-CONTAINERS.md`).
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays
