@@ -15,9 +15,12 @@
 # Licenses/sources policy stays with the ic workspace gate. cargo-deny cannot
 # audit the manifest-less pebble4lunarwing/upstream lock, so WI#626 scans that
 # file directly with pinned cargo-audit after the manifest roots. It reuses
-# cargo-deny's advisory checkout with no second fetch and denies unsound and
-# yanked findings. verify_upstream_lock.py still independently gates the
-# reviewed override digest and package delta.
+# cargo-deny's advisory checkout with no second fetch and denies vulnerability
+# and unsound findings. Yanked-crate denial is best effort: --no-fetch limits
+# it to the existing crates.io index cache, so the status line reports every
+# inconclusive crate check and whether the index cache was unavailable.
+# verify_upstream_lock.py still independently gates the reviewed override
+# digest and package delta.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -73,12 +76,19 @@ while IFS= read -r lock; do
     checked=$((checked + 1))
 done < <(git -C "$repo_root" ls-files '**/Cargo.lock' | grep -v '^ic/vendor/' | sort)
 
-db_dir=$(find "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs -maxdepth 1 -mindepth 1 \
-    -type d -name 'advisory-db-*' 2>/dev/null | head -n 1 || true)
-if [[ -z "$db_dir" ]]; then
+db_dirs=()
+mapfile -t db_dirs < <(find "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs -maxdepth 1 -mindepth 1 \
+    -type d -name 'advisory-db-*' 2>/dev/null | sort)
+if ((${#db_dirs[@]} == 0)); then
     echo "ERROR: cargo-deny left no advisory database for the Pebble override audit" >&2
     exit 1
 fi
+if ((${#db_dirs[@]} > 1)); then
+    echo "ERROR: expected exactly one advisory database for the Pebble override audit; found ${#db_dirs[@]}" >&2
+    printf '  %s\n' "${db_dirs[@]}" >&2
+    exit 1
+fi
+db_dir=${db_dirs[0]}
 echo "advisory-db commit: $(git -C "$db_dir" rev-parse HEAD) ($(git -C "$db_dir" log -1 --format=%cs))"
 
 if [[ ! -f "$repo_root/$override_lock" ]]; then
@@ -91,8 +101,9 @@ if ! command -v "$audit_bin" >/dev/null 2>&1; then
 fi
 
 # cargo-deny cannot inspect a lockfile without a manifest. Reuse its exact
-# advisory checkout and forbid another fetch; unsound and yanked findings keep
-# the same deny policy as ic/deny.toml, while vulnerabilities deny by default.
+# advisory checkout and forbid another fetch. Vulnerabilities and unsound
+# findings deny; cached yanked findings also deny, but cache misses remain
+# inconclusive and are counted in the status line (WI#653).
 audit_status=0
 audit_out=$(cd "$repo_root" && taskset -c 0-11 "$audit_bin" audit \
     --file "$repo_root/$override_lock" \
@@ -100,8 +111,13 @@ audit_out=$(cd "$repo_root" && taskset -c 0-11 "$audit_bin" audit \
     --no-fetch --stale \
     -D unsound -D yanked \
     --color never 2>&1) || audit_status=$?
+yank_unchecked=$(grep -cF "couldn't check if the package is yanked" <<<"$audit_out" || true)
+yank_summary="yank status best-effort from the cached crates.io index; $yank_unchecked crate check(s) inconclusive"
+if grep -qF "couldn't open crates.io index" <<<"$audit_out"; then
+    yank_summary="yank status unavailable: could not open the cached crates.io index; no crates checked for yanks"
+fi
 if ((audit_status != 0)); then
-    echo "FAIL $override_lock (cargo-audit)"
+    echo "FAIL $override_lock (cargo-audit); $yank_summary"
     grep -E 'RUSTSEC-|error(\[|:)|vulnerability|unsound|yanked' <<<"$audit_out" | sed 's/^/  /' || true
     printf '%s\n' "$audit_out"
     failed=1
@@ -109,7 +125,7 @@ else
     if [[ -n "$audit_out" ]]; then
         printf '%s\n' "$audit_out"
     fi
-    echo "OK   $override_lock (cargo-audit)"
+    echo "OK   $override_lock (cargo-audit); $yank_summary"
 fi
 
 echo "satellite advisory sweep: $checked manifest roots ok, $skipped manifest-less cargo-deny skips; Pebble override cargo-audit status above"
