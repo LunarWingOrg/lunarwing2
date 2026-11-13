@@ -332,6 +332,17 @@ _pg_named_volume_present() {
   [[ "$volume_name" == "lunarwing-pg-${name}" ]]
 }
 
+_pg_container_uses_named_volume() {
+  local name="$1" mount
+  # A stopped Quadlet removes its container; its retained exact-name volume
+  # is enough in that case. An existing container must actually use that volume.
+  _ctr_inspect "$name" "lunarwing-pg-${name}" &>/dev/null || return 0
+  mount="$(_ctr_inspect "$name" -f \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}:{{.Name}}{{end}}{{end}}' \
+    "lunarwing-pg-${name}" 2>/dev/null)" || return 1
+  [[ "$mount" == "volume:lunarwing-pg-${name}" ]]
+}
+
 _pg_daemon_activity() {
   local name="$1" state rc=0
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -377,7 +388,7 @@ _pg_replace_container_for_refresh() {
   local name="$1" container_name="lunarwing-pg-$1" quadlet=false
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     quadlet=true
-    render_pg_quadlet "$name" || return 1
+    render_pg_quadlet "$name" "$PG_IMAGE" || return 1
     _systemctl_user "$name" daemon-reload || return 1
     stop_tenant_postgres "$name" || return 1
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -397,19 +408,34 @@ _pg_replace_container_for_refresh() {
       | grep -q true || return 1
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
       _openrc_service "lunarwing-pg-${name}" start || return 1
-      _openrc_service "lunarwing-pg-${name}-sup" start || return 1
+      _openrc_service "lunarwing-pg-${name}-sup" start \
+        || say "WARNING: optional PostgreSQL supervisor for '$name' did not start; inspect it after refresh" >&2
     fi
   fi
 }
 
 _pg_wait_for_refresh_health() {
-  local name="$1" container_name="lunarwing-pg-$1" attempts=0 vector_version
+  local name="$1" container_name="lunarwing-pg-$1" attempts=0 vector_version server_version
   while (( attempts < 120 )); do
     if _ctr "$name" exec "$container_name" pg_isready -U lunarwing -q 2>/dev/null; then
       vector_version="$(_ctr "$name" exec "$container_name" \
-        psql -U lunarwing -d lunarwing -Atc \
+        psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
         "SELECT extversion FROM pg_extension WHERE extname = 'vector'" 2>/dev/null || true)"
-      [[ -n "$vector_version" ]] && return 0
+      if [[ -n "$vector_version" ]] && _ctr "$name" exec "$container_name" \
+          psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
+          "SELECT '[1,2,3]'::vector" >/dev/null 2>&1; then
+        server_version="$(_ctr "$name" exec "$container_name" \
+          psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
+          'SHOW server_version_num' 2>/dev/null)" || return 1
+        [[ "$server_version" =~ ^[0-9]{6}$ ]] || return 1
+        if (( 10#$server_version >= 160016 )); then return 0; fi
+        if [[ "$server_version" == 16* && "${LUNARWING_MT_PG_ALLOW_UNPATCHED:-}" == "$name" ]]; then
+          say "WARNING: explicit unpatched PostgreSQL rollback allowed for '$name' ($server_version)" >&2
+          return 0
+        fi
+        say "PostgreSQL server_version_num=$server_version is below security floor 160016" >&2
+        return 1
+      fi
     fi
     attempts=$((attempts + 1))
     sleep 1
@@ -444,6 +470,8 @@ refresh_tenant_postgres_image() {
   ensure_init_system
   _pg_named_volume_present "$name" \
     || die "PostgreSQL refresh requires the named volume lunarwing-pg-${name}; migrate legacy container-local data first"
+  _pg_container_uses_named_volume "$name" \
+    || die "PostgreSQL container does not mount lunarwing-pg-${name} at /var/lib/postgresql/data; refresh refused before stop"
   tenant_postgres_image_status "$name" || true
   if ! _ctr "$name" pull "$PG_IMAGE"; then
     die "PostgreSQL image pull failed for '$name'; no service was stopped"

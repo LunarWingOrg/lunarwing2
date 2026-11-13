@@ -15,8 +15,9 @@ run_refresh() {
   local init="$1" daemon="$2" volume="$3" pull_ok="$4" health_ok="$5"
   rm -f "$FIXTURE_ROOT/events" "$FIXTURE_ROOT/output"
   mkdir -p "$FIXTURE_ROOT/state"
+  rm -f "$FIXTURE_ROOT/state/"*
   if FIXTURE_INIT="$init" FIXTURE_DAEMON="$daemon" FIXTURE_VOLUME="$volume" \
-      FIXTURE_PULL_OK="$pull_ok" FIXTURE_HEALTH_OK="$health_ok" bash -c '
+      FIXTURE_PULL_OK="$pull_ok" FIXTURE_HEALTH_OK="$health_ok" FIXTURE_CASE="${6:-normal}" bash -c '
     set -uo pipefail
     source "$1"
     INIT_SYSTEM="$FIXTURE_INIT"
@@ -28,11 +29,23 @@ run_refresh() {
     tenant_exists_in_registry() { return 0; }
     sanitize_name() { printf "%s\n" "$1"; }
     podman_supports_quadlet() { [[ "$INIT_SYSTEM" == systemd ]]; }
-    render_pg_quadlet() { printf "render-quadlet\n" >>"$FIXTURE_ROOT/events"; }
-    tenant_postgres_image_status() { printf "inventory\n" >>"$FIXTURE_ROOT/events"; }
+    render_pg_quadlet() { printf "render-quadlet:%s:%s\n" "$1" "${2:-preserve}" >>"$FIXTURE_ROOT/events"; }
+    openrc_dispatch_preflight() { :; }
+    require_root() {
+      printf "root-check\n" >>"$FIXTURE_ROOT/events"
+      [[ "$FIXTURE_CASE" != root-denied && "$FIXTURE_CASE" != status-root-denied ]] || die "root required"
+    }
+    ports_registry_init() { printf "registry-init\n" >>"$FIXTURE_ROOT/events"; }
+    ports_registry_require_readonly() { printf "registry-readonly\n" >>"$FIXTURE_ROOT/events"; }
+    with_tenant_lifecycle_lock() {
+      printf "lock:%s\n" "$1" >>"$FIXTURE_ROOT/events"
+      shift
+      "$@"
+    }
     start_tenant_postgres() {
       printf "pg-create\n" >>"$FIXTURE_ROOT/events"
       touch "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running"
+      [[ "$FIXTURE_CASE" != not-running ]] || rm -f "$FIXTURE_ROOT/state/running"
     }
     stop_tenant_postgres() {
       printf "pg-stop\n" >>"$FIXTURE_ROOT/events"
@@ -49,7 +62,9 @@ run_refresh() {
           fi
           printf "inactive\n"; return 3 ;;
         stop:lunarwing-alice.service) rm -f "$FIXTURE_ROOT/state/daemon-active" ;;
-        start:lunarwing-alice.service) touch "$FIXTURE_ROOT/state/daemon-active" ;;
+        start:lunarwing-alice.service)
+          [[ "$FIXTURE_CASE" != daemon-failure ]] || return 1
+          touch "$FIXTURE_ROOT/state/daemon-active" ;;
         start:lunarwing-pg-alice.service)
           touch "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running" ;;
       esac
@@ -64,8 +79,12 @@ run_refresh() {
           [[ -e "$FIXTURE_ROOT/state/daemon-active" ]] && return 0
           return 3 ;;
         lunarwing-alice:stop) rm -f "$FIXTURE_ROOT/state/daemon-active" ;;
-        lunarwing-alice:start) touch "$FIXTURE_ROOT/state/daemon-active" ;;
+        lunarwing-alice:start)
+          [[ "$FIXTURE_CASE" != daemon-failure ]] || return 1
+          touch "$FIXTURE_ROOT/state/daemon-active" ;;
         lunarwing-pg-alice:stop) rm -f "$FIXTURE_ROOT/state/running" ;;
+        lunarwing-pg-alice:start) [[ "$FIXTURE_CASE" != pg-service-failure ]] || return 1 ;;
+        lunarwing-pg-alice-sup:start) [[ "$FIXTURE_CASE" != supervisor-failure ]] || return 1 ;;
       esac
       return 0
     }
@@ -81,6 +100,10 @@ run_refresh() {
             return 0 ;;
           "{{.Config.Image}}") printf "%s\n" "$PG_IMAGE"; return 0 ;;
           "{{.Image}}") printf "sha256:image-id\n"; return 0 ;;
+          *".Mounts"*)
+            if [[ "$FIXTURE_CASE" == wrong-mount ]]; then printf "volume:anonymous-data\n"
+            else printf "volume:lunarwing-pg-alice\n"; fi
+            return 0 ;;
         esac
       fi
       [[ -e "$FIXTURE_ROOT/state/container" ]]
@@ -96,14 +119,38 @@ run_refresh() {
         rm) rm -f "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running" ;;
         exec)
           [[ "$FIXTURE_HEALTH_OK" == true ]] || return 1
-          if [[ "$*" == *"SELECT extversion"* ]]; then printf "0.8.7\n"; fi
+          if [[ "$*" == *"SELECT extversion"* ]]; then
+            [[ "$FIXTURE_CASE" == no-extension ]] || printf "0.8.7\n"
+          elif [[ "$*" == *"::vector"* ]]; then
+            [[ "$FIXTURE_CASE" != no-vector-library ]] || return 1
+            printf "[1,2,3]\n"
+          elif [[ "$*" == *"SHOW server_version_num"* ]]; then
+            case "$FIXTURE_CASE" in
+              old-version|rollback|wrong-rollback) printf "160015\n" ;;
+              bad-version) printf "unknown\n" ;;
+              *) printf "160016\n" ;;
+            esac
+          elif [[ "$*" == *"SELECT version()"* ]]; then
+            printf "PostgreSQL fixture 16.16\n"
+          fi
           return 0 ;;
       esac
       return 0
     }
     if [[ "$FIXTURE_DAEMON" == active ]]; then touch "$FIXTURE_ROOT/state/daemon-active"; fi
     touch "$FIXTURE_ROOT/state/container" "$FIXTURE_ROOT/state/running"
-    refresh_tenant_postgres_image alice
+    case "$FIXTURE_CASE" in
+      rollback) export LUNARWING_MT_PG_ALLOW_UNPATCHED=alice ;;
+      wrong-rollback) export LUNARWING_MT_PG_ALLOW_UNPATCHED=bob ;;
+    esac
+    case "$FIXTURE_CASE" in
+      status|status-root-denied) main pg-image-status alice ;;
+      missing-arg) main refresh-pg-image ;;
+      extra-arg) main refresh-pg-image alice extra ;;
+      status-missing-arg) main pg-image-status ;;
+      status-extra-arg) main pg-image-status alice extra ;;
+      *) main refresh-pg-image alice ;;
+    esac
   ' _ "$MT_ADMIN" >"$FIXTURE_ROOT/output" 2>&1; then
     REFRESH_RC=0
   else
@@ -157,8 +204,13 @@ assert_rc "systemd refresh succeeds" zero
 assert_order "systemd pulls before stopping daemon" "pull docker.io/pgvector" "stop lunarwing-alice.service"
 assert_order "systemd removes old container before starting replacement" "rm -f lunarwing-pg-alice" "start lunarwing-pg-alice.service"
 assert_order "systemd restarts daemon after replacement" "start lunarwing-pg-alice.service" "start lunarwing-alice.service"
-assert_log "systemd records before and after" "inventory" present
-if [[ "$(grep -c '^inventory$' "$FIXTURE_ROOT/events")" -eq 2 ]]; then
+assert_order "systemd renders before reload" "render-quadlet:alice:docker.io/pgvector" "daemon-reload"
+assert_order "systemd reloads before replacement start" "daemon-reload" "start lunarwing-pg-alice.service"
+assert_order "refresh checks root before registry" "root-check" "registry-init"
+assert_order "refresh takes lifecycle lock before pulling" "lock:alice" "pull docker.io/pgvector"
+assert_order "systemd inventories before pull" "SELECT version()" "pull docker.io/pgvector"
+assert_log "gate uses ON_ERROR_STOP for the real vector operation" "psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc SELECT '[1,2,3]'::vector" present
+if [[ "$(grep -c '^tenant=alice$' "$FIXTURE_ROOT/output")" -eq 2 ]]; then
   pass "systemd has two inventory records"
 else
   fail "systemd inventory count is not two"
@@ -169,6 +221,7 @@ run_refresh openrc active true true true
 assert_rc "OpenRC refresh succeeds" zero
 assert_order "OpenRC supervisor stops before container removal" "lunarwing-pg-alice-sup stop" "rm -f lunarwing-pg-alice"
 assert_order "OpenRC recreates before restarting supervisor" "pg-create" "lunarwing-pg-alice-sup start"
+assert_order "OpenRC database service restarts before supervisor" "lunarwing-pg-alice start" "lunarwing-pg-alice-sup start"
 assert_order "OpenRC daemon restarts after database" "lunarwing-pg-alice-sup start" "lunarwing-alice start"
 
 run_refresh systemd active true false true
@@ -196,6 +249,47 @@ assert_log "initially stopped daemon stays stopped" "lunarwing-alice start" abse
 run_refresh systemd unknown true true true
 assert_rc "unknown daemon state is fatal" nonzero
 assert_log "unknown daemon state prevents container removal" "rm -f lunarwing-pg-alice" absent
+
+for init in systemd openrc; do
+  for fault in no-extension no-vector-library old-version bad-version daemon-failure; do
+    run_refresh "$init" active true true true "$fault"
+    assert_rc "$init refuses $fault" nonzero
+    if [[ "$fault" != daemon-failure ]]; then
+      assert_log "$init $fault leaves daemon stopped" "start lunarwing-alice.service" absent
+      assert_log "$init $fault leaves OpenRC daemon stopped" "lunarwing-alice start" absent
+    fi
+  done
+done
+run_refresh openrc active true true true not-running
+assert_rc "not-running replacement fails" nonzero
+assert_log "not-running replacement never starts daemon" "lunarwing-alice start" absent
+run_refresh openrc active true true true pg-service-failure
+assert_rc "OpenRC database service must start" nonzero
+run_refresh openrc active true true true supervisor-failure
+assert_rc "optional OpenRC supervisor failure is nonfatal" zero
+assert_output "optional supervisor failure warns" "optional PostgreSQL supervisor"
+assert_log "supervisor warning still reaches real vector query" "SELECT '[1,2,3]'::vector" present
+run_refresh systemd active true true true wrong-mount
+assert_rc "container on another volume is refused" nonzero
+assert_log "wrong mount refuses before pull" "pull docker.io/pgvector" absent
+assert_log "wrong mount refuses before removal" "rm -f lunarwing-pg-alice" absent
+run_refresh systemd active true true true rollback
+assert_rc "tenant-scoped unpatched rollback is explicit" zero
+assert_output "unpatched rollback warns" "explicit unpatched PostgreSQL rollback"
+run_refresh systemd active true true true wrong-rollback
+assert_rc "another tenant cannot enable unpatched rollback" nonzero
+run_refresh systemd active true true true status
+assert_rc "pg-image-status dispatcher succeeds" zero
+assert_order "status checks root before readonly registry" "root-check" "registry-readonly"
+assert_output "status prints image reference" "image_reference=docker.io/pgvector"
+assert_output "status prints image ID" "image_id=sha256:image-id"
+assert_output "status prints live version" "server_version=PostgreSQL fixture 16.16"
+assert_log "status never pulls" "pull docker.io/pgvector" absent
+for fault in root-denied status-root-denied missing-arg extra-arg status-missing-arg status-extra-arg; do
+  run_refresh systemd active true true true "$fault"
+  assert_rc "dispatcher refuses $fault" nonzero
+  assert_log "$fault never pulls" "pull docker.io/pgvector" absent
+done
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %s failure(s)\n' "$failures"
