@@ -232,6 +232,11 @@ zbus = "4"
 serde_json = "1"
 
 [dev-dependencies]
+# Test-only `LogScrubber::remove_secret` (WI#633): tests that register a
+# fixture secret with the process-wide daemon scrubber must be able to
+# unregister it again. Dev-dependencies are not built into the shipped
+# binary, so production code has no removal path to call.
+lunarwing_safety = { path = "crates/lunarwing_safety", features = ["test-support"] }
 tokio-test = "0.4"
 tracing-test = "0.2"
 tokio-tungstenite = "0.26"
