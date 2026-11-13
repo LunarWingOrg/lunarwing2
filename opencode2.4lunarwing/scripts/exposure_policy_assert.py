@@ -13,7 +13,9 @@ Assertions (opencode2 lane):
   1. config/opencode2.json parses and pins "share": "disabled" (control 3).
   2. config/opencode2.json pins "update": "disable".
   3. config/opencode2.json carries the shell deny rules for the
-     self-exposure subcommands (control 2, config layer).
+     self-exposure subcommands (control 2, config layer), and sets neither
+     experimental.console_watches nor experimental.all_flags (WI#609, !2398
+     AAV-1: the Console event watches stay off).
   4. entrypoint.sh starts the server with a password and a loopback default
      hostname, never invokes service mode, never passes --service, defaults
      OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
@@ -21,7 +23,9 @@ Assertions (opencode2 lane):
      from /app/config at boot (controls 2+4; expected startup-shape checks).
   5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
      service/pair subcommands, the --service flag, and every --hostname
-     occurrence (control 2, wrapper layer).
+     occurrence (control 2, wrapper layer). It also forces
+     OPENCODE_FLAGS=-console_watches right before it execs the real binary
+     (WI#609, !2398 AAV-1).
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
@@ -70,6 +74,16 @@ OPENTUNNEL_MARKERS = (b"opentunnel.xyz", b"@opentunnel/client", b"@opentunnel/pr
 # sync with sessionPermissions() in scripts/opencode_task_executor.ts.
 REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair", "serve"))
 
+# WI#609, !2398 AAV-1: opencode v2.2.7 ships Console event watches, a remote
+# steering channel through OpenCode Console, behind the feature flag
+# `console_watches`. The lane keeps it off in two places. The lane config must
+# not turn it on (`experimental.all_flags` turns every flag on). And the
+# wrapper forces the flag off in OPENCODE_FLAGS, which upstream resolves before
+# every config document, a project's own opencode.json included.
+FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", "console_watches")
+WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="-console_watches"'
+WRAPPER_EXEC = 'exec "$REAL_OPENCODE" "$@"'
+
 failures: list[str] = []
 
 
@@ -111,6 +125,19 @@ def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
         fail(f"{config_path} permissions must deny shell resources {missing}")
     else:
         check("opencode2.json carries the self-exposure shell deny rules")
+    # Only an explicit false is accepted beside an absent key: upstream reads
+    # these as booleans, and anything else is at best a typo for "on".
+    experimental = config.get("experimental")
+    opted_in = [
+        key
+        for key in FORBIDDEN_EXPERIMENTAL_FLAGS
+        if isinstance(experimental, dict) and experimental.get(key, False) is not False
+    ]
+    if opted_in:
+        fail(f"{config_path} must not set experimental flags {opted_in} — the Console "
+             "event watches are a remote instruction channel and stay off (WI#609 AAV-1)")
+    else:
+        check("opencode2.json leaves the Console event watches flag off")
 
 
 def serve_invocation_lines(code: str) -> list[str]:
@@ -258,6 +285,25 @@ def check_wrapper(lane: pathlib.Path) -> None:
              "scan every argv token, not only $1")
     else:
         check("wrapper scans every argv token (service/pair/--service/--hostname)")
+    # WI#609 AAV-1: the pin must be a real statement, and the last word on
+    # OPENCODE_FLAGS before the real binary starts. A comment that quotes it,
+    # a pin after the exec, or a later unset would all leave the flag to the
+    # caller's environment and to workspace config.
+    lines = [line.strip() for line in text.splitlines()]
+    execs = [index for index, line in enumerate(lines) if line == WRAPPER_EXEC]
+    pins = [index for index, line in enumerate(lines) if line == WRAPPER_FLAG_PIN]
+    pinned = (
+        len(execs) == 1
+        and bool(pins)
+        and pins[-1] < execs[0]
+        and not any("OPENCODE_FLAGS" in line for line in lines[pins[-1] + 1 : execs[0]])
+    )
+    if pinned:
+        check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
+    else:
+        fail(f"{wrapper} must run {WRAPPER_FLAG_PIN!r} as the last OPENCODE_FLAGS statement "
+             f"before its single {WRAPPER_EXEC!r} — the Console event watches stay off "
+             "(WI#609 AAV-1)")
 
 
 def check_binary(binary: pathlib.Path) -> None:
