@@ -524,6 +524,19 @@ pub async fn workload_spawner() -> WorkloadSpawner {
     SPAWNER.spawner().await
 }
 
+/// Current diagnostic mode without triggering detection. Before the first
+/// workload there is no active mode to report; an in-progress probe is waited
+/// on so the result is never reported as a definitive fallback prematurely.
+pub async fn workload_isolation_mode() -> &'static str {
+    let state = SPAWNER.state.lock().await;
+    match &*state {
+        CacheState::Unprobed => "unprobed",
+        CacheState::Definitive(spawner) | CacheState::Transient { spawner, .. } => {
+            spawner.isolation_mode()
+        }
+    }
+}
+
 async fn detect_spawner_with<F, Fut>(probe: F) -> Detection
 where
     F: FnOnce() -> Fut,
