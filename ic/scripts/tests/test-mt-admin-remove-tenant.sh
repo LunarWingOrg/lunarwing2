@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WI#638 — hermetic remove-tenant worker/egress ordering harness.
+# WI#638, WI#650, WI#672 — hermetic remove-tenant worker/egress ordering harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
 
@@ -85,9 +85,9 @@ rc-update() {
 _container_file() { printf '%s/containers/%s\n' "$RUNTIME_DIR" "$1"; }
 _volume_file() { printf '%s/volumes/%s\n' "$RUNTIME_DIR" "$1"; }
 
-# The fake runtime lists containers as "<full id> <name>". The keeper's infra
-# container has a fixed ID, which `pod inspect` also reports; every other
-# container gets an ID made from its name.
+# The fake runtime lists containers as "<id> <name>" and truncates IDs unless
+# --no-trunc is used. The keeper's infra container has a fixed ID, which
+# `pod inspect` also reports; every other container gets an ID from its name.
 KEEPER_INFRA_ID="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 KEEPER_INFRA_NAME="0123456789ab-infra"
 _fake_container_id() { printf 'c0ffee%058d' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
