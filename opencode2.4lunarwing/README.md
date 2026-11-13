@@ -87,6 +87,19 @@ check. See `docs/ops/WORKER-CONTAINERS.md` for the bump review, verification
 and rollout record, including the open WI#369 SDK-gate and WI#424 egress
 follow-ups.
 
+## OpenCode Console credential boundary (WI#665)
+
+The upstream `opencode` integration can fetch a hosted Console Library of
+instructions and skills when it has both a Console credential and egress to
+`opencode.ai`. Its bundled catalog names `OPENCODE_API_KEY`; the
+`console_watches` flag does not gate this Library. The lane therefore refuses
+to start when that variable is present, even empty, unless the operator sets
+`LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
+spellings are accepted). The opt-in acknowledges the credential and egress
+risk; it does not authorize Console-authored instructions or skills. Startup
+messages name the variable but never print its value. The tenant egress
+allowlist remains the boundary against a compromised worker.
+
 ## Do not configure both lanes on one tenant during the transition
 
 With both `opencode` and `opencode2` present the agent sees two `create_job`
