@@ -44,9 +44,8 @@
 //! caller's allowlisted assignments from the file: a secret a tenant places
 //! in the manager's environment (e.g. via `systemctl --user
 //! set-environment`) reaches only workloads whose caller explicitly
-//! forwarded it. Names added to the manager after daemon start are not in
-//! the snapshot and still inherit (documented drift; the probe runs once
-//! per daemon by design).
+//! forwarded it. Names added to the manager after the successful probe are
+//! not in the snapshot and still inherit (documented drift).
 //!
 //! Lifecycle: `systemd-run --wait` proxies stdio and the service's exit
 //! status and returns after the unit is collected (`--collect`), so the
@@ -66,7 +65,7 @@
 //! cancellation-safe finalization call sites should use after dropping a
 //! workload's execution future.
 //!
-//! Configuration (environment, read once at first use):
+//! Configuration (environment, read at detection):
 //! - `LUNARWING_WORKLOAD_ISOLATION`: `auto` (default) or `none` to disable services.
 //! - `LUNARWING_WORKLOAD_SLICE`: service slice (default `lunarwing-workloads.slice`).
 //! - `LUNARWING_WORKLOAD_MEMORY_MAX`: optional per-service `MemoryMax=` value.
@@ -77,7 +76,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::process::Command;
-use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
 /// Default slice for systemd workload services. One name works for every
@@ -87,7 +85,7 @@ const DEFAULT_SLICE: &str = "lunarwing-workloads.slice";
 /// Grace period between SIGTERM and SIGKILL when terminating a workload tree.
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 
-/// Upper bound for the one-time systemd-service capability probe.
+/// Wall-clock upper bound for one systemd-service capability probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default SIGTERM→SIGKILL grace for `systemctl --user stop` of a workload
@@ -105,7 +103,7 @@ enum Isolation {
 
 /// Spawns workload processes with process-group lifecycle guarantees and,
 /// when available, systemd transient-service isolation. Cheap to clone; the
-/// expensive capability probe happens once inside [`workload_spawner`].
+/// capability probe is cached by [`workload_spawner`].
 #[derive(Debug, Clone)]
 pub struct WorkloadSpawner {
     isolation: Isolation,
@@ -140,6 +138,14 @@ impl WorkloadSpawner {
     /// Whether workloads are placed in systemd transient services.
     pub fn uses_systemd_services(&self) -> bool {
         self.isolation == Isolation::SystemdService
+    }
+
+    /// Stable diagnostic name for the active isolation mode.
+    pub fn isolation_mode(&self) -> &'static str {
+        match self.isolation {
+            Isolation::SystemdService => "systemd-service",
+            Isolation::ProcessGroup => "process-group",
+        }
     }
 
     /// `XDG_RUNTIME_DIR` the caller must forward to the child, if the spawner
@@ -419,14 +425,110 @@ fn unset_environment_property(
     Some(format!("--property=UnsetEnvironment={}", names.join(" ")))
 }
 
-/// Process-wide spawner, probed once and cached. Probing never fails the
-/// caller: any error degrades to process-group isolation.
-pub async fn workload_spawner() -> &'static WorkloadSpawner {
-    static SPAWNER: OnceCell<WorkloadSpawner> = OnceCell::const_new();
-    SPAWNER.get_or_init(detect_spawner).await
+/// Minimum interval between probes after a transient failure. The fallback
+/// remains usable during the interval without turning one slow manager into
+/// a process-wide permanent decision.
+const PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug)]
+enum ProbeError {
+    Definitive(String),
+    Transient(String),
 }
 
-async fn detect_spawner() -> WorkloadSpawner {
+impl ProbeError {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Definitive(reason) | Self::Transient(reason) => reason,
+        }
+    }
+
+    fn is_definitive(&self) -> bool {
+        matches!(self, Self::Definitive(_))
+    }
+}
+
+#[derive(Debug)]
+enum Detection {
+    Definitive(WorkloadSpawner),
+    Transient(WorkloadSpawner),
+}
+
+#[derive(Debug)]
+enum CacheState {
+    Unprobed,
+    Definitive(WorkloadSpawner),
+    Transient {
+        spawner: WorkloadSpawner,
+        retry_at: std::time::Instant,
+    },
+}
+
+#[derive(Debug)]
+struct SpawnerCache {
+    state: tokio::sync::Mutex<CacheState>,
+    retry_interval: Duration,
+}
+
+impl SpawnerCache {
+    const fn new(retry_interval: Duration) -> Self {
+        Self {
+            state: tokio::sync::Mutex::const_new(CacheState::Unprobed),
+            retry_interval,
+        }
+    }
+
+    async fn spawner(&self) -> WorkloadSpawner {
+        self.spawner_with(probe_systemd_services).await
+    }
+
+    async fn spawner_with<F, Fut>(&self, probe: F) -> WorkloadSpawner
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<std::ffi::OsString>, ProbeError>>,
+    {
+        let mut state = self.state.lock().await;
+        match &*state {
+            CacheState::Definitive(spawner) => return spawner.clone(),
+            CacheState::Transient { spawner, retry_at }
+                if std::time::Instant::now() < *retry_at =>
+            {
+                return spawner.clone();
+            }
+            CacheState::Unprobed | CacheState::Transient { .. } => {}
+        }
+
+        match detect_spawner_with(probe).await {
+            Detection::Definitive(spawner) => {
+                *state = CacheState::Definitive(spawner.clone());
+                spawner
+            }
+            Detection::Transient(spawner) => {
+                *state = CacheState::Transient {
+                    spawner: spawner.clone(),
+                    retry_at: std::time::Instant::now() + self.retry_interval,
+                };
+                spawner
+            }
+        }
+    }
+}
+
+static SPAWNER: SpawnerCache = SpawnerCache::new(PROBE_RETRY_INTERVAL);
+
+/// Process-wide spawner. Successful detection, configured isolation disable,
+/// and an unavailable user bus are cached. Other failures use process groups
+/// for this call and are retried no more often than [`PROBE_RETRY_INTERVAL`].
+pub async fn workload_spawner() -> WorkloadSpawner {
+    SPAWNER.spawner().await
+}
+
+async fn detect_spawner_with<F, Fut>(probe: F) -> Detection
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::ffi::OsString>, ProbeError>>,
+{
     let mut spawner = WorkloadSpawner::direct();
     if let Ok(slice) = std::env::var("LUNARWING_WORKLOAD_SLICE")
         && !slice.is_empty()
@@ -444,10 +546,10 @@ async fn detect_spawner() -> WorkloadSpawner {
 
     if isolation_disabled() {
         debug!("workload isolation: systemd services disabled by env");
-        return spawner;
+        return Detection::Definitive(spawner);
     }
 
-    match probe_systemd_services().await {
+    match probe().await {
         Ok(captured_env) => {
             spawner.isolation = Isolation::SystemdService;
             spawner.xdg_runtime_dir = ensure_xdg_runtime_dir();
@@ -459,15 +561,21 @@ async fn detect_spawner() -> WorkloadSpawner {
                 manager_env_vars = spawner.manager_env.len(),
                 "workload isolation: systemd user transient services enabled"
             );
+            Detection::Definitive(spawner)
         }
-        Err(reason) => {
+        Err(error) => {
             warn!(
-                reason = %reason,
+                reason = error.reason(),
+                will_retry = !error.is_definitive(),
                 "workload isolation: systemd services unavailable, using process groups only"
             );
+            if error.is_definitive() {
+                Detection::Definitive(spawner)
+            } else {
+                Detection::Transient(spawner)
+            }
         }
     }
-    spawner
 }
 
 fn isolation_disabled() -> bool {
@@ -499,43 +607,109 @@ fn ensure_xdg_runtime_dir() -> Option<String> {
 }
 
 /// Verify `systemd-run --user --wait --pipe` works from this process, and
-/// capture the environment a manager-forked service inherits (the output of
-/// `env -0` run inside the probe service — the manager's own environment at
-/// capture time). Done once; the result is cached by [`workload_spawner`].
-/// The capture is what makes workload environments exact: it is the
-/// inherited layer every service would see, serialized into each
-/// `EnvironmentFile=` so caller additions are the only deltas.
+/// capture the environment a manager-forked service inherits. The blocking
+/// thread and `std::time::Instant` deadline keep a paused tokio clock from
+/// firing the timeout immediately or advancing virtual time.
 #[cfg(target_os = "linux")]
-async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, String> {
-    let mut probe = Command::new("systemd-run");
-    probe.args([
-        "--user",
-        "--wait",
-        "--pipe",
-        "--quiet",
-        "--collect",
-        "--",
-        "env",
-        "-0",
-    ]);
-    if let Some(dir) = ensure_xdg_runtime_dir() {
+async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, ProbeError> {
+    let Some(dir) = ensure_xdg_runtime_dir() else {
+        return Err(ProbeError::Definitive(
+            "no usable XDG_RUNTIME_DIR/user bus".to_string(),
+        ));
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut probe = std::process::Command::new("systemd-run");
+        probe.args([
+            "--user",
+            "--wait",
+            "--pipe",
+            "--quiet",
+            "--collect",
+            "--",
+            "env",
+            "-0",
+        ]);
         probe.env("XDG_RUNTIME_DIR", dir);
-    } else {
-        return Err("no usable XDG_RUNTIME_DIR/user bus".to_string());
-    }
+        run_probe_command(probe, PROBE_TIMEOUT)
+    })
+    .await
+    .map_err(|error| ProbeError::Transient(format!("probe task failed: {error}")))?
+}
+
+/// Run a probe to a wall-clock deadline. A reader thread drains stdout while
+/// the child runs; on timeout the direct child is killed and reaped, and the
+/// detached reader finishes when its pipe closes instead of blocking cleanup.
+#[cfg(target_os = "linux")]
+fn run_probe_command(
+    mut probe: std::process::Command,
+    timeout: Duration,
+) -> Result<Vec<std::ffi::OsString>, ProbeError> {
     probe
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    let mut child = probe
+        .spawn()
+        .map_err(|error| ProbeError::Transient(format!("failed to run systemd-run: {error}")))?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ProbeError::Transient(
+            "failed to capture probe output".to_string(),
+        ));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(result);
+    });
 
-    let output = tokio::time::timeout(PROBE_TIMEOUT, probe.output())
-        .await
-        .map_err(|_| "probe timed out".to_string())?
-        .map_err(|e| format!("failed to run systemd-run: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("probe service exited with {}", output.status));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(PROBE_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError::Transient("probe timed out".to_string()));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError::Transient(format!(
+                    "failed to wait for systemd-run: {error}"
+                )));
+            }
+        }
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let output = match rx.recv_timeout(remaining) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(ProbeError::Transient(format!(
+                "failed to read probe output: {error}"
+            )));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(ProbeError::Transient("probe timed out".to_string()));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(ProbeError::Transient(
+                "probe output reader stopped".to_string(),
+            ));
+        }
+    };
+    if !status.success() {
+        return Err(ProbeError::Transient(format!(
+            "probe service exited with {status}"
+        )));
     }
-    Ok(parse_env_nul(&output.stdout))
+    Ok(parse_env_nul(&output))
 }
 
 /// Parse NUL-delimited `env -0` output into variable entries (order
@@ -550,8 +724,10 @@ fn parse_env_nul(bytes: &[u8]) -> Vec<std::ffi::OsString> {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, String> {
-    Err("systemd services are Linux-only".to_string())
+async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, ProbeError> {
+    Err(ProbeError::Definitive(
+        "systemd services are Linux-only".to_string(),
+    ))
 }
 
 /// Parse captured `env -0` entries into (name, value) pairs.
@@ -1126,6 +1302,94 @@ mod tests {
             .await
             .expect("wait");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn timed_out_probe_is_retried_and_later_enables_services() {
+        let cache = SpawnerCache::new(Duration::ZERO);
+        let first = cache
+            .spawner_with(|| async { Err(ProbeError::Transient("probe timed out".to_string())) })
+            .await;
+        assert!(!first.uses_systemd_services());
+
+        let second = cache
+            .spawner_with(|| async { Ok(vec![std::ffi::OsString::from("PATH=/usr/bin")]) })
+            .await;
+        assert!(second.uses_systemd_services());
+        assert_eq!(second.manager_env.len(), 1);
+
+        let cached = cache
+            .spawner_with(|| async {
+                Err(ProbeError::Transient(
+                    "successful detection was not cached".to_string(),
+                ))
+            })
+            .await;
+        assert!(cached.uses_systemd_services());
+    }
+
+    #[tokio::test]
+    async fn transient_probe_failure_is_bounded_by_retry_interval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = SpawnerCache::new(Duration::from_secs(60));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_attempts = attempts.clone();
+        cache
+            .spawner_with(move || async move {
+                first_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ProbeError::Transient("probe timed out".to_string()))
+            })
+            .await;
+        let second_attempts = attempts.clone();
+        let cached = cache
+            .spawner_with(move || async move {
+                second_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![std::ffi::OsString::from("PATH=/usr/bin")])
+            })
+            .await;
+        assert!(!cached.uses_systemd_services());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Run this test alone on a host with a systemd user manager: CI has no
+    /// user bus and can only exercise the immediate, definitive fallback.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn paused_clock_does_not_cut_short_or_advance_real_probe() {
+        let started = tokio::time::Instant::now();
+        let spawner = workload_spawner().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        if ensure_xdg_runtime_dir().is_some() && !isolation_disabled() {
+            assert!(
+                spawner.uses_systemd_services(),
+                "a host with a user manager must retain service isolation"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_timeout_kills_and_reaps_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("probe.pid");
+        let mut probe = std::process::Command::new("sh");
+        probe
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "probe"])
+            .arg(&pid_path);
+        let error = run_probe_command(probe, Duration::from_secs(1))
+            .expect_err("sleeping probe must time out");
+        assert!(
+            matches!(&error, ProbeError::Transient(reason) if reason == "probe timed out"),
+            "unexpected probe error: {error:?}"
+        );
+        let pid = std::fs::read_to_string(pid_path).expect("probe pid file");
+        let proc_path = PathBuf::from(format!("/proc/{}", pid.trim()));
+        assert!(
+            !proc_path.exists(),
+            "probe child {} survived timeout",
+            pid.trim()
+        );
     }
 
     #[test]
