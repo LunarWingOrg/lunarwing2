@@ -25,7 +25,9 @@ Assertions (opencode2 lane):
      service/pair subcommands, the --service flag, and every --hostname
      occurrence (control 2, wrapper layer). It also forces
      OPENCODE_FLAGS=-console_watches right before it execs the real binary
-     (WI#609, !2398 AAV-1).
+     (WI#609, !2398 AAV-1): those two statements must be the last two code
+     lines, and no other code line may launch the binary or touch the
+     variable.
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
@@ -83,6 +85,10 @@ REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair"
 FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", "console_watches")
 WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="-console_watches"'
 WRAPPER_EXEC = 'exec "$REAL_OPENCODE" "$@"'
+REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
+# Shell features that can make the wrapper's tail unreachable or change what
+# its last two lines mean. The wrapper needs none of them.
+WRAPPER_FORBIDDEN_RE = re.compile(r"\b(alias|eval|source)\b|<<|^\.\s")
 
 failures: list[str] = []
 
@@ -125,13 +131,15 @@ def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
         fail(f"{config_path} permissions must deny shell resources {missing}")
     else:
         check("opencode2.json carries the self-exposure shell deny rules")
-    # Only an explicit false is accepted beside an absent key: upstream reads
-    # these as booleans, and anything else is at best a typo for "on".
-    experimental = config.get("experimental")
+    # Only an explicit false is accepted beside an absent key. Upstream drops
+    # a malformed value, which means off, but a lane config that carries one
+    # says something its author did not mean, so it fails here.
+    experimental = config.get("experimental", {})
+    if not isinstance(experimental, dict):
+        fail(f"{config_path} \"experimental\" must be an object (got {type(experimental).__name__})")
+        return
     opted_in = [
-        key
-        for key in FORBIDDEN_EXPERIMENTAL_FLAGS
-        if isinstance(experimental, dict) and experimental.get(key, False) is not False
+        key for key in FORBIDDEN_EXPERIMENTAL_FLAGS if experimental.get(key, False) is not False
     ]
     if opted_in:
         fail(f"{config_path} must not set experimental flags {opted_in} — the Console "
@@ -285,25 +293,43 @@ def check_wrapper(lane: pathlib.Path) -> None:
              "scan every argv token, not only $1")
     else:
         check("wrapper scans every argv token (service/pair/--service/--hostname)")
-    # WI#609 AAV-1: the pin must be a real statement, and the last word on
-    # OPENCODE_FLAGS before the real binary starts. A comment that quotes it,
-    # a pin after the exec, or a later unset would all leave the flag to the
-    # caller's environment and to workspace config.
-    lines = [line.strip() for line in text.splitlines()]
-    execs = [index for index, line in enumerate(lines) if line == WRAPPER_EXEC]
-    pins = [index for index, line in enumerate(lines) if line == WRAPPER_FLAG_PIN]
-    pinned = (
-        len(execs) == 1
-        and bool(pins)
-        and pins[-1] < execs[0]
-        and not any("OPENCODE_FLAGS" in line for line in lines[pins[-1] + 1 : execs[0]])
-    )
-    if pinned:
-        check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
+    # WI#609 AAV-1 / ABE-3: the pin only holds if every start of the real
+    # binary passes through it. This is a shape check on a reviewed file, so
+    # it is strict about the text instead of clever about the shell: the last
+    # two code lines are the pin and the exec, unindented (not inside a block
+    # or a function), and nothing else in the code launches the binary, names
+    # the variable, or uses a feature that could skip or redefine the tail.
+    # A second launch path, such as a fast path for one subcommand or an
+    # opt-out knob, fails here even when it looks harmless. It does not
+    # defend against a hostile edit (an unbalanced quote can still swallow
+    # the tail); the behaviour tests and the review cover the committed file.
+    raw_code = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    code = [line.strip() for line in raw_code]
+
+    def lines_with(needle: str) -> int:
+        return sum(1 for line in code if needle in line)
+
+    problems = []
+    if raw_code[-2:] != [WRAPPER_FLAG_PIN, WRAPPER_EXEC]:
+        problems.append("the last two code lines are not the unindented pin and exec")
+    if sum(1 for line in code if re.search(r"\bexec\b", line)) != 1:
+        problems.append("more than one code line uses exec")
+    if lines_with("REAL_OPENCODE") != 2:
+        problems.append("REAL_OPENCODE is used outside its assignment and the final exec")
+    if lines_with(REAL_BINARY_PATH) != 1:
+        problems.append("the real binary path appears outside the REAL_OPENCODE default")
+    if lines_with("OPENCODE_FLAGS") != 1:
+        problems.append("another code line names OPENCODE_FLAGS")
+    if any(WRAPPER_FORBIDDEN_RE.search(line) for line in code):
+        problems.append("alias, eval, source or a here-document is used")
+    if len(code) >= 3 and code[-3].endswith("\\"):
+        problems.append("the line before the pin ends in a continuation")
+    if problems:
+        fail(f"{wrapper} must end with exactly {WRAPPER_FLAG_PIN!r} then {WRAPPER_EXEC!r} and "
+             f"launch the real binary nowhere else: {problems} — the Console event watches "
+             "stay off (WI#609 AAV-1)")
     else:
-        fail(f"{wrapper} must run {WRAPPER_FLAG_PIN!r} as the last OPENCODE_FLAGS statement "
-             f"before its single {WRAPPER_EXEC!r} — the Console event watches stay off "
-             "(WI#609 AAV-1)")
+        check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
 
 
 def check_binary(binary: pathlib.Path) -> None:
