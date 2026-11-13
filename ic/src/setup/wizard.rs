@@ -4247,6 +4247,13 @@ mod tests {
         // Clean up: empty values are treated as unset by env_or_override()
         // at every layer (real env, runtime overrides, INJECTED_VARS).
         crate::config::inject_single_var("LUNARWING_CLOUD_API_KEY", "");
+        // WI#633: `inject_single_var` also registered the fixture with the
+        // process-wide log scrubber, which is add-only; unregister it so the
+        // test leaves the scrubber as it found it.
+        assert!(
+            crate::tracing_fmt::daemon_log_scrubber().remove_secret("injected-wizard-key"),
+            "fixture secret was not registered"
+        );
 
         assert!(
             config.lunarwing_cloud.api_key.is_some(),
