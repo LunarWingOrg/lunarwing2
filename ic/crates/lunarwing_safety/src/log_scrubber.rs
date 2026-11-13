@@ -22,7 +22,7 @@
 //!   later through [`LogScrubber::add_secret`] (the daemon registers the
 //!   gateway token and the secrets-store overlay this way).
 //!
-//! Known values are otherwise add-only. [`LogScrubber::remove_secret`] exists
+//! Known values are otherwise add-only. `LogScrubber::remove_secret` exists
 //! only for tests (the `test-support` feature, never enabled for a shipped
 //! build), so a test that registers a fixture can leave a shared scrubber as
 //! it found it (WI#633).
