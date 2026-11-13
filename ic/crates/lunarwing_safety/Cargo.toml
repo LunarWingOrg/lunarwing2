@@ -13,6 +13,12 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[features]
+# Test-only surface (WI#633): lets a test that registers a fixture secret with
+# a shared `LogScrubber` unregister it again. Only dev-dependencies of other
+# crates enable this, so a shipped binary has no secret-removal path at all.
+test-support = []
+
 [dependencies]
 aho-corasick = "1"
 regex = "1"
