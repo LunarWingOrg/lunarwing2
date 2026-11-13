@@ -1554,27 +1554,53 @@ impl TunnelSidecar {
 
     async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut cleanup = SidecarStartCleanup::new(self.clone());
+        let result = self.wait_healthy_until(deadline, timeout).await;
+        if result.is_err() {
+            self.remove_unlocked().await;
+        }
+        cleanup.disarm();
+        result
+    }
+
+    async fn wait_healthy_until(
+        &self,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<()> {
         loop {
-            let error = match self.provider_health().await {
-                Ok(()) => {
-                    return match self.check_egress_firewall().await {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            self.remove_unlocked().await;
-                            Err(error)
-                        }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.health_timeout_error(timeout, None));
+            }
+            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+                Ok(Ok(())) => {
+                    return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(self.health_timeout_error(timeout, None)),
                     };
                 }
-                Err(error) => error,
+                Ok(Err(error)) => error,
+                Err(_) => return Err(self.health_timeout_error(timeout, None)),
             };
-            if tokio::time::Instant::now() >= deadline {
-                self.remove_unlocked().await;
-                return Err(self.error_with_context(
-                    error,
-                    &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
-                ));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.health_timeout_error(timeout, Some(error)));
+            }
+            if remaining <= HEALTH_POLL_INTERVAL {
+                tokio::time::sleep(remaining).await;
+                return Err(self.health_timeout_error(timeout, Some(error)));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    fn health_timeout_error(&self, timeout: Duration, error: Option<SandboxError>) -> SandboxError {
+        let context = format!("sidecar remained unhealthy for {}s", timeout.as_secs());
+        match error {
+            Some(error) => self.error_with_context(error, &context),
+            None => self.unavailable(&context),
         }
     }
 
