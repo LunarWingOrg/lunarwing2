@@ -263,6 +263,16 @@ class ExposurePolicyAssertTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("must not set experimental flags", result.stderr)
 
+    def test_malformed_experimental_block_fails(self) -> None:
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (True, ["console_watches"], "all_flags", None):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('"experimental" must be an object', result.stderr)
+
     def test_unrelated_or_explicitly_off_experimental_settings_pass(self) -> None:
         config_path = self.lane / "config" / "opencode2.json"
         base = json.loads(config_path.read_text())
@@ -278,12 +288,13 @@ class ExposurePolicyAssertTests(unittest.TestCase):
                 self.assertIn("leaves the Console event watches flag off", result.stdout)
 
     def test_wrapper_without_a_live_flag_pin_fails(self) -> None:
-        # WI#609 AAV-1: the pin has to be a statement, and the last word on
-        # OPENCODE_FLAGS before the real binary starts.
+        # WI#609 AAV-1 / ABE-3: the pin and the exec must be the last two code
+        # lines, and nothing else may launch the binary or touch the variable.
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")
         pin = 'export OPENCODE_FLAGS="-console_watches"\n'
         launch = 'exec "$REAL_OPENCODE" "$@"'
+        self.assertTrue(text.endswith(pin + launch + "\n"))
         self.assertEqual(text.count(pin + launch), 1)
         for label, replacement in (
             ("removed", launch),
@@ -293,12 +304,52 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             ("overwritten", pin + 'OPENCODE_FLAGS="all"\n' + launch),
             ("a different flag", 'export OPENCODE_FLAGS="-schedules"\n' + launch),
             ("turned on", 'export OPENCODE_FLAGS="console_watches"\n' + launch),
+            # A second launch path before the pin: each of these passed the
+            # first version of this check and started the binary unpinned.
+            ("fast path for other subcommands",
+             'case "${1:-}" in serve | run) ;; *) exec "${REAL_OPENCODE}" "$@" ;; esac\n' + pin + launch),
+            ("fast path for a leading flag",
+             'case "${1:-}" in -*) exec "${REAL_OPENCODE}" "$@" ;; esac\n' + pin + launch),
+            ("opt-out knob",
+             '[ -z "${LUNARWING_KEEP_OPENCODE_FLAGS:-}" ] || exec "${REAL_OPENCODE}" "$@"\n' + pin + launch),
+            ("launch without exec", '[ "${1:-}" != acp ] || { "$REAL_OPENCODE" "$@"; exit; }\n' + pin + launch),
+            ("launch by the literal path",
+             '[ "${1:-}" != acp ] || exec /usr/local/lib/opencode2/opencode "$@"\n' + pin + launch),
+            ("launch by the literal path without exec",
+             '[ "${1:-}" != acp ] || { /usr/local/lib/opencode2/opencode "$@"; exit; }\n' + pin + launch),
+            ("a second exec of anything", '[ "${1:-}" != acp ] || exec /bin/true\n' + pin + launch),
+            ("variable made read-only first", "readonly OPENCODE_FLAGS\n" + pin + launch),
+            ("pin inside a conditional", "if true; then\n  " + pin + "fi\n" + launch),
+            ("tail inside a function that is never called", "start() {\n" + pin + launch + "\n}"),
+            ("tail swallowed by a here-document", "cat >/dev/null <<EOF\n" + pin + launch),
+            ("exec redefined", "alias exec=true\n" + pin + launch),
+            ("pin rebuilt through eval", 'eval "OPENCODE_FLAGS=all"\n' + pin + launch),
+            ("continuation into the pin", "true \\\n" + pin + launch),
+            ("retarget between pin and exec", pin + "REAL_OPENCODE=/bin/echo\n" + launch),
         ):
             with self.subTest(label=label):
                 wrapper.write_text(text.replace(pin + launch, replacement), encoding="utf-8")
                 result = run_assert("--lane", str(self.lane))
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("as the last OPENCODE_FLAGS statement", result.stderr)
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn("launch the real binary nowhere else", result.stderr)
+
+    def test_comments_around_the_flag_pin_do_not_fail(self) -> None:
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        wrapper.write_text(
+            text.replace(
+                pin + launch,
+                "# exec and REAL_OPENCODE may be named in a comment\n"
+                + pin
+                + "# OPENCODE_FLAGS is final from here on\n\n"
+                + launch,
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_binary_marker_fails(self) -> None:
         binary = self.root / "opencode"
@@ -441,7 +492,9 @@ class ExposureGuardWrapperTests(unittest.TestCase):
     def test_console_watches_flag_is_forced_off_for_the_real_binary(self) -> None:
         # WI#609 AAV-1: whatever OPENCODE_FLAGS the caller holds, the real
         # binary starts with exactly "-console_watches" and its argv intact.
-        with tempfile.TemporaryDirectory() as temporary:
+        # The fake binary is executed, and /tmp is noexec on some dev hosts,
+        # so it lives on the repo tree like the other executable fixtures.
+        with tempfile.TemporaryDirectory(dir=LANE_ROOT) as temporary:
             fake = pathlib.Path(temporary) / "opencode"
             fake.write_text(
                 "#!/bin/sh\n"
@@ -451,8 +504,16 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             )
             fake.chmod(0o755)
             for inherited in (None, "", "all", "console_watches", "schedules,console_watches",
-                              "-console_watches,console_watches"):
-                for form in (("serve", "--port", "4096", "--hostname", "127.0.0.1"), ("run", "x")):
+                              "-console_watches,console_watches", "-schedules,-artifacts"):
+                # Every start mode of entrypoint.sh (serve, run, acp), a
+                # leading global flag, and a server-backed command.
+                for form in (
+                    ("serve", "--port", "4096", "--hostname", "127.0.0.1"),
+                    ("run", "x"),
+                    ("acp",),
+                    ("--print-logs", "serve", "--port", "4096"),
+                    ("session", "list"),
+                ):
                     with self.subTest(inherited=inherited, form=form):
                         env = dict(os.environ)
                         env["LUNARWING_REAL_OPENCODE"] = str(fake)
@@ -469,10 +530,10 @@ class ExposureGuardWrapperTests(unittest.TestCase):
                             ["flags=-console_watches", *(f"arg={arg}" for arg in form)],
                         )
 
-    def test_refusals_come_before_the_real_binary_and_its_environment(self) -> None:
-        # The pin sits right before the exec, so a refused command still
-        # never reaches the real binary.
-        with tempfile.TemporaryDirectory() as temporary:
+    def test_refused_commands_never_start_the_real_binary(self) -> None:
+        # A regression guard for the refusals, not a test of the pin: the pin
+        # sits after them, right before the exec.
+        with tempfile.TemporaryDirectory(dir=LANE_ROOT) as temporary:
             marker = pathlib.Path(temporary) / "ran"
             fake = pathlib.Path(temporary) / "opencode"
             fake.write_text(f"#!/bin/sh\n: > '{marker}'\n", encoding="utf-8")
