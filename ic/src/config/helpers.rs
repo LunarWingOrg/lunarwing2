@@ -631,9 +631,17 @@ mod tests {
         assert!(!scrubbed.contains(&merged), "{scrubbed}");
         assert!(scrubbed.ends_with(" z"), "{scrubbed}");
 
-        assert!(scrubber.remove_secret(&single), "fixture secret was not registered");
-        assert!(scrubber.remove_secret(&merged), "fixture secret was not registered");
-        let cleaned = scrubber.scrub(&format!("x {single} y {merged} z")).into_owned();
+        assert!(
+            scrubber.remove_secret(&single),
+            "fixture secret was not registered"
+        );
+        assert!(
+            scrubber.remove_secret(&merged),
+            "fixture secret was not registered"
+        );
+        let cleaned = scrubber
+            .scrub(&format!("x {single} y {merged} z"))
+            .into_owned();
         assert!(cleaned.contains(&single), "still scrubbed: {cleaned}");
         assert!(cleaned.contains(&merged), "still scrubbed: {cleaned}");
     }
@@ -660,7 +668,10 @@ mod tests {
         assert!(!scrubbed.contains(&secret), "{scrubbed}");
         assert!(scrubbed.contains(&plain), "{scrubbed}");
 
-        assert!(scrubber.remove_secret(&secret), "fixture secret was not registered");
+        assert!(
+            scrubber.remove_secret(&secret),
+            "fixture secret was not registered"
+        );
         let cleaned = scrubber
             .scrub(&format!("a {secret} b {plain} c"))
             .into_owned();

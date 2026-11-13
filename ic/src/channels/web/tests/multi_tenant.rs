@@ -176,7 +176,10 @@ fn gateway_auth_token_is_scrubbed_from_daemon_logs() {
     assert!(scrubbed.contains("for alice"), "{scrubbed}");
     // WI#633: the scrubber is process-wide, so the fixture does not outlive
     // this test.
-    assert!(scrubber.remove_secret(&token), "fixture token was not registered");
+    assert!(
+        scrubber.remove_secret(&token),
+        "fixture token was not registered"
+    );
     let cleaned = scrubber
         .scrub(&format!("auth ok token={token} for alice"))
         .into_owned();
