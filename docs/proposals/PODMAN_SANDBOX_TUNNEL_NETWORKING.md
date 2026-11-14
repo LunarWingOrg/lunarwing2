@@ -111,15 +111,19 @@ local listener resolved peer names and the test zone in both match-only and
 primary modes; uplink captures contained no port-53 packets.
 
 The selected design keeps NetBird's resolver as the only joined-run resolver.
-A per-instance, non-secret backup file is bind-mounted writable at
-`/etc/resolv.conf.original.netbird`; a small wrapper seeds it from the runtime
-file before executing the upstream entrypoint. The rest of the root filesystem
-stays read-only. NetBird then writes only its learned overlay address to the
-sidecar resolver file, joined runs inherit that file, and the firewall permits
-port 53 only to that overlay address. Management DNS changes keep the same
-nameserver address, so exact firewall verification remains stable. The gated
-live lane checks peer and custom-zone answers, rejects every former resolver,
-and requires stable health across reconnect without recreating the container.
+A credential-free bootstrap container first reads the resolver supplied by the
+runtime. LunarWing stages that non-secret content in two per-instance files and
+bind-mounts them writable at `/etc/resolv.conf` and
+`/etc/resolv.conf.original.netbird`; the normal upstream entrypoint then runs
+with the rest of the root filesystem read-only. This is necessary because the
+runtime's own resolver mount is read-only too, and `--network container` does
+not propagate that file to a joiner. NetBird writes its learned overlay address
+to the staged file, joined runs mount the same inode `ro,z`, and the firewall
+permits port 53 only to that overlay address. Management DNS changes keep the
+same nameserver address, so exact firewall verification remains stable. The
+gated live lane checks the read-only mount, peer and custom-zone answers,
+refusal of every former resolver, and stable health across reconnect without
+recreating the container.
 
 `SANDBOX_TUNNEL_DNS` remains rejected for NetBird; the daemon learns the local
 resolver and operators configure upstreams through NetBird nameserver groups.
