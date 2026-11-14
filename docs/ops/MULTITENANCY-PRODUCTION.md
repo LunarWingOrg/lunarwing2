@@ -785,6 +785,20 @@ the cron at the next sync, and until then the cron refuses re-rendered
 units (and pages) rather than accepting them. A health-lib copy without
 the library refuses the same way.
 
+The installed health library is a root trust boundary, not a writable cache of
+the operator checkout. Every install and upgrade refresh builds a fresh staged
+tree, rejects symbolic links, makes the directory and every entry `root:root`,
+removes group/other write permission, and only then replaces the installed
+tree. This also repairs the ownership left by older `cp -a` installs. The
+root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
+every entry in it, and every parent through `/` on every run; any non-root
+owner, symbolic link, or group/other write permission produces a logged refusal
+and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
+contract preflight applies the same check whenever its source resolves to this
+installed library, including a root-owned Study Notes scheduler snapshot. Do
+not hand-copy an operator checkout over the library; rerun the health pipeline
+install instead.
+
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
 ordinary rendering, **not** the migration), validates the target tenant's
