@@ -329,6 +329,29 @@ its ports are deallocated, and with `--purge` its database is reset. Resolve the
 reported keeper problem or remove the unexpected attachment, then rerun
 `remove-tenant` to finish.
 
+**Removal after the tenant account is gone (WI#688).** A rootless tenant's
+containers, egress network and keeper live in its own store and run as its uid
+or its subordinate uids, so without the account mt-admin cannot ask that store
+anything. `add-tenant`, and every `remove-tenant` while the account exists,
+record the uid and the subordinate uid ranges in root-owned
+`/var/lib/lunarwing/tenant-identity/<tenant>` (mode 0644); a finished removal
+deletes it. When the account is
+gone, `remove-tenant` reads `/proc/*/status` first and refuses, before it
+changes anything, while any process has the recorded uid or a subordinate uid
+as its real, effective, saved or filesystem uid. It also refuses when the record
+is missing (tenants added before this change), malformed or without a
+subordinate range, when the uid now belongs to another account, or when the
+process table cannot be read. Once the old identity is proven idle, every lane
+stop, the container and IPC-volume removal, the PostgreSQL stop and the
+`--purge` data reset skip the unreachable store and say so, and the egress
+teardown proves the identity idle again, then flushes the tenant's chains and
+deletes its rendered state; the rootless network, keeper and data volume stay
+in the store under the former home, which the operator removes by hand. A
+rootful runtime needs no account: its stops and removals still run against
+root's store. For a tenant without a record, confirm with `ps -eo uid,pid,args`
+that no process of the former uid or its subordinate range remains, write
+`UID=<uid>` and `SUBUID=<start>:<count>` lines to that file, and rerun.
+
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
 symlinks only during host preparation is insufficient: the runtime can
