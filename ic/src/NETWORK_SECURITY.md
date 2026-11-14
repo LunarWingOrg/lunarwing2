@@ -512,8 +512,10 @@ pulls it under its per-run budget. WireGuard's seven 10-second probes can
 take 70 seconds and NetBird's six can take 60, regardless of auto-pull. Per-run
 recovery uses the same 6-second re-probe, allows a fresh provider at most 20
 seconds (or the
-lower configured timeout), and retains its own 60-second budget. A recovery
-pull is capped by the remaining recovery budget when that is smaller than the
+lower configured timeout), and retains its own 60-second budget. During
+recovery, an existing sidecar that cannot prove its health inside the 6-second
+window is removed and recreated even when it is healthy but only slow. A
+recovery pull is capped by the remaining recovery budget when that is smaller than the
 configured pull timeout, and its diagnostic names the pull. Final verification
 has the same probe bounds as initial verification and never pulls. The three
 stages therefore total at most 200 seconds for WireGuard or 180 for NetBird,
@@ -533,6 +535,16 @@ records a failure matched to its own attempt. Shutdown marks recovery stopping,
 uses bounded waits, and checks before/after starts to remove late containers;
 an explicit cold start can later clear the stop and cached failure. No
 container ID becomes joinable before the firewall verifies.
+
+Provider readiness and health re-probing keep the last completed provider
+failure if a later provider probe exceeds the deadline. Expired budgets never
+start another provider probe, and readiness sleeps are clamped to the time
+remaining. The 6-second re-probe spaces its final retry halfway into the last
+remaining polling interval, leaving time for provider/firewall verification
+under the same deadline rather than probing twice at once. A failed final retry
+returns without spending the unused interval; if no provider error completed,
+the deadline error remains generic. Unverified sidecars are still removed.
+
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted

@@ -94,7 +94,9 @@ image (WI#651): a missing image fails the check fast with a pointer at the
 single-flight recovery, which is the path that pulls it under its per-run
 budget. Recovery re-probes an existing sidecar for at
 most **6 seconds**, waits at most **20 seconds** for a fresh provider (or the
-configured startup timeout when lower), and has a **60-second budget**. A pull
+configured startup timeout when lower), and has a **60-second budget**. During
+recovery, an existing sidecar that cannot prove its health inside the 6-second
+window is removed and recreated even when it is healthy but only slow. A pull
 inside recovery uses the smaller of that configured timeout and the remaining
 recovery budget, and its timeout error names the image pull. Final verification
 runs right after recovery, never pulls, and keeps the same probe deadlines as
@@ -123,6 +125,16 @@ does not cancel recovery, its cleanup, or recording of its result. Later
 callers await that same attempt and then use its recorded back-off. If the
 task ends without publishing a result, the closed channel is also converted
 into a recorded failure instead of wedging later commands.
+
+Provider readiness and health re-probing retain the last completed provider
+failure when a later provider probe is cut by the deadline. No new provider
+probe starts after the budget expires, and readiness polling sleeps are clamped
+to the time left. In the 6-second re-probe, the final retry waits halfway through
+the remaining last polling interval instead of duplicating the previous probe
+immediately; provider and firewall checks still share the original deadline.
+An unsuccessful final retry returns without sleeping away the unused time.
+If no provider probe completed with an error, the timeout stays generic rather
+than inventing a failure reason. The unverified sidecar is still removed.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
