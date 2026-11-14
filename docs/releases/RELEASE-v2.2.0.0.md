@@ -28,4 +28,27 @@ client.
 Russh's optional `rsa` feature remains disabled, and the `rsa` crate remains out
 of LunarWing's dependency graph.
 
+### mt-admin: an unsafe health library no longer bricks the CLI (WI#703)
+
+`lunarwing-mt-admin.sh` used to run the installed-health-library guard as a bare
+statement while it was still sourcing its libraries. On a host where
+`/usr/local/lib/lunarwing-health` (or any parent) is not root-owned, or is
+group/other-writable, that guard aborted **every** subcommand before dispatch —
+including `--help` and `ensure_health_pipeline`/`add-tenant`/`upgrade-tenant`,
+the commands that repair the pipeline.
+
+The CLI now loads, reports the refusal with the failing path component and the
+repair, and refuses only OpenRC operations (exit 126) until the tree is fixed.
+Non-OpenRC commands keep working. Repair the library with
+`ensure_health_pipeline`, `add-tenant`, or `upgrade-tenant`, or by hand:
+`chown -R root:root /usr/local/lib/lunarwing-health && chmod -R go-w
+/usr/local/lib/lunarwing-health` (and the named parent, if any). A host on the
+pre-WI#687 layout therefore stays usable for non-OpenRC administration but
+cannot render or validate OpenRC units until the library is re-owned.
+
+The checkout's `ic-infrastructure-health-check/openrc-proxy-unit-contract.sh`
+is also refused when it is a symbolic link or group/other-writable, since root
+sources it; OpenRC commands then refuse with the file named instead of loading
+a writable contract.
+
 See the [v2.1.9.0 release notes](RELEASE-v2.1.9.0.md) for the previous release.
