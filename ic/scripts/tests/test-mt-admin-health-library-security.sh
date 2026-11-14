@@ -86,6 +86,129 @@ check_source_symlink_refused() {
     "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
 }
 
+# ABZ-2: the optional metrics listener binary lives in the library. A
+# reinstall keeps a safe one. An unsafe one is moved to a root-only
+# quarantine and the install still completes, so a library from before
+# WI#687 is always repaired.
+plant_listener_binary() {
+  rm -rf -- "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  printf 'listener\n' >"$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  chmod 0755 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+}
+
+check_carry_quarantined() {
+  local label="$1" reason="$2" output="" status=0 leftover moved
+  rm -rf -- "$HEALTH_BASE_DIR/quarantine"
+  output="$(ensure_health_pipeline 2>&1)" || status=$?
+  assert_eq "$label: install completes" "0" "$status"
+  assert_contains "$label: warning names the binary" "$output" \
+    "WARNING: health library: $HEALTH_LIB_DIR/lunarwing-health-metrics was not carried"
+  assert_contains "$label: warning gives the reason" "$output" "because $reason"
+  assert_contains "$label: warning says to stop a running listener" "$output" \
+    "Stop the metrics listener now if it is running"
+  assert_eq "$label: binary not in the new library" "1" \
+    "$([[ -e "$HEALTH_LIB_DIR/lunarwing-health-metrics" || -L "$HEALTH_LIB_DIR/lunarwing-health-metrics" ]] && printf 0 || printf 1)"
+  moved="$(command find "$HEALTH_BASE_DIR/quarantine" -mindepth 2 -maxdepth 2 -name lunarwing-health-metrics -print -quit 2>/dev/null || true)"
+  assert_eq "$label: binary kept in the quarantine" "0" "$([[ -n "$moved" ]] && printf 0 || printf 1)"
+  assert_eq "$label: quarantine is root-only" "700" "$(command stat -c '%a' "$HEALTH_BASE_DIR/quarantine" 2>/dev/null || true)"
+  if [[ "$(command id -u)" == 0 ]]; then
+    assert_eq "$label: quarantine owned by root" "0" "$(command stat -c '%u' "$HEALTH_BASE_DIR/quarantine" 2>/dev/null || true)"
+  fi
+  assert_eq "$label: wrapper installed" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
+  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_lib_tree_require_safe '
+  leftover="$(command find "$(dirname -- "$HEALTH_LIB_DIR")" -maxdepth 1 -name '.lunarwing-health.new.*' -print -quit)"
+  assert_eq "$label: no staging directory left" "" "$leftover"
+  rm -rf -- "$HEALTH_BASE_DIR/quarantine"
+}
+
+# When no root-only quarantine can be had, the unsafe entry is still not
+# carried and the install still completes (it is what repairs the library).
+check_carry_dropped() {
+  local label="$1" output="" status=0 leftover
+  plant_listener_binary
+  chmod 0757 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  output="$(ensure_health_pipeline 2>&1)" || status=$?
+  assert_eq "$label: install completes" "0" "$status"
+  assert_contains "$label: warning says no quarantine could be made" "$output" \
+    "and no root-only quarantine could be made under $HEALTH_BASE_DIR/quarantine"
+  assert_eq "$label: binary not in the new library" "1" \
+    "$([[ -e "$HEALTH_LIB_DIR/lunarwing-health-metrics" || -L "$HEALTH_LIB_DIR/lunarwing-health-metrics" ]] && printf 0 || printf 1)"
+  assert_eq "$label: nothing moved into the unsafe quarantine" "" \
+    "$(command find -P "$HEALTH_BASE_DIR/quarantine" -mindepth 1 -name 'lunarwing-health-metrics*' -print -quit 2>/dev/null || true)"
+  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_lib_tree_require_safe '
+  leftover="$(command find "$(dirname -- "$HEALTH_LIB_DIR")" -maxdepth 1 -name '.lunarwing-health.new.*' -print -quit)"
+  assert_eq "$label: no staging directory left" "" "$leftover"
+  rm -rf -- "$HEALTH_BASE_DIR/quarantine"
+}
+
+# The carry cases that need no real ownership: modes, links, file types, and
+# (through the stat mock) a foreign owner. They run in CI's mocked mode too.
+run_carry_cases() {
+  plant_listener_binary
+  ensure_health_pipeline >/dev/null
+  assert_eq "reinstall keeps a safe metrics listener binary" "listener" \
+    "$(cat "$HEALTH_LIB_DIR/lunarwing-health-metrics" 2>/dev/null || true)"
+  plant_listener_binary
+  chmod 0757 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "other-writable listener binary" "it is group/other-writable"
+  plant_listener_binary
+  chmod 0775 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "group-writable listener binary" "it is group/other-writable"
+  plant_listener_binary
+  chmod 4755 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "set-ID listener binary" "it has a set-ID bit"
+  rm -f -- "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  printf 'listener\n' >"$TEST_ROOT/listener.real"
+  ln -s "$TEST_ROOT/listener.real" "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "linked listener binary" "it is a symbolic link"
+  mkdir "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "directory in place of the listener binary" "it is not a regular file"
+  plant_listener_binary
+  chmod 0777 "$HEALTH_LIB_DIR"
+  check_carry_quarantined "safe listener binary in a writable library" \
+    "the installed library or a parent directory is not root-owned"
+  plant_listener_binary
+  printf 'shipped\n' >"$HEALTH_SRC_DIR/lunarwing-health-metrics"
+  local output
+  output="$(ensure_health_pipeline 2>&1)"
+  assert_contains "a copy shipped by the checkout is announced" "$output" \
+    "the checkout ships lunarwing-health-metrics"
+  assert_eq "a copy shipped by the checkout replaces the installed one" "shipped" \
+    "$(cat "$HEALTH_LIB_DIR/lunarwing-health-metrics" 2>/dev/null || true)"
+  rm -f -- "$HEALTH_SRC_DIR/lunarwing-health-metrics"
+  ensure_health_pipeline >/dev/null
+  rm -f -- "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  # A library that is itself a link is replaced, and nothing is taken out of
+  # the directory it points at.
+  mkdir -p "$TEST_ROOT/elsewhere"
+  printf 'elsewhere\n' >"$TEST_ROOT/elsewhere/lunarwing-health-metrics"
+  mv -T -- "$HEALTH_LIB_DIR" "$TEST_ROOT/lib.real"
+  ln -s "$TEST_ROOT/elsewhere" "$HEALTH_LIB_DIR"
+  ensure_health_pipeline >/dev/null
+  assert_eq "a linked library is replaced by a directory" "0" \
+    "$([[ -d "$HEALTH_LIB_DIR" && ! -L "$HEALTH_LIB_DIR" ]] && printf 0 || printf 1)"
+  assert_eq "nothing is moved out of a linked library's target" "elsewhere" \
+    "$(cat "$TEST_ROOT/elsewhere/lunarwing-health-metrics" 2>/dev/null || true)"
+  rm -rf -- "$TEST_ROOT/lib.real" "$TEST_ROOT/elsewhere" "$HEALTH_BASE_DIR/quarantine"
+  rm -rf -- "$HEALTH_BASE_DIR/quarantine"
+  : >"$HEALTH_BASE_DIR/quarantine"
+  check_carry_dropped "quarantine path is a file"
+  mkdir -p "$TEST_ROOT/qelsewhere"
+  ln -s "$TEST_ROOT/qelsewhere" "$HEALTH_BASE_DIR/quarantine"
+  chmod 0755 "$TEST_ROOT/qelsewhere"
+  check_carry_dropped "quarantine path is a link"
+  assert_eq "nothing moved through a linked quarantine" "" \
+    "$(command find "$TEST_ROOT/qelsewhere" -mindepth 1 -print -quit)"
+  assert_eq "a linked quarantine's target keeps its mode" "755" \
+    "$(command stat -c '%a' "$TEST_ROOT/qelsewhere")"
+  rm -rf -- "$TEST_ROOT/qelsewhere"
+  mkdir -p "$HEALTH_BASE_DIR/quarantine"
+  chmod 0777 "$HEALTH_BASE_DIR"
+  check_carry_dropped "quarantine under a writable parent"
+  chmod 0755 "$HEALTH_BASE_DIR"
+}
+
 stat() {
   if [[ "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$MOCK_NONROOT_DIR" ]]; then
     printf '65534\n'
@@ -140,6 +263,18 @@ run_mock_tests() {
   export HEALTH_TEST_MARKER="$TEST_ROOT/marker"
   "$HEALTH_LAUNCHER"
   assert_eq "safe mock launcher executes its wrapper" "executed" "$(<"$HEALTH_TEST_MARKER")"
+  run_carry_cases
+  plant_listener_binary
+  MOCK_NONROOT_DIR="$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "mock foreign-owned listener binary" "it is not owned by root"
+  plant_listener_binary
+  MOCK_NONROOT_DIR="$HEALTH_LIB_DIR"
+  check_carry_quarantined "mock listener binary in a foreign-owned library" \
+    "the installed library or a parent directory is not root-owned"
+  mkdir -p "$HEALTH_BASE_DIR/quarantine"
+  MOCK_NONROOT_DIR="$HEALTH_BASE_DIR/quarantine"
+  check_carry_dropped "mock foreign-owned quarantine"
+  MOCK_NONROOT_DIR=""
 
   chmod 0777 "$HEALTH_LIB_DIR/cron-wrapper.sh"
   assert_launcher_refused "mock group/other-writable wrapper"
@@ -175,6 +310,42 @@ run_real_tests() {
   export HEALTH_TEST_MARKER="$TEST_ROOT/marker"
   "$HEALTH_LAUNCHER"
   assert_eq "root-owned pipeline still executes" "executed" "$(<"$HEALTH_TEST_MARKER")"
+
+  plant_listener_binary
+  : >"$HEALTH_LIB_DIR/stale-file"
+  ensure_health_pipeline >/dev/null
+  assert_eq "kept listener binary stays 755 root:root" "755 0:0" \
+    "$(stat -c '%a %u:%g' "$HEALTH_LIB_DIR/lunarwing-health-metrics")"
+  assert_eq "reinstall still removes other stale entries" "0" \
+    "$([[ -e "$HEALTH_LIB_DIR/stale-file" ]] && printf 1 || printf 0)"
+  run_carry_cases
+  plant_listener_binary
+  chown 65534:65534 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  check_carry_quarantined "foreign-owned listener binary" "it is not owned by root"
+  mkdir -p "$HEALTH_BASE_DIR/quarantine"
+  chmod 0755 "$HEALTH_BASE_DIR/quarantine"
+  chown 65534:65534 "$HEALTH_BASE_DIR/quarantine"
+  check_carry_dropped "foreign-owned quarantine"
+  # check_carry_dropped removed it; the refusal itself must not have chmodded it.
+  mkdir -p "$HEALTH_BASE_DIR/quarantine"
+  chmod 0755 "$HEALTH_BASE_DIR/quarantine"
+  chown 65534:65534 "$HEALTH_BASE_DIR/quarantine"
+  plant_listener_binary
+  chmod 0757 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
+  ensure_health_pipeline >/dev/null 2>&1
+  assert_eq "a foreign-owned quarantine keeps its mode" "755" \
+    "$(command stat -c '%a' "$HEALTH_BASE_DIR/quarantine")"
+  rm -rf -- "$HEALTH_BASE_DIR/quarantine"
+  # The WI#687 upgrade case: a library left owned by the checkout user (old
+  # `cp -a` install) holding a root-installed listener binary. The binary
+  # cannot be trusted, and the library must still be repaired.
+  plant_listener_binary
+  chown 65534:65534 "$HEALTH_LIB_DIR"
+  chmod 0755 "$HEALTH_LIB_DIR"
+  check_carry_quarantined "listener binary in a library from before WI#687" \
+    "the installed library or a parent directory is not root-owned"
+  assert_root_owned_tree "pre-WI#687 library with a listener binary is repaired"
+
   chown -R 65534:65534 "$HEALTH_LIB_DIR"
   chmod 0777 "$HEALTH_LIB_DIR"
   ensure_health_pipeline >/dev/null
