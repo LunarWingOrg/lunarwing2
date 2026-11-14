@@ -24,11 +24,44 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn_err() { printf 'error: %s\n' "$*" >&2; }
 
+# WI#703 (WI#696 ABZ-6): a refusal must name the path component that failed and
+# the repair, not just the library that was being checked. The validators below
+# publish the failing component in HEALTH_LIB_UNSAFE_COMPONENT so a caller that
+# reports the refusal later (the mt-admin OpenRC contract loader) can reuse it.
+HEALTH_LIB_UNSAFE_COMPONENT=""
+
+health_lib_unsafe_repair_command() {  # <path> <component>
+  local path="$1" component="$2"
+  if [[ -L "$component" ]]; then
+    printf 'remove the symbolic link %s or replace it with a root-owned directory' "$component"
+  elif [[ "$component" == "$path" ]]; then
+    printf 'chown -R root:root %s && chmod -R go-w %s' "$path" "$path"
+  else
+    # A parent outside the library (e.g. a writable /tmp-like directory) must
+    # not be made safe by loosening it here; relocate the library instead.
+    printf 'use a health library whose parent is root-owned and not group/other-writable (offending parent: %s)' "$component"
+  fi
+}
+
+health_lib_refusal_text() {  # <path> [entry]
+  local path="$1" kind="${2:-tree}" component="${HEALTH_LIB_UNSAFE_COMPONENT:-$1}" repair
+  repair="$(health_lib_unsafe_repair_command "$path" "$component")"
+  if [[ "$kind" == entry ]]; then
+    printf 'refusing health library entry %s: symbolic link, non-root owner, or group/other-writable; repair with: %s' \
+      "$component" "$repair"
+  else
+    printf 'refusing health library %s: %s must be root-owned, symlink-free, and not group/other-writable; repair with: %s' \
+      "$path" "$component" "$repair"
+  fi
+}
+
 health_lib_validate_root_owned_directory() {
   local path="$1" rest component current="/" owner mode
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   [[ "$path" == /* && -d "$path" ]] || return 1
   rest="${path#/}"
   while :; do
+    HEALTH_LIB_UNSAFE_COMPONENT="$current"
     [[ -d "$current" && ! -L "$current" ]] || return 1
     owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
     mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
@@ -36,7 +69,10 @@ health_lib_validate_root_owned_directory() {
     (( (8#$mode & 0022) == 0 )) || return 1
     [[ -n "$rest" ]] || break
     component="${rest%%/*}"
-    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    if [[ -z "$component" || "$component" == . || "$component" == .. ]]; then
+      HEALTH_LIB_UNSAFE_COMPONENT="$path"
+      return 1
+    fi
     current="${current%/}/$component"
     if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
   done
@@ -45,14 +81,16 @@ health_lib_validate_root_owned_directory() {
 
 health_lib_tree_require_safe() {
   local path="${1:-}" unsafe
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   if [[ "$path" == / ]] || ! health_lib_validate_root_owned_directory "$path"; then
-    printf 'error: refusing health library %s: path and parents must be root-owned, symlink-free, and not group/other-writable\n' "$path" >&2
+    printf 'error: %s\n' "$(health_lib_refusal_text "$path")" >&2
     return 1
   fi
   unsafe="$(find "$path" \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
     || { printf 'error: refusing health library %s: ownership and permissions could not be inspected\n' "$path" >&2; return 1; }
   if [[ -n "$unsafe" ]]; then
-    printf 'error: refusing health library entry %s: symbolic link, non-root owner, or group/other-writable\n' "$unsafe" >&2
+    HEALTH_LIB_UNSAFE_COMPONENT="$unsafe"
+    printf 'error: %s\n' "$(health_lib_refusal_text "$path" entry)" >&2
     return 1
   fi
   return 0
