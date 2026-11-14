@@ -2145,8 +2145,9 @@ start_tenant_opencode() {
 
 stop_tenant_opencode() {
   local name="$1"
-  id -u "$name" >/dev/null 2>&1 || return 0
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" opencode; then
+    return 0
+  fi
 
   local container_name="lunarwing-opencode-$name"
   ensure_init_system
@@ -2363,8 +2364,9 @@ start_tenant_opencode2() {
 
 stop_tenant_opencode2() {
   local name="$1"
-  id -u "$name" >/dev/null 2>&1 || return 0
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" opencode2; then
+    return 0
+  fi
 
   local container_name="lunarwing-opencode2-$name"
   ensure_init_system
@@ -2811,8 +2813,9 @@ start_tenant_kimi() {
 
 stop_tenant_kimi() {
   local name="$1"
-  id -u "$name" >/dev/null 2>&1 || return 0
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" kimi; then
+    return 0
+  fi
 
   local container_name="lunarwing-kimi-$name"
   ensure_init_system
@@ -3027,8 +3030,9 @@ start_tenant_pebble() {
 
 stop_tenant_pebble() {
   local name="$1"
-  id -u "$name" >/dev/null 2>&1 || return 0
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" pebble; then
+    return 0
+  fi
 
   local container_name="lunarwing-pebble-$name"
   ensure_init_system
@@ -3065,6 +3069,13 @@ _remove_tenant_container() {
 remove_tenant_worker_containers() {
   local name="$1" worker container volume volumes
   ensure_container_runtime
+  # WI#688: a rootless store without its account cannot be asked; skipping it
+  # is safe only once no process of the former uids is left.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "skipped worker container removal for $name: the tenant account is gone and no process of its former uids remains"
+    return 0
+  fi
   for worker in pebble opencode kimi opencode2 lunardepth; do
     _remove_tenant_container "$name" "lunarwing-${worker}-${name}" || return 1
     container="$(worker_task_container_name "$worker" "$name")"

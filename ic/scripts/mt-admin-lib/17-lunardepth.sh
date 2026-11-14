@@ -535,8 +535,9 @@ _create_lunardepth_bridge() {  # <tenant> <launch contract> <wss port> [extra ru
 stop_tenant_lunardepth() {
   local name="$1"
   local container_name="lunarwing-lunardepth-$name"
-  id -u "$name" >/dev/null 2>&1 || return 0
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" lunardepth; then
+    return 0
+  fi
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
     _openrc_stop_worker_nondestructive "$container_name"

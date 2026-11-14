@@ -763,8 +763,20 @@ worker_egress_assert_detached() {
 # Check before releasing the keeper so an attachment refusal preserves both the
 # rootless namespace and its chains. Once clear, flush before dropping them.
 worker_egress_teardown() {
-  local name="$1" network conf ruleset hosts network_rm_out
+  local name="$1" network network_rm_out
   _worker_egress_validate_name "$name"
+  # WI#688: without the account the rootless store, its network and keeper
+  # cannot be asked. Nothing can be attached when no process of the former
+  # uids is left, so prove that again right before the flush, then drop only
+  # the root-owned chains and state.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" \
+      || { printf 'worker-egress: tenant account %s is gone and its former uids are not proven idle; refusing teardown\n' "$name" >&2; return 1; }
+    worker_egress_flush "$name"
+    _worker_egress_remove_state "$name"
+    printf 'worker-egress: tenant account %s is gone; flushed its chains and state, its rootless network and keeper stay in the unreachable store\n' "$name"
+    return 0
+  fi
   worker_egress_assert_detached "$name" || return 1
   worker_egress_flush "$name"
   worker_egress_stop_keeper "$name" || return 1
@@ -778,6 +790,11 @@ worker_egress_teardown() {
         return 1 ;;
     esac
   }
+  _worker_egress_remove_state "$name"
+}
+
+_worker_egress_remove_state() {
+  local name="$1" conf ruleset hosts
   _worker_egress_lock
   conf="$(worker_egress_conf_path "$name")"
   ruleset="$(worker_egress_ruleset_path "$name")"

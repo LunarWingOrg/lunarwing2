@@ -191,6 +191,8 @@ create_tenant_user() {
   if [[ "$MT_ROOTLESS" == "true" ]]; then
     ensure_rootless_prereqs "$name"
   fi
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR"
 
   # Persist a per-user runtime manager so /run/user/<uid> survives reboot. Works
   # on both systemd-logind and elogind (OpenRC) — capability-gated, not
@@ -232,9 +234,145 @@ create_tenant_user() {
   ensure_tenant_wasm_toolchain "$name" || true
 }
 
+# ── Former tenant accounts (WI#688) ──────────────────────────────────────────
+#
+# A rootless tenant's containers, egress network and namespace keeper live in
+# its own store and run as its uid or its subordinate uids. Once the account
+# is gone mt-admin cannot ask that store anything, and flushing the tenant's
+# egress allowlist is safe only when nothing of the old identity still runs
+# (WI#357, WI#638): `userdel -f`, or an account deleted under running
+# containers, can leave workers attached to the per-tenant network. The uid
+# and subordinate ranges are recorded while the account exists, so a removal
+# without the account can prove from the process table that none is left.
+
+tenant_identity_path() { printf '%s/%s\n' "$TENANT_IDENTITY_DIR" "$1"; }
+
+# Record (or refresh) the tenant's uid and subordinate uid ranges in a
+# root-owned 0644 file. Needs the account.
+tenant_identity_record() {
+  local name="$1" uid owner start count ranges="" path tmp
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  if [[ -f "$TENANT_SUBUID_FILE" ]]; then
+    while IFS=: read -r owner start count || [[ -n "$owner" ]]; do
+      [[ "$owner" == "$name" || "$owner" == "$uid" ]] || continue
+      [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[1-9][0-9]*$ ]] || continue
+      ranges+="SUBUID=${start}:${count}"$'\n'
+    done <"$TENANT_SUBUID_FILE"
+  fi
+  [[ ! -L "$TENANT_IDENTITY_DIR" ]] || return 1
+  if [[ "$(command id -u)" == 0 ]]; then
+    install -d -o root -g root -m 0755 "$TENANT_IDENTITY_DIR" || return 1
+  else
+    install -d -m 0755 "$TENANT_IDENTITY_DIR" || return 1
+  fi
+  path="$(tenant_identity_path "$name")"
+  tmp="$(mktemp "$path.tmp.XXXXXX")" || return 1
+  if ! printf 'UID=%s\n%s' "$uid" "$ranges" >"$tmp" || ! chmod 0644 "$tmp" \
+      || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# True when the tenant's containers live in its own rootless store and the
+# account that owns that store is gone. Rootful runtimes need no account.
+tenant_rootless_account_gone() {
+  ensure_container_runtime
+  [[ "$MT_ROOTLESS" == true ]] && ! id -u "$1" >/dev/null 2>&1
+}
+
+# Prove that no process of the removed tenant's recorded uid or subordinate
+# uid ranges exists (real, effective, saved or filesystem uid). Prints the
+# reason and returns 1 when that cannot be shown: no record, an unreadable
+# record or process table, the uid now held by another account, or a match.
+tenant_former_identity_idle() {
+  local name="$1" path line value uid="" start count status key r e s f ent
+  local i hit matches="" nmatch=0 seen=0 holder
+  local -a starts=() counts=()
+  path="$(tenant_identity_path "$name")"
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    say "ERROR: tenant account '$name' is gone and no uid was recorded for it in $path (tenants added before WI#688). Check that no process of its former uid or subordinate uid range remains (ps -eo uid,pid,args), then record them as 'UID=<uid>' and 'SUBUID=<start>:<count>' lines in that file and rerun." >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      UID=*) uid="${line#UID=}" ;;
+      SUBUID=*)
+        value="${line#SUBUID=}"
+        start="${value%%:*}"
+        count="${value#*:}"
+        if [[ ! "$start" =~ ^[0-9]+$ || ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+          say "ERROR: invalid subordinate uid range '$value' in $path" >&2
+          return 1
+        fi
+        starts+=("$start")
+        counts+=("$count")
+        ;;
+      '') ;;
+      *) say "ERROR: unexpected line in $path" >&2; return 1 ;;
+    esac
+  done <"$path"
+  if [[ ! "$uid" =~ ^[0-9]+$ ]] || ((uid < 1000)); then
+    say "ERROR: no valid tenant uid recorded in $path" >&2
+    return 1
+  fi
+  if ((${#starts[@]} == 0)); then
+    say "ERROR: no subordinate uid range recorded in $path; the rootless containers of '$name' cannot be ruled out" >&2
+    return 1
+  fi
+  holder="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" || holder=""
+  if [[ -n "$holder" ]]; then
+    say "ERROR: the former uid $uid of '$name' now belongs to account '$holder'; its processes cannot be told apart" >&2
+    return 1
+  fi
+  for status in "$TENANT_PROC_ROOT"/[0-9]*/status; do
+    key=""
+    { while read -r key r e s f; do [[ "$key" != Uid: ]] || break; done <"$status"; } 2>/dev/null \
+      || continue
+    [[ "$key" == Uid: ]] || continue
+    seen=$((seen + 1))
+    hit=false
+    for ent in "$r" "$e" "$s" "$f"; do
+      [[ "$ent" =~ ^[0-9]+$ ]] || continue
+      if ((ent == uid)); then
+        hit=true
+        break
+      fi
+      for i in "${!starts[@]}"; do
+        if ((ent >= starts[i] && ent < starts[i] + counts[i])); then
+          hit=true
+          break 2
+        fi
+      done
+    done
+    [[ "$hit" == true ]] || continue
+    if ((nmatch < 5)); then
+      status="${status%/status}"
+      matches+="${matches:+, }${status##*/}"
+    fi
+    nmatch=$((nmatch + 1))
+  done
+  if ((seen == 0)); then
+    say "ERROR: cannot read the process table under $TENANT_PROC_ROOT; cannot prove that no process of '$name' remains" >&2
+    return 1
+  fi
+  if ((nmatch > 0)); then
+    say "ERROR: $nmatch process(es) of the former uid $uid of '$name' or its subordinate uids still run (pid ${matches}); stop them before removal" >&2
+    return 1
+  fi
+}
+
 remove_tenant_user() {
   local name="$1"
   local purge="${2:-false}"
+
+  # WI#688: an account that is already gone leaves nothing for userdel; its
+  # former home, with the rootless store inside it, stays for the operator.
+  if ! id -u "$name" >/dev/null 2>&1; then
+    say "tenant account '$name' is already gone; its former home $(tenant_home "$name") is left in place"
+    return 0
+  fi
 
   ensure_init_system
 

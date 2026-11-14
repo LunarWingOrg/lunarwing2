@@ -75,6 +75,12 @@ OPENRC_PROXY_BACKUP_DIR="${LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:-/var/lib/lunarw
 # chain (root writes there followed tenant-planted symlinks; and tenant-side
 # sidecars written by an older mt-admin were root-owned and unupdatable).
 CONTAINER_HASH_DIR="${LUNARWING_MT_CONTAINER_HASH_DIR:-/var/lib/lunarwing/container-hashes}"
+# WI#688: each tenant's uid and subordinate uid ranges, recorded in root-owned
+# host state while the account exists, so a removal after the account is gone
+# can prove from the process table that nothing of it still runs.
+TENANT_IDENTITY_DIR="${LUNARWING_MT_TENANT_IDENTITY_DIR:-/var/lib/lunarwing/tenant-identity}"
+TENANT_SUBUID_FILE="${LUNARWING_MT_SUBUID_FILE:-/etc/subuid}"
+TENANT_PROC_ROOT="${LUNARWING_MT_PROC_ROOT:-/proc}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was
