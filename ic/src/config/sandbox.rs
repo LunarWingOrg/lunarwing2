@@ -94,6 +94,36 @@ fn parse_ip_list_env(key: &str) -> Result<Vec<IpAddr>, ConfigError> {
         .map(Option::unwrap_or_default)
 }
 
+/// Ceiling for SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS. The setting bounds a
+/// cold start and, before WI#651, the per-run health-path image pull; an
+/// unbounded value would let one tenant make every run wait arbitrarily
+/// long. Ten minutes is far above the documented cold-start worst cases
+/// (270 s join plus probes) while still bounded.
+const MAX_SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 600;
+
+fn parse_startup_timeout_env() -> Result<Option<u64>, ConfigError> {
+    const KEY: &str = "SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS";
+    optional_env(KEY)?
+        .map(|value| {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    key: KEY.to_string(),
+                    message: "must be a positive number of seconds".to_string(),
+                })?;
+            if parsed > MAX_SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    key: KEY.to_string(),
+                    message: format!(
+                        "must be at most {MAX_SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS} seconds"
+                    ),
+                });
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
 impl SandboxTunnelModeConfig {
     fn resolve_env() -> Result<Self, ConfigError> {
         Ok(Self {
@@ -105,14 +135,7 @@ impl SandboxTunnelModeConfig {
             wireguard_config: optional_env("SANDBOX_TUNNEL_WIREGUARD_CONFIG")?.map(PathBuf::from),
             dns: parse_ip_list_env("SANDBOX_TUNNEL_DNS")?,
             wireguard_canary: parse_optional_ip_env("SANDBOX_TUNNEL_WIREGUARD_CANARY")?,
-            startup_timeout_secs: optional_env("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS")?
-                .map(|value| {
-                    value.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
-                        key: "SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS".to_string(),
-                        message: "must be a positive number of seconds".to_string(),
-                    })
-                })
-                .transpose()?,
+            startup_timeout_secs: parse_startup_timeout_env()?,
         })
     }
 
@@ -1223,6 +1246,34 @@ mod tests {
         let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
             .expect_err("zero timeout must fail");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    /// WI#651 ABV-1: the startup timeout has an upper cap, so a configured
+    /// value can no longer grow the per-run health-path wait without bound.
+    /// 600 seconds resolves; 601 is a config error.
+    #[test]
+    fn tunnel_startup_timeout_over_the_cap_fails_resolve() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_NETWORK", "tunnel");
+            std::env::set_var(
+                "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
+                "https://nb.example.com",
+            );
+            std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
+            std::env::set_var("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS", "600");
+        }
+        let config = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect("600 seconds is the cap and must resolve");
+        assert_eq!(config.tunnel.startup_timeout_secs, Some(600));
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS", "601") };
+        let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect_err("over the cap must fail");
+        assert!(error.to_string().contains("at most 600 seconds"));
     }
 
     #[test]

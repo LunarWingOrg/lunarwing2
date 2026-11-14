@@ -160,21 +160,22 @@ not application auth.
   Starts, recovery, stops, and cancelled-start cleanup therefore exclude each
   other, with stale cleanup queued before the next start. Cold starts use the
   same 6-second adoption re-probe as per-command recovery, then give a fresh
-  provider the full configured startup budget; image pull, runtime start, and
-  provider readiness have separate bounds rather than one cold wall-clock cap.
+  provider the full configured startup budget (capped at 600 seconds); image
+  pull, runtime start, and provider readiness have separate bounds rather than
+  one cold wall-clock cap.
   Per-command recovery gives a fresh provider at most 20 seconds (or the lower
   configured timeout) and has a 60-second budget. A provider that needs longer
   after recreation requires a daemon restart, which the returned error names.
   Initial and final health verification use their individual probe deadlines
   without a second aggregate ceiling: seven probes totaling 70 seconds for
-  WireGuard, six totaling 60 for NetBird. Any image pull retains the configured
-  startup timeout on those health paths; inside recovery it instead uses the
-  smaller of that timeout and the remaining recovery budget, with a pull-specific
-  timeout diagnostic. With the default 90-second pull bound, a health chain can
-  take 160 seconds for WireGuard or 150 for NetBird. Initial verification,
-  recovery, and final verification therefore total at most 200 and 180 seconds
-  with the image present, or 380 and 360 seconds with default auto-pull. The
-  lifecycle operation lock precedes the recovery budget, and joining a cold
+  WireGuard, six totaling 60 for NetBird. The health paths never pull an image
+  (WI#651): a missing image fails the check fast and the single-flight recovery
+  pulls it under its per-run budget, using the smaller of the configured
+  startup timeout and the remaining recovery budget, with a pull-specific
+  timeout diagnostic. Initial verification,
+  recovery, and final verification therefore total at most 200 and 180 seconds,
+  image present or not, plus up to 15 seconds for the lifecycle lock, which
+  precedes the recovery budget; joining a cold
   start can exceed these per-run totals because cold-start phases have separate
   bounds. A slow health check does not record a recovery failure or blame a
   recovery that never started. The returned `SandboxError::TunnelUnavailable`,
