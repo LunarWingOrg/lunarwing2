@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -123,8 +124,27 @@ pub struct TokenStore {
     /// backstop must scrub the same values it armed the harness secrets with.
     /// Held for the job's lifetime like `harness_secrets` (promotion scans and
     /// late events run after the token dies) and released only by
-    /// [`TokenStore::clear_harness_secrets`] on terminal paths.
-    credential_values: Arc<RwLock<HashMap<Uuid, Vec<SecretString>>>>,
+    /// [`TokenStore::clear_harness_secrets`] on terminal paths. Recorded only
+    /// while the job's token is live, so a request that outlives the job
+    /// cannot leave values behind.
+    credential_values: Arc<RwLock<HashMap<Uuid, ServedCredentialValues>>>,
+    /// Source of `ServedCredentialValues::generation`. Store-wide, so a
+    /// generation is never used twice: an entry re-created after a clear
+    /// cannot match a redactor built from the entry before it.
+    credential_generations: Arc<AtomicU64>,
+}
+
+/// Credential values served to one job (WI#666).
+///
+/// `generation` takes a new store-wide number every time a value is added
+/// (0 stands for "no entry"). Unlike harness secrets, these are stored at
+/// request time, any number of times per job, so a redactor build can race a
+/// pull: a redactor is cached only while the generation it was built from is
+/// still current.
+#[derive(Default)]
+struct ServedCredentialValues {
+    values: Vec<SecretString>,
+    generation: u64,
 }
 
 impl TokenStore {
@@ -137,6 +157,7 @@ impl TokenStore {
             harness_secrets_served: Arc::new(RwLock::new(std::collections::HashSet::new())),
             harness_redactors: Arc::new(RwLock::new(HashMap::new())),
             credential_values: Arc::new(RwLock::new(HashMap::new())),
+            credential_generations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -233,16 +254,18 @@ impl TokenStore {
             .await
             .get(&job_id)
             .map(|secrets| secrets.iter().map(|(_, value)| value.clone()).collect());
-        let credential_values: Option<Vec<SecretString>> =
-            self.credential_values.read().await.get(&job_id).cloned();
-        let redactor = build_redactor(
-            &harness_values.unwrap_or_default(),
-            &credential_values.unwrap_or_default(),
-        );
+        let (credential_values, credential_generation) = self
+            .credential_values
+            .read()
+            .await
+            .get(&job_id)
+            .map(|served| (served.values.clone(), served.generation))
+            .unwrap_or_default();
+        let redactor = build_redactor(&harness_values.unwrap_or_default(), &credential_values);
         if !redactor.is_armed() {
             return None;
         }
-        self.cache_redactor_if_held(job_id, Arc::new(redactor))
+        self.cache_redactor_if_held(job_id, Arc::new(redactor), credential_generation)
             .await
     }
 
@@ -250,29 +273,59 @@ impl TokenStore {
     ///
     /// Called right after the secrets store decrypts a grant, so the
     /// daemon-side event/promotion scrubber covers values injected into the
-    /// worker's child-process env. Repeated pulls extend the set (deduped) and
-    /// invalidate the cached redactor. Like `harness_secrets`, these are not
-    /// cleared by [`TokenStore::revoke`] — terminal paths call
+    /// worker's child-process env. Repeated pulls extend the set (deduped); a
+    /// pull that adds a value invalidates the cached redactor, a pull of
+    /// known values keeps it. Like `harness_secrets`, these are not cleared
+    /// by [`TokenStore::revoke`] — terminal paths call
     /// [`TokenStore::clear_harness_secrets`].
+    ///
+    /// Nothing is recorded for a job whose token is gone. The handlers decrypt
+    /// between their auth check and this call, so the job can end in between.
+    /// Every path that ends a job finishes with revoke, then clear
+    /// (`cleanup_job` may clear earlier, while the token is still live, but
+    /// the ending path's own clear follows it). The token guard is held
+    /// across the insert here, so values are either stored before that
+    /// revoke, and its clear releases them, or not stored at all. Without the
+    /// check, values stored after the last clear would stay for the daemon's
+    /// lifetime (the DG-3 class).
     pub async fn store_credential_values(&self, job_id: Uuid, values: Vec<SecretString>) {
         use secrecy::ExposeSecret;
 
         if values.is_empty() {
             return;
         }
+        // Lock order tokens → credential values → redactors; no other path
+        // takes `tokens` while it holds one of the later locks.
+        let tokens = self.tokens.read().await;
+        if !tokens.contains_key(&job_id) {
+            return;
+        }
+        // Every guard is taken before anything changes, so the push, the new
+        // generation and the cache drop below have no await between them: a
+        // handler future dropped mid-call (its client gone) cannot leave a
+        // cached redactor behind a generation that has moved. Holding the
+        // values guard through the drop also means `cache_redactor_if_held`
+        // (which holds the read guard through its insert) can never cache
+        // against a generation that is about to move.
         let mut stored = self.credential_values.write().await;
+        let mut redactors = self.harness_redactors.write().await;
         let entry = stored.entry(job_id).or_default();
+        let mut added = false;
         for value in values {
             if !entry
+                .values
                 .iter()
                 .any(|existing| existing.expose_secret() == value.expose_secret())
             {
-                entry.push(value);
+                entry.values.push(value);
+                added = true;
             }
         }
-        drop(stored);
-        // A re-store invalidates any redactor built from the older values.
-        self.harness_redactors.write().await.remove(&job_id);
+        if !added {
+            return;
+        }
+        entry.generation = self.credential_generations.fetch_add(1, Ordering::Relaxed) + 1;
+        redactors.remove(&job_id);
     }
 
     /// Insert a freshly built redactor only when the job's secrets are still
@@ -281,15 +334,27 @@ impl TokenStore {
     /// Lock order secrets → redactors matches the clear path, so the
     /// re-check and the insert are atomic against a concurrent clear.
     ///
-    /// The re-check covers PRESENCE, not generation: a build racing a
-    /// re-store of different values would cache the older generation. That
-    /// is unreachable today because the only production store runs once at
-    /// dispatch and job ids are fresh UUIDs (a web restart creates a new
-    /// id), so a build can never race a re-store for the same id.
+    /// For harness secrets the re-check covers PRESENCE, not generation: a
+    /// build racing a re-store of different values would cache the older
+    /// generation. That is unreachable today because their only production
+    /// store runs once at dispatch and job ids are fresh UUIDs (a web
+    /// restart creates a new id), so a build can never race a re-store for
+    /// the same id.
+    ///
+    /// Served credential values have no such guarantee: both credential
+    /// routes store at request time, and nothing but the order of calls in
+    /// today's runtimes keeps a pull from racing an event. So for them the
+    /// re-check covers the generation too. `credential_generation` is the
+    /// generation the caller read with the values it built from; a redactor
+    /// from an older generation is handed back to that one caller (its event
+    /// raced the pull, and the worker cannot have echoed values it had not
+    /// yet received) but never cached, so the next call builds from the
+    /// current set.
     async fn cache_redactor_if_held(
         &self,
         job_id: Uuid,
         redactor: Arc<crate::orchestrator::harness::SecretValueRedactor>,
+        credential_generation: u64,
     ) -> Option<Arc<crate::orchestrator::harness::SecretValueRedactor>> {
         // Both guards stay held through the insert: dropping them here would
         // let a concurrent terminal clear slip between the re-check and the
@@ -300,14 +365,19 @@ impl TokenStore {
         // WI#666: grants alone arm a redactor too, so a job with served
         // credential values but no harness secrets must still cache it.
         let credentials = self.credential_values.read().await;
-        let holds_credentials = credentials.contains_key(&job_id);
-        if !holds_secrets && !holds_credentials {
+        let served = credentials.get(&job_id);
+        if !holds_secrets && served.is_none() {
             return None;
+        }
+        if served.map_or(0, |served| served.generation) != credential_generation {
+            return Some(redactor);
         }
         let mut redactors = self.harness_redactors.write().await;
         if let Some(existing) = redactors.get(&job_id) {
-            // A concurrent build won the insert; both describe the same
-            // held values, so either Arc is correct.
+            // A concurrent build won the insert. It was checked against the
+            // same credential generation under the same guard, and a store
+            // that moves the generation drops the entry before it releases
+            // its write guard, so either Arc describes the held values.
             return Some(Arc::clone(existing));
         }
         redactors.insert(job_id, Arc::clone(&redactor));
@@ -599,6 +669,16 @@ mod tests {
         assert!(store.get_mcp_grants(job_a).await.is_none());
     }
 
+    /// The generation of the credential values held for a job, if any.
+    async fn served_generation(store: &TokenStore, job_id: Uuid) -> Option<u64> {
+        store
+            .credential_values
+            .read()
+            .await
+            .get(&job_id)
+            .map(|served| served.generation)
+    }
+
     #[tokio::test]
     async fn credential_values_arm_the_daemon_redactor() {
         // WI#666: a job with granted credentials but no harness secrets must
@@ -606,6 +686,7 @@ mod tests {
         // the child process env.
         let store = TokenStore::new();
         let job_id = Uuid::new_v4();
+        let _token = store.create_token(job_id).await;
         let value = "granted-credential-fixture-value";
         assert!(store.harness_secret_redactor(job_id).await.is_none());
 
@@ -621,15 +702,149 @@ mod tests {
         assert!(!scrubbed.contains(value));
         assert!(scrubbed.contains("[redacted-secret]"));
 
+        // Like harness secrets, the values outlive the token: the write-back
+        // scan runs after `revoke`.
+        store.revoke(job_id).await;
+        assert!(
+            store
+                .harness_secret_redactor(job_id)
+                .await
+                .is_some_and(|redactor| redactor.contains_secret(value))
+        );
+
         // Terminal cleanup releases the values and the cached redactor.
         store.clear_harness_secrets(job_id).await;
         assert!(store.harness_secret_redactor(job_id).await.is_none());
+        assert!(store.credential_values.read().await.get(&job_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_values_are_not_recorded_for_an_ended_job() {
+        // A credential request decrypts between its auth check and the
+        // store. When the job ends in between (revoke, then clear), the late
+        // store must record nothing: no later path would release it.
+        let store = TokenStore::new();
+        let value = "granted-credential-late-store-value";
+
+        let stopped = Uuid::new_v4();
+        let _token = store.create_token(stopped).await;
+        store.revoke(stopped).await;
+        store.clear_harness_secrets(stopped).await;
+        // A job that never had a token is refused the same way.
+        let unknown = Uuid::new_v4();
+
+        for job_id in [stopped, unknown] {
+            store
+                .store_credential_values(job_id, vec![SecretString::from(value.to_string())])
+                .await;
+            assert!(
+                store.credential_values.read().await.get(&job_id).is_none(),
+                "values stored after the terminal clear would never be released"
+            );
+            assert!(store.harness_secret_redactor(job_id).await.is_none());
+            assert!(store.harness_redactors.read().await.get(&job_id).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn redactor_built_before_a_credential_pull_is_not_cached() {
+        // The credential routes store at request time, so an event's redactor
+        // build can race a pull. A build from the older set must not become
+        // the job's cached redactor: every later event would be scrubbed
+        // without the values the pull added.
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        let _token = store.create_token(job_id).await;
+        let first = "granted-credential-first-value";
+        let second = "granted-credential-second-value";
+        store
+            .store_credential_values(job_id, vec![SecretString::from(first.to_string())])
+            .await;
+
+        // The build read the set before the second pull...
+        let older_generation = served_generation(&store, job_id)
+            .await
+            .expect("first pull is recorded"); // safety: test
+        let older = Arc::new(build_redactor(
+            &[],
+            &[SecretString::from(first.to_string())],
+        ));
+        // ...and reaches the cache after it.
+        store
+            .store_credential_values(job_id, vec![SecretString::from(second.to_string())])
+            .await;
+        let returned = store
+            .cache_redactor_if_held(job_id, Arc::clone(&older), older_generation)
+            .await
+            .expect("the job still holds values"); // safety: test
+        assert!(Arc::ptr_eq(&returned, &older));
+        assert!(
+            store.harness_redactors.read().await.get(&job_id).is_none(),
+            "a redactor from an older credential set must not be cached"
+        );
+
+        // The next call builds from the current set and caches that.
+        let current = store
+            .harness_secret_redactor(job_id)
+            .await
+            .expect("credential values arm the redactor"); // safety: test
+        for value in [first, second] {
+            assert!(current.contains_secret(value));
+        }
+        let again = store
+            .harness_secret_redactor(job_id)
+            .await
+            .expect("cached redactor"); // safety: test
+        assert!(Arc::ptr_eq(&current, &again));
+    }
+
+    #[tokio::test]
+    async fn credential_generation_is_not_reused_after_an_early_clear() {
+        // `cleanup_job` can clear while the token is still live (the job
+        // tool's wait path sees `Stopped` before the ending path revokes). A
+        // pull that lands after that clear re-creates the entry. A redactor
+        // built from the entry before the clear must not match it.
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        let _token = store.create_token(job_id).await;
+        let first = "granted-credential-first-value";
+        let second = "granted-credential-second-value";
+        store
+            .store_credential_values(job_id, vec![SecretString::from(first.to_string())])
+            .await;
+        let before_clear = served_generation(&store, job_id)
+            .await
+            .expect("first pull is recorded"); // safety: test
+        let older = Arc::new(build_redactor(
+            &[],
+            &[SecretString::from(first.to_string())],
+        ));
+
+        store.clear_harness_secrets(job_id).await;
+        store
+            .store_credential_values(job_id, vec![SecretString::from(second.to_string())])
+            .await;
+        let after_clear = served_generation(&store, job_id)
+            .await
+            .expect("the late pull is recorded"); // safety: test
+        assert_ne!(before_clear, after_clear, "a generation must not be reused");
+
+        let returned = store
+            .cache_redactor_if_held(job_id, Arc::clone(&older), before_clear)
+            .await
+            .expect("the job holds values again"); // safety: test
+        assert!(Arc::ptr_eq(&returned, &older));
+        assert!(
+            store.harness_redactors.read().await.get(&job_id).is_none(),
+            "a redactor from before the clear must not be cached"
+        );
     }
 
     #[tokio::test]
     async fn credential_values_extend_a_harness_armed_redactor_and_dedupe() {
         let store = TokenStore::new();
         let job_id = Uuid::new_v4();
+        let _token = store.create_token(job_id).await;
         let harness_value = "harness-mounted-fixture-value";
         let credential_value = "granted-credential-fixture-value";
         store
@@ -664,8 +879,25 @@ mod tests {
             );
         }
         // Repeated pulls extend without duplicating the stored value.
-        let stored = store.credential_values.read().await;
-        assert_eq!(stored.get(&job_id).map(Vec::len), Some(1));
+        {
+            let stored = store.credential_values.read().await;
+            assert_eq!(
+                stored.get(&job_id).map(|served| served.values.len()),
+                Some(1)
+            );
+        }
+        // A pull that adds nothing keeps the cached redactor (EB-4).
+        store
+            .store_credential_values(
+                job_id,
+                vec![SecretString::from(credential_value.to_string())],
+            )
+            .await;
+        let after_repeat = store
+            .harness_secret_redactor(job_id)
+            .await
+            .expect("still armed"); // safety: test
+        assert!(Arc::ptr_eq(&redactor, &after_repeat));
     }
 
     #[tokio::test]
@@ -750,7 +982,7 @@ mod tests {
         // No secrets held for the job (as after a racing clear): refused.
         assert!(
             store
-                .cache_redactor_if_held(job_id, Arc::clone(&redactor))
+                .cache_redactor_if_held(job_id, Arc::clone(&redactor), 0)
                 .await
                 .is_none()
         );
@@ -768,7 +1000,7 @@ mod tests {
             .await;
         assert!(
             store
-                .cache_redactor_if_held(job_id, Arc::clone(&redactor))
+                .cache_redactor_if_held(job_id, Arc::clone(&redactor), 0)
                 .await
                 .is_some()
         );
