@@ -305,25 +305,29 @@ It then removes every supported bridge/task container and IPC volume, every
 OpenRC unit/runlevel link, and the systemd Quadlets. Systemd stops task services
 and reloads the user manager before container deletion, so `Restart=on-failure`
 cannot resurrect a task into teardown. Stop, inspection, container/volume
-removal, attachment-query, keeper-removal, and network-removal failures abort
-the command; they are not warnings.
+removal, attachment-query, keeper-identification, keeper-removal, and
+network-removal failures abort the command; they are not warnings.
 
-Egress teardown checks attachments before changing any state. The only
-container it does not count is the managed keeper's own infra container,
-which it identifies by the ID the keeper pod reports. A container that merely
-carries the keeper's label counts as attached, and so does the infra container
-of a foreign pod with the keeper's name. The query uses the network filter
-alone, so it is the same call on Podman and on Docker.
-An attachment refusal, a failed query, or a keeper that cannot be identified
-therefore leaves the running rootless keeper and its namespace, both live
-chains, the egress network, and the rendered state intact for repair and retry
-(rootful runtimes have no keeper). Once clear, teardown flushes the chains,
-removes the keeper, removes the network, and deletes the rendered state, in that
-order. A keeper- or network-removal failure occurs after the flush: rendered
-state still remains for retry, but the live chains have already been deleted.
-At any egress refusal the tenant units, supported containers, and IPC volumes
-are already removed, its ports are deallocated, and with `--purge` its database
-is reset. Remove the unexpected attachment and rerun `remove-tenant` to finish.
+Egress teardown checks the keeper and attachments before changing any state. On
+rootless Podman, a pod with the keeper's name must have the managed purpose
+label and exactly one container; a foreign or multi-container pod is refused.
+For a valid keeper, the only attachment the query exempts is the infra container
+ID reported by that pod. The count check matters because another container
+inside the pod shares its network namespace without its own network attachment.
+A container that merely carries the keeper's label counts as attached. The query
+uses the network filter alone, so it is the same call on Podman and on Docker.
+An attachment refusal, a failed query, a failed keeper-existence check, or a
+keeper that is foreign or cannot be identified therefore leaves the existing
+rootless keeper pod and its namespace, both live chains, the egress network, and
+the rendered state intact for repair and retry (rootful runtimes have no
+keeper). Once clear, teardown flushes the chains, removes the keeper, removes
+the network, and deletes the rendered state, in that order. A keeper- or
+network-removal failure occurs after the flush: rendered state still remains
+for retry, but the live chains have already been deleted. At any egress refusal
+the tenant units, supported containers, and IPC volumes are already removed,
+its ports are deallocated, and with `--purge` its database is reset. Resolve the
+reported keeper problem or remove the unexpected attachment, then rerun
+`remove-tenant` to finish.
 
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
