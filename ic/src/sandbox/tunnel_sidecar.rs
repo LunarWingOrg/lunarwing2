@@ -57,7 +57,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
-const RUN_HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(65);
 const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
 const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
@@ -1211,9 +1210,9 @@ impl TunnelSidecar {
         .await
     }
 
-    /// Health verification has its own ceiling, separate from recovery's budget.
+    /// Verify before and after bounded recovery; each runtime probe keeps its own deadline.
     pub async fn container_for_run(&self) -> Result<String> {
-        match self.ensure_healthy_for_run().await {
+        match self.ensure_healthy().await {
             Ok(container_id) => Ok(container_id),
             Err(error) => {
                 tracing::warn!(
@@ -1221,18 +1220,8 @@ impl TunnelSidecar {
                     "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
                 );
                 self.recover_for_run().await?;
-                self.ensure_healthy_for_run().await
+                self.ensure_healthy().await
             }
-        }
-    }
-
-    async fn ensure_healthy_for_run(&self) -> Result<String> {
-        match tokio::time::timeout(RUN_HEALTH_CHECK_BUDGET, self.ensure_healthy()).await {
-            Ok(result) => result,
-            Err(_) => Err(self.unavailable(&format!(
-                "health check exceeded the {}s health-check budget during image, runtime, provider, or firewall probes",
-                RUN_HEALTH_CHECK_BUDGET.as_secs()
-            ))),
         }
     }
 
@@ -3242,7 +3231,7 @@ mod tests {
             let calls = calls.clone();
             let container_id = "2".repeat(64);
             async move {
-                tokio::time::sleep(Duration::from_secs(9)).await;
+                tokio::time::sleep(Duration::from_millis(9_500)).await;
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let stdout = match args.first().map(String::as_str) {
                     Some("image") if args.iter().any(|arg| arg == "--format") => {
@@ -3303,7 +3292,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let container_id = sidecar.container_for_run().await.unwrap();
         assert_eq!(container_id, "2".repeat(64));
-        assert_eq!(started.elapsed(), Duration::from_secs(63));
+        assert_eq!(started.elapsed(), Duration::from_millis(66_500));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
         let lifecycle = sidecar.lifecycle.state.lock().await;
         assert!(lifecycle.active.is_none());
