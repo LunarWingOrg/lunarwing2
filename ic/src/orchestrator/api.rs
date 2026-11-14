@@ -632,6 +632,20 @@ async fn get_credentials_handler(
         });
     }
 
+    // WI#666: these values are injected into every child process env, so a
+    // child can `printenv` one into tool output. Hold them with the job's
+    // harness secrets so the daemon-side event/promotion scrubber knows them.
+    state
+        .token_store
+        .store_credential_values(
+            job_id,
+            credentials
+                .iter()
+                .map(|credential| secrecy::SecretString::from(credential.value.clone()))
+                .collect(),
+        )
+        .await;
+
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&credentials).unwrap_or(serde_json::Value::Null)),
@@ -726,6 +740,18 @@ async fn get_mcp_credentials_handler(
             value: decrypted.expose().to_string(),
         });
     }
+    // WI#666: MCP credentials are child-process env too — same leak channel,
+    // same daemon-side backstop.
+    state
+        .token_store
+        .store_credential_values(
+            job_id,
+            credentials
+                .iter()
+                .map(|credential| secrecy::SecretString::from(credential.value.clone()))
+                .collect(),
+        )
+        .await;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(credentials).unwrap_or(serde_json::Value::Null)),
