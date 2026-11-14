@@ -421,13 +421,13 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 
 ## Phase 9 - Advanced Operator Notes
 
-45. [x] (H) Deploy the stoplight system for IRC
+45. [x] (H) Deploy the stoplight system for IRC cadence control
 46. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 47. [x] (H) go over work item stuff
 48. [x] (H) FIRST REL NOTES DRAFT after remove crap copy
-49. [x] (H) clean scratch on wt
+49. [x] (H) DONE - clean scratch on wt
 50. [x] (H) Rares exp
-51. [x] (S) Review operator notes after work items are cleared out some more
+51. [x] (H) Review operator notes after work items are cleared out some more
 52. [x] (S) RESERVED
 53. [x] (S) RESERVED
 54. [x] (S) RESERVED
