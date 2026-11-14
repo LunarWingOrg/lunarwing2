@@ -12,11 +12,13 @@ from urllib.parse import urlsplit
 
 PLACEHOLDER_URL = "https://set-lunardepth-base-url.invalid/openai/v1"
 PLACEHOLDER_MODEL = "tensormoon::function_name::lunarwing"
-# The prefix of the model id names the gateway dialect. A gateway answers only
-# ids that carry its own prefix, so the id alone selects the dialect and the
-# provider row is named after it.
+# Both gateways address a function as <prefix>::function_name::<function>: the
+# middle segment is that literal keyword and the function's name comes last.
+# The prefix names the gateway dialect, and the provider row is named after it.
+# A TensorZero gateway answers only tensorzero:: ids; a TensorMoon gateway
+# answers tensormoon:: ids and, as deprecated aliases, tensorzero:: ones.
 DIALECT_DISPLAY_NAMES = {"tensormoon": "TensorMoon", "tensorzero": "TensorZero"}
-MODEL_PATTERN = re.compile(r"^(tensormoon|tensorzero)::[A-Za-z0-9_-]+::lunarwing$")
+MODEL_PATTERN = re.compile(r"^(tensormoon|tensorzero)::function_name::[A-Za-z0-9_-]+$")
 # The template is written in the TensorMoon dialect. Each entry is one of its
 # provider lines, how often the reviewed template contains it, and its form in
 # the selected dialect; a TensorMoon id renders every line unchanged.
@@ -30,8 +32,8 @@ PLACEHOLDER_PROVIDER_LINES = (
 def validate_route(base_url: str, model: str, allow_insecure: bool) -> None:
     if not MODEL_PATTERN.fullmatch(model):
         raise ValueError(
-            "model must have the tensormoon::<function_name>::lunarwing"
-            " or tensorzero::<function_name>::lunarwing form"
+            "model must have the tensormoon::function_name::<function>"
+            " or tensorzero::function_name::<function> form"
         )
     if any(ord(character) < 0x21 or ord(character) == 0x7F for character in base_url):
         raise ValueError("base URL must not contain whitespace or control characters")

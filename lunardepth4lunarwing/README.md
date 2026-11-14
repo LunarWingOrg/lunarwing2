@@ -29,12 +29,14 @@ ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
 
-Two id forms are accepted, and the prefix names the gateway each one targets:
+Two id forms are accepted. Both gateways use the same grammar: the prefix, the literal keyword `function_name`, and last the name of a function defined in that gateway's configuration.
 
-- `tensormoon::<function_name>::lunarwing` targets a TensorMoon gateway, which serves the `lunarwing` function as `tensormoon::function_name::lunarwing`. The rendered provider row is `tensormoon`.
-- `tensorzero::<function_name>::lunarwing` targets a TensorZero gateway, which serves it as `tensorzero::function_name::lunarwing`. The rendered provider row is `tensorzero`.
+- `tensormoon::function_name::<function>` targets a TensorMoon gateway, for example `tensormoon::function_name::lunarwing`. The rendered provider row is `tensormoon`.
+- `tensorzero::function_name::<function>` targets a TensorZero gateway, for example `tensorzero::function_name::lunarwing` or `tensorzero::function_name::FrontierCODE`. The rendered provider row is `tensorzero`.
 
-A gateway refuses an id in the other dialect, and the lane rewrites nothing, so a TensorZero tenant passes `--base-url https://tensorzero.example.com/openai/v1 --model tensorzero::function_name::lunarwing`. `render_overlay.py` selects the dialect from the id alone: it renames the provider row and the two rows that select it, and changes nothing else. A TensorMoon id renders the template's own bytes. Any other id, including one with the `::variant_name::<variant>` suffix a gateway reply echoes, fails route validation.
+`<function>` is the operator's choice among the functions the gateway serves and may contain letters, digits, `_`, and `-`; the lane does not require `lunarwing`. Use the prefix of the gateway behind the base URL: a TensorZero gateway refuses `tensormoon::` ids, and a TensorMoon gateway takes `tensorzero::` ids only as deprecated aliases. The lane rewrites nothing, so a TensorZero tenant passes `--base-url https://tensorzero.example.com/openai/v1 --model tensorzero::function_name::lunarwing`.
+
+`render_overlay.py` selects the dialect from the id alone: it renames the provider row and the two rows that select it, and changes nothing else. `tensormoon::function_name::lunarwing` renders the template's own bytes. Any other id fails route validation: another prefix, a middle segment other than `function_name` (a gateway refuses those, and `model_name` is not accepted), or the `::variant_name::<variant>` suffix a gateway reply echoes.
 
 The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior. Clear those exceptions with `--disallow-insecure-http` and `--require-api-key`. Existing tenants receive their v18 lane ports, registry selection, and daemon endpoint during configuration; route and key values are written literally without Podman-env quotes. `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored.
 

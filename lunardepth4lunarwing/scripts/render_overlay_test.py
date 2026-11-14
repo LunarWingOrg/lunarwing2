@@ -24,11 +24,11 @@ class OverlayTests(unittest.TestCase):
         rendered = MODULE.render(
             self.template.read_text(encoding="utf-8"),
             "https://tensormoon.example.test/openai/v1",
-            "tensormoon::tenant_model::lunarwing",
+            "tensormoon::function_name::tenant_function",
             False,
         )
         self.assertIn("baseURL: 'https://tensormoon.example.test/openai/v1'", rendered)
-        self.assertEqual(rendered.count("tensormoon::tenant_model::lunarwing"), 3)
+        self.assertEqual(rendered.count("tensormoon::function_name::tenant_function"), 3)
         self.assertNotIn("baseURLEnv:", rendered)
         self.assertNotIn("AGENT_AUTH_TOKEN", rendered)
         self.assertNotIn("LUNARDEPTH_API_KEY:", rendered)
@@ -39,12 +39,12 @@ class OverlayTests(unittest.TestCase):
         # for a TensorMoon route: only the URL and the model id are substituted.
         template = self.template.read_text(encoding="utf-8")
         rendered = MODULE.render(
-            template, "https://tensormoon.example.test/openai/v1", "tensormoon::tenant_model::lunarwing", False
+            template, "https://tensormoon.example.test/openai/v1", "tensormoon::function_name::tenant_function", False
         )
         self.assertEqual(
             rendered,
             template.replace(MODULE.PLACEHOLDER_URL, "'https://tensormoon.example.test/openai/v1'")
-            .replace(MODULE.PLACEHOLDER_MODEL, "tensormoon::tenant_model::lunarwing"),
+            .replace(MODULE.PLACEHOLDER_MODEL, "tensormoon::function_name::tenant_function"),
         )
         self.assertEqual(rendered.count("    provider: tensormoon\n"), 2)
         self.assertIn("      tensormoon:\n        displayName: TensorMoon\n", rendered)
@@ -75,19 +75,45 @@ class OverlayTests(unittest.TestCase):
             MODULE.render(template, "http://10.0.0.2:3000/openai/v1", "tensorzero::function_name::lunarwing", True),
         )
 
+    def test_a_function_other_than_lunarwing_renders_in_both_dialects(self):
+        # The function is the operator's choice: the fleet gateway serves
+        # FrontierCODE beside lunarwing, and the lane must not pin either.
+        template = self.template.read_text(encoding="utf-8")
+        for provider in ("tensormoon", "tensorzero"):
+            model = f"{provider}::function_name::FrontierCODE"
+            with self.subTest(model=model):
+                rendered = MODULE.render(template, "https://example.test/openai/v1", model, False)
+                self.assertEqual(rendered.count(model), 3)
+                self.assertNotIn("function_name::lunarwing", rendered)
+                self.assertEqual(rendered.count(f"    provider: {provider}\n"), 2)
+                self.assertIn(f"          - id: {model}\n", rendered)
+
     def test_model_dialects(self):
         url = "https://example.test/openai/v1"
+        # Both gateways take the literal function_name keyword in the middle
+        # and the function's own name last; any configured function is valid.
         for model in (
             "tensormoon::function_name::lunarwing",
+            "tensormoon::function_name::FrontierCODE",
             "tensorzero::function_name::lunarwing",
-            "tensorzero::tenant_model::lunarwing",
+            "tensorzero::function_name::FrontierCODE",
+            "tensorzero::function_name::my-function_2",
         ):
             MODULE.validate_route(url, model, False)
         for model in (
             "tensorone::function_name::lunarwing",
             "TensorZero::function_name::lunarwing",
-            "tensorzero::function_name::other",
+            # A middle segment other than the keyword is refused by both gateways.
+            "tensorzero::tenant_model::lunarwing",
+            "tensorzero::lunarwing_agent::lunarwing",
+            "tensormoon::tenant_model::lunarwing",
+            "tensormoon::FrontierCODE::lunarwing",
+            "tensorzero::model_name::lunarwing",
+            "tensorzero::function_name::",
+            "tensorzero::function_name::a::b",
             "tensorzero::function_name::lunarwing::variant_name::primary",
+            "tensorzero::function_name::has.dot",
+            "tensorzero::function_name::has space",
             "tensorzero::lunarwing",
             "xtensorzero::function_name::lunarwing",
             "tensorzero::function_name::lunarwing\n",
@@ -108,17 +134,17 @@ class OverlayTests(unittest.TestCase):
                     MODULE.render(drifted, "https://example.test/openai/v1", model, False)
 
     def test_transport_validation(self):
-        MODULE.validate_route("http://127.0.0.1:3000/openai/v1", "tensormoon::local::lunarwing", False)
-        MODULE.validate_route("http://[::1]:3000/openai/v1", "tensormoon::local::lunarwing", False)
+        MODULE.validate_route("http://127.0.0.1:3000/openai/v1", "tensormoon::function_name::lunarwing", False)
+        MODULE.validate_route("http://[::1]:3000/openai/v1", "tensormoon::function_name::lunarwing", False)
         with self.assertRaisesRegex(ValueError, "cleartext HTTP"):
-            MODULE.validate_route("http://10.0.0.2/openai/v1", "tensormoon::local::lunarwing", False)
-        MODULE.validate_route("http://10.0.0.2/openai/v1", "tensormoon::local::lunarwing", True)
+            MODULE.validate_route("http://10.0.0.2/openai/v1", "tensormoon::function_name::lunarwing", False)
+        MODULE.validate_route("http://10.0.0.2/openai/v1", "tensormoon::function_name::lunarwing", True)
         with self.assertRaisesRegex(ValueError, "model must"):
             MODULE.validate_route("https://example.test/openai/v1", "other-model", False)
         with self.assertRaisesRegex(ValueError, "API root"):
-            MODULE.validate_route("https://example.test/openai/v1/chat/completions", "tensormoon::x::lunarwing", False)
+            MODULE.validate_route("https://example.test/openai/v1/chat/completions", "tensormoon::function_name::lunarwing", False)
         with self.assertRaisesRegex(ValueError, "whitespace or control"):
-            MODULE.validate_route("https://example.test/openai/v1\nPLANTED=value", "tensormoon::x::lunarwing", False)
+            MODULE.validate_route("https://example.test/openai/v1\nPLANTED=value", "tensormoon::function_name::lunarwing", False)
 
     def test_atomic_mode_and_drift_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,7 +152,7 @@ class OverlayTests(unittest.TestCase):
             args = [
                 "--template", str(self.template),
                 "--base-url", "https://example.test/openai/v1",
-                "--model", "tensormoon::tenant::lunarwing",
+                "--model", "tensormoon::function_name::tenant",
             ]
             original_argv = list(os.sys.argv)
             try:
@@ -153,7 +179,7 @@ class OverlayTests(unittest.TestCase):
             args = [
                 "--template", str(self.template),
                 "--base-url", "https://example.test/openai/v1",
-                "--model", "tensormoon::tenant::lunarwing",
+                "--model", "tensormoon::function_name::tenant",
             ]
             printed = subprocess.run(
                 [sys.executable, "-I", str(script), *args, "--stdout"],

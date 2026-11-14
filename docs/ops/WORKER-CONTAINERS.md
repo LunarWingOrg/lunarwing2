@@ -1401,14 +1401,16 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
 
-The model id names the gateway dialect, and it must be the dialect of the gateway behind the base URL (WI#691):
+The model id names the gateway dialect and the gateway function (WI#691). Both gateways use one grammar: the prefix, the literal keyword `function_name`, and last the name of a function defined in that gateway's configuration.
 
-| Gateway | Accepted id form | Id that serves the `lunarwing` function | Rendered provider row |
+| Gateway | Accepted id form | Example | Rendered provider row |
 |---|---|---|---|
-| TensorMoon | `tensormoon::<function_name>::lunarwing` | `tensormoon::function_name::lunarwing` | `tensormoon` (TensorMoon) |
-| TensorZero | `tensorzero::<function_name>::lunarwing` | `tensorzero::function_name::lunarwing` | `tensorzero` (TensorZero) |
+| TensorMoon | `tensormoon::function_name::<function>` | `tensormoon::function_name::lunarwing` | `tensormoon` (TensorMoon) |
+| TensorZero | `tensorzero::function_name::<function>` | `tensorzero::function_name::lunarwing`, `tensorzero::function_name::FrontierCODE` | `tensorzero` (TensorZero) |
 
-A gateway refuses an id in the other dialect; a TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. The lane translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and the `tensorzero::` id:
+`<function>` is the operator's choice among the functions the gateway serves; the lane does not require `lunarwing`. It accepts letters, digits, `_`, and `-`. The middle segment is not variable: a gateway refuses any word there other than its keyword, so the lane refuses it too, and a `model_name` id is not accepted.
+
+Use the prefix of the gateway behind the base URL. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. A TensorMoon gateway takes `tensorzero::` ids only as deprecated aliases that may be removed. The lane translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
@@ -1417,7 +1419,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
   --api-key-file /protected/tenant-lunardepth-key
 ```
 
-The dialect changes only the name of the rendered provider row and of the two rows that select it; every other overlay value, the credential handling, and the egress derivation are the same. A TensorMoon id renders the same bytes as before the TensorZero dialect existed, so an installed TensorMoon overlay keeps its digest. Any other id is refused by `configure-lunardepth`, `add-tenant`/`add-tenants`/`build-tenant --with-lunardepth`, the start and upgrade preflight, and the task launcher. That includes an id carrying the `::variant_name::<variant>` suffix that a gateway reply echoes in its `model` field. Both dialects need a worker image whose baked renderer knows them: an image built before WI#691 refuses a `tensorzero::` id at start with the `build-lunardepth-worker` hint.
+The dialect changes only the name of the rendered provider row and of the two rows that select it; every other overlay value, the credential handling, and the egress derivation are the same. `tensormoon::function_name::lunarwing` renders the template's own bytes. Any other id is refused by `configure-lunardepth`, `add-tenant`/`add-tenants`/`build-tenant --with-lunardepth`, the start and upgrade preflight, and the task launcher. That includes an id carrying the `::variant_name::<variant>` suffix that a gateway reply echoes in its `model` field. The renderer is baked into the worker image, so an image built before WI#691 refuses a `tensorzero::` id, and any function other than `lunarwing`, at start with the `build-lunardepth-worker` hint. That older renderer also took any word as the middle segment of a `tensormoon::` id and required `lunarwing` last; a stored route of that shape other than `tensormoon::function_name::lunarwing` named nothing a gateway serves and now fails route validation, so reconfigure it.
 
 The URL excludes `/chat/completions`; the example hosts and function name are placeholders, not a fleet default. HTTPS is required beyond loopback. Non-loopback cleartext HTTP requires the separate `--allow-insecure-http` exception. A deliberately unauthenticated gateway requires `--allow-unauthenticated-gateway` and uses only LunarDepth's nonempty placeholder-key behavior. Omitted values and explicit exceptions survive a re-render; no inherited endpoint marker is synthesized. `export-tenant.sh` does not carry the lane's route or key: pass them again to `import-tenant.sh` (`--with-lunardepth`, `--lunardepth-base-url`, `--lunardepth-model`, `--lunardepth-api-key-file`). Clear a previous exception explicitly with `--disallow-insecure-http` or `--require-api-key`, respectively.
 

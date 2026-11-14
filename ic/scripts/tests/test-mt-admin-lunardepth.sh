@@ -100,9 +100,9 @@ refute() {
   # Running: the new configuration is applied in the same command, so the unit
   # never keeps an overlay digest that no longer matches its environment.
   : >"$TMP/pair-running"
-  configure_lunardepth demo tensormoon::other_function::lunarwing '' '' preserve preserve >"$TMP/configure.out"
+  configure_lunardepth demo tensormoon::function_name::other_function '' '' preserve preserve >"$TMP/configure.out"
   grep -q '^start:demo$' "$TMP/configure.calls"
-  grep -q '^LUNARDEPTH_MODEL=tensormoon::other_function::lunarwing$' "$TMP/env/lunardepth-task.env"
+  grep -q '^LUNARDEPTH_MODEL=tensormoon::function_name::other_function$' "$TMP/env/lunardepth-task.env"
   grep -q '^LUNARDEPTH_API_KEY=test-only-key$' "$TMP/env/lunardepth-task.env"
   rm -f "$TMP/pair-running"
   # ZP-8: a key handed over while the unauthenticated-gateway exception is on
@@ -204,7 +204,7 @@ diff -u "$expected" "$calls"
   [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
   for expected in run --rm --pull=never none --read-only ALL no-new-privileges --no-healthcheck /usr/bin/python3 \
       lunarwing-worker-lunardepth:latest -I /app/scripts/render_overlay.py \
-      /app/config/lunarwing-lane.patch.yml --stdout tensormoon::other_function::lunarwing; do
+      /app/config/lunarwing-lane.patch.yml --stdout tensormoon::function_name::other_function; do
     grep -qx -- "$expected" "$TMP/render.args" || { echo "render container lacks: $expected" >&2; exit 1; }
   done
   # Nothing from the operator checkout is mounted into or passed to that container.
@@ -250,22 +250,35 @@ diff -u "$expected" "$calls"
   [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
   grep -qx -- 'tensorzero::function_name::lunarwing' "$TMP/tz-render.args"
   grep -qx -- '--allow-insecure-http' "$TMP/tz-render.args"
+  # The function is the operator's choice, not the lane's: the fleet gateway
+  # serves FrontierCODE beside lunarwing, and omitted values survive.
+  configure_lunardepth demo tensorzero::function_name::FrontierCODE '' '' preserve preserve >"$TMP/tz-configure.out"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::FrontierCODE' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_API_KEY=tz-test-only-key' "$TMP/tz-env/lunardepth-task.env"
+  _lunardepth_route demo
+  [[ "$LUNARDEPTH_MODEL_RESOLVED" == "tensorzero::function_name::FrontierCODE" ]]
+  [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
+  grep -qx -- 'tensorzero::function_name::FrontierCODE' "$TMP/tz-render.args"
   # The egress allowlist derives from the configured endpoint alone; the
-  # dialect adds no target.
+  # dialect and the function add no target.
   [[ "$(worker_egress_lunardepth_backend demo)" == "http://10.20.30.40:3000/openai/v1" ]]
   [[ "$(_worker_egress_llm_targets demo)" == "http://10.20.30.40:3000/openai/v1" ]]
-  # The TensorMoon form still validates. An id of neither dialect, or one that
-  # carries the variant suffix a gateway reply echoes, is refused and nothing
-  # is written.
+  # The TensorMoon form still validates, with any function. An id that no
+  # gateway serves is refused before anything is written: another prefix, a
+  # middle segment other than the function_name keyword (in either dialect),
+  # or the variant suffix a gateway reply echoes.
   _lunardepth_validate_route https://tensormoon.example.test/openai/v1 tensormoon::function_name::lunarwing false
+  _lunardepth_validate_route https://tensormoon.example.test/openai/v1 tensormoon::function_name::FrontierCODE false
   before_env="$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")"
   for bad_model in openai::function_name::lunarwing \
+      tensorzero::tenant_model::lunarwing \
+      tensormoon::other_function::lunarwing \
       tensorzero::function_name::lunarwing::variant_name::primary; do
     if (configure_lunardepth demo "$bad_model" '' '' preserve preserve) >"$TMP/tz-configure.out" 2>&1; then
       echo "configure accepted a model id outside both gateway dialects: $bad_model" >&2
       exit 1
     fi
-    grep -q 'tensorzero::<function_name>::lunarwing' "$TMP/tz-configure.out"
+    grep -q 'tensorzero::function_name::<function>' "$TMP/tz-configure.out"
     [[ "$before_env" == "$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")" ]]
   done
 )

@@ -308,8 +308,8 @@ Commands:
                                    the proven v1 opencode worker)
     --with-lunardepth              Select LunarDepth; requires an explicit route
     --lunardepth-base-url <url>    TensorMoon or TensorZero API root (never inherited)
-    --lunardepth-model <model>     Complete tensormoon::<function>::lunarwing or
-                                   tensorzero::<function>::lunarwing id, in the
+    --lunardepth-model <model>     Complete tensormoon::function_name::<function> or
+                                   tensorzero::function_name::<function> id, in the
                                    dialect of the gateway behind the base URL
     --lunardepth-api-key-file <path>
                                    Per-tenant revocable key, staged for the task only
@@ -557,9 +557,9 @@ Commands:
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-lunardepth <name>      Set the explicit TensorMoon or TensorZero LunarDepth route
-    --model <model>                Complete tensormoon::<function>::lunarwing or
-                                   tensorzero::<function>::lunarwing model id, in the
-                                   dialect of the gateway behind the base URL
+    --model <model>                Complete tensormoon::function_name::<function> or
+                                   tensorzero::function_name::<function> model id, in
+                                   the dialect of the gateway behind the base URL
     --base-url <url>               Complete OpenAI-compatible API root (no inheritance)
     --api-key-file <path>          Stage a per-tenant revocable key only in the task env;
                                    that key is visible to the model. Omitted values survive.
