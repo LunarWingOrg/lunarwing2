@@ -812,9 +812,13 @@ remove_tenant() {
   # after `userdel` below can still prove the old uid idle. Without the account
   # a rootless store is unreachable; every step below then skips it, and that
   # is safe only when no process of the former uids is left.
-  if id -u "$name" >/dev/null 2>&1; then
+  local account_state=0
+  tenant_account_state "$name" || account_state=$?
+  if ((account_state == 0)); then
     tenant_identity_record "$name" \
       || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing removal"
+  elif ((account_state != 2)); then
+    die "cannot tell whether the account of tenant '$name' exists: the account lookup failed without a not-found answer; refusing removal"
   elif tenant_rootless_account_gone "$name"; then
     tenant_former_identity_idle "$name" \
       || die "tenant account '$name' is gone and its former uid is not proven idle; refusing removal"
@@ -860,7 +864,8 @@ remove_tenant() {
   # live chains while the tenant account still exists (the rootless netns and
   # rootless network are owned by it). Only when this tenant ever had egress.
   # WI#688: without the account the teardown proves the former uids idle again
-  # and drops only the root-owned chains and state.
+  # and drops the rendered state; rootless chains stay in the unreachable
+  # namespace, where no process is left to filter.
   # WI#638: teardown itself refuses to flush with attachments; never downgrade
   # that refusal to a warning and report the tenant removed while workers remain.
   if [[ -n "$(worker_egress_state_get "$name" SUBNET)" ]]; then
@@ -876,7 +881,7 @@ remove_tenant() {
   [[ -n "$name" ]] && rm -rf -- "$(_hash_dir "$name")"
   say ""
 
-  remove_tenant_user "$name" "$purge"
+  remove_tenant_user "$name" "$purge" || die "user removal failed for '$name'"
   rm -f -- "$(tenant_identity_path "$name")"
   say ""
 

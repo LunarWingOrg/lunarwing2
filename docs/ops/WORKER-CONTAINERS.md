@@ -330,27 +330,46 @@ reported keeper problem or remove the unexpected attachment, then rerun
 `remove-tenant` to finish.
 
 **Removal after the tenant account is gone (WI#688).** A rootless tenant's
-containers, egress network and keeper live in its own store and run as its uid
-or its subordinate uids, so without the account mt-admin cannot ask that store
-anything. `add-tenant`, and every `remove-tenant` while the account exists,
-record the uid and the subordinate uid ranges in root-owned
-`/var/lib/lunarwing/tenant-identity/<tenant>` (mode 0644); a finished removal
-deletes it. When the account is
-gone, `remove-tenant` reads `/proc/*/status` first and refuses, before it
-changes anything, while any process has the recorded uid or a subordinate uid
-as its real, effective, saved or filesystem uid. It also refuses when the record
-is missing (tenants added before this change), malformed or without a
-subordinate range, when the uid now belongs to another account, or when the
-process table cannot be read. Once the old identity is proven idle, every lane
-stop, the container and IPC-volume removal, the PostgreSQL stop and the
-`--purge` data reset skip the unreachable store and say so, and the egress
-teardown proves the identity idle again, then flushes the tenant's chains and
-deletes its rendered state; the rootless network, keeper and data volume stay
-in the store under the former home, which the operator removes by hand. A
+containers, egress network, keeper and egress chains live in its own store and
+rootless network namespace and run as its uid or its subordinate uids, so
+without the account mt-admin cannot reach any of them. `add-tenant`, and every
+`remove-tenant` while the account exists, record the uid and the subordinate
+uid ranges in root-owned `/var/lib/lunarwing/tenant-identity/<tenant>` (mode
+0644); a finished removal deletes it. "Gone" means that `getent passwd`
+answers "not found"; any other lookup failure refuses the removal. When the
+account is gone, `remove-tenant` reads `/proc/*/status` and
+`/proc/*/task/*/status` first and refuses, before it changes anything, while any
+process or thread has the recorded uid or a subordinate uid as its real,
+effective, saved or filesystem uid. It also refuses when the record is missing
+(tenants added before this change), a symbolic link, malformed (CRLF, more than
+one `UID=` line, an invalid range) or without a subordinate range, when the uid
+now belongs to another account, when the status of a live task cannot be read,
+or when the process table cannot be read at all. Once the old identity is
+proven idle, every lane stop, the container and IPC-volume removal, the
+PostgreSQL stop and the `--purge` data reset skip the unreachable store and say
+so. The egress teardown proves the identity idle again and deletes the rendered
+egress state; on rootless Podman it flushes nothing, because the chains are in
+the tenant's rootless network namespace, which needs the account to enter and
+in which no process is left to filter (another runtime's host-side chains are
+flushed as usual). The rootless network, keeper, chains and data volume stay
+with the store under the former home. That home is still owned by the orphaned
+uid, which the next `useradd` may hand to a new account: the removal prints a
+warning, and the operator removes the home before the next `add-tenant`. A
 rootful runtime needs no account: its stops and removals still run against
-root's store. For a tenant without a record, confirm with `ps -eo uid,pid,args`
-that no process of the former uid or its subordinate range remains, write
-`UID=<uid>` and `SUBUID=<start>:<count>` lines to that file, and rerun.
+root's store.
+
+For a tenant without a record:
+
+1. Stop what can still run as the former uid: a lingering systemd
+   `user@<uid>.service` manager (`systemctl stop user@<uid>.service`) and the
+   tenant's OpenRC `supervise-daemon` units.
+2. Recover the uid from the former home: `stat -c %u /home/<tenant>`. Take the
+   subordinate uid range from a backup of `/etc/subuid`; `userdel` removes the
+   tenant's line.
+3. Confirm with `ps -eLo ruid,euid,suid,fsuid,pid,args` that no process or
+   thread has that uid or a uid in that range in any of the four columns.
+4. Write `UID=<uid>` and `SUBUID=<start>:<count>` lines to the record file as
+   root, then rerun `remove-tenant`.
 
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
