@@ -15,9 +15,10 @@ use crate::tools::builtin::memory::WorkspaceResolver;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
     KNOWLEDGE_SCAN_MAX_NOTES, KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta,
-    KnowledgeNoteRow, KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES,
-    MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS,
-    MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown, summarize_topics,
+    KnowledgeNoteRow, KnowledgeStaleReason, KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES,
+    MAX_CONTENT_BYTES, MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES,
+    MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown,
+    summarize_topics,
 };
 
 /// Default per-note staleness threshold applied on submit when the caller
@@ -189,6 +190,18 @@ fn optional_include_coordination(params: &serde_json::Value) -> Result<bool, Too
     }
 }
 
+/// Parse the `include_status_only` flag (default true). Daily routines can
+/// disable it to skip work they already marked without hiding age/commit hits.
+fn optional_include_status_only(params: &serde_json::Value) -> Result<bool, ToolError> {
+    match params.get("include_status_only") {
+        None | Some(serde_json::Value::Null) => Ok(true),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ToolError::InvalidParameters(
+            "include_status_only must be a boolean".to_string(),
+        )),
+    }
+}
+
 // ── Metadata patch helpers (knowledge_update_status) ───────────────
 
 /// Maximum superseded_by length (UTF-8 bytes), matching the canonical store.
@@ -350,11 +363,12 @@ fn optional_confidence_param(
 /// Filter one metadata scan down to rows needing verification.
 ///
 /// With `include_coordination=false`, wire-ingested coordination notes are
-/// dropped, so routine sweeps that auto-process `needs-verification` notes
-/// never act on unverified claims from other tenants.
+/// dropped. With `include_status_only=false`, notes listed only because they
+/// were already marked are dropped, while age and source-commit hits remain.
 fn select_stale_rows<'a>(
     rows: &'a [KnowledgeNoteRow],
     include_coordination: bool,
+    include_status_only: bool,
     max_age_days: Option<i64>,
     repository_commit: Option<&str>,
     limit: usize,
@@ -362,8 +376,14 @@ fn select_stale_rows<'a>(
     rows.iter()
         .filter(|row| include_coordination || !is_coordination_note(&row.meta))
         .filter(|row| {
-            row.meta
-                .needs_verification(row.updated_at, max_age_days, repository_commit)
+            let reasons = row
+                .meta
+                .stale_reasons(row.updated_at, max_age_days, repository_commit);
+            !reasons.is_empty()
+                && (include_status_only
+                    || reasons
+                        .iter()
+                        .any(|reason| !matches!(reason, KnowledgeStaleReason::Status(_))))
         })
         .take(limit)
         .collect()
@@ -406,11 +426,22 @@ fn meta_json(meta: &KnowledgeNoteMeta) -> serde_json::Value {
     value
 }
 
-fn note_row_json(row: &KnowledgeNoteRow) -> serde_json::Value {
+fn note_row_json(
+    row: &KnowledgeNoteRow,
+    max_age_days: Option<i64>,
+    repository_commit: Option<&str>,
+) -> serde_json::Value {
+    let reasons: Vec<String> = row
+        .meta
+        .stale_reasons(row.updated_at, max_age_days, repository_commit)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let mut value = meta_json(&row.meta);
     value["scope"] = serde_json::Value::String(row.scope.clone());
     value["path"] = serde_json::Value::String(row.path.clone());
     value["updated_at"] = serde_json::Value::String(row.updated_at.to_rfc3339());
+    value["stale_reasons"] = serde_json::json!(reasons);
     value
 }
 
@@ -696,16 +727,12 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
         }
     };
     let studied_at = match optional_string(params, "studied_at")? {
-        None => None,
-        Some(value) => Some(
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .map_err(|_| {
-                    ToolError::InvalidParameters(
-                        "studied_at must be an RFC 3339 timestamp".to_string(),
-                    )
-                })?
-                .with_timezone(&chrono::Utc),
-        ),
+        None => chrono::Utc::now(),
+        Some(value) => chrono::DateTime::parse_from_rfc3339(&value)
+            .map_err(|_| {
+                ToolError::InvalidParameters("studied_at must be an RFC 3339 timestamp".to_string())
+            })?
+            .with_timezone(&chrono::Utc),
     };
     let source_commit = optional_string(params, "source_commit")?;
     if let Some(ref commit) = source_commit
@@ -736,7 +763,7 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
             title: title.to_string(),
             status,
             confidence,
-            studied_at,
+            studied_at: Some(studied_at),
             source_commit,
             tags: optional_tags(params)?,
             superseded_by,
@@ -813,7 +840,7 @@ impl Tool for KnowledgeSubmitNoteTool {
                 },
                 "studied_at": {
                     "type": "string",
-                    "description": "RFC 3339 verification timestamp."
+                    "description": "RFC 3339 verification timestamp (default: now)."
                 },
                 "source_commit": {
                     "type": "string",
@@ -929,11 +956,12 @@ impl Tool for KnowledgeListStaleTool {
     fn description(&self) -> &str {
         "List study notes needing verification: status stale/needs-verification, studied \
          older than max_age_days (or the note's own stale_after_days when no explicit limit \
-         is passed), or recorded against a different source commit. Pass the \
-         current repository commit when freshness materially affects your task. \
-         Coordination-origin wire notes are flagged untrusted in the output; pass \
-         include_coordination=false to exclude those unverified cross-tenant claims from \
-         routine sweeps that auto-process flagged notes."
+         is passed), or recorded against a different source commit. Each note carries canonical \
+         stale_reasons. Daily routines can pass include_status_only=false to skip notes listed \
+         only for an already-recorded status while retaining age and commit hits. Superseded \
+         notes are retired and never listed. Pass the current repository commit when freshness \
+         materially affects your task. Coordination-origin wire notes are flagged untrusted; \
+         pass include_coordination=false to exclude those unverified cross-tenant claims."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -965,6 +993,11 @@ impl Tool for KnowledgeListStaleTool {
                     "type": "boolean",
                     "description": "Include untrusted coordination-room wire notes (default: true). Routines that auto-process flagged notes should pass false.",
                     "default": true
+                },
+                "include_status_only": {
+                    "type": "boolean",
+                    "description": "Include notes listed only for their stored stale/needs-verification status (default: true). Daily routines can pass false to avoid re-processing marked notes; age and source-commit matches remain.",
+                    "default": true
                 }
             }
         })
@@ -991,21 +1024,24 @@ impl Tool for KnowledgeListStaleTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
 
         let include_coordination = optional_include_coordination(&params)?;
+        let include_status_only = optional_include_status_only(&params)?;
         let stale: Vec<serde_json::Value> = select_stale_rows(
             &rows,
             include_coordination,
+            include_status_only,
             max_age_days,
             repository_commit.as_deref(),
             limit,
         )
         .into_iter()
-        .map(note_row_json)
+        .map(|row| note_row_json(row, max_age_days, repository_commit.as_deref()))
         .collect();
         let output = serde_json::json!({
             "criteria": {
                 "max_age_days": max_age_days,
                 "repository_commit": repository_commit,
                 "include_coordination": include_coordination,
+                "include_status_only": include_status_only,
             },
             "scopes": scopes,
             "scanned_notes": rows.len(),
@@ -1510,6 +1546,23 @@ mod tests {
     }
 
     #[test]
+    fn include_status_only_param_defaults_true() {
+        assert!(optional_include_status_only(&serde_json::json!({})).unwrap());
+        assert!(
+            optional_include_status_only(&serde_json::json!({"include_status_only": true}))
+                .unwrap()
+        );
+        assert!(
+            !optional_include_status_only(&serde_json::json!({"include_status_only": false}))
+                .unwrap()
+        );
+        assert!(
+            optional_include_status_only(&serde_json::json!({"include_status_only": "no"}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn stale_selection_can_exclude_coordination_notes() {
         let now = chrono::Utc::now();
         let wire = KnowledgeNoteRow {
@@ -1527,11 +1580,79 @@ mod tests {
         let rows = vec![wire, local];
 
         // sample_meta is needs-verification, so both rows are flagged.
-        let all = select_stale_rows(&rows, true, None, None, 10);
+        let all = select_stale_rows(&rows, true, true, None, None, 10);
         assert_eq!(all.len(), 2);
-        let without_wire = select_stale_rows(&rows, false, None, None, 10);
+        let without_wire = select_stale_rows(&rows, false, true, None, None, 10);
         assert_eq!(without_wire.len(), 1);
         assert_eq!(without_wire[0].meta.tags, vec!["memory".to_string()]);
+    }
+
+    #[test]
+    fn stale_selection_ignores_bare_status_when_requested() {
+        let now = chrono::Utc::now();
+        let aged = now - chrono::Duration::days(60);
+        let mut status_only = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "status-only"),
+            updated_at: now,
+            meta: sample_meta(&["memory"]),
+        };
+        status_only.meta.source_commit = Some("current".to_string());
+        let mut aged_row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "aged"),
+            updated_at: aged,
+            meta: sample_meta(&["memory"]),
+        };
+        aged_row.meta.status = KnowledgeStatus::Active;
+        aged_row.meta.stale_after_days = Some(30);
+        aged_row.meta.source_commit = Some("current".to_string());
+        let mut commit_row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "commit"),
+            updated_at: now,
+            meta: sample_meta(&["memory"]),
+        };
+        commit_row.meta.status = KnowledgeStatus::Active;
+        commit_row.meta.source_commit = Some("old".to_string());
+        let mut mixed_row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "mixed"),
+            updated_at: now,
+            meta: sample_meta(&["memory"]),
+        };
+        mixed_row.meta.status = KnowledgeStatus::Stale;
+        mixed_row.meta.studied_at = Some(aged);
+        mixed_row.meta.stale_after_days = Some(30);
+        mixed_row.meta.source_commit = Some("old".to_string());
+        let mut superseded_row = KnowledgeNoteRow {
+            scope: "alice".to_string(),
+            path: note_path("kimi-1", "superseded"),
+            updated_at: aged,
+            meta: sample_meta(&["memory"]),
+        };
+        superseded_row.meta.status = KnowledgeStatus::Superseded;
+        superseded_row.meta.stale_after_days = Some(30);
+        superseded_row.meta.source_commit = Some("current".to_string());
+        let rows = vec![status_only, aged_row, commit_row, mixed_row, superseded_row];
+
+        let all = select_stale_rows(&rows, true, true, None, Some("current"), 10);
+        assert_eq!(all.len(), 4);
+        let without_status = select_stale_rows(&rows, true, false, None, Some("current"), 10);
+        let paths: Vec<&str> = without_status.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "study-notes/kimi-1/aged.md",
+                "study-notes/kimi-1/commit.md",
+                "study-notes/kimi-1/mixed.md"
+            ]
+        );
+        let output = note_row_json(&rows[3], None, Some("current"));
+        assert_eq!(
+            output["stale_reasons"],
+            serde_json::json!(["status:stale", "source-commit-mismatch", "age-exceeded"])
+        );
     }
 
     struct UnusedResolver;
@@ -1563,6 +1684,12 @@ mod tests {
         let parsed = validate_submission(&good).unwrap();
         assert_eq!(parsed.meta.status, KnowledgeStatus::Active);
         assert_eq!(parsed.meta.confidence, Some(0.9));
+        assert_eq!(
+            parsed.meta.studied_at,
+            chrono::DateTime::parse_from_rfc3339("2026-08-06T10:00:00Z")
+                .ok()
+                .map(|ts| ts.with_timezone(&chrono::Utc))
+        );
         assert!(!parsed.replace);
 
         for bad in [
@@ -1622,6 +1749,7 @@ mod tests {
             parsed.meta.stale_after_days,
             Some(DEFAULT_NOTE_STALE_AFTER_DAYS)
         );
+        assert!(parsed.meta.studied_at.is_some());
         assert_eq!(parsed.meta.status_reason, None);
         assert_eq!(parsed.meta.superseded_by, None);
     }
@@ -1724,6 +1852,15 @@ mod tests {
     }
 
     #[test]
+    fn status_update_does_not_fabricate_a_verification_time() {
+        let mut meta = sample_meta(&["memory"]);
+        assert_eq!(meta.studied_at, None);
+        let update = parse_status_update(&serde_json::json!({"status": "stale"})).unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.studied_at, None);
+    }
+
+    #[test]
     fn new_tools_metadata_only_and_named() {
         let resolver: Arc<dyn WorkspaceResolver> = Arc::new(UnusedResolver);
         let list_topics = KnowledgeListTopicsTool::new(Arc::clone(&resolver));
@@ -1732,5 +1869,82 @@ mod tests {
         assert_eq!(update_status.name(), "knowledge_update_status");
         assert!(!list_topics.requires_sanitization());
         assert!(!update_status.requires_sanitization());
+    }
+
+    #[cfg(feature = "libsql")]
+    mod libsql_integration {
+        use super::*;
+        use crate::tools::builtin::memory::FixedWorkspaceResolver;
+        use crate::workspace::Workspace;
+
+        #[tokio::test]
+        async fn daily_sweep_can_skip_status_only_repeats_through_real_tools() {
+            let (db, _dir) = crate::testing::test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("alice", db));
+            let resolver: Arc<dyn WorkspaceResolver> =
+                Arc::new(FixedWorkspaceResolver::new(Arc::clone(&workspace)));
+            let submit = KnowledgeSubmitNoteTool::new(Arc::clone(&resolver));
+            let list = KnowledgeListStaleTool::new(resolver);
+            let ctx = JobContext {
+                user_id: "alice".to_string(),
+                ..Default::default()
+            };
+            let aged = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+            for params in [
+                serde_json::json!({
+                    "agent": "kimi-1", "topic": "status-only",
+                    "title": "Already marked", "content": "Needs fresh verification.",
+                    "status": "stale", "source_commit": "current", "scope": "private"
+                }),
+                serde_json::json!({
+                    "agent": "kimi-1", "topic": "aged",
+                    "title": "Aged", "content": "Old findings need another look.",
+                    "status": "active", "studied_at": aged, "stale_after_days": 30,
+                    "source_commit": "current", "scope": "private"
+                }),
+            ] {
+                submit.execute(params, &ctx).await.expect("submit note");
+            }
+            let stored = workspace
+                .read_primary(&note_path("kimi-1", "status-only"))
+                .await
+                .expect("read submitted note");
+            let meta = KnowledgeNoteMeta::from_metadata_json(&stored.metadata)
+                .expect("submitted metadata parses");
+            assert!(meta.studied_at.is_some());
+
+            let unfiltered = list
+                .execute(
+                    serde_json::json!({"repository_commit": "current", "scope": "private"}),
+                    &ctx,
+                )
+                .await
+                .expect("default stale list");
+            assert_eq!(unfiltered.result["stale_count"], 2);
+            let notes = unfiltered.result["notes"].as_array().expect("notes array");
+            let repeat = notes
+                .iter()
+                .find(|note| note["topic"] == "status-only")
+                .expect("marked note remains visible");
+            assert_eq!(repeat["stale_reasons"], serde_json::json!(["status:stale"]));
+
+            let filtered = list
+                .execute(
+                    serde_json::json!({
+                        "repository_commit": "current", "scope": "private",
+                        "include_status_only": false
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("filtered stale list");
+            assert_eq!(filtered.result["criteria"]["include_status_only"], false);
+            assert_eq!(filtered.result["stale_count"], 1);
+            assert_eq!(filtered.result["notes"][0]["topic"], "aged");
+            assert_eq!(
+                filtered.result["notes"][0]["stale_reasons"],
+                serde_json::json!(["age-exceeded"])
+            );
+        }
     }
 }

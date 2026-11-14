@@ -38,8 +38,11 @@ Current source remains authority.
 5. Verify stale, conflicting, security-sensitive, and version-sensitive claims
    against current source before editing code.
 6. Call `knowledge_list_stale` with the current repository commit when
-   freshness materially affects the task. A background sweep also marks notes
-   stale automatically once they age past the configured threshold.
+   freshness materially affects the task. Results include `stale_reasons` and
+   keep already-marked notes visible by default. A repetitive daily routine
+   should pass `include_status_only=false` to skip status-only repeats while
+   retaining age and commit matches. A background sweep also marks notes stale
+   automatically once they age past the configured threshold.
 7. Cite note topic and source path when a note materially affects the answer
    or plan.
 8. Continue normal source exploration when notes have no useful result.
@@ -57,6 +60,8 @@ only when the user requested recording or maintaining shared notes.
 - Use `status="needs-verification"` for unresolved findings; use `active` only
   for findings verified against current source in this session.
 - Include `source_commit`, `confidence`, and lowercase `tags` when known.
+  `studied_at` defaults to the submission time; supply it explicitly when the
+  verification happened earlier.
 - `stale_after_days` sets a per-note staleness threshold (default 90 days);
   `status_reason` records why a lifecycle status was chosen.
 - Adjust lifecycle later with `knowledge_update_status` — metadata only
@@ -78,7 +83,9 @@ only when the user requested recording or maintaining shared notes.
 - `knowledge_update_status`: Metadata-only lifecycle updates on an existing
   note version; `superseded` requires `superseded_by`.
 - `knowledge_list_stale`: Notes needing verification by status, age (explicit
-  limit or the note's own `stale_after_days`), or source commit.
+  limit or the note's own `stale_after_days`), or source commit. Canonical
+  `stale_reasons` explain each result; superseded notes are excluded.
+  `include_status_only=false` skips status-only repeats for daily routines.
 - `knowledge_stats`: Store totals, lifecycle status counts, per-scope counts.
 
 ## Search patterns
