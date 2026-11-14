@@ -415,7 +415,7 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
     // would otherwise silently disable orphan recovery on that host.
     let spawner = workload_spawner().await;
     let output = match runtime_cli_output(
-        spawner,
+        &spawner,
         bin,
         &["ps", "-a", "--filter", &filter, "--format", "json"],
         Duration::from_secs(5),
@@ -464,7 +464,7 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
             "Reaper: orphaned sandbox container detected, cleaning up"
         );
         let status =
-            runtime_cli_output(spawner, bin, &["rm", "-f", &name], Duration::from_secs(5)).await;
+            runtime_cli_output(&spawner, bin, &["rm", "-f", &name], Duration::from_secs(5)).await;
         match status {
             Ok(output) if output.status.success() => tracing::info!(
                 container = %name,
@@ -542,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_cli_output_uses_selected_isolation_and_captures_stdout() {
         let detected = workload_spawner().await;
-        for spawner in [&WorkloadSpawner::direct(), detected] {
+        for spawner in [&WorkloadSpawner::direct(), &detected] {
             let output = runtime_cli_output(
                 spawner,
                 "/bin/sh",
@@ -564,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_cli_timeout_reaps_descendants() {
         let detected = workload_spawner().await;
-        for spawner in [&WorkloadSpawner::direct(), detected] {
+        for spawner in [&WorkloadSpawner::direct(), &detected] {
             let temp = tempfile::tempdir().unwrap();
             let pid_path = temp.path().join("child.pid");
             let error = runtime_cli_output(
