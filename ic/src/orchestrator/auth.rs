@@ -348,11 +348,7 @@ fn build_redactor(
     use secrecy::ExposeSecret;
 
     let mut redactor = crate::orchestrator::harness::SecretValueRedactor::new(harness_values);
-    redactor.add_values(
-        credential_values
-            .iter()
-            .map(|value| value.expose_secret()),
-    );
+    redactor.add_values(credential_values.iter().map(|value| value.expose_secret()));
     redactor
 }
 
@@ -614,10 +610,7 @@ mod tests {
         assert!(store.harness_secret_redactor(job_id).await.is_none());
 
         store
-            .store_credential_values(
-                job_id,
-                vec![SecretString::from(value.to_string())],
-            )
+            .store_credential_values(job_id, vec![SecretString::from(value.to_string())])
             .await;
 
         let redactor = store

@@ -905,7 +905,11 @@ mod tests {
         }
         // Tool arguments use the same redactor (second-order channel).
         let leaked = serde_json::json!({"command": format!("echo {}", credentials[0].value)});
-        assert!(!redactor.scrub(&leaked.to_string()).contains(&credentials[0].value));
+        assert!(
+            !redactor
+                .scrub(&leaked.to_string())
+                .contains(&credentials[0].value)
+        );
     }
 
     #[test]
@@ -919,7 +923,11 @@ mod tests {
         arm_mcp_credential_values(&mut redactor, &credentials);
 
         let output = format!("MCP_GITHUB_TOKEN={}", credentials[0].value);
-        assert!(!redactor.scrub_tool_result(&output).contains(&credentials[0].value));
+        assert!(
+            !redactor
+                .scrub_tool_result(&output)
+                .contains(&credentials[0].value)
+        );
     }
 
     #[test]

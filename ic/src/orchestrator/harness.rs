@@ -2965,7 +2965,11 @@ mod tests {
         // be scrubbed from job events exactly like harness secret values.
         let mut redactor = SecretValueRedactor::default();
         assert!(!redactor.is_armed());
-        redactor.add_values(["granted-credential-alpha", "short", "granted-credential-beta"]);
+        redactor.add_values([
+            "granted-credential-alpha",
+            "short",
+            "granted-credential-beta",
+        ]);
         assert!(redactor.is_armed());
         for value in ["granted-credential-alpha", "granted-credential-beta"] {
             let scrubbed = redactor.scrub(&format!("printenv leaked {value} here"));
