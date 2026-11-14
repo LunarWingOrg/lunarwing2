@@ -427,7 +427,7 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 48. [x] (H) FIRST REL NOTES DRAFT after remove crap copy
 49. [x] (H) clean scratch on wt
 50. [x] (H) Rares exp
-51. [x] (S) RESERVED
+51. [x] (S) Review operator notes after work items are cleared out some more
 52. [x] (S) RESERVED
 53. [x] (S) RESERVED
 54. [x] (S) RESERVED
