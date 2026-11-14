@@ -66,6 +66,8 @@ getent() {
   # down (GETENT_FAIL: sssd or LDAP unreachable) also answers 2; only the
   # local files database tells the two apart.
   if [[ "${1:-}" == passwd && "${2:-}" == alpha ]]; then
+    # GETENT_RC: a getent that fails some other way (127: not installed).
+    [[ -z "${GETENT_RC:-}" ]] || return "$GETENT_RC"
     [[ "${GETENT_FAIL:-false}" != true ]] || return 2
     [[ "${MISSING_ACCOUNT:-false}" != true ]] || return 2
     printf 'alpha:x:1000:1000::%s/home:/bin/bash\n' "$CASE_DIR"
@@ -354,6 +356,7 @@ setup_case() {
   REAL_POSTGRES=false
   HELD_UID=""
   GETENT_FAIL=false
+  GETENT_RC=""
   EXIT_BEFORE_READ_PID=""
   FORK_AFTER_LISTING=false
   INIT_SYSTEM="$init"
@@ -735,6 +738,7 @@ run_missing_account_refusal_case() {
       list_tenant_in_passwd
       ;;
     passwd-unreadable) command rm -f -- "$TENANT_PASSWD_FILE" ;;
+    getent-missing) GETENT_RC=127 ;;
     passwd-compat) printf '+@netgroup::::::\n' >>"$TENANT_PASSWD_FILE" ;;
     forked-after-listing) FORK_AFTER_LISTING=true ;;
     empty-proc) command rm -rf -- "$TENANT_PROC_ROOT"; mkdir -p "$TENANT_PROC_ROOT" ;;
@@ -1125,6 +1129,7 @@ run_missing_account_refusal_case systemd thread-only 'still run (5000/task/5001)
 run_missing_account_refusal_case openrc nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
 run_missing_account_refusal_case systemd nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
 run_missing_account_refusal_case openrc passwd-unreadable "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc getent-missing "cannot tell whether the account of tenant 'alpha' is gone"
 run_missing_account_refusal_case openrc passwd-compat "cannot tell whether the account of tenant 'alpha' is gone"
 run_missing_account_refusal_case openrc forked-after-listing 'still run (4900)'
 run_exited_task_case
