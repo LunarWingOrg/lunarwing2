@@ -191,6 +191,8 @@ create_tenant_user() {
   if [[ "$MT_ROOTLESS" == "true" ]]; then
     ensure_rootless_prereqs "$name"
   fi
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR"
 
   # Persist a per-user runtime manager so /run/user/<uid> survives reboot. Works
   # on both systemd-logind and elogind (OpenRC) — capability-gated, not
@@ -232,9 +234,262 @@ create_tenant_user() {
   ensure_tenant_wasm_toolchain "$name" || true
 }
 
+# ── Former tenant accounts (WI#688) ──────────────────────────────────────────
+#
+# A rootless tenant's containers, egress network and namespace keeper live in
+# its own store and run as its uid or its subordinate uids. Once the account
+# is gone mt-admin cannot ask that store anything, and flushing the tenant's
+# egress allowlist is safe only when nothing of the old identity still runs
+# (WI#357, WI#638): `userdel -f`, or an account deleted under running
+# containers, can leave workers attached to the per-tenant network. The uid
+# and subordinate ranges are recorded while the account exists, so a removal
+# without the account can prove from the process table that none is left.
+
+tenant_identity_path() { printf '%s/%s\n' "$TENANT_IDENTITY_DIR" "$1"; }
+
+# Record (or refresh) the tenant's uid and subordinate uid ranges in a
+# root-owned 0644 file. Needs the account.
+tenant_identity_record() {
+  local name="$1" uid owner start count ranges="" path tmp
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  if [[ -f "$TENANT_SUBUID_FILE" ]]; then
+    while IFS=: read -r owner start count || [[ -n "$owner" ]]; do
+      [[ "$owner" == "$name" || "$owner" == "$uid" ]] || continue
+      [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[1-9][0-9]*$ ]] || continue
+      ranges+="SUBUID=${start}:${count}"$'\n'
+    done <"$TENANT_SUBUID_FILE"
+  fi
+  [[ ! -L "$TENANT_IDENTITY_DIR" ]] || return 1
+  if [[ "$(command id -u)" == 0 ]]; then
+    install -d -o root -g root -m 0755 "$TENANT_IDENTITY_DIR" || return 1
+  else
+    install -d -m 0755 "$TENANT_IDENTITY_DIR" || return 1
+  fi
+  path="$(tenant_identity_path "$name")"
+  tmp="$(mktemp "$path.tmp.XXXXXX")" || return 1
+  if ! printf 'UID=%s\n%s' "$uid" "$ranges" >"$tmp" || ! chmod 0644 "$tmp" \
+      || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Whether the local files database names the account: 0 when it does, 1 when
+# it does not, 2 when that cannot be told (unreadable file, or a NIS-compat
+# `+`/`-` entry that hands lookups to another source).
+_tenant_in_passwd_file() {
+  local user rest
+  [[ -f "$TENANT_PASSWD_FILE" && -r "$TENANT_PASSWD_FILE" ]] || return 2
+  while IFS=: read -r user rest || [[ -n "$user" ]]; do
+    [[ "$user" != [+-]* ]] || return 2
+    [[ "$user" != "$1" ]] || return 0
+  done <"$TENANT_PASSWD_FILE"
+  return 1
+}
+
+# The tenant account's state: 0 when it exists, 2 when it is gone, 1 when that
+# cannot be told. glibc's getent exits 2 whenever getpwnam finds nothing, also
+# when an NSS backend (sssd, LDAP) is down, so "not found" alone cannot mean
+# gone. mt-admin creates tenants with useradd, so the local files database is
+# authoritative: gone means absent from it AND not found by the full lookup.
+# A failed lookup must never count as gone, or the store checks are skipped.
+tenant_account_state() {
+  local rc=0
+  id -u "$1" >/dev/null 2>&1 && return 0
+  _tenant_in_passwd_file "$1" || rc=$?
+  ((rc == 1)) || return 1
+  rc=0
+  getent passwd "$1" >/dev/null 2>&1 || rc=$?
+  ((rc == 2)) && return 2
+  return 1
+}
+
+# True when the tenant's containers live in its own rootless store and the
+# account that owns that store is gone. Rootful runtimes need no account.
+tenant_rootless_account_gone() {
+  local rc=0
+  ensure_container_runtime
+  [[ "$MT_ROOTLESS" == true ]] || return 1
+  tenant_account_state "$1" || rc=$?
+  ((rc == 2))
+}
+
+# The uid recorded for a tenant, or nothing.
+tenant_identity_uid() {
+  local path line
+  path="$(tenant_identity_path "$1")"
+  [[ -f "$path" && ! -L "$path" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == UID=* ]] && printf '%s\n' "${line#UID=}" && return 0
+  done <"$path"
+  return 0
+}
+
+# Read one /proc status file's Uid: line into the caller's `ids` array.
+# Returns 1 when the file cannot be read or has no well-formed Uid: line.
+_tenant_status_uids() {
+  local content line
+  # Read the file whole: procfs regenerates a status file on every seek, and
+  # line-by-line reads (which seek back after each line) can misalign and lose
+  # the Uid: line when the task changes state in between.
+  { content="$(<"$1")"; } 2>/dev/null || return 1
+  content=$'\n'"$content"
+  [[ "$content" == *$'\n'Uid:* ]] || return 1
+  line="${content#*$'\n'Uid:}"
+  line="${line%%$'\n'*}"
+  [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+) ]] \
+    || return 1
+  ids=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
+}
+
+# Prove that no process or thread of the removed tenant's recorded uid or
+# subordinate uid ranges exists (real, effective, saved or filesystem uid;
+# threads can carry credentials of their own). Prints the reason and returns 1
+# when that cannot be shown: no record, a malformed record, an unreadable
+# process table or status of a live task, the uid now held by another
+# account, or a match.
+tenant_former_identity_idle() {
+  local name="$1" path line value uid="" uids=0 start count matches="" nmatch=0
+  local seen=0 holder
+  local -a starts=() counts=()
+  path="$(tenant_identity_path "$name")"
+  if [[ -L "$path" ]]; then
+    say "ERROR: the identity record $path is a symbolic link; refusing to trust it" >&2
+    return 1
+  fi
+  if [[ ! -f "$path" ]]; then
+    say "ERROR: tenant account '$name' is gone and no uid was recorded for it in $path. Either the tenant was already removed (a finished removal deletes the record), or it was added before WI#688. For the second case see \"Removal after the tenant account is gone\" in docs/ops/WORKER-CONTAINERS.md: prove that no process or thread of its former uid or subordinate uid range remains (ps -eLo ruid,euid,suid,fsuid,pid,args), then record them as 'UID=<uid>' and 'SUBUID=<start>:<count>' lines in that file and rerun." >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *$'\r'* ]]; then
+      say "ERROR: carriage return in $path; the record must use plain newlines" >&2
+      return 1
+    fi
+    case "$line" in
+      UID=*)
+        uid="${line#UID=}"
+        uids=$((uids + 1))
+        ;;
+      SUBUID=*)
+        value="${line#SUBUID=}"
+        start="${value%%:*}"
+        count="${value#*:}"
+        if [[ ! "$start" =~ ^[0-9]+$ || ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+          say "ERROR: invalid subordinate uid range '$value' in $path" >&2
+          return 1
+        fi
+        starts+=("$start")
+        counts+=("$count")
+        ;;
+      '') ;;
+      *) say "ERROR: unexpected line in $path" >&2; return 1 ;;
+    esac
+  done <"$path"
+  if ((uids != 1)); then
+    say "ERROR: $path must hold exactly one UID= line, it holds $uids" >&2
+    return 1
+  fi
+  if [[ ! "$uid" =~ ^[0-9]+$ ]] || ((uid < 1000)); then
+    say "ERROR: no valid tenant uid recorded in $path" >&2
+    return 1
+  fi
+  if ((${#starts[@]} == 0)); then
+    say "ERROR: no subordinate uid range recorded in $path; the rootless containers of '$name' cannot be ruled out" >&2
+    return 1
+  fi
+  holder="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" || holder=""
+  if [[ -n "$holder" ]]; then
+    say "ERROR: the former uid $uid of '$name' now belongs to account '$holder'; its processes cannot be told apart" >&2
+    return 1
+  fi
+  # A process that keeps forking and exiting can slip between the listing and
+  # the read of one pass; two full passes, each with fresh listings, must both
+  # come out clean. A chain forking faster than a pass is a known limit that
+  # only a cgroup-emptiness check would close.
+  local pass
+  for pass in 1 2; do
+    seen=0
+    nmatch=0
+    matches=""
+    _tenant_scan_former_uids "$name" || return 1
+    if ((seen == 0)); then
+      say "ERROR: cannot read the process table under $TENANT_PROC_ROOT; cannot prove that no process of '$name' remains" >&2
+      return 1
+    fi
+    if ((nmatch > 0)); then
+      say "ERROR: $nmatch process or thread entries of the former uid $uid of '$name' or its subordinate uids still run (${matches}); stop them before removal" >&2
+      return 1
+    fi
+  done
+}
+
+# One pass over the process and thread table, with fresh listings. Uses the
+# caller's uid, starts and counts; adds to its seen, nmatch and matches.
+# Returns 1 when the status of a live task cannot be read.
+_tenant_scan_former_uids() {
+  local name="$1" status task leader ent i hit
+  local -a ids=()
+  for status in "$TENANT_PROC_ROOT"/[0-9]*/status "$TENANT_PROC_ROOT"/[0-9]*/task/[0-9]*/status; do
+    task="${status%/status}"
+    # The thread-group leader's own task entry repeats its status file.
+    if [[ "$task" == */task/* ]]; then
+      leader="${task%/task/*}"
+      [[ "${task##*/}" != "${leader##*/}" ]] || continue
+    fi
+    if ! _tenant_status_uids "$status"; then
+      # A task that exited between the listing and the read is gone; one that
+      # still exists and cannot be read cannot be ruled out.
+      [[ -e "$task" ]] || continue
+      say "ERROR: cannot read $status of a live task; cannot prove that no process of '$name' remains" >&2
+      return 1
+    fi
+    seen=$((seen + 1))
+    hit=false
+    for ent in "${ids[@]}"; do
+      [[ "$ent" =~ ^[0-9]+$ ]] || continue
+      if ((ent == uid)); then
+        hit=true
+        break
+      fi
+      for i in "${!starts[@]}"; do
+        if ((ent >= starts[i] && ent < starts[i] + counts[i])); then
+          hit=true
+          break 2
+        fi
+      done
+    done
+    [[ "$hit" == true ]] || continue
+    if ((nmatch < 5)); then
+      matches+="${matches:+, }${task#"$TENANT_PROC_ROOT"/}"
+    fi
+    nmatch=$((nmatch + 1))
+  done
+}
+
 remove_tenant_user() {
   local name="$1"
   local purge="${2:-false}"
+
+  # WI#688: an account that is already gone leaves nothing for userdel. Its
+  # former home, with the rootless store inside it, stays owned by the orphaned
+  # uid, which the next useradd may hand to a new account.
+  local state=0 former_uid home
+  tenant_account_state "$name" || state=$?
+  if ((state == 2)); then
+    home="$(tenant_home "$name")"
+    if [[ -d "$home" ]]; then
+      former_uid="$(tenant_identity_uid "$name")"
+      say "WARNING: tenant account '$name' was already gone; its former home $home stays, owned by the orphaned uid ${former_uid:-(unrecorded)}. The next useradd may reuse that uid: remove the home before the next add-tenant." >&2
+    else
+      say "tenant account '$name' and its former home were already gone"
+    fi
+    return 0
+  elif ((state != 0)); then
+    say "ERROR: cannot look up the account of tenant '$name'; not removing it" >&2
+    return 1
+  fi
 
   ensure_init_system
 

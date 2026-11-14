@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# WI#638, WI#650, WI#672 — hermetic remove-tenant worker/egress ordering harness.
+# WI#638, WI#650, WI#672, WI#688 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+# Keep the real PostgreSQL steps: the missing-account cases run them against
+# the strict fake runtime, which dies like the real `_ctr` (WI#688, ACA-1).
+eval "$(declare -f stop_tenant_postgres | sed '1s/^stop_tenant_postgres/real_stop_tenant_postgres/')"
+eval "$(declare -f reset_tenant_postgres | sed '1s/^reset_tenant_postgres/real_reset_tenant_postgres/')"
+eval "$(declare -f remove_tenant_user | sed '1s/^remove_tenant_user/real_remove_tenant_user/')"
+eval "$(declare -f _tenant_status_uids | sed '1s/^_tenant_status_uids/real_tenant_status_uids/')"
 
 failures=0
 fixture="$(mktemp -d)"
@@ -24,6 +30,7 @@ line_of() { grep -n -F -m1 -- "$1" "$CALL_LOG" | cut -d: -f1 || true; }
 
 id() {
   if [[ "${1:-}" == -u && "${2:-}" == alpha ]]; then
+    [[ "${MISSING_ACCOUNT:-false}" != true && "${GETENT_FAIL:-false}" != true ]] || return 1
     printf '1000\n'
     return 0
   fi
@@ -46,8 +53,32 @@ _openrc_cgroups_locald_path() { printf '%s/no-cgroups\n' "$CASE_DIR"; }
 _openrc_tenant_subtree_remove() { return 0; }
 all_tenant_names() { printf 'alpha\n'; }
 retire_tenant_nanocode() { record "retire-nanocode:$1"; }
-stop_tenant_postgres() { record "stop-postgres:$1"; }
-reset_tenant_postgres() { record "reset-postgres:$1"; }
+stop_tenant_postgres() {
+  if [[ "$REAL_POSTGRES" == true ]]; then real_stop_tenant_postgres "$@"; return; fi
+  record "stop-postgres:$1"
+}
+reset_tenant_postgres() {
+  if [[ "$REAL_POSTGRES" == true ]]; then real_reset_tenant_postgres "$@"; return; fi
+  record "reset-postgres:$1"
+}
+getent() {
+  # The tenant: an entry, or "not found" (2). Like glibc, a backend that is
+  # down (GETENT_FAIL: sssd or LDAP unreachable) also answers 2; only the
+  # local files database tells the two apart.
+  if [[ "${1:-}" == passwd && "${2:-}" == alpha ]]; then
+    # GETENT_RC: a getent that fails some other way (127: not installed).
+    [[ -z "${GETENT_RC:-}" ]] || return "$GETENT_RC"
+    [[ "${GETENT_FAIL:-false}" != true ]] || return 2
+    [[ "${MISSING_ACCOUNT:-false}" != true ]] || return 2
+    printf 'alpha:x:1000:1000::%s/home:/bin/bash\n' "$CASE_DIR"
+    return 0
+  fi
+  if [[ "${1:-}" == passwd && -n "$HELD_UID" && "${2:-}" == "$HELD_UID" ]]; then
+    printf 'bob:x:%s:%s::/home/bob:/bin/sh\n' "$HELD_UID" "$HELD_UID"
+    return 0
+  fi
+  command getent "$@"
+}
 ports_deallocate() { record "ports-deallocate:$1"; }
 remove_tenant_user() { record "remove-user:$1:$2"; }
 _remove_vision_systemd_fallback() { return 0; }
@@ -100,6 +131,11 @@ _fake_print_container() {
 
 _ctr() {
   local name="$1"
+  # Like the real `_ctr`: only the rootless path needs the tenant account.
+  if [[ "${STRICT_MISSING_ACCOUNT:-false}" == true && "${MISSING_ACCOUNT:-false}" == true \
+      && "$MT_ROOTLESS" == true ]]; then
+    die "cannot resolve uid for tenant '$name'"
+  fi
   shift
   record "${FAKE_RUNTIME}:$name $*"
   local command="${1:-}" container path network_filter format no_trunc
@@ -234,11 +270,61 @@ _ctr() {
 
 worker_egress_nft() {
   local name="$1"
+  # Like the real one: rootless Podman runs nft in the tenant's rootless
+  # network namespace, which needs the account.
+  if [[ "${STRICT_MISSING_ACCOUNT:-false}" == true && "${MISSING_ACCOUNT:-false}" == true \
+      && "$FAKE_RUNTIME" == podman && "$MT_ROOTLESS" == true ]]; then
+    die "cannot resolve uid for tenant '$name'"
+  fi
   shift
   record "nft:$name $*"
   case " $* " in
     *" flush chain "*|*" delete chain "*) command rm -f -- "$RUNTIME_DIR/chains" ;;
   esac
+}
+
+# Process-table races around one status read: a task that exits right before
+# its read (EXIT_BEFORE_READ_PID), or a child forked once the pass has listed
+# the table (FORK_AFTER_LISTING), which only a second pass can see.
+_tenant_status_uids() {
+  if [[ -n "$EXIT_BEFORE_READ_PID" && "$1" == "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID/status" ]]; then
+    command rm -rf -- "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID"
+    return 1
+  fi
+  if [[ "$FORK_AFTER_LISTING" == true && ! -e "$TENANT_PROC_ROOT/4900" ]]; then
+    seed_process 4900 61000
+  fi
+  real_tenant_status_uids "$@"
+}
+
+list_tenant_in_passwd() {
+  printf 'alpha:x:1000:1000::%s/home:/bin/bash\n' "$CASE_DIR" >>"$TENANT_PASSWD_FILE"
+}
+
+_fake_status() {
+  printf 'Name:\tfake\nUid:\t%s\t%s\t%s\t%s\nGid:\t0\t0\t0\t0\n' "$2" "$3" "$4" "$5" >"$1"
+}
+
+# A fake /proc/<pid>/status, and its leader's task entry, with the given
+# real/effective/saved/fs uids (one value repeats into all four).
+seed_process() {
+  local pid="$1" real="$2" effective="${3:-$2}" saved="${4:-$2}" fs="${5:-$2}"
+  mkdir -p "$TENANT_PROC_ROOT/$pid/task/$pid"
+  _fake_status "$TENANT_PROC_ROOT/$pid/status" "$real" "$effective" "$saved" "$fs"
+  _fake_status "$TENANT_PROC_ROOT/$pid/task/$pid/status" "$real" "$effective" "$saved" "$fs"
+}
+
+# One more thread of a process, with credentials of its own.
+seed_thread() {
+  local pid="$1" tid="$2" uid="$3"
+  mkdir -p "$TENANT_PROC_ROOT/$pid/task/$tid"
+  _fake_status "$TENANT_PROC_ROOT/$pid/task/$tid/status" "$uid" "$uid" "$uid" "$uid"
+}
+
+# The identity add-tenant records for the tenant whose account is now gone.
+seed_identity() {
+  mkdir -p "$TENANT_IDENTITY_DIR"
+  printf 'UID=61000\nSUBUID=231072:65536\n' >"$TENANT_IDENTITY_DIR/alpha"
 }
 
 seed_unit() {
@@ -263,6 +349,16 @@ setup_case() {
   OPENRC_RUNLEVELS_DIR="$CASE_DIR/runlevels"
   CONTAINER_HASH_DIR="$CASE_DIR/hashes"
   WORKER_EGRESS_DIR="$CASE_DIR/egress"
+  TENANT_IDENTITY_DIR="$CASE_DIR/identity"
+  TENANT_SUBUID_FILE="$CASE_DIR/subuid"
+  TENANT_PROC_ROOT="$CASE_DIR/proc"
+  TENANT_PASSWD_FILE="$CASE_DIR/passwd"
+  REAL_POSTGRES=false
+  HELD_UID=""
+  GETENT_FAIL=false
+  GETENT_RC=""
+  EXIT_BEFORE_READ_PID=""
+  FORK_AFTER_LISTING=false
   INIT_SYSTEM="$init"
   FAKE_RUNTIME=podman
   CONTAINER_RT="$FAKE_RUNTIME"
@@ -286,6 +382,15 @@ setup_case() {
     "$OPENRC_RUNLEVELS_DIR/default" "$OPENRC_RUNLEVELS_DIR/custom" \
     "$(tenant_quadlet_dir alpha)" "$CASE_DIR/home/.config/systemd/user" "$WORKER_EGRESS_DIR"
   : >"$CALL_LOG"
+  printf 'alpha:231072:65536\n' >"$TENANT_SUBUID_FILE"
+  # The local files database without the tenant: its account is gone there
+  # whenever a case drops it from `id`. Cases with a backend failure add it.
+  printf 'root:x:0:0::/root:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n' >"$TENANT_PASSWD_FILE"
+  # Unrelated processes: root, a system account, and the uid right after the
+  # tenant's subordinate range.
+  seed_process 1 0
+  seed_process 412 966
+  seed_process 977 296608
   printf 'SUBNET=10.89.40.0/24\n' >"$WORKER_EGRESS_DIR/alpha.conf"
   : >"$WORKER_EGRESS_DIR/alpha.nft"
   : >"$WORKER_EGRESS_DIR/alpha.hosts"
@@ -395,6 +500,11 @@ run_success_case() {
     return
   fi
   pass "$init purge=$purge remove-tenant succeeds"
+  if [[ ! -e "$TENANT_IDENTITY_DIR/alpha" ]] && grep -q "^remove-user:alpha:$purge\$" "$CALL_LOG"; then
+    pass "$init purge=$purge removal with the account deletes the identity record it wrote"
+  else
+    fail "$init purge=$purge removal with the account left the identity record"
+  fi
   assert_removals_before_flush
   assert_teardown_order
   assert_no_container_left
@@ -419,6 +529,356 @@ run_success_case() {
   fi
 }
 
+run_missing_account_stop_case() {
+  local init="$1" lane rc
+  setup_case "$init" missing-account-stops
+  for lane in vision voice pebble opencode kimi opencode2 lunardepth; do
+    rc=0
+    (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; "stop_tenant_${lane}" alpha) \
+      >"$CASE_DIR/stop-$lane.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      pass "$init $lane stop tolerates an absent tenant account"
+    else
+      fail "$init $lane stop reached _ctr without a tenant account: $(command cat "$CASE_DIR/stop-$lane.out")"
+    fi
+    if grep -q '^skipped .* stop for alpha: the tenant account is gone' "$CASE_DIR/stop-$lane.out"; then
+      pass "$init $lane stop says that it skipped the unreachable store"
+    else
+      fail "$init $lane stop skipped silently: $(command cat "$CASE_DIR/stop-$lane.out")"
+    fi
+  done
+}
+
+# ACA-2: a rootful runtime needs no tenant account, so every lane still stops
+# its containers when the account is gone.
+# add-tenant and remove-tenant record the uid and the subordinate ranges that
+# belong to the account, by name or by uid, in a root-state file.
+run_identity_record_case() {
+  local rc=0 mode
+  setup_case openrc identity-record
+  printf 'other:100000:65536\nalpha:231072:65536\n1000:400000:1000\nalpha:bad:1\n' >"$TENANT_SUBUID_FILE"
+  tenant_identity_record alpha || rc=$?
+  if [[ "$rc" -eq 0 && "$(command cat "$TENANT_IDENTITY_DIR/alpha")" == \
+      $'UID=1000\nSUBUID=231072:65536\nSUBUID=400000:1000' ]]; then
+    pass 'identity record holds the uid and only the account'"'"'s valid subordinate ranges'
+  else
+    fail "identity record is wrong (rc=$rc): $(command cat "$TENANT_IDENTITY_DIR/alpha" 2>/dev/null)"
+  fi
+  mode="$(stat -c %a "$TENANT_IDENTITY_DIR/alpha" 2>/dev/null || true)"
+  [[ "$mode" == 644 ]] && pass 'identity record is mode 0644' || fail "identity record mode is $mode"
+  rc=0
+  (MISSING_ACCOUNT=true; tenant_identity_record alpha) >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] && pass 'identity record needs the account' || fail 'identity record was written without the account'
+  command rm -rf -- "$TENANT_IDENTITY_DIR"
+  mkdir -p "$CASE_DIR/elsewhere"
+  ln -s "$CASE_DIR/elsewhere" "$TENANT_IDENTITY_DIR"
+  rc=0
+  tenant_identity_record alpha >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 && ! -e "$CASE_DIR/elsewhere/alpha" ]]; then
+    pass 'identity record refuses a linked state directory'
+  else
+    fail 'identity record followed a linked state directory'
+  fi
+  if declare -f create_tenant_user | grep -q 'tenant_identity_record "\$name"'; then
+    pass 'add-tenant records the identity when it creates the account'
+  else
+    fail 'add-tenant does not record the tenant identity'
+  fi
+}
+
+run_rootful_missing_account_stop_case() {
+  local lane rc
+  setup_case openrc rootful-missing-account-stops
+  FAKE_RUNTIME=docker
+  for lane in vision voice pebble opencode kimi opencode2 lunardepth; do
+    rc=0
+    (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; "stop_tenant_${lane}" alpha) \
+      >"$CASE_DIR/stop-$lane.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 ]] && lane_stop_called "$lane" \
+        && ! grep -q '^skipped ' "$CASE_DIR/stop-$lane.out"; then
+      pass "rootful $lane stop still stops the lane without the tenant account"
+    else
+      fail "rootful $lane stop did not stop the lane (rc=$rc): $(command cat "$CASE_DIR/stop-$lane.out")"
+    fi
+  done
+}
+
+# Any stop of one of the lane's roles: its OpenRC unit or babysitter, or the
+# container itself through the root store.
+lane_stop_called() {
+  local lane="$1"
+  grep -Eq "^(docker:alpha stop( --time [0-9]+)? lunarwing-${lane}(-task)?-alpha|rc-service:lunarwing-${lane}(-task)?-alpha(-sup)? stop)\$" \
+    "$CALL_LOG"
+}
+
+assert_nothing_removed_after_refusal() {
+  local label="$1"
+  if grep -q 'nft:alpha' "$CALL_LOG"; then
+    fail "$label touched the egress chains"
+  else
+    pass "$label leaves the egress chains alone"
+  fi
+  if grep -Fxq 'ports-deallocate:alpha' "$CALL_LOG" || grep -q '^remove-user:alpha' "$CALL_LOG"; then
+    fail "$label released ports or removed the user"
+  else
+    pass "$label keeps ports and user"
+  fi
+  [[ -f "$WORKER_EGRESS_DIR/alpha.conf" && -f "$RUNTIME_DIR/chains" ]] \
+    || fail "$label discarded the egress state needed for a retry"
+}
+
+# ACA-1: without the account, removal proves from the process table that no
+# process of the recorded uid or subordinate uids is left, then skips the
+# unreachable rootless store. The strict fake dies on any `_ctr` call, as the
+# real one does; `keep` leaves the store's containers in place so nothing can
+# pretend to have removed them.
+run_missing_account_case() {
+  local init="$1" purge="$2" keep="$3" rc=0 path
+  setup_case "$init" "missing-account-$purge-$keep"
+  if [[ "$keep" == false ]]; then
+    for path in "$RUNTIME_DIR"/containers/* "$RUNTIME_DIR"/volumes/*; do
+      command rm -f -- "$path"
+    done
+  fi
+  seed_identity
+  REAL_POSTGRES=true
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha "$purge") \
+    >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "$init purge=$purge keep=$keep missing-account removal failed: $(command cat "$CASE_DIR/remove.out")"
+    return
+  fi
+  pass "$init purge=$purge keep=$keep missing-account removal completes under the strict fake"
+  if grep -Fxq 'ports-deallocate:alpha' "$CALL_LOG" \
+      && grep -Fxq "remove-user:alpha:$purge" "$CALL_LOG"; then
+    pass "$init purge=$purge keep=$keep missing-account removal reaches ports and user cleanup"
+  else
+    fail "$init purge=$purge keep=$keep missing-account removal skipped ports or user cleanup"
+  fi
+  if grep -q '^podman:' "$CALL_LOG"; then
+    fail "$init purge=$purge keep=$keep reached the rootless store without its account"
+  else
+    pass "$init purge=$purge keep=$keep never calls the unreachable rootless store"
+  fi
+  # The rootless chains live in the tenant's namespace, which needs the account
+  # (the fake nft dies there like the real one): nothing is flushed, only the
+  # rendered state goes.
+  if ! grep -q '^nft:alpha' "$CALL_LOG" && [[ ! -e "$WORKER_EGRESS_DIR/alpha.conf" \
+      && ! -e "$WORKER_EGRESS_DIR/alpha.nft" && ! -e "$WORKER_EGRESS_DIR/alpha.hosts" ]]; then
+    pass "$init purge=$purge keep=$keep drops the rendered egress state without entering the namespace"
+  else
+    fail "$init purge=$purge keep=$keep entered the rootless namespace or left egress state"
+  fi
+  if grep -q 'flushed' "$CASE_DIR/remove.out"; then
+    fail "$init purge=$purge keep=$keep claims a flush it did not do"
+  else
+    pass "$init purge=$purge keep=$keep does not claim a flush"
+  fi
+  if grep -q 'skipped worker container removal for alpha' "$CASE_DIR/remove.out" \
+      && grep -q 'skipped PostgreSQL stop for alpha' "$CASE_DIR/remove.out"; then
+    pass "$init purge=$purge keep=$keep says which store steps it skipped"
+  else
+    fail "$init purge=$purge keep=$keep skipped store steps silently"
+  fi
+  if [[ "$purge" == true ]]; then
+    grep -q 'skipped PostgreSQL data removal for alpha' "$CASE_DIR/remove.out" \
+      && pass "$init purge=true keep=$keep names the PostgreSQL data it cannot remove" \
+      || fail "$init purge=true keep=$keep hid the PostgreSQL data left behind"
+  fi
+  if [[ "$keep" == true ]]; then
+    if [[ -f "$(_container_file lunarwing-pebble-alpha)" && -f "$(_volume_file lunarwing-kimi-alpha-ipc-v2)" ]]; then
+      pass "$init purge=$purge keep=true leaves the unreachable store as it was"
+    else
+      fail "$init purge=$purge keep=true claims to have changed the unreachable store"
+    fi
+  fi
+  [[ ! -e "$TENANT_IDENTITY_DIR/alpha" ]] \
+    && pass "$init purge=$purge keep=$keep drops the identity record at the end" \
+    || fail "$init purge=$purge keep=$keep left the identity record"
+  assert_no_unit_left
+}
+
+# The removal must refuse, before it changes anything, whenever the former
+# identity cannot be proven idle.
+run_missing_account_refusal_case() {
+  local init="$1" label="$2" expect="$3" rc=0
+  setup_case "$init" "missing-account-refusal-$label"
+  [[ "$label" == no-record ]] || seed_identity
+  case "$label" in
+    live-uid) seed_process 4242 61000 ;;
+    live-effective-uid) seed_process 4243 0 61000 0 0 ;;
+    live-fs-uid) seed_process 4244 0 0 0 61000 ;;
+    live-saved-uid) seed_process 4247 0 0 61000 0 ;;
+    live-subuid-first) seed_process 4245 231072 ;;
+    live-subuid-last) seed_process 4246 296607 ;;
+    no-record) ;;
+    no-subuid) printf 'UID=61000\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    bad-record) printf 'UID=61000\nSUBUID=231072:65536\nEXTRA=1\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    system-uid) printf 'UID=0\nSUBUID=231072:65536\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    held-uid) HELD_UID=61000 ;;
+    linked-record)
+      command mv -- "$TENANT_IDENTITY_DIR/alpha" "$CASE_DIR/record"
+      ln -s "$CASE_DIR/record" "$TENANT_IDENTITY_DIR/alpha"
+      ;;
+    bad-subuid) printf 'UID=61000\nSUBUID=231072:x\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    two-uids) printf 'UID=61000\nUID=62000\nSUBUID=231072:65536\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    crlf-record) printf 'UID=61000\r\nSUBUID=231072:65536\r\n' >"$TENANT_IDENTITY_DIR/alpha" ;;
+    unreadable-live-status)
+      # A status that exists and cannot be read (even by root) while its task lives.
+      mkdir -p "$TENANT_PROC_ROOT/4500/status"
+      ;;
+    thread-only)
+      seed_process 5000 0
+      seed_thread 5000 5001 231500
+      ;;
+    nss-failure)
+      # sssd/LDAP down: id fails and getent answers "not found", but useradd's
+      # files database still lists the tenant.
+      GETENT_FAIL=true
+      list_tenant_in_passwd
+      ;;
+    passwd-unreadable) command rm -f -- "$TENANT_PASSWD_FILE" ;;
+    getent-missing) GETENT_RC=127 ;;
+    passwd-compat) printf '+@netgroup::::::\n' >>"$TENANT_PASSWD_FILE" ;;
+    forked-after-listing) FORK_AFTER_LISTING=true ;;
+    empty-proc) command rm -rf -- "$TENANT_PROC_ROOT"; mkdir -p "$TENANT_PROC_ROOT" ;;
+  esac
+  REAL_POSTGRES=true
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha true) \
+    >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "$init missing-account removal with $label succeeded"
+  elif grep -Fq -- "$expect" "$CASE_DIR/remove.out"; then
+    pass "$init missing-account removal with $label refuses: $expect"
+  else
+    fail "$init missing-account removal with $label gave the wrong reason: $(command cat "$CASE_DIR/remove.out")"
+  fi
+  assert_nothing_removed_after_refusal "$init $label refusal"
+  [[ -e "$(tenant_quadlet_dir alpha)/lunarwing-pg-alpha.container" || -e "$OPENRC_INITD_DIR/lunarwing-alpha" ]] \
+    || fail "$init $label refusal removed units before refusing"
+}
+
+# A task listed by the glob that exits before its status is read is skipped,
+# not refused: the read fails and its directory is gone. Without nullglob (as
+# in production) an unmatched task glob is skipped too.
+run_exited_task_case() {
+  local rc=0
+  setup_case openrc exited-task
+  seed_identity
+  seed_process 4700 61000
+  (EXIT_BEFORE_READ_PID=4700; tenant_former_identity_idle alpha) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    pass 'a task that exits between listing and read is skipped, not refused'
+  else
+    fail "a task that exited before its read refused the proof: $(command cat "$CASE_DIR/idle.out")"
+  fi
+  rc=0
+  command rm -rf -- "$TENANT_PROC_ROOT"/*/task
+  (shopt -u nullglob; tenant_former_identity_idle alpha) >"$CASE_DIR/idle-noglob.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    pass 'an unmatched task glob without nullglob is skipped, not refused'
+  else
+    fail "an unmatched task glob refused the proof: $(command cat "$CASE_DIR/idle-noglob.out")"
+  fi
+}
+
+# After a removal without the account the former home stays, owned by the
+# orphaned uid that the next useradd may reuse; the operator is told so. A
+# failed account lookup removes nothing.
+run_orphan_home_warning_case() {
+  local rc=0
+  setup_case openrc orphan-home
+  seed_identity
+  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] \
+      && grep -Fq "WARNING: tenant account 'alpha' was already gone; its former home $CASE_DIR/home stays, owned by the orphaned uid 61000" "$CASE_DIR/user.out" \
+      && grep -Fq 'remove the home before the next add-tenant' "$CASE_DIR/user.out"; then
+    pass 'removal without the account warns about the orphaned home and its uid'
+  else
+    fail "removal without the account did not warn about the orphaned home (rc=$rc): $(command cat "$CASE_DIR/user.out")"
+  fi
+  rc=0
+  command rm -rf -- "$CASE_DIR/home"
+  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-nohome.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && ! grep -q WARNING "$CASE_DIR/user-nohome.out" \
+      && grep -Fq "tenant account 'alpha' and its former home were already gone" "$CASE_DIR/user-nohome.out"; then
+    pass 'no orphaned-home warning once the former home is gone too'
+  else
+    fail "orphaned-home warning without a home (rc=$rc): $(command cat "$CASE_DIR/user-nohome.out")"
+  fi
+  rc=0
+  list_tenant_in_passwd
+  (GETENT_FAIL=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-nss.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'cannot look up the account of tenant' "$CASE_DIR/user-nss.out"; then
+    pass 'a failed account lookup does not count as an already removed account'
+  else
+    fail "a failed account lookup was taken as gone (rc=$rc): $(command cat "$CASE_DIR/user-nss.out")"
+  fi
+}
+
+# The teardown proves the former identity idle again right before its flush.
+run_missing_account_teardown_refusal() {
+  local rc=0
+  setup_case openrc missing-account-teardown
+  seed_identity
+  seed_process 4300 231100
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; worker_egress_teardown alpha) \
+    >"$CASE_DIR/teardown.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'former uids are not proven idle; refusing teardown' "$CASE_DIR/teardown.out"; then
+    pass 'missing-account egress teardown refuses while a former subordinate uid runs'
+  else
+    fail "missing-account egress teardown did not refuse (rc=$rc): $(command cat "$CASE_DIR/teardown.out")"
+  fi
+  assert_nothing_removed_after_refusal 'missing-account teardown refusal'
+}
+
+# The container removal applies the same rule on its own, as the OpenRC
+# uninstall and the systemd uninstall call it.
+run_missing_account_container_removal_refusal() {
+  local init="$1" rc=0
+  setup_case "$init" missing-account-container-removal
+  seed_identity
+  seed_process 4400 61000
+  if [[ "$init" == openrc ]]; then
+    (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; uninstall_tenant_openrc alpha) \
+      >"$CASE_DIR/uninstall.out" 2>&1 || rc=$?
+  else
+    (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; uninstall_tenant_systemd alpha) \
+      >"$CASE_DIR/uninstall.out" 2>&1 || rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/uninstall.out"; then
+    pass "$init container removal without the account refuses while the former uid runs"
+  else
+    fail "$init container removal without the account did not refuse (rc=$rc): $(command cat "$CASE_DIR/uninstall.out")"
+  fi
+}
+
+# ACA-2 end to end: on a rootful host the removal without the account still
+# stops and removes every lane's containers through the root store.
+run_rootful_missing_account_case() {
+  local rc=0 lane
+  setup_case openrc rootful-missing-account
+  FAKE_RUNTIME=docker
+  command rm -f -- "$RUNTIME_DIR/keeper"
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha false) \
+    >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "rootful missing-account removal failed: $(command cat "$CASE_DIR/remove.out")"
+    return
+  fi
+  pass 'rootful missing-account removal completes'
+  for lane in vision voice pebble opencode kimi opencode2 lunardepth; do
+    if lane_stop_called "$lane"; then
+      pass "rootful missing-account removal stops $lane"
+    else
+      fail "rootful missing-account removal did not stop $lane"
+    fi
+  done
+  assert_removals_before_flush
+  assert_no_container_left
+  assert_no_unit_left
+}
+
 run_stop_failure_case() {
   local init="$1" rc=0
   setup_case "$init" false
@@ -435,6 +895,13 @@ run_stop_failure_case() {
     pass "$init task stop failure aborts before any nft flush"
   fi
   [[ -f "$WORKER_EGRESS_DIR/alpha.conf" ]] || fail "$init discarded recoverable egress state"
+  # The record is written before anything stops, so a rerun after a later
+  # `userdel` can still prove the old uid idle.
+  if [[ "$(command cat "$TENANT_IDENTITY_DIR/alpha" 2>/dev/null)" == $'UID=1000\nSUBUID=231072:65536' ]]; then
+    pass "$init aborted removal keeps the identity it recorded first"
+  else
+    fail "$init removal did not record the tenant identity before stopping"
+  fi
 }
 
 run_remove_failure_case() {
@@ -626,10 +1093,48 @@ run_no_keeper_case() {
 for init in openrc systemd; do
   run_success_case "$init" false
   run_success_case "$init" true
+  run_missing_account_stop_case "$init"
+  run_missing_account_case "$init" false false
+  run_missing_account_case "$init" true false
+  run_missing_account_case "$init" false true
+  run_missing_account_case "$init" true true
+  run_missing_account_refusal_case "$init" live-uid 'entries of the former uid 61000'
+  run_missing_account_refusal_case "$init" live-subuid-first 'still run (4245)'
+  run_missing_account_refusal_case "$init" no-record 'Either the tenant was already removed'
   run_stop_failure_case "$init"
   run_remove_failure_case "$init"
 done
 run_volume_failure_case
+run_identity_record_case
+run_rootful_missing_account_stop_case
+run_rootful_missing_account_case
+run_missing_account_refusal_case openrc live-effective-uid 'still run (4243)'
+run_missing_account_refusal_case openrc live-fs-uid 'still run (4244)'
+run_missing_account_refusal_case openrc live-saved-uid 'still run (4247)'
+run_missing_account_container_removal_refusal openrc
+run_missing_account_container_removal_refusal systemd
+run_missing_account_refusal_case openrc live-subuid-last 'still run (4246)'
+run_missing_account_refusal_case openrc no-subuid 'no subordinate uid range recorded'
+run_missing_account_refusal_case openrc bad-record 'unexpected line in'
+run_missing_account_refusal_case openrc system-uid 'no valid tenant uid recorded'
+run_missing_account_refusal_case openrc held-uid "now belongs to account 'bob'"
+run_missing_account_refusal_case openrc empty-proc 'cannot read the process table'
+run_missing_account_refusal_case openrc linked-record 'is a symbolic link; refusing to trust it'
+run_missing_account_refusal_case openrc bad-subuid "invalid subordinate uid range '231072:x'"
+run_missing_account_refusal_case openrc two-uids 'must hold exactly one UID= line, it holds 2'
+run_missing_account_refusal_case openrc crlf-record 'carriage return in'
+run_missing_account_refusal_case openrc unreadable-live-status 'proc/4500/status of a live task'
+run_missing_account_refusal_case openrc thread-only 'still run (5000/task/5001)'
+run_missing_account_refusal_case systemd thread-only 'still run (5000/task/5001)'
+run_missing_account_refusal_case openrc nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case systemd nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc passwd-unreadable "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc getent-missing "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc passwd-compat "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc forked-after-listing 'still run (4900)'
+run_exited_task_case
+run_orphan_home_warning_case
+run_missing_account_teardown_refusal
 run_rootful_docker_case false
 run_rootful_docker_case true
 run_rootful_docker_attached_case

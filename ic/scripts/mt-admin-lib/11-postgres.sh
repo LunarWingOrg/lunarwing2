@@ -223,7 +223,9 @@ start_tenant_postgres() {
 
 stop_tenant_postgres() {
   local name="$1"
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" PostgreSQL; then
+    return 0
+  fi
 
   local container_name="lunarwing-pg-$name"
   ensure_init_system
@@ -243,7 +245,12 @@ stop_tenant_postgres() {
 
 reset_tenant_postgres() {
   local name="$1"
-  ensure_container_runtime
+  # WI#688: the data volume of a rootless tenant whose account is gone stays
+  # in the store under its former home; mt-admin cannot reach it any more.
+  if tenant_rootless_account_gone "$name"; then
+    say "skipped PostgreSQL data removal for $name: the tenant account is gone; its data volume stays in the rootless store under $(tenant_home "$name")"
+    return 0
+  fi
 
   local container_name="lunarwing-pg-$name"
   stop_tenant_postgres "$name"

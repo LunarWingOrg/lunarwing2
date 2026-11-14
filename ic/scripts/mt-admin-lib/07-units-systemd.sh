@@ -1263,8 +1263,10 @@ uninstall_tenant_systemd() {
     # Quadlet before deleting its container so systemd cannot resurrect it into
     # the egress teardown window.
     _systemctl_user "$name" daemon-reload || return 1
-    remove_tenant_worker_containers "$name" || return 1
   fi
+  # WI#688: a rootful store needs no account; a rootless one without its
+  # account is skipped there only after the former uids are proven idle.
+  remove_tenant_worker_containers "$name" || return 1
 
   say "uninstalled systemd units for $name"
 }
