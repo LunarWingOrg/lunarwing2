@@ -1815,7 +1815,7 @@ async fn assert_netbird_joined_run(
             tunnel: Some(TunnelRunConfig {
                 container_id: &container_id,
                 dns: &[],
-                resolv_conf: resolv_conf.as_path(),
+                resolv_conf: Some(resolv_conf.as_path()),
             }),
             protected_paths: &[],
             tenant_logs: false,
