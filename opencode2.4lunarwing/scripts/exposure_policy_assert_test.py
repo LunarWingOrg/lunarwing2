@@ -291,6 +291,155 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("opencode-exposure-guard.sh", result.stderr)
 
+    def test_console_watches_opt_in_in_config_fails(self) -> None:
+        # WI#609 AAV-1: either key turns the Console event watches flag on.
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (
+            {"console_watches": True},
+            {"all_flags": True},
+            {"console_watches": "true"},
+            {"all_flags": None},
+            {"todo": False, "console_watches": True},
+        ):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must not set experimental flags", result.stderr)
+
+    def test_malformed_experimental_block_fails(self) -> None:
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (True, ["console_watches"], "all_flags", None):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('"experimental" must be an object', result.stderr)
+
+    def test_unrelated_or_explicitly_off_experimental_settings_pass(self) -> None:
+        config_path = self.lane / "config" / "opencode2.json"
+        base = json.loads(config_path.read_text())
+        for experimental in (
+            {},
+            {"console_watches": False, "all_flags": False},
+            {"todo": True},
+        ):
+            with self.subTest(experimental=experimental):
+                config_path.write_text(json.dumps({**base, "experimental": experimental}))
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("leaves the Console event watches flag off", result.stdout)
+
+    def test_wrapper_without_a_live_flag_pin_fails(self) -> None:
+        # WI#609 AAV-1 / ABE-3: the pin and the exec must be the last two code
+        # lines, and nothing else may launch the binary or touch the variable.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        self.assertTrue(text.endswith(pin + launch + "\n"))
+        self.assertEqual(text.count(pin + launch), 1)
+        for label, replacement in (
+            ("removed", launch),
+            ("only a comment", "# " + pin + launch),
+            ("after the exec", launch + "\n" + pin),
+            ("unset again", pin + "unset OPENCODE_FLAGS\n" + launch),
+            ("overwritten", pin + 'OPENCODE_FLAGS="all"\n' + launch),
+            ("a different flag", 'export OPENCODE_FLAGS="-schedules"\n' + launch),
+            ("turned on", 'export OPENCODE_FLAGS="console_watches"\n' + launch),
+            # A second launch path before the pin: each of these passed the
+            # first version of this check and started the binary unpinned.
+            ("fast path for other subcommands",
+             'case "${1:-}" in serve | run) ;; *) exec "${REAL_OPENCODE}" "$@" ;; esac\n' + pin + launch),
+            ("fast path for a leading flag",
+             'case "${1:-}" in -*) exec "${REAL_OPENCODE}" "$@" ;; esac\n' + pin + launch),
+            ("opt-out knob",
+             '[ -z "${LUNARWING_KEEP_OPENCODE_FLAGS:-}" ] || exec "${REAL_OPENCODE}" "$@"\n' + pin + launch),
+            ("launch without exec", '[ "${1:-}" != acp ] || { "$REAL_OPENCODE" "$@"; exit; }\n' + pin + launch),
+            ("launch by the literal path",
+             '[ "${1:-}" != acp ] || exec /usr/local/lib/opencode2/opencode "$@"\n' + pin + launch),
+            ("launch by the literal path without exec",
+             '[ "${1:-}" != acp ] || { /usr/local/lib/opencode2/opencode "$@"; exit; }\n' + pin + launch),
+            ("a second exec of anything", '[ "${1:-}" != acp ] || exec /bin/true\n' + pin + launch),
+            ("variable made read-only first", "readonly OPENCODE_FLAGS\n" + pin + launch),
+            ("pin inside a conditional", "if true; then\n  " + pin + "fi\n" + launch),
+            ("tail inside a function that is never called", "start() {\n" + pin + launch + "\n}"),
+            ("tail swallowed by a here-document", "cat >/dev/null <<EOF\n" + pin + launch),
+            ("exec redefined", "alias exec=true\n" + pin + launch),
+            ("pin rebuilt through eval", 'eval "OPENCODE_FLAGS=all"\n' + pin + launch),
+            ("continuation into the pin", "true \\\n" + pin + launch),
+            ("retarget between pin and exec", pin + "REAL_OPENCODE=/bin/echo\n" + launch),
+        ):
+            with self.subTest(label=label):
+                wrapper.write_text(text.replace(pin + launch, replacement), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn("launch the real binary nowhere else", result.stderr)
+
+    def test_wrapper_with_operators_continuing_into_the_pin_fails(self) -> None:
+        # ABH-2: a line that ends in &&, ||, | or () continues into the pin,
+        # so the "last two code lines" check alone is not enough.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        for label, prefix in (
+            ("&&", '[ "${1:-}" != "--version" ] &&\n'),
+            ("||", '[ -r "$HOME/.config/opencode/rc" ] ||\n'),
+            ("pipe", "true |\n"),
+            ("function call", "setup_env()\n"),
+        ):
+            with self.subTest(label=label):
+                wrapper.write_text(text.replace(pin + launch, prefix + pin + launch), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn("shell operator that continues into it", result.stderr)
+
+    def test_wrapper_with_dot_sourcing_mid_line_fails(self) -> None:
+        # ABH-2: `[ ! -r "$f" ] || . "$f"` sources a file mid-line; the dot
+        # rule must not only look at line starts.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        wrapper.write_text(
+            text.replace(pin + launch, '[ ! -r "$HOME/.rc" ] || . "$HOME/.rc"\n' + pin + launch),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("dot-sourcing", result.stderr)
+
+    def test_wrapper_code_edit_outside_the_named_rules_fails_the_digest(self) -> None:
+        # ABH-2's better guard: any code edit, even one the shape checks do
+        # not name, changes the reviewed digest and fails here.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        wrapper.write_text(text.replace("exit 77", "exit 99"), encoding="utf-8")
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("differ from the reviewed digest", result.stderr)
+
+    def test_comments_around_the_flag_pin_do_not_fail(self) -> None:
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        launch = 'exec "$REAL_OPENCODE" "$@"'
+        wrapper.write_text(
+            text.replace(
+                pin + launch,
+                "# exec and REAL_OPENCODE may be named in a comment\n"
+                + pin
+                + "# OPENCODE_FLAGS is final from here on\n\n"
+                + launch,
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_binary_marker_fails(self) -> None:
         binary = self.root / "opencode"
         binary.write_bytes(b"\x7fELF fake build embedding https://opentunnel.xyz relay")
@@ -428,6 +577,64 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
             self.assertEqual(result.stdout.strip(), " ".join(form))
+
+    def test_console_watches_flag_is_forced_off_for_the_real_binary(self) -> None:
+        # WI#609 AAV-1: whatever OPENCODE_FLAGS the caller holds, the real
+        # binary starts with exactly "-console_watches" and its argv intact.
+        # The fake binary is executed, and /tmp is noexec on some dev hosts,
+        # so it lives on the repo tree like the other executable fixtures.
+        with tempfile.TemporaryDirectory(dir=LANE_ROOT) as temporary:
+            fake = pathlib.Path(temporary) / "opencode"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "printf 'flags=%s\\n' \"${OPENCODE_FLAGS-<unset>}\"\n"
+                "printf 'arg=%s\\n' \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            for inherited in (None, "", "all", "console_watches", "schedules,console_watches",
+                              "-console_watches,console_watches", "-schedules,-artifacts"):
+                # Every start mode of entrypoint.sh (serve, run, acp), a
+                # leading global flag, and a server-backed command.
+                for form in (
+                    ("serve", "--port", "4096", "--hostname", "127.0.0.1"),
+                    ("run", "x"),
+                    ("acp",),
+                    ("--print-logs", "serve", "--port", "4096"),
+                    ("session", "list"),
+                ):
+                    with self.subTest(inherited=inherited, form=form):
+                        env = dict(os.environ)
+                        env["LUNARWING_REAL_OPENCODE"] = str(fake)
+                        env.pop("OPENCODE_FLAGS", None)
+                        if inherited is not None:
+                            env["OPENCODE_FLAGS"] = inherited
+                        result = subprocess.run(
+                            ["sh", str(WRAPPER), *form],
+                            capture_output=True, text=True, env=env, timeout=60,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(
+                            result.stdout.splitlines(),
+                            ["flags=-console_watches", *(f"arg={arg}" for arg in form)],
+                        )
+
+    def test_refused_commands_never_start_the_real_binary(self) -> None:
+        # A regression guard for the refusals, not a test of the pin: the pin
+        # sits after them, right before the exec.
+        with tempfile.TemporaryDirectory(dir=LANE_ROOT) as temporary:
+            marker = pathlib.Path(temporary) / "ran"
+            fake = pathlib.Path(temporary) / "opencode"
+            fake.write_text(f"#!/bin/sh\n: > '{marker}'\n", encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ)
+            env["LUNARWING_REAL_OPENCODE"] = str(fake)
+            result = subprocess.run(
+                ["sh", str(WRAPPER), "pair", "--remote", "--yes"],
+                capture_output=True, text=True, env=env, timeout=60,
+            )
+            self.assertEqual(result.returncode, 77)
+            self.assertFalse(marker.exists())
 
 
 class ImageFilesystemDependencyTests(unittest.TestCase):

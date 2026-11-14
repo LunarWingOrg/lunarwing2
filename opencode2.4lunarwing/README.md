@@ -63,7 +63,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.19.5 (proven) | v2.2.6 (beta in practice) |
+| Pin | v1.19.5 (proven) | v2.2.7 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -75,12 +75,21 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.6 pin
-is `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.7 pin
+is `fedc6f208aa2bd54c1019227214568083f6380ad` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
-stays disabled. The lane config's `update: "disable"` pin is not honored by
+stays disabled. The wrapper also starts the binary with
+`OPENCODE_FLAGS=-console_watches`, which keeps v2.2.7's Console event
+watches off whatever the caller's environment or a workspace config says,
+and the builder stage fails the image if the reviewed text behind that pin
+stops holding (a text tripwire, not a proof; re-read the flag code on every
+bump). The pin covers the event watches only: a worker that is given
+an OpenCode Console credential, for example `OPENCODE_API_KEY`, still takes
+Console-authored instructions and skills, plus the Console's config merge
+of providers, remote MCP servers, policies and the web-search selection
+(WI#665). The lane config's `update: "disable"` pin is not honored by
 the updater itself (it reads only the global config dir), so the image
 also carries `OPENCODE_DISABLE_AUTOUPDATE=1` to silence the background
 check. See `docs/ops/WORKER-CONTAINERS.md` for the bump review, verification
