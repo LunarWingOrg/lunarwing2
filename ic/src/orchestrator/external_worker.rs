@@ -5582,7 +5582,8 @@ mod tests {
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(value);
         assert!(!encoded.is_empty());
-        let scrubbed = scrub_granted(redactor.as_ref(), &format!("printenv | base64: {encoded}"));
+        let text = format!("printenv | base64: {encoded}");
+        let scrubbed = scrub_granted(redactor.as_ref(), &text);
         assert!(!scrubbed.contains(&encoded));
     }
 
