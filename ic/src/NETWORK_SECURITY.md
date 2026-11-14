@@ -466,17 +466,18 @@ resolver files `ro,z` into joined runs only and removes every direct uplink DNS
 accept. The sidecar retains its runtime resolver file for bootstrap, but the
 same chain drops its own unmarked post-start lookups too.
 
-NetBird uses a different path. A non-secret per-instance backup file is
-bind-mounted writable at `/etc/resolv.conf.original.netbird` and seeded before
-the upstream entrypoint runs, while the rest of the root filesystem stays
-read-only. NetBird can therefore replace the sidecar resolver with its learned
-overlay listener. Joined runs inherit that file and the firewall allows port 53
-only to the overlay address; no former runtime resolver remains allowed.
-WI#603's live measurements confirmed peer and in-overlay zone resolution with
-no uplink DNS packets. Outside-upstream writes are unmarked and fail closed.
-Use an in-overlay primary group for public and later control-plane lookups.
-`SANDBOX_TUNNEL_DNS` remains rejected with NetBird during configuration
-validation, before any runtime call.
+NetBird uses a different path. A credential-free bootstrap reads the runtime
+resolver. Non-secret per-instance files are then staged and bind-mounted
+writable at `/etc/resolv.conf` and `/etc/resolv.conf.original.netbird`, while
+the rest of the root filesystem stays read-only. NetBird can therefore replace
+the sidecar resolver with its learned overlay listener. Joined runs mount that
+same inode `ro,z` because `--network container` does not propagate the file;
+the firewall allows port 53 only to the overlay address and no former runtime
+resolver remains allowed. WI#603's live measurements confirmed peer and
+in-overlay zone resolution with no uplink DNS packets. Outside-upstream writes
+are unmarked and fail closed. Use an in-overlay primary group for public and
+later control-plane lookups. `SANDBOX_TUNNEL_DNS` remains rejected with NetBird
+during configuration validation, before any runtime call.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
