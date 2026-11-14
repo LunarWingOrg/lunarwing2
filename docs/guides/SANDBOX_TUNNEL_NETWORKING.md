@@ -94,7 +94,9 @@ image (WI#651): a missing image fails the check fast with a pointer at the
 single-flight recovery, which is the path that pulls it under its per-run
 budget. Recovery re-probes an existing sidecar for at
 most **6 seconds**, waits at most **20 seconds** for a fresh provider (or the
-configured startup timeout when lower), and has a **60-second budget**. A pull
+configured startup timeout when lower), and has a **60-second budget**. During
+recovery, an existing sidecar that cannot prove its health inside the 6-second
+window is removed and recreated even when it is healthy but only slow. A pull
 inside recovery uses the smaller of that configured timeout and the remaining
 recovery budget, and its timeout error names the image pull. Final verification
 runs right after recovery, never pulls, and keeps the same probe deadlines as
