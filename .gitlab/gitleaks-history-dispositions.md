@@ -4,7 +4,9 @@ This is the durable, non-confidential record for exact historical fingerprints
 newly accepted by `.gitlab/scripts/refresh-secret-history-baseline.py`. Add one
 row per fingerprint before passing its acceptance file to the helper. Keep the
 rows when refs change or the original work item closes; exact baseline pins are
-also retained deliberately rather than automatically pruned.
+also retained deliberately rather than automatically pruned. A finding in
+`.gitlab/gitleaks-history-pending` must neither receive an acceptance row here
+nor be removed from that file before its external disposition lands.
 
 Never record a secret value, matched content, or confidential discussion here.
 Do not copy findings out of confidential WI#575. The last row that
@@ -18,6 +20,7 @@ For a true positive, revocation or rotation must be complete before acceptance.
 
 | Date | Exact fingerprint | Disposition | Non-confidential reason and evidence |
 | --- | --- | --- | --- |
+| 2026-11-12 | `59b4247c2a7984ccd52126e894df98251c10f030:docs/ops/AGENT_GOALS_2.1.6.0.md:gitlab-pat:1270` | Not a token on this instance | A token-shaped example inside a review sentence (WI#599), no longer in the current tree. An instance administrator's `POST /api/v4/admin/token` lookup on 2026-11-12 returned HTTP 404, confirming that it is not a token on this instance (WI#599 note 15857). |
 | 2026-11-12 | `54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `russh` 0.65.1 (WI#644). The file is cargo's checksum manifest: SHA-256 digests of the crate's files. The package digest in it equals the `russh` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins of other vendored crates. |
 | 2026-11-12 | `54470b308fe4b857402c58bd8105b299847a9af7:ic/vendor/russh/src/helpers.rs:private-key:286` | Upstream test fixture | Vendored `russh` 0.65.1 (WI#644). A constant `RSA_OPENSSH` inside the crate's `#[cfg(test)] mod tests`: a public test key that upstream ships to prove that an RSA key is refused when the `rsa` feature is off. It guards no system, and LunarWing builds without that test module. |
 | 2026-11-12 | `4247229478e0092f219654ab1dff0e977379a815:ic/scripts/lunarwing-mt-admin.sh:generic-api-key:846` | False positive | The `local` declaration that opens the `add-tenants` verb of mt-admin. It makes 33 assignments: 18 empty strings, 11 `true` or `false` values and four references to `DEFAULT_*` variables. Every variable with `api_key` in its name is set to the empty string, and the line holds no other literal. Accepted by the maintainer on 2026-11-12. |
