@@ -965,6 +965,7 @@ start_tenant_vision() {
 
 stop_tenant_vision() {
   local name="$1" container="lunarwing-vision-${1}" running
+  id -u "$name" >/dev/null 2>&1 || return 0
   if tenant_vision_external "$name"; then
     say "external LunarVision remains operator-managed for $name"
     return 0
@@ -1325,6 +1326,7 @@ start_tenant_voice() {
 
 stop_tenant_voice() {
   local name="$1" container_name="lunarwing-voice-$1" running
+  id -u "$name" >/dev/null 2>&1 || return 0
   ensure_container_runtime
   ensure_init_system
   # Supervision stops before the container or it respawns mid-stop.
