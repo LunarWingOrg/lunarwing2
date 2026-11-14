@@ -641,7 +641,7 @@ pub(crate) fn build_sidecar_args(
             {
                 args.extend([
                     "-c".into(),
-                    "cp /etc/resolv.conf /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh".into(),
+                    "cat /etc/resolv.conf > /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh".into(),
                 ]);
             }
         }
@@ -2621,7 +2621,7 @@ mod tests {
         assert_eq!(
             args.last().map(String::as_str),
             Some(
-                "cp /etc/resolv.conf /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh"
+                "cat /etc/resolv.conf > /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh"
             )
         );
     }
