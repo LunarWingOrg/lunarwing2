@@ -327,14 +327,20 @@ tenant_identity_uid() {
 }
 
 # Read one /proc status file's Uid: line into the caller's `ids` array.
-# Returns 1 when the file cannot be read or has no Uid: line.
+# Returns 1 when the file cannot be read or has no well-formed Uid: line.
 _tenant_status_uids() {
-  local key r e s f
-  key=""
-  { while read -r key r e s f; do [[ "$key" != Uid: ]] || break; done <"$1"; } 2>/dev/null \
+  local content line
+  # Read the file whole: procfs regenerates a status file on every seek, and
+  # line-by-line reads (which seek back after each line) can misalign and lose
+  # the Uid: line when the task changes state in between.
+  { content="$(<"$1")"; } 2>/dev/null || return 1
+  content=$'\n'"$content"
+  [[ "$content" == *$'\n'Uid:* ]] || return 1
+  line="${content#*$'\n'Uid:}"
+  line="${line%%$'\n'*}"
+  [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+) ]] \
     || return 1
-  [[ "$key" == Uid: ]] || return 1
-  ids=("$r" "$e" "$s" "$f")
+  ids=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
 }
 
 # Prove that no process or thread of the removed tenant's recorded uid or
