@@ -106,9 +106,23 @@ Consequently, initial verification, recovery, and final verification can take
 at most **200 seconds for WireGuard** or **180 seconds for NetBird**, image
 present or not: auto-pull no longer extends the per-run chain, because the only
 pull happens inside the recovery budget described above. These
-totals include the full recovery budget, and the lifecycle operation lock is
-acquired before that budget starts, so a command can additionally wait up to
-**15 seconds** for the lock. A command that joins an already-running
+totals include the full recovery budget. The lifecycle operation lock is
+acquired before that budget starts, and taking it has no timeout of its own: a
+command waits until whatever holds the lock is done. The only holder that can
+be ahead of a recovering command is the cleanup that a cut-off start leaves
+queued, for example a recovery whose budget ran out in the middle of a start.
+Such a cleanup removes the container (up to 15 seconds), asks the runtime
+whether the container is gone (up to 10 seconds) and releases the helper unit
+(up to 15 seconds). It can therefore hold the lock for up to about 40 seconds,
+or 45 when a retry of the workload spawner's probe falls due; without systemd
+service mode it ends after the removal. The cleanup takes the lock when the
+cut-off recovery records its failure. That is also the start of the 30-second
+back-off, during which commands are refused at once and do not wait. So the
+next command that recovers normally waits at most about **10 to 15 seconds**
+for the lock. A start whose `run` command was refused while a matching
+sidecar was already running, and that is cut off while it waits for that
+sidecar's health, leaves two cleanups queued; then the wait can reach about
+**50 to 55 seconds** (WI#651). A command that joins an already-running
 cold start can instead wait for that attempt's independently bounded image
 pull, runtime start, and provider readiness, plus its probes and cleanup, so
 the per-run totals above do not cap that join. A shell caller can time out

@@ -1443,6 +1443,8 @@ daemon → host-loopback bridge :<lunardepth_wss> → task-runner Unix socket �
 
 Only the bridge publishes anything, and only on host loopback: under mt-admin its WebSocket listens on the tenant's `lunardepth_wss` registry port and its health endpoint (container port `8443`) is published on `lunardepth_health`. `9090` is only the image default, used by the compose file. The bridge holds the tenant hub credential only in its private role. The task receives no `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE`; its runner refuses either. A random per-boot local bearer protects the task-only harness API, whose exact `/ws/agent` upgrade uses `lunarwing-agent-v1`. Task health reports protocol `version: "1"`, not the source release; the bridge reports `lunardepth-worker-1.0.0` separately. Process existence is not readiness.
 
+**`/ready` trusts what the task role reports (WI#636).** The bridge's health server builds `/ready` from three state files (`lunardepth4lunarwing/health_server.py:54-70`). `websocket` is the bridge's own. `task_runner` and `task_gate` are heartbeat files that the task role writes into the shared runner directory. The gate file is rewritten about every 10 seconds while the task's two local probes pass (the harness's loopback `/ready` and a ping on the runner socket), always with `composition`, `sandbox` and `task` set to true (`lunardepth4lunarwing/entrypoint-split.sh:73-87`). The health server checks that each heartbeat is at most 30 seconds old and that the gate's three values are true. It probes nothing inside the task container itself. So a compromised or confused task can keep `/ready` green after its sandbox has in fact broken, and the readers of `/ready` see what the task says, not an independent measurement. Those readers are the container health check where one is set (mt-admin's Quadlet `HealthCmd` on systemd, or the image's own; on OpenRC with Podman the bridge runs with `--no-healthcheck`) and anything that probes the published `lunardepth_health` port. Treat the composition and sandbox parts as advisory. The tenant's egress allowlist stays the boundary against a compromised worker. An independent signal would need a probe from outside the task role, for example one that attempts a forbidden path as the task uid.
+
 Each pair runs one task at a time and explicitly refuses a second. Jobs sharing a pair also share the task uid, workspace, LunarDepth session history/logs, and local transport credential. Separate tenants or pairs are required for separate confidentiality or grant domains; scrubbing child environments does not create per-job isolation.
 
 ### Explicit TensorMoon or TensorZero route and model key
@@ -2293,7 +2295,7 @@ dispatch was performed.
   - The anchor passes on the real v2.2.7 source, in a scratch tree and in
     the builder stage of the image build.
   - A full local OpenCode2 image build (rootless Podman,
-    `--network=host --format docker`, wrapper anchor `e349e842…a9a2e`)
+    `--network=host --format docker`, wrapper anchor `f1e847dd…ed8d`)
     completed: builder gates, every in-image suite, the started-entrypoint
     smoke **5/5** with the server started through the pinned wrapper, and
     the final `--image-filesystem` assertion. In the built image, as uid
@@ -2303,8 +2305,10 @@ dispatch was performed.
 - **Not shown:** the watches themselves were never started, so no run here
   observed the flag keeping a live Console connection down; that rests on the
   upstream code and its tests named above. The `service.json` path and the
-  Console Library were read in the source, not run. No candidate-vs-clean-rebuild
-  comparison, scan or protected job ran. v2.3.0's source was not reviewed for
+  Console Library were read in the source, not run. At that date no
+  candidate-vs-clean-rebuild comparison, scan or protected job had run; the
+  protected jobs ran after the merge (last bullet of this entry). v2.3.0's
+  source was not reviewed for
   this bump because that release is still in its waiting window; at that bump
   the anchor only reports whether its text is unchanged — it does not prove
   the pin holds, and the per-bump re-read (checklist item 7) is what decides.
@@ -2361,6 +2365,22 @@ AAV/ABE review fixes were ported onto target `c48a4f7d3` and re-run there.
   proof. Suites: exposure policy **78/78**, compile-out **27/27**; the
   anchor and every new mutant were also run against the real v2.2.7 tree.
   The wrapper comment edit changes the wrapper anchor to `e349e842…a9a2e`.
+
+- **Which wrapper was built where (2026-11-14, WI#678):** the full local
+  image build listed under "At the second version" is the one of 2026-11-13.
+  It used the wrapper as it was then, `f1e847dd…ed8d`. The re-attempt's
+  local builds of the same day predate the follow-up too. The follow-up above
+  then edited the wrapper's comments, which changed its digest to
+  `e349e842…a9a2e`, and gave the build anchor its whole-tree walk. No local
+  build was made with either. The first images built with both are those of
+  the protected jobs after the merge: master pipeline 7801 on `a3687f0d2`
+  (`worker-opencode2-candidate` 177238, `worker-opencode2-exposure-verify`
+  177240 and `worker-opencode2-scan` 177239, all green), and again pipeline
+  7848 on `27fc6c24b` (candidate job 178620). The candidate job builds the
+  image from the tree with the wrapper's digest as its anchor
+  (`.gitlab/scripts/build-worker-image.sh:135`), so a green job means that
+  the builder gates, the in-image suites and the image-filesystem assertion
+  passed with that wrapper.
 
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 
@@ -2467,13 +2487,29 @@ live-model daemon-dispatched job was performed.
 
 ### OpenCode Console Library (WI#665)
 
-At the current v2.2.6 pin (`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`),
-the upstream `opencode` integration can fetch hosted Console instructions and
-skills into sessions when **both** a Console credential and egress to
-`opencode.ai` are available. This is an additional instruction source, not just
-outbound publication. The bundled catalog names `OPENCODE_API_KEY`; saved
-credentials take precedence over environment credentials. The later v2.2.7
-`console_watches` flag is not in this pinned tree and is not a Library control.
+The lane's pin is v2.2.7 (`fedc6f208aa2bd54c1019227214568083f6380ad`). When
+**both** a Console credential and egress to `opencode.ai` are available, the
+upstream `opencode` integration brings six things into a session: hosted
+Console instructions and skills, and the four allow-listed keys of the
+Console's config document (`providers`, `mcp`, `policies`, `websearch`). This
+is an additional instruction and configuration source, not just outbound
+publication. The v2.2.7 entry above describes all six ("The flag is not the
+whole Console channel") and cites the upstream lines for the config merge and
+for the flag. The bundled catalog names `OPENCODE_API_KEY`;
+saved credentials take precedence over environment credentials. The v2.2.7
+`console_watches` flag is in this tree and the wrapper pins it off. It gates
+the event watches only and is not a Library control.
+
+**What was read at which pin.** This section was written at the v2.2.6 pin
+(`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`), before the lane moved. The
+v2.2.7 entry above records from the v2.2.7 source: the config merge and the
+flag's resolution, both first read at v2.2.7 and cited with upstream lines;
+and that the
+integration still delivers instructions and skills and that the catalog names
+`OPENCODE_API_KEY`, both stated there without lines. Not read again at v2.2.7:
+that saved credentials take precedence over environment credentials, and that
+a credential saved by `opencode auth login` survives a container restart. Both
+were read at v2.2.6 only.
 
 The entrypoint refuses a present `OPENCODE_API_KEY` (even empty) before either
 split role dispatches unless the operator explicitly sets
@@ -2482,8 +2518,10 @@ without printing the credential. This gate checks only the environment variable.
 Credentials saved by `opencode auth login` inside a session bypass it and can
 survive a container restart. With a usable credential and allowed egress, opt-in
 enables the Library surface too; no shipped setting separately withholds its
-instructions or skills. The managed tenant's egress allowlist remains the
-boundary against a compromised worker.
+instructions, its skills or the config merge. The entrypoint's refusal names
+"Console Library egress and instruction risk" and does not mention the config
+merge. The managed tenant's egress allowlist remains the boundary against a
+compromised worker.
 
 **Scope:** WI#665's surface record and environment-credential gate are covered;
 the root-owned managed-policy control has **not** been evaluated on a built
