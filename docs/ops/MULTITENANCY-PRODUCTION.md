@@ -824,8 +824,15 @@ root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
 every entry in it, and every parent through `/` on every run; any non-root
 owner, symbolic link, or group/other write permission produces a logged refusal
 and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
-contract preflight applies the same check whenever its source resolves to this
-installed library, including a root-owned Study Notes scheduler snapshot. Do
+contract preflight applies the same full-tree check whenever the checkout's
+health directory is a symbolic link to this installed library (or another
+root-owned Study Notes scheduler snapshot), and it requires the checkout's
+`openrc-proxy-unit-contract.sh` itself to be a regular, non-symlink,
+non-group/other-writable file, because mt-admin sources it as root. A refused
+contract no longer aborts mt-admin: the CLI reports the failing component and
+the repair, keeps `--help` and non-OpenRC subcommands usable, and refuses only
+OpenRC operations until the tree is fixed — so `upgrade-tenant`/`add-tenant`
+can repair the same library. Do
 not hand-copy an operator checkout over the library; rerun the health pipeline
 install instead (`upgrade-tenant`, `add-tenant`, or
 `ic/scripts/enable-health-fleet.sh`).
