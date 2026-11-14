@@ -720,18 +720,37 @@ run_missing_account_refusal_case() {
     || fail "$init $label refusal removed units before refusing"
 }
 
-# A listed task that is gone by the time it is read (here: the task glob
-# matches nothing, as without nullglob in production) is skipped, not refused.
+# A task listed by the glob that exits before its status is read is skipped,
+# not refused: the read fails and its directory is gone. Without nullglob (as
+# in production) an unmatched task glob is skipped too.
 run_exited_task_case() {
   local rc=0
   setup_case openrc exited-task
   seed_identity
-  command rm -rf -- "$TENANT_PROC_ROOT"/*/task
-  (shopt -u nullglob; tenant_former_identity_idle alpha) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
+  seed_process 4700 61000
+  eval "$(declare -f _tenant_status_uids | sed '1s/^_tenant_status_uids/real_tenant_status_uids/')"
+  (
+    _tenant_status_uids() {
+      if [[ "$1" == "$TENANT_PROC_ROOT/4700/status" ]]; then
+        command rm -rf -- "$TENANT_PROC_ROOT/4700"
+        return 1
+      fi
+      real_tenant_status_uids "$@"
+    }
+    tenant_former_identity_idle alpha
+  ) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]]; then
-    pass 'a task that no longer exists is skipped, not refused'
+    pass 'a task that exits between listing and read is skipped, not refused'
   else
-    fail "a missing task entry refused the proof: $(command cat "$CASE_DIR/idle.out")"
+    fail "a task that exited before its read refused the proof: $(command cat "$CASE_DIR/idle.out")"
+  fi
+  rc=0
+  command rm -rf -- "$TENANT_PROC_ROOT"/*/task
+  (shopt -u nullglob; tenant_former_identity_idle alpha) >"$CASE_DIR/idle-noglob.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    pass 'an unmatched task glob without nullglob is skipped, not refused'
+  else
+    fail "an unmatched task glob refused the proof: $(command cat "$CASE_DIR/idle-noglob.out")"
   fi
 }
 
