@@ -100,9 +100,9 @@ refute() {
   # Running: the new configuration is applied in the same command, so the unit
   # never keeps an overlay digest that no longer matches its environment.
   : >"$TMP/pair-running"
-  configure_lunardepth demo tensormoon::other_function::lunarwing '' '' preserve preserve >"$TMP/configure.out"
+  configure_lunardepth demo tensormoon::function_name::other_function '' '' preserve preserve >"$TMP/configure.out"
   grep -q '^start:demo$' "$TMP/configure.calls"
-  grep -q '^LUNARDEPTH_MODEL=tensormoon::other_function::lunarwing$' "$TMP/env/lunardepth-task.env"
+  grep -q '^LUNARDEPTH_MODEL=tensormoon::function_name::other_function$' "$TMP/env/lunardepth-task.env"
   grep -q '^LUNARDEPTH_API_KEY=test-only-key$' "$TMP/env/lunardepth-task.env"
   rm -f "$TMP/pair-running"
   # ZP-8: a key handed over while the unauthenticated-gateway exception is on
@@ -204,7 +204,7 @@ diff -u "$expected" "$calls"
   [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
   for expected in run --rm --pull=never none --read-only ALL no-new-privileges --no-healthcheck /usr/bin/python3 \
       lunarwing-worker-lunardepth:latest -I /app/scripts/render_overlay.py \
-      /app/config/lunarwing-lane.patch.yml --stdout tensormoon::other_function::lunarwing; do
+      /app/config/lunarwing-lane.patch.yml --stdout tensormoon::function_name::other_function; do
     grep -qx -- "$expected" "$TMP/render.args" || { echo "render container lacks: $expected" >&2; exit 1; }
   done
   # Nothing from the operator checkout is mounted into or passed to that container.
@@ -220,6 +220,67 @@ diff -u "$expected" "$calls"
   head -c 65537 /dev/zero >"$TMP/over.yml"
   refute _lunardepth_overlay_size_ok "$TMP/over.yml"
   refute _lunardepth_overlay_size_ok "$TMP/missing.yml"
+)
+
+# ── WI#691: a TensorZero-form route is configured, re-validated and rendered ──
+# A gateway answers only ids that carry its own prefix, so the lane accepts
+# both dialects and nothing else. Its own env directory keeps this tenant state
+# apart from the sections above.
+(
+  tenant_exists_in_registry() { return 0; }
+  tenant_env_dir() { printf '%s/tz-env' "$TMP"; }
+  read_tenant_env_value() { [[ ! -f "$2" ]] || sed -n "s/^$3=//p" "$2"; }
+  write_tenant_file_atomic() { cat >"$2"; }
+  render_lunardepth_overlay() { echo "configure rendered the overlay" >&2; exit 1; }
+  ensure_external_worker_config() { :; }
+  _lunardepth_pair_running() { return 1; }
+  mkdir -p "$TMP/tz-env"
+  configure_lunardepth demo tensorzero::function_name::lunarwing \
+    http://10.20.30.40:3000/openai/v1 tz-test-only-key true false >"$TMP/tz-configure.out"
+  grep -q "explicit tensorzero:: route" "$TMP/tz-configure.out"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::lunarwing' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_BASE_URL=http://10.20.30.40:3000/openai/v1' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::lunarwing' "$TMP/tz-env/lunardepth-task.env"
+  grep -qx 'LUNARDEPTH_API_KEY=tz-test-only-key' "$TMP/tz-env/lunardepth-task.env"
+  refute grep -q 'LUNARDEPTH_API_KEY' "$TMP/tz-env/lunardepth.env"
+  # Start and the upgrade preflight re-validate the stored route as written.
+  _lunardepth_route demo
+  [[ "$LUNARDEPTH_MODEL_RESOLVED" == "tensorzero::function_name::lunarwing" ]]
+  _ctr() { shift; printf '%s\n' "$@" >"$TMP/tz-render.args"; printf 'rendered-overlay\n'; }
+  [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
+  grep -qx -- 'tensorzero::function_name::lunarwing' "$TMP/tz-render.args"
+  grep -qx -- '--allow-insecure-http' "$TMP/tz-render.args"
+  # The function is the operator's choice, not the lane's: the fleet gateway
+  # serves FrontierCODE beside lunarwing, and omitted values survive.
+  configure_lunardepth demo tensorzero::function_name::FrontierCODE '' '' preserve preserve >"$TMP/tz-configure.out"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::FrontierCODE' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_API_KEY=tz-test-only-key' "$TMP/tz-env/lunardepth-task.env"
+  _lunardepth_route demo
+  [[ "$LUNARDEPTH_MODEL_RESOLVED" == "tensorzero::function_name::FrontierCODE" ]]
+  [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
+  grep -qx -- 'tensorzero::function_name::FrontierCODE' "$TMP/tz-render.args"
+  # The egress allowlist derives from the configured endpoint alone; the
+  # dialect and the function add no target.
+  [[ "$(worker_egress_lunardepth_backend demo)" == "http://10.20.30.40:3000/openai/v1" ]]
+  [[ "$(_worker_egress_llm_targets demo)" == "http://10.20.30.40:3000/openai/v1" ]]
+  # The TensorMoon form still validates, with any function. An id that no
+  # gateway serves is refused before anything is written: another prefix, a
+  # middle segment other than the function_name keyword (in either dialect),
+  # or the variant suffix a gateway reply echoes.
+  _lunardepth_validate_route https://tensormoon.example.test/openai/v1 tensormoon::function_name::lunarwing false
+  _lunardepth_validate_route https://tensormoon.example.test/openai/v1 tensormoon::function_name::FrontierCODE false
+  before_env="$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")"
+  for bad_model in openai::function_name::lunarwing \
+      tensorzero::tenant_model::lunarwing \
+      tensormoon::other_function::lunarwing \
+      tensorzero::function_name::lunarwing::variant_name::primary; do
+    if (configure_lunardepth demo "$bad_model" '' '' preserve preserve) >"$TMP/tz-configure.out" 2>&1; then
+      echo "configure accepted a model id outside both gateway dialects: $bad_model" >&2
+      exit 1
+    fi
+    grep -q 'tensorzero::function_name::<function>' "$TMP/tz-configure.out"
+    [[ "$before_env" == "$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")" ]]
+  done
 )
 
 # ── ZP-6: the out-of-band verifier never reads the image as root ─────────────
@@ -399,4 +460,4 @@ env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 "$(command -v python3)" -I \
   [[ -f "$snapshot/.gitlab/scripts/worker_candidate_config.py" ]]
 )
 
-echo "test-mt-admin-lunardepth: registry v18 migration, lifecycle, bridge flags, overlay rendering, verifier isolation, fleet keys and archive checks passed"
+echo "test-mt-admin-lunardepth: registry v18 migration, lifecycle, bridge flags, overlay rendering, gateway dialects, verifier isolation, fleet keys and archive checks passed"

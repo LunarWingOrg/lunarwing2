@@ -1388,9 +1388,9 @@ Only the bridge publishes anything, and only on host loopback: under mt-admin it
 
 Each pair runs one task at a time and explicitly refuses a second. Jobs sharing a pair also share the task uid, workspace, LunarDepth session history/logs, and local transport credential. Separate tenants or pairs are required for separate confidentiality or grant domains; scrubbing child environments does not create per-job isolation.
 
-### Explicit TensorMoon-compatible route and model key
+### Explicit TensorMoon or TensorZero route and model key
 
-This lane never inherits `LLM_BASE_URL`, `LLM_MODEL`, TensorZero, or another worker's route. Configure a complete OpenAI-compatible API root and model explicitly:
+This lane never inherits `LLM_BASE_URL`, `LLM_MODEL`, the tenant's TensorZero endpoint, or another worker's route. Configure a complete OpenAI-compatible API root and model explicitly:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
@@ -1401,7 +1401,27 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 sudo ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
 
-The URL excludes `/chat/completions`; the example host and function name are placeholders, not a fleet default. HTTPS is required beyond loopback. Non-loopback cleartext HTTP requires the separate `--allow-insecure-http` exception. A deliberately unauthenticated gateway requires `--allow-unauthenticated-gateway` and uses only LunarDepth's nonempty placeholder-key behavior. Omitted values and explicit exceptions survive a re-render; no inherited endpoint marker is synthesized. `export-tenant.sh` does not carry the lane's route or key: pass them again to `import-tenant.sh` (`--with-lunardepth`, `--lunardepth-base-url`, `--lunardepth-model`, `--lunardepth-api-key-file`). Clear a previous exception explicitly with `--disallow-insecure-http` or `--require-api-key`, respectively.
+The model id names the gateway dialect and the gateway function (WI#691). Both gateways use one grammar: the prefix, the literal keyword `function_name`, and last the name of a function defined in that gateway's configuration.
+
+| Gateway | Accepted id form | Example | Rendered provider row |
+|---|---|---|---|
+| TensorMoon | `tensormoon::function_name::<function>` | `tensormoon::function_name::lunarwing` | `tensormoon` (TensorMoon) |
+| TensorZero | `tensorzero::function_name::<function>` | `tensorzero::function_name::lunarwing`, `tensorzero::function_name::FrontierCODE` | `tensorzero` (TensorZero) |
+
+`<function>` is the operator's choice among the functions the gateway serves; the lane does not require `lunarwing`. It accepts letters, digits, `_`, and `-`. The middle segment is not variable: a gateway refuses any word there other than its keyword, so the lane refuses it too, and a `model_name` id is not accepted.
+
+Use the prefix of the gateway behind the base URL. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. A TensorMoon gateway takes `tensorzero::` ids only as deprecated aliases that may be removed. The lane translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
+  --base-url https://tensorzero.example.com/openai/v1 \
+  --model tensorzero::function_name::lunarwing \
+  --api-key-file /protected/tenant-lunardepth-key
+```
+
+The dialect changes only the name of the rendered provider row and of the two rows that select it; every other overlay value, the credential handling, and the egress derivation are the same. `tensormoon::function_name::lunarwing` renders the template's own bytes. Any other id is refused by `configure-lunardepth`, `add-tenant`/`add-tenants`/`build-tenant --with-lunardepth`, the start and upgrade preflight, and the task launcher. That includes an id carrying the `::variant_name::<variant>` suffix that a gateway reply echoes in its `model` field. The renderer is baked into the worker image, so an image built before WI#691 refuses a `tensorzero::` id, and any function other than `lunarwing`, at start with the `build-lunardepth-worker` hint. That older renderer also took any word as the middle segment of a `tensormoon::` id and required `lunarwing` last; a stored route of that shape other than `tensormoon::function_name::lunarwing` named nothing a gateway serves and now fails route validation, so reconfigure it.
+
+The URL excludes `/chat/completions`; the example hosts and function name are placeholders, not a fleet default. HTTPS is required beyond loopback. Non-loopback cleartext HTTP requires the separate `--allow-insecure-http` exception. A deliberately unauthenticated gateway requires `--allow-unauthenticated-gateway` and uses only LunarDepth's nonempty placeholder-key behavior. Omitted values and explicit exceptions survive a re-render; no inherited endpoint marker is synthesized. `export-tenant.sh` does not carry the lane's route or key: pass them again to `import-tenant.sh` (`--with-lunardepth`, `--lunardepth-base-url`, `--lunardepth-model`, `--lunardepth-api-key-file`). Clear a previous exception explicitly with `--disallow-insecure-http` or `--require-api-key`, respectively.
 
 For an existing tenant, `configure-lunardepth` runs the v18 registry migration without renumbering existing ports, allocates the lane's two ports, enables `workers.lunardepth`, and writes the generic daemon endpoint with `supports_credentials = false`. The task env file contains literal unquoted route and key values; placeholder mode and a real key are distinct choices, and `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored. Podman env-file parsing therefore cannot turn the URL or credential into a value containing quote characters.
 
