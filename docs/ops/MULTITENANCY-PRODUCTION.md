@@ -256,10 +256,11 @@ sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant sparkie --purge
 If the tenant's OS account is already gone, `remove-tenant` still finishes
 on a rootless host once it has proven from `/proc` that no process or thread of
 the tenant's recorded uid or subordinate uids remains; otherwise it refuses
-before changing anything. It then skips the unreachable rootless store and its
-network namespace (nothing there is removed or flushed) and warns that the
-former home, still owned by the orphaned uid, must be removed before the next
-`add-tenant`. The rules and the manual record for tenants added before WI#688
+before changing anything. Stop a lingering `user@<uid>.service` and the
+tenant's OpenRC `supervise-daemon` units first. It then skips the unreachable
+rootless store and its network namespace (nothing there is removed or flushed)
+and, when the former home still exists, warns that it is owned by the orphaned
+uid and must be removed before the next `add-tenant`. The rules and the manual record for tenants added before WI#688
 are in `docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is
 gone").
 

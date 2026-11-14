@@ -768,15 +768,16 @@ worker_egress_teardown() {
   # WI#688: without the account the rootless store, its network and keeper
   # cannot be asked. Nothing can be attached when no process of the former
   # uids is left, so prove that again before dropping the rendered state. On
-  # rootless Podman the chains live in the tenant's rootless network
+  # rootless Podman the chains lived only in the tenant's rootless network
   # namespace, which only the tenant can enter (`worker_egress_nft` needs the
-  # account) and in which no process is left to filter: there is nothing to
-  # flush. Host-side chains (another runtime) are flushed as usual.
+  # account) and in which no process is left: there is nothing to flush. The
+  # network and keeper definitions stay in the unreachable store. Host-side
+  # chains (another runtime) are flushed as usual.
   if tenant_rootless_account_gone "$name"; then
     tenant_former_identity_idle "$name" \
       || { printf 'worker-egress: tenant account %s is gone and its former uids are not proven idle; refusing teardown\n' "$name" >&2; return 1; }
     if [[ "$CONTAINER_RT" == podman ]]; then
-      printf 'worker-egress: tenant account %s is gone and no process of it remains; its chains, network and keeper stay in its unreachable rootless store and network namespace\n' "$name"
+      printf 'worker-egress: tenant account %s is gone and no process of it remains; its chains lived only in its rootless network namespace, which no process is left in, and its network and keeper definitions stay in its unreachable store\n' "$name"
     else
       worker_egress_flush "$name"
     fi

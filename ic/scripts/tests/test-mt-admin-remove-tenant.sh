@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 eval "$(declare -f stop_tenant_postgres | sed '1s/^stop_tenant_postgres/real_stop_tenant_postgres/')"
 eval "$(declare -f reset_tenant_postgres | sed '1s/^reset_tenant_postgres/real_reset_tenant_postgres/')"
 eval "$(declare -f remove_tenant_user | sed '1s/^remove_tenant_user/real_remove_tenant_user/')"
+eval "$(declare -f _tenant_status_uids | sed '1s/^_tenant_status_uids/real_tenant_status_uids/')"
 
 failures=0
 fixture="$(mktemp -d)"
@@ -61,10 +62,11 @@ reset_tenant_postgres() {
   record "reset-postgres:$1"
 }
 getent() {
-  # The tenant: an entry, "not found" (2) once the account is gone, or a
-  # failed NSS lookup (1), which must never count as gone.
+  # The tenant: an entry, or "not found" (2). Like glibc, a backend that is
+  # down (GETENT_FAIL: sssd or LDAP unreachable) also answers 2; only the
+  # local files database tells the two apart.
   if [[ "${1:-}" == passwd && "${2:-}" == alpha ]]; then
-    [[ "${GETENT_FAIL:-false}" != true ]] || return 1
+    [[ "${GETENT_FAIL:-false}" != true ]] || return 2
     [[ "${MISSING_ACCOUNT:-false}" != true ]] || return 2
     printf 'alpha:x:1000:1000::%s/home:/bin/bash\n' "$CASE_DIR"
     return 0
@@ -279,6 +281,24 @@ worker_egress_nft() {
   esac
 }
 
+# Process-table races around one status read: a task that exits right before
+# its read (EXIT_BEFORE_READ_PID), or a child forked once the pass has listed
+# the table (FORK_AFTER_LISTING), which only a second pass can see.
+_tenant_status_uids() {
+  if [[ -n "$EXIT_BEFORE_READ_PID" && "$1" == "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID/status" ]]; then
+    command rm -rf -- "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID"
+    return 1
+  fi
+  if [[ "$FORK_AFTER_LISTING" == true && ! -e "$TENANT_PROC_ROOT/4900" ]]; then
+    seed_process 4900 61000
+  fi
+  real_tenant_status_uids "$@"
+}
+
+list_tenant_in_passwd() {
+  printf 'alpha:x:1000:1000::%s/home:/bin/bash\n' "$CASE_DIR" >>"$TENANT_PASSWD_FILE"
+}
+
 _fake_status() {
   printf 'Name:\tfake\nUid:\t%s\t%s\t%s\t%s\nGid:\t0\t0\t0\t0\n' "$2" "$3" "$4" "$5" >"$1"
 }
@@ -330,9 +350,12 @@ setup_case() {
   TENANT_IDENTITY_DIR="$CASE_DIR/identity"
   TENANT_SUBUID_FILE="$CASE_DIR/subuid"
   TENANT_PROC_ROOT="$CASE_DIR/proc"
+  TENANT_PASSWD_FILE="$CASE_DIR/passwd"
   REAL_POSTGRES=false
   HELD_UID=""
   GETENT_FAIL=false
+  EXIT_BEFORE_READ_PID=""
+  FORK_AFTER_LISTING=false
   INIT_SYSTEM="$init"
   FAKE_RUNTIME=podman
   CONTAINER_RT="$FAKE_RUNTIME"
@@ -357,6 +380,9 @@ setup_case() {
     "$(tenant_quadlet_dir alpha)" "$CASE_DIR/home/.config/systemd/user" "$WORKER_EGRESS_DIR"
   : >"$CALL_LOG"
   printf 'alpha:231072:65536\n' >"$TENANT_SUBUID_FILE"
+  # The local files database without the tenant: its account is gone there
+  # whenever a case drops it from `id`. Cases with a backend failure add it.
+  printf 'root:x:0:0::/root:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n' >"$TENANT_PASSWD_FILE"
   # Unrelated processes: root, a system account, and the uid right after the
   # tenant's subordinate range.
   seed_process 1 0
@@ -702,7 +728,15 @@ run_missing_account_refusal_case() {
       seed_process 5000 0
       seed_thread 5000 5001 231500
       ;;
-    nss-failure) GETENT_FAIL=true ;;
+    nss-failure)
+      # sssd/LDAP down: id fails and getent answers "not found", but useradd's
+      # files database still lists the tenant.
+      GETENT_FAIL=true
+      list_tenant_in_passwd
+      ;;
+    passwd-unreadable) command rm -f -- "$TENANT_PASSWD_FILE" ;;
+    passwd-compat) printf '+@netgroup::::::\n' >>"$TENANT_PASSWD_FILE" ;;
+    forked-after-listing) FORK_AFTER_LISTING=true ;;
     empty-proc) command rm -rf -- "$TENANT_PROC_ROOT"; mkdir -p "$TENANT_PROC_ROOT" ;;
   esac
   REAL_POSTGRES=true
@@ -728,17 +762,7 @@ run_exited_task_case() {
   setup_case openrc exited-task
   seed_identity
   seed_process 4700 61000
-  eval "$(declare -f _tenant_status_uids | sed '1s/^_tenant_status_uids/real_tenant_status_uids/')"
-  (
-    _tenant_status_uids() {
-      if [[ "$1" == "$TENANT_PROC_ROOT/4700/status" ]]; then
-        command rm -rf -- "$TENANT_PROC_ROOT/4700"
-        return 1
-      fi
-      real_tenant_status_uids "$@"
-    }
-    tenant_former_identity_idle alpha
-  ) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
+  (EXIT_BEFORE_READ_PID=4700; tenant_former_identity_idle alpha) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     pass 'a task that exits between listing and read is skipped, not refused'
   else
@@ -770,6 +794,16 @@ run_orphan_home_warning_case() {
     fail "removal without the account did not warn about the orphaned home (rc=$rc): $(command cat "$CASE_DIR/user.out")"
   fi
   rc=0
+  command rm -rf -- "$CASE_DIR/home"
+  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-nohome.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && ! grep -q WARNING "$CASE_DIR/user-nohome.out" \
+      && grep -Fq "tenant account 'alpha' and its former home were already gone" "$CASE_DIR/user-nohome.out"; then
+    pass 'no orphaned-home warning once the former home is gone too'
+  else
+    fail "orphaned-home warning without a home (rc=$rc): $(command cat "$CASE_DIR/user-nohome.out")"
+  fi
+  rc=0
+  list_tenant_in_passwd
   (GETENT_FAIL=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-nss.out" 2>&1 || rc=$?
   if [[ "$rc" -ne 0 ]] && grep -q 'cannot look up the account of tenant' "$CASE_DIR/user-nss.out"; then
     pass 'a failed account lookup does not count as an already removed account'
@@ -1062,7 +1096,7 @@ for init in openrc systemd; do
   run_missing_account_case "$init" true true
   run_missing_account_refusal_case "$init" live-uid 'entries of the former uid 61000'
   run_missing_account_refusal_case "$init" live-subuid-first 'still run (4245)'
-  run_missing_account_refusal_case "$init" no-record 'no uid was recorded for it'
+  run_missing_account_refusal_case "$init" no-record 'Either the tenant was already removed'
   run_stop_failure_case "$init"
   run_remove_failure_case "$init"
 done
@@ -1088,7 +1122,11 @@ run_missing_account_refusal_case openrc crlf-record 'carriage return in'
 run_missing_account_refusal_case openrc unreadable-live-status 'proc/4500/status of a live task'
 run_missing_account_refusal_case openrc thread-only 'still run (5000/task/5001)'
 run_missing_account_refusal_case systemd thread-only 'still run (5000/task/5001)'
-run_missing_account_refusal_case openrc nss-failure 'the account lookup failed without a not-found answer'
+run_missing_account_refusal_case openrc nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case systemd nss-failure "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc passwd-unreadable "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc passwd-compat "cannot tell whether the account of tenant 'alpha' is gone"
+run_missing_account_refusal_case openrc forked-after-listing 'still run (4900)'
 run_exited_task_case
 run_orphan_home_warning_case
 run_missing_account_teardown_refusal

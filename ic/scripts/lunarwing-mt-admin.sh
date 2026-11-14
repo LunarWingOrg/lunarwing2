@@ -81,6 +81,8 @@ CONTAINER_HASH_DIR="${LUNARWING_MT_CONTAINER_HASH_DIR:-/var/lib/lunarwing/contai
 TENANT_IDENTITY_DIR="${LUNARWING_MT_TENANT_IDENTITY_DIR:-/var/lib/lunarwing/tenant-identity}"
 TENANT_SUBUID_FILE="${LUNARWING_MT_SUBUID_FILE:-/etc/subuid}"
 TENANT_PROC_ROOT="${LUNARWING_MT_PROC_ROOT:-/proc}"
+# The local files database that useradd writes tenant accounts to.
+TENANT_PASSWD_FILE="${LUNARWING_MT_PASSWD_FILE:-/etc/passwd}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was

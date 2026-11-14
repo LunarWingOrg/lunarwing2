@@ -818,7 +818,7 @@ remove_tenant() {
     tenant_identity_record "$name" \
       || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing removal"
   elif ((account_state != 2)); then
-    die "cannot tell whether the account of tenant '$name' exists: the account lookup failed without a not-found answer; refusing removal"
+    die "cannot tell whether the account of tenant '$name' is gone: its lookup fails, but it is not both absent from $TENANT_PASSWD_FILE and unknown to getent; refusing removal"
   elif tenant_rootless_account_gone "$name"; then
     tenant_former_identity_idle "$name" \
       || die "tenant account '$name' is gone and its former uid is not proven idle; refusing removal"
