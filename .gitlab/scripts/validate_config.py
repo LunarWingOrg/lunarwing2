@@ -3171,8 +3171,159 @@ def validate_include_shape(root: dict, loaded_configs: list, errors: list[str]) 
             )
 
 
+def cargo_dependency_tables(manifest: dict) -> list[tuple[str, str, dict]]:
+    """Return (kind, display name, table) for every Cargo dependency scope."""
+    kinds = ("dependencies", "build-dependencies", "dev-dependencies")
+    tables = []
+    for kind in kinds:
+        table = manifest.get(kind)
+        if isinstance(table, dict):
+            tables.append((kind, kind, table))
+
+    workspace = manifest.get("workspace")
+    if isinstance(workspace, dict) and isinstance(workspace.get("dependencies"), dict):
+        tables.append(("workspace.dependencies", "workspace.dependencies", workspace["dependencies"]))
+
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target, target_config in targets.items():
+            if not isinstance(target_config, dict):
+                continue
+            for kind in kinds:
+                table = target_config.get(kind)
+                if isinstance(table, dict):
+                    tables.append((kind, f"target.{target}.{kind}", table))
+    return tables
+
+
+def safety_dependency_names(tables: list[tuple[str, str, dict]]) -> set[str]:
+    names = set()
+    for _kind, _label, table in tables:
+        for name, spec in table.items():
+            if name == "lunarwing_safety" or (
+                isinstance(spec, dict) and spec.get("package") == "lunarwing_safety"
+            ):
+                names.add(name)
+    return names
+
+
+def validate_scrubber_feature_definition(label: str, manifest: dict, errors: list[str]) -> None:
+    """Keep the guarded feature explicit and impossible to imply locally."""
+    features = manifest.get("features", {})
+    if not isinstance(features, dict) or not isinstance(features.get("test-support"), list):
+        errors.append(f"{label} must declare lunarwing_safety/test-support (WI#662)")
+        return
+    for name, activations in features.items():
+        if name != "test-support" and isinstance(activations, list) and "test-support" in activations:
+            errors.append(
+                f"{label} [features] {name} enables lunarwing_safety/test-support "
+                "through an implied feature (WI#662)"
+            )
+
+
+def validate_scrubber_resolver(manifest: dict, errors: list[str]) -> None:
+    """Require a resolver that separates dev features from production edges."""
+    workspace = manifest.get("workspace", {})
+    package = manifest.get("package", {})
+    edition = package.get("edition", "2015")
+    if isinstance(edition, dict) and edition.get("workspace"):
+        edition = workspace.get("package", {}).get("edition", "2015")
+    resolver = workspace.get("resolver", package.get("resolver"))
+    if resolver is None:
+        resolver = {"2021": "2", "2024": "3"}.get(edition, "1")
+    if resolver not in {"2", "3"}:
+        errors.append(
+            "ic/Cargo.toml must use resolver 2 or 3 to isolate dev-dependency "
+            "features for lunarwing_safety/test-support (WI#662)"
+        )
+
+
+def validate_log_scrubber_test_support(errors: list[str]) -> None:
+    """WI#662: keep the scrubber's removal API out of production Cargo graphs.
+
+    The ci-config image has neither Cargo nor git, so inspect every first-party
+    manifest directly. Target-specific and renamed dependencies count, as do
+    feature-table activations such as `lunarwing_safety/test-support`. The
+    safety crate must declare that feature without any other local feature
+    implying it, and the workspace resolver must isolate dev features.
+    """
+    workspace_root = WORKSPACE_MANIFEST.parent
+    if not WORKSPACE_MANIFEST.is_file():
+        errors.append("ic/Cargo.toml missing; cannot enforce lunarwing_safety test-support boundary")
+        return
+
+    loaded = []
+    for path in sorted(workspace_root.rglob("Cargo.toml")):
+        relative_parts = path.relative_to(workspace_root).parts
+        if any(part in {"target", "vendor"} for part in relative_parts[:-1]):
+            continue
+        try:
+            label = str(path.relative_to(ROOT))
+        except ValueError:
+            label = str(path)
+        try:
+            with path.open("rb") as stream:
+                manifest = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            errors.append(f"cannot inspect {label} for lunarwing_safety test-support: {error}")
+            continue
+        tables = cargo_dependency_tables(manifest)
+        loaded.append((label, manifest, tables))
+        if path == WORKSPACE_MANIFEST:
+            validate_scrubber_resolver(manifest, errors)
+
+    safety_manifests = [
+        (label, manifest) for label, manifest, _tables in loaded
+        if manifest.get("package", {}).get("name") == "lunarwing_safety"
+    ]
+    if not safety_manifests:
+        errors.append("missing lunarwing_safety package; cannot enforce test-support boundary (WI#662)")
+    for label, manifest in safety_manifests:
+        validate_scrubber_feature_definition(label, manifest, errors)
+
+    workspace_names = set()
+    for _label, _manifest, tables in loaded:
+        workspace_tables = [entry for entry in tables if entry[0] == "workspace.dependencies"]
+        workspace_names.update(safety_dependency_names(workspace_tables))
+
+    for label, manifest, tables in loaded:
+        safety_names = safety_dependency_names(tables) | workspace_names
+        for kind, section, table in tables:
+            if kind == "dev-dependencies":
+                continue
+            for name in sorted(safety_names.intersection(table)):
+                spec = table[name]
+                features = spec.get("features", []) if isinstance(spec, dict) else []
+                if isinstance(features, list) and "test-support" in features:
+                    errors.append(
+                        f"{label} [{section}] {name} enables lunarwing_safety/test-support "
+                        "outside dev-dependencies (WI#662)"
+                    )
+
+        features = manifest.get("features")
+        if not isinstance(features, dict):
+            continue
+        for feature_name, activations in features.items():
+            if not isinstance(activations, list):
+                continue
+            for activation in activations:
+                if not isinstance(activation, str):
+                    continue
+                dependency, separator, activated_feature = activation.partition("/")
+                if (
+                    separator
+                    and activated_feature == "test-support"
+                    and dependency.removesuffix("?") in safety_names
+                ):
+                    errors.append(
+                        f"{label} [features] {feature_name} enables "
+                        f"lunarwing_safety/test-support via {activation!r} (WI#662)"
+                    )
+
+
 def main() -> int:
     errors: list[str] = []
+    validate_log_scrubber_test_support(errors)
     root = load_yaml(ROOT_CONFIG)
     validate_stage_consistency(root, errors)
     includes = [item.get("local") for item in root.get("include", [])]
