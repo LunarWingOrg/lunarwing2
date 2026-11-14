@@ -256,6 +256,51 @@ async fn watcher_claim_prevents_late_completion_and_cleanup_removes_handle() {
     assert!(!claim_unreported_exit(&mgr.containers, job_id, "late exit").await);
 }
 
+#[tokio::test]
+async fn write_back_scan_rejects_a_served_credential_value() {
+    // WI#666: the write-back scan uses the job redactor, which also holds the
+    // credential values served to the job. Promotion runs after the token is
+    // revoked, so the values must outlive it.
+    let temp = tempfile::tempdir().unwrap(); // safety: test
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(staging.join("projects")).unwrap(); // safety: test
+    let value = "granted-credential-write-back-value";
+    std::fs::write(staging.join("projects/leak.md"), format!("copied: {value}")).unwrap(); // safety: test
+
+    let token_store = TokenStore::new();
+    let job_id = Uuid::new_v4();
+    let _token = token_store.create_token(job_id).await;
+    token_store
+        .store_credential_values(job_id, vec![secrecy::SecretString::from(value.to_string())])
+        .await;
+    token_store.revoke(job_id).await;
+
+    let deps = PromotionDeps {
+        containers: Arc::new(RwLock::new(HashMap::new())),
+        token_store,
+        workspace: None,
+        store: None,
+    };
+    let summary = run_promotion(
+        &deps,
+        job_id,
+        "owner",
+        &staging,
+        &harness::WriteBackPolicy::default(),
+    )
+    .await;
+    assert!(!summary.skipped, "the scan itself must run: {summary:?}");
+    assert!(
+        summary
+            .rejections
+            .iter()
+            .any(|rejection| rejection.relative_path == "projects/leak.md"
+                && rejection.reason.contains("granted credential")),
+        "a staged file with a served credential value must be rejected: {:?}",
+        summary.rejections
+    );
+}
+
 #[cfg(all(test, feature = "libsql"))]
 mod promotion {
     use super::*;

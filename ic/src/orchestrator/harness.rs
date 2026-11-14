@@ -2059,6 +2059,14 @@ fn relative_lossy(base: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Write-back rejection reasons for a staged path or file that contains a
+/// value from the job redactor: a mounted harness secret (CW-10) or a
+/// credential served to the job (WI#666).
+const STAGED_PATH_SECRET_REASON: &str =
+    "staged path embeds a worker secret value (mounted secret or granted credential)";
+const STAGED_CONTENT_SECRET_REASON: &str =
+    "content embeds a worker secret value (mounted secret or granted credential)";
+
 struct ScreenInput<'a> {
     path: &'a Path,
     relative: &'a str,
@@ -2080,10 +2088,12 @@ fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
     // job can name a file after a mounted secret value, and that name lands
     // in the `harness_write_back` audit event and the `wait=true` result.
     // Reject before any read so the value never reaches the write set.
+    // WI#666: the job redactor also holds the credential values served to
+    // the job, so the reason names both sources.
     if let Some(redactor) = input.redactor
         && redactor.contains_secret(&relative)
     {
-        return Err("staged path embeds a mounted worker secret value".to_string());
+        return Err(STAGED_PATH_SECRET_REASON.to_string());
     }
     if !input.policy.root_allows(&relative) {
         return Err(format!(
@@ -2127,7 +2137,7 @@ fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
     if let Some(redactor) = input.redactor
         && redactor.contains_secret(&content)
     {
-        return Err("content embeds a mounted worker secret value".to_string());
+        return Err(STAGED_CONTENT_SECRET_REASON.to_string());
     }
     Ok(StagedWrite {
         relative_path: relative,
@@ -2818,7 +2828,7 @@ mod tests {
         assert!(
             plan.rejections
                 .iter()
-                .any(|r| r.reason == "staged path embeds a mounted worker secret value"),
+                .any(|r| r.reason == STAGED_PATH_SECRET_REASON),
             "the secret-named staged file must be rejected by the path scan, got {plan:?}"
         );
         // The secret value must never appear in the recorded rejection.

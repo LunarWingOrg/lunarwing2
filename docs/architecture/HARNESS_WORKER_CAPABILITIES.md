@@ -169,17 +169,6 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   `/complete` before persistence and broadcast; the redactor is cleared on the
   same terminal paths, and cache insertion is skipped when a terminal clear
   raced the build (EE-4).
-- **Granted credential values (WI#666):** the `credentials` channel is a
-  second env-bearing channel — `/worker/{id}/credentials` and
-  `/worker/{id}/mcp/credentials` decrypt granted secrets and the worker injects
-  them into child-process env. Both the worker redactor and the daemon-side
-  backstop are armed with those values on top of the mounted secret values, so
-  a child that `printenv`s a live third-party credential has it scrubbed from
-  tool results, tool arguments, and `/complete` exactly like a mounted secret.
-  The daemon records the decrypted values in the per-job token store when the
-  grant is served and releases them on the same terminal clears (they survive
-  `revoke`, like harness values, because promotion and late events run after
-  the token dies).
   - NOT covered (documented gaps): offset/grouped dump formats — plain
     `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
     and never contain a contiguous encoded span; base32 and other alphabets;
@@ -213,6 +202,36 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   - Values shorter than 8 bytes are not value-redacted (scrubbing would
     mangle legitimate output). They are not exported to child env, but a
     tool can still print them.
+- **Granted credential values (WI#666):** the `credentials` channel is a
+  second env-bearing channel — `/worker/{id}/credentials` and
+  `/worker/{id}/mcp/credentials` decrypt granted secrets and the worker injects
+  them into child-process env. Both the conventional worker's redactor and the
+  daemon-side backstop are armed with those values on top of the mounted secret
+  values, so a child that `printenv`s a live third-party credential has it
+  scrubbed from tool results, tool arguments, and `/complete` exactly like a
+  mounted secret. An ACP-bridge job has no worker-side redactor: it pulls
+  `/credentials` only, and its granted values are scrubbed by the daemon
+  backstop alone.
+  The limits listed above for mounted values apply to granted values as well,
+  with one difference: a granted value **is** in a child's env, so one shorter
+  than 8 bytes can be read there and is not value-redacted.
+  - The daemon records the decrypted values in the per-job token store when
+    the grant is served, and only while the job's token is live: a request
+    that is still decrypting when the job ends records nothing. The values
+    survive `revoke`, like harness values, because the write-back scan runs
+    after the token dies, and they are released on the same terminal clears.
+  - Values are recorded at request time, so the cached redactor is rebuilt
+    whenever a pull adds a value. A redactor built from an older set is never
+    cached; a repeated pull of known values keeps the cache.
+  - The conventional worker's own model sees `[redacted-secret]` in place of
+    a granted value in tool output. A task must pass the variable, not the
+    literal. An ACP-bridge agent sees its own tool output unscrubbed; only
+    its events and completion message are scrubbed, at the daemon.
+  - The write-back scan (section 3) uses the same redactor, so a staged path
+    or file that contains a granted value is rejected like one that contains
+    a mounted value. That includes a non-secret value that is kept in the
+    secrets store and granted to the job, such as a user name of 8 bytes or
+    more.
 
 ## 2. Read-only file/memory injection (`inject_files`)
 
@@ -279,7 +298,9 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     (`take(max+1)`); the walk is capped at 4096 entries and the rejection
     list at 128 entries (CW-6).
   - UTF-8 only; `LeakDetector` scan plus an exact-value scan against the
-    job's own mounted secrets (CW-10).
+    job's own mounted secrets (CW-10) and the credential values served to it
+    (WI#666). A value-scan hit is rejected with `embeds a worker secret value
+    (mounted secret or granted credential)`.
   - A staged file named exactly like a root (`projects`) is rejected —
     promotion targets are files BELOW an allowed root (DH-9).
   - Final write goes through `Workspace::write`. Note (DH-9): the
