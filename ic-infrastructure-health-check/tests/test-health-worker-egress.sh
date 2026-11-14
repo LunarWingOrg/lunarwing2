@@ -316,6 +316,11 @@ chmod 0600 "$FIXTURE/pm1.env"
   printf 'ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }\n'
   printf '_install_health_cron() { :; }\n'
   printf '_install_health_systemd_timer() { :; }\n'
+  # The library install hands the tree to root (WI#687), which this
+  # unprivileged fixture cannot do; test-mt-admin-health-library-security.sh
+  # covers it. PM-1 reads health.env and the launch mode, so an empty
+  # library directory is enough here.
+  printf 'sync_health_pipeline_library() { mkdir -p "$HEALTH_LIB_DIR"; }\n'
   printf 'HEALTH_ENV_FILE=%q\n' "$FIXTURE/pm1.env"
   printf 'HEALTH_SRC_DIR=%q\n' "$PIPELINE_SRC"
   printf 'HEALTH_LIB_DIR=%q\n' "$FIXTURE/pm1-lib"
@@ -330,6 +335,11 @@ chmod 0600 "$FIXTURE/pm1.env"
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
   awk '/^health_env_reconcile_line\(\) \{/,/^\}/' \
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
+  # The launcher step embeds the library checks with `declare -f`.
+  awk '/^health_lib_validate_root_owned_directory\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
+  awk '/^health_lib_tree_require_safe\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
   printf 'ensure_health_pipeline\n'
 } >"$PIPELINE_RUN"
 if bash "$PIPELINE_RUN"; then
