@@ -1782,6 +1782,10 @@ async fn assert_netbird_joined_run(
         .map_err(|error| error.to_string())?;
     let backup = assert_netbird_resolver_policy(sidecar).await?;
     let old_resolver_probe = old_resolver_probe(&backup);
+    let resolv_conf = sidecar
+        .tunnel_resolv_conf()
+        .map_err(|error| error.to_string())?
+        .ok_or("NetBird resolver file is not staged for joined runs")?;
     let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
         .await
         .map_err(|error| error.to_string())?;
@@ -1790,7 +1794,7 @@ async fn assert_netbird_joined_run(
         ..ResourceLimits::default()
     };
     let command = format!(
-        "cat /etc/resolv.conf; cat /proc/net/dev; \
+        "cat /etc/resolv.conf; cat /proc/net/dev; cat /proc/self/mountinfo; \
          wget -qO- -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
          && echo LUNARWING-NETBIRD-OVERLAY-OK; \
          {dns_probe} {old_resolver_probe} \
@@ -1811,7 +1815,7 @@ async fn assert_netbird_joined_run(
             tunnel: Some(TunnelRunConfig {
                 container_id: &container_id,
                 dns: &[],
-                resolv_conf: None,
+                resolv_conf: resolv_conf.as_deref(),
             }),
             protected_paths: &[],
             tenant_logs: false,
@@ -1819,6 +1823,7 @@ async fn assert_netbird_joined_run(
         .await
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert_read_only_resolver_mount(&output.stdout);
     assert!(output.stdout.contains("wt0"), "joined run has no wt0");
     for marker in [
         "LUNARWING-NETBIRD-OVERLAY-OK",
