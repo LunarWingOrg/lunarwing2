@@ -1153,7 +1153,7 @@ impl TunnelSidecar {
             return Ok(None);
         };
         if self.cfg.provider == TunnelProvider::Netbird {
-            return Ok(path.is_file().then_some(path));
+            return Ok(Some(path));
         }
         let contents = std::iter::once("# lunarwing-tunnel-dns\n".to_string())
             .chain(
