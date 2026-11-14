@@ -34,6 +34,79 @@ class OverlayTests(unittest.TestCase):
         self.assertNotIn("LUNARDEPTH_API_KEY:", rendered)
         self.assertIn("authToken: !!js process.env.LUNARDEPTH_LOCAL_AUTH_TOKEN", rendered)
 
+    def test_tensormoon_id_renders_the_template_dialect_unchanged(self):
+        # Installed overlays and their launch-contract digests must not move
+        # for a TensorMoon route: only the URL and the model id are substituted.
+        template = self.template.read_text(encoding="utf-8")
+        rendered = MODULE.render(
+            template, "https://tensormoon.example.test/openai/v1", "tensormoon::tenant_model::lunarwing", False
+        )
+        self.assertEqual(
+            rendered,
+            template.replace(MODULE.PLACEHOLDER_URL, "'https://tensormoon.example.test/openai/v1'")
+            .replace(MODULE.PLACEHOLDER_MODEL, "tensormoon::tenant_model::lunarwing"),
+        )
+        self.assertEqual(rendered.count("    provider: tensormoon\n"), 2)
+        self.assertIn("      tensormoon:\n        displayName: TensorMoon\n", rendered)
+
+    def test_tensorzero_id_renders_a_tensorzero_provider_route(self):
+        template = self.template.read_text(encoding="utf-8")
+        url = "https://tensorzero.example.test/openai/v1"
+        rendered = MODULE.render(template, url, "tensorzero::function_name::lunarwing", False)
+        self.assertIn(f"baseURL: '{url}'", rendered)
+        # Worker row, provider model list and agent-default-model name one id.
+        self.assertEqual(rendered.count("tensorzero::function_name::lunarwing"), 3)
+        self.assertEqual(rendered.count("    provider: tensorzero\n"), 2)
+        self.assertIn("      tensorzero:\n        displayName: TensorZero\n", rendered)
+        self.assertNotIn("tensormoon", rendered.lower())
+        # The dialect changes the provider naming and nothing else.
+        self.assertEqual(
+            rendered.replace("tensorzero", "tensormoon").replace("TensorZero", "TensorMoon"),
+            MODULE.render(
+                template, "https://tensormoon.example.test/openai/v1", "tensormoon::function_name::lunarwing", False
+            ),
+        )
+        self.assertNotIn("baseURLEnv:", rendered)
+        self.assertNotIn("LUNARDEPTH_API_KEY:", rendered)
+        self.assertIn("apiKeyEnv: LUNARDEPTH_API_KEY", rendered)
+        self.assertIn("allowInsecureHTTP: false", rendered)
+        self.assertIn(
+            "allowInsecureHTTP: true",
+            MODULE.render(template, "http://10.0.0.2:3000/openai/v1", "tensorzero::function_name::lunarwing", True),
+        )
+
+    def test_model_dialects(self):
+        url = "https://example.test/openai/v1"
+        for model in (
+            "tensormoon::function_name::lunarwing",
+            "tensorzero::function_name::lunarwing",
+            "tensorzero::tenant_model::lunarwing",
+        ):
+            MODULE.validate_route(url, model, False)
+        for model in (
+            "tensorone::function_name::lunarwing",
+            "TensorZero::function_name::lunarwing",
+            "tensorzero::function_name::other",
+            "tensorzero::function_name::lunarwing::variant_name::primary",
+            "tensorzero::lunarwing",
+            "xtensorzero::function_name::lunarwing",
+            "tensorzero::function_name::lunarwing\n",
+        ):
+            with self.subTest(model=model), self.assertRaisesRegex(ValueError, "model must"):
+                MODULE.validate_route(url, model, False)
+
+    def test_provider_placeholder_drift_is_refused_in_both_dialects(self):
+        template = self.template.read_text(encoding="utf-8")
+        for drifted in (
+            template.replace("    provider: tensormoon\n", "    provider: other\n", 1),
+            template.replace("      tensormoon:\n", "      other:\n"),
+            template.replace("        displayName: TensorMoon\n", ""),
+            template + "\n- id: extra\n  config:\n    provider: tensormoon\n",
+        ):
+            for model in ("tensormoon::function_name::lunarwing", "tensorzero::function_name::lunarwing"):
+                with self.subTest(model=model), self.assertRaisesRegex(ValueError, "reviewed pin"):
+                    MODULE.render(drifted, "https://example.test/openai/v1", model, False)
+
     def test_transport_validation(self):
         MODULE.validate_route("http://127.0.0.1:3000/openai/v1", "tensormoon::local::lunarwing", False)
         MODULE.validate_route("http://[::1]:3000/openai/v1", "tensormoon::local::lunarwing", False)
@@ -98,6 +171,27 @@ class OverlayTests(unittest.TestCase):
             )
             self.assertNotEqual(both.returncode, 0)
             self.assertEqual(both.stdout, b"")
+
+    def test_stored_overlay_is_refused_when_the_route_changes_dialect(self):
+        # The task container checks the installed bytes against its own route:
+        # an overlay rendered for one gateway dialect never passes for the other.
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(__file__).with_name("render_overlay.py")
+            command = [
+                sys.executable, "-I", str(script),
+                "--template", str(self.template),
+                "--base-url", "https://example.test/openai/v1",
+            ]
+            tensorzero = ["--model", "tensorzero::function_name::lunarwing"]
+            tensormoon = ["--model", "tensormoon::function_name::lunarwing"]
+            printed = subprocess.run([*command, *tensorzero, "--stdout"], check=True, capture_output=True)
+            self.assertEqual(printed.stderr, b"")
+            staged = Path(directory) / "staged.yml"
+            staged.write_bytes(printed.stdout)
+            subprocess.run([*command, *tensorzero, "--check", str(staged)], check=True)
+            drift = subprocess.run([*command, *tensormoon, "--check", str(staged)], capture_output=True, text=True)
+            self.assertNotEqual(drift.returncode, 0)
+            self.assertIn("effective overlay drift", drift.stderr)
 
 
 if __name__ == "__main__":

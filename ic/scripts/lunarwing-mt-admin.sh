@@ -307,8 +307,10 @@ Commands:
                                    (v2 lane; keep off tenants that already run
                                    the proven v1 opencode worker)
     --with-lunardepth              Select LunarDepth; requires an explicit route
-    --lunardepth-base-url <url>    TensorMoon-compatible API root (never inherited)
-    --lunardepth-model <model>     Complete tensormoon::<function>::lunarwing id
+    --lunardepth-base-url <url>    TensorMoon or TensorZero API root (never inherited)
+    --lunardepth-model <model>     Complete tensormoon::<function>::lunarwing or
+                                   tensorzero::<function>::lunarwing id, in the
+                                   dialect of the gateway behind the base URL
     --lunardepth-api-key-file <path>
                                    Per-tenant revocable key, staged for the task only
                                    (add-tenants: accepted for one tenant only)
@@ -554,8 +556,10 @@ Commands:
     --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
 
-  configure-lunardepth <name>      Set the explicit TensorMoon-compatible LunarDepth route
-    --model <model>                Complete tensormoon::<function>::lunarwing model id
+  configure-lunardepth <name>      Set the explicit TensorMoon or TensorZero LunarDepth route
+    --model <model>                Complete tensormoon::<function>::lunarwing or
+                                   tensorzero::<function>::lunarwing model id, in the
+                                   dialect of the gateway behind the base URL
     --base-url <url>               Complete OpenAI-compatible API root (no inheritance)
     --api-key-file <path>          Stage a per-tenant revocable key only in the task env;
                                    that key is visible to the model. Omitted values survive.

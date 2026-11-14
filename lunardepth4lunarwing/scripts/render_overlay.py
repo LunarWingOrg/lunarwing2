@@ -12,12 +12,27 @@ from urllib.parse import urlsplit
 
 PLACEHOLDER_URL = "https://set-lunardepth-base-url.invalid/openai/v1"
 PLACEHOLDER_MODEL = "tensormoon::function_name::lunarwing"
-MODEL_PATTERN = re.compile(r"^tensormoon::[A-Za-z0-9_-]+::lunarwing$")
+# The prefix of the model id names the gateway dialect. A gateway answers only
+# ids that carry its own prefix, so the id alone selects the dialect and the
+# provider row is named after it.
+DIALECT_DISPLAY_NAMES = {"tensormoon": "TensorMoon", "tensorzero": "TensorZero"}
+MODEL_PATTERN = re.compile(r"^(tensormoon|tensorzero)::[A-Za-z0-9_-]+::lunarwing$")
+# The template is written in the TensorMoon dialect. Each entry is one of its
+# provider lines, how often the reviewed template contains it, and its form in
+# the selected dialect; a TensorMoon id renders every line unchanged.
+PLACEHOLDER_PROVIDER_LINES = (
+    ("    provider: tensormoon\n", 2, "    provider: {provider}\n"),
+    ("      tensormoon:\n", 1, "      {provider}:\n"),
+    ("        displayName: TensorMoon\n", 1, "        displayName: {display_name}\n"),
+)
 
 
 def validate_route(base_url: str, model: str, allow_insecure: bool) -> None:
     if not MODEL_PATTERN.fullmatch(model):
-        raise ValueError("model must have the tensormoon::<function_name>::lunarwing form")
+        raise ValueError(
+            "model must have the tensormoon::<function_name>::lunarwing"
+            " or tensorzero::<function_name>::lunarwing form"
+        )
     if any(ord(character) < 0x21 or ord(character) == 0x7F for character in base_url):
         raise ValueError("base URL must not contain whitespace or control characters")
     parsed = urlsplit(base_url)
@@ -49,9 +64,19 @@ def yaml_string(value: str) -> str:
 
 def render(template: str, base_url: str, model: str, allow_insecure: bool) -> str:
     validate_route(base_url, model, allow_insecure)
-    if template.count(PLACEHOLDER_URL) != 1 or template.count(PLACEHOLDER_MODEL) != 3:
+    if (
+        template.count(PLACEHOLDER_URL) != 1
+        or template.count(PLACEHOLDER_MODEL) != 3
+        or any(template.count(line) != count for line, count, _ in PLACEHOLDER_PROVIDER_LINES)
+    ):
         raise ValueError("overlay template placeholders do not match the reviewed pin")
-    rendered = template.replace(PLACEHOLDER_URL, yaml_string(base_url)).replace(PLACEHOLDER_MODEL, model)
+    provider = model.split("::", 1)[0]
+    rendered = template
+    for line, _, dialect_form in PLACEHOLDER_PROVIDER_LINES:
+        rendered = rendered.replace(
+            line, dialect_form.format(provider=provider, display_name=DIALECT_DISPLAY_NAMES[provider])
+        )
+    rendered = rendered.replace(PLACEHOLDER_URL, yaml_string(base_url)).replace(PLACEHOLDER_MODEL, model)
     expected = "allowInsecureHTTP: true" if allow_insecure else "allowInsecureHTTP: false"
     rendered = rendered.replace("allowInsecureHTTP: false", expected)
     if "baseURLEnv:" in rendered or "AGENT_AUTH_TOKEN" in rendered or "LUNARDEPTH_API_KEY:" in rendered:

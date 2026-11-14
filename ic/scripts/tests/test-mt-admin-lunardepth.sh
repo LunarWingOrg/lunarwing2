@@ -222,6 +222,54 @@ diff -u "$expected" "$calls"
   refute _lunardepth_overlay_size_ok "$TMP/missing.yml"
 )
 
+# ── WI#691: a TensorZero-form route is configured, re-validated and rendered ──
+# A gateway answers only ids that carry its own prefix, so the lane accepts
+# both dialects and nothing else. Its own env directory keeps this tenant state
+# apart from the sections above.
+(
+  tenant_exists_in_registry() { return 0; }
+  tenant_env_dir() { printf '%s/tz-env' "$TMP"; }
+  read_tenant_env_value() { [[ ! -f "$2" ]] || sed -n "s/^$3=//p" "$2"; }
+  write_tenant_file_atomic() { cat >"$2"; }
+  render_lunardepth_overlay() { echo "configure rendered the overlay" >&2; exit 1; }
+  ensure_external_worker_config() { :; }
+  _lunardepth_pair_running() { return 1; }
+  mkdir -p "$TMP/tz-env"
+  configure_lunardepth demo tensorzero::function_name::lunarwing \
+    http://10.20.30.40:3000/openai/v1 tz-test-only-key true false >"$TMP/tz-configure.out"
+  grep -q "explicit tensorzero:: route" "$TMP/tz-configure.out"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::lunarwing' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_BASE_URL=http://10.20.30.40:3000/openai/v1' "$TMP/tz-env/lunardepth.env"
+  grep -qx 'LUNARDEPTH_MODEL=tensorzero::function_name::lunarwing' "$TMP/tz-env/lunardepth-task.env"
+  grep -qx 'LUNARDEPTH_API_KEY=tz-test-only-key' "$TMP/tz-env/lunardepth-task.env"
+  refute grep -q 'LUNARDEPTH_API_KEY' "$TMP/tz-env/lunardepth.env"
+  # Start and the upgrade preflight re-validate the stored route as written.
+  _lunardepth_route demo
+  [[ "$LUNARDEPTH_MODEL_RESOLVED" == "tensorzero::function_name::lunarwing" ]]
+  _ctr() { shift; printf '%s\n' "$@" >"$TMP/tz-render.args"; printf 'rendered-overlay\n'; }
+  [[ "$(_lunardepth_render_in_image demo)" == "rendered-overlay" ]]
+  grep -qx -- 'tensorzero::function_name::lunarwing' "$TMP/tz-render.args"
+  grep -qx -- '--allow-insecure-http' "$TMP/tz-render.args"
+  # The egress allowlist derives from the configured endpoint alone; the
+  # dialect adds no target.
+  [[ "$(worker_egress_lunardepth_backend demo)" == "http://10.20.30.40:3000/openai/v1" ]]
+  [[ "$(_worker_egress_llm_targets demo)" == "http://10.20.30.40:3000/openai/v1" ]]
+  # The TensorMoon form still validates. An id of neither dialect, or one that
+  # carries the variant suffix a gateway reply echoes, is refused and nothing
+  # is written.
+  _lunardepth_validate_route https://tensormoon.example.test/openai/v1 tensormoon::function_name::lunarwing false
+  before_env="$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")"
+  for bad_model in openai::function_name::lunarwing \
+      tensorzero::function_name::lunarwing::variant_name::primary; do
+    if (configure_lunardepth demo "$bad_model" '' '' preserve preserve) >"$TMP/tz-configure.out" 2>&1; then
+      echo "configure accepted a model id outside both gateway dialects: $bad_model" >&2
+      exit 1
+    fi
+    grep -q 'tensorzero::<function_name>::lunarwing' "$TMP/tz-configure.out"
+    [[ "$before_env" == "$(sha256sum "$TMP/tz-env/lunardepth.env" "$TMP/tz-env/lunardepth-task.env")" ]]
+  done
+)
+
 # ── ZP-6: the out-of-band verifier never reads the image as root ─────────────
 (
   mkdir -p "$TMP/oob-source"
@@ -399,4 +447,4 @@ env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 "$(command -v python3)" -I \
   [[ -f "$snapshot/.gitlab/scripts/worker_candidate_config.py" ]]
 )
 
-echo "test-mt-admin-lunardepth: registry v18 migration, lifecycle, bridge flags, overlay rendering, verifier isolation, fleet keys and archive checks passed"
+echo "test-mt-admin-lunardepth: registry v18 migration, lifecycle, bridge flags, overlay rendering, gateway dialects, verifier isolation, fleet keys and archive checks passed"

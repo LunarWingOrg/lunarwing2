@@ -18,7 +18,7 @@ The bridge holds only the tenant hub credential. The task holds only the local t
 
 ## Required model configuration
 
-The lane does not inherit TensorZero, another worker, `LLM_BASE_URL`, or `LLM_MODEL`. Configure an explicit TensorMoon-compatible API root and model:
+The lane does not inherit the tenant's TensorZero endpoint, another worker, `LLM_BASE_URL`, or `LLM_MODEL`. Configure an explicit TensorMoon or TensorZero API root and a model id in that gateway's dialect:
 
 ```sh
 ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
@@ -28,6 +28,13 @@ ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
 ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-lunardepth
 ic/scripts/lunarwing-mt-admin.sh start-worker <tenant> lunardepth
 ```
+
+Two id forms are accepted, and the prefix names the gateway each one targets:
+
+- `tensormoon::<function_name>::lunarwing` targets a TensorMoon gateway, which serves the `lunarwing` function as `tensormoon::function_name::lunarwing`. The rendered provider row is `tensormoon`.
+- `tensorzero::<function_name>::lunarwing` targets a TensorZero gateway, which serves it as `tensorzero::function_name::lunarwing`. The rendered provider row is `tensorzero`.
+
+A gateway refuses an id in the other dialect, and the lane rewrites nothing, so a TensorZero tenant passes `--base-url https://tensorzero.example.com/openai/v1 --model tensorzero::function_name::lunarwing`. `render_overlay.py` selects the dialect from the id alone: it renames the provider row and the two rows that select it, and changes nothing else. A TensorMoon id renders the template's own bytes. Any other id, including one with the `::variant_name::<variant>` suffix a gateway reply echoes, fails route validation.
 
 The URL excludes `/chat/completions`. HTTPS is required beyond loopback. A private-network cleartext exception requires the distinct `--allow-insecure-http` option. A deliberately unauthenticated gateway requires the separate `--allow-unauthenticated-gateway` option and uses only LunarDepth's nonempty placeholder behavior. Clear those exceptions with `--disallow-insecure-http` and `--require-api-key`. Existing tenants receive their v18 lane ports, registry selection, and daemon endpoint during configuration; route and key values are written literally without Podman-env quotes. `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored.
 
@@ -82,7 +89,7 @@ ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>
 ic/scripts/lunarwing-mt-admin.sh worker-smoke <tenant> lunardepth
 ```
 
-Podman 4.5+ or Docker BuildKit/buildx is required for the inline `RUN --network=none` split-role smoke. The build host, the CI runners that build the image and every tenant host need Linux 6.10 or newer with `landlock` in the active LSM list: the pinned launcher reports `fully enforced` only from Landlock ABI 5, and a partial probe is refused. mt-admin checks this before a build and in the upgrade preflight. Protected candidate builds additionally require an uncached clean rebuild with the same whole-image digest, out-of-band rootfs/config verification, a CRITICAL vulnerability gate, and manual promotion of the verified digest. Local tests do not replace those protected jobs or live TensorMoon/OpenRC acceptance.
+Podman 4.5+ or Docker BuildKit/buildx is required for the inline `RUN --network=none` split-role smoke. The build host, the CI runners that build the image and every tenant host need Linux 6.10 or newer with `landlock` in the active LSM list: the pinned launcher reports `fully enforced` only from Landlock ABI 5, and a partial probe is refused. mt-admin checks this before a build and in the upgrade preflight. Protected candidate builds additionally require an uncached clean rebuild with the same whole-image digest, out-of-band rootfs/config verification, a CRITICAL vulnerability gate, and manual promotion of the verified digest. Local tests do not replace those protected jobs or live gateway/OpenRC acceptance.
 
 ### Compose
 

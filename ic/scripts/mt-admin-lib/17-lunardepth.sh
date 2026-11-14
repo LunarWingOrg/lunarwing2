@@ -230,10 +230,11 @@ configure_lunardepth() {
   ports_enable_worker "$name" lunardepth
   ensure_external_worker_config "$name" lunardepth lunardepth_wss \
     || die "could not safely write the LunarDepth external-worker config for tenant '$name'"
+  # The validated id starts with its gateway dialect, tensormoon or tensorzero.
   if [[ "$allow_placeholder" == "true" ]]; then
-    say "LunarDepth configured for tenant '$name' (explicit TensorMoon-compatible route; unauthenticated-gateway exception on, no key stored)"
+    say "LunarDepth configured for tenant '$name' (explicit ${model%%::*}:: route; unauthenticated-gateway exception on, no key stored)"
   else
-    say "LunarDepth configured for tenant '$name' (explicit TensorMoon-compatible route; key staged only in the task env)"
+    say "LunarDepth configured for tenant '$name' (explicit ${model%%::*}:: route; key staged only in the task env)"
   fi
   # The effective overlay and its digest belong to the running units. They are
   # replaced together with those units, never underneath them: a half-applied
