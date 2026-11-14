@@ -123,6 +123,7 @@ run_mock_tests() {
   MOCK_ROOT="$TEST_ROOT"
   MOCK_REAL_USER="$(id -un)"
   MOCK_CHOWN_LOG="$TEST_ROOT/chown.log"
+  : >"$MOCK_CHOWN_LOG"
   MOCK_HEALTH_LIB_DIR="$TEST_ROOT/health-lib"
   MOCK_NONROOT_DIR=""
   MOCK_UNSAFE_ENTRY=""
@@ -184,6 +185,13 @@ run_real_tests() {
   chmod 0755 "$HEALTH_LIB_DIR/cron-wrapper.sh"
   chown 65534:65534 "$HEALTH_LIB_DIR/cron-wrapper.sh"
   assert_launcher_refused "non-root-owned wrapper"
+  HEALTH_SRC_DIR="$TEST_ROOT/health-contract-link"
+  ln -s "$HEALTH_LIB_DIR" "$HEALTH_SRC_DIR"
+  local contract_status=0
+  require_safe_installed_health_source >/dev/null 2>&1 || contract_status=$?
+  assert_eq "OpenRC snapshot source guard refuses a linked unsafe library" "1" "$contract_status"
+  rm "$HEALTH_SRC_DIR"
+  HEALTH_SRC_DIR="$TEST_ROOT/source"
   chown root:root "$HEALTH_LIB_DIR/cron-wrapper.sh"
   chown 65534:65534 "$HEALTH_LIB_DIR"
   assert_launcher_refused "non-root-owned library directory"
