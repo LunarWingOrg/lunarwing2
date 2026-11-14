@@ -3497,13 +3497,98 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn slow_health_fixture(
+    #[derive(Clone, Copy)]
+    enum HealthScript {
+        Slow,
+        SlowFirewall,
+        HealthyOnFinalPoll,
+        Healthy,
+    }
+
+    #[cfg(unix)]
+    struct HealthReply {
+        delay: Duration,
+        stdout: String,
+        success: bool,
+    }
+
+    #[cfg(unix)]
+    impl HealthReply {
+        fn success(stdout: impl Into<String>) -> Self {
+            Self {
+                delay: Duration::ZERO,
+                stdout: stdout.into(),
+                success: true,
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                delay: Duration::ZERO,
+                stdout: String::new(),
+                success: false,
+            }
+        }
+
+        fn after(mut self, seconds: u64) -> Self {
+            self.delay = Duration::from_secs(seconds);
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_netbird_health(command: Option<&str>, listing: &str) -> HealthReply {
+        match command {
+            Some("netbird") => HealthReply::success(""),
+            Some("cat") => HealthReply::success("nameserver 9.9.9.9\n"),
+            Some("nft") => HealthReply::success(listing),
+            other => panic!("unexpected sidecar exec: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_reply(
+        script: HealthScript,
+        command: Option<&str>,
+        attempt: usize,
+        listing: &str,
+    ) -> HealthReply {
+        match script {
+            HealthScript::Slow => HealthReply::success("").after(30),
+            HealthScript::SlowFirewall if command == Some("cat") => {
+                successful_netbird_health(command, listing).after(30)
+            }
+            HealthScript::SlowFirewall | HealthScript::Healthy => {
+                successful_netbird_health(command, listing)
+            }
+            HealthScript::HealthyOnFinalPoll => match (command, attempt) {
+                (Some("netbird"), 0..=2) => HealthReply::failure(),
+                (Some("netbird"), 3) => successful_netbird_health(command, listing).after(1),
+                _ => successful_netbird_health(command, listing),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_runtime_output(stdout: String, success: bool) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_fixture(
         label: &str,
+        script: HealthScript,
     ) -> (
         TunnelSidecar,
         PathBuf,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let base =
             std::env::temp_dir().join(format!("lw-tunnel-health-{label}-{}", uuid::Uuid::new_v4()));
@@ -3512,32 +3597,47 @@ mod tests {
         let instance = instance_id_for(&base);
         let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let removed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let exec_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listing = listing_for(&EgressPolicy {
+            tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
+            resolvers: vec!["9.9.9.9".parse().unwrap()],
+        });
         let runtime = crate::sandbox::cli_runner::TestRuntime::new({
             let removals = removals.clone();
             let removed = removed.clone();
+            let exec_calls = exec_calls.clone();
             move |args, _stdin| {
                 let instance = instance.clone();
                 let removals = removals.clone();
                 let removed = removed.clone();
+                let exec_calls = exec_calls.clone();
+                let listing = listing.clone();
                 let container_id = "2".repeat(64);
                 async move {
-                    let stdout = match args.first().map(String::as_str) {
+                    let (stdout, success) = match args.first().map(String::as_str) {
                         Some("exec") => {
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            String::new()
+                            let attempt =
+                                exec_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let reply = health_reply(
+                                script,
+                                args.get(2).map(String::as_str),
+                                attempt,
+                                &listing,
+                            );
+                            tokio::time::sleep(reply.delay).await;
+                            (reply.stdout, reply.success)
                         }
                         Some("inspect") => {
-                            format!("{container_id}|true|test-hash|{instance}\n")
+                            (format!("{container_id}|true|test-hash|{instance}\n"), true)
                         }
                         Some("rm") => {
                             removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             removed.notify_one();
-                            String::new()
+                            (String::new(), true)
                         }
-                        Some("container") => format!("{container_id}\n"),
                         other => panic!("unexpected runtime call: {other:?}"),
                     };
-                    Ok(successful_runtime_output(stdout))
+                    Ok(health_runtime_output(stdout, success))
                 }
             }
         });
@@ -3548,6 +3648,19 @@ mod tests {
             &runtime_dir,
         )
         .with_test_runtime(runtime);
+        (sidecar, base, removals, removed, exec_calls)
+    }
+
+    #[cfg(unix)]
+    fn slow_health_fixture(
+        label: &str,
+    ) -> (
+        TunnelSidecar,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (sidecar, base, removals, removed, _) = health_fixture(label, HealthScript::Slow);
         (sidecar, base, removals, removed)
     }
 
@@ -3565,6 +3678,75 @@ mod tests {
         assert!(error.to_string().contains("remained unhealthy for 6s"));
         assert_eq!(started.elapsed(), Duration::from_secs(6));
         assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_deadline_bounds_slow_firewall_and_removes_container() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("firewall-deadline", HealthScript::SlowFirewall);
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remained unhealthy for 6s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_uses_last_interval_for_one_more_bounded_probe() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("final-poll", HealthScript::HealthyOnFinalPoll);
+
+        let started = tokio::time::Instant::now();
+        sidecar.wait_healthy(Duration::from_secs(6)).await.unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_accepts_a_successful_chain() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("success", HealthScript::Healthy);
+
+        let started = tokio::time::Instant::now();
+        sidecar.wait_healthy(Duration::from_secs(6)).await.unwrap();
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn provider_ready_deadline_bounds_slow_probe() {
+        let (sidecar, base, _removals, _removed) = slow_health_fixture("provider-ready");
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_provider_ready(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider remained unhealthy for the 6s per-run cap")
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
         std::fs::remove_dir_all(base).unwrap();
     }
 
