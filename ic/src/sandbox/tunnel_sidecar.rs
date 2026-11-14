@@ -10,10 +10,11 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it and, by default, DNS to the resolvers the
-//!   runtime gave the sidecar. For WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to
-//!   resolvers reachable through the tunnel and removes the uplink allowance;
-//!   NetBird rejects that setting during configuration validation (WI#603).
+//!   mark the provider sets on it and DNS to the current sidecar resolvers.
+//!   WireGuard uses runtime resolvers by default; `SANDBOX_TUNNEL_DNS` moves
+//!   joined-run DNS into the tunnel and removes the uplink allowance. NetBird
+//!   replaces the sidecar file with its local overlay resolver and rejects that
+//!   setting during configuration validation (WI#603).
 //!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
@@ -249,7 +250,7 @@ impl TunnelSidecarConfig {
         }
         if self.provider == TunnelProvider::Netbird && !self.dns.is_empty() {
             return Err(
-                "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+                "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use NetBird-managed DNS"
                     .into(),
             );
         }
@@ -710,8 +711,9 @@ fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
 }
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
-/// own control traffic (by socket mark) and, unless custom tunnel DNS is set,
-/// DNS to the runtime-assigned resolvers. Everything else uses the tunnel or drops.
+/// own control traffic (by socket mark) and DNS to its current resolver list.
+/// WireGuard custom DNS empties that list; managed NetBird DNS leaves only its
+/// local overlay resolver. Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     pub tunnel_mark: u32,
@@ -3542,7 +3544,7 @@ mod tests {
         let error = cfg.validate().unwrap_err();
         assert_eq!(
             error,
-            "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+            "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use NetBird-managed DNS"
         );
         assert!(!error.contains("setup-key-1"));
         let misplaced_canary = TunnelSidecarConfig {
