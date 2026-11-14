@@ -26,6 +26,19 @@ LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASSERT = LANE_ROOT / "scripts" / "exposure_policy_assert.py"
 WRAPPER = LANE_ROOT / "scripts" / "opencode-exposure-guard.sh"
 
+CONSOLE_GUARD = '''case "${LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL:-0}" in
+  1|true|TRUE|yes|YES|on|ON) console_credential_opt_in=true ;;
+  0|false|FALSE|no|NO|off|OFF|"") console_credential_opt_in=false ;;
+  *) die "LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL must be a boolean" ;;
+esac
+if [ -n "${OPENCODE_API_KEY+x}" ]; then
+  if [ "$console_credential_opt_in" != true ]; then
+    die "OPENCODE_API_KEY is present; refusing startup without LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1"
+  fi
+fi
+'''
+ROLE_BOUNDARY = 'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
+
 
 def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pathlib.Path:
     lane = root / name
@@ -45,7 +58,9 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
         encoding="utf-8",
     )
     (lane / "entrypoint.sh").write_text(
-        "# comment naming opencode service mode is prose, not an invocation\n"
+        CONSOLE_GUARD
+        + ROLE_BOUNDARY + '\n  :\nfi\n'
+        + "# comment naming opencode service mode is prose, not an invocation\n"
         'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"\n'
         'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"\n'
         'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"\n'
@@ -90,6 +105,36 @@ class ExposurePolicyAssertTests(unittest.TestCase):
     def test_fixture_lane_passes(self) -> None:
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_console_credential_gate_must_precede_role_boundary(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        original = entrypoint.read_text(encoding="utf-8")
+        without_gate = original.replace(CONSOLE_GUARD, "")
+        for text in (
+            without_gate,
+            "\n".join("# " + line for line in CONSOLE_GUARD.splitlines()) + without_gate,
+            without_gate + CONSOLE_GUARD,
+        ):
+            with self.subTest(text=text):
+                entrypoint.write_text(text, encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must refuse an unacknowledged OPENCODE_API_KEY", result.stderr)
+
+    def test_console_credential_gate_requires_known_role_boundary(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        original = entrypoint.read_text(encoding="utf-8")
+        for text in (
+            original.replace(ROLE_BOUNDARY, 'if true; then'),
+            original.replace(CONSOLE_GUARD, "").replace(
+                ROLE_BOUNDARY, ROLE_BOUNDARY.replace('== 1', '== "1"'),
+            ) + CONSOLE_GUARD,
+        ):
+            with self.subTest(text=text):
+                entrypoint.write_text(text, encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must refuse an unacknowledged OPENCODE_API_KEY", result.stderr)
 
     def test_missing_share_pin_fails(self) -> None:
         config = json.loads((self.lane / "config" / "opencode2.json").read_text())

@@ -213,6 +213,23 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
         else:
             fail(f"{entrypoint} must materialize the runtime config from "
                  "/app/config/opencode2.json (copy or symlink) at every boot")
+        # WI#665: the hosted Console Library is an instruction channel whenever
+        # its credential and egress are both present. Keep the credential gate
+        # ahead of role dispatch so neither the bridge nor task role skips it.
+        early, role_boundary, _ = code.partition(
+            'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
+        )
+        console_guard = (
+            'case "${LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL:-0}" in',
+            'if [ -n "${OPENCODE_API_KEY+x}" ]; then',
+            'die "OPENCODE_API_KEY is present; refusing startup without '
+            'LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1',
+        )
+        if role_boundary and all(fragment in early for fragment in console_guard):
+            check("entrypoint.sh gates OpenCode Console credentials before role dispatch")
+        else:
+            fail(f"{entrypoint} must refuse an unacknowledged OPENCODE_API_KEY "
+                 "before role dispatch (WI#665)")
 
 
 def check_wrapper(lane: pathlib.Path) -> None:

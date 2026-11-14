@@ -1020,7 +1020,10 @@ Enforced controls (opencode2 lane unless noted):
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
    auto-update — with the decision for each, not only the bridge call
-   surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
+   surface. Include hosted instruction/skill inputs such as the OpenCode
+   Console Library: review both saved and environment credentials plus egress,
+   not only optional event-watch flags (see WI#665 below).
+   For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
    **Photon-node repair retirement:** when a new OpenCode pin carries the
@@ -2057,6 +2060,45 @@ Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
 the candidate-vs-uncached-clean-rebuild digest comparisons, and a green
 post-merge master pipeline remain CI requirements. No tenant rollout or
 live-model daemon-dispatched job was performed.
+
+### OpenCode Console Library (WI#665)
+
+At the current v2.2.6 pin (`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`),
+the upstream `opencode` integration can fetch hosted Console instructions and
+skills into sessions when **both** a Console credential and egress to
+`opencode.ai` are available. This is an additional instruction source, not just
+outbound publication. The bundled catalog names `OPENCODE_API_KEY`; saved
+credentials take precedence over environment credentials. The later v2.2.7
+`console_watches` flag is not in this pinned tree and is not a Library control.
+
+The entrypoint refuses a present `OPENCODE_API_KEY` (even empty) before either
+split role dispatches unless the operator explicitly sets
+`LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1`; an acknowledged startup warns
+without printing the credential. This gate checks only the environment variable.
+Credentials saved by `opencode auth login` inside a session bypass it and can
+survive a container restart. With a usable credential and allowed egress, opt-in
+enables the Library surface too; no shipped setting separately withholds its
+instructions or skills. The managed tenant's egress allowlist remains the
+boundary against a compromised worker.
+
+**Scope:** WI#665's surface record and environment-credential gate are covered;
+the root-owned managed-policy control has **not** been evaluated on a built
+image or shipped. Acceptance items 3 and 4 remain pending, and WI#665 must stay
+open. No Console request, live credential, image build or tenant rollout is
+claimed by this follow-up.
+
+**!2414 review verification (ABK-1–5, 2026-11-13):** the repaired fixture and
+new negative cases pass all 70 exposure-assert tests; non-root entrypoint tests
+pass 16/16, including both split roles. Scratch-lane mutations that skip the
+task gate or dispatch the bridge before it are both caught. The full worker
+exposure guard passes, and the CI-config suite completes 574 tests with 13
+skips and no failures. CI YAML validation (8 files), Python syntax (169 tracked
+files), Bash syntax (301 scripts plus 3 hooks), warning-level ShellCheck for the
+unchanged entrypoint, the new documentation link, and `git diff --check` pass.
+An extra all-severity ShellCheck run reports only the entrypoint's two existing
+SC2016 informational notices for intentionally deferred Git credential expansion.
+No Rust source changed, so Cargo checks/tests and Clippy do not apply. These are
+local results, not a claim of a new remote pipeline or built-image validation.
 
 ### v2.2.5 bump — WI#531, item 30 (2026-11-02)
 
