@@ -341,10 +341,19 @@ non-loopback peers dropped), optional bearer token via `HEALTH_METRICS_TOKEN`
 
 ```bash
 cd ic && cargo build --release --bin lunarwing-health-metrics
-install -Dm0755 target/release/lunarwing-health-metrics \
+sudo install -Dm0755 target/release/lunarwing-health-metrics \
     /usr/local/lib/lunarwing-health/lunarwing-health-metrics
 sudo ic/scripts/install-health-metrics-listener.sh   # auto-detects systemd/OpenRC/launchd
 ```
+
+Install it as root, as above. mt-admin's health pipeline install carries it
+into each refreshed library only when the library is root-owned through `/`
+and the binary is a root-owned regular file without group/other write or
+set-ID bits. Otherwise the install leaves it out of the new library (moving it
+to the health base directory's `quarantine/` when that is safe) with a
+warning. Stop a running listener then, and reinstall the binary with
+`sudo install` before starting it again (see the installed health library
+paragraph in `docs/ops/MULTITENANCY-PRODUCTION.md`).
 
 On multi-tenant hosts the listener port comes from the ports registry v16
 `health_metrics` slot (`ic/scripts/migrate-ports-v16.sh`; default 50000) —

@@ -12,8 +12,12 @@
 #
 # The binary itself is NOT built here; install it first:
 #   cargo build --release --bin lunarwing-health-metrics
-#   install -m 0755 target/release/lunarwing-health-metrics \
+#   sudo install -m 0755 target/release/lunarwing-health-metrics \
 #       /usr/local/lib/lunarwing-health/lunarwing-health-metrics
+# It must stay a root-owned regular file without group/other write or set-ID
+# bits, in a root-owned library: mt-admin's health library refresh carries it
+# over only then, and otherwise leaves it out with a warning (quarantined under
+# the health base directory when that is safe).
 
 set -euo pipefail
 

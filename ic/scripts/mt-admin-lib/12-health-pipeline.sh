@@ -165,6 +165,134 @@ health_env_reconcile_line() {  # <KEY> <VALUE>
   say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
 }
 
+# Entries that other installers put into the library and the checkout does
+# not ship. The optional metrics listener binary is installed here by hand
+# (ic-infrastructure-health-check/README.md, install-health-metrics-listener.sh)
+# and its OpenRC service runs it as root. A fresh tree would drop it, so it is
+# carried over, but only out of a library that is root-owned and not
+# group/other-writable through /, and only as a root-owned regular file
+# without group/other write or set-ID bits. In any other state another
+# account may have replaced it (a library from before WI#687 is owned by the
+# checkout user), so it is moved to a root-only quarantine with a warning and
+# the install goes on: stopping would leave that exposed library in place.
+health_library_entry_unsafe_reason() {
+  local src="$1" owner mode
+  if ! health_lib_validate_root_owned_directory "$HEALTH_LIB_DIR"; then
+    printf 'the installed library or a parent directory is not root-owned or is group/other-writable (an install from before WI#687)'
+  elif [[ -L "$src" ]]; then
+    printf 'it is a symbolic link'
+  elif [[ ! -f "$src" ]]; then
+    printf 'it is not a regular file'
+  else
+    owner="$(stat -c %u "$src" 2>/dev/null || true)"
+    mode="$(stat -c %a "$src" 2>/dev/null || true)"
+    if [[ "$owner" != 0 ]]; then
+      printf 'it is not owned by root'
+    elif [[ ! "$mode" =~ ^[0-7]+$ ]]; then
+      printf 'its mode could not be read'
+    elif (( (8#$mode & 0022) != 0 )); then
+      printf 'it is group/other-writable'
+    elif (( (8#$mode & 06000) != 0 )); then
+      printf 'it has a set-ID bit'
+    fi
+  fi
+}
+
+# Move an untrusted library entry into a fresh directory under the root-only
+# quarantine and print its new path. Fails, leaving the entry where it is,
+# when the quarantine is not a root-owned 0700 directory with safe parents.
+quarantine_health_library_entry() {
+  local src="$1" entry="$2" qroot="$HEALTH_BASE_DIR/quarantine" qdir
+  # Check an existing path before touching it: never chmod a link's target
+  # or a directory another account owns.
+  if [[ ! -e "$qroot" && ! -L "$qroot" ]]; then
+    install -d -m 0700 "$qroot" 2>/dev/null || return 1
+  fi
+  health_lib_validate_root_owned_directory "$qroot" || return 1
+  chmod 0700 "$qroot" 2>/dev/null || return 1
+  qdir="$(mktemp -d "$qroot/$entry.XXXXXX" 2>/dev/null)" || return 1
+  mv -- "$src" "$qdir/$entry" 2>/dev/null || return 1
+  printf '%s\n' "$qdir/$entry"
+}
+
+carry_health_library_entries() {
+  local stage="$1" entry src reason moved
+  # A linked library is moved aside as a link; never reach through it.
+  [[ -d "$HEALTH_LIB_DIR" && ! -L "$HEALTH_LIB_DIR" ]] || return 0
+  for entry in "${HEALTH_LIB_CARRIED_ENTRIES[@]}"; do
+    src="$HEALTH_LIB_DIR/$entry"
+    [[ -e "$src" || -L "$src" ]] || continue
+    if [[ -e "$stage/$entry" || -L "$stage/$entry" ]]; then
+      say "health library: the checkout ships $entry; it replaces the installed copy"
+      continue
+    fi
+    reason="$(health_library_entry_unsafe_reason "$src")"
+    if [[ -z "$reason" ]]; then
+      cp -p -- "$src" "$stage/$entry" || return 1
+      continue
+    fi
+    # Never stop here: the install that follows is what repairs the library.
+    if moved="$(quarantine_health_library_entry "$src" "$entry")"; then
+      printf 'WARNING: health library: %s was not carried into the new library because %s; it was moved to %s.' \
+        "$src" "$reason" "$moved" >&2
+    else
+      printf 'WARNING: health library: %s was not carried into the new library because %s, and no root-only quarantine could be made under %s; it stays in the old library, which this install replaces and removes.' \
+        "$src" "$reason" "$HEALTH_BASE_DIR/quarantine" >&2
+    fi
+    printf ' Stop the metrics listener now if it is running, and reinstall it from a trusted build (sudo install -m 0755 <binary> %s) before starting it again.\n' \
+      "$src" >&2
+  done
+}
+
+sync_health_pipeline_library() {
+  local parent stage old="" unsafe
+  [[ "$HEALTH_LIB_DIR" == /* && "$HEALTH_LIB_DIR" != / ]] \
+    || die "health library destination must be an absolute non-root path"
+  parent="$(dirname -- "$HEALTH_LIB_DIR")"
+  mkdir -p "$parent"
+  stage="$(mktemp -d "$parent/.lunarwing-health.new.XXXXXX")" \
+    || die "could not create health library staging directory"
+  if ! cp -R --no-preserve=ownership --preserve=mode,timestamps "$HEALTH_SRC_DIR/." "$stage/"; then
+    rm -rf -- "$stage"
+    die "could not copy health pipeline scripts"
+  fi
+  unsafe="$(find "$stage" -type l -print -quit 2>/dev/null)" \
+    || { rm -rf -- "$stage"; die "could not inspect staged health pipeline scripts"; }
+  if [[ -n "$unsafe" ]]; then
+    rm -rf -- "$stage"
+    die "health pipeline source contains a symbolic link: $unsafe"
+  fi
+  if ! chown -R -h root:root "$stage" || ! chmod -R go-w "$stage"; then
+    rm -rf -- "$stage"
+    die "could not secure staged health pipeline scripts"
+  fi
+  find "$stage" -maxdepth 1 -type f -name '*.sh' -exec chmod 0755 -- {} + \
+    || { rm -rf -- "$stage"; die "could not set health pipeline script modes"; }
+  if ! carry_health_library_entries "$stage"; then
+    rm -rf -- "$stage"
+    die "could not carry installed entries into the new health library"
+  fi
+  if ! health_lib_tree_require_safe "$stage"; then
+    rm -rf -- "$stage"
+    die "staged health pipeline failed its ownership check"
+  fi
+  if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]]; then
+    old="$(mktemp -d "$parent/.lunarwing-health.old.XXXXXX")" \
+      || { rm -rf -- "$stage"; die "could not reserve health library backup path"; }
+    rmdir "$old" || { rm -rf -- "$stage"; die "could not prepare health library backup path"; }
+    if ! mv -T -- "$HEALTH_LIB_DIR" "$old"; then
+      rm -rf -- "$stage"
+      die "could not move the previous health library aside"
+    fi
+  fi
+  if ! mv -T -- "$stage" "$HEALTH_LIB_DIR"; then
+    [[ -z "$old" ]] || mv -T -- "$old" "$HEALTH_LIB_DIR" || true
+    rm -rf -- "$stage"
+    die "could not publish staged health pipeline scripts"
+  fi
+  [[ -z "$old" ]] || rm -rf -- "$old"
+}
+
 ensure_health_pipeline() {
   # Idempotently install + schedule the host-global health-check -> self-heal
   # pipeline. Auto-discovers all tenants, so one install covers every tenant.
@@ -185,16 +313,14 @@ ensure_health_pipeline() {
   fi
 
   # 1) Stable copy of the pipeline scripts (survives repo/worktree moves).
-  mkdir -p "$HEALTH_LIB_DIR"
-  cp -a "$HEALTH_SRC_DIR/." "$HEALTH_LIB_DIR/"
-  chmod 0755 "$HEALTH_LIB_DIR"/*.sh 2>/dev/null || true
+  sync_health_pipeline_library
   say "synced pipeline scripts -> $HEALTH_LIB_DIR"
 
   # 2) Host-level report/state dir.
   mkdir -p "$HEALTH_BASE_DIR/workspace/reports/health"
 
   # 3) Config env file (write-if-absent so operator edits survive).
-  mkdir -p /etc/lunarwing
+  mkdir -p "$(dirname -- "$HEALTH_ENV_FILE")"
   local egress_runtime="auto" egress_rootless="auto" _egress
   # Subshell: ensure_container_runtime dies when no runtime is installed, and
   # that must not abort a health-only install.
@@ -340,15 +466,23 @@ ENVEOF
   health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME "$egress_runtime"
   health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS "$egress_rootless"
 
-  # 4) Launcher: source env, then run the pipeline (health-check -> self-heal LIVE).
-  cat >"$HEALTH_LAUNCHER" <<LAUNCHEOF
-#!/bin/sh
+  # 4) Launcher: validate the installed tree before sourcing env or running it.
+  {
+    printf '#!/bin/bash\n'
+    declare -f health_lib_validate_root_owned_directory health_lib_tree_require_safe
+    cat <<LAUNCHEOF
 # Auto-generated by lunarwing-mt-admin.sh. Host-global health/self-heal pipeline.
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin
+export PATH
+if ! health_lib_tree_require_safe "$HEALTH_LIB_DIR"; then
+  exit 126
+fi
 set -a
-[ -r $HEALTH_ENV_FILE ] && . $HEALTH_ENV_FILE
+[ -r "$HEALTH_ENV_FILE" ] && . "$HEALTH_ENV_FILE"
 set +a
-exec $HEALTH_LIB_DIR/cron-wrapper.sh "\$@"
+exec "$HEALTH_LIB_DIR/cron-wrapper.sh" "\$@"
 LAUNCHEOF
+  } >"$HEALTH_LAUNCHER"
   chmod 0755 "$HEALTH_LAUNCHER"
   say "wrote $HEALTH_LAUNCHER"
 
