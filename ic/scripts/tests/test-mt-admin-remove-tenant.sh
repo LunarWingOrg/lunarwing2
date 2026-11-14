@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WI#638, WI#650, WI#672 — hermetic remove-tenant worker/egress ordering harness.
+# WI#638, WI#650, WI#672, WI#688 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
 
@@ -24,6 +24,7 @@ line_of() { grep -n -F -m1 -- "$1" "$CALL_LOG" | cut -d: -f1 || true; }
 
 id() {
   if [[ "${1:-}" == -u && "${2:-}" == alpha ]]; then
+    [[ "${MISSING_ACCOUNT:-false}" != true ]] || return 1
     printf '1000\n'
     return 0
   fi
@@ -100,6 +101,9 @@ _fake_print_container() {
 
 _ctr() {
   local name="$1"
+  if [[ "${STRICT_MISSING_ACCOUNT:-false}" == true && "${MISSING_ACCOUNT:-false}" == true ]]; then
+    die "cannot resolve uid for tenant '$name'"
+  fi
   shift
   record "${FAKE_RUNTIME}:$name $*"
   local command="${1:-}" container path network_filter format no_trunc
@@ -419,6 +423,45 @@ run_success_case() {
   fi
 }
 
+run_missing_account_stop_case() {
+  local init="$1" lane rc
+  setup_case "$init" missing-account-stops
+  for lane in vision voice pebble opencode kimi opencode2 lunardepth; do
+    rc=0
+    (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; "stop_tenant_${lane}" alpha) \
+      >"$CASE_DIR/stop-$lane.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      pass "$init $lane stop tolerates an absent tenant account"
+    else
+      fail "$init $lane stop reached _ctr without a tenant account: $(command cat "$CASE_DIR/stop-$lane.out")"
+    fi
+  done
+}
+
+run_missing_account_case() {
+  local init="$1" purge="$2" rc=0 path
+  setup_case "$init" "missing-account-$purge"
+  # Model the already-deleted tenant's unavailable rootless store; this case
+  # checks the remaining root-owned removal steps after the lane guards above.
+  for path in "$RUNTIME_DIR"/containers/* "$RUNTIME_DIR"/volumes/*; do
+    command rm -f -- "$path"
+  done
+  (MISSING_ACCOUNT=true; remove_tenant alpha "$purge") >"$CASE_DIR/remove.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "$init purge=$purge missing-account removal failed: $(command cat "$CASE_DIR/remove.out")"
+    return
+  fi
+  pass "$init purge=$purge missing-account removal completes"
+  if grep -Fxq 'ports-deallocate:alpha' "$CALL_LOG" \
+      && grep -Fxq "remove-user:alpha:$purge" "$CALL_LOG"; then
+    pass "$init purge=$purge missing-account removal reaches ports and user cleanup"
+  else
+    fail "$init purge=$purge missing-account removal skipped ports or user cleanup"
+  fi
+  assert_no_container_left
+  assert_no_unit_left
+}
+
 run_stop_failure_case() {
   local init="$1" rc=0
   setup_case "$init" false
@@ -626,6 +669,9 @@ run_no_keeper_case() {
 for init in openrc systemd; do
   run_success_case "$init" false
   run_success_case "$init" true
+  run_missing_account_stop_case "$init"
+  run_missing_account_case "$init" false
+  run_missing_account_case "$init" true
   run_stop_failure_case "$init"
   run_remove_failure_case "$init"
 done
