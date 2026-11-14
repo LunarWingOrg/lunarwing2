@@ -7208,22 +7208,63 @@ async fn granted_values_are_redacted_from_progress_and_result() {
 
 /// WI#702: the timeout-evidence snapshot lives in `JobContext.metadata` and a
 /// persisted `partial_output` event, not only in `job_events` message rows.
-/// Both must inherit the scrubbed text on the worker-reported timeout path.
+/// Both timeout-evidence sources are covered: a worker-reported timeout whose
+/// own `task_result.output` carries the value, and one whose output is empty
+/// so the daemon's streamed buffer supplies the evidence.
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn granted_values_are_redacted_from_timeout_evidence() {
     const VALUE: &str = "s3cret-db-password";
     let (store, _db_guard) = test_store().await;
 
+    // Source 1: the worker's own terminal output is the preserved evidence.
     let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
         progress: vec![format!("investigation step: token {VALUE}")],
         result_output: format!("wedged while printing {VALUE}"),
     })
     .await;
+    let (partial, events) =
+        run_timed_out_task_with_grant(&store, &url, VALUE, "worker output").await;
+    assert!(
+        partial.contains("[redacted-secret]"),
+        "worker timeout output must be scrubbed before the metadata write: {partial}"
+    );
+    assert_timeout_rows_are_clean(&events, VALUE);
 
+    // Source 2: empty worker output, so `accumulated_output` supplies the
+    // evidence — proving the streamed-progress scrub reaches the metadata and
+    // the `partial_output` row, not just the message rows.
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        progress: vec![format!("investigation step: token {VALUE}")],
+        result_output: String::new(),
+    })
+    .await;
+    let (partial, events) =
+        run_timed_out_task_with_grant(&store, &url, VALUE, "streamed progress").await;
+    assert!(
+        partial.contains("investigation step"),
+        "streamed evidence must survive to the metadata: {partial}"
+    );
+    assert!(
+        !partial.contains(VALUE),
+        "streamed evidence leaked into partial_output: {partial}"
+    );
+    assert_timeout_rows_are_clean(&events, VALUE);
+}
+
+/// Dispatch one grant-bearing task against a timeout-worker mock and return
+/// the preserved `partial_output` plus every persisted `(event_type, content)`
+/// row for the job.
+#[cfg(feature = "libsql")]
+async fn run_timed_out_task_with_grant(
+    store: &Arc<dyn lunarwing::db::Database>,
+    url: &str,
+    value: &str,
+    label: &str,
+) -> (String, Vec<(String, String)>) {
     let context_manager = Arc::new(ContextManager::new(5));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
-    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+    let mgr = ExternalWorkerManager::new(vec![config_for(url)])
         .with_event_deps(event_tx, Arc::clone(&context_manager))
         .with_store(store.clone());
     let job_id = Uuid::new_v4();
@@ -7231,7 +7272,7 @@ async fn granted_values_are_redacted_from_timeout_evidence() {
         .register_sandbox_job(job_id, "test-user", "task", "task")
         .await
         .expect("register job");
-    seed_agent_job(&store, job_id).await;
+    seed_agent_job(store, job_id).await;
 
     let mut context = TaskContext {
         user_id: "test-user".to_string(),
@@ -7239,7 +7280,7 @@ async fn granted_values_are_redacted_from_timeout_evidence() {
     };
     context
         .environment
-        .insert("DB_PASSWORD".to_string(), VALUE.to_string());
+        .insert("DB_PASSWORD".to_string(), value.to_string());
 
     let res = timeout(
         TEST_BOUND,
@@ -7251,7 +7292,10 @@ async fn granted_values_are_redacted_from_timeout_evidence() {
     .expect("expected a result for wait=true");
 
     assert_eq!(res.status, ExternalTaskStatus::TimedOut);
-    assert!(!res.output.contains(VALUE), "result output leaked: {res:?}");
+    assert!(
+        !res.output.contains(value),
+        "{label}: result output leaked: {res:?}"
+    );
 
     let ctx = context_manager
         .get_context(job_id)
@@ -7261,18 +7305,22 @@ async fn granted_values_are_redacted_from_timeout_evidence() {
         .metadata
         .get("partial_output")
         .and_then(|v| v.as_str())
-        .expect("timeout evidence must be preserved");
-    assert!(!partial.contains(VALUE), "partial_output leaked: {partial}");
-    assert!(partial.contains("investigation step"));
+        .expect("timeout evidence must be preserved")
+        .to_string();
 
-    let events = persisted_event_contents(&store, job_id).await;
+    let events = persisted_event_contents(store, job_id).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "partial_output"),
-        "expected a persisted partial_output row, got {events:?}"
+        "{label}: expected a persisted partial_output row, got {events:?}"
     );
-    for (kind, content) in &events {
+    (partial, events)
+}
+
+#[cfg(feature = "libsql")]
+fn assert_timeout_rows_are_clean(events: &[(String, String)], value: &str) {
+    for (kind, content) in events {
         assert!(
-            !content.contains(VALUE),
+            !content.contains(value),
             "persisted {kind} row leaked the granted value: {content}"
         );
     }
