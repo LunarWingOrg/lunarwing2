@@ -632,6 +632,20 @@ async fn get_credentials_handler(
         });
     }
 
+    // WI#666: these values are injected into every child process env, so a
+    // child can `printenv` one into tool output. Hold them with the job's
+    // harness secrets so the daemon-side event/promotion scrubber knows them.
+    state
+        .token_store
+        .store_credential_values(
+            job_id,
+            credentials
+                .iter()
+                .map(|credential| secrecy::SecretString::from(credential.value.clone()))
+                .collect(),
+        )
+        .await;
+
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&credentials).unwrap_or(serde_json::Value::Null)),
@@ -726,6 +740,18 @@ async fn get_mcp_credentials_handler(
             value: decrypted.expose().to_string(),
         });
     }
+    // WI#666: MCP credentials are child-process env too — same leak channel,
+    // same daemon-side backstop.
+    state
+        .token_store
+        .store_credential_values(
+            job_id,
+            credentials
+                .iter()
+                .map(|credential| secrecy::SecretString::from(credential.value.clone()))
+                .collect(),
+        )
+        .await;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(credentials).unwrap_or(serde_json::Value::Null)),
@@ -1044,6 +1070,133 @@ mod tests {
             "completion message must be redacted: {message}"
         );
         assert!(message.contains("[redacted-secret]"));
+    }
+
+    /// Serve one granted secret to a job over `route`, then post a
+    /// `tool_result` event that echoes the value, and return the broadcast
+    /// output (WI#666). The job holds a plain grant and an MCP grant for the
+    /// same secret; only the route under test is called, so only that
+    /// route's handler can have taught the daemon the value.
+    async fn tool_result_output_after_serving(route: &str, credential_value: &str) -> String {
+        use crate::testing::credentials::test_secrets_store;
+        use secrecy::SecretString;
+
+        let secrets_store = Arc::new(test_secrets_store());
+        secrets_store
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams {
+                    name: "granted_secret".to_string(),
+                    value: SecretString::from(credential_value.to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap(); // safety: test
+
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let job_id = Uuid::new_v4();
+        let token = token_store.create_token(job_id).await;
+        token_store
+            .store_grants(
+                job_id,
+                vec![crate::orchestrator::auth::CredentialGrant {
+                    secret_name: "granted_secret".to_string(),
+                    env_var: "GRANTED_SECRET".to_string(),
+                }],
+            )
+            .await;
+        token_store
+            .store_mcp_grants(
+                job_id,
+                vec![crate::orchestrator::auth::McpCredentialGrant {
+                    server_name: "example".to_string(),
+                    secret_name: "granted_secret".to_string(),
+                    env_var: "GRANTED_SECRET".to_string(),
+                }],
+            )
+            .await;
+        let (tx, mut rx) = broadcast::channel(8);
+        let state = OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store,
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: Some(secrets_store),
+            user_id: "default".to_string(),
+            job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            context_manager: None,
+        };
+        insert_test_handle(&state, job_id, "owner-a").await;
+        let router = OrchestratorApi::router(state);
+
+        // Serve the grant first: the daemon learns the value there.
+        let req = Request::builder()
+            .uri(format!("/worker/{job_id}/{route}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(); // safety: test
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/event"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "event_type": "tool_result",
+                    "data": {
+                        "tool_name": "shell",
+                        "output": format!("GRANTED_SECRET={credential_value}"),
+                        "success": true,
+                    },
+                })
+                .to_string(),
+            ))
+            .unwrap(); // safety: test
+        assert!(router.oneshot(req).await.unwrap().status().is_success());
+
+        let (_, _, event) = rx.recv().await.unwrap(); // safety: test
+        let crate::channels::web::types::SseEvent::JobToolResult { output, .. } = event else {
+            panic!("expected JobToolResult event, got {event:?}"); // safety: test
+        };
+        output
+    }
+
+    #[tokio::test]
+    async fn tool_result_redacts_granted_credential_values() {
+        // WI#666: granted credentials are injected into the child env, so a
+        // `printenv` echoed into tool output must not reach the broadcast
+        // event (and thus persisted job_events / the parent agent context).
+        let credential_value = "granted-credential-tool-result-value";
+        let output = tool_result_output_after_serving("credentials", credential_value).await;
+        assert!(
+            !output.contains(credential_value),
+            "granted credential value must be redacted from the tool result: {output}"
+        );
+        assert!(output.contains("[redacted-secret]"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_redacts_served_mcp_credential_values() {
+        // WI#666: MCP credentials reach MCP server processes through their
+        // env. The daemon is the backstop behind the worker's own scrub, so
+        // the MCP route must teach it the values too.
+        let credential_value = "granted-mcp-credential-tool-result-value";
+        let output = tool_result_output_after_serving("mcp/credentials", credential_value).await;
+        assert!(
+            !output.contains(credential_value),
+            "MCP credential value must be redacted from the tool result: {output}"
+        );
+        assert!(output.contains("[redacted-secret]"));
     }
 
     #[tokio::test]
