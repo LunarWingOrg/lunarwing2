@@ -520,8 +520,14 @@ configured pull timeout, and its diagnostic names the pull. Final verification
 has the same probe bounds as initial verification and never pulls. The three
 stages therefore total at most 200 seconds for WireGuard or 180 for NetBird,
 image present or not,
-plus up to 15 seconds for the lifecycle lock. The lifecycle operation lock is
-acquired before the recovery budget starts; joining an independent cold
+plus the wait for the lifecycle lock. The lifecycle operation lock is
+acquired before the recovery budget starts and has no timeout of its own. Only
+the queued cleanup of a cut-off start can hold it ahead of a command, for up
+to about 40 seconds (45 with a retried spawner probe). The 30-second failure
+back-off starts when that cleanup takes the lock, so a command normally waits
+at most about 10 to 15 seconds, and about 50 to 55 when two cleanups are
+queued. Joining an
+independent cold
 start can exceed these per-run totals
 because its phases have separate bounds rather than one cold wall-clock cap.
 A provider that needs longer after recreation requires a daemon restart. Only

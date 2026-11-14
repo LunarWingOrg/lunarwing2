@@ -575,8 +575,13 @@ the remaining 60-second recovery budget, and its timeout error names the pull.
 Recovery also uses the same 6-second re-probe and at most 20
 seconds for fresh provider readiness (or a lower configured timeout). Initial
 verification, recovery, and final verification total at most 200 seconds for
-WireGuard or 180 for NetBird, image present or not, plus up to 15 seconds for
-the lifecycle lock, which precedes the recovery budget; joining a cold start
+WireGuard or 180 for NetBird, image present or not, plus the wait for the
+lifecycle lock, which precedes the recovery budget and has no timeout of its
+own. Only the queued cleanup of a cut-off start can hold it ahead of a
+command, for up to about 40 seconds (45 with a retried spawner probe). The
+30-second failure back-off starts when that cleanup takes the lock, so a
+command normally waits at most about 10 to 15 seconds, and about 50 to 55 when
+two cleanups are queued. Joining a cold start
 with its independently bounded phases can exceed those per-run totals. Only an
 actual failed recovery starts
 the 30-second failure back-off; a slow health check does not record or blame a
