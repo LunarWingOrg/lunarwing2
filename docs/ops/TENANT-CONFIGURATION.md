@@ -564,16 +564,23 @@ multicast values. Peered WireGuard configs need
 is re-probed after firewall installation. Cold starts use a 6-second adoption
 re-probe and retain the configured `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` budget
 for a fresh provider; image pull and runtime start have separate bounds.
-Each per-command health-verification chain has a 65-second ceiling, separate
-from recovery's 60-second budget. Recovery uses the same 6-second re-probe and
-at most 20 seconds for fresh provider readiness (or a lower configured
-timeout). Only an actual failed recovery starts the 30-second failure back-off;
-a slow health check does not record or blame a recovery that never ran. A
-provider that needs longer after recreation requires a daemon restart. The
-sidecar-owned attempt still finishes and records its result when the calling
-command is cancelled or its result channel closes. Shutdown signals active
-recovery, uses bounded waits, removes late starts, and permits a later explicit
-cold start.
+Per-command health verification has no aggregate ceiling beyond its probes:
+seven 10-second probes total 70 seconds for WireGuard, and six total 60 for
+NetBird. A health-path image pull retains the configured startup timeout; a
+recovery pull uses the smaller of that timeout and the remaining 60-second
+recovery budget. Recovery also uses the same 6-second re-probe and at most 20
+seconds for fresh provider readiness (or a lower configured timeout). Initial
+verification, recovery, and final verification total at most 200 seconds for
+WireGuard or 180 for NetBird with the image present, or 380 and 360 seconds
+with auto-pull and the default 90-second pull bound. The lifecycle lock precedes
+the recovery budget, and joining a cold start with its independently bounded
+phases can exceed those per-run totals. Only an actual failed recovery starts
+the 30-second failure back-off; a slow health check does not record or blame a
+recovery that never ran. A provider that needs longer after recreation requires
+a daemon restart. The sidecar-owned attempt still finishes and records its
+result when the calling command is cancelled or its result channel closes.
+Shutdown signals active recovery, uses bounded waits, removes late starts, and
+permits a later explicit cold start.
 
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in
