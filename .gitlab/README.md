@@ -26,6 +26,25 @@ cannot yet activate one verified CI artifact safely.
   standalone-crate, native package, and production deployment work remains
   deferred until its separate prerequisites are met.
 
+### Log-scrubber test feature boundary (WI#662)
+
+`ci-config` runs `validate_log_scrubber_test_support` in
+`scripts/validate_config.py` without needing Cargo or Git. It requires the
+first-party `lunarwing_safety` package and its `test-support` feature to remain
+present, rejects normal/build dependency activations (including renamed,
+workspace-inherited and target-specific entries), and rejects forwarding that
+feature from a manifest's feature table. No other feature of the safety crate,
+including `default`, may imply `test-support`; this also prevents alias chains
+from making the removal API available to production. The effective workspace
+resolver must be 2 or 3 so dev-dependency features stay separate.
+
+`tests/test_log_scrubber_feature_guard.py` covers these refusal paths and pins
+the checked-in `remove_secret` method to its `cfg(test)` / `test-support` gate.
+Renaming the package, feature or gate therefore requires updating the guard and
+its tests deliberately. This is a conservative manifest policy, not a substitute
+for Cargo's graph resolution. Per the maintainer's WI#662 note 16224, the five
+test-fixture cleanup sites are outside this change's scope.
+
 ## Required runners
 
 Create unprotected, unprivileged runners with these tags:

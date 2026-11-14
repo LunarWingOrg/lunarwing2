@@ -4,7 +4,9 @@
 import importlib.util
 import io
 import pathlib
+import re
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -17,11 +19,12 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 ROOT_MANIFEST = """[workspace]
-members = [".", "crates/engine"]
+members = [".", "crates/engine", "crates/lunarwing_safety"]
 
 [package]
 name = "lunarwing"
 version = "2.2.0"
+edition = "2024"
 rust-version = "1.96.1"
 
 [dev-dependencies]
@@ -36,6 +39,14 @@ name = "lunarwing_engine"
 version = "2.2.0"
 """
 
+SAFETY_MANIFEST = """[package]
+name = "lunarwing_safety"
+version = "2.2.0"
+
+[features]
+test-support = []
+"""
+
 
 class LogScrubberFeatureGuardTests(unittest.TestCase):
     def setUp(self):
@@ -44,9 +55,12 @@ class LogScrubberFeatureGuardTests(unittest.TestCase):
         self.root = pathlib.Path(temporary.name)
         self.workspace = self.root / "ic" / "Cargo.toml"
         self.engine = self.root / "ic" / "crates" / "engine" / "Cargo.toml"
+        self.safety = self.root / "ic" / "crates" / "lunarwing_safety" / "Cargo.toml"
         self.engine.parent.mkdir(parents=True)
+        self.safety.parent.mkdir(parents=True)
         self.write_root()
         self.write_engine()
+        self.write_safety()
 
     def write_root(self, extra=""):
         self.workspace.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +68,9 @@ class LogScrubberFeatureGuardTests(unittest.TestCase):
 
     def write_engine(self, extra=""):
         self.engine.write_text(ENGINE_MANIFEST + extra, encoding="utf-8")
+
+    def write_safety(self, extra=""):
+        self.safety.write_text(SAFETY_MANIFEST + extra, encoding="utf-8")
 
     def errors(self):
         errors = []
@@ -75,6 +92,94 @@ class LogScrubberFeatureGuardTests(unittest.TestCase):
         errors = []
         config.validate_log_scrubber_test_support(errors)
         self.assertEqual(errors, [])
+        safety = ROOT / "ic/crates/lunarwing_safety"
+        manifest = tomllib.loads((safety / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["package"]["name"], "lunarwing_safety")
+        self.assertIn("test-support", manifest["features"])
+        source = (safety / "src/log_scrubber.rs").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            re.compile(
+                r'#\[cfg\(any\(test, feature = "test-support"\)\)\]\s+'
+                r'pub fn remove_secret\(',
+            ),
+        )
+
+    def test_safety_default_cannot_enable_test_support(self):
+        self.write_safety('\ndefault = ["test-support"]\n')
+        self.assert_forbidden("ic/crates/lunarwing_safety/Cargo.toml [features] default")
+
+    def test_safety_local_features_cannot_imply_test_support(self):
+        for declaration in (
+            '[dependencies]\nlunarwing_safety = { path = "crates/lunarwing_safety", '
+            'features = ["diagnostics"] }\n',
+            '[dependencies]\nlunarwing_safety = { path = "crates/lunarwing_safety" }\n'
+            '[features]\ndefault = ["lunarwing_safety/diagnostics"]\n',
+        ):
+            with self.subTest(declaration=declaration):
+                self.write_safety('\ndiagnostics = ["test-support"]\n')
+                self.write_root("\n" + declaration)
+                self.assert_forbidden("ic/crates/lunarwing_safety/Cargo.toml [features] diagnostics")
+
+    def test_transitive_safety_feature_implication_fails(self):
+        self.write_safety('\ndefault = ["diagnostics"]\ndiagnostics = ["test-support"]\n')
+        self.assert_forbidden("[features] diagnostics")
+
+    def test_missing_or_renamed_safety_package_fails_closed(self):
+        for replacement in (None, SAFETY_MANIFEST.replace('"lunarwing_safety"', '"renamed_safety"')):
+            with self.subTest(replacement=replacement):
+                if replacement is None:
+                    self.safety.unlink()
+                else:
+                    self.safety.write_text(replacement, encoding="utf-8")
+                self.assertTrue(any("missing lunarwing_safety package" in error for error in self.errors()))
+
+    def test_missing_or_renamed_guarded_feature_fails_closed(self):
+        for replacement in ("", 'test-hooks = []\n'):
+            with self.subTest(replacement=replacement):
+                self.workspace.write_text(
+                    ROOT_MANIFEST.replace("test-support", "test-hooks")
+                    + '\n[dependencies]\nlunarwing_safety = { path = "crates/lunarwing_safety", '
+                    'features = ["test-hooks"] }\n',
+                    encoding="utf-8",
+                )
+                self.safety.write_text(
+                    SAFETY_MANIFEST.replace('test-support = []\n', replacement), encoding="utf-8",
+                )
+                self.assertTrue(any("must declare lunarwing_safety/test-support" in error for error in self.errors()))
+
+    def test_workspace_resolver_one_fails_closed(self):
+        self.workspace.write_text(ROOT_MANIFEST.replace('[workspace]', '[workspace]\nresolver = "1"'))
+        self.assertTrue(any("must use resolver 2 or 3" in error for error in self.errors()))
+
+    def test_root_package_resolver_one_fails_closed(self):
+        self.workspace.write_text(ROOT_MANIFEST.replace('[package]', '[package]\nresolver = "1"'))
+        self.assertTrue(any("must use resolver 2 or 3" in error for error in self.errors()))
+
+    def test_inherited_edition_uses_the_workspace_package_default(self):
+        self.workspace.write_text(
+            ROOT_MANIFEST.replace('edition = "2024"', 'edition.workspace = true')
+            + '\n[workspace.package]\nedition = "2024"\n',
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_implicit_resolver_one_fails_closed(self):
+        for edition in ('edition = "2018"', ''):
+            with self.subTest(edition=edition):
+                self.workspace.write_text(ROOT_MANIFEST.replace('edition = "2024"', edition))
+                self.assertTrue(any("must use resolver 2 or 3" in error for error in self.errors()))
+
+    def test_resolver_two_and_three_allow_dev_dependencies(self):
+        for resolver in ("2", "3"):
+            with self.subTest(resolver=resolver):
+                self.workspace.write_text(
+                    ROOT_MANIFEST.replace('[workspace]', f'[workspace]\nresolver = "{resolver}"'),
+                )
+                self.assertEqual(self.errors(), [])
+
+    def test_missing_workspace_manifest_fails_closed(self):
+        self.workspace.unlink()
+        self.assertTrue(any("ic/Cargo.toml missing" in error for error in self.errors()))
 
     def test_regular_and_target_dev_dependencies_pass(self):
         self.assertEqual(self.errors(), [])
@@ -88,6 +193,15 @@ class LogScrubberFeatureGuardTests(unittest.TestCase):
                     'features = ["test-support"] }\n'
                 )
                 self.assert_forbidden(f"[{section}]")
+
+    def test_test_support_among_multiple_features_is_forbidden(self):
+        for features in ('["serde", "test-support"]', '["test-support", "serde"]'):
+            with self.subTest(features=features):
+                self.write_root(
+                    '\n[dependencies]\nlunarwing_safety = { path = "crates/lunarwing_safety", '
+                    f'features = {features} }}\n'
+                )
+                self.assert_forbidden("[dependencies]")
 
     def test_target_normal_and_build_dependency_features_fail(self):
         for section in ("dependencies", "build-dependencies"):

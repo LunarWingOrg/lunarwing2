@@ -3207,12 +3207,45 @@ def safety_dependency_names(tables: list[tuple[str, str, dict]]) -> set[str]:
     return names
 
 
+def validate_scrubber_feature_definition(label: str, manifest: dict, errors: list[str]) -> None:
+    """Keep the guarded feature explicit and impossible to imply locally."""
+    features = manifest.get("features", {})
+    if not isinstance(features, dict) or not isinstance(features.get("test-support"), list):
+        errors.append(f"{label} must declare lunarwing_safety/test-support (WI#662)")
+        return
+    for name, activations in features.items():
+        if name != "test-support" and isinstance(activations, list) and "test-support" in activations:
+            errors.append(
+                f"{label} [features] {name} enables lunarwing_safety/test-support "
+                "through an implied feature (WI#662)"
+            )
+
+
+def validate_scrubber_resolver(manifest: dict, errors: list[str]) -> None:
+    """Require a resolver that separates dev features from production edges."""
+    workspace = manifest.get("workspace", {})
+    package = manifest.get("package", {})
+    edition = package.get("edition", "2015")
+    if isinstance(edition, dict) and edition.get("workspace"):
+        edition = workspace.get("package", {}).get("edition", "2015")
+    resolver = workspace.get("resolver", package.get("resolver"))
+    if resolver is None:
+        resolver = {"2021": "2", "2024": "3"}.get(edition, "1")
+    if resolver not in {"2", "3"}:
+        errors.append(
+            "ic/Cargo.toml must use resolver 2 or 3 to isolate dev-dependency "
+            "features for lunarwing_safety/test-support (WI#662)"
+        )
+
+
 def validate_log_scrubber_test_support(errors: list[str]) -> None:
     """WI#662: keep the scrubber's removal API out of production Cargo graphs.
 
     The ci-config image has neither Cargo nor git, so inspect every first-party
     manifest directly. Target-specific and renamed dependencies count, as do
-    feature-table activations such as `lunarwing_safety/test-support`.
+    feature-table activations such as `lunarwing_safety/test-support`. The
+    safety crate must declare that feature without any other local feature
+    implying it, and the workspace resolver must isolate dev features.
     """
     workspace_root = WORKSPACE_MANIFEST.parent
     if not WORKSPACE_MANIFEST.is_file():
@@ -3236,6 +3269,17 @@ def validate_log_scrubber_test_support(errors: list[str]) -> None:
             continue
         tables = cargo_dependency_tables(manifest)
         loaded.append((label, manifest, tables))
+        if path == WORKSPACE_MANIFEST:
+            validate_scrubber_resolver(manifest, errors)
+
+    safety_manifests = [
+        (label, manifest) for label, manifest, _tables in loaded
+        if manifest.get("package", {}).get("name") == "lunarwing_safety"
+    ]
+    if not safety_manifests:
+        errors.append("missing lunarwing_safety package; cannot enforce test-support boundary (WI#662)")
+    for label, manifest in safety_manifests:
+        validate_scrubber_feature_definition(label, manifest, errors)
 
     workspace_names = set()
     for _label, _manifest, tables in loaded:
