@@ -527,8 +527,9 @@ new multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537),
 while an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is
 preserved.
 
-NetBird requires the default runtime DNS path. WI#603 rejects
-`SANDBOX_TUNNEL_DNS` with this provider before any container-runtime call:
+NetBird uses its own local resolver for joined runs. WI#603 keeps
+`SANDBOX_TUNNEL_DNS` rejected with this provider before any container-runtime
+call; configure upstreams with NetBird nameserver groups instead:
 
 ```bash
 SANDBOX_NETWORK=tunnel
@@ -552,12 +553,18 @@ SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53  # joined-run resolvers; disables direc
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 ```
 
+For NetBird public-name resolution and control-plane hostnames that may need to
+be resolved again after startup, configure a primary nameserver group whose
+resolver is reachable through the overlay. Match-only groups are enough for
+private zones. NetBird peer names always use its local resolver; an upstream
+outside the overlay fails closed. Do not move that upstream address into
+`SANDBOX_TUNNEL_DNS`, which remains a WireGuard-only setting.
+
 WireGuard custom DNS is mounted only into joined runs. The sidecar retains its
 runtime resolver file for bootstrap, but the firewall also blocks its own
-post-start lookups when custom DNS is set. The WI#600 live run confirmed that
-NetBird's upstream DNS writes were unmarked and blocked, returning `SERVFAIL`.
-WI#603 therefore rejects that provider/setting combination during validation;
-leave `SANDBOX_TUNNEL_DNS` unset for NetBird.
+post-start lookups when custom DNS is set. NetBird instead replaces the sidecar
+resolver with its learned overlay listener, so its former runtime resolvers are
+not allowed onto the uplink.
 DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
 multicast values. Peered WireGuard configs need
 `PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
