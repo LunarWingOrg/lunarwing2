@@ -169,6 +169,17 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   `/complete` before persistence and broadcast; the redactor is cleared on the
   same terminal paths, and cache insertion is skipped when a terminal clear
   raced the build (EE-4).
+- **Granted credential values (WI#666):** the `credentials` channel is a
+  second env-bearing channel — `/worker/{id}/credentials` and
+  `/worker/{id}/mcp/credentials` decrypt granted secrets and the worker injects
+  them into child-process env. Both the worker redactor and the daemon-side
+  backstop are armed with those values on top of the mounted secret values, so
+  a child that `printenv`s a live third-party credential has it scrubbed from
+  tool results, tool arguments, and `/complete` exactly like a mounted secret.
+  The daemon records the decrypted values in the per-job token store when the
+  grant is served and releases them on the same terminal clears (they survive
+  `revoke`, like harness values, because promotion and late events run after
+  the token dies).
   - NOT covered (documented gaps): offset/grouped dump formats — plain
     `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
     and never contain a contiguous encoded span; base32 and other alphabets;
