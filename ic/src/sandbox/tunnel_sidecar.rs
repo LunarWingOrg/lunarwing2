@@ -178,7 +178,7 @@ impl TunnelSidecarConfig {
         hash_field(&mut hasher, salt);
         hash_field(&mut hasher, self.provider.as_str().as_bytes());
         if self.provider == TunnelProvider::Netbird {
-            hash_field(&mut hasher, b"netbird-managed-resolver-v1");
+            hash_field(&mut hasher, b"netbird-managed-resolver-v2");
         }
         hash_field(&mut hasher, self.image().as_bytes());
         hash_field(&mut hasher, image_id.as_bytes());
@@ -559,12 +559,13 @@ fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigS
 #[derive(Clone, Copy)]
 pub(crate) struct NetbirdSidecarMounts<'a> {
     pub state_volume: Option<&'a str>,
+    pub resolv_conf: Option<&'a Path>,
     pub dns_backup: Option<&'a Path>,
 }
 
 /// The runtime arguments that start the sidecar. `hash` is the salted config
 /// hash published as a label; NetBird's mounts retain its peer identity and
-/// let it back up the runtime resolver despite the read-only root filesystem.
+/// staged resolver state despite the read-only root filesystem.
 pub(crate) fn build_sidecar_args(
     cfg: &TunnelSidecarConfig,
     secret_env_file: Option<&Path>,
@@ -627,23 +628,19 @@ pub(crate) fn build_sidecar_args(
             if let Some(file) = secret_env_file {
                 args.extend(["--env-file".into(), file.display().to_string()]);
             }
+            if let Some(file) = netbird_mounts.and_then(|mounts| mounts.resolv_conf) {
+                args.extend([
+                    "-v".into(),
+                    format!("{}:/etc/resolv.conf:rw", file.display()),
+                ]);
+            }
             if let Some(file) = netbird_mounts.and_then(|mounts| mounts.dns_backup) {
                 args.extend([
                     "-v".into(),
                     format!("{}:/etc/resolv.conf.original.netbird:rw", file.display()),
-                    "--entrypoint=/bin/sh".into(),
                 ]);
             }
             args.push(cfg.image().into());
-            if netbird_mounts
-                .and_then(|mounts| mounts.dns_backup)
-                .is_some()
-            {
-                args.extend([
-                    "-c".into(),
-                    "cat /etc/resolv.conf > /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh".into(),
-                ]);
-            }
         }
         TunnelProvider::Wireguard => {
             if let Some(config) = cfg.wireguard_config.as_deref() {
@@ -1449,10 +1446,11 @@ impl TunnelSidecar {
             TunnelProvider::Wireguard => None,
         };
         let env_file = self.write_secret_env_file()?;
-        let dns_backup = self.stage_netbird_dns_backup()?;
+        let dns_files = self.stage_netbird_dns_files(provider_timeout).await?;
         let mounts = NetbirdSidecarMounts {
             state_volume: state_volume.as_deref(),
-            dns_backup: dns_backup.as_deref(),
+            resolv_conf: dns_files.as_ref().map(|(path, _)| path.as_path()),
+            dns_backup: dns_files.as_ref().map(|(_, path)| path.as_path()),
         };
         let args = build_sidecar_args(
             &self.cfg,
@@ -2108,20 +2106,40 @@ impl TunnelSidecar {
         true
     }
 
-    fn stage_netbird_dns_backup(&self) -> Result<Option<PathBuf>> {
+    async fn bootstrap_resolv_conf(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         if self.cfg.provider != TunnelProvider::Netbird {
             return Ok(None);
         }
-        let path = self.runtime_dir()?.join(format!(
-            "{}.resolv.conf.original.netbird",
-            self.container_name
-        ));
-        match std::fs::remove_file(&path) {
+        let args = [
+            "run",
+            "--rm",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--read-only",
+            "--entrypoint",
+            "cat",
+            self.cfg.image(),
+            "/etc/resolv.conf",
+        ];
+        let output = tokio::time::timeout(timeout, self.runtime_output(&args, None))
+            .await
+            .map_err(|_| self.unavailable("runtime resolver bootstrap timed out"))?
+            .map_err(|_| self.unavailable("could not run the runtime resolver bootstrap"))?;
+        if !output.status.success()
+            || output.stdout.len() > 64 * 1024
+            || std::str::from_utf8(&output.stdout).is_err()
+            || parse_resolvers(&String::from_utf8_lossy(&output.stdout)).is_empty()
+        {
+            return Err(self.unavailable("runtime resolver bootstrap returned no valid resolvers"));
+        }
+        Ok(Some(output.stdout))
+    }
+
+    fn write_netbird_dns_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err(self.unavailable("failed to replace the NetBird resolver backup"));
-            }
+            Err(_) => return Err(self.unavailable("failed to replace the NetBird resolver file")),
         }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -2130,10 +2148,30 @@ impl TunnelSidecar {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        options
-            .open(&path)
-            .map_err(|_| self.unavailable("failed to stage the NetBird resolver backup"))?;
-        Ok(Some(path))
+        let mut file = options
+            .open(path)
+            .map_err(|_| self.unavailable("failed to stage the NetBird resolver file"))?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| self.unavailable("failed to write the NetBird resolver file"))
+    }
+
+    async fn stage_netbird_dns_files(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<(PathBuf, PathBuf)>> {
+        let Some(contents) = self.bootstrap_resolv_conf(timeout).await? else {
+            return Ok(None);
+        };
+        let dir = self.runtime_dir()?;
+        let resolv_conf = dir.join(format!("{}.resolv.conf", self.container_name));
+        let backup = dir.join(format!(
+            "{}.resolv.conf.original.netbird",
+            self.container_name
+        ));
+        self.write_netbird_dns_file(&resolv_conf, &contents)?;
+        self.write_netbird_dns_file(&backup, &contents)?;
+        Ok(Some((resolv_conf, backup)))
     }
 
     fn write_secret_env_file(&self) -> Result<Option<SecretEnvFile>> {
@@ -2592,6 +2630,7 @@ mod tests {
             "abc123",
             Some(NetbirdSidecarMounts {
                 state_volume: Some("lunarwing-sandbox-tunnel-test-instance-netbird-abc123"),
+                resolv_conf: Some(Path::new("/run/user/1000/lw-resolv")),
                 dns_backup: Some(Path::new("/run/user/1000/lw-resolv-backup")),
             }),
         );
@@ -2603,12 +2642,13 @@ mod tests {
         assert!(joined.contains(
             "-v\nlunarwing-sandbox-tunnel-test-instance-netbird-abc123:/var/lib/netbird"
         ));
+        assert!(joined.contains("-v\n/run/user/1000/lw-resolv:/etc/resolv.conf:rw"));
         assert!(
             joined.contains(
                 "-v\n/run/user/1000/lw-resolv-backup:/etc/resolv.conf.original.netbird:rw"
             )
         );
-        assert!(joined.contains("--entrypoint=/bin/sh"));
+        assert!(!joined.contains("--entrypoint=/bin/sh"));
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
@@ -2621,7 +2661,7 @@ mod tests {
         assert_eq!(
             args.last().map(String::as_str),
             Some(
-                "cat /etc/resolv.conf > /etc/resolv.conf.original.netbird && exec /usr/local/bin/netbird-entrypoint.sh"
+                "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
             )
         );
     }
@@ -3291,6 +3331,47 @@ mod tests {
             stdout: stdout.into_bytes(),
             stderr: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn netbird_dns_bootstrap_stages_both_files_without_credentials() {
+        let base = std::env::temp_dir().join(format!("lw-netbird-dns-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let expected = format!(
+            "run --rm --cap-drop=ALL --security-opt=no-new-privileges --read-only --entrypoint cat {} /etc/resolv.conf",
+            netbird_cfg().image()
+        );
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            assert_eq!(args.join(" "), expected);
+            async { Ok(successful_runtime_output("nameserver 10.89.0.1\n".into())) }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let (resolv_conf, backup) = sidecar
+            .stage_netbird_dns_files(Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        for path in [resolv_conf, backup] {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "nameserver 10.89.0.1\n"
+            );
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]
