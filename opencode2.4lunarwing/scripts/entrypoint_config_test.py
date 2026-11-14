@@ -76,6 +76,56 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertEqual(self.source.read_text(), self.baked)
         return json.loads(self.target.read_text())
 
+    def test_console_credential_requires_explicit_opt_in(self) -> None:
+        for credential in ("fixture-console-credential", ""):
+            for opt_in in (None, "0", "false", "no", "off"):
+                with self.subTest(credential=bool(credential), opt_in=opt_in):
+                    overrides = {"OPENCODE_API_KEY": credential}
+                    if opt_in is not None:
+                        overrides["LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL"] = opt_in
+                    result = self.run_boot(**overrides)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("OPENCODE_API_KEY is present", result.stderr)
+                    self.assertIn("LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1", result.stderr)
+                    if credential:
+                        self.assertNotIn(credential, result.stdout + result.stderr)
+
+    def test_console_credential_opt_in_warns_without_disclosing_it(self) -> None:
+        credential = "fixture-console-credential"
+        result = self.run_boot(
+            OPENCODE_API_KEY=credential,
+            LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("WARNING: OPENCODE_API_KEY is present", result.stdout)
+        self.assertIn("operator acknowledged", result.stdout)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+        self.assertTrue(self.target.exists())
+
+    def test_console_credential_opt_in_must_be_boolean(self) -> None:
+        result = self.run_boot(LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL="sometimes")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("must be a boolean", result.stderr)
+
+    def assert_split_console_credential_refused(self, role: str) -> None:
+        credential = "fixture-console-credential"
+        result = self.run_boot(
+            LUNARWING_CONTAINER_ROLE=role,
+            OPENCODE2_TASK_UID=str(self.identity.get("user", os.geteuid())),
+            OPENCODE_API_KEY=credential,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("OPENCODE_API_KEY is present; refusing startup", result.stderr)
+        self.assertIn("LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1", result.stderr)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+        self.assertFalse(self.target.exists(), "refusal must precede task configuration")
+
+    def test_split_task_console_credential_requires_opt_in(self) -> None:
+        self.assert_split_console_credential_refused("split-task")
+
+    def test_split_bridge_console_credential_requires_opt_in(self) -> None:
+        self.assert_split_console_credential_refused("split-bridge")
+
     def test_managed_overrides_work_on_first_boot_and_restart(self) -> None:
         service = self.home / ".config/opencode/service.json"
         overrides = {

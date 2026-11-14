@@ -357,10 +357,18 @@ lw2studymcp surface:
 | `knowledge_search` | FTS with topic, agent, lifecycle, tag, and confidence filters |
 | `knowledge_get_topic` | Return every per-agent version of one canonical topic |
 | `knowledge_list_topics` | Summarize topic coverage, versions, scopes, agents, statuses, and tags |
-| `knowledge_submit_note` | Validate and write a new note or replace the caller's own version |
+| `knowledge_submit_note` | Validate and write a new note or replace the caller's own version, defaulting `studied_at` to now |
 | `knowledge_update_status` | Patch lifecycle/provenance metadata without changing note content |
-| `knowledge_list_stale` | Find status-, age-, or source-commit-stale notes |
+| `knowledge_list_stale` | Find status-, age-, or source-commit-stale notes with per-note reasons and optional status-only filtering |
 | `knowledge_stats` | Count documents, topics, statuses, and scopes |
+
+`knowledge_list_stale` keeps stored `stale` and `needs-verification` statuses as
+reasons to list a note until it is re-studied or superseded; superseded notes
+are always excluded. Each row's canonical `stale_reasons` array contains
+`status:<status>`, `age-exceeded`, and/or `source-commit-mismatch`. A daily
+routine can pass `include_status_only=false` to avoid re-processing status-only
+rows without hiding age or commit matches. The default is true for ordinary
+callers, preserving the verification queue.
 
 Reads default to the caller's private scope plus the `shared` herd scope and can
 be narrowed to `private` or `shared`; writes default private and may explicitly

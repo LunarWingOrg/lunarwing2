@@ -38,6 +38,20 @@ the tool. Restart resets learned statistics; `LUNARWING_TOOL_ESTIMATES=0`
 disables new recording/display. Details and staged scope:
 [runtime estimation](../estimation/README.md).
 
+### Workload process isolation (WI#671)
+
+Direct tool and sandbox workloads use process groups on every Unix host and
+systemd user transient services when a real `systemd-run --user --wait --pipe`
+probe succeeds. A successful probe, configured isolation disable, or a missing
+user bus is cached. Timeouts, spawn failures, and other transient probe errors
+use process-group isolation and are retried at most once every 30 seconds; one
+slow first probe therefore does not disable services for the daemon lifetime.
+The probe runs on a blocking thread with a five-second wall-clock deadline and
+kills and reaps its child on timeout. Authenticated `GET /api/gateway/status`
+reports the active mode as `workload_isolation: "systemd-service"` or
+`"process-group"`, or `"unprobed"` before the first workload. Reading status
+does not itself start a probe.
+
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
 The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through capabilities files.

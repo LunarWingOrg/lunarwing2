@@ -284,6 +284,9 @@ impl TurnCompletion {
             .await;
     }
 
+    /// Once `budget` expires, the independent stop and post-stop graces bound a
+    /// stuck turn's failure report to their sum: 120 seconds in production
+    /// (plus channel delivery), rather than one shared 60-second grace (WI#673).
     async fn late_result(
         &self,
         events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
@@ -312,25 +315,48 @@ impl TurnCompletion {
         self.join_late(stopped).await
     }
 
+    async fn await_late_stop_request(
+        stop_grace: Duration,
+        stop: impl std::future::Future<Output = Result<(), lunarwing_engine::EngineError>>,
+    ) -> Result<Result<(), lunarwing_engine::EngineError>, Error> {
+        tokio::time::timeout(stop_grace, stop).await.map_err(|_| {
+            engine_err(
+                "late turn timeout",
+                "stop request did not complete within its grace period",
+            )
+        })
+    }
+
+    async fn require_late_stop_settled(
+        wait: impl std::future::Future<Output = bool>,
+    ) -> Result<(), Error> {
+        if wait.await {
+            return Ok(());
+        }
+        Err(engine_err(
+            "late turn timeout",
+            "stop succeeded but the post-stop wait did not complete within its grace period",
+        ))
+    }
+
     /// Stops a run whose late budget ran out. `Ok(true)`: the stop request
     /// landed and the run settled. `Ok(false)`: there was nothing to stop.
     ///
-    /// The second case is the run that ended, or paused at a gate, between the
-    /// budget running out and the stop request. It is no longer registered, so
-    /// the engine answers `ThreadNotFound`. That is a miss, not a failure: the
-    /// engine's own shutdown path treats it the same way
-    /// (`ThreadManager::wait_thread_or_stop`), and the caller joins the run
-    /// and delivers its real result (WI#627).
+    /// The second case is the run that ended, or paused at a gate, since the
+    /// wait's last tick. It is no longer registered, so the engine answers
+    /// `ThreadNotFound`. That is a miss, not a failure: the engine's own
+    /// shutdown path treats it the same way (`ThreadManager::wait_thread_or_stop`),
+    /// and the caller joins the run and delivers its real result (WI#627).
     async fn stop_late_thread(
         &self,
         events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
         stop_grace: Duration,
         post_stop_grace: Duration,
     ) -> Result<bool, Error> {
-        tracing::warn!(thread_id = %self.thread_id, "Late turn budget exhausted; stopping thread");
+        tracing::debug!(thread_id = %self.thread_id, "Late turn budget exhausted; requesting thread stop");
         // Leave the handle addressable by /interrupt on either timeout; joining
         // could otherwise remove a still-running thread.
-        let stop = tokio::time::timeout(
+        let stop = Self::await_late_stop_request(
             stop_grace,
             self.state.thread_manager.stop_thread_for_run(
                 self.thread_id,
@@ -338,35 +364,31 @@ impl TurnCompletion {
                 &self.message.user_id,
             ),
         )
-        .await
-        .map_err(|_| {
-            engine_err(
-                "late turn timeout",
-                "stop request did not complete within its grace period",
-            )
-        })?;
+        .await?;
         match stop {
-            Ok(()) => {}
+            Ok(()) => {
+                tracing::warn!(thread_id = %self.thread_id, "Late turn budget exhausted; stopping thread");
+            }
             Err(lunarwing_engine::EngineError::ThreadNotFound(_)) => {
                 tracing::debug!(
                     thread_id = %self.thread_id,
                     "Late turn was no longer running when its stop was requested"
                 );
+                for event in drain_pending_thread_events(events, self.thread_id) {
+                    self.forward(&event).await;
+                }
                 return Ok(false);
             }
             Err(error) => return Err(engine_err("stop late thread", error)),
         }
-        if !self.wait(events, post_stop_grace).await {
-            return Err(engine_err(
-                "late turn timeout",
-                "stop succeeded but the post-stop wait did not complete within its grace period",
-            ));
-        }
+        Self::require_late_stop_settled(self.wait(events, post_stop_grace)).await?;
         Ok(true)
     }
 
     /// Joins a late run. `stopped_by_watchdog` is true only when this turn's
-    /// own stop request landed.
+    /// own stop request landed. If that request raced a user interrupt whose
+    /// bookkeeping was still in progress, the time-limit outcome is retained:
+    /// the engine does not record which accepted stop request came first.
     async fn join_late(&self, stopped_by_watchdog: bool) -> Result<Option<String>, Error> {
         let Some(mut outcome) = self.join().await? else {
             return Ok(None);

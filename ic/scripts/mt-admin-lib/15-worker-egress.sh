@@ -696,17 +696,33 @@ worker_egress_stop_keeper() {
 # container's full ID, or nothing when there is no keeper to exempt: rootful
 # runtimes have none. The ID comes from the keeper pod itself, as in the
 # guard's validate_keeper, so a container that merely carries the keeper's
-# label is still counted as attached, and a foreign pod of the keeper's name
-# exempts nothing. Returns 1 when a keeper exists but cannot be identified.
+# label is still counted as attached. Return 1 when a keeper cannot be
+# identified, or 2 after printing a more specific refusal.
 _worker_egress_keeper_infra_id() {
-  local name="$1" keeper purpose infra
+  local name="$1" keeper purpose count infra rc
   [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
   keeper="lw-egress-keeper-$name"
-  _ctr "$name" pod exists "$keeper" || return 0
+  if _ctr "$name" pod exists "$keeper" >/dev/null 2>&1; then
+    :
+  else
+    rc=$?
+    [[ "$rc" -ne 1 ]] || return 0
+    printf 'worker-egress: cannot check namespace keeper %s; refusing teardown\n' "$keeper" >&2
+    return 2
+  fi
   purpose="$(
     _ctr "$name" pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper" 2>/dev/null
   )" || return 1
-  [[ "$purpose" == worker-egress-keeper ]] || return 0
+  if [[ "$purpose" != worker-egress-keeper ]]; then
+    printf 'worker-egress: refusing to remove foreign keeper pod %s\n' "$keeper" >&2
+    return 2
+  fi
+  count="$(_ctr "$name" pod inspect --format '{{.NumContainers}}' "$keeper" 2>/dev/null)" || return 1
+  if [[ "$count" != 1 ]]; then
+    printf 'worker-egress: namespace keeper %s has unexpected container count %s; refusing teardown\n' \
+      "$keeper" "$count" >&2
+    return 2
+  fi
   infra="$(_ctr "$name" pod inspect --format '{{.InfraContainerID}}' "$keeper" 2>/dev/null)" || return 1
   [[ -n "$infra" ]] || return 1
   printf '%s\n' "$infra"
@@ -717,19 +733,22 @@ _worker_egress_keeper_infra_id() {
 # but Docker's `ps` rejects `label!=`, and then every teardown on a rootful
 # Docker host would refuse.
 worker_egress_assert_detached() {
-  local name="$1" network keeper_infra listed id cname attached=""
+  local name="$1" network keeper_infra keeper_rc=0 listed id cname attached=""
   network="$(worker_egress_network_name "$name")"
   ensure_container_runtime
-  keeper_infra="$(_worker_egress_keeper_infra_id "$name")" || {
-    printf 'worker-egress: cannot identify the namespace keeper of %s; refusing teardown\n' "$network" >&2
+  keeper_infra="$(_worker_egress_keeper_infra_id "$name")" || keeper_rc=$?
+  if ((keeper_rc != 0)); then
+    if ((keeper_rc != 2)); then
+      printf 'worker-egress: cannot identify the namespace keeper of %s; refusing teardown\n' "$network" >&2
+    fi
     return 1
-  }
+  fi
   listed="$(_ctr "$name" ps --all --no-trunc --filter "network=$network" \
     --format '{{.ID}} {{.Names}}' 2>/dev/null)" \
     || { printf 'worker-egress: cannot verify attachments on %s; refusing teardown\n' "$network" >&2; return 1; }
   while read -r id cname; do
     [[ -n "$id" ]] || continue
-    [[ -z "$keeper_infra" || "$id" != "$keeper_infra" ]] || continue
+    [[ "$id" != "$keeper_infra" ]] || continue
     attached+="${attached:+, }${cname:-$id}"
   done <<<"$listed"
   if [[ -n "$attached" ]]; then

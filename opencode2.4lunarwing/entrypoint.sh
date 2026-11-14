@@ -5,6 +5,18 @@ set -euo pipefail
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 
+case "${LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL:-0}" in
+  1|true|TRUE|yes|YES|on|ON) console_credential_opt_in=true ;;
+  0|false|FALSE|no|NO|off|OFF|"") console_credential_opt_in=false ;;
+  *) die "LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL must be a boolean" ;;
+esac
+if [ -n "${OPENCODE_API_KEY+x}" ]; then
+  if [ "$console_credential_opt_in" != true ]; then
+    die "OPENCODE_API_KEY is present; refusing startup without LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1 after the operator reviews OpenCode Console Library egress and instruction risk (WI#665)"
+  fi
+  log "WARNING: OPENCODE_API_KEY is present; the operator acknowledged OpenCode Console credential and egress exposure (WI#665)"
+fi
+
 if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
   [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] || die "rootful workspace identity is required"
   [[ "$(stat -c '%d:%i' -- "${WORKSPACE_ROOT:-/workspace}")" == "$LUNARWING_WORKSPACE_ID" ]] \

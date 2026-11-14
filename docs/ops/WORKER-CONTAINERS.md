@@ -30,7 +30,7 @@ photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
 `61845b0`'s three-space repair. **That repair has been retired since the
-v1.19.5 / v2.2.5 pins (WI#531), including the current v2.2.6 pin (WI#582):**
+v1.19.5 / v2.2.5 pins (WI#531), including the current v2.2.7 pin (WI#609):**
 both trees carry the repair in content (a
 content-equivalent backport — neither tag contains the commit itself, so do
 not test it with `merge-base --is-ancestor`), so the fixer's exact-match
@@ -305,25 +305,29 @@ It then removes every supported bridge/task container and IPC volume, every
 OpenRC unit/runlevel link, and the systemd Quadlets. Systemd stops task services
 and reloads the user manager before container deletion, so `Restart=on-failure`
 cannot resurrect a task into teardown. Stop, inspection, container/volume
-removal, attachment-query, keeper-removal, and network-removal failures abort
-the command; they are not warnings.
+removal, attachment-query, keeper-identification, keeper-removal, and
+network-removal failures abort the command; they are not warnings.
 
-Egress teardown checks attachments before changing any state. The only
-container it does not count is the managed keeper's own infra container,
-which it identifies by the ID the keeper pod reports. A container that merely
-carries the keeper's label counts as attached, and so does the infra container
-of a foreign pod with the keeper's name. The query uses the network filter
-alone, so it is the same call on Podman and on Docker.
-An attachment refusal, a failed query, or a keeper that cannot be identified
-therefore leaves the running rootless keeper and its namespace, both live
-chains, the egress network, and the rendered state intact for repair and retry
-(rootful runtimes have no keeper). Once clear, teardown flushes the chains,
-removes the keeper, removes the network, and deletes the rendered state, in that
-order. A keeper- or network-removal failure occurs after the flush: rendered
-state still remains for retry, but the live chains have already been deleted.
-At any egress refusal the tenant units, supported containers, and IPC volumes
-are already removed, its ports are deallocated, and with `--purge` its database
-is reset. Remove the unexpected attachment and rerun `remove-tenant` to finish.
+Egress teardown checks the keeper and attachments before changing any state. On
+rootless Podman, a pod with the keeper's name must have the managed purpose
+label and exactly one container; a foreign or multi-container pod is refused.
+For a valid keeper, the only attachment the query exempts is the infra container
+ID reported by that pod. The count check matters because another container
+inside the pod shares its network namespace without its own network attachment.
+A container that merely carries the keeper's label counts as attached. The query
+uses the network filter alone, so it is the same call on Podman and on Docker.
+An attachment refusal, a failed query, a failed keeper-existence check, or a
+keeper that is foreign or cannot be identified therefore leaves the existing
+rootless keeper pod and its namespace, both live chains, the egress network, and
+the rendered state intact for repair and retry (rootful runtimes have no
+keeper). Once clear, teardown flushes the chains, removes the keeper, removes
+the network, and deletes the rendered state, in that order. A keeper- or
+network-removal failure occurs after the flush: rendered state still remains
+for retry, but the live chains have already been deleted. At any egress refusal
+the tenant units, supported containers, and IPC volumes are already removed,
+its ports are deallocated, and with `--purge` its database is reset. Resolve the
+reported keeper problem or remove the unexpected attachment, then rerun
+`remove-tenant` to finish.
 
 **Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
 uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
@@ -762,8 +766,8 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
 v2.0.32 bump entry below for the source review and verification status; the
-lane has since advanced to **v2.2.6** (2026-11-08, WI#582) with every gate
-re-verified against a fresh clone — see the v2.2.6 bump entry.
+lane has since advanced to **v2.2.7** (2026-11-12, WI#609) with every gate
+re-verified against a fresh clone — see the v2.2.7 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -838,6 +842,15 @@ Enforced controls (opencode2 lane unless noted):
    `/usr/local/bin/opencode` (real binary at `/usr/local/lib/opencode2/opencode`),
    scanning **every argv token**: `service`/`pair` subcommands, the
    `--service` flag, and every `--hostname` occurrence (loopback only).
+   Since the v2.2.7 bump it also starts the real binary with
+   `OPENCODE_FLAGS=-console_watches`, replacing whatever the caller's
+   environment holds: that keeps the Console event watches off, because
+   upstream resolves the variable before every config document (see the
+   v2.2.7 bump entry). Children the real binary spawns inherit the value,
+   with one exception: a managed service started from a `service.json` that
+   carries its own `env` map gets that map laid over the environment. The
+   wrapper's refusal of `opencode service …` and the boot-time reset of that
+   file, both described next, are the controls for that path.
    Server-backed commands such as `run` and `session list` can spawn the real
    binary directly via `Service.ensure`, bypassing the wrapper. At each boot
    the entrypoint removes whatever sits at
@@ -1015,10 +1028,39 @@ Enforced controls (opencode2 lane unless noted):
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
-   auto-update — with the decision for each, not only the bridge call
-   surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
-   these guards cover the *shipped binary*; against a compromised agent
-   only control 1 makes the crossing safe (see the gate record above).
+   auto-update, and remote steering or event channels — with the decision
+   for each, not only the bridge call surface. Include hosted
+   instruction/skill inputs such as the OpenCode Console Library: review both
+   saved and environment credentials plus egress, not only optional
+   event-watch flags (see WI#665 below). Read the upstream diff under
+   `packages/core/src` as well as `packages/{cli,server,schema}/src`: the
+   v2.2.7 Console event watches live there and the first pass of that bump
+   missed them. **Feature flags:** the wrapper's `-console_watches` pin is
+   only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
+   is ignored without a word, and upstream ships a feature by deleting its
+   flag. The builder stage therefore anchors the pin
+   (`scripts/compile_out_remote_tunnel.py`, `check_flag_pin_anchor`) and
+   fails the image when the whole-file digests of the registry
+   (`packages/schema/src/config/flag.ts`) and the resolver
+   (`packages/core/src/flag.ts`) differ from the reviewed v2.2.7 text, when
+   `packages/core/src/plugin/provider/opencode.ts` no longer computes
+   `watching` from `flags.enabled("console_watches")` and starts the watches
+   from it as its only call site, or when the count of scanned files naming
+   `OpencodeWatches` (2) or `Flag.Overrides` (0) changes. That anchor is a
+   text tripwire, necessary and not sufficient: on EVERY bump, whether or
+   not it fires, re-read the flag code by hand and grep the pinned source
+   for new `syncWatches` call sites, new files naming `OpencodeWatches` or
+   `Flag.Overrides`, and new `OPENCODE_FLAGS` readers, then answer in the
+   bump entry: for every new or removed flag, what it turns on and whether
+   the lane takes it; whether `console_watches` still gates the watches (a
+   removed flag may mean the feature shipped and the watches are now always
+   on, or that the pin predates the flag — decide which); and whether
+   anything now resolves above the variable. Then update `REVIEWED_FLAGS`,
+   the digests and the anchors in the same commit. Do not edit the anchor to
+   make it pass without that review. For opencode2 bumps past v2.0.24 the
+   compile-out guard (8) plus these guards cover the *shipped binary*;
+   against a compromised agent only control 1 makes the crossing safe (see
+   the gate record above).
    **Photon-node repair retirement:** when a new OpenCode pin carries the
    `61845b0` whitespace repair in content (a backport; the tag need not
    contain the commit), `fix_photon_patch_context.py` deliberately fails with
@@ -1033,15 +1075,15 @@ Enforced controls (opencode2 lane unless noted):
    nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
    **WI#369 typecheck compiler:** the gate runs whatever `@typescript/native`
    the upstream lock pins. Check its version on every bump: v2.2.5 moved it
-   from `npm:typescript@7.0.2` to a `7.1.0-beta`, and v2.2.6 retains that
-   version; a beta compiler in a build gate is acceptable only while it is
+   from `npm:typescript@7.0.2` to a `7.1.0-beta`, and v2.2.6 and v2.2.7 retain
+   that version (binary `bin/tsc`); a beta compiler in a build gate is acceptable only while it is
    upstream's own pinned devDependency, resolved through the committed lock,
    and still exposes `tsc` at `bin/tsc`.
    Record the version and the binary path in the bump entry.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
-   tunnel surface; at the current v2.2.6 pin it replaces `remote-tunnel.ts`
-   with a fail-closed stub (re-verified against the real v2.2.6 tree:
+   tunnel surface; at the current v2.2.7 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.2.7 tree:
    importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
@@ -1430,8 +1472,8 @@ stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.2.6** at reviewed full commit
-`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (WI#582; WI#427 boundary crossing
+**v2.2.7** at reviewed full commit
+`fedc6f208aa2bd54c1019227214568083f6380ad` (WI#609; WI#427 boundary crossing
 first crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
@@ -1544,7 +1586,7 @@ cd opencode2.4lunarwing
 # Recompute it after any wrapper edit:
 #   sha256sum scripts/opencode-exposure-guard.sh
 DOCKER_BUILDKIT=1 docker build \
-  --build-arg LUNARWING_WRAPPER_SHA256=f2fc2ba6befc2d6d22dbae33029ab9a84ced4e6fa6927839ac636fdd42ca5b7b \
+  --build-arg LUNARWING_WRAPPER_SHA256=e349e842ba843e068fe4b14d1c63e3d87ea33c8a4079710b18e0bc483a5a9a2e \
   -t lunarwing-worker-opencode2:latest .
 
 # Select the worker per tenant, then build the shared image via mt-admin
@@ -1951,6 +1993,298 @@ CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
 
+### v2.2.7 bump — WI#609, item 39 (2026-11-12)
+
+**Review reconciliation and pins:** in the original 2026-11-12 pass,
+`git ls-remote` resolved lightweight v2.2.7 directly to
+`fedc6f208aa2bd54c1019227214568083f6380ad`, then the newest `v2.*` tag, and
+the fresh clone's HEAD matched. Its 24-hour settling window (ended
+2026-11-11 10:37Z) had passed. npm reported `@moonshot-ai/kimi-code` `latest`
+as **2.6.0**, published **2026-11-12 10:11Z** — inside its own 24-hour window
+at that pass — so the kimi lane took **2.5.3** (2026-11-10 13:12Z, window
+passed). Dockerfile defaults, the CI case blocks, the Kimi manifest and its
+lock moved together. Regenerating the lock with
+`npm install --package-lock-only --ignore-scripts` changed only the three
+version fields and the dependency record: the tarball is
+`https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.5.3.tgz`
+with integrity
+`sha512-NdBttZiktZhKdH1tu/25A+Il1MxO1RTE1gAdZDmogoCT4g8L7k3pcLeJpwy7PNJvHo9CF8fDJiaZ9nsIPn+Gag==`.
+Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
+
+**2026-11-13 re-attempt recheck (20:36Z):** v2.3.0 is now the newest `v2.*`
+tag at `a6b15d33daf6ab7d35569f6d711fdb630b9f04e7`, published 08:55Z, and
+npm `latest` is 2.6.2, published 17:28Z. Both are still inside their own
+24-hour waiting windows, so this re-attempt keeps the reviewed v2.2.7 and
+2.5.3 targets. The v1.19.5 pin was re-checked again: it is still the newest
+`v1.*` tag and resolves to `810c0eba1a7348036f8bdf61e6632d0c36c6876c`, the
+committed pin — no v1 change.
+
+**Kimi 2.5.3 verification:**
+
+- The new steering surface (`POST /api/v1/sessions/{session_id}/steer`) and
+  the Web UI / Windows MCP fixes are outside this subprocess lane: it uses
+  print mode only (`-p <prompt> --output-format stream-json`, pinned by the
+  argv regression) and starts no kimi server, so no new instruction channel
+  exists. The four real 2.5.3 contract cases pass against the installed CLI
+  in the pinned Node shape: headless invocation accepted with the
+  `system.version` / `turn.step.retrying` meta stream unchanged, `--yolo`
+  rejected alongside `-p`, baked `[[hooks]]` PreToolUse guard accepted, and
+  the MCP NDJSON initialize/tools-list handshake with parent-env pass-through.
+  The WI#206 fail-closed hook is unchanged.
+- `engines.node` (`>=22.19.0`) and the runtime dependencies (`ws`, `qrcode`,
+  `chokidar`) are identical to 2.5.2, so the pinned Node 22 base still
+  satisfies the CLI.
+
+**Gate re-verification on the fresh v2.2.7 clone:**
+
+- compile-out: `packages/cli/src/services/remote-tunnel.ts` keeps its path and
+  exact `run`/`ensure`/`hostname` importer surface; the real tree stubs
+  cleanly (exit 0), and after stubbing no scanned source under
+  `packages/{cli,server,schema,core}/src` retains an `@opentunnel` specifier.
+  `@opentunnel/client` remains declared but unimported. The diff from v2.2.6
+  adds no tunnel, pairing, share or relay file under
+  `packages/{cli,server,schema}/src`; the one matching path
+  (`commands/handlers/auth/shared.ts`) is credential plumbing. That pass did
+  not read `packages/core/src`, where v2.2.7 does add a remote instruction
+  channel: see **Console event watches** below.
+- reproducible build: `packages/cli/script/build.ts` retains the pinned
+  `--single` / `bytecode: true` / `splitting: true` anchors and
+  `prepare_reproducible_build.py` exits 0. Bun 1.4.4 and the
+  content-equivalent photon repair are unchanged, so the retired fixer stays
+  removed.
+- SDK surface: the generated client keeps all 6 bridge methods
+  (`session.create/prompt/interrupt`, top-level `permission.reply` beside
+  `permission.request.*`, `event.subscribe`, top-level `message.list`); both
+  known-stale paths stay absent (`session.message` exposes only `get`, and
+  `session.form.reply` is not `session.permission.reply`), and all 8 bridge
+  event names remain literals of the generated `V2Event` union — the
+  `sdk_surface_assert.ts` event gate run against the real v2.2.7
+  `generated/types.ts` exits 0. The typecheck compiler pin is unchanged:
+  `@typescript/native` is still `npm:typescript@7.1.0-beta` with `bin/tsc`, and
+  `tsc --noEmit -p scripts/tsconfig.sdk-surface.json` against the v2.2.7
+  checkout (mapped through the committed `paths`) exits 0.
+- SDK timing change (listed as breaking): the bridge calls none of
+  `agent.list`, `integration.list`, `usage.limits`, `vcs.init`, `rpc.call` or
+  `artifact.*` (grep over every non-test `scripts/*.ts`), so the removal of
+  their up-to-five-second startup wait is a no-op for this lane.
+- prompt cache warming: the `opencode.warming` plugin requires an explicit
+  top-level `warming` setting or a model/provider `cache.warming`; neither is
+  present in `config/opencode2.json`, so `Decision.Off()` applies and the lane
+  sends no background keep-alive requests. Nothing was turned off to get
+  there; `warming` is unset in the lane config. `interval: "auto"` only
+  refines timing when an operator enables warming.
+- shell output format: the new `Exit code: N` / timeout tail is produced in
+  `packages/core/src/shell/result.ts` as tool-output text. The executor reads
+  assistant messages (`message.list`) and event types, never the textual tail
+  of a shell result, and no fixture in
+  `scripts/opencode_task_executor_test.ts` matches the old tail.
+- `@opencode/ai`: the lane imports only `@opencode/client/promise`; the
+  removed `ImageResponse.image` cannot reach it.
+- no new opt-ins: no caller-supplied `OPENCODE_FLAGS` reaches the binary
+  (the wrapper replaces it with `-console_watches`, see below); no MCP
+  `pool: true`, `experimental.all_flags`, `experimental.codemode_vm`, or
+  `websearch.use` entry is added. MCP login, Copilot routing, Console policy loading and
+  `opencode auth logout` changes are unused by the lane; the every-token
+  wrapper and boot-time `service.json` reset remain the exposure controls.
+
+**Local gate results (`taskset -c 0-17`):** opencode2 Python suites
+compile-out **10/10**, reproducible build **3/3**, exposure policy **68/68**,
+image config **11/11**, entrypoint config **11/11**, runtime smoke **50/50**;
+lane Bun suites executor, result, path, SDK surface + negative test, tool
+proxy, tool plugin, bridge and task runner **7/7** pass. The kimi real-CLI
+contract lane **4/4** passes against the installed 2.5.3 binary.
+
+**Not performed in the first local pass:** no full Kimi/OpenCode2 image build
+(`mt-admin build-kimi-worker` / `build-opencode2-worker`) and therefore no
+in-image `opencode --version`/binary marker scan, candidate-vs-clean-rebuild
+digest comparison, protected `worker-*-candidate`/scan jobs, or
+`worker-exposure-policy-guard` CI job run on that branch. Later passes built
+both images; see the OpenCode2 review evidence below and the 2026-11-13
+re-attempt evidence at the end of this entry. No tenant rollout or live-model
+dispatch was performed.
+
+**Console event watches (review finding AAV-1 on !2398; maintainer's decision
+2026-11-13: take v2.2.7, record the surface, pin it off):**
+
+- **What it is.** v2.2.7 adds `packages/core/src/plugin/provider/opencode-watches.ts`
+  (708 lines, not in v2.2.6) behind the feature flag `console_watches`
+  (`packages/schema/src/config/flag.ts:19`). With it on, a worker that has
+  a Console credential holds an event connection to OpenCode Console, by
+  default `https://opencode.ai/console`
+  (`packages/core/src/console-access.ts:5`). When a watched Slack thread,
+  GitHub pull request, issue, commit or Actions run changes, the plugin puts
+  a message into the session with `delivery: "steer"` and resumes the turn
+  (`opencode-watches.ts:151`); upstream's own comment says a reply from a
+  phone steers the agent (`:673`). The model also gets `console_watch` tools
+  to set such watches itself, and with watches on a `git push` or
+  `gh pr create` sets one too. That is an instruction channel into the worker
+  through a hosted third party. LunarWing allows one channel only: daemon job
+  dispatch, the bridge, and the agent API on loopback.
+- **The flag is not the whole Console channel.** The same plugin already
+  delivers more than the watches for a worker with a credential, flag or no
+  flag: Console-authored instructions and skills, and the Console's config
+  document merge, whose allow-listed keys are `providers`, `mcp`, `policies`
+  and `websearch` (`packages/core/src/config/integration.ts:32-37`), merged
+  before the flag is read (`opencode.ts:318-335`, flag at `:337`). v2.2.6
+  has the instructions and skills as the workspace Library, so that part is
+  older than this bump. The pin below covers the event watches only. The
+  rest is WI#665.
+- **What must hold to start the watches**
+  (`packages/core/src/plugin/provider/opencode.ts:337`): the flag is on, the
+  worker has a credential of the `opencode` integration, and Console's
+  config says the workspace has watches. A credential needs no login: any
+  set environment variable that the integration's catalog entry names
+  counts (`packages/core/src/integration.ts:396-400`, `:699-703`), and the
+  bundled catalog names `OPENCODE_API_KEY` for the `opencode` provider. The
+  default lane sets no such variable and talks to the tenant's own LLM
+  endpoint. A tenant pointed at OpenCode's hosted models has one, and for
+  that tenant the flag is the main condition left. The tenant's egress
+  allowlist blocks `opencode.ai` unless the operator lists it. The
+  allowlist is the boundary.
+- **The flag is the weak condition.** Upstream resolves a flag from
+  `OPENCODE_FLAGS` first, then from `experimental.<key>` in the
+  highest-priority config document that sets `experimental` (the blocks are
+  not merged), then from the channel default, which is off for the `latest`
+  channel this lane builds (`packages/core/src/flag.ts:35-41`, `:63-70`). The
+  documents include a project's own `opencode.json`, `opencode.jsonc` and
+  `.opencode` directory, found by walking up from the session's directory
+  (`packages/core/src/config/discovery.ts:12`, `:81-82`), and the runtime copy
+  of the lane config under `$WORKSPACE_ROOT/.opencode/` is writable too. So a
+  file in the task-writable workspace can turn the flag on.
+- **The pin.** `scripts/opencode-exposure-guard.sh` now runs
+  `export OPENCODE_FLAGS="-console_watches"` right before it starts the real
+  binary. A leading `-` turns a flag off and the environment wins over every
+  document (upstream pins both in `packages/core/test/flag.test.ts:53` and
+  `:74`), and with the flag off the watches stay dormant even when Console
+  advertises them (`packages/core/test/plugin/provider-opencode-watches.test.ts:273`).
+  The inherited value is replaced, so `OPENCODE_FLAGS=all` from a caller does
+  not survive either. Three build checks hold it in place, and each is a
+  TEXT TRIPWIRE, necessary and not sufficient:
+  - `exposure_policy_assert.py` requires the pin and the `exec` to be the
+    last two code lines of the wrapper, unindented; refuses any other code
+    line that launches the binary, names the variable, uses `alias`, `eval`,
+    `source`, dot-sourcing or a here-document, or ends in a shell operator
+    (`&&`, `||`, `|`, `()`, `\`) that continues into the pin; and requires
+    the wrapper's code lines to match a reviewed SHA-256 digest, so any code
+    edit — a fast path, an opt-out knob, an operator line — fails the build
+    until the checker is reviewed in the same commit. It also fails when the
+    lane config sets `experimental.console_watches` or
+    `experimental.all_flags`.
+  - The builder stage compares the whole `packages/schema/src/config/flag.ts`
+    and `packages/core/src/flag.ts` against the reviewed v2.2.7 digests,
+    requires the two-statement watch gate (`const watching = …` and its
+    `syncWatches(watching …)` use as the only call site), and counts the
+    scanned files that name `OpencodeWatches` (2) and `Flag.Overrides` (0).
+    A drift fails the image with the drift named, but a green anchor proves
+    only that the text is the same as the review read — the per-bump human
+    re-read (checklist item 7) remains the decision.
+- **What the pin is not.** Like the wrapper as a whole it guards against use
+  by mistake, and it has these edges:
+  - A task that starts the real binary by its path, or with
+    `LUNARWING_REAL_OPENCODE` pointed elsewhere, gets past it.
+  - A managed service started from a `service.json` that carries
+    `env.OPENCODE_FLAGS` gets that value: upstream lays the file's `env` map
+    over the environment (`packages/client/src/service-contender.ts:23`,
+    `packages/cli/src/server-process.ts:80`). The wrapper refuses
+    `opencode service …`, and the entrypoint resets that file at boot only.
+  - The wrapper now owns the variable. An operator's own opt-outs, such as
+    `OPENCODE_FLAGS=-schedules`, are dropped with a caller's `all`, without
+    a message.
+  - Nothing checks the pin on a running server. The runtime smoke does not
+    read the server process's environment.
+  For all of these the egress allowlist is the control. The feature stays in
+  the binary: it is not compiled out, unlike OpenTunnel (WI#427).
+- **Not decided here:** the other six flags of the registry (`todo`,
+  `background_compaction`, `media_blob`, `schedules`, `artifacts`,
+  `codemode_vm`) are not pinned. They are off by default, and a workspace
+  config can still turn them on.
+- **Verification (2026-11-13).** The first version of this change was
+  re-reviewed by a second reviewer that had not seen the author's reasoning
+  (!2398 note 16159). It confirmed the pin and the precedence and found the
+  gaps that the second version closes: the anchor, the stricter wrapper
+  check, and three statements in this entry that said more than was true.
+  At the second version:
+  - Exposure policy suite **75/75** (68 before the decision), on the host
+    and inside the image under dash. It starts the wrapper in every mode of
+    `entrypoint.sh` (`serve`, `run`, `acp`), with a leading global flag and
+    with a server-backed command, against seven inherited values.
+  - Compile-out suite **20/20** (10 before): ten new cases for the anchor.
+  - One scratch mutant per rule, all caught: nine for the wrapper and
+    config checks, eight for the anchor. The wrapper shapes that passed the
+    first version of the check (a fast path for other subcommands or for a
+    leading flag, an opt-out knob) are now cases of the suite.
+  - The anchor passes on the real v2.2.7 source, in a scratch tree and in
+    the builder stage of the image build.
+  - A full local OpenCode2 image build (rootless Podman,
+    `--network=host --format docker`, wrapper anchor `e349e842…a9a2e`)
+    completed: builder gates, every in-image suite, the started-entrypoint
+    smoke **5/5** with the server started through the pinned wrapper, and
+    the final `--image-filesystem` assertion. In the built image, as uid
+    10003: the installed wrapper turns a caller's `OPENCODE_FLAGS=all` into
+    `-console_watches`, and `opencode --version` through it reports
+    `opencode v2.2.7`.
+- **Not shown:** the watches themselves were never started, so no run here
+  observed the flag keeping a live Console connection down; that rests on the
+  upstream code and its tests named above. The `service.json` path and the
+  Console Library were read in the source, not run. No candidate-vs-clean-rebuild
+  comparison, scan or protected job ran. v2.3.0's source was not reviewed for
+  this bump because that release is still in its waiting window; at that bump
+  the anchor only reports whether its text is unchanged — it does not prove
+  the pin holds, and the per-bump re-read (checklist item 7) is what decides.
+
+**2026-11-13 re-attempt verification (SweetieBot):** the upgrade and all
+AAV/ABE review fixes were ported onto target `c48a4f7d3` and re-run there.
+
+- The lock regenerated with zero drift. Host Kimi compilation and its suite
+  passed **180 tests with six intentional skips**; the four real-CLI cases
+  were not skipped in the image. The rootless Podman Kimi build completed all
+  **35 steps** with **183 passes, three intentional skips and zero failures**,
+  including all four contracts against the locked 2.5.3 CLI. The image reports
+  `kimi --version` and `KIMI_CODE_IMAGE_VERSION` as **2.5.3** (image ID
+  `1434f0b642eba060a259c40d18afefdb405635e4cf28ec7b2b784ad9e5194911`).
+- The rootless Podman OpenCode2 build completed all **49 steps**, including
+  the fresh-v2.2.7 compile-out/flag anchors, SDK typecheck, every in-image
+  Bun/Python suite (**75** exposure, **20** compile-out, **11** entrypoint and
+  **50** runtime-smoke regressions), started-entrypoint smoke **5/5**, binary
+  marker scan and final filesystem assertion. It reports `opencode v2.2.7`
+  (image ID `600a2c6583c64cdac0f279c45717857c1cd17d971642321e16f129692e2983d9`).
+  The independent exported-rootfs/full-image-config verifier and all **45**
+  out-of-band regressions also passed.
+- The local `check-worker-exposure-policy.sh` guard, goal-1 CI **286/286**,
+  worker build args **16/16**, reproducibility **7/7**, Kimi image-mode tests,
+  relevant mt-admin Kimi/OpenCode2/image-contract/startup/egress harnesses,
+  eight CI YAML validations, Bash syntax, pinned ShellCheck 0.11.0 and
+  `git diff --check` passed. Both builds used mt-admin's rootless Podman
+  network/format/build-arg shape under goal-specific tags, not the root-only
+  mt-admin commands, and changed no tenant image or container.
+- **Still CI/deployment acceptance:** no exact-head MR pipeline or protected
+  candidate, clean-rebuild digest comparison, scan or promotion ran. No live
+  Console connection, tenant rollout or live-model dispatch was attempted.
+  The local guard and image builds do not substitute for those gates.
+
+- **!2417 run-429 follow-up (ABH-1 High, ABH-2/ABH-3 Medium, ABH-4/ABH-5
+  Low, ABH-6, ABN-1):** the anchor is now honest and tighter. The builder
+  stage pins the whole-file SHA-256 of `packages/core/src/flag.ts` and
+  `packages/schema/src/config/flag.ts` (verified against the real v2.2.7
+  checkout at `fedc6f208`), anchors the watch gate as the two-statement
+  block with its `syncWatches(watching …)` use as the only call site, and
+  counts scanned files naming `OpencodeWatches` (2) and `Flag.Overrides`
+  (0); the success line is now only "flag pin anchor text unchanged", and
+  the early pass is fail-closed when the watch code still exists anywhere in
+  the tree. The wrapper check now refuses a line before the pin ending in
+  `&&`, `||`, `|`, `()` or `\`, refuses dot-sourcing wherever it appears, and
+  requires the wrapper's code lines to match a reviewed SHA-256 digest, so a
+  conditional pin or an opt-out knob fails the build; the wrapper comment
+  and this entry name all six things a Console credential delivers with the
+  flag off (instructions, skills, providers, MCP servers, policies,
+  web-search selection). Checklist item 7 restores the per-bump human
+  re-read — grep the pinned source for new `syncWatches` call sites, new
+  files naming `OpencodeWatches` or `Flag.Overrides`, and new
+  `OPENCODE_FLAGS` readers — because the anchor is a text tripwire, not a
+  proof. Suites: exposure policy **78/78**, compile-out **27/27**; the
+  anchor and every new mutant were also run against the real v2.2.7 tree.
+  The wrapper comment edit changes the wrapper anchor to `e349e842…a9a2e`.
+
 ### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
 
 **Review reconciliation and pins:** this re-attempt combines approved !2277
@@ -2053,6 +2387,45 @@ Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
 the candidate-vs-uncached-clean-rebuild digest comparisons, and a green
 post-merge master pipeline remain CI requirements. No tenant rollout or
 live-model daemon-dispatched job was performed.
+
+### OpenCode Console Library (WI#665)
+
+At the current v2.2.6 pin (`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`),
+the upstream `opencode` integration can fetch hosted Console instructions and
+skills into sessions when **both** a Console credential and egress to
+`opencode.ai` are available. This is an additional instruction source, not just
+outbound publication. The bundled catalog names `OPENCODE_API_KEY`; saved
+credentials take precedence over environment credentials. The later v2.2.7
+`console_watches` flag is not in this pinned tree and is not a Library control.
+
+The entrypoint refuses a present `OPENCODE_API_KEY` (even empty) before either
+split role dispatches unless the operator explicitly sets
+`LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1`; an acknowledged startup warns
+without printing the credential. This gate checks only the environment variable.
+Credentials saved by `opencode auth login` inside a session bypass it and can
+survive a container restart. With a usable credential and allowed egress, opt-in
+enables the Library surface too; no shipped setting separately withholds its
+instructions or skills. The managed tenant's egress allowlist remains the
+boundary against a compromised worker.
+
+**Scope:** WI#665's surface record and environment-credential gate are covered;
+the root-owned managed-policy control has **not** been evaluated on a built
+image or shipped. Acceptance items 3 and 4 remain pending, and WI#665 must stay
+open. No Console request, live credential, image build or tenant rollout is
+claimed by this follow-up.
+
+**!2414 review verification (ABK-1–5, 2026-11-13):** the repaired fixture and
+new negative cases pass all 70 exposure-assert tests; non-root entrypoint tests
+pass 16/16, including both split roles. Scratch-lane mutations that skip the
+task gate or dispatch the bridge before it are both caught. The full worker
+exposure guard passes, and the CI-config suite completes 574 tests with 13
+skips and no failures. CI YAML validation (8 files), Python syntax (169 tracked
+files), Bash syntax (301 scripts plus 3 hooks), warning-level ShellCheck for the
+unchanged entrypoint, the new documentation link, and `git diff --check` pass.
+An extra all-severity ShellCheck run reports only the entrypoint's two existing
+SC2016 informational notices for intentionally deferred Git credential expansion.
+No Rust source changed, so Cargo checks/tests and Clippy do not apply. These are
+local results, not a claim of a new remote pipeline or built-image validation.
 
 ### v2.2.5 bump — WI#531, item 30 (2026-11-02)
 
@@ -2373,8 +2746,8 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.5.2` and must match `kimi-cli/package-lock.json`. WI#582 moved the pin from
-2.4.1 on 2026-11-08; the engine requirement remains `node >=22.19.0`, satisfied
+`2.5.3` and must match `kimi-cli/package-lock.json`. WI#609 moved the pin from
+2.5.2 on 2026-11-12; the engine requirement remains `node >=22.19.0`, satisfied
 by the pinned Node 22 base. The worker uses only headless
 `kimi -p --output-format stream-json`, not the server APIs removed in 2.5.0.
 The real-CLI contract gate (`kimi_cli_contract_test.ts`) runs during the image

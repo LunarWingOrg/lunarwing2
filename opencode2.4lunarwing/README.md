@@ -63,7 +63,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.19.5 (proven) | v2.2.6 (beta in practice) |
+| Pin | v1.19.5 (proven) | v2.2.7 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -75,17 +75,48 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.6 pin
-is `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.7 pin
+is `fedc6f208aa2bd54c1019227214568083f6380ad` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
-stays disabled. The lane config's `update: "disable"` pin is not honored by
+stays disabled. The wrapper also starts the binary with
+`OPENCODE_FLAGS=-console_watches`, which keeps v2.2.7's Console event
+watches off whatever the caller's environment or a workspace config says,
+and the builder stage fails the image if the reviewed text behind that pin
+stops holding (a text tripwire, not a proof; re-read the flag code on every
+bump). The pin covers the event watches only: a worker that is given
+an OpenCode Console credential, for example `OPENCODE_API_KEY`, still takes
+Console-authored instructions and skills, plus the Console's config merge
+of providers, remote MCP servers, policies and the web-search selection
+(WI#665). The lane config's `update: "disable"` pin is not honored by
 the updater itself (it reads only the global config dir), so the image
 also carries `OPENCODE_DISABLE_AUTOUPDATE=1` to silence the background
 check. See `docs/ops/WORKER-CONTAINERS.md` for the bump review, verification
 and rollout record, including the open WI#369 SDK-gate and WI#424 egress
 follow-ups.
+
+## OpenCode Console credential boundary (WI#665)
+
+The upstream `opencode` integration can fetch a hosted Console Library of
+instructions and skills when it has both a Console credential and egress to
+`opencode.ai`. At the pinned v2.2.6, its bundled catalog names
+`OPENCODE_API_KEY`. The lane therefore refuses
+to start when that variable is present, even empty, unless the operator sets
+`LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
+spellings are accepted). With a usable credential and allowed egress, this
+opt-in enables the Library surface too: no shipped setting separately withholds
+Console-authored instructions or skills. Startup messages name the variable but
+never print its value.
+
+This startup gate covers only the environment variable. Upstream prefers saved
+credentials, including credentials saved by `opencode auth login` during a
+session; they bypass this gate and may survive container restarts. The tenant
+egress allowlist remains the boundary against a compromised worker. WI#665's
+root-owned managed-policy evaluation and image enforcement are still pending;
+this change does not claim that Console content is blocked after opt-in or login.
+See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
+for the conditions and remaining work.
 
 ## Do not configure both lanes on one tenant during the transition
 

@@ -388,10 +388,24 @@ _write_systemd_unit() {  # <tenant> <path> <mode> — unit body on stdin
 # Quadlet owns creation (the imperative `_ctr run` is skipped on this path), so
 # the named volume below preserves data across container replacement.
 render_pg_quadlet() {
-  local name="$1"
-  local qdir pg_port pg_password
+  local name="$1" image="${2:-}"
+  local qdir pg_port pg_password pg_snapshot=""
   _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
+  # Ordinary starts/upgrades reconcile units, not database image versions.
+  # Only refresh-pg-image supplies an explicit replacement after its pull.
+  # Snapshot as the tenant: the unit also contains a database password.
+  if [[ -z "$image" ]]; then
+    if [[ -e "$qdir/lunarwing-pg-${name}.container" || -L "$qdir/lunarwing-pg-${name}.container" ]]; then
+      _snapshot_tenant_env "$name" "$qdir/lunarwing-pg-${name}.container" pg_snapshot
+      image="$(sed -n 's/^Image=//p' "$pg_snapshot")"
+      rm -f -- "$pg_snapshot"
+      [[ -n "$image" && "$image" != *[$'\r\n\t ']* ]] \
+        || die "existing PostgreSQL Quadlet has no unambiguous Image=; run: $0 refresh-pg-image $name to rewrite it with the configured image after preflight checks"
+    else
+      image="$PG_IMAGE"
+    fi
+  fi
   pg_port="$(ports_get "$name" postgres)"
   # Run-166 LF-3: a resolver refusal is fatal — an empty password inlined
   # into the 0600 .container would break the tenant's database at start.
@@ -415,7 +429,7 @@ StartLimitBurst=5
 
 [Container]
 ContainerName=lunarwing-pg-${name}
-Image=${PG_IMAGE}
+Image=${image}
 PublishPort=127.0.0.1:${pg_port}:5432
 Volume=lunarwing-pg-${name}:/var/lib/postgresql/data
 Environment=POSTGRES_USER=lunarwing

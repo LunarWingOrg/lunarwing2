@@ -3441,6 +3441,7 @@ async fn gateway_status_handler(
         skills_max_context_tokens: state.active_config.skills_max_context_tokens,
         channel_health,
         channel_config_errors,
+        workload_isolation: crate::tools::process::workload_isolation_mode().await,
     })
 }
 
@@ -3483,6 +3484,7 @@ struct GatewayStatusResponse {
     channel_health: Option<std::collections::HashMap<String, ChannelHealthEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel_config_errors: Option<std::collections::HashMap<String, String>>,
+    workload_isolation: &'static str,
 }
 
 #[cfg(test)]

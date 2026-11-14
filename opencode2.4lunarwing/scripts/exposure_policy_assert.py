@@ -13,7 +13,9 @@ Assertions (opencode2 lane):
   1. config/opencode2.json parses and pins "share": "disabled" (control 3).
   2. config/opencode2.json pins "update": "disable".
   3. config/opencode2.json carries the shell deny rules for the
-     self-exposure subcommands (control 2, config layer).
+     self-exposure subcommands (control 2, config layer), and sets neither
+     experimental.console_watches nor experimental.all_flags (WI#609, !2398
+     AAV-1: the Console event watches stay off).
   4. entrypoint.sh starts the server with a password and a loopback default
      hostname, never invokes service mode, never passes --service, defaults
      OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
@@ -21,7 +23,11 @@ Assertions (opencode2 lane):
      from /app/config at boot (controls 2+4; expected startup-shape checks).
   5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
      service/pair subcommands, the --service flag, and every --hostname
-     occurrence (control 2, wrapper layer).
+     occurrence (control 2, wrapper layer). It also forces
+     OPENCODE_FLAGS=-console_watches right before it execs the real binary
+     (WI#609, !2398 AAV-1): those two statements must be the last two code
+     lines, and no other code line may launch the binary or touch the
+     variable.
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
@@ -70,6 +76,25 @@ OPENTUNNEL_MARKERS = (b"opentunnel.xyz", b"@opentunnel/client", b"@opentunnel/pr
 # sync with sessionPermissions() in scripts/opencode_task_executor.ts.
 REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair", "serve"))
 
+# WI#609, !2398 AAV-1: opencode v2.2.7 ships Console event watches, a remote
+# steering channel through OpenCode Console, behind the feature flag
+# `console_watches`. The lane keeps it off in two places. The lane config must
+# not turn it on (`experimental.all_flags` turns every flag on). And the
+# wrapper forces the flag off in OPENCODE_FLAGS, which upstream resolves before
+# every config document, a project's own opencode.json included.
+FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", "console_watches")
+WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="-console_watches"'
+WRAPPER_EXEC = 'exec "$REAL_OPENCODE" "$@"'
+REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
+# SHA-256 over the wrapper's code lines (comments and blank lines stripped),
+# so ANY code edit — including one the shape checks below do not name — needs
+# a review of this checker in the same commit (WI#609 ABH-2).
+WRAPPER_CODE_DIGEST = "cc551f2668957ba4c1354b79dd3723b7f3b8b97246f9f18ac7ca78481830ba0d"
+# Shell features that can make the wrapper's tail unreachable or change what
+# its last two lines mean. The wrapper needs none of them. Dot-sourcing is
+# refused wherever it appears, not only at a line start.
+WRAPPER_FORBIDDEN_RE = re.compile(r"\b(alias|eval|source)\b|<<|(^|[;&|\s])\.\s")
+
 failures: list[str] = []
 
 
@@ -111,6 +136,21 @@ def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
         fail(f"{config_path} permissions must deny shell resources {missing}")
     else:
         check("opencode2.json carries the self-exposure shell deny rules")
+    # Only an explicit false is accepted beside an absent key. Upstream drops
+    # a malformed value, which means off, but a lane config that carries one
+    # says something its author did not mean, so it fails here.
+    experimental = config.get("experimental", {})
+    if not isinstance(experimental, dict):
+        fail(f"{config_path} \"experimental\" must be an object (got {type(experimental).__name__})")
+        return
+    opted_in = [
+        key for key in FORBIDDEN_EXPERIMENTAL_FLAGS if experimental.get(key, False) is not False
+    ]
+    if opted_in:
+        fail(f"{config_path} must not set experimental flags {opted_in} — the Console "
+             "event watches are a remote instruction channel and stay off (WI#609 AAV-1)")
+    else:
+        check("opencode2.json leaves the Console event watches flag off")
 
 
 def serve_invocation_lines(code: str) -> list[str]:
@@ -213,6 +253,23 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
         else:
             fail(f"{entrypoint} must materialize the runtime config from "
                  "/app/config/opencode2.json (copy or symlink) at every boot")
+        # WI#665: the hosted Console Library is an instruction channel whenever
+        # its credential and egress are both present. Keep the credential gate
+        # ahead of role dispatch so neither the bridge nor task role skips it.
+        early, role_boundary, _ = code.partition(
+            'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
+        )
+        console_guard = (
+            'case "${LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL:-0}" in',
+            'if [ -n "${OPENCODE_API_KEY+x}" ]; then',
+            'die "OPENCODE_API_KEY is present; refusing startup without '
+            'LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1',
+        )
+        if role_boundary and all(fragment in early for fragment in console_guard):
+            check("entrypoint.sh gates OpenCode Console credentials before role dispatch")
+        else:
+            fail(f"{entrypoint} must refuse an unacknowledged OPENCODE_API_KEY "
+                 "before role dispatch (WI#665)")
 
 
 def check_wrapper(lane: pathlib.Path) -> None:
@@ -241,6 +298,52 @@ def check_wrapper(lane: pathlib.Path) -> None:
              "scan every argv token, not only $1")
     else:
         check("wrapper scans every argv token (service/pair/--service/--hostname)")
+    # WI#609 AAV-1 / ABE-3 / ABH-2: the pin only holds if every start of the
+    # real binary passes through it. This is a shape check on a reviewed
+    # file, strict about the text instead of clever about the shell: the
+    # last two code lines are the pin and the exec, unindented (not inside a
+    # block or a function); nothing else in the code launches the binary,
+    # names the variable, or uses a feature that could skip or redefine the
+    # tail; and no line before the pin ends in a shell operator that
+    # continues into it. On top of the named rules the whole code body must
+    # match its reviewed digest, so any code edit fails until this checker is
+    # reviewed in the same commit. The behaviour tests and the review cover
+    # the committed file.
+    raw_code = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    code = [line.strip() for line in raw_code]
+
+    def lines_with(needle: str) -> int:
+        return sum(1 for line in code if needle in line)
+
+    problems = []
+    if raw_code[-2:] != [WRAPPER_FLAG_PIN, WRAPPER_EXEC]:
+        problems.append("the last two code lines are not the unindented pin and exec")
+    if sum(1 for line in code if re.search(r"\bexec\b", line)) != 1:
+        problems.append("the number of code lines using exec is not exactly one")
+    if lines_with("REAL_OPENCODE") != 2:
+        problems.append("REAL_OPENCODE is used outside its assignment and the final exec")
+    if lines_with(REAL_BINARY_PATH) != 1:
+        problems.append("the real binary path appears outside the REAL_OPENCODE default")
+    if lines_with("OPENCODE_FLAGS") != 1:
+        problems.append("another code line names OPENCODE_FLAGS")
+    if any(WRAPPER_FORBIDDEN_RE.search(line) for line in code):
+        problems.append("alias, eval, source, dot-sourcing or a here-document is used")
+    if len(code) >= 3 and code[-3].endswith("\\"):
+        problems.append("the line before the pin ends in a continuation")
+    if len(code) >= 3 and code[-3].endswith(("&&", "||", "|", "()")):
+        problems.append("the line before the pin ends in a shell operator that continues into it")
+    if problems:
+        fail(f"{wrapper} must end with exactly {WRAPPER_FLAG_PIN!r} then {WRAPPER_EXEC!r} and "
+             f"launch the real binary nowhere else: {problems} — the Console event watches "
+             "stay off (WI#609 AAV-1)")
+        return
+    digest = hashlib.sha256("\n".join(code).encode()).hexdigest()
+    if digest != WRAPPER_CODE_DIGEST:
+        fail(f"{wrapper} code lines differ from the reviewed digest ({digest[:12]}…) — any "
+             "wrapper code edit must be reviewed and WRAPPER_CODE_DIGEST updated in the same "
+             "commit (WI#609 ABH-2)")
+        return
+    check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
 
 
 def check_binary(binary: pathlib.Path) -> None:

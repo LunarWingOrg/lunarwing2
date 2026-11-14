@@ -97,6 +97,28 @@ impl std::fmt::Display for KnowledgeStatus {
     }
 }
 
+/// One reason a study note needs verification, using the canonical store's
+/// `stale_reasons` representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeStaleReason {
+    /// The stored lifecycle status already requires verification.
+    Status(KnowledgeStatus),
+    /// The note is older than its effective staleness threshold.
+    AgeExceeded,
+    /// The note was studied against a different source commit.
+    SourceCommitMismatch,
+}
+
+impl std::fmt::Display for KnowledgeStaleReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "status:{status}"),
+            Self::AgeExceeded => f.write_str("age-exceeded"),
+            Self::SourceCommitMismatch => f.write_str("source-commit-mismatch"),
+        }
+    }
+}
+
 /// Whether a workspace path belongs to the study-notes knowledge store.
 pub fn is_knowledge_path(path: &str) -> bool {
     path.strip_prefix(KNOWLEDGE_DIR)
@@ -241,36 +263,51 @@ impl KnowledgeNoteMeta {
         })
     }
 
-    /// Whether this note needs verification given age/commit criteria.
+    /// Every reason this note needs verification, in canonical store order.
     ///
-    /// A note is stale when its status is `stale`/`needs-verification`, when
-    /// it was studied more than the effective age limit ago (falling back to
-    /// `updated_at` when no studied timestamp is recorded), or when its
-    /// source commit differs from `repository_commit`. The effective age
-    /// limit is the caller's `max_age_days` when given, otherwise the note's
-    /// own `stale_after_days` threshold (canonical lw2studymcp semantics).
+    /// Stored `stale`/`needs-verification` statuses remain verification work
+    /// until an agent re-studies or supersedes the note. Superseded notes are
+    /// retired and return no reasons. Age falls back to `updated_at` when no
+    /// studied timestamp is recorded. The effective age limit is the caller's
+    /// `max_age_days` when given, otherwise the note's own `stale_after_days`.
+    pub fn stale_reasons(
+        &self,
+        updated_at: DateTime<Utc>,
+        max_age_days: Option<i64>,
+        repository_commit: Option<&str>,
+    ) -> Vec<KnowledgeStaleReason> {
+        let mut reasons = Vec::with_capacity(3);
+        if self.status == KnowledgeStatus::Superseded {
+            return reasons;
+        }
+        if self.status.is_unverified() {
+            reasons.push(KnowledgeStaleReason::Status(self.status));
+        }
+        if let Some(commit) = repository_commit
+            && self.source_commit.as_deref() != Some(commit)
+        {
+            reasons.push(KnowledgeStaleReason::SourceCommitMismatch);
+        }
+        let age_limit_days = max_age_days.or_else(|| self.stale_after_days.map(i64::from));
+        if let Some(days) = age_limit_days {
+            let studied = self.studied_at.unwrap_or(updated_at);
+            if Utc::now() - studied > chrono::Duration::days(days) {
+                reasons.push(KnowledgeStaleReason::AgeExceeded);
+            }
+        }
+        reasons
+    }
+
+    /// Whether this note needs verification by status, age, or source commit.
     pub fn needs_verification(
         &self,
         updated_at: DateTime<Utc>,
         max_age_days: Option<i64>,
         repository_commit: Option<&str>,
     ) -> bool {
-        if self.status.is_unverified() {
-            return true;
-        }
-        let age_limit_days = max_age_days.or_else(|| self.stale_after_days.map(i64::from));
-        if let Some(days) = age_limit_days {
-            let studied = self.studied_at.unwrap_or(updated_at);
-            if Utc::now() - studied > chrono::Duration::days(days) {
-                return true;
-            }
-        }
-        if let Some(commit) = repository_commit
-            && self.source_commit.as_deref() != Some(commit)
-        {
-            return true;
-        }
-        false
+        !self
+            .stale_reasons(updated_at, max_age_days, repository_commit)
+            .is_empty()
     }
 }
 
@@ -727,9 +764,15 @@ mod tests {
         meta.studied_at = Some(now);
         // Active, fresh, matching commit.
         assert!(!meta.needs_verification(now, Some(30), Some("abc123")));
-        // Status alone triggers.
+        // Status alone triggers and is reported with the canonical reason.
         meta.status = KnowledgeStatus::NeedsVerification;
         assert!(meta.needs_verification(now, None, None));
+        assert_eq!(
+            meta.stale_reasons(now, None, None),
+            vec![KnowledgeStaleReason::Status(
+                KnowledgeStatus::NeedsVerification
+            )]
+        );
         meta.status = KnowledgeStatus::Active;
         // Commit mismatch triggers.
         assert!(meta.needs_verification(now, None, Some("other")));
@@ -743,6 +786,12 @@ mod tests {
         // No studied_at falls back to updated_at.
         meta.studied_at = None;
         assert!(meta.needs_verification(now - chrono::Duration::days(90), Some(30), None));
+        // Superseded notes are retired even when their age and commit differ.
+        meta.status = KnowledgeStatus::Superseded;
+        assert!(
+            meta.stale_reasons(now - chrono::Duration::days(400), Some(30), Some("other"))
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
-# v2.2.6 resolves to this reviewed commit. Both must move together.
+# v2.2.7 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.19.5) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.2.6
-ARG OPENCODE_REF=dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06
+ARG OPENCODE_VERSION=v2.2.7
+ARG OPENCODE_REF=fedc6f208aa2bd54c1019227214568083f6380ad
 ARG DEBIAN_SNAPSHOT=20261105T082236Z
 ARG SOURCE_REVISION=unknown
 
@@ -48,8 +48,8 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 
 WORKDIR /build/opencode
 # The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
-# used to apply at the v2.1.2 pin is retired: v2.2.6 carries that whitespace
-# repair as a content-equivalent backport, so the fixer is redundant.
+# used to apply at the v2.1.2 pin is retired: v2.2.6 and v2.2.7 carry that
+# whitespace repair as a content-equivalent backport, so the fixer is redundant.
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 # WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
@@ -82,6 +82,10 @@ RUN python3 /build/prepare_reproducible_build.py script/build.ts
 # remote-tunnel.ts is replaced with a refusing stub. If upstream
 # moves/renames the module or extends its
 # export surface the build fails instead of silently shipping the tunnel.
+# The same script also trips the WI#609 flag-pin anchor: it compares the
+# flag registry and resolver against the reviewed v2.2.7 digests, requires
+# the two-statement Console watch gate, and counts the watch-wiring names —
+# a text tripwire, not a proof (bump checklist item 7 has the re-read).
 RUN python3 /build/compile_out_remote_tunnel.py /build/opencode
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).
