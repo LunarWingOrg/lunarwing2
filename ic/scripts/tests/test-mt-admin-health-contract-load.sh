@@ -56,15 +56,15 @@ stage_plain_checkout() {  # <root> [contract-mode]
   chmod "$mode" "$root/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
 }
 
-# WI#703 case 1: the real CLI, real ownership, a health dir symlinked to a
-# non-root-owned library. --help must still render, and diagnostics must name
-# the resolved library. Removing the checked loader makes this case silent.
+# WI#703 case 1: the real CLI, a health dir symlinked to a library tree. The
+# tree is unsafe in every environment: a symlinked entry alone fails the guard
+# even when every directory is root-owned (and a writable /tmp-style parent is
+# caught earlier, which is the same refusal). --help must still render, and
+# the refusal must be reported. Removing the checked loader makes this silent.
 check_real_unsafe_library() {
   local root="$WORK/real-linked" lib="$WORK/real-linked-lib" out err status=0
   stage_linked_checkout "$root" "$lib"
-  if [[ "$(id -u)" == 0 ]]; then
-    chown -R 65534:65534 "$lib"
-  fi
+  ln -s /etc/hostname "$lib/escape-entry"
   err="$WORK/real-linked.err"
   out="$(bash "$root/ic/scripts/lunarwing-mt-admin.sh" --help 2>"$err")" || status=$?
   assert_eq "real unsafe library: --help exits 0" "0" "$status"
@@ -73,9 +73,10 @@ check_real_unsafe_library() {
   text="$(<"$err")"
   assert_contains "real unsafe library: refusal is reported" "$text" \
     "OpenRC proxy unit contract not loaded"
-  assert_contains "real unsafe library: refusal names the resolved library" "$text" "$lib"
-  assert_contains "real unsafe library: refusal names a failing component" "$text" \
-    "must be root-owned, symlink-free, and not group/other-writable"
+  assert_contains "real unsafe library: refusal is a health-library refusal" "$text" \
+    "refusing health library"
+  assert_contains "real unsafe library: refusal explains the consequence" "$text" \
+    "OpenRC commands will refuse until it is repaired"
   assert_absent "real unsafe library: no shell error" "$text" "command not found"
 }
 
