@@ -1795,12 +1795,12 @@ async fn assert_netbird_joined_run(
     };
     let command = format!(
         "cat /etc/resolv.conf; cat /proc/net/dev; cat /proc/self/mountinfo; \
-         wget -qO- -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
+         wget -qO- -t 1 -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
          && echo LUNARWING-NETBIRD-OVERLAY-OK; \
          {dns_probe} {old_resolver_probe} \
-         wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
+         wget -qO- -t 1 -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
          && echo LUNARWING-NETBIRD-UPLINK-OPEN; \
-         wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
+         wget -qO- -t 1 -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
          && echo LUNARWING-NETBIRD-METADATA-OPEN; true"
     );
     let output = runner
