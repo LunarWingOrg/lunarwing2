@@ -57,7 +57,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
-const RUN_HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(65);
 const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
 const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
@@ -1211,9 +1210,9 @@ impl TunnelSidecar {
         .await
     }
 
-    /// Health verification has its own ceiling, separate from recovery's budget.
+    /// Verify before and after bounded recovery; each runtime probe keeps its own deadline.
     pub async fn container_for_run(&self) -> Result<String> {
-        match self.ensure_healthy_for_run().await {
+        match self.ensure_healthy().await {
             Ok(container_id) => Ok(container_id),
             Err(error) => {
                 tracing::warn!(
@@ -1221,18 +1220,8 @@ impl TunnelSidecar {
                     "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
                 );
                 self.recover_for_run().await?;
-                self.ensure_healthy_for_run().await
+                self.ensure_healthy().await
             }
-        }
-    }
-
-    async fn ensure_healthy_for_run(&self) -> Result<String> {
-        match tokio::time::timeout(RUN_HEALTH_CHECK_BUDGET, self.ensure_healthy()).await {
-            Ok(result) => result,
-            Err(_) => Err(self.unavailable(&format!(
-                "health check exceeded the {}s health-check budget during image, runtime, provider, or firewall probes",
-                RUN_HEALTH_CHECK_BUDGET.as_secs()
-            ))),
         }
     }
 
@@ -1311,16 +1300,23 @@ impl TunnelSidecar {
         if self.recovery_stop_requested().await {
             return Err(self.unavailable("sidecar recovery interrupted by shutdown"));
         }
-        let attempt = self.start_or_adopt(reprobe_timeout, provider_timeout);
         let result = match budget {
-            Some(budget) => match tokio::time::timeout(budget, attempt).await {
-                Ok(result) => result,
-                Err(_) => Err(self.unavailable(&format!(
-                    "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
-                    budget.as_secs()
-                ))),
-            },
-            None => attempt.await,
+            Some(budget) => {
+                let deadline = tokio::time::Instant::now() + budget;
+                let attempt =
+                    self.start_or_adopt(reprobe_timeout, provider_timeout, Some(deadline));
+                match tokio::time::timeout_at(deadline, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(self.unavailable(&format!(
+                        "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
+                        budget.as_secs()
+                    ))),
+                }
+            }
+            None => {
+                self.start_or_adopt(reprobe_timeout, provider_timeout, None)
+                    .await
+            }
         };
         if self.recovery_stop_requested().await {
             self.remove_unlocked().await;
@@ -1367,9 +1363,10 @@ impl TunnelSidecar {
         &self,
         reprobe_timeout: Duration,
         provider_timeout: Duration,
+        recovery_deadline: Option<tokio::time::Instant>,
     ) -> Result<()> {
         let _ = self.tunnel_resolv_conf()?;
-        let hash = self.current_hash().await?;
+        let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
                 Ok(()) => return Ok(()),
@@ -1405,7 +1402,7 @@ impl TunnelSidecar {
             return Err(self.unavailable("sidecar recovery is in progress"));
         }
         let _ = self.tunnel_resolv_conf()?;
-        let hash = self.current_hash().await?;
+        let hash = self.current_hash(None, false).await?;
         let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         };
@@ -1800,7 +1797,11 @@ impl TunnelSidecar {
         })
     }
 
-    async fn ensure_image_available(&self) -> Result<()> {
+    async fn ensure_image_available(
+        &self,
+        recovery_deadline: Option<tokio::time::Instant>,
+        allow_pull: bool,
+    ) -> Result<()> {
         if self
             .status_probe(&["image", "inspect", self.cfg.image()])
             .await
@@ -1808,13 +1809,42 @@ impl TunnelSidecar {
         {
             return Ok(());
         }
+        if !allow_pull {
+            // WI#651 ABV-1: the per-run health path does not pull. It fails
+            // fast, and the single-flight recovery pulls under its remaining
+            // per-run budget — no parallel unbounded pulls when commands
+            // pile up after a prune or a failed cold start.
+            return Err(self.unavailable(
+                "sidecar image is not present locally; the single-flight recovery pulls it under its per-run budget",
+            ));
+        }
         if !self.cfg.auto_pull_image {
             return Err(self.unavailable(
                 "sidecar image is not present locally and SANDBOX_AUTO_PULL is false",
             ));
         }
-        let pulled = tokio::time::timeout(
-            self.cfg.startup_timeout,
+        let (pull_deadline, budget) = match recovery_deadline {
+            Some(deadline) => {
+                // One Instant::now() read feeds one deadline, so the pull's
+                // timer never lags the outer recovery deadline by a second
+                // clock read (WI#651 ABV-2).
+                let by_startup = tokio::time::Instant::now() + self.cfg.startup_timeout;
+                if by_startup < deadline {
+                    (
+                        by_startup,
+                        format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
+                    )
+                } else {
+                    (deadline, "remaining per-run recovery budget".to_string())
+                }
+            }
+            None => (
+                tokio::time::Instant::now() + self.cfg.startup_timeout,
+                format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
+            ),
+        };
+        let pulled = tokio::time::timeout_at(
+            pull_deadline,
             self.runtime_output(&["pull", self.cfg.image()], None),
         )
         .await;
@@ -1822,7 +1852,7 @@ impl TunnelSidecar {
             Ok(Ok(output)) if output.status.success() => Ok(()),
             Ok(Ok(_)) => Err(self.unavailable("could not pull the sidecar image")),
             Ok(Err(_)) => Err(self.unavailable("failed to execute the image pull")),
-            Err(_) => Err(self.unavailable("sidecar image pull exceeded the startup timeout")),
+            Err(_) => Err(self.unavailable(&format!("sidecar image pull exceeded the {budget}"))),
         }
     }
 
@@ -1928,8 +1958,13 @@ impl TunnelSidecar {
         }
     }
 
-    async fn current_hash(&self) -> Result<String> {
-        self.ensure_image_available().await?;
+    async fn current_hash(
+        &self,
+        recovery_deadline: Option<tokio::time::Instant>,
+        allow_pull: bool,
+    ) -> Result<String> {
+        self.ensure_image_available(recovery_deadline, allow_pull)
+            .await?;
         let image_id = self.resolve_image_id().await?;
         let dir = self.runtime_dir()?;
         let salt = read_or_create_label_salt(&dir)
@@ -3227,6 +3262,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn failed_runtime_output() -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
     fn slow_healthy_runtime(
         hash: String,
         instance: String,
@@ -3242,7 +3287,7 @@ mod tests {
             let calls = calls.clone();
             let container_id = "2".repeat(64);
             async move {
-                tokio::time::sleep(Duration::from_secs(9)).await;
+                tokio::time::sleep(Duration::from_millis(9_500)).await;
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let stdout = match args.first().map(String::as_str) {
                     Some("image") if args.iter().any(|arg| arg == "--format") => {
@@ -3303,7 +3348,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let container_id = sidecar.container_for_run().await.unwrap();
         assert_eq!(container_id, "2".repeat(64));
-        assert_eq!(started.elapsed(), Duration::from_secs(63));
+        assert_eq!(started.elapsed(), Duration::from_millis(66_500));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
         let lifecycle = sidecar.lifecycle.state.lock().await;
         assert!(lifecycle.active.is_none());
@@ -3314,6 +3359,123 @@ mod tests {
                 .is_none()
         );
         drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn recovery_image_pull_uses_remaining_budget_and_names_pull() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-pull-budget-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let pulls = pulls.clone();
+            move |args, _stdin| {
+                let pulls = pulls.clone();
+                async move {
+                    match args.first().map(String::as_str) {
+                        Some("image") => Ok(failed_runtime_output()),
+                        Some("pull") => {
+                            pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_secs(90)).await;
+                            Ok(successful_runtime_output(String::new()))
+                        }
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    }
+                }
+            }
+        });
+        let config = TunnelSidecarConfig {
+            startup_timeout: Duration::from_secs(90),
+            auto_pull_image: true,
+            ..netbird_cfg()
+        };
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar.recover_for_run().await.unwrap_err();
+        let error_text = error.to_string();
+        assert!(error_text.contains("image pull"), "{error_text}");
+        assert!(
+            error_text.contains("remaining per-run recovery budget"),
+            "{error_text}"
+        );
+        assert!(
+            !error_text.contains("sidecar recovery exceeded"),
+            "{error_text}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(
+            lifecycle
+                .cached_reason(tokio::time::Instant::now())
+                .is_some_and(|reason| reason.contains("image pull"))
+        );
+        drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// WI#651 ABV-1: the per-run health path never pulls. A missing image
+    /// fails fast with a pointer at the single-flight recovery, which pulls
+    /// under its per-run budget — even when auto-pull is on and the startup
+    /// timeout is large.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_path_does_not_pull_a_missing_image() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-health-no-pull-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let pulls = pulls.clone();
+            move |args, _stdin| {
+                let pulls = pulls.clone();
+                async move {
+                    match args.first().map(String::as_str) {
+                        Some("image") => Ok(failed_runtime_output()),
+                        Some("pull") => {
+                            pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(successful_runtime_output(String::new()))
+                        }
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    }
+                }
+            }
+        });
+        let config = TunnelSidecarConfig {
+            startup_timeout: Duration::from_secs(600),
+            auto_pull_image: true,
+            ..netbird_cfg()
+        };
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let error = sidecar.ensure_healthy().await.unwrap_err();
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("sidecar image is not present locally"),
+            "{error_text}"
+        );
+        assert!(
+            error_text.contains("single-flight recovery pulls it under its per-run budget"),
+            "{error_text}"
+        );
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
         std::fs::remove_dir_all(base).unwrap();
     }
 
