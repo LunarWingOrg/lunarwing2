@@ -2145,6 +2145,7 @@ start_tenant_opencode() {
 
 stop_tenant_opencode() {
   local name="$1"
+  id -u "$name" >/dev/null 2>&1 || return 0
   ensure_container_runtime
 
   local container_name="lunarwing-opencode-$name"
@@ -2362,6 +2363,7 @@ start_tenant_opencode2() {
 
 stop_tenant_opencode2() {
   local name="$1"
+  id -u "$name" >/dev/null 2>&1 || return 0
   ensure_container_runtime
 
   local container_name="lunarwing-opencode2-$name"
@@ -2809,6 +2811,7 @@ start_tenant_kimi() {
 
 stop_tenant_kimi() {
   local name="$1"
+  id -u "$name" >/dev/null 2>&1 || return 0
   ensure_container_runtime
 
   local container_name="lunarwing-kimi-$name"
@@ -3024,6 +3027,7 @@ start_tenant_pebble() {
 
 stop_tenant_pebble() {
   local name="$1"
+  id -u "$name" >/dev/null 2>&1 || return 0
   ensure_container_runtime
 
   local container_name="lunarwing-pebble-$name"
