@@ -1137,7 +1137,7 @@ impl TunnelSidecar {
     }
 
     fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
-        if self.cfg.dns.is_empty() {
+        if self.cfg.provider != TunnelProvider::Netbird && self.cfg.dns.is_empty() {
             return Ok(None);
         }
         let dir = self.runtime_dir()?;
@@ -1152,6 +1152,9 @@ impl TunnelSidecar {
         let Some(path) = self.resolv_conf_path()? else {
             return Ok(None);
         };
+        if self.cfg.provider == TunnelProvider::Netbird {
+            return Ok(path.is_file().then_some(path));
+        }
         let contents = std::iter::once("# lunarwing-tunnel-dns\n".to_string())
             .chain(
                 self.cfg
@@ -3360,7 +3363,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for path in [resolv_conf, backup] {
+        for path in [&resolv_conf, &backup] {
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
                 "nameserver 10.89.0.1\n"
@@ -3371,6 +3374,7 @@ mod tests {
                 0o600
             );
         }
+        assert_eq!(sidecar.tunnel_resolv_conf().unwrap(), Some(resolv_conf));
         std::fs::remove_dir_all(base).unwrap();
     }
 
