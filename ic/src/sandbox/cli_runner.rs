@@ -502,9 +502,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 } else {
                     args.push("container:".into());
                 }
-                if !tunnel.dns.is_empty()
-                    && let Some(path) = tunnel.resolv_conf
-                {
+                if let Some(path) = tunnel.resolv_conf {
                     args.extend([
                         "-v".into(),
                         format!("{}:/etc/resolv.conf:ro,z", path.display()),
@@ -1902,6 +1900,27 @@ mod tests {
                 .iter()
                 .any(|arg| { arg == "container:lunarwing-sandbox-tunnel" })
         );
+    }
+
+    #[test]
+    fn learned_tunnel_dns_uses_the_resolver_mount_without_static_dns() {
+        let args = build_run_args(&RunSpec {
+            tunnel: Some(TunnelRunConfig {
+                container_id: "lunarwing-sandbox-tunnel-instance",
+                dns: &[],
+                resolv_conf: Some(Path::new("/run/user/1000/netbird.resolv.conf")),
+            }),
+            ..spec(
+                ContainerRuntime::Podman,
+                KeepIdMode::UidPinned,
+                SandboxPolicy::ReadOnly,
+                SandboxNetworkMode::Tunnel,
+                0,
+            )
+        });
+        let joined = args.join(" ");
+        assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
+        assert!(joined.contains("/run/user/1000/netbird.resolv.conf:/etc/resolv.conf:ro,z"));
     }
 
     #[test]
