@@ -808,6 +808,24 @@ remove_tenant() {
   say "=== Removing tenant: $name ==="
   say ""
 
+  # WI#688: refresh the identity record while the account exists, so a rerun
+  # after `userdel` below can still prove the old uid idle. Without the account
+  # a rootless store is unreachable; every step below then skips it, and that
+  # is safe only when no process of the former uids is left.
+  local account_state=0
+  tenant_account_state "$name" || account_state=$?
+  if ((account_state == 0)); then
+    tenant_identity_record "$name" \
+      || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing removal"
+  elif ((account_state != 2)); then
+    die "cannot tell whether the account of tenant '$name' is gone: its lookup fails, but it is not both absent from $TENANT_PASSWD_FILE and unknown to getent; refusing removal"
+  elif tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" \
+      || die "tenant account '$name' is gone and its former uid is not proven idle; refusing removal"
+    say "tenant account '$name' is gone and no process of its former uids remains; its rootless store is treated as gone"
+    say ""
+  fi
+
   retire_tenant_nanocode "$name" \
     || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing removal"
 
@@ -845,6 +863,9 @@ remove_tenant() {
   # WI#424 (run-226 OQ-6): drop the tenant's egress network, rendered state and
   # live chains while the tenant account still exists (the rootless netns and
   # rootless network are owned by it). Only when this tenant ever had egress.
+  # WI#688: without the account the teardown proves the former uids idle again
+  # and drops the rendered state; rootless chains stay in the unreachable
+  # namespace, where no process is left to filter.
   # WI#638: teardown itself refuses to flush with attachments; never downgrade
   # that refusal to a warning and report the tenant removed while workers remain.
   if [[ -n "$(worker_egress_state_get "$name" SUBNET)" ]]; then
@@ -860,7 +881,8 @@ remove_tenant() {
   [[ -n "$name" ]] && rm -rf -- "$(_hash_dir "$name")"
   say ""
 
-  remove_tenant_user "$name" "$purge"
+  remove_tenant_user "$name" "$purge" || die "user removal failed for '$name'"
+  rm -f -- "$(tenant_identity_path "$name")"
   say ""
 
   # Drop the pre-delegated cgroup subtree and re-render the boot-time setup

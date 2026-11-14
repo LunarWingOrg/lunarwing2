@@ -160,25 +160,34 @@ not application auth.
   Starts, recovery, stops, and cancelled-start cleanup therefore exclude each
   other, with stale cleanup queued before the next start. Cold starts use the
   same 6-second adoption re-probe as per-command recovery, then give a fresh
-  provider the full configured startup budget; image pull, runtime start, and
-  provider readiness have separate bounds rather than one cold wall-clock cap.
+  provider the full configured startup budget (capped at 600 seconds); image
+  pull, runtime start, and provider readiness have separate bounds rather than
+  one cold wall-clock cap.
   Per-command recovery gives a fresh provider at most 20 seconds (or the lower
-  configured timeout). A provider that needs longer after recreation requires
-  a daemon restart, which the returned error names. Initial and final health
-  verification each have a 65-second ceiling, below the seven probes' aggregate
-  70 seconds of individual 10-second deadlines; recovery has its own 60-second
-  budget, including image and runtime probes. A slow health check does not
-  record a recovery failure or blame a recovery that never started. The returned
-  `SandboxError::TunnelUnavailable`, mapped to
-  `[sandbox:sandbox_unavailable]`, names the failed probe. Only an actual failed
-  recovery is cached for 30 seconds. Calls inside that window return the reason
-  and next-attempt delay immediately; after it, one call retries. Recovery runs
-  in a sidecar-owned task whose completion is shared through a watch channel.
-  Caller cancellation only drops that caller's wait: the task still cleans up a
-  partial start, records its result, and wakes any later waiters. A channel that
-  closes without a result is matched to its own attempt and recorded as a
-  failure, so a dead task cannot block later recovery or let a stale waiter
-  clear a new attempt.
+  configured timeout) and has a 60-second budget. A provider that needs longer
+  after recreation requires a daemon restart, which the returned error names.
+  Initial and final health verification use their individual probe deadlines
+  without a second aggregate ceiling: seven probes totaling 70 seconds for
+  WireGuard, six totaling 60 for NetBird. The health paths never pull an image
+  (WI#651): a missing image fails the check fast and the single-flight recovery
+  pulls it under its per-run budget, using the smaller of the configured
+  startup timeout and the remaining recovery budget, with a pull-specific
+  timeout diagnostic. Initial verification,
+  recovery, and final verification therefore total at most 200 and 180 seconds,
+  image present or not, plus up to 15 seconds for the lifecycle lock, which
+  precedes the recovery budget; joining a cold
+  start can exceed these per-run totals because cold-start phases have separate
+  bounds. A slow health check does not record a recovery failure or blame a
+  recovery that never started. The returned `SandboxError::TunnelUnavailable`,
+  mapped to `[sandbox:sandbox_unavailable]`, names the failed probe. Only an
+  actual failed recovery is cached for 30 seconds. Calls inside that window
+  return the reason and next-attempt delay immediately; after it, one call
+  retries. Recovery runs in a sidecar-owned task whose completion is shared
+  through a watch channel. Caller cancellation only drops that caller's wait:
+  the task still cleans up a partial start, records its result, and wakes any
+  later waiters. A channel that closes without a result is matched to its own
+  attempt and recorded as a failure, so a dead task cannot block later recovery
+  or let a stale waiter clear a new attempt.
   There is no fallback to `proxy`, `proxy-enforced`, direct egress, or host
   execution.
 - An already verified firewall table is left unchanged. A required installation

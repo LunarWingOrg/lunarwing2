@@ -1494,8 +1494,22 @@ impl SecretValueRedactor {
     /// Add one more value to an existing redactor (e.g. the worker bearer
     /// token, as defense in depth against accidental output — DG-7).
     pub fn add_value(&mut self, value: &str) {
-        self.add_raw(value);
-        self.rebuild_matchers();
+        self.add_values(std::iter::once(value));
+    }
+
+    /// Add several values with a single matcher rebuild (WI#666): a job's
+    /// granted credentials are injected into every child process env, so the
+    /// values are armed alongside the job's harness secrets without paying
+    /// one matcher rebuild per credential. Rebuilds only when a value
+    /// actually contributed a variant.
+    pub fn add_values<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
+        let before = self.direct_variants.len() + self.folded_variants.len();
+        for value in values {
+            self.add_raw(value);
+        }
+        if self.direct_variants.len() + self.folded_variants.len() != before {
+            self.rebuild_matchers();
+        }
     }
 
     fn extend_variants(&mut self, raw: &str) {
@@ -2045,6 +2059,14 @@ fn relative_lossy(base: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Write-back rejection reasons for a staged path or file that contains a
+/// value from the job redactor: a mounted harness secret (CW-10) or a
+/// credential served to the job (WI#666).
+const STAGED_PATH_SECRET_REASON: &str =
+    "staged path embeds a worker secret value (mounted secret or granted credential)";
+const STAGED_CONTENT_SECRET_REASON: &str =
+    "content embeds a worker secret value (mounted secret or granted credential)";
+
 struct ScreenInput<'a> {
     path: &'a Path,
     relative: &'a str,
@@ -2066,10 +2088,12 @@ fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
     // job can name a file after a mounted secret value, and that name lands
     // in the `harness_write_back` audit event and the `wait=true` result.
     // Reject before any read so the value never reaches the write set.
+    // WI#666: the job redactor also holds the credential values served to
+    // the job, so the reason names both sources.
     if let Some(redactor) = input.redactor
         && redactor.contains_secret(&relative)
     {
-        return Err("staged path embeds a mounted worker secret value".to_string());
+        return Err(STAGED_PATH_SECRET_REASON.to_string());
     }
     if !input.policy.root_allows(&relative) {
         return Err(format!(
@@ -2113,7 +2137,7 @@ fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
     if let Some(redactor) = input.redactor
         && redactor.contains_secret(&content)
     {
-        return Err("content embeds a mounted worker secret value".to_string());
+        return Err(STAGED_CONTENT_SECRET_REASON.to_string());
     }
     Ok(StagedWrite {
         relative_path: relative,
@@ -2804,7 +2828,7 @@ mod tests {
         assert!(
             plan.rejections
                 .iter()
-                .any(|r| r.reason == "staged path embeds a mounted worker secret value"),
+                .any(|r| r.reason == STAGED_PATH_SECRET_REASON),
             "the secret-named staged file must be rejected by the path scan, got {plan:?}"
         );
         // The secret value must never appear in the recorded rejection.
@@ -2943,6 +2967,34 @@ mod tests {
         let redactor = SecretValueRedactor::new(&values);
         assert!(!redactor.is_armed());
         assert_eq!(redactor.scrub("a short story"), "a short story");
+    }
+
+    #[test]
+    fn redactor_add_values_arms_every_granted_credential() {
+        // WI#666: grants are injected into the child env, so their values must
+        // be scrubbed from job events exactly like harness secret values.
+        let mut redactor = SecretValueRedactor::default();
+        assert!(!redactor.is_armed());
+        redactor.add_values([
+            "granted-credential-alpha",
+            "short",
+            "granted-credential-beta",
+        ]);
+        assert!(redactor.is_armed());
+        for value in ["granted-credential-alpha", "granted-credential-beta"] {
+            let scrubbed = redactor.scrub(&format!("printenv leaked {value} here"));
+            assert!(!scrubbed.contains(value), "grant value must be scrubbed");
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
+        // The sub-minimum value contributes no variant, same as `new`.
+        assert_eq!(redactor.scrub("short output"), "short output");
+    }
+
+    #[test]
+    fn redactor_add_values_on_empty_iterator_leaves_redactor_unarmed() {
+        let mut redactor = SecretValueRedactor::default();
+        redactor.add_values(std::iter::empty());
+        assert!(!redactor.is_armed());
     }
 
     #[test]

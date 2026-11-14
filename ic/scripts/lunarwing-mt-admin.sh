@@ -75,6 +75,14 @@ OPENRC_PROXY_BACKUP_DIR="${LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:-/var/lib/lunarw
 # chain (root writes there followed tenant-planted symlinks; and tenant-side
 # sidecars written by an older mt-admin were root-owned and unupdatable).
 CONTAINER_HASH_DIR="${LUNARWING_MT_CONTAINER_HASH_DIR:-/var/lib/lunarwing/container-hashes}"
+# WI#688: each tenant's uid and subordinate uid ranges, recorded in root-owned
+# host state while the account exists, so a removal after the account is gone
+# can prove from the process table that nothing of it still runs.
+TENANT_IDENTITY_DIR="${LUNARWING_MT_TENANT_IDENTITY_DIR:-/var/lib/lunarwing/tenant-identity}"
+TENANT_SUBUID_FILE="${LUNARWING_MT_SUBUID_FILE:-/etc/subuid}"
+TENANT_PROC_ROOT="${LUNARWING_MT_PROC_ROOT:-/proc}"
+# The local files database that useradd writes tenant accounts to.
+TENANT_PASSWD_FILE="${LUNARWING_MT_PASSWD_FILE:-/etc/passwd}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was
@@ -113,6 +121,9 @@ HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-}"
 HEALTH_BASE_DIR="${LUNARWING_MT_HEALTH_BASE_DIR:-/var/lib/lunarwing-health}"
 HEALTH_SRC_DIR="$LUNARWING_ROOT/ic-infrastructure-health-check"
 HEALTH_LIB_DIR="/usr/local/lib/lunarwing-health"
+# Library entries installed by other tools that a reinstall keeps (see
+# carry_health_library_entries): the optional metrics listener binary.
+HEALTH_LIB_CARRIED_ENTRIES=(lunarwing-health-metrics)
 HEALTH_ENV_FILE="/etc/lunarwing/health.env"
 HEALTH_LAUNCHER="/usr/local/sbin/lunarwing-mt-health"
 # Gotify for self-heal escalations (token must NOT be committed — supply via env;
@@ -307,8 +318,10 @@ Commands:
                                    (v2 lane; keep off tenants that already run
                                    the proven v1 opencode worker)
     --with-lunardepth              Select LunarDepth; requires an explicit route
-    --lunardepth-base-url <url>    TensorMoon-compatible API root (never inherited)
-    --lunardepth-model <model>     Complete tensormoon::<function>::lunarwing id
+    --lunardepth-base-url <url>    TensorMoon or TensorZero API root (never inherited)
+    --lunardepth-model <model>     Complete tensormoon::function_name::<function> or
+                                   tensorzero::function_name::<function> id, in the
+                                   dialect of the gateway behind the base URL
     --lunardepth-api-key-file <path>
                                    Per-tenant revocable key, staged for the task only
                                    (add-tenants: accepted for one tenant only)
@@ -554,8 +567,10 @@ Commands:
     --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
 
-  configure-lunardepth <name>      Set the explicit TensorMoon-compatible LunarDepth route
-    --model <model>                Complete tensormoon::<function>::lunarwing model id
+  configure-lunardepth <name>      Set the explicit TensorMoon or TensorZero LunarDepth route
+    --model <model>                Complete tensormoon::function_name::<function> or
+                                   tensorzero::function_name::<function> model id, in
+                                   the dialect of the gateway behind the base URL
     --base-url <url>               Complete OpenAI-compatible API root (no inheritance)
     --api-key-file <path>          Stage a per-tenant revocable key only in the task env;
                                    that key is visible to the model. Omitted values survive.

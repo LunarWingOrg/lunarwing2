@@ -57,7 +57,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RUN_RECOVERY_REPROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const RUN_PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(20);
-const RUN_HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(65);
 const RUN_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
 const RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
@@ -1211,9 +1210,9 @@ impl TunnelSidecar {
         .await
     }
 
-    /// Health verification has its own ceiling, separate from recovery's budget.
+    /// Verify before and after bounded recovery; each runtime probe keeps its own deadline.
     pub async fn container_for_run(&self) -> Result<String> {
-        match self.ensure_healthy_for_run().await {
+        match self.ensure_healthy().await {
             Ok(container_id) => Ok(container_id),
             Err(error) => {
                 tracing::warn!(
@@ -1221,18 +1220,8 @@ impl TunnelSidecar {
                     "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
                 );
                 self.recover_for_run().await?;
-                self.ensure_healthy_for_run().await
+                self.ensure_healthy().await
             }
-        }
-    }
-
-    async fn ensure_healthy_for_run(&self) -> Result<String> {
-        match tokio::time::timeout(RUN_HEALTH_CHECK_BUDGET, self.ensure_healthy()).await {
-            Ok(result) => result,
-            Err(_) => Err(self.unavailable(&format!(
-                "health check exceeded the {}s health-check budget during image, runtime, provider, or firewall probes",
-                RUN_HEALTH_CHECK_BUDGET.as_secs()
-            ))),
         }
     }
 
@@ -1311,16 +1300,23 @@ impl TunnelSidecar {
         if self.recovery_stop_requested().await {
             return Err(self.unavailable("sidecar recovery interrupted by shutdown"));
         }
-        let attempt = self.start_or_adopt(reprobe_timeout, provider_timeout);
         let result = match budget {
-            Some(budget) => match tokio::time::timeout(budget, attempt).await {
-                Ok(result) => result,
-                Err(_) => Err(self.unavailable(&format!(
-                    "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
-                    budget.as_secs()
-                ))),
-            },
-            None => attempt.await,
+            Some(budget) => {
+                let deadline = tokio::time::Instant::now() + budget;
+                let attempt =
+                    self.start_or_adopt(reprobe_timeout, provider_timeout, Some(deadline));
+                match tokio::time::timeout_at(deadline, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(self.unavailable(&format!(
+                        "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
+                        budget.as_secs()
+                    ))),
+                }
+            }
+            None => {
+                self.start_or_adopt(reprobe_timeout, provider_timeout, None)
+                    .await
+            }
         };
         if self.recovery_stop_requested().await {
             self.remove_unlocked().await;
@@ -1367,9 +1363,10 @@ impl TunnelSidecar {
         &self,
         reprobe_timeout: Duration,
         provider_timeout: Duration,
+        recovery_deadline: Option<tokio::time::Instant>,
     ) -> Result<()> {
         let _ = self.tunnel_resolv_conf()?;
-        let hash = self.current_hash().await?;
+        let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
                 Ok(()) => return Ok(()),
@@ -1405,7 +1402,7 @@ impl TunnelSidecar {
             return Err(self.unavailable("sidecar recovery is in progress"));
         }
         let _ = self.tunnel_resolv_conf()?;
-        let hash = self.current_hash().await?;
+        let hash = self.current_hash(None, false).await?;
         let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         };
@@ -1531,24 +1528,41 @@ impl TunnelSidecar {
 
     async fn wait_provider_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_error = None;
         loop {
-            let error = match self.provider_health().await {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
-            };
             if tokio::time::Instant::now() >= deadline {
-                let context = if timeout < self.cfg.startup_timeout {
-                    format!(
-                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s; a provider that needs longer after recreation requires a daemon restart",
-                        timeout.as_secs(),
-                        self.cfg.startup_timeout.as_secs()
-                    )
-                } else {
-                    format!("provider remained unhealthy for {}s", timeout.as_secs())
-                };
-                return Err(self.error_with_context(error, &context));
+                return Err(self.provider_ready_timeout_error(timeout, last_error));
             }
-            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+            match tokio::time::timeout_at(deadline, self.provider_health()).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => return Err(self.provider_ready_timeout_error(timeout, last_error)),
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.provider_ready_timeout_error(timeout, last_error));
+            }
+            tokio::time::sleep(HEALTH_POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+
+    fn provider_ready_timeout_error(
+        &self,
+        timeout: Duration,
+        error: Option<SandboxError>,
+    ) -> SandboxError {
+        let context = if timeout < self.cfg.startup_timeout {
+            format!(
+                "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s; a provider that needs longer after recreation requires a daemon restart",
+                timeout.as_secs(),
+                self.cfg.startup_timeout.as_secs()
+            )
+        } else {
+            format!("provider remained unhealthy for {}s", timeout.as_secs())
+        };
+        match error {
+            Some(error) => self.error_with_context(error, &context),
+            None => self.unavailable(&context),
         }
     }
 
@@ -1568,11 +1582,13 @@ impl TunnelSidecar {
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<()> {
+        let mut used_final_attempt = false;
+        let mut last_error = None;
         loop {
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.health_timeout_error(timeout, None));
+                return Err(self.health_timeout_error(timeout, last_error));
             }
-            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+            match tokio::time::timeout_at(deadline, self.provider_health()).await {
                 Ok(Ok(())) => {
                     return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
                         .await
@@ -1581,16 +1597,22 @@ impl TunnelSidecar {
                         Err(_) => Err(self.health_timeout_error(timeout, None)),
                     };
                 }
-                Ok(Err(error)) => error,
-                Err(_) => return Err(self.health_timeout_error(timeout, None)),
-            };
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => return Err(self.health_timeout_error(timeout, last_error)),
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(self.health_timeout_error(timeout, Some(error)));
+                return Err(self.health_timeout_error(timeout, last_error));
             }
             if remaining <= HEALTH_POLL_INTERVAL {
-                tokio::time::sleep(remaining).await;
-                return Err(self.health_timeout_error(timeout, Some(error)));
+                if used_final_attempt {
+                    return Err(self.health_timeout_error(timeout, last_error));
+                }
+                used_final_attempt = true;
+                // Space the last look into the remaining window while leaving
+                // time for the probe and firewall check under the same deadline.
+                tokio::time::sleep(remaining / 2).await;
+                continue;
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
@@ -1800,7 +1822,11 @@ impl TunnelSidecar {
         })
     }
 
-    async fn ensure_image_available(&self) -> Result<()> {
+    async fn ensure_image_available(
+        &self,
+        recovery_deadline: Option<tokio::time::Instant>,
+        allow_pull: bool,
+    ) -> Result<()> {
         if self
             .status_probe(&["image", "inspect", self.cfg.image()])
             .await
@@ -1808,13 +1834,42 @@ impl TunnelSidecar {
         {
             return Ok(());
         }
+        if !allow_pull {
+            // WI#651 ABV-1: the per-run health path does not pull. It fails
+            // fast, and the single-flight recovery pulls under its remaining
+            // per-run budget — no parallel unbounded pulls when commands
+            // pile up after a prune or a failed cold start.
+            return Err(self.unavailable(
+                "sidecar image is not present locally; the single-flight recovery pulls it under its per-run budget",
+            ));
+        }
         if !self.cfg.auto_pull_image {
             return Err(self.unavailable(
                 "sidecar image is not present locally and SANDBOX_AUTO_PULL is false",
             ));
         }
-        let pulled = tokio::time::timeout(
-            self.cfg.startup_timeout,
+        let (pull_deadline, budget) = match recovery_deadline {
+            Some(deadline) => {
+                // One Instant::now() read feeds one deadline, so the pull's
+                // timer never lags the outer recovery deadline by a second
+                // clock read (WI#651 ABV-2).
+                let by_startup = tokio::time::Instant::now() + self.cfg.startup_timeout;
+                if by_startup < deadline {
+                    (
+                        by_startup,
+                        format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
+                    )
+                } else {
+                    (deadline, "remaining per-run recovery budget".to_string())
+                }
+            }
+            None => (
+                tokio::time::Instant::now() + self.cfg.startup_timeout,
+                format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
+            ),
+        };
+        let pulled = tokio::time::timeout_at(
+            pull_deadline,
             self.runtime_output(&["pull", self.cfg.image()], None),
         )
         .await;
@@ -1822,7 +1877,7 @@ impl TunnelSidecar {
             Ok(Ok(output)) if output.status.success() => Ok(()),
             Ok(Ok(_)) => Err(self.unavailable("could not pull the sidecar image")),
             Ok(Err(_)) => Err(self.unavailable("failed to execute the image pull")),
-            Err(_) => Err(self.unavailable("sidecar image pull exceeded the startup timeout")),
+            Err(_) => Err(self.unavailable(&format!("sidecar image pull exceeded the {budget}"))),
         }
     }
 
@@ -1928,8 +1983,13 @@ impl TunnelSidecar {
         }
     }
 
-    async fn current_hash(&self) -> Result<String> {
-        self.ensure_image_available().await?;
+    async fn current_hash(
+        &self,
+        recovery_deadline: Option<tokio::time::Instant>,
+        allow_pull: bool,
+    ) -> Result<String> {
+        self.ensure_image_available(recovery_deadline, allow_pull)
+            .await?;
         let image_id = self.resolve_image_id().await?;
         let dir = self.runtime_dir()?;
         let salt = read_or_create_label_salt(&dir)
@@ -3227,6 +3287,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn failed_runtime_output() -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
     fn slow_healthy_runtime(
         hash: String,
         instance: String,
@@ -3242,7 +3312,7 @@ mod tests {
             let calls = calls.clone();
             let container_id = "2".repeat(64);
             async move {
-                tokio::time::sleep(Duration::from_secs(9)).await;
+                tokio::time::sleep(Duration::from_millis(9_500)).await;
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let stdout = match args.first().map(String::as_str) {
                     Some("image") if args.iter().any(|arg| arg == "--format") => {
@@ -3303,7 +3373,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let container_id = sidecar.container_for_run().await.unwrap();
         assert_eq!(container_id, "2".repeat(64));
-        assert_eq!(started.elapsed(), Duration::from_secs(63));
+        assert_eq!(started.elapsed(), Duration::from_millis(66_500));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
         let lifecycle = sidecar.lifecycle.state.lock().await;
         assert!(lifecycle.active.is_none());
@@ -3318,13 +3388,227 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn slow_health_fixture(
+    #[tokio::test(start_paused = true)]
+    async fn recovery_image_pull_uses_remaining_budget_and_names_pull() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-pull-budget-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let pulls = pulls.clone();
+            move |args, _stdin| {
+                let pulls = pulls.clone();
+                async move {
+                    match args.first().map(String::as_str) {
+                        Some("image") => Ok(failed_runtime_output()),
+                        Some("pull") => {
+                            pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_secs(90)).await;
+                            Ok(successful_runtime_output(String::new()))
+                        }
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    }
+                }
+            }
+        });
+        let config = TunnelSidecarConfig {
+            startup_timeout: Duration::from_secs(90),
+            auto_pull_image: true,
+            ..netbird_cfg()
+        };
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar.recover_for_run().await.unwrap_err();
+        let error_text = error.to_string();
+        assert!(error_text.contains("image pull"), "{error_text}");
+        assert!(
+            error_text.contains("remaining per-run recovery budget"),
+            "{error_text}"
+        );
+        assert!(
+            !error_text.contains("sidecar recovery exceeded"),
+            "{error_text}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let lifecycle = sidecar.lifecycle.state.lock().await;
+        assert!(
+            lifecycle
+                .cached_reason(tokio::time::Instant::now())
+                .is_some_and(|reason| reason.contains("image pull"))
+        );
+        drop(lifecycle);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// WI#651 ABV-1: the per-run health path never pulls. A missing image
+    /// fails fast with a pointer at the single-flight recovery, which pulls
+    /// under its per-run budget — even when auto-pull is on and the startup
+    /// timeout is large.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_path_does_not_pull_a_missing_image() {
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-health-no-pull-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let pulls = pulls.clone();
+            move |args, _stdin| {
+                let pulls = pulls.clone();
+                async move {
+                    match args.first().map(String::as_str) {
+                        Some("image") => Ok(failed_runtime_output()),
+                        Some("pull") => {
+                            pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(successful_runtime_output(String::new()))
+                        }
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    }
+                }
+            }
+        });
+        let config = TunnelSidecarConfig {
+            startup_timeout: Duration::from_secs(600),
+            auto_pull_image: true,
+            ..netbird_cfg()
+        };
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config,
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let error = sidecar.ensure_healthy().await.unwrap_err();
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("sidecar image is not present locally"),
+            "{error_text}"
+        );
+        assert!(
+            error_text.contains("single-flight recovery pulls it under its per-run budget"),
+            "{error_text}"
+        );
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum HealthScript {
+        Slow,
+        SlowFirewall,
+        DelayedFailure,
+        FailsThenSlow(usize),
+        HealthyOnFinalPoll,
+        Healthy,
+    }
+
+    #[cfg(unix)]
+    struct HealthReply {
+        delay: Duration,
+        stdout: String,
+        success: bool,
+    }
+
+    #[cfg(unix)]
+    impl HealthReply {
+        fn success(stdout: impl Into<String>) -> Self {
+            Self {
+                delay: Duration::ZERO,
+                stdout: stdout.into(),
+                success: true,
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                delay: Duration::ZERO,
+                stdout: String::new(),
+                success: false,
+            }
+        }
+
+        fn after(mut self, seconds: u64) -> Self {
+            self.delay = Duration::from_secs(seconds);
+            self
+        }
+
+        fn after_millis(mut self, millis: u64) -> Self {
+            self.delay = Duration::from_millis(millis);
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_netbird_health(command: Option<&str>, listing: &str) -> HealthReply {
+        match command {
+            Some("netbird") => HealthReply::success(""),
+            Some("cat") => HealthReply::success("nameserver 9.9.9.9\n"),
+            Some("nft") => HealthReply::success(listing),
+            other => panic!("unexpected sidecar exec: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_reply(
+        script: HealthScript,
+        command: Option<&str>,
+        attempt: usize,
+        elapsed: Duration,
+        listing: &str,
+    ) -> HealthReply {
+        match script {
+            HealthScript::Slow => HealthReply::success("").after(30),
+            HealthScript::DelayedFailure => HealthReply::failure().after_millis(100),
+            HealthScript::FailsThenSlow(failures) if attempt < failures => {
+                HealthReply::failure().after_millis(100)
+            }
+            HealthScript::FailsThenSlow(_) => HealthReply::success("").after(30),
+            HealthScript::SlowFirewall if command == Some("cat") => {
+                successful_netbird_health(command, listing).after(30)
+            }
+            HealthScript::SlowFirewall | HealthScript::Healthy => {
+                successful_netbird_health(command, listing)
+            }
+            HealthScript::HealthyOnFinalPoll => match command {
+                Some("netbird") if elapsed < Duration::from_secs(5) => HealthReply::failure(),
+                _ => successful_netbird_health(command, listing),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_runtime_output(stdout: String, success: bool) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn health_fixture(
         label: &str,
+        script: HealthScript,
     ) -> (
         TunnelSidecar,
         PathBuf,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let base =
             std::env::temp_dir().join(format!("lw-tunnel-health-{label}-{}", uuid::Uuid::new_v4()));
@@ -3333,32 +3617,49 @@ mod tests {
         let instance = instance_id_for(&base);
         let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let removed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let exec_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listing = listing_for(&EgressPolicy {
+            tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
+            resolvers: vec!["9.9.9.9".parse().unwrap()],
+        });
+        let started = tokio::time::Instant::now();
         let runtime = crate::sandbox::cli_runner::TestRuntime::new({
             let removals = removals.clone();
             let removed = removed.clone();
+            let exec_calls = exec_calls.clone();
             move |args, _stdin| {
                 let instance = instance.clone();
                 let removals = removals.clone();
                 let removed = removed.clone();
+                let exec_calls = exec_calls.clone();
+                let listing = listing.clone();
                 let container_id = "2".repeat(64);
                 async move {
-                    let stdout = match args.first().map(String::as_str) {
+                    let (stdout, success) = match args.first().map(String::as_str) {
                         Some("exec") => {
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            String::new()
+                            let attempt =
+                                exec_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let reply = health_reply(
+                                script,
+                                args.get(2).map(String::as_str),
+                                attempt,
+                                started.elapsed(),
+                                &listing,
+                            );
+                            tokio::time::sleep(reply.delay).await;
+                            (reply.stdout, reply.success)
                         }
                         Some("inspect") => {
-                            format!("{container_id}|true|test-hash|{instance}\n")
+                            (format!("{container_id}|true|test-hash|{instance}\n"), true)
                         }
                         Some("rm") => {
                             removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             removed.notify_one();
-                            String::new()
+                            (String::new(), true)
                         }
-                        Some("container") => format!("{container_id}\n"),
                         other => panic!("unexpected runtime call: {other:?}"),
                     };
-                    Ok(successful_runtime_output(stdout))
+                    Ok(health_runtime_output(stdout, success))
                 }
             }
         });
@@ -3369,6 +3670,19 @@ mod tests {
             &runtime_dir,
         )
         .with_test_runtime(runtime);
+        (sidecar, base, removals, removed, exec_calls)
+    }
+
+    #[cfg(unix)]
+    fn slow_health_fixture(
+        label: &str,
+    ) -> (
+        TunnelSidecar,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (sidecar, base, removals, removed, _) = health_fixture(label, HealthScript::Slow);
         (sidecar, base, removals, removed)
     }
 
@@ -3385,6 +3699,153 @@ mod tests {
 
         assert!(error.to_string().contains("remained unhealthy for 6s"));
         assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_deadline_bounds_slow_firewall_and_removes_container() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("firewall-deadline", HealthScript::SlowFirewall);
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remained unhealthy for 6s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_waits_in_final_interval_for_provider_to_become_healthy() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("final-poll", HealthScript::HealthyOnFinalPoll);
+
+        let started = tokio::time::Instant::now();
+        sidecar.wait_healthy(Duration::from_secs(6)).await.unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_accepts_a_successful_chain() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("success", HealthScript::Healthy);
+
+        let started = tokio::time::Instant::now();
+        sidecar.wait_healthy(Duration::from_secs(6)).await.unwrap();
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn provider_ready_deadline_bounds_slow_probe() {
+        let (sidecar, base, _removals, _removed) = slow_health_fixture("provider-ready");
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_provider_ready(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider remained unhealthy for the 6s per-run cap")
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn provider_ready_deadline_retains_last_probe_error_and_clamps_sleep() {
+        for (script, expected_calls) in [
+            (HealthScript::DelayedFailure, 3),
+            (HealthScript::FailsThenSlow(1), 2),
+        ] {
+            for startup in [false, true] {
+                let (mut sidecar, base, _removals, _removed, exec_calls) =
+                    health_fixture("last-provider-error", script);
+                let timeout = Duration::from_secs(6);
+                if startup {
+                    sidecar.cfg.startup_timeout = timeout;
+                }
+
+                let started = tokio::time::Instant::now();
+                let error = sidecar.wait_provider_ready(timeout).await.unwrap_err();
+                let reason = error.to_string();
+
+                assert!(
+                    reason.contains("netbird status --check startup probe failed"),
+                    "{reason}"
+                );
+                assert!(reason.contains("provider remained unhealthy"), "{reason}");
+                assert_eq!(reason.contains("per-run cap"), !startup, "{reason}");
+                assert_eq!(started.elapsed(), timeout);
+                assert_eq!(
+                    exec_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    expected_calls
+                );
+                std::fs::remove_dir_all(base).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_retains_last_probe_error_when_final_probe_times_out() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("last-health-error", HealthScript::FailsThenSlow(3));
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+        let reason = error.to_string();
+
+        assert!(
+            reason.contains("netbird status --check startup probe failed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("sidecar remained unhealthy for 6s"),
+            "{reason}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn expired_health_deadlines_do_not_start_provider_probes() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("expired-deadline", HealthScript::Slow);
+
+        let started = tokio::time::Instant::now();
+        assert!(sidecar.wait_provider_ready(Duration::ZERO).await.is_err());
+        assert!(sidecar.wait_healthy(Duration::ZERO).await.is_err());
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(base).unwrap();
     }

@@ -763,8 +763,28 @@ worker_egress_assert_detached() {
 # Check before releasing the keeper so an attachment refusal preserves both the
 # rootless namespace and its chains. Once clear, flush before dropping them.
 worker_egress_teardown() {
-  local name="$1" network conf ruleset hosts network_rm_out
+  local name="$1" network network_rm_out
   _worker_egress_validate_name "$name"
+  # WI#688: without the account the rootless store, its network and keeper
+  # cannot be asked. Nothing can be attached when no process of the former
+  # uids is left, so prove that again before dropping the rendered state. On
+  # rootless Podman the chains lived only in the tenant's rootless network
+  # namespace, which only the tenant can enter (`worker_egress_nft` needs the
+  # account) and in which no process is left: there is nothing to flush. The
+  # network and keeper definitions stay in the unreachable store. Host-side
+  # chains (another runtime) are flushed as usual.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" \
+      || { printf 'worker-egress: tenant account %s is gone and its former uids are not proven idle; refusing teardown\n' "$name" >&2; return 1; }
+    if [[ "$CONTAINER_RT" == podman ]]; then
+      printf 'worker-egress: tenant account %s is gone and no process of it remains; its chains lived only in its rootless network namespace, which no process is left in, and its network and keeper definitions stay in its unreachable store\n' "$name"
+    else
+      worker_egress_flush "$name"
+    fi
+    _worker_egress_remove_state "$name"
+    printf 'worker-egress: removed the rendered egress state of %s\n' "$name"
+    return 0
+  fi
   worker_egress_assert_detached "$name" || return 1
   worker_egress_flush "$name"
   worker_egress_stop_keeper "$name" || return 1
@@ -778,6 +798,11 @@ worker_egress_teardown() {
         return 1 ;;
     esac
   }
+  _worker_egress_remove_state "$name"
+}
+
+_worker_egress_remove_state() {
+  local name="$1" conf ruleset hosts
   _worker_egress_lock
   conf="$(worker_egress_conf_path "$name")"
   ruleset="$(worker_egress_ruleset_path "$name")"

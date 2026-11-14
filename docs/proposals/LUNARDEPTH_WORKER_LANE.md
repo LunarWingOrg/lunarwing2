@@ -85,7 +85,7 @@ The !2339 review (note 15301) approved this design with four Low findings that a
 | Harness agent API | task container only, `127.0.0.1:19091/ws/agent`, never published |
 | Workspace | shared at `/workspace`, with existing rootful inode and rootless keep-id guards |
 | IPC | `lunarwing-lunardepth-<tenant>-ipc-v2`, runner Unix socket only; no tool-proxy socket |
-| Model configuration | required explicit `LUNARDEPTH_BASE_URL` and `LUNARDEPTH_MODEL`, rendered as one complete TensorMoon-compatible provider/model route |
+| Model configuration | required explicit `LUNARDEPTH_BASE_URL` and `LUNARDEPTH_MODEL`, rendered as one complete TensorMoon- or TensorZero-dialect provider/model route |
 | Model credential | task-only `LUNARDEPTH_API_KEY`; never the bridge, overlay, argv, logs, or examples |
 | Hub credentials | `supports_credentials = false`; per-job environment/credential grants fail instead of being ignored |
 | Port registry | v18, two ports per tenant from `52000-52999`, disabled unless selected |
@@ -131,7 +131,7 @@ The source SHA and ancestry checks are necessary but insufficient. The image bui
 - the legacy subprotocol is rejected;
 - health, readiness, ready/ping/pong, sequential tasks, cancellation, timeout, and terminal statuses retain the daemon's shapes;
 - output/frame/history bounds remain at or below daemon limits;
-- the complete TensorMoon provider and model row resolves with the lane-owned credential reference;
+- the complete TensorMoon or TensorZero provider and model row resolves with the lane-owned credential reference;
 - remote cleartext HTTP fails without the explicit exception; and
 - unsupported environment, tool-proxy, runtime-steering, and resume surfaces are neither advertised nor executed.
 
@@ -373,20 +373,20 @@ In both cases §9.2's key requirements apply.
 
 ## 8. Model routing, exposure, and egress
 
-### 8.1 Explicit TensorMoon-compatible route
+### 8.1 Explicit TensorMoon or TensorZero route
 
-Use LunarDepth's current native route shape: provider `tensormoon`, API `openai-completions`, and a model id of the reviewed form `tensormoon::<function_name>::lunarwing`. The overlay replaces the complete `llm-pi-ai` provider row and the complete `agent-default-model` row; a Cordis patch replaces a row's whole `config`, so partial inheritance is not accepted.
+Use LunarDepth's current native route shape: API `openai-completions` and a model id of one of the two reviewed forms, `tensormoon::function_name::<function>` or `tensorzero::function_name::<function>` (WI#691). Both gateways define that grammar themselves: the middle segment is the literal keyword `function_name`, and `<function>` is any function the gateway serves, limited here to letters, digits, `_`, and `-`. The id's prefix names the gateway dialect, and the provider row carries the same name, `tensormoon` or `tensorzero`. The id alone selects the dialect; the lane neither translates an id nor accepts a separate dialect setting that could disagree with it. The overlay replaces the complete `llm-pi-ai` provider row and the complete `agent-default-model` row; a Cordis patch replaces a row's whole `config`, so partial inheritance is not accepted.
 
 mt-admin owns two required non-secret settings:
 
 - `LUNARDEPTH_BASE_URL`, the complete OpenAI-compatible API root, including a path such as `/openai/v1` but excluding `/chat/completions`; and
-- `LUNARDEPTH_MODEL`, the complete reviewed TensorMoon model identifier.
+- `LUNARDEPTH_MODEL`, the complete reviewed model identifier in the dialect of the gateway behind that URL.
 
-There is **no automatic inheritance** from `LLM_BASE_URL`, `LLM_MODEL`, TensorZero, or another worker. This monorepo does not yet manage TensorMoon as a first-class component, and an OpenAI-compatible transport does not prove that the gateway accepts TensorMoon function/model naming or the same credential. Selecting the lane requires an explicit per-lane/fleet URL and model. An operator may deliberately reuse an existing endpoint only after confirming that compatibility through `configure-lunardepth`.
+There is **no automatic inheritance** from `LLM_BASE_URL`, `LLM_MODEL`, TensorZero, or another worker. This monorepo does not yet manage TensorMoon as a first-class component, and an OpenAI-compatible transport does not prove that the gateway accepts TensorMoon function/model naming or the same credential. Selecting the lane requires an explicit per-lane/fleet URL and model. An operator may deliberately reuse an existing endpoint only after confirming that compatibility through `configure-lunardepth`. Reusing a TensorZero gateway is such an explicit route: its own API root and a `tensorzero::` id, never an inherited endpoint or a prefix-rewriting proxy.
 
 The effective provider row contains literal `baseURL` and model values, `apiKeyEnv: LUNARDEPTH_API_KEY`, no `baseURLEnv`, and only the selected model. The worker row names the same provider/model pair. `configure-lunardepth --api-key-file` stages the credential through the existing protected file flow. An explicitly unauthenticated gateway may use LunarDepth's documented nonempty placeholder behavior only by a separate operator opt-in. Keys never appear in argv, the overlay, health, logs, export text, or examples.
 
-A placeholder `set-lunardepth-base-url.invalid`, an empty/malformed model, or a model without the reviewed `tensormoon::…::lunarwing` shape fails before readiness. HTTPS is required for non-loopback endpoints in **both** mt-admin's URL validator and the task launcher. A private-network cleartext exception requires exact `LUNARDEPTH_ALLOW_INSECURE_HTTP=true`; only then does the literal provider row contain `allowInsecureHTTP: true`. Otherwise it is false or absent. The exception is never inferred from a private IP, loopback, or another lane's setting. The launcher compares the rendered URL/exception with its validated environment before starting and fails closed on drift.
+A placeholder `set-lunardepth-base-url.invalid`, an empty/malformed model, or a model without one of the two reviewed `tensormoon::function_name::…` and `tensorzero::function_name::…` shapes fails before readiness. HTTPS is required for non-loopback endpoints in **both** mt-admin's URL validator and the task launcher. A private-network cleartext exception requires exact `LUNARDEPTH_ALLOW_INSECURE_HTTP=true`; only then does the literal provider row contain `allowInsecureHTTP: true`. Otherwise it is false or absent. The exception is never inferred from a private IP, loopback, or another lane's setting. The launcher compares the rendered URL/exception with its validated environment before starting and fails closed on drift.
 
 The final overlay also:
 
@@ -519,7 +519,7 @@ The existing protected-ref rules stay intact. An MR pipeline proves source/confi
 - An allowlisted security row that fails to mount in the real boot prevents readiness; a `runnerCommand` or `runnerFailureSignatures` value on the `sandbox` row fails the gate even though enforcement reports `full`.
 - When `tool-fs-search` is disabled (§7), every enabled model-facing tool is run against `/proc/*/environ` and returns no credential value.
 - Full-enforcement bwrap/Landlock unit fixtures permit only the workspace and permitted temp writes and deny an escape; `SANDBOX_UNAVAILABLE`, `partial`, `danger-full-access`, `dsh-bash-local`, and `runnerCommand` all fail the lane policy.
-- Complete TensorMoon provider/model resolution with `LUNARDEPTH_API_KEY`, no `baseURLEnv`, HTTPS enforcement, and the exact insecure-HTTP exception in both mt-admin and the task launcher.
+- Complete TensorMoon and TensorZero provider/model resolution with `LUNARDEPTH_API_KEY`, no `baseURLEnv`, HTTPS enforcement, and the exact insecure-HTTP exception in both mt-admin and the task launcher.
 - LunarDepth's focused API/bundle suites and typechecks against the exact pinned ref, UTF-16 code-unit history boundaries, plus the runtime-closure verifier and explicit resolution of `@lunardepth/dsh-lunarwing-worker-app` and `@lunardepth/dsh-lunarwing-worker` from the materialized deployment.
 
 ### 11.2 Image and exposure tests
@@ -552,7 +552,7 @@ On a disposable tenant, with no production tenant mutation:
 
 1. Build through mt-admin, start the pair, and verify systemd user-manager behavior on a systemd host and rendered/managed units on an OpenRC host.
 2. Run `worker-listeners`, `worker-egress`, `worker-smoke`, and `status`; require only expected host-loopback publications, a proven live filter, a full-enforcement confined bash call, and a denied escape inside the actual restricted task container.
-3. Dispatch `create_job(mode: "lunardepth", wait: false)` through the real daemon to a deterministic model, then make one real tenant-approved TensorMoon inference. Verify job id, progress, final output, workspace write, fresh session behavior, job attribution, and the fresh session's actual permission/sandbox/approval events.
+3. Dispatch `create_job(mode: "lunardepth", wait: false)` through the real daemon to a deterministic model, then make one real tenant-approved TensorMoon or TensorZero inference. Verify job id, progress, final output, workspace write, fresh session behavior, job attribution, and the fresh session's actual permission/sandbox/approval events.
 4. Exercise cancellation and timeout, unsupported steering, credentials/environment rejection, a second concurrent task, workspace escape, unavailable approval, and harness death. Each must have an explicit bounded outcome.
 5. Plant hostile home/profile configuration, arbitrary plugin/`!!js` rows, a `$HOME/.node_modules` module, a profile manifest with a bogus schema version, and workspace/home `.env` files, then restart twice. Require regenerated configuration, an unchanged profile manifest across dump and boot, no loader warnings, no planted execution or temp redirection, preserved session data, and no persistent startup denial of service.
 6. Attempt task-loopback and non-loopback exposure, direct wrapper bypass, arbitrary egress, telemetry/search/update access, unconfined bash selection, and task-port publication. The network/audits and composition gate must deny or flag them.
@@ -566,7 +566,7 @@ Part 2 is complete only when all of the following are true:
 
 1. `lunardepth4lunarwing/` implements this design at a reviewed full LunarDepth SHA containing both required markers, with Node/pnpm and both worker packages resolved from the materialized production closure.
 2. The non-root bridge/task pair passes real protocol, cancellation, workspace, credential-isolation, immutable-overlay, regenerated-lower-layer, launch-environment, effective-composition, fresh-session policy-event, full-confinement, health-supervision, and exposure tests.
-3. mt-admin supports selection, explicit TensorMoon-compatible configuration, build/start/restart/upgrade/rollback, both init systems, v18 ports, listener/egress audits, and candidate promotion without daemon changes.
+3. mt-admin supports selection, explicit TensorMoon- or TensorZero-dialect configuration, build/start/restart/upgrade/rollback, both init systems, v18 ports, listener/egress audits, and candidate promotion without daemon changes.
 4. The generic exposure guard and LunarDepth candidate, out-of-band verification, scan, and protected publication jobs pass on the exact implementation head; the MR pipeline is green.
 5. `docs/ops/WORKER-CONTAINERS.md` gains a LunarDepth section covering pin/ref provenance, dispatch, identities, model/URL configuration, configuration integrity, sandbox/network limits, unsupported capabilities, shared session-history authority, exposure/egress controls, rollout/rollback, and the version-bump exposure checklist, which includes "the profile template and `LUNARDEPTH_REF` move together" and the task-visible model key.
 6. `lunardepth4lunarwing/AGENTS.md`, `.gitlab/deliverables.json`, build/input inventories, and operator examples agree with the implementation and contain no real credentials.

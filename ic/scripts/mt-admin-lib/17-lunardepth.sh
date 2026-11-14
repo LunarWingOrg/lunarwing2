@@ -230,10 +230,11 @@ configure_lunardepth() {
   ports_enable_worker "$name" lunardepth
   ensure_external_worker_config "$name" lunardepth lunardepth_wss \
     || die "could not safely write the LunarDepth external-worker config for tenant '$name'"
+  # The validated id starts with its gateway dialect, tensormoon or tensorzero.
   if [[ "$allow_placeholder" == "true" ]]; then
-    say "LunarDepth configured for tenant '$name' (explicit TensorMoon-compatible route; unauthenticated-gateway exception on, no key stored)"
+    say "LunarDepth configured for tenant '$name' (explicit ${model%%::*}:: route; unauthenticated-gateway exception on, no key stored)"
   else
-    say "LunarDepth configured for tenant '$name' (explicit TensorMoon-compatible route; key staged only in the task env)"
+    say "LunarDepth configured for tenant '$name' (explicit ${model%%::*}:: route; key staged only in the task env)"
   fi
   # The effective overlay and its digest belong to the running units. They are
   # replaced together with those units, never underneath them: a half-applied
@@ -535,7 +536,9 @@ _create_lunardepth_bridge() {  # <tenant> <launch contract> <wss port> [extra ru
 stop_tenant_lunardepth() {
   local name="$1"
   local container_name="lunarwing-lunardepth-$name"
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" lunardepth; then
+    return 0
+  fi
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
     _openrc_stop_worker_nondestructive "$container_name"

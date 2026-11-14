@@ -253,6 +253,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant sparkie
 sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant sparkie --purge
 ```
 
+If the tenant's OS account is already gone, `remove-tenant` still finishes
+on a rootless host once it has proven from `/proc` that no process or thread of
+the tenant's recorded uid or subordinate uids remains; otherwise it refuses
+before changing anything. Stop a lingering `user@<uid>.service` and the
+tenant's OpenRC `supervise-daemon` units first. It then skips the unreachable
+rootless store and its network namespace (nothing there is removed or flushed)
+and, when the former home still exists, warns that it is owned by the orphaned
+uid and must be removed before the next `add-tenant`. The rules and the manual record for tenants added before WI#688
+are in `docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is
+gone").
+
 ### Viewing logs
 
 Systemd:
@@ -784,6 +795,40 @@ scripts source mt-admin's own `openrc_proxy_unit_is_safe` from
 the cron at the next sync, and until then the cron refuses re-rendered
 units (and pages) rather than accepting them. A health-lib copy without
 the library refuses the same way.
+
+The installed health library is a root trust boundary, not a writable cache of
+the operator checkout. Every install and upgrade refresh builds a fresh staged
+tree, rejects symbolic links, makes the directory and every entry `root:root`,
+removes group/other write permission, and only then replaces the installed
+tree. This also repairs the ownership left by older `cp -a` installs. Entries
+the checkout does not ship are dropped, except the optional metrics listener
+binary `lunarwing-health-metrics`. It is carried into the new tree only when
+the old library and every parent through `/` are root-owned and not
+group/other-writable, and the binary is a root-owned regular file without
+group/other write or set-ID bits. In any other state another account may have
+replaced it, so it is not carried: the install moves it to a quarantine
+directory under the health base directory (`quarantine/` under
+`LUNARWING_MT_HEALTH_BASE_DIR`, default `/var/lib/lunarwing-health`), used only
+when it is a root-owned 0700 directory with safe parents. Otherwise the binary
+stays in the old library, which the install replaces and removes. Either way a
+warning names the reason, and the install goes on, because the install is what
+repairs the library. That includes every library from before WI#687, which the
+checkout user owns. A listener already running from the old binary keeps
+running until it is stopped, so stop it, then reinstall the binary from a
+trusted build with `sudo install -m 0755` before starting it again. Do not
+`chown` the old library or the quarantined copy to make it pass: root
+ownership alone does not show where the file came from. A
+`lunarwing-health-metrics` shipped by the checkout replaces the installed one,
+and the install says so. The
+root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
+every entry in it, and every parent through `/` on every run; any non-root
+owner, symbolic link, or group/other write permission produces a logged refusal
+and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
+contract preflight applies the same check whenever its source resolves to this
+installed library, including a root-owned Study Notes scheduler snapshot. Do
+not hand-copy an operator checkout over the library; rerun the health pipeline
+install instead (`upgrade-tenant`, `add-tenant`, or
+`ic/scripts/enable-health-fleet.sh`).
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips

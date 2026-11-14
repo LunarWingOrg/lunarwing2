@@ -3,7 +3,9 @@
 ## Official LunarWing2 Roadmap:
 | Feature | Target |
 |---------|--------|
-| Beta for Desktop/Mobile companion applications for LunarWing (first alpha versions of both should all be available by 2.1.9.0) | v2.2.2.0 |
+| Lunardepth and lunardepth integration polish | v2.2.1.0 |
+| Sandbox network polish | v2.2.1.0 |
+| Beta for Desktop/Mobile companion applications for LunarWing (first alpha versions of both should all be available by 2.2.1.0) | v2.2.2.0 |
 | Lightweight external workers and external worker loops with timers | v2.2.2.0 |
 | LunarVision Polish | v2.2.3.0 |
 | Part 2 of planned overhaul of some LLM engine functionality | v2.2.4.0 |

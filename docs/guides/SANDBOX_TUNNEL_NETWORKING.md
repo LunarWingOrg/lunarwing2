@@ -77,7 +77,8 @@ keep TLS, tokens, mTLS and NetBird ACLs/WireGuard peer policy in force.
   A sidecar that died or drifted gets one bounded recovery attempt.
 
 A manager cold start re-probes an existing sidecar for at most **6 seconds**,
-then retains the full configured startup timeout for a fresh provider. Image
+then retains the full configured startup timeout — capped at **600 seconds** —
+for a fresh provider. Image
 pull, runtime start, and provider readiness have separate configured/probe
 bounds rather than one cold-start wall-clock cap. With the default 90-second
 setting those three phases alone can take 270 seconds, plus the 6-second
@@ -85,26 +86,55 @@ re-probe and bounded inspection, firewall, and cleanup probes. A shell caller
 can time out first; the sidecar-owned attempt still finishes and records its
 result.
 
-Each per-command health-verification chain has its own **65-second ceiling**,
-separate from recovery's **60-second budget**. The health ceiling bounds the
-seven sequential probes below their aggregate 70 seconds of individual
-10-second deadlines, without rejecting a slow but successful chain merely for
-crossing 60 seconds. Recovery re-probes an existing sidecar for at most **6
-seconds** and waits at most **20 seconds** for a fresh provider (or the
-configured startup timeout when lower); the final verification has another
-65-second health ceiling. The per-run error names the failed image, runtime,
-handshake, canary, `netbird status`, or firewall probe. A health-check timeout
-never claims that recovery ran, and only an actual failed recovery is cached
-for **30 seconds**: commands inside that window return the original reason and
-the time until the next attempt immediately, without more container churn.
-After the window, one command tries again. If a provider needs longer than the
-20-second cap after recreation, the error and this contract require a daemon
-restart so the cold-start budget applies. Recovery is owned by the sidecar
-rather than the caller: cancelling a short shell command or stopping it does
-not cancel the attempt, its cleanup, or recording of its result. Later callers
-await that same attempt and then use its recorded back-off. If the task ends
-without publishing a result, the closed channel is also converted into a
-recorded failure instead of wedging later commands.
+Each per-command health-verification chain uses the individual runtime-probe
+deadlines rather than a second aggregate ceiling. WireGuard has seven probes
+with 10-second deadlines, so a healthy chain can take **70 seconds**; NetBird
+has six, so its chain can take **60 seconds**. The health path never pulls an
+image (WI#651): a missing image fails the check fast with a pointer at the
+single-flight recovery, which is the path that pulls it under its per-run
+budget. Recovery re-probes an existing sidecar for at
+most **6 seconds**, waits at most **20 seconds** for a fresh provider (or the
+configured startup timeout when lower), and has a **60-second budget**. During
+recovery, an existing sidecar that cannot prove its health inside the 6-second
+window is removed and recreated even when it is healthy but only slow. A pull
+inside recovery uses the smaller of that configured timeout and the remaining
+recovery budget, and its timeout error names the image pull. Final verification
+runs right after recovery, never pulls, and keeps the same probe deadlines as
+the initial check.
+
+Consequently, initial verification, recovery, and final verification can take
+at most **200 seconds for WireGuard** or **180 seconds for NetBird**, image
+present or not: auto-pull no longer extends the per-run chain, because the only
+pull happens inside the recovery budget described above. These
+totals include the full recovery budget, and the lifecycle operation lock is
+acquired before that budget starts, so a command can additionally wait up to
+**15 seconds** for the lock. A command that joins an already-running
+cold start can instead wait for that attempt's independently bounded image
+pull, runtime start, and provider readiness, plus its probes and cleanup, so
+the per-run totals above do not cap that join. A shell caller can time out
+first; the sidecar-owned attempt still finishes and records its result.
+
+The per-run error names the failed image, runtime, handshake, canary, `netbird
+status`, or firewall probe. Only an actual failed recovery is cached for **30
+seconds**: commands inside that window return the original reason and the time
+until the next attempt immediately, without more container churn. After the
+window, one command tries again. If a provider needs longer than the 20-second
+cap after recreation, the error and this contract require a daemon restart so
+the cold-start budget applies. Cancelling a short shell command or stopping it
+does not cancel recovery, its cleanup, or recording of its result. Later
+callers await that same attempt and then use its recorded back-off. If the
+task ends without publishing a result, the closed channel is also converted
+into a recorded failure instead of wedging later commands.
+
+Provider readiness and health re-probing retain the last completed provider
+failure when a later provider probe is cut by the deadline. No new provider
+probe starts after the budget expires, and readiness polling sleeps are clamped
+to the time left. In the 6-second re-probe, the final retry waits halfway through
+the remaining last polling interval instead of duplicating the previous probe
+immediately; provider and firewall checks still share the original deadline.
+An unsuccessful final retry returns without sleeping away the unused time.
+If no provider probe completed with an error, the timeout stays generic rather
+than inventing a failure reason. The unverified sidecar is still removed.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
@@ -131,7 +161,7 @@ resource limits, and cleanup; they receive none of the sidecar additions.
 ```env
 SANDBOX_NETWORK=tunnel
 SANDBOX_TUNNEL_PROVIDER=netbird          # netbird (default) | wireguard
-SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero
+SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 600
 # WireGuard-only overlay resolvers (rejected with NetBird):
 # SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53
 ```

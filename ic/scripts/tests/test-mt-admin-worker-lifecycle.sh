@@ -72,6 +72,10 @@ ensure_container_runtime() {
   MT_ROOTLESS="${MT_ROOTLESS:-true}"
 }
 ensure_init_system() { :; }
+id() {
+  if [[ "${1:-}" == "-u" ]]; then printf '1000\n'; return 0; fi
+  return 1
+}
 podman_supports_quadlet() { return 0; }
 say() { :; }
 _systemctl_user() { CALLS+=("systemctl:$*"); }
@@ -83,10 +87,10 @@ _ctr() {
   return 0
 }
 # WI#424 control 1: the egress allowlist needs a real tenant account and a real
-# netns (it fails closed without one). These lifecycle tests use fixture tenant
-# names that have no account, so the egress step is stubbed here — its own
-# behaviour is pinned by ic/scripts/tests/test-worker-egress.sh, including the
-# rewritten Quadlet's ExecStartPre and Network= lines.
+# netns (it fails closed without one). These lifecycle tests have no real netns,
+# so the egress step is stubbed here — its own behaviour is pinned by
+# ic/scripts/tests/test-worker-egress.sh, including the rewritten Quadlet's
+# ExecStartPre and Network= lines.
 prepare_worker_egress() {
   CALLS+=("egress:$1:$2")
   WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
@@ -457,10 +461,6 @@ fi
 
 tenant_home() { printf '%s/home/%s' "$fixture" "$1"; }
 tenant_quadlet_dir() { printf '%s/quadlets' "$fixture"; }
-id() {
-  if [[ "${1:-}" == "-u" ]]; then printf '1000\n'; return 0; fi
-  return 1
-}
 getent() {
   [[ "${1:-}" == "passwd" ]] || return 1
   printf 'alice:x:1000:1000::%s/home/alice:/bin/bash\n' "$fixture"

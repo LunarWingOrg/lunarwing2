@@ -19,8 +19,8 @@ x-worker-base: &worker-base
       required: false
   environment: &worker-env
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-lunardepth}
-    LUNARDEPTH_BASE_URL: ${LUNARDEPTH_BASE_URL:?set an explicit TensorMoon-compatible API root}
-    LUNARDEPTH_MODEL: ${LUNARDEPTH_MODEL:?set an explicit TensorMoon model}
+    LUNARDEPTH_BASE_URL: ${LUNARDEPTH_BASE_URL:?set an explicit TensorMoon or TensorZero API root}
+    LUNARDEPTH_MODEL: ${LUNARDEPTH_MODEL:?set an explicit tensormoon:: or tensorzero:: model id}
     LUNARDEPTH_API_KEY: ${LUNARDEPTH_API_KEY:-}
     LUNARDEPTH_ALLOW_INSECURE_HTTP: ${LUNARDEPTH_ALLOW_INSECURE_HTTP:-false}
     LUNARDEPTH_ALLOW_PLACEHOLDER_KEY: ${LUNARDEPTH_ALLOW_PLACEHOLDER_KEY:-false}

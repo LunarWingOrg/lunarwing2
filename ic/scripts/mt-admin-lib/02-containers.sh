@@ -59,6 +59,14 @@ _ctr_inspect() {
   _ctr "$name" container inspect "$@"
 }
 
+# WI#688: without its account a rootless tenant's store is unreachable (`_ctr`
+# dies on `id -u`), so a stop of one of its lanes has nothing it can reach and
+# says so. A rootful runtime needs no account, and its stops still run.
+_tenant_stop_skips_missing_account() {  # <tenant> <lane label>
+  tenant_rootless_account_gone "$1" || return 1
+  say "skipped $2 stop for $1: the tenant account is gone, so its rootless store is unreachable"
+}
+
 # Run the container runtime against ROOT's store (no tenant sudo drop). Used
 # only for the legacy v1.1.0 rootful-data probes (the data-orphan guard in
 # 11-postgres.sh and friends); everything per-tenant must go through `_ctr`.
@@ -969,6 +977,9 @@ stop_tenant_vision() {
     say "external LunarVision remains operator-managed for $name"
     return 0
   fi
+  if _tenant_stop_skips_missing_account "$name" LunarVision; then
+    return 0
+  fi
   ensure_container_runtime
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -1325,7 +1336,9 @@ start_tenant_voice() {
 
 stop_tenant_voice() {
   local name="$1" container_name="lunarwing-voice-$1" running
-  ensure_container_runtime
+  if _tenant_stop_skips_missing_account "$name" LunarVoice; then
+    return 0
+  fi
   ensure_init_system
   # Supervision stops before the container or it respawns mid-stop.
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then

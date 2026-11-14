@@ -24,6 +24,40 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn_err() { printf 'error: %s\n' "$*" >&2; }
 
+health_lib_validate_root_owned_directory() {
+  local path="$1" rest component current="/" owner mode
+  [[ "$path" == /* && -d "$path" ]] || return 1
+  rest="${path#/}"
+  while :; do
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    [[ -n "$rest" ]] || break
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="${current%/}/$component"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+  return 0
+}
+
+health_lib_tree_require_safe() {
+  local path="${1:-}" unsafe
+  if [[ "$path" == / ]] || ! health_lib_validate_root_owned_directory "$path"; then
+    printf 'error: refusing health library %s: path and parents must be root-owned, symlink-free, and not group/other-writable\n' "$path" >&2
+    return 1
+  fi
+  unsafe="$(find "$path" \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
+    || { printf 'error: refusing health library %s: ownership and permissions could not be inspected\n' "$path" >&2; return 1; }
+  if [[ -n "$unsafe" ]]; then
+    printf 'error: refusing health library entry %s: symbolic link, non-root owner, or group/other-writable\n' "$unsafe" >&2
+    return 1
+  fi
+  return 0
+}
+
 # WI#384 display hygiene: tenant-controlled values echoed into root-side
 # terminal output and logs must never carry control bytes or terminal escapes.
 # %-encode every non-printable byte (LC_ALL=C) and cap the echo length so a

@@ -38,4 +38,4 @@ The lane replaces the pinned script's legacy deploy block with pnpm's shared-loc
 
 ## Testing
 
-Run the lane's Node tests, Python policy tests, shell syntax checks, `.gitlab` worker fixtures, and `ic/scripts/check-mt-admin.sh` after changes. The image build must run the real entrypoint with `--network=none`; live acceptance additionally uses `mt-admin worker-listeners`, `worker-egress`, and `worker-smoke` on a disposable tenant. Do not claim live TensorMoon inference, OpenRC execution, or a green exact-head MR pipeline without that evidence.
+Run the lane's Node tests, Python policy tests, shell syntax checks, `.gitlab` worker fixtures, and `ic/scripts/check-mt-admin.sh` after changes. The image build must run the real entrypoint with `--network=none`; live acceptance additionally uses `mt-admin worker-listeners`, `worker-egress`, and `worker-smoke` on a disposable tenant. Do not claim live TensorMoon or TensorZero inference, OpenRC execution, or a green exact-head MR pipeline without that evidence.

@@ -407,6 +407,15 @@ INITEOF
 # beside them, so the renderer, this preflight guard and the cron guard
 # cannot drift apart. The tenant layout helpers (00-common.sh) are defined
 # before this point, so the library's fallbacks are not used by mt-admin.
+require_safe_installed_health_source() {
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR"
+  if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
+    resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
+  fi
+  [[ "$resolved" == "$HEALTH_LIB_DIR" ]] || return 0
+  health_lib_tree_require_safe "$HEALTH_LIB_DIR"
+}
+require_safe_installed_health_source
 # shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
 source "${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
 
