@@ -115,6 +115,16 @@ pub struct TokenStore {
     /// event/complete scrub. Cleared alongside the secrets on terminal paths.
     harness_redactors:
         Arc<RwLock<HashMap<Uuid, Arc<crate::orchestrator::harness::SecretValueRedactor>>>>,
+    /// Granted credential values served to a job (WI#666).
+    ///
+    /// `/worker/{job}/credentials` and `/worker/{job}/mcp/credentials` decrypt
+    /// secrets and hand them to the worker for child-process env injection.
+    /// A child can `printenv` any of them into tool output, so the daemon
+    /// backstop must scrub the same values it armed the harness secrets with.
+    /// Held for the job's lifetime like `harness_secrets` (promotion scans and
+    /// late events run after the token dies) and released only by
+    /// [`TokenStore::clear_harness_secrets`] on terminal paths.
+    credential_values: Arc<RwLock<HashMap<Uuid, Vec<SecretString>>>>,
 }
 
 impl TokenStore {
@@ -126,6 +136,7 @@ impl TokenStore {
             harness_secrets: Arc::new(RwLock::new(HashMap::new())),
             harness_secrets_served: Arc::new(RwLock::new(std::collections::HashSet::new())),
             harness_redactors: Arc::new(RwLock::new(HashMap::new())),
+            credential_values: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -205,10 +216,10 @@ impl TokenStore {
         self.harness_secrets.read().await.get(&job_id).cloned()
     }
 
-    /// The job's redactor over its mounted secret values (CV-7/CW-10), built
-    /// once and cached per job (EB-4) — rebuilding on every event would
-    /// re-allocate the full variant set per request. Returns `None` when the
-    /// job has no harness secrets.
+    /// The job's redactor over its mounted secret values and served
+    /// credential values (CV-7/CW-10, WI#666), built once and cached per job
+    /// (EB-4) — rebuilding on every event would re-allocate the full variant
+    /// set per request. Returns `None` when the job has neither.
     pub async fn harness_secret_redactor(
         &self,
         job_id: Uuid,
@@ -216,20 +227,52 @@ impl TokenStore {
         if let Some(redactor) = self.harness_redactors.read().await.get(&job_id) {
             return Some(Arc::clone(redactor));
         }
-        let values: Vec<SecretString> = self
+        let harness_values: Option<Vec<SecretString>> = self
             .harness_secrets
             .read()
             .await
-            .get(&job_id)?
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect();
-        let redactor = crate::orchestrator::harness::SecretValueRedactor::new(&values);
+            .get(&job_id)
+            .map(|secrets| secrets.iter().map(|(_, value)| value.clone()).collect());
+        let credential_values: Option<Vec<SecretString>> =
+            self.credential_values.read().await.get(&job_id).cloned();
+        let redactor = build_redactor(
+            &harness_values.unwrap_or_default(),
+            &credential_values.unwrap_or_default(),
+        );
         if !redactor.is_armed() {
             return None;
         }
         self.cache_redactor_if_held(job_id, Arc::new(redactor))
             .await
+    }
+
+    /// Record credential values served to a job (WI#666).
+    ///
+    /// Called right after the secrets store decrypts a grant, so the
+    /// daemon-side event/promotion scrubber covers values injected into the
+    /// worker's child-process env. Repeated pulls extend the set (deduped) and
+    /// invalidate the cached redactor. Like `harness_secrets`, these are not
+    /// cleared by [`TokenStore::revoke`] — terminal paths call
+    /// [`TokenStore::clear_harness_secrets`].
+    pub async fn store_credential_values(&self, job_id: Uuid, values: Vec<SecretString>) {
+        use secrecy::ExposeSecret;
+
+        if values.is_empty() {
+            return;
+        }
+        let mut stored = self.credential_values.write().await;
+        let entry = stored.entry(job_id).or_default();
+        for value in values {
+            if !entry
+                .iter()
+                .any(|existing| existing.expose_secret() == value.expose_secret())
+            {
+                entry.push(value);
+            }
+        }
+        drop(stored);
+        // A re-store invalidates any redactor built from the older values.
+        self.harness_redactors.write().await.remove(&job_id);
     }
 
     /// Insert a freshly built redactor only when the job's secrets are still
@@ -248,8 +291,17 @@ impl TokenStore {
         job_id: Uuid,
         redactor: Arc<crate::orchestrator::harness::SecretValueRedactor>,
     ) -> Option<Arc<crate::orchestrator::harness::SecretValueRedactor>> {
+        // Both guards stay held through the insert: dropping them here would
+        // let a concurrent terminal clear slip between the re-check and the
+        // insert, leaving a redactor nothing ever removes. Lock order
+        // secrets → credential values → redactors matches every writer.
         let secrets = self.harness_secrets.read().await;
-        if !secrets.contains_key(&job_id) {
+        let holds_secrets = secrets.contains_key(&job_id);
+        // WI#666: grants alone arm a redactor too, so a job with served
+        // credential values but no harness secrets must still cache it.
+        let credentials = self.credential_values.read().await;
+        let holds_credentials = credentials.contains_key(&job_id);
+        if !holds_secrets && !holds_credentials {
             return None;
         }
         let mut redactors = self.harness_redactors.write().await;
@@ -262,11 +314,13 @@ impl TokenStore {
         Some(redactor)
     }
 
-    /// Release a job's mounted secret values. Called on every terminal path
-    /// (finalize after promotion, stop/cancel, crash watcher, cleanup).
+    /// Release a job's mounted secret values and served credential values.
+    /// Called on every terminal path (finalize after promotion, stop/cancel,
+    /// crash watcher, cleanup).
     pub async fn clear_harness_secrets(&self, job_id: Uuid) {
         self.harness_secrets.write().await.remove(&job_id);
         self.harness_secrets_served.write().await.remove(&job_id);
+        self.credential_values.write().await.remove(&job_id);
         self.harness_redactors.write().await.remove(&job_id);
     }
 
@@ -282,6 +336,24 @@ impl Default for TokenStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a job redactor over harness secret values plus credential values
+/// served to the worker (WI#666). Harness values arm the initial variant set;
+/// credential values are batched in with a single extra matcher rebuild.
+fn build_redactor(
+    harness_values: &[SecretString],
+    credential_values: &[SecretString],
+) -> crate::orchestrator::harness::SecretValueRedactor {
+    use secrecy::ExposeSecret;
+
+    let mut redactor = crate::orchestrator::harness::SecretValueRedactor::new(harness_values);
+    redactor.add_values(
+        credential_values
+            .iter()
+            .map(|value| value.expose_secret()),
+    );
+    redactor
 }
 
 /// Generate a cryptographically random token (32 bytes, hex-encoded = 64 chars).
