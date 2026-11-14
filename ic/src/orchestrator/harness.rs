@@ -1494,8 +1494,22 @@ impl SecretValueRedactor {
     /// Add one more value to an existing redactor (e.g. the worker bearer
     /// token, as defense in depth against accidental output — DG-7).
     pub fn add_value(&mut self, value: &str) {
-        self.add_raw(value);
-        self.rebuild_matchers();
+        self.add_values(std::iter::once(value));
+    }
+
+    /// Add several values with a single matcher rebuild (WI#666): a job's
+    /// granted credentials are injected into every child process env, so the
+    /// values are armed alongside the job's harness secrets without paying
+    /// one matcher rebuild per credential. Rebuilds only when a value
+    /// actually contributed a variant.
+    pub fn add_values<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
+        let before = self.direct_variants.len() + self.folded_variants.len();
+        for value in values {
+            self.add_raw(value);
+        }
+        if self.direct_variants.len() + self.folded_variants.len() != before {
+            self.rebuild_matchers();
+        }
     }
 
     fn extend_variants(&mut self, raw: &str) {
@@ -2943,6 +2957,30 @@ mod tests {
         let redactor = SecretValueRedactor::new(&values);
         assert!(!redactor.is_armed());
         assert_eq!(redactor.scrub("a short story"), "a short story");
+    }
+
+    #[test]
+    fn redactor_add_values_arms_every_granted_credential() {
+        // WI#666: grants are injected into the child env, so their values must
+        // be scrubbed from job events exactly like harness secret values.
+        let mut redactor = SecretValueRedactor::default();
+        assert!(!redactor.is_armed());
+        redactor.add_values(["granted-credential-alpha", "short", "granted-credential-beta"]);
+        assert!(redactor.is_armed());
+        for value in ["granted-credential-alpha", "granted-credential-beta"] {
+            let scrubbed = redactor.scrub(&format!("printenv leaked {value} here"));
+            assert!(!scrubbed.contains(value), "grant value must be scrubbed");
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
+        // The sub-minimum value contributes no variant, same as `new`.
+        assert_eq!(redactor.scrub("short output"), "short output");
+    }
+
+    #[test]
+    fn redactor_add_values_on_empty_iterator_leaves_redactor_unarmed() {
+        let mut redactor = SecretValueRedactor::default();
+        redactor.add_values(std::iter::empty());
+        assert!(!redactor.is_armed());
     }
 
     #[test]
