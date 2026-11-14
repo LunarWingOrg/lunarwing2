@@ -138,8 +138,9 @@ WEECHAT_BOOTSTRAP_OPT_OUT=false   # set true by --no-weechat-bootstrap
 # depending on the host's unqualified-search-registries: docker silently defaults
 # short names to docker.io, but rootless podman errors ("short-name ... did not
 # resolve to an alias and no unqualified-search registries are defined"). Override
-# for a local mirror via LUNARWING_MT_PG_IMAGE.
-PG_IMAGE="${LUNARWING_MT_PG_IMAGE:-docker.io/pgvector/pgvector:pg16}"
+# for a local mirror via LUNARWING_MT_PG_IMAGE. The default is the reviewed
+# 2026-11-12 PostgreSQL 16.16 / pgvector 0.8.7 OCI index.
+PG_IMAGE="${LUNARWING_MT_PG_IMAGE:-docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f}"
 
 # ── Per-tenant PostgreSQL backups ────────────────────────────────────────────
 # pg_dump each tenant's DB (custom -Fc format) to $BACKUP_DIR/<tenant>/. Keep the
@@ -484,6 +485,9 @@ Commands:
                                   No-op when the podman probe is healthy.
   start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
   stop-pg <name>                  Stop only the tenant's PostgreSQL
+  refresh-pg-image <name>         Pull the configured image, recreate PostgreSQL on its
+                                  existing named volume, health-gate, and restore daemon state
+  pg-image-status <name>          Print container image reference/ID and SELECT version()
   start-worker <name> <worker>    Start one enabled external worker
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
@@ -1505,6 +1509,22 @@ main() {
       _pg_only_name="$(sanitize_name "$1")"
       tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
       stop_tenant_postgres "$_pg_only_name"
+      ;;
+
+    refresh-pg-image)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: refresh-pg-image <name>"
+      ports_registry_init
+      _pg_only_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_pg_only_name" \
+        refresh_tenant_postgres_image "$_pg_only_name"
+      ;;
+
+    pg-image-status)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: pg-image-status <name>"
+      ports_registry_require_readonly
+      tenant_postgres_image_status "$1"
       ;;
 
     start-worker|stop-worker|restart-worker|kill-worker)

@@ -24,6 +24,11 @@ WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
 CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 MT_ADMIN_WORKER_CONFIG = ROOT / "ic" / "scripts" / "mt-admin-lib" / "09-worker-config.sh"
+MT_ADMIN_SCRIPT = ROOT / "ic" / "scripts" / "lunarwing-mt-admin.sh"
+REVIEWED_PG_IMAGE = (
+    "docker.io/pgvector/pgvector:pg16@sha256:"
+    "484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f"
+)
 EXTERNAL_WORKER_SOURCE = ROOT / "ic" / "src" / "orchestrator" / "external_worker.rs"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
 OPENCODE2_DOCKERFILE = ROOT / "opencode2.4lunarwing" / "Dockerfile"
@@ -3082,11 +3087,27 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
 
     pg_service = merged.get("rust-test-postgres-integration", {}).get("services", [])
     if not any(
-        isinstance(service, dict)
-        and service.get("name", "").startswith("docker.io/pgvector/pgvector:pg16@sha256:")
+        isinstance(service, dict) and service.get("name") == REVIEWED_PG_IMAGE
         for service in pg_service
     ):
-        errors.append("rust-test-postgres-integration must use a digest-pinned pgvector service")
+        errors.append(
+            "rust-test-postgres-integration must use the reviewed tenant pgvector "
+            f"service {REVIEWED_PG_IMAGE!r}"
+        )
+    if not MT_ADMIN_SCRIPT.is_file():
+        errors.append("ic/scripts/lunarwing-mt-admin.sh missing; cannot verify PG_IMAGE")
+    else:
+        match = re.search(
+            r'(?m)^PG_IMAGE="\$\{LUNARWING_MT_PG_IMAGE:-([^}]+)\}"$',
+            MT_ADMIN_SCRIPT.read_text(encoding="utf-8"),
+        )
+        if match is None:
+            errors.append("mt-admin PG_IMAGE default is missing or not a single image reference")
+        elif match.group(1) != REVIEWED_PG_IMAGE:
+            errors.append(
+                f"mt-admin PG_IMAGE {match.group(1)!r} differs from the CI/reviewed "
+                f"pgvector image {REVIEWED_PG_IMAGE!r}"
+            )
 
 
 def validate_stage_consistency(root: dict, errors: list[str]) -> None:

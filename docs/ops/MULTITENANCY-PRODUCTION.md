@@ -835,6 +835,42 @@ The container is created with `--restart unless-stopped` so it survives host reb
 - **OpenRC** — a dedicated `/etc/init.d/lunarwing-pg-<name>` service (which the main daemon `need`s) `podman start`s the container and waits for `pg_isready`; supported workers get `/etc/init.d/lunarwing-{pebble,opencode,kimi}-<name>` the same way. See the [Gentoo tenant guide](guide-for-spin-up-gentoo-tenants.md).
 - **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See the archived [`MT_SYSTEMD_PARITY.md`](../internal/history/proposals/MT_SYSTEMD_PARITY.md) implementation plan.
 
+### Image inventory and security refresh
+
+`PG_IMAGE` defaults to the reviewed PostgreSQL 16.16 / pgvector 0.8.7 OCI index `docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f`. The PostgreSQL integration CI service uses the same reference; `ci-config` rejects drift. `LUNARWING_MT_PG_IMAGE` remains an explicit mirror/override knob, but production overrides should also name a reviewed digest rather than a floating tag.
+
+Record the running image and server version on every host, for every tenant, before and after the 2026-11-12 security refresh:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh pg-image-status sparkie
+sudo ic/scripts/lunarwing-mt-admin.sh refresh-pg-image sparkie
+sudo ic/scripts/lunarwing-mt-admin.sh pg-image-status sparkie
+```
+
+Save all three outputs in the host's WI#664 inventory record. The refresh command itself also prints the before/after records. `image_id` is the container image content ID, `image_reference` is the reference used to create it, and `server_version` comes from `SELECT version()`; `unavailable` is an uninspected value, not evidence of a patched server.
+
+The refresh needs no dump/restore for a PostgreSQL minor release. It pulls first, then runs `postgres --version` from that pulled image in a disposable container in the tenant's store, without network access, tenant data mounts, or injected credentials. The probe bypasses the image's default entrypoint and never pulls again. An unreadable, unrecognized, or below-floor image version refuses the refresh **before any service stops** (except the explicit PostgreSQL 16 rollback acknowledgement below). It requires the exact named volume `lunarwing-pg-<name>` and, when a container exists, verifies that it mounts that volume at `/var/lib/postgresql/data`. Legacy container-local, anonymous-volume, and bind-mounted data are refused before anything stops. It preserves the daemon's prior active/stopped state, recreates only the PostgreSQL container on that volume, and requires `pg_isready`, the installed extension row, a real `SELECT '[1,2,3]'::vector` query with `ON_ERROR_STOP`, and a second version check of the running server (`server_version_num >= 160016`). Systemd explicitly re-renders the image and reloads the Quadlet; OpenRC stops the `-sup` supervisor before replacement and attempts to restart it after the database. An absent/failing optional supervisor warns but does not bypass the database gates. A stopped daemon is not started merely because its database was refreshed. **The database itself is left running**, including when the daemon and database were stopped before the refresh; use `stop-pg <name>` afterwards if required.
+
+A replacement or health failure returns nonzero, retains the named volume, and leaves an originally active daemon stopped. Inspect `pg-image-status` and the container logs before running `start-tenant <name>`; do not remove the volume to clear a failed gate. Run the refresh for each tenant sequentially on each host. A normal `upgrade-tenant` does not substitute for this operation: ordinary starts and unit re-renders **retain the existing Quadlet `Image=`**, while only `refresh-pg-image` explicitly replaces it. Fresh tenants use the reviewed default. OpenRC/Docker ordinary starts reuse their existing containers. Quadlet recreates containers at every unit start: test installations that used MR !2413's pre-fix head `78868f063` may already have rendered the changed image and could switch on restart/reboot. That was unmerged MR code, not a released upgrade path; record those test installations' inventory **before the first restart with corrected mt-admin**, then use the explicit refresh. Retained legacy floating tags still depend on the tenant's local tag mapping; pin them through the refresh rather than manually pulling/repointing the tag. Always inventory the actual image instead of assuming it matches the fleet default.
+
+If ordinary start/upgrade refuses a Quadlet with a missing, empty, or ambiguous `Image=` line, run `sudo ic/scripts/lunarwing-mt-admin.sh refresh-pg-image <name>`. Its image preflight runs before stopping services; it then explicitly rewrites the unit with the configured image and performs the normal guarded refresh. It does not delete the data volume. Check the unit and recorded image first rather than silently falling back to a potentially different default.
+
+**Extension version:** replacement updates image libraries, not the database's installed extension catalog version. An existing pgvector 0.8.6 remains 0.8.6 even though this image offers 0.8.7. After a backup and a separately planned maintenance window, inspect with `mt-admin psql <name> -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'"`; if wanted, run `mt-admin psql <name> -v ON_ERROR_STOP=1 -c 'ALTER EXTENSION vector UPDATE'` and recheck. The refresh never performs this schema change implicitly.
+
+**Minor-image rollback:** keep the previous reviewed image digest from the before record (the refresh does not prune it). Set `LUNARWING_MT_PG_IMAGE` to that digest and rerun `refresh-pg-image`. If emergency rollback requires a PostgreSQL 16 version below 16.16, the default security floor refuses it; explicitly acknowledge that tenant only:
+
+```bash
+sudo env LUNARWING_MT_PG_IMAGE='<previous-pg16-digest-reference>' \
+  LUNARWING_MT_PG_ALLOW_UNPATCHED=sparkie \
+  ic/scripts/lunarwing-mt-admin.sh refresh-pg-image sparkie
+```
+
+This warns at both version checks, retains the volume and still requires readiness and a working vector library. The acknowledgement cannot permit a pre-16 major at either the image preflight or the running-server gate. It reintroduces the fixed CVEs; isolate the tenant and restore the patched image promptly. This is not a major-version downgrade or an extension-schema rollback: if an extension update or schema migration has occurred, assess compatibility and use the backup recovery plan instead. Keep before/after records for rollback too.
+
+**Restore safety:** `pg_restore` runs inside the tenant container. Refresh that container to 16.16 or newer before restoring any dump received from another host or any archive whose provenance is not fully trusted. The five-byte `PGDMP` check is only a format check; it does not make a crafted archive safe. Do not use legacy rollback/restore helpers against an unrefreshed container for such archives.
+
+The daemon still uses the cluster-superuser role `lunarwing`. WI#664 deliberately does not introduce a second role: migration, extension ownership, backups, and least-privilege SQL boundaries need a separate design and rollout. Until then, host root can issue arbitrary SQL through `mt-admin psql`, anyone with the tenant OS credential and loopback database access has the same role, and the daemon's fixed SQL runs with superuser authority. The built-in workspace search paths bind caller text as parameters and do not expose a general arbitrary-SQL tool; adding an SQL-capable MCP/shell extension changes this assessment and requires a new privilege review.
+
 ## Container Runtime
 
 The script supports both Docker and Podman. Detection priority:
@@ -898,6 +934,8 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 | `LUNARWING_MT_SOURCE_REPO` | repository root | Source checkout cloned for each tenant |
 | `LUNARWING_MT_TENSORZERO_URL` | (empty — required at `add-tenant` since WI#330) | Upstream LLM URL and proxy upstream default |
 | `LUNARWING_MT_LLM_BASE_URL` | empty | Fleet default `LLM_BASE_URL`; empty selects the local proxy when enabled, otherwise `LUNARWING_MT_TENSORZERO_URL` |
+| `LUNARWING_MT_PG_IMAGE` | reviewed PostgreSQL 16.16 / pgvector 0.8.7 digest | Tenant PostgreSQL image override; use a reviewed digest, not a floating tag |
+| `LUNARWING_MT_PG_ALLOW_UNPATCHED` | empty | Emergency minor-image rollback only: exact tenant name acknowledges a PostgreSQL 16 version below 16.16; does not bypass vector/readiness gates |
 | `LUNARWING_MT_BACKUP_DIR` | `/var/lib/lunarwing-backups` | PostgreSQL dump root |
 | `LUNARWING_MT_BACKUP_KEEP` | `7` | Dumps retained per tenant; `0` keeps all |
 
