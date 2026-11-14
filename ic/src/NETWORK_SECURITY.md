@@ -512,8 +512,10 @@ pulls it under its per-run budget. WireGuard's seven 10-second probes can
 take 70 seconds and NetBird's six can take 60, regardless of auto-pull. Per-run
 recovery uses the same 6-second re-probe, allows a fresh provider at most 20
 seconds (or the
-lower configured timeout), and retains its own 60-second budget. A recovery
-pull is capped by the remaining recovery budget when that is smaller than the
+lower configured timeout), and retains its own 60-second budget. During
+recovery, an existing sidecar that cannot prove its health inside the 6-second
+window is removed and recreated even when it is healthy but only slow. A
+recovery pull is capped by the remaining recovery budget when that is smaller than the
 configured pull timeout, and its diagnostic names the pull. Final verification
 has the same probe bounds as initial verification and never pulls. The three
 stages therefore total at most 200 seconds for WireGuard or 180 for NetBird,
