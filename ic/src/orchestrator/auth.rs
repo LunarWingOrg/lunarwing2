@@ -604,6 +604,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_values_arm_the_daemon_redactor() {
+        // WI#666: a job with granted credentials but no harness secrets must
+        // still get a redactor from the served values, since those land in
+        // the child process env.
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        let value = "granted-credential-fixture-value";
+        assert!(store.harness_secret_redactor(job_id).await.is_none());
+
+        store
+            .store_credential_values(
+                job_id,
+                vec![SecretString::from(value.to_string())],
+            )
+            .await;
+
+        let redactor = store
+            .harness_secret_redactor(job_id)
+            .await
+            .expect("credential values must arm the redactor"); // safety: test
+        let scrubbed = redactor.scrub(&format!("printenv leaked {value}"));
+        assert!(!scrubbed.contains(value));
+        assert!(scrubbed.contains("[redacted-secret]"));
+
+        // Terminal cleanup releases the values and the cached redactor.
+        store.clear_harness_secrets(job_id).await;
+        assert!(store.harness_secret_redactor(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_values_extend_a_harness_armed_redactor_and_dedupe() {
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        let harness_value = "harness-mounted-fixture-value";
+        let credential_value = "granted-credential-fixture-value";
+        store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    SecretString::from(harness_value.to_string()),
+                )],
+            )
+            .await;
+
+        // Arm, then serve credentials: the cached redactor must be rebuilt.
+        assert!(store.harness_secret_redactor(job_id).await.is_some());
+        for _ in 0..2 {
+            store
+                .store_credential_values(
+                    job_id,
+                    vec![SecretString::from(credential_value.to_string())],
+                )
+                .await;
+        }
+
+        let redactor = store
+            .harness_secret_redactor(job_id)
+            .await
+            .expect("harness values keep a redactor armed"); // safety: test
+        for value in [harness_value, credential_value] {
+            assert!(
+                !redactor.scrub(value).contains(value),
+                "both channels must be scrubbed"
+            );
+        }
+        // Repeated pulls extend without duplicating the stored value.
+        let stored = store.credential_values.read().await;
+        assert_eq!(stored.get(&job_id).map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
     async fn harness_secrets_survive_revoke_until_explicit_clear() {
         // WI#326: promotion runs after token revocation, so values outlive
         // `revoke` but are dropped by `clear_harness_secrets`.

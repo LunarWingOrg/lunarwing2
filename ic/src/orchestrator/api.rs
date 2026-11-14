@@ -1073,6 +1073,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_redacts_granted_credential_values() {
+        // WI#666: granted credentials are injected into the child env, so a
+        // `printenv` echoed into tool output must not reach the broadcast
+        // event (and thus persisted job_events / the parent agent context).
+        use crate::testing::credentials::test_secrets_store;
+        use secrecy::SecretString;
+
+        let secrets_store = Arc::new(test_secrets_store());
+        let credential_value = "granted-credential-tool-result-value";
+        secrets_store
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams {
+                    name: "granted_secret".to_string(),
+                    value: SecretString::from(credential_value.to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap(); // safety: test
+
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let job_id = Uuid::new_v4();
+        let token = token_store.create_token(job_id).await;
+        token_store
+            .store_grants(
+                job_id,
+                vec![crate::orchestrator::auth::CredentialGrant {
+                    secret_name: "granted_secret".to_string(),
+                    env_var: "GRANTED_SECRET".to_string(),
+                }],
+            )
+            .await;
+        let (tx, mut rx) = broadcast::channel(8);
+        let state = OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store,
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: Some(secrets_store),
+            user_id: "default".to_string(),
+            job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            context_manager: None,
+        };
+        insert_test_handle(&state, job_id, "owner-a").await;
+        let router = OrchestratorApi::router(state);
+
+        // Serve the grant first: the daemon learns the value there.
+        let req = Request::builder()
+            .uri(format!("/worker/{job_id}/credentials"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(); // safety: test
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/event"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "event_type": "tool_result",
+                    "data": {
+                        "tool_name": "shell",
+                        "output": format!("GRANTED_SECRET={credential_value}"),
+                        "success": true,
+                    },
+                })
+                .to_string(),
+            ))
+            .unwrap(); // safety: test
+        assert!(router.oneshot(req).await.unwrap().status().is_success());
+
+        let (_, _, event) = rx.recv().await.unwrap(); // safety: test
+        let crate::channels::web::types::SseEvent::JobToolResult { output, .. } = event else {
+            panic!("expected JobToolResult event, got {event:?}"); // safety: test
+        };
+        assert!(
+            !output.contains(credential_value),
+            "granted credential value must be redacted from the tool result: {output}"
+        );
+        assert!(output.contains("[redacted-secret]"));
+    }
+
+    #[tokio::test]
     async fn harness_secrets_pull_is_one_shot() {
         // DG-7: the worker pulls once at startup; a replay (leaked token)
         // gets 410 Gone and never re-serves values.
