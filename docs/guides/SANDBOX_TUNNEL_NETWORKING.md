@@ -19,11 +19,11 @@ unchanged, and mt-admin preserves every operator-set tier on re-render.
 |---|---|---|
 | `none` (default off Linux) | no network | kernel-enforced `--network none` |
 | `proxy-enforced` (Linux default) | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy; no credential injection |
-| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and, by default, DNS to the sidecar's resolvers on the uplink; WireGuard `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes that direct uplink allowance; NetBird rejects the setting |
+| `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, marked provider control traffic, and DNS to the current sidecar resolver; WireGuard `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes its default direct uplink allowance; NetBird uses its local resolver and rejects the setting |
 | `proxy` | legacy public HTTP(S) | advisory env-var proxy; direct bypass remains possible |
 
 What a sandboxed command can reach in `tunnel` mode is exactly what the tunnel
-routes, plus the default DNS residual. With a split tunnel (`AllowedIPs =
+routes, plus the provider-specific DNS path described below. With a split tunnel (`AllowedIPs =
 10.231.0.0/16`, or NetBird routes) that is those overlay CIDRs; with a
 full-route tunnel (`AllowedIPs = 0.0.0.0/0, ::/0`, or a NetBird exit node) it
 is everything, always through the overlay. The `output` chain drops every
@@ -34,21 +34,27 @@ the cloud metadata service and podman's `host.containers.internal` alias) is
 dropped even for marked traffic. New inbound flows are dropped from every
 direction.
 
-**Residual DNS channel:** by default, UDP/TCP port 53 to the runtime resolvers
-is the one uplink channel open to joined commands. A recursive resolver can
-carry query-based exfiltration even though arbitrary uplink connections are
-dropped. For WireGuard, setting `SANDBOX_TUNNEL_DNS` installs overlay resolvers
+**Residual DNS channel:** with WireGuard's default DNS, UDP/TCP port 53 to the
+runtime resolvers is the one uplink channel open to joined commands. A recursive
+resolver can carry query-based exfiltration even though arbitrary uplink
+connections are dropped. Setting `SANDBOX_TUNNEL_DNS` installs overlay resolvers
 only in joined runs and removes every direct uplink DNS accept. The sidecar
 keeps its runtime resolver file so hostname endpoints resolve during bootstrap,
 before the firewall is installed. Once that firewall is in, the sidecar's own
 new lookups are dropped too: its resolver sockets are unmarked and no uplink
-port-53 rule remains. The WI#600 live NetBird 0.82.0 run confirmed the same
-limitation for NetBird's local resolver: upstream writes were unmarked, the
-lookup returned `SERVFAIL` with `operation not permitted` in the client log,
-and no upstream query reached the uplink. WI#603 therefore chose explicit
-unsupported-combination enforcement: validation rejects `SANDBOX_TUNNEL_DNS`
-with NetBird before any container-runtime call. Leave it unset to use runtime
-DNS with NetBird. A skipped NetBird test is not a pass.
+port-53 rule remains.
+
+NetBird instead manages the sidecar resolver after startup. LunarWing preserves
+the original file in a writable per-instance backup mount, allowing NetBird to
+replace `/etc/resolv.conf` with its learned overlay address. Joined runs inherit
+that file and the firewall permits DNS only to the overlay listener, so there is
+no runtime-resolver uplink channel. Peer names and custom zones resolve through
+NetBird. An upstream outside the overlay fails closed because its resolver
+sockets are unmarked; use an in-overlay primary nameserver group for public
+names and for control-plane hostnames that may need re-resolution. Validation
+still rejects `SANDBOX_TUNNEL_DNS` with NetBird before any container-runtime
+call. Leave it unset and configure upstreams through NetBird, not LunarWing. A
+skipped NetBird test is not a pass.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 one network namespace and its loopback. A listener one command opens on
@@ -338,7 +344,7 @@ are removed; use resolvers reachable through `wg0`, including for joined-run
 name resolution after reconnection. Those rules also deny the sidecar's own
 post-bootstrap lookups. Stock `wg-quick` resolves its endpoint once at start,
 but any later re-resolve script is affected. NetBird rejects this setting during
-validation rather than attempting hostname reconnects without a resolver path.
+validation; configure its upstreams with management-server nameserver groups.
 
 ## Rotation and lifecycle
 
@@ -430,8 +436,10 @@ required.
    accepts for `lo`, `wg0` and `wt0`, the three neighbour-discovery ICMPv6
    accepts, `ip daddr 169.254.0.0/16 drop`, and one `meta mark … accept`.
    Without `SANDBOX_TUNNEL_DNS`, there are also `udp`/`tcp dport 53` accepts
-   for each runtime resolver; with it, no uplink DNS accept is present.
-   Anything else makes the daemon refuse every run.
+   for each current sidecar resolver: runtime resolvers for WireGuard, or only
+   NetBird's learned overlay listener. WireGuard custom DNS removes the uplink
+   accepts; NetBird never adds its former runtime resolvers after managed DNS is
+   active. Anything else makes the daemon refuse every run.
 3. Ask the agent to run `cat /proc/net/dev`: the WireGuard `wg0` or NetBird
    `wt0` interface is visible because only the network namespace is shared;
    `/etc/wireguard`, NetBird state, and sidecar credentials are not mounted.
@@ -488,20 +496,30 @@ required.
    and state volume after recreation. To restart the throwaway management
    deployment instead of only reconnecting the client, set
    `LUNARWING_E2E_NETBIRD_SERVER_CONTAINER` to a space-separated server/proxy
-   list; the lane requires stable health and another joined command afterward.
+   list; the lane requires stable health, the same container ID, and another
+   joined command afterward.
 
-   WI#603's deterministic unit regression rejects custom NetBird DNS before a
-   runtime call. The former live measurement case was removed with that gate;
-   its recorded `SERVFAIL` result is historical evidence, not a configuration
-   that new runs should reproduce.
+   Managed DNS checks require NetBird's learned overlay address in the sidecar
+   resolver file and exact firewall rules, peer-name resolution, and refusal of
+   every former runtime resolver. To require an in-overlay zone, also set
+   `LUNARWING_E2E_NETBIRD_DNS_NAME=probe.lwtest` and
+   `LUNARWING_E2E_NETBIRD_DNS_ADDRESS=10.99.0.1`. With a primary in-overlay
+   group, set `LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS=10.99.0.2` to require that
+   answer for `example.com`. These are assertions, not settings LunarWing
+   applies to the management server.
+
+   WI#603's deterministic unit regression still rejects custom NetBird DNS
+   before a runtime call. The former custom-DNS live case remains removed; its
+   recorded `SERVFAIL` is evidence for outside-upstream failure, not a
+   configuration that new runs should reproduce.
 
    The lane never runs without all three gates and provider settings; a skip is
-   not a live-validation pass. WI#600's 2026-11-11 local run passed the main
-   lane against NetBird 0.82.0, captured the custom-DNS failure that led to the
-   WI#603 rejection, and used an uplink `tcpdump` to check for forbidden
-   destinations. Any podman-capable CI job with protected masked credentials
-   remains future work; neither provider lane currently runs in CI, and no
-   public-cloud run is claimed.
+   not a live-validation pass. WI#600's 2026-11-11 run passed the main lane and
+   captured outside-upstream failure. WI#603's 2026-11-14 measurements covered
+   default mode and in-overlay match/primary groups, with zero-packet uplink
+   captures for the local-resolver path. Any podman-capable CI job with
+   protected masked credentials remains future work; neither provider lane
+   currently runs in CI, and no public-cloud run is claimed.
 6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
    sandbox to an allowed private service. Then run a temporary high-port
    listener in the sandbox and attempt to connect from another overlay peer:
@@ -519,6 +537,6 @@ required.
 | NetBird never becomes ready | management URL and setup-key validity, signal/relay reachability, image version's `status --check startup` support |
 | NetBird connects, then loses management after a while | the client fell back to legacy routing (no socket marks): check its log and remove `NB_USE_LEGACY_ROUTING` / `NB_SKIP_SOCKET_MARK` |
 | a fresh provider exceeds the 20-second per-run cap | restart the daemon so recreation uses the full cold-start budget; investigate why the provider is slow |
-| names do not resolve in the sandbox | with default DNS, check the sidecar's runtime resolvers; with WireGuard custom DNS, check the joined run's mounted file and overlay resolver reachability |
+| names do not resolve in the sandbox | for NetBird, check that the sidecar file contains its overlay listener and that the required nameserver group uses an in-overlay upstream; for WireGuard, check runtime DNS or the custom resolver's mounted file and overlay reachability |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |
