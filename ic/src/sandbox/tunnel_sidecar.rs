@@ -1814,12 +1814,17 @@ impl TunnelSidecar {
             ));
         }
         let (pull_timeout, budget) = match recovery_deadline {
-            Some(deadline) => (
-                self.cfg
-                    .startup_timeout
-                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                "remaining per-run recovery budget".to_string(),
-            ),
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining < self.cfg.startup_timeout {
+                    (remaining, "remaining per-run recovery budget".to_string())
+                } else {
+                    (
+                        self.cfg.startup_timeout,
+                        format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
+                    )
+                }
+            }
             None => (
                 self.cfg.startup_timeout,
                 format!("{}s startup timeout", self.cfg.startup_timeout.as_secs()),
