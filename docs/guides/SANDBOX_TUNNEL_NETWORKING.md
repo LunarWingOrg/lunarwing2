@@ -85,26 +85,41 @@ re-probe and bounded inspection, firewall, and cleanup probes. A shell caller
 can time out first; the sidecar-owned attempt still finishes and records its
 result.
 
-Each per-command health-verification chain has its own **65-second ceiling**,
-separate from recovery's **60-second budget**. The health ceiling bounds the
-seven sequential probes below their aggregate 70 seconds of individual
-10-second deadlines, without rejecting a slow but successful chain merely for
-crossing 60 seconds. Recovery re-probes an existing sidecar for at most **6
-seconds** and waits at most **20 seconds** for a fresh provider (or the
-configured startup timeout when lower); the final verification has another
-65-second health ceiling. The per-run error names the failed image, runtime,
-handshake, canary, `netbird status`, or firewall probe. A health-check timeout
-never claims that recovery ran, and only an actual failed recovery is cached
-for **30 seconds**: commands inside that window return the original reason and
-the time until the next attempt immediately, without more container churn.
-After the window, one command tries again. If a provider needs longer than the
-20-second cap after recreation, the error and this contract require a daemon
-restart so the cold-start budget applies. Recovery is owned by the sidecar
-rather than the caller: cancelling a short shell command or stopping it does
-not cancel the attempt, its cleanup, or recording of its result. Later callers
-await that same attempt and then use its recorded back-off. If the task ends
-without publishing a result, the closed channel is also converted into a
-recorded failure instead of wedging later commands.
+Each per-command health-verification chain uses the individual runtime-probe
+deadlines rather than a second aggregate ceiling. WireGuard has seven probes
+with 10-second deadlines, so a healthy chain can take **70 seconds**; NetBird
+has six, so its chain can take **60 seconds**. An image pull retains the
+configured startup timeout, which adds up to **90 seconds** by default. Thus a
+health chain can take 160 seconds for WireGuard or 150 seconds for NetBird with
+auto-pull and default settings. Recovery re-probes an existing sidecar for at
+most **6 seconds**, waits at most **20 seconds** for a fresh provider (or the
+configured startup timeout when lower), and has a **60-second budget**. A pull
+inside recovery uses the smaller of that configured timeout and the remaining
+recovery budget, and its timeout error names the image pull. Final verification
+has the same probe and pull bounds as the initial check.
+
+Consequently, initial verification, recovery, and final verification can take
+at most **200 seconds for WireGuard** or **180 seconds for NetBird** with the
+image present. With auto-pull and the default 90-second pull bound, those
+per-run totals are **380 seconds** and **360 seconds**, respectively. These
+totals include the full recovery budget; the lifecycle operation lock is
+acquired before that budget starts. A command that joins an already-running
+cold start can instead wait for that attempt's independently bounded image
+pull, runtime start, and provider readiness, plus its probes and cleanup, so
+the per-run totals above do not cap that join. A shell caller can time out
+first; the sidecar-owned attempt still finishes and records its result.
+
+The per-run error names the failed image, runtime, handshake, canary, `netbird
+status`, or firewall probe. Only an actual failed recovery is cached for **30
+seconds**: commands inside that window return the original reason and the time
+until the next attempt immediately, without more container churn. After the
+window, one command tries again. If a provider needs longer than the 20-second
+cap after recreation, the error and this contract require a daemon restart so
+the cold-start budget applies. Cancelling a short shell command or stopping it
+does not cancel recovery, its cleanup, or recording of its result. Later
+callers await that same attempt and then use its recorded back-off. If the
+task ends without publishing a result, the closed channel is also converted
+into a recorded failure instead of wedging later commands.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
