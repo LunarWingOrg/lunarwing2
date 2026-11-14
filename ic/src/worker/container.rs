@@ -26,7 +26,10 @@ use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::tools::execute::{execute_tool_simple, process_tool_result};
-use crate::worker::api::{CompletionReport, JobEventPayload, StatusUpdate, WorkerHttpClient};
+use crate::worker::api::{
+    CompletionReport, CredentialResponse, JobEventPayload, McpCredentialResponse, StatusUpdate,
+    WorkerHttpClient,
+};
 use crate::worker::mcp::WorkerMcpRuntime;
 use crate::worker::proxy_llm::ProxyLlmProvider;
 
@@ -150,6 +153,36 @@ async fn setup_harness_secrets(
     ))
 }
 
+/// Arm the job's event redactor with the credential values injected into
+/// child process env (WI#666).
+///
+/// A child can `printenv` any granted credential into its tool output; without
+/// this the tool-result scrub has no variant to match and the value reaches
+/// persisted job events, the SSE stream, and the parent agent's context.
+fn arm_credential_values(
+    redactor: &mut crate::orchestrator::harness::SecretValueRedactor,
+    credentials: &[CredentialResponse],
+) {
+    redactor.add_values(
+        credentials
+            .iter()
+            .map(|credential| credential.value.as_str()),
+    );
+}
+
+/// Same arming for owner-scoped MCP credentials, which child MCP server
+/// processes also receive through their env (WI#666).
+fn arm_mcp_credential_values(
+    redactor: &mut crate::orchestrator::harness::SecretValueRedactor,
+    credentials: &[McpCredentialResponse],
+) {
+    redactor.add_values(
+        credentials
+            .iter()
+            .map(|credential| credential.value.as_str()),
+    );
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -179,8 +212,11 @@ pub struct WorkerRuntime {
     /// Wrapped in `Arc` to avoid deep-cloning the map on every tool invocation.
     extra_env: Arc<HashMap<String, String>>,
     /// Value-level redactor armed with the job's harness secrets (WI#326
-    /// CV-7): scrubbed from every job event before it leaves the worker.
-    /// Harness values deliberately do NOT live in `extra_env` (CV-3).
+    /// CV-7), its granted credential values (WI#666), and the per-job bearer
+    /// token (DG-7): scrubbed from every job event before it leaves the
+    /// worker. Harness values deliberately do NOT live in `extra_env` (CV-3);
+    /// granted credentials do, which is exactly why their values are armed
+    /// here as well.
     secret_redactor: crate::orchestrator::harness::SecretValueRedactor,
 }
 
@@ -255,7 +291,6 @@ impl WorkerRuntime {
                 credentials.len()
             );
         }
-
         // WI#326 CV-2/CV-3: harness secret files are pulled over the
         // authenticated channel, staged onto the tmpfs mount (0440), and
         // NEVER exported to the child-process env — the job reads the files.
@@ -267,6 +302,13 @@ impl WorkerRuntime {
         // block cannot persist a live token into events. Applies to plain
         // worker jobs too — the token is exposed regardless of harness mode.
         self.secret_redactor.add_value(self.client.bearer_token());
+        // WI#666: granted credentials are injected into every child process
+        // env, so a child can `printenv` a live third-party credential into
+        // its tool output. Arm the redactor with those values as well —
+        // otherwise `scrub_tool_result` has nothing to match and the value
+        // reaches persisted job events, the SSE stream and the parent
+        // agent's context. One batch arm, not one matcher rebuild each.
+        arm_credential_values(&mut self.secret_redactor, &credentials);
 
         let owner_id = if job.owner_id.is_empty() {
             "default".to_string()
@@ -274,6 +316,9 @@ impl WorkerRuntime {
             job.owner_id.clone()
         };
         let mcp_credentials = self.client.fetch_mcp_credentials().await?;
+        // WI#666: MCP server processes receive these credentials as env too,
+        // so the same arming applies to that channel.
+        arm_mcp_credential_values(&mut self.secret_redactor, &mcp_credentials);
         let mut mcp_runtime = match WorkerMcpRuntime::activate(
             Arc::clone(&self.tools),
             job.mcp_servers.clone(),
@@ -832,6 +877,50 @@ impl LoopDelegate for ContainerDelegate {
 mod tests {
     use super::*;
     use crate::agent::agentic_loop::truncate_for_preview;
+
+    #[test]
+    fn granted_credential_values_are_scrubbed_from_tool_results() {
+        // WI#666: the credential values live in the child env by design, so a
+        // `printenv` echo must still be redacted before it leaves the worker.
+        let credentials = vec![
+            CredentialResponse {
+                env_var: "GITHUB_TOKEN".to_string(),
+                value: "granted-credential-alpha-value".to_string(),
+            },
+            CredentialResponse {
+                env_var: "NPM_TOKEN".to_string(),
+                value: "granted-credential-beta-value".to_string(),
+            },
+        ];
+        let mut redactor = crate::orchestrator::harness::SecretValueRedactor::default();
+        arm_credential_values(&mut redactor, &credentials);
+
+        for credential in &credentials {
+            let output = format!("$ printenv {}\n{}", credential.env_var, credential.value);
+            let scrubbed = redactor.scrub_tool_result(&output);
+            assert!(
+                !scrubbed.contains(&credential.value),
+                "granted credential must be scrubbed from tool output"
+            );
+        }
+        // Tool arguments use the same redactor (second-order channel).
+        let leaked = serde_json::json!({"command": format!("echo {}", credentials[0].value)});
+        assert!(!redactor.scrub(&leaked.to_string()).contains(&credentials[0].value));
+    }
+
+    #[test]
+    fn mcp_credential_values_are_scrubbed_from_tool_results() {
+        let credentials = vec![McpCredentialResponse {
+            server_name: "github".to_string(),
+            env_var: "MCP_GITHUB_TOKEN".to_string(),
+            value: "granted-mcp-credential-value".to_string(),
+        }];
+        let mut redactor = crate::orchestrator::harness::SecretValueRedactor::default();
+        arm_mcp_credential_values(&mut redactor, &credentials);
+
+        let output = format!("MCP_GITHUB_TOKEN={}", credentials[0].value);
+        assert!(!redactor.scrub_tool_result(&output).contains(&credentials[0].value));
+    }
 
     #[test]
     fn test_truncate_within_limit() {
