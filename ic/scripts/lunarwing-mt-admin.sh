@@ -768,20 +768,26 @@ EOF
 
 
 main() {
-  local command_name="${1:-}"
+  local command_name="${1:-}" preflight_status=0
   if [[ -z "$command_name" ]]; then
     usage
     exit 1
   fi
   shift || true
 
-  if ! openrc_dispatch_preflight "$command_name" "$@"; then
+  openrc_dispatch_preflight "$command_name" "$@" || preflight_status=$?
+  if (( preflight_status != 0 )); then
     # writers-active has a 0/1/2 state contract (active/stopped/unknown), and
     # export-tenant/import-tenant read 1 as "stopped". A refusal is unknown —
     # never a service state (EQ-1).
     if [[ "$command_name" == writers-active ]]; then
       say "OpenRC proxy migration required; writer state unknown — run: $0 render-units --all-proxies" >&2
       exit 2
+    fi
+    # 126 is WI#703's scoped health-contract refusal, already reported with
+    # the failing component and repair; do not mislabel it a migration.
+    if (( preflight_status == 126 )); then
+      die "refusing $command_name: the OpenRC proxy unit contract could not be loaded"
     fi
     die "OpenRC proxy migration required; refusing $command_name"
   fi
