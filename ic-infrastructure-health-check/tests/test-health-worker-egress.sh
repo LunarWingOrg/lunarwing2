@@ -340,6 +340,10 @@ chmod 0600 "$FIXTURE/pm1.env"
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
   awk '/^health_lib_tree_require_safe\(\) \{/,/^\}/' \
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
+  awk '/^health_lib_unsafe_repair_command\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
+  awk '/^health_lib_refusal_text\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
   printf 'ensure_health_pipeline\n'
 } >"$PIPELINE_RUN"
 if bash "$PIPELINE_RUN"; then
