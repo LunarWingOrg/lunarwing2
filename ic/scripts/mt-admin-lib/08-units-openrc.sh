@@ -408,21 +408,92 @@ INITEOF
 # cannot drift apart. The tenant layout helpers (00-common.sh) are defined
 # before this point, so the library's fallbacks are not used by mt-admin.
 require_safe_installed_health_source() {
-  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR"
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR" contract mode linked="false"
+  HEALTH_CONTRACT_REFUSAL=""
   if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
     resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
+    if [[ -L "$source_dir" ]]; then linked="true"; fi
   fi
-  [[ "$resolved" == "$HEALTH_LIB_DIR" ]] || return 0
-  health_lib_tree_require_safe "$HEALTH_LIB_DIR"
+  # A symlinked source resolves to a tree this process is about to hand to
+  # root, whether or not it is the canonical installed library: require the
+  # whole resolved tree to be root-owned and symlink-free.
+  if [[ "$linked" == "true" || "$resolved" == "$HEALTH_LIB_DIR" ]]; then
+    health_lib_tree_require_safe "$resolved" || {
+      HEALTH_CONTRACT_REFUSAL="$(health_lib_refusal_text "$resolved")"
+      return 1
+    }
+    return 0
+  fi
+  # WI#696 ABZ-3 / WI#703: the ordinary checkout layout is sourced as root
+  # too, so the file itself must be a regular, non-symlink, non-group/other-
+  # writable file. The checkout is user-owned by design (docs invoke
+  # `sudo ic/scripts/...`), so requiring root ownership of the whole checkout
+  # would break every documented invocation; the entire script is already in
+  # that user's trust domain. Group/other write and links are still refused.
+  contract="$resolved/openrc-proxy-unit-contract.sh"
+  [[ -e "$contract" || -L "$contract" ]] || return 0
+  HEALTH_LIB_UNSAFE_COMPONENT="$contract"
+  if [[ ! -f "$contract" || -L "$contract" ]]; then
+    HEALTH_CONTRACT_REFUSAL="refusing health library $contract: the contract source must be a regular file, not a symbolic link or directory; repair with: remove the symbolic link $contract and restore it from a trusted checkout"
+    return 1
+  fi
+  mode="$(stat -c '%a' "$contract" 2>/dev/null || true)"
+  if [[ ! "$mode" =~ ^[0-7]+$ ]] || (( (8#$mode & 0022) != 0 )); then
+    HEALTH_CONTRACT_REFUSAL="refusing health library $contract: the contract source must not be group/other-writable; repair with: chmod go-w $contract"
+    return 1
+  fi
+  return 0
 }
-require_safe_installed_health_source
-# shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
-source "${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
+
+# WI#703: the guard protects exactly one thing — the root `source` below — so a
+# refusal must skip that source, not abort the CLI while it is still sourcing
+# libraries. The composition root runs under `set -euo pipefail`, and the old
+# bare call here made an unsafe installed library kill every subcommand
+# (including --help and the commands that repair the library) before dispatch.
+# The refusal is recorded and enforced only on paths that need the contract.
+MT_ADMIN_OPENRC_CONTRACT_REFUSAL=""
+HEALTH_CONTRACT_REFUSAL=""
+
+openrc_proxy_contract_unavailable() {
+  die "OpenRC proxy unit contract unavailable: ${MT_ADMIN_OPENRC_CONTRACT_REFUSAL:-unknown reason}; --help and non-OpenRC commands remain available"
+}
+
+# Fail closed at the first OpenRC path that needs the contract; the CLI itself
+# stays usable so the same host can be repaired with the same tool.
+require_openrc_proxy_contract() {
+  [[ -n "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" ]] || return 0
+  say "refusing OpenRC operation: OpenRC proxy unit contract unavailable: $MT_ADMIN_OPENRC_CONTRACT_REFUSAL" >&2
+  return 126
+}
+
+load_openrc_proxy_unit_contract() {
+  local contract="${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
+  if [[ ! -e "$contract" || ! -r "$contract" ]]; then
+    MT_ADMIN_OPENRC_CONTRACT_REFUSAL="the contract source $contract is missing or unreadable; restore the checkout or run ensure_health_pipeline"
+  elif ! require_safe_installed_health_source 2>/dev/null; then
+    MT_ADMIN_OPENRC_CONTRACT_REFUSAL="${HEALTH_CONTRACT_REFUSAL:-the health library is unsafe}"
+  fi
+  if [[ -n "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" ]]; then
+    printf 'WARNING: OpenRC proxy unit contract not loaded: %s; OpenRC commands will refuse until it is repaired.\n' \
+      "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" >&2
+    _openrc_proxy_unit_template() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_python3() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_unit_body() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_unit_extract_port() { openrc_proxy_contract_unavailable; }
+    openrc_proxy_unit_is_safe() { openrc_proxy_contract_unavailable; }
+    first_unsafe_openrc_proxy_unit() { openrc_proxy_contract_unavailable; }
+    return 0
+  fi
+  # shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
+  source "$contract"
+}
+load_openrc_proxy_unit_contract
 
 # A dependency-cache rebuild can source every init script, even for a command
 # addressing a different tenant. Inspect files as data before invoking OpenRC.
 require_safe_openrc_proxy_units() {
   local path
+  require_openrc_proxy_contract || return 125
   for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
     [[ -e "$path" || -L "$path" ]] || continue
     if ! openrc_proxy_unit_is_safe "$path"; then
@@ -443,7 +514,14 @@ openrc_dispatch_preflight() {
   # (FL-1): only a positively detected systemd host skips the file-only guard.
   # On failure the command's own ensure_init_system reports the accurate error.
   ensure_init_system 2>/dev/null || true
-  [[ "$INIT_SYSTEM" == systemd ]] || require_safe_openrc_proxy_units
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    return 0
+  fi
+  # WI#703: without the contract the installed units cannot be checked, so an
+  # OpenRC-capable command refuses here with the named repair instead of
+  # failing later inside a renderer.
+  require_openrc_proxy_contract || return 126
+  require_safe_openrc_proxy_units
 }
 
 _openrc_service() {
@@ -472,6 +550,7 @@ _openrc_update() {
 render_all_openrc_proxy_units() {
   ensure_init_system
   [[ "$INIT_SYSTEM" == openrc ]] || die "render-units --all-proxies requires OpenRC"
+  require_openrc_proxy_contract || return 1
   ports_registry_require_readonly
   local names name path
   names="$(all_tenant_names)" || return 1
@@ -558,6 +637,7 @@ backup_openrc_proxy_unit() {
 # interpreter resolution, and template drift fails loudly instead of shipping.
 render_proxy_openrc_unit() {
   local name="$1" proxy_port path tmp
+  require_openrc_proxy_contract || return 1
   proxy_port="$(ports_get "$name" proxy)" || return 1
   [[ "$proxy_port" =~ ^[0123456789]{1,5}$ ]] || die "invalid proxy port for $name"
   mkdir -p "$OPENRC_INITD_DIR" || return 1
