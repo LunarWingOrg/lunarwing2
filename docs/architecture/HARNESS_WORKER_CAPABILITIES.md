@@ -232,6 +232,13 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     a mounted value. That includes a non-secret value that is kept in the
     secrets store and granted to the job, such as a user name of 8 bytes or
     more.
+  - External lanes (kimi, pebble) receive grants inline as
+    `TaskContext.environment` instead of pulling `/credentials`. The daemon
+    arms one redactor per external task from that map and scrubs progress
+    deltas, the worker's terminal output/error, and the timeout-evidence
+    snapshot before they reach `job_events`, the SSE stream, or the parent
+    context (WI#702). The limits above apply unchanged: best effort, not a
+    boundary, and values shorter than 8 bytes are not value-redacted.
 
 ## 2. Read-only file/memory injection (`inject_files`)
 
