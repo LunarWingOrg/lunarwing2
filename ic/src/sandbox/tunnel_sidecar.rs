@@ -1528,15 +1528,19 @@ impl TunnelSidecar {
 
     async fn wait_provider_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_error = None;
         loop {
-            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.provider_ready_timeout_error(timeout, last_error));
+            }
+            match tokio::time::timeout_at(deadline, self.provider_health()).await {
                 Ok(Ok(())) => return Ok(()),
-                Ok(Err(error)) => error,
-                Err(_) => return Err(self.provider_ready_timeout_error(timeout, None)),
-            };
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => return Err(self.provider_ready_timeout_error(timeout, last_error)),
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(self.provider_ready_timeout_error(timeout, Some(error)));
+                return Err(self.provider_ready_timeout_error(timeout, last_error));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL.min(remaining)).await;
         }
@@ -1579,11 +1583,12 @@ impl TunnelSidecar {
         timeout: Duration,
     ) -> Result<()> {
         let mut used_final_attempt = false;
+        let mut last_error = None;
         loop {
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.health_timeout_error(timeout, None));
+                return Err(self.health_timeout_error(timeout, last_error));
             }
-            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+            match tokio::time::timeout_at(deadline, self.provider_health()).await {
                 Ok(Ok(())) => {
                     return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
                         .await
@@ -1592,18 +1597,21 @@ impl TunnelSidecar {
                         Err(_) => Err(self.health_timeout_error(timeout, None)),
                     };
                 }
-                Ok(Err(error)) => error,
-                Err(_) => return Err(self.health_timeout_error(timeout, None)),
-            };
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => return Err(self.health_timeout_error(timeout, last_error)),
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(self.health_timeout_error(timeout, Some(error)));
+                return Err(self.health_timeout_error(timeout, last_error));
             }
             if remaining <= HEALTH_POLL_INTERVAL {
                 if used_final_attempt {
-                    return Err(self.health_timeout_error(timeout, Some(error)));
+                    return Err(self.health_timeout_error(timeout, last_error));
                 }
                 used_final_attempt = true;
+                // Space the last look into the remaining window while leaving
+                // time for the probe and firewall check under the same deadline.
+                tokio::time::sleep(remaining / 2).await;
                 continue;
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
@@ -3501,6 +3509,8 @@ mod tests {
     enum HealthScript {
         Slow,
         SlowFirewall,
+        DelayedFailure,
+        FailsThenSlow(usize),
         HealthyOnFinalPoll,
         Healthy,
     }
@@ -3534,6 +3544,11 @@ mod tests {
             self.delay = Duration::from_secs(seconds);
             self
         }
+
+        fn after_millis(mut self, millis: u64) -> Self {
+            self.delay = Duration::from_millis(millis);
+            self
+        }
     }
 
     #[cfg(unix)]
@@ -3551,19 +3566,24 @@ mod tests {
         script: HealthScript,
         command: Option<&str>,
         attempt: usize,
+        elapsed: Duration,
         listing: &str,
     ) -> HealthReply {
         match script {
             HealthScript::Slow => HealthReply::success("").after(30),
+            HealthScript::DelayedFailure => HealthReply::failure().after_millis(100),
+            HealthScript::FailsThenSlow(failures) if attempt < failures => {
+                HealthReply::failure().after_millis(100)
+            }
+            HealthScript::FailsThenSlow(_) => HealthReply::success("").after(30),
             HealthScript::SlowFirewall if command == Some("cat") => {
                 successful_netbird_health(command, listing).after(30)
             }
             HealthScript::SlowFirewall | HealthScript::Healthy => {
                 successful_netbird_health(command, listing)
             }
-            HealthScript::HealthyOnFinalPoll => match (command, attempt) {
-                (Some("netbird"), 0..=2) => HealthReply::failure(),
-                (Some("netbird"), 3) => successful_netbird_health(command, listing).after(1),
+            HealthScript::HealthyOnFinalPoll => match command {
+                Some("netbird") if elapsed < Duration::from_secs(5) => HealthReply::failure(),
                 _ => successful_netbird_health(command, listing),
             },
         }
@@ -3602,6 +3622,7 @@ mod tests {
             tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
             resolvers: vec!["9.9.9.9".parse().unwrap()],
         });
+        let started = tokio::time::Instant::now();
         let runtime = crate::sandbox::cli_runner::TestRuntime::new({
             let removals = removals.clone();
             let removed = removed.clone();
@@ -3622,6 +3643,7 @@ mod tests {
                                 script,
                                 args.get(2).map(String::as_str),
                                 attempt,
+                                started.elapsed(),
                                 &listing,
                             );
                             tokio::time::sleep(reply.delay).await;
@@ -3702,7 +3724,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
-    async fn health_reprobe_uses_last_interval_for_one_more_bounded_probe() {
+    async fn health_reprobe_waits_in_final_interval_for_provider_to_become_healthy() {
         let (sidecar, base, removals, _removed, exec_calls) =
             health_fixture("final-poll", HealthScript::HealthyOnFinalPoll);
 
@@ -3747,6 +3769,84 @@ mod tests {
                 .contains("provider remained unhealthy for the 6s per-run cap")
         );
         assert_eq!(started.elapsed(), Duration::from_secs(6));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn provider_ready_deadline_retains_last_probe_error_and_clamps_sleep() {
+        for (script, expected_calls) in [
+            (HealthScript::DelayedFailure, 3),
+            (HealthScript::FailsThenSlow(1), 2),
+        ] {
+            for startup in [false, true] {
+                let (mut sidecar, base, _removals, _removed, exec_calls) =
+                    health_fixture("last-provider-error", script);
+                let timeout = Duration::from_secs(6);
+                if startup {
+                    sidecar.cfg.startup_timeout = timeout;
+                }
+
+                let started = tokio::time::Instant::now();
+                let error = sidecar.wait_provider_ready(timeout).await.unwrap_err();
+                let reason = error.to_string();
+
+                assert!(
+                    reason.contains("netbird status --check startup probe failed"),
+                    "{reason}"
+                );
+                assert!(reason.contains("provider remained unhealthy"), "{reason}");
+                assert_eq!(reason.contains("per-run cap"), !startup, "{reason}");
+                assert_eq!(started.elapsed(), timeout);
+                assert_eq!(
+                    exec_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    expected_calls
+                );
+                std::fs::remove_dir_all(base).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_retains_last_probe_error_when_final_probe_times_out() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("last-health-error", HealthScript::FailsThenSlow(3));
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+        let reason = error.to_string();
+
+        assert!(
+            reason.contains("netbird status --check startup probe failed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("sidecar remained unhealthy for 6s"),
+            "{reason}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn expired_health_deadlines_do_not_start_provider_probes() {
+        let (sidecar, base, removals, _removed, exec_calls) =
+            health_fixture("expired-deadline", HealthScript::Slow);
+
+        let started = tokio::time::Instant::now();
+        assert!(sidecar.wait_provider_ready(Duration::ZERO).await.is_err());
+        assert!(sidecar.wait_healthy(Duration::ZERO).await.is_err());
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(base).unwrap();
     }
 

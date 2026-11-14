@@ -126,6 +126,16 @@ callers await that same attempt and then use its recorded back-off. If the
 task ends without publishing a result, the closed channel is also converted
 into a recorded failure instead of wedging later commands.
 
+Provider readiness and health re-probing retain the last completed provider
+failure when a later provider probe is cut by the deadline. No new provider
+probe starts after the budget expires, and readiness polling sleeps are clamped
+to the time left. In the 6-second re-probe, the final retry waits halfway through
+the remaining last polling interval instead of duplicating the previous probe
+immediately; provider and firewall checks still share the original deadline.
+An unsuccessful final retry returns without sleeping away the unused time.
+If no provider probe completed with an error, the timeout stays generic rather
+than inventing a failure reason. The unverified sidecar is still removed.
+
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
 keyed by container name, so independently constructed handles cannot remove or

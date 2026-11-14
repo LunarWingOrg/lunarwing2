@@ -535,6 +535,16 @@ records a failure matched to its own attempt. Shutdown marks recovery stopping,
 uses bounded waits, and checks before/after starts to remove late containers;
 an explicit cold start can later clear the stop and cached failure. No
 container ID becomes joinable before the firewall verifies.
+
+Provider readiness and health re-probing keep the last completed provider
+failure if a later provider probe exceeds the deadline. Expired budgets never
+start another provider probe, and readiness sleeps are clamped to the time
+remaining. The 6-second re-probe spaces its final retry halfway into the last
+remaining polling interval, leaving time for provider/firewall verification
+under the same deadline rather than probing twice at once. A failed final retry
+returns without spending the unused interval; if no provider error completed,
+the deadline error remains generic. Unverified sidecars are still removed.
+
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
