@@ -44,11 +44,13 @@ before the firewall is installed. Once that firewall is in, the sidecar's own
 new lookups are dropped too: its resolver sockets are unmarked and no uplink
 port-53 rule remains.
 
-NetBird instead manages the sidecar resolver after startup. LunarWing preserves
-the original file in a writable per-instance backup mount, allowing NetBird to
-replace `/etc/resolv.conf` with its learned overlay address. Joined runs inherit
-that file and the firewall permits DNS only to the overlay listener, so there is
-no runtime-resolver uplink channel. Peer names and custom zones resolve through
+NetBird instead manages the sidecar resolver after startup. A credential-free
+bootstrap reads the runtime resolver; LunarWing then stages writable resolver
+and backup mounts so NetBird can replace `/etc/resolv.conf` with its learned
+overlay address despite the read-only rootfs. Joined runs mount that same file
+read-only (`ro,z`) because `--network container` does not propagate it. The
+firewall permits DNS only to the overlay listener, so there is no
+runtime-resolver uplink channel. Peer names and custom zones resolve through
 NetBird. An upstream outside the overlay fails closed because its resolver
 sockets are unmarked; use an in-overlay primary nameserver group for public
 names and for control-plane hostnames that may need re-resolution. Validation
