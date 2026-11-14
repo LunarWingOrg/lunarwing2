@@ -1529,23 +1529,36 @@ impl TunnelSidecar {
     async fn wait_provider_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let error = match self.provider_health().await {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
+            let error = match tokio::time::timeout_at(deadline, self.provider_health()).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(_) => return Err(self.provider_ready_timeout_error(timeout, None)),
             };
-            if tokio::time::Instant::now() >= deadline {
-                let context = if timeout < self.cfg.startup_timeout {
-                    format!(
-                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s; a provider that needs longer after recreation requires a daemon restart",
-                        timeout.as_secs(),
-                        self.cfg.startup_timeout.as_secs()
-                    )
-                } else {
-                    format!("provider remained unhealthy for {}s", timeout.as_secs())
-                };
-                return Err(self.error_with_context(error, &context));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.provider_ready_timeout_error(timeout, Some(error)));
             }
-            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+            tokio::time::sleep(HEALTH_POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+
+    fn provider_ready_timeout_error(
+        &self,
+        timeout: Duration,
+        error: Option<SandboxError>,
+    ) -> SandboxError {
+        let context = if timeout < self.cfg.startup_timeout {
+            format!(
+                "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s; a provider that needs longer after recreation requires a daemon restart",
+                timeout.as_secs(),
+                self.cfg.startup_timeout.as_secs()
+            )
+        } else {
+            format!("provider remained unhealthy for {}s", timeout.as_secs())
+        };
+        match error {
+            Some(error) => self.error_with_context(error, &context),
+            None => self.unavailable(&context),
         }
     }
 
@@ -1565,6 +1578,7 @@ impl TunnelSidecar {
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<()> {
+        let mut used_final_attempt = false;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(self.health_timeout_error(timeout, None));
@@ -1586,8 +1600,11 @@ impl TunnelSidecar {
                 return Err(self.health_timeout_error(timeout, Some(error)));
             }
             if remaining <= HEALTH_POLL_INTERVAL {
-                tokio::time::sleep(remaining).await;
-                return Err(self.health_timeout_error(timeout, Some(error)));
+                if used_final_attempt {
+                    return Err(self.health_timeout_error(timeout, Some(error)));
+                }
+                used_final_attempt = true;
+                continue;
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
