@@ -237,8 +237,13 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     arms one redactor per external task from that map and scrubs progress
     deltas, the worker's terminal output/error, and the timeout-evidence
     snapshot before they reach `job_events`, the SSE stream, or the parent
-    context (WI#702). The limits above apply unchanged: best effort, not a
-    boundary, and values shorter than 8 bytes are not value-redacted.
+    context (WI#702). Proxied tool-call input previews and recorded tool
+    output, denial, and failure reasons are scrubbed before `tool_use` and
+    `tool_result` rows are persisted. Protocol-error reasons are scrubbed on
+    the terminal bookkeeping paths and at the blocking `execute_task` return,
+    covering the job status, job context, and parent's `create_job` tool error
+    (WI#711). The limits above apply unchanged: best effort, not a boundary,
+    and values shorter than 8 bytes are not value-redacted.
 
 ## 2. Read-only file/memory injection (`inject_files`)
 
