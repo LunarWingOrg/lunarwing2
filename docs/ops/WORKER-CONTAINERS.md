@@ -416,18 +416,20 @@ rosters, legacy Nanocode supervision, container and IPC-volume removal, the
 PostgreSQL stop and the `--purge` data reset skip their account-dependent
 steps and say so. The unsafe installed-proxy-unit refusal runs before the
 OpenRC account-gone skip: its repair (`render-units --all-proxies`) needs no
-tenant account, and skipping the roster must never hide the repair hint. Standalone `stop-pg` and `stop-tenant` use the same proof:
-if it fails they exit non-zero because the stop state is unknown,
-not successfully report a skip. The egress teardown proves the identity idle
-again and deletes the rendered egress state. On rootless Podman it flushes
-nothing: the chains lived only in the tenant's rootless network namespace,
-which needs the account to enter and in which no process is left (another
-runtime's host-side chains are flushed as usual). The network and keeper
-definitions and the PostgreSQL data volume stay in the store under the former
-home. When that home still exists it is owned by the orphaned uid, which the
-next `useradd` may hand to a new account: the removal prints a warning, and the
-operator removes the home before the next `add-tenant`. A rootful runtime needs
-no account: its stops and removals still run against root's store.
+tenant account, and skipping the roster must never hide the repair hint.
+Standalone `stop-pg`, `stop-tenant` and `stop-worker` use the same proof: if it
+fails they exit non-zero because the stop state is unknown, rather than
+successfully report a skip; `stop-worker` names the skip it performed. The
+egress teardown proves the identity idle again and deletes the rendered egress
+state. On rootless Podman it flushes nothing: the chains lived only in the
+tenant's rootless network namespace, which needs the account to enter and in
+which no process is left (another runtime's host-side chains are flushed as
+usual). The network and keeper definitions and the PostgreSQL data volume stay
+in the store under the former home. When that home still exists it is owned by
+the orphaned uid, which the next `useradd` may hand to a new account: the
+removal prints a warning, and the operator removes the home before the next
+`add-tenant`. A rootful runtime needs no account: its stops and removals still
+run against root's store.
 
 For a tenant without a record:
 
