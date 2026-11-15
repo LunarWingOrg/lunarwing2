@@ -120,6 +120,11 @@ DEFAULT_HEALTH_ENABLED="${LUNARWING_MT_HEALTH_ENABLED:-true}"
 HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-}"
 HEALTH_BASE_DIR="${LUNARWING_MT_HEALTH_BASE_DIR:-/var/lib/lunarwing-health}"
 HEALTH_SRC_DIR="$LUNARWING_ROOT/ic-infrastructure-health-check"
+# Knowledge-sync snapshots carry their own contract; never resolve back to a
+# sibling checkout or the separately installed host health library.
+if [[ -f "$SCRIPT_DIR/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh" ]]; then
+  HEALTH_SRC_DIR="$SCRIPT_DIR/ic-infrastructure-health-check"
+fi
 HEALTH_LIB_DIR="/usr/local/lib/lunarwing-health"
 # Library entries installed by other tools that a reinstall keeps (see
 # carry_health_library_entries): the optional metrics listener binary.
