@@ -145,7 +145,7 @@ fi
 # account is already gone must still be told to repair the fleet, because the
 # repair needs no account and the skip would otherwise hide the hint.
 legacy_unit mallory
-if (MT_ROOTLESS=true
+if (export CONTAINER_RT=podman MT_ROOTLESS=true
   id() { [[ "${1:-}" == -u && "${2:-}" == mallory ]] && return 1; command id "$@"; }
   _tenant_in_passwd_file() { return 1; }
   getent() { [[ "${1:-}" == passwd ]] && return 2; command getent "$@"; }
