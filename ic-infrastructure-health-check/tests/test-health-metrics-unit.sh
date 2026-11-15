@@ -134,7 +134,7 @@ assert_absent "$OPENRC_UNIT" 'checkpath -d' \
 # operator's existing conf.d instead of resetting port, token and base dir.
 assert_contains "$INSTALLER" 'groupadd --system lunarwing-metrics' \
     "installer creates the dedicated system group"
-assert_contains "$INSTALLER" 'useradd --system --no-create-home --home-dir /var/empty \' \
+assert_contains "$INSTALLER" 'useradd --system --no-create-home --home-dir /var/empty' \
     "installer creates a home-free nologin system user"
 assert_contains "$INSTALLER" '--gid lunarwing-metrics lunarwing-metrics' \
     "installer assigns the dedicated primary group"
