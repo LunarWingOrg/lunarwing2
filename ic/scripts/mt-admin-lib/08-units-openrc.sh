@@ -407,22 +407,63 @@ INITEOF
 # beside them, so the renderer, this preflight guard and the cron guard
 # cannot drift apart. The tenant layout helpers (00-common.sh) are defined
 # before this point, so the library's fallbacks are not used by mt-admin.
+MT_ADMIN_OPENRC_CONTRACT_REFUSAL=""
+HEALTH_CONTRACT_REFUSAL=""
+
 require_safe_installed_health_source() {
-  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR"
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR" linked="false"
+  HEALTH_CONTRACT_REFUSAL=""
   if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
     resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
+    if [[ -L "$source_dir" ]]; then linked="true"; fi
   fi
-  [[ "$resolved" == "$HEALTH_LIB_DIR" ]] || return 0
-  health_lib_tree_require_safe "$HEALTH_LIB_DIR"
+  if [[ "$linked" == "true" || "$resolved" == "$HEALTH_LIB_DIR" ]]; then
+    health_lib_tree_require_safe "$resolved" || {
+      HEALTH_CONTRACT_REFUSAL="$(health_lib_refusal_text "$resolved")"
+      return 1
+    }
+  fi
+  return 0
 }
-require_safe_installed_health_source
-# shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
-source "${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
+
+openrc_proxy_contract_unavailable() {
+  die "OpenRC proxy unit contract unavailable: ${MT_ADMIN_OPENRC_CONTRACT_REFUSAL:-unknown reason}"
+}
+
+require_openrc_proxy_contract() {
+  [[ -n "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" ]] || return 0
+  say "refusing OpenRC operation: OpenRC proxy unit contract unavailable: $MT_ADMIN_OPENRC_CONTRACT_REFUSAL" >&2
+  return 126
+}
+
+load_openrc_proxy_unit_contract() {
+  local contract="${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
+  if [[ ! -e "$contract" || ! -r "$contract" ]]; then
+    MT_ADMIN_OPENRC_CONTRACT_REFUSAL="the contract source $contract is missing or unreadable; restore it from a trusted checkout"
+  elif ! require_safe_installed_health_source 2>/dev/null; then
+    MT_ADMIN_OPENRC_CONTRACT_REFUSAL="${HEALTH_CONTRACT_REFUSAL:-the health library is unsafe}"
+  fi
+  if [[ -n "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" ]]; then
+    printf 'WARNING: OpenRC proxy unit contract not loaded: %s; OpenRC commands will refuse until it is repaired.\n' \
+      "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" >&2
+    _openrc_proxy_unit_template() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_python3() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_unit_body() { openrc_proxy_contract_unavailable; }
+    _openrc_proxy_unit_extract_port() { openrc_proxy_contract_unavailable; }
+    openrc_proxy_unit_is_safe() { openrc_proxy_contract_unavailable; }
+    first_unsafe_openrc_proxy_unit() { openrc_proxy_contract_unavailable; }
+    return 0
+  fi
+  # shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
+  source "$contract"
+}
+load_openrc_proxy_unit_contract
 
 # A dependency-cache rebuild can source every init script, even for a command
 # addressing a different tenant. Inspect files as data before invoking OpenRC.
 require_safe_openrc_proxy_units() {
   local path
+  require_openrc_proxy_contract || return 125
   for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
     [[ -e "$path" || -L "$path" ]] || continue
     if ! openrc_proxy_unit_is_safe "$path"; then
@@ -436,14 +477,18 @@ require_safe_openrc_proxy_units() {
 # probe as an inactive service. Keep help and the file-only migration paths open.
 openrc_dispatch_preflight() {
   case "$1" in
-    help|--help|-h|upgrade-tenant) return 0 ;;
+    help|--help|-h|upgrade-tenant|reinstall-health-library) return 0 ;;
     render-units) [[ $# -eq 2 && "$2" == --all-proxies ]] && return 0 ;;
   esac
   # Detection failure must not become a false "migration required" refusal
   # (FL-1): only a positively detected systemd host skips the file-only guard.
   # On failure the command's own ensure_init_system reports the accurate error.
   ensure_init_system 2>/dev/null || true
-  [[ "$INIT_SYSTEM" == systemd ]] || require_safe_openrc_proxy_units
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    return 0
+  fi
+  require_openrc_proxy_contract || return 126
+  require_safe_openrc_proxy_units
 }
 
 _openrc_service() {
@@ -472,6 +517,7 @@ _openrc_update() {
 render_all_openrc_proxy_units() {
   ensure_init_system
   [[ "$INIT_SYSTEM" == openrc ]] || die "render-units --all-proxies requires OpenRC"
+  require_openrc_proxy_contract || return 1
   ports_registry_require_readonly
   local names name path
   names="$(all_tenant_names)" || return 1
@@ -558,6 +604,7 @@ backup_openrc_proxy_unit() {
 # interpreter resolution, and template drift fails loudly instead of shipping.
 render_proxy_openrc_unit() {
   local name="$1" proxy_port path tmp
+  require_openrc_proxy_contract || return 1
   proxy_port="$(ports_get "$name" proxy)" || return 1
   [[ "$proxy_port" =~ ^[0123456789]{1,5}$ ]] || die "invalid proxy port for $name"
   mkdir -p "$OPENRC_INITD_DIR" || return 1
