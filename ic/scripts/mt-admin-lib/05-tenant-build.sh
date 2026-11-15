@@ -1074,9 +1074,13 @@ upgrade_candidate_sandbox_image_ref() {  # <tenant>
 }
 
 _prepare_sandbox_image_source() {  # <tenant> [release ref]
-  local source_root
+  local source_root release_ref="${2:-}"
   source_root="$(tenant_lw_root "$1")"
-  _prepare_worker_build_source "$source_root" ic/docker "${2:-}" sandbox.Dockerfile
+  if [[ -z "$release_ref" ]]; then
+    release_ref="$(git -C "$LUNARWING_ROOT" rev-parse --verify 'HEAD^{commit}')" \
+      || die "cannot resolve operator checkout HEAD for sandbox image build"
+  fi
+  _prepare_worker_build_source "$source_root" ic/docker "$release_ref" sandbox.Dockerfile
   SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$WORKER_BUILD_SOURCE_ROOT/ic"
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 }
@@ -1917,6 +1921,9 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   release_ref="$(_operator_worker_release_ref "$requested")" || release_ref=""
   [[ -n "$release_ref" ]] \
     || die "tenant '$owner' HEAD $revision has no operator release ref matching '$requested'"
+  if [[ "$release_ref" =~ ^[0-9a-f]{40}$ && "$revision" != "$release_ref" ]]; then
+    die "tenant '$owner' HEAD $revision does not match selected operator revision $release_ref"
+  fi
   git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref" \
     || die "tenant '$owner' HEAD $revision is not on operator release ref $release_ref"
   WORKER_BUILD_SOURCE_REVISION="$revision"
