@@ -75,6 +75,9 @@ Observed:
   this positive health response instead of relying on the 404 alone.
 
 This proves the fresh tenant's ordinary rootless-container DNS and overlay
-path work. It does not by itself prove the real shell sandbox works: the
-`proxy-enforced` sandbox deliberately removes container networking and applies
-a public-only destination policy. That end-to-end test follows after the build.
+path work. A second mechanism probe with `podman run --network none` returned
+`getent` exit 2 and curl exit 6 (`Could not resolve host`, HTTP 000). This
+isolates the effect of removing the network namespace, but it is still not a
+substitute for the real daemon shell-tool test: `proxy-enforced` also inserts
+its Unix-relay HTTP proxy and applies a public-only destination policy. That
+end-to-end test follows after the build.
