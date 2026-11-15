@@ -1936,7 +1936,7 @@ upgrade_tenant_locked() {
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" "$sandbox_policy" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$target_commit" "$with_lunardepth" "$sandbox_policy" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
   # Candidate builds read the tenant revision as its owner and build from
