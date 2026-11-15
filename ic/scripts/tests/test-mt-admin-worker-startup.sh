@@ -8,6 +8,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+mkdir -p "$TENANT_IDENTITY_DIR"
+printf 'alice:231072:65536\n' >"$TENANT_SUBUID_FILE"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == alice ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
 TENANT_LIFECYCLE_LOCK_DIR="$fixture/locks"
 events="$fixture/events"
 output="$fixture/output"
