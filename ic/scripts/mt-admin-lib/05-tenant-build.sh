@@ -1095,32 +1095,32 @@ upgrade_candidate_sandbox_image_ref() {  # <tenant>
   printf 'lunarwing-sandbox:%s' "$(_upgrade_candidate_tag_suffix "$1")"
 }
 
-_prepare_sandbox_image_source() {  # <tenant> [release ref]
-  local source_root release_ref="${2:-}"
+_prepare_sandbox_image_source() {  # <tenant> [release ref] [selected commit]
+  local source_root release_ref="${2:-}" selected_commit="${3:-}"
   source_root="$(tenant_lw_root "$1")"
-  if [[ -z "$release_ref" ]]; then
-    release_ref="$(git -C "$LUNARWING_ROOT" rev-parse --verify 'HEAD^{commit}')" \
-      || die "cannot resolve operator checkout HEAD for sandbox image build"
-  fi
-  _prepare_worker_build_source "$source_root" ic/docker "$release_ref" sandbox.Dockerfile
+  _prepare_worker_build_source "$source_root" ic/docker "$release_ref" sandbox.Dockerfile "$selected_commit"
   SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$WORKER_BUILD_SOURCE_ROOT/ic"
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 }
 
-ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref]
-  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}" release_ref="${3:-}"
+ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref] [selected commit]
+  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}" release_ref="${3:-}" selected_commit="${4:-}"
   local rc=0
   validate_sandbox_image_policy "$policy"
   tenant_uses_managed_sandbox_image "$name" || return 0
   [[ "$policy" != never ]] || return 0
-  _prepare_sandbox_image_source "$name" "$release_ref"
+  if [[ -z "$selected_commit" ]]; then
+    selected_commit="$(git -C "$LUNARWING_ROOT" rev-parse --verify "${release_ref:-HEAD}^{commit}")" \
+      || die "cannot resolve operator checkout revision for sandbox image build"
+  fi
+  _prepare_sandbox_image_source "$name" "$release_ref" "$selected_commit"
   ensure_sandbox_image_current "$name" "$policy" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT" || rc=$?
   _worker_build_context_finish || return 1
   return "$rc"
 }
 
-build_candidate_sandbox_image() {  # <tenant> <policy> [release ref]
-  local name="$1" policy="$2" release_ref="${3:-}"
+build_candidate_sandbox_image() {  # <tenant> <policy> [release ref] [selected commit]
+  local name="$1" policy="$2" release_ref="${3:-}" selected_commit="${4:-}"
   local runtime candidate_ref marker build_rc=0
   _ensure_marker_dir
   marker="$(tenant_candidate_sandbox_file "$name")"
@@ -1128,7 +1128,7 @@ build_candidate_sandbox_image() {  # <tenant> <policy> [release ref]
   validate_sandbox_image_policy "$policy"
   tenant_uses_managed_sandbox_image "$name" || return 0
   [[ "$policy" != never ]] || return 0
-  _prepare_sandbox_image_source "$name" "$release_ref"
+  _prepare_sandbox_image_source "$name" "$release_ref" "$selected_commit"
   if [[ "$policy" == auto ]] \
       && ! sandbox_image_build_required "$name" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT"; then
     say "sandbox image $SANDBOX_IMAGE_TAG already matches its Dockerfile and Debian snapshot"
@@ -1151,15 +1151,15 @@ build_candidate_sandbox_image() {  # <tenant> <policy> [release ref]
 # Build every selected lane's candidate image, recording each success. Fails at
 # the first failing worker lane with that lane named, leaving the tenant untouched.
 # A sandbox candidate failure is non-fatal and leaves :latest untouched.
-# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref] [with_lunardepth] [sandbox_policy]
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref] [with_lunardepth] [sandbox_policy] [selected_commit]
 build_candidate_workers() {
   local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
   local with_pebble="${5:-false}" with_toolchains="${6:-false}" release_ref="${7:-}" with_lunardepth="${8:-false}"
-  local sandbox_policy="${9:-$SANDBOX_IMAGE_POLICY}"
+  local sandbox_policy="${9:-$SANDBOX_IMAGE_POLICY}" selected_commit="${10:-}"
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   : >"$(tenant_candidate_sandbox_file "$name")"
-  : >"$(tenant_sandbox_image_status_file "$name")"
+  clear_sandbox_image_status "$name"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
   # a later failed run could "restore" a lane to an image this run never had.
   clear_promote_rollback "$name"
@@ -1174,10 +1174,10 @@ build_candidate_workers() {
     esac
     say ""
     say "=== Building $lane worker candidate image (tenant still running) ==="
-    build_candidate_worker "$name" "$lane" "$with_toolchains" "$release_ref" \
+    build_candidate_worker "$name" "$lane" "$with_toolchains" "$release_ref" "$selected_commit" \
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
   done
-  if ! ( build_candidate_sandbox_image "$name" "$sandbox_policy" "$release_ref" ); then
+  if ! ( build_candidate_sandbox_image "$name" "$sandbox_policy" "$release_ref" "$selected_commit" ); then
     _record_sandbox_image_status "$name" previous
     say "WARNING: managed sandbox candidate failed; keeping the previous $SANDBOX_IMAGE_TAG and continuing the upgrade. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
   fi
