@@ -413,15 +413,15 @@ else
   run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune \
     || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
          die "git fetch failed; tenant '$TENANT' was not stopped"; }
-  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF" \
-    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
-         die "git checkout $TARGET_REF failed; tenant '$TENANT' was not stopped"; }
   TARGET_COMMIT="$TARGET_REF"
   if ! $DRY_RUN; then
-    TARGET_COMMIT="$(sudo -u "$TENANT" git -C "$LWROOT" rev-parse --verify 'HEAD^{commit}')" \
+    TARGET_COMMIT="$(mt resolve-upgrade-target "$TARGET_REF")" \
       || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
-           die "could not resolve the checked-out revision; tenant '$TENANT' was not stopped"; }
+           die "could not resolve target '$TARGET_REF' in the operator checkout; tenant '$TENANT' was not stopped"; }
   fi
+  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_COMMIT" \
+    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+         die "git checkout of operator-selected $TARGET_COMMIT failed; tenant '$TENANT' was not stopped"; }
   # WI#527: build the worker candidate images WHILE the tenant still runs. A
   # lane failure here leaves the running tenant untouched.
   # run-300 TO-5: --enabled rebuilds every lane this tenant has enabled (the
@@ -431,7 +431,7 @@ else
   # as an explicit opt-in for a pebble lane the registry does not list.
   # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
   # so the running tenant's clone is exactly as it was.
-  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_COMMIT" --sandbox-image "$SANDBOX_IMAGE_POLICY")
+  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" --selected-commit "$TARGET_COMMIT" --sandbox-image "$SANDBOX_IMAGE_POLICY")
   $WITH_PEBBLE && cand_args+=(--with-pebble)
   cand_rc=0
   set +e
