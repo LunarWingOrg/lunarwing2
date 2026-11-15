@@ -184,7 +184,10 @@ export function assertLaunchEnvironment(env: NodeJS.ProcessEnv): void {
     if (env[name] !== value) throw new Error(`launch environment drift: ${name}`)
   }
   if (!env.LUNARDEPTH_LOCAL_AUTH_TOKEN) throw new Error("launch environment is missing the local credential")
-  for (const name of ["NODE_OPTIONS", "DSH_PERMISSION_MODE", "LUNARDEPTH_LOCAL_AUTH_TOKEN_FILE"]) {
+  for (const name of [
+    "NODE_OPTIONS", "DSH_PERMISSION_MODE", "LUNARDEPTH_LOCAL_AUTH_TOKEN_FILE",
+    "DSH_MODEL_GATEWAY", "DSH_MODEL_GATEWAY_FUNCTION", "TENSORZERO_BASE_URL", "TENSORZERO_API_KEY",
+  ]) {
     if (env[name] !== undefined) throw new Error(`launch environment retains forbidden ${name}`)
   }
   if ((env.PATH ?? "").split(":").some(entry => !isAbsolute(entry))) {
