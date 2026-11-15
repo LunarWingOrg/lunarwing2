@@ -2958,8 +2958,8 @@ impl Tool for JobEventsTool {
 
     fn description(&self) -> &str {
         "Read the event log for a sandbox job. Shows messages, tool calls, results, \
-         and status changes from the container. Use this to check what Claude Code \
-         or a worker sub-agent has been doing."
+         and status changes from the container. Use this to check what the sandbox \
+         worker has been doing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -4867,7 +4867,7 @@ mod tests {
     }
 
     /// WI#328 (MR !1508 CT-7): a job recorded as external with NO live task
-    /// handle must fail honestly instead of queueing into the Claude Code
+    /// handle must fail honestly instead of queueing into the local sandbox
     /// prompt queue that nothing drains for external jobs.
     #[cfg(feature = "libsql")]
     #[tokio::test]
