@@ -24,9 +24,11 @@ bad() { printf 'FAIL: %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
 
 assert_contains() {
     local file="$1" needle="$2" label="$3"
-    grep -qF -- "$needle" "$file" \
-        && ok "$label" \
-        || bad "$label" "missing: $needle"
+    if grep -qF -- "$needle" "$file"; then
+        ok "$label"
+    else
+        bad "$label" "missing: $needle"
+    fi
 }
 
 assert_absent() {
@@ -167,6 +169,7 @@ PY
     sed -e "s/^export HEALTH_METRICS_LISTEN=.*/export HEALTH_METRICS_LISTEN=\"127.0.0.1:${live_port}\"/" \
         -e "s|^export LUNARWING_BASE_DIR=.*|export LUNARWING_BASE_DIR=\"${live_base}\"|" \
         "$CONFD" >"$live_confd"
+    # shellcheck disable=SC2016  # $1/$2 are intentionally expanded by the child shell.
     env -i HOME=/root PATH="$PATH" bash -c '
         set -a
         . "$1"
