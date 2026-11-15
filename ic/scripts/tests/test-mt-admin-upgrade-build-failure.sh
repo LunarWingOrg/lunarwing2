@@ -263,7 +263,7 @@ run_upgrade_named() { upgrade_tenant_locked fixture moving '' false false; }
 git -C "$fixture_repo" reset -q --hard "$source_rev"
 : >"$events"; : >"$cand_events"; : >"$promote_events"
 capture run_upgrade_named
-if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-release-ref")" == refs/heads/moving \
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-release-ref")" == refs/remotes/origin/moving \
     && "$(cat "$fixture/candidate-selected-commit")" == "$target" \
     && "$(cat "$fixture/sandbox-selected-commit")" == "$target" \
     && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$target" ]]; then
@@ -273,7 +273,7 @@ else
 fi
 
 # Put an off-release object in both clones and make only the tenant's moving ref
-# select it. The operator's moving ref still selects the reviewed release commit.
+# select it. The operator's local and remote-tracking refs select the release.
 git -C "$operator_repo" checkout -q -b off-release "$source_rev"
 printf 'off-release tenant choice\n' >"$operator_repo/off-release.txt"
 git -C "$operator_repo" add off-release.txt
@@ -282,6 +282,7 @@ git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.inval
 off_release_target="$(git -C "$operator_repo" rev-parse HEAD)"
 git -C "$operator_repo" push -qf origin HEAD:refs/heads/moving
 git -C "$operator_repo" checkout -q moving
+git -C "$operator_repo" update-ref refs/remotes/origin/moving "$target"
 git -C "$fixture_repo" reset -q --hard "$source_rev"
 : >"$events"; : >"$cand_events"; : >"$promote_events"
 capture run_upgrade_named
@@ -292,6 +293,31 @@ if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-selected-commit")" == "$target" 
   pass 'tenant off-release target resolution cannot select the image build commit'
 else
   fail "tenant off-release target selected a candidate (rc=$rc): $output"
+fi
+
+# WI#723: a normal stale local branch must not silently downgrade the upgrade.
+# Keep local moving at the old release while origin/moving names its descendant.
+git -C "$operator_repo" checkout -q -b remote-newer "$target"
+printf 'newer remote-tracking target\n' >"$operator_repo/remote-newer.txt"
+git -C "$operator_repo" add remote-newer.txt
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Newer remote-tracking target'
+remote_target="$(git -C "$operator_repo" rev-parse HEAD)"
+git -C "$operator_repo" push -q origin HEAD:refs/heads/moving
+git -C "$operator_repo" checkout -q moving
+git -C "$operator_repo" update-ref refs/remotes/origin/moving "$remote_target"
+[[ "$(git -C "$operator_repo" rev-parse refs/heads/moving)" == "$target" ]]
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade_named
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-release-ref")" == refs/remotes/origin/moving \
+    && "$(cat "$fixture/candidate-selected-commit")" == "$remote_target" \
+    && "$(cat "$fixture/sandbox-selected-commit")" == "$remote_target" \
+    && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$remote_target" \
+    && "$(git -C "$operator_repo" rev-parse refs/heads/moving)" == "$target" ]]; then
+  pass 'a stale operator local branch cannot override the newer remote-tracking target'
+else
+  fail "stale operator local branch selected the installed commit (rc=$rc): $output"
 fi
 
 eval "$REAL_TENANT_USES_SANDBOX"
