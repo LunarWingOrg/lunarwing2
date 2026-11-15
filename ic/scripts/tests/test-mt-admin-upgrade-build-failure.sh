@@ -96,6 +96,9 @@ start_tenant() { printf 'start\n' >>"$events"; }
 render_tenant_units() { :; }
 patch_tenant_env() { :; }
 refresh_deployed_health_pipeline() { :; }
+# WI#715: host-global Study Notes snapshot refresh runs after the
+# health pipeline; stub it so this harness never touches /usr/local.
+refresh_deployed_knowledge_sync_scheduler() { :; }
 recover_failed_tenant_checkout() { :; }
 tenant_worker_enabled() { [[ "$2" == kimi ]]; }
 opencode2_builder_supported() { OPENCODE2_BUILDER_FLOOR_PROBLEM=""; return 0; }

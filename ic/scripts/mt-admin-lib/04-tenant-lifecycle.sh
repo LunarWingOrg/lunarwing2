@@ -2006,6 +2006,10 @@ upgrade_tenant_locked() {
   startup_rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   refresh_deployed_health_pipeline
+  # WI#715: the root-side Study Notes sync runs from a staged copy of this
+  # checkout. Restage it when (and only when) a scheduler is already installed,
+  # so upgrade-delivered fixes actually reach the hourly root job.
+  refresh_deployed_knowledge_sync_scheduler
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
   # the 1.1.9-only compat symlinks — warn (don't fail) if any remain.
@@ -2511,6 +2515,9 @@ doctor() {
   if [[ "$DEFAULT_HEALTH_ENABLED" == "true" ]]; then
     _check "health pipeline scheduled" bash -c 'systemctl is-enabled lunarwing-mt-health.timer >/dev/null 2>&1 || crontab -l 2>/dev/null | grep -q lunarwing-mt-health || { command -v fcrontab >/dev/null 2>&1 && fcrontab -l 2>/dev/null | grep -q lunarwing-mt-health; }'
   fi
+  # WI#715: report what the hourly root-side Study Notes sync is running, so a
+  # snapshot frozen at an older checkout is visible instead of silent.
+  report_knowledge_sync_scheduler_status
   _check "pebble worker dir exists" test -d "$LUNARWING_ROOT/pebble4lunarwing"
   _check "pebble worker Dockerfile exists" test -f "$LUNARWING_ROOT/pebble4lunarwing/Dockerfile"
   _check "opencode worker dir exists" test -d "$LUNARWING_ROOT/opencode4lunarwing"
