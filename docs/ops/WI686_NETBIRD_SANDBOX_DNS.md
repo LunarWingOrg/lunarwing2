@@ -34,6 +34,43 @@ keys, gateway tokens, or environment-file contents belong in this report.
 
 ## Test matrix and results
 
-Provisioning and live probes are in progress. This section will distinguish
-observed results from expectations and will include the exact non-secret probe
-commands and final tenant disposition.
+### 1. Fresh tenant provisioning
+
+`mt-admin add-tenant netbirddnstester --no-health --no-ssh
+--no-weechat-bootstrap --llm-base-url http://100.88.232.146:3000/openai/v1
+--llm-model tensorzero::function_name::lunarwing` completed successfully. The
+tenant received ports 10020–10029 and the managed `lunarwing-sandbox:latest`
+image. WeeChat was disabled; no external workers were selected. The required
+release daemon build is running through `mt-admin build-tenant` with 18 jobs.
+
+### 2. Rootless-runtime diagnostic (not yet the daemon sandbox)
+
+Before the daemon build completed, this direct one-shot container established
+the tenant runtime's baseline without any LunarWing proxy or sandbox policy:
+
+```bash
+sudo -u netbirddnstester XDG_RUNTIME_DIR=/run/user/1005 \
+  podman run --rm --entrypoint sh lunarwing-sandbox:latest -c \
+  'cat /etc/resolv.conf; getent ahostsv4 cotterhomelab3.netbird.selfhosted;
+   getent hosts cotterhomelab3.netbird.selfhosted sweetiebot.netbird.selfhosted;
+   curl --max-time 10 http://cotterhomelab3.netbird.selfhosted:3000/openai/v1/models;
+   curl --max-time 10 http://100.88.232.146:3000/openai/v1/models'
+```
+
+Observed:
+
+- `/etc/resolv.conf` contained `search netbird.selfhosted`, runtime resolver
+  `169.254.1.1`, and NetBird resolver `100.88.145.188`.
+- `getent ahostsv4 cotterhomelab3.netbird.selfhosted` returned
+  `100.88.232.146` (exit 0).
+- `getent hosts` returned NetBird IPv6 addresses for both `cotterhomelab3` and
+  `sweetiebot` (exit 0).
+- HTTP by MagicDNS name returned **404** from the target's NetBird IPv6
+  address; HTTP by numeric NetBird IPv4 also returned **404**. As on the host,
+  the expected unauthenticated `/openai/v1/models` response is evidence of a
+  completed HTTP exchange, not an application-level models API success.
+
+This proves the fresh tenant's ordinary rootless-container DNS and overlay
+path work. It does not by itself prove the real shell sandbox works: the
+`proxy-enforced` sandbox deliberately removes container networking and applies
+a public-only destination policy. That end-to-end test follows after the build.
