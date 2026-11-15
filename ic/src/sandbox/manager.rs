@@ -993,7 +993,8 @@ mod tests {
     /// carries `--entrypoint cat` and no labels (WI#724 ADN-7).
     #[cfg(unix)]
     fn is_resolver_helper(args: &[String]) -> bool {
-        args.first().map(String::as_str) == Some("run") && args.iter().any(|arg| arg == "--entrypoint")
+        args.first().map(String::as_str) == Some("run")
+            && args.iter().any(|arg| arg == "--entrypoint")
     }
 
     /// NetBird rewrites `/etc/resolv.conf`, which is the staged host file bind

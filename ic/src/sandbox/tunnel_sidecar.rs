@@ -748,6 +748,12 @@ impl EgressPolicy {
             .iter()
             .map(|kind| format!("icmpv6 type {kind} accept")),
         );
+        // The NetBird resolver is the namespace's own `wt0` address, so packets
+        // to it leave through `lo` and the loopback accept above already
+        // carries them; these rules are belt-and-braces and never match
+        // (WI#724 ADN-4). What protects is that no rule accepts DNS to an
+        // uplink address. They stay because they cost nothing and keep the
+        // allowance explicit next to the provider it belongs to.
         for resolver in &self.resolvers {
             let family = if resolver.is_ipv4() { "ip" } else { "ip6" };
             rules.push(format!("{family} daddr {resolver} udp dport 53 accept"));
@@ -1489,9 +1495,8 @@ impl TunnelSidecar {
                 ));
             }
             Err(_) => {
-                return Err(self.unavailable(
-                    "the tunnel resolver file joined runs mount could not be read",
-                ));
+                return Err(self
+                    .unavailable("the tunnel resolver file joined runs mount could not be read"));
             }
         };
         let listener = self.netbird_listener().await?;
@@ -3585,11 +3590,7 @@ mod tests {
         let path = sidecar.resolv_conf_path().unwrap().unwrap();
 
         let missing = sidecar.host_resolver_ready().await.unwrap_err();
-        assert!(
-            missing.to_string().contains("is missing"),
-            "{}",
-            missing
-        );
+        assert!(missing.to_string().contains("is missing"), "{}", missing);
 
         std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
         let diverged = sidecar.host_resolver_ready().await.unwrap_err();
