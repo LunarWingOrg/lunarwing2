@@ -1929,7 +1929,7 @@ _operator_worker_release_ref() {  # <branch, tag, remote ref, or commit>
   case "$requested" in
     refs/*)   candidates=("$requested") ;;
     origin/*) candidates=("refs/remotes/$requested" "refs/heads/${requested#origin/}" "refs/tags/${requested#origin/}") ;;
-    *)        candidates=("refs/heads/$requested" "refs/remotes/origin/$requested" "refs/tags/$requested") ;;
+    *)        candidates=("refs/remotes/origin/$requested" "refs/heads/$requested" "refs/tags/$requested") ;;
   esac
   for candidate in "${candidates[@]}"; do
     git check-ref-format "$candidate" >/dev/null 2>&1 || continue
