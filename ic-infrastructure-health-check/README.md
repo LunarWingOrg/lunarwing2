@@ -354,7 +354,10 @@ dedicated `lunarwing-metrics` system user and group (no home directory,
 writes the pid file at `/run/lunarwing-health-metrics.pid`, and nothing on that
 path belongs to the account. The only path the account owns is the log file, a
 file inside root-owned `/var/log`; the exported 0644 `.prom` file stays
-readable without write access to the health library.
+readable without write access to the health library. The empty capability set
+and `no_new_privs` need an OpenRC built with libcap (Gentoo's and Alpine's
+are); on a build without it `supervise-daemon` refuses to start the service
+rather than run it with a wider privilege set.
 
 The installer writes `/etc/conf.d/lunarwing-health-metrics` only when it does
 not already exist, so re-running it on upgrade keeps the operator's port,
