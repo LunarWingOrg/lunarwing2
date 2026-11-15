@@ -1043,6 +1043,7 @@ impl CliRunner {
         let spawner = crate::tools::process::workload_spawner().await;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut cmd = spawner.command(self.runtime.binary(), &arg_refs);
+        apply_container_runtime_path(&mut cmd);
 
         // In service mode the manager forks the workload, so the environment
         // must be handed over via EnvironmentFile= (mode 0600, deleted after
