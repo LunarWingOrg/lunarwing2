@@ -187,3 +187,31 @@ Rust/Go sets used by other workers:
 - **Determinism:** `diff -r run1 run2` is empty, and regenerating the fixture on
   the host reproduced `access.log` byte for byte (SHA-256
   `a1a1ae8a74ae9232be749c0784175e6cd0d15d99fa58e1642e9d1245d2329d4f`).
+
+### Job 2 — C++17 weighted interval scheduling: PASS
+
+- Job `f43d93a1-d0dd-486b-b37b-e2002f4a5ec2`, mode `external:lunardepth`,
+  completed with 19 persisted events, `stuck=false`, zero repair attempts.
+  It ran under the `always` approval granted on job 1; no second gate appeared,
+  so the harness had no gate to answer (see finding F3).
+- `/workspace/wi719_cpp_wis` contains `wis.hpp`, `main.cpp`, `Makefile`,
+  `run1.stdout/stderr`, `run2.stdout/stderr`, the built `wis_test` and
+  `SUMMARY.md`.
+- The worker's driver reports 8/8 directed cases, an exhaustive-subset oracle
+  over 300 seeded instances (value + reconstruction non-overlap + index
+  consistency), every edge case, and a scaling case with N=2500.
+- **Independent forced rebuild** on the host with
+  `g++ -O2 -std=c++17 -Wall -Wextra -Werror` succeeded. Two fresh executions
+  were byte-identical to each other, and identical to the worker's transcript
+  except for one added line the worker prints to stderr
+  (`scaling case DP time: …`, added after it captured `run2.stdout`).
+  The two worker transcripts are themselves byte-identical (SHA-256
+  `2111187a86df892fa026dec878400d0588672034e30e7ab61e19986fc73da8cd`).
+- **Independent oracle of the algorithm itself** (not the worker's driver, and
+  not the exhaustive oracle inside it): a separate Python DP using
+  `bisect` over finish-sorted intervals, cross-checked against brute-force
+  subset enumeration, agreed with `wis::solve` on 120 fresh seeded instances
+  (including empty input and negative weights): 0 mismatches.
+- **Independent scaling check:** the C++ instance generator was regenerated
+  from its documented seed (`7192500`) and fed to the independent Python DP,
+  which reproduced the reported `optimum=732406` and `selected=1183`.
