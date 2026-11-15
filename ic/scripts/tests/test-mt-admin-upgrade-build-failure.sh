@@ -512,6 +512,7 @@ _record_sandbox_image_status fixture previous
   }
   getent() { printf 'fixture:x:1000:1000::%s:/bin/bash\n' "$wrapper_status_home"; }
   jq() { return 0; }
+  stat() { command stat "$@"; }
   sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
   mock() {
     case "${1:-}" in
