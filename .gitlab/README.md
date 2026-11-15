@@ -253,8 +253,8 @@ worker pushes — that fires only on transient signatures
 (`failed to fetch oauth token` / `429 Too Many Requests`, or an
 `unexpected status from PUT request` / `PATCH request` to the configured
 registry with status 499, 502, 503 or 504). Registry 401, 403 and 404
-refusals and genuine build failures still exit on the first attempt. On the candidate leg the
-build is deterministic and the retry reuses the layer cache, so only the
+refusals and genuine build failures still exit on the first attempt. On the
+candidate leg the build is deterministic and the retry reuses the layer cache, so only the
 push is re-executed — but the clean-rebuild leg is deliberately the
 uncached `--no-cache` build, so a sustained 429 on its push re-runs the
 full rebuild on every attempt (the WI#467 residual: with eight attempts
