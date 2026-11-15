@@ -424,8 +424,12 @@ _pg_replace_container_for_refresh() {
 _pg_refresh_version_allowed() {
   local name="$1" server_version="$2"
   [[ "$server_version" =~ ^[0-9]{6}$ ]] || return 1
+  if [[ "$server_version" != 16* ]]; then
+    say "PostgreSQL server_version_num=$server_version is not major 16; use a separate major-version migration" >&2
+    return 1
+  fi
   if (( 10#$server_version >= 160016 )); then return 0; fi
-  if [[ "$server_version" == 16* && "${LUNARWING_MT_PG_ALLOW_UNPATCHED:-}" == "$name" ]]; then
+  if [[ "${LUNARWING_MT_PG_ALLOW_UNPATCHED:-}" == "$name" ]]; then
     say "WARNING: explicit unpatched PostgreSQL rollback allowed for '$name' ($server_version)" >&2
     return 0
   fi
@@ -462,11 +466,12 @@ _pg_wait_for_refresh_health() {
       if [[ -n "$vector_version" ]] && _ctr "$name" exec "$container_name" \
           psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
           "SELECT '[1,2,3]'::vector" >/dev/null 2>&1; then
-        server_version="$(_ctr "$name" exec "$container_name" \
-          psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
-          'SHOW server_version_num' 2>/dev/null)" || return 1
-        _pg_refresh_version_allowed "$name" "$server_version"
-        return $?
+        if server_version="$(_ctr "$name" exec "$container_name" \
+            psql -v ON_ERROR_STOP=1 -U lunarwing -d lunarwing -Atc \
+            'SHOW server_version_num' 2>/dev/null)"; then
+          _pg_refresh_version_allowed "$name" "$server_version"
+          return $?
+        fi
       fi
     fi
     attempts=$((attempts + 1))
