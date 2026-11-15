@@ -780,6 +780,24 @@ tenant_candidate_sandbox_file() {
   printf '%s' "${LUNARWING_MT_CANDIDATE_SANDBOX_FILE:-$(_tenant_marker_dir)/$1-candidate-sandbox}"
 }
 
+tenant_sandbox_image_status_file() {
+  printf '%s' "${LUNARWING_MT_SANDBOX_IMAGE_STATUS_FILE:-$(_tenant_marker_dir)/$1-sandbox-image-status}"
+}
+
+_record_sandbox_image_status() {  # <tenant> <status>
+  _ensure_marker_dir
+  printf '%s\n' "$2" >"$(tenant_sandbox_image_status_file "$1")"
+}
+
+report_retained_sandbox_image() {  # <tenant>
+  local name="$1" file status
+  file="$(tenant_sandbox_image_status_file "$name")"
+  status="$(cat "$file" 2>/dev/null || true)"
+  [[ "$status" == previous ]] || return 0
+  say "WARNING: sandbox image: tenant '$name' remains on the previous $SANDBOX_IMAGE_TAG because no candidate was promoted. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
+  rm -f "$file"
+}
+
 # Ensure the root-owned marker directory exists and is safe (root:root 0700).
 # Callers must run as root; the dir is shared with the lifecycle lock path.
 # run-294 TJ-4: same hardened sequence as the lifecycle lock directory in
@@ -1074,9 +1092,13 @@ upgrade_candidate_sandbox_image_ref() {  # <tenant>
 }
 
 _prepare_sandbox_image_source() {  # <tenant> [release ref]
-  local source_root
+  local source_root release_ref="${2:-}"
   source_root="$(tenant_lw_root "$1")"
-  _prepare_worker_build_source "$source_root" ic/docker "${2:-}" sandbox.Dockerfile
+  if [[ -z "$release_ref" ]]; then
+    release_ref="$(git -C "$LUNARWING_ROOT" rev-parse --verify 'HEAD^{commit}')" \
+      || die "cannot resolve operator checkout HEAD for sandbox image build"
+  fi
+  _prepare_worker_build_source "$source_root" ic/docker "$release_ref" sandbox.Dockerfile
   SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$WORKER_BUILD_SOURCE_ROOT/ic"
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 }
@@ -1133,6 +1155,7 @@ build_candidate_workers() {
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   : >"$(tenant_candidate_sandbox_file "$name")"
+  : >"$(tenant_sandbox_image_status_file "$name")"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
   # a later failed run could "restore" a lane to an image this run never had.
   clear_promote_rollback "$name"
@@ -1151,6 +1174,7 @@ build_candidate_workers() {
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
   done
   if ! ( build_candidate_sandbox_image "$name" "$sandbox_policy" "$release_ref" ); then
+    _record_sandbox_image_status "$name" previous
     say "WARNING: managed sandbox candidate failed; keeping the previous $SANDBOX_IMAGE_TAG and continuing the upgrade. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
   fi
   return 0
@@ -1183,14 +1207,14 @@ clear_promote_rollback() {  # <name>
   rm -f "$(_promote_rollback_file "$1")"
 }
 
-# Append <lane>'s pre-promotion image id unless this run already recorded one.
-_promote_rollback_record() {  # <name> <lane> <old_id>
-  local name="$1" lane="$2" old_id="$3" file
+# Append <lane>'s old and promoted image ids unless this run already recorded them.
+_promote_rollback_record() {  # <name> <lane> <old_id> <promoted_id>
+  local name="$1" lane="$2" old_id="$3" promoted_id="$4" file
   file="$(_promote_rollback_file "$name")"
   _ensure_marker_dir
   [[ -f "$file" ]] || : >"$file"
   awk -F'\t' -v lane="$lane" '$1 == lane { found = 1 } END { exit !found }' "$file" \
-    || printf '%s\t%s\n' "$lane" "$old_id" >>"$file"
+    || printf '%s\t%s\t%s\n' "$lane" "$old_id" "$promoted_id" >>"$file"
 }
 
 promote_candidate_sandbox_image() {  # <tenant>
@@ -1202,14 +1226,22 @@ promote_candidate_sandbox_image() {  # <tenant>
     || die "candidate sandbox marker for '$name' names an invalid runtime"
   candidate_ref="$(upgrade_candidate_sandbox_image_ref "$name")"
   candidate_id="$("$runtime" image inspect --format '{{.Id}}' "$candidate_ref" 2>/dev/null || true)"
-  [[ -n "$candidate_id" ]] || die "candidate image $candidate_ref is missing; cannot promote the sandbox"
+  if [[ -z "$candidate_id" ]]; then
+    _record_sandbox_image_status "$name" previous
+    say "WARNING: candidate image $candidate_ref is missing; leaving $SANDBOX_IMAGE_TAG unchanged and continuing the upgrade" >&2
+    rm -f "$marker"
+    return 0
+  fi
   old_id="$("$runtime" image inspect --format '{{.Id}}' "$SANDBOX_IMAGE_TAG" 2>/dev/null || true)"
   if [[ "$old_id" == "$candidate_id" ]]; then
     say "$SANDBOX_IMAGE_TAG already at sandbox candidate, skipping"
   else
-    [[ -z "$old_id" ]] || _promote_rollback_record "$name" sandbox "$old_id"
-    "$runtime" tag "$candidate_ref" "$SANDBOX_IMAGE_TAG" \
-      || die "cannot promote $candidate_ref to $SANDBOX_IMAGE_TAG"
+    [[ -z "$old_id" ]] || _promote_rollback_record "$name" sandbox "$old_id" "$candidate_id"
+    if ! "$runtime" tag "$candidate_ref" "$SANDBOX_IMAGE_TAG"; then
+      _record_sandbox_image_status "$name" previous
+      say "WARNING: cannot promote $candidate_ref to $SANDBOX_IMAGE_TAG; leaving the previous image in place and continuing the upgrade" >&2
+      return 0
+    fi
     say "promoted $SANDBOX_IMAGE_TAG"
   fi
   rm -f "$marker"
@@ -1227,11 +1259,11 @@ cleanup_candidate_sandbox_image() {  # <tenant>
   rm -f "$marker"
 }
 
-restore_promoted_workers() {  # <name> — re-tag the pre-promotion :latest ids
-  local name="$1" file lane old_id latest_ref runtime rc=0
+restore_promoted_workers() {  # <name> — re-tag only tags this run still owns
+  local name="$1" file lane old_id promoted_id current_id latest_ref runtime rc=0
   file="$(_promote_rollback_file "$name")"
   [[ -r "$file" ]] || return 0
-  while IFS=$'\t' read -r lane old_id; do
+  while IFS=$'\t' read -r lane old_id promoted_id; do
     [[ -n "$lane" && -n "$old_id" ]] || continue
     if [[ "$lane" == sandbox ]]; then
       runtime="$(sandbox_container_runtime "$name")" || { rc=1; continue; }
@@ -1240,6 +1272,21 @@ restore_promoted_workers() {  # <name> — re-tag the pre-promotion :latest ids
       if ! _upgrade_validate_lane "$lane"; then rc=1; continue; fi
       runtime="$CONTAINER_RT"
       latest_ref="$(worker_image_ref "$lane" latest)"
+    fi
+    current_id="$("$runtime" image inspect --format '{{.Id}}' "$latest_ref" 2>/dev/null || true)"
+    if [[ "$current_id" == "$old_id" ]]; then
+      say "$latest_ref already at pre-promotion image $old_id"
+      continue
+    fi
+    if [[ -z "$promoted_id" ]]; then
+      say "WARNING: cannot safely roll back $latest_ref: rollback record has no promoted image ID" >&2
+      rc=1
+      continue
+    fi
+    if [[ "$current_id" != "$promoted_id" ]]; then
+      say "WARNING: leaving $latest_ref unchanged during rollback: another promotion replaced $promoted_id with ${current_id:-no image}" >&2
+      rc=1
+      continue
     fi
     # TD-10: only claim a rollback when the re-tag actually succeeded (a pruned
     # old image must not be reported as restored).
@@ -1287,7 +1334,7 @@ promote_candidate_workers() {  # <tenant>
       die "candidate image $candidate_ref is missing; cannot promote lane '$lane'"
     fi
     # TD-4: record the old :latest id before overwriting the tag (first wins).
-    [[ -n "$old_id" ]] && _promote_rollback_record "$name" "$lane" "$old_id"
+    [[ -n "$old_id" ]] && _promote_rollback_record "$name" "$lane" "$old_id" "$candidate_id"
     "$CONTAINER_RT" tag "$candidate_ref" "$latest_ref" \
       || die "cannot promote $candidate_ref to $latest_ref"
     say "promoted $latest_ref"
@@ -1917,6 +1964,9 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   release_ref="$(_operator_worker_release_ref "$requested")" || release_ref=""
   [[ -n "$release_ref" ]] \
     || die "tenant '$owner' HEAD $revision has no operator release ref matching '$requested'"
+  if [[ "$release_ref" =~ ^[0-9a-f]{40}$ && "$revision" != "$release_ref" ]]; then
+    die "tenant '$owner' HEAD $revision does not match selected operator revision $release_ref"
+  fi
   git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref" \
     || die "tenant '$owner' HEAD $revision is not on operator release ref $release_ref"
   WORKER_BUILD_SOURCE_REVISION="$revision"
