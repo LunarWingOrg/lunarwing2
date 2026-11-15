@@ -175,11 +175,12 @@ impl LunarWingCloudChatProvider {
     ///
     /// Priority order:
     /// 1. `config.api_key` (set at construction from env/config)
-    /// 2. Session token (OAuth flow)
-    /// 3. `LUNARWING_CLOUD_API_KEY` env var (set by interactive `api_key_login()`)
+    /// 2. Existing session token (OAuth flow)
+    /// 3. Newly authenticated session token
+    /// 4. `LUNARWING_CLOUD_API_KEY` from the layered environment
     ///
-    /// The env var fallback (#3) only triggers after `ensure_authenticated()`
-    /// runs, because `api_key_login()` sets the env var but not a session token.
+    /// The API-key fallback (#4) only triggers after `ensure_authenticated()`
+    /// runs, because `api_key_login()` sets a runtime override but not a session token.
     async fn resolve_bearer_token(&self) -> Result<String, LlmError> {
         // 1. Config-level API key takes priority
         if let Some(ref api_key) = self.config.api_key {
@@ -194,17 +195,18 @@ impl LunarWingCloudChatProvider {
 
         // No token yet, trigger interactive login
         self.session.ensure_authenticated().await?;
+        self.resolve_bearer_token_after_login().await
+    }
 
+    async fn resolve_bearer_token_after_login(&self) -> Result<String, LlmError> {
         // 3. After login, check if a session token was stored (OAuth path)
         if self.session.has_token().await {
             let token = self.session.get_token().await?;
             return Ok(token.expose_secret().to_string());
         }
 
-        // 4. api_key_login() sets LUNARWING_CLOUD_API_KEY env var but not a session token
-        if let Ok(key) = std::env::var("LUNARWING_CLOUD_API_KEY")
-            && !key.is_empty()
-        {
+        // 4. api_key_login() sets a runtime override but not a session token.
+        if let Some(key) = crate::config::env_or_override("LUNARWING_CLOUD_API_KEY") {
             return Ok(key);
         }
 
@@ -1583,6 +1585,7 @@ mod tests {
     async fn test_resolve_bearer_token_session_beats_env_var() {
         // Session token takes priority over LUNARWING_CLOUD_API_KEY env var.
         // This prevents unexpected auth mode switches mid-run.
+        let _env = crate::config::helpers::lock_env();
         let mut cfg = test_lunarwing_cloud_config("http://localhost:8318");
         cfg.api_key = None;
         let session = test_session();
@@ -1605,16 +1608,12 @@ mod tests {
             token, "oauth-token",
             "session token must take priority over env var"
         );
-
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("LUNARWING_CLOUD_API_KEY");
-        }
     }
 
     #[tokio::test]
     async fn test_resolve_bearer_token_config_beats_session_and_env() {
         // Config API key should win even when session token AND env var are set.
+        let _env = crate::config::helpers::lock_env();
         let cfg = test_lunarwing_cloud_config("http://localhost:8318");
         let session = test_session();
         session
@@ -1635,11 +1634,48 @@ mod tests {
             token, "test-key",
             "config api_key must win over session token and env var"
         );
+    }
 
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("LUNARWING_CLOUD_API_KEY");
+    struct RuntimeOverrideReset {
+        previous: Option<String>,
+    }
+
+    impl RuntimeOverrideReset {
+        fn new() -> Self {
+            Self {
+                previous: crate::config::helpers::runtime_env_override("LUNARWING_CLOUD_API_KEY"),
+            }
         }
+    }
+
+    impl Drop for RuntimeOverrideReset {
+        fn drop(&mut self) {
+            crate::config::set_runtime_env(
+                "LUNARWING_CLOUD_API_KEY",
+                self.previous.as_deref().unwrap_or(""),
+            );
+            crate::tracing_fmt::daemon_log_scrubber().remove_secret("runtime-only-api-key");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bearer_token_after_login_reads_runtime_api_key() {
+        let _env = crate::config::helpers::lock_env();
+        // SAFETY: the crate-wide environment mutex serializes this mutation.
+        unsafe { std::env::remove_var("LUNARWING_CLOUD_API_KEY") };
+        let _runtime = RuntimeOverrideReset::new();
+        crate::config::set_runtime_env("LUNARWING_CLOUD_API_KEY", "runtime-only-api-key");
+
+        let mut cfg = test_lunarwing_cloud_config("http://localhost:8318");
+        cfg.api_key = None;
+        let provider = LunarWingCloudChatProvider::new(cfg, test_session()).expect("provider");
+
+        let token = provider
+            .resolve_bearer_token_after_login()
+            .await
+            .expect("runtime-only API key should resolve");
+
+        assert_eq!(token, "runtime-only-api-key");
     }
 
     // -- ModelInfo serde alias tests ------------------------------------------
