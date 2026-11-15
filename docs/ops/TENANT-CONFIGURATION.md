@@ -728,6 +728,31 @@ default_timezone = "America/New_York"
 
 Environment variables always take precedence over `config.toml` values.
 
+## Settings scope (`lunarwing config`)
+
+`lunarwing config list|get|set|reset` read and write the same database rows the
+daemon reads: the settings scope named by the owner id (`LUNARWING_OWNER_ID`,
+then `owner_id` in `config.toml`, then `default`). On a tenant that scope is
+the tenant name, so a write is not silently lost.
+
+Run the command with the tenant's environment loaded, which is what supplies
+`LUNARWING_OWNER_ID` (the same loader the routine example above uses):
+
+```bash
+sudo -u <tenant> bash /home/<tenant>/lunarwing/ic/scripts/lunarwing-openrc-env-exec.sh \
+  --env-file /home/<tenant>/lunarwing/env/lunarwing.env -- \
+  /home/<tenant>/lunarwing/ic/target/release/lunarwing --no-onboard \
+  config set sandbox.extra_allowed_domains '["host.example"]'
+```
+
+Every command names the scope it used (`Set … (scope: <tenant>)`,
+`Settings (scope: …)`), and `config get` prints `Scope: <tenant>` on stderr so
+`$(lunarwing config get <path>)` still yields the bare value. If the printed
+scope is `default` on a tenant, the command did not get the tenant environment
+and the daemon will not read that row — rerun it with the env loader above.
+Settings written this way are read at daemon start, so restart the tenant
+afterwards (see [Applying Changes](#applying-changes)).
+
 ## Applying Changes
 
 After editing configuration files, restart the affected service. The simplest,
