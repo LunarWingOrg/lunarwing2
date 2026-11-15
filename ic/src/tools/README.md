@@ -38,19 +38,26 @@ the tool. Restart resets learned statistics; `LUNARWING_TOOL_ESTIMATES=0`
 disables new recording/display. Details and staged scope:
 [runtime estimation](../estimation/README.md).
 
-### Workload process isolation (WI#671)
+### Workload process isolation (WI#671, WI#679)
 
 Direct tool and sandbox workloads use process groups on every Unix host and
 systemd user transient services when a real `systemd-run --user --wait --pipe`
-probe succeeds. A successful probe, configured isolation disable, or a missing
-user bus is cached. Timeouts, spawn failures, and other transient probe errors
-use process-group isolation and are retried at most once every 30 seconds; one
-slow first probe therefore does not disable services for the daemon lifetime.
+probe succeeds. A successful probe, configured isolation disable, a missing
+user bus, or a missing `systemd-run` executable is cached as a final answer.
+Timeouts and other transient probe errors use process-group isolation and retry
+with exponential backoff: 30 seconds initially, doubling to a five-minute cap.
+The first failure and each changed failure reason warn; an unchanged failure
+does not warn on every retry. One slow first probe therefore does not disable
+services for the daemon lifetime or cause a fixed-interval warning storm.
+
 The probe runs on a blocking thread with a five-second wall-clock deadline and
-kills and reaps its child on timeout. Authenticated `GET /api/gateway/status`
-reports the active mode as `workload_isolation: "systemd-service"` or
-`"process-group"`, or `"unprobed"` before the first workload. Reading status
-does not itself start a probe.
+kills and reaps its child on timeout. Its detached reader thread can outlive a
+timed-out probe if a stuck user manager keeps the pipe's write end open; it
+exits once every writer closes the pipe. Authenticated
+`GET /api/gateway/status` reports `workload_isolation` as `"systemd-service"`,
+a settled `"process-group"` fallback, `"process-group-retrying"` between and
+during transient retries, `"probing"` during the first probe, or `"unprobed"`
+before the first workload. Reading status neither starts nor waits for a probe.
 
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 

@@ -18,6 +18,7 @@
 #   - bridge unreachable/not running when XMPP is configured -> degraded
 #   - bridge delivery backlog (queued messages)    -> degraded/critical
 #   - gateway channels reporting unhealthy         -> degraded (real failure)
+#   - workload isolation process-group-retrying    -> degraded (probe failing)
 #   - pending gates (approval/auth waits)          -> metric only, never a
 #     failure: normal interactive waits are not stalled execution; but a
 #     reachable gateway whose /api/chat/pending-gates endpoint cannot be
@@ -116,14 +117,14 @@ http_get() {
 }
 
 # Probe one tenant's runtime. Sets globals: p_gw_reachable
-# p_gw_uptime p_gw_connections p_gw_channels_unhealthy p_pending_gates
-# p_bridge_reachable p_bridge_running p_bridge_queued p_bridge_outbound_hour
-# p_bridge_omemo p_bridge_prekeys p_issues (array).
+# p_gw_uptime p_gw_connections p_gw_channels_unhealthy p_gw_workload_isolation
+# p_pending_gates p_bridge_reachable p_bridge_running p_bridge_queued
+# p_bridge_outbound_hour p_bridge_omemo p_bridge_prekeys p_issues (array).
 probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
   local tenant="$1" gw_port="$2" bridge_port="$3" env_file="$4"
   local gw_token bridge_token gw_body bridge_body
   p_gw_reachable=false; p_gw_uptime=0; p_gw_connections=0
-  p_gw_channels_unhealthy=0; p_pending_gates=-1
+  p_gw_channels_unhealthy=0; p_gw_workload_isolation=unknown; p_pending_gates=-1
   p_bridge_reachable=false; p_bridge_running=false; p_bridge_queued=-1
   p_bridge_outbound_hour=-1; p_bridge_omemo=false; p_bridge_prekeys=-1
   p_probe_exhausted=false
@@ -139,6 +140,7 @@ probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
     p_gw_uptime="$(jq -r '.uptime_secs // 0' <<<"$gw_body" 2>/dev/null || echo 0)"
     p_gw_connections="$(jq -r '.total_connections // 0' <<<"$gw_body" 2>/dev/null || echo 0)"
     p_gw_channels_unhealthy="$(jq -r '[.channel_health // {} | to_entries[] | select(.value.healthy == false)] | length' <<<"$gw_body" 2>/dev/null || echo 0)"
+    p_gw_workload_isolation="$(jq -r '.workload_isolation // "unknown"' <<<"$gw_body" 2>/dev/null || echo unknown)"
   else
     p_issues+=("gateway unreachable at 127.0.0.1:${gw_port}")
   fi
@@ -248,6 +250,9 @@ for target in "${targets[@]}"; do
   elif [[ "$p_bridge_queued" =~ ^[0-9]+$ ]] && [[ "$p_bridge_queued" -gt "$QUEUE_CRITICAL" ]]; then
     inst_status="critical"; inst_exit=2
     p_issues+=("xmpp bridge delivery backlog critical: ${p_bridge_queued} queued")
+  elif [[ "$p_gw_workload_isolation" == "process-group-retrying" ]]; then
+    inst_status="degraded"; inst_exit=1
+    p_issues+=("workload isolation degraded: process-group fallback is being retried")
   elif [[ "$p_gw_channels_unhealthy" =~ ^[0-9]+$ ]] && [[ "$p_gw_channels_unhealthy" -gt 0 ]]; then
     # MR !1041 review finding 5: channels the gateway itself reports unhealthy
     # must never produce a healthy verdict. A normal approval wait stays
@@ -279,6 +284,7 @@ for target in "${targets[@]}"; do
     --arg bridge_reachable "$p_bridge_reachable" \
     --arg bridge_running "$p_bridge_running" \
     --arg bridge_omemo "$p_bridge_omemo" \
+    --arg gw_workload_isolation "$p_gw_workload_isolation" \
     --argjson gw_uptime "$([[ "$p_gw_uptime" =~ ^[0-9]+$ ]] && echo "$p_gw_uptime" || echo 0)" \
     --argjson gw_connections "$([[ "$p_gw_connections" =~ ^[0-9]+$ ]] && echo "$p_gw_connections" || echo 0)" \
     --argjson channels_unhealthy "$([[ "$p_gw_channels_unhealthy" =~ ^[0-9]+$ ]] && echo "$p_gw_channels_unhealthy" || echo 0)" \
@@ -291,6 +297,7 @@ for target in "${targets[@]}"; do
       bridge_running:($bridge_running=="true"),bridge_omemo_enabled:($bridge_omemo=="true"),
       gateway_uptime_secs:$gw_uptime,gateway_connections:$gw_connections,
       channels_unhealthy:$channels_unhealthy,pending_gates:$pending_gates,
+      workload_isolation:$gw_workload_isolation,
       bridge_queued_messages:$bridge_queued,bridge_outbound_last_hour:$bridge_outbound_hour,
       bridge_prekeys_available:$bridge_prekeys,issues:$issues}')"
   instances="$(jq -c --argjson item "$inst" '. + [$item]' <<<"$instances")"
