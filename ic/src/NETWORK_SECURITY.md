@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-14 (health path no longer pulls; per-run pull budgets, WI#651)
+**Last updated:** 2026-11-15 (NetBird managed resolver and `wt0`-only DNS, WI#695)
 
 ---
 
@@ -401,7 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default off Linux) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (Linux default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
-| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; WireGuard custom joined-run DNS removes direct uplink DNS rules, NetBird custom DNS is rejected | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. Core NetBird 0.82.0 interoperability is live-validated in WI#600; WI#603 rejects custom DNS before runtime |
+| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and provider-specific DNS pass; link-local IPv4 drops; WireGuard custom joined-run DNS removes direct uplink DNS rules, NetBird allows only its `wt0` resolver and rejects custom DNS | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the provider-specific DNS path; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. Core NetBird 0.82.0 interoperability is live-validated in WI#600; NetBird custom DNS is rejected before runtime |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#537, v2.2.0.0):** on Linux the in-code default and new
@@ -450,27 +450,37 @@ replace the complete table atomically, with no unfiltered delete/rebuild window:
   traffic only. A sandbox process cannot bind an inbound service reachable
   from the host, the LAN or the overlay (WI#357).
 - `output`, policy `drop`: accepts loopback, the tunnel interfaces (`wg0`,
-  `wt0`), IPv6 neighbour discovery, by default DNS (`udp`/`tcp` 53) to the
-  resolvers listed in the sidecar's `/etc/resolv.conf`, and packets carrying
-  the provider's socket mark (NetBird's control-plane mark `0x1bd00`, or the
-  WireGuard device fwmark; the sidecar sets `0x4c57` on a device whose config
-  left it off). `169.254.0.0/16` (cloud metadata, podman's host alias) is
-  dropped before the mark accept. Joiners have no `NET_ADMIN`, so they cannot
-  set a socket mark or alter either chain.
+  `wt0`), IPv6 neighbour discovery, DNS (`udp`/`tcp` 53) only to the
+  provider-specific permitted resolver, and packets carrying the provider's
+  socket mark (NetBird's control-plane mark `0x1bd00`, or the WireGuard device
+  fwmark; the sidecar sets `0x4c57` on a device whose config left it off).
+  `169.254.0.0/16` (cloud metadata, podman's host alias) is dropped before the
+  mark accept. Joiners have no `NET_ADMIN`, so they cannot set a socket mark or
+  alter either chain.
 
-The default runtime-resolver DNS allowance is the one residual uplink channel:
-recursive DNS can carry query-based exfiltration even though other uplink,
-host-loopback, LAN, and metadata connections are unreachable.
+WireGuard's default runtime-resolver DNS allowance is one residual uplink
+channel: recursive DNS can carry query-based exfiltration even though other
+uplink, host-loopback, LAN, and metadata connections are unreachable.
 For WireGuard, `SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay
 resolver files `ro,z` into joined runs only and removes every direct uplink DNS
 accept. The sidecar retains its runtime resolver file for bootstrap, but the
-same chain drops its own unmarked post-start lookups too. The WI#600 live run
-confirmed that NetBird's local resolver listens on the sidecar's overlay IP but
-its upstream writes are unmarked: joined lookups returned `SERVFAIL`, the client
-log reported `operation not permitted`, and no query reached the uplink. WI#603
-therefore rejects `SANDBOX_TUNNEL_DNS` with NetBird during configuration
-validation, before any runtime call; default runtime DNS is required for
-NetBird.
+same chain drops its own unmarked post-start lookups too.
+
+NetBird has no runtime-resolver allowance. A credential-free helper reads the
+initial file from the inspected hashed image ID with `--pull=never`; LunarWing
+stages mode-`0644` resolver and backup files and mounts them `rw,z` for NetBird.
+Joined runs mount the resolver `ro,z`, readable under every supported keep-id
+mapping. Within the provider deadline, startup requires exactly one valid
+nameserver equal to NetBird's `wt0` IPv4 listener. The initial runtime resolver,
+any other or malformed nameserver, and DNS management left off fail closed
+before firewall installation. Installation and every later health check derive
+the expected DNS rules from `wt0`, never from a later file rewrite, so retaining
+the same listener does not invalidate the table. WI#695 note **17394** measured
+the old unmanaged file's uplink DNS and confirmed direct NetBird-listener peer
+and in-overlay primary resolution with zero uplink packets; it is not a staged
+live-pass claim. Outside-upstream writes remain unmarked and fail closed.
+`SANDBOX_TUNNEL_DNS` stays rejected during configuration validation, before any
+runtime call.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
