@@ -237,4 +237,11 @@ assert_eq "$(jq -r '.metrics.instances[0].workload_isolation' <<<"$oJ2")" "proce
 assert_contains "$(jq -r '.issues[0]' <<<"$oJ2")" "workload isolation degraded" "J5: retrying fallback explained"
 assert_eq "$j2_rc" "1" "J6: retrying fallback returns degraded exit"
 
+fix_body "$j" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":60}'
+oJ3="$(run_hc "$j" LUNARWING_TENANTS_FILE="$j/ports.json")"
+j3_rc=$?
+assert_eq "$(jq -r '.status' <<<"$oJ3")" "critical" "J7: retrying fallback does not mask critical backlog"
+assert_contains "$(jq -r '.issues[0]' <<<"$oJ3")" "backlog critical" "J8: critical backlog remains explained"
+assert_eq "$j3_rc" "2" "J9: critical backlog retains critical exit"
+
 finish

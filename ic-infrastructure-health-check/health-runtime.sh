@@ -245,14 +245,14 @@ for target in "${targets[@]}"; do
   inst_status="healthy"; inst_exit=0
   if [[ "$p_gw_reachable" != "true" ]]; then
     inst_status="critical"; inst_exit=2
-  elif [[ "$p_gw_workload_isolation" == "process-group-retrying" ]]; then
-    inst_status="degraded"; inst_exit=1
-    p_issues+=("workload isolation degraded: process-group fallback is being retried")
   elif [[ "$p_bridge_reachable" != "true" || "$p_bridge_running" != "true" ]]; then
     inst_status="degraded"; inst_exit=1
   elif [[ "$p_bridge_queued" =~ ^[0-9]+$ ]] && [[ "$p_bridge_queued" -gt "$QUEUE_CRITICAL" ]]; then
     inst_status="critical"; inst_exit=2
     p_issues+=("xmpp bridge delivery backlog critical: ${p_bridge_queued} queued")
+  elif [[ "$p_gw_workload_isolation" == "process-group-retrying" ]]; then
+    inst_status="degraded"; inst_exit=1
+    p_issues+=("workload isolation degraded: process-group fallback is being retried")
   elif [[ "$p_gw_channels_unhealthy" =~ ^[0-9]+$ ]] && [[ "$p_gw_channels_unhealthy" -gt 0 ]]; then
     # MR !1041 review finding 5: channels the gateway itself reports unhealthy
     # must never produce a healthy verdict. A normal approval wait stays
