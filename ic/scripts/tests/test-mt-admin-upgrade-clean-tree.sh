@@ -142,6 +142,9 @@ mkdir -p "$HEALTH_LIB_DIR"
 # a fresh host-global install during a tenant upgrade.
 : >"$HEALTH_LIB_DIR/cron-wrapper.sh"
 ensure_health_pipeline() { printf 'refreshed\n' >>"$health_refresh_log"; }
+# WI#715: the upgrade also refreshes the host-global Study Notes snapshot;
+# stub it so this harness never touches /usr/local.
+refresh_deployed_knowledge_sync_scheduler() { :; }
 move_ref_on_stop=false
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
