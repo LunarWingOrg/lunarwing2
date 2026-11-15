@@ -1104,7 +1104,8 @@ _prepare_sandbox_image_source() {  # <tenant> [release ref] [selected commit]
 }
 
 ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref] [selected commit]
-  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}" release_ref="${3:-}" selected_commit="${4:-}"
+  local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}"
+  local release_ref="${3:-${LUNARWING_MT_UPGRADE_RELEASE_REF:-}}" selected_commit="${4:-${LUNARWING_MT_UPGRADE_SELECTED_COMMIT:-}}"
   local rc=0
   validate_sandbox_image_policy "$policy"
   tenant_uses_managed_sandbox_image "$name" || return 0
