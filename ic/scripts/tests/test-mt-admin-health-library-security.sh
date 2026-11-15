@@ -446,8 +446,11 @@ check_post_copy_file_type_check() {
 
 # ADO-3: CI's image has coreutils 9.1, which has no mv --exchange, so CI runs
 # only the fallback. Both paths are exercised here: an mv that reports the
-# option, and one that does not. The report is what the code decides on, so a
-# fake is enough to drive either branch on any host.
+# option and performs the exchange, and one that does not. The report is what
+# the code decides on, so a fake is enough to drive either branch on any host.
+# The option is matched anywhere in the arguments: the call is
+# `mv -T --exchange -- SOURCE DEST`, so a first-argument test never fires and
+# the host's own mv would silently cover for it.
 fake_mv_exchange() {
   # shellcheck disable=SC2329  # invoked indirectly by ensure_health_pipeline
   mv() {
@@ -455,18 +458,27 @@ fake_mv_exchange() {
       printf '      --exchange           exchange source and destination\n'
       return 0
     fi
-    if [[ "${1:-}" == --exchange ]]; then
-      local source="$3" destination="$4" parking
-      parking="$(mktemp -d "$(dirname -- "$source")/.exchange.XXXXXX")" && rmdir -- "$parking" || return 1
-      command mv -T -- "$source" "$parking" || return 1
-      command mv -T -- "$destination" "$source" || return 1
-      command mv -T -- "$parking" "$destination"
+    local arg has_exchange=false source destination parking
+    local -a passthrough=()
+    for arg in "$@"; do
+      if [[ "$arg" == --exchange ]]; then has_exchange=true; else passthrough+=("$arg"); fi
+    done
+    if [[ "$has_exchange" != true ]]; then
+      command mv "${passthrough[@]}"
       return
     fi
-    command mv "$@"
+    source="${passthrough[$((${#passthrough[@]} - 2))]}"
+    destination="${passthrough[$((${#passthrough[@]} - 1))]}"
+    parking="$(mktemp -d "$(dirname -- "$source")/.exchange.XXXXXX")" || return 1
+    rmdir -- "$parking" || return 1
+    command mv -T -- "$source" "$parking" || return 1
+    command mv -T -- "$destination" "$source" || return 1
+    command mv -T -- "$parking" "$destination"
   }
 }
 
+# Reports no --exchange and refuses the option outright, so the exchange
+# branch cannot quietly succeed through the host's mv where coreutils has it.
 fake_mv_without_exchange() {
   # shellcheck disable=SC2329  # invoked indirectly by ensure_health_pipeline
   mv() {
@@ -474,6 +486,13 @@ fake_mv_without_exchange() {
       printf 'Usage: mv [OPTION]... SOURCE... DIRECTORY\n'
       return 0
     fi
+    local arg
+    for arg in "$@"; do
+      if [[ "$arg" == --exchange ]]; then
+        printf 'mv: unrecognized option --exchange\n' >&2
+        return 1
+      fi
+    done
     command mv "$@"
   }
 }
