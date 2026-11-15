@@ -36,6 +36,7 @@ say() { :; }
 FAIL_BUILD=""
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# shellcheck disable=SC2034  # consumed by the sourced identity writer
 TENANT_IDENTITY_DIR="$fixture/identity"
 TENANT_SUBUID_FILE="$fixture/subuid"
 printf 'tenant-a:231072:65536\n' >"$TENANT_SUBUID_FILE"
