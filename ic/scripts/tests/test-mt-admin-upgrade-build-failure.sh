@@ -617,6 +617,30 @@ else
   pass 'real promote is re-runnable (an already-promoted lane is skipped)'
 fi
 
+# 6e. WI#642: a worker rollback must not undo another tenant's later promotion.
+printf 'kimi\n' >"$lane_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+capture promote_candidate_workers fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "worker interleaved-rollback setup promotion failed: $output"
+else
+  register_image "lunarwing-worker-kimi:latest" sha256:kimi-other-tenant
+  : >"$runtime_log"; : >"$say_log"
+  capture restore_promoted_workers fixture
+  if [[ "$rc" -eq 0 ]]; then
+    fail 'worker rollback claimed success despite an interleaved promotion'
+  elif [[ "$(cat "$ids_dir/lunarwing-worker-kimi:latest")" != sha256:kimi-other-tenant ]]; then
+    fail 'worker rollback replaced the image promoted by another tenant'
+  elif grep -q '^tag sha256:kimi-old lunarwing-worker-kimi:latest' "$runtime_log"; then
+    fail 'worker rollback re-tagged the old ID over an interleaved promotion'
+  elif [[ "$output" != *'another promotion replaced'* ]]; then
+    fail 'worker rollback skipped an interleaved promotion without a warning'
+  else
+    pass 'worker rollback preserves a later promotion by another tenant'
+  fi
+fi
+
 # ── 7. the upgrade wrapper's own verbs must not deadlock (run-300 TO-1) ──────
 # The wrapper's boundary takes flock on <build lock>.<tenant>.upgrade for the
 # whole run and re-enters mt-admin for build-worker-candidates and
