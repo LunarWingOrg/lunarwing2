@@ -2,7 +2,8 @@
 
 > Test started 2026-11-15 by Rarity on branch
 > `rarity/kimi-wi685-20261115-0830`, at tree `028404983`.
-> This report is a work in progress while the live tenant exercise runs.
+> Live exercise completed the same day: all three real LunarDepth jobs passed
+> with independent artifact verification.
 
 ## Scope
 
@@ -97,8 +98,7 @@ which blocked tenant creation:
   does not alter that listener or claim metrics endpoint health. The routine
   `fcron has already been started` warning was also harmless.
 
-The fat build is running through mt-admin under tmux, constrained to CPUs
-0–17:
+The fat build ran through mt-admin under tmux, constrained to CPUs 0–17:
 
 ```bash
 sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
@@ -107,11 +107,11 @@ sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
 ```
 
 The daemon release build finished in **9m18s** and the XMPP bridge release
-build finished in **7m49s**. The LunarDepth image phase is in progress: its
-pinned source checkout, pnpm 11.7.0 frozen install, runtime-closure check (4
-agent presets / 182 workspace packages), native host build, and TypeScript
-build have run. pnpm printed its expected unsupported-platform, cyclic-workspace,
-and not-yet-built `bin.js` warnings; none stopped the build.
+build finished in **7m49s**. The LunarDepth image phase used a pinned source
+checkout, pnpm 11.7.0 frozen install, runtime-closure check (4 agent presets /
+182 workspace packages), native host build, and TypeScript build. pnpm printed
+its expected unsupported-platform, cyclic-workspace, and not-yet-built `bin.js`
+warnings; none stopped the build.
 
 The fat candidate image was produced as
 `269216fa5ab8658cda7afe2dcd5256ae5395ac66d4f9b7a1fe8e4a5bbaa4587c`.
@@ -155,6 +155,9 @@ Source-side prechecks on the exact lane checkout passed:
   migration, lifecycle, bridge flags, overlay, gateway-dialect, verifier
   isolation, fleet-key, and archive checks.
 - `bash scripts/tests/test-worker-llm-entrypoints.sh`: passed.
+- `bash scripts/tests/test-mt-admin-worker-image-contract.sh`: all worker
+  image-contract tests passed, including LunarDepth imperative/Quadlet
+  recreation, identity refusal, root-owned files, and out-of-band verification.
 - `bash scripts/tests/test-worker-egress.sh`: all fixture checks passed,
   including cold apply/first start/post-start verification in one rootless
   namespace, fail-closed guard behavior, and bridge/task launch contracts. Its
@@ -190,17 +193,18 @@ Live startup and audit results:
   `python3 --version` = 3.11.2, `g++` = Debian 12.2.0-14+deb12u1, and
   `node --version` = 22.23.4.
 
-Real TensorZero job evidence: pending.
+All three real TensorZero jobs completed and passed independent verification;
+their evidence follows.
 
 ## Job exercise
 
-Jobs will run sequentially through fresh gateway threads. Each prompt asks the
+Jobs ran sequentially through fresh gateway threads. Each prompt asked the
 tenant agent for exactly one `create_job(mode="lunardepth", wait=false)` call;
-the harness discovers that thread's Engine V2 pending gate, approves it with
-the owning `thread_id`, finds the job by a unique title prefix, and saves the
+the harness discovered that thread's Engine V2 pending gate, approved it with
+the owning `thread_id`, found the job by a unique title prefix, and saved the
 job detail/events without printing the gateway credential.
 
-Planned focused tasks, chosen for the lane's Python/C++ toolchain rather than
+The focused tasks were chosen for the lane's Python/C++ toolchain rather than
 the Rust/Go sets used by other workers:
 
 1. **Medium — Python log pipeline:** deterministic 300-line fixture with two
@@ -254,8 +258,110 @@ the Rust/Go sets used by other workers:
   is absent. It did not affect compilation or execution; the actual binary ran
   successfully with exit 0.
 
-Job 3: pending.
+### Job 3 — Parallel statistics with independent cross-check: PASS
+
+- Job `bd58dc0c-4d67-4017-a2bf-937121779125`, created 09:42:54Z and
+  completed 09:52:59Z (**605 s** job elapsed; 625.8 s wall including
+  dispatch), with 27 events and zero repairs/stuck state.
+- `/workspace/wi685_parallel_stats` contains the generator, 20,000-row CSV,
+  C++17 `std::async` aggregator and binary, five run transcripts, independent
+  Python checker/JSON, comparator results, hashes, and `SUMMARY.md`.
+- A fresh build with `g++ -O2 -std=c++17 -pthread -Wall -Wextra -Werror`
+  succeeded. Three new p4 runs were byte-identical to the originals; new p1/p8
+  runs matched every aggregate and checksum. The regenerated CSV was also
+  byte-identical (SHA-256
+  `4577b94ec700e49c41d6c7952b2f0f1dae3fc9dd7dd63aed09d95f41ebcab6e7`).
+- All five runs passed 26 field comparisons each (130 total, zero mismatches).
+  A **separate host-side implementation**, using `math.fsum` and
+  `statistics.pstdev` rather than the worker's code, independently reproduced
+  every value at precision 6 and the same FNV-1a checksum `0x2b492f97`:
+
+| Category | Count | Sum | Mean | Min | Max | Population stddev |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 5000 | 64680.583747 | 12.936117 | -999.630762 | 999.447746 | 584.286372 |
+| B | 5000 | -13592.980430 | -2.718596 | -999.436576 | 999.692289 | 576.767884 |
+| C | 5000 | -14676.732081 | -2.935346 | -999.454800 | 999.736377 | 577.267775 |
+| D | 5000 | -50962.716726 | -10.192543 | -999.865234 | 999.350347 | 573.539757 |
+
+- The worker caught one real bug during its own task: `std::hex` leaked into a
+  later row-count line. It added `std::dec`, rebuilt, and repeated all runs;
+  the final artifacts and independent checks have decimal `rows=20000`.
+
+### Job inventory
+
+| Job | ID | State | Job elapsed | Independent result |
+| --- | --- | --- | ---: | --- |
+| Python log pipeline | `213f3217-2f06-4b05-b06f-2c139a05d10d` | completed | 468 s | 16 tests + deterministic diffs + independent metrics |
+| C++ weighted interval scheduling | `04044cd8-c2a0-4e1b-a055-57b91fd7ed81` | completed | 331 s | forced rebuild, 240 oracle cases, edge/scaling cases, identical reruns |
+| Parallel statistics | `bd58dc0c-4d67-4017-a2bf-937121779125` | completed | 605 s | five runs, 130 comparisons, independent host numerical oracle |
+
+The final `/api/jobs?mode=external:lunardepth` inventory contains exactly these
+three jobs, all `completed` and all attributed to `external:lunardepth`.
 
 ## Findings and hand-off
 
-Pending.
+### Findings
+
+1. **F1 (host prerequisite, resolved):** the first build reached out-of-band
+   verification but failed because Gentoo's `util-linux` lacked the `caps` USE
+   flag and therefore `setpriv`. The documented package.use change plus a
+   one-package rebuild fixed it; the standard mt-admin build then passed and
+   promoted the verified fat image. `/usr/bin/setpriv` and `caps` remain
+   enabled for later builds.
+2. **F2 (the WI#692 route risk did not reproduce):** the current
+   `da06c33b…` pin successfully served all three real jobs through
+   `tensorzero::function_name::lunarwing`, with no prefix-rewriting proxy and
+   no lane source change. This is direct evidence against treating the old pin
+   as unable to serve this TensorZero route on this host. WI#692 still remains
+   the separate requested upstream pin/profile-schema bump; this test neither
+   performs nor claims that bump.
+3. **F3 (latency, not a hang):** initial model requests had quiet periods of
+   roughly 3–6 minutes before the first events, but every job then progressed
+   and completed with `stuck=false` and zero repair attempts. Operators should
+   inspect events/readiness rather than cancelling during the first silent
+   interval.
+4. **F4 (API ergonomics):** each detail record has an empty `description` and
+   places the full task text after a newline in `title`. Unique title-prefix
+   matching worked reliably; exact title equality would have missed all three
+   jobs. The first `always` approval covered later `create_job` calls without
+   additional gates and without duplicate dispatch.
+5. **F5 (minor image/task observations):** the optional `file` utility is not
+   installed in the fat image, though Python, g++, Node, compilation, and
+   execution all work. One task's `std::hex` formatting bug was self-corrected
+   and fully retested. The earlier direct probes with 16/64-token limits ended
+   with empty visible content and `finish_reason=length`; a 512-token baseline
+   and every worker job proved real content generation.
+6. **F6 (host-only/pre-existing):** provisioning quarantined the optional old
+   health-metrics binary under the WI#687 ownership check and warned that
+   fcron was already running. Neither affected the tenant, gateway, or worker.
+   This run did not validate the optional metrics listener.
+
+### Final state and evidence
+
+- **`lunardepthtester` is deliberately left running** for operator inspection;
+  no remove/purge was run. Final mt-admin status shows the daemon, PostgreSQL,
+  XMPP bridge, WeeChat/adapter, LunarVision, and LunarDepth running under
+  OpenRC. Gateway health and `/ready` are green.
+- Final `worker-listeners` is clean, `worker-egress` verifies both roles and
+  the live allowlist, and `worker-smoke` again returns 0 after all jobs.
+- Ports remain allocated: gateway 10010, LunarVision 20015/20016, LunarDepth
+  52010/52011. Both stores retain fat image
+  `3285688081822c91597ca60defe18abd7dc1038821fa2ecbe03f2f2efdbc39c9`.
+- Raw gateway details/events and copied worker artifacts are under
+  `/tmp/wi685-results/`. Dispatch/audit logs are `/tmp/wi685-*.log`, and the
+  standard-library dispatch harness is `/tmp/wi685_dispatch.py`. No credential
+  is included in the report or the evidence index.
+- The host package prerequisite persists as
+  `/etc/portage/package.use/lunarwing-setpriv`. Root filesystem usage rose
+  during source/image builds; final free space is **34 GiB (87% used)**.
+- No daemon, lane, mt-admin, CI, or goals-file source was changed for this
+  work-item run. The only repository deliverable is this report.
+
+### Verification limits
+
+This is live OpenRC/rootless-Podman/TensorZero evidence, not a protected CI
+candidate, clean-rebuild digest comparison, CRITICAL scan, manual image
+promotion, systemd test, TensorMoon test, or credentialed-gateway test. The
+explicit unauthenticated-gateway and private-network HTTP exceptions were used
+for this herd endpoint. Cron, steering, tool proxy, resume, and credential
+injection are intentionally unsupported by this lane and were not exercised.
