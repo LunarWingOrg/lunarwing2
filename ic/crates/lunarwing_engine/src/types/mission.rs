@@ -154,6 +154,7 @@ pub struct Mission {
 
     // ── Evolving strategy ──
     /// What the next thread should focus on (updated after each thread).
+    #[serde(default)]
     pub current_focus: Option<String>,
     /// What approaches have been tried and what happened.
     ///
@@ -162,12 +163,15 @@ pub struct Mission {
     /// growing the persisted record and every subsequent meta-prompt).
     /// Evicted entries are summarized into `metadata`; the full thread
     /// transcripts remain on disk.
+    #[serde(default)]
     pub approach_history: Vec<String>,
 
     // ── Progress tracking ──
     /// History of threads spawned by this mission.
+    #[serde(default)]
     pub thread_history: Vec<ThreadId>,
     /// Optional criteria for declaring the mission complete.
+    #[serde(default)]
     pub success_criteria: Option<String>,
 
     // ── Notification ──
@@ -179,8 +183,10 @@ pub struct Mission {
     // ── Budget ──
     /// Maximum threads per day (0 = unlimited). New missions without an
     /// explicit value start at [`DEFAULT_MAX_THREADS_PER_DAY`].
+    #[serde(default = "default_max_threads_per_day")]
     pub max_threads_per_day: u32,
     /// Threads spawned on `threads_today_date`.
+    #[serde(default)]
     pub threads_today: u32,
     /// UTC date associated with `threads_today`. Missing on older persisted missions.
     #[serde(default)]
@@ -189,6 +195,7 @@ pub struct Mission {
     // ── Trigger payload ──
     /// Payload from the most recent trigger (webhook body, event data, etc.).
     /// Injected into the thread's context so the code can access it.
+    #[serde(default)]
     pub last_trigger_payload: Option<serde_json::Value>,
 
     // ── Trigger dedup ──
@@ -211,10 +218,12 @@ pub struct Mission {
     #[serde(default)]
     pub insight_generation: u64,
 
+    #[serde(default = "empty_mission_metadata")]
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// When the next thread should be spawned (for Cron cadence).
+    #[serde(default)]
     pub next_fire_at: Option<DateTime<Utc>>,
     /// When this mission last spawned a thread (UTC). Legacy records may lack
     /// this timestamp despite having thread history; use `has_fired()` to
@@ -231,6 +240,14 @@ pub struct Mission {
     /// fire is lost, as before work item #188).
     #[serde(default)]
     pub retry_policy: MissionRetryPolicy,
+}
+
+fn default_max_threads_per_day() -> u32 {
+    DEFAULT_MAX_THREADS_PER_DAY
+}
+
+fn empty_mission_metadata() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 /// Default daily thread budget applied when a mission is created without an
@@ -576,6 +593,76 @@ mod tests {
         );
         assert_eq!(mission.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
         assert_eq!(DEFAULT_MAX_THREADS_PER_DAY, 30);
+    }
+
+    #[test]
+    fn legacy_mission_without_evolving_state_still_deserializes() {
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mission_id = mission.id;
+        let mut value = serde_json::to_value(mission).expect("serialize mission");
+        let object = value.as_object_mut().expect("mission should be an object");
+        for field in [
+            "current_focus",
+            "approach_history",
+            "thread_history",
+            "success_criteria",
+            "max_threads_per_day",
+            "threads_today",
+            "last_trigger_payload",
+            "metadata",
+            "next_fire_at",
+        ] {
+            object.remove(field);
+        }
+
+        let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
+        assert_eq!(restored.id, mission_id);
+        assert!(restored.current_focus.is_none());
+        assert!(restored.approach_history.is_empty());
+        assert!(restored.thread_history.is_empty());
+        assert!(restored.success_criteria.is_none());
+        assert_eq!(restored.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
+        assert_eq!(restored.threads_today, 0);
+        assert!(restored.last_trigger_payload.is_none());
+        assert_eq!(restored.metadata, serde_json::json!({}));
+        assert!(restored.next_fire_at.is_none());
+    }
+
+    #[test]
+    fn legacy_defaults_do_not_fabricate_required_mission_fields() {
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        for field in [
+            "id",
+            "project_id",
+            "name",
+            "goal",
+            "status",
+            "cadence",
+            "created_at",
+            "updated_at",
+        ] {
+            let mut value = serde_json::to_value(&mission).expect("serialize mission");
+            value
+                .as_object_mut()
+                .expect("mission should be an object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<Mission>(value).is_err(),
+                "missing required field {field} must still be rejected"
+            );
+        }
     }
 
     #[test]
