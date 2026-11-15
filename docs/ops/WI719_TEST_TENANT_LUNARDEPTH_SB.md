@@ -136,3 +136,54 @@ Provisioning hiccups, neither blocking:
   `lunarwing-lunardepth-task-lunardepthtester` — the list only enumerates the
   other lanes (as `unknown`). The worker's own health and `/ready` endpoints,
   `worker-listeners` and `worker-smoke` all confirm the pair is running.
+
+## Job exercise
+
+Jobs ran sequentially through fresh gateway threads. Each prompt asked the
+tenant agent for exactly one `create_job(mode="lunardepth", wait=false)` call;
+the harness polled that thread's Engine V2 pending gate, approved it with the
+owning `thread_id` and `always` so later calls were covered, found the job by a
+unique title prefix, and saved job detail/events. The gateway bearer was read
+only inside the script and never printed.
+
+The tasks were chosen for the lane's fat Python/C++ toolchain rather than the
+Rust/Go sets used by other workers:
+
+1. **Medium — Python log pipeline:** deterministic 360-row fixture with two
+   malformed rows at fixed line numbers, strict parser plus text/JSON reports,
+   nearest-rank percentiles, at least 12 unit tests, and a byte-identical rerun
+   check.
+2. **Medium/high — C++17 weighted interval scheduling:** DP plus
+   reconstruction, an independent exhaustive-subset oracle over at least 260
+   seeded instances, edge cases, and an N=2500 scaling case, compiled with
+   warnings as errors.
+3. **High — parallel statistics with an independent oracle:** deterministic
+   24,000-row CSV, C++17 `std::async` aggregation over 1/4/8 partitions with an
+   FNV-1a checksum, and an independent Python recomputation of every aggregate.
+
+### Job 1 — Python access-log pipeline: PASS
+
+- Job `10372b43-58e3-4da2-8c71-9723a2bd0eb8`, mode `external:lunardepth`,
+  created 22:08:28Z and completed 22:29:22Z (**1284 s** job elapsed; 1286 s wall
+  including discovery/approval). 25 persisted job events, `stuck=false`, zero
+  repair attempts.
+- The worker produced `generator.py`, `log_pipeline.py`,
+  `test_log_pipeline.py`, `access.log`, `report.txt`, `report.json`, `run1/`,
+  `run2/` and `SUMMARY.md` under
+  `/workspace/wi719_python_log`.
+- **Independent host re-run of the tests:** all 18 tests passed.
+- **Independent host parser** (not the worker's module) reproduced every value:
+
+| Metric | Worker | Independent |
+| --- | ---: | ---: |
+| total rows | 360 | 360 |
+| well-formed rows | 358 | 358 |
+| malformed line numbers | 71, 171 | 71, 171 |
+| `/index` / `/search` / `/cart` | 120 / 119 / 119 | 120 / 119 / 119 |
+| status ≥ 500 | 58 | 58 |
+| status ≥ 400 fraction | 0.311111 | 0.311111 |
+| nearest-rank p50 / p95 (ms) | 516 / 951 | 516 / 951 |
+
+- **Determinism:** `diff -r run1 run2` is empty, and regenerating the fixture on
+  the host reproduced `access.log` byte for byte (SHA-256
+  `a1a1ae8a74ae9232be749c0784175e6cd0d15d99fa58e1642e9d1245d2329d4f`).
