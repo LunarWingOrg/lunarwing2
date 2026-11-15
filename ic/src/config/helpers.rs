@@ -557,12 +557,24 @@ mod tests {
         for directory in ["config", "setup", "cli"] {
             collect_rust_sources(&source_root.join(directory), &mut sources);
         }
+        // Overlay-backed readers fixed outside those directories (WI#646, WI#655).
+        for file in ["llm/lunarwing_cloud_chat.rs", "sandbox/proxy/http.rs"] {
+            sources.push(source_root.join(file));
+        }
         sources.sort();
         let keys = audited_overlay_keys();
         let dynamic_reads = [
+            "std::env::var(name)",
             "std::env::var(env_var)",
             "std::env::var(env)",
             "std::env::var(&def.model_env)",
+        ];
+        let dynamic_read_files = [
+            "setup/wizard.rs",
+            "cli/models.rs",
+            "cli/status.rs",
+            "llm/lunarwing_cloud_chat.rs",
+            "sandbox/proxy/http.rs",
         ];
 
         for path in sources {
@@ -577,7 +589,10 @@ mod tests {
                     relative.display()
                 );
             }
-            if relative.ends_with("setup/wizard.rs") || relative.ends_with("cli/models.rs") {
+            if dynamic_read_files
+                .iter()
+                .any(|file| relative.ends_with(file))
+            {
                 for raw_read in dynamic_reads {
                     assert!(
                         !production.contains(raw_read),
