@@ -206,6 +206,24 @@ git -C "$tenant_root" checkout -q --detach "$base_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$base_head" ]] \
   || fail 'a detached operator checkout rejected an older release ancestor'
+
+mkdir -p "$tenant_root/ic" "$fixture_dir/tenant-env"
+BUILD_LOCK="$fixture_dir/build.lock"
+_ensure_marker_dir() { :; }
+_reset_build_stage_file() { :; }
+_record_build_stage() { :; }
+_run_tenant_build() { :; }
+tenant_repo() { printf '%s/ic\n' "$tenant_root"; }
+tenant_lw_root() { printf '%s\n' "$tenant_root"; }
+tenant_env_dir() { printf '%s/tenant-env\n' "$fixture_dir"; }
+all_tenant_names() { printf 'fixture\n'; }
+sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
+build_tenant fixture false true
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'build-tenant rejected an older ancestor with a detached operator checkout'
+build_all false true
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'build-all rejected an older ancestor with a detached operator checkout'
 git -C "$operator_root" checkout -q main
 
 build_pebble_worker false false "$tenant_root"
