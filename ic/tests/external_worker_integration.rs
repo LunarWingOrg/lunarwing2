@@ -3668,6 +3668,93 @@ async fn proxied_calls_persist_canonical_tool_events() {
     );
 }
 
+/// WI#711: proxied arguments and tool output need value-level scrubbing too;
+/// the sensitive-parameter map and vendor-pattern leak scan do not know this
+/// task's granted credential.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn granted_values_are_redacted_from_proxied_tool_events() {
+    const VALUE: &str = "s3cret-db-password";
+    let (db, _tmp) = test_db().await;
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(GateProbeTool {
+            tool_name: "knowledge_search".to_string(),
+            output: format!("tool output: {VALUE}"),
+            autonomous: true,
+            calls: AtomicUsize::new(0),
+        }))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "query": VALUE }),
+        )],
+        replies: reply_tx,
+    })
+    .await;
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config])
+        .with_tool_proxy(test_proxy(tools))
+        .with_store(db.clone());
+    let job_id = Uuid::new_v4();
+    seed_agent_job(&db, job_id).await;
+
+    let mut context = TaskContext {
+        user_id: "tenant-user".to_string(),
+        ..Default::default()
+    };
+    context
+        .environment
+        .insert("DB_PASSWORD".to_string(), VALUE.to_string());
+    let result = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(MOCK_TASK_TIMEOUT_MS),
+            true,
+            context,
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(result.status, ExternalTaskStatus::Success);
+    let reply = reply_rx.recv().await.expect("tool_result reply");
+    assert_eq!(reply["payload"]["status"], "success");
+
+    let events = db
+        .list_job_events(job_id, None)
+        .await
+        .expect("list job events");
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.event_type.as_str(), "tool_use" | "tool_result"))
+        .collect();
+    assert_eq!(tool_events.len(), 2, "expected tool_use + tool_result");
+    assert_eq!(tool_events[0].event_type, "tool_use");
+    assert_eq!(tool_events[1].event_type, "tool_result");
+    for event in tool_events {
+        let data = event.data.to_string();
+        assert!(
+            !data.contains(VALUE),
+            "persisted {} row leaked the granted value: {data}",
+            event.event_type
+        );
+        assert!(
+            data.contains("[redacted-secret]"),
+            "persisted {} row must show value redaction: {data}",
+            event.event_type
+        );
+    }
+}
+
 #[tokio::test]
 async fn tool_output_is_sanitized_before_reaching_worker() {
     // MR !1506 review (CQ-2) / WI#324 AC5 regression guard: tool output and
