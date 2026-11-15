@@ -1894,7 +1894,7 @@ mod tests {
                 serde_json::json!({
                     "agent": "kimi-1", "topic": "status-only",
                     "title": "Already marked", "content": "Needs fresh verification.",
-                    "status": "stale", "source_commit": "current", "scope": "private"
+                    "status": "stale", "scope": "private"
                 }),
                 serde_json::json!({
                     "agent": "kimi-1", "topic": "aged",

@@ -270,6 +270,8 @@ impl KnowledgeNoteMeta {
     /// retired and return no reasons. Age falls back to `updated_at` when no
     /// studied timestamp is recorded. The effective age limit is the caller's
     /// `max_age_days` when given, otherwise the note's own `stale_after_days`.
+    /// Both commit values are trimmed before comparison. A missing or blank
+    /// value on either side disables the commit check, matching the canonical store.
     pub fn stale_reasons(
         &self,
         updated_at: DateTime<Utc>,
@@ -283,8 +285,16 @@ impl KnowledgeNoteMeta {
         if self.status.is_unverified() {
             reasons.push(KnowledgeStaleReason::Status(self.status));
         }
-        if let Some(commit) = repository_commit
-            && self.source_commit.as_deref() != Some(commit)
+        let repository_commit = repository_commit
+            .map(str::trim)
+            .filter(|commit| !commit.is_empty());
+        let source_commit = self
+            .source_commit
+            .as_deref()
+            .map(str::trim)
+            .filter(|commit| !commit.is_empty());
+        if let (Some(commit), Some(source_commit)) = (repository_commit, source_commit)
+            && source_commit != commit
         {
             reasons.push(KnowledgeStaleReason::SourceCommitMismatch);
         }
@@ -776,9 +786,25 @@ mod tests {
         meta.status = KnowledgeStatus::Active;
         // Commit mismatch triggers.
         assert!(meta.needs_verification(now, None, Some("other")));
-        // Missing commit triggers when a commit is provided.
+        // A missing note commit does not mismatch the caller's commit.
         meta.source_commit = None;
-        assert!(meta.needs_verification(now, None, Some("abc123")));
+        assert!(meta.stale_reasons(now, None, Some("abc123")).is_empty());
+        // Empty or blank note commits count as no recorded commit.
+        for source_commit in ["", " \t\n"] {
+            meta.source_commit = Some(source_commit.to_string());
+            assert!(meta.stale_reasons(now, None, Some("abc123")).is_empty());
+        }
+        // Empty or blank caller commits disable commit comparison.
+        meta.source_commit = Some("abc123".to_string());
+        for repository_commit in ["", " \t\n"] {
+            assert!(
+                meta.stale_reasons(now, None, Some(repository_commit))
+                    .is_empty()
+            );
+        }
+        // Surrounding whitespace does not create a commit mismatch.
+        meta.source_commit = Some("abc123 \n".to_string());
+        assert!(meta.stale_reasons(now, None, Some("abc123")).is_empty());
         // Age triggers (studied_at far in the past).
         meta.studied_at = Some(now - chrono::Duration::days(90));
         assert!(meta.needs_verification(now, Some(30), None));
