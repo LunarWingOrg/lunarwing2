@@ -58,7 +58,10 @@ sidecars. Per-run netns/veth pairs or per-run enrollment would add routing and
 credential/peer churn without improving the cross-tenant boundary. Do not run
 mutually untrusted workloads in one tenant, and do not treat loopback listeners
 as private between its commands. Overlay membership is not authentication:
-keep TLS, tokens, mTLS and NetBird ACLs/WireGuard peer policy in force.
+keep TLS, tokens, and mTLS in force. NetBird ACLs and WireGuard peer policy
+still limit what a sandbox can reach, because the destination peers and any
+routing peers enforce them; they do not filter inbound to the sandbox sidecar
+peer itself, whose only inbound filter is LunarWing's input chain.
 
 ## Common requirements
 
@@ -272,6 +275,13 @@ sets `NB_DISABLE_FIREWALL=true` because NetBird 0.82.0's interface allower
 otherwise inserts an `iifname "wt0" accept` into LunarWing's own input chain and
 reapplies it through a netlink monitor. Advanced routing remains enabled, while
 LunarWing's exact input/output chains are the only packet filter.
+`NB_DISABLE_FIREWALL=true` also means NetBird enforces no access control on this
+peer: the policies configured in NetBird are not evaluated here, and any peer
+that can reach this one over the tunnel is filtered only by the host's own
+rules. LunarWing's `input` chain is those rules — `policy drop`, with loopback
+and `ct state established,related` only — and it is the only inbound filter for
+this sidecar peer. A change that adds any inbound accept there has nothing
+behind it.
 
 Readiness requires `netbird status --check startup` to succeed (management and
 signal connected, plus relay availability when relays are configured). NetBird
@@ -284,10 +294,12 @@ The custom-DNS forwarding check failed closed as described above. WI#603 now
 rejects that configuration during validation; no CI or public-cloud run is
 claimed.
 
-Use restrictive NetBird ACLs for defense-in-depth even though the local input
-firewall drops inbound connections. Do not reuse the gateway-exposure NetBird
-peer or setup key from `docs/guides/NETBIRD_TUNNEL.md`; that is a separate,
-inbound gateway feature.
+NetBird ACLs still matter, but only in the outbound direction: they limit what
+the sandbox can reach, enforced by the destination peers and by routing peers,
+not by this peer. Use restrictive ACLs for that reachability control, and do not
+count them as a second layer behind LunarWing's input chain — there is none.
+Do not reuse the gateway-exposure NetBird peer or setup key from
+`docs/guides/NETBIRD_TUNNEL.md`; that is a separate, inbound gateway feature.
 
 ## WireGuard
 
@@ -470,7 +482,9 @@ required.
    ```
 
    `input` must show `policy drop`, loopback accept and
-   `ct state established,related accept`. `output` must show `policy drop`,
+   `ct state established,related accept`; for a NetBird sidecar this chain is
+   the only inbound filter, because `NB_DISABLE_FIREWALL=true` leaves no
+   NetBird ACL layer behind it. `output` must show `policy drop`,
    accepts for `lo`, `wg0` and `wt0`, the three neighbour-discovery ICMPv6
    accepts, `ip daddr 169.254.0.0/16 drop`, and one `meta mark … accept`.
    Without `SANDBOX_TUNNEL_DNS`, there are also `udp`/`tcp dport 53` accepts

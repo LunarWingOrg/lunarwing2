@@ -97,7 +97,10 @@ channel for both joiners and the sidecar itself. Bootstrap DNS still works, but
 post-start sidecar lookups have no unmarked uplink path. NetBird's own firewall
 is disabled with `NB_DISABLE_FIREWALL=true`: its 0.82.0 interface allower would
 otherwise insert and continually reapply an `iifname "wt0" accept` in this exact
-input chain. Advanced routing and its socket marks remain active.
+input chain. Advanced routing and its socket marks remain active. The same
+setting means NetBird evaluates no policies on this peer, so the input chain is
+the only inbound filter here; NetBird ACLs bound egress only, enforced by the
+destination and routing peers.
 
 The WI#600 live run measured NetBird's local resolver on the sidecar's overlay
 IP. Its upstream writes are unmarked and fail with `operation not permitted`,
@@ -118,8 +121,10 @@ is one trust domain; separate daemons use separate sidecars. Per-run netns/veth
 pairs or per-run enrollment were rejected as routing/capability complexity and
 credential/peer churn that would not strengthen the cross-tenant boundary. Do
 not schedule mutually untrusted workloads in one tenant. NetBird ACLs and
-WireGuard peer policy remain separate defense-in-depth; overlay membership is
-not application auth.
+WireGuard peer policy still bound what a sandbox can reach, because the
+destination and routing peers enforce them; they do not filter inbound to the
+sidecar peer, whose only inbound filter is LunarWing's input chain. Overlay
+membership is not application auth.
 
 ### Lifecycle and failure posture
 
