@@ -20,6 +20,7 @@ use lunarwing::orchestrator::{ReaperConfig, sweep_cli_sandboxes_once};
 use lunarwing::sandbox::{
     SandboxConfig, SandboxManager, SandboxNetworkMode, SandboxPolicy, SandboxRuntime,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const IMAGE: &str = "lunarwing-sandbox:latest";
 
@@ -236,6 +237,57 @@ print("direct-blocked")'"#
     );
 }
 
+async fn legacy_podman_proxy_acceptance(dir: &Path) {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback upstream");
+    let port = upstream.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.expect("accept proxied request");
+        let mut request = [0; 4096];
+        let read = stream
+            .read(&mut request)
+            .await
+            .expect("read proxied request");
+        assert!(read > 0, "proxy sent an empty request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nwi717-proxy-ok",
+            )
+            .await
+            .expect("write upstream response");
+    });
+
+    let mut cfg = config(SandboxRuntime::Podman, SandboxNetworkMode::Proxy);
+    cfg.network_allowlist = vec!["127.0.0.1".into()];
+    let manager = SandboxManager::new(cfg);
+    manager.initialize().await.expect("initialize legacy proxy");
+    let command = format!(
+        r#"python3 -I -c '
+import os
+for name in ("NO_PROXY", "no_proxy"):
+    os.environ.pop(name, None)
+import urllib.request
+print(urllib.request.urlopen("http://127.0.0.1:{port}/wi717", timeout=15).read().decode())'"#
+    );
+    let out = manager
+        .execute(&command, dir, HashMap::new())
+        .await
+        .expect("execute legacy proxy fetch");
+    assert_eq!(
+        out.exit_code, 0,
+        "legacy proxy fetch failed: stdout={} stderr={}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("wi717-proxy-ok"),
+        "host-loopback upstream response did not return through the proxy: {}",
+        out.stdout
+    );
+    server.await.expect("loopback upstream task");
+    manager.shutdown().await;
+}
+
 fn bin(runtime: SandboxRuntime) -> &'static str {
     match runtime {
         SandboxRuntime::Podman => "podman",
@@ -273,4 +325,17 @@ async fn generic_sandbox_hardening_and_egress_acceptance() {
     if !ran {
         eprintln!("SKIP live acceptance: enable a Podman/Docker E2E lane");
     }
+}
+
+#[tokio::test]
+async fn generic_sandbox_legacy_podman_proxy_acceptance() {
+    if std::env::var("LUNARWING_E2E_PODMAN_TESTS").as_deref() != Ok("1")
+        && !std::env::var("LUNARWING_E2E_PODMAN_TESTS")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        eprintln!("SKIP legacy proxy acceptance: enable the Podman E2E lane");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("scratch dir");
+    legacy_podman_proxy_acceptance(dir.path()).await;
 }
