@@ -1251,7 +1251,7 @@ Existing multi-tenant envs with an explicit `SANDBOX_NETWORK=none` stay on
 value set changes from `none` to `proxy-enforced` on upgrade; set `none`
 explicitly before upgrading to retain no-egress behavior.
 
-### Generic sandbox image + tenant defaults (WI#223/537/596)
+### Generic sandbox image + tenant defaults (WI#223/537/596/642)
 
 For new multi-tenant tenants, the generic sandbox's image is
 **`lunarwing-sandbox:latest`**, built from `ic/docker/sandbox.Dockerfile`
@@ -1287,14 +1287,19 @@ build and `never` suppresses it. Set the policy on an upgrade with
 `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
 
 For both tenant-driven paths, mt-admin verifies the tenant HEAD as the tenant
-user and requires it to be known to and on the selected operator release ref.
-It then uses `git archive` on the **operator checkout** to extract `ic/docker/`
-at that revision into a private root-owned mode-0700 directory. The digest and
-build read only that archive. A dirty, unknown, or off-release tenant source is
-refused without replacing the current image. Root never reads or builds the
-tenant-writable working-tree Dockerfile, including when Podman uses
-`--network=host`. The standalone `build-sandbox-image` recovery command
-continues to use the operator checkout directly.
+user and pins the build to one exact commit. `add-tenant` selects the operator
+checkout's HEAD. Both upgrade paths resolve the target immediately after their
+checkout and pass that full commit to every sandbox and worker candidate; a
+tenant HEAD that has moved to any other commit, even an older commit on the
+same release ref, is refused before a runtime build. The selected commit must
+be present in the operator checkout. mt-admin then uses `git archive` on the
+**operator checkout** to extract `ic/docker/` at that revision into a private
+root-owned mode-0700 directory. The digest and build read only that archive. A
+dirty, unknown, mismatched, or off-release tenant source is refused without
+replacing the current image. Root never reads or builds the tenant-writable
+working-tree Dockerfile, including when Podman uses `--network=host`. The
+standalone `build-sandbox-image` recovery command continues to use the operator
+checkout directly.
 
 For rootless Podman, `start-tenant` distributes the admin image into the
 tenant's own store only when its image ID differs; unchanged inputs therefore
@@ -1311,25 +1316,39 @@ Single-node hosts keep the in-code defaults (`auto` runtime preference,
 During `upgrade-tenant`, the candidate is built while the old daemon still
 runs. Only a successful candidate is promoted to `lunarwing-sandbox:latest`,
 after the daemon/bridge/WASM build and before `start-tenant` distributes it. A
-failed candidate or source-verification refusal leaves the previous tag and
-image ID in place, prints a recovery command, and does **not** abort the daemon
-or worker upgrade. Promotion records the previous admin image ID in the same
-rollback record as the worker candidates; a post-promotion upgrade failure
-re-tags that ID before the previous version restarts. The record is cleared
-only after the whole upgrade succeeds. Old images can be pruned after that
-rollback window with the operator's normal dangling-image maintenance.
+failed or missing candidate, a failed promotion, or a source-verification
+refusal leaves the previous tag and image ID in place and does **not** abort the
+daemon or worker upgrade. mt-admin prints a recovery command when the build
+fails and names the retained previous image again in the closing summary of
+both upgrade paths. Promotion records both the previous and promoted admin
+image IDs in the same rollback record as the worker candidates. A
+post-promotion upgrade failure re-tags the previous ID only while `latest`
+still has this run's promoted ID. If another tenant promoted in between, the
+rollback warns and leaves that newer tag unchanged; a legacy record without a
+promoted ID is not safe to restore. The record is cleared only after the whole
+upgrade succeeds. Old images can be pruned after that rollback window with the
+operator's normal dangling-image maintenance.
 
-**Shared-tag decision:** WI#596 retains `lunarwing-sandbox:latest` rather than
-introducing per-release tags. There is one such tag per runtime admin store,
-shared by every managed tenant using that runtime on the host. Upgrading one
-tenant can therefore update the image for all of them. Docker tenants use that
-shared store for subsequent sandbox commands immediately; rootless Podman
+**Shared-tag decision:** WI#596/WI#642 retain `lunarwing-sandbox:latest` rather
+than introducing per-release tags. There is one such tag per runtime admin
+store, shared by every managed tenant using that runtime on the host. Upgrading
+one tenant can therefore update the image for all of them. Docker tenants use
+that shared store for subsequent sandbox commands immediately; rootless Podman
 tenants receive the new ID at their next `start-tenant`, even if their daemon
-was not upgraded. Podman and Docker admin stores remain independent. Operators
-who need a fixed image must use a custom `SANDBOX_IMAGE`; custom-image tenants
-and legacy tenants without the managed key are never rebuilt or redistributed.
-To opt an older tenant into the managed image, set the three variables in its
-`lunarwing.env` and run `upgrade-tenant`, or build manually and restart.
+was not upgraded. Podman and Docker admin stores remain independent.
+
+The `auto` policy deliberately compares only the Dockerfile/snapshot digest; it
+does **not** order operator revisions or refuse an older build. Consequently,
+adding or upgrading a tenant at an older revision moves the shared tag
+**backwards** when that revision's inputs differ from the current image;
+`always` can do the same, while `never` suppresses the managed rebuild. This is
+the accepted last-builder policy, not a rollback guard bypass: the guard above
+only prevents one tenant's failed upgrade from undoing another tenant's later
+promotion. Operators who need a fixed image must use a custom `SANDBOX_IMAGE`;
+custom-image tenants and legacy tenants without the managed key are never
+rebuilt or redistributed. To opt an older tenant into the managed image, set
+the three variables in its `lunarwing.env` and run `upgrade-tenant`, or build
+manually and restart.
 
 Manual build/recovery:
 
@@ -1525,7 +1544,7 @@ The build produces a candidate image ID, exports and inspects that immutable ima
 
 The production closure is locked twice: the workspace install uses `pnpm install --frozen-lockfile`, and an exact-block transformation of the pinned build script replaces its legacy live-registry deploy with pnpm's shared-lockfile deploy (`--frozen-lockfile`, injected workspace packages, and `minimumReleaseAgeStrict=true`). `pnpm-workspace.yaml` and its `minimumReleaseAgeExclude` list must not change. After deployment, the lane rejects every installed external `name@version` absent from `pnpm-lock.yaml`, checks workspace versions against the lockfile's importer manifests, and records the sorted inventory hash as `LUNARDEPTH_DEPLOYED_PACKAGES_SHA256` in `worker-inputs.sha256`. Five-digit directory/file modes clear inherited set-ID bits, and the final build assertion rejects any residual set-ID or write bit under `/app`, `/opt/lunardepth`, or `/opt/lunardepth-templates`.
 
-`promote-worker-images <tenant>` records each prior image ID before promotion. `restore-worker-images <tenant>` re-tags those recorded IDs without rebuilding after a failed upgrade; retain the rollback record until the complete upgrade succeeds. Restart the pair after restoring and repeat listener/egress/smoke checks. Rollback requires matching lane scripts, mt-admin modules, units, configuration, and IPC contract. It must not rename or adopt an older writable IPC volume, erase the workspace, or print a rollback token or model key. A pruned old image cannot be restored from its record and is an explicit failure, not a claimed rollback.
+`promote-worker-images <tenant>` records each prior and promoted image ID before promotion. `restore-worker-images <tenant>` re-tags the prior ID without rebuilding after a failed upgrade only while `latest` still has that promoted ID; it warns and preserves a later promotion by another tenant. Retain the rollback record until the complete upgrade succeeds. Restart the pair after restoring and repeat listener/egress/smoke checks. Rollback requires matching lane scripts, mt-admin modules, units, configuration, and IPC contract. It must not rename or adopt an older writable IPC volume, erase the workspace, or print a rollback token or model key. A pruned old image cannot be restored from its record and is an explicit failure, not a claimed rollback.
 
 ### Publication and version-bump checklist
 
@@ -1625,12 +1644,14 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   the wrapper's missing-marker read as "none").
 - `promote-worker-images <tenant>` re-runs a promotion that failed after the
   daemon build: already-promoted lanes are skipped, the rollback file keeps the
-  **first** pre-promotion `:latest` ID per lane (so a re-run never records an
-  already-promoted candidate as the old image), and the lane list is updated
-  per lane, so a re-run only promotes what remains. `restore-worker-images
-  <tenant>` re-tags those recorded IDs; both upgrade paths call it on a failed
-  upgrade, and it is printed in the wrapper's rollback steps. A rollback is
-  only reported when the re-tag actually succeeded. The record is cleared by
+  **first** pre-promotion `:latest` ID and the promoted candidate ID per lane
+  (so a re-run never records an already-promoted candidate as the old image),
+  and the lane list is updated per lane, so a re-run only promotes what remains.
+  `restore-worker-images <tenant>` re-tags the old ID only while `latest` still
+  has the recorded promoted ID; if another tenant promoted in between, it warns
+  and leaves that tag unchanged. Both upgrade paths call it on a failed upgrade,
+  and it is printed in the wrapper's rollback steps. A rollback is only reported
+  when the re-tag actually succeeded. The record is cleared by
   `clear-promote-rollback` only when the **whole** upgrade has succeeded
   (both paths), and a new candidate run discards any record from an earlier
   run, so a later failure can never re-tag a lane to an image this run never
@@ -1640,6 +1661,11 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   upgrade wrapper's own locked boundary they reuse the inherited descriptor
   instead of re-flocking — a second open-file description would deadlock
   against that parent, which was the run-300 TO-1 blocker.
+- Worker `:latest` tags are also shared per runtime and are not revision
+  ordered. A candidate built for a tenant at an older target can therefore move
+  a lane's shared tag backwards to that older reviewed definition. The rollback
+  ID guard prevents accidental cross-tenant rollback overwrites; it does not
+  reject an intentionally selected older candidate.
 - A pebble candidate keeps the toolchain profile of the `:latest` image it will
   replace (the image's `org.opencontainers.image.toolchain-profile` label), so
   an upgrade no longer downgrades an operator's fat (`--with-toolchains`) image
