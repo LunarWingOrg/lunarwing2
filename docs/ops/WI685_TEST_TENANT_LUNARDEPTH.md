@@ -118,8 +118,17 @@ The fat candidate image was produced as
 Its real `RUN --network=none` split-role smoke regenerated the task
 configuration, started the non-root bridge, brought the task harness and
 runner to ready, and shut both roles down cleanly. This proves the image's
-fake-model composition/readiness path, not real TensorZero inference. Final
-out-of-band verification and tag promotion remain pending.
+fake-model composition/readiness path, not real TensorZero inference.
+
+The first full build then exited **1** during out-of-band verification:
+`17-lunardepth.sh:383: setpriv: command not found`. This is a host prerequisite
+failure, not a failed image policy assertion. The candidate was not promoted to
+`:latest`. Gentoo's installed `sys-apps/util-linux-2.42.3` has `caps` disabled,
+and the repository's `docs/guides/GENTOO_PACKAGE_LIST.md` §1b states that this
+USE flag builds `setpriv`. Following that guide, I added
+`sys-apps/util-linux caps` as `/etc/portage/package.use/lunarwing-setpriv` and
+started the one-package emerge. The cached build retry and out-of-band
+verification remain pending; no verifier privilege check was bypassed.
 
 ## Runtime audits
 
