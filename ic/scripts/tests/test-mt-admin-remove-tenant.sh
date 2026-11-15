@@ -598,12 +598,55 @@ run_standalone_missing_account_stop_refusal() {
   rc=0
   (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
     tenant_exists_in_registry() { return 0; }
+    stop_worker alpha opencode) >"$CASE_DIR/stop-worker.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && grep -q 'skipped opencode stop for alpha' "$CASE_DIR/stop-worker.out" \
+      && grep -q 'skipped opencode task container stop for alpha' "$CASE_DIR/stop-worker.out"; then
+    pass 'standalone stop-worker names the account-gone skip instead of exiting silently'
+  else
+    fail "standalone stop-worker exited without naming the skip (rc=$rc): $(command cat "$CASE_DIR/stop-worker.out")"
+  fi
+  rc=0
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
+    tenant_exists_in_registry() { return 0; }
     stop_tenant alpha) >"$CASE_DIR/stop-tenant-idle.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]] && grep -q 'nothing is left to stop' "$CASE_DIR/stop-tenant-idle.out"; then
     pass 'standalone stop-tenant reports an already idle former identity explicitly'
   else
     fail "standalone stop-tenant failed after the former identity became idle (rc=$rc): $(command cat "$CASE_DIR/stop-tenant-idle.out")"
   fi
+}
+
+# ACV-7: the stop roster covers every installed unit type, not only the
+# sidecar lane whose stop() needs the account. Cutting the roster down to
+# `vision` must fail, so every unit gets a case.
+run_openrc_stop_roster_case() {
+  local rc=0 unit
+  local -a units=(
+    lunarwing-alpha xmpp-bridge-alpha lunarwing-proxy-alpha
+    lunarwing-weechat-adapter-alpha lunarwing-weechat-alpha
+    lunarwing-opencode-alpha-sup lunarwing-opencode-task-alpha-sup
+    lunarwing-opencode2-alpha-sup lunarwing-kimi-alpha-sup
+    lunarwing-lunardepth-alpha-sup lunarwing-pebble-alpha-sup
+    lunarwing-vision-alpha lunarwing-voice-alpha
+    lunarwing-pg-alpha-sup lunarwing-pg-alpha
+  )
+  setup_case openrc openrc-stop-roster
+  for unit in "${units[@]}"; do
+    printf '#!/bin/sh\n' >"$OPENRC_INITD_DIR/$unit"
+    chmod 0755 "$OPENRC_INITD_DIR/$unit"
+  done
+  stop_tenant_openrc alpha >"$CASE_DIR/stop.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "OpenRC stop roster failed (rc=$rc): $(command cat "$CASE_DIR/stop.out")"
+    return
+  fi
+  for unit in "${units[@]}"; do
+    if grep -Fq -- "rc-service:$unit stop" "$CALL_LOG"; then
+      pass "OpenRC stop roster stops $unit"
+    else
+      fail "OpenRC stop roster skipped $unit"
+    fi
+  done
 }
 
 # ACA-2: a rootful runtime needs no tenant account, so every lane still stops
@@ -1235,6 +1278,7 @@ run_volume_failure_case
 run_identity_record_case
 run_lifecycle_identity_record_case
 run_standalone_missing_account_stop_refusal
+run_openrc_stop_roster_case
 run_rootful_missing_account_stop_case
 run_rootful_missing_account_case
 run_missing_account_refusal_case openrc live-effective-uid 'still run (4243)'
