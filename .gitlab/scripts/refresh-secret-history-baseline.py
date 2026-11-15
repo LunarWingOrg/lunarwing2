@@ -110,6 +110,7 @@ def read_dispositions(path: pathlib.Path) -> set[str]:
     if not path.is_file():
         raise ValueError(f"dispositions file is missing: {path}")
     dispositions = set()
+    incomplete = set()
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         if not raw_line.lstrip().startswith("|"):
             continue
@@ -117,8 +118,18 @@ def read_dispositions(path: pathlib.Path) -> set[str]:
         if len(columns) < 2:
             continue
         match = re.fullmatch(r"`([^`]+)`", columns[1])
-        if match is not None:
-            dispositions.add(validate_fingerprint(match.group(1)))
+        if match is None:
+            continue
+        fingerprint = validate_fingerprint(match.group(1))
+        if len(columns) < 4 or not columns[2] or not columns[3]:
+            incomplete.add(fingerprint)
+        else:
+            dispositions.add(fingerprint)
+    if incomplete:
+        rows = "\n".join(sorted(incomplete))
+        raise ValueError(
+            f"disposition rows require a non-empty disposition and reason in {path}:\n{rows}"
+        )
     return dispositions
 
 
