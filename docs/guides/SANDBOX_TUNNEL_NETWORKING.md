@@ -148,7 +148,10 @@ the remaining last polling interval instead of duplicating the previous probe
 immediately; provider and firewall checks still share the original deadline.
 An unsuccessful final retry returns without sleeping away the unused time.
 If no provider probe completed with an error, the timeout stays generic rather
-than inventing a failure reason. The unverified sidecar is still removed.
+than inventing a failure reason. When the provider answers healthy but the
+firewall check is cut by that deadline, the error names the egress firewall
+check instead of claiming that the sidecar remained unhealthy. The unverified
+sidecar is still removed.
 
 Within one daemon, manager initialization is single-flight. Sidecar starts,
 recoveries, stops, and cancelled-start cleanup also share a fair lifecycle lock
