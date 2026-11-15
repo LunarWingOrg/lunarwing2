@@ -53,7 +53,57 @@ Any failure attributable to the old pin will be reported as such.
 
 ## Provisioning and build
 
-Pending.
+Provisioned with:
+
+```bash
+sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
+  bash ic/scripts/lunarwing-mt-admin.sh add-tenant lunardepthtester \
+  --no-ssh --no-weechat-bootstrap \
+  --llm-base-url http://100.88.232.146:3000/openai/v1 \
+  --with-lunardepth \
+  --lunardepth-base-url http://100.88.232.146:3000/openai/v1 \
+  --lunardepth-model tensorzero::function_name::lunarwing \
+  --lunardepth-allow-insecure-http \
+  --lunardepth-allow-unauthenticated-gateway
+```
+
+`ADD_EXIT=0` after about 220 seconds. The tenant clone is at commit
+`9afc94d78283fd3d85d865c0418b93846fa43c90`, so it includes this report's
+initial commit but no later test-only edits. Only `workers.lunardepth` is
+selected. The generic sandbox image was built and distributed successfully,
+and PostgreSQL is running. SSH provisioning and WeeChat relay bootstrap were
+intentionally skipped as unrelated to this lane test; WeeChat itself remains
+enabled by the normal tenant defaults.
+
+| Purpose | Port |
+| --- | ---: |
+| gateway / HTTP / bridge | 10010 / 10011 / 10012 |
+| PostgreSQL | 10013 |
+| LunarVision API / health | 20015 / 20016 |
+| LunarDepth WebSocket / health | 52010 / 52011 |
+
+Two pre-existing/host-side hiccups appeared during provisioning, neither of
+which blocked tenant creation:
+
+- rustup reported that Rust was already installed and continued; this is a
+  benign idempotence warning.
+- The host health-pipeline installer quarantined an older
+  `lunarwing-health-metrics` binary because its installed library path failed
+  the root-owned/non-writable check (WI#687). It requested a trusted
+  reinstallation before the optional metrics listener is restarted. This test
+  does not alter that listener or claim metrics endpoint health. The routine
+  `fcron has already been started` warning was also harmless.
+
+The fat build is running through mt-admin under tmux, constrained to CPUs
+0–17:
+
+```bash
+sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
+  taskset -c 0-17 bash ic/scripts/lunarwing-mt-admin.sh \
+  build-tenant lunardepthtester --with-lunardepth --with-toolchains
+```
+
+Build result pending.
 
 ## Runtime audits
 
