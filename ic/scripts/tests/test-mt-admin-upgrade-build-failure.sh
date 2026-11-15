@@ -70,6 +70,9 @@ git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@example.invali
 target="$(git -C "$fixture_repo" rev-parse HEAD)"
 git -C "$fixture_repo" push -q origin HEAD:refs/heads/moving
 git -C "$fixture_repo" reset -q --hard "$source_rev"
+operator_repo="$fixture/operator"
+git clone -q --branch moving "$fixture/origin.git" "$operator_repo"
+LUNARWING_ROOT="$operator_repo"
 
 export BUILD_LOCK="$fixture/build.lock"
 # TD-2: stage/candidate marker files live in the root-owned lifecycle lock
