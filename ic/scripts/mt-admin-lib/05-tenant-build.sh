@@ -780,6 +780,24 @@ tenant_candidate_sandbox_file() {
   printf '%s' "${LUNARWING_MT_CANDIDATE_SANDBOX_FILE:-$(_tenant_marker_dir)/$1-candidate-sandbox}"
 }
 
+tenant_sandbox_image_status_file() {
+  printf '%s' "${LUNARWING_MT_SANDBOX_IMAGE_STATUS_FILE:-$(_tenant_marker_dir)/$1-sandbox-image-status}"
+}
+
+_record_sandbox_image_status() {  # <tenant> <status>
+  _ensure_marker_dir
+  printf '%s\n' "$2" >"$(tenant_sandbox_image_status_file "$1")"
+}
+
+report_retained_sandbox_image() {  # <tenant>
+  local name="$1" file status
+  file="$(tenant_sandbox_image_status_file "$name")"
+  status="$(cat "$file" 2>/dev/null || true)"
+  [[ "$status" == previous ]] || return 0
+  say "WARNING: sandbox image: tenant '$name' remains on the previous $SANDBOX_IMAGE_TAG because no candidate was promoted. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
+  rm -f "$file"
+}
+
 # Ensure the root-owned marker directory exists and is safe (root:root 0700).
 # Callers must run as root; the dir is shared with the lifecycle lock path.
 # run-294 TJ-4: same hardened sequence as the lifecycle lock directory in
@@ -1137,6 +1155,7 @@ build_candidate_workers() {
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   : >"$(tenant_candidate_sandbox_file "$name")"
+  : >"$(tenant_sandbox_image_status_file "$name")"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
   # a later failed run could "restore" a lane to an image this run never had.
   clear_promote_rollback "$name"
@@ -1155,6 +1174,7 @@ build_candidate_workers() {
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
   done
   if ! ( build_candidate_sandbox_image "$name" "$sandbox_policy" "$release_ref" ); then
+    _record_sandbox_image_status "$name" previous
     say "WARNING: managed sandbox candidate failed; keeping the previous $SANDBOX_IMAGE_TAG and continuing the upgrade. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
   fi
   return 0
@@ -1206,14 +1226,22 @@ promote_candidate_sandbox_image() {  # <tenant>
     || die "candidate sandbox marker for '$name' names an invalid runtime"
   candidate_ref="$(upgrade_candidate_sandbox_image_ref "$name")"
   candidate_id="$("$runtime" image inspect --format '{{.Id}}' "$candidate_ref" 2>/dev/null || true)"
-  [[ -n "$candidate_id" ]] || die "candidate image $candidate_ref is missing; cannot promote the sandbox"
+  if [[ -z "$candidate_id" ]]; then
+    _record_sandbox_image_status "$name" previous
+    say "WARNING: candidate image $candidate_ref is missing; leaving $SANDBOX_IMAGE_TAG unchanged and continuing the upgrade" >&2
+    rm -f "$marker"
+    return 0
+  fi
   old_id="$("$runtime" image inspect --format '{{.Id}}' "$SANDBOX_IMAGE_TAG" 2>/dev/null || true)"
   if [[ "$old_id" == "$candidate_id" ]]; then
     say "$SANDBOX_IMAGE_TAG already at sandbox candidate, skipping"
   else
     [[ -z "$old_id" ]] || _promote_rollback_record "$name" sandbox "$old_id" "$candidate_id"
-    "$runtime" tag "$candidate_ref" "$SANDBOX_IMAGE_TAG" \
-      || die "cannot promote $candidate_ref to $SANDBOX_IMAGE_TAG"
+    if ! "$runtime" tag "$candidate_ref" "$SANDBOX_IMAGE_TAG"; then
+      _record_sandbox_image_status "$name" previous
+      say "WARNING: cannot promote $candidate_ref to $SANDBOX_IMAGE_TAG; leaving the previous image in place and continuing the upgrade" >&2
+      return 0
+    fi
     say "promoted $SANDBOX_IMAGE_TAG"
   fi
   rm -f "$marker"
