@@ -1239,11 +1239,13 @@ run_missing_account_refusal_case openrc no-subuid 'no subordinate uid range reco
 run_missing_account_refusal_case openrc bad-record 'unexpected line in'
 run_missing_account_refusal_case openrc system-uid 'no valid tenant uid recorded'
 run_missing_account_refusal_case openrc held-uid "now belongs to account 'bob'"
+run_missing_account_refusal_case openrc held-uid "remove-tenant bob --purge"
 run_missing_account_refusal_case openrc empty-proc 'cannot verify that'
 run_missing_account_refusal_case openrc hidden-init 'cannot verify that'
 run_missing_account_refusal_case openrc foreign-init 'is not a supported host init'
 run_missing_account_refusal_case openrc foreign-init-root 'has a different root directory'
 run_missing_account_refusal_case openrc reassigned-subuid 'overlaps recorded range'
+run_missing_account_refusal_case openrc reassigned-subuid 'remove-tenant bob --purge'
 run_missing_account_refusal_case openrc current-subuid-mismatch 'current-side range differs'
 run_missing_account_refusal_case openrc record-subuid-mismatch 'record-side range differs'
 run_missing_account_refusal_case openrc busy-openrc-cgroup 'stop OpenRC service lunarwing-vision-alpha before removal'
