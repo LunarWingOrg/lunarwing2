@@ -218,6 +218,7 @@ sandbox_image_build_required() { return 0; }
 sandbox_container_runtime() { printf 'podman'; }
 _prepare_sandbox_image_source() {
   printf '%s\n' "${2:-}" >"$fixture/sandbox-release-ref"
+  printf '%s\n' "${3:-}" >"$fixture/sandbox-selected-commit"
   # shellcheck disable=SC2034  # consumed by build_candidate_sandbox_image
   SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$fixture_repo/ic"
 }
