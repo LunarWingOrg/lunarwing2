@@ -346,6 +346,14 @@ sudo install -Dm0755 target/release/lunarwing-health-metrics \
 sudo ic/scripts/install-health-metrics-listener.sh   # auto-detects systemd/OpenRC/launchd
 ```
 
+On OpenRC, the installer creates the dedicated `lunarwing-metrics` system user
+and group (no home directory, `/sbin/nologin` shell). The service runs under
+`supervise-daemon` as that user with an empty capability set and
+`no_new_privs=yes`. Its `checkpath` setup gives the account ownership of
+`/run/lunarwing-health-metrics/` and the listener log file; the exported 0644
+`.prom` file remains readable without granting write access to the health
+library.
+
 Install it as root, as above. mt-admin's health pipeline install carries it
 into each refreshed library only when the library is root-owned through `/`
 and the binary is a root-owned regular file without group/other write or
