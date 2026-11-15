@@ -497,7 +497,9 @@ ENVEOF
   # block because a fresh install already wrote the values above.
   health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME "$egress_runtime"
   health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS "$egress_rootless"
-  health_metrics_confd_reconcile
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    health_metrics_confd_reconcile
+  fi
 
   # 4) Launcher: validate the installed tree before sourcing env or running it.
   {
