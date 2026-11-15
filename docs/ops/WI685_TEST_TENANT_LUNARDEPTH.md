@@ -111,8 +111,26 @@ Pending.
 
 ## Job exercise
 
-Pending; jobs will be listed here with their real IDs, outcomes, timings, and
-independent verification.
+Jobs will run sequentially through fresh gateway threads. Each prompt asks the
+tenant agent for exactly one `create_job(mode="lunardepth", wait=false)` call;
+the harness discovers that thread's Engine V2 pending gate, approves it with
+the owning `thread_id`, finds the job by a unique title prefix, and saves the
+job detail/events without printing the gateway credential.
+
+Planned focused tasks, chosen for the lane's Python/C++ toolchain rather than
+the Rust/Go sets used by other workers:
+
+1. **Medium — Python log pipeline:** deterministic 300-line fixture with two
+   malformed rows, parser plus text/JSON reports, nearest-rank percentiles, at
+   least ten unit tests, and byte-identical rerun diffs.
+2. **Medium/high — C++17 weighted interval scheduling:** DP plus reconstruction,
+   an independent exhaustive oracle over at least 240 seeded instances, edge
+   cases, and an N=2000 scaling case, compiled with warnings as errors.
+3. **High — parallel statistics with an independent oracle:** deterministic
+   20,000-row CSV, C++17 `std::async` aggregation and checksum, repeated 1/4/8
+   partition runs, and an independent Python recomputation of every aggregate.
+
+Real IDs, outcomes, timings, and independent verification: pending.
 
 ## Findings and hand-off
 
