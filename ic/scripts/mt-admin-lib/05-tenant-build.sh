@@ -2030,15 +2030,15 @@ _archive_worker_source() {  # <tenant source root> <lane> [Dockerfile name]
   WORKER_BUILD_ARCHIVE_ROOT="$tmp"
 }
 
-_prepare_worker_build_source() {  # <source root> <lane> [release ref] [Dockerfile name]
-  local source_root="$1" lane="$2" release_ref="${3:-}" dockerfile_name="${4:-Dockerfile}"
+_prepare_worker_build_source() {  # <source root> <lane> [release ref] [Dockerfile name] [selected commit]
+  local source_root="$1" lane="$2" release_ref="${3:-}" dockerfile_name="${4:-Dockerfile}" selected_commit="${5:-}"
   WORKER_BUILD_SOURCE_ROOT="$source_root"
   WORKER_BUILD_ARCHIVE_ROOT=""
   if [[ "$source_root" == "$LUNARWING_ROOT" ]]; then
     WORKER_BUILD_SOURCE_REVISION="$(_worker_source_revision "$source_root" "$lane")"
     return 0
   fi
-  _worker_source_provenance "$source_root" "$lane" "$release_ref"
+  _worker_source_provenance "$source_root" "$lane" "$release_ref" "$selected_commit"
   _archive_worker_source "$source_root" "$lane" "$dockerfile_name"
 }
 
