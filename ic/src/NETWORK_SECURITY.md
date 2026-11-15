@@ -549,7 +549,10 @@ remaining. The 6-second re-probe spaces its final retry halfway into the last
 remaining polling interval, leaving time for provider/firewall verification
 under the same deadline rather than probing twice at once. A failed final retry
 returns without spending the unused interval; if no provider error completed,
-the deadline error remains generic. Unverified sidecars are still removed.
+the deadline error remains generic. If the provider answers healthy but the
+firewall check is cut by that deadline, the error names the egress firewall
+check rather than claiming that the sidecar remained unhealthy. Unverified
+sidecars are still removed.
 
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`
