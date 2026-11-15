@@ -281,7 +281,11 @@ async fn init_toml(
         .save_toml(&path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    println!("Config file written to {}", path.display());
+    println!(
+        "Config file written to {} (settings scope: {})",
+        path.display(),
+        owner_id
+    );
     println!();
     println!("Edit the file to customize settings.");
     println!("Priority: env var > config.toml > database > defaults");
