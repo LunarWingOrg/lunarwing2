@@ -326,8 +326,10 @@ metadata_digest() {
 # 5984 lost the opencode, opencode2 and kimi candidates (and, by cascade, their
 # scans) to one such burst, and pipeline 6212 lost the kimi candidate to a
 # sustained 429 burst that outlasted the original 4-attempt/3-minute window.
-# Pipeline 7855 added registry PUT/PATCH 499 and 502/503/504 responses to the
-# same transient class; 401/403/404 refusals still fail immediately.
+# Registry PUT/PATCH 499 and 502/503/504 responses are in the same transient
+# class; 401/403/404 refusals still fail immediately. Pipeline 7855's
+# 60-second upload cut is the edge/runner incident tracked in WI#706; this
+# retry does not resolve that incident or the separate artifact upload cut.
 # Pipeline 7174 instead lost the opencode candidate after a stalled
 # snapshot.debian.org apt step was killed. The build is deterministic and the
 # retry reuses the layer cache, so only the narrow observed transient
