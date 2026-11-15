@@ -120,11 +120,14 @@ loopback, listeners, and port space. This is accepted because one daemon/tenant
 is one trust domain; separate daemons use separate sidecars. Per-run netns/veth
 pairs or per-run enrollment were rejected as routing/capability complexity and
 credential/peer churn that would not strengthen the cross-tenant boundary. Do
-not schedule mutually untrusted workloads in one tenant. NetBird ACLs and
-WireGuard peer policy still bound what a sandbox can reach, because the
-destination and routing peers enforce them; they do not filter inbound to the
-sidecar peer, whose only inbound filter is LunarWing's input chain. Overlay
-membership is not application auth.
+not schedule mutually untrusted workloads in one tenant. NetBird ACLs still
+bound what a sandbox can reach, because the destination and routing peers
+enforce them; they are not evaluated on the sidecar peer and do not filter
+inbound there. WireGuard `AllowedIPs` are enforced on the sidecar's receiving
+`wg0` interface: a packet whose source address is outside the sending peer's
+`AllowedIPs` is dropped by the sidecar itself. LunarWing's input chain then
+filters what remains in both cases; for NetBird, it is the sidecar's only
+inbound filter. Overlay membership is not application auth.
 
 ### Lifecycle and failure posture
 
