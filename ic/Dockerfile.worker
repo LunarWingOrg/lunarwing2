@@ -57,9 +57,7 @@ COPY --from=builder /build/target/release/lunarwing /usr/local/bin/lunarwing
 # Create non-root user (UID 1000 matches the orchestrator's container config)
 RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /workspace \
-    && chown sandbox:sandbox /workspace \
-    && mkdir -p /home/sandbox/.claude \
-    && chown sandbox:sandbox /home/sandbox/.claude
+    && chown sandbox:sandbox /workspace
 
 USER sandbox
 WORKDIR /workspace
