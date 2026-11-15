@@ -2736,6 +2736,7 @@ async fn run_external_task(
                                 "unknown",
                                 false,
                                 "tool_call frame rejected: too large",
+                                granted_redactor,
                             )
                             .await;
                         }
@@ -2917,6 +2918,7 @@ async fn run_external_task(
                                         "unknown",
                                         false,
                                         "tool_call frame rejected: too large",
+                                granted_redactor,
                                     )
                                     .await;
                                 }
@@ -2956,6 +2958,7 @@ async fn run_external_task(
                                             cap_name,
                                             false,
                                             "tool_call denied: per-job call cap reached",
+                                            granted_redactor,
                                         )
                                         .await;
                                     }
@@ -2977,6 +2980,7 @@ async fn run_external_task(
                                         job_id,
                                         worker_name,
                                         user_id: &event_user_id,
+                                        granted_redactor,
                                     };
                                     handle_tool_call(&call_ctx, call, &cancel_rx).await
                                 }
@@ -3002,6 +3006,7 @@ async fn run_external_task(
                                         "unknown",
                                         false,
                                         "malformed tool_call frame",
+                                        granted_redactor,
                                     )
                                     .await;
                                     tool_result_envelope(
@@ -3143,6 +3148,7 @@ async fn run_external_task(
                             worker_name,
                             ack_budget,
                             store,
+                            granted_redactor,
                         )
                         .await
                     {
@@ -3207,6 +3213,7 @@ async fn run_external_task(
                 worker_name,
                 CANCEL_ACK_TIMEOUT,
                 store,
+                granted_redactor,
             )
             .await;
             // WI#263: the streamed investigation is real work. Persist a
@@ -3559,6 +3566,7 @@ async fn wait_for_cancel_ack(
     worker_name: &str,
     budget: Duration,
     store: Option<&Arc<dyn Database>>,
+    granted_redactor: Option<&SecretValueRedactor>,
 ) -> Option<ExternalTaskResult> {
     let mut handoff_tool_calls: u32 = 0;
     let deadline = tokio::time::timeout(budget, async {
@@ -3592,6 +3600,7 @@ async fn wait_for_cancel_ack(
                         "unknown",
                         false,
                         "tool_call rejected during cancel handoff",
+                        granted_redactor,
                     )
                     .await;
                 }
@@ -3945,11 +3954,10 @@ async fn persist_event_value(
 }
 
 /// Record a proxied call in the canonical `tool_use {tool_name,input}` shape
-/// (same schema as `worker/job.rs`). The input preview is scrubbed first
-/// (MR !1521 DD-7): redacted with the resolved tool's sensitive params and
-/// passed through the sanitizer's leak scan, so worker-supplied arguments
-/// can never land a secret in job_events. (The tool is resolved here only
-/// for its `sensitive_params`; the gates re-resolve authoritatively.)
+/// (same schema as `worker/job.rs`). The input preview is redacted with the
+/// resolved tool's sensitive params, passed through the sanitizer's leak scan,
+/// and scrubbed for this task's granted values (WI#711). The tool is resolved
+/// here only for its `sensitive_params`; the gates re-resolve authoritatively.
 async fn record_tool_use(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload) {
     let input = match ctx.proxy {
         Some(proxy) => {
@@ -3964,23 +3972,22 @@ async fn record_tool_use(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload) {
             };
             let redacted = redact_params(&call.arguments, sensitive);
             drop(resolved);
-            preview(
-                &proxy
-                    .safety
-                    .sanitize_tool_output(&call.name, &redacted.to_string())
-                    .content,
-                500,
-            )
+            proxy
+                .safety
+                .sanitize_tool_output(&call.name, &redacted.to_string())
+                .content
         }
-        None => preview(&call.arguments.to_string(), 500),
+        None => call.arguments.to_string(),
     };
+    let input = scrub_granted(ctx.granted_redactor, &input);
+    let tool_name = scrub_granted(ctx.granted_redactor, &call.name);
     persist_event_value(
         ctx.store,
         ctx.job_id,
         "tool_use",
         serde_json::json!({
-            "tool_name": call.name,
-            "input": input,
+            "tool_name": tool_name.as_ref(),
+            "input": preview(input.as_ref(), 500),
         }),
     )
     .await;
@@ -3996,15 +4003,18 @@ async fn record_tool_result(
     tool_name: &str,
     success: bool,
     output: &str,
+    granted_redactor: Option<&SecretValueRedactor>,
 ) {
+    let tool_name = scrub_granted(granted_redactor, tool_name);
+    let output = scrub_granted(granted_redactor, output);
     persist_event_value(
         store,
         job_id,
         "tool_result",
         serde_json::json!({
-            "tool_name": tool_name,
+            "tool_name": tool_name.as_ref(),
             "success": success,
-            "output": preview(output, 500),
+            "output": preview(output.as_ref(), 500),
         }),
     )
     .await;
@@ -4021,6 +4031,7 @@ struct ToolCallCtx<'a> {
     job_id: Uuid,
     worker_name: &'a str,
     user_id: &'a str,
+    granted_redactor: Option<&'a SecretValueRedactor>,
 }
 
 /// Handle one worker `tool_call` frame: job binding → identifier checks →
@@ -4097,6 +4108,7 @@ async fn frame_binding_rejection(
             "unknown",
             false,
             "tool_call rejected: task_id missing or mismatched",
+            ctx.granted_redactor,
         )
         .await;
         return Some(tool_result_envelope(
@@ -4118,6 +4130,7 @@ async fn frame_binding_rejection(
             "unknown",
             false,
             "tool_call rejected: invalid call_id",
+            ctx.granted_redactor,
         )
         .await;
         return Some(tool_result_envelope(
@@ -4134,6 +4147,7 @@ async fn frame_binding_rejection(
             "unknown",
             false,
             "tool_call rejected: invalid tool name",
+            ctx.granted_redactor,
         )
         .await;
         return Some(tool_result_envelope(
@@ -4170,7 +4184,15 @@ async fn deny_tool_call(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload, reason: S
         %reason,
         "Denied proxied tool call"
     );
-    record_tool_result(ctx.store, ctx.job_id, &call.name, false, &reason).await;
+    record_tool_result(
+        ctx.store,
+        ctx.job_id,
+        &call.name,
+        false,
+        &reason,
+        ctx.granted_redactor,
+    )
+    .await;
     tool_result_envelope(&call.call_id, "denied", String::new(), Some(reason))
 }
 
@@ -4178,7 +4200,15 @@ async fn deny_tool_call(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload, reason: S
 /// itself could not be carried out).
 async fn fail_tool_call(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload, reason: String) -> Envelope {
     let reason = sanitize_proxy_text(ctx, &call.name, reason);
-    record_tool_result(ctx.store, ctx.job_id, &call.name, false, &reason).await;
+    record_tool_result(
+        ctx.store,
+        ctx.job_id,
+        &call.name,
+        false,
+        &reason,
+        ctx.granted_redactor,
+    )
+    .await;
     tool_result_envelope(&call.call_id, "error", String::new(), Some(reason))
 }
 
@@ -4568,6 +4598,7 @@ async fn execute_proxied_call(
         &prepared.resolved_name,
         status == "success",
         error.as_deref().unwrap_or(&output),
+        ctx.granted_redactor,
     )
     .await;
 
