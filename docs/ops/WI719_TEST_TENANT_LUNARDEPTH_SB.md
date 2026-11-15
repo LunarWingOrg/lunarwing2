@@ -262,3 +262,96 @@ Rust/Go sets used by other workers:
 
 Final `GET /api/jobs?mode=external:lunardepth` contains exactly these three
 jobs, all `completed` and all attributed to `external:lunardepth`.
+
+## Findings and hand-off
+
+### Findings
+
+1. **F1 (provisioning: no WASM channels).** I provisioned and built with only
+   `--with-lunardepth --with-toolchains`, omitting `--with-wasm`. The daemon
+   therefore logged `Native XMPP config detected, but the installable xmpp
+   channel could not be installed … Channel 'xmpp' WASM not found` at boot, and
+   WeeChat cannot work either because it is also a WASM channel. Gateway job
+   dispatch is unaffected, so the lane test is valid, but a normal tenant needs
+   `--with-wasm` (the `add-tenant` "next steps" line says so). This is my
+   omission, not a lane defect.
+2. **F2 (orchestrator warns about Docker on a podman-only host).** At boot the
+   daemon logged `Docker is not installed -- sandbox disabled for this session`
+   even though the tenant runs rootless Podman and `SANDBOX_RUNTIME=podman` is
+   set. `setup_orchestrator` only probes Docker
+   (`ic/src/orchestrator/mod.rs:121-135`); that status gates only the container
+   job backend, and the external-worker manager starts independently
+   (`needs_event_tx` includes `has_external_workers`). The tool-level sandbox
+   still used Podman — a sandbox proxy started and the tenant's own `shell` tool
+   worked. The message is therefore misleading on every podman-only MT host,
+   but it did not block this lane.
+3. **F3 (approval semantics for the harness).** The first `create_job` gate was
+   answered with action `always`. Job 2 then ran with **no** gate at all, so a
+   client that waits for one blocks forever; my first dispatch loop did exactly
+   that and had to be stopped (the worker job kept running and finished
+   normally). Job 3 produced a `shell` gate first, because the tenant agent ran a
+   preparatory shell command before calling `create_job`. A robust external
+   client must poll `/api/chat/pending-gates` repeatedly, answer whichever tool
+   is gated, and never assume the next gate is `create_job`.
+4. **F4 (API ergonomics for external jobs, reproduces WI#685 F4 and adds one).**
+   Each job detail has an empty `description` and puts the full task text after
+   a newline in `title`; unique title-prefix matching is the practical
+   correlation key. New in this run: `browse_url` is
+   `/projects/<job-id>/` while `project_dir` is empty for external jobs, so the
+   `/api/jobs/{id}/files/*` endpoints (which join on `project_dir`) cannot list
+   an external job's artifacts. The worker's `/workspace` on the tenant host is
+   the only way to inspect them. `job_kind` is also reported as `sandbox`,
+   which mislabels an external-worker job.
+5. **F5 (`mt-admin status` omits the LunarDepth units).** `status` reports
+   `LunarDepth worker: running (…, WSS port 52000)` but its OpenRC unit listing
+   never includes `lunarwing-lunardepth-lunardepthtester` or
+   `lunarwing-lunardepth-task-lunardepthtester`; it lists only the other lanes,
+   as `unknown`. Worker health, `/ready`, `worker-listeners` and `worker-smoke`
+   all confirm the pair, so this is a display gap in the status summary.
+6. **F6 (liveness probe counts unselected lanes).** Before the lane came up the
+   daemon logged `External worker liveness probe: 0 reachable, 3 unreachable`
+   for `lunardepth`, `opencode` and `pebble`, and later `1 reachable, 2
+   unreachable`, even though only `lunardepth` is configured for this tenant.
+   Informational only, but it looks alarming in a fresh podman tenant's log.
+7. **F7 (environment, not a product bug).** `/tmp` on this host is mounted
+   `noexec`, so a copied worker binary cannot be run from there; independent
+   C++ rebuilds were executed from `/var/tmp`.
+8. **F8 (latency pattern, not a hang).** Job 1 had a quiet interval between the
+   initial `todo_write`/`bash` events and the first artifacts, and job 3 spent
+   its first several minutes on toolchain checks and data generation. Every job
+   progressed with `stuck=false` and zero repair attempts, so operators should
+   inspect job events rather than cancelling during a silent stretch.
+
+### Final state and evidence
+
+- **`lunardepthtester` is deliberately left running** for operator inspection;
+  no remove/purge was run. Final `status` shows the daemon, PostgreSQL and its
+  supervisor, XMPP bridge, WeeChat/adapter, LunarVision, and the LunarDepth
+  bridge/task pair running under OpenRC.
+- Final `/ready` is green (`websocket`, `task_runner`, `task_gate` all true,
+  uptime ~66 min). `worker-listeners` is still clean, `worker-egress` still
+  verifies both roles and the live allowlist, and a second `worker-smoke`
+  returns 0 after all jobs.
+- Ports remain allocated: gateway 10000, LunarVision 20005/20006, LunarDepth
+  52000/52001. Both image stores hold
+  `1c16fb498d30d712e8504424fb779628d03e4374ee47f39fdcf46ae2159758bd`.
+- Worker artifacts live in
+  `/home/lunardepthtester/lunarwing/lunardepth-workspace/` (`wi719_python_log`,
+  `wi719_cpp_wis`, `wi719_parallel_stats`). Raw job details/events and copied
+  artifacts are under `/tmp/wi719-results/`; logs are `/tmp/wi719-add.log`,
+  `/tmp/wi719-build.log` and `/tmp/wi719-dispatch.log`. No credential appears in
+  the report or the evidence.
+- Root filesystem usage went from 297 GiB free to 288 GiB free after the daemon
+  and worker image builds.
+- No daemon, lane, mt-admin, CI, or goals-file source was changed. The only
+  repository deliverable is this report.
+
+### Verification limits
+
+This is live OpenRC/rootless-Podman/TensorZero evidence on a dev host. It is not
+a protected CI candidate, clean-rebuild digest comparison, CRITICAL scan,
+manual image promotion, or a systemd run. The lane used the explicit
+unauthenticated-gateway and private-network cleartext exceptions for this herd
+endpoint. Cron, steering, tool proxy, resume, and credential injection remain
+unsupported by this lane and were not exercised. No WASM channels were
+installed (F1), so XMPP and WeeChat behaviour was not validated.
