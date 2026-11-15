@@ -502,6 +502,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audited_overlay_keys_avoid_process_only_readers() {
+        let sources = [
+            (
+                "llm/lunarwing_cloud_chat.rs",
+                include_str!("../llm/lunarwing_cloud_chat.rs"),
+            ),
+            ("setup/wizard.rs", include_str!("../setup/wizard.rs")),
+            ("cli/status.rs", include_str!("../cli/status.rs")),
+            ("cli/models.rs", include_str!("../cli/models.rs")),
+            (
+                "sandbox/proxy/http.rs",
+                include_str!("../sandbox/proxy/http.rs"),
+            ),
+        ];
+        let keys = [
+            "LUNARWING_CLOUD_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "LLM_BACKEND",
+            "LLM_API_KEY",
+            "LLM_BASE_URL",
+            "LUNARWING_CLOUD_MODEL",
+            "LUNARWING_CLOUD_FALLBACK_MODEL",
+            "LUNARWING_CLOUD_CHEAP_MODEL",
+            "EMBEDDING_ENABLED",
+            "HEARTBEAT_ENABLED",
+        ];
+        let dynamic_reads = [
+            "std::env::var(name)",
+            "std::env::var(env_var)",
+            "std::env::var(env)",
+            "std::env::var(&def.model_env)",
+        ];
+
+        for (path, source) in sources {
+            for key in keys {
+                let raw_read = format!("std::env::var(\"{key}\")");
+                assert!(
+                    !source.contains(&raw_read),
+                    "{path} reads overlay-backed {key} through the process environment only"
+                );
+            }
+            for raw_read in dynamic_reads {
+                assert!(
+                    !source.contains(raw_read),
+                    "{path} contains a process-only dynamic environment read: {raw_read}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn runtime_env_override_is_visible_to_env_or_override() {
         // Use a unique key that won't collide with real env vars.
         let key = "LUNARWING_TEST_RUNTIME_OVERRIDE_42";
