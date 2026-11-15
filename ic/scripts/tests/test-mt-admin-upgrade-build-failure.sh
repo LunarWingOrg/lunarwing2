@@ -35,7 +35,13 @@ REAL_CLEANUP_CANDIDATE_WORKERS="$(declare -f cleanup_candidate_workers)"
 
 # The marker dir is root-owned in production; a non-root harness cannot chown it.
 install() { command mkdir -p "${!#}"; }
-stat() { printf '0:700\n'; }
+stat() {
+  if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then
+    command stat "$@"
+  else
+    printf '0:700\n'
+  fi
+}
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
