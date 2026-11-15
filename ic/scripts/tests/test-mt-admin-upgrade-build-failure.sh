@@ -44,6 +44,7 @@ trap 'rm -rf "$fixture"' EXIT
 export TMPDIR="$fixture"
 fixture_repo="$fixture/repo"
 events="$fixture/events"
+say_log="$fixture/say.log"
 failures=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
@@ -69,6 +70,9 @@ git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@example.invali
 target="$(git -C "$fixture_repo" rev-parse HEAD)"
 git -C "$fixture_repo" push -q origin HEAD:refs/heads/moving
 git -C "$fixture_repo" reset -q --hard "$source_rev"
+operator_repo="$fixture/operator"
+git clone -q --branch moving "$fixture/origin.git" "$operator_repo"
+LUNARWING_ROOT="$operator_repo"
 
 export BUILD_LOCK="$fixture/build.lock"
 # TD-2: stage/candidate marker files live in the root-owned lifecycle lock
@@ -83,7 +87,7 @@ tenant_state_dir() { printf '%s/state' "$fixture"; }
 mkdir -p "$fixture/state"
 
 # ── stubs (mirror test-mt-admin-upgrade-opencode2-preflight.sh) ───────────────
-say() { :; }
+say() { printf '%s\n' "$*" >>"$say_log"; }
 sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
@@ -114,6 +118,9 @@ build_candidate_worker() {
 build_candidate_workers() {
   local name="$1" oc="$2" kimi="$3" oc2="$4" pebble="${5:-false}"
   : >"$(tenant_candidate_lanes_file "$name")"
+  : >"$(tenant_sandbox_image_status_file "$name")"
+  printf '%s\n' "${7:-}" >"$fixture/candidate-release-ref"
+  printf '%s\n' "${10:-}" >"$fixture/candidate-selected-commit"
   local lane
   for lane in pebble opencode kimi opencode2; do
     case "$lane" in
@@ -126,7 +133,8 @@ build_candidate_workers() {
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
     printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
   done
-  if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}"; then
+  if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}" "${10:-}"; then
+    _record_sandbox_image_status "$name" previous
     printf 'sandbox-failed\n' >>"$cand_events"
   fi
 }
@@ -213,6 +221,7 @@ sandbox_image_build_required() { return 0; }
 sandbox_container_runtime() { printf 'podman'; }
 _prepare_sandbox_image_source() {
   printf '%s\n' "${2:-}" >"$fixture/sandbox-release-ref"
+  printf '%s\n' "${3:-}" >"$fixture/sandbox-selected-commit"
   # shellcheck disable=SC2034  # consumed by build_candidate_sandbox_image
   SANDBOX_IMAGE_BUILD_SOURCE_ROOT="$fixture_repo/ic"
 }
@@ -236,16 +245,55 @@ for init in openrc systemd; do
 done
 INIT_SYSTEM=systemd
 SANDBOX_CANDIDATE_FAIL=true
-: >"$events"; : >"$cand_events"; : >"$promote_events"
+: >"$events"; : >"$cand_events"; : >"$promote_events"; : >"$say_log"
 capture run_upgrade
 if [[ "$rc" -eq 0 && "$(cat "$events")" == $'sandbox-build\nstop\nbuild\nstart' ]] \
     && grep -qx 'sandbox-failed' "$cand_events" \
-    && ! grep -qx 'sandbox-promote' "$events"; then
-  pass 'failed sandbox candidate is non-fatal and is never promoted'
+    && ! grep -qx 'sandbox-promote' "$events" \
+    && grep -Fq "sandbox image: tenant 'fixture' remains on the previous lunarwing-sandbox:latest" "$say_log"; then
+  pass 'failed sandbox candidate is non-fatal, unpromoted, and named in the closing summary'
 else
-  fail "failed sandbox candidate stranded or promoted the tenant (rc=$rc): $output"
+  fail "failed sandbox candidate stranded, promoted, or hid the retained image (rc=$rc): $output"
 fi
 SANDBOX_CANDIDATE_FAIL=false
+
+# WI#708: a named target is resolved in the operator checkout, not the tenant's.
+# An older release ancestor must not become the candidate revision.
+run_upgrade_named() { upgrade_tenant_locked fixture moving '' false false; }
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade_named
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-release-ref")" == refs/heads/moving \
+    && "$(cat "$fixture/candidate-selected-commit")" == "$target" \
+    && "$(cat "$fixture/sandbox-selected-commit")" == "$target" \
+    && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'an older tenant cannot move candidates behind the operator release commit'
+else
+  fail "older tenant selected a non-operator candidate (rc=$rc): $output"
+fi
+
+# Put an off-release object in both clones and make only the tenant's moving ref
+# select it. The operator's moving ref still selects the reviewed release commit.
+git -C "$operator_repo" checkout -q -b off-release "$source_rev"
+printf 'off-release tenant choice\n' >"$operator_repo/off-release.txt"
+git -C "$operator_repo" add off-release.txt
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Off-release tenant choice'
+off_release_target="$(git -C "$operator_repo" rev-parse HEAD)"
+git -C "$operator_repo" push -qf origin HEAD:refs/heads/moving
+git -C "$operator_repo" checkout -q moving
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade_named
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-selected-commit")" == "$target" \
+    && "$(cat "$fixture/sandbox-selected-commit")" == "$target" \
+    && "$(cat "$fixture/candidate-selected-commit")" != "$off_release_target" \
+    && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'tenant off-release target resolution cannot select the image build commit'
+else
+  fail "tenant off-release target selected a candidate (rc=$rc): $output"
+fi
+
 eval "$REAL_TENANT_USES_SANDBOX"
 eval "$REAL_SANDBOX_BUILD_REQUIRED"
 eval "$REAL_SANDBOX_RUNTIME"
@@ -444,6 +492,58 @@ else
   pass 'wrapper reports a failed restart as the tenant remaining stopped'
 fi
 
+# 5d. WI#708: a mark left by an aborted run must not leak into a later
+# --skip-build summary. Run an unmodified wrapper copy with no-op mt-admin verbs;
+# its boundary switches the dry-run admission into execution against fixtures.
+wrapper_status_dir="$fixture/wrapper-status"
+wrapper_status_home="$wrapper_status_dir/home"
+mkdir -p "$wrapper_status_home/lunarwing/env" "$wrapper_status_dir/backups"
+cp "$wrapper" "$wrapper_status_dir/upgrade-tenant.sh"
+: >"$wrapper_status_dir/mock"
+chmod +x "$wrapper_status_dir/mock"
+printf '{"tenants":{"fixture":{}}}\n' >"$wrapper_status_dir/ports.json"
+: >"$wrapper_status_home/lunarwing/env/lunarwing.env"
+: >"$wrapper_status_home/lunarwing/env/xmpp-bridge.env"
+git -C "$wrapper_status_home" init -q lunarwing
+git -C "$wrapper_status_home/lunarwing" add .
+git -C "$wrapper_status_home/lunarwing" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Wrapper status fixture'
+_record_sandbox_image_status fixture previous
+(
+  id() {
+    if [[ "${1:-}" == -u && $# -eq 1 ]]; then printf '0\n'; else printf '1000\n'; fi
+  }
+  getent() { printf 'fixture:x:1000:1000::%s:/bin/bash\n' "$wrapper_status_home"; }
+  jq() { return 0; }
+  stat() { command stat "$@"; }
+  sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
+  mock() {
+    case "${1:-}" in
+      validate-upgrade-wrapper-boundary) DRY_RUN=false ;;
+      backup-tenant)
+        mkdir -p "$BACKUP_DIR/$TENANT"
+        printf 'PGDMP-fixture-data\n' >"$BACKUP_DIR/$TENANT/fixture.dump"
+        ;;
+      last-build-stage) printf 'none\n' ;;
+      clear-sandbox-image-status) clear_sandbox_image_status "$2" ;;
+      report-sandbox-image) report_retained_sandbox_image "$2" ;;
+    esac
+  }
+  LUNARWING_MT_ADMIN=mock
+  LUNARWING_MT_UPGRADE_BOUNDARY_TENANT=fixture
+  LUNARWING_PORTS_REGISTRY="$wrapper_status_dir/ports.json"
+  LUNARWING_MT_BACKUP_DIR="$wrapper_status_dir/backups"
+  cd "$wrapper_status_dir"
+  source ./upgrade-tenant.sh fixture --skip-build --dry-run --yes --keep-rootful
+) >"$fixture/wrapper-status.out" 2>&1 && wrapper_status_rc=0 || wrapper_status_rc=$?
+if [[ "$wrapper_status_rc" -eq 0 \
+    && ! -e "$(tenant_sandbox_image_status_file fixture)" ]] \
+    && ! grep -Fq 'remains on the previous lunarwing-sandbox:latest' "$fixture/wrapper-status.out"; then
+  pass 'wrapper skip-build discards an aborted run retained-image mark'
+else
+  fail "wrapper skip-build leaked a stale retained-image mark (rc=$wrapper_status_rc): $(cat "$fixture/wrapper-status.out")"
+fi
+
 # ── 6. the REAL promote path (run-294 TJ-7) ──────────────────────────────────
 # Run-291 shipped a promote that aborted on an unset
 # ${LUNARWING_MT_CANDIDATE_LANES_FILE} because every harness stubbed it. Here the
@@ -614,6 +714,30 @@ elif grep -q '^tag ' "$runtime_log"; then
   fail "an already-promoted lane was re-tagged: $(cat "$runtime_log")"
 else
   pass 'real promote is re-runnable (an already-promoted lane is skipped)'
+fi
+
+# 6e. WI#642: a worker rollback must not undo another tenant's later promotion.
+printf 'kimi\n' >"$lane_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+capture promote_candidate_workers fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "worker interleaved-rollback setup promotion failed: $output"
+else
+  register_image "lunarwing-worker-kimi:latest" sha256:kimi-other-tenant
+  : >"$runtime_log"; : >"$say_log"
+  capture restore_promoted_workers fixture
+  if [[ "$rc" -eq 0 ]]; then
+    fail 'worker rollback claimed success despite an interleaved promotion'
+  elif [[ "$(cat "$ids_dir/lunarwing-worker-kimi:latest")" != sha256:kimi-other-tenant ]]; then
+    fail 'worker rollback replaced the image promoted by another tenant'
+  elif grep -q '^tag sha256:kimi-old lunarwing-worker-kimi:latest' "$runtime_log"; then
+    fail 'worker rollback re-tagged the old ID over an interleaved promotion'
+  elif [[ "$output" != *'another promotion replaced'* ]]; then
+    fail 'worker rollback skipped an interleaved promotion without a warning'
+  else
+    pass 'worker rollback preserves a later promotion by another tenant'
+  fi
 fi
 
 # ── 7. the upgrade wrapper's own verbs must not deadlock (run-300 TO-1) ──────
