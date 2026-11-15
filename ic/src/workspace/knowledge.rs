@@ -270,6 +270,8 @@ impl KnowledgeNoteMeta {
     /// retired and return no reasons. Age falls back to `updated_at` when no
     /// studied timestamp is recorded. The effective age limit is the caller's
     /// `max_age_days` when given, otherwise the note's own `stale_after_days`.
+    /// Commit mismatches require a recorded source commit; notes without one
+    /// do not mismatch, matching the canonical store.
     pub fn stale_reasons(
         &self,
         updated_at: DateTime<Utc>,
@@ -284,7 +286,8 @@ impl KnowledgeNoteMeta {
             reasons.push(KnowledgeStaleReason::Status(self.status));
         }
         if let Some(commit) = repository_commit
-            && self.source_commit.as_deref() != Some(commit)
+            && let Some(source_commit) = self.source_commit.as_deref()
+            && source_commit != commit
         {
             reasons.push(KnowledgeStaleReason::SourceCommitMismatch);
         }
@@ -776,9 +779,12 @@ mod tests {
         meta.status = KnowledgeStatus::Active;
         // Commit mismatch triggers.
         assert!(meta.needs_verification(now, None, Some("other")));
-        // Missing commit triggers when a commit is provided.
+        // A missing note commit does not mismatch the caller's commit.
         meta.source_commit = None;
-        assert!(meta.needs_verification(now, None, Some("abc123")));
+        assert!(
+            meta.stale_reasons(now, None, Some("abc123"))
+                .is_empty()
+        );
         // Age triggers (studied_at far in the past).
         meta.studied_at = Some(now - chrono::Duration::days(90));
         assert!(meta.needs_verification(now, Some(30), None));
