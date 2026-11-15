@@ -683,8 +683,8 @@ LunarWing Cloud keys. Only the explicitly selected legacy `proxy` mode installs
 those default mappings. Its resolver reads the daemon's layered environment at
 request time: process environment first, then runtime overrides, then secrets
 injected from the encrypted store. It supports bearer tokens, custom headers
-such as `X-API-Key`, and query parameters. Injection works only on plain-HTTP forward requests; CONNECT is
-opaque. Consequently a legacy-mode injected secret is sent on the cleartext
+such as `X-API-Key`, and query parameters. Injection works only on plain-HTTP
+forward requests; CONNECT is opaque. Consequently a legacy-mode injected secret is sent on the cleartext
 network path, even though it never enters the container environment or
 filesystem. Operators who do not explicitly accept that risk must use
 `proxy-enforced` or `none`.
