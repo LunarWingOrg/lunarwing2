@@ -1304,20 +1304,23 @@ build and `never` suppresses it. Set the policy on an upgrade with
 `--sandbox-image`, or on either command through
 `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
 
-For both tenant-driven paths, mt-admin verifies the tenant HEAD as the tenant
-user and pins the build to one exact commit. `add-tenant` selects the operator
-checkout's HEAD. Both upgrade paths resolve the target immediately after their
-checkout and pass that full commit to every sandbox and worker candidate; a
-tenant HEAD that has moved to any other commit, even an older commit on the
-same release ref, is refused before a runtime build. The selected commit must
-be present in the operator checkout. mt-admin then uses `git archive` on the
-**operator checkout** to extract `ic/docker/` at that revision into a private
-root-owned mode-0700 directory. The digest and build read only that archive. A
-dirty, unknown, mismatched, or off-release tenant source is refused without
-replacing the current image. Root never reads or builds the tenant-writable
-working-tree Dockerfile, including when Podman uses `--network=host`. The
-standalone `build-sandbox-image` recovery command continues to use the operator
-checkout directly.
+For `add-tenant` and both upgrade paths, mt-admin verifies the tenant HEAD as
+the tenant user and pins the build to one exact commit. `add-tenant` selects the
+operator checkout's HEAD. Before checking out the tenant, both upgrade paths
+resolve the named target in the **operator checkout**, keep its release ref for
+the ancestry check, and pass the resulting full commit separately to every
+sandbox and worker candidate. The tenant clone must contain that object and is
+checked out at exactly that commit; its own interpretation of the target name
+does not select the build. A tenant HEAD that differs from the selected commit,
+including an older commit on the same release ref, is refused before a runtime
+build. The selected commit must also be on the named operator release ref.
+mt-admin then uses `git archive` on the operator checkout to extract
+`ic/docker/` at that revision into a private root-owned mode-0700 directory.
+The digest and build read only that archive. A dirty, unknown, mismatched, or
+off-release tenant source is refused without replacing the current image. Root
+never reads or builds the tenant-writable working-tree Dockerfile, including
+when Podman uses `--network=host`. The standalone `build-sandbox-image`
+recovery command continues to use the operator checkout directly.
 
 For rootless Podman, `start-tenant` distributes the admin image into the
 tenant's own store only when its image ID differs; unchanged inputs therefore
@@ -1338,7 +1341,10 @@ failed or missing candidate, a failed promotion, or a source-verification
 refusal leaves the previous tag and image ID in place and does **not** abort the
 daemon or worker upgrade. mt-admin prints a recovery command when the build
 fails and names the retained previous image again in the closing summary of
-both upgrade paths. Promotion records both the previous and promoted admin
+both upgrade paths. That retained-image mark is scoped to one run: a new run or
+an abort clears it, as do a successful promotion or named manual rebuild, so a
+later `--skip-build` run cannot repeat a stale warning. Promotion records both
+the previous and promoted admin
 image IDs in the same rollback record as the worker candidates. A
 post-promotion upgrade failure re-tags the previous ID only while `latest`
 still has this run's promoted ID. If another tenant promoted in between, the
@@ -1359,10 +1365,12 @@ The `auto` policy deliberately compares only the Dockerfile/snapshot digest; it
 does **not** order operator revisions or refuse an older build. Consequently,
 adding or upgrading a tenant at an older revision moves the shared tag
 **backwards** when that revision's inputs differ from the current image;
-`always` can do the same, while `never` suppresses the managed rebuild. This is
-the accepted last-builder policy, not a rollback guard bypass: the guard above
-only prevents one tenant's failed upgrade from undoing another tenant's later
-promotion. Operators who need a fixed image must use a custom `SANDBOX_IMAGE`;
+`always` can do the same, while `never` suppresses the managed rebuild. Whether
+`auto` should instead refuse to replace an image built from a newer operator
+revision remains an open policy decision. The current last-builder behavior is
+separate from the rollback guard above, which only prevents one tenant's failed
+upgrade from undoing another tenant's later promotion. Operators who need a
+fixed image must use a custom `SANDBOX_IMAGE`;
 custom-image tenants and legacy tenants without the managed key are never
 rebuilt or redistributed. To opt an older tenant into the managed image, set
 the three variables in its `lunarwing.env` and run `upgrade-tenant`, or build
@@ -3350,12 +3358,20 @@ worker directory to be clean. That SHA is the image's `SOURCE_REVISION`, but it
 is a provenance identifier, not a trust boundary. The commit must already be an
 object in the operator checkout and an ancestor of the release ref being
 deployed. `build-tenant` and `build-all` use the operator checkout's current
-local branch (`refs/heads/*`), or its exact HEAD commit when detached; the
-tenant's branch name and detached state are never consulted. Upgrade candidates
-use the explicit `upgrade-tenant --target` ref, which may name a local branch,
-tag, remote-tracking ref, or commit. Any ancestor of the selected ref is
-accepted, not only its tip. Unknown and off-ref commits are refused before any
-image build.
+local branch (`refs/heads/*`), or its HEAD commit as the ref when detached; the
+tenant's branch name and detached state are never consulted. These default
+builds accept any ancestor of that ref, including an older tenant commit when
+the operator is detached. A 40-hex default ref does not itself impose an
+exact-match rule.
+
+Both upgrade paths instead resolve the explicit `upgrade-tenant --target` in
+the operator checkout before tenant checkout. The target may name a local
+branch, tag, remote-tracking ref, or commit. Its operator release ref remains
+the ancestry anchor, while the resulting full commit is passed separately as
+the exact selected revision. The tenant is checked out at that commit and its
+HEAD must equal it; an older on-release ancestor or an off-release commit does
+not match and builds no image. Unknown commits and selected commits outside
+the named operator release ref are likewise refused before any image build.
 
 Fetch and fast-forward the operator checkout's current local branch before a
 default tenant build. Fetching only `origin/*` does not update that default, so
