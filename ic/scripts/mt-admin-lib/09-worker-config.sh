@@ -1291,6 +1291,14 @@ _stop_nanocode_supervision() {
   local unit="lunarwing-nanocode-${name}.service"
   local container="lunarwing-nanocode-${name}" load_state="" user_unit_dir
   ensure_init_system
+  # Legacy unit files remain removable after the account is gone. Their stop
+  # commands are unreachable, so require the former-identity proof instead of
+  # refusing every such removal; live cgroups/processes still fail closed.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "skipped legacy Nanocode $INIT_SYSTEM supervision stop for $name: the tenant account is gone and its former identity is proven idle"
+    return 0
+  fi
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
     if id -u "$name" >/dev/null 2>&1; then

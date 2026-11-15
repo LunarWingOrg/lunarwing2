@@ -1191,7 +1191,19 @@ start_tenant_systemd() {
 stop_tenant_systemd() {
   local name="$1"
   local uid state rc stop_failed=false worker
-  uid="$(id -u "$name" 2>/dev/null)" || return 0
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "skipped systemd unit stop for $name: the tenant account is gone and its former identity is proven idle"
+    return 0
+  fi
+  uid="$(id -u "$name" 2>/dev/null)" || {
+    if [[ "$MT_ROOTLESS" == true ]]; then
+      say "ERROR: cannot resolve the tenant account '$name'; systemd stop state is unknown" >&2
+      return 1
+    fi
+    say "skipped systemd unit stop for $name: the account is unavailable; rootful container stops continue"
+    return 0
+  }
   local -a services=(
     "lunarwing-${name}.service" "xmpp-bridge-${name}.service"
     "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service"
