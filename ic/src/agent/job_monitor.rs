@@ -324,10 +324,7 @@ mod tests {
         assert_eq!(msg.thread_id, Some("thread-1".to_string()));
         assert_eq!(
             msg.content,
-            format!(
-                "[Job {}] Worker: I found a bug",
-                &job_id.to_string()[..8]
-            )
+            format!("[Job {}] Worker: I found a bug", &job_id.to_string()[..8])
         );
         assert!(msg.is_internal, "monitor messages must be marked internal");
     }
