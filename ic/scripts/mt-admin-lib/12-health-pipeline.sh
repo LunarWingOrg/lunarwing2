@@ -165,6 +165,38 @@ health_env_reconcile_line() {  # <KEY> <VALUE>
   say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
 }
 
+# Keep the optional OpenRC listener on the same report directory as the
+# exporter. The listener is installed separately, so an absent confd is not an
+# error and must not cause us to install one implicitly.
+health_metrics_confd_reconcile() {
+  [[ "${INIT_SYSTEM:-}" == "openrc" ]] || return 0
+  local confd="${OPENRC_CONFD_DIR:-/etc/conf.d}/lunarwing-health-metrics"
+  [[ -f "$confd" ]] || return 0
+  local desired tmp
+  desired="export LUNARWING_BASE_DIR=\"$HEALTH_BASE_DIR\""
+  tmp="$(mktemp "$(dirname -- "$confd")/.lunarwing-health-metrics.XXXXXX")" || return 1
+  if ! HEALTH_METRICS_CONFD_DESIRED="$desired" awk '
+    /^[[:space:]]*(export[[:space:]]+)?LUNARWING_BASE_DIR=/ {
+      if (!seen) print ENVIRON["HEALTH_METRICS_CONFD_DESIRED"]
+      seen = 1
+      next
+    }
+    { print }
+    END { if (!seen) print ENVIRON["HEALTH_METRICS_CONFD_DESIRED"] }
+  ' "$confd" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if cmp -s "$tmp" "$confd"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod --reference="$confd" "$tmp" || { rm -f "$tmp"; return 1; }
+  chown --reference="$confd" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$confd" || { rm -f "$tmp"; return 1; }
+  say "reconciled LUNARWING_BASE_DIR=$HEALTH_BASE_DIR in $confd"
+}
+
 # Entries that other installers put into the library and the checkout does
 # not ship. The optional metrics listener binary is installed here by hand
 # (ic-infrastructure-health-check/README.md, install-health-metrics-listener.sh)
@@ -465,6 +497,7 @@ ENVEOF
   # block because a fresh install already wrote the values above.
   health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME "$egress_runtime"
   health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS "$egress_rootless"
+  health_metrics_confd_reconcile
 
   # 4) Launcher: validate the installed tree before sourcing env or running it.
   {
