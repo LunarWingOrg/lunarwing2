@@ -80,7 +80,7 @@ use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
-/// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
+/// Shared prompt queue: maps job IDs to pending follow-up prompts for sandbox workers.
 pub type PromptQueue = Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<

@@ -9,7 +9,7 @@
 # The image includes common development tools so workers can build software,
 # run tests, and execute shell commands.
 
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.96.1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends cmake make pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
@@ -48,7 +48,7 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 \
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.96.1 \
     && chmod -R a+r /usr/local/rustup /usr/local/cargo
 
 # Copy the binary
@@ -57,9 +57,7 @@ COPY --from=builder /build/target/release/lunarwing /usr/local/bin/lunarwing
 # Create non-root user (UID 1000 matches the orchestrator's container config)
 RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /workspace \
-    && chown sandbox:sandbox /workspace \
-    && mkdir -p /home/sandbox/.claude \
-    && chown sandbox:sandbox /home/sandbox/.claude
+    && chown sandbox:sandbox /workspace
 
 USER sandbox
 WORKDIR /workspace

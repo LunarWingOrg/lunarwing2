@@ -757,10 +757,9 @@ pub async fn jobs_restart_handler(
 /// Submit a follow-up prompt to a running job.
 ///
 /// Routes to the appropriate backend:
-/// - Claude Code sandbox jobs → prompt queue (polled by the bridge)
 /// - External worker jobs → runtime control channel `task_prompt` (WI#328)
 /// - Agent (non-sandbox) jobs → WorkerMessage injection via scheduler
-/// - Worker-mode sandbox jobs → not supported (no mechanism to inject)
+/// - Other sandbox jobs → not supported by this gateway endpoint
 pub async fn jobs_prompt_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,

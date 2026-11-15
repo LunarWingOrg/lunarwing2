@@ -2824,8 +2824,8 @@ impl SetupWizard {
     ///
     /// Only true chicken-and-egg settings are written here — things needed
     /// before the database is connected: `DATABASE_BACKEND`, `DATABASE_URL`,
-    /// `LIBSQL_PATH`, `SECRETS_MASTER_KEY`, `ONBOARD_COMPLETED`, and
-    /// channel config vars (Signal, Claude Code sandbox).
+    /// `LIBSQL_PATH`, `SECRETS_MASTER_KEY`, `ONBOARD_COMPLETED`, and Signal
+    /// channel config vars.
     ///
     /// **LLM settings and credentials are NOT written here.** `LLM_BACKEND`,
     /// base URLs, and model names are persisted to the DB via
