@@ -348,13 +348,15 @@ health_pipeline_stage_mark_executables() {  # <tree>
 
 publish_health_pipeline_library() {
   local stage="$1" parent="$2" old=""
-  if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]] \
-    && mv --help 2>/dev/null | grep -q -- '--exchange'; then
-    if mv -T --exchange -- "$stage/tree" "$HEALTH_LIB_DIR"; then
+  if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]]; then
+    if ! mv --help 2>/dev/null | grep -q -- '--exchange'; then
+      printf 'health pipeline: this mv has no --exchange; using the rollback-protected replacement\n' >&2
+    elif mv -T --exchange -- "$stage/tree" "$HEALTH_LIB_DIR"; then
       rm -rf -- "$stage"
       return 0
+    else
+      printf 'WARNING: atomic health library exchange failed; using the rollback-protected replacement\n' >&2
     fi
-    say "WARNING: atomic health library exchange unavailable; using rollback-protected replacement" >&2
   fi
   if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]]; then
     old="$(mktemp -d "$parent/.lunarwing-health.old.XXXXXX")" \

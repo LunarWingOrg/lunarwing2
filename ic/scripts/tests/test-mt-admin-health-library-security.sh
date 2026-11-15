@@ -185,6 +185,8 @@ run_carry_cases() {
   ensure_health_pipeline >/dev/null
   assert_eq "reinstall keeps a safe metrics listener binary" "listener" \
     "$(cat "$HEALTH_LIB_DIR/lunarwing-health-metrics" 2>/dev/null || true)"
+  assert_eq "a carried listener binary stays executable" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/lunarwing-health-metrics" ]] && printf 0 || printf 1)"
   plant_listener_binary
   chmod 0757 "$HEALTH_LIB_DIR/lunarwing-health-metrics"
   check_carry_quarantined "other-writable listener binary" "it is group/other-writable"
@@ -212,6 +214,10 @@ run_carry_cases() {
     "the checkout ships lunarwing-health-metrics"
   assert_eq "a copy shipped by the checkout replaces the installed one" "shipped" \
     "$(cat "$HEALTH_LIB_DIR/lunarwing-health-metrics" 2>/dev/null || true)"
+  assert_eq "a copy shipped by the checkout stays executable" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/lunarwing-health-metrics" ]] && printf 0 || printf 1)"
+  assert_eq "a copy shipped by the checkout uses the executable mode" "755" \
+    "$(stat -c '%a' "$HEALTH_LIB_DIR/lunarwing-health-metrics" 2>/dev/null || true)"
   rm -f -- "$HEALTH_SRC_DIR/lunarwing-health-metrics"
   ensure_health_pipeline >/dev/null
   rm -f -- "$HEALTH_LIB_DIR/lunarwing-health-metrics"
@@ -321,20 +327,170 @@ check_staging_mode_and_acl_rules() {
   chmod 0644 "$HEALTH_SRC_DIR/nested/data"
 }
 
-check_setgid_directory_refused_at_runtime() {
+# ADO-2: a directory made under a set-group-ID parent inherits the bit and
+# chmod 0755 does not clear it, so the run-time check must accept it: on a
+# root-owned directory nobody else can write, the bit changes only the group of
+# new entries. A set-ID bit on a regular file changes what runs and stays
+# refused.
+check_setid_directory_accepted_at_runtime() {
   mkdir "$HEALTH_LIB_DIR/setgid-directory"
   chmod 2755 "$HEALTH_LIB_DIR/setgid-directory"
-  assert_launcher_refused "set-ID library directory"
-  assert_contains "set-ID refusal names the entry" "$LAST_REFUSAL_OUTPUT" "$HEALTH_LIB_DIR/setgid-directory"
-  chmod 0755 "$HEALTH_LIB_DIR/setgid-directory"
+  rm -f "$HEALTH_TEST_MARKER"
+  prepare_launcher_for_test
+  if bash "$HEALTH_LAUNCHER" >/dev/null 2>&1; then
+    pass "set-group-ID library directory is accepted"
+  else
+    fail "set-group-ID library directory is accepted"
+  fi
+  assert_eq "launcher still runs its wrapper under a set-group-ID directory" "executed" \
+    "$(cat "$HEALTH_TEST_MARKER" 2>/dev/null || true)"
   rmdir "$HEALTH_LIB_DIR/setgid-directory"
+}
+
+check_setid_file_refused_at_runtime() {
+  chmod 4755 "$HEALTH_LIB_DIR/cron-wrapper.sh"
+  assert_launcher_refused "set-ID library file"
+  assert_contains "set-ID file refusal names the cause" "$LAST_REFUSAL_OUTPUT" \
+    "set-ID bits on a regular file"
+  assert_contains "set-ID file refusal names the entry" "$LAST_REFUSAL_OUTPUT" \
+    "$HEALTH_LIB_DIR/cron-wrapper.sh"
+  chmod 0755 "$HEALTH_LIB_DIR/cron-wrapper.sh"
+}
+
+# ADO-3: the FIFO case above covers the source side; the run-time check must
+# also refuse a non-regular entry that sits in the installed library.
+check_non_regular_entry_refused_at_runtime() {
+  mkfifo "$HEALTH_LIB_DIR/surprise-fifo"
+  assert_launcher_refused "non-regular entry in the installed library"
+  assert_contains "non-regular refusal names the cause" "$LAST_REFUSAL_OUTPUT" "non-regular file type"
+  assert_contains "non-regular refusal names the entry" "$LAST_REFUSAL_OUTPUT" \
+    "$HEALTH_LIB_DIR/surprise-fifo"
+  rm -f "$HEALTH_LIB_DIR/surprise-fifo"
 }
 
 run_metadata_cases() {
   check_linked_source_directory_refused
   check_fifo_source_refused
   check_staging_mode_and_acl_rules
-  check_setgid_directory_refused_at_runtime
+  check_setid_directory_accepted_at_runtime
+  check_setid_file_refused_at_runtime
+  check_non_regular_entry_refused_at_runtime
+}
+
+assert_no_stage_left() {
+  local label="$1" leftover
+  leftover="$(command find "$(dirname -- "$HEALTH_LIB_DIR")" -maxdepth 1 \
+    \( -name '.lunarwing-health.new.*' -o -name '.lunarwing-health.old.*' \) -print -quit)"
+  assert_eq "$label: no staging or backup directory left" "" "$leftover"
+}
+
+# ADO-3: the last check of the staged tree before publication. A carry that
+# leaves an unsafe entry behind (a race, or a future carry rule) must refuse
+# the install and leave no stage behind.
+check_final_stage_check() {
+  local output="" status=0
+  output="$(
+    # shellcheck disable=SC2329  # override consumed by ensure_health_pipeline
+    carry_health_library_entries() {
+      mkdir -p "$1/nested"
+      : >"$1/nested/unsafe"
+      chmod 0777 "$1/nested/unsafe"
+    }
+    ensure_health_pipeline 2>&1
+  )" || status=$?
+  assert_eq "an unsafe entry left by the carry refuses the install" "1" "$status"
+  assert_contains "final stage refusal names the cause" "$output" \
+    "staged health pipeline failed its ownership check"
+  assert_contains "final stage refusal names the entry" "$output" "nested/unsafe"
+  assert_no_stage_left "final stage refusal"
+  assert_eq "final stage refusal keeps the previous wrapper" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
+}
+
+# ADO-3: the second regular-file check after the copy, reached only when the
+# source changes between the two checks.
+check_post_copy_file_type_check() {
+  local output="" status=0
+  output="$(
+    # shellcheck disable=SC2329  # override consumed by ensure_health_pipeline
+    cp() {
+      command cp "$@" || return
+      if [[ " $* " == *" --no-preserve=all "* ]]; then
+        mkfifo "${!#}/injected-fifo"
+      fi
+    }
+    ensure_health_pipeline 2>&1
+  )" || status=$?
+  assert_eq "a non-regular entry that appears after the source check refuses the install" "1" "$status"
+  assert_contains "post-copy refusal names the cause" "$output" "contains a non-regular entry"
+  assert_contains "post-copy refusal names the entry" "$output" "injected-fifo"
+  assert_no_stage_left "post-copy refusal"
+  assert_eq "post-copy refusal keeps the previous wrapper" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
+}
+
+# ADO-3: CI's image has coreutils 9.1, which has no mv --exchange, so CI runs
+# only the fallback. Both paths are exercised here: an mv that reports the
+# option, and one that does not. The report is what the code decides on, so a
+# fake is enough to drive either branch on any host.
+fake_mv_exchange() {
+  mv() {
+    if [[ "${1:-}" == --help ]]; then
+      printf '      --exchange           exchange source and destination\n'
+      return 0
+    fi
+    if [[ "${1:-}" == --exchange ]]; then
+      local source="$3" destination="$4" parking
+      parking="$(mktemp -d "$(dirname -- "$source")/.exchange.XXXXXX")" && rmdir -- "$parking" || return 1
+      command mv -T -- "$source" "$parking" || return 1
+      command mv -T -- "$destination" "$source" || return 1
+      command mv -T -- "$parking" "$destination"
+      return
+    fi
+    command mv "$@"
+  }
+}
+
+fake_mv_without_exchange() {
+  mv() {
+    if [[ "${1:-}" == --help ]]; then
+      printf 'Usage: mv [OPTION]... SOURCE... DIRECTORY\n'
+      return 0
+    fi
+    command mv "$@"
+  }
+}
+
+assert_publication_path() {
+  local label="$1" expect_exchange="$2" output="" status=0 fake="$3"
+  : >"$HEALTH_LIB_DIR/stale-before-publication"
+  output="$(
+    "$fake"
+    ensure_health_pipeline 2>&1
+  )" || status=$?
+  assert_eq "$label: install completes" "0" "$status"
+  assert_eq "$label: previous library replaced" "0" \
+    "$([[ -e "$HEALTH_LIB_DIR/stale-before-publication" ]] && printf 1 || printf 0)"
+  assert_eq "$label: new wrapper installed" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
+  assert_no_stage_left "$label"
+  if [[ "$expect_exchange" == true ]]; then
+    if [[ "$output" == *"rollback-protected replacement"* ]]; then
+      fail "$label: took the rollback fallback instead of the exchange"
+    else
+      pass "$label: used the atomic exchange"
+    fi
+  else
+    assert_contains "$label: announced the rollback fallback" "$output" \
+      "rollback-protected replacement"
+  fi
+}
+
+run_publication_cases() {
+  check_final_stage_check
+  check_post_copy_file_type_check
+  assert_publication_path "exchange publication" true fake_mv_exchange
+  assert_publication_path "fallback publication" false fake_mv_without_exchange
 }
 
 assert_cli_source_refused() {
@@ -441,6 +597,7 @@ run_mock_tests() {
   assert_eq "safe mock launcher executes its wrapper" "executed" "$(<"$HEALTH_TEST_MARKER")"
   run_metadata_cases
   run_carry_cases
+  run_publication_cases
   plant_listener_binary
   MOCK_NONROOT_DIR="$HEALTH_LIB_DIR/lunarwing-health-metrics"
   check_carry_quarantined "mock foreign-owned listener binary" "it is not owned by root"
@@ -469,6 +626,42 @@ run_mock_tests() {
   unset MOCK_REAL_USER MOCK_CHOWN_LOG MOCK_HEALTH_LIB_DIR MOCK_NONROOT_DIR MOCK_UNSAFE_ENTRY
   if ((failures != 0)); then return 1; fi
   printf 'RESULT: mock ownership and refusal harness passed\n'
+}
+
+# ADO-2: a set-group-ID parent must not stop the install. A directory made
+# under it inherits the bit, and chmod 0755 does not clear it, so the old
+# `-perm /6000` test refused the stage, the snapshot and the checkout. The
+# stage clears the bit; the check accepts it on a directory.
+check_setgid_parent_install() {
+  local parent="$TEST_ROOT/setgid-parent" saved_lib="$HEALTH_LIB_DIR"
+  # check_source_symlink_refused leaves its decoy link in the source.
+  rm -f -- "$HEALTH_SRC_DIR/escape.sh"
+  mkdir -p "$parent"
+  chown root:root "$parent"
+  chmod 2755 "$parent"
+  HEALTH_LIB_DIR="$parent/health-lib"
+  local output="" status=0
+  output="$(ensure_health_pipeline 2>&1)" || status=$?
+  assert_eq "install under a set-group-ID parent completes" "0" "$status"
+  assert_eq "install under a set-group-ID parent leaves no staging directory" "0" \
+    "$([[ -d "$HEALTH_LIB_DIR" ]] && printf 0 || printf 1)"
+  assert_eq "the staged library drops the inherited set-group-ID bit" "755" \
+    "$(command stat -c '%a' "$HEALTH_LIB_DIR" 2>/dev/null || true)"
+  assert_eq "the set-group-ID parent keeps its own mode" "2755" \
+    "$(command stat -c '%a' "$parent" 2>/dev/null || true)"
+  rm -f "$HEALTH_TEST_MARKER"
+  prepare_launcher_for_test
+  if bash "$HEALTH_LAUNCHER" >/dev/null 2>&1; then
+    pass "the launcher accepts a library published under a set-group-ID parent"
+  else
+    fail "the launcher accepts a library published under a set-group-ID parent"
+  fi
+  assert_eq "the launcher runs its wrapper under a set-group-ID parent" "executed" \
+    "$(cat "$HEALTH_TEST_MARKER" 2>/dev/null || true)"
+  assert_no_stage_left "set-group-ID parent install"
+  rm -rf -- "$parent"
+  HEALTH_LIB_DIR="$saved_lib"
+  ensure_health_pipeline >/dev/null
 }
 
 run_real_tests() {
@@ -565,6 +758,7 @@ run_real_tests() {
   rm "$HEALTH_LIB_DIR/cron-wrapper.sh"
   mv "$TEST_ROOT/cron-wrapper.real" "$HEALTH_LIB_DIR/cron-wrapper.sh"
   check_source_symlink_refused "real chmod symlink attack"
+  check_setgid_parent_install
   check_snapshot_source_load
   if ((failures != 0)); then return 1; fi
   printf 'RESULT: real ownership and refusal harness passed\n'
