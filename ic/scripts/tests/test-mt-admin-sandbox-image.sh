@@ -495,6 +495,22 @@ for source_mode in upgrade add worker; do
   fi
 done
 
+# The wrapper's idempotent add-tenant reprovision inherits the upgrade target,
+# so it does not replace that target with the operator checkout's current HEAD.
+wrapper_target="$(git -C "$tenant_repo" rev-parse HEAD)"
+rm -f "$fixture/last-build-dockerfile"
+(
+  export LUNARWING_MT_UPGRADE_RELEASE_REF="$wrapper_target"
+  export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$wrapper_target"
+  ensure_sandbox_image_current_from_tenant tenant-a always
+) >"$fixture/reprovision.out" 2>&1 && reprovision_rc=0 || reprovision_rc=$?
+if [[ "$reprovision_rc" -eq 0 && -e "$fixture/last-build-dockerfile" \
+    && "${IMAGE_INPUTS[${IMAGE_IDS[$SANDBOX_IMAGE_TAG]}]:-}" == "$current_digest" ]]; then
+  ok 'wrapper reprovision reuses the selected target instead of operator HEAD'
+else
+  bad "wrapper reprovision lost the selected target: $(cat "$fixture/reprovision.out")"
+fi
+
 # A tenant-owned target name may resolve to an operator object that is not on
 # the operator's release ref. Resolving the same name on the operator side must
 # select the release commit instead; the mismatched tenant HEAD builds nothing.
