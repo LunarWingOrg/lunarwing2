@@ -51,8 +51,13 @@ NetBird has no runtime-resolver fallback. Its firewall permits UDP/TCP port 53
 only to NetBird's own `wt0` listener; validation still rejects
 `SANDBOX_TUNNEL_DNS` before any container-runtime call. Configure upstreams as
 NetBird nameserver groups reachable through the overlay. An upstream outside
-the overlay fails closed because NetBird's resolver sockets are unmarked. A
-skipped NetBird test is not a pass.
+the overlay fails closed because NetBird's resolver sockets are unmarked. That
+last clause is the whole closure: NetBird registers the backup file's
+nameservers as its last-resort upstream for names no group covers, so a public
+lookup asked of the listener does make the client try the runtime resolver —
+and the query is dropped only because the client opens it unmarked. See the
+bump checklist below before moving the pinned client. A skipped NetBird test is
+not a pass.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 one network namespace and its loopback. A listener one command opens on
