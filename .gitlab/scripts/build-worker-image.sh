@@ -320,12 +320,14 @@ metadata_digest() {
     awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
 }
 
-# Bounded retries for transient registry-auth push and Debian snapshot flakes.
+# Bounded retries for transient registry push and Debian snapshot flakes.
 # BuildKit fetches a jwt/auth token per push, and several worker candidates
 # pushing at once trip GitLab's 429 rate limit at the very last step — pipeline
 # 5984 lost the opencode, opencode2 and kimi candidates (and, by cascade, their
 # scans) to one such burst, and pipeline 6212 lost the kimi candidate to a
 # sustained 429 burst that outlasted the original 4-attempt/3-minute window.
+# Pipeline 7855 added registry PUT/PATCH 499 and 502/503/504 responses to the
+# same transient class; 401/403/404 refusals still fail immediately.
 # Pipeline 7174 instead lost the opencode candidate after a stalled
 # snapshot.debian.org apt step was killed. The build is deterministic and the
 # retry reuses the layer cache, so only the narrow observed transient
@@ -360,7 +362,11 @@ push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
 transient_push_failure() {
-    grep -qE 'failed to fetch oauth token|429 Too Many Requests' "$push_attempt_log"
+    if grep -qE 'failed to fetch oauth token|429 Too Many Requests' "$push_attempt_log"; then
+        return 0
+    fi
+    grep -E 'unexpected status from (PUT|PATCH) request to https://[^/]+/v2/.*: (499|502|503|504)([ :]|$)' "$push_attempt_log" |
+        grep -qF "https://${CI_REGISTRY}/v2/"
 }
 
 transient_snapshot_failure() {
@@ -402,7 +408,7 @@ build_image_with_retry() {
             _bwr_base=$((_bwr_base_delay * (1 << (_bwr_attempt - 1))))
             _bwr_jitter=$(( CI_JOB_ID % 30 ))
             _bwr_delay=$((_bwr_base + _bwr_jitter))
-            echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
+            echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry push error; retrying in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
             _bwr_attempt=$((_bwr_attempt + 1))
         elif [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] &&

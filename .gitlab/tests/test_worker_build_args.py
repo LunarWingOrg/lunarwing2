@@ -73,6 +73,9 @@ if mode == "fail_always" or (mode == "fail_once" and count == 1):
     print("#33 [auth] registry.invalid/example/worker/worker-opencode2:pull,push token for registry.invalid", file=sys.stderr)
     print("ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://git.lunarwing.invalid/jwt/auth: 429 Too Many Requests: Retry later", file=sys.stderr)
     sys.exit(1)
+if mode == "fail_push_trace_once" and count == 1:
+    print(os.environ["PUSH_TRACE_LINE"], file=sys.stderr)
+    sys.exit(1)
 if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 1):
     print("#12 [builder 3/13] RUN apt-get update && apt-get install", file=sys.stderr)
     print("E: Failed to fetch https://snapshot.debian.org/archive/debian/20261024T011300Z/pool/example.deb  504  Gateway Timeout", file=sys.stderr)
@@ -196,9 +199,70 @@ for index, argument in enumerate(args):
         self.assertNotIn("--no-cache", calls[0])
         self.assertNotIn("--no-cache", calls[1])
         self.assertIn("--no-cache", calls[2])
-        self.assertIn("transient registry-auth error", result.stderr)
+        self.assertIn("transient registry push error", result.stderr)
         # The retry message must report the current max-attempts count.
         self.assertIn("/8", result.stderr)
+
+    def test_registry_push_transient_statuses_are_retried(self):
+        reasons = {
+            "499": "status code 499: Client Closed Request",
+            "502": "Bad Gateway",
+            "503": "Service Unavailable",
+            "504": "Gateway Timeout",
+        }
+        for method in ("PUT", "PATCH"):
+            for status, reason in reasons.items():
+                with self.subTest(method=method, status=status):
+                    (self.root / "buildctl-count").unlink(missing_ok=True)
+                    self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
+                    self.env["PUSH_TRACE_LINE"] = (
+                        "ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: "
+                        f"unexpected status from {method} request to "
+                        "https://registry.invalid/v2/example/worker/worker-opencode2/"
+                        f"blobs/uploads/fixture: {status} {reason}"
+                    )
+                    result = self.run_build()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = self.log.read_text().splitlines()
+                    self.assertEqual(len(calls), 3)
+                    self.assertIn("transient registry push error", result.stderr)
+                    self.assertEqual(self.recorded_sleeps(), [47])
+
+    def test_job_178891_registry_499_trace_is_retried(self):
+        self.env["CI_REGISTRY"] = "registry.git.lunarwing.org"
+        self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
+        self.env["PUSH_TRACE_LINE"] = "2026-11-14T21:37:43.409091Z 01O #52 ERROR: failed to push registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode2:fcb07a8e8abd3d101db013754236818b0aa99cd1-7855-178891: unexpected status from PUT request to https://registry.git.lunarwing.org/v2/lunarwing/lunarwing2/worker-opencode2/blobs/uploads/81db004d-e010-4480-a366-88507c3dc9ab?_state=pKr-IhpSRmFbh84Ti81GL6uXtvmMFDJc1yEiIj7kC4l7Ik5hbWUiOiJsdW5hcndpbmcvbHVuYXJ3aW5nMi93b3JrZXItb3BlbmNvZGUyIiwiVVVJRCI6IjgxZGIwMDRkLWUwMTAtNDQ4MC1hMzY2LTg4NTA3YzNkYzlhYiIsIk9mZnNldCI6MCwiU3RhcnRlZEF0IjoiMjAyNi0xMS0xNFQyMTozNjo0MS41OTY4NTExMzRaIn0%3D&digest=sha256%3A31776f813e27a90ae0cd3c67f4bea6150914b0c7356285398244dc5ec7952938: 499 status code 499: Client Closed Request"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("transient registry push error", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [47])
+
+    def test_registry_push_refusal_statuses_are_not_retried(self):
+        reasons = {
+            "401": "Unauthorized",
+            "403": "Forbidden",
+            "404": "Not Found",
+        }
+        for method in ("PUT", "PATCH"):
+            for status, reason in reasons.items():
+                with self.subTest(method=method, status=status):
+                    (self.root / "buildctl-count").unlink(missing_ok=True)
+                    self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
+                    self.env["PUSH_TRACE_LINE"] = (
+                        "ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: "
+                        f"unexpected status from {method} request to "
+                        "https://registry.invalid/v2/example/worker/worker-opencode2/"
+                        f"blobs/uploads/fixture: {status} {reason}"
+                    )
+                    result = self.run_build()
+                    self.assertNotEqual(result.returncode, 0)
+                    calls = self.log.read_text().splitlines()
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn("not retrying", result.stderr)
+                    self.assertNotIn("transient registry push error", result.stderr)
+                    self.assertEqual(self.recorded_sleeps(), [])
 
     def test_persistent_transient_failure_exhausts_retries(self):
         self.env["BUILDCTL_MODE"] = "fail_always"
