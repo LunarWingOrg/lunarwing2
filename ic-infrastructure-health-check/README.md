@@ -346,7 +346,21 @@ sudo install -Dm0755 target/release/lunarwing-health-metrics \
 sudo ic/scripts/install-health-metrics-listener.sh   # auto-detects systemd/OpenRC/launchd
 ```
 
-Install it as root, as above. mt-admin's health pipeline install carries it
+Install it as root, as above. On OpenRC, the installer also creates the
+dedicated `lunarwing-metrics` system user and group (no home directory,
+`/sbin/nologin` shell), and the service runs the listener under
+`supervise-daemon` as that user with an empty capability set and
+`no_new_privs=yes`. The listener needs no runtime directory: root's supervisor
+writes the pid file at `/run/lunarwing-health-metrics.pid`, and nothing on that
+path belongs to the account. The only path the account owns is the log file, a
+file inside root-owned `/var/log`; the exported 0644 `.prom` file stays
+readable without write access to the health library.
+
+The installer writes `/etc/conf.d/lunarwing-health-metrics` only when it does
+not already exist, so re-running it on upgrade keeps the operator's port,
+token and base directory.
+
+mt-admin's health pipeline install carries it
 into each refreshed library only when the library is root-owned through `/`
 and the binary is a root-owned regular file without group/other write or
 set-ID bits. Otherwise the install leaves it out of the new library (moving it
@@ -366,7 +380,8 @@ report as the exporter. `ensure_health_pipeline` reconciles that line in an
 existing confd on install/upgrade, including when
 `LUNARWING_MT_HEALTH_BASE_DIR` overrides the default, while preserving the
 other listener settings. Restart the OpenRC listener after changing this
-value; the pipeline does not install the optional listener or create its confd.
+value; the pipeline does not install the optional listener or create its confd,
+and the installer leaves an existing confd alone.
 
 `contrib/` ships a Prometheus alerting-rules YAML and a Grafana dashboard JSON
 covering the three canonical early warnings (rising latency, rising error
