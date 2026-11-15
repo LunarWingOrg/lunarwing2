@@ -858,6 +858,14 @@ run_missing_account_refusal_case() {
       mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
       printf 'populated unknown\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
       ;;
+    missing-cgroup-events)
+      # A managed tree without cgroup.events cannot be proven empty: the
+      # populated bit is the only proof that closes the fork/exit race.
+      mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+      ;;
+    missing-systemd-cgroup-events)
+      mkdir -p "$TENANT_CGROUP_ROOT/user.slice/user-61000.slice"
+      ;;
     missing-cgroup-controllers) command rm -f -- "$TENANT_CGROUP_ROOT/cgroup.controllers" ;;
   esac
   REAL_POSTGRES=true
@@ -1252,6 +1260,8 @@ run_missing_account_refusal_case openrc busy-openrc-cgroup 'stop OpenRC service 
 run_missing_account_refusal_case openrc busy-openrc-subtree 'tenant alpha cgroup'
 run_missing_account_refusal_case systemd busy-systemd-cgroup 'systemd user-61000.slice cgroup'
 run_missing_account_refusal_case openrc invalid-cgroup-events 'no single valid populated value'
+run_missing_account_refusal_case openrc missing-cgroup-events 'cgroup.events; cannot prove the tenant alpha cgroup empty'
+run_missing_account_refusal_case systemd missing-systemd-cgroup-events 'cgroup.events; cannot prove the systemd user-61000.slice cgroup empty'
 run_missing_account_refusal_case openrc missing-cgroup-controllers 'cgroup v2 is not readable'
 run_missing_account_refusal_case openrc linked-record 'is a symbolic link; refusing to trust it'
 run_missing_account_refusal_case openrc bad-subuid "invalid subordinate uid range '231072:x'"
