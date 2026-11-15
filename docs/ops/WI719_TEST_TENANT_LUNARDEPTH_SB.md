@@ -339,8 +339,10 @@ jobs, all `completed` and all attributed to `external:lunardepth`.
   `/home/lunardepthtester/lunarwing/lunardepth-workspace/` (`wi719_python_log`,
   `wi719_cpp_wis`, `wi719_parallel_stats`). Raw job details/events and copied
   artifacts are under `/tmp/wi719-results/`; logs are `/tmp/wi719-add.log`,
-  `/tmp/wi719-build.log` and `/tmp/wi719-dispatch.log`. No credential appears in
-  the report or the evidence.
+  `/tmp/wi719-build.log` and `/tmp/wi719-dispatch.log`, and the standard-library
+  dispatch/monitor helpers are `/tmp/wi719_dispatch.py`,
+  `/tmp/wi719_dispatch_one.py`, `/tmp/wi719_monitor.py` and
+  `/tmp/wi719_jobs.json`. No credential appears in the report or the evidence.
 - Root filesystem usage went from 297 GiB free to 288 GiB free after the daemon
   and worker image builds.
 - No daemon, lane, mt-admin, CI, or goals-file source was changed. The only
