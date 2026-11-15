@@ -53,9 +53,10 @@ fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
 # Two commits: the clone starts at the source revision (A) and the upgrade
 # target is a newer commit (B), so previous_commit != target_commit and the
 # restore path is observable.
-mkdir -p "$fixture_repo/ic/migrations"
+mkdir -p "$fixture_repo/ic/migrations" "$fixture_repo/kimicode4lunarwing"
 git -C "$fixture" init -q repo
 printf 'fixture migration\n' >"$fixture_repo/ic/migrations/V1.sql"
+printf 'FROM scratch\n' >"$fixture_repo/kimicode4lunarwing/Dockerfile"
 git -C "$fixture_repo" add .
 git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
   commit -qm 'Initial fixture'
@@ -635,11 +636,17 @@ mkdir -p "$(dirname "$lane_file")"
 tag_file="$fixture/built-tag"
 ref_file="$fixture/built-ref"
 rm -f "$tag_file" "$ref_file"
+# shellcheck disable=SC2034  # read by the sourced operator-archive helpers
+LUNARWING_WORKER_BUILD_TMPDIR="$fixture/archives"
+mkdir -p "$LUNARWING_WORKER_BUILD_TMPDIR"
 build_kimi_worker() {
   printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$tag_file"
   worker_image_ref kimi >"$ref_file"
-  return 0
+  _prepare_worker_build_source "${4:-$LUNARWING_ROOT}" kimicode4lunarwing \
+    "${5:-}" Dockerfile "${6:-}"
+  _worker_build_context_finish
 }
+git -C "$fixture_repo" reset -q --hard "$target"
 : >"$lane_file"
 rm -f "$runtime_log"
 capture build_candidate_workers fixture false true false false false
@@ -653,6 +660,20 @@ elif ! grep -qx kimi "$lane_file"; then
   fail "real candidate builder did not record the lane: $(cat "$lane_file")"
 else
   pass 'real candidate builder builds to the per-tenant tag and records the lane'
+fi
+
+# WI#723: dropping the selected commit from the real lane call would silently
+# accept this older tenant HEAD as an ancestor of the named release ref.
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$lane_file"
+capture build_candidate_workers fixture false true false false false \
+  refs/remotes/origin/moving false never "$target"
+if [[ "$rc" -ne 0 ]] \
+    && grep -Fq "does not match selected operator revision $target" <<<"$output" \
+    && ! grep -qx kimi "$lane_file"; then
+  pass 'real candidate builder forwards the selected commit to a worker lane'
+else
+  fail "real candidate builder dropped the lane selected commit (rc=$rc): $output"
 fi
 
 # WI#507: the pebble candidate must use the tenant checkout too. Keep this
