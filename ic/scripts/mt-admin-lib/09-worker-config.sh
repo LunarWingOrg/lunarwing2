@@ -3158,6 +3158,15 @@ stop_worker() {
   ensure_container_runtime
   ensure_init_system
 
+  # Without its account a rootless store is unreachable; say so instead of
+  # failing silently on the first runtime or user-manager call. The proof is
+  # the same one the lane stops use, so a live former identity still refuses.
+  if tenant_rootless_account_gone "$name"; then
+    _tenant_stop_skips_missing_account "$name" "$worker" || return 1
+    say "skipped $worker task container stop for $name: the tenant account is gone and its former identity is proven idle"
+    return 0
+  fi
+
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
