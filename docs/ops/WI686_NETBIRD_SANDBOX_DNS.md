@@ -41,7 +41,8 @@ keys, gateway tokens, or environment-file contents belong in this report.
 --llm-model tensorzero::function_name::lunarwing` completed successfully. The
 tenant received ports 10020–10029 and the managed `lunarwing-sandbox:latest`
 image. WeeChat was disabled; no external workers were selected. The required
-release daemon build is running through `mt-admin build-tenant` with 18 jobs.
+release daemon and companion bridge builds completed through `mt-admin
+build-tenant` with 18 jobs, and `mt-admin start-tenant` succeeded.
 
 ### 2. Rootless-runtime diagnostic (not yet the daemon sandbox)
 
@@ -203,3 +204,50 @@ the advisory proxy for this target (for example with `curl --noproxy '*'` or a
 narrow `NO_PROXY`). The legacy tier permits direct egress by design, so this is
 not an equivalent security boundary to `proxy-enforced` or `tunnel`. Raw event
 evidence is `/tmp/lw686-legacy-proxy.json`.
+
+## Final disposition and recommendations
+
+The test-only changes were removed after the successful legacy-mode probe:
+`SANDBOX_NETWORK` was restored to `proxy-enforced`, the owner-scoped setting
+was deleted through the gateway API, and the tenant was restarted. Final checks
+showed:
+
+- Gateway `GET /api/health`: **HTTP 200**, `healthy`.
+- Owner-scoped `GET /api/settings/sandbox.extra_allowed_domains`: **404**,
+  confirming deletion; the `default` scope also reads `[]` after its reset.
+- `SANDBOX_NETWORK=proxy-enforced`, confirmed through mt-admin's env reader.
+- `mt-admin status netbirddnstester`: daemon, PostgreSQL and supervisors,
+  XMPP bridge, and healthy managed LunarVision all started.
+- The tenant container list contained only `lunarwing-pg-netbirddnstester` and
+  `lunarwing-vision-netbirddnstester`; no one-shot sandbox container leaked.
+
+`netbirddnstester` is left running and boot-persistent in that restored secure
+configuration. It therefore no longer has NetBird access from the real shell
+sandbox; the successful legacy result above is an explicitly tested option,
+not the final tenant policy. Re-enable it only on a disposable test tenant
+that accepts direct, advisory-only egress. The tested command form was
+`curl --noproxy '*' http://cotterhomelab3.netbird.selfhosted:3000/health`.
+
+No dedicated **fleet** NetBird setup key was provided or inferred, so this run
+did not configure `SANDBOX_NETWORK=tunnel` against the fleet overlay or claim a
+secure-tunnel pass. The pre-existing disposable WI#603 management deployment
+was not substituted for the fleet DNS target. For production overlay access,
+use the documented `tunnel` tier with a separate revocable enrollment per
+tenant and default runtime DNS, then validate it independently. NetBird rejects
+`SANDBOX_TUNNEL_DNS`; do not copy the legacy direct-egress workaround into a
+production tenant.
+
+Two follow-ups are worth separate work items rather than scope expansion here:
+
+1. Legacy proxy reachability through `host.containers.internal` on this Podman
+   version/network shape. Preserve the loopback-only bind; do not expose the
+   proxy on all interfaces as a workaround.
+2. `lunarwing config set/get` uses the `default` settings scope even when
+   `LUNARWING_OWNER_ID` selects a different tenant scope. Owner-scoped gateway
+   settings APIs avoided the mismatch in this run.
+
+No Rust source or runtime behavior was changed. The release builds and four
+real sandbox probes supplied the verification for this operational work item;
+a debug build was not run. All non-secret probe logs and event captures remain
+under `/tmp/lw686-*` on the test host, while this report is the committed
+record.
