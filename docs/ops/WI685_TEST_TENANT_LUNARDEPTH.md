@@ -111,8 +111,15 @@ build finished in **7m49s**. The LunarDepth image phase is in progress: its
 pinned source checkout, pnpm 11.7.0 frozen install, runtime-closure check (4
 agent presets / 182 workspace packages), native host build, and TypeScript
 build have run. pnpm printed its expected unsupported-platform, cyclic-workspace,
-and not-yet-built `bin.js` warnings; none had stopped the build at this point.
-Final image and out-of-band verification results remain pending.
+and not-yet-built `bin.js` warnings; none stopped the build.
+
+The fat candidate image was produced as
+`269216fa5ab8658cda7afe2dcd5256ae5395ac66d4f9b7a1fe8e4a5bbaa4587c`.
+Its real `RUN --network=none` split-role smoke regenerated the task
+configuration, started the non-root bridge, brought the task harness and
+runner to ready, and shut both roles down cleanly. This proves the image's
+fake-model composition/readiness path, not real TensorZero inference. Final
+out-of-band verification and tag promotion remain pending.
 
 ## Runtime audits
 
