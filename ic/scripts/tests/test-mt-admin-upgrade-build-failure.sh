@@ -116,6 +116,8 @@ build_candidate_workers() {
   local name="$1" oc="$2" kimi="$3" oc2="$4" pebble="${5:-false}"
   : >"$(tenant_candidate_lanes_file "$name")"
   : >"$(tenant_sandbox_image_status_file "$name")"
+  printf '%s\n' "${7:-}" >"$fixture/candidate-release-ref"
+  printf '%s\n' "${10:-}" >"$fixture/candidate-selected-commit"
   local lane
   for lane in pebble opencode kimi opencode2; do
     case "$lane" in
@@ -128,7 +130,7 @@ build_candidate_workers() {
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
     printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
   done
-  if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}"; then
+  if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}" "${10:-}"; then
     _record_sandbox_image_status "$name" previous
     printf 'sandbox-failed\n' >>"$cand_events"
   fi
