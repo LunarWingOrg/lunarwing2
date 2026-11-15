@@ -1598,6 +1598,9 @@ fn build_tick_context(
     chain_index: u32,
     project_dir: &str,
 ) -> crate::orchestrator::external_worker::TaskContext {
+    // WI#702: cron ticks carry no credential grants, so the external-lane
+    // value redactor is not armed for them. If tick dispatch ever grows a
+    // grants/environment path, arm one from it the way `execute_task` does.
     let mut context = build_task_context(
         owner_id,
         Some(project_dir),

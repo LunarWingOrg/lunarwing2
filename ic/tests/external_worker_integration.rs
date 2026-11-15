@@ -7103,3 +7103,257 @@ async fn control_channel_records_unacked_delivered_seq() {
         "no ack was sent, so no ack row may exist, got: {events:?}"
     );
 }
+
+/// WI#702: a granted credential value is injected into the external lane's
+/// child env, so a task that prints it must not leak it into the streamed
+/// `message` events, the broadcast SSE frames, or the terminal result. The
+/// value has no recognizable vendor prefix, so only value-level redaction can
+/// catch it; the base64 form proves an encoded print is covered too.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn granted_values_are_redacted_from_progress_and_result() {
+    use base64::Engine;
+
+    const VALUE: &str = "s3cret-db-password";
+    let encoded = base64::engine::general_purpose::STANDARD.encode(VALUE);
+    let (store, _db_guard) = test_store().await;
+
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Success {
+        progress: vec![
+            format!("env DB_PASSWORD={VALUE}\n"),
+            format!("printenv | base64: {encoded}\n"),
+        ],
+        output: format!("report: {VALUE} / {encoded}"),
+    })
+    .await;
+
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(64);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager))
+        .with_store(store.clone());
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+    seed_agent_job(&store, job_id).await;
+
+    let mut context = TaskContext {
+        user_id: "test-user".to_string(),
+        ..Default::default()
+    };
+    context
+        .environment
+        .insert("DB_PASSWORD".to_string(), VALUE.to_string());
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(job_id, "mock", "task", Some(5_000), true, context),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+    assert!(!res.output.contains(VALUE), "result output leaked: {res:?}");
+    assert!(
+        !res.output.contains(&encoded),
+        "result output leaked base64"
+    );
+
+    let mut streamed = String::new();
+    while let Ok((event_job_id, _, event)) = event_rx.try_recv() {
+        if event_job_id == job_id
+            && let SseEvent::JobMessage { content, .. } = event
+        {
+            streamed.push_str(&content);
+        }
+    }
+    assert!(!streamed.is_empty(), "expected broadcast progress frames");
+    assert!(
+        !streamed.contains(VALUE),
+        "broadcast JobMessage leaked: {streamed}"
+    );
+    assert!(
+        !streamed.contains(&encoded),
+        "broadcast JobMessage leaked base64: {streamed}"
+    );
+
+    let events = persisted_event_contents(&store, job_id).await;
+    let message_rows: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _)| kind == "message")
+        .map(|(_, content)| content.as_str())
+        .collect();
+    assert!(!message_rows.is_empty(), "expected persisted message rows");
+    for content in &message_rows {
+        assert!(
+            !content.contains(VALUE),
+            "persisted message row leaked: {content}"
+        );
+        assert!(
+            !content.contains(&encoded),
+            "persisted message row leaked base64: {content}"
+        );
+    }
+    for (kind, content) in &events {
+        assert!(
+            !content.contains(VALUE) && !content.contains(&encoded),
+            "persisted {kind} row leaked the granted value: {content}"
+        );
+    }
+}
+
+/// WI#702: the timeout-evidence snapshot lives in `JobContext.metadata` and a
+/// persisted `partial_output` event, not only in `job_events` message rows.
+/// Both timeout-evidence sources are covered: a worker-reported timeout whose
+/// own `task_result.output` carries the value, and one whose output is empty
+/// so the daemon's streamed buffer supplies the evidence.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn granted_values_are_redacted_from_timeout_evidence() {
+    const VALUE: &str = "s3cret-db-password";
+    let (store, _db_guard) = test_store().await;
+
+    // Source 1: the worker's own terminal output is the preserved evidence.
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        progress: vec![format!("investigation step: token {VALUE}")],
+        result_output: format!("wedged while printing {VALUE}"),
+    })
+    .await;
+    let (partial, events) =
+        run_timed_out_task_with_grant(&store, &url, VALUE, "worker output").await;
+    assert!(
+        partial.contains("[redacted-secret]"),
+        "worker timeout output must be scrubbed before the metadata write: {partial}"
+    );
+    assert_timeout_rows_are_clean(&events, VALUE);
+
+    // Source 2: empty worker output, so `accumulated_output` supplies the
+    // evidence — proving the streamed-progress scrub reaches the metadata and
+    // the `partial_output` row, not just the message rows.
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        progress: vec![format!("investigation step: token {VALUE}")],
+        result_output: String::new(),
+    })
+    .await;
+    let (partial, events) =
+        run_timed_out_task_with_grant(&store, &url, VALUE, "streamed progress").await;
+    assert!(
+        partial.contains("investigation step"),
+        "streamed evidence must survive to the metadata: {partial}"
+    );
+    assert!(
+        !partial.contains(VALUE),
+        "streamed evidence leaked into partial_output: {partial}"
+    );
+    assert_timeout_rows_are_clean(&events, VALUE);
+}
+
+/// Dispatch one grant-bearing task against a timeout-worker mock and return
+/// the preserved `partial_output` plus every persisted `(event_type, content)`
+/// row for the job.
+#[cfg(feature = "libsql")]
+async fn run_timed_out_task_with_grant(
+    store: &Arc<dyn lunarwing::db::Database>,
+    url: &str,
+    value: &str,
+    label: &str,
+) -> (String, Vec<(String, String)>) {
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
+    let mgr = ExternalWorkerManager::new(vec![config_for(url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager))
+        .with_store(store.clone());
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+    seed_agent_job(store, job_id).await;
+
+    let mut context = TaskContext {
+        user_id: "test-user".to_string(),
+        ..Default::default()
+    };
+    context
+        .environment
+        .insert("DB_PASSWORD".to_string(), value.to_string());
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(job_id, "mock", "task", Some(5_000), true, context),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::TimedOut);
+    assert!(
+        !res.output.contains(value),
+        "{label}: result output leaked: {res:?}"
+    );
+
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
+    let partial = ctx
+        .metadata
+        .get("partial_output")
+        .and_then(|v| v.as_str())
+        .expect("timeout evidence must be preserved")
+        .to_string();
+
+    let events = persisted_event_contents(store, job_id).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "partial_output"),
+        "{label}: expected a persisted partial_output row, got {events:?}"
+    );
+    (partial, events)
+}
+
+#[cfg(feature = "libsql")]
+fn assert_timeout_rows_are_clean(events: &[(String, String)], value: &str) {
+    for (kind, content) in events {
+        assert!(
+            !content.contains(value),
+            "persisted {kind} row leaked the granted value: {content}"
+        );
+    }
+}
+
+/// WI#702: a dispatch with no grants must behave exactly as before — no
+/// redactor is armed and worker text is returned verbatim.
+#[tokio::test]
+async fn task_without_grants_keeps_worker_text_verbatim() {
+    let output = "unchanged output with no grant in sight";
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Success {
+        progress: vec!["progress line".to_string()],
+        output: output.to_string(),
+    })
+    .await;
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(5_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+    assert_eq!(res.output, output);
+}
