@@ -127,8 +127,17 @@ failure, not a failed image policy assertion. The candidate was not promoted to
 and the repository's `docs/guides/GENTOO_PACKAGE_LIST.md` §1b states that this
 USE flag builds `setpriv`. Following that guide, I added
 `sys-apps/util-linux caps` as `/etc/portage/package.use/lunarwing-setpriv` and
-started the one-package emerge. The cached build retry and out-of-band
-verification remain pending; no verifier privilege check was bypassed.
+started the one-package emerge. That succeeded and installed
+`/usr/bin/setpriv`; no verifier privilege check was bypassed.
+
+The mt-admin retry returned **0**. It rebuilt the runtime layers, repeated the
+network-isolated split-role smoke, ran the out-of-band verifier as `nobody`,
+and promoted verified image
+`3285688081822c91597ca60defe18abd7dc1038821fa2ecbe03f2f2efdbc39c9`
+(2,126,553,198 bytes) to `lunarwing-worker-lunardepth:latest`. Its source label
+still names the original pin `da06c33b2091546dc38c61b95452ce27a4ce32d5`;
+WI#692 was not silently applied. The image is the fat `--with-toolchains`
+build, and the daemon/bridge stages completed in 1.22 s / 1.00 s on this retry.
 
 ## Runtime audits
 
