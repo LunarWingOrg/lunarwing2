@@ -15,6 +15,22 @@ export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
 export PORTS_REGISTRY="$fixture/ports.json"
 export INIT_SYSTEM=openrc
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
+# The fixture tenants exist, as on a real host: this harness exercises the
+# unsafe-unit refusal and the unit roster, not the account-gone skip. Give
+# `alice` an account and an identity record so a rootless runtime cannot take
+# the skip branch first and hide the repair hint this harness checks.
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+mkdir -p "$TENANT_IDENTITY_DIR"
+printf 'alice:231072:65536\n' >"$TENANT_SUBUID_FILE"
+printf 'UID=61000\nSUBUID=231072:65536\n' >"$TENANT_IDENTITY_DIR/alice"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == alice ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
 cat >"$PORTS_REGISTRY" <<'JSON'
 {"tenants":{"alice":{"enable_proxy":true,"ports":{"proxy":23104}},"bob":{"enable_proxy":true,"ports":{"proxy":23204}},"disabled":{"enable_proxy":false,"ports":{"proxy":23304}},"new":{"enable_proxy":true,"ports":{"proxy":23404}}}}
 JSON
