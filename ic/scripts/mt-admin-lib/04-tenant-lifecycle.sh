@@ -1727,19 +1727,20 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.
-upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth> [sandbox_policy]
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth> [sandbox_policy] [selected_commit]
   local name="$1" lw_root="$2" previous_commit="$3"
   local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8" lunardepth="${9:-false}"
-  local sandbox_policy="${10:-$SANDBOX_IMAGE_POLICY}"
+  local sandbox_policy="${10:-$SANDBOX_IMAGE_POLICY}" selected_commit="${11:-}"
   local rc=0 caller_errexit=false
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" "$sandbox_policy" )
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" "$sandbox_policy" "$selected_commit" )
   rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   [[ "$rc" -eq 0 ]] && return 0
   say "worker candidate build failed; discarding candidates and restoring the previous checkout (tenant was not stopped)" >&2
   cleanup_candidate_workers "$name"
+  clear_sandbox_image_status "$name"
   _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false \
     || say "WARNING: could not return the clone to $previous_commit; tenant '$name' is still running its previous build" >&2
   return "$rc"
