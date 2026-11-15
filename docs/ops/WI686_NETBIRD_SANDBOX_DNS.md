@@ -126,3 +126,44 @@ MagicDNS target. This is the expected network-none and allowlist boundary, not
 a failure of NetBird or of the tenant's underlying container runtime. Raw
 non-secret gateway event evidence is in `/tmp/lw686-default.json` on the test
 host.
+
+### 4. `proxy-enforced` plus one allowlisted MagicDNS host
+
+The first configuration attempt used:
+
+```bash
+lunarwing config set sandbox.extra_allowed_domains \
+  '["cotterhomelab3.netbird.selfhosted"]'
+```
+
+After a tenant restart, the identical probe still returned the original
+allowlist denial. This was a **settings-scope mistake**, not a network result:
+`lunarwing config set` writes the hard-coded `default` user scope
+(`ic/src/cli/config.rs`), while this tenant resolves
+`LUNARWING_OWNER_ID=netbirddnstester`. `config get` showed the value in the
+wrong scope, and the daemon correctly ignored it.
+
+The misplaced `default`-scope row was reset. The authenticated gateway API was
+then used to set the same value in the daemon's actual owner scope:
+
+```http
+PUT /api/settings/sandbox.extra_allowed_domains
+Content-Type: application/json
+
+{"value":["cotterhomelab3.netbird.selfhosted"]}
+```
+
+The API returned 204, GET returned the expected value, and the tenant was
+restarted again. The repeated real-sandbox probe showed:
+
+- Resolver contents and both `getent` failures were unchanged.
+- The proxy denial changed to **HTTP 403** with `sandbox-proxy denied:
+  proxy-enforced forbids non-public destination addresses`.
+- Direct curl still returned exit 6 and **HTTP 000**.
+- The shell result again had `"sandboxed":true` and `"truncated":false`.
+
+**Result:** the hostname allowlist and public-address policy are independent.
+Allowlisting the MagicDNS name is not enough: enforced mode intentionally
+rejects NetBird's CGNAT/ULA destinations and network-none prevents direct DNS.
+Event captures are `/tmp/lw686-enforced-allowlisted.json` (wrong-scope attempt)
+and `/tmp/lw686-enforced-owner-allowlist.json` (corrected scope).
