@@ -952,6 +952,9 @@ mod tests {
         removals: usize,
         live_removals: usize,
         unexpected: Vec<Vec<String>>,
+        /// Where the staged resolver files live, so the fake start can model
+        /// NetBird rewriting the bind-mounted file with its own listener.
+        runtime_dir: Option<std::path::PathBuf>,
     }
 
     #[cfg(unix)]
@@ -986,6 +989,33 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The resolver helper is a `run` too, but it is not the sidecar: it
+    /// carries `--entrypoint cat` and no labels (WI#724 ADN-7).
+    #[cfg(unix)]
+    fn is_resolver_helper(args: &[String]) -> bool {
+        args.first().map(String::as_str) == Some("run") && args.iter().any(|arg| arg == "--entrypoint")
+    }
+
+    /// NetBird rewrites `/etc/resolv.conf`, which is the staged host file bind
+    /// mounted read-write. The fake start does the same so the joined-run gate
+    /// sees the sidecar's file (WI#724 ADN-2/ADN-7).
+    #[cfg(unix)]
+    fn fake_netbird_rewrite_resolver(state: &CountingRuntimeState) {
+        let Some(dir) = state.runtime_dir.as_deref() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".resolv.conf") && !name.ends_with(".original.netbird") {
+                let _ = std::fs::write(entry.path(), "nameserver 9.9.9.9\n");
+            }
+        }
+    }
+
     #[cfg(unix)]
     async fn run_fake_sidecar(state: &SharedRuntimeState, args: &[String]) -> std::process::Output {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -995,6 +1025,7 @@ mod tests {
         state.hash = sidecar_label(args, "lunarwing.sandbox-tunnel-hash");
         state.instance = sidecar_label(args, "lunarwing.sandbox-tunnel-instance");
         state.listing = None;
+        fake_netbird_rewrite_resolver(&state);
         fake_output(true, String::new(), String::new())
     }
 
@@ -1018,6 +1049,9 @@ mod tests {
         let interactive = args.get(1).map(String::as_str) == Some("-i");
         let command_index = if interactive { 3 } else { 2 };
         match args.get(command_index).map(String::as_str) {
+            Some("netbird") if args.iter().any(|arg| arg == "--ipv4") => {
+                fake_output(state.started, "9.9.9.9\n".into(), String::new())
+            }
             Some("netbird") => fake_output(state.started, String::new(), String::new()),
             Some("cat") => fake_output(true, "nameserver 9.9.9.9\n".into(), String::new()),
             Some("nft") if args.get(command_index + 1).map(String::as_str) == Some("-f") => {
@@ -1056,6 +1090,13 @@ mod tests {
             let state = state.clone();
             async move {
                 if args.first().map(String::as_str) == Some("run") {
+                    if is_resolver_helper(&args) {
+                        return Ok(fake_output(
+                            true,
+                            "nameserver 10.89.0.1\n".into(),
+                            String::new(),
+                        ));
+                    }
                     return Ok(run_fake_sidecar(&state, &args).await);
                 }
                 let mut state = lock_runtime_state(&state);
@@ -1113,6 +1154,7 @@ mod tests {
         let workdir = std::env::temp_dir().join(format!("lw-tunnel-init-{}", uuid::Uuid::new_v4()));
         let runtime_dir = workdir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        lock_runtime_state(&state).runtime_dir = Some(runtime_dir.clone());
         let tunnel_config = TunnelSidecarConfig {
             auto_pull_image: false,
             startup_timeout: Duration::from_secs(2),
@@ -1178,7 +1220,7 @@ mod tests {
             let run_started = run_started.clone();
             let release_run = release_run.clone();
             async move {
-                if args.first().map(String::as_str) == Some("run") {
+                if args.first().map(String::as_str) == Some("run") && !is_resolver_helper(&args) {
                     run_started.notify_one();
                     release_run.notified().await;
                 }
@@ -1199,6 +1241,7 @@ mod tests {
         let workdir = std::env::temp_dir().join(format!("lw-tunnel-stop-{}", uuid::Uuid::new_v4()));
         let runtime_dir = workdir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        lock_runtime_state(&state).runtime_dir = Some(runtime_dir.clone());
         let config = TunnelSidecarConfig {
             auto_pull_image: false,
             startup_timeout: Duration::from_secs(2),

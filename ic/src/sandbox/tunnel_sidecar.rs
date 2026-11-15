@@ -1413,7 +1413,14 @@ impl TunnelSidecar {
         let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => match self.host_resolver_ready().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => tracing::warn!(
+                        container = %self.container_name,
+                        error = %error,
+                        "Sandbox tunnel sidecar failed its joined-run resolver gate; recreating"
+                    ),
+                },
                 Err(error) => tracing::warn!(
                     container = %self.container_name,
                     error = %error,
@@ -1452,7 +1459,42 @@ impl TunnelSidecar {
         };
         self.provider_health().await?;
         self.check_egress_firewall().await?;
+        self.host_resolver_ready().await?;
         Ok(container_id)
+    }
+
+    /// Joined runs mount a host file that must still be the file the sidecar
+    /// writes. It comes apart when a start re-stages the file under a sidecar
+    /// that is then adopted, when a stop deletes it while the container
+    /// survives, or when NetBird writes the runtime resolver back. Any of
+    /// those makes this sidecar unhealthy so recovery stages the file again.
+    async fn host_resolver_ready(&self) -> Result<()> {
+        if self.cfg.provider != TunnelProvider::Netbird {
+            return Ok(());
+        }
+        let Some(path) = self.resolv_conf_path()? else {
+            return Ok(());
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.unavailable(
+                    "the tunnel resolver file joined runs mount is missing; recovery restages it",
+                ));
+            }
+            Err(_) => {
+                return Err(self.unavailable(
+                    "the tunnel resolver file joined runs mount could not be read",
+                ));
+            }
+        };
+        let listener = self.netbird_listener().await?;
+        if netbird_resolver_file_matches(&contents, listener) {
+            return Ok(());
+        }
+        Err(self.unavailable(
+            "the tunnel resolver file joined runs mount no longer names NetBird's wt0 listener; recovery restages it",
+        ))
     }
 
     async fn start_fresh(&self, hash: &str, provider_timeout: Duration) -> Result<()> {
@@ -1464,8 +1506,8 @@ impl TunnelSidecar {
             }
             TunnelProvider::Wireguard => None,
         };
-        let env_file = self.write_secret_env_file()?;
         let dns_files = self.stage_netbird_dns_files(provider_timeout).await?;
+        let env_file = self.write_secret_env_file()?;
         let mounts = NetbirdSidecarMounts {
             state_volume: state_volume.as_deref(),
             resolv_conf: dns_files.as_ref().map(|(path, _)| path.as_path()),
@@ -3510,6 +3552,50 @@ mod tests {
                 "accepted invalid resolver file: {contents}"
             );
         }
+    }
+
+    /// WI#724 ADN-2: a joined run must never start against a host resolver
+    /// file that is missing or that no longer names NetBird's own listener.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn netbird_host_resolver_file_must_stay_the_sidecars() {
+        let base = std::env::temp_dir().join(format!("lw-netbird-host-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            let stdout = match args.get(2).map(String::as_str) {
+                Some("netbird") if args.iter().any(|arg| arg == "--ipv4") => "100.75.1.2\n",
+                other => panic!("unexpected sidecar exec: {other:?}"),
+            };
+            async move { Ok(successful_runtime_output(stdout.to_string())) }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+        let path = sidecar.resolv_conf_path().unwrap().unwrap();
+
+        let missing = sidecar.host_resolver_ready().await.unwrap_err();
+        assert!(
+            missing.to_string().contains("is missing"),
+            "{}",
+            missing
+        );
+
+        std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
+        let diverged = sidecar.host_resolver_ready().await.unwrap_err();
+        assert!(
+            diverged.to_string().contains("no longer names"),
+            "{}",
+            diverged
+        );
+
+        std::fs::write(&path, "nameserver 100.75.1.2\n").unwrap();
+        sidecar.host_resolver_ready().await.unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]
