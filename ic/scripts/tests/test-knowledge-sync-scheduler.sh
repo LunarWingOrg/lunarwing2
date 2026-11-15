@@ -68,4 +68,77 @@ release_count="$(find "$fixture/admin/releases" -mindepth 1 -maxdepth 1 -type d 
   exit 1
 }
 
+# WI#684: the release is self-contained. Its parent has no sibling health
+# checkout, and loading must not fall back to the installed host health library.
+test ! -e "$fixture/admin/ic-infrastructure-health-check"
+test -x "$fixture/admin/current/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+(
+  cd "$fixture"
+  "$stable_entrypoint" --help
+) >"$fixture/snapshot-help"
+grep -Fq 'sync-knowledge-sources' "$fixture/snapshot-help"
+
+# Drive the staged dispatcher against a real Study Notes checkout. Only the
+# host account/init boundaries are stubbed; registry parsing, tenant filtering,
+# Git synchronization and generation publication remain the production paths.
+study_origin="$fixture/study-origin"
+enabled_home="$fixture/shared/enabled"
+mkdir -p "$study_origin/agent-notes-by-agent/test-agent" \
+  "$study_origin/skills/study-notes"
+touch "$study_origin/study_notes_mcp.py" "$study_origin/memorydb.py" \
+  "$study_origin/agent-notes.sqlite3" "$study_origin/skills/study-notes/SKILL.md"
+printf 'snapshot v1\n' >"$study_origin/agent-notes-by-agent/test-agent/topic.md"
+git -C "$study_origin" init -q -b main
+git -C "$study_origin" add -A
+git -C "$study_origin" -c user.email=test@example.com -c user.name=test commit -q -m initial
+
+for name in enabled unset false zero; do
+  mkdir -p "$fixture/env/$name"
+done
+printf 'KNOWLEDGE_SYNC_ENABLED=true\nLW2STUDYMCP_HOME=%s\n' "$enabled_home" \
+  >"$fixture/env/enabled/lunarwing.env"
+printf 'LW2STUDYMCP_HOME=%s\n' "$fixture/shared/unset" \
+  >"$fixture/env/unset/lunarwing.env"
+printf 'KNOWLEDGE_SYNC_ENABLED=false\nLW2STUDYMCP_HOME=%s\n' "$fixture/shared/false" \
+  >"$fixture/env/false/lunarwing.env"
+printf 'KNOWLEDGE_SYNC_ENABLED=0\nLW2STUDYMCP_HOME=%s\n' "$fixture/shared/zero" \
+  >"$fixture/env/zero/lunarwing.env"
+jq -n '{version:16,tenants:{enabled:{},unset:{},false:{},zero:{}}}' >"$fixture/ports.json"
+
+# shellcheck disable=SC2034  # Fixture values are consumed by sourced mt-admin functions.
+run_snapshot_sync() (
+  # shellcheck source=../lunarwing-mt-admin.sh
+  source "$stable_entrypoint"
+  require_root() { :; }
+  openrc_dispatch_preflight() { :; }
+  tenant_env_dir() { printf '%s/env/%s' "$fixture" "$1"; }
+  PORTS_REGISTRY="$fixture/ports.json"
+  STUDY_NOTES_REPO="$study_origin"
+  STUDY_NOTES_DEFAULT_HOME="$enabled_home"
+  main sync-knowledge-sources
+)
+
+sync_output="$(run_snapshot_sync)"
+printf 'snapshot v2\n' >"$study_origin/agent-notes-by-agent/test-agent/topic.md"
+git -C "$study_origin" add -A
+git -C "$study_origin" -c user.email=test@example.com -c user.name=test commit -q -m refresh
+sync_output+="$(run_snapshot_sync)"
+grep -Fqx 'snapshot v2' "$enabled_home/agent-notes-by-agent/test-agent/topic.md"
+[[ "$(jq -r '.source_revision' "$enabled_home/.git/lunarwing-study-notes-generation.json")" \
+  == "$(git -C "$study_origin" rev-parse HEAD)" ]]
+for name in unset false zero; do
+  [[ ! -e "$fixture/shared/$name" ]] || {
+    printf 'disabled tenant %s unexpectedly reached Study Notes sync\n' "$name" >&2
+    exit 1
+  }
+done
+[[ "$sync_output" != *"enables knowledge sync"* ]] || {
+  printf 'unset KNOWLEDGE_SYNC_ENABLED produced an enabled-tenant warning\n' >&2
+  exit 1
+}
+[[ "$sync_output" != *"tenant 'false'"* && "$sync_output" != *"tenant 'zero'"* ]] || {
+  printf 'false/0 KNOWLEDGE_SYNC_ENABLED produced a warning\n' >&2
+  exit 1
+}
+
 printf 'Knowledge sync scheduler tests passed\n'

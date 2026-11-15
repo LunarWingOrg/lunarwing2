@@ -128,10 +128,13 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    transient fast-forward failure (e.g. network blip) restores the last-good
    publication when HEAD still matches its recorded revision; a dirty checkout
    or one that moved forward keeps the barrier down. Only `true`/`1`
-   (case-insensitive) enable sync — the same values the daemon accepts — so a
-   hand-edited `yes`/`on` cannot leave the host refreshing a source the daemon
-   refuses to start with. Root-owned scheduler snapshots are pruned to the
-   newest five releases (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`).
+   (case-insensitive) enable sync — the same values the daemon accepts. Unset,
+   `false`, and `0` are skipped without warnings, and a hand-edited `yes`/`on`
+   cannot leave the host refreshing a source the daemon refuses to start with.
+   Each root-owned scheduler snapshot carries its own OpenRC proxy contract,
+   so it does not source a sibling checkout or the host health library. Snapshots
+   are pruned to the newest five releases
+   (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`).
 3. Each tenant daemon independently checks on its configured cadence (six hours
    by default, with deterministic startup jitter). When the revision changes it
    scans the checkout and imports only missing paths.

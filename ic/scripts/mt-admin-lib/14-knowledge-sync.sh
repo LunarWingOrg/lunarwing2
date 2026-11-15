@@ -13,11 +13,13 @@ install_knowledge_sync_admin_snapshot() {
     || die "knowledge sync admin root must be an absolute safe path"
   install -d -m 0755 -- "$releases"
   release="$releases/$(date -u '+%Y%m%d%H%M%S')-$$"
-  install -d -m 0755 -- "$release/mt-admin-lib"
+  install -d -m 0755 -- "$release/mt-admin-lib" "$release/ic-infrastructure-health-check"
   install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh"
   for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
     install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")"
   done
+  install -m 0755 -- "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh" \
+    "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
   current_tmp="$root/.current.$$"
   ln -s -- "$release" "$current_tmp"
   mv -fT -- "$current_tmp" "$root/current"
@@ -145,14 +147,14 @@ sync_enabled_study_notes_sources() {
     env_path="$(tenant_env_dir "$name")/lunarwing.env"
     [[ -f "$env_path" ]] || continue
     enabled="$(_env_existing "$env_path" KNOWLEDGE_SYNC_ENABLED)"
-    # Mirror the daemon's parse_bool_env contract exactly (case-insensitive
-    # true/1 only) so a hand-edited value can never leave the host scheduler
-    # refreshing a source the daemon refuses to start with (yes/on).
+    # Mirror the daemon's parse_bool_env contract exactly: case-insensitive
+    # true/1 enable, while unset/false/0 use the daemon's default of false.
+    # Other hand-edited values (yes/on) never leave the host scheduler
+    # refreshing a source the daemon refuses to start with.
     enabled="${enabled,,}"
     case "$enabled" in
       1|true) ;;
-      "")
-        ;;
+      ""|false|0) continue ;;
       *)
         say "WARNING: tenant '$name' has unsupported KNOWLEDGE_SYNC_ENABLED='$enabled' (expected true/1/false/0); skipping"
         continue
