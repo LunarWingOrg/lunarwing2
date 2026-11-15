@@ -489,6 +489,57 @@ else
   pass 'wrapper reports a failed restart as the tenant remaining stopped'
 fi
 
+# 5d. WI#708: a mark left by an aborted run must not leak into a later
+# --skip-build summary. Run an unmodified wrapper copy with no-op mt-admin verbs;
+# its boundary switches the dry-run admission into execution against fixtures.
+wrapper_status_dir="$fixture/wrapper-status"
+wrapper_status_home="$wrapper_status_dir/home"
+mkdir -p "$wrapper_status_home/lunarwing/env" "$wrapper_status_dir/backups"
+cp "$wrapper" "$wrapper_status_dir/upgrade-tenant.sh"
+: >"$wrapper_status_dir/mock"
+chmod +x "$wrapper_status_dir/mock"
+printf '{"tenants":{"fixture":{}}}\n' >"$wrapper_status_dir/ports.json"
+: >"$wrapper_status_home/lunarwing/env/lunarwing.env"
+: >"$wrapper_status_home/lunarwing/env/xmpp-bridge.env"
+git -C "$wrapper_status_home" init -q lunarwing
+git -C "$wrapper_status_home/lunarwing" add .
+git -C "$wrapper_status_home/lunarwing" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Wrapper status fixture'
+_record_sandbox_image_status fixture previous
+(
+  id() {
+    if [[ "${1:-}" == -u && $# -eq 1 ]]; then printf '0\n'; else printf '1000\n'; fi
+  }
+  getent() { printf 'fixture:x:1000:1000::%s:/bin/bash\n' "$wrapper_status_home"; }
+  jq() { return 0; }
+  sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
+  mock() {
+    case "${1:-}" in
+      validate-upgrade-wrapper-boundary) DRY_RUN=false ;;
+      backup-tenant)
+        mkdir -p "$BACKUP_DIR/$TENANT"
+        printf 'PGDMP-fixture-data\n' >"$BACKUP_DIR/$TENANT/fixture.dump"
+        ;;
+      last-build-stage) printf 'none\n' ;;
+      clear-sandbox-image-status) clear_sandbox_image_status "$2" ;;
+      report-sandbox-image) report_retained_sandbox_image "$2" ;;
+    esac
+  }
+  LUNARWING_MT_ADMIN=mock
+  LUNARWING_MT_UPGRADE_BOUNDARY_TENANT=fixture
+  LUNARWING_PORTS_REGISTRY="$wrapper_status_dir/ports.json"
+  LUNARWING_MT_BACKUP_DIR="$wrapper_status_dir/backups"
+  cd "$wrapper_status_dir"
+  source ./upgrade-tenant.sh fixture --skip-build --dry-run --yes --keep-rootful
+) >"$fixture/wrapper-status.out" 2>&1 && wrapper_status_rc=0 || wrapper_status_rc=$?
+if [[ "$wrapper_status_rc" -eq 0 \
+    && ! -e "$(tenant_sandbox_image_status_file fixture)" ]] \
+    && ! grep -Fq 'remains on the previous lunarwing-sandbox:latest' "$fixture/wrapper-status.out"; then
+  pass 'wrapper skip-build discards an aborted run retained-image mark'
+else
+  fail "wrapper skip-build leaked a stale retained-image mark (rc=$wrapper_status_rc): $(cat "$fixture/wrapper-status.out")"
+fi
+
 # ── 6. the REAL promote path (run-294 TJ-7) ──────────────────────────────────
 # Run-291 shipped a promote that aborted on an unset
 # ${LUNARWING_MT_CANDIDATE_LANES_FILE} because every harness stubbed it. Here the
