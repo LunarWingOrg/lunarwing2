@@ -253,6 +253,44 @@ else
   fail "failed sandbox candidate stranded, promoted, or hid the retained image (rc=$rc): $output"
 fi
 SANDBOX_CANDIDATE_FAIL=false
+
+# WI#708: a named target is resolved in the operator checkout, not the tenant's.
+# An older release ancestor must not become the candidate revision.
+run_upgrade_named() { upgrade_tenant_locked fixture moving '' false false; }
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade_named
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-release-ref")" == refs/heads/moving \
+    && "$(cat "$fixture/candidate-selected-commit")" == "$target" \
+    && "$(cat "$fixture/sandbox-selected-commit")" == "$target" \
+    && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'an older tenant cannot move candidates behind the operator release commit'
+else
+  fail "older tenant selected a non-operator candidate (rc=$rc): $output"
+fi
+
+# Put an off-release object in both clones and make only the tenant's moving ref
+# select it. The operator's moving ref still selects the reviewed release commit.
+git -C "$operator_repo" checkout -q -b off-release "$source_rev"
+printf 'off-release tenant choice\n' >"$operator_repo/off-release.txt"
+git -C "$operator_repo" add off-release.txt
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Off-release tenant choice'
+off_release_target="$(git -C "$operator_repo" rev-parse HEAD)"
+git -C "$operator_repo" push -q origin HEAD:refs/heads/moving
+git -C "$operator_repo" checkout -q moving
+git -C "$fixture_repo" reset -q --hard "$source_rev"
+: >"$events"; : >"$cand_events"; : >"$promote_events"
+capture run_upgrade_named
+if [[ "$rc" -eq 0 && "$(cat "$fixture/candidate-selected-commit")" == "$target" \
+    && "$(cat "$fixture/sandbox-selected-commit")" == "$target" \
+    && "$(cat "$fixture/candidate-selected-commit")" != "$off_release_target" \
+    && "$(git -C "$fixture_repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'tenant off-release target resolution cannot select the image build commit'
+else
+  fail "tenant off-release target selected a candidate (rc=$rc): $output"
+fi
+
 eval "$REAL_TENANT_USES_SANDBOX"
 eval "$REAL_SANDBOX_BUILD_REQUIRED"
 eval "$REAL_SANDBOX_RUNTIME"
