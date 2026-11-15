@@ -1041,9 +1041,9 @@ _upgrade_validate_lane() {  # <lane>
 }
 
 # Build <lane>'s image to this run's candidate tag and record it.
-# Usage: build_candidate_worker <tenant> <lane> <with_toolchains> [release_ref]
+# Usage: build_candidate_worker <tenant> <lane> <with_toolchains> [release_ref] [selected_commit]
 build_candidate_worker() {
-  local name="$1" lane="$2" with_toolchains="${3:-false}" release_ref="${4:-}"
+  local name="$1" lane="$2" with_toolchains="${3:-false}" release_ref="${4:-}" selected_commit="${5:-}"
   local lw_root tag rc=0 profile
   _upgrade_validate_lane "$lane" || die "unknown worker lane '$lane'"
   ensure_container_runtime
@@ -1063,11 +1063,11 @@ build_candidate_worker() {
     with_toolchains="$profile"
   fi
   case "$lane" in
-    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
-    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
-    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" "$release_ref" || rc=$? ;;
-    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
-    lunardepth) LUNARWING_WORKER_IMAGE_TAG="$tag" build_lunardepth_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
+    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;
+    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;
+    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;
+    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;
+    lunardepth) LUNARWING_WORKER_IMAGE_TAG="$tag" build_lunardepth_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;
   esac
   [[ "$rc" -eq 0 ]] || return "$rc"
   _ensure_marker_dir
