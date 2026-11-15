@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Static + systemd-analyze validation of the healthpoint metrics listener's
-# systemd unit (ic/systemd/lunarwing-health-metrics.service).
+# Static + parser validation of the healthpoint metrics listener's units.
 #
-# The listener is loopback-only by construction in the binary; the unit must
-# keep that contract: read-only filesystem, dynamic user, optional env file,
-# no committed tokens, no write paths. systemd-analyze verify runs only when
-# the tool exists (this suite is also green on OpenRC-only hosts).
+# The listener is loopback-only by construction in the binary; both units must
+# run it without privileges, embed no tokens, and suggest no wildcard binds.
+# systemd-analyze verify runs only when the tool exists (this suite is also
+# green on OpenRC-only hosts).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UNIT="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.service"
+OPENRC_UNIT="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.openrc"
 CONFD="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.confd"
+INSTALLER="$ROOT_DIR/ic/scripts/install-health-metrics-listener.sh"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/health-metrics-unit-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -82,6 +83,41 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 else
     ok "SKIP: systemd-analyze unavailable (unit parse check skipped)"
 fi
+
+# OpenRC parity: a dedicated user, no capabilities, and no new privileges.
+assert_contains "$OPENRC_UNIT" 'command_user="lunarwing-metrics:lunarwing-metrics"' \
+    "OpenRC listener uses its dedicated unprivileged user"
+assert_contains "$OPENRC_UNIT" 'supervisor="supervise-daemon"' \
+    "OpenRC listener uses the privilege-aware supervisor"
+assert_contains "$OPENRC_UNIT" 'capabilities="^"' \
+    "OpenRC listener has an empty capability set"
+assert_contains "$OPENRC_UNIT" 'no_new_privs="yes"' \
+    "OpenRC listener cannot gain privileges"
+assert_contains "$OPENRC_UNIT" 'pidfile="/run/lunarwing-health-metrics/lunarwing-health-metrics.pid"' \
+    "OpenRC pidfile has a dedicated runtime directory"
+assert_contains "$OPENRC_UNIT" 'checkpath -d -m 0750 -o "${command_user}" /run/lunarwing-health-metrics' \
+    "OpenRC runtime directory belongs to the listener"
+assert_contains "$OPENRC_UNIT" 'checkpath -f -m 0640 -o "${command_user}" "${output_log}" "${error_log}"' \
+    "OpenRC log files are writable by the listener"
+assert_contains "$OPENRC_UNIT" 'respawn_delay="5"' \
+    "OpenRC listener restarts after a failure"
+assert_absent "$OPENRC_UNIT" 'command_background=' \
+    "OpenRC does not bypass supervise-daemon"
+assert_absent "$OPENRC_UNIT" '0.0.0.0' \
+    "OpenRC unit never suggests a wildcard bind"
+if sh -n "$OPENRC_UNIT"; then
+    ok "OpenRC unit passes shell syntax validation"
+else
+    bad "OpenRC unit passes shell syntax validation" "shell parser rejected the init script"
+fi
+
+# The OpenRC installer creates the account used by the unit.
+assert_contains "$INSTALLER" 'groupadd --system lunarwing-metrics' \
+    "installer creates the dedicated system group"
+assert_contains "$INSTALLER" 'useradd --system --no-create-home --shell /sbin/nologin \' \
+    "installer creates a home-free nologin system user"
+assert_contains "$INSTALLER" '--gid lunarwing-metrics lunarwing-metrics' \
+    "installer assigns the dedicated primary group"
 
 # confd contract: documented listen default stays loopback; token ships empty.
 assert_contains "$CONFD" 'export HEALTH_METRICS_LISTEN="127.0.0.1:50000"' \
