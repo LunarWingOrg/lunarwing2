@@ -789,13 +789,17 @@ _record_sandbox_image_status() {  # <tenant> <status>
   printf '%s\n' "$2" >"$(tenant_sandbox_image_status_file "$1")"
 }
 
+clear_sandbox_image_status() {  # <tenant>
+  rm -f "$(tenant_sandbox_image_status_file "$1")"
+}
+
 report_retained_sandbox_image() {  # <tenant>
   local name="$1" file status
   file="$(tenant_sandbox_image_status_file "$name")"
   status="$(cat "$file" 2>/dev/null || true)"
-  [[ "$status" == previous ]] || return 0
+  [[ "$status" == previous ]] || { clear_sandbox_image_status "$name"; return 0; }
   say "WARNING: sandbox image: tenant '$name' remains on the previous $SANDBOX_IMAGE_TAG because no candidate was promoted. Recovery: sudo $0 build-sandbox-image $name && sudo $0 start-tenant $name" >&2
-  rm -f "$file"
+  clear_sandbox_image_status "$name"
 }
 
 # Ensure the root-owned marker directory exists and is safe (root:root 0700).
