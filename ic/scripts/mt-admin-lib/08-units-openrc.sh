@@ -402,10 +402,11 @@ INITEOF
 # verdict cache — is ONE file shared with the root health cron:
 # ic-infrastructure-health-check/openrc-proxy-unit-contract.sh (WI#393
 # GR-1/HF-1 for the renderer/contract pairing, WI#410 ID-2 for the cron).
-# mt-admin sources it from the repo; health-openrc.sh and
-# lunarwing-self-heal.sh source the copy ensure_health_pipeline installs
-# beside them, so the renderer, this preflight guard and the cron guard
-# cannot drift apart. The tenant layout helpers (00-common.sh) are defined
+# mt-admin sources it from the repo or from the private copy staged beside a
+# knowledge-sync snapshot; health-openrc.sh and lunarwing-self-heal.sh source
+# the copy ensure_health_pipeline installs beside them, so the renderer, this
+# preflight guard and the cron guard cannot drift apart. The tenant layout
+# helpers (00-common.sh) are defined
 # before this point, so the library's fallbacks are not used by mt-admin.
 require_safe_installed_health_source() {
   local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR"
