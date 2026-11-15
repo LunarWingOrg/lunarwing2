@@ -531,6 +531,7 @@ note "Run the infra health check once: ic-infrastructure-health-check/infrastruc
 
 # ---- DONE + rollback notes ---------------------------------------------------
 banner "Done — '$TENANT' upgraded to $TARGET_REF ($MODE)"
+run mt report-sandbox-image "$TENANT"
 say ""
 say "IMPORTANT:"
 if [[ "$KEEP_ROOTFUL" == false ]]; then
