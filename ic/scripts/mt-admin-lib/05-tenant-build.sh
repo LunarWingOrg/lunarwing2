@@ -1106,13 +1106,24 @@ _prepare_sandbox_image_source() {  # <tenant> [release ref] [selected commit]
 ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref] [selected commit]
   local name="$1" policy="${2:-$SANDBOX_IMAGE_POLICY}"
   local release_ref="${3:-${LUNARWING_MT_UPGRADE_RELEASE_REF:-}}" selected_commit="${4:-${LUNARWING_MT_UPGRADE_SELECTED_COMMIT:-}}"
-  local rc=0
+  local rc=0 source_root revision dirty
   validate_sandbox_image_policy "$policy"
   tenant_uses_managed_sandbox_image "$name" || return 0
   [[ "$policy" != never ]] || return 0
   if [[ -z "$selected_commit" ]]; then
     selected_commit="$(git -C "$LUNARWING_ROOT" rev-parse --verify "${release_ref:-HEAD}^{commit}")" \
       || die "cannot resolve operator checkout revision for sandbox image build"
+  fi
+  source_root="$(tenant_lw_root "$name")"
+  revision="$(_worker_source_git "$source_root" rev-parse --verify HEAD 2>/dev/null)" || revision=""
+  if [[ "$revision" =~ ^[0-9a-f]{40}$ && "$revision" != "$selected_commit" ]]; then
+    dirty="$(_worker_source_git "$source_root" status --porcelain --untracked-files=all -- ic/docker)" \
+      || dirty="unverified"
+    if [[ -z "$dirty" ]] \
+        && git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$selected_commit"; then
+      say "sandbox image not rebuilt: tenant '$name' is behind the operator checkout ($revision -> $selected_commit)" >&2
+      return 2
+    fi
   fi
   _prepare_sandbox_image_source "$name" "$release_ref" "$selected_commit"
   ensure_sandbox_image_current "$name" "$policy" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT" || rc=$?
