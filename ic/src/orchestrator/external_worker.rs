@@ -1423,7 +1423,9 @@ impl ExternalWorkerManager {
 
                 close_control_queue(job_id, &mut prompt_rx, store.as_ref()).await;
                 active_handles.write().await.remove(&job_id);
-                return result.map(Some);
+                return result
+                    .map(Some)
+                    .map_err(|error| scrub_external_task_error(error, granted_redactor.as_ref()));
             }
 
             active_handles.write().await.remove(&job_id);
@@ -4881,6 +4883,36 @@ fn scrub_task_result(
         output: redactor.scrub(&result.output),
         error: result.error.as_deref().map(|error| redactor.scrub(error)),
         ..result
+    }
+}
+
+/// Scrub worker-influenced failure text at the blocking dispatch boundary so
+/// `execute_task` never returns a granted value to `create_job` (WI#711).
+/// Preserve the error variant for callers that distinguish connection and
+/// protocol failures.
+fn scrub_external_task_error(
+    error: OrchestratorError,
+    redactor: Option<&SecretValueRedactor>,
+) -> OrchestratorError {
+    let Some(redactor) = redactor else {
+        return error;
+    };
+    match error {
+        OrchestratorError::ExternalWorkerConnectionFailed {
+            worker_name,
+            reason,
+        } => OrchestratorError::ExternalWorkerConnectionFailed {
+            worker_name,
+            reason: redactor.scrub(&reason),
+        },
+        OrchestratorError::ExternalWorkerProtocolError {
+            worker_name,
+            reason,
+        } => OrchestratorError::ExternalWorkerProtocolError {
+            worker_name,
+            reason: redactor.scrub(&reason),
+        },
+        other => other,
     }
 }
 
