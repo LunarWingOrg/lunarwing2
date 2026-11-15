@@ -1250,6 +1250,7 @@ promote_candidate_sandbox_image() {  # <tenant>
   fi
   rm -f "$marker"
   "$runtime" rmi "$candidate_ref" >/dev/null 2>&1 || true
+  clear_sandbox_image_status "$name"
 }
 
 cleanup_candidate_sandbox_image() {  # <tenant>
