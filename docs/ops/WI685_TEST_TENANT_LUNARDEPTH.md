@@ -124,6 +124,10 @@ Source-side prechecks on the exact lane checkout passed:
   migration, lifecycle, bridge flags, overlay, gateway-dialect, verifier
   isolation, fleet-key, and archive checks.
 - `bash scripts/tests/test-worker-llm-entrypoints.sh`: passed.
+- `bash scripts/tests/test-worker-egress.sh`: all fixture checks passed,
+  including cold apply/first start/post-start verification in one rootless
+  namespace, fail-closed guard behavior, and bridge/task launch contracts. Its
+  optional live arm was not used as a substitute for the real tenant audit.
 
 These do not establish live inference or container confinement. In particular,
 mt-admin's remote `worker-smoke` does not enable the smoke client's task
