@@ -1,11 +1,11 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#600, WI#602, WI#603, WI#604, and WI#614).
+//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#600, WI#602, WI#603, WI#604, WI#614, and WI#695).
 //!
 //! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
 //! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
 //! LUNARWING_E2E_NETBIRD_TESTS=1, a real management service, a reusable key
 //! file, and an image containing NetBird, nftables, nc, wget, ping, and nslookup.
-//! Optional settings cover management-server restart. NetBird custom DNS is
-//! rejected by the unit-level configuration gate in WI#603.
+//! Optional settings cover management-server restart and an in-overlay DNS
+//! fixture. NetBird custom DNS is rejected by the unit-level configuration gate.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -1662,6 +1662,165 @@ async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
     Err("the plain-peer HTTP listener never became ready".into())
 }
 
+async fn netbird_fqdn(container: &str) -> Result<String, String> {
+    netbird_status_detail(container)
+        .await?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("FQDN: "))
+        .map(str::to_string)
+        .ok_or_else(|| "NetBird status did not report an FQDN".into())
+}
+
+async fn assert_netbird_resolver_policy(sidecar: &TunnelSidecar) -> Result<String, String> {
+    let name = sidecar.container_name();
+    let resolver = netbird_ipv4(name).await?;
+    let resolv_conf = sidecar_resolv_conf(sidecar).await?;
+    let nameservers: Vec<&str> = resolv_conf
+        .lines()
+        .filter(|line| line.starts_with("nameserver "))
+        .collect();
+    let expected = format!("nameserver {resolver}");
+    if nameservers.len() != 1 || nameservers[0] != expected {
+        return Err(format!(
+            "NetBird resolver file does not contain only its wt0 listener:\n{resolv_conf}"
+        ));
+    }
+    let backup = podman_output(&["exec", name, "cat", "/etc/resolv.conf.original.netbird"]).await?;
+    if !backup.status.success() {
+        return Err("NetBird's original resolver backup is missing".into());
+    }
+    let backup = String::from_utf8_lossy(&backup.stdout).into_owned();
+    let listing = podman_output(&[
+        "exec",
+        name,
+        "nft",
+        "list",
+        "table",
+        "inet",
+        "lunarwing_sandbox_egress",
+    ])
+    .await?;
+    if !listing.status.success() {
+        return Err("could not list the NetBird DNS firewall rules".into());
+    }
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    for protocol in ["udp", "tcp"] {
+        let expected = format!("ip daddr {resolver} {protocol} dport 53 accept");
+        if !listing.contains(&expected) {
+            return Err(format!("missing {expected:?} in:\n{listing}"));
+        }
+    }
+    for original in backup
+        .lines()
+        .filter_map(|line| line.strip_prefix("nameserver "))
+    {
+        let original = original.trim();
+        if resolv_conf.contains(&format!("nameserver {original}\n"))
+            || listing.contains(&format!("daddr {original} "))
+        {
+            return Err(format!("former resolver {original} remains available"));
+        }
+    }
+    Ok(backup)
+}
+
+fn valid_probe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-')
+}
+
+fn netbird_dns_probe(peer_fqdn: &str, peer_ip: IpAddr) -> Result<String, String> {
+    if !valid_probe_name(peer_fqdn) {
+        return Err("unsafe NetBird peer name".into());
+    }
+    let mut probe = format!(
+        "nslookup -type=A {peer_fqdn} 2>&1 | grep -q 'Address: {peer_ip}' \
+         && echo LUNARWING-NETBIRD-PEER-DNS-OK; "
+    );
+    if let Ok(name) = std::env::var("LUNARWING_E2E_NETBIRD_DNS_NAME") {
+        let expected = required_env("LUNARWING_E2E_NETBIRD_DNS_ADDRESS")?
+            .parse::<IpAddr>()
+            .map_err(|_| "invalid NetBird DNS test address".to_string())?;
+        if !valid_probe_name(&name) {
+            return Err("unsafe NetBird DNS test name".into());
+        }
+        probe.push_str(&format!(
+            "nslookup -type=A {name} 2>&1 | grep -q 'Address: {expected}' \
+             && echo LUNARWING-NETBIRD-ZONE-DNS-OK; "
+        ));
+    }
+    if let Ok(expected) = std::env::var("LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS") {
+        let expected = expected
+            .parse::<IpAddr>()
+            .map_err(|_| "invalid NetBird public DNS test address".to_string())?;
+        probe.push_str(&format!(
+            "nslookup -type=A example.com 2>&1 | grep -q 'Address: {expected}' \
+             && echo LUNARWING-NETBIRD-PUBLIC-DNS-OK; "
+        ));
+    }
+    Ok(probe)
+}
+
+async fn start_netbird_dns_fixture(peer: &str) -> Result<(), String> {
+    let Ok(name) = std::env::var("LUNARWING_E2E_NETBIRD_DNS_NAME") else {
+        return Ok(());
+    };
+    if !valid_probe_name(&name) {
+        return Err("unsafe NetBird DNS test name".into());
+    }
+    let expected = required_env("LUNARWING_E2E_NETBIRD_DNS_ADDRESS")?
+        .parse::<IpAddr>()
+        .map_err(|_| "invalid NetBird DNS test address".to_string())?;
+    let peer_ip = netbird_ipv4(peer).await?;
+    podman_success(&["exec", peer, "netbird", "down"]).await?;
+    podman_success(&[
+        "exec",
+        peer,
+        "netbird",
+        "up",
+        "--disable-dns",
+        "--dns-resolver-address",
+        "127.0.0.1:5053",
+    ])
+    .await?;
+    wait_netbird_ready(peer).await?;
+    let mut args = vec![
+        "exec".to_string(),
+        "-d".to_string(),
+        peer.to_string(),
+        "dnsmasq".to_string(),
+        "--no-daemon".to_string(),
+        "--bind-interfaces".to_string(),
+        format!("--listen-address={peer_ip}"),
+        "--no-resolv".to_string(),
+        format!("--address=/{name}/{expected}"),
+    ];
+    if let Ok(public) = std::env::var("LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS") {
+        let public = public
+            .parse::<IpAddr>()
+            .map_err(|_| "invalid NetBird public DNS test address".to_string())?;
+        args.push(format!("--address=/example.com/{public}"));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    podman_success(&refs).await?;
+    let peer_ip = peer_ip.to_string();
+    let expected = expected.to_string();
+    for _ in 0..30 {
+        if let Ok(output) =
+            podman_output(&["exec", peer, "nslookup", "-type=a", &name, &peer_ip]).await
+            && output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&expected)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err("the in-overlay NetBird DNS fixture did not become ready".into())
+}
+
 async fn assert_netbird_joined_run(
     sidecar: &TunnelSidecar,
     image: &str,
@@ -1669,11 +1828,29 @@ async fn assert_netbird_joined_run(
     peer: &str,
 ) -> Result<(), String> {
     let peer_ip = netbird_ipv4(peer).await?;
+    let peer_fqdn = netbird_fqdn(peer).await?;
+    let dns_probe = netbird_dns_probe(&peer_fqdn, peer_ip)?;
     start_netbird_http_server(peer).await?;
     let container_id = sidecar
         .ensure_healthy()
         .await
         .map_err(|error| error.to_string())?;
+    let backup = assert_netbird_resolver_policy(sidecar).await?;
+    let old_resolver_probe = old_resolver_probe(&backup);
+    let resolv_conf = sidecar
+        .tunnel_resolv_conf()
+        .map_err(|error| error.to_string())?
+        .ok_or("NetBird resolver file is not staged for joined runs")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&resolv_conf)
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "joined resolver file is not readable");
+    }
     let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
         .await
         .map_err(|error| error.to_string())?;
@@ -1682,12 +1859,10 @@ async fn assert_netbird_joined_run(
         ..ResourceLimits::default()
     };
     let command = format!(
-        // `-t 1` keeps each denial probe to a single bounded try: a dropped
-        // uplink would otherwise repeat wget's default 20 attempts and can
-        // exhaust the whole per-command budget.
-        "cat /proc/net/dev; \
-         wget -qO- -t 3 -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
+        "cat /etc/resolv.conf; cat /proc/net/dev; cat /proc/self/mountinfo; \
+         wget -qO- -t 1 -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
          && echo LUNARWING-NETBIRD-OVERLAY-OK; \
+         {dns_probe} {old_resolver_probe} \
          wget -qO- -t 1 -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
          && echo LUNARWING-NETBIRD-UPLINK-OPEN; \
          wget -qO- -t 1 -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
@@ -1705,7 +1880,7 @@ async fn assert_netbird_joined_run(
             tunnel: Some(TunnelRunConfig {
                 container_id: &container_id,
                 dns: &[],
-                resolv_conf: None,
+                resolv_conf: Some(resolv_conf.as_path()),
             }),
             protected_paths: &[],
             tenant_logs: false,
@@ -1713,15 +1888,28 @@ async fn assert_netbird_joined_run(
         .await
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert_read_only_resolver_mount(&output.stdout);
     assert!(output.stdout.contains("wt0"), "joined run has no wt0");
-    assert!(
-        output.stdout.contains("LUNARWING-NETBIRD-OVERLAY-OK"),
-        "peer HTTP fetch failed: {}{}",
-        output.stdout,
-        output.stderr
-    );
+    for marker in [
+        "LUNARWING-NETBIRD-OVERLAY-OK",
+        "LUNARWING-NETBIRD-PEER-DNS-OK",
+    ] {
+        assert!(
+            output.stdout.contains(marker),
+            "missing {marker}: {}{}",
+            output.stdout,
+            output.stderr
+        );
+    }
+    if std::env::var("LUNARWING_E2E_NETBIRD_DNS_NAME").is_ok() {
+        assert!(output.stdout.contains("LUNARWING-NETBIRD-ZONE-DNS-OK"));
+    }
+    if std::env::var("LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS").is_ok() {
+        assert!(output.stdout.contains("LUNARWING-NETBIRD-PUBLIC-DNS-OK"));
+    }
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-UPLINK-OPEN"));
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-METADATA-OPEN"));
+    assert!(!output.stdout.contains("LUNARWING-OLD-RESOLVER-OPEN"));
     Ok(())
 }
 
@@ -1850,6 +2038,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
             fresh_start.elapsed().as_secs_f64()
         );
         start_plain_netbird_peer(&image, &peer_name, &peer_env).await?;
+        start_netbird_dns_fixture(&peer_name).await?;
         assert_netbird_peers_connected(primary.container_name(), &peer_name).await?;
         assert_netbird_mark_rule(&primary).await?;
         assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
