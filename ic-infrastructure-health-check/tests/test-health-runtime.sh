@@ -243,5 +243,36 @@ j3_rc=$?
 assert_eq "$(jq -r '.status' <<<"$oJ3")" "critical" "J7: retrying fallback does not mask critical backlog"
 assert_contains "$(jq -r '.issues[0]' <<<"$oJ3")" "backlog critical" "J8: critical backlog remains explained"
 assert_eq "$j3_rc" "2" "J9: critical backlog retains critical exit"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ3")" "workload isolation degraded" "J9b: critical backlog retains retrying fallback diagnostics"
+
+# J10-J18 — retrying isolation is additive, never a mask for other degradation.
+j4="$(new_sb)"; mk_registry "$j4" acme acme 3001 8788
+fix_body "$j4" "http://127.0.0.1:3001/api/gateway/status" \
+  '{"uptime_secs":10,"total_connections":0,"workload_isolation":"process-group-retrying","channel_health":{"xmpp":{"healthy":false}}}'
+fix_body "$j4" "http://127.0.0.1:3001/api/chat/pending-gates" '{"gates":[]}'
+fix_body "$j4" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":0}'
+oJ4="$(run_hc "$j4" LUNARWING_TENANTS_FILE="$j4/ports.json")"
+assert_eq "$(jq -r '.metrics.instances[0].status' <<<"$oJ4")" "degraded" "J10: retrying fallback with unhealthy channel stays degraded"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ4")" "channels unhealthy" "J11: retrying fallback does not mask channel failure"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ4")" "workload isolation degraded" "J12: channel failure retains retrying fallback diagnostics"
+
+j5="$(new_sb)"; mk_registry "$j5" acme acme 3001 8788
+fix_body "$j5" "http://127.0.0.1:3001/api/gateway/status" \
+  '{"uptime_secs":10,"total_connections":0,"workload_isolation":"process-group-retrying"}'
+fix_body "$j5" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":0}'
+oJ5="$(run_hc "$j5" LUNARWING_TENANTS_FILE="$j5/ports.json")"
+assert_eq "$(jq -r '.metrics.instances[0].status' <<<"$oJ5")" "degraded" "J13: retrying fallback with unavailable pending-gates stays degraded"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ5")" "pending-gates diagnostics unavailable" "J14: retrying fallback does not mask pending-gates observability gap"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ5")" "workload isolation degraded" "J15: pending-gates gap retains retrying fallback diagnostics"
+
+j6="$(new_sb)"; mk_registry "$j6" acme acme 3001 8788
+fix_body "$j6" "http://127.0.0.1:3001/api/gateway/status" \
+  '{"uptime_secs":10,"total_connections":0,"workload_isolation":"process-group-retrying"}'
+fix_body "$j6" "http://127.0.0.1:3001/api/chat/pending-gates" '{"gates":[]}'
+fix_body "$j6" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":30}'
+oJ6="$(run_hc "$j6" LUNARWING_TENANTS_FILE="$j6/ports.json")"
+assert_eq "$(jq -r '.metrics.instances[0].status' <<<"$oJ6")" "degraded" "J16: retrying fallback with elevated backlog stays degraded"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ6")" "backlog elevated" "J17: retrying fallback does not mask elevated backlog"
+assert_contains "$(jq -r '.metrics.instances[0].issues[]' <<<"$oJ6")" "workload isolation degraded" "J18: elevated backlog retains retrying fallback diagnostics"
 
 finish
