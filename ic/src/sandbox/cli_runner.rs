@@ -1020,6 +1020,17 @@ impl CliRunner {
         })
     }
 
+    fn build_run_command(
+        spawner: &crate::tools::process::WorkloadSpawner,
+        runtime: ContainerRuntime,
+        args: &[String],
+    ) -> tokio::process::Command {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut cmd = spawner.command(runtime.binary(), &arg_refs);
+        apply_container_runtime_path(&mut cmd);
+        cmd
+    }
+
     /// Spawn the run command, stream output into capped buffers, enforce the
     /// timeout, and return the container's exit code and output.
     ///
@@ -1041,9 +1052,7 @@ impl CliRunner {
         // NoNewPrivileges/PrivateTmp context and cannot join the tenant's
         // rootless user namespace.
         let spawner = crate::tools::process::workload_spawner().await;
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut cmd = spawner.command(self.runtime.binary(), &arg_refs);
-        apply_container_runtime_path(&mut cmd);
+        let mut cmd = Self::build_run_command(&spawner, self.runtime, args);
 
         // In service mode the manager forks the workload, so the environment
         // must be handed over via EnvironmentFile= (mode 0600, deleted after
@@ -2309,6 +2318,43 @@ mod tests {
             container_runtime_path("/usr/local/sbin:/usr/sbin:/sbin"),
             "/usr/local/sbin:/usr/sbin:/sbin"
         );
+    }
+
+    #[test]
+    fn run_container_service_path_includes_sbin() {
+        let spawner = crate::tools::process::WorkloadSpawner::systemd_for_test(vec![
+            ("HOME".into(), "/home/test".into()),
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+        ]);
+        let args = vec!["run".to_string(), "image".to_string()];
+        let mut cmd = CliRunner::build_run_command(&spawner, ContainerRuntime::Podman, &args);
+        let spec = spawner.prepare_service(&mut cmd).expect("service spec");
+        let env_path = spec.env_file.as_ref().expect("environment file");
+        let environment = std::fs::read_to_string(env_path).expect("read environment file");
+        std::fs::remove_file(env_path).expect("remove environment file");
+
+        let path = environment
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("PATH=\"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .expect("serialized container runtime PATH");
+        for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
+            assert!(path.split(':').any(|part| part == directory));
+        }
+
+        let args = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let unset = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--property=UnsetEnvironment="))
+            .expect("manager environment unset property");
+        assert!(unset.split(' ').any(|name| name == "HOME"));
+        assert!(!unset.split(' ').any(|name| name == "PATH"));
     }
 
     #[tokio::test]
