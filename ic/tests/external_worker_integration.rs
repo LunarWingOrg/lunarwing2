@@ -7413,6 +7413,107 @@ fn assert_timeout_rows_are_clean(events: &[(String, String)], value: &str) {
     }
 }
 
+/// WI#711: serde quotes a wrongly typed string in its protocol error. Drive
+/// the public create_job path to cover the parent error and both job records.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn granted_values_are_redacted_from_malformed_result_errors() {
+    use lunarwing::secrets::SecretsStore as _;
+
+    const VALUE: &str = "s3cret-db-password";
+    let (db, _tmp) = test_db().await;
+    let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyRaw {
+        frames: vec![(
+            "task_result".to_string(),
+            serde_json::json!({
+                "task_id": "@task_id@",
+                "status": "success",
+                "output": "",
+                "error": null,
+                "duration_ms": VALUE,
+            }),
+        )],
+        replies: reply_tx,
+    })
+    .await;
+    let mut config = config_for(&url);
+    config.supports_credentials = true;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let manager = ExternalWorkerManager::new(vec![config])
+        .with_event_deps(event_tx, Arc::clone(&context_manager))
+        .with_store(db.clone());
+    let crypto = Arc::new(
+        lunarwing::secrets::SecretsCrypto::new(secrecy::SecretString::from(
+            lunarwing::secrets::keychain::generate_master_key_hex(),
+        ))
+        .expect("test crypto"),
+    );
+    let secrets = Arc::new(lunarwing::secrets::InMemorySecretsStore::new(crypto));
+    secrets
+        .create(
+            "test-user",
+            lunarwing::secrets::CreateSecretParams::new("db_password", VALUE),
+        )
+        .await
+        .expect("create secret");
+    let tool = CreateJobTool::new(Arc::clone(&context_manager))
+        .with_external_workers(Arc::new(manager), Some(db.clone()))
+        .with_secrets(secrets);
+    let error = timeout(
+        TEST_BOUND,
+        tool.execute(
+            serde_json::json!({
+                "title": "Malformed result",
+                "description": "Return a wrongly typed terminal field",
+                "mode": "mock",
+                "wait": true,
+                "credentials": {"db_password": "DB_PASSWORD"},
+            }),
+            &JobContext::with_user("test-user", "parent", "parent"),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect_err("malformed task_result must fail");
+    let parent_error = error.to_string();
+    assert!(
+        !parent_error.contains(VALUE),
+        "parent error: {parent_error}"
+    );
+    assert!(parent_error.contains("[redacted-secret]"));
+
+    let jobs = context_manager.all_jobs_for("test-user").await;
+    assert_eq!(jobs.len(), 1);
+    let job_id = jobs[0];
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let record = db
+        .get_sandbox_job(job_id)
+        .await
+        .expect("job row")
+        .expect("missing job row");
+    let status_reason = record.failure_reason.unwrap_or_default();
+    assert!(
+        !status_reason.contains(VALUE),
+        "job status: {status_reason}"
+    );
+    assert!(status_reason.contains("[redacted-secret]"));
+
+    let context = context_manager.get_context(job_id).await.expect("context");
+    let context_reasons = context
+        .transitions
+        .iter()
+        .filter_map(|transition| transition.reason.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !context_reasons.contains(VALUE),
+        "job context: {context_reasons}"
+    );
+    assert!(context_reasons.contains("[redacted-secret]"));
+}
+
 /// WI#702: a dispatch with no grants must behave exactly as before — no
 /// redactor is armed and worker text is returned verbatim.
 #[tokio::test]
