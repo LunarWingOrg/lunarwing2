@@ -5,15 +5,26 @@
 
 description="LunarWing healthpoint metrics exporter (loopback listener)"
 command="/usr/local/lib/lunarwing-health/lunarwing-health-metrics"
-command_background="yes"
-pidfile="/run/lunarwing-health-metrics.pid"
+command_user="lunarwing-metrics:lunarwing-metrics"
+supervisor="supervise-daemon"
+pidfile="/run/lunarwing-health-metrics/lunarwing-health-metrics.pid"
 output_log="/var/log/lunarwing-health-metrics.log"
 error_log="/var/log/lunarwing-health-metrics.log"
+capabilities="^"
+no_new_privs="yes"
+respawn_delay="5"
+respawn_max="5"
+respawn_period="60"
+required_files="${command}"
 
 # No reload command on purpose: the daemon is configured purely via
-# environment and installs no SIGHUP handler, so a HUP "reload" would kill it
-# (default disposition) with nothing supervising a restart. Use restart.
+# environment and installs no SIGHUP handler. Use restart.
 extra_commands="healthcheck"
+
+start_pre() {
+	checkpath -d -m 0750 -o "${command_user}" /run/lunarwing-health-metrics || return 1
+	checkpath -f -m 0640 -o "${command_user}" "${output_log}" "${error_log}" || return 1
+}
 
 depend() {
 	need localmount
