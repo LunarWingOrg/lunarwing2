@@ -28,4 +28,26 @@ client.
 Russh's optional `rsa` feature remains disabled, and the `rsa` crate remains out
 of LunarWing's dependency graph.
 
+### mt-admin: scoped health-library refusal and a reachable repair (WI#709)
+
+Previously, an unsafe `/usr/local/lib/lunarwing-health` or parent directory
+aborted every mt-admin subcommand while libraries were loading, including
+`--help` and the commands needed to repair an old installation. mt-admin now
+skips only the OpenRC proxy contract, reports the failing path component, and
+keeps `--help` available. Ordinary checkouts do not gain a new contract-file
+mode check.
+
+On OpenRC, `reinstall-health-library` is the only non-help command available
+while the contract is refused; other commands remain available on positively
+detected systemd hosts. From the refused checkout, reinstall from a separate
+trusted checkout:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/checkout
+```
+
+The repair replaces the library without rendering or changing OpenRC units.
+Installs refuse to copy from the installed library itself while it fails the
+safety check, so an unsafe tree cannot be republished as trusted.
+
 See the [v2.1.9.0 release notes](RELEASE-v2.1.9.0.md) for the previous release.
