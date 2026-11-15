@@ -218,6 +218,7 @@ if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
 fi
 "$MT" validate-upgrade-wrapper-boundary "$TENANT"
 run mt clear-sandbox-image-status "$TENANT"
+rc=0
 trap 'rc=$?; if [[ "$rc" -ne 0 && "$DRY_RUN" == false ]]; then mt clear-sandbox-image-status "$TENANT" >/dev/null 2>&1 || true; fi' EXIT
 
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
