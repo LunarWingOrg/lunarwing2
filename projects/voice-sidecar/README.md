@@ -55,16 +55,39 @@ per component before acquiring a shared permit**, then moves both permits into
 the blocking worker. Requests for an occupied component return **503**
 (`unavailable`) immediately, even before the original request times out. They
 cannot queue behind its model mutex or take additional shared permits. A
-timed-out TTS call can therefore retain only one permit. With the default two
-permits, STT/VAD can use the remaining capacity; with a limit of one, or other
-components also occupying the pool, they return 503 too. This is admission
-isolation, not native cancellation or a guarantee of inference completion.
+timed-out TTS call therefore retains its one TTS admission permit and one
+shared-capacity permit; rejected retries hold neither. With the default two
+shared permits, STT/VAD can use the remaining capacity; with a limit of one, or
+other components also occupying the pool, they return 503 too. This is
+admission isolation, not native cancellation or a guarantee of inference
+completion.
 
 When abandoned inference returns normally (including a returned inference
-error), its mutex/permits are released and admission recovers automatically.
-Caller/worker settlement is serialized so a concurrent completion cannot
-underflow abandonment counts. An ordinary processing failure remains **422**
-(`processing_failed`).
+error), its mutex and both permits are released and admission recovers
+automatically. Caller/worker settlement is serialized so a concurrent
+completion cannot underflow abandonment counts. An ordinary processing failure
+remains **422** (`processing_failed`).
+
+**Size the shared pool for native workers, not request rate.**
+`VOICE_MAX_CONCURRENT_INFERENCE` (default `2`, range `1..64`; mt-admin flag
+`--max-concurrent-inference`) caps native workers across all components.
+Because each component admits only one worker, at most three can run
+concurrently; values above `3` add no admission capacity. With `1`, one running
+or abandoned worker exhausts the pool. With `2`, one shared slot remains, but
+the other components can still contend for it and fail fast with 503. With `3`
+and all components enabled, one stuck worker leaves capacity for the other two.
+More workers consume more CPU and RAM (`ORT_NUM_THREADS` is applied to each
+component), so use `3` only when the host has enough headroom and preserving
+cross-component capacity is necessary. A larger pool neither admits retries to
+an occupied component nor repairs a hung model.
+
+**Timeout and retry tuning is not cancellation.** A shorter
+`VOICE_REQUEST_TIMEOUT_SECS` only makes the caller leave sooner; it does not
+release either permit or stop native CPU use. Set the timeout for expected
+slow-but-valid decoding and inference rather than using it to free capacity.
+After a 504, retry with backoff: the same component returns 503 until its
+worker settles, and other components also return 503 while no shared permit is
+available.
 
 **Panics require restart.** A Rust panic while holding a model mutex releases
 permits through unwinding but may leave native state invalid. The component is
