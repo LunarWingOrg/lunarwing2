@@ -958,7 +958,7 @@ impl Store {
 
 // ==================== Job Events ====================
 
-/// A persisted job streaming event (from worker or Claude Code bridge).
+/// A persisted streaming event from a sandbox worker.
 #[derive(Debug, Clone)]
 pub struct JobEventRecord {
     pub id: i64,
