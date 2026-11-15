@@ -824,13 +824,31 @@ root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
 every entry in it, and every parent through `/` on every run; any non-root
 owner, symbolic link, or group/other write permission produces a logged refusal
 and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
-contract preflight applies the same check whenever its source resolves to this
+contract loader applies the same check whenever its source resolves to this
 installed library. A root-owned Study Notes scheduler snapshot instead stages
 and sources a private contract copy beside mt-admin, so it needs neither a
-sibling checkout nor the installed host health library. Do
-not hand-copy an operator checkout over the library; rerun the health pipeline
-install instead (`upgrade-tenant`, `add-tenant`, or
-`ic/scripts/enable-health-fleet.sh`).
+sibling checkout nor the installed host health library. The loader does not
+impose a new ownership or mode check on an ordinary checkout. A refusal skips
+only the contract source and leaves `--help` usable. On a positively detected
+systemd host other commands remain available; on OpenRC only `--help` and
+`reinstall-health-library` are usable until the contract is repaired. OpenRC
+operations fail closed rather than treating a missing contract as proof that
+units are safe.
+
+Repair a refused library or unsafe entry from a **separate trusted checkout**
+by running the refused mt-admin executable as root, for example:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/checkout
+```
+
+This command only replaces the health library; it does not render, start, or
+stop OpenRC units. The next invocation loads the repaired contract. Every
+install refuses to copy from a source that resolves to the installed library
+while that library fails the safety check, so the refused bytes cannot be
+published back into the root trust boundary. Do not hand-copy an operator
+checkout over the library. Normal refreshes when the contract is available
+remain `upgrade-tenant`, `add-tenant`, or `ic/scripts/enable-health-fleet.sh`.
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
