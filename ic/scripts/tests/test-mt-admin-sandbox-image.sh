@@ -301,15 +301,33 @@ else
   bad "sandbox build used an untrusted Dockerfile: $build_dockerfile"
 fi
 promote_candidate_sandbox_image tenant-a
+rollback_file="$(_promote_rollback_file tenant-a)"
 if [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$new_id" \
-    && "$(awk -F '\t' '$1 == "sandbox" {print $2}' "$(_promote_rollback_file tenant-a)")" == sandbox-old ]]; then
-  ok 'promotion moves latest to the candidate and records the previous ID'
+    && "$(awk -F '\t' '$1 == "sandbox" {print $2}' "$rollback_file")" == sandbox-old \
+    && "$(awk -F '\t' '$1 == "sandbox" {print $3}' "$rollback_file")" == "$new_id" ]]; then
+  ok 'promotion records both the previous and promoted sandbox image IDs'
 else
   bad 'sandbox promotion or rollback record is incorrect'
 fi
+
+# WI#642: tenant B can promote after tenant A but before A's failed upgrade
+# rolls back. A must leave B's tag alone; with A's own promoted ID restored to
+# latest, the ordinary rollback still succeeds from the same record.
+register_image "$SANDBOX_IMAGE_TAG" sandbox-other-tenant outdated
+: >"$warnings"
+( restore_promoted_workers tenant-a ) >/dev/null 2>&1 \
+  && interleaved_rc=0 || interleaved_rc=$?
+if [[ "$interleaved_rc" -ne 0 \
+    && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-other-tenant ]] \
+    && grep -Fq 'another promotion replaced' "$warnings"; then
+  ok 'rollback leaves a tag promoted by another tenant unchanged'
+else
+  bad "rollback replaced another tenant's tag: $(cat "$warnings")"
+fi
+register_image "$SANDBOX_IMAGE_TAG" "$new_id" "$current_digest"
 restore_promoted_workers tenant-a
 if [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-old ]]; then
-  ok 'upgrade rollback restores the previous sandbox image ID'
+  ok 'upgrade rollback restores the previous sandbox image ID when its promoted ID is current'
 else
   bad 'sandbox rollback did not restore the previous image ID'
 fi
