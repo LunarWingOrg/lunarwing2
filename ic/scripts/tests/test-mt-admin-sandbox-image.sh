@@ -474,6 +474,8 @@ for source_mode in upgrade add worker; do
   expected_rc=1
   expected_message='does not match selected operator revision'
   pass_message="$source_mode refuses an older clean tenant HEAD before building"
+  message_file="$fixture/older-head.out"
+  : >"$warnings"
   rm -f "$fixture/last-build-dockerfile"
   case "$source_mode" in
     upgrade)
@@ -487,6 +489,7 @@ for source_mode in upgrade add worker; do
       expected_rc=2
       expected_message='is behind the operator checkout'
       pass_message='add-tenant helper distinguishes a behind tenant from a build failure'
+      message_file="$warnings"
       ( ensure_sandbox_image_current_from_tenant tenant-a always ) \
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
@@ -497,7 +500,7 @@ for source_mode in upgrade add worker; do
   esac
   if [[ "$older_head_rc" -eq "$expected_rc" && ! -e "$fixture/last-build-dockerfile" \
       && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
-      && grep -Fq "$expected_message" "$fixture/older-head.out"; then
+      && grep -Fq "$expected_message" "$message_file"; then
     ok "$pass_message"
   else
     bad "$source_mode accepted or misclassified an older clean tenant HEAD (rc=$older_head_rc): $(cat "$fixture/older-head.out")"
