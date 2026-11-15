@@ -1201,7 +1201,7 @@ main() {
       # calls this before its stop so a lane build failure cannot strand it.
       require_root
       local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false" cand_lunardepth="false"
-      local cand_all_enabled="false" cand_target="" cand_sandbox_policy="$SANDBOX_IMAGE_POLICY"
+      local cand_all_enabled="false" cand_target="" cand_selected_commit="" cand_sandbox_policy="$SANDBOX_IMAGE_POLICY"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --enabled)        cand_all_enabled="true"; shift ;;
@@ -1212,6 +1212,8 @@ main() {
           --with-lunardepth) cand_lunardepth="true"; shift ;;
           --target)         cand_target="$2"; shift 2 ;;
           --target=*)       cand_target="${1#*=}"; shift ;;
+          --selected-commit) [[ $# -ge 2 ]] || die "--selected-commit requires a value"; cand_selected_commit="$2"; shift 2 ;;
+          --selected-commit=*) cand_selected_commit="${1#*=}"; shift ;;
           --sandbox-image)  cand_sandbox_policy="$2"; shift 2 ;;
           --sandbox-image=*) cand_sandbox_policy="${1#*=}"; shift ;;
           -*)               die "unknown flag: $1" ;;
@@ -1222,7 +1224,7 @@ main() {
             ;;
         esac
       done
-      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--target <ref>] [--sandbox-image auto|always|never]"
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--target <ref>] [--selected-commit <sha>] [--sandbox-image auto|always|never]"
       cand_name="$(sanitize_name "$cand_name")"
       validate_sandbox_image_policy "$cand_sandbox_policy"
       ports_registry_init
@@ -1242,7 +1244,7 @@ main() {
       # same tenant (they share the candidate tag). run-300 TO-1: inside the
       # upgrade wrapper that run's inherited lock is used, not re-acquired.
       with_tenant_upgrade_lock "$cand_name" \
-        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false" "$cand_target" "$cand_lunardepth" "$cand_sandbox_policy"
+        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false" "$cand_target" "$cand_lunardepth" "$cand_sandbox_policy" "$cand_selected_commit"
       ;;
 
     last-build-stage)
