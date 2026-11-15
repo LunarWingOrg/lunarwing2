@@ -1958,8 +1958,8 @@ _default_operator_worker_release_ref() {
   printf '%s\n' "$release_ref"
 }
 
-_worker_source_provenance() {  # <tenant source root> <lane> [release ref]
-  local source_root="$1" lane="$2" requested="${3:-}"
+_worker_source_provenance() {  # <tenant source root> <lane> [release ref] [selected commit]
+  local source_root="$1" lane="$2" requested="${3:-}" selected_commit="${4:-}"
   local revision dirty owner release_ref
   revision="$(_worker_source_git "$source_root" rev-parse --verify HEAD)" || revision=""
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] \
@@ -1978,8 +1978,11 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   release_ref="$(_operator_worker_release_ref "$requested")" || release_ref=""
   [[ -n "$release_ref" ]] \
     || die "tenant '$owner' HEAD $revision has no operator release ref matching '$requested'"
-  if [[ "$release_ref" =~ ^[0-9a-f]{40}$ && "$revision" != "$release_ref" ]]; then
-    die "tenant '$owner' HEAD $revision does not match selected operator revision $release_ref"
+  if [[ -n "$selected_commit" ]]; then
+    [[ "$selected_commit" =~ ^[0-9a-f]{40}$ ]] \
+      || die "selected operator revision is not a full commit: $selected_commit"
+    [[ "$revision" == "$selected_commit" ]] \
+      || die "tenant '$owner' HEAD $revision does not match selected operator revision $selected_commit"
   fi
   git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref" \
     || die "tenant '$owner' HEAD $revision is not on operator release ref $release_ref"
