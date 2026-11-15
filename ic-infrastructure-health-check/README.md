@@ -360,6 +360,14 @@ On multi-tenant hosts the listener port comes from the ports registry v16
 never hardcode a tenant port. Tenant-scoped listeners are not planned; one
 host-global exporter carries per-tenant labels.
 
+On OpenRC, `/etc/conf.d/lunarwing-health-metrics` exports
+`LUNARWING_BASE_DIR=/var/lib/lunarwing-health` so the listener reads the same
+report as the exporter. `ensure_health_pipeline` reconciles that line in an
+existing confd on install/upgrade, including when
+`LUNARWING_MT_HEALTH_BASE_DIR` overrides the default, while preserving the
+other listener settings. Restart the OpenRC listener after changing this
+value; the pipeline does not install the optional listener or create its confd.
+
 `contrib/` ships a Prometheus alerting-rules YAML and a Grafana dashboard JSON
 covering the three canonical early warnings (rising latency, rising error
 rate, report staleness) plus unit/self-heal alerting.
