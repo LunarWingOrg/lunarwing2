@@ -81,3 +81,48 @@ isolates the effect of removing the network namespace, but it is still not a
 substitute for the real daemon shell-tool test: `proxy-enforced` also inserts
 its Unix-relay HTTP proxy and applies a public-only destination policy. That
 end-to-end test follows after the build.
+
+### 3. Untouched real sandbox: `proxy-enforced`, empty extra-domain list
+
+The release daemon and companion bridge builds completed in 9m14s and 8m20s.
+`mt-admin start-tenant netbirddnstester` succeeded; gateway health returned
+HTTP 200. Before this probe, `lunarwing config get
+sandbox.extra_allowed_domains` returned `[]`, and the tenant's
+`SANDBOX_NETWORK` was `proxy-enforced`.
+
+A fresh gateway thread asked the agent to run one fixed command through the
+`shell` tool. The shell approval was accepted once. Its result had
+`"sandboxed":true`, `"success":true`, and `"truncated":false`. The command was:
+
+```sh
+printf 'RESOLV_CONF\n'; cat /etc/resolv.conf
+printf 'DNS_A\n'; getent ahostsv4 cotterhomelab3.netbird.selfhosted 2>&1
+printf 'DNS_A_RC=%s\n' "$?"
+printf 'DNS_BOTH\n'; getent hosts cotterhomelab3.netbird.selfhosted sweetiebot.netbird.selfhosted 2>&1
+printf 'DNS_BOTH_RC=%s\n' "$?"
+printf 'PROXY_HEALTH\n'
+curl -sS --max-time 8 -w '\nPROXY_HTTP=%{http_code} REMOTE=%{remote_ip}\n' \
+  http://cotterhomelab3.netbird.selfhosted:3000/health 2>&1
+printf 'PROXY_RC=%s\n' "$?"
+printf 'DIRECT_HEALTH\n'
+curl --noproxy '*' -sS --max-time 8 -w '\nDIRECT_HTTP=%{http_code} REMOTE=%{remote_ip}\n' \
+  http://cotterhomelab3.netbird.selfhosted:3000/health 2>&1
+printf 'DIRECT_RC=%s\n' "$?"
+```
+
+Observed in the real sandbox:
+
+- `/etc/resolv.conf` contained only public resolvers `1.1.1.1` and `1.0.0.1`.
+- Both `getent` calls returned exit 2 with no addresses.
+- The proxied health request returned **HTTP 403** with `sandbox-proxy denied:
+  host 'cotterhomelab3.netbird.selfhosted' not in allowlist`.
+- Direct curl returned exit 6, **HTTP 000**, `Could not resolve host`.
+- No files were modified by the probe. The managed image's `/etc/hosts` was
+  also checked separately and contained no NetBird name mappings, so the
+  positive runtime lookups above were DNS, not static-host overrides.
+
+**Result:** the untouched secure default does not resolve or reach the fleet
+MagicDNS target. This is the expected network-none and allowlist boundary, not
+a failure of NetBird or of the tenant's underlying container runtime. Raw
+non-secret gateway event evidence is in `/tmp/lw686-default.json` on the test
+host.
