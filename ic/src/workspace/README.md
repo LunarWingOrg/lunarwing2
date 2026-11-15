@@ -391,8 +391,10 @@ Seven native tools (see `src/tools/builtin/knowledge.rs`):
   `knowledge_submit_note` with `replace=true`.
 - **`knowledge_list_stale`** — notes needing verification by status, age
   (`max_age_days`, falling back to the note's own `stale_after_days`), or
-  `repository_commit` mismatch. Every result carries canonical `stale_reasons`
-  (`status:<status>`, `age-exceeded`, `source-commit-mismatch`). Superseded
+  `repository_commit` mismatch. A commit mismatch requires a recorded, different
+  note `source_commit`; notes without commit provenance do not get that reason.
+  Every result carries canonical `stale_reasons` (`status:<status>`,
+  `age-exceeded`, `source-commit-mismatch`). Superseded
   notes are retired and excluded. Daily routines can pass
   `include_status_only=false` to skip notes listed only for an already-marked
   status while retaining age and commit matches; the default remains true so
