@@ -10,6 +10,10 @@ export HEALTH_METRICS_LISTEN="127.0.0.1:50000"
 # Optional bearer token; empty = no auth on loopback.
 export HEALTH_METRICS_TOKEN=""
 
+# Base directory containing the exporter's workspace/reports/health report.
+# mt-admin reconciles this line when its health base directory is overridden.
+export LUNARWING_BASE_DIR="/var/lib/lunarwing-health"
+
 # Path to the .prom file to serve (must match the exporter's
 # HEALTH_METRICS_OUTPUT), and the refresh interval (seconds) for the served
 # snapshot.
