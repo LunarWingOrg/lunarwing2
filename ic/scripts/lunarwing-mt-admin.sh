@@ -1288,7 +1288,7 @@ main() {
         local sandbox_tenant
         sandbox_tenant="$(sanitize_name "$1")"
         tenant_exists_in_registry "$sandbox_tenant" || die "tenant '$sandbox_tenant' not found in registry"
-        build_sandbox_image "$sandbox_tenant"
+        build_sandbox_image "$sandbox_tenant" && clear_sandbox_image_status "$sandbox_tenant"
       else
         build_sandbox_image
       fi
