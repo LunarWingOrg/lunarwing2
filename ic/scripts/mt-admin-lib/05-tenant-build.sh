@@ -343,12 +343,136 @@ _tenant_status_uids() {
   ids=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
 }
 
+# Compare the recorded subordinate ranges with the current file. A deleted
+# account normally has no entry of its own; stale entries for its name/uid must
+# match the record, and no other account may now own any part of those ranges.
+# Uses the caller's starts and counts arrays.
+_tenant_subuid_record_current() {
+  local name="$1" uid="$2" owner start count range i
+  local current_owned=false
+  local -A current_ranges=()
+  [[ -f "$TENANT_SUBUID_FILE" && -r "$TENANT_SUBUID_FILE" ]] || {
+    say "ERROR: cannot read current subordinate uid ranges from $TENANT_SUBUID_FILE" >&2
+    return 1
+  }
+  while IFS=: read -r owner start count || [[ -n "$owner" ]]; do
+    [[ -n "$owner" && "$owner" != \#* ]] || continue
+    if [[ ! "$start" =~ ^[0-9]+$ || ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+      say "ERROR: invalid entry '$owner:$start:$count' in current $TENANT_SUBUID_FILE" >&2
+      return 1
+    fi
+    range="$start:$count"
+    if [[ "$owner" == "$name" || "$owner" == "$uid" ]]; then
+      current_owned=true
+      current_ranges["$range"]=1
+      for i in "${!starts[@]}"; do
+        [[ "${starts[i]}:${counts[i]}" != "$range" ]] || continue 2
+      done
+      say "ERROR: current $TENANT_SUBUID_FILE range '$range' for '$owner' is absent from the identity record of '$name'; the current-side range differs" >&2
+      return 1
+    fi
+    for i in "${!starts[@]}"; do
+      if ((start < starts[i] + counts[i] && starts[i] < start + count)); then
+        say "ERROR: current $TENANT_SUBUID_FILE entry '$owner:$range' overlaps recorded range '${starts[i]}:${counts[i]}' for '$name'; the current file and identity record differ" >&2
+        return 1
+      fi
+    done
+  done <"$TENANT_SUBUID_FILE"
+  [[ "$current_owned" == true ]] || return 0
+  for i in "${!starts[@]}"; do
+    range="${starts[i]}:${counts[i]}"
+    [[ -n "${current_ranges[$range]+present}" ]] && continue
+    say "ERROR: recorded range '$range' is absent from the current $TENANT_SUBUID_FILE entries for '$name'; the record-side range differs" >&2
+    return 1
+  done
+}
+
+# A readable mt-admin status file is not proof of a complete /proc: a PID
+# namespace or LSM can hide every other task. PID 1 must be visible, be a
+# supported host init, and have the same root directory as this mt-admin.
+_tenant_proc_host_visible() {
+  local root="$TENANT_PROC_ROOT" comm
+  if [[ ! -r "$root/1/status" || ! -r "$root/1/comm" ]]; then
+    say "ERROR: cannot verify that $root/1 is the host init; the process table may be namespace- or LSM-filtered" >&2
+    return 1
+  fi
+  { comm="$(<"$root/1/comm")"; } 2>/dev/null || comm=""
+  case "$comm" in
+    systemd|init|sysvinit|openrc-init) ;;
+    *)
+      say "ERROR: $root/1 is not a supported host init (comm: ${comm:-unreadable}); refusing to trust a partial process table" >&2
+      return 1 ;;
+  esac
+  if [[ ! "$root/1/root" -ef / ]]; then
+    say "ERROR: $root/1 has a different root directory; refusing to trust a non-host process table" >&2
+    return 1
+  fi
+}
+
+# cgroup membership cannot be escaped by forking. Check every cgroup.procs in
+# the tenant's tree, not just its root, and fail if a live member or unreadable
+# file prevents an emptiness proof. Runs in a subshell to contain glob options.
+_tenant_cgroup_tree_empty() (
+  local label="$1" root="$2" procs contents
+  [[ -e "$root" ]] || return 0
+  [[ -d "$root" && -r "$root" ]] || {
+    say "ERROR: cannot inspect $label cgroup $root" >&2
+    return 1
+  }
+  shopt -s nullglob globstar
+  local -a files=("$root"/**/cgroup.procs)
+  ((${#files[@]} > 0)) || {
+    say "ERROR: no cgroup.procs under $label cgroup $root" >&2
+    return 1
+  }
+  for procs in "${files[@]}"; do
+    [[ -e "$procs" ]] || continue
+    { contents="$(<"$procs")"; } 2>/dev/null || {
+      say "ERROR: cannot read $procs; cannot prove the $label cgroup empty" >&2
+      return 1
+    }
+    [[ -n "$contents" ]] || continue
+    contents="${contents//$'\n'/ }"
+    say "ERROR: $label cgroup $root is not empty (pids: $contents); stop $label before removal" >&2
+    return 1
+  done
+  return 0
+)
+
+_tenant_former_cgroups_idle() {
+  local name="$1" uid="$2" root="$TENANT_CGROUP_ROOT" svc worker
+  [[ -r "$root/cgroup.controllers" ]] || {
+    say "ERROR: cgroup v2 is not readable at $root; cannot close the fork/exit race in the process-table proof" >&2
+    return 1
+  }
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _tenant_cgroup_tree_empty "systemd user-${uid}.slice" "$root/user.slice/user-${uid}.slice" || return 1
+    _tenant_cgroup_tree_empty "systemd user-${uid}.slice" "$root/user-${uid}.slice" || return 1
+    return 0
+  fi
+  _tenant_cgroup_tree_empty "tenant $name" "$root/lunarwing-${name}" || return 1
+  local -a services=(
+    "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}"
+    "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"
+    "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "weechat-${name}"
+  )
+  for worker in nanocode pebble opencode opencode2 lunardepth kimi vision voice pg; do
+    services+=(
+      "lunarwing-${worker}-${name}" "lunarwing-${worker}-${name}-sup"
+      "lunarwing-${worker}-task-${name}" "lunarwing-${worker}-task-${name}-sup"
+    )
+  done
+  for svc in "${services[@]}"; do
+    _tenant_cgroup_tree_empty "OpenRC service $svc" "$root/openrc.$svc" || return 1
+  done
+}
+
 # Prove that no process or thread of the removed tenant's recorded uid or
 # subordinate uid ranges exists (real, effective, saved or filesystem uid;
 # threads can carry credentials of their own). Prints the reason and returns 1
-# when that cannot be shown: no record, a malformed record, an unreadable
-# process table or status of a live task, the uid now held by another
-# account, or a match.
+# when that cannot be shown: no record, a malformed or stale record, a partial
+# process table, a non-empty tenant cgroup, or a matching live task.
 tenant_former_identity_idle() {
   local name="$1" path line value uid="" uids=0 start count matches="" nmatch=0
   local seen=0 holder
@@ -399,15 +523,17 @@ tenant_former_identity_idle() {
     say "ERROR: no subordinate uid range recorded in $path; the rootless containers of '$name' cannot be ruled out" >&2
     return 1
   fi
+  _tenant_subuid_record_current "$name" "$uid" || return 1
   holder="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" || holder=""
   if [[ -n "$holder" ]]; then
     say "ERROR: the former uid $uid of '$name' now belongs to account '$holder'; its processes cannot be told apart" >&2
     return 1
   fi
-  # A process that keeps forking and exiting can slip between the listing and
-  # the read of one pass; two full passes, each with fresh listings, must both
-  # come out clean. A chain forking faster than a pass is a known limit that
-  # only a cgroup-emptiness check would close.
+  _tenant_proc_host_visible || return 1
+  _tenant_former_cgroups_idle "$name" "$uid" || return 1
+  # Empty cgroup trees close the fork/exit race: a child inherits its parent's
+  # cgroup. Two fresh process-table passes additionally check per-thread
+  # credentials and any relevant process outside the known service trees.
   local pass
   for pass in 1 2; do
     seen=0
