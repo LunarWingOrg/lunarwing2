@@ -412,6 +412,42 @@ else
 fi
 unset LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT
 
+# WI#642: a clean older tenant HEAD is not the revision mt-admin selected.
+# Both tenant-driven sandbox paths and the shared worker provenance helper must
+# refuse it before a runtime build, rather than accepting any release ancestor.
+printf '# newer operator-selected revision\n' \
+  >>"$operator_repo/ic/docker/sandbox.Dockerfile"
+git -C "$operator_repo" add ic/docker/sandbox.Dockerfile
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Newer operator revision'
+selected_head="$(git -C "$operator_repo" rev-parse HEAD)"
+[[ "$(git -C "$tenant_repo" rev-parse HEAD)" != "$selected_head" ]]
+for source_mode in upgrade add worker; do
+  before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
+  rm -f "$fixture/last-build-dockerfile"
+  case "$source_mode" in
+    upgrade)
+      ( build_candidate_sandbox_image tenant-a always "$selected_head" ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+    add)
+      ( ensure_sandbox_image_current_from_tenant tenant-a always ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+    worker)
+      ( _prepare_worker_build_source "$tenant_repo" ic/docker "$selected_head" ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+  esac
+  if [[ "$older_head_rc" -ne 0 && ! -e "$fixture/last-build-dockerfile" \
+      && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
+      && grep -Fq 'does not match selected operator revision' "$fixture/older-head.out"; then
+    ok "$source_mode refuses an older clean tenant HEAD before building"
+  else
+    bad "$source_mode accepted an older clean tenant HEAD: $(cat "$fixture/older-head.out")"
+  fi
+done
+
 # Exercise the actual start_tenant recovery path without touching systemd,
 # OpenRC, a tenant account, or a container store. A failed distribution warns
 # but does not prevent the base tenant from starting.
