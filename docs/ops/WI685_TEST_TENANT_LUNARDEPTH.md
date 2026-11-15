@@ -107,7 +107,18 @@ Build result pending.
 
 ## Runtime audits
 
-Pending.
+Source-side prechecks on the exact lane checkout passed:
+
+- `python3 scripts/render_overlay_test.py`: 10 tests passed, including the
+  TensorZero/TensorMoon route renderer cases.
+- `python3 health_server_test.py`: 4 tests passed.
+- `python3 scripts/exposure_policy_assert.py --source .`: passed.
+
+These do not establish live inference or container confinement. In particular,
+mt-admin's remote `worker-smoke` does not enable the smoke client's task
+inference path; real inference must come from the gateway jobs below.
+
+Live build/start/listener/egress/smoke results: pending.
 
 ## Job exercise
 
