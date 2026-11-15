@@ -232,7 +232,29 @@ the Rust/Go sets used by other workers:
   status-500 8; 39 errors at status >=400, rate 0.130872; nearest-rank p50=55
   and p95=436. Every value matches the worker's report.
 
-Jobs 2 and 3: pending.
+### Job 2 — C++17 weighted interval scheduling: PASS
+
+- Job `04044cd8-c2a0-4e1b-a055-57b91fd7ed81`, created 09:36:07Z and
+  completed 09:41:39Z (**331 s** job elapsed; 350.4 s wall including
+  dispatch). It used the previous `always` approval, emitted 21 events, and
+  had zero repairs/stuck state.
+- `/workspace/wi685_cpp_wis` contains `wis.hpp`, `main.cpp`, `Makefile`, the
+  binary/object, transcript, and `SUMMARY.md`. The test driver has an actual
+  exhaustive-subset oracle independent of the DP recurrence.
+- Reported and independently reproduced results: 8/8 directed cases; 240
+  seeded random instances with zero optimum/reconstruction mismatches; N=2000
+  optimum 463293 with 761 selected and matching independent DP; empty,
+  touching-endpoint, heavier-equal-overlap, duplicate, and negative-weight
+  edge cases all passed.
+- **Independent forced rebuild and rerun:** `make -B` succeeded with
+  `g++ -O2 -std=c++17 -Wall -Wextra -Werror`; two new executions matched each
+  other and the original transcript byte for byte (SHA-256
+  `301cc5e1090fb57583164cd58e4599fde8a023dc99a2cace8ec7a7dbce0a15c4`).
+- Minor environment hiccup: the worker noted that the optional `file` utility
+  is absent. It did not affect compilation or execution; the actual binary ran
+  successfully with exit 0.
+
+Job 3: pending.
 
 ## Findings and hand-off
 
