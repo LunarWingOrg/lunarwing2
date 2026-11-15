@@ -24,9 +24,9 @@ def valid_config():
         "Env": [
             "NODE_VERSION=22.23.4",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "LUNARDEPTH_IMAGE_REVISION=da06c33b2091546dc38c61b95452ce27a4ce32d5",
+            "LUNARDEPTH_IMAGE_REVISION=0472d115e5297093f249c222639431ba8ff0bb78",
             "LUNARDEPTH_IMAGE_VERSION=0.2.1-alpha.1",
-            "LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned",
+            "LUNARDEPTH_PROFILE_SCHEMA_VERSION=1",
             "LUNARDEPTH_TASK_UID=10005",
             "LUNARDEPTH_TASK_GID=10005",
             "LUNARDEPTH_BRIDGE_UID=10105",
