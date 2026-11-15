@@ -217,6 +217,8 @@ if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
   exec "$MT" upgrade-wrapper-boundary "$TENANT" "${ORIGINAL_ARGS[@]}"
 fi
 "$MT" validate-upgrade-wrapper-boundary "$TENANT"
+run mt clear-sandbox-image-status "$TENANT"
+trap 'rc=$?; if [[ "$rc" -ne 0 && "$DRY_RUN" == false ]]; then mt clear-sandbox-image-status "$TENANT" >/dev/null 2>&1 || true; fi' EXIT
 
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
 # This tool backs up the root-store DB (step 1) and restores into the fresh
