@@ -147,7 +147,7 @@ run_refresh() {
               image-newer-minor) printf "160017\n" ;;
               bad-version) printf "unknown\n" ;;
               gate-arithmetic-injection)
-                printf '160016+a[$(touch %s/arithmetic-executed)]\n' "$FIXTURE_ROOT" ;;
+                printf "160016+a[\$(touch %s/arithmetic-executed)]\n" "$FIXTURE_ROOT" ;;
               version-probe-transient)
                 if [[ ! -e "$FIXTURE_ROOT/state/version-probe-attempted" ]]; then
                   touch "$FIXTURE_ROOT/state/version-probe-attempted"
