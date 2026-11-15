@@ -1938,6 +1938,16 @@ _operator_worker_release_ref() {  # <branch, tag, remote ref, or commit>
   return 1
 }
 
+OPERATOR_UPGRADE_TARGET_REF=""
+OPERATOR_UPGRADE_TARGET_COMMIT=""
+_resolve_operator_upgrade_target() {  # <branch, tag, remote ref, or commit>
+  local requested="$1" release_ref commit
+  release_ref="$(_operator_worker_release_ref "$requested")" || return 1
+  commit="$(git -C "$LUNARWING_ROOT" rev-parse --verify "${release_ref}^{commit}")" || return 1
+  OPERATOR_UPGRADE_TARGET_REF="$release_ref"
+  OPERATOR_UPGRADE_TARGET_COMMIT="$commit"
+}
+
 _default_operator_worker_release_ref() {
   local release_ref
   release_ref="$(git -C "$LUNARWING_ROOT" symbolic-ref --quiet HEAD 2>/dev/null)" || release_ref=""
