@@ -56,7 +56,7 @@ the proxy at all (WI#717), so nothing is injected there; this applies where the
 proxy is reachable, which is the Docker runtime and whatever WI#717's fix makes
 work. Move a tenant to `proxy-enforced` if the outbound key is not wanted.
 
-### Root health library refresh and refusal diagnostics (WI#687, WI#696)
+### Root health library refresh and refusal diagnostics (WI#687, WI#696, WI#725)
 
 A host whose `/usr/local/lib/lunarwing-health` was installed before WI#687 can
 still contain files owned by the checkout user, and its old
@@ -68,9 +68,14 @@ the refresh replaces the old library and launcher.
 
 The refreshed installer uses a root-only staging tree, refuses linked or
 non-regular sources, and does not inherit checkout modes, ACLs, or set-ID bits.
-The new launcher validates the installed tree before loading its environment
-and reports the failing path component on stderr and to syslog. Root-owned
-mt-admin snapshots apply the same source-tree check to linked installed
-libraries and real-directory OpenRC contract siblings.
+Every file the library runs is left executable, including a
+`lunarwing-health-metrics` binary the checkout ships: earlier refreshes
+installed it 0644, so a listener that could not start is repaired by the next
+`add-tenant`, `upgrade-tenant` or `enable-health-fleet.sh`. An install under a
+set-group-ID parent now succeeds instead of refusing its own stage; the stage
+clears the inherited bit. The new launcher validates the installed tree before
+loading its environment and reports the failing path component on stderr and to
+syslog. Root-owned mt-admin snapshots apply the same source-tree check to
+linked installed libraries and real-directory OpenRC contract siblings.
 
 See the [v2.1.9.0 release notes](RELEASE-v2.1.9.0.md) for the previous release.
