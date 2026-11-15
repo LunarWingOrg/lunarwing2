@@ -412,15 +412,16 @@ MT_ADMIN_OPENRC_CONTRACT_REFUSAL=""
 HEALTH_CONTRACT_REFUSAL=""
 
 require_safe_installed_health_source() {
-  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR" linked="false"
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR" linked="false" refusal
   HEALTH_CONTRACT_REFUSAL=""
   if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
     resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
     if [[ -L "$source_dir" ]]; then linked="true"; fi
   fi
   if [[ "$linked" == "true" || "$resolved" == "$HEALTH_LIB_DIR" ]]; then
-    health_lib_tree_require_safe "$resolved" || {
-      HEALTH_CONTRACT_REFUSAL="$(health_lib_refusal_text "$resolved")"
+    refusal="$(health_lib_tree_require_safe "$resolved" 2>&1)" || {
+      printf '%s\n' "$refusal" >&2
+      HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
       return 1
     }
   fi
