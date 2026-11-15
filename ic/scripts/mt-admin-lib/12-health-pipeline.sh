@@ -347,9 +347,13 @@ health_pipeline_stage_mark_executables() {  # <tree>
 }
 
 publish_health_pipeline_library() {
-  local stage="$1" parent="$2" old=""
+  local stage="$1" parent="$2" old="" mv_help=""
+  # Capture the help text instead of piping it into grep -q: grep exits on the
+  # first match, and under `set -o pipefail` the SIGPIPE that gives mv would
+  # read as "no --exchange" on a host that has it.
+  mv_help="$(mv --help 2>/dev/null || true)"
   if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]]; then
-    if ! mv --help 2>/dev/null | grep -q -- '--exchange'; then
+    if [[ "$mv_help" != *--exchange* ]]; then
       printf 'health pipeline: this mv has no --exchange; using the rollback-protected replacement\n' >&2
     elif mv -T --exchange -- "$stage/tree" "$HEALTH_LIB_DIR"; then
       rm -rf -- "$stage"
