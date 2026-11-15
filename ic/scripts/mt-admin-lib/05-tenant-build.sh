@@ -373,7 +373,7 @@ _tenant_subuid_record_current() {
     fi
     for i in "${!starts[@]}"; do
       if ((start < starts[i] + counts[i] && starts[i] < start + count)); then
-        say "ERROR: current $TENANT_SUBUID_FILE entry '$owner:$range' overlaps recorded range '${starts[i]}:${counts[i]}' for '$name'; the current file and identity record differ. Stop and remove '$owner' and its workloads (for a LunarWing tenant, run 'remove-tenant $owner --purge'), then rerun; the former range cannot be released while reused" >&2
+        say "ERROR: current $TENANT_SUBUID_FILE entry '$owner:$range' overlaps recorded range '${starts[i]}:${counts[i]}' for '$name'; the current file and identity record differ. Stop and remove '$owner' and its workloads (for a LunarWing tenant, save any data you need from '$owner' first, then run 'remove-tenant $owner --purge'), then rerun; the former range cannot be released while reused" >&2
         return 1
       fi
     done
@@ -531,7 +531,7 @@ tenant_former_identity_idle() {
   _tenant_subuid_record_current "$name" "$uid" || return 1
   holder="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" || holder=""
   if [[ -n "$holder" ]]; then
-    say "ERROR: the former uid $uid of '$name' now belongs to account '$holder'; its processes cannot be told apart. Stop and remove '$holder' and its workloads (for a LunarWing tenant, run 'remove-tenant $holder --purge'), then rerun; the former identity cannot be released while reused" >&2
+    say "ERROR: the former uid $uid of '$name' now belongs to account '$holder'; its processes cannot be told apart. Stop and remove '$holder' and its workloads (for a LunarWing tenant, save any data you need from '$holder' first, then run 'remove-tenant $holder --purge'), then rerun; the former identity cannot be released while reused" >&2
     return 1
   fi
   _tenant_proc_host_visible || return 1
