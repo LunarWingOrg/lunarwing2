@@ -41,7 +41,9 @@ Current source remains authority.
    freshness materially affects the task. Results include `stale_reasons` and
    keep already-marked notes visible by default. A repetitive daily routine
    should pass `include_status_only=false` to skip status-only repeats while
-   retaining age and commit matches. A background sweep also marks notes stale
+   retaining age and commit matches. Notes without a recorded `source_commit`
+   do not produce commit mismatches, so marked notes without one are skipped
+   when they have no age match. A background sweep also marks notes stale
    automatically once they age past the configured threshold.
 7. Cite note topic and source path when a note materially affects the answer
    or plan.
