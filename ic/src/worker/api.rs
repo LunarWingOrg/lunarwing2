@@ -110,7 +110,7 @@ pub struct CompletionReport {
     pub iterations: u32,
 }
 
-/// Payload sent to the orchestrator for each job event (shared by worker and Claude Code bridge).
+/// Payload sent to the orchestrator for each sandbox worker job event.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JobEventPayload {
     pub event_type: String,
