@@ -207,6 +207,8 @@ git -C "$tenant_root" checkout -q --detach "$base_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$base_head" ]] \
   || fail 'an ancestor on the operator release branch was not accepted'
+assert_build_refusal older-selected-revision \
+  'does not match selected operator revision' "$tenant_head"
 git -C "$tenant_root" checkout -q --detach "$tenant_head"
 
 expected_lane=kimicode4lunarwing
