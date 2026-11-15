@@ -50,13 +50,13 @@ pub trait CredentialResolver: Send + Sync {
     async fn resolve(&self, name: &str) -> Option<String>;
 }
 
-/// A credential resolver that uses environment variables.
+/// A credential resolver that uses the daemon's layered environment.
 pub struct EnvCredentialResolver;
 
 #[async_trait::async_trait]
 impl CredentialResolver for EnvCredentialResolver {
     async fn resolve(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
+        crate::config::env_or_override(name)
     }
 }
 
