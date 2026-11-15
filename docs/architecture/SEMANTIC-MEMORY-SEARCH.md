@@ -365,10 +365,12 @@ lw2studymcp surface:
 `knowledge_list_stale` keeps stored `stale` and `needs-verification` statuses as
 reasons to list a note until it is re-studied or superseded; superseded notes
 are always excluded. Each row's canonical `stale_reasons` array contains
-`status:<status>`, `age-exceeded`, and/or `source-commit-mismatch`. A daily
-routine can pass `include_status_only=false` to avoid re-processing status-only
-rows without hiding age or commit matches. The default is true for ordinary
-callers, preserving the verification queue.
+`status:<status>`, `age-exceeded`, and/or `source-commit-mismatch`. The commit
+reason requires a recorded note `source_commit` that differs from the caller's
+`repository_commit`; a note without commit provenance never gets that reason.
+A daily routine can pass `include_status_only=false` to avoid re-processing
+status-only rows without hiding age or commit matches. The default is true for
+ordinary callers, preserving the verification queue.
 
 Reads default to the caller's private scope plus the `shared` herd scope and can
 be narrowed to `private` or `shared`; writes default private and may explicitly
