@@ -1009,6 +1009,10 @@ start_tenant() {
   TENANT_START_NOT_ATTEMPTED_WORKERS=()
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  # Backfill pre-WI#688 tenants and refresh subordinate ranges while the
+  # account exists, so a later account-gone removal has a current record.
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing start"
 
   say "=== Starting tenant: $name ==="
 
@@ -1620,6 +1624,8 @@ upgrade_tenant() {
   local name="$1"
   shift
   name="$(sanitize_name "$name")"
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing upgrade"
   with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
 }
 
