@@ -502,10 +502,11 @@ rm -f "$fixture/last-build-dockerfile"
 (
   export LUNARWING_MT_UPGRADE_RELEASE_REF="$wrapper_target"
   export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$wrapper_target"
-  ensure_sandbox_image_current_from_tenant tenant-a always
+  ensure_sandbox_image_current_from_tenant tenant-a always \
+    && printf '%s\n' "${IMAGE_INPUTS[${IMAGE_IDS[$SANDBOX_IMAGE_TAG]}]:-}" >"$fixture/reprovision.digest"
 ) >"$fixture/reprovision.out" 2>&1 && reprovision_rc=0 || reprovision_rc=$?
 if [[ "$reprovision_rc" -eq 0 && -e "$fixture/last-build-dockerfile" \
-    && "${IMAGE_INPUTS[${IMAGE_IDS[$SANDBOX_IMAGE_TAG]}]:-}" == "$current_digest" ]]; then
+    && "$(cat "$fixture/reprovision.digest")" == "$current_digest" ]]; then
   ok 'wrapper reprovision reuses the selected target instead of operator HEAD'
 else
   bad "wrapper reprovision lost the selected target: $(cat "$fixture/reprovision.out")"
