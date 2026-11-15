@@ -12,6 +12,17 @@ trap '[[ -z "$holder_pid" ]] || kill "$holder_pid" 2>/dev/null || true; rm -rf "
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$1"; }
 
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+printf 'fixture:231072:65536\n' >"$TENANT_SUBUID_FILE"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == fixture ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
+
 tenant_darkirc_enabled() { return 0; }
 tenant_weechat_enabled() { return 1; }
 tenant_proxy_enabled() { return 1; }
