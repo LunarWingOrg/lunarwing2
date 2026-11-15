@@ -7,8 +7,9 @@
 # Sourced by ic/scripts/lunarwing-mt-admin.sh; do not execute directly.
 
 install_knowledge_sync_admin_snapshot() {
-  local root="${LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT:-/usr/local/lib/lunarwing-study-notes-sync}"
-  local releases="$root/releases" release base bump=1 current_tmp file source_commit
+  local root release base bump=1 current_tmp file source_commit
+  root="$(knowledge_sync_admin_root)"
+  local releases="$root/releases"
   [[ "$root" == /* && "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || die "knowledge sync admin root must be an absolute safe path"
   install -d -m 0755 -- "$releases"
