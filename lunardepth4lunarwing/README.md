@@ -2,7 +2,7 @@
 
 `lunardepth4lunarwing` runs the LunarDepth fork of DeepSeek Harness as an opt-in LunarWing external worker. The daemon uses `create_job(mode: "lunardepth")`; no daemon-specific Rust backend is added.
 
-The lane pins `https://git.lunarwing.org/lunarwing/lunardepth.git` at `da06c33b2091546dc38c61b95452ce27a4ce32d5` (source package `0.2.1-alpha.1`). The compatibility and TensorMoon routing ancestry gates are `17aef23e05cc074c8621d38d159d77d25cb348ca` and `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`. Branches, short SHAs, moving tags, and alternate repositories are not accepted build inputs.
+The lane pins `https://git.lunarwing.org/lunarwing/lunardepth.git` at `0472d115e5297093f249c222639431ba8ff0bb78` (source package `0.2.1-alpha.1`). The compatibility and TensorMoon routing ancestry gates are `17aef23e05cc074c8621d38d159d77d25cb348ca` and `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`. Branches, short SHAs, moving tags, and alternate repositories are not accepted build inputs.
 
 ## Dispatch and identities
 
