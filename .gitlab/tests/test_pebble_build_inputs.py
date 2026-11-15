@@ -304,18 +304,26 @@ class WorkerSourceProvenanceTests(unittest.TestCase):
         self.assertNotIn('_worker_source_git "$source_root" symbolic-ref', build_lib)
         self.assertGreaterEqual(build_lib.count('[[ "$BASHPID" == "$$"'), 3)
 
-    def test_upgrade_paths_forward_the_release_ref(self):
+    def test_upgrade_paths_forward_operator_target_and_selected_commit(self):
         lifecycle = (ROOT / "ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh").read_text(encoding="utf-8")
         wrapper = (ROOT / "ic/scripts/upgrade-tenant.sh").read_text(encoding="utf-8")
         dispatcher = (ROOT / "ic/scripts/lunarwing-mt-admin.sh").read_text(encoding="utf-8")
-        self.assertIn('"$with_opencode2" "$target_commit"', lifecycle)
+        self.assertIn('_resolve_operator_upgrade_target "$target"', lifecycle)
         self.assertIn(
-            'cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_COMMIT" '
-            '--sandbox-image "$SANDBOX_IMAGE_POLICY")',
+            '"$with_opencode2" "$operator_release_ref" "$with_lunardepth" '
+            '"$sandbox_policy" "$target_commit"',
+            lifecycle,
+        )
+        self.assertIn('TARGET_COMMIT="$(mt resolve-upgrade-target "$TARGET_REF")"', wrapper)
+        self.assertIn(
+            'cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" '
+            '--selected-commit "$TARGET_COMMIT" --sandbox-image "$SANDBOX_IMAGE_POLICY")',
             wrapper,
         )
-        self.assertIn("git -C \"$LWROOT\" rev-parse --verify 'HEAD^{commit}'", wrapper)
+        self.assertNotIn("git -C \"$LWROOT\" rev-parse --verify 'HEAD^{commit}'", wrapper)
+        self.assertIn('run mt report-sandbox-image "$TENANT"', wrapper)
         self.assertIn('"$cand_pebble" "false" "$cand_target"', dispatcher)
+        self.assertIn('"$cand_sandbox_policy" "$cand_selected_commit"', dispatcher)
 
 
 class ToolchainProfileBehaviourTests(unittest.TestCase):
