@@ -2019,6 +2019,7 @@ upgrade_tenant_locked() {
   fi
 
   say ""
+  report_retained_sandbox_image "$name"
   if [[ "$startup_rc" -ne 0 ]]; then
     warn_err "tenant '$name' upgrade incomplete: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null); startup failed (status $startup_rc); $(_tenant_worker_start_failure_summary)"
     say "target is installed; repair the failed lanes and re-run start-tenant $name; verify with: $0 status $name"
