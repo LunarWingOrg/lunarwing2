@@ -1487,7 +1487,7 @@ The model id names the gateway dialect and the gateway function (WI#691). Both g
 
 `<function>` is the operator's choice among the functions the gateway serves; the lane does not require `lunarwing`. It accepts letters, digits, `_`, and `-`. The middle segment is not variable: a gateway refuses any word there other than its keyword, so the lane refuses it too, and a `model_name` id is not accepted.
 
-Use the prefix of the gateway behind the base URL. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. A TensorMoon gateway takes `tensorzero::` ids only as deprecated aliases that may be removed. The lane translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
+Use the gateway's native prefix. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. TensorMoon master accepts `tensorzero::` ids as deprecated aliases from commit `cf686a42c600e84567322a77a29273df3fdebc05` (2026-10-03), but an older deployed TensorMoon image may not contain that change; the lane does not rely on alias support. It translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
