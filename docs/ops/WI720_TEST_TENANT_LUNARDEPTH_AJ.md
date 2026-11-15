@@ -63,15 +63,39 @@ LunarDepth WebSocket `52010`. The tenant clone tracks this branch. Only the
 LunarDepth lane was selected. SSH provisioning and WeeChat relay bootstrap
 were intentionally skipped as unrelated to this worker test.
 
-One early warning appeared: mt-admin could not pre-warm the rootless Podman
-user namespace and deferred its creation to the first Podman call. Provisioning
-continued through repository cloning and explicit LunarDepth configuration.
-The remaining provisioning, build, runtime, and job results are recorded below
-once observed.
+`add-tenant` returned **0**. PostgreSQL started on `10013`, the generic
+sandbox image was distributed into the tenant's rootless store, and OpenRC
+services were rendered. The final registry confirms `workers: lunardepth`,
+LunarDepth WebSocket `52010`, and no proxy, SSH harness, Study Notes MCP, or
+WeeChat relay bootstrap.
+
+Three non-blocking host hiccups appeared:
+
+- mt-admin could not pre-warm the rootless Podman user namespace and deferred
+  its creation to the first Podman call; subsequent image distribution and
+  PostgreSQL startup succeeded.
+- The PAM cgroup hooks installed, but `/etc/local.d` was absent, so the final
+  `lunarwing-cgroups.start` move failed and mt-admin recommended `setup-cgroups`.
+  This test does not alter that unrelated host configuration.
+- The health pipeline scripts and 15-minute crontab entry installed, but no
+  cron daemon init script was found. The scheduled host health pipeline is
+  therefore not claimed as active or validated.
+
+Source-side checks on the exact checkout also passed: all **31** lane Python
+tests, `test-mt-admin-lunardepth.sh`, and `check-mt-admin.sh` (ShellCheck over
+mt-admin and every numbered module).
 
 ## Build and runtime results
 
-Pending live completion.
+The fat build is running through the standard mt-admin path under tmux:
+
+```bash
+sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
+  taskset -c 0-11 bash ic/scripts/lunarwing-mt-admin.sh \
+  build-tenant lunardepthtester --with-lunardepth --with-toolchains
+```
+
+Build and live runtime outcomes are pending.
 
 ## Job exercise
 
