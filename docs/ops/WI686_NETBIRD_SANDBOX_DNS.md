@@ -233,9 +233,9 @@ did not configure `SANDBOX_NETWORK=tunnel` against the fleet overlay or claim a
 secure-tunnel pass. The pre-existing disposable WI#603 management deployment
 was not substituted for the fleet DNS target. For production overlay access,
 use the documented `tunnel` tier with a separate revocable enrollment per
-tenant and default runtime DNS, then validate it independently. NetBird rejects
-`SANDBOX_TUNNEL_DNS`; do not copy the legacy direct-egress workaround into a
-production tenant.
+tenant and default runtime DNS, then validate it independently. LunarWing
+rejects `SANDBOX_TUNNEL_DNS` with NetBird; do not copy the legacy direct-egress
+workaround into a production tenant.
 
 Two follow-ups are worth separate work items rather than scope expansion here:
 
@@ -246,8 +246,8 @@ Two follow-ups are worth separate work items rather than scope expansion here:
    `LUNARWING_OWNER_ID` selects a different tenant scope. Owner-scoped gateway
    settings APIs avoided the mismatch in this run.
 
-No Rust source or runtime behavior was changed. The release builds and four
-real sandbox probes supplied the verification for this operational work item;
-a debug build was not run. All non-secret probe logs and event captures remain
-under `/tmp/lw686-*` on the test host, while this report is the committed
-record.
+No Rust source was changed, and the tenant's original runtime network policy
+was restored. The release builds and four real sandbox probes supplied the
+verification for this operational work item; a debug build was not run. All
+non-secret probe logs and event captures remain under `/tmp/lw686-*` on the
+test host, while this report is the committed record.
