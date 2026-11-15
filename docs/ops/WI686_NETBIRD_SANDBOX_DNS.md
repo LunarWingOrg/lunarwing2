@@ -167,3 +167,39 @@ Allowlisting the MagicDNS name is not enough: enforced mode intentionally
 rejects NetBird's CGNAT/ULA destinations and network-none prevents direct DNS.
 Event captures are `/tmp/lw686-enforced-allowlisted.json` (wrong-scope attempt)
 and `/tmp/lw686-enforced-owner-allowlist.json` (corrected scope).
+
+### 5. Legacy `proxy`: DNS and direct overlay access work
+
+The tenant's `SANDBOX_NETWORK` was changed to `proxy` through mt-admin's
+atomic tenant-env helper, followed by `mt-admin restart-tenant`. The correct
+owner-scoped single-host allowlist from section 4 remained in place. The same
+real gateway/shell probe then produced:
+
+- `/etc/resolv.conf`: `search netbird.selfhosted`, `nameserver 169.254.1.1`,
+  and `nameserver 100.88.145.188`.
+- `getent ahostsv4 cotterhomelab3.netbird.selfhosted`: **exit 0**, returning
+  `100.88.232.146` for STREAM, DGRAM, and RAW.
+- `getent hosts` for `cotterhomelab3` and `sweetiebot`: **exit 0**, returning
+  each host's NetBird IPv6 address.
+- Direct health (`curl --noproxy '*'` by MagicDNS name): **exit 0, HTTP 200**,
+  connected to `cotterhomelab3`'s NetBird IPv6 address. The response body
+  reported `gateway`, `clickhouse`, `postgres`, `valkey`, and `valkey_cache`
+  all `ok`.
+- Ordinary proxied health: **exit 7, HTTP 000**, unable to connect to
+  `host.containers.internal` on the daemon-assigned proxy port.
+
+The proxy failure was investigated without changing any listener security:
+`ss` on the host confirmed the daemon was listening on `127.0.0.1:39193`, but
+that loopback listener was not reachable through the container's
+`host.containers.internal` alias. A one-shot `--network pasta` runtime
+diagnostic reproduced both sides: MagicDNS/direct HTTP 200 worked, while the
+same host-alias proxy connection still failed with exit 7. This Podman version
+removed `slirp4netns` and directed the test to `pasta`; no tenant-wide network
+driver or loopback bind was changed.
+
+**Result:** the work item's DNS and outbound overlay requirement is achievable
+in the real sandbox with `SANDBOX_NETWORK=proxy`, but the command must bypass
+the advisory proxy for this target (for example with `curl --noproxy '*'` or a
+narrow `NO_PROXY`). The legacy tier permits direct egress by design, so this is
+not an equivalent security boundary to `proxy-enforced` or `tunnel`. Raw event
+evidence is `/tmp/lw686-legacy-proxy.json`.
