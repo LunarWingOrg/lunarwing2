@@ -200,7 +200,8 @@ health_metrics_confd_reconcile() {
 # Entries that other installers put into the library and the checkout does
 # not ship. The optional metrics listener binary is installed here by hand
 # (ic-infrastructure-health-check/README.md, install-health-metrics-listener.sh)
-# and its OpenRC service runs it as root. A fresh tree would drop it, so it is
+# and its OpenRC service runs it as the unprivileged lunarwing-metrics account.
+# A fresh tree would drop it, so it is
 # carried over, but only out of a library that is root-owned and not
 # group/other-writable through /, and only as a root-owned regular file
 # without group/other write or set-ID bits. In any other state another
