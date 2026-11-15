@@ -164,7 +164,7 @@ Rust/Go sets used by other workers:
 ### Job 1 — Python access-log pipeline: PASS
 
 - Job `10372b43-58e3-4da2-8c71-9723a2bd0eb8`, mode `external:lunardepth`,
-  created 22:08:28Z and completed 22:29:22Z (**1284 s** job elapsed; 1286 s wall
+  created 22:08:28Z and completed 22:29:22Z (**1254 s** job elapsed; 1286 s wall
   including discovery/approval). 25 persisted job events, `stuck=false`, zero
   repair attempts.
 - The worker produced `generator.py`, `log_pipeline.py`,
