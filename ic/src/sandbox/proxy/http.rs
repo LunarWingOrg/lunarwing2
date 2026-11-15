@@ -50,13 +50,13 @@ pub trait CredentialResolver: Send + Sync {
     async fn resolve(&self, name: &str) -> Option<String>;
 }
 
-/// A credential resolver that uses environment variables.
+/// A credential resolver that uses the daemon's layered environment.
 pub struct EnvCredentialResolver;
 
 #[async_trait::async_trait]
 impl CredentialResolver for EnvCredentialResolver {
     async fn resolve(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
+        crate::config::env_or_override(name)
     }
 }
 
@@ -935,6 +935,30 @@ mod tests {
             }
         });
         port
+    }
+
+    #[tokio::test]
+    async fn env_credential_resolver_reads_runtime_and_injected_layers() {
+        let _env = crate::config::helpers::lock_env();
+        const KEY: &str = "LUNARWING_WI646_PROXY_TEST_API_KEY";
+        // SAFETY: the crate-wide environment mutex serializes this mutation.
+        unsafe { std::env::remove_var(KEY) };
+        let resolver = EnvCredentialResolver;
+
+        crate::config::set_runtime_env(KEY, "runtime-proxy-key");
+        let runtime = resolver.resolve(KEY).await;
+        crate::config::set_runtime_env(KEY, "");
+
+        crate::config::inject_single_var(KEY, "injected-proxy-key");
+        let injected = resolver.resolve(KEY).await;
+        crate::config::inject_single_var(KEY, "");
+
+        let scrubber = crate::tracing_fmt::daemon_log_scrubber();
+        let _ = scrubber.remove_secret("runtime-proxy-key");
+        let _ = scrubber.remove_secret("injected-proxy-key");
+
+        assert_eq!(runtime.as_deref(), Some("runtime-proxy-key"));
+        assert_eq!(injected.as_deref(), Some("injected-proxy-key"));
     }
 
     #[tokio::test]
