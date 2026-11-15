@@ -12,6 +12,7 @@ trap '[[ -z "$holder_pid" ]] || kill "$holder_pid" 2>/dev/null || true; rm -rf "
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$1"; }
 
+# shellcheck disable=SC2034  # consumed by the sourced identity writer
 TENANT_IDENTITY_DIR="$fixture/identity"
 TENANT_SUBUID_FILE="$fixture/subuid"
 printf 'fixture:231072:65536\n' >"$TENANT_SUBUID_FILE"
