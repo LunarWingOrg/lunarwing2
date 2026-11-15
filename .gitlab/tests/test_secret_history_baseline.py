@@ -166,10 +166,14 @@ class BaselineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "commit-bound"):
                 baseline.read_fingerprint_file(accepted)
 
-    def run_main(self, root, scanned, accepted=None, draft=None, dispositions=None):
+    def run_main(
+        self, root, scanned, accepted=None, draft=None, dispositions=None, dispositions_path=None
+    ):
         output = root / "history.ignore"
         pending = root / "pending.ignore"
-        write_dispositions(root, dispositions or ())
+        default_dispositions = root / ".gitlab/gitleaks-history-dispositions.md"
+        if dispositions is not None or not default_dispositions.is_file():
+            write_dispositions(root, dispositions or ())
         arguments = [
             "refresh-secret-history-baseline.py",
             "--repo",
@@ -185,6 +189,8 @@ class BaselineTests(unittest.TestCase):
             arguments.extend(["--accept", str(accepted)])
         if draft is not None:
             arguments.extend(["--draft-accept", str(draft)])
+        if dispositions_path is not None:
+            arguments.extend(["--dispositions", str(dispositions_path)])
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
