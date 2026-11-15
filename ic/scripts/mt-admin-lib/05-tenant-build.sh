@@ -409,35 +409,40 @@ _tenant_proc_host_visible() {
   fi
 }
 
-# cgroup membership cannot be escaped by forking. Check every cgroup.procs in
-# the tenant's tree, not just its root, and fail if a live member or unreadable
-# file prevents an emptiness proof. Runs in a subshell to contain glob options.
-_tenant_cgroup_tree_empty() (
-  local label="$1" root="$2" procs contents
+# cgroup membership cannot be escaped by forking. The kernel's populated bit
+# covers the whole subtree in one read, so a process moving between children
+# cannot hide between separate cgroup.procs reads.
+_tenant_cgroup_tree_empty() {
+  local label="$1" root="$2" events key value rest populated=""
   [[ -e "$root" ]] || return 0
   [[ -d "$root" && -r "$root" ]] || {
     say "ERROR: cannot inspect $label cgroup $root" >&2
     return 1
   }
-  shopt -s nullglob globstar
-  local -a files=("$root"/**/cgroup.procs)
-  ((${#files[@]} > 0)) || {
-    say "ERROR: no cgroup.procs under $label cgroup $root" >&2
+  { events="$(<"$root/cgroup.events")"; } 2>/dev/null || {
+    say "ERROR: cannot read $root/cgroup.events; cannot prove the $label cgroup empty" >&2
     return 1
   }
-  for procs in "${files[@]}"; do
-    [[ -e "$procs" ]] || continue
-    { contents="$(<"$procs")"; } 2>/dev/null || {
-      say "ERROR: cannot read $procs; cannot prove the $label cgroup empty" >&2
+  while read -r key value rest; do
+    [[ "$key" == populated ]] || continue
+    if [[ -n "$rest" || -n "$populated" || ! "$value" =~ ^[01]$ ]]; then
+      populated=invalid
+      break
+    fi
+    populated="$value"
+  done <<<"$events"
+  case "$populated" in
+    0) return 0 ;;
+    1)
+      say "ERROR: $label cgroup $root is not empty (cgroup.events populated=1); stop $label before removal" >&2
       return 1
-    }
-    [[ -n "$contents" ]] || continue
-    contents="${contents//$'\n'/ }"
-    say "ERROR: $label cgroup $root is not empty (pids: $contents); stop $label before removal" >&2
-    return 1
-  done
-  return 0
-)
+      ;;
+    *)
+      say "ERROR: $root/cgroup.events has no single valid populated value; cannot prove the $label cgroup empty" >&2
+      return 1
+      ;;
+  esac
+}
 
 _tenant_former_cgroups_idle() {
   local name="$1" uid="$2" root="$TENANT_CGROUP_ROOT" svc worker
