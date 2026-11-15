@@ -475,6 +475,33 @@ mod tests {
         assert_eq!(settings.agent.name, "lunarwing");
     }
 
+    /// WI#716: the scope the commands target is the daemon's owner ladder —
+    /// `LUNARWING_OWNER_ID` when set, `default` otherwise. Without this the
+    /// CLI writes a row the daemon never reads.
+    #[test]
+    fn owner_scope_follows_the_daemon_owner_ladder() {
+        let _guard = crate::config::helpers::lock_env();
+
+        // SAFETY: env mutation is serialized by the test-only env mutex held
+        // by `_guard`, which also restores the prior environment on drop.
+        unsafe {
+            std::env::set_var("LUNARWING_OWNER_ID", "netbirddnstester");
+            std::env::remove_var("IRONCLAW_OWNER_ID");
+        }
+        let tenant_scope =
+            crate::config::resolve_owner_id(&Settings::default()).expect("owner id resolves");
+        assert_eq!(tenant_scope, "netbirddnstester");
+
+        // SAFETY: same guard; removing both spellings exercises the fallback.
+        unsafe {
+            std::env::remove_var("LUNARWING_OWNER_ID");
+            std::env::remove_var("IRONCLAW_OWNER_ID");
+        }
+        let single_node_scope =
+            crate::config::resolve_owner_id(&Settings::default()).expect("owner id resolves");
+        assert_eq!(single_node_scope, DEFAULT_OWNER_ID);
+    }
+
     /// WI#716: on a tenant the CLI must write the scope the daemon reads
     /// (`LUNARWING_OWNER_ID` -> owner id), not the legacy `default` scope.
     #[tokio::test]
