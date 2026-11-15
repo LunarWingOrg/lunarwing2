@@ -321,6 +321,8 @@ class WorkerSourceProvenanceTests(unittest.TestCase):
             wrapper,
         )
         self.assertNotIn("git -C \"$LWROOT\" rev-parse --verify 'HEAD^{commit}'", wrapper)
+        self.assertIn('export LUNARWING_MT_UPGRADE_RELEASE_REF="$TARGET_REF"', wrapper)
+        self.assertIn('export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$TARGET_COMMIT"', wrapper)
         self.assertIn('run mt report-sandbox-image "$TENANT"', wrapper)
         self.assertIn('"$cand_pebble" "false" "$cand_target"', dispatcher)
         self.assertIn('"$cand_sandbox_policy" "$cand_selected_commit"', dispatcher)
