@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WI#638, WI#650, WI#672, WI#688 — hermetic remove-tenant worker/egress harness.
+# WI#638, WI#650, WI#672, WI#688, WI#699 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
 
@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 eval "$(declare -f stop_tenant_postgres | sed '1s/^stop_tenant_postgres/real_stop_tenant_postgres/')"
 eval "$(declare -f reset_tenant_postgres | sed '1s/^reset_tenant_postgres/real_reset_tenant_postgres/')"
 eval "$(declare -f remove_tenant_user | sed '1s/^remove_tenant_user/real_remove_tenant_user/')"
+eval "$(declare -f retire_tenant_nanocode | sed '1s/^retire_tenant_nanocode/real_retire_tenant_nanocode/')"
 eval "$(declare -f _tenant_status_uids | sed '1s/^_tenant_status_uids/real_tenant_status_uids/')"
 
 failures=0
@@ -52,7 +53,19 @@ _hash_dir() { printf '%s/hashes\n' "$CASE_DIR"; }
 _openrc_cgroups_locald_path() { printf '%s/no-cgroups\n' "$CASE_DIR"; }
 _openrc_tenant_subtree_remove() { return 0; }
 all_tenant_names() { printf 'alpha\n'; }
-retire_tenant_nanocode() { record "retire-nanocode:$1"; }
+retire_tenant_nanocode() {
+  if [[ "$REAL_NANOCODE" == true ]]; then real_retire_tenant_nanocode "$@"; return; fi
+  record "retire-nanocode:$1"
+}
+# The production lock requires root-owned host directories. Serialization is
+# irrelevant in these single-process fixtures, so execute its callback directly.
+with_tenant_lifecycle_lock() { shift; "$@"; }
+# Keep the real retirement and supervision stop. Only its unrelated host-side
+# effects are replaced; unit removal and the rc-service path remain real.
+_stop_nanocode_containers() { record "nanocode-containers:$1"; }
+remove_external_worker_config() { record "remove-external-worker:$1:$2"; }
+_archive_nanocode_env() { record "archive-nanocode:$1"; }
+ports_retire_nanocode() { record "retire-nanocode-port:$1"; }
 stop_tenant_postgres() {
   if [[ "$REAL_POSTGRES" == true ]]; then real_stop_tenant_postgres "$@"; return; fi
   record "stop-postgres:$1"
@@ -312,6 +325,10 @@ seed_process() {
   mkdir -p "$TENANT_PROC_ROOT/$pid/task/$pid"
   _fake_status "$TENANT_PROC_ROOT/$pid/status" "$real" "$effective" "$saved" "$fs"
   _fake_status "$TENANT_PROC_ROOT/$pid/task/$pid/status" "$real" "$effective" "$saved" "$fs"
+  if [[ "$pid" == 1 ]]; then
+    printf 'init\n' >"$TENANT_PROC_ROOT/1/comm"
+    ln -s / "$TENANT_PROC_ROOT/1/root"
+  fi
 }
 
 # One more thread of a process, with credentials of its own.
@@ -352,8 +369,11 @@ setup_case() {
   TENANT_IDENTITY_DIR="$CASE_DIR/identity"
   TENANT_SUBUID_FILE="$CASE_DIR/subuid"
   TENANT_PROC_ROOT="$CASE_DIR/proc"
+  TENANT_CGROUP_ROOT="$CASE_DIR/cgroup"
   TENANT_PASSWD_FILE="$CASE_DIR/passwd"
+  TENANT_LIFECYCLE_LOCK_DIR="$CASE_DIR/lifecycle-locks"
   REAL_POSTGRES=false
+  REAL_NANOCODE=false
   HELD_UID=""
   GETENT_FAIL=false
   GETENT_RC=""
@@ -380,8 +400,10 @@ setup_case() {
   mkdir -p "$RUNTIME_DIR/containers" "$RUNTIME_DIR/volumes" \
     "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" \
     "$OPENRC_RUNLEVELS_DIR/default" "$OPENRC_RUNLEVELS_DIR/custom" \
-    "$(tenant_quadlet_dir alpha)" "$CASE_DIR/home/.config/systemd/user" "$WORKER_EGRESS_DIR"
+    "$(tenant_quadlet_dir alpha)" "$CASE_DIR/home/.config/systemd/user" \
+    "$WORKER_EGRESS_DIR" "$TENANT_CGROUP_ROOT"
   : >"$CALL_LOG"
+  : >"$TENANT_CGROUP_ROOT/cgroup.controllers"
   printf 'alpha:231072:65536\n' >"$TENANT_SUBUID_FILE"
   # The local files database without the tenant: its account is gone there
   # whenever a case drops it from `id`. Cases with a backend failure add it.
@@ -532,6 +554,7 @@ run_success_case() {
 run_missing_account_stop_case() {
   local init="$1" lane rc
   setup_case "$init" missing-account-stops
+  seed_identity
   for lane in vision voice pebble opencode kimi opencode2 lunardepth; do
     rc=0
     (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; "stop_tenant_${lane}" alpha) \
@@ -547,6 +570,40 @@ run_missing_account_stop_case() {
       fail "$init $lane stop skipped silently: $(command cat "$CASE_DIR/stop-$lane.out")"
     fi
   done
+}
+
+run_standalone_missing_account_stop_refusal() {
+  local rc=0
+  setup_case openrc standalone-missing-account-stop
+  seed_identity
+  seed_process 4545 231100
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; real_stop_tenant_postgres alpha) \
+    >"$CASE_DIR/stop-pg.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'PostgreSQL stop state is unknown' "$CASE_DIR/stop-pg.out" \
+      && ! grep -q '^podman:' "$CALL_LOG"; then
+    pass 'standalone stop-pg refuses an unproven former identity instead of printing skipped'
+  else
+    fail "standalone stop-pg hid a live former uid (rc=$rc): $(command cat "$CASE_DIR/stop-pg.out")"
+  fi
+  rc=0
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
+    tenant_exists_in_registry() { return 0; }
+    stop_tenant alpha) >"$CASE_DIR/stop-tenant.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/stop-tenant.out"; then
+    pass 'standalone stop-tenant refuses while a former subordinate uid runs'
+  else
+    fail "standalone stop-tenant reported success without the idle proof (rc=$rc): $(command cat "$CASE_DIR/stop-tenant.out")"
+  fi
+  command rm -rf -- "$TENANT_PROC_ROOT/4545"
+  rc=0
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
+    tenant_exists_in_registry() { return 0; }
+    stop_tenant alpha) >"$CASE_DIR/stop-tenant-idle.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && grep -q 'nothing is left to stop' "$CASE_DIR/stop-tenant-idle.out"; then
+    pass 'standalone stop-tenant reports an already idle former identity explicitly'
+  else
+    fail "standalone stop-tenant failed after the former identity became idle (rc=$rc): $(command cat "$CASE_DIR/stop-tenant-idle.out")"
+  fi
 }
 
 # ACA-2: a rootful runtime needs no tenant account, so every lane still stops
@@ -583,6 +640,30 @@ run_identity_record_case() {
     pass 'add-tenant records the identity when it creates the account'
   else
     fail 'add-tenant does not record the tenant identity'
+  fi
+}
+
+run_lifecycle_identity_record_case() {
+  local rc=0 expected=$'UID=1000\nSUBUID=231072:65536'
+  setup_case openrc start-identity-record
+  (tenant_exists_in_registry() { return 0; }
+    tenant_darkirc_enabled() { return 0; }
+    darkirc_load_compatibility() { return 1; }
+    start_tenant alpha) >"$CASE_DIR/start.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 && "$(command cat "$TENANT_IDENTITY_DIR/alpha" 2>/dev/null)" == "$expected" ]] \
+      && grep -q 'attested DarkIRC release' "$CASE_DIR/start.out"; then
+    pass 'start-tenant backfills the identity before later start preflights'
+  else
+    fail "start-tenant did not backfill the identity (rc=$rc): $(command cat "$CASE_DIR/start.out")"
+  fi
+  setup_case openrc upgrade-identity-record
+  rc=0
+  (with_tenant_lifecycle_lock() { return 0; }
+    upgrade_tenant alpha) >"$CASE_DIR/upgrade.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 && "$(command cat "$TENANT_IDENTITY_DIR/alpha" 2>/dev/null)" == "$expected" ]]; then
+    pass 'upgrade-tenant backfills the identity before taking the lifecycle lock'
+  else
+    fail "upgrade-tenant did not backfill the identity (rc=$rc): $(command cat "$CASE_DIR/upgrade.out")"
   fi
 }
 
@@ -642,6 +723,11 @@ run_missing_account_case() {
   fi
   seed_identity
   REAL_POSTGRES=true
+  REAL_NANOCODE=true
+  # Exercise the real retire_tenant_nanocode and stop rosters. The fake
+  # rc-service refuses the old vision stop path, so skipping it cannot be
+  # hidden by a universally successful command stub.
+  RC_STOP_FAIL="lunarwing-vision-alpha"
   (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha "$purge") \
     >"$CASE_DIR/remove.out" 2>&1 || rc=$?
   if [[ "$rc" -ne 0 ]]; then
@@ -742,6 +828,37 @@ run_missing_account_refusal_case() {
     passwd-compat) printf '+@netgroup::::::\n' >>"$TENANT_PASSWD_FILE" ;;
     forked-after-listing) FORK_AFTER_LISTING=true ;;
     empty-proc) command rm -rf -- "$TENANT_PROC_ROOT"; mkdir -p "$TENANT_PROC_ROOT" ;;
+    hidden-init) command rm -rf -- "$TENANT_PROC_ROOT/1" ;;
+    foreign-init) printf 'bash\n' >"$TENANT_PROC_ROOT/1/comm" ;;
+    foreign-init-root)
+      command rm -f -- "$TENANT_PROC_ROOT/1/root"
+      ln -s "$CASE_DIR" "$TENANT_PROC_ROOT/1/root"
+      ;;
+    reassigned-subuid) printf 'bob:231072:65536\n' >"$TENANT_SUBUID_FILE" ;;
+    current-subuid-mismatch) printf 'alpha:240000:65536\n' >"$TENANT_SUBUID_FILE" ;;
+    record-subuid-mismatch)
+      printf 'UID=61000\nSUBUID=231072:65536\nSUBUID=400000:1000\n' >"$TENANT_IDENTITY_DIR/alpha"
+      ;;
+    busy-openrc-cgroup)
+      mkdir -p "$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha"
+      : >"$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha/cgroup.events"
+      ;;
+    busy-openrc-subtree)
+      mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha/session"
+      printf '4502\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/session/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
+      ;;
+    busy-systemd-cgroup)
+      mkdir -p "$TENANT_CGROUP_ROOT/user.slice/user-61000.slice"
+      : >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.events"
+      ;;
+    invalid-cgroup-events)
+      mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+      printf 'populated unknown\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
+      ;;
+    missing-cgroup-controllers) command rm -f -- "$TENANT_CGROUP_ROOT/cgroup.controllers" ;;
   esac
   REAL_POSTGRES=true
   (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha true) \
@@ -765,6 +882,8 @@ run_exited_task_case() {
   local rc=0
   setup_case openrc exited-task
   seed_identity
+  mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+  printf 'populated 0\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
   seed_process 4700 61000
   (EXIT_BEFORE_READ_PID=4700; tenant_former_identity_idle alpha) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]]; then
@@ -1106,6 +1225,8 @@ for init in openrc systemd; do
 done
 run_volume_failure_case
 run_identity_record_case
+run_lifecycle_identity_record_case
+run_standalone_missing_account_stop_refusal
 run_rootful_missing_account_stop_case
 run_rootful_missing_account_case
 run_missing_account_refusal_case openrc live-effective-uid 'still run (4243)'
@@ -1118,7 +1239,20 @@ run_missing_account_refusal_case openrc no-subuid 'no subordinate uid range reco
 run_missing_account_refusal_case openrc bad-record 'unexpected line in'
 run_missing_account_refusal_case openrc system-uid 'no valid tenant uid recorded'
 run_missing_account_refusal_case openrc held-uid "now belongs to account 'bob'"
-run_missing_account_refusal_case openrc empty-proc 'cannot read the process table'
+run_missing_account_refusal_case openrc held-uid "remove-tenant bob --purge"
+run_missing_account_refusal_case openrc empty-proc 'cannot verify that'
+run_missing_account_refusal_case openrc hidden-init 'cannot verify that'
+run_missing_account_refusal_case openrc foreign-init 'is not a supported host init'
+run_missing_account_refusal_case openrc foreign-init-root 'has a different root directory'
+run_missing_account_refusal_case openrc reassigned-subuid 'overlaps recorded range'
+run_missing_account_refusal_case openrc reassigned-subuid 'remove-tenant bob --purge'
+run_missing_account_refusal_case openrc current-subuid-mismatch 'current-side range differs'
+run_missing_account_refusal_case openrc record-subuid-mismatch 'record-side range differs'
+run_missing_account_refusal_case openrc busy-openrc-cgroup 'stop OpenRC service lunarwing-vision-alpha before removal'
+run_missing_account_refusal_case openrc busy-openrc-subtree 'tenant alpha cgroup'
+run_missing_account_refusal_case systemd busy-systemd-cgroup 'systemd user-61000.slice cgroup'
+run_missing_account_refusal_case openrc invalid-cgroup-events 'no single valid populated value'
+run_missing_account_refusal_case openrc missing-cgroup-controllers 'cgroup v2 is not readable'
 run_missing_account_refusal_case openrc linked-record 'is a symbolic link; refusing to trust it'
 run_missing_account_refusal_case openrc bad-subuid "invalid subordinate uid range '231072:x'"
 run_missing_account_refusal_case openrc two-uids 'must hold exactly one UID= line, it holds 2'
