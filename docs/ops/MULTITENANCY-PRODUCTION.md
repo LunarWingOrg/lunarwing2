@@ -797,13 +797,21 @@ units (and pages) rather than accepting them. A health-lib copy without
 the library refuses the same way.
 
 The installed health library is a root trust boundary, not a writable cache of
-the operator checkout. Every install and upgrade refresh builds a fresh staged
-tree, rejects symbolic links, makes the directory and every entry `root:root`,
-removes group/other write permission, and only then replaces the installed
-tree. This also repairs the ownership left by older `cp -a` installs. Entries
-the checkout does not ship are dropped, except the optional metrics listener
-binary `lunarwing-health-metrics`. It is carried into the new tree only when
-the old library and every parent through `/` are root-owned and not
+the operator checkout. Every install and upgrade refresh builds a fresh tree in
+a root-only staging directory. A linked source directory, a symbolic link, or
+any entry that is not a regular file or directory is refused. The copy runs
+under `umask 077` without preserving ownership, modes, ACLs, or other metadata
+(only timestamps are retained), then receives explicit modes: directories
+0755, regular files 0644, and top-level `*.sh` files 0755. This strips set-ID
+bits as well as group/other write permission and avoids exposing the checkout's
+modes or default ACLs in the staging window. The checked tree is made
+`root:root` before publication, which also repairs ownership left by older
+`cp -a` installs. Publication uses an atomic exchange when the host's `mv`
+supports it; older hosts retain the rollback-protected two-rename fallback.
+
+Entries the checkout does not ship are dropped, except the optional metrics
+listener binary `lunarwing-health-metrics`. It is carried into the new tree only
+when the old library and every parent through `/` are root-owned and not
 group/other-writable, and the binary is a root-owned regular file without
 group/other write or set-ID bits. In any other state another account may have
 replaced it, so it is not carried: the install moves it to a quarantine
@@ -819,16 +827,21 @@ trusted build with `sudo install -m 0755` before starting it again. Do not
 `chown` the old library or the quarantined copy to make it pass: root
 ownership alone does not show where the file came from. A
 `lunarwing-health-metrics` shipped by the checkout replaces the installed one,
-and the install says so. The
-root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
-every entry in it, and every parent through `/` on every run; any non-root
-owner, symbolic link, or group/other write permission produces a logged refusal
-and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
-contract preflight applies the same check whenever its source resolves to this
-installed library, including a root-owned Study Notes scheduler snapshot. Do
-not hand-copy an operator checkout over the library; rerun the health pipeline
-install instead (`upgrade-tenant`, `add-tenant`, or
-`ic/scripts/enable-health-fleet.sh`).
+and the install says so.
+
+The root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the
+library, every entry in it, and every parent through `/` on every run. A
+non-root owner, symbolic link, group/other write permission, set-ID bit, or
+non-regular entry produces a refusal that names the failing component on stderr
+and in syslog (`daemon.err`, tag `lunarwing-mt-health`), then exits 126 before
+the environment or `cron-wrapper.sh` is loaded. Its inspection `stat` and `find`
+are pinned to `/usr/bin`, not resolved through `/usr/local/bin`. The OpenRC
+contract preflight resolves both the contract source and installed library. It
+checks a source resolving to the installed library and, whenever mt-admin's own
+directory is root-owned, also checks the actual source tree, including a
+real-directory sibling of a Study Notes scheduler snapshot. Do not hand-copy an
+operator checkout over the library; rerun the health pipeline install instead
+(`upgrade-tenant`, `add-tenant`, or `ic/scripts/enable-health-fleet.sh`).
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
