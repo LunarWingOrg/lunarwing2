@@ -135,6 +135,20 @@ impl WorkloadSpawner {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn systemd_for_test(
+        manager_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Self {
+        Self {
+            isolation: Isolation::SystemdService,
+            slice: DEFAULT_SLICE.to_string(),
+            memory_max: None,
+            timeout_stop_secs: DEFAULT_TIMEOUT_STOP_SECS,
+            xdg_runtime_dir: None,
+            manager_env: std::sync::Arc::new(manager_env),
+        }
+    }
+
     /// Whether workloads are placed in systemd transient services.
     pub fn uses_systemd_services(&self) -> bool {
         self.isolation == Isolation::SystemdService
