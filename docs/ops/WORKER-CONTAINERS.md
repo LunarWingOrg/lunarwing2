@@ -1439,7 +1439,7 @@ the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
 
 ### Provenance and image contents
 
-The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `da06c33b2091546dc38c61b95452ce27a4ce32d5` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
+The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `0472d115e5297093f249c222639431ba8ff0bb78` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
 
 - compatibility/item 9: `17aef23e05cc074c8621d38d159d77d25cb348ca`;
 - TensorMoon routing: `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`.
