@@ -95,6 +95,9 @@ consumers (wizard, onboarding detection, status and doctor) use the same layers.
 Backend autodetection considers process env, runtime overrides and injected
 secrets; only if all are unset and `<base_dir>/ironclaw.db` exists does it select
 libSQL. Empty backend values count as unset, consistently with config resolution.
+Quick-mode provider fast paths, provider-key menu markers, and embeddings
+availability use those same three layers rather than reading only the process
+environment.
 
 ---
 
