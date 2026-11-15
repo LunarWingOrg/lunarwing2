@@ -304,7 +304,7 @@ git -C "$operator_repo" add remote-newer.txt
 git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
   commit -qm 'Newer remote-tracking target'
 remote_target="$(git -C "$operator_repo" rev-parse HEAD)"
-git -C "$operator_repo" push -q origin HEAD:refs/heads/moving
+git -C "$operator_repo" push -qf origin HEAD:refs/heads/moving
 git -C "$operator_repo" checkout -q moving
 git -C "$operator_repo" update-ref refs/remotes/origin/moving "$remote_target"
 [[ "$(git -C "$operator_repo" rev-parse refs/heads/moving)" == "$target" ]]
