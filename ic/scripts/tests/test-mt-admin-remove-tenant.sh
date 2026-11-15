@@ -830,6 +830,10 @@ run_missing_account_refusal_case() {
     empty-proc) command rm -rf -- "$TENANT_PROC_ROOT"; mkdir -p "$TENANT_PROC_ROOT" ;;
     hidden-init) command rm -rf -- "$TENANT_PROC_ROOT/1" ;;
     foreign-init) printf 'bash\n' >"$TENANT_PROC_ROOT/1/comm" ;;
+    foreign-init-root)
+      command rm -f -- "$TENANT_PROC_ROOT/1/root"
+      ln -s "$CASE_DIR" "$TENANT_PROC_ROOT/1/root"
+      ;;
     reassigned-subuid) printf 'bob:231072:65536\n' >"$TENANT_SUBUID_FILE" ;;
     current-subuid-mismatch) printf 'alpha:240000:65536\n' >"$TENANT_SUBUID_FILE" ;;
     record-subuid-mismatch)
@@ -837,16 +841,24 @@ run_missing_account_refusal_case() {
       ;;
     busy-openrc-cgroup)
       mkdir -p "$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha"
-      printf '4501\n' >"$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha/cgroup.procs"
+      : >"$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/openrc.lunarwing-vision-alpha/cgroup.events"
       ;;
     busy-openrc-subtree)
       mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha/session"
       printf '4502\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/session/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
       ;;
     busy-systemd-cgroup)
       mkdir -p "$TENANT_CGROUP_ROOT/user.slice/user-61000.slice"
-      printf '4503\n' >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.procs"
+      : >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.procs"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.events"
       ;;
+    invalid-cgroup-events)
+      mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+      printf 'populated unknown\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
+      ;;
+    missing-cgroup-controllers) command rm -f -- "$TENANT_CGROUP_ROOT/cgroup.controllers" ;;
   esac
   REAL_POSTGRES=true
   (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; remove_tenant alpha true) \
@@ -870,6 +882,8 @@ run_exited_task_case() {
   local rc=0
   setup_case openrc exited-task
   seed_identity
+  mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+  printf 'populated 0\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
   seed_process 4700 61000
   (EXIT_BEFORE_READ_PID=4700; tenant_former_identity_idle alpha) >"$CASE_DIR/idle.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]]; then
@@ -1228,12 +1242,15 @@ run_missing_account_refusal_case openrc held-uid "now belongs to account 'bob'"
 run_missing_account_refusal_case openrc empty-proc 'cannot verify that'
 run_missing_account_refusal_case openrc hidden-init 'cannot verify that'
 run_missing_account_refusal_case openrc foreign-init 'is not a supported host init'
+run_missing_account_refusal_case openrc foreign-init-root 'has a different root directory'
 run_missing_account_refusal_case openrc reassigned-subuid 'overlaps recorded range'
 run_missing_account_refusal_case openrc current-subuid-mismatch 'current-side range differs'
 run_missing_account_refusal_case openrc record-subuid-mismatch 'record-side range differs'
 run_missing_account_refusal_case openrc busy-openrc-cgroup 'stop OpenRC service lunarwing-vision-alpha before removal'
 run_missing_account_refusal_case openrc busy-openrc-subtree 'tenant alpha cgroup'
 run_missing_account_refusal_case systemd busy-systemd-cgroup 'systemd user-61000.slice cgroup'
+run_missing_account_refusal_case openrc invalid-cgroup-events 'no single valid populated value'
+run_missing_account_refusal_case openrc missing-cgroup-controllers 'cgroup v2 is not readable'
 run_missing_account_refusal_case openrc linked-record 'is a symbolic link; refusing to trust it'
 run_missing_account_refusal_case openrc bad-subuid "invalid subordinate uid range '231072:x'"
 run_missing_account_refusal_case openrc two-uids 'must hold exactly one UID= line, it holds 2'
