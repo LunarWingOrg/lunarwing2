@@ -1116,6 +1116,7 @@ ensure_sandbox_image_current_from_tenant() {  # <tenant> [policy] [release ref] 
   _prepare_sandbox_image_source "$name" "$release_ref" "$selected_commit"
   ensure_sandbox_image_current "$name" "$policy" "$SANDBOX_IMAGE_BUILD_SOURCE_ROOT" || rc=$?
   _worker_build_context_finish || return 1
+  [[ "$rc" -ne 0 ]] || clear_sandbox_image_status "$name"
   return "$rc"
 }
 
