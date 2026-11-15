@@ -69,6 +69,10 @@ Observed:
   address; HTTP by numeric NetBird IPv4 also returned **404**. As on the host,
   the expected unauthenticated `/openai/v1/models` response is evidence of a
   completed HTTP exchange, not an application-level models API success.
+- A follow-up probe of `/health` on the same name and port returned **HTTP 200**
+  both from the host and from the tenant's one-shot container. The container
+  connected to the target's NetBird IPv6 address. Subsequent sandbox tests use
+  this positive health response instead of relying on the 404 alone.
 
 This proves the fresh tenant's ordinary rootless-container DNS and overlay
 path work. It does not by itself prove the real shell sandbox works: the
