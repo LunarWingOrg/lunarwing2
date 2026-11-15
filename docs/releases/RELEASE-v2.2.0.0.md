@@ -28,19 +28,20 @@ client.
 Russh's optional `rsa` feature remains disabled, and the `rsa` crate remains out
 of LunarWing's dependency graph.
 
-### mt-admin: scoped health-library refusal and a reachable repair (WI#709)
+### mt-admin: scoped health-library refusal and reachable repairs (WI#722)
 
 Previously, an unsafe `/usr/local/lib/lunarwing-health` or parent directory
 aborted every mt-admin subcommand while libraries were loading, including
 `--help` and the commands needed to repair an old installation. mt-admin now
 skips only the OpenRC proxy contract, reports the failing path component, and
 keeps `--help` available. Ordinary checkouts do not gain a new contract-file
-mode check.
+mode check, and a link to an unrelated health source is not refused merely
+because it is a link.
 
 On OpenRC, `reinstall-health-library` is the only non-help command available
 while the contract is refused; other commands remain available on positively
-detected systemd hosts. From the refused checkout, reinstall from a separate
-trusted checkout:
+detected systemd hosts. For an unsafe library or entry, reinstall from a
+separate trusted checkout (a fresh root-owned clone at a verified commit):
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/checkout
@@ -48,6 +49,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/
 
 The repair replaces the library without rendering or changing OpenRC units.
 Installs refuse to copy from the installed library itself while it fails the
-safety check, so an unsafe tree cannot be republished as trusted.
+safety check, so an unsafe tree cannot be republished as trusted. When the
+refusal names an unsafe parent directory instead, run the printed
+non-recursive `chown root:root -- <parent> && chmod go-w -- <parent>` repair on
+that parent only, or move the library elsewhere; reinstalling cannot repair
+its own parent.
 
 See the [v2.1.9.0 release notes](RELEASE-v2.1.9.0.md) for the previous release.
