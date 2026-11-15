@@ -1,4 +1,4 @@
-//! Background job monitor that forwards sandbox worker output to the main agent loop.
+//! Background job monitor that forwards worker output to the main agent loop.
 //!
 //! When the main agent kicks off a sandbox job, this monitor subscribes to the
 //! broadcast event channel and injects relevant
@@ -109,7 +109,7 @@ pub fn spawn_job_monitor_with_context(
                             let mut msg = IncomingMessage::new(
                                 route.channel.clone(),
                                 route.user_id.clone(),
-                                format!("[Job {}] Sandbox worker: {}", short_id, content),
+                                format!("[Job {}] Worker: {}", short_id, content),
                             )
                             .into_internal();
                             if let Some(ref thread_id) = route.thread_id {
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(
             msg.content,
             format!(
-                "[Job {}] Sandbox worker: I found a bug",
+                "[Job {}] Worker: I found a bug",
                 &job_id.to_string()[..8]
             )
         );
