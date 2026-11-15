@@ -8,11 +8,19 @@
 
 install_knowledge_sync_admin_snapshot() {
   local root="${LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT:-/usr/local/lib/lunarwing-study-notes-sync}"
-  local releases="$root/releases" release current_tmp file
+  local releases="$root/releases" release base bump=1 current_tmp file source_commit
   [[ "$root" == /* && "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || die "knowledge sync admin root must be an absolute safe path"
   install -d -m 0755 -- "$releases"
-  release="$releases/$(date -u '+%Y%m%d%H%M%S')-$$"
+  # A same-second re-arm (configure-study-mcp followed by an upgrade, a test
+  # loop) must publish a NEW release directory: reusing the live one would leave
+  # the stamp naming the previous commit while the files were overwritten.
+  base="$releases/$(date -u '+%Y%m%d%H%M%S')-$$"
+  release="$base"
+  while [[ -e "$release" ]]; do
+    release="$base-$bump"
+    bump=$((bump + 1))
+  done
   install -d -m 0755 -- "$release/mt-admin-lib" "$release/ic-infrastructure-health-check"
   install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh"
   for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
@@ -20,6 +28,17 @@ install_knowledge_sync_admin_snapshot() {
   done
   install -m 0755 -- "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh" \
     "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  # WI#715: record what this frozen copy was staged from. Root's hourly timer
+  # executes this release until something restages it, so the commit is the
+  # only way for an operator to tell a fresh copy from one frozen at the last
+  # configure-study-mcp --enable-knowledge-sync.
+  source_commit="$(knowledge_sync_checkout_commit)"
+  {
+    printf 'commit=%s\n' "${source_commit:-unknown}"
+    printf 'source=%s\n' "$SCRIPT_DIR"
+    printf 'staged_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >"$release/STAGED-FROM"
+  chmod 0644 -- "$release/STAGED-FROM"
   current_tmp="$root/.current.$$"
   ln -s -- "$release" "$current_tmp"
   mv -fT -- "$current_tmp" "$root/current"
@@ -42,6 +61,99 @@ _prune_knowledge_sync_snapshots() {  # <releases dir> <retained release path>
       || say "WARNING: could not prune old knowledge sync snapshot: $file"
   done < <(find "$releases" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KNOWLEDGE_SYNC_SNAPSHOT_KEEP")
   return 0
+}
+
+# ── WI#715: snapshot provenance and upgrade restaging ────────────────────────
+#
+# Root's hourly Study Notes refresh runs from the release under `current`, not
+# from this checkout. Before WI#715 that snapshot was only staged by
+# `configure-study-mcp --enable-knowledge-sync` (and add-tenant's Study MCP
+# path), so an upgrade delivered a new daemon but left the root-side sync — and
+# its security fixes, including the WI#445 trust gate — frozen at the day the
+# opt-in was last enabled. `upgrade-tenant` now calls
+# refresh_deployed_knowledge_sync_scheduler (after the health-pipeline refresh)
+# when, and only when, a scheduler is already installed.
+
+knowledge_sync_admin_root() {
+  printf '%s\n' "${LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT:-/usr/local/lib/lunarwing-study-notes-sync}"
+}
+
+# Commit of the operator checkout this mt-admin was read from. Empty when the
+# host has no git metadata (a tarball deploy); callers then record "unknown"
+# and restage on upgrade rather than compare two unavailable values.
+knowledge_sync_checkout_commit() {
+  git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true
+}
+
+# Commit recorded in the installed release. Empty for a snapshot staged before
+# this stamp existed (WI#715).
+knowledge_sync_staged_commit() {  # <admin root>
+  local stamp="$1/current/STAGED-FROM" key value
+  [[ -r "$stamp" ]] || return 0
+  while IFS='=' read -r key value; do
+    if [[ "$key" == "commit" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done <"$stamp"
+}
+
+knowledge_sync_scheduler_installed() {
+  local root
+  root="$(knowledge_sync_admin_root)"
+  [[ -x "$root/current/lunarwing-mt-admin.sh" ]]
+}
+
+# Restage an existing scheduler after an upgrade. NEVER creates the scheduler:
+# a host without one must keep receiving no opt-in from an upgrade. A restage
+# failure warns instead of failing the upgrade, whose tenant already restarted;
+# the hourly job then keeps running the previous staged copy.
+refresh_deployed_knowledge_sync_scheduler() {
+  local root checkout_commit staged_commit restage_rc=0
+  root="$(knowledge_sync_admin_root)"
+  if ! knowledge_sync_scheduler_installed; then
+    say "knowledge sync scheduler: not installed; skipping upgrade refresh"
+    return 0
+  fi
+  checkout_commit="$(knowledge_sync_checkout_commit)"
+  staged_commit="$(knowledge_sync_staged_commit "$root")"
+  if [[ -n "$checkout_commit" && "$staged_commit" == "$checkout_commit" ]]; then
+    say "knowledge sync scheduler: snapshot already staged from $checkout_commit"
+    return 0
+  fi
+  # Contain die(): ensure_knowledge_source_scheduler exits on a missing
+  # systemctl/crontab, and that must not turn a completed upgrade into a
+  # failure. Full reinstall also repairs a timer/cron block an OS update lost.
+  ( set -e; ensure_knowledge_source_scheduler ) || restage_rc=$?
+  if (( restage_rc != 0 )); then
+    say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the hourly job keeps running the previous staged copy"
+    return 0
+  fi
+  say "knowledge sync scheduler: restaged from ${checkout_commit:-an unknown checkout}"
+}
+
+# One operator-visible line for doctor: what the hourly root-side sync is
+# actually running, and whether it lags this checkout.
+report_knowledge_sync_scheduler_status() {
+  local root staged_commit checkout_commit
+  root="$(knowledge_sync_admin_root)"
+  if ! knowledge_sync_scheduler_installed; then
+    printf '[info] knowledge sync scheduler: not installed (opt-in via configure-study-mcp --enable-knowledge-sync)\n'
+    return 0
+  fi
+  staged_commit="$(knowledge_sync_staged_commit "$root")"
+  if [[ -z "$staged_commit" ]]; then
+    staged_commit="unknown (staged before WI#715 provenance stamping)"
+  fi
+  printf '[info] knowledge sync scheduler: staged from %s (%s/current)\n' \
+    "$staged_commit" "$root"
+  checkout_commit="$(knowledge_sync_checkout_commit)"
+  [[ -n "$checkout_commit" ]] || return 0
+  if [[ "$staged_commit" == "$checkout_commit" ]]; then
+    return 0
+  fi
+  printf '[WARN] knowledge sync scheduler is stale: staged %s, this checkout %s; restage with upgrade-tenant <tenant>\n' \
+    "$staged_commit" "$checkout_commit"
 }
 
 _install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
