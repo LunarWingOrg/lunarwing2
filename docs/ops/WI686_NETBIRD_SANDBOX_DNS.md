@@ -1,8 +1,8 @@
 # WI#686 — NetBird DNS and access from a fresh tenant sandbox
 
-Date: 2026-11-15  
-Branch: `rarity/kimi-wi686-20261115-1000`  
-Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/686
+- Date: 2026-11-15
+- Branch: `rarity/kimi-wi686-20261115-1000`
+- Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/686
 
 ## Scope
 
