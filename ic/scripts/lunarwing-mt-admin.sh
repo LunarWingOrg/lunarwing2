@@ -1177,6 +1177,20 @@ main() {
       clear_promote_rollback "$(sanitize_name "$1")"
       ;;
 
+    resolve-upgrade-target)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: resolve-upgrade-target <ref>"
+      _resolve_operator_upgrade_target "$1" \
+        || die "target ref '$1' not found in operator checkout $LUNARWING_ROOT"
+      printf '%s\n' "$OPERATOR_UPGRADE_TARGET_COMMIT"
+      ;;
+
+    clear-sandbox-image-status)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: clear-sandbox-image-status <name>"
+      clear_sandbox_image_status "$(sanitize_name "$1")"
+      ;;
+
     report-sandbox-image)
       require_root
       [[ $# -eq 1 ]] || die "usage: report-sandbox-image <name>"
