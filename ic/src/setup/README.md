@@ -654,6 +654,12 @@ encrypted in the secrets DB.
 All other settings are stored as key-value pairs in the `settings` table,
 keyed by `(user_id, key)`. Written by `set_all_settings()`.
 
+`lunarwing config list|get|set|reset` (and `init`) read and write the same
+`user_id` scope the daemon reads: the owner id resolved by
+`Config::from_env()` (`LUNARWING_OWNER_ID` > `settings.owner_id` >
+`default`). On a tenant that is the tenant id, so the rows the CLI touches
+are the rows the daemon loads. Each command names the scope it used.
+
 Settings are serialized via `Settings::to_db_map()` as dotted paths:
 ```
 database_backend = "libsql"
