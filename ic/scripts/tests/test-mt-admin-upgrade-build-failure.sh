@@ -277,7 +277,7 @@ git -C "$operator_repo" add off-release.txt
 git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
   commit -qm 'Off-release tenant choice'
 off_release_target="$(git -C "$operator_repo" rev-parse HEAD)"
-git -C "$operator_repo" push -q origin HEAD:refs/heads/moving
+git -C "$operator_repo" push -qf origin HEAD:refs/heads/moving
 git -C "$operator_repo" checkout -q moving
 git -C "$fixture_repo" reset -q --hard "$source_rev"
 : >"$events"; : >"$cand_events"; : >"$promote_events"
