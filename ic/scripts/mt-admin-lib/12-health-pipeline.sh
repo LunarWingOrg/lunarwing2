@@ -277,37 +277,37 @@ carry_health_library_entries() {
   done
 }
 
-sync_health_pipeline_library() {
-  local parent stage old="" unsafe
-  [[ "$HEALTH_LIB_DIR" == /* && "$HEALTH_LIB_DIR" != / ]] \
-    || die "health library destination must be an absolute non-root path"
-  parent="$(dirname -- "$HEALTH_LIB_DIR")"
-  mkdir -p "$parent"
-  stage="$(mktemp -d "$parent/.lunarwing-health.new.XXXXXX")" \
-    || die "could not create health library staging directory"
-  if ! cp -R --no-preserve=ownership --preserve=mode,timestamps "$HEALTH_SRC_DIR/." "$stage/"; then
-    rm -rf -- "$stage"
-    die "could not copy health pipeline scripts"
-  fi
-  unsafe="$(find "$stage" -type l -print -quit 2>/dev/null)" \
-    || { rm -rf -- "$stage"; die "could not inspect staged health pipeline scripts"; }
-  if [[ -n "$unsafe" ]]; then
-    rm -rf -- "$stage"
-    die "health pipeline source contains a symbolic link: $unsafe"
-  fi
-  if ! chown -R -h root:root "$stage" || ! chmod -R go-w "$stage"; then
-    rm -rf -- "$stage"
-    die "could not secure staged health pipeline scripts"
-  fi
-  find "$stage" -maxdepth 1 -type f -name '*.sh' -exec chmod 0755 -- {} + \
+health_pipeline_tree_require_regular() {
+  local path="$1" unsafe
+  unsafe="$(find "$path" -type l -print -quit 2>/dev/null)" \
+    || die "could not inspect health pipeline source entries"
+  [[ -z "$unsafe" ]] || die "health pipeline source contains a symbolic link: $unsafe"
+  unsafe="$(find "$path" ! \( -type f -o -type d \) -print -quit 2>/dev/null)" \
+    || die "could not inspect health pipeline source file types"
+  [[ -z "$unsafe" ]] || die "health pipeline source contains a non-regular entry: $unsafe"
+}
+
+secure_health_pipeline_stage() {
+  local stage="$1"
+  chown -R -h root:root "$stage/tree" \
+    || { rm -rf -- "$stage"; die "could not own staged health pipeline scripts as root"; }
+  find "$stage/tree" -type d -exec chmod 0755 -- {} + \
+    || { rm -rf -- "$stage"; die "could not set health pipeline directory modes"; }
+  find "$stage/tree" -type f -exec chmod 0644 -- {} + \
+    || { rm -rf -- "$stage"; die "could not set health pipeline file modes"; }
+  find "$stage/tree" -maxdepth 1 -type f -name '*.sh' -exec chmod 0755 -- {} + \
     || { rm -rf -- "$stage"; die "could not set health pipeline script modes"; }
-  if ! carry_health_library_entries "$stage"; then
-    rm -rf -- "$stage"
-    die "could not carry installed entries into the new health library"
-  fi
-  if ! health_lib_tree_require_safe "$stage"; then
-    rm -rf -- "$stage"
-    die "staged health pipeline failed its ownership check"
+}
+
+publish_health_pipeline_library() {
+  local stage="$1" parent="$2" old=""
+  if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]] \
+    && mv --help 2>/dev/null | grep -q -- '--exchange'; then
+    if mv -T --exchange -- "$stage/tree" "$HEALTH_LIB_DIR"; then
+      rm -rf -- "$stage"
+      return 0
+    fi
+    say "WARNING: atomic health library exchange unavailable; using rollback-protected replacement" >&2
   fi
   if [[ -e "$HEALTH_LIB_DIR" || -L "$HEALTH_LIB_DIR" ]]; then
     old="$(mktemp -d "$parent/.lunarwing-health.old.XXXXXX")" \
@@ -318,12 +318,42 @@ sync_health_pipeline_library() {
       die "could not move the previous health library aside"
     fi
   fi
-  if ! mv -T -- "$stage" "$HEALTH_LIB_DIR"; then
+  if ! mv -T -- "$stage/tree" "$HEALTH_LIB_DIR"; then
     [[ -z "$old" ]] || mv -T -- "$old" "$HEALTH_LIB_DIR" || true
     rm -rf -- "$stage"
     die "could not publish staged health pipeline scripts"
   fi
+  rm -rf -- "$stage"
   [[ -z "$old" ]] || rm -rf -- "$old"
+}
+
+sync_health_pipeline_library() {
+  local parent stage
+  [[ "$HEALTH_LIB_DIR" == /* && "$HEALTH_LIB_DIR" != / ]] \
+    || die "health library destination must be an absolute non-root path"
+  [[ -d "$HEALTH_SRC_DIR" && ! -L "$HEALTH_SRC_DIR" ]] \
+    || die "health pipeline source must be a real directory, not a symbolic link: $HEALTH_SRC_DIR"
+  health_pipeline_tree_require_regular "$HEALTH_SRC_DIR"
+  parent="$(dirname -- "$HEALTH_LIB_DIR")"
+  mkdir -p "$parent"
+  stage="$(mktemp -d "$parent/.lunarwing-health.new.XXXXXX")" \
+    || die "could not create health library staging directory"
+  if ! (umask 077 && mkdir "$stage/tree" \
+    && cp -R --no-preserve=all --preserve=timestamps "$HEALTH_SRC_DIR/." "$stage/tree/"); then
+    rm -rf -- "$stage"
+    die "could not copy health pipeline scripts into a root-only stage"
+  fi
+  health_pipeline_tree_require_regular "$stage/tree"
+  secure_health_pipeline_stage "$stage"
+  if ! carry_health_library_entries "$stage/tree"; then
+    rm -rf -- "$stage"
+    die "could not carry installed entries into the new health library"
+  fi
+  if ! health_lib_tree_require_safe "$stage/tree"; then
+    rm -rf -- "$stage"
+    die "staged health pipeline failed its ownership check"
+  fi
+  publish_health_pipeline_library "$stage" "$parent"
 }
 
 ensure_health_pipeline() {
@@ -510,7 +540,13 @@ ENVEOF
 # Auto-generated by lunarwing-mt-admin.sh. Host-global health/self-heal pipeline.
 PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin
 export PATH
-if ! health_lib_tree_require_safe "$HEALTH_LIB_DIR"; then
+HEALTH_LIB_STAT=/usr/bin/stat
+HEALTH_LIB_FIND=/usr/bin/find
+HEALTH_LIB_LOGGER=/usr/bin/logger
+health_refusal=""
+if ! health_refusal="\$(health_lib_tree_require_safe "$HEALTH_LIB_DIR" 2>&1)"; then
+  printf '%s\n' "\$health_refusal" >&2
+  "\$HEALTH_LIB_LOGGER" -p daemon.err -t lunarwing-mt-health -- "\$health_refusal" >/dev/null 2>&1 || true
   exit 126
 fi
 set -a
