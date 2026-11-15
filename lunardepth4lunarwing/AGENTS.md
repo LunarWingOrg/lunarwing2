@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Opt-in LunarWing external worker for the LunarDepth fork of DeepSeek Harness. The pinned source is `lunarwing/lunardepth` at `da06c33b2091546dc38c61b95452ce27a4ce32d5`. The lane implements `docs/proposals/LUNARDEPTH_WORKER_LANE.md`; treat that design and `docs/ops/WORKER-CONTAINERS.md` as the security contract.
+Opt-in LunarWing external worker for the LunarDepth fork of DeepSeek Harness. The pinned source is `lunarwing/lunardepth` at `0472d115e5297093f249c222639431ba8ff0bb78`. The lane implements `docs/proposals/LUNARDEPTH_WORKER_LANE.md`; treat that design and `docs/ops/WORKER-CONTAINERS.md` as the security contract.
 
 The daemon dispatches `create_job(mode: "lunardepth")` to a non-root bridge. The bridge delegates over the `-ipc-v2` Unix socket to the non-root task runner, which alone connects to LunarDepth on `127.0.0.1:19091/ws/agent` with `lunarwing-agent-v1`. Never connect the daemon directly to the harness or put the hub credential in the task container.
 

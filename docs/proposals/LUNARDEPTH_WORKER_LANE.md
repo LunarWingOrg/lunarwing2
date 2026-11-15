@@ -24,7 +24,7 @@ The daemon resolves external-worker names generically. `create_job(mode: "lunard
 
 ### 2.1 Current source baseline
 
-This revision is based on LunarDepth `master` at **`da06c33b2091546dc38c61b95452ce27a4ce32d5`** (2026-11-09), which remains the current `master` at the time of this re-attempt. The commit is interface evidence, not a moving source pin. Part 2 must select and review a full commit SHA and re-check the then-current `master` before choosing it.
+This revision is based on LunarDepth `master` at **`0472d115e5297093f249c222639431ba8ff0bb78`** (2026-11-14), the immutable source pin selected by WI#692. The commit is interface evidence, not a moving source pin. Part 2 must select and review a full commit SHA and re-check the then-current `master` before choosing it.
 
 Two landed LunarDepth goal items are mandatory:
 
