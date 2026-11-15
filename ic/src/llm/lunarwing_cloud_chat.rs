@@ -175,10 +175,11 @@ impl LunarWingCloudChatProvider {
     ///
     /// Priority order:
     /// 1. `config.api_key` (set at construction from env/config)
-    /// 2. Session token (OAuth flow)
-    /// 3. `LUNARWING_CLOUD_API_KEY` from the layered environment
+    /// 2. Existing session token (OAuth flow)
+    /// 3. Newly authenticated session token
+    /// 4. `LUNARWING_CLOUD_API_KEY` from the layered environment
     ///
-    /// The API-key fallback (#3) only triggers after `ensure_authenticated()`
+    /// The API-key fallback (#4) only triggers after `ensure_authenticated()`
     /// runs, because `api_key_login()` sets a runtime override but not a session token.
     async fn resolve_bearer_token(&self) -> Result<String, LlmError> {
         // 1. Config-level API key takes priority
