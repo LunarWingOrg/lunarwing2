@@ -15,8 +15,8 @@ PLACEHOLDER_MODEL = "tensormoon::function_name::lunarwing"
 # Both gateways address a function as <prefix>::function_name::<function>: the
 # middle segment is that literal keyword and the function's name comes last.
 # The prefix names the gateway dialect, and the provider row is named after it.
-# A TensorZero gateway answers only tensorzero:: ids; a TensorMoon gateway
-# answers tensormoon:: ids and, as deprecated aliases, tensorzero:: ones.
+# A TensorZero gateway answers only tensorzero:: ids. TensorMoon versions with
+# legacy compatibility also accept tensorzero:: aliases, but the lane never relies on them.
 DIALECT_DISPLAY_NAMES = {"tensormoon": "TensorMoon", "tensorzero": "TensorZero"}
 MODEL_PATTERN = re.compile(r"^(tensormoon|tensorzero)::function_name::[A-Za-z0-9_-]+$")
 # The template is written in the TensorMoon dialect. Each entry is one of its
