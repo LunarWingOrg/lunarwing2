@@ -90,6 +90,56 @@ assert_contains "$CONFD" 'export HEALTH_METRICS_TOKEN=""' \
     "confd ships with an empty token"
 assert_absent "$CONFD" '0.0.0.0' \
     "confd never suggests a wildcard bind"
+assert_contains "$CONFD" 'export LUNARWING_BASE_DIR="/var/lib/lunarwing-health"' \
+    "confd exports the exporter base directory"
+
+PIPELINE="$ROOT_DIR/ic/scripts/mt-admin-lib/12-health-pipeline.sh"
+assert_contains "$PIPELINE" '  health_metrics_confd_reconcile' \
+    "health pipeline reconciles the OpenRC listener confd"
+
+# Exercise the shipped reconciler against an installed confd. The listener is
+# optional, so this fixture explicitly provides the file the helper manages.
+RECONCILE_CONFD="$TMP/lunarwing-health-metrics"
+RECONCILE_SCRIPT="$TMP/reconcile-confd.sh"
+cat >"$RECONCILE_CONFD" <<'EOF'
+# Operator-owned listener settings must survive reconciliation.
+export HEALTH_METRICS_LISTEN="127.0.0.1:50123"
+export LUNARWING_BASE_DIR="/old/base"
+export HEALTH_METRICS_TOKEN="keep-token"
+export LUNARWING_BASE_DIR="/duplicate/base"
+EOF
+chmod 0640 "$RECONCILE_CONFD"
+{
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'say() { :; }\nINIT_SYSTEM=openrc\n'
+    printf 'OPENRC_CONFD_DIR=%q\nHEALTH_BASE_DIR=%q\n' "$TMP" "$TMP/custom-base"
+    awk '/^health_metrics_confd_reconcile\(\) \{/,/^\}/' "$PIPELINE"
+    printf 'health_metrics_confd_reconcile\nhealth_metrics_confd_reconcile\n'
+} >"$RECONCILE_SCRIPT"
+if bash "$RECONCILE_SCRIPT"; then
+    assert_contains "$RECONCILE_CONFD" "export LUNARWING_BASE_DIR=\"$TMP/custom-base\"" \
+        "reconciler applies an overridden health base directory"
+    assert_absent "$RECONCILE_CONFD" '/old/base' \
+        "reconciler removes the stale base directory"
+    assert_absent "$RECONCILE_CONFD" '/duplicate/base' \
+        "reconciler removes duplicate base assignments"
+    assert_contains "$RECONCILE_CONFD" 'export HEALTH_METRICS_TOKEN="keep-token"' \
+        "reconciler preserves the operator token"
+    assert_contains "$RECONCILE_CONFD" 'export HEALTH_METRICS_LISTEN="127.0.0.1:50123"' \
+        "reconciler preserves the operator listen address"
+    if [[ "$(grep -Ec '^[[:space:]]*(export[[:space:]]+)?LUNARWING_BASE_DIR=' "$RECONCILE_CONFD")" == 1 ]]; then
+        ok "reconciler is idempotent and leaves one base assignment"
+    else
+        bad "reconciler is idempotent and leaves one base assignment" "unexpected assignment count"
+    fi
+    if [[ "$(stat -c '%a' "$RECONCILE_CONFD")" == 640 ]]; then
+        ok "reconciler preserves confd permissions"
+    else
+        bad "reconciler preserves confd permissions" "expected mode 640"
+    fi
+else
+    bad "OpenRC confd reconciler runs" "fixture returned non-zero"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
