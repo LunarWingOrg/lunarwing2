@@ -306,8 +306,8 @@ for lane in pebble4lunarwing opencode4lunarwing opencode2.4lunarwing kimicode4lu
   grep -Fq "_prepare_worker_build_source \"\$source_root\" $lane" "$BUILD_LIB" \
     || fail "$lane does not use the shared operator-archive helper"
 done
-grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;' "$BUILD_LIB" \
-  || fail 'upgrade candidate builds do not forward the release ref and tenant revision source'
+grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;' "$BUILD_LIB" \
+  || fail 'upgrade candidate builds do not forward the release ref, selected commit, and tenant source'
 grep -Fq 'worker_paths+=(pebble4lunarwing)' "$BUILD_LIB" \
   || fail 'build-all dirty-source guard does not cover pebble4lunarwing'
 grep -Fq 'git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}"' "$BUILD_LIB" \
