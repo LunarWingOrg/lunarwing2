@@ -2,8 +2,9 @@
 # shellcheck disable=SC2034  # fixture values are consumed by sourced mt-admin functions
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$TEST_SCRIPT_DIR"
+MT_ADMIN="$TEST_SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
@@ -25,6 +26,17 @@ assert_contains() {
   if [[ "$text" == *"$needle"* ]]; then pass "$label"; else fail "$label (missing '$needle')"; fi
 }
 
+assert_before() {
+  local label="$1" first="$2" second="$3"
+  if [[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ ]] && ((first < second)); then
+    pass "$label"
+  else
+    fail "$label (expected '$first' before '$second')"
+  fi
+}
+
+logger() { printf '%s\n' "$*" >>"${HEALTH_TEST_LOGGER_LOG:?}"; }
+
 configure_health_fixture() {
   local root="$1"
   HEALTH_SRC_DIR="$root/source"
@@ -32,6 +44,7 @@ configure_health_fixture() {
   HEALTH_ENV_FILE="$root/config/health.env"
   HEALTH_BASE_DIR="$root/state"
   HEALTH_LAUNCHER="$root/lunarwing-mt-health"
+  HEALTH_TEST_LOGGER_LOG="$root/logger.log"
   PORTS_REGISTRY="$root/ports.json"
   HEALTH_INTERVAL_MIN=15
   HEALTH_INTERVAL_SOURCE="test"
@@ -44,22 +57,45 @@ printf 'executed\n' >"$HEALTH_TEST_MARKER"
 EOF
   chmod 0755 "$HEALTH_SRC_DIR/cron-wrapper.sh"
   : >"$PORTS_REGISTRY"
+  : >"$HEALTH_TEST_LOGGER_LOG"
+  export HEALTH_TEST_LOGGER_LOG
   ensure_init_system() { INIT_SYSTEM=systemd; }
   ensure_container_runtime() { return 1; }
   _install_health_systemd_timer() { :; }
 }
 
+prepare_launcher_for_test() {
+  sed -i 's|^HEALTH_LIB_LOGGER=.*$|HEALTH_LIB_LOGGER=logger|' "$HEALTH_LAUNCHER"
+  if [[ -n "$MOCK_ROOT" || "${HEALTH_TEST_NAMESPACE:-false}" == true ]]; then
+    sed -i 's|^HEALTH_LIB_STAT=.*$|HEALTH_LIB_STAT=stat|; s|^HEALTH_LIB_FIND=.*$|HEALTH_LIB_FIND=find|' \
+      "$HEALTH_LAUNCHER"
+  fi
+  : >"$HEALTH_TEST_LOGGER_LOG"
+  export -f logger
+}
+
 assert_launcher_refused() {
   local label="$1" output="" status=0
   rm -f "$HEALTH_TEST_MARKER"
-  if output="$("$HEALTH_LAUNCHER" 2>&1)"; then
+  prepare_launcher_for_test
+  if output="$(bash "$HEALTH_LAUNCHER" 2>&1)"; then
     fail "$label: launcher succeeded"
   else
     status=$?
     assert_eq "$label: exit status" "126" "$status"
     assert_contains "$label: refusal logged" "$output" "error: refusing health library"
+    assert_contains "$label: refusal sent to syslog" "$(<"$HEALTH_TEST_LOGGER_LOG")" \
+      "daemon.err -t lunarwing-mt-health -- error: refusing health library"
   fi
+  LAST_REFUSAL_OUTPUT="$output"
   assert_eq "$label: wrapper not executed" "0" "$([[ -e "$HEALTH_TEST_MARKER" ]] && printf 1 || printf 0)"
+}
+
+assert_launcher_guard_precedes_env() {
+  local guard_line env_line
+  guard_line="$(grep -n 'if ! health_refusal=' "$HEALTH_LAUNCHER" | cut -d: -f1)"
+  env_line="$(grep -n '^set -a$' "$HEALTH_LAUNCHER" | cut -d: -f1)"
+  assert_before "launcher checks the library before loading the environment" "$guard_line" "$env_line"
 }
 
 assert_root_owned_tree() {
@@ -116,7 +152,7 @@ check_carry_quarantined() {
   fi
   assert_eq "$label: wrapper installed" "0" \
     "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
-  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_lib_tree_require_safe '
+  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_refusal='
   leftover="$(command find "$(dirname -- "$HEALTH_LIB_DIR")" -maxdepth 1 -name '.lunarwing-health.new.*' -print -quit)"
   assert_eq "$label: no staging directory left" "" "$leftover"
   rm -rf -- "$HEALTH_BASE_DIR/quarantine"
@@ -136,7 +172,7 @@ check_carry_dropped() {
     "$([[ -e "$HEALTH_LIB_DIR/lunarwing-health-metrics" || -L "$HEALTH_LIB_DIR/lunarwing-health-metrics" ]] && printf 0 || printf 1)"
   assert_eq "$label: nothing moved into the unsafe quarantine" "" \
     "$(command find -P "$HEALTH_BASE_DIR/quarantine" -mindepth 1 -name 'lunarwing-health-metrics*' -print -quit 2>/dev/null || true)"
-  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_lib_tree_require_safe '
+  assert_contains "$label: checked launcher written" "$(<"$HEALTH_LAUNCHER")" 'if ! health_refusal='
   leftover="$(command find "$(dirname -- "$HEALTH_LIB_DIR")" -maxdepth 1 -name '.lunarwing-health.new.*' -print -quit)"
   assert_eq "$label: no staging directory left" "" "$leftover"
   rm -rf -- "$HEALTH_BASE_DIR/quarantine"
@@ -209,6 +245,139 @@ run_carry_cases() {
   chmod 0755 "$HEALTH_BASE_DIR"
 }
 
+expect_install_refused() {
+  local label="$1" reason="$2" output="" status=0
+  output="$(ensure_health_pipeline 2>&1)" || status=$?
+  assert_eq "$label: install refused" "1" "$status"
+  assert_contains "$label: refusal reason" "$output" "$reason"
+  assert_eq "$label: previous valid wrapper remains installed" "0" \
+    "$([[ -x "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] && printf 0 || printf 1)"
+}
+
+check_linked_source_directory_refused() {
+  mv -- "$HEALTH_SRC_DIR" "$TEST_ROOT/source.real"
+  ln -s "$TEST_ROOT/source.real" "$HEALTH_SRC_DIR"
+  expect_install_refused "linked health source directory" \
+    "source must be a real directory, not a symbolic link: $HEALTH_SRC_DIR"
+  rm -- "$HEALTH_SRC_DIR"
+  mv -- "$TEST_ROOT/source.real" "$HEALTH_SRC_DIR"
+}
+
+check_fifo_source_refused() {
+  mkfifo "$HEALTH_SRC_DIR/not-a-regular-file"
+  expect_install_refused "FIFO in health source" "contains a non-regular entry: $HEALTH_SRC_DIR/not-a-regular-file"
+  rm -- "$HEALTH_SRC_DIR/not-a-regular-file"
+}
+
+check_staging_mode_and_acl_rules() {
+  mkdir -p "$HEALTH_SRC_DIR/nested"
+  printf 'data\n' >"$HEALTH_SRC_DIR/nested/data"
+  chmod 0777 "$HEALTH_SRC_DIR" "$HEALTH_SRC_DIR/nested"
+  chmod 4755 "$HEALTH_SRC_DIR/cron-wrapper.sh"
+  chmod 2775 "$HEALTH_SRC_DIR/nested"
+  chmod 0666 "$HEALTH_SRC_DIR/nested/data"
+  local acl_case=false acl_output
+  if command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1; then
+    setfacl -m d:u:65534:rwx "$HEALTH_SRC_DIR/nested"
+    acl_case=true
+  fi
+  # shellcheck disable=SC2329  # invoked indirectly by ensure_health_pipeline
+  cp() {
+    command cp "$@" || return
+    if [[ " $* " == *" --no-preserve=all "* ]]; then
+      local destination="${!#}"
+      command stat -c '%a' "$destination" "$destination/nested" "$(dirname -- "$destination")" \
+        >"$TEST_ROOT/stage.modes"
+    fi
+  }
+  ensure_health_pipeline >/dev/null
+  unset -f cp
+  local -a stage_modes=()
+  mapfile -t stage_modes <"$TEST_ROOT/stage.modes"
+  assert_eq "stage tree stays root-only during a world-writable checkout copy" "700" "${stage_modes[0]:-}"
+  assert_eq "stage subdirectory stays root-only during the copy" "700" "${stage_modes[1]:-}"
+  assert_eq "stage parent stays root-only during the copy" "700" "${stage_modes[2]:-}"
+  assert_eq "installed source directory uses the directory mode rule" "755" "$(stat -c '%a' "$HEALTH_LIB_DIR")"
+  assert_eq "installed nested directory loses set-ID and write bits" "755" "$(stat -c '%a' "$HEALTH_LIB_DIR/nested")"
+  assert_eq "installed top-level shell script loses set-ID and keeps execute" "755" \
+    "$(stat -c '%a' "$HEALTH_LIB_DIR/cron-wrapper.sh")"
+  assert_eq "installed regular data file uses the file mode rule" "644" \
+    "$(stat -c '%a' "$HEALTH_LIB_DIR/nested/data")"
+  assert_eq "installed tree has no set-ID entries" "" \
+    "$(command find "$HEALTH_LIB_DIR" -perm /6000 -print -quit)"
+  if [[ "$acl_case" == true ]]; then
+    acl_output="$(getfacl -cp "$HEALTH_LIB_DIR/nested" 2>/dev/null)"
+    if [[ "$acl_output" != *"user:65534"* && "$acl_output" != *"default:"* ]]; then
+      pass "default ACLs are not inherited from the checkout"
+    else
+      fail "default ACLs are not inherited from the checkout"
+    fi
+    setfacl -b -k "$HEALTH_SRC_DIR/nested"
+  else
+    assert_contains "copy explicitly disables ACL and other metadata preservation" \
+      "$(declare -f sync_health_pipeline_library)" '--no-preserve=all --preserve=timestamps'
+  fi
+  chmod 0755 "$HEALTH_SRC_DIR" "$HEALTH_SRC_DIR/nested" "$HEALTH_SRC_DIR/cron-wrapper.sh"
+  chmod 0644 "$HEALTH_SRC_DIR/nested/data"
+}
+
+check_setgid_directory_refused_at_runtime() {
+  mkdir "$HEALTH_LIB_DIR/setgid-directory"
+  chmod 2755 "$HEALTH_LIB_DIR/setgid-directory"
+  assert_launcher_refused "set-ID library directory"
+  assert_contains "set-ID refusal names the entry" "$LAST_REFUSAL_OUTPUT" "$HEALTH_LIB_DIR/setgid-directory"
+  chmod 0755 "$HEALTH_LIB_DIR/setgid-directory"
+  rmdir "$HEALTH_LIB_DIR/setgid-directory"
+}
+
+run_metadata_cases() {
+  check_linked_source_directory_refused
+  check_fifo_source_refused
+  check_staging_mode_and_acl_rules
+  check_setgid_directory_refused_at_runtime
+}
+
+assert_cli_source_refused() {
+  local label="$1" cli="$2" component="$3"
+  local stdout="$TEST_ROOT/cli.stdout" stderr="$TEST_ROOT/cli.stderr"
+  if bash "$cli" --help >"$stdout" 2>"$stderr"; then
+    fail "$label: CLI loaded an unsafe health contract"
+  else
+    pass "$label: CLI refuses before dispatch"
+  fi
+  assert_eq "$label: no normal output precedes the refusal" "" "$(<"$stdout")"
+  assert_contains "$label: refusal names the failing component" "$(<"$stderr")" "$component"
+}
+
+check_snapshot_source_load() {
+  local snapshot="$TEST_ROOT/snapshot" cli contract
+  cli="$snapshot/ic/scripts/lunarwing-mt-admin.sh"
+  contract="$TEST_SCRIPT_DIR/../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  mkdir -p "$snapshot/ic/scripts/mt-admin-lib" "$snapshot/ic-infrastructure-health-check"
+  cp -- "$MT_ADMIN" "$cli"
+  cp -R -- "$TEST_SCRIPT_DIR/../mt-admin-lib/." "$snapshot/ic/scripts/mt-admin-lib/"
+  cp -- "$contract" "$snapshot/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  if bash "$cli" --help >"$TEST_ROOT/safe-cli.stdout" 2>"$TEST_ROOT/safe-cli.stderr"; then
+    pass "root-owned snapshot loads a safe real-directory contract"
+  else
+    fail "root-owned snapshot loads a safe real-directory contract"
+  fi
+  assert_contains "safe snapshot control reaches usage output" "$(<"$TEST_ROOT/safe-cli.stdout")" 'Usage:'
+
+  cp -- "$contract" "$HEALTH_LIB_DIR/openrc-proxy-unit-contract.sh"
+  chown 65534:65534 "$HEALTH_LIB_DIR/cron-wrapper.sh"
+  rm -rf -- "$snapshot/ic-infrastructure-health-check"
+  ln -s "$HEALTH_LIB_DIR" "$snapshot/ic-infrastructure-health-check"
+  assert_cli_source_refused "snapshot linked to an unsafe library" "$cli" "$HEALTH_LIB_DIR/cron-wrapper.sh"
+
+  rm -- "$snapshot/ic-infrastructure-health-check"
+  mkdir "$snapshot/ic-infrastructure-health-check"
+  cp -- "$contract" "$snapshot/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  chown -R 65534:65534 "$snapshot/ic-infrastructure-health-check"
+  assert_cli_source_refused "snapshot with an unsafe real-directory sibling" "$cli" \
+    "$snapshot/ic-infrastructure-health-check"
+}
+
 stat() {
   if [[ "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$MOCK_NONROOT_DIR" ]]; then
     printf '65534\n'
@@ -231,6 +400,9 @@ find() {
     if [[ "$1" == ! && "${2:-}" == -user && "${3:-}" == root ]]; then
       args+=('!' '(' -user root -o -user "$MOCK_REAL_USER" ')')
       shift 3
+    elif [[ "$1" == ! && "${2:-}" == -uid && "${3:-}" == 0 ]]; then
+      args+=('!' '(' -uid 0 -o -user "$MOCK_REAL_USER" ')')
+      shift 3
     else
       args+=("$1")
       shift
@@ -242,7 +414,7 @@ find() {
 chown() { printf '%s\n' "$*" >>"$MOCK_CHOWN_LOG"; }
 
 run_mock_tests() {
-  TEST_ROOT="$(mktemp -d /tmp/lunarwing-health-mock.XXXXXX)"
+  TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-health-mock.XXXXXX")"
   MOCK_ROOT="$TEST_ROOT"
   MOCK_REAL_USER="$(id -un)"
   MOCK_CHOWN_LOG="$TEST_ROOT/chown.log"
@@ -259,10 +431,15 @@ run_mock_tests() {
 
   assert_contains "fake chown forces root ownership recursively" "$(<"$MOCK_CHOWN_LOG")" "-R -h root:root "
   assert_eq "refresh removes stale entries" "0" "$([[ -e "$HEALTH_LIB_DIR/stale-file" ]] && printf 1 || printf 0)"
-  assert_contains "launcher embeds the run-time guard" "$(<"$HEALTH_LAUNCHER")" 'if ! health_lib_tree_require_safe '
+  assert_contains "launcher embeds the run-time guard" "$(<"$HEALTH_LAUNCHER")" 'if ! health_refusal='
+  assert_contains "launcher pins stat outside the checkout PATH" "$(<"$HEALTH_LAUNCHER")" 'HEALTH_LIB_STAT=/usr/bin/stat'
+  assert_contains "launcher pins find outside the checkout PATH" "$(<"$HEALTH_LAUNCHER")" 'HEALTH_LIB_FIND=/usr/bin/find'
+  assert_launcher_guard_precedes_env
   export HEALTH_TEST_MARKER="$TEST_ROOT/marker"
-  "$HEALTH_LAUNCHER"
+  prepare_launcher_for_test
+  bash "$HEALTH_LAUNCHER"
   assert_eq "safe mock launcher executes its wrapper" "executed" "$(<"$HEALTH_TEST_MARKER")"
+  run_metadata_cases
   run_carry_cases
   plant_listener_binary
   MOCK_NONROOT_DIR="$HEALTH_LIB_DIR/lunarwing-health-metrics"
@@ -295,7 +472,7 @@ run_mock_tests() {
 }
 
 run_real_tests() {
-  TEST_ROOT="$(mktemp -d /tmp/lunarwing-health-root.XXXXXX)"
+  TEST_ROOT="$(mktemp -d "${HEALTH_TEST_REAL_PARENT:-/tmp}/lunarwing-health-root.XXXXXX")"
   REAL_ROOT="$TEST_ROOT"
   configure_health_fixture "$TEST_ROOT"
   chown -R 65534:65534 "$HEALTH_SRC_DIR"
@@ -306,10 +483,13 @@ run_real_tests() {
   ensure_health_pipeline >/dev/null
   assert_root_owned_tree "non-root checkout install"
   assert_eq "install removes stale entries" "0" "$([[ -e "$HEALTH_LIB_DIR/stale-file" ]] && printf 1 || printf 0)"
+  assert_launcher_guard_precedes_env
 
   export HEALTH_TEST_MARKER="$TEST_ROOT/marker"
-  "$HEALTH_LAUNCHER"
+  prepare_launcher_for_test
+  bash "$HEALTH_LAUNCHER"
   assert_eq "root-owned pipeline still executes" "executed" "$(<"$HEALTH_TEST_MARKER")"
+  run_metadata_cases
 
   plant_listener_binary
   : >"$HEALTH_LIB_DIR/stale-file"
@@ -372,6 +552,8 @@ run_real_tests() {
   chmod 0755 "$HEALTH_LIB_DIR"
   chmod 0777 "$TEST_ROOT"
   assert_launcher_refused "group/other-writable parent"
+  assert_contains "parent refusal names the failing component" "$LAST_REFUSAL_OUTPUT" "component $TEST_ROOT "
+  assert_contains "syslog refusal names the failing component" "$(<"$HEALTH_TEST_LOGGER_LOG")" "component $TEST_ROOT "
   chmod 0700 "$TEST_ROOT"
   : >"$HEALTH_LIB_DIR/nested-data"
   chown 65534:65534 "$HEALTH_LIB_DIR/nested-data"
@@ -383,13 +565,15 @@ run_real_tests() {
   rm "$HEALTH_LIB_DIR/cron-wrapper.sh"
   mv "$TEST_ROOT/cron-wrapper.real" "$HEALTH_LIB_DIR/cron-wrapper.sh"
   check_source_symlink_refused "real chmod symlink attack"
+  check_snapshot_source_load
   if ((failures != 0)); then return 1; fi
-  printf 'RESULT: real user-namespace ownership and refusal harness passed\n'
+  printf 'RESULT: real ownership and refusal harness passed\n'
 }
 
 if [[ "${1:-}" == --namespace ]]; then
   unset -f stat find chown
   unset MOCK_REAL_USER MOCK_CHOWN_LOG MOCK_HEALTH_LIB_DIR MOCK_NONROOT_DIR MOCK_UNSAFE_ENTRY
+  HEALTH_TEST_NAMESPACE=true
   # Host-owned / is the overflow UID in a rootless user namespace. Normalize
   # only that report; installed-tree ownership still uses real chown and find.
   stat() {
@@ -410,6 +594,11 @@ run_mock_tests
 if command -v podman >/dev/null 2>&1 && command -v unshare >/dev/null 2>&1 \
   && podman unshare unshare --mount sh -c 'mount -t tmpfs tmpfs /tmp' >/dev/null 2>&1; then
   podman unshare unshare --mount bash "$0" --namespace
+elif [[ "$(command id -u)" == 0 ]]; then
+  HEALTH_TEST_REAL_PARENT=/root run_real_tests
+elif [[ -n "${CI:-}" ]]; then
+  printf 'FAIL: real ownership tests require root or a working podman user namespace in CI\n' >&2
+  exit 1
 else
   printf 'SKIP: real ownership namespace unavailable; fake-chown and launcher refusal cases completed\n'
 fi
