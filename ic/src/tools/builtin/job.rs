@@ -2958,7 +2958,7 @@ impl Tool for JobEventsTool {
 
     fn description(&self) -> &str {
         "Read the event log for a sandbox job. Shows messages, tool calls, results, \
-         and status changes from the container. Use this to check what the sandbox \
+         and status changes from the container. Use this to check what the job's \
          worker has been doing."
     }
 
