@@ -374,16 +374,22 @@ mt-admin, so mt-admin's own readable `/proc` entry cannot satisfy the proof
 when the process table is namespace- or LSM-filtered.
 
 The process scans are paired with cgroup v2 checks, which close the race where
-a chain keeps forking and exiting between passes. On systemd every
-`cgroup.procs` under `user.slice/user-<uid>.slice` must be empty. On OpenRC the
-check covers the delegated `lunarwing-<tenant>` subtree and every matching
-`openrc.<service>` tree, including daemon, sidecar, worker, task-supervisor and
-legacy Nanocode units. OpenRC services do not live in the delegated login/build
-subtree, so checking that subtree alone is not sufficient. A non-empty or
-unreadable cgroup refuses the removal and names the unit to stop; stop a
-lingering systemd manager with `systemctl stop user@<uid>.service` and the
-named OpenRC service before rerunning. An unreadable cgroup v2 mount also
-refuses rather than restoring the fork/exit race.
+a chain keeps forking and exiting between passes for processes inside the
+managed trees. On systemd the `user-<uid>.slice` root's `cgroup.events` must
+report `populated 0`. On OpenRC the same root-level check covers the delegated
+`lunarwing-<tenant>` subtree and every matching `openrc.<service>` tree,
+including daemon, sidecar, worker, task-supervisor and legacy Nanocode units.
+The kernel's `populated` bit covers every descendant in one read, so a process
+moving between child cgroups cannot hide between separate `cgroup.procs` reads.
+OpenRC services do not live in the delegated login/build subtree, so checking
+that subtree alone is not sufficient. A process of a former uid outside these
+named trees (for example, one left in root's cgroup by `sudo -u`) is still
+covered only by the two process-table passes; the fork/exit race there remains
+a known limit. A populated or unreadable cgroup refuses the removal and names
+the unit to stop; stop a lingering systemd manager with `systemctl stop
+user@<uid>.service` and the named OpenRC service before rerunning. An
+unreadable cgroup v2 mount, or a missing, unreadable or invalid `cgroup.events`
+in an existing managed tree, also refuses rather than restoring that race.
 
 The recorded ranges are cross-checked against the current `/etc/subuid`.
 Entries still naming the tenant or its former uid must match the record, and
@@ -393,13 +399,18 @@ account is normal. The removal also refuses when the record is missing (the
 tenant was already removed, or was added before WI#688), a symbolic link,
 malformed (CRLF, more than one `UID=` line, an invalid range) or without a
 subordinate range, when the uid now belongs to another account, or when the
-status of a live task cannot be read.
+status of a live task cannot be read. If a new account owns the former uid or
+any part of its range, stop and remove that account and its workloads before
+retrying. For a LunarWing tenant, preserve any needed data and run
+`remove-tenant <new-owner> --purge`; this clears the conflicting account and
+subordinate-range ownership so the former tenant's proof can run without
+guessing which processes belong to which identity.
 
 Once the old identity is proven idle, every lane stop, the init-level unit stop
 rosters, legacy Nanocode supervision, container and IPC-volume removal, the
 PostgreSQL stop and the `--purge` data reset skip their account-dependent
-steps and say so. Standalone `stop-pg`, `stop-worker` and `stop-tenant` use the
-same proof: if it fails they exit non-zero because the stop state is unknown,
+steps and say so. Standalone `stop-pg` and `stop-tenant` use the same proof:
+if it fails they exit non-zero because the stop state is unknown,
 not successfully report a skip. The egress teardown proves the identity idle
 again and deletes the rendered egress state. On rootless Podman it flushes
 nothing: the chains lived only in the tenant's rootless network namespace,
