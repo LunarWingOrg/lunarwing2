@@ -191,7 +191,8 @@ Rust/Go sets used by other workers:
 ### Job 2 — C++17 weighted interval scheduling: PASS
 
 - Job `f43d93a1-d0dd-486b-b37b-e2002f4a5ec2`, mode `external:lunardepth`,
-  completed with 19 persisted events, `stuck=false`, zero repair attempts.
+  created 22:29:44Z and completed 22:44:18Z (**874 s** job elapsed), with 19
+  persisted events, `stuck=false`, zero repair attempts.
   It ran under the `always` approval granted on job 1; no second gate appeared,
   so the harness had no gate to answer (see finding F3).
 - `/workspace/wi719_cpp_wis` contains `wis.hpp`, `main.cpp`, `Makefile`,
@@ -215,3 +216,49 @@ Rust/Go sets used by other workers:
 - **Independent scaling check:** the C++ instance generator was regenerated
   from its documented seed (`7192500`) and fed to the independent Python DP,
   which reproduced the reported `optimum=732406` and `selected=1183`.
+
+### Job 3 — Parallel statistics with independent cross-check: PASS
+
+- Job `6a6555e9-90d5-45c5-a414-14b37ec2aae2`, mode `external:lunardepth`,
+  created 22:48:28Z and completed 23:09:24Z (**1256 s** job elapsed), with 48
+  persisted events, `stuck=false`, zero repair attempts.
+- `/workspace/wi719_parallel_stats` contains `gen_data.py`, `data.csv`,
+  `sha256_data.txt`, `stats.cpp`, the built `stats`, `check_independent.py`,
+  `compare_runs.py`, `out_p1.txt` / `out_p4.txt` / `out_p4_repeat.txt` /
+  `out_p8.txt`, both checker outputs, and `SUMMARY.md`.
+- The worker's checker reports **84 PASS, 0 FAIL** (4 categories × 7 fields ×
+  3 partition counts) against its own `math.fsum`/`statistics.pstdev`
+  recomputation, and `compare_runs.py` reports **28 PASS, 0 FAIL** across the
+  three partition runs.
+- **Independent host rebuild and rerun:**
+  `g++ -O2 -std=c++17 -pthread -Wall -Wextra -Werror` succeeded, and a fresh
+  4-partition run was **byte-identical** to the worker's `out_p4.txt`.
+- **A separate host-side implementation** (my own `csv`/`math.fsum`/
+  `statistics.pstdev` script, not the worker's checker) reproduced every
+  aggregate at 6 decimals:
+
+| Category | Count | Sum | Mean | Min | Max | Population stddev |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 6000 | 210661.170000 | 35.110195 | -9997.610000 | 9995.890000 | 5757.338318 |
+| B | 6000 | 766623.590000 | 127.770598 | -9999.440000 | 9998.730000 | 5755.740371 |
+| C | 6000 | 73112.700000 | 12.185450 | -9993.110000 | 9997.040000 | 5757.283212 |
+| D | 6000 | 456821.160000 | 76.136860 | -9990.650000 | 9995.230000 | 5801.860529 |
+
+- **FNV-1a checksums** were reproduced independently from the documented
+  canonical text (`%.6f` of each value in cents-then-position order, newline
+  separated): A `cf760272`, B `0841428d`, C `f1564075`, D `5de07e4d` — all four
+  match the worker's output.
+- **Fixture determinism:** re-running `gen_data.py` on the host reproduced
+  `data.csv` byte for byte, including row order (SHA-256
+  `1276b18785fd51e48ab678bf8d562ec739280264146fea43601bbb9b6dc922fe`).
+
+### Job inventory
+
+| Job | ID | State | Job elapsed | Independent result |
+| --- | --- | --- | ---: | --- |
+| Python access-log pipeline | `10372b43-58e3-4da2-8c71-9723a2bd0eb8` | completed | 1284 s | 18 tests + deterministic reruns + independent metrics/percentiles |
+| C++ weighted interval scheduling | `f43d93a1-d0dd-486b-b37b-e2002f4a5ec2` | completed | 874 s | forced rebuild, identical reruns, independent DP + brute force (120 cases), scaling check |
+| Parallel statistics | `6a6555e9-90d5-45c5-a414-14b37ec2aae2` | completed | 1256 s | fresh rebuild, identical p4 run, independent aggregates and FNV-1a |
+
+Final `GET /api/jobs?mode=external:lunardepth` contains exactly these three
+jobs, all `completed` and all attributed to `external:lunardepth`.
