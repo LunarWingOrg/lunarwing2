@@ -90,9 +90,20 @@ install_systemd() {
   say "installed + started ${SYSTEMD_UNIT} (systemctl status for details)"
 }
 
+ensure_openrc_account() {
+  if ! getent group lunarwing-metrics >/dev/null 2>&1; then
+    groupadd --system lunarwing-metrics
+  fi
+  if ! id -u lunarwing-metrics >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /sbin/nologin \
+      --gid lunarwing-metrics lunarwing-metrics
+  fi
+}
+
 install_openrc() {
   [[ -x "${HEALTH_LIB_DIR}/lunarwing-health-metrics" ]] \
     || die "binary missing at ${HEALTH_LIB_DIR}/lunarwing-health-metrics (see header for build+install)"
+  ensure_openrc_account
   install -o root -g root -m 0755 \
     "${IC_DIR}/systemd/lunarwing-health-metrics.openrc" "${OPENRC_INIT_DIR}/${OPENRC_UNIT}"
   install -o root -g root -m 0644 \
