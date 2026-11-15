@@ -249,9 +249,11 @@ and clean rebuild) in a bounded retry — up to 8 attempts with exponential
 backoff from a 45 s base (45/90/180/360/720/1440/2880s; the eighth attempt
 is final, so the curve ends at its last rung — there is no separate cap)
 plus job-id-based jitter (`CI_JOB_ID % 30`) to desynchronize concurrent
-worker pushes — that fires only on this transient signature
-(`failed to fetch oauth token` / `429 Too Many Requests`), and a genuine
-build failure still exits on the first attempt. On the candidate leg the
+worker pushes — that fires only on transient signatures
+(`failed to fetch oauth token` / `429 Too Many Requests`, or an
+`unexpected status from PUT request` / `PATCH request` to the configured
+registry with status 499, 502, 503 or 504). Registry 401, 403 and 404
+refusals and genuine build failures still exit on the first attempt. On the candidate leg the
 build is deterministic and the retry reuses the layer cache, so only the
 push is re-executed — but the clean-rebuild leg is deliberately the
 uncached `--no-cache` build, so a sustained 429 on its push re-runs the
