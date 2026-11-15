@@ -421,6 +421,9 @@ Commands:
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
+  report-sandbox-image <name>      Warn when an upgrade retained the previous
+                                   managed sandbox image instead of a candidate
+
   cleanup-worker-candidates <name> Discard this run's candidate worker and sandbox
                                    images; failed removals stay listed for retry
 
@@ -1172,6 +1175,12 @@ main() {
       [[ -n "${1:-}" ]] || die "usage: clear-promote-rollback <name>"
       _ensure_marker_dir
       clear_promote_rollback "$(sanitize_name "$1")"
+      ;;
+
+    report-sandbox-image)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: report-sandbox-image <name>"
+      report_retained_sandbox_image "$(sanitize_name "$1")"
       ;;
 
     cleanup-worker-candidates)
