@@ -105,6 +105,7 @@ printf 'KNOWLEDGE_SYNC_ENABLED=0\nLW2STUDYMCP_HOME=%s\n' "$fixture/shared/zero" 
   >"$fixture/env/zero/lunarwing.env"
 jq -n '{version:16,tenants:{enabled:{},unset:{},false:{},zero:{}}}' >"$fixture/ports.json"
 
+# shellcheck disable=SC2034  # Fixture values are consumed by sourced mt-admin functions.
 run_snapshot_sync() (
   # shellcheck source=../lunarwing-mt-admin.sh
   source "$stable_entrypoint"
