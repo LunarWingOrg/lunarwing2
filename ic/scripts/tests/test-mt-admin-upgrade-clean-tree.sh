@@ -10,6 +10,16 @@ export INIT_SYSTEM=systemd
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+printf 'fixture:231072:65536\n' >"$TENANT_SUBUID_FILE"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == fixture ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
 repo="$fixture/repo"
 lockfile="$repo/ic/channels-src/xmpp/Cargo.lock"
 tracked_file="$repo/README.md"

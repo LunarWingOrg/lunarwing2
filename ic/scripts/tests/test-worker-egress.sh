@@ -888,6 +888,17 @@ assert_absent "$(cat "$fixture/locked-apply.out")" 'worker egress filter enforce
 stop_order="$fixture/stop-order.log"
 if (
   record_stop_step() { printf '%s\n' "$1" >>"$stop_order"; }
+  TENANT_IDENTITY_DIR="$fixture/stop-identity"
+  TENANT_SUBUID_FILE="$fixture/stop-subuid"
+  printf 'alpha:231072:65536\n' >"$TENANT_SUBUID_FILE"
+  id() {
+    if [[ "${1:-}" == -u && "${2:-}" == alpha ]]; then
+      printf '61000\n'
+    else
+      command id "$@"
+    fi
+  }
+  tenant_identity_record alpha
   tenant_exists_in_registry() { return 0; }
   stop_tenant_init_services() { record_stop_step services-stopped; }
   stop_tenant_vision() { :; }

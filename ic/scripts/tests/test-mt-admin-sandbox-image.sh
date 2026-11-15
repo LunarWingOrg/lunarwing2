@@ -36,6 +36,17 @@ say() { :; }
 FAIL_BUILD=""
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# shellcheck disable=SC2034  # consumed by the sourced identity writer
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+printf 'tenant-a:231072:65536\n' >"$TENANT_SUBUID_FILE"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == tenant-a ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
 tenant_env_dir() { printf '%s/%s/env\n' "$fixture" "$1"; }
 mkdir -p "$(tenant_env_dir tenant-a)"
 runtime_selector="$(declare -f sandbox_container_runtime)"
