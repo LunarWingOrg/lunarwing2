@@ -217,6 +217,9 @@ if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
   exec "$MT" upgrade-wrapper-boundary "$TENANT" "${ORIGINAL_ARGS[@]}"
 fi
 "$MT" validate-upgrade-wrapper-boundary "$TENANT"
+run mt clear-sandbox-image-status "$TENANT"
+rc=0
+trap 'rc=$?; if [[ "$rc" -ne 0 && "$DRY_RUN" == false ]]; then mt clear-sandbox-image-status "$TENANT" >/dev/null 2>&1 || true; fi' EXIT
 
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
 # This tool backs up the root-store DB (step 1) and restores into the fresh
@@ -411,9 +414,15 @@ else
   run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune \
     || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
          die "git fetch failed; tenant '$TENANT' was not stopped"; }
-  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF" \
+  TARGET_COMMIT="$TARGET_REF"
+  if ! $DRY_RUN; then
+    TARGET_COMMIT="$(mt resolve-upgrade-target "$TARGET_REF")" \
+      || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+           die "could not resolve target '$TARGET_REF' in the operator checkout; tenant '$TENANT' was not stopped"; }
+  fi
+  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_COMMIT" \
     || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
-         die "git checkout $TARGET_REF failed; tenant '$TENANT' was not stopped"; }
+         die "git checkout of operator-selected $TARGET_COMMIT failed; tenant '$TENANT' was not stopped"; }
   # WI#527: build the worker candidate images WHILE the tenant still runs. A
   # lane failure here leaves the running tenant untouched.
   # run-300 TO-5: --enabled rebuilds every lane this tenant has enabled (the
@@ -423,7 +432,7 @@ else
   # as an explicit opt-in for a pebble lane the registry does not list.
   # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
   # so the running tenant's clone is exactly as it was.
-  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" --sandbox-image "$SANDBOX_IMAGE_POLICY")
+  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" --selected-commit "$TARGET_COMMIT" --sandbox-image "$SANDBOX_IMAGE_POLICY")
   $WITH_PEBBLE && cand_args+=(--with-pebble)
   cand_rc=0
   set +e
@@ -467,8 +476,13 @@ banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
 XMPP_JID="$(grep -m1 '^XMPP_JID=' "$ENVF" 2>/dev/null | cut -d= -f2- || true)"
 add_args=(add-tenant "$TENANT" --no-health)
 [[ -n "$XMPP_JID" ]] && add_args+=(--xmpp-jid "$XMPP_JID")
+if [[ -n "${TARGET_COMMIT:-}" ]]; then
+  export LUNARWING_MT_UPGRADE_RELEASE_REF="$TARGET_REF"
+  export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$TARGET_COMMIT"
+fi
 run mt "${add_args[@]}"      # rootless: ensure_rootless_prereqs + empty PG quadlet + render; daemon NOT started
                              # keep-rootful: reuses existing root PG; back-fills HTTP_HOST/secret
+unset LUNARWING_MT_UPGRADE_RELEASE_REF LUNARWING_MT_UPGRADE_SELECTED_COMMIT
 
 # add-tenant rewrote the env files and reset operator-customizable XMPP/LLM config
 # to defaults. Re-apply those specific keys from the step-1 backup (both modes).
@@ -525,6 +539,7 @@ note "Run the infra health check once: ic-infrastructure-health-check/infrastruc
 
 # ---- DONE + rollback notes ---------------------------------------------------
 banner "Done — '$TENANT' upgraded to $TARGET_REF ($MODE)"
+run mt report-sandbox-image "$TENANT"
 say ""
 say "IMPORTANT:"
 if [[ "$KEEP_ROOTFUL" == false ]]; then
