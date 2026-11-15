@@ -164,7 +164,33 @@ These do not establish live inference or container confinement. In particular,
 mt-admin's remote `worker-smoke` does not enable the smoke client's task
 inference path; real inference must come from the gateway jobs below.
 
-Live build/start/listener/egress/smoke results: pending.
+Live startup and audit results:
+
+- `start-tenant lunardepthtester` returned **0**. The daemon, PostgreSQL and
+  its supervisor, XMPP bridge, WeeChat plus adapter, LunarVision plus
+  supervisor, and the LunarDepth bridge/task pair are running under OpenRC.
+  The proxy and LunarVoice are intentionally not running; the other worker
+  lanes were never selected.
+- Gateway `:10010/api/health` is healthy. LunarDepth `:52011/health` reports
+  `lunardepth-worker-1.0.0` and the original source pin; `/ready` returns
+  `ready: true`, with WebSocket, task runner, and task gate all ready.
+- `worker-listeners lunardepthtester` is **clean**. Bridge publications are
+  host-loopback-only, its expected container binds are 52010/tcp and 8443/tcp,
+  and the task has no non-loopback listener.
+- `worker-egress lunardepthtester` shows both roles exclusively attached to
+  `lw-egress-lunardepthtester` (10.89.12.0/24), DNS pinned and static hosts
+  current. The live forward/input reject rules are verified, and the only
+  derived model target is `100.88.232.146` TCP 3000.
+- `worker-smoke lunardepthtester lunardepth` returned **0** (with no stdout).
+  As noted above, this covers live protocol/readiness/authentication/listener
+  and confined-bash checks, not real model inference.
+- Admin and tenant stores carry the same image ID
+  `3285688081822c91597ca60defe18abd7dc1038821fa2ecbe03f2f2efdbc39c9`;
+  the toolchain-profile label is `true`. In the task container,
+  `python3 --version` = 3.11.2, `g++` = Debian 12.2.0-14+deb12u1, and
+  `node --version` = 22.23.4.
+
+Real TensorZero job evidence: pending.
 
 ## Job exercise
 
