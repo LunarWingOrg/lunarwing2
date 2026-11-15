@@ -434,6 +434,7 @@ check_post_copy_file_type_check() {
 # option, and one that does not. The report is what the code decides on, so a
 # fake is enough to drive either branch on any host.
 fake_mv_exchange() {
+  # shellcheck disable=SC2329  # invoked indirectly by ensure_health_pipeline
   mv() {
     if [[ "${1:-}" == --help ]]; then
       printf '      --exchange           exchange source and destination\n'
@@ -452,6 +453,7 @@ fake_mv_exchange() {
 }
 
 fake_mv_without_exchange() {
+  # shellcheck disable=SC2329  # invoked indirectly by ensure_health_pipeline
   mv() {
     if [[ "${1:-}" == --help ]]; then
       printf 'Usage: mv [OPTION]... SOURCE... DIRECTORY\n'
