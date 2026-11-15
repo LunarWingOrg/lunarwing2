@@ -1620,7 +1620,10 @@ upgrade_tenant() {
   local name="$1"
   shift
   name="$(sanitize_name "$name")"
-  with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+  (
+    trap 'rc=$?; [[ "$rc" -eq 0 ]] || clear_sandbox_image_status "$name"' EXIT
+    with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+  )
 }
 
 _upgrade_tenant_lifecycle_locked() {
@@ -1727,19 +1730,20 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.
-upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth> [sandbox_policy]
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref> <lunardepth> [sandbox_policy] [selected_commit]
   local name="$1" lw_root="$2" previous_commit="$3"
   local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8" lunardepth="${9:-false}"
-  local sandbox_policy="${10:-$SANDBOX_IMAGE_POLICY}"
+  local sandbox_policy="${10:-$SANDBOX_IMAGE_POLICY}" selected_commit="${11:-}"
   local rc=0 caller_errexit=false
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" "$sandbox_policy" )
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" "$lunardepth" "$sandbox_policy" "$selected_commit" )
   rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   [[ "$rc" -eq 0 ]] && return 0
   say "worker candidate build failed; discarding candidates and restoring the previous checkout (tenant was not stopped)" >&2
   cleanup_candidate_workers "$name"
+  clear_sandbox_image_status "$name"
   _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false \
     || say "WARNING: could not return the clone to $previous_commit; tenant '$name' is still running its previous build" >&2
   return "$rc"
@@ -1848,17 +1852,18 @@ upgrade_tenant_locked() {
 
   say "fetching tags + refs from origin (as $name) ..."
   "${tgit[@]}" fetch --tags --prune origin || die "git fetch failed"
-  "${tgit[@]}" rev-parse --verify --quiet "${target}^{commit}" >/dev/null 2>&1 \
-    || "${tgit[@]}" rev-parse --verify --quiet "origin/${target}^{commit}" >/dev/null 2>&1 \
-    || die "target ref '$target' not found after fetch (need a branch, tag, or commit reachable from origin)"
 
-  local checkout_ref target_commit
+  local checkout_ref target_commit operator_release_ref
+  _resolve_operator_upgrade_target "$target" \
+    || die "target ref '$target' not found in operator checkout $LUNARWING_ROOT (tenant was not stopped)"
+  target_commit="$OPERATOR_UPGRADE_TARGET_COMMIT"
+  operator_release_ref="$OPERATOR_UPGRADE_TARGET_REF"
+  "${tgit[@]}" cat-file -e "${target_commit}^{commit}" 2>/dev/null \
+    || die "operator-selected commit $target_commit is missing from tenant clone $lw_root after fetch (tenant was not stopped)"
   checkout_ref="$target"
   if "${tgit[@]}" rev-parse --verify --quiet "refs/remotes/origin/$target" >/dev/null 2>&1; then
     checkout_ref="origin/$target"
   fi
-  target_commit="$("${tgit[@]}" rev-parse --verify "${checkout_ref}^{commit}")" \
-    || die "failed to resolve target ref '$target'"
 
   local build_lock_fd migrations_type previous_commit
   say "acquiring build lock for checkout ..."
@@ -1936,7 +1941,7 @@ upgrade_tenant_locked() {
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" "$with_lunardepth" "$sandbox_policy" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$operator_release_ref" "$with_lunardepth" "$sandbox_policy" "$target_commit" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
   # Candidate builds read the tenant revision as its owner and build from
@@ -2023,6 +2028,7 @@ upgrade_tenant_locked() {
   fi
 
   say ""
+  report_retained_sandbox_image "$name"
   if [[ "$startup_rc" -ne 0 ]]; then
     warn_err "tenant '$name' upgrade incomplete: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null); startup failed (status $startup_rc); $(_tenant_worker_start_failure_summary)"
     say "target is installed; repair the failed lanes and re-run start-tenant $name; verify with: $0 status $name"
