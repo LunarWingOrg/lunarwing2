@@ -141,4 +141,22 @@ if (main render-units --all-proxies) >"$fixture/symlink.log" 2>&1; then
 fi
 [[ -L "$OPENRC_INITD_DIR/lunarwing-proxy-bob" ]] || fail 'unsafe link was replaced'
 
+# The unsafe-unit refusal comes before the account-gone skip. A tenant whose
+# account is already gone must still be told to repair the fleet, because the
+# repair needs no account and the skip would otherwise hide the hint.
+legacy_unit mallory
+if (MT_ROOTLESS=true
+  id() { [[ "${1:-}" == -u && "${2:-}" == mallory ]] && return 1; command id "$@"; }
+  _tenant_in_passwd_file() { return 1; }
+  getent() { [[ "${1:-}" == passwd ]] && return 2; command getent "$@"; }
+  stop_tenant_openrc mallory) >"$fixture/no-account.log" 2>&1; then
+  fail 'account-gone skip accepted unsafe installed proxy units'
+fi
+grep -Fq 'render-units --all-proxies' "$fixture/no-account.log" \
+  || fail 'account-gone refusal hid the unsafe-unit repair hint'
+if grep -Fq 'skipped OpenRC unit stop' "$fixture/no-account.log"; then
+  fail 'account-gone skip ran before the unsafe-unit refusal'
+fi
+rm -f "$OPENRC_INITD_DIR/lunarwing-proxy-mallory"
+
 printf 'ALL TESTS PASSED\n'
