@@ -277,26 +277,73 @@ carry_health_library_entries() {
   done
 }
 
-health_pipeline_tree_require_regular() {
+# Leaf checks below print the precise reason and return non-zero. The caller
+# removes the staging directory and dies once, so every refusal leaves nothing
+# behind in the library's parent.
+health_pipeline_tree_require_regular() {  # <path>
   local path="$1" unsafe
-  unsafe="$(find "$path" -type l -print -quit 2>/dev/null)" \
-    || die "could not inspect health pipeline source entries"
-  [[ -z "$unsafe" ]] || die "health pipeline source contains a symbolic link: $unsafe"
-  unsafe="$(find "$path" ! \( -type f -o -type d \) -print -quit 2>/dev/null)" \
-    || die "could not inspect health pipeline source file types"
-  [[ -z "$unsafe" ]] || die "health pipeline source contains a non-regular entry: $unsafe"
+  unsafe="$(find "$path" -type l -print -quit 2>/dev/null)" || {
+    printf 'error: could not inspect health pipeline source entries\n' >&2
+    return 1
+  }
+  if [[ -n "$unsafe" ]]; then
+    printf 'error: health pipeline source contains a symbolic link: %s\n' "$unsafe" >&2
+    return 1
+  fi
+  unsafe="$(find "$path" ! \( -type f -o -type d \) -print -quit 2>/dev/null)" || {
+    printf 'error: could not inspect health pipeline source file types\n' >&2
+    return 1
+  }
+  if [[ -n "$unsafe" ]]; then
+    printf 'error: health pipeline source contains a non-regular entry: %s\n' "$unsafe" >&2
+    return 1
+  fi
+  return 0
 }
 
-secure_health_pipeline_stage() {
-  local stage="$1"
-  chown -R -h root:root "$stage/tree" \
-    || { rm -rf -- "$stage"; die "could not own staged health pipeline scripts as root"; }
-  find "$stage/tree" -type d -exec chmod 0755 -- {} + \
-    || { rm -rf -- "$stage"; die "could not set health pipeline directory modes"; }
-  find "$stage/tree" -type f -exec chmod 0644 -- {} + \
-    || { rm -rf -- "$stage"; die "could not set health pipeline file modes"; }
-  find "$stage/tree" -maxdepth 1 -type f -name '*.sh' -exec chmod 0755 -- {} + \
-    || { rm -rf -- "$stage"; die "could not set health pipeline script modes"; }
+# Modes by rule, not from the checkout. chmod 0755 leaves an inherited
+# set-group-ID bit on a directory in place (GNU coreutils does not clear it
+# unless asked), so the directory rule clears it explicitly and a stage made
+# under a set-group-ID parent publishes a library without the bit.
+secure_health_pipeline_stage() {  # <stage>
+  local tree="$1/tree"
+  chown -R -h root:root "$tree" || {
+    printf 'error: could not own staged health pipeline scripts as root\n' >&2
+    return 1
+  }
+  find "$tree" -type d -exec chmod 0755 -- {} + || {
+    printf 'error: could not set health pipeline directory modes\n' >&2
+    return 1
+  }
+  find "$tree" -type d -exec chmod u-s,g-s -- {} + || {
+    printf 'error: could not clear set-ID bits from health pipeline directories\n' >&2
+    return 1
+  }
+  find "$tree" -type f -exec chmod 0644 -- {} + || {
+    printf 'error: could not set health pipeline file modes\n' >&2
+    return 1
+  }
+  find "$tree" -maxdepth 1 -type f -name '*.sh' -exec chmod 0755 -- {} + || {
+    printf 'error: could not set health pipeline script modes\n' >&2
+    return 1
+  }
+  return 0
+}
+
+# Every file the library runs must be executable after staging, including a
+# listener binary the checkout ships: the checkouts are made 0644 by the rule
+# above and a 0644 listener cannot start. Carried entries arrive after that
+# rule, so this runs after the carry and covers both sources.
+health_pipeline_stage_mark_executables() {  # <tree>
+  local tree="$1" entry
+  for entry in "${HEALTH_LIB_CARRIED_ENTRIES[@]}"; do
+    [[ -e "$tree/$entry" ]] || continue
+    chmod 0755 -- "$tree/$entry" || {
+      printf 'error: could not make health library entry executable: %s\n' "$tree/$entry" >&2
+      return 1
+    }
+  done
+  return 0
 }
 
 publish_health_pipeline_library() {
@@ -333,7 +380,8 @@ sync_health_pipeline_library() {
     || die "health library destination must be an absolute non-root path"
   [[ -d "$HEALTH_SRC_DIR" && ! -L "$HEALTH_SRC_DIR" ]] \
     || die "health pipeline source must be a real directory, not a symbolic link: $HEALTH_SRC_DIR"
-  health_pipeline_tree_require_regular "$HEALTH_SRC_DIR"
+  health_pipeline_tree_require_regular "$HEALTH_SRC_DIR" \
+    || die "health pipeline source is refused: correct the entry named above"
   parent="$(dirname -- "$HEALTH_LIB_DIR")"
   mkdir -p "$parent"
   stage="$(mktemp -d "$parent/.lunarwing-health.new.XXXXXX")" \
@@ -343,11 +391,21 @@ sync_health_pipeline_library() {
     rm -rf -- "$stage"
     die "could not copy health pipeline scripts into a root-only stage"
   fi
-  health_pipeline_tree_require_regular "$stage/tree"
-  secure_health_pipeline_stage "$stage"
+  if ! health_pipeline_tree_require_regular "$stage/tree"; then
+    rm -rf -- "$stage"
+    die "health pipeline source changed while it was copied: the staged copy is refused"
+  fi
+  if ! secure_health_pipeline_stage "$stage"; then
+    rm -rf -- "$stage"
+    die "could not secure the staged health pipeline tree"
+  fi
   if ! carry_health_library_entries "$stage/tree"; then
     rm -rf -- "$stage"
     die "could not carry installed entries into the new health library"
+  fi
+  if ! health_pipeline_stage_mark_executables "$stage/tree"; then
+    rm -rf -- "$stage"
+    die "could not make carried health library entries executable"
   fi
   if ! health_lib_tree_require_safe "$stage/tree"; then
     rm -rf -- "$stage"
