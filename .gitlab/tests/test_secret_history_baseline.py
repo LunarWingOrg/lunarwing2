@@ -277,6 +277,61 @@ class BaselineTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(pinned, existing | {classified})
 
+    def test_cli_rejects_incomplete_disposition_rows(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        classified = fingerprint("1", "classified-fixture.txt")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text("", encoding="utf-8")
+            accepted = root / "accepted.ignore"
+            accepted.write_text(f"{classified}\n", encoding="utf-8")
+            log = root / ".gitlab/gitleaks-history-dispositions.md"
+            log.parent.mkdir(parents=True, exist_ok=True)
+
+            for disposition, reason in (("", "Test fixture."), ("False positive", "")):
+                with self.subTest(disposition=disposition, reason=reason):
+                    log.write_text(
+                        "| Date | Exact fingerprint | Disposition | Reason |\n"
+                        "| --- | --- | --- | --- |\n"
+                        f"| 2026-11-15 | `{classified}` | {disposition} | {reason} |\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as raised:
+                        self.run_main(root, [classified], accepted)
+                    message = str(raised.exception)
+                    self.assertIn("non-empty disposition and reason", message)
+                    self.assertIn(classified, message)
+                    self.assertEqual(
+                        baseline.read_fingerprint_file(root / "history.ignore"), existing
+                    )
+
+    def test_cli_accept_uses_dispositions_outside_repo(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        classified = fingerprint("1", "classified-fixture.txt")
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as operator:
+            root = pathlib.Path(temporary)
+            external = pathlib.Path(operator)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text("", encoding="utf-8")
+            accepted = root / "accepted.ignore"
+            accepted.write_text(f"{classified}\n", encoding="utf-8")
+            write_dispositions(external, {classified})
+            log = external / ".gitlab/gitleaks-history-dispositions.md"
+
+            status, pinned, _, _ = self.run_main(
+                root,
+                [classified],
+                accepted,
+                dispositions_path=log,
+            )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(pinned, existing | {classified})
+            self.assertFalse(
+                baseline.read_dispositions(root / ".gitlab/gitleaks-history-dispositions.md")
+            )
+
     def test_cli_groups_vendor_rows_and_writes_an_inert_draft_without_pending(self):
         existing = {fingerprint("0", "old-fixture.txt")}
         first = fingerprint("1", "ic/vendor/example-crate/tests/first.txt")
