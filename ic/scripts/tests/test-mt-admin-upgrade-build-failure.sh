@@ -44,6 +44,7 @@ trap 'rm -rf "$fixture"' EXIT
 export TMPDIR="$fixture"
 fixture_repo="$fixture/repo"
 events="$fixture/events"
+say_log="$fixture/say.log"
 failures=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
@@ -83,7 +84,7 @@ tenant_state_dir() { printf '%s/state' "$fixture"; }
 mkdir -p "$fixture/state"
 
 # ── stubs (mirror test-mt-admin-upgrade-opencode2-preflight.sh) ───────────────
-say() { :; }
+say() { printf '%s\n' "$*" >>"$say_log"; }
 sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
@@ -111,6 +112,7 @@ build_candidate_worker() {
 build_candidate_workers() {
   local name="$1" oc="$2" kimi="$3" oc2="$4" pebble="${5:-false}"
   : >"$(tenant_candidate_lanes_file "$name")"
+  : >"$(tenant_sandbox_image_status_file "$name")"
   local lane
   for lane in pebble opencode kimi opencode2; do
     case "$lane" in
@@ -124,6 +126,7 @@ build_candidate_workers() {
     printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
   done
   if ! build_candidate_sandbox_image "$name" "${9:-auto}" "${7:-}"; then
+    _record_sandbox_image_status "$name" previous
     printf 'sandbox-failed\n' >>"$cand_events"
   fi
 }
@@ -233,14 +236,15 @@ for init in openrc systemd; do
 done
 INIT_SYSTEM=systemd
 SANDBOX_CANDIDATE_FAIL=true
-: >"$events"; : >"$cand_events"; : >"$promote_events"
+: >"$events"; : >"$cand_events"; : >"$promote_events"; : >"$say_log"
 capture run_upgrade
 if [[ "$rc" -eq 0 && "$(cat "$events")" == $'sandbox-build\nstop\nbuild\nstart' ]] \
     && grep -qx 'sandbox-failed' "$cand_events" \
-    && ! grep -qx 'sandbox-promote' "$events"; then
-  pass 'failed sandbox candidate is non-fatal and is never promoted'
+    && ! grep -qx 'sandbox-promote' "$events" \
+    && grep -Fq "sandbox image: tenant 'fixture' remains on the previous lunarwing-sandbox:latest" "$say_log"; then
+  pass 'failed sandbox candidate is non-fatal, unpromoted, and named in the closing summary'
 else
-  fail "failed sandbox candidate stranded or promoted the tenant (rc=$rc): $output"
+  fail "failed sandbox candidate stranded, promoted, or hid the retained image (rc=$rc): $output"
 fi
 SANDBOX_CANDIDATE_FAIL=false
 eval "$REAL_TENANT_USES_SANDBOX"
@@ -611,6 +615,30 @@ elif grep -q '^tag ' "$runtime_log"; then
   fail "an already-promoted lane was re-tagged: $(cat "$runtime_log")"
 else
   pass 'real promote is re-runnable (an already-promoted lane is skipped)'
+fi
+
+# 6e. WI#642: a worker rollback must not undo another tenant's later promotion.
+printf 'kimi\n' >"$lane_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+capture promote_candidate_workers fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "worker interleaved-rollback setup promotion failed: $output"
+else
+  register_image "lunarwing-worker-kimi:latest" sha256:kimi-other-tenant
+  : >"$runtime_log"; : >"$say_log"
+  capture restore_promoted_workers fixture
+  if [[ "$rc" -eq 0 ]]; then
+    fail 'worker rollback claimed success despite an interleaved promotion'
+  elif [[ "$(cat "$ids_dir/lunarwing-worker-kimi:latest")" != sha256:kimi-other-tenant ]]; then
+    fail 'worker rollback replaced the image promoted by another tenant'
+  elif grep -q '^tag sha256:kimi-old lunarwing-worker-kimi:latest' "$runtime_log"; then
+    fail 'worker rollback re-tagged the old ID over an interleaved promotion'
+  elif [[ "$output" != *'another promotion replaced'* ]]; then
+    fail 'worker rollback skipped an interleaved promotion without a warning'
+  else
+    pass 'worker rollback preserves a later promotion by another tenant'
+  fi
 fi
 
 # ── 7. the upgrade wrapper's own verbs must not deadlock (run-300 TO-1) ──────
