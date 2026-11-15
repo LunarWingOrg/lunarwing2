@@ -340,9 +340,10 @@ CALLS=()
 if build_candidate_workers tenant-a false false false false false '' false auto \
     && [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-old ]] \
     && [[ ! -s "$candidate_marker" ]] \
+    && [[ "$(cat "$(tenant_sandbox_image_status_file tenant-a)")" == previous ]] \
     && grep -Fq 'keeping the previous lunarwing-sandbox:latest' "$warnings" \
     && grep -Fq 'build-sandbox-image tenant-a' "$warnings"; then
-  ok 'failed candidate keeps the old image and continues with recovery guidance'
+  ok 'real candidate builder records and reports the retained previous image'
 else
   bad "failed candidate changed latest or aborted the upgrade: ${CALLS[*]}"
 fi
