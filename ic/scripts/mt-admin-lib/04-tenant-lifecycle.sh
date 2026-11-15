@@ -1620,7 +1620,10 @@ upgrade_tenant() {
   local name="$1"
   shift
   name="$(sanitize_name "$name")"
-  with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+  (
+    trap 'rc=$?; [[ "$rc" -eq 0 ]] || clear_sandbox_image_status "$name"' EXIT
+    with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+  )
 }
 
 _upgrade_tenant_lifecycle_locked() {
