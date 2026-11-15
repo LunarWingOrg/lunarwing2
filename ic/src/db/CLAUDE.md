@@ -65,6 +65,15 @@ are optional overrides.
   a note here.
 - Do not regress existing libSQL coverage.
 
+## Historical Claude Code event schema (WI#693)
+
+PostgreSQL migration V5 intentionally remains immutable historical schema. Its
+`claude_code_events` table is not orphaned: V7 renames that table and its index
+to the actively used `job_events` / `idx_job_events_job` names. A forward
+migration must not drop `job_events`; current PostgreSQL workers persist
+streaming events there, and fresh libSQL databases create the same table
+directly under its current name.
+
 ## Cron tick retention primitives (WI#370, v2.1.6.0)
 
 `SandboxStore` carries two methods backing the cron supervisor's per-mission
