@@ -192,8 +192,10 @@ async fn get_setting(
 
     match settings.get(path) {
         Some(value) => {
+            // Scope goes to stderr so `$(lunarwing config get <path>)` still
+            // yields the bare value for scripts.
+            eprintln!("Scope: {}", owner_id);
             println!("{}", value);
-            println!("Scope: {}", owner_id);
             Ok(())
         }
         None => {
