@@ -31,12 +31,13 @@ The exercise uses the real mt-admin and daemon paths:
 - Existing registry tenant: `dash`. No `lunardepthtester` account and no admin
   `lunarwing-worker-lunardepth:latest` image existed at preflight.
 - TensorZero at `http://100.88.232.146:3000` returned HTTP 200 on `/status`
-  (version 2026.6.0). An unauthenticated
-  `/openai/v1/chat/completions` request using
-  `tensorzero::function_name::lunarwing` returned HTTP 200. The deliberately
-  tiny 16-token cap produced an empty completion with `finish_reason=length`;
-  this probe establishes route reachability and authentication behavior, not a
-  successful content test.
+  (version 2026.6.0). Unauthenticated `/openai/v1/chat/completions` requests
+  using `tensorzero::function_name::lunarwing` also returned HTTP 200. Deliberately
+  small 16- and 64-token caps were consumed before visible content and ended
+  with `finish_reason=length`; an adequately sized 512-token cap returned the
+  exact marker `WI685_ROUTE_OK`, `finish_reason=stop`, and usage of 47
+  completion tokens. This proves the baseline gateway/model path before the
+  LunarDepth lane enters it.
 - The lane therefore uses its explicit
   `--lunardepth-allow-unauthenticated-gateway` mode, not a copied sibling key.
   The private-network cleartext route also requires the separate
@@ -113,6 +114,14 @@ Source-side prechecks on the exact lane checkout passed:
   TensorZero/TensorMoon route renderer cases.
 - `python3 health_server_test.py`: 4 tests passed.
 - `python3 scripts/exposure_policy_assert.py --source .`: passed.
+- `python3 -m unittest discover -s scripts -p '*_test.py'`: all 31 lane Python
+  tests passed (a superset of the two focused suites above).
+- `bash scripts/check-mt-admin.sh` from `ic/`: ShellCheck passed for mt-admin
+  and every numbered module, including `17-lunardepth.sh`.
+- `bash scripts/tests/test-mt-admin-lunardepth.sh`: passed its registry v18
+  migration, lifecycle, bridge flags, overlay, gateway-dialect, verifier
+  isolation, fleet-key, and archive checks.
+- `bash scripts/tests/test-worker-llm-entrypoints.sh`: passed.
 
 These do not establish live inference or container confinement. In particular,
 mt-admin's remote `worker-smoke` does not enable the smoke client's task
