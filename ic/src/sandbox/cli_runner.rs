@@ -297,8 +297,8 @@ impl Drop for EmptyMaskFile {
 pub struct TunnelRunConfig<'a> {
     pub container_id: &'a str,
     pub dns: &'a [IpAddr],
-    /// World-readable resolver file mounted when `dns` is nonempty so every
-    /// keep-id mode can read it. Runtimes reject `--dns` with `--network container`.
+    /// World-readable resolver file for custom or provider-managed DNS. Every
+    /// keep-id mode can read it; runtimes reject `--dns` with `--network container`.
     pub resolv_conf: Option<&'a Path>,
 }
 
@@ -502,9 +502,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 } else {
                     args.push("container:".into());
                 }
-                if !tunnel.dns.is_empty()
-                    && let Some(path) = tunnel.resolv_conf
-                {
+                if let Some(path) = tunnel.resolv_conf {
                     args.extend([
                         "-v".into(),
                         format!("{}:/etc/resolv.conf:ro,z", path.display()),
@@ -1912,6 +1910,34 @@ mod tests {
                 .iter()
                 .any(|arg| { arg == "container:lunarwing-sandbox-tunnel" })
         );
+    }
+
+    #[test]
+    fn provider_managed_dns_mounts_resolver_for_every_keep_id_mode() {
+        for (runtime, keep_id) in [
+            (ContainerRuntime::Podman, KeepIdMode::UidPinned),
+            (ContainerRuntime::Podman, KeepIdMode::Plain),
+            (ContainerRuntime::Podman, KeepIdMode::Off),
+            (ContainerRuntime::Docker, KeepIdMode::Off),
+        ] {
+            let args = build_run_args(&RunSpec {
+                tunnel: Some(TunnelRunConfig {
+                    container_id: "lunarwing-sandbox-tunnel-instance",
+                    dns: &[],
+                    resolv_conf: Some(Path::new("/run/user/1000/netbird.resolv.conf")),
+                }),
+                ..spec(
+                    runtime,
+                    keep_id,
+                    SandboxPolicy::ReadOnly,
+                    SandboxNetworkMode::Tunnel,
+                    0,
+                )
+            });
+            let joined = args.join(" ");
+            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
+            assert!(joined.contains("/run/user/1000/netbird.resolv.conf:/etc/resolv.conf:ro,z"));
+        }
     }
 
     #[test]
