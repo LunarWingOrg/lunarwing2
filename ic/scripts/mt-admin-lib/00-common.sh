@@ -31,6 +31,9 @@ health_lib_refusal_text() {  # <path> [entry]
   if [[ "$kind" == entry ]]; then
     printf 'refusing health library entry %s: symbolic link, non-root owner, or group/other-writable; reinstall from a trusted checkout with: ic/scripts/lunarwing-mt-admin.sh reinstall-health-library <trusted-checkout>' \
       "$component"
+  elif [[ "$component" != "$path" ]]; then
+    printf 'refusing health library %s: parent directory %s must be root-owned, symlink-free, and not group/other-writable; repair that parent (not the library tree) with: chown root:root -- %q && chmod go-w -- %q; alternatively, move the health library elsewhere' \
+      "$path" "$component" "$component" "$component"
   else
     printf 'refusing health library %s: path component %s must be root-owned, symlink-free, and not group/other-writable; reinstall from a trusted checkout with: ic/scripts/lunarwing-mt-admin.sh reinstall-health-library <trusted-checkout>' \
       "$path" "$component"
