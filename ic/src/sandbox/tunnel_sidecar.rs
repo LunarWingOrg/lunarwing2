@@ -1594,7 +1594,7 @@ impl TunnelSidecar {
                         .await
                     {
                         Ok(result) => result,
-                        Err(_) => Err(self.health_timeout_error(timeout, None)),
+                        Err(_) => Err(self.health_firewall_timeout_error(timeout)),
                     };
                 }
                 Ok(Err(error)) => last_error = Some(error),
@@ -1616,6 +1616,13 @@ impl TunnelSidecar {
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
+    }
+
+    fn health_firewall_timeout_error(&self, timeout: Duration) -> SandboxError {
+        self.unavailable(&format!(
+            "provider was healthy, but the egress firewall check did not finish within the {}s health re-probe",
+            timeout.as_secs()
+        ))
     }
 
     fn health_timeout_error(&self, timeout: Duration, error: Option<SandboxError>) -> SandboxError {
@@ -3512,6 +3519,7 @@ mod tests {
         DelayedFailure,
         FailsThenSlow(usize),
         HealthyOnFinalPoll,
+        HealthyOnFinalPollSlowFirewall,
         Healthy,
     }
 
@@ -3584,6 +3592,11 @@ mod tests {
             }
             HealthScript::HealthyOnFinalPoll => match command {
                 Some("netbird") if elapsed < Duration::from_secs(5) => HealthReply::failure(),
+                _ => successful_netbird_health(command, listing),
+            },
+            HealthScript::HealthyOnFinalPollSlowFirewall => match command {
+                Some("netbird") if elapsed < Duration::from_secs(5) => HealthReply::failure(),
+                Some("nft") => successful_netbird_health(command, listing).after(30),
                 _ => successful_netbird_health(command, listing),
             },
         }
@@ -3714,8 +3727,13 @@ mod tests {
             .wait_healthy(Duration::from_secs(6))
             .await
             .unwrap_err();
+        let reason = error.to_string();
 
-        assert!(error.to_string().contains("remained unhealthy for 6s"));
+        assert!(
+            reason.contains("egress firewall check did not finish within the 6s health re-probe"),
+            "{reason}"
+        );
+        assert!(!reason.contains("remained unhealthy"), "{reason}");
         assert_eq!(started.elapsed(), Duration::from_secs(6));
         assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3734,6 +3752,32 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(5));
         assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
         assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn health_reprobe_names_firewall_timeout_after_healthy_final_provider_probe() {
+        let (sidecar, base, removals, _removed, exec_calls) = health_fixture(
+            "final-poll-firewall-deadline",
+            HealthScript::HealthyOnFinalPollSlowFirewall,
+        );
+
+        let started = tokio::time::Instant::now();
+        let error = sidecar
+            .wait_healthy(Duration::from_secs(6))
+            .await
+            .unwrap_err();
+        let reason = error.to_string();
+
+        assert!(
+            reason.contains("egress firewall check did not finish within the 6s health re-probe"),
+            "{reason}"
+        );
+        assert!(!reason.contains("remained unhealthy"), "{reason}");
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(base).unwrap();
     }
 

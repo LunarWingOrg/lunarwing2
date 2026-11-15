@@ -1644,7 +1644,10 @@ async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
         peer,
         "sh",
         "-c",
-        "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nLUNARWING-NETBIRD-OK\\n' | nc -l -p 8080; done",
+        // Content-Length lets the client complete without waiting for EOF, so
+        // the listener can restart immediately (`-q` would leave a one-second
+        // window with no listener and flake this probe).
+        "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 21\\r\\n\\r\\nLUNARWING-NETBIRD-OK\\n' | nc -l -p 8080; done",
     ])
     .await?;
     for _ in 0..30 {
@@ -1679,12 +1682,15 @@ async fn assert_netbird_joined_run(
         ..ResourceLimits::default()
     };
     let command = format!(
+        // `-t 1` keeps each denial probe to a single bounded try: a dropped
+        // uplink would otherwise repeat wget's default 20 attempts and can
+        // exhaust the whole per-command budget.
         "cat /proc/net/dev; \
-         wget -qO- -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
+         wget -qO- -t 3 -T 5 http://{peer_ip}:8080/ | grep -q LUNARWING-NETBIRD-OK \
          && echo LUNARWING-NETBIRD-OVERLAY-OK; \
-         wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
+         wget -qO- -t 1 -T 4 http://1.1.1.1/ >/dev/null 2>&1 \
          && echo LUNARWING-NETBIRD-UPLINK-OPEN; \
-         wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
+         wget -qO- -t 1 -T 3 http://169.254.169.254/ >/dev/null 2>&1 \
          && echo LUNARWING-NETBIRD-METADATA-OPEN; true"
     );
     let output = runner
@@ -1832,10 +1838,17 @@ async fn podman_tunnel_sidecar_netbird_live() {
         .expect("stage plain-peer credentials");
     let volume_prefix = format!("{}-netbird-", primary.container_name());
     let result = async {
+        // Measured for WI#604 ZT-1: NetBird start time against the 20-second
+        // per-run provider cap.
+        let fresh_start = std::time::Instant::now();
         primary
             .ensure_started()
             .await
             .map_err(|error| error.to_string())?;
+        eprintln!(
+            "LUNARWING-NETBIRD-FRESH-START-SECONDS={:.2}",
+            fresh_start.elapsed().as_secs_f64()
+        );
         start_plain_netbird_peer(&image, &peer_name, &peer_env).await?;
         assert_netbird_peers_connected(primary.container_name(), &peer_name).await?;
         assert_netbird_mark_rule(&primary).await?;
@@ -1847,7 +1860,19 @@ async fn podman_tunnel_sidecar_netbird_live() {
         );
         assert_netbird_reconnect(&primary).await?;
         assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
-        assert_netbird_ingress_denied(&primary, &peer_name).await
+        assert_netbird_ingress_denied(&primary, &peer_name).await?;
+        // WI#604 ZT-1: the per-run recovery path (sidecar-owned attempt plus
+        // the single lifecycle lock) must replace a killed sidecar in time.
+        let killed = podman_success(&["kill", primary.container_name()]).await;
+        let recovery = std::time::Instant::now();
+        let recovered = primary.container_for_run().await;
+        eprintln!(
+            "LUNARWING-NETBIRD-RUN-RECOVERY-SECONDS={:.2} ok={} kill_ok={}",
+            recovery.elapsed().as_secs_f64(),
+            recovered.is_ok(),
+            killed.is_ok()
+        );
+        recovered.map_err(|error| error.to_string())
     }
     .await;
     primary.stop().await;

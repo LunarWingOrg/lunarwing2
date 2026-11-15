@@ -22,6 +22,20 @@ def fingerprint(digit: str, path: str) -> str:
     return f"{digit * 40}:{path}:generic-api-key:1"
 
 
+def write_dispositions(root, approved=()):
+    output = root / ".gitlab/gitleaks-history-dispositions.md"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rows = "".join(
+        f"| 2026-11-15 | `{entry}` | False positive | Test fixture. |\n"
+        for entry in sorted(approved)
+    )
+    output.write_text(
+        "| Date | Exact fingerprint | Disposition | Reason |\n"
+        "| --- | --- | --- | --- |\n" + rows,
+        encoding="utf-8",
+    )
+
+
 class BaselineTests(unittest.TestCase):
     def write_report(self, directory: str, findings: list[dict]) -> pathlib.Path:
         report = pathlib.Path(directory) / "report.json"
@@ -74,12 +88,12 @@ class BaselineTests(unittest.TestCase):
     def test_refresh_preserves_existing_and_requires_vendor_acceptance(self):
         existing = {fingerprint("0", "old-fixture.txt")}
         vendor = fingerprint("1", "ic/vendor/example-crate/tests/fixture.txt")
-        plan = baseline.plan_refresh(existing, [vendor], set(), set())
+        plan = baseline.plan_refresh(existing, [vendor], set(), set(), set())
         self.assertEqual(plan.pinned, sorted(existing))
         self.assertEqual(plan.unclassified, {vendor})
         self.assertFalse(plan.accepted_vendor)
 
-        plan = baseline.plan_refresh(existing, [vendor], {vendor}, set())
+        plan = baseline.plan_refresh(existing, [vendor], {vendor}, set(), {vendor})
         self.assertEqual(plan.pinned, sorted(existing | {vendor}))
         self.assertEqual(plan.accepted_vendor, {vendor})
         self.assertFalse(plan.unclassified)
@@ -88,7 +102,7 @@ class BaselineTests(unittest.TestCase):
     def test_new_non_vendor_finding_is_not_written_without_acceptance(self):
         existing = {fingerprint("0", "old-fixture.txt")}
         unclassified = fingerprint("1", "new-fixture.txt")
-        plan = baseline.plan_refresh(existing, [unclassified], set(), set())
+        plan = baseline.plan_refresh(existing, [unclassified], set(), set(), set())
         self.assertEqual(plan.unclassified, {unclassified})
         with tempfile.TemporaryDirectory() as temporary:
             output = pathlib.Path(temporary) / "history.ignore"
@@ -97,14 +111,23 @@ class BaselineTests(unittest.TestCase):
 
     def test_explicit_acceptance_allows_classified_non_vendor_finding(self):
         classified = fingerprint("1", "classified-fixture.txt")
-        plan = baseline.plan_refresh(set(), [classified], {classified}, set())
+        plan = baseline.plan_refresh(
+            set(), [classified], {classified}, set(), {classified}
+        )
         self.assertEqual(plan.pinned, [classified])
         self.assertEqual(plan.accepted, {classified})
         self.assertFalse(plan.unclassified)
 
+    def test_existing_pin_does_not_require_retroactive_disposition(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        plan = baseline.plan_refresh(existing, sorted(existing), existing, set(), set())
+        self.assertEqual(plan.pinned, sorted(existing))
+        self.assertFalse(plan.accepted)
+        self.assertFalse(plan.unclassified)
+
     def test_pending_finding_is_never_written_even_when_accepted(self):
         pending = fingerprint("1", "pending-fixture.txt")
-        plan = baseline.plan_refresh(set(), [pending], {pending}, {pending})
+        plan = baseline.plan_refresh(set(), [pending], {pending}, {pending}, set())
         self.assertEqual(plan.pending, {pending})
         self.assertEqual(plan.refused, {pending})
         self.assertFalse(plan.accepted)
@@ -116,7 +139,7 @@ class BaselineTests(unittest.TestCase):
     def test_pending_finding_already_in_baseline_is_rejected(self):
         pending = fingerprint("1", "pending-fixture.txt")
         with self.assertRaisesRegex(ValueError, "already present"):
-            baseline.plan_refresh({pending}, [], set(), {pending})
+            baseline.plan_refresh({pending}, [], set(), {pending}, set())
 
     def test_committed_baseline_pins_no_pending_finding(self):
         # Only the refresh helper refuses a pending row. A hand edit of the
@@ -130,6 +153,12 @@ class BaselineTests(unittest.TestCase):
             "a finding awaiting disposition is pinned in the history baseline",
         )
 
+    def test_committed_dispositions_use_exact_fingerprints(self):
+        dispositions = baseline.read_dispositions(
+            ROOT / ".gitlab/gitleaks-history-dispositions.md"
+        )
+        self.assertTrue(dispositions)
+
     def test_acceptance_file_requires_commit_bound_fingerprints(self):
         with tempfile.TemporaryDirectory() as temporary:
             accepted = pathlib.Path(temporary) / "accepted.ignore"
@@ -137,9 +166,10 @@ class BaselineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "commit-bound"):
                 baseline.read_fingerprint_file(accepted)
 
-    def run_main(self, root, scanned, accepted=None, draft=None):
+    def run_main(self, root, scanned, accepted=None, draft=None, dispositions=None):
         output = root / "history.ignore"
         pending = root / "pending.ignore"
+        write_dispositions(root, dispositions or ())
         arguments = [
             "refresh-secret-history-baseline.py",
             "--repo",
@@ -198,7 +228,12 @@ class BaselineTests(unittest.TestCase):
                 f"{unclassified}\n{pending}\n{vendor}\n{unmatched}\n",
                 encoding="utf-8",
             )
-            status, pinned, stdout, stderr = self.run_main(root, scanned, accepted)
+            status, pinned, stdout, stderr = self.run_main(
+                root,
+                scanned,
+                accepted,
+                dispositions={unclassified, vendor},
+            )
             self.assertEqual(status, 1)
             self.assertEqual(pinned, existing | {vendor, unclassified})
             self.assertNotIn(pending, pinned)
@@ -207,7 +242,36 @@ class BaselineTests(unittest.TestCase):
             self.assertIn(f"refused although accepted: {pending}", stderr)
             self.assertIn(f"matched no scanned row: {unmatched}", stderr)
 
-    def test_cli_groups_vendor_rows_and_writes_a_draft_without_pending(self):
+    def test_cli_rejects_accepted_fingerprint_missing_disposition(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        classified = fingerprint("1", "classified-fixture.txt")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text("", encoding="utf-8")
+            accepted = root / "accepted.ignore"
+            accepted.write_text(f"{classified}\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError) as raised:
+                self.run_main(root, [classified], accepted)
+            message = str(raised.exception)
+            self.assertIn("accepted fingerprints missing from", message)
+            self.assertIn(".gitlab/gitleaks-history-dispositions.md", message)
+            self.assertIn(classified, message)
+            self.assertEqual(
+                baseline.read_fingerprint_file(root / "history.ignore"), existing
+            )
+
+            status, pinned, _, _ = self.run_main(
+                root,
+                [classified],
+                accepted,
+                dispositions={classified},
+            )
+            self.assertEqual(status, 0)
+            self.assertEqual(pinned, existing | {classified})
+
+    def test_cli_groups_vendor_rows_and_writes_an_inert_draft_without_pending(self):
         existing = {fingerprint("0", "old-fixture.txt")}
         first = fingerprint("1", "ic/vendor/example-crate/tests/first.txt")
         second = fingerprint("2", "ic/vendor/example-crate/tests/second.txt")
@@ -224,15 +288,20 @@ class BaselineTests(unittest.TestCase):
             status, pinned, stdout, stderr = self.run_main(root, scanned, draft=draft)
             self.assertEqual(status, 1)
             self.assertEqual(pinned, existing)
-            self.assertEqual(
-                baseline.read_fingerprint_file(draft),
-                {first, second, private_key, other_crate, non_vendor},
-            )
-            self.assertNotIn(pending, baseline.read_fingerprint_file(draft))
+            expected = {first, second, private_key, other_crate, non_vendor}
+            self.assertFalse(baseline.read_fingerprint_file(draft))
+            content = draft.read_text(encoding="utf-8")
+            for entry in expected:
+                self.assertIn(f"# {entry}\n", content)
+            self.assertNotIn(pending, content)
             self.assertIn("example-crate / generic-api-key (2):", stderr)
             self.assertIn("example-crate / private-key (1):", stderr)
             self.assertIn("other-crate / generic-api-key (1):", stderr)
             self.assertIn("wrote 5 unclassified fingerprints to draft", stdout)
+
+            status, pinned, _, _ = self.run_main(root, scanned, accepted=draft)
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing)
 
     def test_scan_cache_reuses_one_scan_only_while_refs_are_unchanged(self):
         scanned = [fingerprint("1", "ic/vendor/example-crate/tests/fixture.txt")]

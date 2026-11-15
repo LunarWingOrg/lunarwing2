@@ -2862,6 +2862,71 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn legacy_mission_missing_state_fields_survives_boot_reload() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("legacy-mission-boot", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "legacy project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "safetylayer-watch",
+            "keep watching",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        let object = raw.as_object_mut().expect("mission should be an object");
+        for field in [
+            "current_focus",
+            "approach_history",
+            "thread_history",
+            "success_criteria",
+            "max_threads_per_day",
+            "threads_today",
+            "last_trigger_payload",
+            "metadata",
+            "next_fire_at",
+        ] {
+            object.remove(field);
+        }
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("write legacy mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        let loaded = reloaded
+            .load_mission(mission.id)
+            .await
+            .expect("load mission")
+            .expect("legacy mission must survive boot");
+        assert_eq!(loaded.name, "safetylayer-watch");
+        assert!(loaded.approach_history.is_empty());
+        assert!(loaded.thread_history.is_empty());
+        assert_eq!(loaded.max_threads_per_day, 30);
+        assert_eq!(loaded.metadata, serde_json::json!({}));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     #[traced_test]
     async fn corrupt_mission_json_warns_with_identifiers_instead_of_vanishing() {
         // WI#321 regression: a mission.json that fails to deserialize used to be

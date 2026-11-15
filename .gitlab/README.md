@@ -249,10 +249,12 @@ and clean rebuild) in a bounded retry — up to 8 attempts with exponential
 backoff from a 45 s base (45/90/180/360/720/1440/2880s; the eighth attempt
 is final, so the curve ends at its last rung — there is no separate cap)
 plus job-id-based jitter (`CI_JOB_ID % 30`) to desynchronize concurrent
-worker pushes — that fires only on this transient signature
-(`failed to fetch oauth token` / `429 Too Many Requests`), and a genuine
-build failure still exits on the first attempt. On the candidate leg the
-build is deterministic and the retry reuses the layer cache, so only the
+worker pushes — that fires only on transient signatures
+(`failed to fetch oauth token` / `429 Too Many Requests`, or an
+`unexpected status from PUT request` / `PATCH request` to the configured
+registry with status 499, 502, 503 or 504). Registry 401, 403 and 404
+refusals and genuine build failures still exit on the first attempt. On the
+candidate leg the build is deterministic and the retry reuses the layer cache, so only the
 push is re-executed — but the clean-rebuild leg is deliberately the
 uncached `--no-cache` build, so a sustained 429 on its push re-runs the
 full rebuild on every attempt (the WI#467 residual: with eight attempts
@@ -780,7 +782,8 @@ git fetch origin '+refs/heads/*:refs/remotes/origin/*' \
 draft="$(git rev-parse --absolute-git-dir)/secret-history-accept.ignore"
 python3 .gitlab/scripts/refresh-secret-history-baseline.py --draft-accept "$draft"
 # Add every approved row's disposition to
-# .gitlab/gitleaks-history-dispositions.md, and delete every unapproved row.
+# .gitlab/gitleaks-history-dispositions.md.
+# Uncomment exactly those approved rows; leave every other row commented out.
 ${EDITOR:-vi} "$draft"
 python3 .gitlab/scripts/refresh-secret-history-baseline.py --accept "$draft"
 ```
@@ -790,9 +793,11 @@ The helper requires branch, tag, and merge-request refs, performs a fully
 redacted scan without either ignore file, and validates every fingerprint.
 Unclassified vendor rows are printed with counts grouped by crate and rule;
 non-vendor rows remain separate. `--draft-accept` writes all and only the
-unclassified rows in acceptance-file format, excluding pending rows, so the
-reviewer edits a draft instead of copying terminal output. The draft and cache
-are local mode-0600 files and contain no secret values or matched content.
+unclassified rows as commented-out acceptance rows, excluding pending rows, so
+the reviewer edits a draft instead of copying terminal output. Passing an
+unchanged draft to `--accept` pins nothing; each approved row must be
+uncommented individually. The draft and cache are local mode-0600 files and
+contain no secret values or matched content.
 
 The first run saves the redacted fingerprint list. In a non-bare checkout the
 default cache is `.git/secret-history-baseline-cache.json`; for a bare mirror it
@@ -810,11 +815,14 @@ old refs can return. Every new fingerprint, including one under `ic/vendor/`, is
 left unpinned unless an explicit `--accept <file>` names its exact commit-bound
 fingerprint. Record each newly accepted row in
 `.gitlab/gitleaks-history-dispositions.md`, the durable non-confidential
-disposition log, before supplying that file. Do not copy confidential findings
-out of WI#575 into the log. Accepted vendor additions are printed by crate and
-rule for comparison with the refresh-vendor diff. An accepted entry that matches
-no scanned row produces a warning. Never suppress new vendor churn by adding a
-path or rule exclusion.
+disposition log, before supplying that file. The helper refuses the entire
+refresh if any newly approved fingerprint lacks its own exact table row, and
+the error names every missing fingerprint. Pins already in the committed
+baseline predate this rule and do not need retroactive disposition rows. Do not
+copy confidential findings out of WI#575 into the log. Accepted vendor additions
+are printed by crate and rule for comparison with the refresh-vendor diff. An
+accepted entry that matches no scanned row produces a warning. Never suppress
+new vendor churn by adding a path or rule exclusion.
 
 Automatic vendor-path acceptance is deliberately forbidden. Comparing a file
 with its crate's `.cargo-checksum.json` cannot establish upstream provenance:

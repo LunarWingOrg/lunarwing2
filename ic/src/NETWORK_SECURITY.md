@@ -496,7 +496,13 @@ The NetBird sidecar adds only `NET_ADMIN`, `NET_RAW`, and `NET_BIND_SERVICE`,
 never `SYS_ADMIN`; joined commands receive none of them.
 `NB_DISABLE_FIREWALL=true` prevents NetBird's interface allower from inserting
 and reapplying its own `wt0` accept in LunarWing's verified input chain, while
-advanced-routing socket marks remain active.
+advanced-routing socket marks remain active. This also disables NetBird's access
+control on the peer: its policies are not evaluated there, so LunarWing's
+`input` chain (`policy drop`; loopback and `ct state established,related`
+only) is the sole inbound filter for the sidecar peer. Any inbound accept added
+to that chain has no NetBird policy behind it, so treat such a change as a
+boundary weakening. NetBird ACLs still bound what the sandbox can reach:
+destination and routing peers enforce them, not this peer.
 Every start/health check hashes the resolved local image ID so tag rotation
 recreates the sidecar. Missing `nft`, an unhealthy provider, or an
 altered/missing chain returns `[sandbox:sandbox_unavailable]` without degrading
@@ -549,7 +555,10 @@ remaining. The 6-second re-probe spaces its final retry halfway into the last
 remaining polling interval, leaving time for provider/firewall verification
 under the same deadline rather than probing twice at once. A failed final retry
 returns without spending the unused interval; if no provider error completed,
-the deadline error remains generic. Unverified sidecars are still removed.
+the deadline error remains generic. If the provider answers healthy but the
+firewall check is cut by that deadline, the error names the egress firewall
+check rather than claiming that the sidecar remained unhealthy. Unverified
+sidecars are still removed.
 
 NetBird management URL/setup key travel through an atomically created
 mode-0600 `--env-file` under the private runtime directory (no `/tmp`

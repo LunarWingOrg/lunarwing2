@@ -14,6 +14,7 @@
 #   G2: a real critical landed within budget still dominates coverage loss
 #   H: gateway channels reporting unhealthy -> degraded, never healthy (review F5)
 #   I: reachable gateway with unobservable pending-gates -> degraded (review F5)
+#   J: retrying workload isolation -> degraded; settled fallback stays healthy
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/lib.sh
@@ -216,5 +217,31 @@ fix_body "$i2" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messag
 oI2="$(run_hc "$i2" LUNARWING_TENANTS_FILE="$i2/ports.json")"
 assert_eq "$(jq -r '.status' <<<"$oI2")" "healthy" "I2b1: normal approval waits never degrade"
 assert_eq "$(jq -r '.metrics.instances[0].pending_gates' <<<"$oI2")" "2" "I2b2: wait count surfaced as a metric"
+
+# ── J: retrying workload isolation is degraded, settled fallback is not ──────
+j="$(new_sb)"; mk_registry "$j" acme acme 3001 8788
+fix_body "$j" "http://127.0.0.1:3001/api/gateway/status" \
+  '{"uptime_secs":10,"total_connections":0,"workload_isolation":"process-group"}'
+fix_body "$j" "http://127.0.0.1:3001/api/chat/pending-gates" '{"gates":[]}'
+fix_body "$j" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":0}'
+oJ="$(run_hc "$j" LUNARWING_TENANTS_FILE="$j/ports.json")"
+assert_eq "$(jq -r '.status' <<<"$oJ")" "healthy" "J1: settled process-group fallback stays healthy"
+assert_eq "$(jq -r '.metrics.instances[0].workload_isolation' <<<"$oJ")" "process-group" "J2: isolation mode surfaced"
+
+fix_body "$j" "http://127.0.0.1:3001/api/gateway/status" \
+  '{"uptime_secs":10,"total_connections":0,"workload_isolation":"process-group-retrying"}'
+oJ2="$(run_hc "$j" LUNARWING_TENANTS_FILE="$j/ports.json")"
+j2_rc=$?
+assert_eq "$(jq -r '.status' <<<"$oJ2")" "degraded" "J3: retrying process-group fallback degrades health"
+assert_eq "$(jq -r '.metrics.instances[0].workload_isolation' <<<"$oJ2")" "process-group-retrying" "J4: retrying mode surfaced"
+assert_contains "$(jq -r '.issues[0]' <<<"$oJ2")" "workload isolation degraded" "J5: retrying fallback explained"
+assert_eq "$j2_rc" "1" "J6: retrying fallback returns degraded exit"
+
+fix_body "$j" "http://127.0.0.1:8788/v1/status" '{"running":true,"queued_messages":60}'
+oJ3="$(run_hc "$j" LUNARWING_TENANTS_FILE="$j/ports.json")"
+j3_rc=$?
+assert_eq "$(jq -r '.status' <<<"$oJ3")" "critical" "J7: retrying fallback does not mask critical backlog"
+assert_contains "$(jq -r '.issues[0]' <<<"$oJ3")" "backlog critical" "J8: critical backlog remains explained"
+assert_eq "$j3_rc" "2" "J9: critical backlog retains critical exit"
 
 finish

@@ -25,6 +25,7 @@ use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::error::OrchestratorError;
 use crate::hooks::{HookError, HookEvent, HookOutcome, HookRegistry};
+use crate::orchestrator::harness::SecretValueRedactor;
 use crate::safety::SafetyLayer;
 use crate::tools::builtin::memory::resolve_memory_write_target;
 use crate::tools::permissions::{
@@ -1223,6 +1224,11 @@ impl ExternalWorkerManager {
 
         let timeout = timeout_ms.unwrap_or(config.timeout_ms);
 
+        // WI#702: external lanes get granted values inline in the task
+        // environment. Build the redactor once per dispatch and share it
+        // across the read loop and the terminal bookkeeping paths.
+        let granted_redactor = granted_value_redactor(&context.environment);
+
         // Use load balancer to select an endpoint and acquire an active-connection
         // lease. The lease is held for the task's lifetime (moved into the spawned
         // task on the fire-and-forget path) so LeastConnections reflects real load.
@@ -1326,6 +1332,7 @@ impl ExternalWorkerManager {
                 context_manager.as_ref(),
                 store.as_ref(),
                 result.error.as_deref().unwrap_or(reason.message()),
+                granted_redactor.as_ref(),
             )
             .await;
             active_handles.write().await.remove(&job_id);
@@ -1373,6 +1380,7 @@ impl ExternalWorkerManager {
                     store.as_ref(),
                     cancel_rx.clone(),
                     context.clone(),
+                    granted_redactor.as_ref(),
                     tool_binding.clone(),
                     &pool,
                     &attempt_pool_key,
@@ -1408,6 +1416,7 @@ impl ExternalWorkerManager {
                         event_tx.as_ref(),
                         context_manager.as_ref(),
                         store.as_ref(),
+                        granted_redactor.as_ref(),
                     )
                     .await;
                 }
@@ -1438,6 +1447,7 @@ impl ExternalWorkerManager {
                     store.as_ref(),
                     cancel_rx,
                     context,
+                    granted_redactor.as_ref(),
                     tool_binding,
                     &pool,
                     &pool_key,
@@ -1457,6 +1467,7 @@ impl ExternalWorkerManager {
                         event_tx.as_ref(),
                         context_manager.as_ref(),
                         store.as_ref(),
+                        granted_redactor.as_ref(),
                     )
                     .await;
                 }
@@ -2547,6 +2558,7 @@ async fn run_external_task(
     store: Option<&Arc<dyn Database>>,
     cancel_rx: watch::Receiver<Option<CancelReason>>,
     context: TaskContext,
+    granted_redactor: Option<&SecretValueRedactor>,
     tool_binding: ToolProxyBinding,
     pool: &WorkerConnectionPool,
     pool_key: &str,
@@ -2750,6 +2762,12 @@ async fn run_external_task(
                     match env.msg_type.as_str() {
                         "task_progress" => {
                             if let Ok(progress) = serde_json::from_value::<TaskProgressPayload>(env.payload) {
+                                // WI#702: the granted credential values are
+                                // in this task's child env, so any streamed
+                                // text may echo one. Scrub once here — the
+                                // accumulated buffer, the SSE frame and the
+                                // persisted row all take the scrubbed text.
+                                let delta = scrub_granted(granted_redactor, &progress.delta);
                                 // WI#263: a streamed delta is proof the worker
                                 // is alive — unless it is a synthetic worker
                                 // heartbeat (the kimi executor's "[worker]
@@ -2772,7 +2790,7 @@ async fn run_external_task(
                                         .update_context(job_id, |ctx| {
                                             record_external_progress_at(
                                                 ctx,
-                                                &progress.delta,
+                                                delta.as_ref(),
                                                 Utc::now(),
                                             );
                                         })
@@ -2792,8 +2810,8 @@ async fn run_external_task(
                                 // "Transient provider failure; retrying…"
                                 // retry notices are real evidence of what the
                                 // worker was doing and must survive here.
-                                if !is_heartbeat_only_frame(&progress.delta) {
-                                    accumulated_output.push_str(&progress.delta);
+                                if !is_heartbeat_only_frame(delta.as_ref()) {
+                                    accumulated_output.push_str(delta.as_ref());
                                 }
 
                                 emit_event(
@@ -2802,13 +2820,13 @@ async fn run_external_task(
                                     &event_user_id,
                                     SseEvent::JobMessage {
                                         job_id: job_id.to_string(),
-                                        content: progress.delta.clone(),
+                                        content: delta.to_string(),
                                         role: "assistant".to_string(),
                                     },
                                 );
 
                                 // Persist as job event
-                                persist_event(store, job_id, "message", &progress.delta).await;
+                                persist_event(store, job_id, "message", delta.as_ref()).await;
                             }
                         }
                         "task_result" => {
@@ -2859,12 +2877,19 @@ async fn run_external_task(
                                 _ => result.output.clone(),
                             };
 
-                            return Ok(ExternalTaskResult {
-                                status,
-                                output: final_output,
-                                error: result.error,
-                                duration_ms: result.duration_ms,
-                            });
+                            // WI#702: scrub the terminal text before the
+                            // result is built, so the parent tool result, the
+                            // `result` event, the DB row and the timeout
+                            // evidence all inherit value-redacted text.
+                            return Ok(scrub_task_result(
+                                ExternalTaskResult {
+                                    status,
+                                    output: final_output,
+                                    error: result.error,
+                                    duration_ms: result.duration_ms,
+                                },
+                                granted_redactor,
+                            ));
                         }
                         // WI#324: proxied tool path. The worker invokes an
                         // allowlisted in-process tool; the reply rides the
@@ -3121,14 +3146,18 @@ async fn run_external_task(
                         )
                         .await
                     {
-                        return Ok(result);
+                        // WI#702: the acked terminal frame is worker text too.
+                        return Ok(scrub_task_result(result, granted_redactor));
                     }
-                    return Ok(ExternalTaskResult {
-                        status: ExternalTaskStatus::Cancelled,
-                        output: accumulated_output.clone(),
-                        error: Some(reason.message().to_string()),
-                        duration_ms: 0,
-                    });
+                    return Ok(scrub_task_result(
+                        ExternalTaskResult {
+                            status: ExternalTaskStatus::Cancelled,
+                            output: accumulated_output.clone(),
+                            error: Some(reason.message().to_string()),
+                            duration_ms: 0,
+                        },
+                        granted_redactor,
+                    ));
                 }
             }
         }
@@ -4775,6 +4804,55 @@ fn timed_out_result_message(error: Option<&str>, output: &str) -> String {
 /// via `persist_event`; the snapshot is the tail an operator reads first.
 const TIMEOUT_EVIDENCE_SNAPSHOT_BYTES: usize = 16_384;
 
+/// Arm a value redactor from the credential grants handed to an external task
+/// (WI#702).
+///
+/// External lanes receive `create_job` grants inline as
+/// [`TaskContext::environment`] — kimi spreads them into the child env and
+/// pebble merges them into an already-cleared env — so the decrypted values
+/// are already in hand at dispatch. No token-store entry or pull endpoint is
+/// involved, which is why the harness/ACP redactor cannot reach these lanes.
+///
+/// An empty map, or values all below the 8-byte minimum, yields `None` so a
+/// task without grants pays no scan and no allocation per frame.
+fn granted_value_redactor(environment: &HashMap<String, String>) -> Option<SecretValueRedactor> {
+    if environment.is_empty() {
+        return None;
+    }
+    let mut redactor = SecretValueRedactor::default();
+    redactor.add_values(environment.values().map(String::as_str));
+    redactor.is_armed().then_some(redactor)
+}
+
+/// Scrub granted credential values out of worker-supplied text before it
+/// reaches an event, a stream consumer, or the job context (WI#702).
+///
+/// `None` is the no-grants fast path: the original text is borrowed.
+fn scrub_granted<'a>(redactor: Option<&SecretValueRedactor>, text: &'a str) -> Cow<'a, str> {
+    match redactor {
+        Some(redactor) => Cow::Owned(redactor.scrub(text)),
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// Scrub a worker result before any of its text is persisted, emitted, or
+/// returned to the parent agent (WI#702). A grant value could reach `output`
+/// or `error` directly — a task that echoes its environment, or a worker
+/// that folds streamed deltas into its terminal message.
+fn scrub_task_result(
+    result: ExternalTaskResult,
+    redactor: Option<&SecretValueRedactor>,
+) -> ExternalTaskResult {
+    let Some(redactor) = redactor else {
+        return result;
+    };
+    ExternalTaskResult {
+        output: redactor.scrub(&result.output),
+        error: result.error.as_deref().map(|error| redactor.scrub(error)),
+        ..result
+    }
+}
+
 /// Preserve a partial-evidence snapshot when an external worker task times out
 /// (WI#263).
 ///
@@ -4791,6 +4869,11 @@ const TIMEOUT_EVIDENCE_SNAPSHOT_BYTES: usize = 16_384;
 /// short streamed investigation is still real evidence, and dropping it under
 /// an arbitrary size floor left `job_status.partial_output` null exactly when
 /// the recovery path was needed most.
+///
+/// The caller's buffer is already value-redacted (WI#702): progress deltas are
+/// scrubbed at ingest and a worker result is scrubbed before the result is
+/// built, so both the `partial_output` metadata snapshot and the persisted
+/// event inherit scrubbed text.
 async fn preserve_timeout_evidence(
     job_id: Uuid,
     worker_name: &str,
@@ -4857,8 +4940,12 @@ async fn record_external_task_error(
     event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
+    granted_redactor: Option<&SecretValueRedactor>,
 ) {
-    let reason = error.to_string();
+    // WI#702: a protocol-error reason can embed worker-supplied text, and an
+    // external lane's granted values live in the worker's child env — scrub
+    // before the reason reaches the log, context, event, or DB row.
+    let reason = scrub_granted(granted_redactor, &error.to_string()).into_owned();
     // WI#464 (note #11332): the blocking (wait=true) dispatch path had no
     // tracing on final connect failure, so a dead worker was invisible in
     // daemon.log until an operator noticed the failed job.  This function is
@@ -4868,7 +4955,7 @@ async fn record_external_task_error(
         "External worker '{}' job {} failed: {}",
         worker_name,
         job_id,
-        error
+        reason
     );
     let status = if matches!(error, OrchestratorError::ExternalWorkerTimeout { .. }) {
         "timed_out"
@@ -4922,7 +5009,10 @@ async fn record_external_task_cancelled(
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
     reason: &str,
+    granted_redactor: Option<&SecretValueRedactor>,
 ) {
+    // WI#702: scrub the worker-influenced reason before any persistence.
+    let reason = scrub_granted(granted_redactor, reason);
     if let Some(context_manager) = context_manager {
         let _ = context_manager
             .update_context(job_id, |context| {
@@ -4934,7 +5024,7 @@ async fn record_external_task_cancelled(
             })
             .await;
     }
-    persist_event(store, job_id, "result", reason).await;
+    persist_event(store, job_id, "result", reason.as_ref()).await;
     emit_event(
         event_tx,
         job_id,
@@ -4952,7 +5042,7 @@ async fn record_external_task_cancelled(
                 job_id,
                 "cancelled",
                 Some(false),
-                Some(reason),
+                Some(reason.as_ref()),
                 None,
                 Some(Utc::now()),
             )
@@ -5447,6 +5537,90 @@ mod tests {
             timed_out_result_message(None, ""),
             "External worker timed out"
         );
+    }
+
+    #[test]
+    fn granted_values_arm_a_redactor_only_when_present() {
+        // WI#702: no grants (or values below the 8-byte floor) must leave the
+        // per-frame path untouched.
+        assert!(granted_value_redactor(&HashMap::new()).is_none());
+
+        let mut short = HashMap::new();
+        short.insert("SHORT".to_string(), "abc".to_string());
+        assert!(granted_value_redactor(&short).is_none());
+
+        let mut grants = HashMap::new();
+        grants.insert("DB_PASSWORD".to_string(), "s3cret-db-pass".to_string());
+        assert!(granted_value_redactor(&grants).is_some());
+    }
+
+    #[test]
+    fn granted_values_are_scrubbed_from_worker_text() {
+        let mut grants = HashMap::new();
+        grants.insert("DB_PASSWORD".to_string(), "s3cret-db-pass".to_string());
+        let redactor = granted_value_redactor(&grants);
+
+        let text = "env: DB_PASSWORD=s3cret-db-pass";
+        let scrubbed = scrub_granted(redactor.as_ref(), text);
+        assert!(!scrubbed.contains("s3cret-db-pass"));
+        assert!(scrubbed.contains("[redacted-secret]"));
+
+        // No grants: the original text is borrowed, not copied.
+        assert!(matches!(
+            scrub_granted(None, text),
+            Cow::Borrowed(t) if t == text
+        ));
+    }
+
+    #[test]
+    fn granted_values_are_scrubbed_in_base64_form() {
+        use base64::Engine;
+        let value = "db-password-1234";
+        let mut grants = HashMap::new();
+        grants.insert("DB_PASSWORD".to_string(), value.to_string());
+        let redactor = granted_value_redactor(&grants);
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        assert!(!encoded.is_empty());
+        let text = format!("printenv | base64: {encoded}");
+        let scrubbed = scrub_granted(redactor.as_ref(), &text);
+        assert!(!scrubbed.contains(&encoded));
+    }
+
+    #[test]
+    fn task_result_output_and_error_are_scrubbed() {
+        let mut grants = HashMap::new();
+        grants.insert("DB_PASSWORD".to_string(), "s3cret-db-pass".to_string());
+        let redactor = granted_value_redactor(&grants);
+
+        let result = ExternalTaskResult {
+            status: ExternalTaskStatus::Failed,
+            output: "leaked s3cret-db-pass in output".to_string(),
+            error: Some("failed with s3cret-db-pass".to_string()),
+            duration_ms: 7,
+        };
+        let scrubbed = scrub_task_result(result, redactor.as_ref());
+        assert!(!scrubbed.output.contains("s3cret-db-pass"));
+        assert!(
+            !scrubbed
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("s3cret-db-pass")
+        );
+
+        // No grants: identity, including the terminal status and duration.
+        let result = ExternalTaskResult {
+            status: ExternalTaskStatus::Success,
+            output: "unchanged".to_string(),
+            error: None,
+            duration_ms: 3,
+        };
+        let untouched = scrub_task_result(result, None);
+        assert_eq!(untouched.status, ExternalTaskStatus::Success);
+        assert_eq!(untouched.output, "unchanged");
+        assert!(untouched.error.is_none());
+        assert_eq!(untouched.duration_ms, 3);
     }
 
     #[tokio::test]

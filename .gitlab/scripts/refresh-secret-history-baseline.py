@@ -21,8 +21,8 @@ HEADER = """# WI#590 / WI#575: reviewed Gitleaks v8.30.1 historical findings.
 # with .gitlab/scripts/refresh-secret-history-baseline.py.
 """
 DRAFT_HEADER = """# Draft secret-history acceptance file; review every row before use.
-# Delete every fingerprint whose disposition is not recorded in
-# .gitlab/gitleaks-history-dispositions.md, then pass this file to --accept.
+# Every row is commented out. Uncomment only rows whose disposition is recorded
+# in .gitlab/gitleaks-history-dispositions.md, then pass this file to --accept.
 # No pending findings are included. Never add secret values or matched content.
 """
 
@@ -106,6 +106,22 @@ def read_fingerprint_file(path: pathlib.Path) -> set[str]:
     return pinned
 
 
+def read_dispositions(path: pathlib.Path) -> set[str]:
+    if not path.is_file():
+        raise ValueError(f"dispositions file is missing: {path}")
+    dispositions = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.lstrip().startswith("|"):
+            continue
+        columns = [column.strip() for column in raw_line.strip().strip("|").split("|")]
+        if len(columns) < 2:
+            continue
+        match = re.fullmatch(r"`([^`]+)`", columns[1])
+        if match is not None:
+            dispositions.add(validate_fingerprint(match.group(1)))
+    return dispositions
+
+
 def fingerprints(report_path: pathlib.Path) -> list[str]:
     findings = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(findings, list):
@@ -123,12 +139,20 @@ def plan_refresh(
     scanned: list[str],
     accepted: set[str],
     pending: set[str],
+    dispositions: set[str],
 ) -> RefreshPlan:
     if existing & pending:
         raise ValueError("a pending fingerprint is already present in the baseline")
     candidates = set(scanned) - existing
     blocked = candidates & pending
     approved = (candidates - blocked) & accepted
+    missing_dispositions = approved - dispositions
+    if missing_dispositions:
+        missing = "\n".join(sorted(missing_dispositions))
+        raise ValueError(
+            "accepted fingerprints missing from "
+            f".gitlab/gitleaks-history-dispositions.md:\n{missing}"
+        )
     accepted_vendor = {
         fingerprint
         for fingerprint in approved
@@ -167,7 +191,7 @@ def write_baseline(output: pathlib.Path, pinned: list[str]) -> None:
 
 
 def write_draft(output: pathlib.Path, unclassified: list[str]) -> None:
-    content = fingerprint_file_content(DRAFT_HEADER, unclassified)
+    content = DRAFT_HEADER + "".join(f"# {fingerprint}\n" for fingerprint in unclassified)
     write_text_atomic(output, content, 0o600)
 
 
@@ -339,6 +363,7 @@ def main() -> int:
     repo = args.repo.resolve()
     output = args.output or repo / ".gitlab/gitleaks-history-ignore"
     pending_path = args.pending or repo / ".gitlab/gitleaks-history-pending"
+    dispositions_path = repo / ".gitlab/gitleaks-history-dispositions.md"
     validate_mirror(repo)
     cache_path = None
     if not args.no_cache:
@@ -346,6 +371,7 @@ def main() -> int:
     named_paths = {
         "--output": output,
         "--pending": pending_path,
+        "--dispositions": dispositions_path,
         "--accept": args.accept,
         "--draft-accept": args.draft_accept,
         "--cache": cache_path,
@@ -362,6 +388,7 @@ def main() -> int:
     existing = read_fingerprint_file(output)
     pending = read_fingerprint_file(pending_path)
     accepted = read_fingerprint_file(args.accept) if args.accept else set()
+    dispositions = read_dispositions(dispositions_path) if args.accept else set()
     command = shlex.split(args.gitleaks)
     version = subprocess.run(
         [*command, "version"], check=True, capture_output=True, text=True
@@ -372,7 +399,7 @@ def main() -> int:
     scanned = scan(repo, command) if cache_path is None else scan_with_cache(
         repo, command, version, cache_path
     )
-    plan = plan_refresh(existing, scanned, accepted, pending)
+    plan = plan_refresh(existing, scanned, accepted, pending, dispositions)
     write_baseline(output, plan.pinned)
     if args.draft_accept:
         write_draft(args.draft_accept, sorted(plan.unclassified))

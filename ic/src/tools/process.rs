@@ -425,10 +425,11 @@ fn unset_environment_property(
     Some(format!("--property=UnsetEnvironment={}", names.join(" ")))
 }
 
-/// Minimum interval between probes after a transient failure. The fallback
+/// Initial interval between probes after a transient failure. The fallback
 /// remains usable during the interval without turning one slow manager into
-/// a process-wide permanent decision.
+/// a process-wide permanent decision. Repeated failures double the interval.
 const PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const PROBE_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
@@ -452,7 +453,10 @@ impl ProbeError {
 #[derive(Debug)]
 enum Detection {
     Definitive(WorkloadSpawner),
-    Transient(WorkloadSpawner),
+    Transient {
+        spawner: WorkloadSpawner,
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -462,6 +466,8 @@ enum CacheState {
     Transient {
         spawner: WorkloadSpawner,
         retry_at: std::time::Instant,
+        failure_count: u32,
+        reason: String,
     },
 }
 
@@ -469,6 +475,7 @@ enum CacheState {
 struct SpawnerCache {
     state: tokio::sync::Mutex<CacheState>,
     retry_interval: Duration,
+    retrying: std::sync::atomic::AtomicBool,
 }
 
 impl SpawnerCache {
@@ -476,6 +483,7 @@ impl SpawnerCache {
         Self {
             state: tokio::sync::Mutex::const_new(CacheState::Unprobed),
             retry_interval,
+            retrying: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -489,28 +497,77 @@ impl SpawnerCache {
         Fut: std::future::Future<Output = Result<Vec<std::ffi::OsString>, ProbeError>>,
     {
         let mut state = self.state.lock().await;
-        match &*state {
+        let previous_failure = match &*state {
             CacheState::Definitive(spawner) => return spawner.clone(),
-            CacheState::Transient { spawner, retry_at }
-                if std::time::Instant::now() < *retry_at =>
-            {
+            CacheState::Transient {
+                spawner, retry_at, ..
+            } if std::time::Instant::now() < *retry_at => {
                 return spawner.clone();
             }
-            CacheState::Unprobed | CacheState::Transient { .. } => {}
-        }
+            CacheState::Transient {
+                failure_count,
+                reason,
+                ..
+            } => Some((*failure_count, reason.clone())),
+            CacheState::Unprobed => None,
+        };
 
         match detect_spawner_with(probe).await {
             Detection::Definitive(spawner) => {
+                self.retrying
+                    .store(false, std::sync::atomic::Ordering::Release);
                 *state = CacheState::Definitive(spawner.clone());
                 spawner
             }
-            Detection::Transient(spawner) => {
+            Detection::Transient { spawner, reason } => {
+                let failure_count = previous_failure
+                    .as_ref()
+                    .map_or(1, |(count, _)| count.saturating_add(1));
+                let retry_delay = self.retry_delay(failure_count);
+                if previous_failure
+                    .as_ref()
+                    .is_none_or(|(_, previous_reason)| previous_reason != &reason)
+                {
+                    warn!(
+                        reason = reason.as_str(),
+                        will_retry = true,
+                        consecutive_failures = failure_count,
+                        retry_in_secs = retry_delay.as_secs(),
+                        "workload isolation: systemd services unavailable, using process groups only"
+                    );
+                }
+                self.retrying
+                    .store(true, std::sync::atomic::Ordering::Release);
                 *state = CacheState::Transient {
                     spawner: spawner.clone(),
-                    retry_at: std::time::Instant::now() + self.retry_interval,
+                    retry_at: std::time::Instant::now() + retry_delay,
+                    failure_count,
+                    reason,
                 };
                 spawner
             }
+        }
+    }
+
+    fn retry_delay(&self, failure_count: u32) -> Duration {
+        let exponent = failure_count.saturating_sub(1).min(4);
+        self.retry_interval
+            .saturating_mul(2_u32.pow(exponent))
+            .min(PROBE_MAX_RETRY_INTERVAL)
+    }
+
+    async fn isolation_mode(&self) -> &'static str {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) if self.retrying.load(std::sync::atomic::Ordering::Acquire) => {
+                return "process-group-retrying";
+            }
+            Err(_) => return "probing",
+        };
+        match &*state {
+            CacheState::Unprobed => "unprobed",
+            CacheState::Definitive(spawner) => spawner.isolation_mode(),
+            CacheState::Transient { .. } => "process-group-retrying",
         }
     }
 }
@@ -519,22 +576,17 @@ static SPAWNER: SpawnerCache = SpawnerCache::new(PROBE_RETRY_INTERVAL);
 
 /// Process-wide spawner. Successful detection, configured isolation disable,
 /// and an unavailable user bus are cached. Other failures use process groups
-/// for this call and are retried no more often than [`PROBE_RETRY_INTERVAL`].
+/// for this call and back off from [`PROBE_RETRY_INTERVAL`] to
+/// [`PROBE_MAX_RETRY_INTERVAL`].
 pub async fn workload_spawner() -> WorkloadSpawner {
     SPAWNER.spawner().await
 }
 
-/// Current diagnostic mode without triggering detection. Before the first
-/// workload there is no active mode to report; an in-progress probe is waited
-/// on so the result is never reported as a definitive fallback prematurely.
+/// Current diagnostic mode without triggering detection or waiting for a probe.
+/// `probing` reports the first in-flight probe; a transient fallback remains
+/// `process-group-retrying` both between and during later probes.
 pub async fn workload_isolation_mode() -> &'static str {
-    let state = SPAWNER.state.lock().await;
-    match &*state {
-        CacheState::Unprobed => "unprobed",
-        CacheState::Definitive(spawner) | CacheState::Transient { spawner, .. } => {
-            spawner.isolation_mode()
-        }
-    }
+    SPAWNER.isolation_mode().await
 }
 
 async fn detect_spawner_with<F, Fut>(probe: F) -> Detection
@@ -576,18 +628,18 @@ where
             );
             Detection::Definitive(spawner)
         }
-        Err(error) => {
+        Err(error) if error.is_definitive() => {
             warn!(
                 reason = error.reason(),
-                will_retry = !error.is_definitive(),
+                will_retry = false,
                 "workload isolation: systemd services unavailable, using process groups only"
             );
-            if error.is_definitive() {
-                Detection::Definitive(spawner)
-            } else {
-                Detection::Transient(spawner)
-            }
+            Detection::Definitive(spawner)
         }
+        Err(error) => Detection::Transient {
+            spawner,
+            reason: error.reason().to_string(),
+        },
     }
 }
 
@@ -650,8 +702,9 @@ async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, ProbeError>
 }
 
 /// Run a probe to a wall-clock deadline. A reader thread drains stdout while
-/// the child runs; on timeout the direct child is killed and reaped, and the
-/// detached reader finishes when its pipe closes instead of blocking cleanup.
+/// the child runs; on timeout the direct child is killed and reaped. The reader
+/// can outlive a timed-out probe when a stuck user manager retains the pipe's
+/// write end; it is deliberately detached and exits after every writer closes.
 #[cfg(target_os = "linux")]
 fn run_probe_command(
     mut probe: std::process::Command,
@@ -661,9 +714,14 @@ fn run_probe_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = probe
-        .spawn()
-        .map_err(|error| ProbeError::Transient(format!("failed to run systemd-run: {error}")))?;
+    let mut child = probe.spawn().map_err(|error| {
+        let reason = format!("failed to run systemd-run: {error}");
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ProbeError::Definitive(reason)
+        } else {
+            ProbeError::Transient(reason)
+        }
+    })?;
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -1363,6 +1421,167 @@ mod tests {
             .await;
         assert!(!cached.uses_systemd_services());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn status_is_prompt_and_distinguishes_retrying_from_settled_fallback() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(SpawnerCache::new(Duration::from_secs(60)));
+        assert_eq!(cache.isolation_mode().await, "unprobed");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let probe = {
+            let cache = cache.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                cache
+                    .spawner_with(move || async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Err(ProbeError::Transient("probe timed out".to_string()))
+                    })
+                    .await
+            })
+        };
+        started.notified().await;
+        let status = tokio::time::timeout(Duration::from_secs(1), cache.isolation_mode()).await;
+        release.notify_one();
+        probe.await.expect("first probe task");
+        assert_eq!(status.expect("status waited for probe"), "probing");
+        assert_eq!(cache.isolation_mode().await, "process-group-retrying");
+
+        {
+            let mut state = cache.state.lock().await;
+            match &mut *state {
+                CacheState::Transient { retry_at, .. } => {
+                    *retry_at = std::time::Instant::now();
+                }
+                other => panic!("unexpected cache state: {other:?}"),
+            }
+        }
+        let retry_started = Arc::new(Notify::new());
+        let finish_retry = Arc::new(Notify::new());
+        let retry = {
+            let cache = cache.clone();
+            let retry_started = retry_started.clone();
+            let finish_retry = finish_retry.clone();
+            tokio::spawn(async move {
+                cache
+                    .spawner_with(move || async move {
+                        retry_started.notify_one();
+                        finish_retry.notified().await;
+                        Err(ProbeError::Definitive("no user bus".to_string()))
+                    })
+                    .await
+            })
+        };
+        retry_started.notified().await;
+        let retry_status =
+            tokio::time::timeout(Duration::from_secs(1), cache.isolation_mode()).await;
+        finish_retry.notify_one();
+        retry.await.expect("retry probe task");
+        assert_eq!(
+            retry_status.expect("status waited for retry"),
+            "process-group-retrying"
+        );
+        assert_eq!(cache.isolation_mode().await, "process-group");
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_back_off_and_track_changed_reason() {
+        let cache = SpawnerCache::new(Duration::from_secs(30));
+        for (failures, seconds) in [
+            (1, 30),
+            (2, 60),
+            (3, 120),
+            (4, 240),
+            (5, 300),
+            (u32::MAX, 300),
+        ] {
+            assert_eq!(cache.retry_delay(failures), Duration::from_secs(seconds));
+        }
+
+        cache
+            .spawner_with(|| async { Err(ProbeError::Transient("first failure".to_string())) })
+            .await;
+        {
+            let mut state = cache.state.lock().await;
+            match &mut *state {
+                CacheState::Transient {
+                    failure_count,
+                    reason,
+                    retry_at,
+                    ..
+                } => {
+                    assert_eq!(*failure_count, 1);
+                    assert_eq!(reason.as_str(), "first failure");
+                    *retry_at = std::time::Instant::now();
+                }
+                other => panic!("unexpected cache state: {other:?}"),
+            }
+        }
+
+        let before = std::time::Instant::now();
+        cache
+            .spawner_with(|| async { Err(ProbeError::Transient("second failure".to_string())) })
+            .await;
+        let after = std::time::Instant::now();
+        let state = cache.state.lock().await;
+        match &*state {
+            CacheState::Transient {
+                failure_count,
+                reason,
+                retry_at,
+                ..
+            } => {
+                assert_eq!(*failure_count, 2);
+                assert_eq!(reason.as_str(), "second failure");
+                assert!(*retry_at >= before + Duration::from_secs(60));
+                assert!(*retry_at <= after + Duration::from_secs(60));
+            }
+            other => panic!("unexpected cache state: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn missing_systemd_run_is_final_and_status_is_settled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let probe_path = temp.path().join("missing-systemd-run");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = SpawnerCache::new(Duration::ZERO);
+        let first = {
+            let attempts = attempts.clone();
+            cache
+                .spawner_with(move || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    run_probe_command(
+                        std::process::Command::new(probe_path),
+                        Duration::from_secs(1),
+                    )
+                })
+                .await
+        };
+        assert!(!first.uses_systemd_services());
+        let first_status = cache.isolation_mode().await;
+        let second = {
+            let attempts = attempts.clone();
+            cache
+                .spawner_with(move || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::new())
+                })
+                .await
+        };
+        assert!(!second.uses_systemd_services());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(first_status, "process-group");
+        assert_eq!(cache.isolation_mode().await, "process-group");
     }
 
     #[cfg(target_os = "linux")]

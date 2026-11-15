@@ -13,7 +13,7 @@ fail() { printf 'FAIL: %s\n' "$*"; failures=$((failures + 1)); }
 
 run_refresh() {
   local init="$1" daemon="$2" volume="$3" pull_ok="$4" health_ok="$5"
-  rm -f "$FIXTURE_ROOT/events" "$FIXTURE_ROOT/output"
+  rm -f "$FIXTURE_ROOT/events" "$FIXTURE_ROOT/output" "$FIXTURE_ROOT/arithmetic-executed"
   mkdir -p "$FIXTURE_ROOT/state"
   rm -f "$FIXTURE_ROOT/state/"*
   if FIXTURE_INIT="$init" FIXTURE_DAEMON="$daemon" FIXTURE_VOLUME="$volume" \
@@ -120,9 +120,12 @@ run_refresh() {
           case "$FIXTURE_CASE" in
             image-probe-failure) printf "postgres (PostgreSQL) 16.16\n"; return 1 ;;
             image-bad-version) printf "postgres (PostgreSQL) 16rc1\n" ;;
+            image-prerelease) printf "postgres (PostgreSQL) 16rc17\n" ;;
             image-empty-version) : ;;
             image-old-version|rollback|wrong-rollback) printf "postgres (PostgreSQL) 16.15\n" ;;
             image-rollback-other-major) printf "postgres (PostgreSQL) 15.15\n" ;;
+            image-major-17) printf "postgres (PostgreSQL) 17.2\n" ;;
+            image-major-18) printf "postgres (PostgreSQL) 18.1\n" ;;
             image-newer-minor) printf "postgres (PostgreSQL) 16.17\n" ;;
             *) printf "postgres (PostgreSQL) 16.16 (Debian 16.16-1.pgdg12+1)\n" ;;
           esac
@@ -139,8 +142,18 @@ run_refresh() {
             case "$FIXTURE_CASE" in
               old-version|rollback|wrong-rollback) printf "160015\n" ;;
               gate-rollback-other-major) printf "150015\n" ;;
+              gate-major-17) printf "170002\n" ;;
+              gate-major-18) printf "180001\n" ;;
               image-newer-minor) printf "160017\n" ;;
               bad-version) printf "unknown\n" ;;
+              gate-arithmetic-injection)
+                printf "160016+BASH_LINENO[\$(touch %s/arithmetic-executed)]\n" "$FIXTURE_ROOT" ;;
+              version-probe-transient)
+                if [[ ! -e "$FIXTURE_ROOT/state/version-probe-attempted" ]]; then
+                  touch "$FIXTURE_ROOT/state/version-probe-attempted"
+                  return 1
+                fi
+                printf "160016\n" ;;
               *) printf "160016\n" ;;
             esac
           elif [[ "$*" == *"SELECT version()"* ]]; then
@@ -269,15 +282,22 @@ assert_rc "unknown daemon state is fatal" nonzero
 assert_log "unknown daemon state prevents container removal" "rm -f lunarwing-pg-alice" absent
 
 for init in systemd openrc; do
-  for fault in no-extension no-vector-library old-version bad-version daemon-failure; do
+  for fault in no-extension no-vector-library old-version bad-version gate-arithmetic-injection daemon-failure; do
     run_refresh "$init" active true true true "$fault"
     assert_rc "$init refuses $fault" nonzero
     if [[ "$fault" != daemon-failure ]]; then
       assert_log "$init $fault leaves daemon stopped" "start lunarwing-alice.service" absent
       assert_log "$init $fault leaves OpenRC daemon stopped" "lunarwing-alice start" absent
     fi
-    if [[ "$fault" == old-version || "$fault" == bad-version ]]; then
+    if [[ "$fault" == old-version || "$fault" == bad-version || "$fault" == gate-arithmetic-injection ]]; then
       assert_log "$init $fault still checks the running server after swap" "SHOW server_version_num" present
+    fi
+    if [[ "$fault" == gate-arithmetic-injection ]]; then
+      if [[ ! -e "$FIXTURE_ROOT/arithmetic-executed" ]]; then
+        pass "$init numeric guard blocks arithmetic command substitution"
+      else
+        fail "$init numeric guard allowed arithmetic command substitution"
+      fi
     fi
   done
 done
@@ -301,7 +321,7 @@ run_refresh systemd active true true true wrong-rollback
 assert_rc "another tenant cannot enable unpatched rollback" nonzero
 assert_log "another tenant's acknowledgement refuses before stopping the daemon" "stop lunarwing-alice.service" absent
 for init in systemd openrc; do
-  for fault in image-old-version image-bad-version image-empty-version image-probe-failure image-rollback-other-major; do
+  for fault in image-old-version image-bad-version image-prerelease image-empty-version image-probe-failure image-rollback-other-major image-major-17 image-major-18; do
     run_refresh "$init" active true true true "$fault"
     assert_rc "$init refuses $fault before downtime" nonzero
     assert_output "$init $fault explains no downtime" "image version preflight failed"
@@ -312,11 +332,20 @@ for init in systemd openrc; do
     assert_log "$init $fault never removes the old container" "rm -f lunarwing-pg-alice" absent
     assert_log "$init $fault never rewrites the Quadlet" "render-quadlet" absent
   done
-  run_refresh "$init" active true true true gate-rollback-other-major
-  assert_rc "$init post-swap gate refuses another major even with acknowledgement" nonzero
-  assert_log "$init other-major case reaches the second version check" "SHOW server_version_num" present
-  assert_log "$init other-major gate leaves the systemd daemon stopped" "start lunarwing-alice.service" absent
-  assert_log "$init other-major gate leaves the OpenRC daemon stopped" "lunarwing-alice start" absent
+  for fault in gate-rollback-other-major gate-major-17 gate-major-18; do
+    run_refresh "$init" active true true true "$fault"
+    assert_rc "$init post-swap gate refuses $fault" nonzero
+    assert_log "$init $fault reaches the second version check" "SHOW server_version_num" present
+    assert_log "$init $fault leaves the systemd daemon stopped" "start lunarwing-alice.service" absent
+    assert_log "$init $fault leaves the OpenRC daemon stopped" "lunarwing-alice start" absent
+  done
+  run_refresh "$init" active true true true version-probe-transient
+  assert_rc "$init retries a transient version probe failure" zero
+  if [[ "$(grep -c 'SHOW server_version_num' "$FIXTURE_ROOT/events")" -eq 2 ]]; then
+    pass "$init transient version probe runs twice"
+  else
+    fail "$init transient version probe did not run exactly twice"
+  fi
 done
 run_refresh systemd active true true true image-newer-minor
 assert_rc "newer PostgreSQL minor versions pass both version checks" zero
