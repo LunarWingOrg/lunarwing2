@@ -512,7 +512,12 @@ The one-shot state is `state/knowledge_seed_state.json`; additive cadence,
 revision, and failure/backoff state are in `state/knowledge_sync_state.json`.
 The host publishes a validated Git generation hourly through a systemd timer or
 OpenRC cron entry; tenant imports remain bounded, additive-only, and never
-replace existing paths. Run an immediate pass with
+replace existing paths. That timer executes a root-owned snapshot of mt-admin
+under `/usr/local/lib/lunarwing-study-notes-sync/current`, not this checkout:
+`upgrade-tenant` restages it from the upgraded-from checkout when the scheduler
+is already installed (it never creates one), and each release records the
+staging commit in `STAGED-FROM`. `lunarwing-mt-admin.sh doctor` prints that
+commit and warns when it lags the checkout. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 
