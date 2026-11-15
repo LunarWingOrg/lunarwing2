@@ -229,7 +229,7 @@ impl SessionManager {
     ///
     /// For LunarWing Cloud Cloud API key:
     /// 1. Prompt user for API key from lunarwing.org
-    /// 2. Set LUNARWING_CLOUD_API_KEY env var and save to bootstrap .env
+    /// 2. Set a LUNARWING_CLOUD_API_KEY runtime override and save to bootstrap .env
     /// 3. No session token saved (different auth model)
     async fn initiate_login(&self) -> Result<(), LlmError> {
         use crate::llm::oauth_helpers;
