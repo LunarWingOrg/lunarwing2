@@ -198,23 +198,28 @@ Older images without the split exposed their bridge credentials through
 same-uid `/proc` reads; deploying a source update without rebuilding and
 recreating the worker pair does not repair that old image.
 
-**Grant values in external-lane events (WI#702).** kimi and pebble receive
-`create_job` grants inline as `TaskContext.environment` (they spread/merge it
-into the child env) rather than through the harness credential endpoints, so
-the WI#666 token-store redactor never sees them. The daemon therefore arms one
-`SecretValueRedactor` per external task from that environment map at dispatch
-and value-redacts the worker's `task_progress` deltas before they reach
-`accumulated_output`, the SSE `job_message` frame, or a `message` job event,
-and its `task_result` output/error before the result message, the `result`
-event, the job-context metadata, the timeout-evidence snapshot, or the DB row
-is written. Result and protocol-error text on the terminal bookkeeping paths
-is scrubbed the same way. A task dispatched with no grants arms nothing and
-pays no per-frame cost. The limits are the same as for mounted and granted
-values in `docs/architecture/HARNESS_WORKER_CAPABILITIES.md`: redaction is
-**best-effort, not a boundary**, values shorter than 8 bytes are not
-value-redacted, and the redactor only knows the granted values — other
-task-visible secrets such as the lane's LLM provider key (which is present in
-the same child env by design) are not covered by this pass.
+**Grant values in external-lane events (WI#702, WI#711).** kimi and pebble
+receive `create_job` grants inline as `TaskContext.environment` (they
+spread/merge it into the child env) rather than through the harness credential
+endpoints, so the WI#666 token-store redactor never sees them. The daemon
+therefore arms one `SecretValueRedactor` per external task from that
+environment map at dispatch and value-redacts the worker's `task_progress`
+deltas before they reach `accumulated_output`, the SSE `job_message` frame, or
+a `message` job event, and its `task_result` output/error before the result
+message, the `result` event, the job-context metadata, the timeout-evidence
+snapshot, or the DB row is written. Proxied tool-call input previews and
+recorded tool output, denial, and failure reasons are scrubbed before the
+canonical `tool_use` and `tool_result` job events are persisted. Result and
+protocol-error text on the terminal bookkeeping paths is scrubbed the same
+way; protocol errors are also scrubbed at the blocking `execute_task` return,
+so the job status, job context, and parent's `create_job` tool error receive
+the cleaned reason. A task dispatched with no grants arms nothing and pays no
+per-frame cost. The limits are the same as for mounted and granted values in
+`docs/architecture/HARNESS_WORKER_CAPABILITIES.md`: redaction is **best-effort,
+not a boundary**, values shorter than 8 bytes are not value-redacted, and the
+redactor only knows the granted values — other task-visible secrets such as
+the lane's LLM provider key (which is present in the same child env by design)
+are not covered by this pass.
 
 ### Non-root bridge and task pairs (WI#454, supersedes WI#400)
 
