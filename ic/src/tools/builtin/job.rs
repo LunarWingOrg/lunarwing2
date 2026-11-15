@@ -3057,13 +3057,12 @@ impl Tool for JobEventsTool {
     }
 }
 
-/// Tool for sending follow-up prompts to a running Claude Code sandbox job.
+/// Tool for sending follow-up prompts to a running sandbox job.
 ///
-/// The prompt is queued in an in-memory `PromptQueue` (a broadcast channel
-/// shared with the web gateway). The Claude Code bridge inside the container
-/// polls for queued prompts between turns and feeds them into the next
-/// `claude --resume` invocation, enabling interactive multi-turn sessions
-/// with long-running sandbox jobs.
+/// The prompt is queued in an in-memory `PromptQueue` shared with the web
+/// gateway. The worker inside the container polls for queued prompts between
+/// LLM calls and injects them into its reasoning context, enabling interactive
+/// multi-turn sessions with long-running sandbox jobs.
 ///
 /// `prompt_queue` is `None` on sandbox-disabled deployments (the tool stays
 /// registered so external-worker jobs remain promptable via the control
@@ -3116,7 +3115,7 @@ impl Tool for JobPromptTool {
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up prompt to a running job. For Claude Code sandbox jobs the prompt is \
+        "Send a follow-up prompt to a running job. For local sandbox jobs the prompt is \
          queued and delivered on the next poll cycle. For external workers (opencode, harness, \
          etc.) the prompt travels over the runtime control channel: the worker applies it after \
          its current turn ends, never mid-call, and only workers that advertise the \
@@ -3202,8 +3201,8 @@ impl Tool for JobPromptTool {
         // External worker jobs receive follow-up prompts over the runtime
         // control channel (WI#328). Route on the manager's live state first
         // (MR !1508 review CT-7): an active handle is authoritative, while a
-        // missing/errored store lookup must never fall through to the Claude
-        // Code prompt queue — nothing drains that queue for an external job
+        // missing/errored store lookup must never fall through to the local
+        // sandbox prompt queue — nothing drains that queue for an external job
         // and the tool would still have reported "Prompt queued".
         if let Some(ref ewm) = self.external_worker_manager
             && ewm.is_task_active(job_id).await

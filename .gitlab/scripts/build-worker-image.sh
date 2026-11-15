@@ -248,12 +248,12 @@ lunardepth4lunarwing/scripts/verify_deployed_closure.ts
 lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
-        source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5
+        source_ref=0472d115e5297093f249c222639431ba8ff0bb78
         build_args="LUNARDEPTH_REPOSITORY=https://git.lunarwing.org/lunarwing/lunardepth.git
-LUNARDEPTH_REF=da06c33b2091546dc38c61b95452ce27a4ce32d5
+LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78
 LUNARDEPTH_COMPATIBILITY_REF=17aef23e05cc074c8621d38d159d77d25cb348ca
 LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b
-LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned
+LUNARDEPTH_PROFILE_SCHEMA_VERSION=1
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -326,8 +326,10 @@ metadata_digest() {
 # 5984 lost the opencode, opencode2 and kimi candidates (and, by cascade, their
 # scans) to one such burst, and pipeline 6212 lost the kimi candidate to a
 # sustained 429 burst that outlasted the original 4-attempt/3-minute window.
-# Pipeline 7855 added registry PUT/PATCH 499 and 502/503/504 responses to the
-# same transient class; 401/403/404 refusals still fail immediately.
+# Registry PUT/PATCH 499 and 502/503/504 responses are in the same transient
+# class; 401/403/404 refusals still fail immediately. Pipeline 7855's
+# 60-second upload cut is the edge/runner incident tracked in WI#706; this
+# retry does not resolve that incident or the separate artifact upload cut.
 # Pipeline 7174 instead lost the opencode candidate after a stalled
 # snapshot.debian.org apt step was killed. The build is deterministic and the
 # retry reuses the layer cache, so only the narrow observed transient

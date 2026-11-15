@@ -231,7 +231,15 @@ for index, argument in enumerate(args):
     def test_job_178891_registry_499_trace_is_retried(self):
         self.env["CI_REGISTRY"] = "registry.git.lunarwing.org"
         self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
-        self.env["PUSH_TRACE_LINE"] = "2026-11-14T21:37:43.409091Z 01O #52 ERROR: failed to push registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode2:fcb07a8e8abd3d101db013754236818b0aa99cd1-7855-178891: unexpected status from PUT request to https://registry.git.lunarwing.org/v2/lunarwing/lunarwing2/worker-opencode2/blobs/uploads/81db004d-e010-4480-a366-88507c3dc9ab?_state=pKr-IhpSRmFbh84Ti81GL6uXtvmMFDJc1yEiIj7kC4l7Ik5hbWUiOiJsdW5hcndpbmcvbHVuYXJ3aW5nMi93b3JrZXItb3BlbmNvZGUyIiwiVVVJRCI6IjgxZGIwMDRkLWUwMTAtNDQ4MC1hMzY2LTg4NTA3YzNkYzlhYiIsIk9mZnNldCI6MCwiU3RhcnRlZEF0IjoiMjAyNi0xMS0xNFQyMTozNjo0MS41OTY4NTExMzRaIn0%3D&digest=sha256%3A31776f813e27a90ae0cd3c67f4bea6150914b0c7356285398244dc5ec7952938: 499 status code 499: Client Closed Request"
+        self.env["PUSH_TRACE_LINE"] = (
+            "2026-11-14T21:37:43.409091Z 01O #52 ERROR: failed to push "
+            "registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode2:"
+            "fcb07a8e8abd3d101db013754236818b0aa99cd1-7855-178891: "
+            "unexpected status from PUT request to "
+            "https://registry.git.lunarwing.org/v2/lunarwing/lunarwing2/"
+            "worker-opencode2/blobs/uploads/fixture: "
+            "499 status code 499: Client Closed Request"
+        )
         result = self.run_build()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
@@ -263,6 +271,36 @@ for index, argument in enumerate(args):
                     self.assertIn("not retrying", result.stderr)
                     self.assertNotIn("transient registry push error", result.stderr)
                     self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_registry_push_transient_status_on_other_host_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
+        self.env["PUSH_TRACE_LINE"] = (
+            "ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: "
+            "unexpected status from PUT request to "
+            "https://registry.other.invalid/v2/example/worker/worker-opencode2/"
+            "blobs/uploads/fixture: 502 Bad Gateway"
+        )
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient registry push error", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_registry_push_status_prefix_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_push_trace_once"
+        self.env["PUSH_TRACE_LINE"] = (
+            "ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: "
+            "unexpected status from PUT request to "
+            "https://registry.invalid/v2/example/worker/worker-opencode2/"
+            "blobs/uploads/fixture: 5020 Bad Gateway"
+        )
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient registry push error", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [])
 
     def test_persistent_transient_failure_exhausts_retries(self):
         self.env["BUILDCTL_MODE"] = "fail_always"

@@ -198,23 +198,28 @@ Older images without the split exposed their bridge credentials through
 same-uid `/proc` reads; deploying a source update without rebuilding and
 recreating the worker pair does not repair that old image.
 
-**Grant values in external-lane events (WI#702).** kimi and pebble receive
-`create_job` grants inline as `TaskContext.environment` (they spread/merge it
-into the child env) rather than through the harness credential endpoints, so
-the WI#666 token-store redactor never sees them. The daemon therefore arms one
-`SecretValueRedactor` per external task from that environment map at dispatch
-and value-redacts the worker's `task_progress` deltas before they reach
-`accumulated_output`, the SSE `job_message` frame, or a `message` job event,
-and its `task_result` output/error before the result message, the `result`
-event, the job-context metadata, the timeout-evidence snapshot, or the DB row
-is written. Result and protocol-error text on the terminal bookkeeping paths
-is scrubbed the same way. A task dispatched with no grants arms nothing and
-pays no per-frame cost. The limits are the same as for mounted and granted
-values in `docs/architecture/HARNESS_WORKER_CAPABILITIES.md`: redaction is
-**best-effort, not a boundary**, values shorter than 8 bytes are not
-value-redacted, and the redactor only knows the granted values — other
-task-visible secrets such as the lane's LLM provider key (which is present in
-the same child env by design) are not covered by this pass.
+**Grant values in external-lane events (WI#702, WI#711).** kimi and pebble
+receive `create_job` grants inline as `TaskContext.environment` (they
+spread/merge it into the child env) rather than through the harness credential
+endpoints, so the WI#666 token-store redactor never sees them. The daemon
+therefore arms one `SecretValueRedactor` per external task from that
+environment map at dispatch and value-redacts the worker's `task_progress`
+deltas before they reach `accumulated_output`, the SSE `job_message` frame, or
+a `message` job event, and its `task_result` output/error before the result
+message, the `result` event, the job-context metadata, the timeout-evidence
+snapshot, or the DB row is written. Proxied tool-call input previews and
+recorded tool output, denial, and failure reasons are scrubbed before the
+canonical `tool_use` and `tool_result` job events are persisted. Result and
+protocol-error text on the terminal bookkeeping paths is scrubbed the same
+way; protocol errors are also scrubbed at the blocking `execute_task` return,
+so the job status, job context, and parent's `create_job` tool error receive
+the cleaned reason. A task dispatched with no grants arms nothing and pays no
+per-frame cost. The limits are the same as for mounted and granted values in
+`docs/architecture/HARNESS_WORKER_CAPABILITIES.md`: redaction is **best-effort,
+not a boundary**, values shorter than 8 bytes are not value-redacted, and the
+redactor only knows the granted values — other task-visible secrets such as
+the lane's LLM provider key (which is present in the same child env by design)
+are not covered by this pass.
 
 ### Non-root bridge and task pairs (WI#454, supersedes WI#400)
 
@@ -1439,7 +1444,7 @@ the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
 
 ### Provenance and image contents
 
-The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `da06c33b2091546dc38c61b95452ce27a4ce32d5` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
+The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `0472d115e5297093f249c222639431ba8ff0bb78` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
 
 - compatibility/item 9: `17aef23e05cc074c8621d38d159d77d25cb348ca`;
 - TensorMoon routing: `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`.
@@ -1487,7 +1492,7 @@ The model id names the gateway dialect and the gateway function (WI#691). Both g
 
 `<function>` is the operator's choice among the functions the gateway serves; the lane does not require `lunarwing`. It accepts letters, digits, `_`, and `-`. The middle segment is not variable: a gateway refuses any word there other than its keyword, so the lane refuses it too, and a `model_name` id is not accepted.
 
-Use the prefix of the gateway behind the base URL. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. A TensorMoon gateway takes `tensorzero::` ids only as deprecated aliases that may be removed. The lane translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
+Use the gateway's native prefix. A TensorZero gateway answers a `tensormoon::` id with `model field must start with tensorzero::function_name:: or tensorzero::model_name::`. TensorMoon master accepts `tensorzero::` ids as deprecated aliases from commit `cf686a42c600e84567322a77a29273df3fdebc05` (2026-10-03), but an older deployed TensorMoon image may not contain that change; the lane does not rely on alias support. It translates nothing: the id reaches the gateway exactly as configured, and no prefix-rewriting proxy belongs in front of it. To point a tenant at a TensorZero gateway, pass that gateway's API root and a `tensorzero::` id:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-lunardepth <tenant> \
@@ -1514,9 +1519,9 @@ Three reviewed v1 choices are deliberate:
 
 - `tool-fs-search` is disabled because its unsandboxed ripgrep could expose the model key through `/proc/<pid>/environ`. `ptc-runtime` and `workflow-ptc` are also disabled rather than leaving a second executor surface.
 - `TMPDIR`, `TMP`, and `TEMP` are all `/tmp`, allowing confined `mktemp` under both built-in runners. They cannot be redirected through home or workspace `.env` files.
-- The profile template is generated at image build by the pinned source's `initProfile`, never by a handwritten manifest. The current pin exports no `PROFILE_SCHEMA_VERSION`, so its recorded schema is `unversioned`. A future pin must export and match its declared schema.
+- The profile template is generated at image build by the pinned source's `initProfile`, never by a handwritten manifest. The current pin exports `PROFILE_SCHEMA_VERSION = 1`; the generated manifest declares `dsh.profile.schemaVersion: 1`, and schema `1` is recorded in `worker-inputs.sha256` and image metadata. `migrateProfileManifest` returns this current manifest without a write or writer lock, preserving the before-dump/after-dump/after-readiness hash invariant.
 
-Every start removes lower configuration except the real task-owned `sessions`, `storages`, and `attachments` data directories, then regenerates the profile, home patch, and home `.env` from root-owned read-only templates. The harness gets an empty root-owned launch cwd and home, a system-only absolute `PATH`, and `WS_NO_BUFFER_UTIL=1` plus `WS_NO_UTF_8_VALIDATE=1`. HMR, runtime plugin installation/editing, and settings/config editing are disabled. Task setup is sourced into the task launcher so its `HOME`, `DSH_HOME`, model key, local token, temp paths, and security unsets actually reach the harness and runner.
+Every start removes lower configuration except the real task-owned `sessions`, `storages`, and `attachments` data directories, then regenerates the profile, home patch, and home `.env` from root-owned read-only templates. Any planted profile manifest, writer lock, takeover claim, or temporary migration file is discarded before LunarDepth loads it. The harness gets an empty root-owned launch cwd and home, a system-only absolute `PATH`, and `WS_NO_BUFFER_UTIL=1` plus `WS_NO_UTF_8_VALIDATE=1`. HMR, runtime plugin installation/editing, and settings/config editing are disabled. Task setup strips `TENSORZERO_BASE_URL`, `TENSORZERO_API_KEY`, `DSH_MODEL_GATEWAY`, and `DSH_MODEL_GATEWAY_FUNCTION` in addition to the existing TensorMoon and DeepSeek variables; only the lane's explicit `LUNARDEPTH_*` route and task-visible key survive. Task setup is sourced into the task launcher so its `HOME`, `DSH_HOME`, model key, local token, temp paths, and security unsets actually reach the harness and runner.
 
 The effective overlay is rendered by the tenant's worker image itself. At every start mt-admin runs the image's own `render_overlay.py --stdout` on the template baked into that image, in a throw-away container with no network, no capabilities and a read-only root, and installs the bytes root-owned and mode `0444` on the host. The task container renders again from the same template and requires byte equality, so both sides always come from one image: an operator checkout at a newer revision cannot break a tenant whose image is older. The overlay changes on disk only together with the units that use it. The task cannot rely on owner UID `0` appearing correctly under rootless `keep-id`, so the launch contract passes the rendered file's SHA-256; setup requires that exact digest and mode `0444` before validating the route. Host-side root ownership, the read-only bind, and regeneration still apply. Study Notes and SSH-agent mounts are off in v1.
 
@@ -1525,6 +1530,20 @@ Before readiness, the effective-composition gate requires the exact package/row 
 LunarDepth's sandbox confines file effects only; it is not a network boundary. The per-tenant `lw-egress-<tenant>` nftables allowlist is the only boundary against a compromised agent. It admits the configured model endpoint and explicitly approved job hosts, not npm, DeepSeek account services, telemetry, public fetch/search, model catalogs, or update services. A missing, malformed, or unresolvable LunarDepth backend fails locally with status 4 rather than silently omitting its target.
 
 The v1 task protocol deliberately has no credential/environment grants, cron, steering, resume, LunarWing tool proxy, or follow-up `task_prompt` capability; unsupported frames are rejected rather than silently discarded. The daemon's ordinary `user_id`, string metadata, conversation history, and empty environment map are accepted. History is bounded at the harness's own caps, 50 messages, 10,000 UTF-16 code units per message and 50,000 in total; the lane overlay sets the harness to those caps and the bridge adapter enforces the same bounds, so every history the daemon sends at its default limits fits, and one above the caps gets an explicit error result, never truncation; a non-empty environment or credential grant returns an explicit error `task_result` without disconnecting. There is no tunnel, relay, pairing, public share, web UI, non-loopback harness, remote plugin, self-update, or third-party telemetry path. The root-owned `dsh` refusal wrapper is only naive-use protection: direct Node invocation can bypass it. The unpublished loopback harness, immutable configuration, host listener audits, and egress filter are the real boundaries.
+
+### WI#692 upstream review at 0472d115e
+
+The full `da06c33b2091546dc38c61b95452ce27a4ce32d5..0472d115e5297093f249c222639431ba8ff0bb78` diff (40 commits, 66 files) was reviewed, including source, configuration, tests, SDK, and documentation. Its exposure and publication dispositions are:
+
+- **Gateway routing:** upstream adds a TensorZero provider and `DSH_MODEL_GATEWAY*` expressions to the base and ACP defaults, plus `TENSORZERO_*` endpoint/key reads there and in `sdk-minimal`. The lane replaces the complete `llm-pi-ai`, `agent-default-model`, and `lunarwing-worker` rows, so its effective composition contains only the explicitly rendered provider, literal `baseURL`, `LUNARDEPTH_API_KEY`, and selected model: no `baseURLEnv`, upstream selector expression, or `TENSORZERO_*` read survives. Task setup strips those variables and their selectors. The Python SDK's new route selection is not a worker entrypoint, and WI#357 egress enforcement is unchanged.
+- **Profile schema migration:** the pinned `initProfile` now emits schema `1`. Current v1 manifests return before migration's file lock and atomic write. Its `AsyncLocalStorage` lease is process-local; `package.json.lock`, record-derived takeover claims, and random temporary siblings can exist only beside the runtime manifest during an actual migration. Wholesale profile regeneration removes planted versions and all such residue before either the dump or real boot. The three-point manifest hash gate remains mandatory.
+- **Listeners and tests:** the new gateway test's HTTP server binds an ephemeral loopback port in test code only; it is not a production listener, and test directories are pruned from the deployed closure. ACP and SDK routing changes do not add a worker listener or change the authenticated loopback-only `lunarwing-worker` transport.
+- **Other exposure surfaces:** the diff adds no tunnel, relay, pairing, session-sharing, telemetry, DeepSeek account, remote-plugin/MCP, settings/HMR, self-update, public-fetch, or public-search implementation. The lane's existing whole-row disables for web UI, fetch/search, OTel and DeepSeek session upload, direct DeepSeek, plugin managers, settings/config editing, and HMR remain required. The model-key reader and programmatic-execution disables are unchanged.
+- **Build inventory:** source package `0.2.1-alpha.1`, Node `22.23.4`, pnpm `11.7.0`, the Debian snapshot, `pnpm-lock.yaml`, toolchain guard, deployment script, native sandbox inputs, and both ancestry markers are unchanged. The pin and schema inventories move together; the real build must still prove the frozen lock, deployed closure, and network-isolated smoke.
+
+Local verification produced rootless candidate `sha256:5555282843d259037f5fee643ab1b5601dbe211b1ee3fd9e6af2e69e438da209`. Its pinned toolchain and frozen-lock checks, 35 focused upstream worker tests, schema-v1 template generation, three-point manifest gates, and network-isolated split-role smoke passed. The generated template declares schema `1` with manifest SHA-256 `826442644989efd99c074be91906710e3eb7f1c1d0a3c18f909014ef87387721`; image-config and exported-rootfs verification passed. Two further real restarts discarded a planted future-schema manifest, writer-lock/takeover/temp files, a hostile `.env` and module, preserved session data, and left the runtime manifest byte-identical to that template.
+
+These are source-review and local rootless results, not claims of protected publication or live gateway inference. The protected candidate/rebuild digest match, protected out-of-band exposure verification, CRITICAL scan, and disposable-tenant TensorZero smoke remain required on the exact head.
 
 ### Ports, rollout, and rollback
 
@@ -1557,7 +1576,7 @@ For every LunarDepth version or security-input bump:
 4. **The profile template and `LUNARDEPTH_REF` move together.** Regenerate it with the pinned `initProfile`; inspect `PROFILE_SCHEMA_VERSION`, every profile writer/migration path, and the before-dump/after-dump/after-readiness hash invariant. Replace `unversioned` only when that exact pin exports the schema.
 5. Re-prove full built-in sandbox enforcement, `/tmp` and workspace writes, a denied escape, fresh-session policy events, lower-layer regeneration across two restarts, and no hostile `.env`, module, or profile-manifest persistence. Do not replace a failed real entrypoint smoke with source-only tests.
 6. Reconcile Node, pnpm, Debian snapshot, runtime/toolchain, lane input, parser, image-config, and deployment inventories. Keep the two production worker packages resolvable from the materialized closure.
-7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorMoon inference before claiming live acceptance.
+7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorZero inference before claiming live acceptance; repeat with TensorMoon when an endpoint is available.
 
 ## OpenCode 2 Worker (opencode2)
 

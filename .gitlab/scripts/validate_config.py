@@ -2374,17 +2374,17 @@ def validate_lunardepth_versions(errors: list[str]) -> None:
     block = worker_case_blocks(build_script).get("lunardepth")
     expected = {
         "LUNARDEPTH_REPOSITORY": "https://git.lunarwing.org/lunarwing/lunardepth.git",
-        "LUNARDEPTH_REF": "da06c33b2091546dc38c61b95452ce27a4ce32d5",
+        "LUNARDEPTH_REF": "0472d115e5297093f249c222639431ba8ff0bb78",
         "LUNARDEPTH_COMPATIBILITY_REF": "17aef23e05cc074c8621d38d159d77d25cb348ca",
         "LUNARDEPTH_MODEL_ROUTING_REF": "8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
-        "LUNARDEPTH_PROFILE_SCHEMA_VERSION": "unversioned",
+        "LUNARDEPTH_PROFILE_SCHEMA_VERSION": "1",
     }
     for name, value in expected.items():
         if f"ARG {name}={value}" not in dockerfile:
             errors.append(f"LunarDepth Dockerfile must declare {name}={value}")
         if block is None or f"{name}={value}" not in block:
             errors.append(f"build-worker-image.sh LunarDepth block must carry {name}={value}")
-    if block is None or "source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5" not in block:
+    if block is None or "source_ref=0472d115e5297093f249c222639431ba8ff0bb78" not in block:
         errors.append("build-worker-image.sh LunarDepth source_ref must equal LUNARDEPTH_REF")
     if "pnpm@11.7.0" not in dockerfile or "22.23.4-bookworm-slim" not in dockerfile:
         errors.append("LunarDepth Node/pnpm pins drifted")

@@ -406,20 +406,22 @@ impl SetupWizard {
             self.auto_setup_security().await?;
             self.persist_after_step().await;
 
-            // Pre-populate backend from env so step_inference_provider
+            // Pre-populate backend from the layered environment so step_inference_provider
             // can offer "Keep current provider?" instead of asking from scratch.
             if self.settings.llm_backend.is_none() {
-                if let Ok(b) = std::env::var("LLM_BACKEND") {
+                if let Some(b) = crate::config::helpers::env_or_override("LLM_BACKEND") {
                     self.settings.llm_backend = Some(b);
-                } else if std::env::var("LUNARWING_CLOUD_API_KEY").is_ok() {
+                } else if crate::config::helpers::env_or_override("LUNARWING_CLOUD_API_KEY")
+                    .is_some()
+                {
                     self.settings.llm_backend = Some("lunarwing_cloud".to_string());
-                } else if std::env::var("OPENROUTER_API_KEY").is_ok() {
+                } else if crate::config::helpers::env_or_override("OPENROUTER_API_KEY").is_some() {
                     self.settings.llm_backend = Some("openrouter".to_string());
                 }
             }
 
-            if let Ok(api_key) = std::env::var("LUNARWING_CLOUD_API_KEY")
-                && !api_key.is_empty()
+            if let Some(api_key) =
+                crate::config::helpers::env_or_override("LUNARWING_CLOUD_API_KEY")
                 && self.settings.llm_backend.as_deref() == Some("lunarwing_cloud")
             {
                 // LUNARWING_CLOUD_API_KEY is set and backend auto-detected — skip interactive prompts
@@ -440,8 +442,8 @@ impl SetupWizard {
                     print_info(&format!("Using default model: {default}"));
                 }
                 self.persist_after_step().await;
-            } else if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
-                && !api_key.is_empty()
+            } else if let Some(api_key) =
+                crate::config::helpers::env_or_override("OPENROUTER_API_KEY")
                 && self.settings.llm_backend.as_deref() == Some("openrouter")
             {
                 // OpenRouter key detected — skip interactive prompts
@@ -467,9 +469,7 @@ impl SetupWizard {
                 && self.settings.openai_compatible_base_url.is_some()
             {
                 print_info("OpenAI-compatible config found — using configured provider");
-                if let Ok(api_key) = std::env::var("LLM_API_KEY")
-                    && !api_key.is_empty()
-                {
+                if let Some(api_key) = crate::config::helpers::env_or_override("LLM_API_KEY") {
                     self.llm_api_key = Some(SecretString::from(api_key));
                 }
                 let registry = crate::llm::ProviderRegistry::load();
@@ -1396,13 +1396,16 @@ impl SetupWizard {
         // Build menu: LunarWing Cloud first, then registry providers
         let selectable = registry.selectable();
 
-        // Detect which providers have API keys already set in the environment.
+        // Detect provider keys in the process env, runtime overrides, or injected secrets.
         let detected_env: HashMap<&str, bool> = [
             (
                 "lunarwing_cloud",
-                std::env::var("LUNARWING_CLOUD_API_KEY").is_ok(),
+                crate::config::helpers::env_or_override("LUNARWING_CLOUD_API_KEY").is_some(),
             ),
-            ("openrouter", std::env::var("OPENROUTER_API_KEY").is_ok()),
+            (
+                "openrouter",
+                crate::config::helpers::env_or_override("OPENROUTER_API_KEY").is_some(),
+            ),
         ]
         .into_iter()
         .collect();
@@ -1657,8 +1660,8 @@ impl SetupWizard {
 
         self.set_llm_backend_preserving_model(backend);
 
-        // Check env var first
-        if let Ok(existing) = std::env::var(env_var) {
+        // Check the layered environment first.
+        if let Some(existing) = crate::config::helpers::env_or_override(env_var) {
             print_info(&format!("{env_var} found: {}", mask_api_key(&existing)));
             if confirm("Use this key?", true).map_err(SetupError::Io)? {
                 // Persist env-provided key to secrets store for future runs
@@ -1755,7 +1758,7 @@ impl SetupWizard {
             .settings
             .openai_compatible_base_url
             .clone()
-            .or_else(|| std::env::var("LLM_BASE_URL").ok());
+            .or_else(|| crate::config::helpers::env_or_override("LLM_BASE_URL"));
 
         let url = if let Some(ref u) = existing_url {
             let url_input = optional_input("Base URL", Some(&format!("current: {}", u)))
@@ -2007,7 +2010,7 @@ impl SetupWizard {
             .llm_backend
             .as_deref()
             .unwrap_or("lunarwing_cloud");
-        let has_openai_key = std::env::var("OPENAI_API_KEY").is_ok();
+        let has_openai_key = crate::config::helpers::env_or_override("OPENAI_API_KEY").is_some();
         let has_lunarwing_cloud = backend == "lunarwing_cloud" || self.session_manager.is_some();
 
         // If no LunarWing Cloud session and no OpenAI key, only OpenAI is viable
@@ -2821,8 +2824,8 @@ impl SetupWizard {
     ///
     /// Only true chicken-and-egg settings are written here — things needed
     /// before the database is connected: `DATABASE_BACKEND`, `DATABASE_URL`,
-    /// `LIBSQL_PATH`, `SECRETS_MASTER_KEY`, `ONBOARD_COMPLETED`, and
-    /// channel config vars (Signal, Claude Code sandbox).
+    /// `LIBSQL_PATH`, `SECRETS_MASTER_KEY`, `ONBOARD_COMPLETED`, and Signal
+    /// channel config vars.
     ///
     /// **LLM settings and credentials are NOT written here.** `LLM_BACKEND`,
     /// base URLs, and model names are persisted to the DB via

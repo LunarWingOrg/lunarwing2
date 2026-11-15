@@ -46,10 +46,10 @@ def source_policy(root: Path) -> None:
     dockerfile = (root / "Dockerfile").read_text()
     require(dockerfile, [
         "node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da",
-        "pnpm@11.7.0", "LUNARDEPTH_REF=da06c33b2091546dc38c61b95452ce27a4ce32d5",
+        "pnpm@11.7.0", "LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78",
         "LUNARDEPTH_COMPATIBILITY_REF=17aef23e05cc074c8621d38d159d77d25cb348ca",
         "LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
-        "LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned", "DEBIAN_SNAPSHOT=20261105T082236Z",
+        "LUNARDEPTH_PROFILE_SCHEMA_VERSION=1", "DEBIAN_SNAPSHOT=20261105T082236Z",
         "build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth", "profile_template.js",
         "sed -i '/^  \"prunedAt\":/d' /opt/lunardepth/node_modules/.modules.yaml",
         "musl-tools", "pnpm exec tsx native/system/scripts/build.ts", "--probe | grep -q 'fully enforced'",
@@ -63,6 +63,7 @@ def source_policy(root: Path) -> None:
         "export TMPDIR=/tmp TMP=/tmp TEMP=/tmp", "export WS_NO_BUFFER_UTIL=1 WS_NO_UTF_8_VALIDATE=1",
         "sessions|storages|attachments", "cp -a \"$TEMPLATE_ROOT/profiles/lunarwing-worker\"",
         "secrets.token_hex(32)", "render_overlay.py", "unset NODE_OPTIONS",
+        "DSH_MODEL_GATEWAY DSH_MODEL_GATEWAY_FUNCTION", "TENSORZERO_BASE_URL TENSORZERO_API_KEY",
         "LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256", "effective overlay digest differs from its launch contract",
     ], "task setup")
     split = (root / "entrypoint-split.sh").read_text()

@@ -28,7 +28,7 @@ use crate::worker::api::{
     ProxyToolCompletionResponse, StatusUpdate,
 };
 
-/// A follow-up prompt queued for a Claude Code bridge.
+/// A follow-up prompt queued for a sandbox job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPrompt {
     pub content: String,
@@ -398,7 +398,7 @@ fn job_result_status(data: &serde_json::Value) -> String {
 
 // -- Sandbox job event handlers --
 
-/// Receive a job event from a worker or Claude Code bridge and broadcast + persist it.
+/// Receive a job event from a worker and broadcast + persist it.
 async fn job_event_handler(
     State(state): State<OrchestratorState>,
     Path(job_id): Path<Uuid>,
@@ -549,7 +549,7 @@ async fn job_event_handler(
     Ok(StatusCode::OK)
 }
 
-/// Return the next queued follow-up prompt for a Claude Code bridge.
+/// Return the next queued follow-up prompt for a sandbox job.
 /// Returns 204 No Content if no prompt is available.
 async fn get_prompt_handler(
     State(state): State<OrchestratorState>,

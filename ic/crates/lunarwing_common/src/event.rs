@@ -158,7 +158,7 @@ pub enum AppEvent {
     #[serde(rename = "heartbeat")]
     Heartbeat,
 
-    // Sandbox job streaming events (worker + Claude Code bridge)
+    // Sandbox worker job streaming events
     #[serde(rename = "job_message")]
     JobMessage {
         job_id: String,

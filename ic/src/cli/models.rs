@@ -84,13 +84,15 @@ fn resolve_active(config_path: Option<&Path>) -> (String, String) {
     resolve_active_from_settings(&settings)
 }
 
+fn resolve_backend_from_settings(settings: &Settings) -> String {
+    crate::config::env_or_override("LLM_BACKEND")
+        .or_else(|| settings.llm_backend.clone())
+        .unwrap_or_else(|| "lunarwing_cloud".to_string())
+}
+
 /// Resolve active backend + model from a pre-loaded Settings.
 fn resolve_active_from_settings(settings: &Settings) -> (String, String) {
-    let backend = std::env::var("LLM_BACKEND")
-        .ok()
-        .or_else(|| settings.llm_backend.clone())
-        .unwrap_or_else(|| "lunarwing_cloud".to_string());
-
+    let backend = resolve_backend_from_settings(settings);
     let registry = ProviderRegistry::load();
 
     let canonical_backend = registry
@@ -99,13 +101,11 @@ fn resolve_active_from_settings(settings: &Settings) -> (String, String) {
         .unwrap_or_else(|| backend.clone());
 
     let model = if canonical_backend == "lunarwing_cloud" {
-        std::env::var("LUNARWING_CLOUD_MODEL")
-            .ok()
+        crate::config::env_or_override("LUNARWING_CLOUD_MODEL")
             .or_else(|| settings.selected_model.clone())
             .unwrap_or_else(|| "qwen2.5-72b-instruct:free".to_string())
     } else if let Some(def) = registry.find(&canonical_backend) {
-        std::env::var(&def.model_env)
-            .ok()
+        crate::config::env_or_override(&def.model_env)
             .or_else(|| settings.selected_model.clone())
             .unwrap_or_else(|| def.default_model.clone())
     } else {
@@ -174,11 +174,11 @@ async fn try_fetch_models(provider_id: &str, config_path: Option<&Path>) -> Opti
                 .as_ref()
                 .is_none_or(|p| p.provider_id != def.id)
         {
-            // Build a minimal RegistryProviderConfig from env + registry
+            // Build a minimal RegistryProviderConfig from the layered environment + registry
             let api_key = def
                 .api_key_env
                 .as_ref()
-                .and_then(|env| std::env::var(env).ok());
+                .and_then(|env| crate::config::env_or_override(env));
             if def.api_key_required && api_key.is_none() {
                 return None;
             }
@@ -244,8 +244,8 @@ fn cmd_status(json: bool, config_path: Option<&Path>) -> anyhow::Result<()> {
     let (backend, model) = resolve_active_from_settings(&settings);
     let registry = ProviderRegistry::load();
 
-    let fallback = std::env::var("LUNARWING_CLOUD_FALLBACK_MODEL").ok();
-    let cheap = std::env::var("LUNARWING_CLOUD_CHEAP_MODEL").ok();
+    let fallback = crate::config::env_or_override("LUNARWING_CLOUD_FALLBACK_MODEL");
+    let cheap = crate::config::env_or_override("LUNARWING_CLOUD_CHEAP_MODEL");
 
     let description = if backend == "lunarwing_cloud" {
         "LunarWing Cloud inference (default)".to_string()
@@ -312,10 +312,7 @@ fn cmd_set_model(model: &str, config_path: Option<&Path>) -> anyhow::Result<()> 
     settings.selected_model = Some(trimmed.to_string());
     save_settings(&settings, config_path)?;
 
-    let backend = std::env::var("LLM_BACKEND")
-        .ok()
-        .or_else(|| settings.llm_backend.clone())
-        .unwrap_or_else(|| "lunarwing_cloud".to_string());
+    let backend = resolve_backend_from_settings(&settings);
 
     // Also write to .env so the change takes effect immediately
     let model_env = if backend == "lunarwing_cloud" {
@@ -710,11 +707,46 @@ async fn cmd_show_provider(
 mod tests {
     use super::*;
 
+    struct RuntimeBackendReset {
+        previous: Option<String>,
+    }
+
+    impl RuntimeBackendReset {
+        fn new() -> Self {
+            let previous = crate::config::helpers::runtime_env_override("LLM_BACKEND");
+            crate::config::set_runtime_env("LLM_BACKEND", "");
+            // SAFETY: callers hold the crate-wide environment mutex.
+            unsafe { std::env::remove_var("LLM_BACKEND") };
+            Self { previous }
+        }
+    }
+
+    impl Drop for RuntimeBackendReset {
+        fn drop(&mut self) {
+            crate::config::set_runtime_env("LLM_BACKEND", self.previous.as_deref().unwrap_or(""));
+        }
+    }
+
     #[test]
     fn resolve_active_defaults_to_lunarwing_cloud() {
         let settings = Settings::default();
         assert!(settings.llm_backend.is_none());
         assert!(settings.selected_model.is_none());
+    }
+
+    #[test]
+    fn resolve_active_reads_runtime_backend_override() {
+        let _env = crate::config::helpers::lock_env();
+        let _reset = RuntimeBackendReset::new();
+        crate::config::set_runtime_env("LLM_BACKEND", "openrouter");
+        let settings = Settings {
+            llm_backend: Some("ollama".to_string()),
+            ..Settings::default()
+        };
+
+        let (backend, _) = resolve_active_from_settings(&settings);
+
+        assert_eq!(backend, "openrouter");
     }
 
     #[test]

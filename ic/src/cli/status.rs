@@ -35,6 +35,12 @@ fn load_settings_from(json_path: &std::path::Path, toml_path: &std::path::Path) 
     settings
 }
 
+fn embeddings_enabled(settings: &Settings) -> bool {
+    settings.embeddings.enabled
+        || crate::config::env_or_override("OPENAI_API_KEY").is_some()
+        || crate::config::env_or_override("EMBEDDING_ENABLED").is_some_and(|v| v == "true")
+}
+
 /// Run the status command, printing system health info.
 pub async fn run_status_command() -> anyhow::Result<()> {
     let settings = load_settings();
@@ -114,12 +120,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     println!("{}", fmt::kv_line("Secrets", &secrets_value, 12));
 
     // Embeddings
-    let emb_enabled = settings.embeddings.enabled
-        || std::env::var("OPENAI_API_KEY").is_ok()
-        || std::env::var("EMBEDDING_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-    let emb_value = if emb_enabled {
+    let emb_value = if embeddings_enabled(&settings) {
         format!(
             "enabled (provider: {}, model: {})",
             settings.embeddings.provider, settings.embeddings.model
@@ -167,9 +168,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
 
     // Heartbeat
     let hb_enabled = settings.heartbeat.enabled
-        || std::env::var("HEARTBEAT_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        || crate::config::env_or_override("HEARTBEAT_ENABLED").is_some_and(|v| v == "true");
     let hb_value = if hb_enabled {
         format!("enabled (interval: {}s)", settings.heartbeat.interval_secs)
     } else {
@@ -300,7 +299,46 @@ fn default_channels_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_settings_from, summarize_mcp_servers};
+    use super::{embeddings_enabled, load_settings_from, summarize_mcp_servers};
+    use crate::settings::Settings;
+
+    struct EmbeddingsEnvReset {
+        runtime_values: [(&'static str, Option<String>); 2],
+    }
+
+    impl EmbeddingsEnvReset {
+        const KEYS: [&'static str; 2] = ["OPENAI_API_KEY", "EMBEDDING_ENABLED"];
+
+        fn new() -> Self {
+            let runtime_values = Self::KEYS.map(|key| {
+                let previous = crate::config::helpers::runtime_env_override(key);
+                crate::config::set_runtime_env(key, "");
+                // SAFETY: callers hold the crate-wide environment mutex.
+                unsafe { std::env::remove_var(key) };
+                (key, previous)
+            });
+            Self { runtime_values }
+        }
+    }
+
+    impl Drop for EmbeddingsEnvReset {
+        fn drop(&mut self) {
+            for (key, value) in &self.runtime_values {
+                crate::config::set_runtime_env(key, value.as_deref().unwrap_or(""));
+            }
+            let _ = crate::tracing_fmt::daemon_log_scrubber()
+                .remove_secret("status-runtime-openai-key");
+        }
+    }
+
+    #[test]
+    fn status_embeddings_detect_runtime_openai_key() {
+        let _env = crate::config::helpers::lock_env();
+        let _reset = EmbeddingsEnvReset::new();
+        crate::config::set_runtime_env("OPENAI_API_KEY", "status-runtime-openai-key");
+
+        assert!(embeddings_enabled(&Settings::default()));
+    }
 
     /// Regression test for #354: load_settings_from must read config.toml.
     #[test]

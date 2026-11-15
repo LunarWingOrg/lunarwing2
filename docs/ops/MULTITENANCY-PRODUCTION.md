@@ -825,7 +825,9 @@ every entry in it, and every parent through `/` on every run; any non-root
 owner, symbolic link, or group/other write permission produces a logged refusal
 and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
 contract preflight applies the same check whenever its source resolves to this
-installed library, including a root-owned Study Notes scheduler snapshot. Do
+installed library. A root-owned Study Notes scheduler snapshot instead stages
+and sources a private contract copy beside mt-admin, so it needs neither a
+sibling checkout nor the installed host health library. Do
 not hand-copy an operator checkout over the library; rerun the health pipeline
 install instead (`upgrade-tenant`, `add-tenant`, or
 `ic/scripts/enable-health-fleet.sh`).

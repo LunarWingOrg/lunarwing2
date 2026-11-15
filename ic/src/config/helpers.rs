@@ -501,6 +501,109 @@ mod tests {
 
     use super::*;
 
+    fn collect_rust_sources(dir: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source directory") {
+            let path = entry.expect("read source directory entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, sources);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+
+    fn production_source(source: &str) -> &str {
+        source
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(source, |(production, _)| production)
+    }
+
+    fn audited_overlay_keys() -> Vec<String> {
+        let mut keys: Vec<String> = [
+            "AGENT_AUTO_APPROVE_TOOLS",
+            "DATABASE_BACKEND",
+            "DATABASE_URL",
+            "EMBEDDING_ENABLED",
+            "HEARTBEAT_ENABLED",
+            "LLM_BACKEND",
+            "LLM_API_KEY",
+            "LLM_BASE_URL",
+            "LUNARWING_CLOUD_API_KEY",
+            "LUNARWING_CLOUD_CHEAP_MODEL",
+            "LUNARWING_CLOUD_FALLBACK_MODEL",
+            "LUNARWING_CLOUD_MODEL",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "SECRETS_MASTER_KEY",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for definition in crate::llm::ProviderRegistry::load().all() {
+            keys.push(definition.model_env.clone());
+            if let Some(api_key_env) = &definition.api_key_env {
+                keys.push(api_key_env.clone());
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    #[test]
+    fn audited_overlay_keys_avoid_process_only_readers() {
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        for directory in ["config", "setup", "cli"] {
+            collect_rust_sources(&source_root.join(directory), &mut sources);
+        }
+        // Overlay-backed readers fixed outside those directories (WI#646, WI#655).
+        for file in ["llm/lunarwing_cloud_chat.rs", "sandbox/proxy/http.rs"] {
+            sources.push(source_root.join(file));
+        }
+        sources.sort();
+        let keys = audited_overlay_keys();
+        let dynamic_reads = [
+            "std::env::var(name)",
+            "std::env::var(env_var)",
+            "std::env::var(env)",
+            "std::env::var(&def.model_env)",
+        ];
+        let dynamic_read_files = [
+            "setup/wizard.rs",
+            "cli/models.rs",
+            "cli/status.rs",
+            "llm/lunarwing_cloud_chat.rs",
+            "sandbox/proxy/http.rs",
+        ];
+
+        for path in sources {
+            let source = std::fs::read_to_string(&path).expect("read Rust source");
+            let production = production_source(&source);
+            let relative = path.strip_prefix(&source_root).expect("source below src");
+            for key in &keys {
+                let raw_read = format!("std::env::var(\"{key}\")");
+                assert!(
+                    !production.contains(&raw_read),
+                    "{} reads overlay-backed {key} through the process environment only",
+                    relative.display()
+                );
+            }
+            if dynamic_read_files
+                .iter()
+                .any(|file| relative.ends_with(file))
+            {
+                for raw_read in dynamic_reads {
+                    assert!(
+                        !production.contains(raw_read),
+                        "{} contains a process-only dynamic environment read: {raw_read}",
+                        relative.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn runtime_env_override_is_visible_to_env_or_override() {
         // Use a unique key that won't collide with real env vars.

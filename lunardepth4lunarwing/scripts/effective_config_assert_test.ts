@@ -41,6 +41,12 @@ test("launch gate retains the sourced task environment", () => {
     () => assertLaunchEnvironment({ ...validLaunchEnvironment, PATH: "/usr/bin:" }),
     /PATH contains a relative or empty entry/,
   )
+  for (const name of ["DSH_MODEL_GATEWAY", "DSH_MODEL_GATEWAY_FUNCTION", "TENSORZERO_BASE_URL", "TENSORZERO_API_KEY"]) {
+    assert.throws(
+      () => assertLaunchEnvironment({ ...validLaunchEnvironment, [name]: "upstream-value" }),
+      new RegExp(`launch environment retains forbidden ${name}`),
+    )
+  }
 })
 
 function manifest(directory: string, schemaVersion?: number): string {

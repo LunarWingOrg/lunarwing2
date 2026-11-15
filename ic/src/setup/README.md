@@ -95,6 +95,9 @@ consumers (wizard, onboarding detection, status and doctor) use the same layers.
 Backend autodetection considers process env, runtime overrides and injected
 secrets; only if all are unset and `<base_dir>/ironclaw.db` exists does it select
 libSQL. Empty backend values count as unset, consistently with config resolution.
+Quick-mode provider fast paths, provider-key menu markers, and embeddings
+availability use those same three layers rather than reading only the process
+environment.
 
 ---
 
@@ -715,7 +718,8 @@ that are needed before the DB is connected):
   non-default `libsql-remote-replica` cargo feature; WI#331)
 - `SECRETS_MASTER_KEY` (if env key source selected in Step 2)
 - `ONBOARD_COMPLETED` (always, "true")
-- Channel/sandbox vars: `CLAUDE_CODE_ENABLED`, `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init may precede DB)
+- Signal channel vars: `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init
+  may precede DB)
 
 LLM settings (`LLM_BACKEND`, `LLM_BASE_URL`, model, API keys) are persisted
 to the DB via `persist_settings()` and loaded by `Config::from_db_with_toml()`

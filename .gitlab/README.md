@@ -817,9 +817,15 @@ fingerprint. Record each newly accepted row in
 `.gitlab/gitleaks-history-dispositions.md`, the durable non-confidential
 disposition log, before supplying that file. The helper refuses the entire
 refresh if any newly approved fingerprint lacks its own exact table row, and
-the error names every missing fingerprint. Pins already in the committed
-baseline predate this rule and do not need retroactive disposition rows. Do not
-copy confidential findings out of WI#575 into the log. Accepted vendor additions
+the error names every missing fingerprint. Every fingerprint row must have a
+non-empty disposition and a non-empty reason; `--accept` refuses a row with
+either field empty and names every incomplete row's fingerprint. The log
+defaults to `<repo>/.gitlab/gitleaks-history-dispositions.md`;
+`--dispositions <file>` reads it from another path, such as a working tree
+outside a bare mirror (where `--output` and `--pending` must also name their
+files explicitly). Pins already in the committed baseline predate this rule and
+do not need retroactive disposition rows. Do not copy confidential findings out
+of WI#575 into the log. Accepted vendor additions
 are printed by crate and rule for comparison with the refresh-vendor diff. An
 accepted entry that matches no scanned row produces a warning. Never suppress
 new vendor churn by adding a path or rule exclusion.

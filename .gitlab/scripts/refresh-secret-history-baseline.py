@@ -110,6 +110,7 @@ def read_dispositions(path: pathlib.Path) -> set[str]:
     if not path.is_file():
         raise ValueError(f"dispositions file is missing: {path}")
     dispositions = set()
+    incomplete = set()
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         if not raw_line.lstrip().startswith("|"):
             continue
@@ -117,8 +118,18 @@ def read_dispositions(path: pathlib.Path) -> set[str]:
         if len(columns) < 2:
             continue
         match = re.fullmatch(r"`([^`]+)`", columns[1])
-        if match is not None:
-            dispositions.add(validate_fingerprint(match.group(1)))
+        if match is None:
+            continue
+        fingerprint = validate_fingerprint(match.group(1))
+        if len(columns) < 4 or not columns[2] or not columns[3]:
+            incomplete.add(fingerprint)
+        else:
+            dispositions.add(fingerprint)
+    if incomplete:
+        rows = "\n".join(sorted(incomplete))
+        raise ValueError(
+            f"disposition rows require a non-empty disposition and reason in {path}:\n{rows}"
+        )
     return dispositions
 
 
@@ -351,6 +362,7 @@ def main() -> int:
     parser.add_argument("--accept", type=pathlib.Path)
     parser.add_argument("--draft-accept", type=pathlib.Path)
     parser.add_argument("--pending", type=pathlib.Path)
+    parser.add_argument("--dispositions", type=pathlib.Path)
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument("--cache", type=pathlib.Path, help="override the scan cache path")
     cache.add_argument("--no-cache", action="store_true", help="force a fresh scan without caching")
@@ -363,7 +375,7 @@ def main() -> int:
     repo = args.repo.resolve()
     output = args.output or repo / ".gitlab/gitleaks-history-ignore"
     pending_path = args.pending or repo / ".gitlab/gitleaks-history-pending"
-    dispositions_path = repo / ".gitlab/gitleaks-history-dispositions.md"
+    dispositions_path = args.dispositions or repo / ".gitlab/gitleaks-history-dispositions.md"
     validate_mirror(repo)
     cache_path = None
     if not args.no_cache:

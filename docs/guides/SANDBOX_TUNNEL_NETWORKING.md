@@ -58,10 +58,14 @@ sidecars. Per-run netns/veth pairs or per-run enrollment would add routing and
 credential/peer churn without improving the cross-tenant boundary. Do not run
 mutually untrusted workloads in one tenant, and do not treat loopback listeners
 as private between its commands. Overlay membership is not authentication:
-keep TLS, tokens, and mTLS in force. NetBird ACLs and WireGuard peer policy
-still limit what a sandbox can reach, because the destination peers and any
-routing peers enforce them; they do not filter inbound to the sandbox sidecar
-peer itself, whose only inbound filter is LunarWing's input chain.
+keep TLS, tokens, and mTLS in force. NetBird ACLs still limit what a sandbox
+can reach, because the destination peers and any routing peers enforce them;
+they are not evaluated on the sandbox sidecar peer and do not filter inbound
+there. WireGuard `AllowedIPs` are enforced on the sidecar's receiving `wg0`
+interface: a packet whose source address is outside the sending peer's
+`AllowedIPs` is dropped by the sidecar itself. LunarWing's input chain then
+filters what remains in both cases; for NetBird, it is the sidecar's only
+inbound filter.
 
 ## Common requirements
 

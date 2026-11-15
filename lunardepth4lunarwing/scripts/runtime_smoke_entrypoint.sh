@@ -40,8 +40,10 @@ setpriv --reuid=10005 --regid=10005 --clear-groups --ambient-caps=-all --inh-cap
   LUNARDEPTH_BASE_URL=http://127.0.0.1:18080/openai/v1 \
   LUNARDEPTH_MODEL=tensormoon::function_name::lunarwing \
   LUNARDEPTH_API_KEY=lunardepth-build-smoke-only-not-a-secret \
+  DSH_MODEL_GATEWAY=tensorzero DSH_MODEL_GATEWAY_FUNCTION=upstream-must-not-survive \
+  TENSORZERO_BASE_URL=http://127.0.0.1:9/openai/v1 TENSORZERO_API_KEY=lunardepth-build-smoke-upstream-key \
   LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256="$(sha256sum /run/lunardepth-config/lunarwing-lane.patch.yml | cut -d' ' -f1)" \
-  LUNARDEPTH_IMAGE_REVISION=da06c33b2091546dc38c61b95452ce27a4ce32d5 \
+  LUNARDEPTH_IMAGE_REVISION=0472d115e5297093f249c222639431ba8ff0bb78 \
   /app/entrypoint.sh &
 TASK_PID=$!
 
@@ -50,7 +52,7 @@ setpriv --reuid=10105 --regid=10005 --clear-groups --ambient-caps=-all --inh-cap
   HOME=/home/lunardepth-bridge LUNARWING_CONTAINER_ROLE=split-bridge WORKSPACE_ROOT=/workspace \
   AGENT_AUTH_TOKEN=lunardepth-build-smoke-hub-token-0123456789abcdef \
   WS_BIND_HOST=0.0.0.0 WS_PORT=9090 HEALTH_PORT=8443 \
-  LUNARDEPTH_IMAGE_REVISION=da06c33b2091546dc38c61b95452ce27a4ce32d5 \
+  LUNARDEPTH_IMAGE_REVISION=0472d115e5297093f249c222639431ba8ff0bb78 \
   /app/entrypoint.sh &
 BRIDGE_PID=$!
 
