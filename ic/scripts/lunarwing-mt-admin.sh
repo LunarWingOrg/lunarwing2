@@ -421,6 +421,12 @@ Commands:
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
+  resolve-upgrade-target <ref>     Resolve a target to a commit in the operator
+                                   checkout (used by the upgrade wrapper)
+
+  clear-sandbox-image-status <name>
+                                   Clear retained-image state at a run boundary
+
   report-sandbox-image <name>      Warn when an upgrade retained the previous
                                    managed sandbox image instead of a candidate
 
@@ -432,6 +438,7 @@ Commands:
     --enabled                      Build every worker lane the tenant has enabled
     --with-pebble --with-opencode --with-kimi --with-opencode2 --with-lunardepth
     --target <ref>                 Operator release ref for source provenance
+    --selected-commit <sha>        Require this exact operator-selected tenant HEAD
     --sandbox-image <mode>         Managed sandbox policy: auto (default), always, never
 
   last-build-stage <name>          Print the last completed build stage
