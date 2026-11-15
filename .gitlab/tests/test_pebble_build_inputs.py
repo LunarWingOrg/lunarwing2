@@ -308,12 +308,13 @@ class WorkerSourceProvenanceTests(unittest.TestCase):
         lifecycle = (ROOT / "ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh").read_text(encoding="utf-8")
         wrapper = (ROOT / "ic/scripts/upgrade-tenant.sh").read_text(encoding="utf-8")
         dispatcher = (ROOT / "ic/scripts/lunarwing-mt-admin.sh").read_text(encoding="utf-8")
-        self.assertIn('"$with_opencode2" "$checkout_ref"', lifecycle)
+        self.assertIn('"$with_opencode2" "$target_commit"', lifecycle)
         self.assertIn(
-            'cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF" '
+            'cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_COMMIT" '
             '--sandbox-image "$SANDBOX_IMAGE_POLICY")',
             wrapper,
         )
+        self.assertIn("git -C \"$LWROOT\" rev-parse --verify 'HEAD^{commit}'", wrapper)
         self.assertIn('"$cand_pebble" "false" "$cand_target"', dispatcher)
 
 
