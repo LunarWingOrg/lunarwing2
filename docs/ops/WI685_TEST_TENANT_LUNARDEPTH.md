@@ -213,7 +213,26 @@ the Rust/Go sets used by other workers:
    20,000-row CSV, C++17 `std::async` aggregation and checksum, repeated 1/4/8
    partition runs, and an independent Python recomputation of every aggregate.
 
-Real IDs, outcomes, timings, and independent verification: pending.
+### Job 1 — Python log pipeline: PASS
+
+- Job `213f3217-2f06-4b05-b06f-2c139a05d10d`, mode
+  `external:lunardepth`, created 09:25:53Z and completed 09:33:41Z
+  (**468 s** job elapsed; 500.6 s including gateway discovery/approval).
+  Approval request `3e91a95b-4bb0-41d8-97cd-86286a67f181`; 23 persisted job
+  events; zero repair attempts and no stuck flag.
+- The worker emitted real bash/write activity and produced `generator.py`,
+  `access.log`, `log_pipeline.py`, `test_log_pipeline.py`, four reports, and
+  `SUMMARY.md` under `/workspace/wi685_python_log`.
+- **Independent in-container rerun:** all 16 tests passed; text and JSON report
+  diffs were empty; regenerating the fixture produced a byte-identical file.
+  The copied fixture's SHA-256 is
+  `d413598d8a486703af49121e5b5a30c07f2680c2c9a4afb47270c47388caf4b1`.
+- **Independent parser (not the worker's module):** 300 total, 298 parsed,
+  exactly two malformed rows at 61/131; `/index` 161, `/search` 91, `/cart` 46;
+  status-500 8; 39 errors at status >=400, rate 0.130872; nearest-rank p50=55
+  and p95=436. Every value matches the worker's report.
+
+Jobs 2 and 3: pending.
 
 ## Findings and hand-off
 
