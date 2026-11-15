@@ -106,7 +106,13 @@ sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
   build-tenant lunardepthtester --with-lunardepth --with-toolchains
 ```
 
-Build result pending.
+The daemon release build finished in **9m18s** and the XMPP bridge release
+build finished in **7m49s**. The LunarDepth image phase is in progress: its
+pinned source checkout, pnpm 11.7.0 frozen install, runtime-closure check (4
+agent presets / 182 workspace packages), native host build, and TypeScript
+build have run. pnpm printed its expected unsupported-platform, cyclic-workspace,
+and not-yet-built `bin.js` warnings; none had stopped the build at this point.
+Final image and out-of-band verification results remain pending.
 
 ## Runtime audits
 
