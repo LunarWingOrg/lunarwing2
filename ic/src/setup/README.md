@@ -715,7 +715,8 @@ that are needed before the DB is connected):
   non-default `libsql-remote-replica` cargo feature; WI#331)
 - `SECRETS_MASTER_KEY` (if env key source selected in Step 2)
 - `ONBOARD_COMPLETED` (always, "true")
-- Channel/sandbox vars: `CLAUDE_CODE_ENABLED`, `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init may precede DB)
+- Signal channel vars: `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init
+  may precede DB)
 
 LLM settings (`LLM_BACKEND`, `LLM_BASE_URL`, model, API keys) are persisted
 to the DB via `persist_settings()` and loaded by `Config::from_db_with_toml()`
