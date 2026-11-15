@@ -835,8 +835,10 @@ systemd host other commands remain available; on OpenRC only `--help` and
 operations fail closed rather than treating a missing contract as proof that
 units are safe.
 
-Repair a refused library or unsafe entry from a **separate trusted checkout**
-by running the refused mt-admin executable as root, for example:
+Repair a refused library or unsafe entry from a **separate trusted checkout**:
+a fresh root-owned clone at a verified commit, not the refused checkout or a
+copy of its health directory. Run the refused mt-admin executable as root, for
+example:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/checkout
@@ -847,8 +849,18 @@ stop OpenRC units. The next invocation loads the repaired contract. Every
 install refuses to copy from a source that resolves to the installed library
 while that library fails the safety check, so the refused bytes cannot be
 published back into the root trust boundary. Do not hand-copy an operator
-checkout over the library. Normal refreshes when the contract is available
-remain `upgrade-tenant`, `add-tenant`, or `ic/scripts/enable-health-fleet.sh`.
+checkout over the library.
+
+A refusal that names a **parent directory** needs a different repair because
+reinstalling stages beneath that same parent and cannot make the parent safe.
+Run the exact non-recursive command printed by the refusal on the named parent
+only (`chown root:root -- <parent> && chmod go-w -- <parent>`), or move the
+health library elsewhere. If the parent is a symbolic link, replace it with a
+real directory or move the library instead. Never apply `chown` recursively to
+the refused library tree.
+
+Normal refreshes when the contract is available remain `upgrade-tenant`,
+`add-tenant`, or `ic/scripts/enable-health-fleet.sh`.
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
