@@ -74,6 +74,14 @@ migration must not drop `job_events`; current PostgreSQL workers persist
 streaming events there, and fresh libSQL databases create the same table
 directly under its current name.
 
+## Sandbox job modes (WI#693)
+
+`agent_jobs.job_mode` deliberately remains TEXT rather than gaining a
+single-value or fixed-enum constraint. Live writers store `worker`, `harness`,
+and `external:<worker-name>`; external worker names are dynamic, and both the
+web job filters and cron-retention queries consume these distinct values. The
+`worker` default only describes ordinary sandbox jobs, not the full domain.
+
 ## Cron tick retention primitives (WI#370, v2.1.6.0)
 
 `SandboxStore` carries two methods backing the cron supervisor's per-mission
