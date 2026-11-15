@@ -362,6 +362,7 @@ def main() -> int:
     parser.add_argument("--accept", type=pathlib.Path)
     parser.add_argument("--draft-accept", type=pathlib.Path)
     parser.add_argument("--pending", type=pathlib.Path)
+    parser.add_argument("--dispositions", type=pathlib.Path)
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument("--cache", type=pathlib.Path, help="override the scan cache path")
     cache.add_argument("--no-cache", action="store_true", help="force a fresh scan without caching")
@@ -374,7 +375,7 @@ def main() -> int:
     repo = args.repo.resolve()
     output = args.output or repo / ".gitlab/gitleaks-history-ignore"
     pending_path = args.pending or repo / ".gitlab/gitleaks-history-pending"
-    dispositions_path = repo / ".gitlab/gitleaks-history-dispositions.md"
+    dispositions_path = args.dispositions or repo / ".gitlab/gitleaks-history-dispositions.md"
     validate_mirror(repo)
     cache_path = None
     if not args.no_cache:
