@@ -1849,17 +1849,18 @@ upgrade_tenant_locked() {
 
   say "fetching tags + refs from origin (as $name) ..."
   "${tgit[@]}" fetch --tags --prune origin || die "git fetch failed"
-  "${tgit[@]}" rev-parse --verify --quiet "${target}^{commit}" >/dev/null 2>&1 \
-    || "${tgit[@]}" rev-parse --verify --quiet "origin/${target}^{commit}" >/dev/null 2>&1 \
-    || die "target ref '$target' not found after fetch (need a branch, tag, or commit reachable from origin)"
 
-  local checkout_ref target_commit
+  local checkout_ref target_commit operator_release_ref
+  _resolve_operator_upgrade_target "$target" \
+    || die "target ref '$target' not found in operator checkout $LUNARWING_ROOT (tenant was not stopped)"
+  target_commit="$OPERATOR_UPGRADE_TARGET_COMMIT"
+  operator_release_ref="$OPERATOR_UPGRADE_TARGET_REF"
+  "${tgit[@]}" cat-file -e "${target_commit}^{commit}" 2>/dev/null \
+    || die "operator-selected commit $target_commit is missing from tenant clone $lw_root after fetch (tenant was not stopped)"
   checkout_ref="$target"
   if "${tgit[@]}" rev-parse --verify --quiet "refs/remotes/origin/$target" >/dev/null 2>&1; then
     checkout_ref="origin/$target"
   fi
-  target_commit="$("${tgit[@]}" rev-parse --verify "${checkout_ref}^{commit}")" \
-    || die "failed to resolve target ref '$target'"
 
   local build_lock_fd migrations_type previous_commit
   say "acquiring build lock for checkout ..."
