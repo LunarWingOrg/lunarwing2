@@ -352,14 +352,15 @@ its ports are deallocated, and with `--purge` its database is reset. Resolve the
 reported keeper problem or remove the unexpected attachment, then rerun
 `remove-tenant` to finish.
 
-**Removal after the tenant account is gone (WI#688).** A rootless tenant's
-containers, egress network and keeper live in its own store, its egress chains
-live in its rootless network namespace, and all of them run as its uid or its
-subordinate uids, so without the account mt-admin cannot reach any of them.
-`add-tenant`, and every `remove-tenant` while the account exists, record the uid
-and the subordinate uid ranges in root-owned
+**Removal after the tenant account is gone (WI#688, WI#699).** A rootless
+tenant's containers, egress network and keeper live in its own store, its
+egress chains live in its rootless network namespace, and all of them run as
+its uid or its subordinate uids, so without the account mt-admin cannot reach
+any of them. `add-tenant`, `start-tenant`, `upgrade-tenant`, and every
+`remove-tenant` while the account exists record or refresh the uid and the
+subordinate uid ranges in root-owned
 `/var/lib/lunarwing/tenant-identity/<tenant>` (mode 0644); a finished removal
-deletes it.
+deletes it. Start and upgrade therefore backfill tenants added before WI#688.
 
 "Gone" means that the account is absent from `/etc/passwd` (useradd's local
 files database, which mt-admin creates tenants in) and that the full `getent
@@ -369,24 +370,53 @@ alone is not enough. A tenant still listed in `/etc/passwd` whose lookup fails,
 an unreadable `/etc/passwd`, or a NIS-compat `+`/`-` entry there refuses the
 removal.
 
-Before every removal without the account, stop what can still run as the former
-uid: a lingering systemd `user@<uid>.service` manager (`systemctl stop
-user@<uid>.service`) and the tenant's OpenRC `supervise-daemon` units. Then
-`remove-tenant` reads `/proc/*/status` and `/proc/*/task/*/status` first and
-refuses, before it changes anything, while any process or thread has the
-recorded uid or a subordinate uid as its real, effective, saved or filesystem
-uid. It scans twice, with fresh listings each time, and both passes must be
-clean; a process chain that forks faster than one pass can still slip through.
-That is a known limit, which only a check that the tenant's cgroups are empty
-would close. The removal also refuses when the record is missing (the tenant
-was already removed, or was added before this change), a symbolic link,
-malformed (CRLF, more than one `UID=` line, an invalid range) or without a
-subordinate range, when the uid now belongs to another account, when the status
-of a live task cannot be read, or when the process table cannot be read at all.
+Before changing anything, `remove-tenant` without the account proves the old
+identity idle. It reads `/proc/*/status` and `/proc/*/task/*/status` twice,
+with fresh listings, and refuses while any process or thread has the recorded
+uid or a subordinate uid as its real, effective, saved or filesystem uid. PID 1
+must also be visible as a supported host init with the same root directory as
+mt-admin, so mt-admin's own readable `/proc` entry cannot satisfy the proof
+when the process table is namespace- or LSM-filtered.
 
-Once the old identity is proven idle, every lane stop, the container and
-IPC-volume removal, the PostgreSQL stop and the `--purge` data reset skip the
-unreachable store and say so. The egress teardown proves the identity idle
+The process scans are paired with cgroup v2 checks, which close the race where
+a chain keeps forking and exiting between passes for processes inside the
+managed trees. On systemd the `user-<uid>.slice` root's `cgroup.events` must
+report `populated 0`. On OpenRC the same root-level check covers the delegated
+`lunarwing-<tenant>` subtree and every matching `openrc.<service>` tree,
+including daemon, sidecar, worker, task-supervisor and legacy Nanocode units.
+The kernel's `populated` bit covers every descendant in one read, so a process
+moving between child cgroups cannot hide between separate `cgroup.procs` reads.
+OpenRC services do not live in the delegated login/build subtree, so checking
+that subtree alone is not sufficient. A process of a former uid outside these
+named trees (for example, one left in root's cgroup by `sudo -u`) is still
+covered only by the two process-table passes; the fork/exit race there remains
+a known limit. A populated or unreadable cgroup refuses the removal and names
+the unit to stop; stop a lingering systemd manager with `systemctl stop
+user@<uid>.service` and the named OpenRC service before rerunning. An
+unreadable cgroup v2 mount, or a missing, unreadable or invalid `cgroup.events`
+in an existing managed tree, also refuses rather than restoring that race.
+
+The recorded ranges are cross-checked against the current `/etc/subuid`.
+Entries still naming the tenant or its former uid must match the record, and
+another account's entry may not overlap a recorded range. The refusal says
+whether the current-side or record-side range differs. No entry for the deleted
+account is normal. The removal also refuses when the record is missing (the
+tenant was already removed, or was added before WI#688), a symbolic link,
+malformed (CRLF, more than one `UID=` line, an invalid range) or without a
+subordinate range, when the uid now belongs to another account, or when the
+status of a live task cannot be read. If a new account owns the former uid or
+any part of its range, stop and remove that account and its workloads before
+retrying. For a LunarWing tenant, preserve any needed data and run
+`remove-tenant <new-owner> --purge`; this clears the conflicting account and
+subordinate-range ownership so the former tenant's proof can run without
+guessing which processes belong to which identity.
+
+Once the old identity is proven idle, every lane stop, the init-level unit stop
+rosters, legacy Nanocode supervision, container and IPC-volume removal, the
+PostgreSQL stop and the `--purge` data reset skip their account-dependent
+steps and say so. Standalone `stop-pg` and `stop-tenant` use the same proof:
+if it fails they exit non-zero because the stop state is unknown,
+not successfully report a skip. The egress teardown proves the identity idle
 again and deletes the rendered egress state. On rootless Podman it flushes
 nothing: the chains lived only in the tenant's rootless network namespace,
 which needs the account to enter and in which no process is left (another
