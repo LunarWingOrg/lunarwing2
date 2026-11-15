@@ -704,12 +704,17 @@ add_tenant() {
   # image with the same input label needs no build or redistribution. The build
   # context comes from the operator checkout, never the tenant-writable tree.
   # Build/distribution failure remains non-fatal for base provisioning.
-  local sandbox_image_ok="operator-managed" sandbox_image
+  local sandbox_image_ok="operator-managed" sandbox_image sandbox_image_rc=0
   sandbox_image="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" SANDBOX_IMAGE)"
   if tenant_uses_managed_sandbox_image "$name"; then
     sandbox_image_ok="ready"
     ( ensure_sandbox_image_current_from_tenant "$name" "$SANDBOX_IMAGE_POLICY" ) \
-      || sandbox_image_ok="needs recovery"
+      || sandbox_image_rc=$?
+    case "$sandbox_image_rc" in
+      0) ;;
+      2) sandbox_image_ok="not rebuilt: tenant is behind the operator checkout" ;;
+      *) sandbox_image_ok="needs recovery" ;;
+    esac
     if ! ensure_tenant_sandbox_image "$name"; then
       sandbox_image_ok="needs recovery"
       say "WARNING: sandbox image $SANDBOX_IMAGE_TAG is unavailable for '$name'. Recovery: sudo $0 build-sandbox-image $name; sudo $0 start-tenant $name" >&2
