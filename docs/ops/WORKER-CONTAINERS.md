@@ -1569,7 +1569,7 @@ For every LunarDepth version or security-input bump:
 4. **The profile template and `LUNARDEPTH_REF` move together.** Regenerate it with the pinned `initProfile`; inspect `PROFILE_SCHEMA_VERSION`, every profile writer/migration path, and the before-dump/after-dump/after-readiness hash invariant. Replace `unversioned` only when that exact pin exports the schema.
 5. Re-prove full built-in sandbox enforcement, `/tmp` and workspace writes, a denied escape, fresh-session policy events, lower-layer regeneration across two restarts, and no hostile `.env`, module, or profile-manifest persistence. Do not replace a failed real entrypoint smoke with source-only tests.
 6. Reconcile Node, pnpm, Debian snapshot, runtime/toolchain, lane input, parser, image-config, and deployment inventories. Keep the two production worker packages resolvable from the materialized closure.
-7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorMoon inference before claiming live acceptance.
+7. Require the protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan on the exact head before immutable promotion. Exercise mt-admin candidate promotion and image-ID rollback, both init systems, real daemon dispatch, and one tenant-approved TensorZero inference before claiming live acceptance; repeat with TensorMoon when an endpoint is available.
 
 ## OpenCode 2 Worker (opencode2)
 
