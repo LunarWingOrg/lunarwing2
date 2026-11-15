@@ -14,7 +14,8 @@ UNIT="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.service"
 CONFD="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.confd"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/health-metrics-unit-test.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+listener_pid=""
+trap 'if [[ -n "$listener_pid" ]]; then kill "$listener_pid" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
 pass=0
 fail=0
@@ -139,6 +140,62 @@ if bash "$RECONCILE_SCRIPT"; then
     fi
 else
     bad "OpenRC confd reconciler runs" "fixture returned non-zero"
+fi
+
+# Acceptance check for WI#700: with no inherited base-dir or output override,
+# the confd alone must send the listener to the exporter's report (200, not
+# the permanent 503 produced by root's default HOME fallback).
+METRICS_BIN="${LUNARWING_HEALTH_METRICS_BIN:-$ROOT_DIR/ic/target/release/lunarwing-health-metrics}"
+if [[ ! -x "$METRICS_BIN" ]]; then
+    ok "SKIP: live confd scrape (set LUNARWING_HEALTH_METRICS_BIN to the listener binary)"
+elif ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    ok "SKIP: live confd scrape (curl and python3 are required)"
+else
+    live_base="$TMP/live-base"
+    live_confd="$TMP/live.confd"
+    live_output="$TMP/live.metrics"
+    live_log="$TMP/live.log"
+    mkdir -p "$live_base/workspace/reports/health"
+    printf 'lunarwing_health_overall_status 0\n' >"$live_base/workspace/reports/health/metrics.prom"
+    live_port="$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+    sed -e "s/^export HEALTH_METRICS_LISTEN=.*/export HEALTH_METRICS_LISTEN=\"127.0.0.1:${live_port}\"/" \
+        -e "s|^export LUNARWING_BASE_DIR=.*|export LUNARWING_BASE_DIR=\"${live_base}\"|" \
+        "$CONFD" >"$live_confd"
+    env -i HOME=/root PATH="$PATH" bash -c '
+        set -a
+        . "$1"
+        set +a
+        exec "$2"
+    ' _ "$live_confd" "$METRICS_BIN" >"$live_log" 2>&1 &
+    listener_pid=$!
+    live_code=""
+    for _ in {1..50}; do
+        live_code="$(curl -sS --noproxy '*' --max-time 1 -o "$live_output" -w '%{http_code}' \
+            "http://127.0.0.1:${live_port}/metrics" 2>/dev/null || true)"
+        [[ "$live_code" == 200 ]] && break
+        kill -0 "$listener_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ "$live_code" == 200 ]]; then
+        ok "confd-only listener serves the exporter report with HTTP 200"
+    else
+        bad "confd-only listener serves the exporter report with HTTP 200" \
+            "HTTP ${live_code:-unavailable}; $(tail -n 2 "$live_log" 2>/dev/null || true)"
+    fi
+    if grep -qF 'lunarwing_health_overall_status 0' "$live_output" 2>/dev/null; then
+        ok "confd-only listener returns the configured report body"
+    else
+        bad "confd-only listener returns the configured report body" "report marker was absent"
+    fi
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+    listener_pid=""
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
