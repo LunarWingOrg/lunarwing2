@@ -1234,6 +1234,13 @@ stop_tenant() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
   say "=== Stopping tenant: $name ==="
+  # Without the account there is no rootless store or user manager to stop.
+  # Do not turn that into a silent success while an old process may still run.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "tenant account '$name' is gone and no process of its former uids remains; nothing is left to stop"
+    return 0
+  fi
   stop_tenant_init_services "$name" || return 1
 
   stop_tenant_vision "$name"
