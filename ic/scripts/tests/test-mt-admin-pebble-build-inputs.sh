@@ -173,10 +173,10 @@ git -C "$operator_root" update-ref refs/remotes/origin/release "$tenant_head"
 printf 'operator edit\n' >>"$operator_root/pebble4lunarwing/Dockerfile"
 
 build_count() { wc -l <"$build_log"; }
-assert_build_refusal() {  # <label> <required diagnostic> [explicit release ref]
-  local label="$1" diagnostic="$2" release_ref="${3:-}" before
+assert_build_refusal() {  # <label> <required diagnostic> [explicit release ref] [selected commit]
+  local label="$1" diagnostic="$2" release_ref="${3:-}" selected_commit="${4:-}" before
   before="$(build_count)"
-  if (build_pebble_worker false false "$tenant_root" "$release_ref") >"$fixture_dir/$label.log" 2>&1; then
+  if (build_pebble_worker false false "$tenant_root" "$release_ref" "$selected_commit") >"$fixture_dir/$label.log" 2>&1; then
     fail "$label was accepted"
   fi
   grep -Fq -- "$diagnostic" "$fixture_dir/$label.log" \
@@ -195,20 +195,24 @@ expected_dockerfile="$(git -C "$tenant_root" show HEAD:pebble4lunarwing/Dockerfi
   || fail 'builder received working-tree bytes instead of the committed Dockerfile'
 [[ ! -e "$build_context" ]] || fail "archived build context was not removed: $build_context"
 
-# Default provenance comes only from the operator, including detached HEADs.
+# Default provenance comes only from the operator. A detached operator HEAD does
+# not select an exact commit for build-tenant/build-all: older ancestors remain valid.
 git -C "$operator_root" checkout -q --detach main
 git -C "$tenant_root" checkout -q --detach "$tenant_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$tenant_head" ]] \
   || fail 'detached operator/tenant HEADs did not use the exact operator commit'
+git -C "$tenant_root" checkout -q --detach "$base_head"
+build_pebble_worker false false "$tenant_root"
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'a detached operator checkout rejected an older release ancestor'
 git -C "$operator_root" checkout -q main
 
-git -C "$tenant_root" checkout -q --detach "$base_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$base_head" ]] \
   || fail 'an ancestor on the operator release branch was not accepted'
 assert_build_refusal older-selected-revision \
-  'does not match selected operator revision' "$tenant_head"
+  'does not match selected operator revision' refs/heads/main "$tenant_head"
 git -C "$tenant_root" checkout -q --detach "$tenant_head"
 
 expected_lane=kimicode4lunarwing
