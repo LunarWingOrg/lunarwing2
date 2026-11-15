@@ -471,13 +471,22 @@ _resolve_operator_upgrade_target "$operator_branch"
 [[ "$OPERATOR_UPGRADE_TARGET_COMMIT" == "$selected_head" ]]
 for source_mode in upgrade add worker; do
   before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
+  expected_rc=1
+  expected_message='does not match selected operator revision'
+  pass_message="$source_mode refuses an older clean tenant HEAD before building"
   rm -f "$fixture/last-build-dockerfile"
   case "$source_mode" in
     upgrade)
-      ( build_candidate_sandbox_image tenant-a always "$OPERATOR_UPGRADE_TARGET_REF" "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
+      expected_rc=0
+      pass_message='real candidate builder forwards the selected commit to the sandbox image'
+      ( build_candidate_workers tenant-a false false false false false \
+          "$OPERATOR_UPGRADE_TARGET_REF" false always "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
     add)
+      expected_rc=2
+      expected_message='is behind the operator checkout'
+      pass_message='add-tenant helper distinguishes a behind tenant from a build failure'
       ( ensure_sandbox_image_current_from_tenant tenant-a always ) \
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
@@ -486,12 +495,12 @@ for source_mode in upgrade add worker; do
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
   esac
-  if [[ "$older_head_rc" -ne 0 && ! -e "$fixture/last-build-dockerfile" \
+  if [[ "$older_head_rc" -eq "$expected_rc" && ! -e "$fixture/last-build-dockerfile" \
       && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
-      && grep -Fq 'does not match selected operator revision' "$fixture/older-head.out"; then
-    ok "$source_mode refuses an older clean tenant HEAD before building"
+      && grep -Fq "$expected_message" "$fixture/older-head.out"; then
+    ok "$pass_message"
   else
-    bad "$source_mode accepted an older clean tenant HEAD: $(cat "$fixture/older-head.out")"
+    bad "$source_mode accepted or misclassified an older clean tenant HEAD (rc=$older_head_rc): $(cat "$fixture/older-head.out")"
   fi
 done
 
