@@ -556,7 +556,7 @@ impl SpawnerCache {
             .min(PROBE_MAX_RETRY_INTERVAL)
     }
 
-    fn isolation_mode(&self) -> &'static str {
+    async fn isolation_mode(&self) -> &'static str {
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(_) if self.retrying.load(std::sync::atomic::Ordering::Acquire) => {
@@ -586,7 +586,7 @@ pub async fn workload_spawner() -> WorkloadSpawner {
 /// `probing` reports the first in-flight probe; a transient fallback remains
 /// `process-group-retrying` both between and during later probes.
 pub async fn workload_isolation_mode() -> &'static str {
-    SPAWNER.isolation_mode()
+    SPAWNER.isolation_mode().await
 }
 
 async fn detect_spawner_with<F, Fut>(probe: F) -> Detection
