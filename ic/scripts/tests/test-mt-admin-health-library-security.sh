@@ -98,6 +98,21 @@ assert_launcher_guard_precedes_env() {
   assert_before "launcher checks the library before loading the environment" "$guard_line" "$env_line"
 }
 
+# ADO-5: only the launcher pins the inspection binaries. A value inherited
+# from root's environment must not survive mt-admin's load.
+check_inspection_binaries_not_inherited() {
+  local status=0
+  (
+    HEALTH_LIB_STAT=/bin/false
+    HEALTH_LIB_FIND=/bin/false
+    export HEALTH_LIB_STAT HEALTH_LIB_FIND
+    # shellcheck source=../lunarwing-mt-admin.sh
+    source "$MT_ADMIN"
+    [[ -z "${HEALTH_LIB_STAT:-}" && -z "${HEALTH_LIB_FIND:-}" ]]
+  ) || status=$?
+  assert_eq "mt-admin drops an inherited HEALTH_LIB_STAT and HEALTH_LIB_FIND" "0" "$status"
+}
+
 assert_root_owned_tree() {
   local label="$1" unsafe
   unsafe="$(find "$HEALTH_LIB_DIR" \( ! -user root -o ! -group root -o -perm /022 \) -print -quit)"
@@ -593,6 +608,7 @@ run_mock_tests() {
   assert_contains "launcher pins stat outside the checkout PATH" "$(<"$HEALTH_LAUNCHER")" 'HEALTH_LIB_STAT=/usr/bin/stat'
   assert_contains "launcher pins find outside the checkout PATH" "$(<"$HEALTH_LAUNCHER")" 'HEALTH_LIB_FIND=/usr/bin/find'
   assert_launcher_guard_precedes_env
+  check_inspection_binaries_not_inherited
   export HEALTH_TEST_MARKER="$TEST_ROOT/marker"
   prepare_launcher_for_test
   bash "$HEALTH_LAUNCHER"
