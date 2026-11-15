@@ -1312,15 +1312,20 @@ build and `never` suppresses it. Set the policy on an upgrade with
 For `add-tenant` and both upgrade paths, mt-admin verifies the tenant HEAD as
 the tenant user and pins the build to one exact commit. Standalone `add-tenant`
 selects the operator checkout's HEAD; the upgrade wrapper's internal
-reprovision instead inherits the same selected target as its candidates. Before
-checking out the tenant, both upgrade paths
-resolve the named target in the **operator checkout**, keep its release ref for
-the ancestry check, and pass the resulting full commit separately to every
-sandbox and worker candidate. The tenant clone must contain that object and is
-checked out at exactly that commit; its own interpretation of the target name
-does not select the build. A tenant HEAD that differs from the selected commit,
-including an older commit on the same release ref, is refused before a runtime
-build. The selected commit must also be on the named operator release ref.
+reprovision instead inherits the same selected target as its candidates. An
+`add-tenant` rerun whose clean tenant HEAD is an older ancestor of that selected
+commit does not rebuild the image and reports `not rebuilt: tenant is behind the
+operator checkout`, not `needs recovery`. Other mismatches remain refusals.
+Before checking out the tenant, both upgrade paths resolve the named target in
+the **operator checkout**, trying `refs/remotes/origin/<name>` before a local
+branch or tag of that name, keep its release ref for the ancestry check, and
+pass the resulting full commit separately to every sandbox and worker
+candidate. A stale local branch therefore cannot silently downgrade the
+installation. The tenant clone must contain that object and is checked out at
+exactly that commit; its own interpretation of the target name does not select
+the build. A tenant HEAD that differs from the selected commit, including an
+older commit on the same release ref, is refused before a runtime build. The
+selected commit must also be on the named operator release ref.
 mt-admin then uses `git archive` on the operator checkout to extract
 `ic/docker/` at that revision into a private root-owned mode-0700 directory.
 The digest and build read only that archive. A dirty, unknown, mismatched, or
@@ -3387,12 +3392,15 @@ exact-match rule.
 
 Both upgrade paths instead resolve the explicit `upgrade-tenant --target` in
 the operator checkout before tenant checkout. The target may name a local
-branch, tag, remote-tracking ref, or commit. Its operator release ref remains
-the ancestry anchor, while the resulting full commit is passed separately as
-the exact selected revision. The tenant is checked out at that commit and its
-HEAD must equal it; an older on-release ancestor or an off-release commit does
-not match and builds no image. Unknown commits and selected commits outside
-the named operator release ref are likewise refused before any image build.
+branch, tag, remote-tracking ref, or commit. For an unqualified name, the
+operator's `refs/remotes/origin/<name>` is tried before the local branch and
+tag, so a stale local branch cannot silently select an older installation. Its
+operator release ref remains the ancestry anchor, while the resulting full
+commit is passed separately as the exact selected revision. The tenant is
+checked out at that commit and its HEAD must equal it; an older on-release
+ancestor or an off-release commit does not match and builds no image. Unknown
+commits and selected commits outside the named operator release ref are
+likewise refused before any image build.
 
 Fetch and fast-forward the operator checkout's current local branch before a
 default tenant build. Fetching only `origin/*` does not update that default, so
