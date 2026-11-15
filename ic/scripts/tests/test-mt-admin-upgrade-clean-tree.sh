@@ -62,6 +62,9 @@ git -C "$fixture/target-work" push -q origin invalid-layout
 fixture_invalid_commit="$(git -C "$fixture/target-work" rev-parse HEAD)"
 git -C "$repo" push -q origin HEAD:refs/heads/moving
 git -C "$repo" push -q origin HEAD:refs/heads/checkout-failure
+LUNARWING_ROOT="$fixture/origin.git"
+TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
+mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
 
 printf 'build-regenerated lock\n' >"$lockfile"
 mkdir -p "$repo/env" "$repo/opencode-workspace" "$repo/state"
