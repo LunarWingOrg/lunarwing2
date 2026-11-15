@@ -33,6 +33,7 @@ git clone -q --bare "$fixture_repo" "$fixture/origin.git"
 git -C "$fixture_repo" remote add origin "$fixture/origin.git"
 git -C "$fixture_repo" push -q origin HEAD:refs/heads/moving
 target="$(git -C "$fixture_repo" rev-parse HEAD)"
+LUNARWING_ROOT="$fixture/origin.git"
 
 export BUILD_LOCK="$fixture/build.lock"
 events="$fixture/events"
