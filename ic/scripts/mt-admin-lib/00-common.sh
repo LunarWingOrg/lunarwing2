@@ -50,6 +50,7 @@ health_lib_validate_root_owned_directory() {
 health_lib_tree_require_safe() {
   local path="${1:-}" unsafe component
   local find_bin="${HEALTH_LIB_FIND:-find}"
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   if [[ "$path" == / ]] || ! health_lib_validate_root_owned_directory "$path"; then
     component="${HEALTH_LIB_UNSAFE_COMPONENT:-$path}"
     printf 'error: refusing health library component %s (library %s): path and parents must be root-owned, symlink-free, and not group/other-writable\n' \
