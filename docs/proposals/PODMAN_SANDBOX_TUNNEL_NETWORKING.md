@@ -61,7 +61,8 @@ and installs an `inet lunarwing_sandbox_egress` table with two base chains:
 - `output`, policy `drop`: loopback; the tunnel interfaces `wg0` and `wt0`;
   IPv6 neighbour discovery; DNS (`udp`/`tcp` 53) only to the provider-specific
   permitted resolver; an explicit drop of `169.254.0.0/16`; and, last, packets
-  carrying the provider's socket mark. Everything else is dropped. WireGuard's
+  carrying the provider's socket mark. Everything else is dropped. There is no
+  default DNS channel to the runtime resolvers (WI#724). WireGuard's
   optional `SANDBOX_TUNNEL_DNS` is deliberately **not** passed to the provider:
   it needs runtime DNS to resolve hostname endpoints before the tunnel exists.
   Instead, a non-secret mode-`0644` resolver file is atomically installed and
@@ -69,7 +70,8 @@ and installs an `inet lunarwing_sandbox_egress` table with two base chains:
   container`), and every direct uplink DNS rule is removed. The configured
   resolvers must be reachable through `wg0`. NetBird instead permits only its
   learned `wt0` listener and rejects `SANDBOX_TUNNEL_DNS` during validation,
-  before any runtime call.
+  before any runtime call; a public name resolves there only through an
+  operator nameserver group whose upstream is reachable through the overlay.
 
 The mark is how the tunnel's own control plane keeps using the uplink without
 an address allowlist that would have to track management, signal, relay and
@@ -78,9 +80,9 @@ opens (advanced routing, the Linux default with `NET_ADMIN`), and a WireGuard
 device stamps its encapsulated packets with its fwmark (the sidecar sets
 `0x4c57` on a device whose config left it off and keeps wg-quick's full-route
 mark otherwise). Setting a socket mark needs `NET_ADMIN`, which joiners do not
-have. Apart from the default DNS residual, a joined command can leave only
-through the tunnel interface: a split tunnel reaches its overlay CIDRs, a
-full-route tunnel reaches everything through the overlay. UID- and cgroup-based
+have. A joined command can leave only through the tunnel interface: a split
+tunnel reaches its overlay CIDRs, a full-route tunnel reaches everything through
+the overlay. UID- and cgroup-based
 allowances were rejected: under rootless podman the sidecar's root and the
 keep-id sandbox user map to the same host uid, and cgroup paths differ between
 cgroup managers and runtimes.

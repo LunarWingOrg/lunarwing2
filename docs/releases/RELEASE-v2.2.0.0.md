@@ -6,6 +6,26 @@
 
 ## Compatibility
 
+### Sandbox tunnel mode: no uplink DNS channel (WI#724)
+
+`SANDBOX_NETWORK=tunnel` no longer has a DNS channel to the runtime resolvers.
+NetBird (the default provider) allows DNS only to its own `wt0` listener, which
+joined runs reach over loopback; the sidecar's firewall derives that address
+from `netbird status --ipv4` and never from `/etc/resolv.conf`.
+
+**Operator action before upgrading.** A tenant already on
+`SANDBOX_NETWORK=tunnel` with NetBird resolves peer names only after this
+upgrade unless a NetBird nameserver group covers the names it needs. Public
+names such as package mirrors stop resolving at the first start after the
+upgrade, because the runtime-resolver allowance is gone. Configure a nameserver
+group (match domain or primary) whose upstream is reachable through the overlay
+before upgrading, or accept peer-only resolution.
+
+The same release adds a NetBird bump checklist to
+`docs/guides/SANDBOX_TUNNEL_NETWORKING.md`. The closure depends on NetBird not
+marking its resolver sockets: a version that does reopens the path through which
+the client falls back to the backup file's nameservers.
+
 ### SSH private keys and host keys: Ed25519 or ECDSA (WI#368, WI#616)
 
 LunarWing's SSH harness accepts only Ed25519 and ECDSA private keys. RSA key

@@ -2,10 +2,13 @@
 
 `SANDBOX_NETWORK=tunnel` lets generic shell-sandbox commands make **outbound**
 connections through a NetBird or WireGuard sidecar. It does not expose the web
-gateway, open a host port, or let overlay peers connect into the sandbox. Apart
-from the default DNS allowance described below, it does not let a sandboxed
-command reach the host, LAN, cloud metadata service, or public internet through
-the sidecar's own uplink. Design and alternatives:
+gateway, open a host port, or let overlay peers connect into the sandbox. It
+does not start with a DNS channel to the runtime resolvers: NetBird sandboxes
+resolve names only through NetBird's own listener and whatever upstreams are
+reachable through the overlay, and WireGuard has no uplink DNS unless the
+operator sets `SANDBOX_TUNNEL_DNS` to an overlay resolver. Otherwise a sandboxed
+command cannot reach the host, LAN, cloud metadata service, or public internet
+through the sidecar's own uplink. Design and alternatives:
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
 WI#537 selects `proxy-enforced` as the Linux default; other platforms default
@@ -332,6 +335,42 @@ count them as a second layer behind LunarWing's input chain — there is none.
 Do not reuse the gateway-exposure NetBird peer or setup key from
 `docs/guides/NETBIRD_TUNNEL.md`; that is a separate, inbound gateway feature.
 
+**Operator fact.** Without a NetBird nameserver group whose upstream is
+reachable through the overlay, a NetBird sandbox resolves peer names only:
+`example.com`, package mirrors, and every other public name fail. A tenant that
+already runs `SANDBOX_NETWORK=tunnel` with NetBird loses public-name resolution
+at its first start after upgrading to this release, because the runtime-resolver
+allowance it used until then is gone. Configure a nameserver group (match
+domain or primary) with an overlay-reachable upstream before upgrading, or
+accept peer-only resolution.
+
+### NetBird bump checklist
+
+Before moving the pinned NetBird image, confirm each of these against the new
+version; the DNS boundary rests on them:
+
+- **The client writes only its own listener into `/etc/resolv.conf` when a
+  backup file is present.** NetBird 0.82.0 does this with or without a
+  nameserver group (`client/internal/dns/file_unix.go`). If a new version
+  appends upstreams instead, the startup check fails closed on every start and
+  the sidecar never becomes healthy rather than allowing them.
+- **The listener binds the `wt0` address on port 53** and `netbird status
+  --ipv4` reports that address (`service_listener.go`). LunarWing derives the
+  whole allowance from that answer.
+- **Resolver sockets are not marked.** NetBird registers the backup file's
+  nameservers as its last-resort upstream. Those queries are dropped only
+  because the client opens them unmarked, so the sidecar's `output` chain has no
+  accept for them. A version that marks resolver sockets reopens an uplink DNS
+  channel; check `client/internal/dns/upstream_general.go` for a socket mark or
+  `SO_MARK` on the upstream client before pinning.
+- **Advanced routing stays on.** The control-plane accept depends on the
+  `0x1bd00` socket mark. `NB_USE_LEGACY_ROUTING`, `NB_SKIP_SOCKET_MARK`, and
+  `NB_DISABLE_CUSTOM_ROUTING` must stay unset.
+
+Run the gated NetBird lane after any bump. It asks the listener for a public name
+in the runs without `LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS` and requires that
+lookup not to resolve, with the uplink port-53 capture at zero.
+
 ## WireGuard
 
 ```env
@@ -592,6 +631,16 @@ required.
    domain; the lane then requires `example.com` to resolve to that address too.
    A match-only group omits the public-address variable. These are optional live
    fixtures, not operator configuration through `SANDBOX_TUNNEL_DNS`.
+
+   Without `LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS` the lane also runs the ADN-1
+   negative probe: it asks the listener for `example.com` and requires that the
+   lookup not resolve (`LUNARWING-NETBIRD-PUBLIC-DNS-LEAK` must be absent). This
+   covers the one path where an old uplink DNS channel could survive — NetBird's
+   last-resort upstream taken from the backup file, which is dropped only
+   because the client opens that socket unmarked. Pair the probe with a
+   host-side capture of the uplink port 53 in the same run; it must stay at
+   zero packets. Copy the capture count and the lane summary into the work
+   item.
 
    The lane never runs without all three gates and provider settings; a skip is
    not a live-validation pass. WI#600's 2026-11-11 local run passed the main

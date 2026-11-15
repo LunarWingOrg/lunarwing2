@@ -10,10 +10,13 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it and, by default, DNS to the resolvers the
-//!   runtime gave the sidecar. For WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to
-//!   resolvers reachable through the tunnel and removes the uplink allowance;
-//!   NetBird rejects that setting during configuration validation (WI#603).
+//!   mark the provider sets on it. There is no uplink DNS channel (WI#724):
+//!   NetBird's DNS allowance is its own `wt0` listener, which joined runs and
+//!   the sidecar reach over `lo`; public names resolve only through an operator
+//!   nameserver group whose upstream is reachable through the overlay. For
+//!   WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to resolvers reachable through
+//!   the tunnel and, without it, no uplink DNS is allowed either; NetBird
+//!   rejects that setting during configuration validation (WI#603).
 //!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
@@ -708,8 +711,11 @@ fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
 }
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
-/// own control traffic (by socket mark) and, unless custom tunnel DNS is set,
-/// DNS to the runtime-assigned resolvers. Everything else uses the tunnel or drops.
+/// own control traffic (by socket mark) and the DNS listener the accepted runs
+/// may query. For NetBird that is only its `wt0` listener, reached over `lo`;
+/// for WireGuard it is the configured overlay resolvers, or none without
+/// `SANDBOX_TUNNEL_DNS`. There is no runtime-resolver allowance (WI#724).
+/// Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     pub tunnel_mark: u32,

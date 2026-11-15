@@ -1760,6 +1760,19 @@ fn netbird_dns_probe(peer_fqdn: &str, peer_ip: IpAddr) -> Result<String, String>
             "nslookup -type=A example.com 2>&1 | grep -q 'Address: {expected}' \
              && echo LUNARWING-NETBIRD-PUBLIC-DNS-OK; "
         ));
+    } else {
+        // WI#724 ADN-1: without a nameserver group that answers public names,
+        // a lookup for one asked of the listener must not resolve. NetBird
+        // registers the backup file's nameservers as its last-resort upstream,
+        // so this is the one path where the old uplink DNS channel could
+        // survive; the caller pairs the marker's absence with a capture check.
+        // The answer line is the only `Address:` without a `#53` port suffix,
+        // so the server header cannot satisfy this match.
+        probe.push_str(
+            "nslookup -type=A example.com 2>&1 \
+             | grep -Eq '^Address:[[:space:]]*[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' \
+             && echo LUNARWING-NETBIRD-PUBLIC-DNS-LEAK; ",
+        );
     }
     Ok(probe)
 }
@@ -1906,6 +1919,16 @@ async fn assert_netbird_joined_run(
     }
     if std::env::var("LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS").is_ok() {
         assert!(output.stdout.contains("LUNARWING-NETBIRD-PUBLIC-DNS-OK"));
+    } else {
+        // WI#724 ADN-1: no nameserver group answers public names, so asking
+        // the listener for one must not resolve. The host-side port-53 capture
+        // for this run must also stay at zero (see the guide's bump checklist).
+        assert!(
+            !output.stdout.contains("LUNARWING-NETBIRD-PUBLIC-DNS-LEAK"),
+            "a public name resolved without a nameserver group: {}{}",
+            output.stdout,
+            output.stderr
+        );
     }
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-UPLINK-OPEN"));
     assert!(!output.stdout.contains("LUNARWING-NETBIRD-METADATA-OPEN"));
