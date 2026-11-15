@@ -36,8 +36,10 @@ The exercise uses the real mt-admin and daemon paths:
   small 16- and 64-token caps were consumed before visible content and ended
   with `finish_reason=length`; an adequately sized 512-token cap returned the
   exact marker `WI685_ROUTE_OK`, `finish_reason=stop`, and usage of 47
-  completion tokens. This proves the baseline gateway/model path before the
-  LunarDepth lane enters it.
+  completion tokens. A separate streaming request reconstructed
+  `WI685_STREAM_OK`, ended with `finish_reason=stop`, and received `[DONE]`.
+  This proves the baseline gateway/model path in both response modes before
+  the LunarDepth lane enters it.
 - The lane therefore uses its explicit
   `--lunardepth-allow-unauthenticated-gateway` mode, not a copied sibling key.
   The private-network cleartext route also requires the separate
