@@ -455,22 +455,26 @@ else
 fi
 unset LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT
 
-# WI#642: a clean older tenant HEAD is not the revision mt-admin selected.
-# Both tenant-driven sandbox paths and the shared worker provenance helper must
-# refuse it before a runtime build, rather than accepting any release ancestor.
+# WI#708: the operator checkout resolves the target separately from the tenant.
+# A clean older tenant HEAD is not the selected revision, and none of the
+# tenant-driven sandbox paths or the shared worker helper may build it.
 printf '# newer operator-selected revision\n' \
   >>"$operator_repo/ic/docker/sandbox.Dockerfile"
 git -C "$operator_repo" add ic/docker/sandbox.Dockerfile
 git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
   commit -qm 'Newer operator revision'
 selected_head="$(git -C "$operator_repo" rev-parse HEAD)"
+operator_release_ref="$(git -C "$operator_repo" symbolic-ref HEAD)"
+operator_branch="${operator_release_ref#refs/heads/}"
 [[ "$(git -C "$tenant_repo" rev-parse HEAD)" != "$selected_head" ]]
+_resolve_operator_upgrade_target "$operator_branch"
+[[ "$OPERATOR_UPGRADE_TARGET_COMMIT" == "$selected_head" ]]
 for source_mode in upgrade add worker; do
   before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
   rm -f "$fixture/last-build-dockerfile"
   case "$source_mode" in
     upgrade)
-      ( build_candidate_sandbox_image tenant-a always "$selected_head" ) \
+      ( build_candidate_sandbox_image tenant-a always "$OPERATOR_UPGRADE_TARGET_REF" "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
     add)
@@ -478,7 +482,7 @@ for source_mode in upgrade add worker; do
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
     worker)
-      ( _prepare_worker_build_source "$tenant_repo" ic/docker "$selected_head" ) \
+      ( _prepare_worker_build_source "$tenant_repo" ic/docker "$OPERATOR_UPGRADE_TARGET_REF" sandbox.Dockerfile "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
         >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
       ;;
   esac
@@ -490,6 +494,32 @@ for source_mode in upgrade add worker; do
     bad "$source_mode accepted an older clean tenant HEAD: $(cat "$fixture/older-head.out")"
   fi
 done
+
+# A tenant-owned target name may resolve to an operator object that is not on
+# the operator's release ref. Resolving the same name on the operator side must
+# select the release commit instead; the mismatched tenant HEAD builds nothing.
+git -C "$operator_repo" checkout -q -b off-release
+printf '# off-release tenant choice\n' >>"$operator_repo/ic/docker/sandbox.Dockerfile"
+git -C "$operator_repo" add ic/docker/sandbox.Dockerfile
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Off-release commit'
+off_release_head="$(git -C "$operator_repo" rev-parse HEAD)"
+git -C "$operator_repo" checkout -q "$operator_branch"
+git -C "$tenant_repo" fetch -q "$operator_repo" off-release
+git -C "$tenant_repo" checkout -q -B "$operator_branch" "$off_release_head"
+_resolve_operator_upgrade_target "$operator_branch"
+[[ "$OPERATOR_UPGRADE_TARGET_COMMIT" == "$selected_head" ]]
+before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
+rm -f "$fixture/last-build-dockerfile"
+( build_candidate_sandbox_image tenant-a always "$OPERATOR_UPGRADE_TARGET_REF" "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
+  >"$fixture/off-release-head.out" 2>&1 && off_release_rc=0 || off_release_rc=$?
+if [[ "$off_release_rc" -ne 0 && ! -e "$fixture/last-build-dockerfile" \
+    && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
+    && grep -Fq 'does not match selected operator revision' "$fixture/off-release-head.out"; then
+  ok 'operator target resolution never builds the tenant off-release commit'
+else
+  bad "tenant off-release commit reached the build: $(cat "$fixture/off-release-head.out")"
+fi
 
 # Exercise the actual start_tenant recovery path without touching systemd,
 # OpenRC, a tenant account, or a container store. A failed distribution warns
