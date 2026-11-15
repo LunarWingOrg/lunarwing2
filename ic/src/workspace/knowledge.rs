@@ -781,10 +781,7 @@ mod tests {
         assert!(meta.needs_verification(now, None, Some("other")));
         // A missing note commit does not mismatch the caller's commit.
         meta.source_commit = None;
-        assert!(
-            meta.stale_reasons(now, None, Some("abc123"))
-                .is_empty()
-        );
+        assert!(meta.stale_reasons(now, None, Some("abc123")).is_empty());
         // Age triggers (studied_at far in the past).
         meta.studied_at = Some(now - chrono::Duration::days(90));
         assert!(meta.needs_verification(now, Some(30), None));
