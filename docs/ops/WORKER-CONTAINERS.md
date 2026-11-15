@@ -1305,8 +1305,10 @@ build and `never` suppresses it. Set the policy on an upgrade with
 `LUNARWING_MT_SANDBOX_IMAGE_POLICY`.
 
 For `add-tenant` and both upgrade paths, mt-admin verifies the tenant HEAD as
-the tenant user and pins the build to one exact commit. `add-tenant` selects the
-operator checkout's HEAD. Before checking out the tenant, both upgrade paths
+the tenant user and pins the build to one exact commit. Standalone `add-tenant`
+selects the operator checkout's HEAD; the upgrade wrapper's internal
+reprovision instead inherits the same selected target as its candidates. Before
+checking out the tenant, both upgrade paths
 resolve the named target in the **operator checkout**, keep its release ref for
 the ancestry check, and pass the resulting full commit separately to every
 sandbox and worker candidate. The tenant clone must contain that object and is
