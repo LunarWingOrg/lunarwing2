@@ -13,11 +13,13 @@ install_knowledge_sync_admin_snapshot() {
     || die "knowledge sync admin root must be an absolute safe path"
   install -d -m 0755 -- "$releases"
   release="$releases/$(date -u '+%Y%m%d%H%M%S')-$$"
-  install -d -m 0755 -- "$release/mt-admin-lib"
+  install -d -m 0755 -- "$release/mt-admin-lib" "$release/ic-infrastructure-health-check"
   install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh"
   for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
     install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")"
   done
+  install -m 0755 -- "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh" \
+    "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
   current_tmp="$root/.current.$$"
   ln -s -- "$release" "$current_tmp"
   mv -fT -- "$current_tmp" "$root/current"
