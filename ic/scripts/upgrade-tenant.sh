@@ -476,8 +476,13 @@ banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
 XMPP_JID="$(grep -m1 '^XMPP_JID=' "$ENVF" 2>/dev/null | cut -d= -f2- || true)"
 add_args=(add-tenant "$TENANT" --no-health)
 [[ -n "$XMPP_JID" ]] && add_args+=(--xmpp-jid "$XMPP_JID")
+if [[ -n "${TARGET_COMMIT:-}" ]]; then
+  export LUNARWING_MT_UPGRADE_RELEASE_REF="$TARGET_REF"
+  export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$TARGET_COMMIT"
+fi
 run mt "${add_args[@]}"      # rootless: ensure_rootless_prereqs + empty PG quadlet + render; daemon NOT started
                              # keep-rootful: reuses existing root PG; back-fills HTTP_HOST/secret
+unset LUNARWING_MT_UPGRADE_RELEASE_REF LUNARWING_MT_UPGRADE_SELECTED_COMMIT
 
 # add-tenant rewrote the env files and reset operator-customizable XMPP/LLM config
 # to defaults. Re-apply those specific keys from the step-1 backup (both modes).
