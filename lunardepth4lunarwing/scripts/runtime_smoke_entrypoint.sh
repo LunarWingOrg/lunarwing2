@@ -52,7 +52,7 @@ setpriv --reuid=10105 --regid=10005 --clear-groups --ambient-caps=-all --inh-cap
   HOME=/home/lunardepth-bridge LUNARWING_CONTAINER_ROLE=split-bridge WORKSPACE_ROOT=/workspace \
   AGENT_AUTH_TOKEN=lunardepth-build-smoke-hub-token-0123456789abcdef \
   WS_BIND_HOST=0.0.0.0 WS_PORT=9090 HEALTH_PORT=8443 \
-  LUNARDEPTH_IMAGE_REVISION=da06c33b2091546dc38c61b95452ce27a4ce32d5 \
+  LUNARDEPTH_IMAGE_REVISION=0472d115e5297093f249c222639431ba8ff0bb78 \
   /app/entrypoint.sh &
 BRIDGE_PID=$!
 
