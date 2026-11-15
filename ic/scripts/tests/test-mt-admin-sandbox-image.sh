@@ -421,6 +421,30 @@ else
   bad "Docker candidate path used the wrong store or network: ${CALLS[*]}"
 fi
 
+# WI#642: losing a candidate before promotion has the same non-fatal contract
+# as a failed build, and the retained-image note survives until the summary.
+register_image "$SANDBOX_IMAGE_TAG" docker-old outdated
+build_candidate_sandbox_image tenant-a always
+docker rmi "$candidate_ref" >/dev/null
+: >"$warnings"
+if promote_candidate_sandbox_image tenant-a \
+    && [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == docker-old ]] \
+    && [[ "$(cat "$(tenant_sandbox_image_status_file tenant-a)")" == previous ]] \
+    && grep -Fq 'candidate image' "$warnings"; then
+  ok 'missing sandbox candidate is non-fatal and records the retained image'
+else
+  bad "missing sandbox candidate aborted or changed latest: ${CALLS[*]}"
+fi
+: >"$warnings"
+report_retained_sandbox_image tenant-a
+if grep -Fq 'sandbox image:' "$warnings" \
+    && grep -Fq 'remains on the previous lunarwing-sandbox:latest' "$warnings" \
+    && [[ ! -e "$(tenant_sandbox_image_status_file tenant-a)" ]]; then
+  ok 'closing report names the previous sandbox image and clears its status'
+else
+  bad 'closing report omitted the retained sandbox image'
+fi
+
 # shellcheck disable=SC2034  # read by sandbox_debian_snapshot in sourced mt-admin
 LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT=20260101T000000Z
 if [[ "$(sandbox_image_input_digest "$candidate_source")" != "$current_digest" ]]; then
