@@ -406,7 +406,7 @@ malformed (CRLF, more than one `UID=` line, an invalid range) or without a
 subordinate range, when the uid now belongs to another account, or when the
 status of a live task cannot be read. If a new account owns the former uid or
 any part of its range, stop and remove that account and its workloads before
-retrying. For a LunarWing tenant, preserve any needed data and run
+retrying. For a LunarWing tenant, save that tenant's data first, then run
 `remove-tenant <new-owner> --purge`; this clears the conflicting account and
 subordinate-range ownership so the former tenant's proof can run without
 guessing which processes belong to which identity.
@@ -414,7 +414,9 @@ guessing which processes belong to which identity.
 Once the old identity is proven idle, every lane stop, the init-level unit stop
 rosters, legacy Nanocode supervision, container and IPC-volume removal, the
 PostgreSQL stop and the `--purge` data reset skip their account-dependent
-steps and say so. Standalone `stop-pg` and `stop-tenant` use the same proof:
+steps and say so. The unsafe installed-proxy-unit refusal runs before the
+OpenRC account-gone skip: its repair (`render-units --all-proxies`) needs no
+tenant account, and skipping the roster must never hide the repair hint. Standalone `stop-pg` and `stop-tenant` use the same proof:
 if it fails they exit non-zero because the stop state is unknown,
 not successfully report a skip. The egress teardown proves the identity idle
 again and deletes the rendered egress state. On rootless Podman it flushes
