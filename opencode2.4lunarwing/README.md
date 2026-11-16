@@ -111,12 +111,41 @@ never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
-session; they bypass this gate and may survive container restarts. The tenant
-egress allowlist remains the boundary against a compromised worker. WI#665's
-root-owned managed-policy evaluation and image enforcement are still pending;
-this change does not claim that Console content is blocked after opt-in or login.
+session; they bypass this gate and may survive container restarts. The managed
+Console deny below is the control that covers them.
+
+## Managed Console policy (WI#665)
+
+The image ships a root-owned, read-only managed policy at
+`/etc/opencode/opencode.json` (source: `config/managed/opencode.json`):
+
+```json
+{ "policies": [ { "action": "integration.use", "resource": "opencode*", "effect": "deny" } ] }
+```
+
+opencode loads `/etc/opencode` as managed settings above every project, global
+and explicit document, and evaluates a managed document's policies first. The
+deny therefore holds for a saved Console login, for a workspace `opencode.json`
+that allows the integration, and for the real binary started without the
+wrapper. It withholds everything the `opencode` integration supplies:
+Console instructions and skills, and the Console config document's providers,
+remote MCP servers, policies and web-search selection.
+
+What it does **not** do is stop the requests. On a built image at the pin,
+with a saved Console credential, the plugin still fetches
+`/api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`; the deny is
+applied to what comes back. The tenant egress allowlist remains the only
+control on outbound traffic. The evaluation that established this, and how to
+repeat it, is in `docs/ops/WORKER-CONTAINERS.md` and
+`scripts/console_policy_eval.py`.
+
+Managed settings outrank every other layer for ordinary settings too, so the
+file carries `policies` and nothing else — an `experimental` or `model` key
+there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
+enforces that, the exact resource pattern, and the installed copy's owner and
+mode.
 See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
-for the conditions and remaining work.
+for the conditions and the evaluation log.
 
 ## Do not configure both lanes on one tenant during the transition
 
