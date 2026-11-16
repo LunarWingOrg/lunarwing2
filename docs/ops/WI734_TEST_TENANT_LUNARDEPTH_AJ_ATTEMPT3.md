@@ -289,8 +289,9 @@ test harness called it), or the **host**.
    symlinks, links leaving the roots, links to non-regular members, and links
    to unseen paths. Built with that patch, the image verified on the first try
    (`README`-level evidence above). Nothing in this run weakens the gate: the
-   verifier is the patched one from !2501, and `worker-lunardepth-ts` and
-   `worker-lunardepth-exposure-verify` are green on pipeline 8000.
+   verifier is the patched one from !2501, and pipeline 8000 for that MR is
+   green, including `worker-lunardepth-ts` (the CI exposure-verify job runs on
+   master pipelines, not on that MR's pipeline, and was not observed here).
    - Note for the reviewer: the image label carries `…-dirty` because the two
      !2501 files were applied to the worktree rather than merged. The verifier
      is the only thing that changed; the worker runtime is unaffected.
