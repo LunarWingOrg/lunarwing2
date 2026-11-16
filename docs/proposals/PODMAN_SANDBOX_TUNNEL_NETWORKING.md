@@ -61,8 +61,10 @@ and installs an `inet lunarwing_sandbox_egress` table with two base chains:
 - `output`, policy `drop`: loopback; the tunnel interfaces `wg0` and `wt0`;
   IPv6 neighbour discovery; DNS (`udp`/`tcp` 53) only to the provider-specific
   permitted resolver; an explicit drop of `169.254.0.0/16`; and, last, packets
-  carrying the provider's socket mark. Everything else is dropped. There is no
-  default DNS channel to the runtime resolvers (WI#724). WireGuard's
+  carrying the provider's socket mark. Everything else is dropped. NetBird has
+  no DNS channel to the runtime resolvers (WI#724); WireGuard without
+  `SANDBOX_TUNNEL_DNS` keeps port 53 to them as a residual uplink channel,
+  which that setting removes. WireGuard's
   optional `SANDBOX_TUNNEL_DNS` is deliberately **not** passed to the provider:
   it needs runtime DNS to resolve hostname endpoints before the tunnel exists.
   Instead, a non-secret mode-`0644` resolver file is atomically installed and
@@ -80,7 +82,8 @@ opens (advanced routing, the Linux default with `NET_ADMIN`), and a WireGuard
 device stamps its encapsulated packets with its fwmark (the sidecar sets
 `0x4c57` on a device whose config left it off and keeps wg-quick's full-route
 mark otherwise). Setting a socket mark needs `NET_ADMIN`, which joiners do not
-have. A joined command can leave only through the tunnel interface: a split
+have. A joined command can leave only through the tunnel interface, plus the
+provider-specific DNS path above: a split
 tunnel reaches its overlay CIDRs, a full-route tunnel reaches everything through
 the overlay. UID- and cgroup-based
 allowances were rejected: under rootless podman the sidecar's root and the
