@@ -216,6 +216,7 @@ report_output="$(report_knowledge_sync_scheduler_status)"
 # call, and an upgrade must not restore it. On OpenRC the managed crontab block
 # IS the schedule, so a host without that block gets its staged copy refreshed
 # and nothing else.
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 INIT_SYSTEM=openrc
 sed '/^# BEGIN lunarwing-study-notes-sync managed block$/,/^# END lunarwing-study-notes-sync managed block$/d' \
   "$FCRONTAB_STATE" >"$FCRONTAB_STATE.tmp"
@@ -239,6 +240,176 @@ report_output="$(report_knowledge_sync_scheduler_status)"
   exit 1
 }
 
+# Review AEG-2: on OpenRC the schedule is live only while the managed block
+# holds an entry cron would run. An operator who commented the line out switched
+# the schedule off, and an upgrade must not switch it on again.
+managed_entry="17 * * * * $fixture/refresh-admin/current/lunarwing-mt-admin.sh sync-knowledge-sources"
+write_managed_block() {  # <the block's one line>
+  sed '/^# BEGIN lunarwing-study-notes-sync managed block$/,/^# END lunarwing-study-notes-sync managed block$/d' \
+    "$FCRONTAB_STATE" >"$FCRONTAB_STATE.tmp"
+  {
+    cat "$FCRONTAB_STATE.tmp"
+    printf '%s\n' '# BEGIN lunarwing-study-notes-sync managed block' "$1" \
+      '# END lunarwing-study-notes-sync managed block'
+  } >"$FCRONTAB_STATE"
+  rm -f "$FCRONTAB_STATE.tmp"
+}
+write_managed_block "#$managed_entry"
+if knowledge_sync_scheduler_live; then
+  printf 'a commented-out cron entry was counted as a live schedule\n' >&2
+  exit 1
+fi
+ln -sfn -- "$old_release" "$fixture/refresh-admin/current"
+cron_before="$(cat "$FCRONTAB_STATE")"
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"hourly schedule is not active"* ]] || {
+  printf 'refresh did not treat the commented-out entry as switched off: %s\n' "$refresh_output" >&2
+  exit 1
+}
+[[ "$(cat "$FCRONTAB_STATE")" == "$cron_before" ]] || {
+  printf 'refresh rewrote a commented-out cron entry:\n%s\n' "$(cat "$FCRONTAB_STATE")" >&2
+  exit 1
+}
+write_managed_block "$managed_entry"
+knowledge_sync_scheduler_live || {
+  printf 'an active cron entry was not counted as a live schedule\n' >&2
+  exit 1
+}
+
+# WI#736 (review AEG-3): a refused staging must leave a live schedule exactly as
+# it was. The refusal comes from the real load guard: a contract source whose
+# path cannot be resolved. Before the fix the installer went on with an empty
+# entrypoint and rewrote root's cron line to a bare command.
+ln -sfn -- "$old_release" "$fixture/refresh-admin/current"
+cron_before="$(cat "$FCRONTAB_STATE")"
+releases_before="$(find "$fixture/refresh-admin/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+refresh_output="$(HEALTH_SRC_DIR="$fixture/missing/health" refresh_deployed_knowledge_sync_scheduler 2>&1)"
+[[ "$(cat "$FCRONTAB_STATE")" == "$cron_before" ]] || {
+  printf 'a refused staging rewrote the live cron entry:\n%s\n' "$(cat "$FCRONTAB_STATE")" >&2
+  exit 1
+}
+[[ "$(readlink -- "$fixture/refresh-admin/current")" == "$old_release" ]] || {
+  printf 'a refused staging moved current\n' >&2
+  exit 1
+}
+[[ "$refresh_output" == *"refusing health contract source"* \
+  && "$refresh_output" == *"could not stage the Study Notes sync snapshot"* \
+  && "$refresh_output" == *"could not restage the root Study Notes sync snapshot"* ]] || {
+  printf 'a refused staging did not give the refusal as the reason: %s\n' "$refresh_output" >&2
+  exit 1
+}
+[[ "$refresh_output" != *"scheduled with"* && "$refresh_output" != *"restaged from"* ]] || {
+  printf 'a refused staging was reported as scheduled or restaged: %s\n' "$refresh_output" >&2
+  exit 1
+}
+
+# The same holds for the installer itself in a context where bash ignores
+# errexit, which is how the upgrade contains it.
+installer_rc=0
+( set -e; HEALTH_SRC_DIR="$fixture/missing/health" ensure_knowledge_source_scheduler ) \
+  >/dev/null 2>&1 || installer_rc=$?
+[[ "$installer_rc" -ne 0 && "$(cat "$FCRONTAB_STATE")" == "$cron_before" ]] || {
+  printf 'the installer wrote a schedule after a failed staging (rc=%s):\n%s\n' \
+    "$installer_rc" "$(cat "$FCRONTAB_STATE")" >&2
+  exit 1
+}
+# Neither installer accepts a command that is not the absolute path of an
+# executable, however it is reached.
+for bad_entrypoint in '' 'sync-knowledge-sources' "$fixture/refresh-admin/missing/lunarwing-mt-admin.sh"; do
+  installer_rc=0
+  ( _install_knowledge_source_cron "$bad_entrypoint" ) >/dev/null 2>&1 || installer_rc=$?
+  [[ "$installer_rc" -ne 0 && "$(cat "$FCRONTAB_STATE")" == "$cron_before" ]] || {
+    printf 'the cron installer accepted the entrypoint "%s"\n' "$bad_entrypoint" >&2
+    exit 1
+  }
+  service_before="$(cat "$fixture/systemd/lunarwing-study-notes-sync.service")"
+  : >"$SYSTEMCTL_LOG"
+  installer_rc=0
+  ( _install_knowledge_source_systemd_timer "$bad_entrypoint" ) >/dev/null 2>&1 || installer_rc=$?
+  [[ "$installer_rc" -ne 0 && ! -s "$SYSTEMCTL_LOG" \
+    && "$(cat "$fixture/systemd/lunarwing-study-notes-sync.service")" == "$service_before" ]] || {
+    printf 'the systemd installer accepted the entrypoint "%s"\n' "$bad_entrypoint" >&2
+    exit 1
+  }
+done
+
+# Review AEG-4: a release that lacks a file is never published. A failed copy
+# stands in for a full disk; the staging stops, removes the partial release and
+# leaves current and the schedule alone.
+install() {
+  [[ "${*: -1}" != */mt-admin-lib/14-knowledge-sync.sh ]] || return 1
+  command install "$@"
+}
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler 2>&1)"
+unset -f install
+[[ "$(readlink -- "$fixture/refresh-admin/current")" == "$old_release" \
+  && "$(cat "$FCRONTAB_STATE")" == "$cron_before" ]] || {
+  printf 'an incomplete release was published or scheduled: %s\n' "$refresh_output" >&2
+  exit 1
+}
+[[ "$(find "$fixture/refresh-admin/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq "$releases_before" ]] || {
+  printf 'a partial release was left behind after a failed copy\n' >&2
+  exit 1
+}
+[[ "$refresh_output" == *"could not stage a complete Study Notes sync release"* \
+  && "$refresh_output" != *"restaged from"* ]] || {
+  printf 'an incomplete release was not reported as a failed restage: %s\n' "$refresh_output" >&2
+  exit 1
+}
+
+# WI#736: a host that already carries the empty command is repaired by the next
+# restage that succeeds.
+write_managed_block '17 * * * *  sync-knowledge-sources'
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler 2>&1)"
+grep -Fqx "$managed_entry" "$FCRONTAB_STATE" || {
+  printf 'a successful restage did not repair the empty cron command:\n%s\n' "$(cat "$FCRONTAB_STATE")" >&2
+  exit 1
+}
+[[ "$refresh_output" == *"restaged from $checkout_commit"* ]] || {
+  printf 'the repairing restage was not reported: %s\n' "$refresh_output" >&2
+  exit 1
+}
+
+# Review AEG-5: the probe's other answers. Each unit file is needed on systemd,
+# and every state the probe cannot read counts as "not live", so an upgrade only
+# refreshes files there.
+probe_not_live() {  # <what the case models>
+  if knowledge_sync_scheduler_live; then
+    printf 'the schedule was counted as live with %s\n' "$1" >&2
+    exit 1
+  fi
+}
+(
+  INIT_SYSTEM=systemd
+  knowledge_sync_scheduler_live || {
+    printf 'an enabled timer with both unit files was not counted as live\n' >&2
+    exit 1
+  }
+  for unit in timer service; do
+    mv "$fixture/systemd/lunarwing-study-notes-sync.$unit" "$fixture/systemd/aside.$unit"
+    probe_not_live "the $unit unit file missing"
+    mv "$fixture/systemd/aside.$unit" "$fixture/systemd/lunarwing-study-notes-sync.$unit"
+  done
+  INIT_SYSTEM=launchd
+  probe_not_live 'an init system it does not schedule on'
+  INIT_SYSTEM=''
+  detect_init_system() { return 1; }
+  probe_not_live 'an init system that cannot be detected'
+)
+(
+  mkdir -p "$fixture/no-cron-bin"
+  # shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+  INIT_SYSTEM=openrc
+  # shellcheck disable=SC2123  # The case is a search path without a cron command.
+  PATH="$fixture/no-cron-bin"
+  probe_not_live 'no cron command on OpenRC'
+)
+
+# The cases below need a host whose schedule is not live again.
+sed '/^# BEGIN lunarwing-study-notes-sync managed block$/,/^# END lunarwing-study-notes-sync managed block$/d' \
+  "$FCRONTAB_STATE" >"$FCRONTAB_STATE.tmp"
+mv "$FCRONTAB_STATE.tmp" "$FCRONTAB_STATE"
+
 # Review ADV-1: a restage that could not replace the release must warn instead
 # of reporting delivery. Stubbing the installer models a read-only releases
 # directory whose publish silently left the old copy in place.
@@ -251,6 +422,15 @@ refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
 }
 [[ "$refresh_output" != *"restaged from"* ]] || {
   printf 'a restage that changed nothing was reported as delivered: %s\n' "$refresh_output" >&2
+  exit 1
+}
+
+# Review AEG-4: the same must hold for a checkout without git metadata, where
+# there is no commit to compare. The link under current decides.
+knowledge_sync_checkout_commit() { :; }
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"was not replaced"* && "$refresh_output" != *"restaged from"* ]] || {
+  printf 'a restage that changed nothing was reported as delivered without git metadata: %s\n' "$refresh_output" >&2
   exit 1
 }
 

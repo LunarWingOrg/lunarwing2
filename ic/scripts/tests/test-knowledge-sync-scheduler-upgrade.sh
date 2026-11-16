@@ -182,6 +182,73 @@ else
   fail "second upgrade restaged again or failed (rc=$rc): $output"
 fi
 
+# ── live scheduler, staging refused: the schedule stays exactly as it was ───
+# WI#736 (review AEG-3): the staging refuses a contract source the load guard
+# rejects; here its path cannot be resolved. The upgrade contains that refusal,
+# and it must not go on to rewrite the unit with an empty command, reload
+# systemd or re-enable the timer.
+ln -sfn -- "$old_release" "$fixture/admin/current"
+service_before="$(cat "$fixture/systemd/lunarwing-study-notes-sync.service")"
+timer_before="$(cat "$fixture/systemd/lunarwing-study-notes-sync.timer")"
+: >"$events"
+: >"$SYSTEMCTL_LOG"
+: >"$SAY_LOG"
+set +e
+output="$(HEALTH_SRC_DIR="$fixture/missing/health" upgrade_tenant_locked fixture "$target" '' false false 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] && grep -qx 'start' "$events"; then
+  pass 'upgrade completes when the staging is refused'
+else
+  fail "upgrade with a refused staging failed (rc=$rc): $output"
+fi
+if [[ "$(cat "$fixture/systemd/lunarwing-study-notes-sync.service")" == "$service_before" \
+  && "$(cat "$fixture/systemd/lunarwing-study-notes-sync.timer")" == "$timer_before" ]]; then
+  pass 'a refused staging leaves the unit files byte for byte as they were'
+else
+  fail "a refused staging rewrote a unit: $(grep -F ExecStart "$fixture/systemd/lunarwing-study-notes-sync.service")"
+fi
+if ! grep -qvx 'is-enabled --quiet lunarwing-study-notes-sync.timer' "$SYSTEMCTL_LOG"; then
+  pass 'a refused staging neither reloads systemd nor re-enables the timer'
+else
+  fail "a refused staging called systemctl: $(tr '\n' ' ' <"$SYSTEMCTL_LOG")"
+fi
+if [[ "$(readlink -- "$fixture/admin/current")" == "$old_release" ]]; then
+  pass 'a refused staging leaves current on the previous release'
+else
+  fail 'a refused staging moved current'
+fi
+if [[ "$output" == *'refusing health contract source'* ]] \
+  && grep -Fq 'could not restage the root Study Notes sync snapshot' "$SAY_LOG"; then
+  pass 'the upgrade gives the refusal as the reason the restage failed'
+else
+  fail "the refusal was not given as the reason: $output / $(tr '\n' ' ' <"$SAY_LOG")"
+fi
+if grep -Eq 'scheduled with|restaged from' "$SAY_LOG"; then
+  fail "a refused staging was reported as scheduled or restaged: $(tr '\n' ' ' <"$SAY_LOG")"
+else
+  pass 'a refused staging is not reported as scheduled or restaged'
+fi
+
+# A host that already carries the empty command (the state the defect left) is
+# repaired by the next restage that succeeds.
+sed -i 's|^ExecStart=.*|ExecStart= sync-knowledge-sources|' \
+  "$fixture/systemd/lunarwing-study-notes-sync.service"
+: >"$events"
+: >"$SYSTEMCTL_LOG"
+set +e
+output="$(upgrade_tenant_locked fixture "$target" '' false false 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] \
+  && grep -Fqx "ExecStart=$fixture/admin/current/lunarwing-mt-admin.sh sync-knowledge-sources" \
+    "$fixture/systemd/lunarwing-study-notes-sync.service" \
+  && [[ "$(sed -n 's/^commit=//p' "$fixture/admin/current/STAGED-FROM")" == "$checkout_commit" ]]; then
+  pass 'the next successful restage repairs a unit that carried an empty command'
+else
+  fail "the empty command was not repaired (rc=$rc): $(grep -F ExecStart "$fixture/systemd/lunarwing-study-notes-sync.service")"
+fi
+
 # ── host whose timer was disabled while the snapshot stayed ─────────────────
 # WI#715 box 2 / review ADV-2: the operator's removal is not an upgrade's to
 # undo. The files are refreshed so a later re-arm runs fixed code; the timer is
