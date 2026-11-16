@@ -212,4 +212,31 @@ report_output="$(report_knowledge_sync_scheduler_status)"
   exit 1
 }
 
+# WI#715 box 2 / review ADV-2: removing the hourly schedule is the operator's
+# call, and an upgrade must not restore it. On OpenRC the managed crontab block
+# IS the schedule, so a host without that block gets its staged copy refreshed
+# and nothing else.
+INIT_SYSTEM=openrc
+sed '/^# BEGIN lunarwing-study-notes-sync managed block$/,/^# END lunarwing-study-notes-sync managed block$/d' \
+  "$FCRONTAB_STATE" >"$FCRONTAB_STATE.tmp"
+mv "$FCRONTAB_STATE.tmp" "$FCRONTAB_STATE"
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"hourly schedule is not active"* ]] || {
+  printf 'refresh did not notice the removed cron block: %s\n' "$refresh_output" >&2
+  exit 1
+}
+[[ "$(sed -n 's/^commit=//p' "$fixture/refresh-admin/current/STAGED-FROM")" == "$checkout_commit" ]] || {
+  printf 'a host without the hourly schedule did not get its staged copy refreshed\n' >&2
+  exit 1
+}
+if grep -Fq 'lunarwing-study-notes-sync managed block' "$FCRONTAB_STATE"; then
+  printf 'refresh re-created a removed cron schedule:\n%s\n' "$FCRONTAB_STATE" >&2
+  exit 1
+fi
+report_output="$(report_knowledge_sync_scheduler_status)"
+[[ "$report_output" == *"hourly schedule is not active"* ]] || {
+  printf 'doctor did not report the dormant OpenRC schedule: %s\n' "$report_output" >&2
+  exit 1
+}
+
 printf 'Knowledge sync scheduler tests passed\n'
