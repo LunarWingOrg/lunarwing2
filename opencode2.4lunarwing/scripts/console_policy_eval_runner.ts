@@ -21,6 +21,8 @@ type Reported = {
   ok: boolean;
   consoleRequests: string[];
   consoleSkills: string[];
+  consoleProviders: string[];
+  consoleMcpServers: string[];
   configDocument: unknown;
   managedPolicyPresent: boolean;
   error?: string;
@@ -52,6 +54,22 @@ const SKILL_BUNDLE = {
     },
   ],
 };
+// A Console config document that supplies a provider and an MCP server, so the
+// merge surface is observable as well as the Library: both must be absent when
+// the deny holds.
+const CONSOLE_PROVIDER = "wi665-console-provider";
+const CONSOLE_MCP = "wi665-console-mcp";
+const CONSOLE_CONFIG = {
+  providers: {
+    [CONSOLE_PROVIDER]: {
+      name: "WI665 Console Provider",
+      package: "@ai-sdk/openai-compatible",
+      settings: { apiKey: "unused", baseURL: "http://127.0.0.1:9/v1" },
+      models: { "wi665-console-model": { name: "wi665-console-model" } },
+    },
+  },
+  mcp: { servers: { [CONSOLE_MCP]: { type: "remote", url: "http://127.0.0.1:9/mcp" } } },
+};
 
 const requests: string[] = [];
 const consoleServer = Bun.serve({
@@ -60,7 +78,7 @@ const consoleServer = Bun.serve({
   fetch(request) {
     const path = new URL(request.url).pathname;
     requests.push(`${request.method} ${path}`);
-    if (path === "/api/v2/config") return Response.json({});
+    if (path === "/api/v2/config") return Response.json(CONSOLE_CONFIG);
     if (path === "/api/v2/instructions") return Response.json({ instructions: [INSTRUCTION] });
     if (path === "/api/v2/skills") return Response.json({ skills: [{ slug: SKILL_SLUG, version: "1" }] });
     if (path === `/api/v2/skills/${SKILL_SLUG}`) return Response.json(SKILL_BUNDLE);
@@ -123,6 +141,14 @@ async function evaluate(): Promise<Reported> {
   const skills = (await get(`/api/skill?location[directory]=${location}`)) as {
     data?: { id?: string; name?: string; path?: string }[];
   };
+  const providers = (await get(`/api/provider?location[directory]=${location}`)) as {
+    data?: { id?: string }[];
+  } | { id?: string }[];
+  const mcp = (await get(`/api/mcp?location[directory]=${location}`)) as {
+    data?: { name?: string }[];
+  } | { name?: string }[];
+  const providerList = Array.isArray(providers) ? providers : (providers.data ?? []);
+  const mcpList = Array.isArray(mcp) ? mcp : (mcp.data ?? []);
   const config = (await get(`/api/config?location[directory]=${location}`)) as {
     data?: { type?: string; integrationID?: string; info?: unknown }[];
   };
@@ -144,6 +170,12 @@ async function evaluate(): Promise<Reported> {
     ok: true,
     consoleRequests: requests,
     consoleSkills: (skills.data ?? []).map((skill) => `${skill.id} ${skill.path ?? ""}`.trim()),
+    consoleProviders: providerList
+      .map((provider) => provider.id ?? "")
+      .filter((id) => id.includes("wi665")),
+    consoleMcpServers: mcpList
+      .map((server) => server.name ?? "")
+      .filter((name) => name.includes("wi665")),
     configDocument: document ?? null,
     managedPolicyPresent,
   };
@@ -157,6 +189,8 @@ try {
     ok: false,
     consoleRequests: requests,
     consoleSkills: [],
+    consoleProviders: [],
+    consoleMcpServers: [],
     configDocument: null,
     managedPolicyPresent: false,
     error: error instanceof Error ? error.message : String(error),

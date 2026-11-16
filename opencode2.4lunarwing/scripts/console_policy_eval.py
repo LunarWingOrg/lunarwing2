@@ -49,7 +49,40 @@ def _prepare(root: pathlib.Path) -> pathlib.Path:
     (root / "config-dir").mkdir()
     (root / "empty-etc").mkdir()
     shutil.copy(RUNNER, root / RUNNER.name)
+    # The image runs as the task uid (10003); the mounted tree is read-only
+    # but must be readable, and the working tree must be writable for the
+    # server's own state.
+    for path in (root, root / "config-dir", root / "empty-etc"):
+        path.chmod(0o755)
+    work.chmod(0o777)
+    for path in (root.rglob("*")):
+        if path.is_file():
+            path.chmod(0o644)
     return root
+
+
+def _set_project_allow(root: pathlib.Path, present: bool) -> None:
+    """A project document that *allows* what the managed policy denies.
+
+    Managed policies load last and evaluate first, so this must not lift the
+    deny; a project file could not lift the Console document either (upstream:
+    "a project file can never strip the Console document carrying org policy").
+    """
+    path = root / "workdir" / "opencode.json"
+    if present:
+        path.write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "opencode*", "effect": "allow"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o644)
+    elif path.exists():
+        path.unlink()
 
 
 def _run_container(image: str, root: pathlib.Path, *, control: bool) -> dict:
@@ -82,25 +115,32 @@ def _run_container(image: str, root: pathlib.Path, *, control: bool) -> dict:
     return payload
 
 
-def _verdict(control: dict, guarded: dict) -> tuple[int, list[str]]:
+def _verdict(control: dict, guarded: dict, project_allow: dict) -> tuple[int, list[str]]:
     lines = []
     control_skills = [s for s in control.get("consoleSkills", []) if SKILL_MARKER in s]
     guarded_skills = [s for s in guarded.get("consoleSkills", []) if SKILL_MARKER in s]
+    allow_skills = [s for s in project_allow.get("consoleSkills", []) if SKILL_MARKER in s]
     control_requests = control.get("consoleRequests", [])
     guarded_requests = guarded.get("consoleRequests", [])
 
-    for label, run in (("control (no managed policy)", control), ("guarded (image policy)", guarded)):
+    for label, run in (
+        ("control (no managed policy)", control),
+        ("guarded (image policy)", guarded),
+        ("guarded + project allow", project_allow),
+    ):
         lines.append(
             f"{label}: ok={run.get('ok')} policy_present={run.get('managedPolicyPresent')} "
             f"requests={len(run.get('consoleRequests', []))} "
-            f"console_skills={len([s for s in run.get('consoleSkills', []) if SKILL_MARKER in s])}"
+            f"console_skills={len([s for s in run.get('consoleSkills', []) if SKILL_MARKER in s])} "
+            f"console_providers={run.get('consoleProviders', [])} "
+            f"console_mcp={run.get('consoleMcpServers', [])}"
         )
         if run.get("error"):
             lines.append(f"  error: {run['error']}")
         for request in run.get("consoleRequests", []):
             lines.append(f"  {request}")
 
-    if not control.get("ok") or not guarded.get("ok"):
+    if not control.get("ok") or not guarded.get("ok") or not project_allow.get("ok"):
         lines.append("RESULT: INCONCLUSIVE — a run failed")
         return 1, lines
     if not control_skills:
@@ -122,6 +162,34 @@ def _verdict(control: dict, guarded: dict) -> tuple[int, list[str]]:
             "and the guarded run registered none"
         )
         status = 0
+    if allow_skills:
+        lines.append(
+            "RESULT: A PROJECT ALLOW LIFTS THE DENY — managed policies were not decisive"
+        )
+        status = 1
+    else:
+        lines.append(
+            "RESULT: A PROJECT ALLOW DOES NOT LIFT THE DENY — the managed statement outranks it"
+        )
+    control_merge = bool(control.get("consoleProviders")) or bool(control.get("consoleMcpServers"))
+    guarded_merge = bool(guarded.get("consoleProviders")) or bool(guarded.get("consoleMcpServers"))
+    if not control_merge:
+        lines.append(
+            "RESULT: INCONCLUSIVE for the config merge — the control run got no Console "
+            "provider or MCP server, so the guarded run proves nothing there"
+        )
+        status = 2
+    elif guarded_merge:
+        lines.append(
+            "RESULT: CONFIG MERGE NOT WITHHELD — a Console provider or MCP server reached "
+            "the guarded session"
+        )
+        status = 1
+    else:
+        lines.append(
+            "RESULT: CONFIG MERGE WITHHELD — the control got a Console provider and MCP "
+            "server and the guarded run got neither"
+        )
     if guarded_requests:
         lines.append(
             "RESULT: DENY DOES NOT STOP THE REQUESTS — the guarded run still contacted the "
@@ -152,8 +220,11 @@ def main() -> int:
         root = _prepare(pathlib.Path(temporary).resolve())
         control = _run_container(args.image, root, control=True)
         guarded = _run_container(args.image, root, control=False)
+        _set_project_allow(root, True)
+        project_allow = _run_container(args.image, root, control=False)
+        _set_project_allow(root, False)
 
-    status, lines = _verdict(control, guarded)
+    status, lines = _verdict(control, guarded, project_allow)
     print("\n".join(lines))
     return status
 
