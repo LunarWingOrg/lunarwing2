@@ -134,7 +134,15 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    Each root-owned scheduler snapshot carries its own OpenRC proxy contract,
    so it does not source a sibling checkout or the host health library. Snapshots
    are pruned to the newest five releases
-   (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`).
+   (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`). `upgrade-tenant` republishes
+   an existing snapshot from the upgraded-from checkout (stamped in
+   `STAGED-FROM`); when the hourly schedule was removed or disabled, it
+   refreshes the staged files and leaves the removal in place — an upgrade
+   never creates a scheduler or re-enables a disabled timer (on OpenRC, a
+   commented-out entry in the managed cron block counts as disabled). A staging
+   that is refused or fails changes neither the schedule nor the staged copy.
+   `doctor` reports
+   the staged commit and flags a snapshot that has outlived its schedule.
 3. Each tenant daemon independently checks on its configured cadence (six hours
    by default, with deterministic startup jitter). When the revision changes it
    scans the checkout and imports only missing paths.

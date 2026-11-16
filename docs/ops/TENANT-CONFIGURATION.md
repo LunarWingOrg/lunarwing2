@@ -514,10 +514,22 @@ The host publishes a validated Git generation hourly through a systemd timer or
 OpenRC cron entry; tenant imports remain bounded, additive-only, and never
 replace existing paths. That timer executes a root-owned snapshot of mt-admin
 under `/usr/local/lib/lunarwing-study-notes-sync/current`, not this checkout:
-`upgrade-tenant` restages it from the upgraded-from checkout when the scheduler
-is already installed (it never creates one), and each release records the
-staging commit in `STAGED-FROM`. `lunarwing-mt-admin.sh doctor` prints that
-commit and warns when it lags the checkout. Run an immediate pass with
+`upgrade-tenant` restages it from the upgraded-from checkout when the hourly
+schedule is still installed, and each release records the staging commit in
+`STAGED-FROM`. A schedule an operator removed or disabled stays that way: the
+upgrade refreshes the staged files so a later re-arm runs fixed code, but it
+never re-creates the unit or re-enables the timer. On OpenRC a managed cron
+block whose entry is commented out counts as disabled; on systemd a timer that
+is enabled but stopped is started again. When the staging is refused or fails,
+the upgrade prints the reason and leaves the schedule and the previous staged
+copy as they were; when a later step of the schedule install fails, it says
+that the copy was replaced and the install did not finish. A managed cron
+block without its exact END line is not counted as a schedule, and
+`--enable-knowledge-sync` refuses to rebuild root's crontab around it until
+the block is repaired by hand.
+`lunarwing-mt-admin.sh
+doctor` prints the staged commit, warns when it lags the checkout, and says
+when the snapshot has outlived its schedule. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 

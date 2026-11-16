@@ -2035,8 +2035,9 @@ upgrade_tenant_locked() {
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   refresh_deployed_health_pipeline
   # WI#715: the root-side Study Notes sync runs from a staged copy of this
-  # checkout. Restage it when (and only when) a scheduler is already installed,
-  # so upgrade-delivered fixes actually reach the hourly root job.
+  # checkout. Refresh it when a snapshot already exists so upgrade-delivered
+  # fixes reach the hourly root job; a schedule an operator removed or disabled
+  # stays that way (only the staged files are republished).
   refresh_deployed_knowledge_sync_scheduler
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
