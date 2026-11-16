@@ -522,8 +522,11 @@ never re-creates the unit or re-enables the timer. On OpenRC a managed cron
 block whose entry is commented out counts as disabled; on systemd a timer that
 is enabled but stopped is started again. When the staging is refused or fails,
 the upgrade prints the reason and leaves the schedule and the previous staged
-copy as they were; when a later step of the schedule repair fails, it says
-that the copy was replaced and the schedule was not repaired.
+copy as they were; when a later step of the schedule install fails, it says
+that the copy was replaced and the install did not finish. A managed cron
+block without its exact END line is not counted as a schedule, and
+`--enable-knowledge-sync` refuses to rebuild root's crontab around it until
+the block is repaired by hand.
 `lunarwing-mt-admin.sh
 doctor` prints the staged commit, warns when it lags the checkout, and says
 when the snapshot has outlived its schedule. Run an immediate pass with
