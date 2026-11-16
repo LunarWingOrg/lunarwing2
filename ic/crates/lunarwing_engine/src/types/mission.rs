@@ -728,6 +728,29 @@ mod tests {
         assert_eq!(restored.goal, "keep working");
         assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
         assert_eq!(restored.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
+
+        // The same record plus a PARTIAL retry_policy object (a key with only
+        // some scalars) must also load — the outer serde(default) covers an
+        // absent key, the per-field defaults cover an incomplete object.
+        let mut partial = serde_json::to_value(&mission).expect("serialize mission");
+        partial
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .retain(|key, _| REQUIRED.contains(&key.as_str()));
+        partial
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .insert(
+                "retry_policy".to_string(),
+                serde_json::json!({ "max_retries": 5 }),
+            );
+        let restored: Mission = serde_json::from_value(partial)
+            .expect("required-only mission with a partial retry_policy must deserialize");
+        assert_eq!(restored.retry_policy.max_retries, 5);
+        assert_eq!(
+            restored.retry_policy.initial_delay_secs,
+            MissionRetryPolicy::default().initial_delay_secs
+        );
     }
 
     #[test]
