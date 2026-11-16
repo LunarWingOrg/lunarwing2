@@ -104,10 +104,9 @@ instructions and skills when it has both a Console credential and egress to
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
-spellings are accepted). With a usable credential and allowed egress, this
-opt-in enables the Library surface too: no shipped setting separately withholds
-Console-authored instructions or skills. Startup messages name the variable but
-never print its value.
+spellings are accepted). Acknowledging the credential does not make the Console
+content reach the session: the managed policy below withholds it either way.
+Startup messages name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
