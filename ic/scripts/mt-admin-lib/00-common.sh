@@ -710,15 +710,16 @@ tenant_voice_enabled() {
 
 # ── Managed scheduler writers (root crontab block, root unit pair) ────────────
 #
-# The host health pipeline (12-health-pipeline.sh) and the Study Notes sync
-# scheduler (14-knowledge-sync.sh) each own a block in root's crontab and a
-# pair of root unit files, and each replaces something root's scheduler runs on
-# a timer. A half-written replacement is worse than no update: root's other
-# cron jobs disappear, or the unit root's timer runs is left empty. So each
-# helper builds the replacement beside its place, checks it, and only then
-# installs it. Both are reached from callers that may run with errexit ignored,
-# so they return nonzero and print the reason instead of exiting; the caller
-# decides whether that is fatal (WI#740).
+# The host health pipeline (12-health-pipeline.sh) owns a block in root's
+# crontab and a pair of root unit files, and replaces something root's scheduler
+# runs on a timer. A half-written replacement is worse than no update: root's
+# other cron jobs disappear, or the unit root's timer runs is left empty. Each
+# helper therefore builds the replacement beside its place, checks it, and only
+# then installs it. Both are reached from callers that may run with errexit
+# ignored, so they return nonzero and print the reason instead of exiting; the
+# caller decides whether that is fatal (WI#740). The Study Notes sync scheduler
+# (14-knowledge-sync.sh) writes the same two shapes with its own copy from
+# WI#736 and its failure-injection harness; it can move onto these later.
 
 # Print, on stdout, the table root's crontab must become: every line of the
 # current table outside the managed block, byte for byte, then the <block>
