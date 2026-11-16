@@ -2645,10 +2645,56 @@ merge. The managed tenant's egress allowlist remains the boundary against a
 compromised worker.
 
 **Scope:** WI#665's surface record and environment-credential gate are covered;
-the root-owned managed-policy control has **not** been evaluated on a built
-image or shipped. Acceptance items 3 and 4 remain pending, and WI#665 must stay
-open. No Console request, live credential, image build or tenant rollout is
-claimed by this follow-up.
+the root-owned managed-policy control is **evaluated on a built image and
+shipped** (see the next section). Acceptance item 3's two halves did not come
+out the same way: the content half holds, the "no request goes to the Console"
+half does not. No live Console request, live Console credential or tenant
+rollout is claimed — the Console in the evaluation was a loopback fake.
+
+**Managed-policy evaluation (WI#665 item 3, 2026-11-16).** Run on a locally
+built candidate image of this lane at the pin (`podman build`, then
+`podman run --network=none`), with `scripts/console_policy_eval.py`. Each run
+starts the image's real `/usr/local/lib/opencode2/opencode` server, stores a
+**saved** credential for the `opencode` integration (the path that bypasses the
+entrypoint's `OPENCODE_API_KEY` gate) whose `metadata.server` names a fake
+Console on loopback, and reads back what the session holds. Three runs per
+evaluation:
+
+| run | Console skill | Console provider | Console MCP server | Console requests |
+|---|---|---|---|---|
+| control, `/etc/opencode` empty | `wi665-console-eval` present | present | present | config, instructions, skills, skill bundle |
+| image policy | absent | absent | absent | config, instructions, skills |
+| image policy + project `opencode.json` allow | absent | absent | absent | config, instructions, skills |
+
+The control run proves the harness works (a Console-authored skill, provider
+and MCP server all arrived). With the policy in place none of the three did,
+the `opencode` integration document was absent from `/api/config`, and a
+project document that *allows* `integration.use` for the same resource did not
+lift the deny — the managed statement is decisive, as the source says.
+
+**What the policy does not do.** The guarded runs still issued
+`GET /api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`. The plugin
+loads from the Console first and applies the policy to what it supplies
+(`packages/core/src/plugin/provider/opencode.ts:318-336,362-366` at the pin),
+so acceptance item 3's "no request goes to the Console" does **not** hold. The
+tenant egress allowlist stays the only control on that traffic; the policy's
+value is that nothing arriving from the Console reaches the session, whatever
+the egress path or the credential's provenance.
+
+**Shipped (item 4).** `config/managed/opencode.json` is installed to
+`/etc/opencode/opencode.json` as root:root 0444 in a root:root 0755 directory
+by a Dockerfile `RUN` that also asserts both. `scripts/exposure_policy_assert.py`
+checks the source file's shape (only `policies`; an `integration.use` deny whose
+pattern covers both the bare integration ID and `<integration>#<account>` under
+upstream's wildcard rules) and, under `--image-filesystem`, the installed copy's
+owner, mode, non-writable parents and byte-identity to the checkout.
+`.gitlab/scripts/verify-opencode2-exposure-out-of-band.py` treats the installed
+file as a required member of the tar export, so the out-of-band verifier sees
+it too. The managed policy is in the lane's `input_files` hash list.
+
+Only `policies` is shipped from the managed layer: a managed document outranks
+every other layer for ordinary settings, so an `experimental` or `model` key
+there would shadow the lane's own config. The assertion fails if one appears.
 
 **!2414 review verification (ABK-1–5, 2026-11-13):** the repaired fixture and
 new negative cases pass all 70 exposure-assert tests; non-root entrypoint tests
