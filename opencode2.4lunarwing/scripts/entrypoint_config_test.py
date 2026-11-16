@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -256,7 +257,13 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertIn(str(study / "skills"), config["skills"]["paths"])
 
     def prepare_cli(self, timeout_ms: str) -> tuple[Path, dict[str, str]]:
-        """Build the full entrypoint around a CLI stuck in background_wait."""
+        """Build the full entrypoint around a CLI stuck in background_wait.
+
+        The fake writes a readiness marker after it flushes background_wait so
+        the caller can cancel a run that has provably started. It lives under
+        HOME, which the root-CI uid 10003 identity owns; the fixture root does
+        not.
+        """
         # The real health server is irrelevant here; exiting immediately keeps
         # the one-shot CLI process as the only child this test must reap.
         (self.app / "health_server.py").write_text("")
@@ -289,6 +296,8 @@ def cancelled(signum, frame):
 
 signal.signal(signal.SIGTERM, cancelled)
 emit("background_wait", 1)
+with open(os.environ["FAKE_CLI_READY_FILE"], "w") as marker:
+    marker.write("ready\\n")
 while True:
     time.sleep(60)
 """)
@@ -301,6 +310,7 @@ while True:
         env = {
             **self.env,
             "AGENT_AUTH_TOKEN": "fixture-hub-credential",
+            "FAKE_CLI_READY_FILE": str(self.home / "fake-cli-ready"),
             "OPENCODE_MODE": "cli",
             "OPENCODE_BIN": str(fake_cli),
             "OPENCODE_RUN_TIMEOUT_MS": timeout_ms,
@@ -310,24 +320,83 @@ while True:
     def run_cli(self, timeout_ms: str) -> subprocess.CompletedProcess:
         script, env = self.prepare_cli(timeout_ms)
         return subprocess.run(
-            ["bash", str(script)], text=True, capture_output=True, timeout=15,
+            ["bash", str(script)], text=True, capture_output=True, timeout=30,
             env=env, cwd=self.root, **self.identity,
         )
 
-    def test_cli_background_wait_is_bounded_and_cancelled(self) -> None:
-        started = time.monotonic()
-        result = self.run_cli("2000")
+    def run_cli_until_ready(self, timeout_ms: str) -> subprocess.CompletedProcess:
+        """Run the CLI under its default hour, then stop it like a container.
+
+        Waiting for the fake's own marker instead of a wall-clock deadline is
+        what makes this independent of host load: a starved host delays the
+        fake's start, not its readiness signal. SIGTERM goes to the entrypoint's
+        PID, which CLI mode has exec'd into `timeout`, so the signal travels the
+        same path a `docker stop` takes (WI#582).
+        """
+        script, env = self.prepare_cli(timeout_ms)
+        ready = Path(env["FAKE_CLI_READY_FILE"])
+        process = subprocess.Popen(
+            ["bash", str(script)], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, cwd=self.root, **self.identity,
+        )
+        # Generous: only a wedged fixture reaches it, and each poll costs one
+        # scheduler turn.
+        deadline = time.monotonic() + 120
+        while not ready.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    f"the CLI exited {process.returncode} before it reached "
+                    f"background_wait:\n{stdout}{stderr}"
+                )
+            if time.monotonic() > deadline:
+                process.kill()
+                stdout, stderr = process.communicate()
+                self.fail(f"the CLI never reached background_wait:\n{stdout}{stderr}")
+            time.sleep(0.05)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=60)
+        return subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr,
+        )
+
+    def test_cli_background_wait_is_cancelled_by_sigterm(self) -> None:
+        # The entrypoint's own one-hour default: the deadline is not part of
+        # this case, so no assertion here waits on the fake to start.
+        result = self.run_cli_until_ready("3600000")
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
-        self.assertLess(time.monotonic() - started, 10)
         events = [
             json.loads(line) for line in result.stdout.splitlines()
             if line.startswith("{")
         ]
+        self.assertTrue(events, result.stdout + result.stderr)
         self.assertEqual(events[0]["type"], "background_wait")
         self.assertEqual(events[0]["sessionID"], "ses_1")
         self.assertEqual(events[0]["jobs"][0]["id"], "sh_train")
         self.assertFalse(events[0]["credential_present"])
         self.assertEqual(events[-1]["type"], "test_cancelled")
+
+    def test_cli_run_is_bounded_by_the_configured_deadline(self) -> None:
+        """A 2 s deadline ends the run with SIGTERM's status, not 124.
+
+        Deliberately asserts nothing about the fake's output: on a starved host
+        `timeout` can signal the fake before its interpreter installs the
+        handler, and that is still the behaviour under test — the deadline was
+        honored and `--preserve-status` kept the status 143. The run cannot
+        outlive `run_cli`'s 30 s budget, which is far below the one-hour
+        default, so removing the `timeout` wrapper still fails here.
+        """
+        started = time.monotonic()
+        try:
+            result = self.run_cli("2000")
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "the CLI run was not bounded by OPENCODE_RUN_TIMEOUT_MS=2000: "
+                "it was still running after the harness budget"
+            )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertLess(elapsed, 20, f"the 2 s deadline took {elapsed:.1f}s")
 
     def test_cli_rejects_an_unbounded_or_invalid_timeout(self) -> None:
         for value in ("0", "-1", "1.5", "unbounded"):
