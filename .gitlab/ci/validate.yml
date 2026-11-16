@@ -8,7 +8,10 @@ ci-config:
     - export PATH="/tmp/lunarwing-go/go/bin:$PATH"
   script:
     - python3 .gitlab/scripts/validate_config.py
-    - python3 -m unittest discover -s .gitlab/tests -p 'test_*.py'
+    # WI#738: -v names each test before it runs and -u keeps that line from
+    # sitting in a block buffer, so a job cut off by the runner limit ends on
+    # the name of the test it was in (job 183172 named nothing for an hour).
+    - python3 -u -m unittest discover -v -s .gitlab/tests -p 'test_*.py'
     - python3 .gitlab/scripts/verify_release_version.py --self-test
     - python3 .gitlab/scripts/promote-worker-image.py self-test
 

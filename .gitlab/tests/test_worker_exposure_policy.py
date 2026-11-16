@@ -19,6 +19,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".gitlab" / "scripts" / "check-worker-exposure-policy.sh"
 PARSER_DIR = ROOT / ".gitlab" / "go" / "dockerfile-parse"
 GO = shutil.which("go")
+# WI#738: the guard ends its stderr with this block when a lane suite failed;
+# the names follow it, one per line.
+NESTED_FAILURE_BLOCK = "ERROR: nested lane test suites failed (WI#738):"
 
 EXECUTOR_RULESET = """
 function sessionPermissions() {
@@ -173,6 +176,12 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             timeout=120,
         )
         if result.returncode != 0:
+            # WI#738: a fixture mutation below expects one Dockerfile diagnostic,
+            # but when the guard's own lane suites fail first the Dockerfile
+            # checks never run and that assertion reports only "not found in
+            # <the whole nested output>". Name the real cause at the front of
+            # stderr so the assertion message leads with it.
+            result.stderr = self.nested_failure_diagnostic(result.stderr) + result.stderr
             return result
         if GO is None:
             raise unittest.SkipTest("Go toolchain unavailable; required parser CI job owns this lane")
@@ -187,6 +196,23 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         parser_result.stdout = result.stdout + parser_result.stdout
         parser_result.stderr = result.stderr + parser_result.stderr
         return parser_result
+
+    def nested_failure_diagnostic(self, stderr: str) -> str:
+        """Front-load the guard's named nested failures (WI#738)."""
+        lines = stderr.splitlines()
+        start = next(
+            (i for i, line in enumerate(lines) if NESTED_FAILURE_BLOCK in line), None
+        )
+        if start is None:
+            return ""
+        names = [line.split("ERROR:", 1)[1].strip() for line in lines[start + 1:]
+                 if line.startswith("ERROR: ")]
+        return (
+            "NESTED GUARD FAILURE (WI#738): the guard's own lane suites failed, so "
+            "no Dockerfile check ran. Failing suites:\n"
+            + "".join(f"  {name}\n" for name in names)
+            + "\n"
+        )
 
     def test_real_tree_passes(self):
         result = self.run_guard(ROOT)
@@ -454,6 +480,29 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         self.assertIn("the guard's own tests failed before the Dockerfile check", message)
         self.assertIn("nested test failed", message)
         self.assertLess(len(message), 4100)
+
+    def test_failing_lane_suite_is_named_before_the_dockerfile_checks(self):
+        # WI#738: job 182901 reported only "must not override exposure-policy
+        # variables" not found, burying the lane failure that never let the
+        # Dockerfile checks run. The guard names the suite and run_guard puts
+        # that name first.
+        broken = self.root / "opencode2.4lunarwing" / "scripts" / "image_config_policy_test.py"
+        broken.write_text(
+            "import sys\nprint('deliberate lane failure')\nsys.exit(3)\n", encoding="utf-8"
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(
+            result.stderr.startswith("NESTED GUARD FAILURE (WI#738):"), result.stderr[:500]
+        )
+        self.assertIn(
+            "opencode2.4lunarwing/scripts/image_config_policy_test.py", result.stderr
+        )
+        self.assertNotIn("worker exposure policy guard: ok", result.stdout)
+
+    def test_nested_failure_diagnostic_is_silent_when_no_suite_failed(self):
+        self.assertEqual(self.nested_failure_diagnostic(""), "")
+        self.assertEqual(self.nested_failure_diagnostic("ok: fine\n"), "")
 
     def test_dockerfile_compile_out_must_precede_builder_build(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
