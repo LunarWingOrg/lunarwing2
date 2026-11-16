@@ -319,7 +319,12 @@ oob_serve_wrapper_file="$wrapper_file"
 oob_prepare_image() {
   rm -rf "$oob_image_root"
   mkdir -p "$oob_image_root/app/node_modules" "$oob_image_root/usr/bin" \
-    "$oob_image_root/usr/local/bin" "$oob_image_root/usr/local/lib/opencode2"
+    "$oob_image_root/usr/local/bin" "$oob_image_root/usr/local/lib/opencode2" \
+    "$oob_image_root/etc/opencode"
+  # WI#665: the image installs the managed Console policy root:root 0444 and
+  # the out-of-band verifier requires it; the fake export sets the owner.
+  install -m 0444 "$fixture/target/opencode2.4lunarwing/config/managed/opencode.json" \
+    "$oob_image_root/etc/opencode/opencode.json"
   cp -a "$fixture/target/opencode2.4lunarwing/scripts" "$oob_image_root/app/scripts"
   cp -a "$fixture/target/opencode2.4lunarwing/config" "$oob_image_root/app/config"
   cp -a "$fixture/target/opencode2.4lunarwing/entrypoint.sh" \
