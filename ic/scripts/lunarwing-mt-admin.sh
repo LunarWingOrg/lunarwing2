@@ -294,6 +294,9 @@ Production multi-tenant administration for LunarWing.
 Manages OS users, port allocation, per-tenant services, and builds.
 
 Commands:
+  reinstall-health-library <trusted-checkout>
+                                   Replace the installed health library from a separate
+                                   trusted checkout; allowed while the OpenRC contract is refused
   add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                    generate env, render and install services
     --docker-group                 Add user to docker/podman group (opt-in:
@@ -787,14 +790,22 @@ EOF
 
 
 main() {
-  local command_name="${1:-}"
+  local command_name="${1:-}" preflight_status=0
   if [[ -z "$command_name" ]]; then
     usage
     exit 1
   fi
   shift || true
 
-  if ! openrc_dispatch_preflight "$command_name" "$@"; then
+  openrc_dispatch_preflight "$command_name" "$@" || preflight_status=$?
+  if (( preflight_status != 0 )); then
+    if (( preflight_status == 126 )); then
+      if [[ "$command_name" == writers-active ]]; then
+        say "OpenRC proxy unit contract unavailable; writer state unknown" >&2
+        exit 2
+      fi
+      die "refusing $command_name: the OpenRC proxy unit contract could not be loaded"
+    fi
     # writers-active has a 0/1/2 state contract (active/stopped/unknown), and
     # export-tenant/import-tenant read 1 as "stopped". A refusal is unknown —
     # never a service state (EQ-1).
@@ -813,6 +824,11 @@ main() {
   [[ -z "${LUNARWING_CONTAINER_RUNTIME:-}" ]] || ensure_container_runtime
 
   case "$command_name" in
+    reinstall-health-library)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: reinstall-health-library <trusted-checkout>"
+      reinstall_health_library "$1"
+      ;;
     add-tenant)
       require_root
       local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"

@@ -808,7 +808,12 @@ remove_tenant() {
   name="$(sanitize_name "$name")"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == openrc ]]; then
-    require_safe_openrc_proxy_units || die "OpenRC proxy migration required; refusing removal"
+    require_safe_openrc_proxy_units || {
+      if [[ -n "${MT_ADMIN_OPENRC_CONTRACT_REFUSAL:-}" ]]; then
+        die "OpenRC proxy unit contract unavailable; refusing removal"
+      fi
+      die "OpenRC proxy migration required; refusing removal"
+    }
   fi
   say "=== Removing tenant: $name ==="
   say ""
