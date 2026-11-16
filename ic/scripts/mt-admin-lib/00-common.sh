@@ -722,8 +722,10 @@ tenant_voice_enabled() {
 # WI#736 and its failure-injection harness; it can move onto these later.
 
 # Print, on stdout, the table root's crontab must become: every line of the
-# current table outside the managed block, byte for byte, then the <block>
-# lines. Returns nonzero, having printed no table, when the current table
+# current table outside the managed block, byte for byte, then the block —
+# <begin>, the <block> lines, <end> — or nothing at all when no block lines are
+# given, which is how a block is removed. Returns nonzero, having printed no
+# table, when the current table
 # cannot be delimited — a BEGIN line with no later END line, or a second BEGIN
 # line before the first one's END line. Dropping "everything from BEGIN to the
 # end of the file" would take root's later jobs with it, so the caller must
@@ -768,8 +770,16 @@ _managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
     warn_err "root's crontab has the line '$begin' without a later line that reads exactly '$end'; repair the block with '$command -e', then schedule again; the crontab was left as it was"
     return 1
   fi
-  printf '%s' "$kept"
-  (( $# == 0 )) || printf '%s\n' "$@"
+  # Each write is checked: a table that lost a line to a full disk must report
+  # the failure rather than install the rest of itself.
+  printf '%s' "$kept" || return 1
+  if (( $# )); then
+    {
+      printf '%s\n' "$begin" \
+        && printf '%s\n' "$@" \
+        && printf '%s\n' "$end"
+    } || return 1
+  fi
 }
 
 # Replace root's crontab with the table _managed_cron_table builds. Nothing is
@@ -787,7 +797,7 @@ _install_managed_cron_block() {  # <crontab command> <begin> <end> [<block line>
     warn_err "could not rebuild root's crontab; the crontab was left as it was"
     return 1
   fi
-  if [[ $# -gt 0 && "$(tail -n 1 -- "$tmp")" != "${!#}" ]]; then
+  if [[ $# -gt 0 && "$(tail -n 1 -- "$tmp")" != "$end" ]]; then
     rm -f -- "$tmp"
     warn_err "could not write the new root crontab completely; the crontab was left as it was"
     return 1
