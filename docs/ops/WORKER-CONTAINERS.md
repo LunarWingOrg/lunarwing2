@@ -401,8 +401,9 @@ instead of checking the OpenRC layout on a host that has none. The proof reads
 Bash's `$(<file)`: under `set -e`, Bash 5.2 ends the shell when the redirection
 of `$(<file)` fails, before a `||` branch can print why, so a task that exits
 during the scan or a tree found without `cgroup.events` would lose the refusal.
-The other `$(<file)` reads in mt-admin sit behind a `-f`/`-r` test or read a
-file mt-admin has just written and are left as they are.
+The other `$(<file)` reads in mt-admin read a file tested with `-f`/`-r` just
+before, a file mt-admin has just written, or run inside a command substitution
+whose failure the caller already handles; they are left as they are.
 
 The recorded ranges are cross-checked against the current `/etc/subuid`.
 Entries still naming the tenant or its former uid must match the record, and
