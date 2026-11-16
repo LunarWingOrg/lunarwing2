@@ -9,11 +9,11 @@ Redaction is not an execution boundary. The call that resumes an approval
 still uses the real parameters, and several at-rest surfaces keep the raw
 values (see [What is not redacted](#what-is-not-redacted)).
 
-Two independent mechanisms share the same vocabulary:
+Two mechanisms apply redaction, with different markers:
 
 | Mechanism | Applies to | Marker |
 |---|---|---|
-| Wasm HTTP host boundary | Any `http_request` made by a WASM tool/channel | `[REDACTED:<credential_name>]`, `[REDACTED:host_credential]` |
+| Wasm HTTP host boundary | Any `http_request` made by a WASM tool/channel | `[REDACTED:<placeholder_name>]` for `{PLACEHOLDER}` substitutions, `[REDACTED:host_credential]` for capability/host-resolved credentials |
 | Display/event redaction | `ApprovalRequested.parameters`, approval prompts, `ToolCall` hooks, summaries | `[REDACTED]` |
 
 ## Default redacted parameter keys
@@ -58,14 +58,17 @@ host substitutes them in `http_request`
 - **Capability mappings** — `capabilities.http.credentials` in the tool's
   `*.capabilities.json` names the secret, the injection location (`bearer`,
   `basic`, `header`, `query_param`, `url_path`), and the `host_patterns` the
-  credential applies to.
-- **Host credentials** — separately resolved credentials for a host are merged
-  into the request headers (host credentials take precedence over guest
-  headers) and appended as URL query parameters when configured, gated by an
-  optional URL prefix.
+  credential applies to. These are resolved before the guest runs and become
+  entries in the same host-credential list described next.
+- **Host credentials** — credentials resolved for the requesting user are
+  matched against the request host and merged into the request headers (host
+  credentials take precedence over guest headers) and appended as URL query
+  parameters when configured, gated by an optional URL prefix.
 
 A credential is injected only when the request host matches the mapping's host
-pattern; the guest's own headers are never merged over an injected one.
+pattern; injected headers overwrite any guest-supplied header of the same name.
+An exchange that injected any credential also forces `accept-encoding: identity`
+and drops `TE` offers, so the response body stays scrubbable (see below).
 
 ## What the WASM HTTP boundary scrubs
 
@@ -84,41 +87,43 @@ everything the guest sees (`ic/src/tools/wasm/wrapper.rs`). It covers:
 - **Response bodies** — a byte-level scrub, so a redirect `Location` or echoed
   request is covered even when the body is not text.
 
-The needle set for a tool execution contains the injected capability
-credentials (marker `[REDACTED:<name>]`, using the credential's declared name)
-and the resolved host credentials (marker `[REDACTED:host_credential]`).
+The needle set for a tool execution contains the placeholder-injected secrets
+(marker `[REDACTED:<placeholder_name>]`, using the placeholder the tool wrote,
+e.g. `{GOOGLE_ACCESS_TOKEN}`) and the resolved capability/host credentials
+(marker `[REDACTED:host_credential]`, which covers every
+`capabilities.http.credentials` mapping and every host-resolved credential).
 Needles include encoded spellings, because an upstream server may echo the
 value after decoding or re-encoding:
 
 - the raw value;
 - percent-encoded and form-encoded spellings;
 - the URL-parser's query and path normalization of the value;
-- the `+`-decoded spelling;
-- the JSON-string-escaping inner value;
+- the `+`-to-space, percent-decoded spelling;
+- the JSON-string-escaped inner value;
 - lowercase and uppercase hexadecimal.
 
 Values shorter than four bytes are not tracked (a short value would match
 ordinary text). Needles are sorted longest-first, so a credential nested inside
 another cannot leave a visible remainder, and duplicates are removed.
 
-**Encoded bodies are refused.** When an exchange carried credentials and the
-response declares any content coding other than `identity` — or a transfer
-coding other than the single `chunked` layer hyper removes — the boundary
-returns an error instead of the body:
+**Encoded bodies are refused.** When an exchange carried credentials and a
+non-empty response declares any content coding other than `identity` — or a
+transfer coding other than the single `chunked` layer hyper removes — the
+boundary returns an error instead of the body:
 
 ```
 HTTP response refused: encoded body cannot be inspected for echoed credentials
 ```
 
-The scrub cannot see through compression or leftover chunk framing, and the
-guest chose `Accept-Encoding`, so the exchange fails closed rather than
-handing over bytes that might contain the credential.
+The host forces `identity` on those requests, so an encoded answer means the
+peer ignored it; the boundary fails closed rather than handing over bytes that
+might contain the credential.
 
 > This section describes the WASM `http_request` host call. The built-in
-> `http` and `web_fetch` tools do not use placeholder injection; they are
-> approval-gated when their parameters carry manually supplied credentials or
-> the target host has registered credentials, and their display copies are
-> redacted as described next.
+> `http` and `web_fetch` tools do not use placeholder injection; they require
+> approval unless auto-approved when their parameters carry manually supplied
+> credentials or the target host has registered credentials, and their display
+> copies are redacted as described next.
 
 ## `ApprovalRequested` display parameters
 
@@ -157,11 +162,12 @@ credential-like; `mission_*` verbs summarize as `name`/`id` only, so a
 mis-keyed `hmac_secret` or a positional `_args[0]` payload cannot ride the
 summary into a status line.
 
-The same predicate drives `redact_display_params` for approval prompts and
-`ToolCall` hook payloads (`ic/src/tools/tool.rs`), so the prompt a user sees
-matches the persisted event. `http` and `web_fetch` declare no
-`sensitive_params`; the HTTP-surface arm is what keeps a raw `Authorization`
-header or `?api_key=…` URL out of the prompt.
+`redact_display_params` applies the tool's exact-match `sensitive_params` and,
+for `http`/`web_fetch`, delegates to `redact_event_params`
+(`ic/src/tools/tool.rs`), so the prompt a user sees matches the persisted
+event. `http` and `web_fetch` declare no `sensitive_params`; the HTTP-surface
+arm is what keeps a raw `Authorization` header or `?api_key=…` URL out of the
+prompt.
 
 ## Inspecting the sanitized strings
 
@@ -172,7 +178,8 @@ header or `?api_key=…` URL out of the prompt.
 | Persisted event | The thread's `ApprovalRequested` event — `action_name`, `call_id`, `parameters` (redacted), `params_summary` |
 | Hooks | `ToolCall` hook payloads receive the redacted parameter copy |
 
-None of these surfaces can return the executable parameters. To see what an
+For Engine V2 gates these surfaces expose only the display copy; the
+executable parameters stay on the in-memory gate. To see what an
 approval would actually run, read the pending-gate store
 (`$LUNARWING_BASE_DIR/pending-gates.json`, mode 0600) or the thread transcript —
 both hold the raw copy.
