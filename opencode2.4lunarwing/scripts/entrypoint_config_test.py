@@ -317,12 +317,114 @@ while True:
         }
         return script, env
 
+    def start_cli(self, script: Path, env: dict[str, str]) -> subprocess.Popen:
+        """Start the fixture as the leader of a session of its own.
+
+        Whatever the entrypoint starts stays in that session, so `reap_cli`
+        can find all of it, whichever state a failed case left it in.
+        """
+        process = subprocess.Popen(
+            ["bash", str(script)], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, cwd=self.root,
+            start_new_session=True, **self.identity,
+        )
+        self.addCleanup(self.reap_cli, process)
+        return process
+
+    @staticmethod
+    def cli_session(process: subprocess.Popen) -> list[int]:
+        """PIDs still running in the fixture's session; zombies do not count."""
+        running = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                # getsid() first: reading every stat file costs ten times the
+                # CPU, and on a starved host that is seconds per sweep.
+                if os.getsid(int(entry)) != process.pid:
+                    continue
+                # "pid (comm) state ..."; comm may hold ")".
+                stat = Path("/proc", entry, "stat").read_bytes()
+                state = stat.rpartition(b")")[2].split()[0]
+            except (OSError, IndexError):
+                continue  # exited between the listing and the look
+            if state not in b"ZX":
+                running.append(int(entry))
+        return running
+
+    @classmethod
+    def reap_cli(cls, process: subprocess.Popen) -> str:
+        """SIGKILL whatever is left of the fixture and return its output.
+
+        `process.kill()` does not do this. It reaches one PID: bash, or
+        `timeout` once the entrypoint has exec'd it. A SIGKILLed `timeout`
+        cannot run its `-k 5s`, which only starts after `timeout` has sent its
+        own first signal. The most its command then gets is a parent-death
+        SIGTERM (coreutils 9.12 sets one), and a child that bash is blocked in
+        gets nothing at all. What lives on keeps the pipes open under
+        `communicate()`. The group kill takes the leader's process group in
+        one call; the sweep takes what left that group but not the session, as
+        a `timeout` that the entrypoint did not exec does. Every wait here has
+        a limit.
+        """
+        deadline = time.monotonic() + 30
+        while True:
+            # The leader's PID names its group only until the leader is reaped.
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            running = cls.cli_session(process)
+            for pid in running:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not running or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        if process.stdout.closed and process.stderr.closed:
+            return ""  # the case ran to its end and collected the output
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            return "(no output: something outside the session holds the pipes)"
+        return stdout + stderr
+
+    def await_cli(self, process: subprocess.Popen, marker: Path, stage: str,
+                  limit: float = 120) -> None:
+        """Wait until the fake has written `marker`; fail once it cannot."""
+        # Generous: only a wedged fixture reaches it, and each poll costs one
+        # scheduler turn.
+        deadline = time.monotonic() + limit
+        while not marker.exists():
+            if process.poll() is not None:
+                self.fail(
+                    f"the CLI exited {process.returncode} before it reached "
+                    f"{stage}:\n{self.reap_cli(process)}"
+                )
+            if time.monotonic() > deadline:
+                self.fail(f"the CLI never reached {stage}:\n{self.reap_cli(process)}")
+            time.sleep(0.05)
+
+    def collect_cli(self, process: subprocess.Popen, limit: float,
+                    since: str) -> subprocess.CompletedProcess:
+        """Collect a run that has to end by itself within `limit` seconds."""
+        try:
+            stdout, stderr = process.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f"the CLI was still running {limit} s after {since}:\n"
+                f"{self.reap_cli(process)}"
+            )
+        return subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr,
+        )
+
     def run_cli(self, timeout_ms: str) -> subprocess.CompletedProcess:
         script, env = self.prepare_cli(timeout_ms)
-        return subprocess.run(
-            ["bash", str(script)], text=True, capture_output=True, timeout=30,
-            env=env, cwd=self.root, **self.identity,
-        )
+        return self.collect_cli(self.start_cli(script, env), 30, "its start")
 
     def run_cli_until_ready(self, timeout_ms: str) -> subprocess.CompletedProcess:
         """Run the CLI under its default hour, then stop it like a container.
@@ -334,45 +436,10 @@ while True:
         same path a `docker stop` takes (WI#582).
         """
         script, env = self.prepare_cli(timeout_ms)
-        ready = Path(env["FAKE_CLI_READY_FILE"])
-        process = subprocess.Popen(
-            ["bash", str(script)], text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env, cwd=self.root, **self.identity,
-        )
-        # A fixture that wedges the poll loop must not outlive the case: the
-        # entrypoint execs `timeout`, whose -k 5s then reaps the fake.
-        self.addCleanup(self.reap_cli, process)
-        # Generous: only a wedged fixture reaches it, and each poll costs one
-        # scheduler turn.
-        deadline = time.monotonic() + 120
-        while not ready.exists():
-            if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                self.fail(
-                    f"the CLI exited {process.returncode} before it reached "
-                    f"background_wait:\n{stdout}{stderr}"
-                )
-            if time.monotonic() > deadline:
-                process.kill()
-                stdout, stderr = process.communicate()
-                self.fail(f"the CLI never reached background_wait:\n{stdout}{stderr}")
-            time.sleep(0.05)
+        process = self.start_cli(script, env)
+        self.await_cli(process, Path(env["FAKE_CLI_READY_FILE"]), "background_wait")
         process.send_signal(signal.SIGTERM)
-        stdout, stderr = process.communicate(timeout=60)
-        return subprocess.CompletedProcess(
-            process.args, process.returncode, stdout, stderr,
-        )
-
-    @staticmethod
-    def reap_cli(process: subprocess.Popen) -> None:
-        """Leave no fixture process behind if a case failed mid-run."""
-        if process.poll() is not None:
-            return
-        process.kill()
-        try:
-            process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
+        return self.collect_cli(process, 60, "SIGTERM")
 
     def test_cli_background_wait_is_cancelled_by_sigterm(self) -> None:
         # The entrypoint's own one-hour default: the deadline is not part of
@@ -401,16 +468,49 @@ while True:
         default, so removing the `timeout` wrapper still fails here.
         """
         started = time.monotonic()
-        try:
-            result = self.run_cli("2000")
-        except subprocess.TimeoutExpired:
-            self.fail(
-                "the CLI run was not bounded by OPENCODE_RUN_TIMEOUT_MS=2000: "
-                "it was still running after the harness budget"
-            )
+        result = self.run_cli("2000")
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
         self.assertLess(elapsed, 20, f"the 2 s deadline took {elapsed:.1f}s")
+
+    def test_cli_fixture_wedged_in_a_child_fails_within_its_deadline(self) -> None:
+        """A fixture that wedges must fail its case, not hang it (WI#738).
+
+        The wedge is one `process.kill()` cannot clear: the fake moves to a
+        process group of its own, as a `timeout` that the entrypoint did not
+        exec does, and blocks in a child that never ends and holds the pipes.
+        """
+        script, env = self.prepare_cli("3600000")
+        wedged = self.home / "fake-cli-wedged"
+        (self.root / "fake-opencode.py").write_text(f"""#!/usr/bin/env python3
+import os
+import subprocess
+
+os.setpgid(0, 0)
+child = subprocess.Popen(["sleep", "738"])
+open({str(wedged)!r}, "w").close()
+child.wait()
+""")
+        process = self.start_cli(script, env)
+        self.await_cli(process, wedged, "its wedge")
+        running = self.cli_session(process)
+        self.assertGreaterEqual(len(running), 3, running)  # timeout, fake, sleep
+
+        # A helper that waits without limit would never get to a failing
+        # assertion; the alarm turns that hang into an error of this case.
+        def hung(signum, frame):
+            raise TimeoutError("the wedged fixture still blocked its helper after 120 s")
+
+        previous = signal.signal(signal.SIGALRM, hung)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        signal.alarm(120)
+        with self.assertRaisesRegex(self.failureException, "never reached background_wait"):
+            self.await_cli(
+                process, Path(env["FAKE_CLI_READY_FILE"]), "background_wait", limit=0.2,
+            )
+        signal.alarm(0)
+        self.assertEqual(self.cli_session(process), [])
 
     def test_cli_rejects_an_unbounded_or_invalid_timeout(self) -> None:
         for value in ("0", "-1", "1.5", "unbounded"):
