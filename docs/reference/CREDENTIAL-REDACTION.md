@@ -9,18 +9,26 @@ Redaction is not an execution boundary. The call that resumes an approval
 still uses the real parameters, and several at-rest surfaces keep the raw
 values (see [What is not redacted](#what-is-not-redacted)).
 
+How much is redacted differs per surface. The persisted event gets the shared
+key list for every action; approval prompts, hook payloads, and failure
+statuses get it only for some actions. See
+[Which surface gets which redaction](#which-surface-gets-which-redaction)
+before relying on any of them.
+
 Two mechanisms apply redaction, with different markers:
 
 | Mechanism | Applies to | Marker |
 |---|---|---|
 | Wasm HTTP host boundary | Any `http_request` made by a WASM tool/channel | `[REDACTED:<placeholder_name>]` for `{PLACEHOLDER}` substitutions, `[REDACTED:host_credential]` for capability/host-resolved credentials |
-| Display/event redaction | `ApprovalRequested.parameters`, approval prompts, `ToolCall` hooks, summaries | `[REDACTED]` |
+| Display/event redaction | `ApprovalRequested.parameters` for every action; approval prompts, `ToolCall` hooks, and failure statuses to the extent listed [per surface](#which-surface-gets-which-redaction); summaries | `[REDACTED]` |
 
 ## Default redacted parameter keys
 
-Display redaction classifies a key with
-`lunarwing_safety::is_credential_param_key`
-(`ic/crates/lunarwing_safety/src/credential_detect.rs`). The key is normalized
+The shared key list is `lunarwing_safety::is_credential_param_key`
+(`ic/crates/lunarwing_safety/src/credential_detect.rs`). It is applied to the
+persisted `ApprovalRequested` event for every action, and to the other display
+surfaces only for the actions named
+[per surface](#which-surface-gets-which-redaction). The key is normalized
 first — fullwidth Latin (U+FF01..=U+FF5E) is folded to ASCII, then it is
 lowercased and `_`/`-` are stripped — so `apiKey`, `api_key`, `api-key`, and
 `ａｐｉ＿ｋｅｙ` all fold to `apikey`.
@@ -48,25 +56,36 @@ redacting them would claim a credential was present when none was.
 
 ## HTTP tool credential injection (WASM host boundary)
 
-WASM tools never receive secret values. They reference credentials and the
-host substitutes them in `http_request`
-(`ic/src/tools/wasm/wrapper.rs`):
+WASM tools and channels never receive secret values. The host adds
+credentials to their `http_request` calls
+(`ic/src/tools/wasm/wrapper.rs`, `ic/src/channels/wasm/wrapper.rs`):
 
-- **Placeholders** — a tool writes `{SECRET_NAME}` in the URL, headers, or
-  body; the host replaces the placeholder with the stored value before the
-  request leaves the sandbox.
+- **Placeholders** — the guest writes `{SECRET_NAME}` in the URL or in a
+  header value; the host replaces the placeholder with the stored value before
+  the request leaves the sandbox. The request body is not substituted. The
+  placeholder map is filled for WASM channels. For a WASM tool it is empty in
+  production, so a tool gets its credentials through capability mappings.
 - **Capability mappings** — `capabilities.http.credentials` in the tool's
   `*.capabilities.json` names the secret, the injection location (`bearer`,
   `basic`, `header`, `query_param`, `url_path`), and the `host_patterns` the
   credential applies to. These are resolved before the guest runs and become
-  entries in the same host-credential list described next.
+  entries in the same host-credential list described next. The exception is
+  `url_path`: such a mapping is left to placeholder substitution and never
+  joins that list, so for a tool it injects nothing today. No bundled tool
+  declares one.
 - **Host credentials** — credentials resolved for the requesting user are
-  matched against the request host and merged into the request headers (host
-  credentials take precedence over guest headers) and appended as URL query
+  matched against the request host and merged into the request headers (a
+  host credential replaces a guest header of the identical name) and appended as URL query
   parameters when configured, gated by an optional URL prefix.
 
-A credential is injected only when the request host matches the mapping's host
-pattern; injected headers overwrite any guest-supplied header of the same name.
+A capability or host credential is injected only when the request host matches
+the mapping's host pattern. A placeholder is substituted wherever the guest
+wrote it: no host pattern binds it, and the request passes only the general
+checks (the HTTP allowlist and private-address vetting). An injected
+header replaces a guest-supplied header only when the name is spelled the same,
+case included. With another spelling (a guest `authorization` next to the
+injected `Authorization`) both are sent; the guest still never sees the
+injected value.
 An exchange that injected any credential also forces `accept-encoding: identity`
 and drops `TE` offers, so the response body stays scrubbable (see below).
 
@@ -87,11 +106,12 @@ everything the guest sees (`ic/src/tools/wasm/wrapper.rs`). It covers:
 - **Response bodies** — a byte-level scrub, so a redirect `Location` or echoed
   request is covered even when the body is not text.
 
-The needle set for a tool execution contains the placeholder-injected secrets
-(marker `[REDACTED:<placeholder_name>]`, using the placeholder the tool wrote,
-e.g. `{GOOGLE_ACCESS_TOKEN}`) and the resolved capability/host credentials
+The needle set for an execution contains every secret in the placeholder map
+(marker `[REDACTED:<placeholder_name>]`, e.g. `{GOOGLE_ACCESS_TOKEN}`; the map
+is empty for a tool today) and the resolved capability/host credentials
 (marker `[REDACTED:host_credential]`, which covers every
-`capabilities.http.credentials` mapping and every host-resolved credential).
+`capabilities.http.credentials` mapping except `url_path` ones, and every
+host-resolved credential).
 Needles include encoded spellings, because an upstream server may echo the
 value after decoding or re-encoding:
 
@@ -120,10 +140,14 @@ peer ignored it; the boundary fails closed rather than handing over bytes that
 might contain the credential.
 
 > This section describes the WASM `http_request` host call. The built-in
-> `http` and `web_fetch` tools do not use placeholder injection; they require
-> approval unless auto-approved when their parameters carry manually supplied
-> credentials or the target host has registered credentials, and their display
-> copies are redacted as described next.
+> `http` tool does not use placeholder injection; it requires approval unless
+> auto-approved when its parameters carry manually supplied credentials or the
+> target host has registered credentials, and its display copies are redacted
+> as described next. There is no built-in `web_fetch` tool. The name is on the
+> registry's protected list, but that list only stops an extension from
+> replacing a built-in that is registered, so by itself it does not reserve
+> the name. Where this page says "`http` and `web_fetch`" it means that
+> redaction treats an action of either name alike.
 
 ## `ApprovalRequested` display parameters
 
@@ -156,27 +180,69 @@ path, so it keeps only the redacted copy.
      byte-for-byte.
 
 `params_summary` is generated separately by `summarize_params`. For `http` and
-`web_fetch` it shows the sanitized URL (query credentials removed, truncated to
-80 characters); the generic fallback skips values whose keys look
+`web_fetch` it shows the sanitized URL (query credentials removed, cut after
+80 bytes and followed by `...`); the generic fallback skips values whose keys look
 credential-like; `mission_*` verbs summarize as `name`/`id` only, so a
 mis-keyed `hmac_secret` or a positional `_args[0]` payload cannot ride the
 summary into a status line.
 
-`redact_display_params` applies the tool's exact-match `sensitive_params` and,
-for `http`/`web_fetch`, delegates to `redact_event_params`
-(`ic/src/tools/tool.rs`), so the prompt a user sees matches the persisted
-event. `http` and `web_fetch` declare no `sensitive_params`; the HTTP-surface
-arm is what keeps a raw `Authorization` header or `?api_key=…` URL out of the
-prompt.
+## Which surface gets which redaction
+
+Engine V2 and the v1 chat loop do not share every surface. The persisted
+`ApprovalRequested` event exists only on Engine V2, and it is the only surface
+that gets the shared key list for every action. The failed-tool status that
+carries parameters exists only on v1.
+
+Approval prompts, the Engine V2 hook payload of a registered tool, and the v1
+failure status go through `redact_display_params` (`ic/src/tools/tool.rs`): it
+applies the tool's exact-match `sensitive_params` and, for an action named
+`http` or `web_fetch` only, delegates to `redact_event_params`. Mission verbs
+take the shared key list directly. The hook payloads of the v1 chat loop, the
+background job worker, and the external-worker tool proxy get
+`sensitive_params` only. So for an `http` call the prompt a user sees matches
+the persisted event; for any tool other than `http` and the mission verbs, the
+prompt is not passed through the key list. `http` declares no
+`sensitive_params`; the HTTP-surface arm is what keeps a raw `Authorization`
+header or `?api_key=…` URL out of the prompt.
+
+| Surface | Shared key list | HTTP surface (URL, headers, body) | Tool's `sensitive_params` |
+|---|---|---|---|
+| Persisted `ApprovalRequested.parameters` (Engine V2) | every action | `http`, `web_fetch` | not applied |
+| Engine V2 approval prompt, and the copies of it served by `GET /api/chat/pending-gates` and the history envelope | `http`, `web_fetch`, and `mission_*` actions | `http`, `web_fetch`; on the first prompt also when no tool of that name is registered | applied when the tool is registered |
+| v1 approval prompt, and its copy in the history envelope | `http`, `web_fetch` | `http`, `web_fetch` | applied |
+| v1 failed-tool channel status | `http`, `web_fetch` | `http`, `web_fetch` | applied when the tool is known |
+| `ToolCall` hook payload, Engine V2 | `http`, and `mission_*` actions; `web_fetch` only if a tool of that name is registered | `http`; `web_fetch` only if a tool of that name is registered | applied; **an action that is neither a mission verb nor a registered tool passes its parameters on unredacted** |
+| `ToolCall` hook payload: v1 chat loop, background job worker, external-worker tool proxy | not applied | not applied | applied |
+
+A gate that Engine V2 raises again after an approval shows `null` in place of
+the parameters when its tool is no longer registered.
+
+No built-in tool declares `sensitive_params` today, and a WASM or MCP tool
+cannot declare any, so the last column changes nothing at present.
+
+What this means in practice: take a WASM or MCP tool called with
+`{"api_key": "…"}`.
+
+- On Engine V2 the persisted event shows `[REDACTED]`; the approval prompt and
+  the `ToolCall` hook payload show the value.
+- On v1, which has no `ApprovalRequested` event, the approval prompt, the hook
+  payload, and the failed-tool status show it.
+
+Do not send hook payloads or approval prompts to an external consumer on the
+assumption that the shared key list was applied to them.
 
 ## Inspecting the sanitized strings
 
 | Surface | How to read it |
 |---|---|
-| Live pending gates | `GET /api/chat/pending-gates` — each `PendingGateView.parameters` is the redacted display copy, pretty-printed as a JSON string; `tool_name` and `resume_kind` identify the call |
-| History envelope | `GET /api/chat/history` — `pending_approval` carries `request_id`, `tool_name`, and the redacted display parameters for a live Engine V2 approval gate |
-| Persisted event | The thread's `ApprovalRequested` event — `action_name`, `call_id`, `parameters` (redacted), `params_summary` |
-| Hooks | `ToolCall` hook payloads receive the redacted parameter copy |
+| Live pending gates (Engine V2) | `GET /api/chat/pending-gates` — each `PendingGateView.parameters` is the approval prompt's display copy, pretty-printed as a JSON string; `tool_name` and `resume_kind` identify the call |
+| History envelope | `GET /api/chat/history` — `pending_approval` carries `request_id`, `tool_name`, and the approval prompt's display parameters for a live approval (an Engine V2 gate or a v1 approval) |
+| Persisted event | The thread's `ApprovalRequested` event — `action_name`, `call_id`, `parameters` (redacted with the shared key list), `params_summary` |
+| Hooks | `ToolCall` hook payloads receive the hook copy, which is redacted the same as the persisted event or less |
+
+The prompt and hook copies are redacted as listed
+[per surface](#which-surface-gets-which-redaction), not as the persisted event
+is.
 
 For Engine V2 gates these surfaces expose only the display copy; the
 executable parameters stay on the in-memory gate. To see what an
@@ -189,12 +255,15 @@ both hold the raw copy.
 - **WASM tools** declare injected credentials in `capabilities.http.credentials`
   in the tool's `*.capabilities.json` — `secret_name`, `location`, and
   `host_patterns`. This is also what makes the credential value a redaction
-  needle for that tool's `http_request` calls.
-- **Built-in tools** that accept plaintext secrets as parameters override
+  needle for that tool's `http_request` calls (except for a `url_path`
+  mapping, which is never resolved for a tool).
+- **A Rust tool compiled into the daemon** that accepts plaintext secrets as parameters can override
   `Tool::sensitive_params()` and return the exact parameter names to blank
   (`ic/src/tools/tool.rs`). This is an exact-match, per-tool contract — it can
   name a parameter (e.g. a plain `value` key) that the shared heuristic cannot
-  infer, and it is intentionally distinct from `is_credential_param_key`.
+  infer, and it is intentionally distinct from `is_credential_param_key`. No
+  built-in tool overrides it today; the default is an empty list. A WASM or
+  MCP tool cannot declare any.
 - **The shared key list is compiled in.** There is no runtime or per-tenant
   setting that adds keys to it; extending the list is a source change in
   `lunarwing_safety::credential_detect`.
@@ -207,6 +276,10 @@ the following safe to share:
 - the pending-gate store (`pending-gates.json`, mode 0600) and the in-memory
   gate, which need the executable parameters to resume;
 - thread transcript action arguments — a pre-existing at-rest class;
+- job `tool_use` events, which are persisted and sent to the job's event
+  stream: the in-process job worker records the first 500 bytes of the
+  parameters as they are, and the external-worker tool proxy applies
+  `sensitive_params` and its own leak scan but not the shared key list;
 - persisted `MessageAdded` content previews;
 - daemon logs, which have their own scrubber but are not the same path.
 

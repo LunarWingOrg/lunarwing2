@@ -711,8 +711,11 @@ conversation scope, so an unmatched approval is diagnosable from logs.
 Approval prompts and `ToolCall` hook payloads use the shared
 `redact_display_params` path (WI#392): registered tool-sensitive fields and HTTP
 headers, URLs, and bodies are redacted, including JSON embedded in string-form
-arguments. An unregistered-tool fallback still applies the shared credential
-redactor. This protects display/hook copies; the mode-0600 pending-gate file
+arguments. For an action that is neither a mission verb nor a registered tool,
+the `ToolCall` hook payload is passed on unredacted, and the approval prompt is
+redacted only when the action is named `http` or `web_fetch`. The shared
+credential key list reaches these copies only for `http`/`web_fetch` and the
+mission verbs. This protects display/hook copies; the mode-0600 pending-gate file
 retains executable parameters, and transcript storage has its own at-rest
 exposure class. A redacted prompt is not evidence that credentials were removed
 from every persisted surface. The default redacted keys, the Wasm HTTP
