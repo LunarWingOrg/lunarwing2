@@ -75,7 +75,7 @@ name. No maintainer decision was needed on this item.
 
 ## Provisioning
 
-Provisioning began at 07:33Z with no service-manager override:
+Provisioning began at 07:32Z with no service-manager override:
 
 ```bash
 sudo taskset -c 0-11 bash ic/scripts/lunarwing-mt-admin.sh add-tenant lunardepthtester \
@@ -86,6 +86,41 @@ sudo taskset -c 0-11 bash ic/scripts/lunarwing-mt-admin.sh add-tenant lunardepth
   --lunardepth-model tensorzero::function_name::lunarwing \
   --lunardepth-allow-insecure-http \
   --lunardepth-allow-unauthenticated-gateway
+```
+
+`ADD_EXIT=0`. What it did, from `/tmp/wi734-add.log`:
+
+- Allocated block 10010–10019 and LunarDepth 52010/52011; registry entry
+  `workers.lunardepth=true`, all other lanes false.
+- Created the account, enabled linger, and rendered **systemd user units** into
+  `/home/lunardepthtester/.config/systemd/user`
+  (`lunarwing-lunardepthtester.service`, `xmpp-bridge-lunardepthtester.service`,
+  the WeeChat pair, `lunarwing-build.slice`, `lunarwing-workloads.slice`). This
+  is the host's own manager, chosen by detection, not by an override.
+- Started PostgreSQL as the user quadlet `lunarwing-pg-lunardepthtester` on
+  10013.
+- Distributed the generic sandbox image into the tenant's rootless store.
+- Left `/etc/lunarwing/health.env` alone (`already exists (preserving)`) and
+  scheduled the host pipeline through its **systemd timer**.
+- Wrote the LunarDepth external-worker block with the explicit `tensorzero::`
+  route and the unauthenticated-gateway exception; no key stored.
+- Tenant clone at `d872e9632` on branch `aj/kimi-wi734-20261116-0731`, whose
+  history contains `f0d47a882` (the target `aragents/kimil00p/v2.2.0.0`).
+
+One hiccup at provisioning, non-blocking and already a tracked bug:
+
+- **H1 (host, cosmetic):** `WARNING: could not pre-warm the rootless podman
+  userns for lunardepthtester; the first podman call will create it in its own
+  context (see docs/bugs/BUG-workload-scope-podman-userns.md)`. Image
+  distribution and the PostgreSQL quadlet both succeeded afterwards, so the
+  deferred userns creation cost one slow first call and nothing else.
+
+### First mt-admin command output (abridged)
+
+```text
+=== Adding tenant: lunardepthtester ===
+allocated port block 10010-10019 for tenant 'lunardepthtester'
+created user: lunardepthtester
 ```
 
 ## Build
