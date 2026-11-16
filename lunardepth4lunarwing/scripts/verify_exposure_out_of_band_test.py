@@ -54,6 +54,21 @@ class OutOfBandTests(unittest.TestCase):
                 info.uid = info.gid = 0
                 archive.addfile(info, io.BytesIO(data))
 
+    def add_regular(self, archive, name, data, mode=0o444):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = mode
+        info.uid = info.gid = 0
+        archive.addfile(info, io.BytesIO(data))
+
+    def add_hard_link(self, archive, name, target, mode=0o444):
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.LNKTYPE
+        info.linkname = target
+        info.mode = mode
+        info.uid = info.gid = 0
+        archive.addfile(info)
+
     def test_valid_archive_and_config(self):
         validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
 
@@ -85,6 +100,54 @@ class OutOfBandTests(unittest.TestCase):
             info.uid = info.gid = 0
             archive.addfile(info, io.BytesIO(data))
         with self.assertRaisesRegex(ValueError, "test/package-manager residue"):
+            validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
+    def test_link_members_of_one_shared_inode_are_allowed(self):
+        # WI#739: identical declaration files of different packages can share
+        # one inode of pnpm's content-addressed store; a tar exporter writes
+        # the first path as a regular member and every later path as a hard
+        # link to it. That names bytes already in the closure and cannot
+        # redirect outside it, so it is accepted. The target must precede the
+        # link, as `podman export` and BuildKit both write it.
+        first = "opt/lunardepth/node_modules/@agentclientprotocol/sdk/dist/acp.test.d.ts"
+        second = "opt/lunardepth/node_modules/@agentclientprotocol/sdk/dist/connection.test.d.ts"
+        third = "opt/lunardepth/node_modules/gaxios/build/esm/test/common.test.d.ts"
+        with tarfile.open(self.archive_path, "a") as archive:
+            self.add_regular(archive, first, b"export {};\n")
+            self.add_hard_link(archive, second, first)
+            self.add_hard_link(archive, third, first)
+        validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
+    def test_symlink_in_closure_fails(self):
+        with tarfile.open(self.archive_path, "a") as archive:
+            info = tarfile.TarInfo("app/scripts/inside.js")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "../opt/lunardepth/node_modules/inside.js"
+            info.mode = 0o444
+            info.uid = info.gid = 0
+            archive.addfile(info)
+        with self.assertRaisesRegex(ValueError, "symlink in application closure"):
+            validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
+    def test_hard_link_leaving_the_checked_roots_fails(self):
+        with tarfile.open(self.archive_path, "a") as archive:
+            self.add_regular(archive, "usr/bin/perl", b"base image fixture\n", mode=0o555)
+            self.add_hard_link(archive, "opt/lunardepth/planted", "usr/bin/perl")
+        with self.assertRaisesRegex(ValueError, "leaves the checked roots"):
+            validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
+    def test_hard_link_to_an_unseen_member_fails(self):
+        with tarfile.open(self.archive_path, "a") as archive:
+            self.add_hard_link(archive, "opt/lunardepth/early", "opt/lunardepth/late")
+            self.add_regular(archive, "opt/lunardepth/late", b"late\n")
+        with self.assertRaisesRegex(ValueError, "not a second name for an earlier"):
+            validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
+
+    def test_writable_hard_link_member_fails(self):
+        with tarfile.open(self.archive_path, "a") as archive:
+            self.add_regular(archive, "opt/lunardepth/read-only", b"data\n")
+            self.add_hard_link(archive, "opt/lunardepth/writable", "opt/lunardepth/read-only", mode=0o644)
+        with self.assertRaisesRegex(ValueError, "writable"):
             validate_archive(self.archive_path, self.config_path, self.lane_root, self.compiled_root)
 
     def test_smoke_secret_and_checkout_drift_fail(self):
