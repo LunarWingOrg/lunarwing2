@@ -238,6 +238,21 @@ class VerifyRegistryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("no generic rule covers lunarwing-ci-tools", result.stdout)
 
+    def test_only_a_star_is_a_wildcard_in_a_rule_pattern(self) -> None:
+        # GitLab compares these literally, so none of them protects the package.
+        for pattern in ("lunarwing-ci-tool?", "lunarwing-ci-tool[s]", "lunarwing.ci.tools"):
+            with self.subTest(pattern=pattern):
+                routes = self.routes(rules=[self.rule(pattern=pattern)])
+                result = self.run_verifier(self.serve(routes))
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("no generic rule covers lunarwing-ci-tools", result.stdout)
+        for pattern in ("lunarwing-*", "*-ci-*", "*"):
+            with self.subTest(pattern=pattern):
+                routes = self.routes(rules=[self.rule(pattern=pattern)])
+                result = self.run_verifier(self.serve(routes))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"rule 7 matches {pattern} with push level", result.stdout)
+
     def test_no_rule_does_not_count(self) -> None:
         result = self.run_verifier(self.serve(self.routes(rules=[])))
         self.assertEqual(result.returncode, 3, result.stderr)

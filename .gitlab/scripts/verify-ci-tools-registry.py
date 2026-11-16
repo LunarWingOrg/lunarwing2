@@ -15,7 +15,6 @@ not checkable, 4 any other HTTP status on a download. The highest one wins.
 """
 
 import argparse
-import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -170,6 +169,15 @@ def list_rules(api_url: str, project_id: str, token: str) -> list[object]:
     raise ValueError(f"more than {RULE_PAGES} pages of rules")
 
 
+def covers_package(pattern: object) -> bool:
+    # GitLab turns only `*` into a wildcard (Gitlab::SQL::Glob), so `?` and `[`
+    # are literal there. It also ignores case; staying exact errs to exit 3.
+    if not isinstance(pattern, str):
+        return False
+    expression = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(expression, PACKAGE) is not None
+
+
 def check_protection(api_url: str, project_id: str, token: str) -> int:
     user, _ = get_json(f"{api_url}/user", token)
     if isinstance(user, dict) and user.get("is_admin"):
@@ -183,8 +191,7 @@ def check_protection(api_url: str, project_id: str, token: str) -> int:
     for rule in list_rules(api_url, project_id, token):
         if not isinstance(rule, dict) or rule.get("package_type") != "generic":
             continue
-        pattern = rule.get("package_name_pattern") or ""
-        if fnmatch.fnmatchcase(PACKAGE, pattern):
+        if covers_package(rule.get("package_name_pattern")):
             matching.append(rule)
     # GitLab refuses a push when any matching rule asks for more than the
     # pusher's level (Packages::Protection::Rule.for_action_exists?), so one
