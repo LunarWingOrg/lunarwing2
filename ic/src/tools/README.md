@@ -280,6 +280,11 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 - Single binary, no process management, works offline
 - Cost: must build yourself in Rust, no ecosystem, synchronous only
 
+The credential-injection and error/response scrub contract for `http_request`
+(placeholder substitution, `[REDACTED:…]` markers, encoded-body refusal) is
+documented in
+[`docs/reference/CREDENTIAL-REDACTION.md`](../../../docs/reference/CREDENTIAL-REDACTION.md).
+
 **MCP Servers (Model Context Protocol)**
 
 - Growing ecosystem of pre-built servers (GitHub, Notion, Postgres, etc.)

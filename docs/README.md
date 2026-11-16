@@ -114,6 +114,7 @@ Protocol specs, contract definitions, and API references.
 
 | File | Description |
 |------|-------------|
+| [`CREDENTIAL-REDACTION.md`](reference/CREDENTIAL-REDACTION.md) | Credential redaction contract: default redacted parameter keys, WASM `http_request` error/header/body scrubbing and encoded-body refusal, `ApprovalRequested` display parameters, inspection surfaces |
 | [`custom_bridges/XMPP.md`](reference/custom_bridges/XMPP.md) | XMPP custom-bridge reference: architecture, loopback HTTP API, env vars, deployment |
 
 ---
