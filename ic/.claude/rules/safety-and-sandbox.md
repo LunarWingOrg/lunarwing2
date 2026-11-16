@@ -48,11 +48,14 @@ runtime or image is unavailable, commands error with a structured
 - `tunnel` (WI#248/592): runs join their daemon instance's verified NetBird/
   WireGuard sidecar container ID while keeping every hardening flag. Mandatory
   sidecar `nftables` chains drop new inbound flows (never an inbound listener)
-  and non-tunnel egress, except for marked provider traffic and, by default, DNS
-  to runtime resolvers. That default DNS is a residual uplink/exfiltration
-  channel. WireGuard `SANDBOX_TUNNEL_DNS` mounts overlay resolvers into joined
-  runs only and removes direct uplink DNS; provider bootstrap keeps runtime DNS.
-  NetBird rejects that setting (WI#603); core interoperability is live-validated
+  and non-tunnel egress, except for marked provider traffic. There is no
+  default DNS channel to the runtime resolvers (WI#724): NetBird resolves
+  through its own listener only, so a sandbox gets peer names plus whatever an
+  operator nameserver group offers through the overlay, and a NetBird tenant
+  without such a group cannot resolve public names. WireGuard
+  `SANDBOX_TUNNEL_DNS` mounts overlay resolvers into joined runs only and
+  removes direct uplink DNS; provider bootstrap keeps runtime DNS. NetBird
+  rejects that setting (WI#603); core interoperability is live-validated
   (WI#600).
   Link-local IPv4 (cloud metadata, host alias) is dropped. Provider health and
   both chains are rechecked rule by rule before every run; failures return

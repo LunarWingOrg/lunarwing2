@@ -10,10 +10,13 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it and, by default, DNS to the resolvers the
-//!   runtime gave the sidecar. For WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to
-//!   resolvers reachable through the tunnel and removes the uplink allowance;
-//!   NetBird rejects that setting during configuration validation (WI#603).
+//!   mark the provider sets on it. There is no uplink DNS channel (WI#724):
+//!   NetBird's DNS allowance is its own `wt0` listener, which joined runs and
+//!   the sidecar reach over `lo`; public names resolve only through an operator
+//!   nameserver group whose upstream is reachable through the overlay. For
+//!   WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to resolvers reachable through
+//!   the tunnel and, without it, no uplink DNS is allowed either; NetBird
+//!   rejects that setting during configuration validation (WI#603).
 //!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
@@ -175,6 +178,9 @@ impl TunnelSidecarConfig {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, salt);
         hash_field(&mut hasher, self.provider.as_str().as_bytes());
+        if self.provider == TunnelProvider::Netbird {
+            hash_field(&mut hasher, b"netbird-managed-resolver-v3");
+        }
         hash_field(&mut hasher, self.image().as_bytes());
         hash_field(&mut hasher, image_id.as_bytes());
         for resolver in &self.dns {
@@ -224,7 +230,7 @@ impl TunnelSidecarConfig {
     }
 
     fn uplink_resolvers(&self, resolv_conf: &str) -> Vec<IpAddr> {
-        if self.dns.is_empty() {
+        if self.provider != TunnelProvider::Netbird && self.dns.is_empty() {
             parse_resolvers(resolv_conf)
         } else {
             Vec::new()
@@ -245,7 +251,7 @@ impl TunnelSidecarConfig {
         }
         if self.provider == TunnelProvider::Netbird && !self.dns.is_empty() {
             return Err(
-                "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+                "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use NetBird's managed resolver"
                     .into(),
             );
         }
@@ -551,16 +557,23 @@ fn parse_wireguard_config(content: &str) -> std::result::Result<WireGuardConfigS
     Ok(summary)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NetbirdSidecarMounts<'a> {
+    pub state_volume: Option<&'a str>,
+    pub resolv_conf: Option<&'a Path>,
+    pub dns_backup: Option<&'a Path>,
+}
+
 /// The runtime arguments that start the sidecar. `hash` is the salted config
-/// hash published as a label; `netbird_state_volume` is the named volume that
-/// keeps NetBird's peer identity across restarts.
+/// hash published as a label; NetBird's mounts retain its peer identity and
+/// staged resolver state despite the read-only root filesystem.
 pub(crate) fn build_sidecar_args(
     cfg: &TunnelSidecarConfig,
     secret_env_file: Option<&Path>,
     container_name: &str,
     instance_id: &str,
     hash: &str,
-    netbird_state_volume: Option<&str>,
+    netbird_mounts: Option<NetbirdSidecarMounts<'_>>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".into(),
@@ -610,11 +623,23 @@ pub(crate) fn build_sidecar_args(
                 "--device".into(),
                 "/dev/net/tun".into(),
             ]);
-            if let Some(volume) = netbird_state_volume {
+            if let Some(volume) = netbird_mounts.and_then(|mounts| mounts.state_volume) {
                 args.extend(["-v".into(), format!("{volume}:/var/lib/netbird")]);
             }
             if let Some(file) = secret_env_file {
                 args.extend(["--env-file".into(), file.display().to_string()]);
+            }
+            if let Some(file) = netbird_mounts.and_then(|mounts| mounts.resolv_conf) {
+                args.extend([
+                    "-v".into(),
+                    format!("{}:/etc/resolv.conf:rw,z", file.display()),
+                ]);
+            }
+            if let Some(file) = netbird_mounts.and_then(|mounts| mounts.dns_backup) {
+                args.extend([
+                    "-v".into(),
+                    format!("{}:/etc/resolv.conf.original.netbird:rw,z", file.display()),
+                ]);
             }
             // The upstream image's entrypoint runs `netbird service run` and
             // `netbird up` itself and ignores its arguments.
@@ -686,8 +711,11 @@ fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
 }
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
-/// own control traffic (by socket mark) and, unless custom tunnel DNS is set,
-/// DNS to the runtime-assigned resolvers. Everything else uses the tunnel or drops.
+/// own control traffic (by socket mark) and the DNS listener the accepted runs
+/// may query. For NetBird that is only its `wt0` listener, reached over `lo`;
+/// for WireGuard it is the configured overlay resolvers, or none without
+/// `SANDBOX_TUNNEL_DNS`. There is no runtime-resolver allowance (WI#724).
+/// Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     pub tunnel_mark: u32,
@@ -720,6 +748,12 @@ impl EgressPolicy {
             .iter()
             .map(|kind| format!("icmpv6 type {kind} accept")),
         );
+        // The NetBird resolver is the namespace's own `wt0` address, so packets
+        // to it leave through `lo` and the loopback accept above already
+        // carries them; these rules are belt-and-braces and never match
+        // (WI#724 ADN-4). What protects is that no rule accepts DNS to an
+        // uplink address. They stay because they cost nothing and keep the
+        // allowance explicit next to the provider it belongs to.
         for resolver in &self.resolvers {
             let family = if resolver.is_ipv4() { "ip" } else { "ip6" };
             rules.push(format!("{family} daddr {resolver} udp dport 53 accept"));
@@ -893,6 +927,25 @@ pub(crate) fn parse_resolvers(resolv_conf: &str) -> Vec<IpAddr> {
         }
     }
     resolvers
+}
+
+fn netbird_resolver_file_matches(resolv_conf: &str, listener: IpAddr) -> bool {
+    let mut nameserver_count = 0;
+    for line in resolv_conf.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        nameserver_count += 1;
+        let address = parts
+            .next()
+            .and_then(|address| address.split('%').next())
+            .and_then(|address| address.parse::<IpAddr>().ok());
+        if address != Some(listener) || parts.next().is_some() {
+            return false;
+        }
+    }
+    nameserver_count == 1
 }
 
 /// `wg show wg0 fwmark` prints `off` or a hex mark.
@@ -1114,7 +1167,7 @@ impl TunnelSidecar {
     }
 
     fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
-        if self.cfg.dns.is_empty() {
+        if self.cfg.provider != TunnelProvider::Netbird && self.cfg.dns.is_empty() {
             return Ok(None);
         }
         let dir = self.runtime_dir()?;
@@ -1129,6 +1182,9 @@ impl TunnelSidecar {
         let Some(path) = self.resolv_conf_path()? else {
             return Ok(None);
         };
+        if self.cfg.provider == TunnelProvider::Netbird {
+            return Ok(Some(path));
+        }
         let contents = std::iter::once("# lunarwing-tunnel-dns\n".to_string())
             .chain(
                 self.cfg
@@ -1369,7 +1425,14 @@ impl TunnelSidecar {
         let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => match self.host_resolver_ready().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => tracing::warn!(
+                        container = %self.container_name,
+                        error = %error,
+                        "Sandbox tunnel sidecar failed its joined-run resolver gate; recreating"
+                    ),
+                },
                 Err(error) => tracing::warn!(
                     container = %self.container_name,
                     error = %error,
@@ -1408,7 +1471,41 @@ impl TunnelSidecar {
         };
         self.provider_health().await?;
         self.check_egress_firewall().await?;
+        self.host_resolver_ready().await?;
         Ok(container_id)
+    }
+
+    /// Joined runs mount a host file that must still be the file the sidecar
+    /// writes. It comes apart when a start re-stages the file under a sidecar
+    /// that is then adopted, when a stop deletes it while the container
+    /// survives, or when NetBird writes the runtime resolver back. Any of
+    /// those makes this sidecar unhealthy so recovery stages the file again.
+    async fn host_resolver_ready(&self) -> Result<()> {
+        if self.cfg.provider != TunnelProvider::Netbird {
+            return Ok(());
+        }
+        let Some(path) = self.resolv_conf_path()? else {
+            return Ok(());
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.unavailable(
+                    "the tunnel resolver file joined runs mount is missing; recovery restages it",
+                ));
+            }
+            Err(_) => {
+                return Err(self
+                    .unavailable("the tunnel resolver file joined runs mount could not be read"));
+            }
+        };
+        let listener = self.netbird_listener().await?;
+        if netbird_resolver_file_matches(&contents, listener) {
+            return Ok(());
+        }
+        Err(self.unavailable(
+            "the tunnel resolver file joined runs mount no longer names NetBird's wt0 listener; recovery restages it",
+        ))
     }
 
     async fn start_fresh(&self, hash: &str, provider_timeout: Duration) -> Result<()> {
@@ -1420,14 +1517,20 @@ impl TunnelSidecar {
             }
             TunnelProvider::Wireguard => None,
         };
+        let dns_files = self.stage_netbird_dns_files(provider_timeout).await?;
         let env_file = self.write_secret_env_file()?;
+        let mounts = NetbirdSidecarMounts {
+            state_volume: state_volume.as_deref(),
+            resolv_conf: dns_files.as_ref().map(|(path, _)| path.as_path()),
+            dns_backup: dns_files.as_ref().map(|(_, path)| path.as_path()),
+        };
         let args = build_sidecar_args(
             &self.cfg,
             env_file.as_ref().map(SecretEnvFile::as_path),
             &self.container_name,
             &self.instance_id,
             hash,
-            state_volume.as_deref(),
+            (self.cfg.provider == TunnelProvider::Netbird).then_some(mounts),
         );
         let mut cleanup = SidecarStartCleanup::new(self.clone());
         let started = match self
@@ -1450,8 +1553,8 @@ impl TunnelSidecar {
             provider = self.cfg.provider.as_str(),
             "Sandbox tunnel sidecar started"
         );
-        // Provider startup finishes before the firewall goes in so bootstrap
-        // DNS and endpoint connections can use the still-open uplink.
+        // Provider startup and NetBird's resolver rewrite finish before the
+        // firewall goes in so bootstrap DNS and endpoints can use the open uplink.
         if let Err(error) = self.wait_provider_ready(provider_timeout).await {
             return Err(self.abort_start(&mut cleanup, error).await);
         }
@@ -1533,7 +1636,7 @@ impl TunnelSidecar {
             if tokio::time::Instant::now() >= deadline {
                 return Err(self.provider_ready_timeout_error(timeout, last_error));
             }
-            match tokio::time::timeout_at(deadline, self.provider_health()).await {
+            match tokio::time::timeout_at(deadline, self.provider_and_resolver_ready()).await {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => last_error = Some(error),
                 Err(_) => return Err(self.provider_ready_timeout_error(timeout, last_error)),
@@ -1544,6 +1647,11 @@ impl TunnelSidecar {
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL.min(remaining)).await;
         }
+    }
+
+    async fn provider_and_resolver_ready(&self) -> Result<()> {
+        self.provider_health().await?;
+        self.netbird_resolver_ready().await
     }
 
     fn provider_ready_timeout_error(
@@ -1733,14 +1841,25 @@ impl TunnelSidecar {
         Err(self.unavailable(&reason))
     }
 
-    /// The uplink allowance for the running sidecar. `set_wireguard_mark`
-    /// assigns [`LUNARWING_TUNNEL_FWMARK`] to a WireGuard device that has none
-    /// (install time); verification only reads.
-    async fn egress_policy(&self, set_wireguard_mark: bool) -> Result<EgressPolicy> {
-        let tunnel_mark = match self.cfg.provider {
-            TunnelProvider::Netbird => NETBIRD_CONTROL_PLANE_MARK,
-            TunnelProvider::Wireguard => self.wireguard_fwmark(set_wireguard_mark).await?,
-        };
+    async fn netbird_listener(&self) -> Result<IpAddr> {
+        let args = exec_args(&["netbird", "status", "--ipv4"], &self.container_name);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self
+            .output_probe(&refs)
+            .await
+            .map_err(|_| self.unavailable("could not query NetBird's wt0 listener"))?;
+        if !output.status.success() {
+            return Err(self.unavailable("could not query NetBird's wt0 listener"));
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<IpAddr>()
+            .ok()
+            .filter(IpAddr::is_ipv4)
+            .ok_or_else(|| self.unavailable("NetBird returned no valid wt0 IPv4 listener"))
+    }
+
+    async fn read_sidecar_resolv_conf(&self) -> Result<String> {
         let cat = exec_args(&["cat", "/etc/resolv.conf"], &self.container_name);
         let cat_refs: Vec<&str> = cat.iter().map(String::as_str).collect();
         let resolv = self
@@ -1750,11 +1869,38 @@ impl TunnelSidecar {
         if !resolv.status.success() {
             return Err(self.unavailable("could not read the sidecar's resolver list"));
         }
+        Ok(String::from_utf8_lossy(&resolv.stdout).into_owned())
+    }
+
+    async fn netbird_resolver_ready(&self) -> Result<()> {
+        if self.cfg.provider != TunnelProvider::Netbird {
+            return Ok(());
+        }
+        let listener = self.netbird_listener().await?;
+        let resolv_conf = self.read_sidecar_resolv_conf().await?;
+        if netbird_resolver_file_matches(&resolv_conf, listener) {
+            return Ok(());
+        }
+        Err(self.unavailable(&format!(
+            "NetBird managed DNS must replace the runtime resolver with only its wt0 listener {listener}; refusing firewall installation"
+        )))
+    }
+
+    /// The uplink allowance for the running sidecar. `set_wireguard_mark`
+    /// assigns [`LUNARWING_TUNNEL_FWMARK`] to a WireGuard device that has none
+    /// (install time); verification only reads.
+    async fn egress_policy(&self, set_wireguard_mark: bool) -> Result<EgressPolicy> {
+        if self.cfg.provider == TunnelProvider::Netbird {
+            return Ok(EgressPolicy {
+                tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
+                resolvers: vec![self.netbird_listener().await?],
+            });
+        }
+        let tunnel_mark = self.wireguard_fwmark(set_wireguard_mark).await?;
+        let resolv_conf = self.read_sidecar_resolv_conf().await?;
         Ok(EgressPolicy {
             tunnel_mark,
-            resolvers: self
-                .cfg
-                .uplink_resolvers(&String::from_utf8_lossy(&resolv.stdout)),
+            resolvers: self.cfg.uplink_resolvers(&resolv_conf),
         })
     }
 
@@ -2143,6 +2289,92 @@ impl TunnelSidecar {
             }
         }
         true
+    }
+
+    async fn bootstrap_resolv_conf(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        if self.cfg.provider != TunnelProvider::Netbird {
+            return Ok(None);
+        }
+        let image_id = self.resolve_image_id().await?;
+        let args = [
+            "run",
+            "--rm",
+            "--pull=never",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--read-only",
+            "--entrypoint",
+            "cat",
+            image_id.as_str(),
+            "/etc/resolv.conf",
+        ];
+        let output = tokio::time::timeout(timeout, self.runtime_output(&args, None))
+            .await
+            .map_err(|_| self.unavailable("runtime resolver bootstrap timed out"))?
+            .map_err(|_| self.unavailable("could not run the runtime resolver bootstrap"))?;
+        if !output.status.success()
+            || output.stdout.len() > 64 * 1024
+            || std::str::from_utf8(&output.stdout).is_err()
+            || parse_resolvers(&String::from_utf8_lossy(&output.stdout)).is_empty()
+        {
+            return Err(self.unavailable("runtime resolver bootstrap returned no valid resolvers"));
+        }
+        Ok(Some(output.stdout))
+    }
+
+    fn write_netbird_dns_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(self.unavailable("failed to replace the NetBird resolver file")),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|_| self.unavailable("failed to stage the NetBird resolver file"))?;
+        if file
+            .write_all(contents)
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(self.unavailable("failed to write the NetBird resolver file"));
+        }
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).is_err() {
+                let _ = std::fs::remove_file(path);
+                return Err(self.unavailable("failed to set NetBird resolver permissions"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn stage_netbird_dns_files(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<(PathBuf, PathBuf)>> {
+        let Some(contents) = self.bootstrap_resolv_conf(timeout).await? else {
+            return Ok(None);
+        };
+        let dir = self.runtime_dir()?;
+        let resolv_conf = dir.join(format!("{}.resolv.conf", self.container_name));
+        let backup = dir.join(format!(
+            "{}.resolv.conf.original.netbird",
+            self.container_name
+        ));
+        self.write_netbird_dns_file(&resolv_conf, &contents)?;
+        self.write_netbird_dns_file(&backup, &contents)?;
+        Ok(Some((resolv_conf, backup)))
     }
 
     fn write_secret_env_file(&self) -> Result<Option<SecretEnvFile>> {
@@ -2599,7 +2831,11 @@ mod tests {
             "lunarwing-sandbox-tunnel-test",
             "test-instance",
             "abc123",
-            Some("lunarwing-sandbox-tunnel-test-instance-netbird-abc123"),
+            Some(NetbirdSidecarMounts {
+                state_volume: Some("lunarwing-sandbox-tunnel-test-instance-netbird-abc123"),
+                resolv_conf: Some(Path::new("/run/user/1000/lw-resolv")),
+                dns_backup: Some(Path::new("/run/user/1000/lw-resolv-backup")),
+            }),
         );
         let joined = args.join("\n");
         assert!(!joined.contains("setup-key-1"));
@@ -2608,6 +2844,10 @@ mod tests {
         assert!(joined.contains("--device\n/dev/net/tun"));
         assert!(joined.contains(
             "-v\nlunarwing-sandbox-tunnel-test-instance-netbird-abc123:/var/lib/netbird"
+        ));
+        assert!(joined.contains("-v\n/run/user/1000/lw-resolv:/etc/resolv.conf:rw,z"));
+        assert!(joined.contains(
+            "-v\n/run/user/1000/lw-resolv-backup:/etc/resolv.conf.original.netbird:rw,z"
         ));
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
@@ -3303,6 +3543,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn netbird_resolver_file_requires_only_the_wt0_listener() {
+        let listener: IpAddr = "100.75.1.2".parse().unwrap();
+        assert!(netbird_resolver_file_matches(
+            "search netbird.selfhosted\nnameserver 100.75.1.2\n",
+            listener
+        ));
+        for contents in [
+            "nameserver 10.89.0.1\n",
+            "nameserver 100.75.1.2\nnameserver 10.89.0.1\n",
+            "nameserver 100.75.1.2\nnameserver 100.75.1.2\n",
+            "nameserver 100.75.1.2 extra\n",
+            "nameserver invalid\n",
+            "search netbird.selfhosted\n",
+        ] {
+            assert!(
+                !netbird_resolver_file_matches(contents, listener),
+                "accepted invalid resolver file: {contents}"
+            );
+        }
+    }
+
+    /// WI#724 ADN-2: a joined run must never start against a host resolver
+    /// file that is missing or that no longer names NetBird's own listener.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn netbird_host_resolver_file_must_stay_the_sidecars() {
+        let base = std::env::temp_dir().join(format!("lw-netbird-host-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            let stdout = match args.get(2).map(String::as_str) {
+                Some("netbird") if args.iter().any(|arg| arg == "--ipv4") => "100.75.1.2\n",
+                other => panic!("unexpected sidecar exec: {other:?}"),
+            };
+            async move { Ok(successful_runtime_output(stdout.to_string())) }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+        let path = sidecar.resolv_conf_path().unwrap().unwrap();
+
+        let missing = sidecar.host_resolver_ready().await.unwrap_err();
+        assert!(missing.to_string().contains("is missing"), "{}", missing);
+
+        std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
+        let diverged = sidecar.host_resolver_ready().await.unwrap_err();
+        assert!(
+            diverged.to_string().contains("no longer names"),
+            "{}",
+            diverged
+        );
+
+        std::fs::write(&path, "nameserver 100.75.1.2\n").unwrap();
+        sidecar.host_resolver_ready().await.unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn netbird_dns_bootstrap_stages_readable_files_without_credentials() {
+        let base = std::env::temp_dir().join(format!("lw-netbird-dns-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let image_id = format!("sha256:{}", "1".repeat(64));
+        let expected = format!(
+            "run --rm --pull=never --cap-drop=ALL --security-opt=no-new-privileges --read-only --entrypoint cat {image_id} /etc/resolv.conf"
+        );
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new(move |args, _stdin| {
+            let stdout = if args.first().map(String::as_str) == Some("image") {
+                format!("{image_id}\n")
+            } else {
+                assert_eq!(args.join(" "), expected);
+                "nameserver 10.89.0.1\n".to_string()
+            };
+            async move { Ok(successful_runtime_output(stdout)) }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let (resolv_conf, backup) = sidecar
+            .stage_netbird_dns_files(Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        for path in [&resolv_conf, &backup] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "nameserver 10.89.0.1\n"
+            );
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert_eq!(sidecar.tunnel_resolv_conf().unwrap(), Some(resolv_conf));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn netbird_readiness_waits_for_listener_and_policy_ignores_the_file() {
+        let base = std::env::temp_dir().join(format!("lw-netbird-ready-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let cat_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let cat_calls = cat_calls.clone();
+            move |args, _stdin| {
+                let cat_calls = cat_calls.clone();
+                let stdout = match args.get(2).map(String::as_str) {
+                    Some("netbird") if args.iter().any(|arg| arg == "--ipv4") => {
+                        "100.75.1.2\n".to_string()
+                    }
+                    Some("netbird") => String::new(),
+                    Some("cat") => {
+                        let call = cat_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if call < 3 {
+                            "nameserver 10.89.0.1\n".to_string()
+                        } else {
+                            "nameserver 100.75.1.2\n".to_string()
+                        }
+                    }
+                    other => panic!("unexpected sidecar exec: {other:?}"),
+                };
+                async move { Ok(successful_runtime_output(stdout)) }
+            }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+
+        let error = sidecar.netbird_resolver_ready().await.unwrap_err();
+        assert!(error.to_string().contains("refusing firewall installation"));
+        sidecar
+            .wait_provider_ready(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let policy = sidecar.egress_policy(false).await.unwrap();
+        assert_eq!(
+            policy.resolvers,
+            vec!["100.75.1.2".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(cat_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(unix)]
     fn slow_healthy_runtime(
         hash: String,
@@ -3562,7 +3963,7 @@ mod tests {
     #[cfg(unix)]
     fn successful_netbird_health(command: Option<&str>, listing: &str) -> HealthReply {
         match command {
-            Some("netbird") => HealthReply::success(""),
+            Some("netbird") => HealthReply::success("9.9.9.9\n"),
             Some("cat") => HealthReply::success("nameserver 9.9.9.9\n"),
             Some("nft") => HealthReply::success(listing),
             other => panic!("unexpected sidecar exec: {other:?}"),
@@ -3584,7 +3985,7 @@ mod tests {
                 HealthReply::failure().after_millis(100)
             }
             HealthScript::FailsThenSlow(_) => HealthReply::success("").after(30),
-            HealthScript::SlowFirewall if command == Some("cat") => {
+            HealthScript::SlowFirewall if command == Some("nft") => {
                 successful_netbird_health(command, listing).after(30)
             }
             HealthScript::SlowFirewall | HealthScript::Healthy => {
@@ -3735,7 +4136,7 @@ mod tests {
         );
         assert!(!reason.contains("remained unhealthy"), "{reason}");
         assert_eq!(started.elapsed(), Duration::from_secs(6));
-        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(removals.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -3982,7 +4383,7 @@ mod tests {
         let error = cfg.validate().unwrap_err();
         assert_eq!(
             error,
-            "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use runtime DNS"
+            "SANDBOX_TUNNEL_DNS is unsupported with the netbird provider; leave it unset to use NetBird's managed resolver"
         );
         assert!(!error.contains("setup-key-1"));
         let misplaced_canary = TunnelSidecarConfig {
@@ -4002,8 +4403,13 @@ mod tests {
             .join(" ");
         assert!(!args.contains("--dns"));
         assert!(cfg.uplink_resolvers("nameserver 169.254.1.1\n").is_empty());
+        assert!(
+            netbird_cfg()
+                .uplink_resolvers("nameserver 169.254.1.1\n")
+                .is_empty()
+        );
         assert_eq!(
-            netbird_cfg().uplink_resolvers("nameserver 169.254.1.1\n"),
+            wireguard_cfg(None).uplink_resolvers("nameserver 169.254.1.1\n"),
             vec!["169.254.1.1".parse::<IpAddr>().unwrap()]
         );
         let invalid = TunnelSidecarConfig {
