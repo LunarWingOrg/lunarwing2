@@ -518,7 +518,11 @@ under `/usr/local/lib/lunarwing-study-notes-sync/current`, not this checkout:
 schedule is still installed, and each release records the staging commit in
 `STAGED-FROM`. A schedule an operator removed or disabled stays that way: the
 upgrade refreshes the staged files so a later re-arm runs fixed code, but it
-never re-creates the unit or re-enables the timer. `lunarwing-mt-admin.sh
+never re-creates the unit or re-enables the timer. On OpenRC a managed cron
+block whose entry is commented out counts as disabled; on systemd a timer that
+is enabled but stopped is started again. When the restage is refused or fails,
+the upgrade prints the reason and leaves the schedule and the previous staged
+copy as they were. `lunarwing-mt-admin.sh
 doctor` prints the staged commit, warns when it lags the checkout, and says
 when the snapshot has outlived its schedule. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:

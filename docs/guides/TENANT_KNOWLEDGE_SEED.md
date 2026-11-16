@@ -138,7 +138,10 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    an existing snapshot from the upgraded-from checkout (stamped in
    `STAGED-FROM`); when the hourly schedule was removed or disabled, it
    refreshes the staged files and leaves the removal in place — an upgrade
-   never creates a scheduler or re-enables a disabled timer. `doctor` reports
+   never creates a scheduler or re-enables a disabled timer (on OpenRC, a
+   commented-out entry in the managed cron block counts as disabled). A restage
+   that is refused or fails changes neither the schedule nor the staged copy.
+   `doctor` reports
    the staged commit and flags a snapshot that has outlived its schedule.
 3. Each tenant daemon independently checks on its configured cadence (six hours
    by default, with deterministic startup jitter). When the revision changes it
