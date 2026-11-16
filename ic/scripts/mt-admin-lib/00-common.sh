@@ -26,12 +26,15 @@ warn_err() { printf 'error: %s\n' "$*" >&2; }
 
 health_lib_validate_root_owned_directory() {
   local path="$1" rest component current="/" owner mode
+  local stat_bin="${HEALTH_LIB_STAT:-stat}"
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   [[ "$path" == /* && -d "$path" ]] || return 1
   rest="${path#/}"
   while :; do
+    HEALTH_LIB_UNSAFE_COMPONENT="$current"
     [[ -d "$current" && ! -L "$current" ]] || return 1
-    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
-    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    owner="$("$stat_bin" -c '%u' "$current" 2>/dev/null || true)"
+    mode="$("$stat_bin" -c '%a' "$current" 2>/dev/null || true)"
     [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
     (( (8#$mode & 0022) == 0 )) || return 1
     [[ -n "$rest" ]] || break
@@ -40,19 +43,31 @@ health_lib_validate_root_owned_directory() {
     current="${current%/}/$component"
     if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
   done
+  HEALTH_LIB_UNSAFE_COMPONENT=""
   return 0
 }
 
+# A root-owned directory with no group/other write grants a set-group-ID bit
+# nothing: the bit only changes the group of new entries, and nobody else can
+# create any. It is inherited from a set-group-ID parent (chmod 0755 does not
+# clear it), so refusing it on directories would stop an install, a snapshot
+# load and every command of a checkout that live under such a parent. Set-ID
+# bits are therefore refused on regular files only, where they do change what
+# the file does when it runs.
 health_lib_tree_require_safe() {
-  local path="${1:-}" unsafe
+  local path="${1:-}" unsafe component
+  local find_bin="${HEALTH_LIB_FIND:-find}"
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   if [[ "$path" == / ]] || ! health_lib_validate_root_owned_directory "$path"; then
-    printf 'error: refusing health library %s: path and parents must be root-owned, symlink-free, and not group/other-writable\n' "$path" >&2
+    component="${HEALTH_LIB_UNSAFE_COMPONENT:-$path}"
+    printf 'error: refusing health library component %s (library %s): path and parents must be root-owned, symlink-free, and not group/other-writable\n' \
+      "$component" "$path" >&2
     return 1
   fi
-  unsafe="$(find "$path" \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
-    || { printf 'error: refusing health library %s: ownership and permissions could not be inspected\n' "$path" >&2; return 1; }
+  unsafe="$("$find_bin" "$path" \( -type l -o ! -uid 0 -o -perm /022 -o \( -type f -a -perm /6000 \) -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null)" \
+    || { printf 'error: refusing health library %s: ownership, file types, and permissions could not be inspected\n' "$path" >&2; return 1; }
   if [[ -n "$unsafe" ]]; then
-    printf 'error: refusing health library entry %s: symbolic link, non-root owner, or group/other-writable\n' "$unsafe" >&2
+    printf 'error: refusing health library entry %s: symbolic link, non-root owner, group/other write, set-ID bits on a regular file, or a non-regular file type\n' "$unsafe" >&2
     return 1
   fi
   return 0

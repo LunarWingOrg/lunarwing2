@@ -409,12 +409,19 @@ INITEOF
 # helpers (00-common.sh) are defined
 # before this point, so the library's fallbacks are not used by mt-admin.
 require_safe_installed_health_source() {
-  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR"
-  if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
-    resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved_source resolved_library resolved_admin
+  resolved_source="$(readlink -f -- "$source_dir" 2>/dev/null)" || {
+    printf 'error: refusing health contract source %s: path could not be resolved\n' "$source_dir" >&2
+    return 1
+  }
+  resolved_library="$(readlink -f -- "$HEALTH_LIB_DIR" 2>/dev/null)" || resolved_library="$HEALTH_LIB_DIR"
+  resolved_admin="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || resolved_admin="$SCRIPT_DIR"
+  if health_lib_validate_root_owned_directory "$resolved_admin"; then
+    health_lib_tree_require_safe "$resolved_source"
+    return
   fi
-  [[ "$resolved" == "$HEALTH_LIB_DIR" ]] || return 0
-  health_lib_tree_require_safe "$HEALTH_LIB_DIR"
+  [[ "$resolved_source" == "$resolved_library" ]] || return 0
+  health_lib_tree_require_safe "$resolved_library"
 }
 require_safe_installed_health_source
 # shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh

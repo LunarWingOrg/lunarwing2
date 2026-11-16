@@ -129,6 +129,10 @@ HEALTH_LIB_DIR="/usr/local/lib/lunarwing-health"
 # Library entries installed by other tools that a reinstall keeps (see
 # carry_health_library_entries): the optional metrics listener binary.
 HEALTH_LIB_CARRIED_ENTRIES=(lunarwing-health-metrics)
+# The inspection binaries are the generated launcher's to pin, and only the
+# launcher does. Drop values inherited from the environment that started
+# mt-admin so the library cannot be probed through a substituted stat/find.
+unset HEALTH_LIB_STAT HEALTH_LIB_FIND
 HEALTH_ENV_FILE="/etc/lunarwing/health.env"
 HEALTH_LAUNCHER="/usr/local/sbin/lunarwing-mt-health"
 # Gotify for self-heal escalations (token must NOT be committed — supply via env;
