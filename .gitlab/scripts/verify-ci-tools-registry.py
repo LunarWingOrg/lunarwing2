@@ -9,8 +9,9 @@ what keeps non-Maintainers from publishing to `lunarwing-ci-tools`. The token
 goes to the configured API host only: over https (plain http is accepted for a
 loopback address), and never to a redirect target.
 
-Exit codes: 0 ok, 1 checksum mismatch, 2 archive absent or unreachable,
-3 protection rule missing or weaker than Maintainer.
+Exit codes: 0 ok, 1 checksum mismatch or unreadable pin, 2 archive absent (404)
+or registry unreachable, 3 protection rule missing, weaker than Maintainer or
+not checkable, 4 any other HTTP status on a download. The highest one wins.
 """
 
 import argparse
@@ -32,6 +33,7 @@ OK = 0
 MISMATCH = 1
 MISSING = 2
 UNPROTECTED = 3
+REGISTRY_ERROR = 4
 TIMEOUT = 120
 TOOLS = (
     {
@@ -210,8 +212,14 @@ def main() -> int:
         try:
             actual = fetch_sha256(url)
         except urllib.error.HTTPError as error:
-            print(f"{pin['name']} {pin['version']}: ABSENT (HTTP {error.code}) {url}")
-            status = max(status, MISSING)
+            if error.code == 404:
+                print(f"{pin['name']} {pin['version']}: ABSENT (HTTP 404) {url}")
+                status = max(status, MISSING)
+            else:
+                # Not proof of absence: an overloaded edge answers 503 for a
+                # published archive, and a second upload would duplicate it.
+                print(f"{pin['name']} {pin['version']}: ERROR (HTTP {error.code}) {url}")
+                status = max(status, REGISTRY_ERROR)
             continue
         except urllib.error.URLError as error:
             print(f"{pin['name']} {pin['version']}: UNREACHABLE ({error.reason}) {url}")

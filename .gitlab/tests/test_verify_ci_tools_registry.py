@@ -180,7 +180,16 @@ class VerifyRegistryTests(unittest.TestCase):
         }
         result = self.run_verifier(self.serve(routes))
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("shellcheck 9.9.9: ABSENT", result.stdout)
+        self.assertIn("shellcheck 9.9.9: ABSENT (HTTP 404)", result.stdout)
+
+    def test_registry_error_is_not_reported_as_absence(self) -> None:
+        server = self.serve(self.routes())
+        server.statuses[SCCACHE_PATH] = 503
+        result = self.run_verifier(server)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("sccache 9.9.9: ERROR (HTTP 503)", result.stdout)
+        self.assertNotIn("ABSENT", result.stdout)
+        self.assertIn("shellcheck 9.9.9: ok", result.stdout)
 
     def test_corrupt_archive_fails_the_pin(self) -> None:
         routes = {**self.routes(), SCCACHE_PATH: b"tampered"}

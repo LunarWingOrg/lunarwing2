@@ -1048,9 +1048,12 @@ Publication remains a Maintainer action; agents must not upload these archives.
 Check the whole contract with
 `python3 .gitlab/scripts/verify-ci-tools-registry.py --token-file ~/.gl-maint-header`
 (omit the token to check only publication): it reads both pins from the
-installers, downloads the archives anonymously, and compares hashes. It exits 2
-when an archive is absent, 1 on a pin mismatch, and 3 when no generic rule keeps
-push at Maintainer or above. A protection rule does not constrain instance
+installers, downloads the archives anonymously, and compares hashes. It exits 1
+on a pin mismatch or an unreadable pin, 2 when an archive is absent (404) or the
+registry is unreachable, 3 when no generic rule keeps push at Maintainer or
+above or the rule check cannot be completed, and 4 when a download gets any
+other HTTP status: that is an error to retry, not proof of absence. The highest
+code wins. A protection rule does not constrain instance
 admins — GitLab admits admin-flagged accounts at every level, and an agent
 service account can carry that flag — so confirm the publishing account is a
 plain Maintainer before trusting the rule as a boundary.
