@@ -201,7 +201,27 @@ The tasks were chosen for the lane's fat Python/C++ toolchain:
   report pair, regenerated fixture), and the SHA-256 pairs match
   (`access.log` = `7f8e0303…e45aa27`, `report.json` = `f59fed2f…b3aefdd`).
 
-### The first dispatch of this task failed (H2)
+### Job 2 — C++17 weighted interval scheduling: PASS
+
+- Job `c6c15f0b-92ca-415a-b3df-b020f06b3649`, mode `external:lunardepth`,
+  created 22:01:29Z and completed 22:15:16Z (**827 s**). The worker left
+  `wis.hpp`, `main.cpp`, `tests.cpp`, `Makefile`, three transcripts and
+  `SUMMARY.md` under `/workspace/wi734_aj_cpp_wis`.
+- The worker's driver reports **15/15 directed cases**, an exhaustive-subset
+  oracle over **320 seeded instances** (optimum weight, reconstructed-set
+  weight, and non-overlap on each), and a scaling case at **N=2500** with
+  `optimum=1080 selected=62`.
+- **Independent forced rebuild on the host** with
+  `g++ -O2 -std=c++17 -Wall -Wextra -Werror` succeeded, and the full suite
+  passed again: `Directed: 15 passed`, `Oracle: 320 passed`,
+  `Scaling: 1 passed`, `FINAL: ALL TESTS PASSED`.
+- **Determinism:** `transcript2.txt` and `transcript3.txt` are byte-identical.
+- **Independent oracle of the algorithm itself** (a separate Python DP using
+  `bisect` over finish-sorted intervals, not the worker's driver): 60 fresh
+  seeded instances, including empty input and negative weights, **0
+  mismatches** against `wis_main`'s reported optimum.
+
+### The first dispatch of job 1 failed (H2)
 
 The first attempt at job 1, `20d31ff7-1318-4393-a28a-777d6fd33da8`, ran
 21:13:46Z→21:44:02Z and **failed** with
