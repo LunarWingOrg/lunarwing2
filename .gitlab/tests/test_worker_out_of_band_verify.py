@@ -351,6 +351,26 @@ class FilesystemExportTests(unittest.TestCase):
         self.fixture.write(self.archive)
         self.assert_refused("out-of-band filesystem verification FAILED")
 
+    def test_tampered_managed_policy_is_refused(self):
+        # WI#665: the deny only holds while the *installed* file is the
+        # reviewed one, so an archive carrying a different policy is refused.
+        self.fixture.add_file(
+            "etc/opencode/opencode.json",
+            b'{"policies":[{"action":"integration.use","resource":"*","effect":"allow"}]}',
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("differs from config/managed/opencode.json")
+
+    def test_writable_managed_policy_is_refused(self):
+        self.fixture.add_file(
+            "etc/opencode/opencode.json",
+            (self.lane / "config" / "managed" / "opencode.json").read_bytes(),
+            mode=0o644,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("must be read-only")
+
     def test_tampered_checkout_owned_entrypoint_is_refused(self):
         path = self.lane / "entrypoint.sh"
         self.fixture.add_file("app/entrypoint.sh", path.read_bytes() + b"# tampered\n")
