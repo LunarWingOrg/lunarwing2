@@ -139,7 +139,7 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    `STAGED-FROM`); when the hourly schedule was removed or disabled, it
    refreshes the staged files and leaves the removal in place — an upgrade
    never creates a scheduler or re-enables a disabled timer (on OpenRC, a
-   commented-out entry in the managed cron block counts as disabled). A restage
+   commented-out entry in the managed cron block counts as disabled). A staging
    that is refused or fails changes neither the schedule nor the staged copy.
    `doctor` reports
    the staged commit and flags a snapshot that has outlived its schedule.
