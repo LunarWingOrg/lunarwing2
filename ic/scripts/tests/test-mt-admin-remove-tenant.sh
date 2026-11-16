@@ -298,11 +298,15 @@ worker_egress_nft() {
 
 # Process-table races around one status read: a task that exits right before
 # its read (EXIT_BEFORE_READ_PID), or a child forked once the pass has listed
-# the table (FORK_AFTER_LISTING), which only a second pass can see.
+# the table (FORK_AFTER_LISTING), which only a second pass can see. The task
+# that exits is then read by the REAL reader, on a file that is gone, so the
+# case holds what it names: under bash 5.2 a $(<file) read there would end
+# mt-admin before the proof could skip the task.
 _tenant_status_uids() {
   if [[ -n "$EXIT_BEFORE_READ_PID" && "$1" == "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID/status" ]]; then
     command rm -rf -- "$TENANT_PROC_ROOT/$EXIT_BEFORE_READ_PID"
-    return 1
+    real_tenant_status_uids "$@"
+    return
   fi
   if [[ "$FORK_AFTER_LISTING" == true && ! -e "$TENANT_PROC_ROOT/4900" ]]; then
     seed_process 4900 61000
@@ -595,6 +599,18 @@ run_standalone_missing_account_stop_refusal() {
     fail "standalone stop-tenant reported success without the idle proof (rc=$rc): $(command cat "$CASE_DIR/stop-tenant.out")"
   fi
   command rm -rf -- "$TENANT_PROC_ROOT/4545"
+  seed_process 4646 61000
+  rc=0
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
+    tenant_exists_in_registry() { return 0; }
+    stop_worker alpha opencode) >"$CASE_DIR/stop-worker-live.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/stop-worker-live.out" \
+      && grep -q 'opencode stop state is unknown' "$CASE_DIR/stop-worker-live.out"; then
+    pass 'standalone stop-worker refuses while a process of the former uid runs'
+  else
+    fail "standalone stop-worker reached its skip with a live former uid (rc=$rc): $(command cat "$CASE_DIR/stop-worker-live.out")"
+  fi
+  command rm -rf -- "$TENANT_PROC_ROOT/4646"
   rc=0
   (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true
     tenant_exists_in_registry() { return 0; }
@@ -892,6 +908,18 @@ run_missing_account_refusal_case() {
       printf '4502\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/session/cgroup.procs"
       printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
       ;;
+    busy-openrc-base-service-cgroup)
+      # Pins the eight base services of the cgroup list: a list cut down to
+      # the vision lane loses them, and this tree would pass unproven.
+      mkdir -p "$TENANT_CGROUP_ROOT/openrc.weechat-alpha"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/openrc.weechat-alpha/cgroup.events"
+      ;;
+    busy-openrc-worker-cgroup)
+      # Pins the per-lane services, including the -sup pair: a list cut down
+      # to vision loses the other lanes.
+      mkdir -p "$TENANT_CGROUP_ROOT/openrc.lunarwing-pebble-alpha-sup"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/openrc.lunarwing-pebble-alpha-sup/cgroup.events"
+      ;;
     busy-systemd-cgroup)
       mkdir -p "$TENANT_CGROUP_ROOT/user.slice/user-61000.slice"
       : >"$TENANT_CGROUP_ROOT/user.slice/user-61000.slice/cgroup.procs"
@@ -949,6 +977,24 @@ run_exited_task_case() {
     pass 'an unmatched task glob without nullglob is skipped, not refused'
   else
     fail "an unmatched task glob refused the proof: $(command cat "$CASE_DIR/idle-noglob.out")"
+  fi
+}
+
+# An init system that cannot be detected must refuse the cgroup step: with no
+# result it checked the OpenRC trees, which a systemd host does not have, and
+# passed a populated user slice unproven.
+run_undetected_init_cgroup_case() {
+  local rc=0
+  setup_case openrc undetected-init
+  seed_identity
+  mkdir -p "$TENANT_CGROUP_ROOT/lunarwing-alpha"
+  printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/lunarwing-alpha/cgroup.events"
+  (ensure_init_system() { INIT_SYSTEM=""; return 1; }; tenant_former_identity_idle alpha) \
+    >"$CASE_DIR/idle.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'cannot detect the init system; cannot prove the cgroup tree' "$CASE_DIR/idle.out"; then
+    pass 'an undetected init system refuses the cgroup step with a reason'
+  else
+    fail "an undetected init system did not refuse the cgroup step (rc=$rc): $(command cat "$CASE_DIR/idle.out")"
   fi
 }
 
@@ -1302,6 +1348,8 @@ run_missing_account_refusal_case openrc current-subuid-mismatch 'current-side ra
 run_missing_account_refusal_case openrc record-subuid-mismatch 'record-side range differs'
 run_missing_account_refusal_case openrc busy-openrc-cgroup 'stop OpenRC service lunarwing-vision-alpha before removal'
 run_missing_account_refusal_case openrc busy-openrc-subtree 'tenant alpha cgroup'
+run_missing_account_refusal_case openrc busy-openrc-base-service-cgroup 'OpenRC service weechat-alpha cgroup'
+run_missing_account_refusal_case openrc busy-openrc-worker-cgroup 'OpenRC service lunarwing-pebble-alpha-sup cgroup'
 run_missing_account_refusal_case systemd busy-systemd-cgroup 'systemd user-61000.slice cgroup'
 run_missing_account_refusal_case openrc invalid-cgroup-events 'no single valid populated value'
 run_missing_account_refusal_case openrc missing-cgroup-events 'cgroup.events; cannot prove the tenant alpha cgroup empty'
@@ -1321,6 +1369,7 @@ run_missing_account_refusal_case openrc getent-missing "cannot tell whether the 
 run_missing_account_refusal_case openrc passwd-compat "cannot tell whether the account of tenant 'alpha' is gone"
 run_missing_account_refusal_case openrc forked-after-listing 'still run (4900)'
 run_exited_task_case
+run_undetected_init_cgroup_case
 run_orphan_home_warning_case
 run_missing_account_teardown_refusal
 run_rootful_docker_case false
