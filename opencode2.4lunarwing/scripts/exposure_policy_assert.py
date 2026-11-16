@@ -53,8 +53,10 @@ Assertions (opencode2 lane):
      any other key there would shadow the lane's own); its resource pattern
      covers both forms upstream builds (the bare integration ID for an
      environment credential and `<integration>#<account>` for a saved login);
-     and the installed /etc/opencode/opencode.json is root-owned, read-only,
-     under non-writable parents, and byte-identical to the checkout's copy.
+     the installed /etc/opencode/opencode.json is root-owned, read-only,
+     under non-writable parents, and byte-identical to the checkout's copy;
+     and it is the only entry of /etc/opencode (upstream also loads a sibling
+     `opencode.jsonc` from the managed directory, above `opencode.json`).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1 has no service mode or
@@ -179,6 +181,34 @@ def check_managed_policy(lane: pathlib.Path) -> None:
               "for both the bare and the account-qualified resource")
 
 
+def _managed_directory_extras(
+    policy_path: pathlib.Path,
+    image_root: pathlib.Path | None,
+    records: dict[str, dict[str, int]] | None,
+) -> list[str]:
+    """Every entry of the managed directory other than the reviewed file.
+
+    In-image this lists the directory. Out of band it reads the tar-header
+    records, because the verifier materializes only the files it compares:
+    names are relative to the directory and cover every depth.
+    """
+    directory = policy_path.parent
+    if records is None:
+        names = os.listdir(directory)
+    else:
+        if image_root is None:
+            raise OSError("tar-header metadata requires an image root")
+        try:
+            relative = pathlib.Path(os.path.abspath(directory)).relative_to(
+                pathlib.Path(os.path.abspath(image_root))
+            )
+        except ValueError as error:
+            raise OSError(f"path {directory} escapes image root {image_root}") from error
+        prefix = f"{relative.as_posix()}/"
+        names = [name[len(prefix):] for name in records if name.startswith(prefix)]
+    return sorted(name for name in names if name != policy_path.name)
+
+
 def check_installed_managed_policy(
     lane: pathlib.Path,
     policy_path: pathlib.Path = MANAGED_POLICY_INSTALLED,
@@ -188,11 +218,12 @@ def check_installed_managed_policy(
     image_root: pathlib.Path | None = None,
     image_metadata: dict[str, dict[str, int]] | None = None,
 ) -> None:
-    """WI#665: the installed policy is root-owned, read-only and unchanged.
+    """WI#665: the installed policy is root-owned, read-only, unchanged, alone.
 
     The build copies the checkout's file here, so an installed copy that no
-    longer matches it, or one the task user could rewrite, would silently lift
-    the deny. Checked in-image and from a tar export, like the wrapper.
+    longer matches it, one the task user could rewrite, or a second managed
+    document beside it would silently lift the deny. Checked in-image and
+    from a tar export, like the wrapper.
     """
     try:
         metadata = _path_metadata(policy_path, image_root, image_metadata)
@@ -220,6 +251,26 @@ def check_installed_managed_policy(
         image_root=image_root,
         image_metadata=image_metadata,
     )
+    # Upstream reads two names from the managed directory, `opencode.json` and
+    # `opencode.jsonc` (packages/core/src/config/discovery.ts:12 and
+    # config.ts:270-277 at the v2.2.7 pin), and the second one's policies
+    # outrank the first's (config.ts:313-325), so a sibling document can lift
+    # the reviewed deny while the reviewed file is untouched. The directory
+    # is also a config directory entry (config.ts:275), the kind upstream
+    # scans for skills and plugins. It must therefore hold the one reviewed
+    # file and nothing else.
+    try:
+        extras = _managed_directory_extras(policy_path, image_root, image_metadata)
+    except OSError as error:
+        fail(f"managed directory {policy_path.parent} cannot be listed: {error} (WI#665)")
+        return
+    if extras:
+        fail(f"managed directory {policy_path.parent} must hold only "
+             f"{policy_path.name} (also found {extras}) — everything there is "
+             "managed config, and a sibling opencode.jsonc outranks the reviewed "
+             "deny (WI#665)")
+    else:
+        check(f"managed directory {policy_path.parent} holds only {policy_path.name}")
     try:
         installed = policy_path.read_text(encoding="utf-8")
     except OSError as error:

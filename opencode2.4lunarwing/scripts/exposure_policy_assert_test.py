@@ -249,6 +249,77 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             installed.unlink()
             self.assertTrue(any("missing or unreadable" in f for f in run(metadata)), run(metadata))
 
+    def test_installed_managed_directory_must_hold_only_the_policy(self) -> None:
+        # WI#665 (review AEP-3): upstream loads `opencode.jsonc` from the
+        # managed directory above `opencode.json` and scans the directory as
+        # managed config, so anything beside the reviewed file is refused:
+        # from the tar-header records out of band, and from the directory
+        # itself in-image.
+        allow = {"policies": [{"action": "integration.use", "resource": "opencode*", "effect": "allow"}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            etc = root / "etc" / "opencode"
+            etc.mkdir(parents=True)
+            for directory in (root, root / "etc", etc):
+                directory.chmod(0o755)
+            installed = etc / "opencode.json"
+            installed.write_text(json.dumps(MANAGED_POLICY), encoding="utf-8")
+            installed.chmod(0o444)
+            directory_record = {"mode": 0o40755, "uid": 0, "gid": 0}
+            file_record = {"mode": 0o100444, "uid": 0, "gid": 0}
+            metadata = {
+                "": directory_record,
+                "etc": directory_record,
+                "etc/opencode": directory_record,
+                "etc/opencode/opencode.json": file_record,
+            }
+
+            def run(records: dict[str, dict[str, int]] | None) -> list[str]:
+                self.assert_module.failures.clear()
+                self.assert_module.check_installed_managed_policy(
+                    self.lane,
+                    installed,
+                    owner_uid=0 if records is not None else os.geteuid(),
+                    parent_root=root,
+                    image_root=root if records is not None else None,
+                    image_metadata=records,
+                )
+                return list(self.assert_module.failures)
+
+            def refused(failures: list[str], entry: str) -> bool:
+                return any(
+                    "must hold only opencode.json" in failure and entry in failure
+                    for failure in failures
+                )
+
+            # Out of band: every tar member under the directory counts, at
+            # any depth, whether or not the file was materialized.
+            self.assertEqual(run(metadata), [])
+            cases = {
+                "opencode.jsonc": {"etc/opencode/opencode.jsonc": file_record},
+                "skill": {"etc/opencode/skill": directory_record},
+                "skill/x/SKILL.md": {"etc/opencode/skill/x/SKILL.md": file_record},
+            }
+            for entry, extra in cases.items():
+                with self.subTest(source="tar records", entry=entry):
+                    failures = run({**metadata, **extra})
+                    self.assertTrue(refused(failures, entry), failures)
+            neighbours = {"etc/opencode.jsonc": file_record, "etc/opencode-other/x": file_record}
+            self.assertEqual(run({**metadata, **neighbours}), [])
+
+            # In-image: the directory is listed.
+            self.assertEqual(run(None), [])
+            sibling = etc / "opencode.jsonc"
+            sibling.write_text(json.dumps(allow), encoding="utf-8")
+            failures = run(None)
+            self.assertTrue(refused(failures, "opencode.jsonc"), failures)
+            sibling.unlink()
+            (etc / "skill").mkdir()
+            failures = run(None)
+            self.assertTrue(refused(failures, "skill"), failures)
+            (etc / "skill").rmdir()
+            self.assertEqual(run(None), [])
+
     def test_service_invocation_in_entrypoint_fails(self) -> None:
         with (self.lane / "entrypoint.sh").open("a", encoding="utf-8") as handle:
             handle.write('"$OPENCODE_BIN" service start\n')

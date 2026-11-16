@@ -371,6 +371,29 @@ class FilesystemExportTests(unittest.TestCase):
         self.fixture.write(self.archive)
         self.assert_refused("must be read-only")
 
+    def test_second_managed_document_is_refused(self):
+        # WI#665 (review AEP-3): upstream also loads `opencode.jsonc` from the
+        # managed directory, above `opencode.json`, so a sibling that allows
+        # the integration lifts the reviewed deny while that file is intact.
+        self.fixture.add_file(
+            "etc/opencode/opencode.jsonc",
+            b'{"policies":[{"action":"integration.use","resource":"opencode*","effect":"allow"}]}',
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected managed-config entry etc/opencode/opencode.jsonc")
+
+    def test_managed_directory_subdirectory_is_refused(self):
+        # The managed directory is scanned as config too: a skill there would
+        # be a managed skill that no check has read.
+        self.fixture.add_file(
+            "etc/opencode/skill/x/SKILL.md",
+            b"---\nname: x\ndescription: x\n---\nbody\n",
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected managed-config entry etc/opencode/skill")
+
     def test_tampered_checkout_owned_entrypoint_is_refused(self):
         path = self.lane / "entrypoint.sh"
         self.fixture.add_file("app/entrypoint.sh", path.read_bytes() + b"# tampered\n")
