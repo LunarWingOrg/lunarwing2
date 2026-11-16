@@ -5,7 +5,9 @@ The pins are read from the installers that consume them, so this never drifts
 from what CI checks. Each archive is downloaded anonymously from the project's
 generic package registry, the way a job downloads it, and its SHA256 must equal
 the pin. With --token-file the package protection rule is checked too: it is
-what keeps non-Maintainers from publishing to `lunarwing-ci-tools`.
+what keeps non-Maintainers from publishing to `lunarwing-ci-tools`. The token
+goes to the configured API host only: over https (plain http is accepted for a
+loopback address), and never to a redirect target.
 
 Exit codes: 0 ok, 1 checksum mismatch, 2 archive absent or unreachable,
 3 protection rule missing or weaker than Maintainer.
@@ -14,12 +16,14 @@ Exit codes: 0 ok, 1 checksum mismatch, 2 archive absent or unreachable,
 import argparse
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -108,9 +112,37 @@ def read_token(path: pathlib.Path) -> str:
     raise ValueError(f"{path} holds no token")
 
 
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would repeat the token header to the redirect target, on any host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing the redirect to {newurl}", headers, fp
+        )
+
+
+def token_opener(url: str) -> urllib.request.OpenerDirector:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return urllib.request.build_opener(RefuseRedirect)
+    # A name such as localhost is whatever the resolver says, so only a
+    # literal loopback address may take the token unencrypted.
+    try:
+        loopback = ipaddress.ip_address(parts.hostname or "").is_loopback
+    except ValueError:
+        loopback = False
+    if parts.scheme != "http" or not loopback:
+        raise ValueError(
+            f"refusing to send the token to {parts.scheme}://{parts.hostname}: "
+            "use https (plain http only for a loopback address such as 127.0.0.1)"
+        )
+    # Unencrypted, so no proxy from the environment may relay it either.
+    return urllib.request.build_opener(RefuseRedirect, urllib.request.ProxyHandler({}))
+
+
 def get_json(url: str, token: str) -> object:
     request = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    with token_opener(url).open(request, timeout=TIMEOUT) as response:
         return json.load(response)
 
 

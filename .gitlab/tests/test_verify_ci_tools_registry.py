@@ -4,12 +4,14 @@
 import hashlib
 import http.server
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -18,8 +20,9 @@ SCCACHE = b"sccache archive fixture"
 SHELLCHECK = b"shellcheck archive fixture"
 SCCACHE_ARCHIVE = "sccache-v9.9.9-x86_64-unknown-linux-musl.tar.gz"
 SHELLCHECK_ARCHIVE = "shellcheck-v9.9.9.linux.x86_64.tar.xz"
+SCCACHE_PATH = f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SCCACHE_ARCHIVE}"
 PRESENT = {
-    f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SCCACHE_ARCHIVE}": SCCACHE,
+    SCCACHE_PATH: SCCACHE,
     f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SHELLCHECK_ARCHIVE}": SHELLCHECK,
 }
 RULES_PATH = "/api/v4/projects/35/packages/protection/rules"
@@ -37,23 +40,42 @@ class RegistryFixture(http.server.ThreadingHTTPServer):
     def __init__(self, routes: dict[str, bytes]) -> None:
         self.routes = routes
         self.statuses: dict[str, int] = {}
+        self.redirects: dict[str, str] = {}
+        self.seen: list[tuple[str, str | None]] = []
         super().__init__(("127.0.0.1", 0), RegistryHandler)
 
     @property
+    def origin(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+    @property
     def api_url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}/api/v4"
+        return f"{self.origin}/api/v4"
+
+    def paths_given_the_token(self) -> set[str]:
+        return {path for path, token in self.seen if token is not None}
 
 
 class RegistryHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path in self.server.statuses:
-            self.send_error(self.server.statuses[self.path])
+        # A client that takes this server for its proxy sends the whole URL.
+        path = urllib.parse.urlsplit(self.path).path
+        token = self.headers.get("PRIVATE-TOKEN")
+        self.server.seen.append((path, token))
+        if path in self.server.redirects:
+            self.send_response(302)
+            self.send_header("Location", self.server.redirects[path])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path in self.server.statuses:
+            self.send_error(self.server.statuses[path])
             return
         # GitLab answers both API endpoints with 401 when no valid token comes.
-        if self.path in (RULES_PATH, USER_PATH) and self.headers.get("PRIVATE-TOKEN") != TOKEN:
+        if path in (RULES_PATH, USER_PATH) and token != TOKEN:
             self.send_error(401)
             return
-        body = self.server.routes.get(self.path)
+        body = self.server.routes.get(path)
         if body is None:
             self.send_error(404)
             return
@@ -96,13 +118,21 @@ class VerifyRegistryTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def run_verifier(self, server: RegistryFixture) -> subprocess.CompletedProcess[str]:
+    def run_verifier(
+        self, server: RegistryFixture, api_url: str | None = None, proxy: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        # Only the proxy a test names: the runner's own settings must not route these.
+        env = {
+            key: value for key, value in os.environ.items() if not key.lower().endswith("_proxy")
+        }
+        if proxy is not None:
+            env["http_proxy"] = proxy
         return subprocess.run(
             [
                 sys.executable,
                 str(SCRIPT),
                 "--api-url",
-                server.api_url,
+                server.api_url if api_url is None else api_url,
                 "--repo-root",
                 str(self.root),
                 "--token-file",
@@ -111,6 +141,7 @@ class VerifyRegistryTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
 
     def rule(
@@ -152,10 +183,7 @@ class VerifyRegistryTests(unittest.TestCase):
         self.assertIn("shellcheck 9.9.9: ABSENT", result.stdout)
 
     def test_corrupt_archive_fails_the_pin(self) -> None:
-        routes = {
-            **self.routes(),
-            f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SCCACHE_ARCHIVE}": b"tampered",
-        }
+        routes = {**self.routes(), SCCACHE_PATH: b"tampered"}
         result = self.run_verifier(self.serve(routes))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("sccache 9.9.9: MISMATCH", result.stdout)
@@ -206,6 +234,50 @@ class VerifyRegistryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn("protection check failed: HTTP Error 403", result.stderr)
         self.assertIn("shellcheck 9.9.9: ok", result.stdout)
+
+    def test_token_is_not_sent_to_a_redirect_target(self) -> None:
+        for path in (USER_PATH, RULES_PATH):
+            with self.subTest(path=path):
+                # The target would answer the token with a passing state.
+                target = self.serve(self.routes())
+                server = self.serve(self.routes())
+                server.redirects[path] = f"{target.origin}{path}"
+                result = self.run_verifier(server)
+                self.assertEqual(target.paths_given_the_token(), set())
+                self.assertIn((path, TOKEN), server.seen)
+                self.assertEqual(result.returncode, 3, result.stdout)
+                self.assertIn("refusing the redirect", result.stderr)
+
+    def test_token_is_not_sent_over_http_to_another_host(self) -> None:
+        # No request may leave for registry.invalid, so the fixture is the
+        # proxy for it and sees whatever the verifier would have sent there.
+        server = self.serve(self.routes())
+        result = self.run_verifier(
+            server, api_url="http://registry.invalid/api/v4", proxy=server.origin
+        )
+        self.assertEqual(server.paths_given_the_token(), set())
+        self.assertIn("sccache 9.9.9: ok", result.stdout)
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("refusing to send the token to http://registry.invalid", result.stderr)
+
+    def test_token_is_not_sent_to_a_proxy_for_loopback_http(self) -> None:
+        proxy = self.serve(self.routes())
+        server = self.serve(self.routes())
+        result = self.run_verifier(server, proxy=proxy.origin)
+        self.assertEqual(proxy.paths_given_the_token(), set())
+        self.assertEqual(server.paths_given_the_token(), {USER_PATH, RULES_PATH})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_archive_downloads_follow_redirects_without_the_token(self) -> None:
+        # GitLab redirects a package download to object storage.
+        storage = self.serve(dict(PRESENT))
+        server = self.serve(self.routes())
+        server.redirects[SCCACHE_PATH] = f"{storage.origin}{SCCACHE_PATH}"
+        result = self.run_verifier(server)
+        self.assertEqual(storage.paths_given_the_token(), set())
+        self.assertEqual(server.paths_given_the_token(), {USER_PATH, RULES_PATH})
+        self.assertIn((SCCACHE_PATH, None), storage.seen)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
