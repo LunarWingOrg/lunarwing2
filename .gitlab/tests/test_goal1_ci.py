@@ -402,6 +402,21 @@ class FullValidationTests(unittest.TestCase):
         config.validate_test_shapes(merged, errors)
         self.assertIn("ci-config must run the pinned Go bootstrap before its parser fixtures", errors)
 
+    def test_ci_config_discovery_must_stay_verbose_and_unbuffered(self):
+        # WI#738: dot mode plus a block-buffered stdout left job 183172 with no
+        # output for an hour, so nothing named the test that was running.
+        merged = copy.deepcopy(self.merged)
+        merged["ci-config"]["script"] = [
+            command.replace("-u -m unittest discover -v", "-m unittest discover")
+            for command in merged["ci-config"]["script"]
+        ]
+        errors = []
+        config.validate_test_shapes(merged, errors)
+        self.assertTrue(
+            any("verbose, unbuffered output is what names a test" in error for error in errors),
+            errors,
+        )
+
 
 class BuildkitParserGoVersionTests(unittest.TestCase):
     """WI#500: the parser floor, CI image and bootstrap must move together."""
