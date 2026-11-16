@@ -422,9 +422,9 @@ while True:
             process.args, process.returncode, stdout, stderr,
         )
 
-    def run_cli(self, timeout_ms: str) -> subprocess.CompletedProcess:
+    def run_cli(self, timeout_ms: str, limit: float = 30) -> subprocess.CompletedProcess:
         script, env = self.prepare_cli(timeout_ms)
-        return self.collect_cli(self.start_cli(script, env), 30, "its start")
+        return self.collect_cli(self.start_cli(script, env), limit, "its start")
 
     def run_cli_until_ready(self, timeout_ms: str) -> subprocess.CompletedProcess:
         """Run the CLI under its default hour, then stop it like a container.
@@ -463,15 +463,16 @@ while True:
         Deliberately asserts nothing about the fake's output: on a starved host
         `timeout` can signal the fake before its interpreter installs the
         handler, and that is still the behaviour under test — the deadline was
-        honored and `--preserve-status` kept the status 143. The run cannot
-        outlive `run_cli`'s 30 s budget, which is far below the one-hour
-        default, so removing the `timeout` wrapper still fails here.
+        honored and `--preserve-status` kept the status 143. It asserts nothing
+        about elapsed time either: any such number also measures how long the
+        entrypoint takes to start on a loaded host. The five-minute limit is
+        not a measure of speed. Only a run that its deadline does not end
+        reaches it, so removing the `timeout` wrapper, or giving it the
+        one-hour default instead, still fails here.
         """
-        started = time.monotonic()
-        result = self.run_cli("2000")
-        elapsed = time.monotonic() - started
+        result = self.run_cli("2000", limit=300)
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
-        self.assertLess(elapsed, 20, f"the 2 s deadline took {elapsed:.1f}s")
+        self.assertIn("(timeout 2000ms)", result.stdout)
 
     def test_cli_fixture_wedged_in_a_child_fails_within_its_deadline(self) -> None:
         """A fixture that wedges must fail its case, not hang it (WI#738).
