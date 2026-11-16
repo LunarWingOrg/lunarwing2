@@ -126,21 +126,24 @@ class RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
 def token_opener(url: str) -> urllib.request.OpenerDirector:
     parts = urllib.parse.urlsplit(url)
-    if parts.scheme == "https":
-        return urllib.request.build_opener(RefuseRedirect)
-    # A name such as localhost is whatever the resolver says, so only a
-    # literal loopback address may take the token unencrypted.
-    try:
-        loopback = ipaddress.ip_address(parts.hostname or "").is_loopback
-    except ValueError:
-        loopback = False
-    if parts.scheme != "http" or not loopback:
-        raise ValueError(
-            f"refusing to send the token to {parts.scheme}://{parts.hostname}: "
-            "use https (plain http only for a loopback address such as 127.0.0.1)"
-        )
-    # Unencrypted, so no proxy from the environment may relay it either.
-    return urllib.request.build_opener(RefuseRedirect, urllib.request.ProxyHandler({}))
+    # One handler list for both schemes: the redirect refusal the tests
+    # exercise over loopback http is the same object https uses.
+    handlers: list[object] = [RefuseRedirect]
+    if parts.scheme != "https":
+        # A name such as localhost is whatever the resolver says, so only a
+        # literal loopback address may take the token unencrypted.
+        try:
+            loopback = ipaddress.ip_address(parts.hostname or "").is_loopback
+        except ValueError:
+            loopback = False
+        if parts.scheme != "http" or not loopback:
+            raise ValueError(
+                f"refusing to send the token to {parts.scheme}://{parts.hostname}: "
+                "use https (plain http only for a loopback address such as 127.0.0.1)"
+            )
+        # Unencrypted, so no proxy from the environment may relay it either.
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
 
 
 def get_json(url: str, token: str) -> tuple[object, str]:
