@@ -322,6 +322,16 @@ file, so a later NetBird rewrite that retains the listener does not change the
 expected table or force recovery. There is no runtime-DNS fallback; restore
 managed DNS or use another supported provider after such a startup failure.
 
+The host file is checked again before every run, and before a running sidecar is
+adopted: a missing file, or one that does not name the `wt0` listener exactly,
+refuses the run and recreates the sidecar, which stages the file again. That
+gate closes the window where the file comes apart from the sidecar's copy — a
+re-stage under an adopted sidecar, a stop that removed the file while the
+container survived, or NetBird writing the runtime resolver back after managed
+DNS is turned off on the server. Both messages are in the troubleshooting table
+below. The same `netbird status --ipv4` answer feeds the firewall's expected
+policy and this check, so a run asks NetBird once.
+
 WI#695 measurement note **17394** recorded the unchanged-target behavior: the
 file never changed, joined public lookups used the runtime resolver over the
 uplink, peer/custom-zone names failed, and direct queries to NetBird's listener
@@ -673,5 +683,6 @@ required.
 | NetBird connects, then loses management after a while | the client fell back to legacy routing (no socket marks): check its log and remove `NB_USE_LEGACY_ROUTING` / `NB_SKIP_SOCKET_MARK` |
 | a fresh provider exceeds the 20-second per-run cap | restart the daemon so recreation uses the full cold-start budget; investigate why the provider is slow |
 | names do not resolve in the sandbox | for NetBird, check that managed DNS is enabled, the staged file names only `wt0`, and the nameserver group is reachable through the overlay; for WireGuard, check the mounted file and overlay resolver reachability, or the runtime resolvers when custom DNS is unset |
+| `the tunnel resolver file joined runs mount is missing; recovery restages it` or `... no longer names NetBird's wt0 listener; recovery restages it` | the host file joined runs mount was deleted or rewritten after the sidecar started (a re-stage under an adopted sidecar, a stop that left the container, or NetBird writing the runtime resolver back, typically after DNS management was turned off on the server). The daemon refuses the run and recreates the sidecar so the file is staged again; if it recurs, check whether managed DNS is still enabled for the peer |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |
