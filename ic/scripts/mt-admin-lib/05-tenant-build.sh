@@ -333,7 +333,10 @@ _tenant_status_uids() {
   # Read the file whole: procfs regenerates a status file on every seek, and
   # line-by-line reads (which seek back after each line) can misalign and lose
   # the Uid: line when the task changes state in between.
-  { content="$(<"$1")"; } 2>/dev/null || return 1
+  # cat, not $(<file): under `set -e` bash 5.2 ends the shell when the
+  # redirection of $(<file) fails, before a `||` branch can say why. A failed
+  # cat is an ordinary command failure the caller can handle.
+  content="$(cat -- "$1" 2>/dev/null)" || return 1
   content=$'\n'"$content"
   [[ "$content" == *$'\n'Uid:* ]] || return 1
   line="${content#*$'\n'Uid:}"
@@ -419,7 +422,9 @@ _tenant_cgroup_tree_empty() {
     say "ERROR: cannot inspect $label cgroup $root" >&2
     return 1
   }
-  { events="$(<"$root/cgroup.events")"; } 2>/dev/null || {
+  # cat, not $(<file): see _tenant_status_uids. Under bash 5.2 the failed
+  # redirection would end mt-admin before this refusal could be printed.
+  events="$(cat -- "$root/cgroup.events" 2>/dev/null)" || {
     say "ERROR: cannot read $root/cgroup.events; cannot prove the $label cgroup empty" >&2
     return 1
   }
@@ -450,7 +455,10 @@ _tenant_former_cgroups_idle() {
     say "ERROR: cgroup v2 is not readable at $root; cannot close the fork/exit race in the process-table proof" >&2
     return 1
   }
-  ensure_init_system
+  if ! ensure_init_system || [[ -z "$INIT_SYSTEM" ]]; then
+    say "ERROR: cannot detect the init system; cannot prove the cgroup tree of '$name' empty" >&2
+    return 1
+  fi
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _tenant_cgroup_tree_empty "systemd user-${uid}.slice" "$root/user.slice/user-${uid}.slice" || return 1
     _tenant_cgroup_tree_empty "systemd user-${uid}.slice" "$root/user-${uid}.slice" || return 1
