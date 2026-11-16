@@ -854,11 +854,27 @@ A root-owned snapshot stages and sources a private contract copy beside
 mt-admin, so it needs neither a sibling checkout nor the installed host health
 library.
 
-A refusal skips only the contract source and leaves `--help` usable. On a
+A checkout that is not root-owned gets no new ownership or mode check. A
+refusal skips only the contract source and leaves `--help` usable. On a
 positively detected systemd host other commands remain available; on OpenRC
 only `--help` and `reinstall-health-library` are usable until the contract is
 repaired. OpenRC operations fail closed rather than treating a missing contract
 as proof that units are safe.
+
+On either init system, a refused source is never copied into a root-owned
+tree. The health library install (`add-tenant`, `upgrade-tenant`,
+`enable-health-fleet.sh`) and the staging of the Study Notes scheduler
+snapshot ask the same check again and stop with the refusal; an upgrade that
+cannot restage the snapshot warns and keeps the previous one. The contract is
+read from the resolved path that was checked, not from the path as given.
+
+The refusal says which tree failed. "health library" is the installed library,
+and the repair is the reinstall below. "health contract source" is a source
+that is not the installed library: the health directory of a root-owned
+checkout or snapshot. Correct or remove the named entry there, or run mt-admin
+from a clean root-owned checkout; reinstalling the library does not change it.
+No `chown` is printed for a contract source or its parents: those belong to
+the owner of that checkout.
 
 Repair a refused library or unsafe entry from a **separate trusted checkout**:
 a fresh root-owned clone at a verified commit, not the refused checkout or a
@@ -871,18 +887,27 @@ sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/
 
 This command only replaces the health library; it does not render, start, or
 stop OpenRC units. The next invocation loads the repaired contract. Every
-install refuses to copy from a source that resolves to the installed library
-while that library fails the safety check, so the refused bytes cannot be
-published back into the root trust boundary. Do not hand-copy an operator
-checkout over the library.
+install refuses to copy from a source that resolves to the installed library,
+or lies inside it, while that library fails the safety check, so mt-admin does
+not publish the refused bytes back into the root trust boundary. Do not
+hand-copy an operator checkout over the library.
 
-A refusal that names a **parent directory** needs a different repair because
-reinstalling stages beneath that same parent and cannot make the parent safe.
-Run the exact non-recursive command printed by the refusal on the named parent
-only (`chown root:root -- <parent> && chmod go-w -- <parent>`), or move the
-health library elsewhere. If the parent is a symbolic link, replace it with a
-real directory or move the library instead. Never apply `chown` recursively to
-the refused library tree.
+When the library path is itself a symbolic link, the refusal names the link
+and where it points, and the repair is the same reinstall: it replaces the
+link with a real root-owned directory. Do not change the owner of the tree the
+link points to.
+
+A health library refusal that names a **parent directory** needs a different
+repair because reinstalling stages beneath that same parent and cannot make
+the parent safe. Run the exact non-recursive command printed by the refusal on
+the named parent only (`chown root:root -- <parent> && chmod go-w --
+<parent>`). If the parent is a symbolic link, the health launcher and the
+install say so and print no command, because `chown` and `chmod` would change
+only the link's target: replace the link with a real root-owned directory.
+mt-admin's own load check follows such a link and judges the tree behind it,
+so it can report an unsafe library first and the link only when the reinstall
+is tried. The library's location is fixed, so it cannot be moved out of the
+way. Never apply `chown` recursively to the refused library tree.
 
 Normal refreshes when the contract is available remain `upgrade-tenant`,
 `add-tenant`, or `ic/scripts/enable-health-fleet.sh`.

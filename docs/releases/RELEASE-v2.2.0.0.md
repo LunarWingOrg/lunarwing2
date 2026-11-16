@@ -44,9 +44,14 @@ Previously, an unsafe `/usr/local/lib/lunarwing-health` or parent directory
 aborted every mt-admin subcommand while libraries were loading, including
 `--help` and the commands needed to repair an old installation. mt-admin now
 skips only the OpenRC proxy contract, reports the failing path component, and
-keeps `--help` available. Ordinary checkouts do not gain a new contract-file
-mode check, and a link to an unrelated health source is not refused merely
-because it is a link.
+keeps `--help` available. A checkout that is not root-owned gains no new check.
+Where mt-admin's own directory is root-owned (a scheduler snapshot, a
+root-owned checkout), the contract source is checked wherever it lies (WI#725);
+a refused source is skipped in the same way, and its refusal names that
+checkout, not the library, as the thing to correct. A refused source is also
+never copied into a root-owned tree: the health library install and the
+staging of the Study Notes scheduler snapshot stop with the same refusal, on
+systemd and on OpenRC.
 
 On OpenRC, `reinstall-health-library` is the only non-help command available
 while the contract is refused; other commands remain available on positively
@@ -59,11 +64,14 @@ sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/
 
 The repair replaces the library without rendering or changing OpenRC units.
 Installs refuse to copy from the installed library itself while it fails the
-safety check, so an unsafe tree cannot be republished as trusted. When the
-refusal names an unsafe parent directory instead, run the printed
-non-recursive `chown root:root -- <parent> && chmod go-w -- <parent>` repair on
-that parent only, or move the library elsewhere; reinstalling cannot repair
-its own parent.
+safety check, so mt-admin does not republish an unsafe tree as trusted. A
+library path that is a symbolic link is repaired by the same reinstall, which
+replaces the link. When a health library refusal names an unsafe parent
+directory instead, run the printed non-recursive `chown root:root -- <parent>
+&& chmod go-w -- <parent>` repair on that parent only; reinstalling cannot
+repair its own parent. If that parent is a symbolic link, the health launcher
+and the install say so instead: replace the link with a real root-owned
+directory.
 
 ## Security and upgrade actions
 
