@@ -3612,6 +3612,153 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// WI#732 ADT-3: the gate must be reached from both callers, not only
+    /// proven to refuse on its own. These two tests fail when either call is
+    /// removed: the health path must refuse, and adoption must recreate.
+    #[cfg(unix)]
+    struct ResolverGate {
+        sidecar: TunnelSidecar,
+        base: PathBuf,
+        removals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        hash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[cfg(unix)]
+    fn resolver_gate_fixture(label: &str) -> ResolverGate {
+        let base = std::env::temp_dir().join(format!(
+            "lw-tunnel-gate-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let instance = instance_id_for(&base);
+        let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hash = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let listing = listing_for(&EgressPolicy {
+            tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
+            resolvers: vec!["9.9.9.9".parse().unwrap()],
+        });
+        let runtime = crate::sandbox::cli_runner::TestRuntime::new({
+            let removals = removals.clone();
+            let hash = hash.clone();
+            move |args, _stdin| {
+                let instance = instance.clone();
+                let removals = removals.clone();
+                let hash = hash.clone();
+                let listing = listing.clone();
+                async move {
+                    let first = args.first().map(String::as_str);
+                    let (stdout, success) = match first {
+                        Some("image") if args.iter().any(|arg| arg == "--format") => {
+                            (format!("sha256:{}\n", "3".repeat(64)), true)
+                        }
+                        Some("image") => (String::new(), true),
+                        Some("inspect") => {
+                            let label = hash
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or_else(|| "stale-hash".to_string());
+                            (format!("{}|true|{label}|{instance}\n", "2".repeat(64)), true)
+                        }
+                        Some("exec") => {
+                            let reply =
+                                successful_netbird_health(args.get(2).map(String::as_str), &listing);
+                            (reply.stdout, true)
+                        }
+                        Some("volume") => (String::new(), true),
+                        Some("rm") => {
+                            removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            (String::new(), true)
+                        }
+                        // The bootstrap helper is where a recreation attempt
+                        // stops here: driving a full start from a fake runtime
+                        // would prove nothing about the gate.
+                        Some("run") => (String::new(), false),
+                        other => panic!("unexpected runtime call: {other:?}"),
+                    };
+                    Ok(health_runtime_output(stdout, success))
+                }
+            }
+        });
+        let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            netbird_cfg(),
+            &base,
+            &runtime_dir,
+        )
+        .with_test_runtime(runtime);
+        ResolverGate {
+            sidecar,
+            base,
+            removals,
+            hash,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_healthy_refuses_a_missing_or_diverged_host_resolver_file() {
+        let gate = resolver_gate_fixture("refuse");
+        let hash = gate.sidecar.current_hash(None, false).await.unwrap();
+        *gate.hash.lock().unwrap() = Some(hash);
+
+        let missing = gate.sidecar.ensure_healthy().await.unwrap_err();
+        assert!(
+            missing.to_string().contains("is missing"),
+            "{}",
+            missing
+        );
+
+        let path = gate.sidecar.resolv_conf_path().unwrap().unwrap();
+        std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
+        let diverged = gate.sidecar.ensure_healthy().await.unwrap_err();
+        assert!(
+            diverged.to_string().contains("no longer names"),
+            "{}",
+            diverged
+        );
+
+        std::fs::write(&path, "nameserver 9.9.9.9\n").unwrap();
+        gate.sidecar.ensure_healthy().await.unwrap();
+        assert_eq!(
+            gate.removals.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        std::fs::remove_dir_all(gate.base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopting_a_sidecar_recreates_it_when_the_host_resolver_file_is_gone() {
+        let gate = resolver_gate_fixture("adopt");
+        let hash = gate.sidecar.current_hash(None, false).await.unwrap();
+        *gate.hash.lock().unwrap() = Some(hash);
+
+        let error = gate
+            .sidecar
+            .start_or_adopt(
+                Duration::from_secs(6),
+                Duration::from_secs(6),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("runtime resolver bootstrap returned no valid resolvers"),
+            "{error}"
+        );
+        assert_eq!(
+            gate.removals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "adoption must remove the sidecar whose host resolver file is missing"
+        );
+        std::fs::remove_dir_all(gate.base).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn netbird_dns_bootstrap_stages_readable_files_without_credentials() {
