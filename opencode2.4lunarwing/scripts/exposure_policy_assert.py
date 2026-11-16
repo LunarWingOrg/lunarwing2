@@ -47,6 +47,14 @@ Assertions (opencode2 lane):
      --image-env-file from the actual image config. Host ownership and the CI
      job's own environment are never treated as image facts; the CI driver
      separately pins the complete runtime config, including PATH order.
+  8. WI#665: config/managed/opencode.json carries the single
+     `integration.use` deny that withholds the OpenCode Console Library, and
+     nothing else (a managed document outranks every other config layer, so
+     any other key there would shadow the lane's own); its resource pattern
+     covers both forms upstream builds (the bare integration ID for an
+     environment credential and `<integration>#<account>` for a saved login);
+     and the installed /etc/opencode/opencode.json is root-owned, read-only,
+     under non-writable parents, and byte-identical to the checkout's copy.
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1 has no service mode or
