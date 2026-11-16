@@ -585,11 +585,20 @@ See `docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
 The advisory `proxy` mode remains supported for single-node backwards
 compatibility but is no longer any default.
 
-In proxy mode the container is pointed at the proxy via
-`http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns
-maps that alias to the host's loopback, so the proxy's `127.0.0.1` bind is
-reachable) or `http://host.docker.internal:<port>` plus
-`--add-host host.docker.internal:host-gateway` on the docker CLI fallback.
+In legacy proxy mode on Podman, the container keeps its normal network and
+uses the same per-execution Unix-socket relay as enforced mode. Its proxy
+variables point to `http://127.0.0.1:3128`, where an in-container relay
+forwards through the mounted socket to the proxy's host-loopback listener.
+The container's normal network is what makes this tier advisory: a process
+that ignores or bypasses those variables can still egress directly. Python 3
+is required in the image, and relay setup failure stops the command.
+
+Rootless Podman with pasta resolves `host.containers.internal` to a gateway
+address (for example `169.254.1.2`), not to the host's loopback. A listener
+bound only to `127.0.0.1` on the host is therefore not reachable through that
+alias; legacy Podman mode does not use it for proxy transport. The Docker CLI
+fallback retains `http://host.docker.internal:<port>` plus
+`--add-host host.docker.internal:host-gateway`.
 FullAccess keeps full, unsandboxed network.
 
 Policy denials returned by the proxy carry the stable body prefix
