@@ -53,6 +53,9 @@ build_tenant() { printf 'build\n' >>"$events"; }
 render_tenant_units() { :; }
 patch_tenant_env() { :; }
 refresh_deployed_health_pipeline() { :; }
+# WI#715: host-global Study Notes snapshot refresh runs after the
+# health pipeline; stub it so this harness never touches /usr/local.
+refresh_deployed_knowledge_sync_scheduler() { :; }
 recover_failed_tenant_checkout() { :; }
 # WI#527: candidates build pre-stop; stubbed here (this harness pins the floor
 # preflight, not the candidate build itself).
