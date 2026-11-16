@@ -298,15 +298,15 @@ were never dispatched.
    not available … (skipping)`. A caller cannot tell a healthy start from a
    tenant whose only selected worker did not start. `start_tenant_lunardepth`
    returns 0 on the `_ensure_tenant_image` miss
-   (`ic/scripts/mt-admin-lib/17-lunardepth.sh:397-407`).
+   (`ic/scripts/mt-admin-lib/17-lunardepth.sh:404-406`).
 3. **F3 (product, display): `worker-listeners` reports `clean` for a lane with
    no containers.** It printed `lunardepth: not present … skipped` and then
    `worker listener audit: clean`, exit 0. A vacuous pass is indistinguishable
    from a verified one; it should say "not present" or return a distinct code.
 4. **F4 (product, display; WI#719 F5/F6 reproduced):**
    - `mt-admin status lunardepthtester` lists no `lunardepth_wss`/`lunardepth_health`
-     ports although the registry holds 52010/52011 and `add-tenant` printed
-     them.
+     ports although the registry holds 52010/52011; `add-tenant` printed the
+     `lunardepth_wss` line but `status` prints neither.
    - `state/config.toml` carries `pebble` and `opencode` external-worker blocks
      even though only `lunardepth` is selected, and the daemon logs liveness
      probes for all three (as in WI#719 F6).
