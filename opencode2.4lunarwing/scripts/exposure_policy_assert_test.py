@@ -39,6 +39,13 @@ fi
 '''
 ROLE_BOUNDARY = 'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
 
+# WI#665: the managed policy the image installs at /etc/opencode/opencode.json.
+MANAGED_POLICY = {
+    "policies": [
+        {"action": "integration.use", "resource": "opencode*", "effect": "deny"},
+    ]
+}
+
 
 def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pathlib.Path:
     lane = root / name
@@ -76,6 +83,9 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
         encoding="utf-8",
     )
     shutil.copy(WRAPPER, lane / "scripts" / WRAPPER.name)
+    managed = lane / "config" / "managed"
+    managed.mkdir()
+    (managed / "opencode.json").write_text(json.dumps(MANAGED_POLICY), encoding="utf-8")
     return lane
 
 
@@ -96,6 +106,11 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
         self.lane = write_lane(self.root)
+        spec = importlib.util.spec_from_file_location("exposure_policy_assert", ASSERT)
+        if spec is None or spec.loader is None:  # pragma: no cover - import shape
+            raise AssertionError("cannot load exposure_policy_assert")
+        self.assert_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.assert_module)
 
     def test_real_lane_passes(self) -> None:
         result = run_assert()
@@ -151,6 +166,88 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 1)
         self.assertIn("must deny shell resources", result.stderr)
+
+    def test_managed_policy_source_failures(self) -> None:
+        # WI#665: the installed /etc/opencode policy is only a control while
+        # the shipped file still denies the integration and carries nothing
+        # that could shadow the lane's own settings through the managed layer.
+        source = self.lane / "config" / "managed" / "opencode.json"
+        cases = {
+            "missing": None,
+            "not an object": {"policies": []},
+            "empty policies": {"policies": []},
+            "shadowing key": {
+                "policies": MANAGED_POLICY["policies"],
+                "experimental": {"all_flags": True},
+            },
+            "wrong action": {"policies": [{"action": "provider.use", "resource": "opencode*", "effect": "deny"}]},
+            "wrong effect": {"policies": [{"action": "integration.use", "resource": "opencode*", "effect": "allow"}]},
+            "bare id only": {"policies": [{"action": "integration.use", "resource": "opencode", "effect": "deny"}]},
+            "other integration": {
+                "policies": [{"action": "integration.use", "resource": "anthropic*", "effect": "deny"}],
+            },
+        }
+        for name, document in cases.items():
+            with self.subTest(case=name):
+                self.assert_module.failures.clear()
+                if document is None:
+                    source.unlink()
+                else:
+                    source.write_text(json.dumps(document), encoding="utf-8")
+                self.assert_module.check_managed_policy(self.lane)
+                self.assertTrue(self.assert_module.failures, name)
+        # The bare-ID statement alone cannot cover a saved Console login,
+        # which resolves to `opencode#<account>`; the shipped `opencode*` can.
+        self.assertTrue(self.assert_module._managed_policy_covers("opencode*"))
+        self.assertFalse(self.assert_module._managed_policy_covers("opencode"))
+        source.write_text(json.dumps(MANAGED_POLICY), encoding="utf-8")
+        self.assert_module.failures.clear()
+        self.assert_module.check_managed_policy(self.lane)
+        self.assertEqual(self.assert_module.failures, [])
+
+    def test_installed_managed_policy_failures(self) -> None:
+        # WI#665: an installed copy the task user can rewrite, or one that no
+        # longer matches the checkout, would lift the deny without a diff.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            etc = root / "etc" / "opencode"
+            etc.mkdir(parents=True)
+            installed = etc / "opencode.json"
+            installed.write_text(json.dumps(MANAGED_POLICY), encoding="utf-8")
+            installed.chmod(0o444)
+            metadata = {
+                "": {"mode": 0o40755, "uid": 0, "gid": 0},
+                "etc": {"mode": 0o40755, "uid": 0, "gid": 0},
+                "etc/opencode": {"mode": 0o40755, "uid": 0, "gid": 0},
+                "etc/opencode/opencode.json": {"mode": 0o100444, "uid": 0, "gid": 0},
+            }
+
+            def run(records: dict[str, dict[str, int]]) -> list[str]:
+                self.assert_module.failures.clear()
+                self.assert_module.check_installed_managed_policy(
+                    self.lane,
+                    installed,
+                    parent_root=root,
+                    image_root=root,
+                    image_metadata=records,
+                )
+                return list(self.assert_module.failures)
+
+            self.assertEqual(run(metadata), [])
+            writable = {**metadata, "etc/opencode/opencode.json": {"mode": 0o100644, "uid": 0, "gid": 0}}
+            self.assertTrue(any("read-only" in f for f in run(writable)), run(writable))
+            not_root = {**metadata, "etc/opencode/opencode.json": {"mode": 0o100444, "uid": 10003, "gid": 10003}}
+            self.assertTrue(any("owned by uid 0" in f for f in run(not_root)), run(not_root))
+            symlink = {**metadata, "etc/opencode/opencode.json": {"mode": 0o120777, "uid": 0, "gid": 0}}
+            self.assertTrue(any("regular file" in f for f in run(symlink)), run(symlink))
+            open_dir = {**metadata, "etc/opencode": {"mode": 0o40777, "uid": 0, "gid": 0}}
+            self.assertTrue(any("writable" in f for f in run(open_dir)), run(open_dir))
+            installed.chmod(0o644)
+            installed.write_text(json.dumps({"policies": []}), encoding="utf-8")
+            installed.chmod(0o444)
+            self.assertTrue(any("differs from" in f for f in run(metadata)), run(metadata))
+            installed.unlink()
+            self.assertTrue(any("missing or unreadable" in f for f in run(metadata)), run(metadata))
 
     def test_service_invocation_in_entrypoint_fails(self) -> None:
         with (self.lane / "entrypoint.sh").open("a", encoding="utf-8") as handle:
@@ -1111,6 +1208,18 @@ class InstalledWrapperTests(unittest.TestCase):
             "            lane, image_root=args.image_root, image_metadata=image_metadata\n"
             "        )\n"
             "        if is_v2:\n"
+            "            installed_policy = (\n"
+            "                args.image_root / \"etc/opencode/opencode.json\"\n"
+            "                if args.image_root is not None\n"
+            "                else MANAGED_POLICY_INSTALLED\n"
+            "            )\n"
+            "            check_installed_managed_policy(\n"
+            "                lane,\n"
+            "                installed_policy,\n"
+            "                parent_root=args.image_root,\n"
+            "                image_root=args.image_root,\n"
+            "                image_metadata=image_metadata,\n"
+            "            )\n"
             "            if args.image_root is not None:\n"
             "                check_installed_wrapper(\n"
             "                    lane,\n"
