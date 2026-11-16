@@ -196,7 +196,7 @@ knowledge_sync_scheduler_live() {
 # host whose hourly schedule was removed or disabled gets its staged files
 # refreshed but keeps that removal (WI#715 box 2, review ADV-2). A restage
 # failure warns instead of failing the upgrade, whose tenant already restarted;
-# the hourly job then keeps running the previous staged copy.
+# the warning says whether the staged copy was replaced.
 refresh_deployed_knowledge_sync_scheduler() {
   local root checkout_commit staged_commit restaged_commit restage_rc=0
   local current_before current_after
@@ -234,7 +234,7 @@ refresh_deployed_knowledge_sync_scheduler() {
   if (( restage_rc != 0 )); then
     if [[ -n "$current_after" && "$current_after" != "$current_before" ]]; then
       # The staging delivered; a later step of the schedule install failed.
-      say "WARNING: the root Study Notes sync snapshot was restaged, but the hourly schedule could not be repaired (exit $restage_rc); the reason is printed above"
+      say "WARNING: the root Study Notes sync snapshot was restaged, but the schedule install did not finish (exit $restage_rc); the reason is printed above"
     else
       say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the reason is printed above. The schedule and the previous staged copy were left as they were"
     fi
@@ -308,6 +308,10 @@ _install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
   # run this with errexit ignored (WI#736), and a write that fails half-way
   # (a full disk) must leave the unit root's timer runs as it was, not empty.
   # systemd does not read the temporary names: they end in no unit suffix.
+  # A rename would replace a symbolic link with a regular file, and so undo an
+  # operator's `systemctl mask` or a unit linked from elsewhere.
+  [[ ! -L "$service" && ! -L "$timer" ]] \
+    || die "a Study Notes source unit under $unit_dir is a symbolic link (a masked or linked unit); unmask or remove it, then schedule again"
   local service_tmp timer_tmp
   service_tmp="$(mktemp "$service.XXXXXX")" \
     || die "cannot create a temporary file beside $service"
@@ -341,7 +345,7 @@ EOF
   if ! { chmod 0644 -- "$service_tmp" "$timer_tmp" \
     && mv -f -- "$service_tmp" "$service" && mv -f -- "$timer_tmp" "$timer"; }; then
     rm -f -- "$service_tmp" "$timer_tmp"
-    die "could not put the Study Notes source units in place under $unit_dir"
+    die "could not put both Study Notes source units in place under $unit_dir; compare the service and the timer there before the next start"
   fi
   systemctl daemon-reload >/dev/null \
     || die "failed to reload systemd after installing Study Notes source timer"
@@ -361,19 +365,21 @@ _install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
   [[ -n "$command" ]] \
     || die "fcrontab/crontab not found; cannot schedule Study Notes source refresh"
   # The new table replaces root's whole crontab, so it is built whole first.
-  # The caller may run this with errexit ignored (WI#736): every step is
-  # checked, and a failure leaves the crontab as it was.
+  # The caller may run this with errexit ignored (WI#736): every step up to
+  # the install is checked, and a failure before it leaves the crontab as it
+  # was.
   listing="$("$command" -l 2>/dev/null || true)"
   if [[ -n "$listing" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       if [[ "$line" == "$begin" ]]; then inside=1; continue; fi
       if [[ "$line" == "$end" ]]; then inside=0; continue; fi
       ((inside)) || kept+="$line"$'\n'
-    done <<<"$listing"
+    done <<<"$listing" \
+      || die "could not read back the listing of root's crontab; the crontab was left as it was"
   fi
   # Dropping "everything after BEGIN" would take root's other jobs with it.
   ((inside == 0)) \
-    || die "root's crontab has a '$begin' line without its END line; repair the block by hand, then schedule again"
+    || die "root's crontab has the line '$begin' without a later line that reads exactly '$end'; repair the block with '$command -e', then schedule again"
   tmp="$(mktemp)" || die "cannot create a temporary file for the Study Notes source schedule"
   if ! {
     printf '%s' "$kept" \
