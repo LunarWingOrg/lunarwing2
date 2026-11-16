@@ -707,3 +707,133 @@ require_root() {
 tenant_voice_enabled() {
   [[ "$(jq -r --arg name "$1" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)" == "true" ]]
 }
+
+# ── Managed scheduler writers (root crontab block, root unit pair) ────────────
+#
+# The host health pipeline (12-health-pipeline.sh) and the Study Notes sync
+# scheduler (14-knowledge-sync.sh) each own a block in root's crontab and a
+# pair of root unit files, and each replaces something root's scheduler runs on
+# a timer. A half-written replacement is worse than no update: root's other
+# cron jobs disappear, or the unit root's timer runs is left empty. So each
+# helper builds the replacement beside its place, checks it, and only then
+# installs it. Both are reached from callers that may run with errexit ignored,
+# so they return nonzero and print the reason instead of exiting; the caller
+# decides whether that is fatal (WI#740).
+
+# Print, on stdout, the table root's crontab must become: every line of the
+# current table outside the managed block, byte for byte, then the <block>
+# lines. Returns nonzero, having printed no table, when the current table
+# cannot be delimited — a BEGIN line with no later END line, or a second BEGIN
+# line before the first one's END line. Dropping "everything from BEGIN to the
+# end of the file" would take root's later jobs with it, so the caller must
+# leave the crontab as it was. An END line with no BEGIN line above it belongs
+# to root's own jobs and is kept. A root without a crontab is not an error:
+# only the block is printed.
+_managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
+  local command="$1" begin="$2" end="$3" listing line inside=0 kept="" read_rc=0
+  shift 3
+  listing="$("$command" -l 2>/dev/null)" || read_rc=$?
+  if (( read_rc != 0 )); then
+    if [[ -n "$listing" ]]; then
+      warn_err "could not read root's crontab with $command: it failed (exit $read_rc) after printing part of the table; the crontab was left as it was"
+      return 1
+    fi
+    # `-l` exits nonzero for a root without a crontab, and that is the empty
+    # table the block is added to.
+    listing=""
+  fi
+  if [[ -n "$listing" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$begin" ]]; then
+        if (( inside )); then
+          warn_err "root's crontab has a second line '$begin' before the line '$end'; repair the block with '$command -e', then schedule again; the crontab was left as it was"
+          return 1
+        fi
+        inside=1
+        continue
+      fi
+      if [[ "$line" == "$end" ]]; then
+        if (( inside )); then
+          inside=0
+          continue
+        fi
+        kept+="$line"$'\n'
+        continue
+      fi
+      (( inside )) || kept+="$line"$'\n'
+    done <<<"$listing"
+  fi
+  if (( inside )); then
+    warn_err "root's crontab has the line '$begin' without a later line that reads exactly '$end'; repair the block with '$command -e', then schedule again; the crontab was left as it was"
+    return 1
+  fi
+  printf '%s' "$kept"
+  (( $# == 0 )) || printf '%s\n' "$@"
+}
+
+# Replace root's crontab with the table _managed_cron_table builds. Nothing is
+# handed to the scheduler until the new table is complete, so a failed read, a
+# block that cannot be delimited, or a failed write leaves the crontab as it was
+# and the reason is printed. Returns nonzero on any of those, after removing the
+# temporary file.
+_install_managed_cron_block() {  # <crontab command> <begin> <end> [<block line>...]
+  local command="$1" begin="$2" end="$3" tmp
+  shift 3
+  tmp="$(mktemp 2>/dev/null)" \
+    || { warn_err "could not create a temporary file to rebuild root's crontab; the crontab was left as it was"; return 1; }
+  if ! _managed_cron_table "$command" "$begin" "$end" "$@" >"$tmp"; then
+    rm -f -- "$tmp"
+    warn_err "could not rebuild root's crontab; the crontab was left as it was"
+    return 1
+  fi
+  if [[ $# -gt 0 && "$(tail -n 1 -- "$tmp")" != "${!#}" ]]; then
+    rm -f -- "$tmp"
+    warn_err "could not write the new root crontab completely; the crontab was left as it was"
+    return 1
+  fi
+  if ! "$command" "$tmp"; then
+    rm -f -- "$tmp"
+    warn_err "could not hand the new root crontab to $command; check root's crontab with '$command -l' before scheduling again"
+    return 1
+  fi
+  rm -f -- "$tmp"
+}
+
+# Install a root .service + .timer pair. Both files are written beside their
+# places and moved into place only once both are complete, so a write that
+# fails half-way (a full disk) leaves the units root's timer runs as they were
+# rather than empty. The temporary names end in no unit suffix, so systemd
+# never reads them. A symbolic link at either path — a masked unit, or one
+# linked in from another tree — is refused instead: renaming over it would
+# replace the link with a regular file and undo the operator's mask.
+_install_unit_pair() {  # <unit dir> <service name> <timer name> <service body> <timer body>
+  local unit_dir="$1" svc tmr svc_tmp tmr_tmp
+  svc="$unit_dir/$2"
+  tmr="$unit_dir/$3"
+  mkdir -p -- "$unit_dir" 2>/dev/null \
+    || { warn_err "cannot create $unit_dir; both units were left as they were"; return 1; }
+  if [[ -L "$svc" || -L "$tmr" ]]; then
+    warn_err "a unit under $unit_dir is a symbolic link (a masked or linked unit); unmask or remove it, then schedule again; both units were left as they were"
+    return 1
+  fi
+  svc_tmp="$(mktemp "$svc.XXXXXX" 2>/dev/null)" \
+    || { warn_err "could not create a temporary file beside $svc; both units were left as they were"; return 1; }
+  if ! printf '%s' "$4" >"$svc_tmp"; then
+    rm -f -- "$svc_tmp"
+    warn_err "could not write $svc; both units were left as they were"
+    return 1
+  fi
+  tmr_tmp="$(mktemp "$tmr.XXXXXX" 2>/dev/null)" \
+    || { rm -f -- "$svc_tmp"; warn_err "could not create a temporary file beside $tmr; both units were left as they were"; return 1; }
+  if ! printf '%s' "$5" >"$tmr_tmp"; then
+    rm -f -- "$svc_tmp" "$tmr_tmp"
+    warn_err "could not write $tmr; both units were left as they were"
+    return 1
+  fi
+  if ! { chmod 0644 -- "$svc_tmp" "$tmr_tmp" \
+      && mv -f -- "$svc_tmp" "$svc" && mv -f -- "$tmr_tmp" "$tmr"; }; then
+    rm -f -- "$svc_tmp" "$tmr_tmp"
+    warn_err "could not put both units in place under $unit_dir; compare $svc and $tmr before the next start"
+    return 1
+  fi
+}
