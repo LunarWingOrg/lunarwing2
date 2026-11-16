@@ -17,7 +17,12 @@ install_knowledge_sync_admin_snapshot() {
   # there: as a root-owned copy it would pass every later check.
   require_safe_installed_health_source \
     || die "refusing to stage the Study Notes sync snapshot from a refused health contract source; the reason is printed above"
-  install -d -m 0755 -- "$releases"
+  # Every step from here on is checked by hand (WI#736). Callers run this
+  # function inside a command substitution, where bash drops errexit, and
+  # inside `( … ) || rc=$?`, where bash ignores it: an unchecked failure used
+  # to publish an incomplete release, or none, and still report success.
+  install -d -m 0755 -- "$releases" \
+    || die "cannot create the Study Notes sync release directory $releases"
   # A same-second re-arm (configure-study-mcp followed by an upgrade, a test
   # loop) must publish a NEW release directory: reusing the live one would leave
   # the stamp naming the previous commit while the files were overwritten.
@@ -27,13 +32,34 @@ install_knowledge_sync_admin_snapshot() {
     release="$base-$bump"
     bump=$((bump + 1))
   done
-  install -d -m 0755 -- "$release/mt-admin-lib" "$release/ic-infrastructure-health-check"
-  install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh"
+  if ! _stage_knowledge_sync_release "$release"; then
+    rm -rf -- "$release"
+    die "could not stage a complete Study Notes sync release under $releases; $root/current was not changed"
+  fi
+  current_tmp="$root/.current.$$"
+  if ! { ln -s -- "$release" "$current_tmp" && mv -fT -- "$current_tmp" "$root/current"; }; then
+    rm -f -- "$current_tmp"
+    rm -rf -- "$release"
+    die "could not publish the Study Notes sync release $release; $root/current was not changed"
+  fi
+  _prune_knowledge_sync_snapshots "$releases" "$release"
+  printf '%s/lunarwing-mt-admin.sh\n' "$root/current"
+}
+
+# Copy one release and prove that every file arrived whole. Returns non-zero at
+# the first step that fails; the caller removes the partial directory and stops
+# before `current` is switched, so root's hourly job never runs a release that
+# lacks a file.
+_stage_knowledge_sync_release() {  # <new release dir>
+  local release="$1" file source_commit
+  local contract="$HEALTH_CONTRACT_RESOLVED_DIR/openrc-proxy-unit-contract.sh"
+  install -d -m 0755 -- "$release/mt-admin-lib" "$release/ic-infrastructure-health-check" || return 1
+  install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh" || return 1
   for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
-    install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")"
+    install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")" || return 1
   done
-  install -m 0755 -- "$HEALTH_CONTRACT_RESOLVED_DIR/openrc-proxy-unit-contract.sh" \
-    "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  install -m 0755 -- "$contract" \
+    "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh" || return 1
   # WI#715: record what this frozen copy was staged from. Root's hourly timer
   # executes this release until something restages it, so the commit is the
   # only way for an operator to tell a fresh copy from one frozen at the last
@@ -43,13 +69,15 @@ install_knowledge_sync_admin_snapshot() {
     printf 'commit=%s\n' "${source_commit:-unknown}"
     printf 'source=%s\n' "$SCRIPT_DIR"
     printf 'staged_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } >"$release/STAGED-FROM"
-  chmod 0644 -- "$release/STAGED-FROM"
-  current_tmp="$root/.current.$$"
-  ln -s -- "$release" "$current_tmp"
-  mv -fT -- "$current_tmp" "$root/current"
-  _prune_knowledge_sync_snapshots "$releases" "$release"
-  printf '%s/lunarwing-mt-admin.sh\n' "$root/current"
+  } >"$release/STAGED-FROM" || return 1
+  chmod 0644 -- "$release/STAGED-FROM" || return 1
+  [[ -x "$release/lunarwing-mt-admin.sh" ]] || return 1
+  cmp -s -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh" || return 1
+  for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
+    cmp -s -- "$file" "$release/mt-admin-lib/$(basename -- "$file")" || return 1
+  done
+  cmp -s -- "$contract" \
+    "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh" || return 1
 }
 
 # Retain only the newest releases (the live one plus a small rollback margin).
@@ -117,11 +145,13 @@ knowledge_sync_scheduler_installed() {
 # the schedule are separate facts: the snapshot outlives a timer an operator
 # removed or disabled, and that removal is an operator decision an upgrade must
 # not undo. On systemd, the enabled state is the standing intent (a stopped but
-# enabled timer is repaired); on OpenRC, the managed crontab block is. A host
-# with no init manager detected reports "not live", so an upgrade only ever
-# refreshes files there.
+# enabled timer is repaired); on OpenRC, an entry in the managed crontab block
+# that cron would run is: a block whose line an operator commented out is a
+# schedule switched off. A host with no init manager detected reports "not
+# live", so an upgrade only ever refreshes files there.
 knowledge_sync_scheduler_live() {
   local init unit_dir command begin='# BEGIN lunarwing-study-notes-sync managed block'
+  local end='# END lunarwing-study-notes-sync managed block' line inside=0 live=1
   init="${INIT_SYSTEM:-}"
   if [[ -z "$init" ]]; then
     init="$(detect_init_system 2>/dev/null)" || return 1
@@ -138,7 +168,13 @@ knowledge_sync_scheduler_live() {
       command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
       [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
       [[ -n "$command" ]] || return 1
-      "$command" -l 2>/dev/null | grep -Fqx -- "$begin"
+      while IFS= read -r line; do
+        if [[ "$line" == "$begin" ]]; then inside=1; continue; fi
+        if [[ "$line" == "$end" ]]; then inside=0; continue; fi
+        ((inside)) || continue
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] || live=0
+      done < <("$command" -l 2>/dev/null)
+      return "$live"
       ;;
     *) return 1 ;;
   esac
@@ -152,6 +188,7 @@ knowledge_sync_scheduler_live() {
 # the hourly job then keeps running the previous staged copy.
 refresh_deployed_knowledge_sync_scheduler() {
   local root checkout_commit staged_commit restaged_commit restage_rc=0
+  local current_before current_after
   root="$(knowledge_sync_admin_root)"
   if ! knowledge_sync_scheduler_installed; then
     say "knowledge sync scheduler: not installed; skipping upgrade refresh"
@@ -163,11 +200,14 @@ refresh_deployed_knowledge_sync_scheduler() {
     say "knowledge sync scheduler: snapshot already staged from $checkout_commit"
     return 0
   fi
+  current_before="$(readlink -- "$root/current" 2>/dev/null || true)"
   if knowledge_sync_scheduler_live; then
     # Live schedule: restage the files and repair the unit/cron entry in one
-    # install. Contain die(): ensure_knowledge_source_scheduler exits on a
-    # missing systemctl/crontab, and that must not turn a completed upgrade
-    # into a failure.
+    # install. Contain die(): the staging exits on a refused source, and
+    # ensure_knowledge_source_scheduler on a missing systemctl/crontab; neither
+    # may turn a completed upgrade into a failure. bash ignores errexit inside
+    # this `||`, so both functions check their own steps and stop before any
+    # unit or cron line is written (WI#736).
     ( set -e; ensure_knowledge_source_scheduler ) || restage_rc=$?
   else
     # The snapshot outlived its schedule: the unit files are gone, the timer is
@@ -178,7 +218,7 @@ refresh_deployed_knowledge_sync_scheduler() {
     ( set -e; install_knowledge_sync_admin_snapshot >/dev/null ) || restage_rc=$?
   fi
   if (( restage_rc != 0 )); then
-    say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the hourly job keeps running the previous staged copy"
+    say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the reason is printed above. The schedule was left as it was, and the hourly job keeps running the previous staged copy"
     return 0
   fi
   # A restage that could not replace the release — a read-only releases
@@ -186,6 +226,14 @@ refresh_deployed_knowledge_sync_scheduler() {
   restaged_commit="$(knowledge_sync_staged_commit "$root")"
   if [[ -n "$checkout_commit" && "$restaged_commit" != "$checkout_commit" ]]; then
     say "WARNING: the Study Notes sync snapshot still names '${restaged_commit:-nothing}' after restaging from $checkout_commit; check that $root/releases is writable"
+    return 0
+  fi
+  # Every staging publishes a new release directory, so an unchanged link means
+  # nothing was delivered. This also holds for a checkout without git metadata,
+  # where there is no commit to compare.
+  current_after="$(readlink -- "$root/current" 2>/dev/null || true)"
+  if [[ -z "$current_after" || "$current_after" == "$current_before" ]]; then
+    say "WARNING: the Study Notes sync snapshot was not replaced: $root/current still points at '${current_before:-nothing}'; check that $root/releases is writable"
     return 0
   fi
   say "knowledge sync scheduler: restaged from ${checkout_commit:-an unknown checkout}"
@@ -219,11 +267,22 @@ report_knowledge_sync_scheduler_status() {
     "$staged_commit" "$checkout_commit"
 }
 
+# Root's schedule must name the absolute path of an existing executable. An
+# empty or bare command would be looked up in the scheduler's own search path,
+# and whoever can write a directory of that path would supply what root runs
+# every hour (WI#736). Checked in each installer as well as in their caller, so
+# the property does not depend on how they are reached.
+_require_knowledge_sync_entrypoint() {  # <entrypoint>
+  [[ "${1:-}" =~ ^/[A-Za-z0-9._/-]+$ && -x "$1" ]] \
+    || die "refusing to schedule the Study Notes source refresh with '${1:-}': the command must be the absolute path of an existing executable"
+}
+
 _install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
-  local entrypoint="$1"
+  local entrypoint="${1:-}"
   local unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
   local service="$unit_dir/lunarwing-study-notes-sync.service"
   local timer="$unit_dir/lunarwing-study-notes-sync.timer"
+  _require_knowledge_sync_entrypoint "$entrypoint"
   command -v systemctl >/dev/null 2>&1 \
     || die "systemctl not found; cannot install Study Notes source scheduler"
   mkdir -p "$unit_dir"
@@ -260,9 +319,10 @@ EOF
 }
 
 _install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
-  local entrypoint="$1"
+  local entrypoint="${1:-}"
   local command="" begin="# BEGIN lunarwing-study-notes-sync managed block"
   local end="# END lunarwing-study-notes-sync managed block" tmp
+  _require_knowledge_sync_entrypoint "$entrypoint"
   command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
   [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
   [[ -n "$command" ]] \
@@ -285,7 +345,14 @@ _install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
 
 ensure_knowledge_source_scheduler() {
   local entrypoint
-  entrypoint="$(install_knowledge_sync_admin_snapshot)"
+  # A refused or failed staging ends only this command substitution, and a
+  # caller that contains this function with `||` runs it with errexit ignored
+  # (WI#736). So the result is checked here, whatever the caller's errexit
+  # state: without a staged entrypoint no unit is written, no cron line, and
+  # nothing is enabled or reloaded.
+  entrypoint="$(install_knowledge_sync_admin_snapshot)" \
+    || die "could not stage the Study Notes sync snapshot (the reason is printed above); the hourly schedule was left as it was"
+  _require_knowledge_sync_entrypoint "$entrypoint"
   ensure_init_system
   case "$INIT_SYSTEM" in
     systemd) _install_knowledge_source_systemd_timer "$entrypoint" ;;
