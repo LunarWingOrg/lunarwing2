@@ -33,7 +33,7 @@ Recorded before the first `mt-admin` command, on the host this run used:
 | `rc-service` | absent (`command -v rc-service` → not found) |
 | `systemctl` | `/usr/sbin/systemctl` |
 | Kernel | `6.18.54-2-lts` (`uname -a`, `6.18.54-2-lts #1 SMP PREEMPT_DYNAMIC`) |
-| Podman | `6.2.0`, rootless |
+| Podman | `6.2.0`, rootful for mt-admin (`podman info`: rootless=false, `overlay`); each tenant's containers run in that tenant's rootless store |
 | CPUs | 12 (`nproc`); every build was confined with `taskset -c 0-11` |
 | RAM / disk at start | 17 GiB available of 23 GiB; 173 GiB free on `/` |
 | LSM | `capability,landlock,lockdown,yama,bpf` — Landlock present |
