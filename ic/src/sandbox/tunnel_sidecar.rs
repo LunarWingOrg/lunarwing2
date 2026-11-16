@@ -10,13 +10,15 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it. There is no uplink DNS channel (WI#724):
-//!   NetBird's DNS allowance is its own `wt0` listener, which joined runs and
-//!   the sidecar reach over `lo`; public names resolve only through an operator
-//!   nameserver group whose upstream is reachable through the overlay. For
-//!   WireGuard, `SANDBOX_TUNNEL_DNS` moves DNS to resolvers reachable through
-//!   the tunnel and, without it, no uplink DNS is allowed either; NetBird
-//!   rejects that setting during configuration validation (WI#603).
+//!   mark the provider sets on it. The DNS channel is per provider (WI#724):
+//!   NetBird has none to the runtime resolvers: its DNS allowance is its own
+//!   `wt0` listener, which joined runs and the sidecar reach over `lo`, and
+//!   public names resolve only through an operator nameserver group whose
+//!   upstream is reachable through the overlay. WireGuard without
+//!   `SANDBOX_TUNNEL_DNS` does accept port 53 to every runtime resolver on the
+//!   uplink, which remains a residual channel; setting it moves DNS to
+//!   resolvers reachable through the tunnel and removes that allowance.
+//!   NetBird rejects that setting during configuration validation (WI#603).
 //!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
@@ -712,9 +714,11 @@ fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
 /// own control traffic (by socket mark) and the DNS listener the accepted runs
-/// may query. For NetBird that is only its `wt0` listener, reached over `lo`;
-/// for WireGuard it is the configured overlay resolvers, or none without
-/// `SANDBOX_TUNNEL_DNS`. There is no runtime-resolver allowance (WI#724).
+/// may query. For NetBird that is only its `wt0` listener, reached over `lo`,
+/// with no runtime-resolver allowance. For WireGuard it is the configured
+/// overlay resolvers, or -- without `SANDBOX_TUNNEL_DNS` -- every runtime
+/// resolver on the uplink, a residual channel that the setting removes
+/// (WI#724).
 /// Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
@@ -748,12 +752,15 @@ impl EgressPolicy {
             .iter()
             .map(|kind| format!("icmpv6 type {kind} accept")),
         );
-        // The NetBird resolver is the namespace's own `wt0` address, so packets
-        // to it leave through `lo` and the loopback accept above already
-        // carries them; these rules are belt-and-braces and never match
-        // (WI#724 ADN-4). What protects is that no rule accepts DNS to an
-        // uplink address. They stay because they cost nothing and keep the
-        // allowance explicit next to the provider it belongs to.
+        // NetBird: the resolver is the namespace's own `wt0` address, so
+        // packets to it leave through `lo` and the loopback accept above
+        // already carries them; these rules are belt-and-braces and never
+        // match (WI#724 ADN-4). What protects is that no rule accepts DNS to
+        // an uplink address. They stay because they cost nothing and keep the
+        // allowance explicit next to the provider it belongs to. WireGuard:
+        // for the configured overlay resolvers, and for the runtime resolvers
+        // when `SANDBOX_TUNNEL_DNS` is unset, these rules do match and are the
+        // channel (WI#724).
         for resolver in &self.resolvers {
             let family = if resolver.is_ipv4() { "ip" } else { "ip6" };
             rules.push(format!("{family} daddr {resolver} udp dport 53 accept"));
