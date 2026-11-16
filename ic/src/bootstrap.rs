@@ -677,6 +677,14 @@ impl PidLock {
             .truncate(false)
             .open(&path)?;
 
+        #[cfg(test)]
+        if let Some(delay_ms) = std::env::var("LUNARWING_PID_LOCK_TEST_PRE_LOCK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
         // Try non-blocking exclusive lock — if another process holds it,
         // this fails immediately instead of blocking.
         match file.try_lock() {
@@ -1602,28 +1610,34 @@ INJECTED="pwned"#;
             .env("LUNARWING_PID_LOCK_CHILD", "1")
             .env("LUNARWING_PID_LOCK_PATH", pid_path.display().to_string())
             .env("LUNARWING_PID_LOCK_HOLD_MS", "3000")
+            .env("LUNARWING_PID_LOCK_TEST_PRE_LOCK_DELAY_MS", "500")
             .spawn()
             .unwrap();
 
+        let child_pid = child.id();
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(2) {
-            if pid_path.exists() {
+        loop {
+            let child_wrote_pid = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok())
+                == Some(child_pid);
+            if child_wrote_pid {
                 break;
             }
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("child exited before acquiring lock: {}", status);
             }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "child did not write its pid to the lock file in time: {}",
+                pid_path.display()
+            );
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            pid_path.exists(),
-            "child did not create lock file in time: {}",
-            pid_path.display()
-        );
 
         let result = PidLock::acquire_at(pid_path.clone());
         match result.unwrap_err() {
-            PidLockError::AlreadyRunning { .. } => {}
+            PidLockError::AlreadyRunning { pid } => assert_eq!(pid, child_pid),
             other => panic!("expected AlreadyRunning, got: {}", other),
         }
 
