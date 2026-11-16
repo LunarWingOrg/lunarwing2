@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12",
+  "version": "1.0.0",
+  "description": "LunarWing OpenCode Worker — WebSocket agent communication protocol",
+
+  "connection": {
+    "uri": "ws://agent-hub:9000/opencode",
+    "tls": false,
+    "reconnect_ms": 3000,
+    "ping_interval_ms": 20000,
+    "auth": {
+      "method": "bearer",
+      "token_env": "AGENT_AUTH_TOKEN"
+    }
+  },
+
+  "message_format": {
+    "encoding": "json",
+    "envelope": {
+      "id":        { "type": "string",  "description": "UUID v4 message identifier" },
+      "type":      { "type": "string",  "description": "Message type (see message_types)" },
+      "timestamp": { "type": "string",  "description": "ISO-8601 UTC timestamp" },
+      "payload":   { "type": "object",  "description": "Type-specific payload" }
+    }
+  },
+
+  "message_types": {
+    "inbound": {
+      "task_request": {
+        "description": "Agent → Worker: submit a coding task",
+        "payload": {
+          "task_id":     "string — unique task identifier",
+          "prompt":      "string — natural-language task description",
+          "context":     "object — optional TaskContext. conversation_history contains bounded user/assistant messages used only as untrusted JSON reference context; metadata, environment, and user_id are never added to model prompts. A non-empty environment map is rejected before any SDK/session work (WI#474); use kimi/pebble for per-task credential delivery. cron_tick.event = cron.tick enables creation of a relative project_dir under WORKSPACE_ROOT; creation is descriptor-relative and never creates through a symlink component (the returned path is re-resolved and confined to the root); ordinary tasks do not create directories",
+          "timeout_ms":  "integer — hard deadline for the task (default 3600000)"
+        }
+      },
+      "cancel": {
+        "description": "Agent → Worker: cancel an in-flight task",
+        "payload": {
+          "task_id": "string"
+        }
+      },
+      "ping": {
+        "description": "Agent → Worker: keep-alive probe",
+        "payload": {}
+      },
+      "task_prompt": {
+        "description": "Agent → Worker: follow-up prompt/directive for a RUNNING task (WI#328 runtime control channel; not currently consumed by this worker — it does not advertise the task_prompt capability, so the daemon never sends this frame to it)",
+        "payload": {
+          "task_id": "string",
+          "seq":     "integer — monotonic per job, for ordering and dedupe",
+          "prompt":  "string — TEXT directive only; validated daemon-side (16 KiB cap, no NUL bytes)",
+          "done":    "boolean — true signals 'no more prompts coming, wrap up cleanly'"
+        }
+      },
+      "tool_result": {
+        "description": "Agent → Worker: WI#324 reply to a tool_call. Routed by the bridge relay to the in-task plugin call by call_id.",
+        "payload": {
+          "call_id": "string — echoed from tool_call",
+          "status":  "string — success | error | denied",
+          "output":  "string — sanitized tool result (pretty JSON)",
+          "error":   "string | null — sanitized reason for error/denied"
+        }
+      },
+      "tool_catalog": {
+        "description": "Agent → Worker: WI#324 reply to tool_list. Contains exactly the tools this worker may call (allowlist + phase-1 gates applied).",
+        "payload": {
+          "tools": "array of { name, description, parameters (JSON schema) } — empty array on failure",
+          "error": "string — present alongside tools: [] on failure (fail-closed)"
+        }
+      }
+    },
+
+    "outbound": {
+      "task_progress": {
+        "description": "Worker → Agent: streaming progress update",
+        "payload": {
+          "task_id": "string",
+          "delta":   "string — incremental output chunk",
+          "done":    "boolean — true on final chunk"
+        }
+      },
+      "task_result": {
+        "description": "Worker → Agent: final result after completion",
+        "payload": {
+          "task_id":     "string",
+          "status":      "string — success | error | cancelled | timed_out",
+          "output":      "string — full generated output",
+          "error":       "string | null — error message if status=error",
+          "duration_ms": "integer"
+        }
+      },
+      "pong": {
+        "description": "Worker → Agent: keep-alive reply",
+        "payload": {}
+      },
+      "tool_call": {
+        "description": "Worker → Agent: WI#324 proxied tool invocation, emitted by the bridge relay for the in-task plugin. task_id must equal the job this connection serves; frames over 256 KiB are rejected with error.",
+        "payload": {
+          "task_id":   "string — the active job id (required, binding)",
+          "call_id":   "string — worker-chosen correlation id [A-Za-z0-9_-]{1,128}",
+          "name":      "string — allowlisted tool name",
+          "arguments": "object | null — tool arguments"
+        }
+      },
+      "tool_list": {
+        "description": "Worker → Agent: WI#324 request for the callable tool catalog. Payload { task_id } from this worker's relay (task_id optional hub-side, must equal the job id when present). Shares the per-job 100 control-frame budget with tool_call.",
+        "payload": {
+          "task_id": "string — the active job id"
+        }
+      },
+      "ready": {
+        "description": "Worker → Agent: sent once on connect to signal readiness",
+        "payload": {
+          "worker_id":     "string",
+          "version":       "string",
+          "mode":          "string — websocket",
+          "capabilities":  "array of string — optional capability advertisement (WI#328); 'task_prompt' means the worker consumes runtime control prompts (this worker does not advertise it)"
+        }
+      },
+      "task_prompt_ack": {
+        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328), not proof of execution. Sent only by capable workers. accepted=false means unknown/finished task, closed admission (including after done=true), foreign connection, invalid payload, or the 64-prompt worker queue cap. While admission is open a redelivered seq is acked accepted=true without re-queueing; closed admission refuses redeliveries too. Malformed instructions echo valid task_id/seq fields; invalid identifiers use empty task_id/seq=0 and cannot be correlated",
+        "payload": {
+          "task_id":  "string",
+          "seq":      "integer — echoes the task_prompt seq",
+          "accepted": "boolean"
+        }
+      }
+    }
+  },
+
+  "error_codes": {
+    "4001": "Unauthorized — invalid or missing auth token",
+    "4002": "Task not found — cancel referencing unknown task_id",
+    "4003": "Timeout — task exceeded timeout_ms",
+    "4004": "Rate limited — too many concurrent tasks",
+    "5000": "Internal worker error"
+  }
+}

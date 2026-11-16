@@ -131,6 +131,10 @@ def _managed_policy_covers(pattern: str) -> bool:
     def matches(resource: str) -> bool:
         escaped = re.sub(r"([.+^${}()|\[\]\\])", r"\\\1", pattern)
         escaped = escaped.replace("*", ".*").replace("?", ".")
+        # Upstream's own special case: a pattern ending in " .*" also matches
+        # without the trailing group.
+        if escaped.endswith(" .*"):
+            escaped = escaped[: -len(" .*")] + "( .*)?"
         return re.fullmatch(escaped, resource, re.DOTALL) is not None
 
     return matches(MANAGED_POLICY_INTEGRATION) and matches(f"{MANAGED_POLICY_INTEGRATION}#org_01")
