@@ -252,9 +252,9 @@ The tasks were chosen for the lane's fat Python/C++ toolchain:
 | Python access-log pipeline | `59919468-d069-4a32-aed9-6721dc9aacf4` | completed | 571 s | 20 tests + independent metrics/percentiles |
 | C++17 weighted interval scheduling | `c6c15f0b-92ca-415a-b3df-b020f06b3649` | completed | 827 s | host rebuild + 320-instance oracle + separate DP oracle |
 | Parallel statistics | `b0d7cdd1-e689-4adb-a1e7-2293a4e5636c` | completed | 1679 s | host rebuild + byte-identical p4 run + separate oracle |
-| Python access-log pipeline (first dispatch) | `20d31ff7-1318-4393-a28a-777d6fd33da8` | failed | 1816 s | H2: six idle model-stream timeouts |
+| Python access-log pipeline (first dispatch) | `20d31ff7-1318-4393-a28a-777d6fd33da8` | failed | 1816 s | H1: six idle model-stream timeouts |
 
-### The first dispatch of job 1 failed (H2)
+### The first dispatch of job 1 failed (H1)
 
 The first attempt at job 1, `20d31ff7-1318-4393-a28a-777d6fd33da8`, ran
 21:13:46Z→21:44:02Z and **failed** with
@@ -272,7 +272,7 @@ receipts are beside the successful run:
   first event in 1.5 s.
 
 The retry, with no change to the tenant, the image or the route, completed
-normally. It is recorded as a host/infra or model-side stall (H2), not a worker
+normally. It is recorded as a host/infra or model-side stall (H1), not a worker
 defect, and it is the one thing in this run that could not be reproduced on
 demand.
 
@@ -288,14 +288,14 @@ test harness called it), or the **host**.
    earlier regular file beneath the checked roots, and keeps rejecting
    symlinks, links leaving the roots, links to non-regular members, and links
    to unseen paths. Built with that patch, the image verified on the first try
-   (`README`-level evidence above). Nothing in this run weakens the gate: the
+   (the stage table above). Nothing in this run weakens the gate: the
    verifier is the patched one from !2501, and pipeline 8000 for that MR is
    green, including `worker-lunardepth-ts` (the CI exposure-verify job runs on
    master pipelines, not on that MR's pipeline, and was not observed here).
    - Note for the reviewer: the image label carries `…-dirty` because the two
      !2501 files were applied to the worktree rather than merged. The verifier
      is the only thing that changed; the worker runtime is unaffected.
-2. **F2 (product, API shape): `GET /api/chat/pending-gates` returns
+2. **F2 (call): `GET /api/chat/pending-gates` returns
    `parameters` as a JSON string, and the action name is `tool_name`.** The
    harness copied from the WI#719 run read `parameters["title"]` and
    `action_name`, and crashed:
@@ -306,23 +306,35 @@ test harness called it), or the **host**.
    ```
    The live payload is
    `{"request_id": "945e9dd1-…", "thread_id": "fec915d4-…", "gate_name": "approval", "tool_name": "create_job", "description": "Tool 'create_job' requires approval (gate: approval)", "parameters": "{\n  \"description\": \"Medium-complexity Python …"}`.
-   This is a documented-interface question, not a test failure: a client written
-   against the WI#719 shape silently breaks. Either the endpoint changed shape
-   or the old harness was written against a different route; the report cannot
-   tell which. A tolerant client (parse when it is a string, accept
+   This is the endpoint's documented shape, not a product defect
+   (`PendingGateView` in `ic/src/gate/pending.rs`; "Inspecting the sanitized
+   strings" in `docs/reference/CREDENTIAL-REDACTION.md`; the envelope in
+   `docs/guides/GATEWAY_CHAT_API.md`). The view's `parameters` has been a
+   pretty-printed JSON string and its call field `tool_name` since this
+   repository's first commit (`13f5d80ed`), and the route has served that
+   view since it was added (`252352d8b`, 2026-09-18). This run's harness,
+   copied from the WI#719 one, expected another shape; why is not
+   established here. A tolerant client (parse when it is a string, accept
    `tool_name` or `action_name`) works.
-3. **F3 (product, small): `create_job` accepted a ~1.8 KB title and an empty
-   description.** The model put the whole task into `title` and left
-   `description` empty for all four dispatches, despite the instruction to use
-   the marker alone:
+3. **F3 (product, small; reproduces the title/description part of F4 of the
+   WI#719 run): the job views show the whole task text as `title` and an
+   empty `description`.** Each job reads back with a ~1.8 KB title:
    ```text
    b0d7cdd1-… completed title= 'wi734-aj3b-parstats\n\nHigh-complexity parallel numerical task' len 1864
    59919468-… completed title= 'wi734-aj3b-pylog\n\nMedium-complexity Python validation task. ' len 1792
    ```
    The job then renders with `"description": ""` and the full text as a title.
-   The tasks still ran correctly because the daemon hands the worker the task
-   text, so this is display and validation hygiene, not a blocker. It is worth
-   a length check or a "title is one line" rule in the tool schema.
+   The model used the marker alone as `title`, as the prompt asked. The daemon
+   joins the two fields into the job's task text
+   (`format!("{}\n\n{}", title, description)` in
+   `ic/src/tools/builtin/job.rs`), stores only that text, and the job views
+   show it as `title` with a fixed empty `description`
+   (`ic/src/channels/web/handlers/jobs.rs`). All four saved job titles are the
+   marker, a blank line and the task, and none ends in a blank line, so in
+   every dispatch `description` held the task; the gated call quoted under F2
+   shows the same. The tasks ran correctly, so this is display hygiene, not a
+   blocker: keeping the two fields apart in the job record and showing them
+   separately would fix it, and a length rule on `title` would not.
 4. **H1 (host, model-side): the first job dispatch's LLM stream stalled six
    times.** `20d31ff7-…` failed with `pi-ai stream idle timeout after 300000ms`
    after 30 minutes; the retry of the same task with no change finished in
@@ -370,8 +382,11 @@ In order:
    no lasting container or network object.
 
 No `LUNARWING_SERVICE_MANAGER` appears in any command or log of this run;
-`/etc/lunarwing/health.env` still reads `systemd`, and the host's own tenants
-(`hermes`, `antelope`) were not touched.
+`/etc/lunarwing/health.env` still reads `systemd`, and the host's other tenant
+(`hermes`) was not touched. `antelope`, which the second attempt's report
+lists, was no longer on the host during this run: the maintainer had removed
+it at 18:39Z, and the registry row under *Host and preflight* shows the two
+tenants that were there.
 
 ## Acceptance
 
