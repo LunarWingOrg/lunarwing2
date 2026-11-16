@@ -48,6 +48,7 @@ fcrontab() {
   if [[ "${1:-}" == "-l" ]]; then
     [[ -e "$CRONTAB_STATE" ]] || return 1
     command cat -- "$CRONTAB_STATE"
+    [[ -z "${FCRONTAB_PARTIAL_READ:-}" ]] || return 1
     return 0
   fi
   printf 'install\n' >>"$CRONTAB_INSTALLS"
@@ -118,6 +119,19 @@ assert_eq "no temporary file: no install was attempted" "$installs_before" "$(in
 assert_contains "no temporary file: the reason is printed" "$BLOCKED_INSTALL_OUTPUT" \
   "could not create a temporary file"
 assert_not_contains "no temporary file: not reported as scheduled" "$BLOCKED_INSTALL_OUTPUT" "scheduled health pipeline"
+
+# A listing that fails after printing part of the table must not be taken for
+# an empty one: that would install a crontab holding only the block, and every
+# job root had would be gone.
+command cat -- "$CRONTAB_STATE" >"$fixture/cron.before"
+installs_before="$(install_count)"
+status=0
+output="$(FCRONTAB_PARTIAL_READ=1 _install_health_cron 2>&1)" || status=$?
+assert_eq "partially read table: the installer fails" "1" "$status"
+assert_same_file "partially read table: the crontab is unchanged" "$fixture/cron.before" "$CRONTAB_STATE"
+assert_eq "partially read table: no install was attempted" "$installs_before" "$(install_count)"
+assert_contains "partially read table: the reason is printed" "$output" "after printing part of the table"
+assert_not_contains "partially read table: not reported as scheduled" "$output" "scheduled health pipeline"
 
 # A write into the temporary file that fails (a full disk): the table built
 # from root's jobs is never handed to the scheduler.
