@@ -12,6 +12,11 @@ install_knowledge_sync_admin_snapshot() {
   local releases="$root/releases"
   [[ "$root" == /* && "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || die "knowledge sync admin root must be an absolute safe path"
+  # The contract is copied into a root-owned release that root's hourly job
+  # sources. A source the load guard refuses (WI#722, WI#725) must not get
+  # there: as a root-owned copy it would pass every later check.
+  require_safe_installed_health_source \
+    || die "refusing to stage the Study Notes sync snapshot from a refused health contract source; the reason is printed above"
   install -d -m 0755 -- "$releases"
   # A same-second re-arm (configure-study-mcp followed by an upgrade, a test
   # loop) must publish a NEW release directory: reusing the live one would leave
@@ -27,7 +32,7 @@ install_knowledge_sync_admin_snapshot() {
   for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
     install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")"
   done
-  install -m 0755 -- "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh" \
+  install -m 0755 -- "$HEALTH_CONTRACT_RESOLVED_DIR/openrc-proxy-unit-contract.sh" \
     "$release/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
   # WI#715: record what this frozen copy was staged from. Root's hourly timer
   # executes this release until something restages it, so the commit is the

@@ -410,23 +410,54 @@ INITEOF
 # before this point, so the library's fallbacks are not used by mt-admin.
 MT_ADMIN_OPENRC_CONTRACT_REFUSAL=""
 HEALTH_CONTRACT_REFUSAL=""
+HEALTH_CONTRACT_RESOLVED_DIR=""
 
-require_safe_installed_health_source() {
+# WI#725 decides what is checked: the source of the contract, the installed
+# library and mt-admin's own directory are all resolved first, so a symbolic
+# link anywhere in those paths cannot switch the check off. A source that is
+# the installed library, or lies inside it, is always checked. Any other source
+# is checked when mt-admin's own directory is root-owned (a snapshot, a
+# root-owned checkout); an ordinary operator checkout gets no new check.
+# `installed-only` limits the call to the first case; the install uses it to
+# name the reinstall as the repair before its own checks of the source run.
+# WI#722 decides what a refusal does: the reason is printed and kept in
+# HEALTH_CONTRACT_REFUSAL, and the caller chooses whether to stop.
+# The resolved source is kept in HEALTH_CONTRACT_RESOLVED_DIR: a caller that
+# goes on to read the source must read that path, because a link in the given
+# path can point somewhere else by then.
+require_safe_installed_health_source() {  # [installed-only]
   local source_dir="${HEALTH_SRC_DIR:?}" resolved_source resolved_library resolved_admin refusal
+  local what=library checked
   HEALTH_CONTRACT_REFUSAL=""
+  HEALTH_CONTRACT_RESOLVED_DIR=""
   resolved_source="$(readlink -f -- "$source_dir" 2>/dev/null)" || {
     refusal="error: refusing health contract source $source_dir: path could not be resolved"
     printf '%s\n' "$refusal" >&2
     HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
     return 1
   }
+  HEALTH_CONTRACT_RESOLVED_DIR="$resolved_source"
   resolved_library="$(readlink -f -- "$HEALTH_LIB_DIR" 2>/dev/null)" || resolved_library="$HEALTH_LIB_DIR"
-  resolved_admin="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || resolved_admin="$SCRIPT_DIR"
-  if ! health_lib_validate_root_owned_directory "$resolved_admin"; then
-    HEALTH_LIB_UNSAFE_COMPONENT=""
-    [[ "$resolved_source" == "$resolved_library" ]] || return 0
+  checked="$resolved_source"
+  if [[ "$resolved_source" == "$resolved_library"/* ]]; then
+    checked="$resolved_library"
+  elif [[ "$resolved_source" != "$resolved_library" ]]; then
+    [[ "${1:-}" != installed-only ]] || return 0
+    resolved_admin="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || resolved_admin="$SCRIPT_DIR"
+    if ! health_lib_validate_root_owned_directory "$resolved_admin"; then
+      HEALTH_LIB_UNSAFE_COMPONENT=""
+      return 0
+    fi
+    what=source
   fi
-  refusal="$(health_lib_tree_require_safe "$resolved_source" 2>&1)" || {
+  refusal="$(health_lib_tree_require_safe "$checked" "$what" 2>&1)" || {
+    # The library path itself is a link: the tree it points to is not the
+    # operator's to repair on mt-admin's word, and the install replaces the
+    # link, so the reinstall is the repair whatever failed in the target.
+    if [[ "$what" == library && -L "$HEALTH_LIB_DIR" ]]; then
+      HEALTH_LIB_UNSAFE_COMPONENT="$resolved_library"
+      refusal="error: $(health_lib_refusal_text "$HEALTH_LIB_DIR" link)"
+    fi
     printf '%s\n' "$refusal" >&2
     HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
     return 1
@@ -452,7 +483,8 @@ load_openrc_proxy_unit_contract() {
     MT_ADMIN_OPENRC_CONTRACT_REFUSAL="${HEALTH_CONTRACT_REFUSAL:-the health library is unsafe}"
   fi
   if [[ -n "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" ]]; then
-    printf 'WARNING: OpenRC proxy unit contract not loaded: %s; OpenRC commands will refuse until it is repaired.\n' \
+    # The reason ends the line: it may close with a command to paste.
+    printf 'WARNING: OpenRC proxy unit contract not loaded; OpenRC commands will refuse until it is repaired: %s\n' \
       "$MT_ADMIN_OPENRC_CONTRACT_REFUSAL" >&2
     _openrc_proxy_unit_template() { openrc_proxy_contract_unavailable; }
     _openrc_proxy_python3() { openrc_proxy_contract_unavailable; }
@@ -462,8 +494,10 @@ load_openrc_proxy_unit_contract() {
     first_unsafe_openrc_proxy_unit() { openrc_proxy_contract_unavailable; }
     return 0
   fi
+  # Source the path the guard resolved and checked, not the one it was given:
+  # a link in the given path can be turned between the check and the read.
   # shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
-  source "$contract"
+  source "$HEALTH_CONTRACT_RESOLVED_DIR/openrc-proxy-unit-contract.sh"
 }
 load_openrc_proxy_unit_contract
 

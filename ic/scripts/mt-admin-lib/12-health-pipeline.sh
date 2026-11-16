@@ -394,7 +394,9 @@ reinstall_health_library() {
 
 sync_health_pipeline_library() {
   local parent stage
-  require_safe_installed_health_source \
+  # A source that is the installed library must pass its check first: the
+  # install would otherwise publish the refused bytes as a root-owned library.
+  require_safe_installed_health_source installed-only \
     || die "refusing to install from the unsafe installed health library; reinstall from a trusted checkout with: ic/scripts/lunarwing-mt-admin.sh reinstall-health-library <trusted-checkout>"
   [[ "$HEALTH_LIB_DIR" == /* && "$HEALTH_LIB_DIR" != / ]] \
     || die "health library destination must be an absolute non-root path"
@@ -402,6 +404,11 @@ sync_health_pipeline_library() {
     || die "health pipeline source must be a real directory, not a symbolic link: $HEALTH_SRC_DIR"
   health_pipeline_tree_require_regular "$HEALTH_SRC_DIR" \
     || die "health pipeline source is refused: correct the entry named above"
+  # A source the load guard refuses (WI#725) must not become root's library
+  # either. The load no longer ends mt-admin on a refusal (WI#722), and on a
+  # systemd host the command goes on, so the install asks again.
+  require_safe_installed_health_source \
+    || die "refusing to install from a refused health contract source; the reason is printed above"
   parent="$(dirname -- "$HEALTH_LIB_DIR")"
   mkdir -p "$parent"
   stage="$(mktemp -d "$parent/.lunarwing-health.new.XXXXXX")" \
