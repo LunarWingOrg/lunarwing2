@@ -287,25 +287,52 @@ pub const DEFAULT_MAX_THREADS_PER_DAY: u32 = 30;
 /// the failing fire, so an event/webhook payload that is re-delivered after
 /// an unsuccessful run can fire again (the rollback contract previously
 /// covered spawn failure only).
+///
+/// Every scalar is defaulted (WI#576): a stored `retry_policy` object written
+/// by an older binary may carry only some of these keys, and a missing scalar
+/// must fall back to its default instead of failing the whole mission record
+/// with a position-less Data error (`line=0 column=0`). The outer
+/// `#[serde(default)]` on `Mission::retry_policy` only covers an absent key,
+/// not an incomplete object.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MissionRetryPolicy {
     /// Max automatic re-fires per failing fire (0 = no retry).
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Delay in seconds before the first retry.
+    #[serde(default = "default_initial_delay_secs")]
     pub initial_delay_secs: u64,
     /// Multiplier applied to the delay after each retry.
+    #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
     /// Maximum delay in seconds (caps exponential growth).
+    #[serde(default = "default_max_delay_secs")]
     pub max_delay_secs: u64,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_initial_delay_secs() -> u64 {
+    60
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_max_delay_secs() -> u64 {
+    3600
 }
 
 impl Default for MissionRetryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            initial_delay_secs: 60,
-            backoff_multiplier: 2.0,
-            max_delay_secs: 3600,
+            max_retries: default_max_retries(),
+            initial_delay_secs: default_initial_delay_secs(),
+            backoff_multiplier: default_backoff_multiplier(),
+            max_delay_secs: default_max_delay_secs(),
         }
     }
 }
@@ -666,6 +693,67 @@ mod tests {
     }
 
     #[test]
+    fn eight_required_fields_only_still_deserializes() {
+        // WI#576 ACT-2: a mission record carrying only the eight required
+        // fields must load. Any FUTURE Mission field added without a
+        // #[serde(default)] fails this guard at review time instead of
+        // dropping every schema-stale mission.json at the next tenant boot.
+        const REQUIRED: [&str; 8] = [
+            "id",
+            "project_id",
+            "name",
+            "goal",
+            "status",
+            "cadence",
+            "created_at",
+            "updated_at",
+        ];
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "required-only",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(&mission).expect("serialize mission");
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .retain(|key, _| REQUIRED.contains(&key.as_str()));
+
+        let restored: Mission =
+            serde_json::from_value(value).expect("required-fields-only mission must deserialize");
+        assert_eq!(restored.id, mission.id);
+        assert_eq!(restored.name, "required-only");
+        assert_eq!(restored.goal, "keep working");
+        assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
+        assert_eq!(restored.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
+
+        // The same record plus a PARTIAL retry_policy object (a key with only
+        // some scalars) must also load — the outer serde(default) covers an
+        // absent key, the per-field defaults cover an incomplete object.
+        let mut partial = serde_json::to_value(&mission).expect("serialize mission");
+        partial
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .retain(|key, _| REQUIRED.contains(&key.as_str()));
+        partial
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .insert(
+                "retry_policy".to_string(),
+                serde_json::json!({ "max_retries": 5 }),
+            );
+        let restored: Mission = serde_json::from_value(partial)
+            .expect("required-only mission with a partial retry_policy must deserialize");
+        assert_eq!(restored.retry_policy.max_retries, 5);
+        assert_eq!(
+            restored.retry_policy.initial_delay_secs,
+            MissionRetryPolicy::default().initial_delay_secs
+        );
+    }
+
+    #[test]
     fn legacy_mission_without_budget_date_still_deserializes() {
         let mission = Mission::new(
             ProjectId::new(),
@@ -704,6 +792,47 @@ mod tests {
         let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
         assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
         assert!(restored.retry_policy.is_enabled());
+    }
+
+    #[test]
+    fn partial_retry_policy_object_still_deserializes() {
+        // WI#576: an older or partial writer may persist a retry_policy
+        // object with only some scalars. An absent key is covered by the
+        // outer #[serde(default)]; an incomplete object must fall back to the
+        // per-field defaults instead of dropping the whole mission record
+        // with a position-less Data error (line=0 column=0).
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "partial-retry",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        for (policy, expected_retries) in [
+            (
+                serde_json::json!({}),
+                MissionRetryPolicy::default().max_retries,
+            ),
+            (serde_json::json!({ "max_retries": 7 }), 7),
+            (
+                serde_json::json!({ "initial_delay_secs": 5, "max_delay_secs": 30 }),
+                3,
+            ),
+        ] {
+            let mut value = serde_json::to_value(&mission).expect("serialize mission");
+            value
+                .as_object_mut()
+                .expect("mission should serialize as object")
+                .insert("retry_policy".to_string(), policy);
+
+            let restored: Mission = serde_json::from_value(value)
+                .expect("mission with a partial retry_policy must deserialize");
+            assert_eq!(restored.retry_policy.max_retries, expected_retries);
+            assert_eq!(
+                restored.retry_policy.backoff_multiplier,
+                MissionRetryPolicy::default().backoff_multiplier
+            );
+        }
     }
 
     #[test]

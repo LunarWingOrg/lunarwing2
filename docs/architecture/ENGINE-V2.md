@@ -852,7 +852,10 @@ when the mission's `retry_policy` has attempts left, schedules a delayed
 re-fire with exponential backoff (default 1m → 2m → 4m, capped at 1h;
 `initial_delay_secs = 60`, `backoff_multiplier = 2.0`, `max_delay_secs = 3600`,
 `max_retries = 3`; all four scalars are exposed by `mission_update`, or can
-be set through the persisted `retry_policy`). The interruption path above
+be set through the persisted `retry_policy`). A persisted `retry_policy` may
+be partial: each missing scalar deserializes to the default above, so an
+older or partial writer cannot drop the whole mission record at boot
+(WI#576). The interruption path above
 describes a mission that is still Active: a thread signal-stopped while its
 mission is no longer Active (the operator pause that stops its workers, a
 retirement) is instead recorded quietly as `STOPPED: mission <status> while
