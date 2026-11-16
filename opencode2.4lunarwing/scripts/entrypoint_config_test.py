@@ -339,6 +339,9 @@ while True:
             ["bash", str(script)], text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, cwd=self.root, **self.identity,
         )
+        # A fixture that wedges the poll loop must not outlive the case: the
+        # entrypoint execs `timeout`, whose -k 5s then reaps the fake.
+        self.addCleanup(self.reap_cli, process)
         # Generous: only a wedged fixture reaches it, and each poll costs one
         # scheduler turn.
         deadline = time.monotonic() + 120
@@ -359,6 +362,17 @@ while True:
         return subprocess.CompletedProcess(
             process.args, process.returncode, stdout, stderr,
         )
+
+    @staticmethod
+    def reap_cli(process: subprocess.Popen) -> None:
+        """Leave no fixture process behind if a case failed mid-run."""
+        if process.poll() is not None:
+            return
+        process.kill()
+        try:
+            process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
 
     def test_cli_background_wait_is_cancelled_by_sigterm(self) -> None:
         # The entrypoint's own one-hour default: the deadline is not part of
