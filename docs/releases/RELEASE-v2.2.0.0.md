@@ -28,6 +28,16 @@ client.
 Russh's optional `rsa` feature remains disabled, and the `rsa` crate remains out
 of LunarWing's dependency graph.
 
+### mt-admin upgrades install the operator checkout's target (WI#708, WI#723)
+
+Update the operator checkout and fetch the intended target before running
+`upgrade-tenant`, whether through mt-admin or `ic/scripts/upgrade-tenant.sh`.
+The target must resolve in that operator checkout; the upgrade checks out and
+builds the operator-selected commit for the sandbox image and every enabled
+worker lane. It no longer resolves the build revision from the tenant's clone.
+For a named branch, `refs/remotes/origin/<name>` takes precedence over a local
+branch, so a stale local branch cannot silently select an older installation.
+
 ### mt-admin: scoped health-library refusal and reachable repairs (WI#722)
 
 Previously, an unsafe `/usr/local/lib/lunarwing-health` or parent directory
@@ -54,5 +64,80 @@ refusal names an unsafe parent directory instead, run the printed
 non-recursive `chown root:root -- <parent> && chmod go-w -- <parent>` repair on
 that parent only, or move the library elsewhere; reinstalling cannot repair
 its own parent.
+
+## Security and upgrade actions
+
+### Legacy `proxy` mode now injects the LunarWing Cloud key (WI#655, WI#721)
+
+The sandbox HTTP proxy's credential resolver now reads the daemon's layered
+environment: the process environment first, then runtime overrides, then
+secrets injected from the secrets store. Before, the default credential
+mappings could not resolve on a standard install — the daemon's keys live in
+the secrets store, not in the process environment — so the proxy logged
+`credential not found` and forwarded the request without a key.
+
+A tenant whose `SANDBOX_NETWORK` is the legacy `proxy` mode therefore now gets
+its **`LUNARWING_CLOUD_API_KEY`** injected as a bearer token into plain-HTTP
+requests that sandbox code makes to `api.lunarwing.org`. As
+`ic/src/NETWORK_SECURITY.md` documents, a legacy-mode injected secret is sent
+on the cleartext network path, though it still never enters the container's
+environment or filesystem. For a tenant already on that mode, the first
+request after the upgrade is the first time this key leaves that way.
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` follow only when a provider in the
+user's `providers.json`, or a dotenv value, puts them into an overlay.
+
+Only the legacy `proxy` mode is affected. `proxy-enforced`, the Linux default,
+is built with no credential mappings and is unchanged; `none` and `tunnel` do
+not use this proxy. On rootless Podman with pasta the legacy mode cannot reach
+the proxy at all (WI#717), so nothing is injected there; this applies where the
+proxy is reachable, which is the Docker runtime and whatever WI#717's fix makes
+work. Move a tenant to `proxy-enforced` if the outbound key is not wanted.
+
+### Root health library refresh and refusal diagnostics (WI#687, WI#696, WI#725)
+
+A host whose `/usr/local/lib/lunarwing-health` was installed before WI#687 can
+still contain files owned by the checkout user, and its old
+`/usr/local/sbin/lunarwing-mt-health` launcher has no ownership or permission
+check. **Updating the source checkout alone does not repair that host or close
+this exposure.** Run `add-tenant` or `upgrade-tenant` through the updated
+mt-admin, or run `ic/scripts/enable-health-fleet.sh`, on every affected host;
+the refresh replaces the old library and launcher.
+
+The refreshed installer uses a root-only staging tree, refuses linked or
+non-regular sources, and does not inherit checkout modes, ACLs, or set-ID bits.
+Every file the library runs is left executable, including a
+`lunarwing-health-metrics` binary the checkout ships: earlier refreshes
+installed it 0644, so a listener that could not start is repaired by the next
+`add-tenant`, `upgrade-tenant` or `enable-health-fleet.sh`. An install under a
+set-group-ID parent now succeeds instead of refusing its own stage; the stage
+clears the inherited bit. The new launcher validates the installed tree before
+loading its environment and reports the failing path component on stderr and to
+syslog. Root-owned mt-admin snapshots apply the same source-tree check to
+linked installed libraries and real-directory OpenRC contract siblings.
+
+## Upgrade Notes
+
+### Root-side Study Notes sync snapshot (WI#715)
+
+The hourly root-side Study Notes source refresh runs from a private copy of
+mt-admin under `/usr/local/lib/lunarwing-study-notes-sync/releases/<stamp>/`
+(the stable `current` symlink), not from the operator checkout. Before this
+release that copy was staged only by `configure-study-mcp
+--enable-knowledge-sync` and `add-tenant --with-study-mcp`, so `upgrade-tenant`
+delivered a new daemon but left the root-side sync running whatever mt-admin
+code existed the day the opt-in was last enabled — including security fixes
+such as the WI#445 trusted-home gate.
+
+`upgrade-tenant` now restages the snapshot from the upgraded-from checkout when
+a scheduler is already installed; a host without one still gets none. Each
+release records the commit it was staged from in its `STAGED-FROM` file, and
+`lunarwing-mt-admin.sh doctor` prints that commit and warns when it lags the
+operator checkout.
+
+**On a host that already has the scheduler:** the first `upgrade-tenant`
+performed with this release restages it automatically. If you cannot upgrade
+that host yet, or want the explicit re-arm, run
+`configure-study-mcp <tenant> --enable-knowledge-sync` once after upgrading;
+until then the hourly job keeps executing the old snapshot.
 
 See the [v2.1.9.0 release notes](RELEASE-v2.1.9.0.md) for the previous release.

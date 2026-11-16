@@ -90,21 +90,50 @@ install_systemd() {
   say "installed + started ${SYSTEMD_UNIT} (systemctl status for details)"
 }
 
+# The unit runs the listener as this account, with no capabilities and no new
+# privileges. No home is created: the listener reads its report through
+# LUNARWING_BASE_DIR / HEALTH_METRICS_OUTPUT from the conf.d file.
+ensure_openrc_account() {
+  if ! getent group lunarwing-metrics >/dev/null 2>&1; then
+    groupadd --system lunarwing-metrics
+  fi
+  if ! id -u lunarwing-metrics >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir /var/empty \
+      --shell /sbin/nologin --gid lunarwing-metrics lunarwing-metrics
+  fi
+}
+
+# An installed conf.d holds the operator's port, token and base directory. The
+# installer runs again on upgrade, so it must never be overwritten: mt-admin's
+# health pipeline reconciles only the base-directory line
+# (health_metrics_confd_reconcile).
+install_openrc_confd() {
+  [[ -e "$OPENRC_CONFD" ]] || install -o root -g root -m 0644 \
+    "${IC_DIR}/systemd/lunarwing-health-metrics.confd" "$OPENRC_CONFD"
+}
+
 install_openrc() {
   [[ -x "${HEALTH_LIB_DIR}/lunarwing-health-metrics" ]] \
     || die "binary missing at ${HEALTH_LIB_DIR}/lunarwing-health-metrics (see header for build+install)"
+  ensure_openrc_account
   install -o root -g root -m 0755 \
     "${IC_DIR}/systemd/lunarwing-health-metrics.openrc" "${OPENRC_INIT_DIR}/${OPENRC_UNIT}"
-  install -o root -g root -m 0644 \
-    "${IC_DIR}/systemd/lunarwing-health-metrics.confd" "$OPENRC_CONFD"
+  local confd_state="installed ${OPENRC_CONFD}"
+  if [[ -e "$OPENRC_CONFD" ]]; then
+    confd_state="kept existing ${OPENRC_CONFD}"
+  fi
+  install_openrc_confd
   # conf.d values must be exported for openrc-run's supervise-daemon child.
   set -a
   # shellcheck disable=SC1090
   [[ -r "$OPENRC_CONFD" ]] && source "$OPENRC_CONFD"
   set +a
   rc-update add "$OPENRC_UNIT" default >/dev/null 2>&1 || true
-  rc-service "$OPENRC_UNIT" restart >/dev/null 2>&1 || true
-  say "installed + started OpenRC service ${OPENRC_UNIT} (config: ${OPENRC_CONFD})"
+  local start_state="started"
+  rc-service "$OPENRC_UNIT" restart >/dev/null 2>&1 \
+    || start_state="NOT started (rc-service ${OPENRC_UNIT} status)"
+  say "installed the OpenRC service ${OPENRC_UNIT} (${start_state})"
+  say "${confd_state}"
 }
 
 install_launchd() {

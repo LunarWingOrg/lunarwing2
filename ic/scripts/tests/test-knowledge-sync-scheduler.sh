@@ -33,6 +33,17 @@ grep -Fq 'OnCalendar=hourly' "$fixture/systemd/lunarwing-study-notes-sync.timer"
 grep -Fqx 'daemon-reload' "$SYSTEMCTL_LOG"
 grep -Fqx 'enable --now lunarwing-study-notes-sync.timer' "$SYSTEMCTL_LOG"
 
+# WI#715: the published release names the checkout commit it was staged from,
+# so a frozen snapshot can be told apart from a fresh one.
+checkout_commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+staged_commit="$(sed -n 's/^commit=//p' "$fixture/admin/current/STAGED-FROM")"
+[[ "$staged_commit" == "$checkout_commit" ]] || {
+  printf 'staged release names %s, checkout is %s\n' \
+    "$staged_commit" "$checkout_commit" >&2
+  exit 1
+}
+grep -Fqx "source=$SCRIPT_DIR" "$fixture/admin/current/STAGED-FROM"
+
 export FCRONTAB_STATE="$fixture/fcrontab"
 cat >"$fixture/bin/fcrontab" <<'EOF'
 #!/usr/bin/env bash
@@ -138,6 +149,66 @@ done
 }
 [[ "$sync_output" != *"tenant 'false'"* && "$sync_output" != *"tenant 'zero'"* ]] || {
   printf 'false/0 KNOWLEDGE_SYNC_ENABLED produced a warning\n' >&2
+  exit 1
+}
+
+# WI#715: upgrade-tenant must restage an EXISTING scheduler snapshot and must
+# never invent one on a host that never armed it. Drive the same function the
+# upgrade calls (after refresh_deployed_health_pipeline).
+export LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT="$fixture/refresh-admin"
+refresh_deployed_knowledge_sync_scheduler
+[[ ! -e "$fixture/refresh-admin/current" && ! -e "$fixture/refresh-admin/releases" ]] || {
+  printf 'refresh created a scheduler on a host without one\n' >&2
+  exit 1
+}
+
+# A snapshot staged from an older checkout, as on a host that enabled knowledge
+# sync before a fix landed.
+old_release="$fixture/refresh-admin/releases/20260101000000-1"
+mkdir -p "$old_release/mt-admin-lib"
+printf 'commit=deadbeef\nsource=/old/checkout\nstaged_at=2026-01-01T00:00:00Z\n' \
+  >"$old_release/STAGED-FROM"
+printf '#!/usr/bin/env bash\n' >"$old_release/lunarwing-mt-admin.sh"
+chmod +x "$old_release/lunarwing-mt-admin.sh"
+ln -s -- "$old_release" "$fixture/refresh-admin/current"
+
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"restaged from $checkout_commit"* ]] || {
+  printf 'restage did not report the new commit: %s\n' "$refresh_output" >&2
+  exit 1
+}
+new_release_count="$(find "$fixture/refresh-admin/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[[ "$new_release_count" -eq 2 ]] || {
+  printf 'restage published %s releases, expected 2\n' "$new_release_count" >&2
+  exit 1
+}
+test -d "$old_release"
+[[ "$(sed -n 's/^commit=//p' "$fixture/refresh-admin/current/STAGED-FROM")" == "$checkout_commit" ]] || {
+  printf 'current does not point at a release staged from the new checkout\n' >&2
+  exit 1
+}
+
+# An already-current snapshot is left alone (no release churn on every upgrade).
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"already staged from $checkout_commit"* ]]
+[[ "$(find "$fixture/refresh-admin/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 ]]
+
+# One operator command prints the provenance: doctor calls this reporter.
+report_output="$(report_knowledge_sync_scheduler_status)"
+[[ "$report_output" == *"knowledge sync scheduler: staged from $checkout_commit"* ]] || {
+  printf 'status did not print the staged commit: %s\n' "$report_output" >&2
+  exit 1
+}
+[[ "$report_output" != *"[WARN]"* ]] || {
+  printf 'status warned about a fresh snapshot: %s\n' "$report_output" >&2
+  exit 1
+}
+
+# A snapshot that lags the checkout is reported as stale, not silently run.
+ln -sfn -- "$old_release" "$fixture/refresh-admin/current"
+report_output="$(report_knowledge_sync_scheduler_status)"
+[[ "$report_output" == *"[WARN] knowledge sync scheduler is stale"* ]] || {
+  printf 'status did not warn about a stale snapshot: %s\n' "$report_output" >&2
   exit 1
 }
 

@@ -412,18 +412,25 @@ MT_ADMIN_OPENRC_CONTRACT_REFUSAL=""
 HEALTH_CONTRACT_REFUSAL=""
 
 require_safe_installed_health_source() {
-  local source_dir="${HEALTH_SRC_DIR:?}" resolved="$HEALTH_SRC_DIR" refusal
+  local source_dir="${HEALTH_SRC_DIR:?}" resolved_source resolved_library resolved_admin refusal
   HEALTH_CONTRACT_REFUSAL=""
-  if [[ "$source_dir" != "$HEALTH_LIB_DIR" && -d "$source_dir" ]]; then
-    resolved="$(readlink -f -- "$source_dir" 2>/dev/null)" || return 0
+  resolved_source="$(readlink -f -- "$source_dir" 2>/dev/null)" || {
+    refusal="error: refusing health contract source $source_dir: path could not be resolved"
+    printf '%s\n' "$refusal" >&2
+    HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
+    return 1
+  }
+  resolved_library="$(readlink -f -- "$HEALTH_LIB_DIR" 2>/dev/null)" || resolved_library="$HEALTH_LIB_DIR"
+  resolved_admin="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || resolved_admin="$SCRIPT_DIR"
+  if ! health_lib_validate_root_owned_directory "$resolved_admin"; then
+    HEALTH_LIB_UNSAFE_COMPONENT=""
+    [[ "$resolved_source" == "$resolved_library" ]] || return 0
   fi
-  if [[ "$resolved" == "$HEALTH_LIB_DIR" ]]; then
-    refusal="$(health_lib_tree_require_safe "$resolved" 2>&1)" || {
-      printf '%s\n' "$refusal" >&2
-      HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
-      return 1
-    }
-  fi
+  refusal="$(health_lib_tree_require_safe "$resolved_source" 2>&1)" || {
+    printf '%s\n' "$refusal" >&2
+    HEALTH_CONTRACT_REFUSAL="${refusal#error: }"
+    return 1
+  }
   return 0
 }
 

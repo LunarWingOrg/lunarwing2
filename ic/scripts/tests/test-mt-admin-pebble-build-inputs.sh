@@ -173,10 +173,10 @@ git -C "$operator_root" update-ref refs/remotes/origin/release "$tenant_head"
 printf 'operator edit\n' >>"$operator_root/pebble4lunarwing/Dockerfile"
 
 build_count() { wc -l <"$build_log"; }
-assert_build_refusal() {  # <label> <required diagnostic> [explicit release ref]
-  local label="$1" diagnostic="$2" release_ref="${3:-}" before
+assert_build_refusal() {  # <label> <required diagnostic> [explicit release ref] [selected commit]
+  local label="$1" diagnostic="$2" release_ref="${3:-}" selected_commit="${4:-}" before
   before="$(build_count)"
-  if (build_pebble_worker false false "$tenant_root" "$release_ref") >"$fixture_dir/$label.log" 2>&1; then
+  if (build_pebble_worker false false "$tenant_root" "$release_ref" "$selected_commit") >"$fixture_dir/$label.log" 2>&1; then
     fail "$label was accepted"
   fi
   grep -Fq -- "$diagnostic" "$fixture_dir/$label.log" \
@@ -195,18 +195,42 @@ expected_dockerfile="$(git -C "$tenant_root" show HEAD:pebble4lunarwing/Dockerfi
   || fail 'builder received working-tree bytes instead of the committed Dockerfile'
 [[ ! -e "$build_context" ]] || fail "archived build context was not removed: $build_context"
 
-# Default provenance comes only from the operator, including detached HEADs.
+# Default provenance comes only from the operator. A detached operator HEAD does
+# not select an exact commit for build-tenant/build-all: older ancestors remain valid.
 git -C "$operator_root" checkout -q --detach main
 git -C "$tenant_root" checkout -q --detach "$tenant_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$tenant_head" ]] \
   || fail 'detached operator/tenant HEADs did not use the exact operator commit'
-git -C "$operator_root" checkout -q main
-
 git -C "$tenant_root" checkout -q --detach "$base_head"
 build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$base_head" ]] \
+  || fail 'a detached operator checkout rejected an older release ancestor'
+
+mkdir -p "$tenant_root/ic" "$fixture_dir/tenant-env"
+BUILD_LOCK="$fixture_dir/build.lock"
+_ensure_marker_dir() { :; }
+_reset_build_stage_file() { :; }
+_record_build_stage() { :; }
+_run_tenant_build() { :; }
+tenant_repo() { printf '%s/ic\n' "$tenant_root"; }
+tenant_lw_root() { printf '%s\n' "$tenant_root"; }
+tenant_env_dir() { printf '%s/tenant-env\n' "$fixture_dir"; }
+all_tenant_names() { printf 'fixture\n'; }
+sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
+build_tenant fixture false true
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'build-tenant rejected an older ancestor with a detached operator checkout'
+build_all false true
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'build-all rejected an older ancestor with a detached operator checkout'
+git -C "$operator_root" checkout -q main
+
+build_pebble_worker false false "$tenant_root"
+[[ "$effective_revision" == "$base_head" ]] \
   || fail 'an ancestor on the operator release branch was not accepted'
+assert_build_refusal older-selected-revision \
+  'does not match selected operator revision' refs/heads/main "$tenant_head"
 git -C "$tenant_root" checkout -q --detach "$tenant_head"
 
 expected_lane=kimicode4lunarwing
@@ -282,8 +306,8 @@ for lane in pebble4lunarwing opencode4lunarwing opencode2.4lunarwing kimicode4lu
   grep -Fq "_prepare_worker_build_source \"\$source_root\" $lane" "$BUILD_LIB" \
     || fail "$lane does not use the shared operator-archive helper"
 done
-grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;' "$BUILD_LIB" \
-  || fail 'upgrade candidate builds do not forward the release ref and tenant revision source'
+grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" "$selected_commit" || rc=$? ;;' "$BUILD_LIB" \
+  || fail 'upgrade candidate builds do not forward the release ref, selected commit, and tenant source'
 grep -Fq 'worker_paths+=(pebble4lunarwing)' "$BUILD_LIB" \
   || fail 'build-all dirty-source guard does not cover pebble4lunarwing'
 grep -Fq 'git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}"' "$BUILD_LIB" \

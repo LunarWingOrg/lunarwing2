@@ -281,7 +281,7 @@ impl GatewayChannel {
         self
     }
 
-    /// Inject the prompt queue for Claude Code follow-up prompts.
+    /// Inject the prompt queue for sandbox worker follow-up prompts.
     pub fn with_prompt_queue(
         mut self,
         pq: Arc<
