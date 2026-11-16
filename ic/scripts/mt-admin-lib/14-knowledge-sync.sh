@@ -78,7 +78,10 @@ _prune_knowledge_sync_snapshots() {  # <releases dir> <retained release path>
 # its security fixes, including the WI#445 trust gate — frozen at the day the
 # opt-in was last enabled. `upgrade-tenant` now calls
 # refresh_deployed_knowledge_sync_scheduler (after the health-pipeline refresh)
-# when, and only when, a scheduler is already installed.
+# when, and only when, the hourly schedule itself is present on the host. It
+# republishes the staged files and nothing else: an upgrade must neither create
+# a schedule nor re-enable one an operator removed or disabled (WI#715 box 2,
+# review ADV-2).
 
 knowledge_sync_admin_root() {
   printf '%s\n' "${LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT:-/usr/local/lib/lunarwing-study-notes-sync}"
@@ -110,8 +113,41 @@ knowledge_sync_scheduler_installed() {
   [[ -x "$root/current/lunarwing-mt-admin.sh" ]]
 }
 
-# Restage an existing scheduler after an upgrade. NEVER creates the scheduler:
-# a host without one must keep receiving no opt-in from an upgrade. A restage
+# Is the hourly root-side schedule live on this host? The staged snapshot and
+# the schedule are separate facts: the snapshot outlives a timer an operator
+# removed or disabled, and that removal is an operator decision an upgrade must
+# not undo. On systemd, the enabled state is the standing intent (a stopped but
+# enabled timer is repaired); on OpenRC, the managed crontab block is. A host
+# with no init manager detected reports "not live", so an upgrade only ever
+# refreshes files there.
+knowledge_sync_scheduler_live() {
+  local init unit_dir command begin='# BEGIN lunarwing-study-notes-sync managed block'
+  init="${INIT_SYSTEM:-}"
+  if [[ -z "$init" ]]; then
+    init="$(detect_init_system 2>/dev/null)" || return 1
+  fi
+  case "$init" in
+    systemd)
+      unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+      [[ -f "$unit_dir/lunarwing-study-notes-sync.timer" ]] || return 1
+      [[ -f "$unit_dir/lunarwing-study-notes-sync.service" ]] || return 1
+      systemctl is-enabled --quiet lunarwing-study-notes-sync.timer 2>/dev/null
+      ;;
+    openrc)
+      command=""
+      command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
+      [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
+      [[ -n "$command" ]] || return 1
+      "$command" -l 2>/dev/null | grep -Fqx -- "$begin"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Restage an existing scheduler after an upgrade. NEVER creates the scheduler
+# and NEVER re-enables one: a host without a snapshot receives nothing, and a
+# host whose hourly schedule was removed or disabled gets its staged files
+# refreshed but keeps that removal (WI#715 box 2, review ADV-2). A restage
 # failure warns instead of failing the upgrade, whose tenant already restarted;
 # the hourly job then keeps running the previous staged copy.
 refresh_deployed_knowledge_sync_scheduler() {
@@ -127,19 +163,37 @@ refresh_deployed_knowledge_sync_scheduler() {
     say "knowledge sync scheduler: snapshot already staged from $checkout_commit"
     return 0
   fi
-  # Contain die(): ensure_knowledge_source_scheduler exits on a missing
-  # systemctl/crontab, and that must not turn a completed upgrade into a
-  # failure. Full reinstall also repairs a timer/cron block an OS update lost.
-  ( set -e; ensure_knowledge_source_scheduler ) || restage_rc=$?
+  if knowledge_sync_scheduler_live; then
+    # Live schedule: restage the files and repair the unit/cron entry in one
+    # install. Contain die(): ensure_knowledge_source_scheduler exits on a
+    # missing systemctl/crontab, and that must not turn a completed upgrade
+    # into a failure.
+    ( set -e; ensure_knowledge_source_scheduler ) || restage_rc=$?
+  else
+    # The snapshot outlived its schedule: the unit files are gone, the timer is
+    # disabled, or the managed cron block was removed. Republish the files so a
+    # later re-arm runs fixed code, and touch nothing else — no unit is
+    # written, nothing is enabled, no daemon-reload.
+    say "knowledge sync scheduler: hourly schedule is not active on this host; refreshing the staged copy without re-arming it"
+    ( set -e; install_knowledge_sync_admin_snapshot >/dev/null ) || restage_rc=$?
+  fi
   if (( restage_rc != 0 )); then
     say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the hourly job keeps running the previous staged copy"
+    return 0
+  fi
+  # A restage that could not replace the release — a read-only releases
+  # directory, a full disk — must not be reported as delivered (review ADV-1).
+  if [[ -n "$checkout_commit" ]] \
+    && [[ "$(knowledge_sync_staged_commit "$root")" != "$checkout_commit" ]]; then
+    say "WARNING: the Study Notes sync snapshot still names '$(knowledge_sync_staged_commit "$root")' after restaging from $checkout_commit; check that $root/releases is writable"
     return 0
   fi
   say "knowledge sync scheduler: restaged from ${checkout_commit:-an unknown checkout}"
 }
 
-# One operator-visible line for doctor: what the hourly root-side sync is
-# actually running, and whether it lags this checkout.
+# One operator-visible block for doctor: what the hourly root-side sync is
+# actually running, whether it lags this checkout, and — when the snapshot
+# outlived its schedule — that an upgrade will refresh but not re-arm it.
 report_knowledge_sync_scheduler_status() {
   local root staged_commit checkout_commit
   root="$(knowledge_sync_admin_root)"
@@ -153,6 +207,9 @@ report_knowledge_sync_scheduler_status() {
   fi
   printf '[info] knowledge sync scheduler: staged from %s (%s/current)\n' \
     "$staged_commit" "$root"
+  if ! knowledge_sync_scheduler_live; then
+    printf '[info] knowledge sync scheduler: hourly schedule is not active (removed or disabled); upgrade-tenant refreshes the staged copy but does not re-arm it — re-arm with configure-study-mcp <tenant> --enable-knowledge-sync\n'
+  fi
   checkout_commit="$(knowledge_sync_checkout_commit)"
   [[ -n "$checkout_commit" ]] || return 0
   if [[ "$staged_commit" == "$checkout_commit" ]]; then

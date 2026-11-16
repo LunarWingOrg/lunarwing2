@@ -37,8 +37,10 @@ LUNARWING_ROOT="$fixture/origin.git"
 export BUILD_LOCK="$fixture/build.lock"
 events="$fixture/events"
 : >"$events"
+export SAY_LOG="$fixture/say.log"
+: >"$SAY_LOG"
 
-say() { :; }
+say() { printf '%s\n' "$*" >>"$SAY_LOG"; }
 sudo() { [[ "${1:-}" == "-u" ]] || return 64; shift 2; "$@"; }
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
@@ -63,12 +65,18 @@ tenant_worker_enabled() { return 1; }
 clear_promote_rollback() { :; }
 
 # Fake systemd + fixture admin root so the restaged timer is observable without
-# touching the host, including on hosts that really run the scheduler.
+# touching the host, including on hosts that really run the scheduler. The
+# timer's enabled state is a marker file so a case can model an operator who
+# disabled it: `is-enabled` then fails and the upgrade must not re-arm it.
 export SYSTEMCTL_LOG="$fixture/systemctl.log"
+export SYSTEMCTL_ENABLED_MARKER="$fixture/timer-enabled"
 mkdir -p "$fixture/bin" "$fixture/systemd"
 cat >"$fixture/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+if [[ "${1:-}" == "is-enabled" ]]; then
+  [[ -f "$SYSTEMCTL_ENABLED_MARKER" ]]
+fi
 EOF
 chmod +x "$fixture/bin/systemctl"
 PATH="$fixture/bin:$PATH"
@@ -102,6 +110,27 @@ printf 'commit=deadbeef\nsource=/old/checkout\nstaged_at=2026-01-01T00:00:00Z\n'
 printf '#!/usr/bin/env bash\n' >"$old_release/lunarwing-mt-admin.sh"
 chmod +x "$old_release/lunarwing-mt-admin.sh"
 ln -s -- "$old_release" "$fixture/admin/current"
+# An armed host: both unit files, timer enabled.
+cat >"$fixture/systemd/lunarwing-study-notes-sync.service" <<EOF
+[Unit]
+Description=Publish fresh Study Notes checkout generations for LunarWing tenants
+
+[Service]
+Type=oneshot
+ExecStart=$fixture/admin/current/lunarwing-mt-admin.sh sync-knowledge-sources
+EOF
+cat >"$fixture/systemd/lunarwing-study-notes-sync.timer" <<'EOF'
+[Unit]
+Description=Refresh LunarWing Study Notes source generations hourly
+
+[Timer]
+OnCalendar=hourly
+Unit=lunarwing-study-notes-sync.service
+
+[Install]
+WantedBy=timers.target
+EOF
+: >"$SYSTEMCTL_ENABLED_MARKER"
 : >"$events"
 : >"$SYSTEMCTL_LOG"
 
@@ -151,6 +180,79 @@ if [[ "$rc" -eq 0 ]] \
   pass 'a second upgrade does not restage an already-current snapshot'
 else
   fail "second upgrade restaged again or failed (rc=$rc): $output"
+fi
+
+# ── host whose timer was disabled while the snapshot stayed ─────────────────
+# WI#715 box 2 / review ADV-2: the operator's removal is not an upgrade's to
+# undo. The files are refreshed so a later re-arm runs fixed code; the timer is
+# neither re-enabled nor rewritten.
+ln -sfn -- "$old_release" "$fixture/admin/current"
+rm -f "$SYSTEMCTL_ENABLED_MARKER"
+: >"$events"
+: >"$SYSTEMCTL_LOG"
+: >"$SAY_LOG"
+set +e
+output="$(upgrade_tenant_locked fixture "$target" '' false false 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] && grep -qx 'start' "$events"; then
+  pass 'upgrade completes on a host with a disabled timer'
+else
+  fail "upgrade with a disabled timer failed (rc=$rc): $output"
+fi
+if [[ "$(sed -n 's/^commit=//p' "$fixture/admin/current/STAGED-FROM")" == "$checkout_commit" ]]; then
+  pass 'a disabled timer still gets its staged copy refreshed'
+else
+  fail 'a disabled timer left the staged copy frozen'
+fi
+if [[ ! -s "$SYSTEMCTL_LOG" ]] \
+  || ! grep -qE '^(enable|disable|start|stop|restart|daemon-reload)' "$SYSTEMCTL_LOG"; then
+  pass 'a disabled timer is neither re-enabled nor rewritten by the upgrade'
+else
+  fail "the upgrade touched a disabled timer: $(tr '\n' ' ' <"$SYSTEMCTL_LOG")"
+fi
+if grep -Fq 'hourly schedule is not active' "$SAY_LOG"; then
+  pass 'the upgrade says the schedule is inactive instead of silently re-arming'
+else
+  fail "the upgrade did not name the inactive schedule: $(tr '\n' ' ' <"$SAY_LOG")"
+fi
+
+# ── host whose timer units were removed while the snapshot stayed ───────────
+ln -sfn -- "$old_release" "$fixture/admin/current"
+rm -f "$fixture/systemd/lunarwing-study-notes-sync.timer" \
+  "$fixture/systemd/lunarwing-study-notes-sync.service"
+: >"$events"
+: >"$SYSTEMCTL_LOG"
+set +e
+output="$(upgrade_tenant_locked fixture "$target" '' false false 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] && grep -qx 'start' "$events"; then
+  pass 'upgrade completes after the timer units were removed'
+else
+  fail "upgrade after timer removal failed (rc=$rc): $output"
+fi
+if [[ "$(sed -n 's/^commit=//p' "$fixture/admin/current/STAGED-FROM")" == "$checkout_commit" ]] \
+  && [[ -x "$fixture/admin/current/lunarwing-mt-admin.sh" ]]; then
+  pass 'a removed timer still gets its staged copy refreshed'
+else
+  fail 'a removed timer left the staged copy frozen'
+fi
+if [[ ! -e "$fixture/systemd/lunarwing-study-notes-sync.timer" \
+  && ! -e "$fixture/systemd/lunarwing-study-notes-sync.service" && ! -s "$SYSTEMCTL_LOG" ]]; then
+  pass 'a removed timer is not re-created by the upgrade'
+else
+  fail 'the upgrade re-created a removed timer'
+fi
+
+# Doctor reports the dormant snapshot instead of a silently broken schedule.
+report_output="$(report_knowledge_sync_scheduler_status)"
+if [[ "$report_output" == *"staged from $checkout_commit"* \
+  && "$report_output" == *'hourly schedule is not active'* \
+  && "$report_output" != *'[WARN]'* ]]; then
+  pass 'doctor names a refreshed but unscheduled snapshot'
+else
+  fail "doctor did not report the dormant snapshot: $report_output"
 fi
 
 if [[ "$failures" -ne 0 ]]; then
