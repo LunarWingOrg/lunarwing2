@@ -19,8 +19,12 @@ from !2487 in four ways:
 2. The state in which the tenant name is found is recorded before anything is
    done, and nothing is removed or reused without the maintainer's word.
 3. The run is finished — build, runtime and jobs — before the MR is opened.
+   This attempt could not meet that: see F1.
 4. Each hiccup is recorded as what it was: a finding about the call, the
    product, or the host.
+
+The branch `aj/kimi-wi720-20261115-2200` was used only as an outline source;
+this branch starts from the current target rather than from that tree.
 
 ## Host and preflight
 
@@ -261,7 +265,15 @@ said so and skipped it:
 LunarDepth worker image not available; run 'build-lunardepth-worker' first (skipping)
 ```
 
-while `start-tenant` still returned 0 (finding F2).
+while `start-tenant` still returned 0 (finding F2). The tenant daemon logged
+the consequence at 09:09:57Z:
+
+```text
+ERROR External worker 'lunardepth' unreachable at loopback:52010: IO error: Connection refused (os error 111)
+ERROR External worker 'pebble' unreachable at loopback:10018: IO error: Connection refused (os error 111)
+ERROR External worker 'opencode' unreachable at loopback:20017: IO error: Connection refused (os error 111)
+ WARN External worker liveness probe: 0 reachable, 3 unreachable
+```
 
 ## Job exercise
 
@@ -308,8 +320,9 @@ were never dispatched.
      ports although the registry holds 52010/52011; `add-tenant` printed the
      `lunardepth_wss` line but `status` prints neither.
    - `state/config.toml` carries `pebble` and `opencode` external-worker blocks
-     even though only `lunardepth` is selected, and the daemon logs liveness
-     probes for all three (as in WI#719 F6).
+     even though only `lunardepth` is selected, and the daemon logs
+     `External worker liveness probe: 0 reachable, 3 unreachable` (09:09:57Z,
+     quoted above), as WI#719 F6 reported.
 5. **F5 (product, hygiene): test declaration files are in the runtime
    closure.** `@agentclientprotocol/sdk/dist/connection.test.d.ts` and 274
    sibling `.d.ts` test declarations reach `/opt/lunardepth`; the residue gate
