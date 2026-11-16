@@ -22,6 +22,9 @@ PRESENT = {
     f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SCCACHE_ARCHIVE}": SCCACHE,
     f"/api/v4/projects/35/packages/generic/lunarwing-ci-tools/9.9.9/{SHELLCHECK_ARCHIVE}": SHELLCHECK,
 }
+RULES_PATH = "/api/v4/projects/35/packages/protection/rules"
+USER_PATH = "/api/v4/user"
+TOKEN = "test-token"
 
 
 def digest(payload: bytes) -> str:
@@ -29,10 +32,11 @@ def digest(payload: bytes) -> str:
 
 
 class RegistryFixture(http.server.ThreadingHTTPServer):
-    """Serve the two archives plus the rule and user endpoints from memory."""
+    """Serve the two archives to anyone, the rule and user endpoints to the token."""
 
     def __init__(self, routes: dict[str, bytes]) -> None:
         self.routes = routes
+        self.statuses: dict[str, int] = {}
         super().__init__(("127.0.0.1", 0), RegistryHandler)
 
     @property
@@ -42,6 +46,13 @@ class RegistryFixture(http.server.ThreadingHTTPServer):
 
 class RegistryHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path in self.server.statuses:
+            self.send_error(self.server.statuses[self.path])
+            return
+        # GitLab answers both API endpoints with 401 when no valid token comes.
+        if self.path in (RULES_PATH, USER_PATH) and self.headers.get("PRIVATE-TOKEN") != TOKEN:
+            self.send_error(401)
+            return
         body = self.server.routes.get(self.path)
         if body is None:
             self.send_error(404)
@@ -60,22 +71,22 @@ class VerifyRegistryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
-        scripts = self.root / ".gitlab/scripts"
-        scripts.mkdir(parents=True)
-        (scripts / "bootstrap-sccache.sh").write_text(
+        self.scripts = self.root / ".gitlab/scripts"
+        self.scripts.mkdir(parents=True)
+        (self.scripts / "bootstrap-sccache.sh").write_text(
             'SCCACHE_VERSION="9.9.9"\n'
             f'SCCACHE_SHA256="{digest(SCCACHE)}"\n'
             f'SCCACHE_ARCHIVE="{SCCACHE_ARCHIVE}"\n',
             encoding="utf-8",
         )
-        (scripts / "install-shellcheck.sh").write_text(
+        (self.scripts / "install-shellcheck.sh").write_text(
             'readonly version="9.9.9"\n'
             f'readonly archive="{SHELLCHECK_ARCHIVE}"\n'
             f'readonly checksum="{digest(SHELLCHECK)}"\n',
             encoding="utf-8",
         )
         self.token = self.root / "header"
-        self.token.write_text("PRIVATE-TOKEN: test-token\n", encoding="utf-8")
+        self.token.write_text(f"PRIVATE-TOKEN: {TOKEN}\n", encoding="utf-8")
 
     def serve(self, routes: dict[str, bytes]) -> RegistryFixture:
         server = RegistryFixture(routes)
@@ -102,23 +113,26 @@ class VerifyRegistryTests(unittest.TestCase):
             check=False,
         )
 
-    def rule(self, level: str | None) -> bytes:
-        return json.dumps(
-            [
-                {
-                    "id": 7,
-                    "package_name_pattern": "lunarwing-ci-tools",
-                    "package_type": "generic",
-                    "minimum_access_level_for_push": level,
-                }
-            ]
-        ).encode()
+    def rule(
+        self,
+        level: str | None = "maintainer",
+        pattern: str = "lunarwing-ci-tools",
+        package_type: str = "generic",
+    ) -> dict[str, object]:
+        return {
+            "id": 7,
+            "package_name_pattern": pattern,
+            "package_type": package_type,
+            "minimum_access_level_for_push": level,
+        }
 
-    def routes(self, level: str | None = "maintainer", admin: bool = False) -> dict[str, bytes]:
+    def routes(
+        self, rules: list[dict[str, object]] | None = None, admin: bool = False
+    ) -> dict[str, bytes]:
         return {
             **PRESENT,
-            "/api/v4/projects/35/packages/protection/rules": self.rule(level),
-            "/api/v4/user": json.dumps({"is_admin": admin}).encode(),
+            RULES_PATH: json.dumps([self.rule()] if rules is None else rules).encode(),
+            USER_PATH: json.dumps({"is_admin": admin}).encode(),
         }
 
     def test_published_archives_and_rule_pass(self) -> None:
@@ -146,11 +160,52 @@ class VerifyRegistryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("sccache 9.9.9: MISMATCH", result.stdout)
 
+    def test_missing_installer_fails(self) -> None:
+        (self.scripts / "install-shellcheck.sh").unlink()
+        result = self.run_verifier(self.serve(self.routes()))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("cannot read pins", result.stderr)
+
+    def test_installer_without_a_pin_fails(self) -> None:
+        (self.scripts / "bootstrap-sccache.sh").write_text(
+            f'SCCACHE_VERSION="9.9.9"\nSCCACHE_ARCHIVE="{SCCACHE_ARCHIVE}"\n', encoding="utf-8"
+        )
+        result = self.run_verifier(self.serve(self.routes()))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no SCCACHE_SHA256 assignment", result.stderr)
+
     def test_weak_rule_and_admin_token_are_flagged(self) -> None:
-        result = self.run_verifier(self.serve(self.routes(level="developer", admin=True)))
+        routes = self.routes(rules=[self.rule(level="developer")], admin=True)
+        result = self.run_verifier(self.serve(routes))
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("weaker than Maintainer", result.stdout)
         self.assertIn("admins bypass package protection levels", result.stdout)
+
+    def test_rule_for_another_package_type_does_not_count(self) -> None:
+        routes = self.routes(rules=[self.rule(package_type="npm")])
+        result = self.run_verifier(self.serve(routes))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("no generic rule covers lunarwing-ci-tools", result.stdout)
+
+    def test_rule_for_another_package_name_does_not_count(self) -> None:
+        routes = self.routes(rules=[self.rule(pattern="lunarwing-ci-tools-*")])
+        result = self.run_verifier(self.serve(routes))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("no generic rule covers lunarwing-ci-tools", result.stdout)
+
+    def test_no_rule_does_not_count(self) -> None:
+        result = self.run_verifier(self.serve(self.routes(rules=[])))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("no generic rule covers lunarwing-ci-tools", result.stdout)
+
+    def test_failed_rule_request_does_not_count(self) -> None:
+        # What a Developer's token gets: the archives are fine, the rules are not shown.
+        server = self.serve(self.routes())
+        server.statuses[RULES_PATH] = 403
+        result = self.run_verifier(server)
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("protection check failed: HTTP Error 403", result.stderr)
+        self.assertIn("shellcheck 9.9.9: ok", result.stdout)
 
 
 if __name__ == "__main__":
