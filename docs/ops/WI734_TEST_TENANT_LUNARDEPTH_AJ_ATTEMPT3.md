@@ -156,7 +156,73 @@ START_EXIT=0
 
 ## Job exercise
 
-<!-- RESULTS: jobs -->
+Jobs ran through fresh gateway threads on the tenant's own gateway
+(`127.0.0.1:10010`). Each prompt asked the tenant agent for exactly one
+`create_job(mode="lunardepth", wait=false)` call; the harness polled the
+thread's pending gate, approved it with the owning `thread_id` and `always`,
+found the job by a unique title marker, and saved the job detail and events. The
+gateway bearer token was read inside the script through `mt-admin tokens` and
+never printed.
+
+The tasks were chosen for the lane's fat Python/C++ toolchain:
+
+1. **Medium — Python access-log pipeline:** deterministic 360-row fixture with
+   three malformed rows at fixed line numbers, strict parser with text/JSON
+   reports, nearest-rank percentiles, at least 12 unit tests, and
+   byte-identical rerun checks.
+2. **Medium/high — C++17 weighted interval scheduling:** DP plus
+   reconstruction, an independent exhaustive-subset oracle, edge cases, and an
+   N=2500 scaling case, compiled with warnings as errors.
+3. **High — parallel statistics with an independent oracle:** deterministic
+   24,000-row CSV, C++17 `std::async` aggregation over 1/2/4/8 partitions with
+   an FNV-1a checksum, and an independent Python recomputation.
+
+### Job 1 — Python access-log pipeline: PASS
+
+- Job `59919468-d069-4a32-aed9-6721dc9aacf4`, mode `external:lunardepth`,
+  created 21:49:08Z and completed 21:58:39Z (**571 s**). The worker wrote
+  `generate_logs.py`, `log_parser.py`, `test_log_pipeline.py`, `access.log`,
+  `report.txt`, `report.json`, a second pair of reports, three empty diff
+  proofs and `SUMMARY.md` under `/workspace/wi734_aj_log_pipeline`.
+- **Independent host re-run of the worker's tests:** `Ran 20 tests ... OK`.
+- **Independent host parser** (written for this report, not the worker's
+  module) reproduced every value in `report.json`:
+
+| Metric | Worker | Independent |
+| --- | ---: | ---: |
+| total lines / valid | 360 / 357 | 360 / 357 |
+| malformed line numbers | 42, 181, 307 | 42, 181, 307 |
+| `/api` / `/search` / `/checkout` / `/health` | 90 / 89 / 89 / 89 | 90 / 89 / 89 / 89 |
+| 2xx / 4xx / 5xx | 286 / 50 / 21 | 286 / 50 / 21 |
+| errors (status ≥ 400), rate | 71, 0.1989 | 71, 0.1989 |
+| nearest-rank p50 / p95 / p99 (ms) | 285 / 1328 / 2135 | 285 / 1328 / 2135 |
+
+- **Determinism:** all three `diff` files are 0 bytes (text report pair, JSON
+  report pair, regenerated fixture), and the SHA-256 pairs match
+  (`access.log` = `7f8e0303…e45aa27`, `report.json` = `f59fed2f…b3aefdd`).
+
+### The first dispatch of this task failed (H2)
+
+The first attempt at job 1, `20d31ff7-1318-4393-a28a-777d6fd33da8`, ran
+21:13:46Z→21:44:02Z and **failed** with
+`pi-ai stream idle timeout after 300000ms`. Its worker session shows six
+consecutive stream attempts (initial plus retries 1–5), each idle for five
+minutes and producing no chunk, then `turn/end` with `code: TIMEOUT`. The
+receipts are beside the successful run:
+
+- The same route answered from the host in 25.7 s for a 900-token request and
+  in 2–4 s for short streaming probes.
+- From the **worker's own network namespace**, a replay of the failed session's
+  **exact request body** (16,420 bytes, 17 tools) streamed its first chunk in
+  1.7 s and completed in 215.5 s.
+- The `pi-ai` client called directly inside the task container streamed its
+  first event in 1.5 s.
+
+The retry, with no change to the tenant, the image or the route, completed
+normally. It is recorded as a host/infra or model-side stall (H2), not a worker
+defect, and it is the one thing in this run that could not be reproduced on
+demand.
+
 
 ## Findings and hiccups
 
