@@ -320,6 +320,25 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             (etc / "skill").rmdir()
             self.assertEqual(run(None), [])
 
+    def test_broken_managed_policy_source_fails_the_whole_checker(self) -> None:
+        # WI#665 (review AEP-5): check_managed_policy is exercised directly
+        # above; this pins that the checker's main run still calls it, so a
+        # source policy that no longer denies the integration fails the build.
+        source = self.lane / "config" / "managed" / "opencode.json"
+        source.write_text(
+            json.dumps(
+                {"policies": [{"action": "integration.use", "resource": "opencode*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("must deny integration.use", result.stderr)
+        source.unlink()
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("opencode.json does not parse", result.stderr)
+
     def test_service_invocation_in_entrypoint_fails(self) -> None:
         with (self.lane / "entrypoint.sh").open("a", encoding="utf-8") as handle:
             handle.write('"$OPENCODE_BIN" service start\n')
