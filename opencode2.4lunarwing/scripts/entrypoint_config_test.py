@@ -422,6 +422,27 @@ while True:
             process.args, process.returncode, stdout, stderr,
         )
 
+    @staticmethod
+    def cli_leader_argv(process: subprocess.Popen, limit: float = 30) -> list[str] | None:
+        """The fixture leader's argv once it is neither bash nor `env`.
+
+        CLI mode execs `env`, which execs `timeout`, so the leader's PID then
+        names the wrapper and its arguments. None means the leader ended, or
+        was still bash, before that could be read. A missing reading proves
+        nothing: callers assert on a reading only, never on its absence.
+        """
+        deadline = time.monotonic() + limit
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                argv = Path("/proc", str(process.pid), "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                return None
+            name = os.path.basename(argv[0].decode(errors="replace"))
+            if name and name not in ("bash", "env"):
+                return [arg.decode(errors="replace") for arg in argv if arg]
+            time.sleep(0.01)
+        return None
+
     def run_cli(self, timeout_ms: str, limit: float = 30) -> subprocess.CompletedProcess:
         script, env = self.prepare_cli(timeout_ms)
         return self.collect_cli(self.start_cli(script, env), limit, "its start")
@@ -465,12 +486,25 @@ while True:
         handler, and that is still the behaviour under test — the deadline was
         honored and `--preserve-status` kept the status 143. It asserts nothing
         about elapsed time either: any such number also measures how long the
-        entrypoint takes to start on a loaded host. The five-minute limit is
-        not a measure of speed. Only a run that its deadline does not end
-        reaches it, so removing the `timeout` wrapper, or giving it the
-        one-hour default instead, still fails here.
+        entrypoint takes to start on a loaded host.
+
+        A missing wrapper, another deadline or a dropped `--preserve-status`
+        is read off the leader's command line, so each fails here at once and
+        by name. That matters inside `ci-config`, where this suite runs once
+        per guard run under the guard's own two-minute limit: a case that
+        waited minutes for a run that never ends would turn one regression
+        into a timeout of every guard run. The 60-second limit is the backstop
+        for a run that ends for neither reason. It is not a measure of speed:
+        a sound run took 13 s on one CPU shared with 160 busy loops.
         """
-        result = self.run_cli("2000", limit=300)
+        script, env = self.prepare_cli("2000")
+        process = self.start_cli(script, env)
+        leader = self.cli_leader_argv(process, limit=10)
+        if leader is not None:
+            self.assertEqual(
+                leader[:5], ["timeout", "--preserve-status", "-k", "5s", "2.000"], leader,
+            )
+        result = self.collect_cli(process, 60, "the look at its wrapper")
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
         self.assertIn("(timeout 2000ms)", result.stdout)
 
