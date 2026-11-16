@@ -399,7 +399,8 @@ _tenant_proc_host_visible() {
     say "ERROR: cannot verify that $root/1 is the host init; the process table may be namespace- or LSM-filtered" >&2
     return 1
   fi
-  { comm="$(<"$root/1/comm")"; } 2>/dev/null || comm=""
+  # cat, not $(<file), for the same bash 5.2 reason as _tenant_status_uids.
+  comm="$(cat -- "$root/1/comm" 2>/dev/null)" || comm=""
   case "$comm" in
     systemd|init|sysvinit|openrc-init) ;;
     *)

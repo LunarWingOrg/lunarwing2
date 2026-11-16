@@ -394,7 +394,15 @@ a known limit. A populated or unreadable cgroup refuses the removal and names
 the unit to stop; stop a lingering systemd manager with `systemctl stop
 user@<uid>.service` and the named OpenRC service before rerunning. An
 unreadable cgroup v2 mount, or a missing, unreadable or invalid `cgroup.events`
-in an existing managed tree, also refuses rather than restoring that race.
+in an existing managed tree, also refuses rather than restoring that race. When
+the init system cannot be detected, the cgroup step refuses with its reason
+instead of checking the OpenRC layout on a host that has none. The proof reads
+`/proc/<pid>/status`, `cgroup.events` and PID 1's `comm` with `cat` rather than
+Bash's `$(<file)`: under `set -e`, Bash 5.2 ends the shell when the redirection
+of `$(<file)` fails, before a `||` branch can print why, so a task that exits
+during the scan or a tree found without `cgroup.events` would lose the refusal.
+The other `$(<file)` reads in mt-admin sit behind a `-f`/`-r` test or read a
+file mt-admin has just written and are left as they are.
 
 The recorded ranges are cross-checked against the current `/etc/subuid`.
 Entries still naming the tenant or its former uid must match the record, and
