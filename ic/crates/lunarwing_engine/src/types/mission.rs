@@ -287,25 +287,52 @@ pub const DEFAULT_MAX_THREADS_PER_DAY: u32 = 30;
 /// the failing fire, so an event/webhook payload that is re-delivered after
 /// an unsuccessful run can fire again (the rollback contract previously
 /// covered spawn failure only).
+///
+/// Every scalar is defaulted (WI#576): a stored `retry_policy` object written
+/// by an older binary may carry only some of these keys, and a missing scalar
+/// must fall back to its default instead of failing the whole mission record
+/// with a position-less Data error (`line=0 column=0`). The outer
+/// `#[serde(default)]` on `Mission::retry_policy` only covers an absent key,
+/// not an incomplete object.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MissionRetryPolicy {
     /// Max automatic re-fires per failing fire (0 = no retry).
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Delay in seconds before the first retry.
+    #[serde(default = "default_initial_delay_secs")]
     pub initial_delay_secs: u64,
     /// Multiplier applied to the delay after each retry.
+    #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
     /// Maximum delay in seconds (caps exponential growth).
+    #[serde(default = "default_max_delay_secs")]
     pub max_delay_secs: u64,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_initial_delay_secs() -> u64 {
+    60
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_max_delay_secs() -> u64 {
+    3600
 }
 
 impl Default for MissionRetryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            initial_delay_secs: 60,
-            backoff_multiplier: 2.0,
-            max_delay_secs: 3600,
+            max_retries: default_max_retries(),
+            initial_delay_secs: default_initial_delay_secs(),
+            backoff_multiplier: default_backoff_multiplier(),
+            max_delay_secs: default_max_delay_secs(),
         }
     }
 }
