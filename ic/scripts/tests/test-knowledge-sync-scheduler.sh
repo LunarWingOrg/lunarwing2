@@ -248,7 +248,7 @@ report_output="$(report_knowledge_sync_scheduler_status)"
 # holds an entry cron would run. An operator who commented the line out switched
 # the schedule off, and an upgrade must not switch it on again.
 managed_entry="17 * * * * $fixture/refresh-admin/current/lunarwing-mt-admin.sh sync-knowledge-sources"
-job_before='5 4 * * * /usr/bin/true job-before-the-block'
+job_before='5 4 * * * /usr/bin/true "$(date +\%F)" job-before\the-block'
 job_after='6 4 * * * /usr/bin/true job-after-the-block'
 write_managed_block() {  # <the block's lines, one argument each>
   {
@@ -393,6 +393,15 @@ for bad_compare in '*/mt-admin-lib/14-knowledge-sync.sh' '*/lunarwing-mt-admin.s
   unset -f cmp
   staging_left_everything "a copy of $bad_compare that differs" 'could not stage a complete Study Notes sync release'
 done
+# The stamp's first line cannot be written: a stamp without its commit must
+# not be published.
+printf() {
+  [[ "$1" != 'commit=%s\n' ]] || return 1
+  builtin printf "$@"
+}
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler 2>&1)"
+unset -f printf
+staging_left_everything 'a failed first line of the stamp' 'could not stage a complete Study Notes sync release'
 # The stamp cannot be made readable, and the publish itself fails.
 chmod() { return 1; }
 refresh_output="$(refresh_deployed_knowledge_sync_scheduler 2>&1)"
@@ -437,9 +446,23 @@ printf '%s\n' "$job_before" '# BEGIN lunarwing-study-notes-sync managed block' "
 probe_shape_not_live 'a block without its END line in front of another job'
 printf '%s\n' "$job_before" "$job_after" >"$FCRONTAB_STATE"
 probe_shape_not_live 'other jobs and no managed block'
-write_managed_block "@hourly $fixture/refresh-admin/current/lunarwing-mt-admin.sh sync-knowledge-sources"
+printf '%s\n' "$job_before" '# BEGIN lunarwing-study-notes-sync managed block' "$job_after" \
+  '# BEGIN lunarwing-study-notes-sync managed block' "#$managed_entry" \
+  '# END lunarwing-study-notes-sync managed block' >"$FCRONTAB_STATE"
+probe_shape_not_live 'another job between an unclosed BEGIN line and a complete block that is switched off'
+for live_entry in "@hourly $fixture/refresh-admin/current/lunarwing-mt-admin.sh sync-knowledge-sources" \
+  "   $managed_entry" "&bootrun $managed_entry" \
+  "%hourly 17 $fixture/refresh-admin/current/lunarwing-mt-admin.sh sync-knowledge-sources"; do
+  write_managed_block "$live_entry"
+  knowledge_sync_scheduler_live || {
+    printf 'the entry "%s" in the managed block was not counted as live\n' "$live_entry" >&2
+    exit 1
+  }
+done
+printf '%s\n%s\n%s' '# BEGIN lunarwing-study-notes-sync managed block' "$managed_entry" \
+  '# END lunarwing-study-notes-sync managed block' >"$FCRONTAB_STATE"
 knowledge_sync_scheduler_live || {
-  printf 'an @hourly entry in the managed block was not counted as live\n' >&2
+  printf 'a block whose END line has no newline was not counted as live\n' >&2
   exit 1
 }
 
@@ -456,26 +479,36 @@ installer_output="$( ( _install_knowledge_source_cron "$fixture/refresh-admin/cu
   || installer_rc=$?
 [[ "$installer_rc" -ne 0 && "$(cat "$FCRONTAB_STATE")" == "$cron_before" \
   && "$(wc -l <"$FCRONTAB_INSTALLS")" -eq "$installs_before" \
-  && "$installer_output" == *"without its END line"* ]] || {
+  && "$installer_output" == *"without a later line that reads exactly"* \
+  && "$installer_output" == *"fcrontab -e"* ]] || {
   printf 'the cron installer rebuilt a crontab around an unterminated block (rc=%s): %s\n%s\n' \
     "$installer_rc" "$installer_output" "$(cat "$FCRONTAB_STATE")" >&2
   exit 1
 }
 write_managed_block "$managed_entry"
 cron_before="$(cat "$FCRONTAB_STATE")"
-# A failing printf leaves the temporary file empty, as a full disk would.
+# A failing printf of the entry leaves the temporary file without it, as a
+# full disk would; the stubs leave every other printf, die and say alone.
 for failing in mktemp printf; do
   installs_before="$(wc -l <"$FCRONTAB_INSTALLS")"
   installer_rc=0
   installer_output="$(
     (
       set -e
-      eval "$failing() { return 1; }"
+      if [[ "$failing" == mktemp ]]; then
+        mktemp() { return 1; }
+      else
+        printf() {
+          [[ "$1" != '17 * * * * %s sync-knowledge-sources\n' ]] || return 1
+          builtin printf "$@"
+        }
+      fi
       _install_knowledge_source_cron "$fixture/refresh-admin/current/lunarwing-mt-admin.sh"
     ) 2>&1
   )" || installer_rc=$?
   [[ "$installer_rc" -ne 0 && "$(cat "$FCRONTAB_STATE")" == "$cron_before" \
     && "$(wc -l <"$FCRONTAB_INSTALLS")" -eq "$installs_before" \
+    && "$installer_output" == *"error: c"* \
     && "$installer_output" != *"scheduled with"* ]] || {
     printf 'with a failing %s the cron installer replaced the crontab (rc=%s): %s\n%s\n' \
       "$failing" "$installer_rc" "$installer_output" "$(cat "$FCRONTAB_STATE")" >&2
@@ -505,13 +538,29 @@ other_jobs_kept || {
 # leaves both as they were and reloads nothing.
 service_before="$(cat "$fixture/systemd/lunarwing-study-notes-sync.service")"
 timer_before="$(cat "$fixture/systemd/lunarwing-study-notes-sync.timer")"
-for failing in mktemp cat chmod mv; do
+for failing in mktemp cat chmod mv timer-mktemp timer-cat; do
   : >"$SYSTEMCTL_LOG"
   installer_rc=0
   installer_output="$(
     (
       set -e
-      eval "$failing() { return 1; }"
+      case "$failing" in
+        timer-mktemp)
+          mktemp() {
+            [[ "$1" != *.timer.* ]] || return 1
+            command mktemp "$@"
+          }
+          ;;
+        timer-cat)
+          cat_calls=0
+          cat() {
+            cat_calls=$((cat_calls + 1))
+            ((cat_calls < 2)) || return 1
+            command cat "$@"
+          }
+          ;;
+        *) eval "$failing() { return 1; }" ;;
+      esac
       _install_knowledge_source_systemd_timer "$fixture/refresh-admin/current/lunarwing-mt-admin.sh"
     ) 2>&1
   )" || installer_rc=$?
@@ -528,6 +577,62 @@ for failing in mktemp cat chmod mv; do
     exit 1
   }
 done
+
+# A unit an operator masked is a symbolic link. The installer must refuse it:
+# a rename over the link would unmask the unit.
+for masked in service timer; do
+  mv "$fixture/systemd/lunarwing-study-notes-sync.$masked" "$fixture/systemd/aside.$masked"
+  ln -s /dev/null "$fixture/systemd/lunarwing-study-notes-sync.$masked"
+  : >"$SYSTEMCTL_LOG"
+  installer_rc=0
+  installer_output="$(
+    ( _install_knowledge_source_systemd_timer "$fixture/refresh-admin/current/lunarwing-mt-admin.sh" ) 2>&1
+  )" || installer_rc=$?
+  [[ "$installer_rc" -ne 0 && -L "$fixture/systemd/lunarwing-study-notes-sync.$masked" \
+    && ! -s "$SYSTEMCTL_LOG" && "$installer_output" == *"symbolic link"* ]] || {
+    printf 'the systemd installer replaced or enabled a masked %s unit (rc=%s): %s\n' \
+      "$masked" "$installer_rc" "$installer_output" >&2
+    exit 1
+  }
+  [[ -z "$(find "$fixture/systemd" -name 'lunarwing-study-notes-sync.*.*' -print -quit)" ]] || {
+    printf 'the systemd installer left a temporary file beside a masked %s unit\n' "$masked" >&2
+    exit 1
+  }
+  rm -f "$fixture/systemd/lunarwing-study-notes-sync.$masked"
+  mv "$fixture/systemd/aside.$masked" "$fixture/systemd/lunarwing-study-notes-sync.$masked"
+done
+
+# A listing the installer cannot read back must not be taken for an empty
+# table. bash keeps a large here-string in a temporary file; a file size limit
+# stands in for a temporary directory that cannot hold it.
+{
+  printf '%s\n' "$job_before"
+  for ((filler = 0; filler < 3000; filler++)); do
+    printf '7 3 * * * /usr/bin/true filler-job-%04d-with-padding-to-pass-the-pipe-size\n' "$filler"
+  done
+  printf '%s\n' '# BEGIN lunarwing-study-notes-sync managed block' "$managed_entry" \
+    '# END lunarwing-study-notes-sync managed block' "$job_after"
+} >"$FCRONTAB_STATE"
+cron_lines_before="$(wc -l <"$FCRONTAB_STATE")"
+installs_before="$(wc -l <"$FCRONTAB_INSTALLS")"
+installer_rc=0
+installer_output="$(
+  (
+    ulimit -f 32
+    _install_knowledge_source_cron "$fixture/refresh-admin/current/lunarwing-mt-admin.sh"
+  ) 2>&1
+)" || installer_rc=$?
+[[ "$(wc -l <"$FCRONTAB_STATE")" -eq "$cron_lines_before" ]] && other_jobs_kept || {
+  printf 'a listing that could not be read back cost root its other jobs (rc=%s, %s lines left): %s\n' \
+    "$installer_rc" "$(wc -l <"$FCRONTAB_STATE")" "$installer_output" >&2
+  exit 1
+}
+[[ "$installer_rc" -ne 0 && "$(wc -l <"$FCRONTAB_INSTALLS")" -eq "$installs_before" ]] || {
+  printf 'a listing that could not be read back was followed by an install (rc=%s): %s\n' \
+    "$installer_rc" "$installer_output" >&2
+  exit 1
+}
+write_managed_block "$managed_entry"
 
 # Review of the fix (R2, R3, R6), on an admin root of its own so the release
 # count of the root above stays where the older cases expect it.
@@ -546,7 +651,7 @@ done
   # that the copy was replaced, not that everything was left as it was.
   late_output="$(FCRONTAB_FAIL_INSTALL=1 refresh_deployed_knowledge_sync_scheduler 2>&1)"
   [[ "$(readlink -- "$fixture/late-admin/current")" != "$late_old" \
-    && "$late_output" == *"was restaged, but the hourly schedule could not be repaired"* \
+    && "$late_output" == *"was restaged, but the schedule install did not finish"* \
     && "$late_output" != *"left as they were"* && "$late_output" != *"restaged from"* ]] || {
     printf 'a failure after the staging was reported wrongly: %s\n' "$late_output" >&2
     exit 1
