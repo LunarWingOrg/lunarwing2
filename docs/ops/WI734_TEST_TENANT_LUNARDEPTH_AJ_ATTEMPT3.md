@@ -221,6 +221,39 @@ The tasks were chosen for the lane's fat Python/C++ toolchain:
   seeded instances, including empty input and negative weights, **0
   mismatches** against `wis_main`'s reported optimum.
 
+### Job 3 — parallel statistics with independent cross-check: PASS
+
+- Job `b0d7cdd1-e689-4adb-a1e7-2293a4e5636c`, mode `external:lunardepth`,
+  created 22:17:43Z and completed 22:45:42Z (**1679 s**). The worker left
+  `generate_data.py`, `data.csv`, `aggregator.cpp`, `check.py`,
+  `run_analysis.sh`, per-partition transcripts (1/2/4/8 plus repeats), diff
+  proofs and `SUMMARY.md` under `/workspace/wi734_aj_parallel_stats`.
+- The worker's checker reports `TOTAL: 140 fields, 0 mismatches` across the
+  four partition counts against its own `math.fsum`/`statistics.pstdev`
+  recomputation; the partition-4 repeat transcripts are byte-identical.
+- **Independent host rebuild and rerun:**
+  `g++ -O2 -std=c++17 -pthread -Wall -Wextra -Werror` succeeded, and a fresh
+  4-partition run was **byte-identical** to the worker's `transcript_p4.txt`.
+- **A separate host-side implementation** (my own parser, not the worker's
+  `check.py`) reproduced every aggregate at 6 decimals:
+
+| Group | Count | Sum | Mean | Min | Max | Population stddev |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 6000 | -90632.005644 | -15.105334 | -999.986051 | 999.904089 | 579.872686 |
+| B | 6000 | -63801.033643 | -10.633506 | -999.768931 | 999.702694 | 574.014895 |
+| C | 6000 | -103022.937076 | -17.170490 | -999.976848 | 999.913292 | 584.094751 |
+| D | 6000 | -132997.020243 | -22.166170 | -999.674795 | 999.877539 | 572.493239 |
+| ALL | 24000 | -390452.996606 | -16.268875 | -999.986051 | 999.913292 | 577.652431 |
+
+### Job inventory
+
+| Job | ID | State | Job elapsed | Independent result |
+| --- | --- | --- | ---: | --- |
+| Python access-log pipeline | `59919468-d069-4a32-aed9-6721dc9aacf4` | completed | 571 s | 20 tests + independent metrics/percentiles |
+| C++17 weighted interval scheduling | `c6c15f0b-92ca-415a-b3df-b020f06b3649` | completed | 827 s | host rebuild + 320-instance oracle + separate DP oracle |
+| Parallel statistics | `b0d7cdd1-e689-4adb-a1e7-2293a4e5636c` | completed | 1679 s | host rebuild + byte-identical p4 run + separate oracle |
+| Python access-log pipeline (first dispatch) | `20d31ff7-1318-4393-a28a-777d6fd33da8` | failed | 1816 s | H2: six idle model-stream timeouts |
+
 ### The first dispatch of job 1 failed (H2)
 
 The first attempt at job 1, `20d31ff7-1318-4393-a28a-777d6fd33da8`, ran
@@ -246,12 +279,117 @@ demand.
 
 ## Findings and hiccups
 
-<!-- RESULTS: findings -->
+Each item is classified as a finding about the **product**, the **call** (how the
+test harness called it), or the **host**.
+
+1. **F1 (product, resolved by WI#739): the out-of-band verifier rejected the
+   image's intra-archive hard links.** In the previous attempt this blocked the
+   whole lane. MR !2501 accepts a hard-link member only when its target is an
+   earlier regular file beneath the checked roots, and keeps rejecting
+   symlinks, links leaving the roots, links to non-regular members, and links
+   to unseen paths. Built with that patch, the image verified on the first try
+   (`README`-level evidence above). Nothing in this run weakens the gate: the
+   verifier is the patched one from !2501, and `worker-lunardepth-ts` and
+   `worker-lunardepth-exposure-verify` are green on pipeline 8000.
+   - Note for the reviewer: the image label carries `…-dirty` because the two
+     !2501 files were applied to the worktree rather than merged. The verifier
+     is the only thing that changed; the worker runtime is unaffected.
+2. **F2 (product, API shape): `GET /api/chat/pending-gates` returns
+   `parameters` as a JSON string, and the action name is `tool_name`.** The
+   harness copied from the WI#719 run read `parameters["title"]` and
+   `action_name`, and crashed:
+   ```text
+   File "/tmp/wi734_dispatch.py", line 113, in main
+       title = str(parameters.get("title") or "")
+   AttributeError: 'str' object has no attribute 'get'
+   ```
+   The live payload is
+   `{"request_id": "945e9dd1-…", "thread_id": "fec915d4-…", "gate_name": "approval", "tool_name": "create_job", "description": "Tool 'create_job' requires approval (gate: approval)", "parameters": "{\n  \"description\": \"Medium-complexity Python …"}`.
+   This is a documented-interface question, not a test failure: a client written
+   against the WI#719 shape silently breaks. Either the endpoint changed shape
+   or the old harness was written against a different route; the report cannot
+   tell which. A tolerant client (parse when it is a string, accept
+   `tool_name` or `action_name`) works.
+3. **F3 (product, small): `create_job` accepted a ~1.8 KB title and an empty
+   description.** The model put the whole task into `title` and left
+   `description` empty for all four dispatches, despite the instruction to use
+   the marker alone:
+   ```text
+   b0d7cdd1-… completed title= 'wi734-aj3b-parstats\n\nHigh-complexity parallel numerical task' len 1864
+   59919468-… completed title= 'wi734-aj3b-pylog\n\nMedium-complexity Python validation task. ' len 1792
+   ```
+   The job then renders with `"description": ""` and the full text as a title.
+   The tasks still ran correctly because the daemon hands the worker the task
+   text, so this is display and validation hygiene, not a blocker. It is worth
+   a length check or a "title is one line" rule in the tool schema.
+4. **H1 (host, model-side): the first job dispatch's LLM stream stalled six
+   times.** `20d31ff7-…` failed with `pi-ai stream idle timeout after 300000ms`
+   after 30 minutes; the retry of the same task with no change finished in
+   571 s. The evidence that the route and worker were healthy is in *Job
+   exercise* above. Classified as host/infra: the worker's own network
+   namespace streamed the exact request body in 1.7 s.
+5. **H2 (host, cosmetic): `mt-admin status` prints `inactive` twice for lanes
+   that are not selected.** The service list renders
+   ```text
+     lunarwing-proxy-lunardepthtester.service: inactive
+   inactive
+   ```
+   — the second `inactive` is the unit's `ActiveState` echoed on its own line.
+   The same shape appeared for the pebble/opencode/opencode2 units. Cosmetic;
+   the same display is pinned by `test-mt-admin-*` elsewhere, so changing it is
+   a design decision.
+6. **H3 (call, cosmetic): `podman logs --since 21:13` is rejected**
+   (`Error: parsing --since "21:13": unable to interpret time value`). Podman
+   6.2 requires a date-qualified or duration value. Not a product issue; noted
+   because it slowed the log reading during the run.
 
 ## Host changes this run made
 
-<!-- RESULTS: host-changes -->
+In order:
+
+1. **Worker image build** (`build-lunardepth-worker --with-toolchains`): the
+   rootless build store gained the pinned base images and the layer cache, and
+   the root store gained `lunarwing-worker-lunardepth:latest`
+   (`d083885d1e08…`). The failed candidate from the second attempt's state was
+   not present; nothing was deleted.
+2. **`start-tenant lunardepthtester`**: distributed the image into the tenant's
+   rootless store, regenerated the tenant's LunarDepth overlay and task
+   environment, created the `lw-egress-lunardepthtester` network and its
+   nftables chains, and force-recreated the two LunarDepth quadlet units
+   (`lunarwing-lunardepth-lunardepthtester`, `lunarwing-lunardepth-task-lunardepthtester`).
+   The daemon, PostgreSQL, vision sidecar and XMPP bridge units were already
+   running and were not recreated.
+3. **Three job dispatches plus one failed first dispatch**: the tenant's
+   `/workspace/wi734_aj_*` directories (inside the task container), the job
+   rows in the tenant database, and the tenant's gateway conversations. No
+   project outside the tenant was touched.
+4. **Read-only probes**: `podman image inspect`, `nsenter` reads of the task
+   container's filesystem and `/proc`, `journalctl --user`, `ss`, and four
+   model-route probes from the worker's network namespace. The probes created
+   no lasting container or network object.
+
+No `LUNARWING_SERVICE_MANAGER` appears in any command or log of this run;
+`/etc/lunarwing/health.env` still reads `systemd`, and the host's own tenants
+(`hermes`, `antelope`) were not touched.
 
 ## Acceptance
 
-<!-- RESULTS: acceptance -->
+- [x] The report's host line is true (Arch Linux, systemd, kernel
+  `6.18.54-2-lts`, Podman 6.2.0), and no command of the run forced a service
+  manager the host does not run.
+- [x] The report says in which state the tenant name was found (present and
+  running, without a worker) and what was done about it (reused as it stands,
+  nothing removed, no new tenant), with the maintainer asked in note 18277 and
+  the decision recorded in note 18295.
+- [x] The tenant has the LunarDepth external worker **running** with
+  `--with-toolchains`: `build-lunardepth-worker --with-toolchains` produced
+  `d083885d1e08…` with `toolchain-profile=true`, and the runtime audit shows
+  health/ready true and `worker-smoke` exit 0.
+- [x] Jobs of medium to high complexity ran and their results are in this
+  report: three jobs completed and each was re-verified on the host by an
+  independent implementation; a fourth dispatch failed on a model-stream stall
+  (H1) and is recorded as such.
+- [x] Every hiccup is recorded with its command and output, classified as a
+  finding about the product, the call or the host.
+- [x] No section of this report is pending.
+
