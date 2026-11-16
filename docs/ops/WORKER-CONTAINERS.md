@@ -1155,7 +1155,13 @@ Enforced controls (opencode2 lane unless noted):
    for each, not only the bridge call surface. Include hosted
    instruction/skill inputs such as the OpenCode Console Library: review both
    saved and environment credentials plus egress, not only optional
-   event-watch flags (see WI#665 below). Read the upstream diff under
+   event-watch flags (see WI#665 below). On every opencode2 bump, also re-run
+   `scripts/console_policy_eval.py` against the candidate image: the shipped
+   managed policy depends on upstream's managed-config discovery
+   (`packages/core/src/config/discovery.ts`), on managed policies loading and
+   evaluating first (`packages/core/src/config.ts`), and on the plugin honouring
+   `integration.use` for what it supplies
+   (`packages/core/src/plugin/provider/opencode.ts`). Read the upstream diff under
    `packages/core/src` as well as `packages/{cli,server,schema}/src`: the
    v2.2.7 Console event watches live there and the first pass of that bump
    missed them. **Feature flags:** the wrapper's `-console_watches` pin is
