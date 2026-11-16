@@ -2643,12 +2643,11 @@ split role dispatches unless the operator explicitly sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1`; an acknowledged startup warns
 without printing the credential. This gate checks only the environment variable.
 Credentials saved by `opencode auth login` inside a session bypass it and can
-survive a container restart. With a usable credential and allowed egress, opt-in
-enables the Library surface too; no shipped setting separately withholds its
-instructions, its skills or the config merge. The entrypoint's refusal names
-"Console Library egress and instruction risk" and does not mention the config
-merge. The managed tenant's egress allowlist remains the boundary against a
-compromised worker.
+survive a container restart. Opt-in no longer means Console content reaches the
+session: the image's managed policy withholds the instructions, the skills and
+the config merge either way (see the evaluation below). It does not withhold the
+requests, so the managed tenant's egress allowlist remains the boundary against
+a compromised worker.
 
 **Scope:** WI#665's surface record and environment-credential gate are covered;
 the root-owned managed-policy control is **evaluated on a built image and
