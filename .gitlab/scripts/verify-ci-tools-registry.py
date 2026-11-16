@@ -35,6 +35,8 @@ MISSING = 2
 UNPROTECTED = 3
 REGISTRY_ERROR = 4
 TIMEOUT = 120
+PUSH_LEVELS = ("maintainer", "owner", "admin")
+RULE_PAGES = 50
 TOOLS = (
     {
         "name": "sccache",
@@ -142,14 +144,34 @@ def token_opener(url: str) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(RefuseRedirect, urllib.request.ProxyHandler({}))
 
 
-def get_json(url: str, token: str) -> object:
+def get_json(url: str, token: str) -> tuple[object, str]:
     request = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
     with token_opener(url).open(request, timeout=TIMEOUT) as response:
-        return json.load(response)
+        return json.load(response), (response.headers.get("X-Next-Page") or "").strip()
+
+
+def list_rules(api_url: str, project_id: str, token: str) -> list[object]:
+    rules: list[object] = []
+    page = "1"
+    # GitLab names the next page in X-Next-Page; an unpaged list sends none.
+    for _ in range(RULE_PAGES):
+        payload, page = get_json(
+            f"{api_url}/projects/{project_id}/packages/protection/rules"
+            f"?per_page=100&page={page}",
+            token,
+        )
+        if not isinstance(payload, list):
+            raise ValueError("the rules answer is not a list")
+        rules.extend(payload)
+        if not page:
+            return rules
+        if not page.isdecimal():
+            raise ValueError(f"unexpected X-Next-Page {page!r}")
+    raise ValueError(f"more than {RULE_PAGES} pages of rules")
 
 
 def check_protection(api_url: str, project_id: str, token: str) -> int:
-    user = get_json(f"{api_url}/user", token)
+    user, _ = get_json(f"{api_url}/user", token)
     if isinstance(user, dict) and user.get("is_admin"):
         # GitLab admits admins everywhere, so no rule level can constrain them.
         print(
@@ -157,26 +179,29 @@ def check_protection(api_url: str, project_id: str, token: str) -> int:
             "protection levels, so this rule cannot stop that account publishing "
             "(WI#598)."
         )
-    rules = get_json(f"{api_url}/projects/{project_id}/packages/protection/rules", token)
-    for rule in rules if isinstance(rules, list) else []:
+    matching = []
+    for rule in list_rules(api_url, project_id, token):
         if not isinstance(rule, dict) or rule.get("package_type") != "generic":
             continue
         pattern = rule.get("package_name_pattern") or ""
-        if not fnmatch.fnmatchcase(PACKAGE, pattern):
-            continue
+        if fnmatch.fnmatchcase(PACKAGE, pattern):
+            matching.append(rule)
+    # GitLab refuses a push when any matching rule asks for more than the
+    # pusher's level (Packages::Protection::Rule.for_action_exists?), so one
+    # Maintainer rule protects the package whatever the other rules say.
+    strong = [
+        rule for rule in matching if rule.get("minimum_access_level_for_push") in PUSH_LEVELS
+    ]
+    for rule in strong or matching:
         level = rule.get("minimum_access_level_for_push")
-        if level in {"maintainer", "owner", "admin"}:
-            print(
-                f"protection: rule {rule.get('id')} matches {pattern} with push level {level}"
-            )
-            return OK
-        print(
-            f"protection: rule {rule.get('id')} matches {pattern} but push level "
-            f"{level!r} is weaker than Maintainer"
-        )
-        return UNPROTECTED
-    print(f"protection: no generic rule covers {PACKAGE}")
-    return UNPROTECTED
+        found = f"protection: rule {rule.get('id')} matches {rule.get('package_name_pattern')}"
+        if strong:
+            print(f"{found} with push level {level}")
+        else:
+            print(f"{found} but push level {level!r} is weaker than Maintainer")
+    if not matching:
+        print(f"protection: no generic rule covers {PACKAGE}")
+    return OK if strong else UNPROTECTED
 
 
 def main() -> int:

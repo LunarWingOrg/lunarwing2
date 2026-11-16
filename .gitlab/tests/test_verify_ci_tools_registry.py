@@ -41,6 +41,7 @@ class RegistryFixture(http.server.ThreadingHTTPServer):
         self.routes = routes
         self.statuses: dict[str, int] = {}
         self.redirects: dict[str, str] = {}
+        self.pages: list[bytes] = []
         self.seen: list[tuple[str, str | None]] = []
         super().__init__(("127.0.0.1", 0), RegistryHandler)
 
@@ -59,7 +60,7 @@ class RegistryFixture(http.server.ThreadingHTTPServer):
 class RegistryHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # A client that takes this server for its proxy sends the whole URL.
-        path = urllib.parse.urlsplit(self.path).path
+        path, query = urllib.parse.urlsplit(self.path)[2:4]
         token = self.headers.get("PRIVATE-TOKEN")
         self.server.seen.append((path, token))
         if path in self.server.redirects:
@@ -80,6 +81,12 @@ class RegistryHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_response(200)
+        if path == RULES_PATH and self.server.pages:
+            # A paged GitLab list: the header is there and empty on the last page.
+            page = int(urllib.parse.parse_qs(query).get("page", ["1"])[0])
+            body = self.server.pages[page - 1]
+            following = str(page + 1) if page < len(self.server.pages) else ""
+            self.send_header("X-Next-Page", following)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -149,9 +156,10 @@ class VerifyRegistryTests(unittest.TestCase):
         level: str | None = "maintainer",
         pattern: str = "lunarwing-ci-tools",
         package_type: str = "generic",
+        rule_id: int = 7,
     ) -> dict[str, object]:
         return {
-            "id": 7,
+            "id": rule_id,
             "package_name_pattern": pattern,
             "package_type": package_type,
             "minimum_access_level_for_push": level,
@@ -243,6 +251,40 @@ class VerifyRegistryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn("protection check failed: HTTP Error 403", result.stderr)
         self.assertIn("shellcheck 9.9.9: ok", result.stdout)
+
+    def test_one_maintainer_rule_among_the_matching_rules_protects(self) -> None:
+        # A rule that sets only a delete level has no push level of its own.
+        broad = self.rule(level=None, pattern="lunarwing-*", rule_id=6)
+        for rules in ([broad, self.rule()], [self.rule(), broad]):
+            with self.subTest(first=rules[0]["id"]):
+                result = self.run_verifier(self.serve(self.routes(rules=rules)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("rule 7 matches lunarwing-ci-tools with push level", result.stdout)
+                self.assertNotIn("weaker than Maintainer", result.stdout)
+
+    def test_matching_rules_without_a_maintainer_level_do_not_count(self) -> None:
+        rules = [self.rule(level=None, pattern="lunarwing-*", rule_id=6), self.rule(level=None)]
+        result = self.run_verifier(self.serve(self.routes(rules=rules)))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("rule 6 matches lunarwing-* but push level None", result.stdout)
+        self.assertIn("rule 7 matches lunarwing-ci-tools but push level None", result.stdout)
+
+    def test_every_page_of_rules_is_read(self) -> None:
+        server = self.serve(self.routes())
+        server.pages = [
+            json.dumps([self.rule(pattern="another-package", rule_id=6)]).encode(),
+            json.dumps([self.rule()]).encode(),
+        ]
+        result = self.run_verifier(server)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rule 7 matches lunarwing-ci-tools with push level", result.stdout)
+
+    def test_rule_pages_without_end_do_not_count(self) -> None:
+        server = self.serve(self.routes())
+        server.pages = [json.dumps([self.rule()]).encode()] * 51
+        result = self.run_verifier(server)
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("protection check failed: more than 50 pages of rules", result.stderr)
 
     def test_token_is_not_sent_to_a_redirect_target(self) -> None:
         for path in (USER_PATH, RULES_PATH):
