@@ -239,6 +239,13 @@ class TarFixture:
                 else:
                     self.add_file(name, path.read_bytes(), mode=0o444)
         self.add_file("usr/local/bin/opencode", WRAPPER.read_bytes(), mode=0o755)
+        # WI#665: the image installs the managed Console policy here.
+        self.add_dir("etc/opencode")
+        self.add_file(
+            "etc/opencode/opencode.json",
+            (lane / "config" / "managed" / "opencode.json").read_bytes(),
+            mode=0o444,
+        )
         self.add_file(
             "usr/local/lib/opencode2/opencode", b"\x7fELF clean pinned build", mode=0o755,
         )

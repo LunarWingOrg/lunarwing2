@@ -27,7 +27,12 @@ ASSERT = LANE / "scripts" / "exposure_policy_assert.py"
 EXPORT_ARCHIVE_NAME = "opencode2-rootfs.tar"
 BOOT_FILES = ("entrypoint.sh", "entrypoint-split.sh", "health_server.py", "agent_comm_protocol.json")
 SOURCE_PREFIXES = ("app/scripts", "app/config")
-INSTALLED_FILES = ("usr/local/bin/opencode", "usr/local/lib/opencode2/opencode")
+INSTALLED_FILES = (
+    "usr/local/bin/opencode",
+    "usr/local/lib/opencode2/opencode",
+    # WI#665: the managed Console policy the image installs from the checkout.
+    "etc/opencode/opencode.json",
+)
 CHECKOUT_ENV_KEYS = (
     "OPENCODE_DISABLE_AUTOUPDATE", "LUNARWING_REAL_OPENCODE", "OPENCODE_BIN",
 )
@@ -268,7 +273,7 @@ def _validate_members(members: dict[str, tarfile.TarInfo]) -> None:
         die("tar export root entry is not a directory")
     required_dirs = {
         "app", "app/node_modules", "usr", "usr/bin", "usr/local", "usr/local/bin",
-        "usr/local/lib", "usr/local/lib/opencode2", *SOURCE_PREFIXES,
+        "usr/local/lib", "usr/local/lib/opencode2", "etc/opencode", *SOURCE_PREFIXES,
     }
     for name in required_dirs:
         if name not in members or not members[name].isdir():
