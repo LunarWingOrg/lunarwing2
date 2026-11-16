@@ -3,12 +3,13 @@
 `SANDBOX_NETWORK=tunnel` lets generic shell-sandbox commands make **outbound**
 connections through a NetBird or WireGuard sidecar. It does not expose the web
 gateway, open a host port, or let overlay peers connect into the sandbox. It
-does not start with a DNS channel to the runtime resolvers: NetBird sandboxes
-resolve names only through NetBird's own listener and whatever upstreams are
-reachable through the overlay, and WireGuard has no uplink DNS unless the
-operator sets `SANDBOX_TUNNEL_DNS` to an overlay resolver. Otherwise a sandboxed
-command cannot reach the host, LAN, cloud metadata service, or public internet
-through the sidecar's own uplink. Design and alternatives:
+gives NetBird sandboxes no DNS channel to the runtime resolvers: they resolve
+names only through NetBird's own listener and whatever upstreams are reachable
+through the overlay. WireGuard without `SANDBOX_TUNNEL_DNS` keeps port 53 to the
+runtime resolvers as a residual uplink channel; setting it to an overlay
+resolver removes that channel. Otherwise a sandboxed command cannot reach the
+host, LAN, cloud metadata service, or public internet through the sidecar's own
+uplink. Design and alternatives:
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
 WI#537 selects `proxy-enforced` as the Linux default; other platforms default
