@@ -715,7 +715,9 @@ arguments. An unregistered-tool fallback still applies the shared credential
 redactor. This protects display/hook copies; the mode-0600 pending-gate file
 retains executable parameters, and transcript storage has its own at-rest
 exposure class. A redacted prompt is not evidence that credentials were removed
-from every persisted surface.
+from every persisted surface. The default redacted keys, the Wasm HTTP
+boundary's error/header/body scrub, and the inspection endpoints are documented
+in [`../reference/CREDENTIAL-REDACTION.md`](../reference/CREDENTIAL-REDACTION.md).
 
 `POST /api/chat/approval` resolves the owning thread server-side (WI#472).
 `thread_id` is optional: the handler looks up the live approval gate by
@@ -1377,7 +1379,9 @@ The event keeps this redacted copy rather than the raw call parameters —
 the pending gate still holds the raw copy
 for resume, and the thread transcript's action arguments plus the
 `MessageAdded` content previews remain pre-existing at-rest classes (AQ-4,
-WI#359 CL-4); the webhook single-owner rule (a fire
+WI#359 CL-4) — see
+[`../reference/CREDENTIAL-REDACTION.md`](../reference/CREDENTIAL-REDACTION.md)
+for the default key list and the display-parameter contract. The webhook single-owner rule (a fire
 matches every Active mission on a path **across projects** — the route is
 one public endpoint — with each candidate checked against its own
 configured secret in constant time, so a non-terminal path may only have
