@@ -937,6 +937,16 @@ run_missing_account_refusal_case() {
     missing-systemd-cgroup-events)
       mkdir -p "$TENANT_CGROUP_ROOT/user.slice/user-61000.slice"
       ;;
+    busy-systemd-legacy-slice)
+      # The second systemd slice path: a host that has user-<uid>.slice
+      # directly under the cgroup root instead of inside user.slice.
+      mkdir -p "$TENANT_CGROUP_ROOT/user-61000.slice"
+      printf 'populated 1\n' >"$TENANT_CGROUP_ROOT/user-61000.slice/cgroup.events"
+      ;;
+    cgroup-tree-is-file)
+      # An existing managed path that is not a directory cannot be inspected.
+      : >"$TENANT_CGROUP_ROOT/lunarwing-alpha"
+      ;;
     missing-cgroup-controllers) command rm -f -- "$TENANT_CGROUP_ROOT/cgroup.controllers" ;;
   esac
   REAL_POSTGRES=true
@@ -995,6 +1005,50 @@ run_undetected_init_cgroup_case() {
     pass 'an undetected init system refuses the cgroup step with a reason'
   else
     fail "an undetected init system did not refuse the cgroup step (rc=$rc): $(command cat "$CASE_DIR/idle.out")"
+  fi
+}
+
+# The lane stops and the legacy Nanocode retire each run the proof before
+# their account-gone skip. remove-tenant proves the identity idle before any of
+# them, so only a direct call can show that a live former identity refuses
+# these paths too. The OpenRC stop's unsafe-unit gate needs no account and is
+# stubbed out of this case's way.
+run_direct_proof_callers_case() {
+  local rc=0
+  setup_case systemd direct-systemd-stop
+  seed_identity
+  seed_process 4650 61000
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; stop_tenant_systemd alpha) \
+    >"$CASE_DIR/systemd-stop.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/systemd-stop.out" \
+      && ! grep -q 'skipped systemd unit stop' "$CASE_DIR/systemd-stop.out"; then
+    pass 'systemd stop refuses while a process of the former uid runs'
+  else
+    fail "systemd stop skipped with a live former uid (rc=$rc): $(command cat "$CASE_DIR/systemd-stop.out")"
+  fi
+  rc=0
+  setup_case openrc direct-openrc-stop
+  seed_identity
+  seed_process 4651 61000
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; stop_tenant_openrc alpha) \
+    >"$CASE_DIR/openrc-stop.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/openrc-stop.out" \
+      && ! grep -q 'skipped OpenRC unit stop' "$CASE_DIR/openrc-stop.out"; then
+    pass 'OpenRC stop refuses while a process of the former uid runs'
+  else
+    fail "OpenRC stop skipped with a live former uid (rc=$rc): $(command cat "$CASE_DIR/openrc-stop.out")"
+  fi
+  rc=0
+  setup_case systemd direct-nanocode-retire
+  seed_identity
+  seed_process 4652 61000
+  (MISSING_ACCOUNT=true STRICT_MISSING_ACCOUNT=true; real_retire_tenant_nanocode alpha) \
+    >"$CASE_DIR/nanocode.out" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q 'entries of the former uid 61000' "$CASE_DIR/nanocode.out" \
+      && ! grep -q 'skipped legacy Nanocode' "$CASE_DIR/nanocode.out"; then
+    pass 'legacy Nanocode retire refuses while a process of the former uid runs'
+  else
+    fail "legacy Nanocode retire skipped with a live former uid (rc=$rc): $(command cat "$CASE_DIR/nanocode.out")"
   fi
 }
 
@@ -1337,12 +1391,14 @@ run_missing_account_refusal_case openrc no-subuid 'no subordinate uid range reco
 run_missing_account_refusal_case openrc bad-record 'unexpected line in'
 run_missing_account_refusal_case openrc system-uid 'no valid tenant uid recorded'
 run_missing_account_refusal_case openrc held-uid "now belongs to account 'bob'"
+run_missing_account_refusal_case openrc held-uid "save any data you need from 'bob' first"
 run_missing_account_refusal_case openrc held-uid "remove-tenant bob --purge"
 run_missing_account_refusal_case openrc empty-proc 'cannot verify that'
 run_missing_account_refusal_case openrc hidden-init 'cannot verify that'
 run_missing_account_refusal_case openrc foreign-init 'is not a supported host init'
 run_missing_account_refusal_case openrc foreign-init-root 'has a different root directory'
 run_missing_account_refusal_case openrc reassigned-subuid 'overlaps recorded range'
+run_missing_account_refusal_case openrc reassigned-subuid "save any data you need from 'bob' first"
 run_missing_account_refusal_case openrc reassigned-subuid 'remove-tenant bob --purge'
 run_missing_account_refusal_case openrc current-subuid-mismatch 'current-side range differs'
 run_missing_account_refusal_case openrc record-subuid-mismatch 'record-side range differs'
@@ -1351,6 +1407,8 @@ run_missing_account_refusal_case openrc busy-openrc-subtree 'tenant alpha cgroup
 run_missing_account_refusal_case openrc busy-openrc-base-service-cgroup 'OpenRC service weechat-alpha cgroup'
 run_missing_account_refusal_case openrc busy-openrc-worker-cgroup 'OpenRC service lunarwing-pebble-alpha-sup cgroup'
 run_missing_account_refusal_case systemd busy-systemd-cgroup 'systemd user-61000.slice cgroup'
+run_missing_account_refusal_case systemd busy-systemd-legacy-slice 'systemd user-61000.slice cgroup'
+run_missing_account_refusal_case openrc cgroup-tree-is-file 'cannot inspect'
 run_missing_account_refusal_case openrc invalid-cgroup-events 'no single valid populated value'
 run_missing_account_refusal_case openrc missing-cgroup-events 'cgroup.events; cannot prove the tenant alpha cgroup empty'
 run_missing_account_refusal_case systemd missing-systemd-cgroup-events 'cgroup.events; cannot prove the systemd user-61000.slice cgroup empty'
@@ -1370,6 +1428,7 @@ run_missing_account_refusal_case openrc passwd-compat "cannot tell whether the a
 run_missing_account_refusal_case openrc forked-after-listing 'still run (4900)'
 run_exited_task_case
 run_undetected_init_cgroup_case
+run_direct_proof_callers_case
 run_orphan_home_warning_case
 run_missing_account_teardown_refusal
 run_rootful_docker_case false
