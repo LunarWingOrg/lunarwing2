@@ -62,6 +62,17 @@ EOF
   ensure_init_system() { INIT_SYSTEM=systemd; }
   ensure_container_runtime() { return 1; }
   _install_health_systemd_timer() { :; }
+  # The install cases copy from a checkout that is not root's: a foreign-owned
+  # or world-writable source, set-ID bits, ACLs. mt-admin checks the ownership
+  # of a contract source only when its own directory is root-owned (WI#725),
+  # and such a source is then refused before any copy. So the fixture states
+  # the premise instead of inheriting it from wherever this harness runs: the
+  # directory of mt-admin is group-writable, as in an operator checkout.
+  # check_refused_source_is_not_copied holds the root-owned half.
+  OPERATOR_ADMIN_DIR="$root/operator-scripts"
+  mkdir -p "$OPERATOR_ADMIN_DIR"
+  chmod 0775 "$OPERATOR_ADMIN_DIR"
+  SCRIPT_DIR="$OPERATOR_ADMIN_DIR"
 }
 
 prepare_launcher_for_test() {
@@ -529,16 +540,94 @@ run_publication_cases() {
   assert_publication_path "fallback publication" false fake_mv_without_exchange
 }
 
-assert_cli_source_refused() {
-  local label="$1" cli="$2" component="$3"
+# WI#725 with WI#722: the load guard's refusal no longer ends mt-admin, and on
+# a systemd host the command goes on. The health install and the Study Notes
+# snapshot staging are the two places that copy the contract source into a
+# root-owned tree, where it would pass every later check, so each asks the
+# guard itself. <make-foreign> and <make-root> change the source's owner under
+# the half's own ownership model.
+check_refused_source_is_not_copied() {  # <make-foreign> <make-root>
+  local make_foreign="$1" make_root="$2" output="" status=0
+  local label="root-owned mt-admin, foreign-owned source"
+  local saved_admin="$SCRIPT_DIR" sync_root="$TEST_ROOT/knowledge-admin"
+  local contract="$TEST_SCRIPT_DIR/../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  cp -- "$contract" "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh"
+  SCRIPT_DIR="$TEST_ROOT/root-owned-scripts"
+  mkdir -p "$SCRIPT_DIR"
+  chmod 0755 "$SCRIPT_DIR"
+  "$make_foreign" "$HEALTH_SRC_DIR"
+  expect_install_refused "$label" "refusing health contract source $HEALTH_SRC_DIR"
+  assert_no_stage_left "$label"
+  # The reinstall repairs the library. It changes nothing in a checkout, so it
+  # must not be what this refusal offers.
+  output="$(ensure_health_pipeline 2>&1)" || true
+  if [[ "$output" == *"reinstall-health-library"* ]]; then
+    fail "$label: the library reinstall is not offered"
+  else
+    pass "$label: the library reinstall is not offered"
+  fi
+  output="$(LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT="$sync_root" install_knowledge_sync_admin_snapshot 2>&1)" \
+    || status=$?
+  assert_eq "$label: snapshot staging refused" "1" "$status"
+  assert_contains "$label: snapshot refusal names the source" "$output" \
+    "refusing health contract source $HEALTH_SRC_DIR"
+  assert_eq "$label: no snapshot release is staged" "0" "$([[ ! -e "$sync_root" ]] && printf 0 || printf 1)"
+
+  # The same bytes from an operator checkout are the ordinary install.
+  SCRIPT_DIR="$saved_admin"
+  status=0
+  output="$(ensure_health_pipeline 2>&1)" || status=$?
+  assert_eq "operator checkout, foreign-owned source: install completes" "0" "$status"
+  "$make_root" "$HEALTH_SRC_DIR"
+  rm -f -- "$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh"
+  ensure_health_pipeline >/dev/null
+}
+
+# The snapshot staging from a checkout whose health directory is the installed
+# library, while that library fails its check: both designs refuse the load,
+# and the staging must not publish the refused contract as root's either.
+check_unsafe_library_is_not_staged() {
+  local output="" status=0 sync_root="$TEST_ROOT/knowledge-admin-linked"
+  output="$(LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT="$sync_root" install_knowledge_sync_admin_snapshot 2>&1)" \
+    || status=$?
+  assert_eq "snapshot staging from a linked unsafe library is refused" "1" "$status"
+  assert_contains "snapshot staging refusal names the library" "$output" "refusing health library"
+  assert_eq "no snapshot release is staged from an unsafe library" "0" \
+    "$([[ ! -e "$sync_root" ]] && printf 0 || printf 1)"
+}
+
+# A refused contract source is never sourced. Since WI#722 the refusal does not
+# end mt-admin any more: `--help` stays usable so the repair can be found, and
+# a command that needs the contract is refused.
+assert_cli_source_refused() {  # <label> <cli> <component> <which tree the refusal names>
+  local label="$1" cli="$2" component="$3" tree="$4"
   local stdout="$TEST_ROOT/cli.stdout" stderr="$TEST_ROOT/cli.stderr"
   if bash "$cli" --help >"$stdout" 2>"$stderr"; then
-    fail "$label: CLI loaded an unsafe health contract"
+    pass "$label: --help stays usable"
   else
-    pass "$label: CLI refuses before dispatch"
+    fail "$label: --help stays usable"
   fi
-  assert_eq "$label: no normal output precedes the refusal" "" "$(<"$stdout")"
+  assert_contains "$label: the contract is reported as not loaded" "$(<"$stderr")" \
+    "OpenRC proxy unit contract not loaded"
   assert_contains "$label: refusal names the failing component" "$(<"$stderr")" "$component"
+  assert_contains "$label: refusal names the right tree" "$(<"$stderr")" "$tree"
+  if grep -q UNSAFE_CONTRACT_SOURCED "$stdout" "$stderr"; then
+    fail "$label: the unsafe contract was sourced"
+  else
+    pass "$label: the unsafe contract is not sourced"
+  fi
+  if LUNARWING_SERVICE_MANAGER=openrc bash "$cli" list-tenants >"$stdout" 2>"$stderr"; then
+    fail "$label: an OpenRC command ran without the contract"
+  else
+    pass "$label: an OpenRC command is refused"
+  fi
+  assert_contains "$label: the command refusal names the contract" "$(<"$stderr")" \
+    "the OpenRC proxy unit contract could not be loaded"
+  if grep -q UNSAFE_CONTRACT_SOURCED "$stdout" "$stderr"; then
+    fail "$label: the refused command sourced the unsafe contract"
+  else
+    pass "$label: the refused command does not source the unsafe contract"
+  fi
 }
 
 check_snapshot_source_load() {
@@ -557,17 +646,24 @@ check_snapshot_source_load() {
   assert_contains "safe snapshot control reaches usage output" "$(<"$TEST_ROOT/safe-cli.stdout")" 'Usage:'
 
   cp -- "$contract" "$HEALTH_LIB_DIR/openrc-proxy-unit-contract.sh"
+  printf "printf 'UNSAFE_CONTRACT_SOURCED\\n' >&2\n" >>"$HEALTH_LIB_DIR/openrc-proxy-unit-contract.sh"
   chown 65534:65534 "$HEALTH_LIB_DIR/cron-wrapper.sh"
   rm -rf -- "$snapshot/ic-infrastructure-health-check"
   ln -s "$HEALTH_LIB_DIR" "$snapshot/ic-infrastructure-health-check"
-  assert_cli_source_refused "snapshot linked to an unsafe library" "$cli" "$HEALTH_LIB_DIR/cron-wrapper.sh"
+  # The copy must name the fixture's library as its own, or the link is only
+  # one more contract source and the library route is not the one under test.
+  sed -i "s|^HEALTH_LIB_DIR=.*|HEALTH_LIB_DIR=\"$HEALTH_LIB_DIR\"|" "$cli"
+  assert_cli_source_refused "snapshot linked to an unsafe library" "$cli" "$HEALTH_LIB_DIR/cron-wrapper.sh" \
+    "refusing health library entry"
 
   rm -- "$snapshot/ic-infrastructure-health-check"
   mkdir "$snapshot/ic-infrastructure-health-check"
   cp -- "$contract" "$snapshot/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
+  printf "printf 'UNSAFE_CONTRACT_SOURCED\\n' >&2\n" \
+    >>"$snapshot/ic-infrastructure-health-check/openrc-proxy-unit-contract.sh"
   chown -R 65534:65534 "$snapshot/ic-infrastructure-health-check"
   assert_cli_source_refused "snapshot with an unsafe real-directory sibling" "$cli" \
-    "$snapshot/ic-infrastructure-health-check"
+    "$snapshot/ic-infrastructure-health-check" "refusing health contract source"
 }
 
 stat() {
@@ -604,6 +700,11 @@ find() {
 }
 
 chown() { printf '%s\n' "$*" >>"$MOCK_CHOWN_LOG"; }
+
+mock_foreign_owner() { MOCK_NONROOT_DIR="$1"; }
+mock_root_owner() { MOCK_NONROOT_DIR=""; }
+real_foreign_owner() { chown -R 65534:65534 "$1"; }
+real_root_owner() { chown -R root:root "$1"; }
 
 run_mock_tests() {
   TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-health-mock.XXXXXX")"
@@ -657,6 +758,8 @@ run_mock_tests() {
   assert_launcher_refused "mock non-root-owned directory"
   MOCK_NONROOT_DIR=""
   check_source_symlink_refused "mock chmod symlink attack"
+  rm -f -- "$HEALTH_SRC_DIR/escape.sh"
+  check_refused_source_is_not_copied mock_foreign_owner mock_root_owner
   rm -rf -- "$MOCK_ROOT"
   MOCK_ROOT=""
   unset -f stat find chown
@@ -771,6 +874,7 @@ run_real_tests() {
   local contract_status=0
   require_safe_installed_health_source >/dev/null 2>&1 || contract_status=$?
   assert_eq "OpenRC snapshot source guard refuses a linked unsafe library" "1" "$contract_status"
+  check_unsafe_library_is_not_staged
   rm "$HEALTH_SRC_DIR"
   HEALTH_SRC_DIR="$TEST_ROOT/source"
   chown root:root "$HEALTH_LIB_DIR/cron-wrapper.sh"
@@ -782,8 +886,8 @@ run_real_tests() {
   chmod 0755 "$HEALTH_LIB_DIR"
   chmod 0777 "$TEST_ROOT"
   assert_launcher_refused "group/other-writable parent"
-  assert_contains "parent refusal names the failing component" "$LAST_REFUSAL_OUTPUT" "component $TEST_ROOT "
-  assert_contains "syslog refusal names the failing component" "$(<"$HEALTH_TEST_LOGGER_LOG")" "component $TEST_ROOT "
+  assert_contains "parent refusal names the failing component" "$LAST_REFUSAL_OUTPUT" "parent directory $TEST_ROOT must"
+  assert_contains "syslog refusal names the failing component" "$(<"$HEALTH_TEST_LOGGER_LOG")" "parent directory $TEST_ROOT must"
   chmod 0700 "$TEST_ROOT"
   : >"$HEALTH_LIB_DIR/nested-data"
   chown 65534:65534 "$HEALTH_LIB_DIR/nested-data"
@@ -796,6 +900,7 @@ run_real_tests() {
   mv "$TEST_ROOT/cron-wrapper.real" "$HEALTH_LIB_DIR/cron-wrapper.sh"
   check_source_symlink_refused "real chmod symlink attack"
   check_setgid_parent_install
+  check_refused_source_is_not_copied real_foreign_owner real_root_owner
   check_snapshot_source_load
   if ((failures != 0)); then return 1; fi
   printf 'RESULT: real ownership and refusal harness passed\n'
