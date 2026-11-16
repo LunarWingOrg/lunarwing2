@@ -693,6 +693,44 @@ mod tests {
     }
 
     #[test]
+    fn eight_required_fields_only_still_deserializes() {
+        // WI#576 ACT-2: a mission record carrying only the eight required
+        // fields must load. Any FUTURE Mission field added without a
+        // #[serde(default)] fails this guard at review time instead of
+        // dropping every schema-stale mission.json at the next tenant boot.
+        const REQUIRED: [&str; 8] = [
+            "id",
+            "project_id",
+            "name",
+            "goal",
+            "status",
+            "cadence",
+            "created_at",
+            "updated_at",
+        ];
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "required-only",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(&mission).expect("serialize mission");
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .retain(|key, _| REQUIRED.contains(&key.as_str()));
+
+        let restored: Mission =
+            serde_json::from_value(value).expect("required-fields-only mission must deserialize");
+        assert_eq!(restored.id, mission.id);
+        assert_eq!(restored.name, "required-only");
+        assert_eq!(restored.goal, "keep working");
+        assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
+        assert_eq!(restored.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
+    }
+
+    #[test]
     fn legacy_mission_without_budget_date_still_deserializes() {
         let mission = Mission::new(
             ProjectId::new(),
@@ -731,6 +769,47 @@ mod tests {
         let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
         assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
         assert!(restored.retry_policy.is_enabled());
+    }
+
+    #[test]
+    fn partial_retry_policy_object_still_deserializes() {
+        // WI#576: an older or partial writer may persist a retry_policy
+        // object with only some scalars. An absent key is covered by the
+        // outer #[serde(default)]; an incomplete object must fall back to the
+        // per-field defaults instead of dropping the whole mission record
+        // with a position-less Data error (line=0 column=0).
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "partial-retry",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        for (policy, expected_retries) in [
+            (
+                serde_json::json!({}),
+                MissionRetryPolicy::default().max_retries,
+            ),
+            (serde_json::json!({ "max_retries": 7 }), 7),
+            (
+                serde_json::json!({ "initial_delay_secs": 5, "max_delay_secs": 30 }),
+                3,
+            ),
+        ] {
+            let mut value = serde_json::to_value(&mission).expect("serialize mission");
+            value
+                .as_object_mut()
+                .expect("mission should serialize as object")
+                .insert("retry_policy".to_string(), policy);
+
+            let restored: Mission = serde_json::from_value(value)
+                .expect("mission with a partial retry_policy must deserialize");
+            assert_eq!(restored.retry_policy.max_retries, expected_retries);
+            assert_eq!(
+                restored.retry_policy.backoff_multiplier,
+                MissionRetryPolicy::default().backoff_multiplier
+            );
+        }
     }
 
     #[test]
