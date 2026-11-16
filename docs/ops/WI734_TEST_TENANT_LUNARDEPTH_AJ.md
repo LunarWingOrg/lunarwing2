@@ -6,6 +6,12 @@
 > This is the second attempt at the WI#720 test; !2487 was closed without
 > merging and its review (MR !2487 notes 17864 and 17866) is the input for this
 > report. The goals file is deliberately unchanged; this is a work-item run.
+>
+> Corrected in review on 2026-11-16 (!2497 notes 18173 and 18186): the cause
+> and the CI comparison under F1, the sentence about the fix, F3, F5 and the
+> hand-off.
+> The measurements those corrections rest on are the reviewer's; they are
+> marked "review" where they appear and are not part of this run.
 
 ## Scope
 
@@ -182,8 +188,9 @@ LANE_BUILD_EXIT=1
 
 ### Why it fails (F1, blocking)
 
-The archive member is a **hardlink**, not a symlink, and the hardlink is
-benign content deduplication inside the image:
+The archive member is a **hardlink**, not a symlink. It comes from identical
+files that share one inode inside the image, not from a link that leaves the
+closure:
 
 - `lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py:99-100` rejects
   any member for which `member.issym() or member.islnk()` is true, under
@@ -198,8 +205,12 @@ benign content deduplication inside the image:
 
   All 275 paths that share that inode are 11-byte `.d.ts` files
   (`find / -xdev -inum 8322670` lists `gaxios/build/esm/test/*.d.ts`,
-  `gaxios/build/cjs/test/*.d.ts`, …). pnpm's content-addressed store links
-  identical files to one inode; nothing here is a symlink or an escape.
+  `gaxios/build/cjs/test/*.d.ts`, …). Identical files of different packages
+  on one inode is what a link from pnpm's content-addressed store gives;
+  nothing here is a symlink or an escape. One thing does not fit and is
+  unexplained: at the deploy step the build log says `Packages are copied from
+  the content-addressable store to the virtual store.`
+  (`/tmp/wi734-build-lane.log:6194`), not "hard linked" (review; WI#739).
 - The host's container store is `overlay`, and `podman 6.2.0 export` writes
   hardlinked files as tar hardlink entries. A two-file probe on this host:
 
@@ -213,8 +224,18 @@ benign content deduplication inside the image:
   `podman export --help` offers no dereference option.
 - CI takes its export from BuildKit (`type=tar` in
   `.gitlab/scripts/build-worker-image.sh:579`), not from `podman export`; I
-  did not run that path, so whether it flattens these links is unverified.
-  On this host and through mt-admin it does not.
+  did not run that path. Review measured it on the archive of master pipeline
+  7965 (job 182945, `worker-lunardepth-candidate`):
+  - BuildKit's export keeps hard-link entries too: the archive has three, all
+    from the base image (`usr/bin/perl5.36.0`, `usr/bin/perlthanks`,
+    `usr/bin/uncompress`).
+  - Under `app/` and `opt/lunardepth` it has none; the path rejected here is a
+    plain 11-byte file there.
+  - At the deploy step CI's log says `Packages are cloned from the
+    content-addressable store`.
+
+  So CI's image has no shared inodes in the closure. The inference from that
+  (review, not measured): the image differs, not the exporter.
 - The verifier's own unit tests
   (`lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py`) cover no
   link case at all.
@@ -289,22 +310,28 @@ were never dispatched.
 
 ### Findings
 
-1. **F1 (blocking, product): the out-of-band export verifier rejects benign
-   hardlinks, so the LunarDepth image cannot be built through mt-admin on this
-   host.**
+1. **F1 (blocking, product): the image built on this host has hard links in
+   the closure, and the out-of-band export verifier rejects every link, so the
+   LunarDepth image cannot be built through mt-admin on this host.**
    - Where: `lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py:99-100`
      rejects `member.islnk()`; `ic/scripts/mt-admin-lib/17-lunardepth.sh:339-390`
      feeds it a `podman export` tar.
-   - What: pnpm 11.7.0 deduplicates identical files into one inode; on this
-     host's `overlay` store `podman export` encodes them as tar hardlink
-     entries (`links=275` on an 11-byte `.d.ts`; probe above).
+   - What: the image built here has closure files that share an inode
+     (`links=275` on an 11-byte `.d.ts`). `podman export` writes them as tar
+     hardlink entries (probe above), as BuildKit's export would; CI's image
+     has none (review).
    - Command and output: the second `build-lunardepth-worker --with-toolchains`
      above; `LANE_BUILD_EXIT=1`.
-   - Why not fixed here: it is a security-gate change, and this item is a test.
-     A safe fix would accept hardlinks whose `linkname` is another archive
-     member beneath the checked roots (the checker already validates the
-     target member's bytes and ownership) and keep rejecting symlinks, plus a
-     unit test. That is a product change on a different work item.
+   - Why not fixed here: this item is a test, and the fix is a product
+     change on its own work item, WI#739. Where it belongs is open:
+     - the build could leave no file in the closure with a link count above 1,
+       which keeps the gate as it is; or
+     - the verifier could accept a hard link whose `linkname` is another
+       archive member beneath the checked roots, and keep rejecting symlinks.
+       That is a change to a security gate and needs its own argument: the
+       checker compares bytes only for the lane's own inputs
+       (`verify_exposure_out_of_band.py:88-93`); for a file under
+       `node_modules` it checks owner, mode and name (`:94-110`), not bytes.
 2. **F2 (product, small): `start-tenant` returns 0 when a selected lane is
    skipped.** The run above returned 0 while printing `LunarDepth worker image
    not available … (skipping)`. A caller cannot tell a healthy start from a
@@ -315,6 +342,9 @@ were never dispatched.
    no containers.** It printed `lunardepth: not present … skipped` and then
    `worker listener audit: clean`, exit 0. A vacuous pass is indistinguishable
    from a verified one; it should say "not present" or return a distinct code.
+   This is the tested behaviour, not a slip:
+   `ic/scripts/tests/test-mt-admin-worker-listeners.sh:266` pins "not present"
+   together with "clean" and exit 0, so changing it is a design decision.
 4. **F4 (product, display; WI#719 F5/F6 reproduced):**
    - `mt-admin status lunardepthtester` lists no `lunardepth_wss`/`lunardepth_health`
      ports although the registry holds 52010/52011; `add-tenant` printed the
@@ -324,8 +354,12 @@ were never dispatched.
      `External worker liveness probe: 0 reachable, 3 unreachable` (09:09:57Z,
      quoted above), as WI#719 F6 reported.
 5. **F5 (product, hygiene): test declaration files are in the runtime
-   closure.** `@agentclientprotocol/sdk/dist/connection.test.d.ts` and 274
-   sibling `.d.ts` test declarations reach `/opt/lunardepth`; the residue gate
+   closure.** `@agentclientprotocol/sdk/dist/connection.test.d.ts` reaches
+   `/opt/lunardepth`; CI's closure also holds its sibling `acp.test.d.ts`
+   (review). How many of the 275 paths
+   on the shared inode lie in the closure was not counted on this host's
+   image. CI's closure holds 38 `.d.ts` files of 11 bytes, 12 of them from
+   `gaxios` (review), so most of the 275 are probably outside it. The residue gate
    rejects `_test.ts`, `_test.js` and `_test.py` but not `.test.d.ts`
    (`verify_exposure_out_of_band.py:107-110`). Harmless here, but the closure
    is not as clean as the gate claims.
@@ -375,12 +409,25 @@ No `LUNARWING_SERVICE_MANAGER` appears in any command or log of this run;
 ### Hand-off
 
 The item is **not done**: the tenant exists and runs, but its only selected
-worker is not built or running, and no job ran. The next attempt needs either
-a product fix for F1 (preferred; a separate work item on the verifier's
-hardlink handling) or a host whose `podman export` flattens hardlinks, such as
-the Gentoo host that passed the same lane for WI#719. F2 and F3 should be
-filed with the same caution as WI#730: they are product behavior, not test
-hiccups.
+worker is not built or running, and no job ran. The next attempt needs the
+product fix for F1, which is WI#739.
+
+The record gives no reason to expect a different `podman export` to help:
+CI's exporter keeps link entries as podman's does, and CI's image has none in
+the closure (review, above). Whether the Gentoo host's export behaves
+differently was not checked.
+
+A candidate cause (review; inference, not measured) is the filesystem under
+the build store: where pnpm can clone files (reflinks), each file gets its own
+inode, and this host's store is on ext4, which has no reflinks. Two things are
+still open. This host's log says "copied", which would also give each file its
+own inode. And the build tool differs as well: this host builds with `podman
+build`, CI with BuildKit, and the closure reaches the final image through a
+`COPY --from=builder`. Nobody has checked the Gentoo host's filesystem or its
+build log, so why it passed the same lane for WI#719 is not shown.
+
+F2 and F3 should be filed with the same caution as WI#730: they are product
+behavior, not test hiccups.
 
 ## Acceptance
 
