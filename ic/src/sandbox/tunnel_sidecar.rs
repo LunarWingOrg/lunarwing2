@@ -1432,7 +1432,7 @@ impl TunnelSidecar {
         let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
-                Ok(()) => match self.host_resolver_ready().await {
+                Ok(()) => match self.host_resolver_ready(None).await {
                     Ok(()) => return Ok(()),
                     Err(error) => tracing::warn!(
                         container = %self.container_name,
@@ -1477,8 +1477,9 @@ impl TunnelSidecar {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         };
         self.provider_health().await?;
-        self.check_egress_firewall().await?;
-        self.host_resolver_ready().await?;
+        let policy = self.check_egress_firewall().await?;
+        self.host_resolver_ready(policy.resolvers.first().copied())
+            .await?;
         Ok(container_id)
     }
 
@@ -1487,7 +1488,10 @@ impl TunnelSidecar {
     /// that is then adopted, when a stop deletes it while the container
     /// survives, or when NetBird writes the runtime resolver back. Any of
     /// those makes this sidecar unhealthy so recovery stages the file again.
-    async fn host_resolver_ready(&self) -> Result<()> {
+    ///
+    /// `listener` reuses the `wt0` address the caller already asked NetBird
+    /// for; without it the address is queried here (WI#732 ADT-4).
+    async fn host_resolver_ready(&self, listener: Option<IpAddr>) -> Result<()> {
         if self.cfg.provider != TunnelProvider::Netbird {
             return Ok(());
         }
@@ -1506,7 +1510,10 @@ impl TunnelSidecar {
                     .unavailable("the tunnel resolver file joined runs mount could not be read"));
             }
         };
-        let listener = self.netbird_listener().await?;
+        let listener = match listener {
+            Some(listener) => listener,
+            None => self.netbird_listener().await?,
+        };
         if netbird_resolver_file_matches(&contents, listener) {
             return Ok(());
         }
@@ -1708,7 +1715,7 @@ impl TunnelSidecar {
                     return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
                         .await
                     {
-                        Ok(result) => result,
+                        Ok(result) => result.map(|_policy| ()),
                         Err(_) => Err(self.health_firewall_timeout_error(timeout)),
                     };
                 }
@@ -1955,9 +1962,10 @@ impl TunnelSidecar {
         self.verify_egress_firewall(&policy).await
     }
 
-    async fn check_egress_firewall(&self) -> Result<()> {
+    async fn check_egress_firewall(&self) -> Result<EgressPolicy> {
         let policy = self.egress_policy(false).await?;
-        self.verify_egress_firewall(&policy).await
+        self.verify_egress_firewall(&policy).await?;
+        Ok(policy)
     }
 
     async fn verify_egress_firewall(&self, policy: &EgressPolicy) -> Result<()> {
@@ -3596,11 +3604,11 @@ mod tests {
         .with_test_runtime(runtime);
         let path = sidecar.resolv_conf_path().unwrap().unwrap();
 
-        let missing = sidecar.host_resolver_ready().await.unwrap_err();
+        let missing = sidecar.host_resolver_ready(None).await.unwrap_err();
         assert!(missing.to_string().contains("is missing"), "{}", missing);
 
         std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
-        let diverged = sidecar.host_resolver_ready().await.unwrap_err();
+        let diverged = sidecar.host_resolver_ready(None).await.unwrap_err();
         assert!(
             diverged.to_string().contains("no longer names"),
             "{}",
@@ -3608,7 +3616,7 @@ mod tests {
         );
 
         std::fs::write(&path, "nameserver 100.75.1.2\n").unwrap();
-        sidecar.host_resolver_ready().await.unwrap();
+        sidecar.host_resolver_ready(None).await.unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3625,10 +3633,8 @@ mod tests {
 
     #[cfg(unix)]
     fn resolver_gate_fixture(label: &str) -> ResolverGate {
-        let base = std::env::temp_dir().join(format!(
-            "lw-tunnel-gate-{label}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("lw-tunnel-gate-{label}-{}", uuid::Uuid::new_v4()));
         let runtime_dir = base.join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let instance = instance_id_for(&base);
@@ -3659,11 +3665,16 @@ mod tests {
                                 .unwrap()
                                 .clone()
                                 .unwrap_or_else(|| "stale-hash".to_string());
-                            (format!("{}|true|{label}|{instance}\n", "2".repeat(64)), true)
+                            (
+                                format!("{}|true|{label}|{instance}\n", "2".repeat(64)),
+                                true,
+                            )
                         }
                         Some("exec") => {
-                            let reply =
-                                successful_netbird_health(args.get(2).map(String::as_str), &listing);
+                            let reply = successful_netbird_health(
+                                args.get(2).map(String::as_str),
+                                &listing,
+                            );
                             (reply.stdout, true)
                         }
                         Some("volume") => (String::new(), true),
@@ -3704,11 +3715,7 @@ mod tests {
         *gate.hash.lock().unwrap() = Some(hash);
 
         let missing = gate.sidecar.ensure_healthy().await.unwrap_err();
-        assert!(
-            missing.to_string().contains("is missing"),
-            "{}",
-            missing
-        );
+        assert!(missing.to_string().contains("is missing"), "{}", missing);
 
         let path = gate.sidecar.resolv_conf_path().unwrap().unwrap();
         std::fs::write(&path, "nameserver 10.89.0.1\n").unwrap();
@@ -3721,10 +3728,7 @@ mod tests {
 
         std::fs::write(&path, "nameserver 9.9.9.9\n").unwrap();
         gate.sidecar.ensure_healthy().await.unwrap();
-        assert_eq!(
-            gate.removals.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        assert_eq!(gate.removals.load(std::sync::atomic::Ordering::SeqCst), 0);
         std::fs::remove_dir_all(gate.base).unwrap();
     }
 
@@ -3737,11 +3741,7 @@ mod tests {
 
         let error = gate
             .sidecar
-            .start_or_adopt(
-                Duration::from_secs(6),
-                Duration::from_secs(6),
-                None,
-            )
+            .start_or_adopt(Duration::from_secs(6), Duration::from_secs(6), None)
             .await
             .unwrap_err();
 
