@@ -779,6 +779,11 @@ CI_CONFIG_BEFORE_SCRIPT = [
     'export PATH="/tmp/lunarwing-go/go/bin:$PATH"',
 ]
 
+# WI#738: with dot mode and a block-buffered stdout, a ci-config attempt that
+# the runner limit cut off printed nothing between the Go downloads and its
+# last breath, so the log could not name the test it was in (job 183172).
+CI_CONFIG_DISCOVERY = "python3 -u -m unittest discover -v -s .gitlab/tests -p 'test_*.py'"
+
 
 def validate_ci_config_go_bootstrap(merged: dict, errors: list[str]) -> None:
     job = merged.get("ci-config")
@@ -787,6 +792,11 @@ def validate_ci_config_go_bootstrap(merged: dict, errors: list[str]) -> None:
         return
     if job.get("before_script") != CI_CONFIG_BEFORE_SCRIPT:
         errors.append("ci-config must run the pinned Go bootstrap before its parser fixtures")
+    if CI_CONFIG_DISCOVERY not in (job.get("script") or []):
+        errors.append(
+            f"ci-config must run its discovery as {CI_CONFIG_DISCOVERY!r}: verbose, "
+            "unbuffered output is what names a test when the job is cut off"
+        )
 
 
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:

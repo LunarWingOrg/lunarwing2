@@ -1647,7 +1647,19 @@ _openrc_stop_service_if_installed() {
 
 stop_tenant_openrc() {
   local name="$1"
+  # The unsafe-unit gate comes first, even without the account: installed proxy
+  # bytes that can run arbitrary code on a dependency-cache rebuild are a
+  # fleet-wide hazard, its repair (`render-units --all-proxies`) needs no
+  # tenant account, and skipping the roster must never hide its repair hint.
   require_safe_openrc_proxy_units || return 1
+  # A rendered unit's stop() may need the missing account (the sidecar units
+  # call sudo). Skip that whole roster only after the same idle proof as the
+  # unreachable rootless stores; a non-empty service cgroup still refuses.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "skipped OpenRC unit stop for $name: the tenant account is gone and its former identity is proven idle"
+    return 0
+  fi
   local stop_failed=false worker
   # Every unit is stopped only when its init script is installed: an absent
   # unit is already stopped, so a partially provisioned or partially removed

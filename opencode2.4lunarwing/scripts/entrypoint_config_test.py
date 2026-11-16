@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -256,7 +257,13 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertIn(str(study / "skills"), config["skills"]["paths"])
 
     def prepare_cli(self, timeout_ms: str) -> tuple[Path, dict[str, str]]:
-        """Build the full entrypoint around a CLI stuck in background_wait."""
+        """Build the full entrypoint around a CLI stuck in background_wait.
+
+        The fake writes a readiness marker after it flushes background_wait so
+        the caller can cancel a run that has provably started. It lives under
+        HOME, which the root-CI uid 10003 identity owns; the fixture root does
+        not.
+        """
         # The real health server is irrelevant here; exiting immediately keeps
         # the one-shot CLI process as the only child this test must reap.
         (self.app / "health_server.py").write_text("")
@@ -289,6 +296,8 @@ def cancelled(signum, frame):
 
 signal.signal(signal.SIGTERM, cancelled)
 emit("background_wait", 1)
+with open(os.environ["FAKE_CLI_READY_FILE"], "w") as marker:
+    marker.write("ready\\n")
 while True:
     time.sleep(60)
 """)
@@ -301,33 +310,242 @@ while True:
         env = {
             **self.env,
             "AGENT_AUTH_TOKEN": "fixture-hub-credential",
+            "FAKE_CLI_READY_FILE": str(self.home / "fake-cli-ready"),
             "OPENCODE_MODE": "cli",
             "OPENCODE_BIN": str(fake_cli),
             "OPENCODE_RUN_TIMEOUT_MS": timeout_ms,
         }
         return script, env
 
-    def run_cli(self, timeout_ms: str) -> subprocess.CompletedProcess:
-        script, env = self.prepare_cli(timeout_ms)
-        return subprocess.run(
-            ["bash", str(script)], text=True, capture_output=True, timeout=15,
-            env=env, cwd=self.root, **self.identity,
+    def start_cli(self, script: Path, env: dict[str, str]) -> subprocess.Popen:
+        """Start the fixture as the leader of a session of its own.
+
+        Whatever the entrypoint starts stays in that session, so `reap_cli`
+        can find all of it, whichever state a failed case left it in.
+        """
+        process = subprocess.Popen(
+            ["bash", str(script)], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, cwd=self.root,
+            start_new_session=True, **self.identity,
+        )
+        self.addCleanup(self.reap_cli, process)
+        return process
+
+    @staticmethod
+    def cli_session(process: subprocess.Popen) -> list[int]:
+        """PIDs still running in the fixture's session; zombies do not count."""
+        running = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                # getsid() first: reading every stat file costs ten times the
+                # CPU, and on a starved host that is seconds per sweep.
+                if os.getsid(int(entry)) != process.pid:
+                    continue
+                # "pid (comm) state ..."; comm may hold ")".
+                stat = Path("/proc", entry, "stat").read_bytes()
+                state = stat.rpartition(b")")[2].split()[0]
+            except (OSError, IndexError):
+                continue  # exited between the listing and the look
+            if state not in b"ZX":
+                running.append(int(entry))
+        return running
+
+    @classmethod
+    def reap_cli(cls, process: subprocess.Popen) -> str:
+        """SIGKILL whatever is left of the fixture and return its output.
+
+        `process.kill()` does not do this. It reaches one PID: bash, or
+        `timeout` once the entrypoint has exec'd it. A SIGKILLed `timeout`
+        cannot run its `-k 5s`, which only starts after `timeout` has sent its
+        own first signal. The most its command then gets is a parent-death
+        SIGTERM (coreutils 9.12 sets one), and a child that bash is blocked in
+        gets nothing at all. What lives on keeps the pipes open under
+        `communicate()`. The group kill takes the leader's process group in
+        one call; the sweep takes what left that group but not the session, as
+        a `timeout` that the entrypoint did not exec does. Every wait here has
+        a limit.
+        """
+        deadline = time.monotonic() + 30
+        while True:
+            # The leader's PID names its group only until the leader is reaped.
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            running = cls.cli_session(process)
+            for pid in running:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not running or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        if process.stdout.closed and process.stderr.closed:
+            return ""  # the case ran to its end and collected the output
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            return "(no output: something outside the session holds the pipes)"
+        return stdout + stderr
+
+    def await_cli(self, process: subprocess.Popen, marker: Path, stage: str,
+                  limit: float = 120) -> None:
+        """Wait until the fake has written `marker`; fail once it cannot."""
+        # Generous: only a wedged fixture reaches it, and each poll costs one
+        # scheduler turn.
+        deadline = time.monotonic() + limit
+        while not marker.exists():
+            if process.poll() is not None:
+                self.fail(
+                    f"the CLI exited {process.returncode} before it reached "
+                    f"{stage}:\n{self.reap_cli(process)}"
+                )
+            if time.monotonic() > deadline:
+                self.fail(f"the CLI never reached {stage}:\n{self.reap_cli(process)}")
+            time.sleep(0.05)
+
+    def collect_cli(self, process: subprocess.Popen, limit: float,
+                    since: str) -> subprocess.CompletedProcess:
+        """Collect a run that has to end by itself within `limit` seconds."""
+        try:
+            stdout, stderr = process.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f"the CLI was still running {limit} s after {since}:\n"
+                f"{self.reap_cli(process)}"
+            )
+        return subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr,
         )
 
-    def test_cli_background_wait_is_bounded_and_cancelled(self) -> None:
-        started = time.monotonic()
-        result = self.run_cli("2000")
+    @staticmethod
+    def cli_leader_argv(process: subprocess.Popen, limit: float = 30) -> list[str] | None:
+        """The fixture leader's argv once it is neither bash nor `env`.
+
+        CLI mode execs `env`, which execs `timeout`, so the leader's PID then
+        names the wrapper and its arguments. None means the leader ended, or
+        was still bash, before that could be read. A missing reading proves
+        nothing: callers assert on a reading only, never on its absence.
+        """
+        deadline = time.monotonic() + limit
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                argv = Path("/proc", str(process.pid), "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                return None
+            name = os.path.basename(argv[0].decode(errors="replace"))
+            if name and name not in ("bash", "env"):
+                return [arg.decode(errors="replace") for arg in argv if arg]
+            time.sleep(0.01)
+        return None
+
+    def run_cli(self, timeout_ms: str, limit: float = 30) -> subprocess.CompletedProcess:
+        script, env = self.prepare_cli(timeout_ms)
+        return self.collect_cli(self.start_cli(script, env), limit, "its start")
+
+    def run_cli_until_ready(self, timeout_ms: str) -> subprocess.CompletedProcess:
+        """Run the CLI under its default hour, then stop it like a container.
+
+        Waiting for the fake's own marker instead of a wall-clock deadline is
+        what makes this independent of host load: a starved host delays the
+        fake's start, not its readiness signal. SIGTERM goes to the entrypoint's
+        PID, which CLI mode has exec'd into `timeout`, so the signal travels the
+        same path a `docker stop` takes (WI#582).
+        """
+        script, env = self.prepare_cli(timeout_ms)
+        process = self.start_cli(script, env)
+        self.await_cli(process, Path(env["FAKE_CLI_READY_FILE"]), "background_wait")
+        process.send_signal(signal.SIGTERM)
+        return self.collect_cli(process, 60, "SIGTERM")
+
+    def test_cli_background_wait_is_cancelled_by_sigterm(self) -> None:
+        # The entrypoint's own one-hour default: the deadline is not part of
+        # this case, so no assertion here waits on the fake to start.
+        result = self.run_cli_until_ready("3600000")
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
-        self.assertLess(time.monotonic() - started, 10)
         events = [
             json.loads(line) for line in result.stdout.splitlines()
             if line.startswith("{")
         ]
+        self.assertTrue(events, result.stdout + result.stderr)
         self.assertEqual(events[0]["type"], "background_wait")
         self.assertEqual(events[0]["sessionID"], "ses_1")
         self.assertEqual(events[0]["jobs"][0]["id"], "sh_train")
         self.assertFalse(events[0]["credential_present"])
         self.assertEqual(events[-1]["type"], "test_cancelled")
+
+    def test_cli_run_is_bounded_by_the_configured_deadline(self) -> None:
+        """A 2 s deadline ends the run with SIGTERM's status, not 124.
+
+        Deliberately asserts nothing about the fake's output: on a starved host
+        `timeout` can signal the fake before its interpreter installs the
+        handler, and that is still the behaviour under test — the deadline was
+        honored and `--preserve-status` kept the status 143. It asserts nothing
+        about elapsed time either: any such number also measures how long the
+        entrypoint takes to start on a loaded host.
+
+        A missing wrapper, another deadline or a dropped `--preserve-status`
+        is read off the leader's command line, so each fails here at once and
+        by name. That matters inside `ci-config`, where this suite runs once
+        per guard run under the guard's own two-minute limit: a case that
+        waited minutes for a run that never ends would turn one regression
+        into a timeout of every guard run. The 60-second limit is the backstop
+        for a run that ends for neither reason. It is not a measure of speed:
+        a sound run took 13 s on one CPU shared with 160 busy loops.
+        """
+        script, env = self.prepare_cli("2000")
+        process = self.start_cli(script, env)
+        leader = self.cli_leader_argv(process, limit=10)
+        if leader is not None:
+            self.assertEqual(
+                leader[:5], ["timeout", "--preserve-status", "-k", "5s", "2.000"], leader,
+            )
+        result = self.collect_cli(process, 60, "the look at its wrapper")
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertIn("(timeout 2000ms)", result.stdout)
+
+    def test_cli_fixture_wedged_in_a_child_fails_within_its_deadline(self) -> None:
+        """A fixture that wedges must fail its case, not hang it (WI#738).
+
+        The wedge is one `process.kill()` cannot clear: the fake moves to a
+        process group of its own, as a `timeout` that the entrypoint did not
+        exec does, and blocks in a child that never ends and holds the pipes.
+        """
+        script, env = self.prepare_cli("3600000")
+        wedged = self.home / "fake-cli-wedged"
+        (self.root / "fake-opencode.py").write_text(f"""#!/usr/bin/env python3
+import os
+import subprocess
+
+os.setpgid(0, 0)
+child = subprocess.Popen(["sleep", "738"])
+open({str(wedged)!r}, "w").close()
+child.wait()
+""")
+        process = self.start_cli(script, env)
+        self.await_cli(process, wedged, "its wedge")
+        running = self.cli_session(process)
+        self.assertGreaterEqual(len(running), 3, running)  # timeout, fake, sleep
+
+        # A helper that waits without limit would never get to a failing
+        # assertion; the alarm turns that hang into an error of this case.
+        def hung(signum, frame):
+            raise TimeoutError("the wedged fixture still blocked its helper after 120 s")
+
+        previous = signal.signal(signal.SIGALRM, hung)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        signal.alarm(120)
+        with self.assertRaisesRegex(self.failureException, "never reached background_wait"):
+            self.await_cli(
+                process, Path(env["FAKE_CLI_READY_FILE"]), "background_wait", limit=0.2,
+            )
+        signal.alarm(0)
+        self.assertEqual(self.cli_session(process), [])
 
     def test_cli_rejects_an_unbounded_or_invalid_timeout(self) -> None:
         for value in ("0", "-1", "1.5", "unbounded"):

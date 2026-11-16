@@ -60,11 +60,15 @@ _ctr_inspect() {
 }
 
 # WI#688: without its account a rootless tenant's store is unreachable (`_ctr`
-# dies on `id -u`), so a stop of one of its lanes has nothing it can reach and
-# says so. A rootful runtime needs no account, and its stops still run.
+# dies on `id -u`). Never report that store stopped until the former identity
+# is proven idle; otherwise a standalone stop-pg/stop-worker can hide a live
+# container. A rootful runtime needs no account, and its stops still run.
 _tenant_stop_skips_missing_account() {  # <tenant> <lane label>
-  tenant_rootless_account_gone "$1" || return 1
-  say "skipped $2 stop for $1: the tenant account is gone, so its rootless store is unreachable"
+  local name="$1" label="$2"
+  tenant_rootless_account_gone "$name" || return 1
+  tenant_former_identity_idle "$name" \
+    || die "tenant account '$name' is gone and its former uid is not proven idle; $label stop state is unknown"
+  say "skipped $label stop for $name: the tenant account is gone and no process of its former uids remains, so its rootless store is unreachable"
 }
 
 # Run the container runtime against ROOT's store (no tenant sudo drop). Used

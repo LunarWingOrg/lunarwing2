@@ -54,7 +54,7 @@ No specs exist yet for the agent, web-gateway, llm, e2e, or engine subsystems â€
 - OpenClaw port staging work: `ic/openclaw-ports/`. For OpenClaw port tasks, keep edits inside `ic/openclaw-ports/` unless the user explicitly approves touching core LunarWing files.
 - DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS
 
-## Build Constraints (Gentoo Dev VM)
+## Build Constraints (Gentoo or Arch dev VM or dedicated dev rig)
 
 This machine is a dedicated dev/test machine with limited resources. **All cargo commands must follow these rules:**
 

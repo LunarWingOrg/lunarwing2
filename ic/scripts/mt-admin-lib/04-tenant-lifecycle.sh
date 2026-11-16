@@ -1019,6 +1019,10 @@ start_tenant() {
   TENANT_START_NOT_ATTEMPTED_WORKERS=()
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  # Backfill pre-WI#688 tenants and refresh subordinate ranges while the
+  # account exists, so a later account-gone removal has a current record.
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing start"
 
   say "=== Starting tenant: $name ==="
 
@@ -1240,6 +1244,13 @@ stop_tenant() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
   say "=== Stopping tenant: $name ==="
+  # Without the account there is no rootless store or user manager to stop.
+  # Do not turn that into a silent success while an old process may still run.
+  if tenant_rootless_account_gone "$name"; then
+    tenant_former_identity_idle "$name" || return 1
+    say "tenant account '$name' is gone and no process of its former uids remains; nothing is left to stop"
+    return 0
+  fi
   stop_tenant_init_services "$name" || return 1
 
   stop_tenant_vision "$name"
@@ -1630,6 +1641,8 @@ upgrade_tenant() {
   local name="$1"
   shift
   name="$(sanitize_name "$name")"
+  tenant_identity_record "$name" \
+    || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing upgrade"
   (
     trap 'rc=$?; [[ "$rc" -eq 0 ]] || clear_sandbox_image_status "$name"' EXIT
     with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
@@ -2022,8 +2035,9 @@ upgrade_tenant_locked() {
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   refresh_deployed_health_pipeline
   # WI#715: the root-side Study Notes sync runs from a staged copy of this
-  # checkout. Restage it when (and only when) a scheduler is already installed,
-  # so upgrade-delivered fixes actually reach the hourly root job.
+  # checkout. Refresh it when a snapshot already exists so upgrade-delivered
+  # fixes reach the hourly root job; a schedule an operator removed or disabled
+  # stays that way (only the staged files are republished).
   refresh_deployed_knowledge_sync_scheduler
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through

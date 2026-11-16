@@ -15,6 +15,22 @@ export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
 export PORTS_REGISTRY="$fixture/ports.json"
 export INIT_SYSTEM=openrc
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
+# The fixture tenants exist, as on a real host: this harness exercises the
+# unsafe-unit refusal and the unit roster, not the account-gone skip. Give
+# `alice` an account and an identity record so a rootless runtime cannot take
+# the skip branch first and hide the repair hint this harness checks.
+TENANT_IDENTITY_DIR="$fixture/identity"
+TENANT_SUBUID_FILE="$fixture/subuid"
+mkdir -p "$TENANT_IDENTITY_DIR"
+printf 'alice:231072:65536\n' >"$TENANT_SUBUID_FILE"
+printf 'UID=61000\nSUBUID=231072:65536\n' >"$TENANT_IDENTITY_DIR/alice"
+id() {
+  if [[ "${1:-}" == -u && "${2:-}" == alice ]]; then
+    printf '61000\n'
+  else
+    command id "$@"
+  fi
+}
 cat >"$PORTS_REGISTRY" <<'JSON'
 {"tenants":{"alice":{"enable_proxy":true,"ports":{"proxy":23104}},"bob":{"enable_proxy":true,"ports":{"proxy":23204}},"disabled":{"enable_proxy":false,"ports":{"proxy":23304}},"new":{"enable_proxy":true,"ports":{"proxy":23404}}}}
 JSON
@@ -124,5 +140,23 @@ if (main render-units --all-proxies) >"$fixture/symlink.log" 2>&1; then
   fail 'fleet render followed a symlinked installed proxy'
 fi
 [[ -L "$OPENRC_INITD_DIR/lunarwing-proxy-bob" ]] || fail 'unsafe link was replaced'
+
+# The unsafe-unit refusal comes before the account-gone skip. A tenant whose
+# account is already gone must still be told to repair the fleet, because the
+# repair needs no account and the skip would otherwise hide the hint.
+legacy_unit mallory
+if (export CONTAINER_RT=podman MT_ROOTLESS=true
+  id() { [[ "${1:-}" == -u && "${2:-}" == mallory ]] && return 1; command id "$@"; }
+  _tenant_in_passwd_file() { return 1; }
+  getent() { [[ "${1:-}" == passwd ]] && return 2; command getent "$@"; }
+  stop_tenant_openrc mallory) >"$fixture/no-account.log" 2>&1; then
+  fail 'account-gone skip accepted unsafe installed proxy units'
+fi
+grep -Fq 'render-units --all-proxies' "$fixture/no-account.log" \
+  || fail 'account-gone refusal hid the unsafe-unit repair hint'
+if grep -Fq 'skipped OpenRC unit stop' "$fixture/no-account.log"; then
+  fail 'account-gone skip ran before the unsafe-unit refusal'
+fi
+rm -f "$OPENRC_INITD_DIR/lunarwing-proxy-mallory"
 
 printf 'ALL TESTS PASSED\n'

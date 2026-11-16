@@ -514,10 +514,22 @@ The host publishes a validated Git generation hourly through a systemd timer or
 OpenRC cron entry; tenant imports remain bounded, additive-only, and never
 replace existing paths. That timer executes a root-owned snapshot of mt-admin
 under `/usr/local/lib/lunarwing-study-notes-sync/current`, not this checkout:
-`upgrade-tenant` restages it from the upgraded-from checkout when the scheduler
-is already installed (it never creates one), and each release records the
-staging commit in `STAGED-FROM`. `lunarwing-mt-admin.sh doctor` prints that
-commit and warns when it lags the checkout. Run an immediate pass with
+`upgrade-tenant` restages it from the upgraded-from checkout when the hourly
+schedule is still installed, and each release records the staging commit in
+`STAGED-FROM`. A schedule an operator removed or disabled stays that way: the
+upgrade refreshes the staged files so a later re-arm runs fixed code, but it
+never re-creates the unit or re-enables the timer. On OpenRC a managed cron
+block whose entry is commented out counts as disabled; on systemd a timer that
+is enabled but stopped is started again. When the staging is refused or fails,
+the upgrade prints the reason and leaves the schedule and the previous staged
+copy as they were; when a later step of the schedule install fails, it says
+that the copy was replaced and the install did not finish. A managed cron
+block without its exact END line is not counted as a schedule, and
+`--enable-knowledge-sync` refuses to rebuild root's crontab around it until
+the block is repaired by hand.
+`lunarwing-mt-admin.sh
+doctor` prints the staged commit, warns when it lags the checkout, and says
+when the snapshot has outlived its schedule. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 
@@ -525,15 +537,17 @@ commit and warns when it lags the checkout. Run an immediate pass with
 
 `SANDBOX_NETWORK=tunnel` gives the generic shell sandbox outbound access to a
 NetBird or WireGuard overlay through a daemon-owned sidecar whose kernel
-firewall drops new inbound flows and non-tunnel egress. By default, DNS to the
-runtime resolvers remains a residual uplink channel; host loopback, other
-tenants, the LAN, and cloud metadata stay unreachable. It is opt-in per tenant;
-new multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537),
-while an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is
-preserved.
+firewall drops new inbound flows and non-tunnel egress. WireGuard's default
+runtime-resolver DNS remains a residual uplink channel; NetBird permits DNS
+only to its `wt0` listener. Host loopback, other tenants, the LAN, and cloud
+metadata stay unreachable. It is opt-in per tenant; new multi-tenant envs
+default to `SANDBOX_NETWORK=proxy-enforced` (WI#537), while an existing `none`,
+`proxy-enforced`, `tunnel`, or `proxy` value is preserved.
 
-NetBird requires the default runtime DNS path. WI#603 rejects
-`SANDBOX_TUNNEL_DNS` with this provider before any container-runtime call:
+NetBird uses its own managed resolver. Leave `SANDBOX_TUNNEL_DNS` unset and
+configure upstreams as NetBird nameserver groups reachable through the overlay;
+an outside upstream fails closed. The setting is rejected before any
+container-runtime call:
 
 ```bash
 SANDBOX_NETWORK=tunnel
@@ -542,6 +556,7 @@ SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird@sha256:<64-hex-digest>  
 SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://netbird.example.com
 SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>  # secret
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90  # 1-600 seconds
+# SANDBOX_TUNNEL_DNS stays unset; use NetBird nameserver groups instead.
 ```
 
 WireGuard can instead use overlay resolvers for joined runs and an optional
@@ -557,12 +572,18 @@ SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53  # joined-run resolvers; disables direc
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90  # 1-600 seconds
 ```
 
+NetBird's daemon-staged resolver and backup files are non-secret mode `0644`;
+the sidecar mounts them `rw,z`, and joined runs mount the resolver `ro,z` under
+every supported keep-id mapping. Startup must observe exactly one nameserver,
+NetBird's `wt0` IPv4 listener, within the provider timeout. A runtime resolver,
+another or malformed nameserver, or DNS management left off prevents firewall
+installation and joined execution instead of restoring the old uplink path.
+Later firewall checks derive from `wt0`, not from file rewrites. WI#695 note
+**17394** records the unchanged-target measurements and direct-listener control.
+
 WireGuard custom DNS is mounted only into joined runs. The sidecar retains its
 runtime resolver file for bootstrap, but the firewall also blocks its own
-post-start lookups when custom DNS is set. The WI#600 live run confirmed that
-NetBird's upstream DNS writes were unmarked and blocked, returning `SERVFAIL`.
-WI#603 therefore rejects that provider/setting combination during validation;
-leave `SANDBOX_TUNNEL_DNS` unset for NetBird.
+post-start lookups when custom DNS is set.
 DNS/canary addresses reject loopback, link-local, broadcast, unspecified, and
 multicast values. Peered WireGuard configs need
 `PersistentKeepalive = 1..=60` on at least one peer or an overlay canary, which
@@ -611,8 +632,9 @@ salt, so host reboots and image changes retain the peer; management URL or
 setup-key rotation changes it. The first start after the WI#602 fix re-enrols
 once under a new persistent-salt volume name and prunes the old instance-scoped
 volume, so plan one valid setup-key use and revoke the old peer. WI#600
-validated core NetBird 0.82.0 interoperability on 2026-11-11; WI#603 rejects
-custom DNS after its upstream writes failed closed. Operator guide:
+validated core NetBird 0.82.0 interoperability on 2026-11-11; WI#695 makes the
+managed `wt0` resolver the only joined-run DNS path and keeps custom DNS
+rejected. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior
