@@ -239,4 +239,19 @@ report_output="$(report_knowledge_sync_scheduler_status)"
   exit 1
 }
 
+# Review ADV-1: a restage that could not replace the release must warn instead
+# of reporting delivery. Stubbing the installer models a read-only releases
+# directory whose publish silently left the old copy in place.
+ln -sfn -- "$old_release" "$fixture/refresh-admin/current"
+install_knowledge_sync_admin_snapshot() { return 0; }
+refresh_output="$(refresh_deployed_knowledge_sync_scheduler)"
+[[ "$refresh_output" == *"still names 'deadbeef' after restaging"* ]] || {
+  printf 'a restage that changed nothing was not reported: %s\n' "$refresh_output" >&2
+  exit 1
+}
+[[ "$refresh_output" != *"restaged from"* ]] || {
+  printf 'a restage that changed nothing was reported as delivered: %s\n' "$refresh_output" >&2
+  exit 1
+}
+
 printf 'Knowledge sync scheduler tests passed\n'

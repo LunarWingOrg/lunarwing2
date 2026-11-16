@@ -151,7 +151,7 @@ knowledge_sync_scheduler_live() {
 # failure warns instead of failing the upgrade, whose tenant already restarted;
 # the hourly job then keeps running the previous staged copy.
 refresh_deployed_knowledge_sync_scheduler() {
-  local root checkout_commit staged_commit restage_rc=0
+  local root checkout_commit staged_commit restaged_commit restage_rc=0
   root="$(knowledge_sync_admin_root)"
   if ! knowledge_sync_scheduler_installed; then
     say "knowledge sync scheduler: not installed; skipping upgrade refresh"
@@ -183,9 +183,9 @@ refresh_deployed_knowledge_sync_scheduler() {
   fi
   # A restage that could not replace the release — a read-only releases
   # directory, a full disk — must not be reported as delivered (review ADV-1).
-  if [[ -n "$checkout_commit" ]] \
-    && [[ "$(knowledge_sync_staged_commit "$root")" != "$checkout_commit" ]]; then
-    say "WARNING: the Study Notes sync snapshot still names '$(knowledge_sync_staged_commit "$root")' after restaging from $checkout_commit; check that $root/releases is writable"
+  restaged_commit="$(knowledge_sync_staged_commit "$root")"
+  if [[ -n "$checkout_commit" && "$restaged_commit" != "$checkout_commit" ]]; then
+    say "WARNING: the Study Notes sync snapshot still names '${restaged_commit:-nothing}' after restaging from $checkout_commit; check that $root/releases is writable"
     return 0
   fi
   say "knowledge sync scheduler: restaged from ${checkout_commit:-an unknown checkout}"
