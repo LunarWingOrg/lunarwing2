@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Verify the publication contract for the pinned CI tool archives.
+
+The pins are read from the installers that consume them, so this never drifts
+from what CI checks. Each archive is downloaded anonymously from the project's
+generic package registry, the way a job downloads it, and its SHA256 must equal
+the pin. With --token-file the package protection rule is checked too: it is
+what keeps non-Maintainers from publishing to `lunarwing-ci-tools`.
+
+Exit codes: 0 ok, 1 checksum mismatch, 2 archive absent or unreachable,
+3 protection rule missing or weaker than Maintainer.
+"""
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+PACKAGE = "lunarwing-ci-tools"
+OK = 0
+MISMATCH = 1
+MISSING = 2
+UNPROTECTED = 3
+TIMEOUT = 120
+TOOLS = (
+    {
+        "name": "sccache",
+        "script": ".gitlab/scripts/bootstrap-sccache.sh",
+        "version": "SCCACHE_VERSION",
+        "sha256": "SCCACHE_SHA256",
+        "archive": "SCCACHE_ARCHIVE",
+    },
+    {
+        "name": "shellcheck",
+        "script": ".gitlab/scripts/install-shellcheck.sh",
+        "version": "version",
+        "sha256": "checksum",
+        "archive": "archive",
+    },
+)
+
+
+def assignment(text: str, name: str) -> str:
+    match = re.search(
+        rf'^(?:readonly\s+|local\s+)?{re.escape(name)}="([^"]*)"', text, re.MULTILINE
+    )
+    if match is None:
+        raise ValueError(f"no {name} assignment")
+    return match.group(1)
+
+
+def expand(template: str, values: dict[str, str]) -> str:
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise ValueError(f"unknown placeholder ${{{key}}}")
+        return values[key]
+
+    return re.sub(r"\$\{(\w+)\}", substitute, template)
+
+
+def load_pins(root: pathlib.Path) -> list[dict[str, str]]:
+    pins = []
+    for tool in TOOLS:
+        text = (root / tool["script"]).read_text(encoding="utf-8")
+        version = assignment(text, tool["version"])
+        pins.append(
+            {
+                "name": tool["name"],
+                "version": version,
+                "sha256": assignment(text, tool["sha256"]),
+                "archive": expand(
+                    assignment(text, tool["archive"]),
+                    {"version": version, "SCCACHE_VERSION": version},
+                ),
+            }
+        )
+    return pins
+
+
+def fetch_sha256(url: str) -> str:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "verify-ci-tools-registry"}
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        digest = hashlib.sha256()
+        while chunk := response.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_token(path: pathlib.Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        header, separator, value = line.partition(":")
+        if separator and header.strip().upper() == "PRIVATE-TOKEN":
+            return value.strip()
+        return line
+    raise ValueError(f"{path} holds no token")
+
+
+def get_json(url: str, token: str) -> object:
+    request = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return json.load(response)
+
+
+def check_protection(api_url: str, project_id: str, token: str) -> int:
+    user = get_json(f"{api_url}/user", token)
+    if isinstance(user, dict) and user.get("is_admin"):
+        # GitLab admits admins everywhere, so no rule level can constrain them.
+        print(
+            "WARNING: this token belongs to an instance admin; admins bypass package "
+            "protection levels, so this rule cannot stop that account publishing "
+            "(WI#598)."
+        )
+    rules = get_json(f"{api_url}/projects/{project_id}/packages/protection/rules", token)
+    for rule in rules if isinstance(rules, list) else []:
+        if not isinstance(rule, dict) or rule.get("package_type") != "generic":
+            continue
+        pattern = rule.get("package_name_pattern") or ""
+        if not fnmatch.fnmatchcase(PACKAGE, pattern):
+            continue
+        level = rule.get("minimum_access_level_for_push")
+        if level in {"maintainer", "owner", "admin"}:
+            print(
+                f"protection: rule {rule.get('id')} matches {pattern} with push level {level}"
+            )
+            return OK
+        print(
+            f"protection: rule {rule.get('id')} matches {pattern} but push level "
+            f"{level!r} is weaker than Maintainer"
+        )
+        return UNPROTECTED
+    print(f"protection: no generic rule covers {PACKAGE}")
+    return UNPROTECTED
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("CI_API_V4_URL", "https://git.lunarwing.org/api/v4"),
+    )
+    parser.add_argument(
+        "--project-id", default=os.environ.get("CI_PROJECT_ID", "35")
+    )
+    parser.add_argument("--repo-root", type=pathlib.Path, default=ROOT)
+    parser.add_argument(
+        "--token-file",
+        type=pathlib.Path,
+        help="raw token or a PRIVATE-TOKEN header line; enables the rule check",
+    )
+    args = parser.parse_args()
+    api_url = args.api_url.rstrip("/")
+
+    try:
+        pins = load_pins(args.repo_root)
+    except (OSError, ValueError) as error:
+        print(f"ERROR: cannot read pins: {error}", file=sys.stderr)
+        return MISMATCH
+
+    status = OK
+    for pin in pins:
+        url = (
+            f"{api_url}/projects/{args.project_id}/packages/generic/{PACKAGE}"
+            f"/{pin['version']}/{pin['archive']}"
+        )
+        try:
+            actual = fetch_sha256(url)
+        except urllib.error.HTTPError as error:
+            print(f"{pin['name']} {pin['version']}: ABSENT (HTTP {error.code}) {url}")
+            status = max(status, MISSING)
+            continue
+        except urllib.error.URLError as error:
+            print(f"{pin['name']} {pin['version']}: UNREACHABLE ({error.reason}) {url}")
+            status = max(status, MISSING)
+            continue
+        if actual != pin["sha256"]:
+            print(
+                f"{pin['name']} {pin['version']}: MISMATCH registry {actual} "
+                f"pin {pin['sha256']}"
+            )
+            status = max(status, MISMATCH)
+        else:
+            print(f"{pin['name']} {pin['version']}: ok {actual}")
+
+    if args.token_file is None:
+        print("protection: skipped (pass --token-file to check the rule)")
+    else:
+        try:
+            token = read_token(args.token_file)
+            status = max(status, check_protection(api_url, args.project_id, token))
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            print(f"ERROR: protection check failed: {error}", file=sys.stderr)
+            status = max(status, UNPROTECTED)
+
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
