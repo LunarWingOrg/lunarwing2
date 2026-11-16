@@ -1,8 +1,9 @@
-"""In-container relay for proxy-enforced; launched with Python isolated mode.
+"""In-container relay for proxy-backed modes; launched with Python isolated mode.
 
-This process has no external network interface and forwards only to the mounted
-Unix socket. The host endpoint always forwards to the validating HTTP proxy.
-The command is a separate argv value, never interpolated into this program.
+The enforced container has no external network interface. Legacy Podman keeps
+its normal advisory network. Both forward proxy traffic only to the mounted
+Unix socket, whose host endpoint reaches the validating HTTP proxy. The command
+is a separate argv value, never interpolated into this program.
 """
 
 import select
@@ -61,7 +62,7 @@ class Relay(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def main():
     try:
         # Establish transport before starting the untrusted command. A missing
-        # socket, wrong image, or denied mount never degrades to advisory mode.
+        # socket, wrong image, or denied mount prevents the command from running.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.settimeout(5)
             probe.connect(SOCKET)

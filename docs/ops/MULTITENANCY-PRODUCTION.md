@@ -797,13 +797,24 @@ units (and pages) rather than accepting them. A health-lib copy without
 the library refuses the same way.
 
 The installed health library is a root trust boundary, not a writable cache of
-the operator checkout. Every install and upgrade refresh builds a fresh staged
-tree, rejects symbolic links, makes the directory and every entry `root:root`,
-removes group/other write permission, and only then replaces the installed
-tree. This also repairs the ownership left by older `cp -a` installs. Entries
-the checkout does not ship are dropped, except the optional metrics listener
-binary `lunarwing-health-metrics`. It is carried into the new tree only when
-the old library and every parent through `/` are root-owned and not
+the operator checkout. Every install and upgrade refresh builds a fresh tree in
+a root-only staging directory. A linked source directory, a symbolic link, or
+any entry that is not a regular file or directory is refused. The copy runs
+under `umask 077` without preserving ownership, modes, ACLs, or other metadata
+(only timestamps are retained), then receives explicit modes: directories
+0755, regular files 0644, and top-level `*.sh` files 0755. This strips set-ID
+bits as well as group/other write permission and avoids exposing the checkout's
+modes or default ACLs in the staging window. Every entry of the carried set
+below that the staged tree holds is then made 0755, so a listener binary the
+checkout ships stays executable and the install cannot report success while
+leaving a binary that cannot start. The checked tree is made `root:root`
+before publication, which also repairs ownership left by older `cp -a`
+installs. Publication uses an atomic exchange when the host's `mv` supports
+it; older hosts retain the rollback-protected two-rename fallback.
+
+Entries the checkout does not ship are dropped, except the optional metrics
+listener binary `lunarwing-health-metrics`. It is carried into the new tree only
+when the old library and every parent through `/` are root-owned and not
 group/other-writable, and the binary is a root-owned regular file without
 group/other write or set-ID bits. In any other state another account may have
 replaced it, so it is not carried: the install moves it to a quarantine
@@ -819,18 +830,87 @@ trusted build with `sudo install -m 0755` before starting it again. Do not
 `chown` the old library or the quarantined copy to make it pass: root
 ownership alone does not show where the file came from. A
 `lunarwing-health-metrics` shipped by the checkout replaces the installed one,
-and the install says so. The
-root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the library,
-every entry in it, and every parent through `/` on every run; any non-root
-owner, symbolic link, or group/other write permission produces a logged refusal
-and exit 126 before the environment or `cron-wrapper.sh` is loaded. The OpenRC
-contract preflight applies the same check whenever its source resolves to this
-installed library. A root-owned Study Notes scheduler snapshot instead stages
-and sources a private contract copy beside mt-admin, so it needs neither a
-sibling checkout nor the installed host health library. Do
-not hand-copy an operator checkout over the library; rerun the health pipeline
-install instead (`upgrade-tenant`, `add-tenant`, or
-`ic/scripts/enable-health-fleet.sh`).
+and the install says so.
+
+The root-owned `/usr/local/sbin/lunarwing-mt-health` launcher re-checks the
+library, every entry in it, and every parent through `/` on every run. A
+non-root owner, symbolic link, group/other write permission, set-ID bit on a
+regular file, or non-regular entry produces a refusal that names the failing
+component on stderr and in syslog (`daemon.err`, tag `lunarwing-mt-health`),
+then exits 126 before the environment or `cron-wrapper.sh` is loaded. Its
+inspection `stat` and `find` are pinned to `/usr/bin`, not resolved through
+`/usr/local/bin`, and mt-admin drops any inherited `HEALTH_LIB_STAT` or
+`HEALTH_LIB_FIND` when it loads. A set-ID bit on a *directory* is accepted:
+`chmod 0755` does not clear a bit inherited from a set-group-ID parent, and on
+a root-owned directory nobody else can write the bit grants nothing. The stage
+clears it anyway, so an install under such a parent publishes a library
+without it.
+
+The OpenRC contract preflight resolves both the contract source and the
+installed library. It checks a source resolving to the installed library and,
+whenever mt-admin's own directory is root-owned, also checks the actual source
+tree, including a real-directory sibling of a Study Notes scheduler snapshot.
+A root-owned snapshot stages and sources a private contract copy beside
+mt-admin, so it needs neither a sibling checkout nor the installed host health
+library.
+
+A checkout that is not root-owned gets no new ownership or mode check. A
+refusal skips only the contract source and leaves `--help` usable. On a
+positively detected systemd host other commands remain available; on OpenRC
+only `--help` and `reinstall-health-library` are usable until the contract is
+repaired. OpenRC operations fail closed rather than treating a missing contract
+as proof that units are safe.
+
+On either init system, a refused source is never copied into a root-owned
+tree. The health library install (`add-tenant`, `upgrade-tenant`,
+`enable-health-fleet.sh`) and the staging of the Study Notes scheduler
+snapshot ask the same check again and stop with the refusal; an upgrade that
+cannot restage the snapshot warns and keeps the previous one. The contract is
+read from the resolved path that was checked, not from the path as given.
+
+The refusal says which tree failed. "health library" is the installed library,
+and the repair is the reinstall below. "health contract source" is a source
+that is not the installed library: the health directory of a root-owned
+checkout or snapshot. Correct or remove the named entry there, or run mt-admin
+from a clean root-owned checkout; reinstalling the library does not change it.
+No `chown` is printed for a contract source or its parents: those belong to
+the owner of that checkout.
+
+Repair a refused library or unsafe entry from a **separate trusted checkout**:
+a fresh root-owned clone at a verified commit, not the refused checkout or a
+copy of its health directory. Run the refused mt-admin executable as root, for
+example:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh reinstall-health-library /path/to/trusted/checkout
+```
+
+This command only replaces the health library; it does not render, start, or
+stop OpenRC units. The next invocation loads the repaired contract. Every
+install refuses to copy from a source that resolves to the installed library,
+or lies inside it, while that library fails the safety check, so mt-admin does
+not publish the refused bytes back into the root trust boundary. Do not
+hand-copy an operator checkout over the library.
+
+When the library path is itself a symbolic link, the refusal names the link
+and where it points, and the repair is the same reinstall: it replaces the
+link with a real root-owned directory. Do not change the owner of the tree the
+link points to.
+
+A health library refusal that names a **parent directory** needs a different
+repair because reinstalling stages beneath that same parent and cannot make
+the parent safe. Run the exact non-recursive command printed by the refusal on
+the named parent only (`chown root:root -- <parent> && chmod go-w --
+<parent>`). If the parent is a symbolic link, the health launcher and the
+install say so and print no command, because `chown` and `chmod` would change
+only the link's target: replace the link with a real root-owned directory.
+mt-admin's own load check follows such a link and judges the tree behind it,
+so it can report an unsafe library first and the link only when the reinstall
+is tried. The library's location is fixed, so it cannot be moved out of the
+way. Never apply `chown` recursively to the refused library tree.
+
+Normal refreshes when the contract is available remain `upgrade-tenant`,
+`add-tenant`, or `ic/scripts/enable-health-fleet.sh`.
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips

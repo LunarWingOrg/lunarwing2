@@ -1010,7 +1010,11 @@ podman() {
 }
 ensure_sandbox_image_current_from_tenant() {
   echo "sandbox-image-built" >>"$call_order_log"
-  [[ "${sandbox_build_fail_mode:-}" != "true" ]]
+  case "${sandbox_build_fail_mode:-}" in
+    behind) return 2 ;;
+    true) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 ensure_tenant_sandbox_image() { echo "sandbox-image-distributed:$1" >>"$call_order_log"; return 0; }
 # Consumed by the sourced add_tenant body.
@@ -1141,6 +1145,24 @@ if grep -q 'postgres' "$call_order_log" \
   echo "  PASS: sandbox build failure leaves base tenant available with recovery status"
 else
   echo "  FAIL: sandbox build failure hid the recovery state or stranded the tenant"
+  failures=$((failures + 1))
+fi
+
+# WI#723: an existing tenant behind the operator checkout is not a broken image.
+: >"$call_order_log"
+sandbox_build_fail_mode="behind"
+DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
+  VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
+  DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
+  add_tenant "sandbox-behind" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  >"$MT_FIXTURE/sandbox-behind.out" 2>&1 || true
+sandbox_build_fail_mode=""
+if grep -q 'postgres' "$call_order_log" \
+    && grep -q 'sandbox image:.*not rebuilt: tenant is behind the operator checkout' "$MT_FIXTURE/sandbox-behind.out" \
+    && ! grep -q 'sandbox image:.*needs recovery' "$MT_FIXTURE/sandbox-behind.out"; then
+  echo "  PASS: add_tenant distinguishes a behind tenant from sandbox recovery"
+else
+  echo "  FAIL: add_tenant reported a behind tenant as needing recovery"
   failures=$((failures + 1))
 fi
 

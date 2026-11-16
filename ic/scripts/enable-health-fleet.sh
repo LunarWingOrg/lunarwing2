@@ -93,8 +93,13 @@ esac
 # main()'s openrc_dispatch_preflight never runs; check explicitly here. The
 # DOWN-probe below hides the refusal behind >/dev/null 2>&1, which made every
 # tenant merely look DOWN while --allow-down still armed the cron.
-[[ "$INIT_SYSTEM" != openrc ]] || require_safe_openrc_proxy_units \
-  || _die "unsafe legacy proxy units installed; run first: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"
+if [[ "$INIT_SYSTEM" == openrc ]] && ! require_safe_openrc_proxy_units; then
+  # A contract that could not be loaded is not a migration (WI#722): the
+  # reason and its repair are printed above, and render-units refuses too.
+  [[ -z "${MT_ADMIN_OPENRC_CONTRACT_REFUSAL:-}" ]] \
+    || _die "the OpenRC proxy unit contract could not be loaded; repair it as the refusal above says, then run this again"
+  _die "unsafe legacy proxy units installed; run first: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"
+fi
 
 [[ -f "$PORTS_REGISTRY" ]] || _die "ports registry not found: $PORTS_REGISTRY"
 mapfile -t TENANTS < <(jq -r '.tenants | keys[]' "$PORTS_REGISTRY" 2>/dev/null || true)

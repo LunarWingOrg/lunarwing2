@@ -42,7 +42,8 @@ pub enum SandboxNetworkMode {
     /// Route egress through the validating HTTP proxy (allowlist + credential
     /// injection). Advisory: enforced via `http_proxy`/`https_proxy` env vars
     /// set in the container, so a process that ignores proxy env vars can
-    /// still reach the network directly.
+    /// still reach the network directly. Podman uses the per-execution Unix
+    /// relay and requires Python 3 in the image while retaining direct egress.
     Proxy,
     /// Network-isolated container plus a per-execution Unix-socket relay to
     /// the allowlist proxy (WI#155): the container keeps `--network none` and

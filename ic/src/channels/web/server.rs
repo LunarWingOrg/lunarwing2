@@ -377,7 +377,7 @@ pub struct GatewayState {
     pub job_manager: Option<Arc<ContainerJobManager>>,
     /// External worker manager for cancelling persistent worker jobs.
     pub external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
-    /// Prompt queue for Claude Code follow-up prompts.
+    /// Prompt queue for sandbox worker follow-up prompts.
     pub prompt_queue: Option<PromptQueue>,
     /// Durable owner scope for persistence and unauthenticated callback flows.
     pub owner_id: String,

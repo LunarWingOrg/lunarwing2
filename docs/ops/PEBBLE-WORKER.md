@@ -176,12 +176,22 @@ candidate builds during `upgrade-tenant`) resolve the tenant clone's clean HEAD
 for the `SOURCE_REVISION` stamp, but do not build from that tenant-writable
 directory. The commit must already exist in the operator checkout and be an
 ancestor of the release ref being deployed. Default builds use the operator's
-current local branch, or its exact HEAD when detached; upgrades use the explicit
-target ref. Tenant branch names are ignored, and ancestors behind the ref tip
-are accepted. Fast-forward the operator's local branch before default builds:
-`--source-repo` / `LUNARWING_MT_SOURCE_REPO` updates the tenant clone's source,
-not the operator archive's provenance anchor. The Dockerfile and build context
-come from a private, root-owned `git archive` of that commit in the operator
+current local branch, or its HEAD commit as the ref when detached. They accept
+ancestors behind that ref tip, including an older tenant commit with a detached
+operator checkout; a 40-hex default ref does not select an exact revision.
+
+Both upgrade paths instead resolve the explicit target in the operator checkout
+before checking out the tenant. For an unqualified name,
+`refs/remotes/origin/<name>` is tried before the local branch and tag, so a
+stale local branch cannot silently select an older installation. They keep the
+operator release ref for the ancestry check and pass its resolved full commit
+separately as the exact selected revision. The tenant is checked out at and
+must remain at that commit; its own target-name resolution cannot choose an
+older or off-release build.
+Fast-forward the operator's local branch before default builds: `--source-repo`
+/ `LUNARWING_MT_SOURCE_REPO` updates the tenant clone's source, not the operator
+archive's provenance anchor. The Dockerfile and build context come from a
+private, root-owned `git archive` of the selected commit in the operator
 checkout; links are refused and the archive is removed on exit. Thus tenant and
 operator working-tree edits cannot enter the image, while the image still names
 the tenant's commit. The fat-build toolchain smoke helper also executes from the

@@ -51,16 +51,30 @@ impl ContainerRuntime {
         }
     }
 
-    /// Host alias that reaches host-loopback services from inside a container.
+    /// Host alias for the legacy direct-TCP proxy transport.
     ///
-    /// Rootless podman (pasta/slirp4netns) maps `host.containers.internal`
-    /// to the host's loopback, so the sandbox proxy can keep binding
-    /// 127.0.0.1. Docker needs the `host-gateway` alias instead.
+    /// Legacy Podman runs use the Unix relay instead: pasta resolves
+    /// `host.containers.internal` to its gateway, not to a host-loopback
+    /// listener. Docker keeps using its explicit `host-gateway` alias.
     fn host_alias(&self) -> &'static str {
         match self {
             ContainerRuntime::Podman => "host.containers.internal",
             ContainerRuntime::Docker => "host.docker.internal",
         }
+    }
+}
+
+fn uses_proxy_relay(runtime: ContainerRuntime, network: SandboxNetworkMode) -> bool {
+    network == SandboxNetworkMode::ProxyEnforced
+        || (network == SandboxNetworkMode::Proxy && runtime == ContainerRuntime::Podman)
+}
+
+fn add_proxy_relay_args(args: &mut Vec<String>, proxy_dir: Option<&str>) {
+    if let Some(dir) = proxy_dir {
+        args.extend(["-v".into(), format!("{}:/run/lunarwing-proxy:ro,z", dir)]);
+    }
+    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
     }
 }
 
@@ -323,8 +337,8 @@ pub(crate) struct RunSpec<'a> {
     pub proxy_port: u16,
     pub tunnel: Option<TunnelRunConfig<'a>>,
     /// Host directory holding the per-execution proxy relay socket
-    /// (proxy-enforced mode only). Bind-mounted read-only at
-    /// `/run/lunarwing-proxy`.
+    /// (proxy-enforced and legacy Podman proxy modes). Bind-mounted read-only
+    /// at `/run/lunarwing-proxy`.
     pub proxy_dir: Option<&'a str>,
     /// Per-container process limit (`--pids-limit`).
     pub pids_limit: u32,
@@ -460,31 +474,29 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         }
         SandboxNetworkMode::Proxy => {
             if spec.proxy_port > 0 && spec.policy.is_sandboxed() {
-                let host = spec.runtime.host_alias();
-                let proxy_url = format!("http://{host}:{}", spec.proxy_port);
-                for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
-                    args.push("-e".into());
-                    args.push(format!("{var}={proxy_url}"));
-                }
-                if spec.runtime == ContainerRuntime::Docker {
-                    // Docker's bridge gateway needs an explicit host alias.
-                    args.push("--add-host".into());
-                    args.push("host.docker.internal:host-gateway".into());
+                if uses_proxy_relay(spec.runtime, spec.network) {
+                    add_proxy_relay_args(&mut args, spec.proxy_dir);
+                } else {
+                    let host = spec.runtime.host_alias();
+                    let proxy_url = format!("http://{host}:{}", spec.proxy_port);
+                    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+                        args.push("-e".into());
+                        args.push(format!("{var}={proxy_url}"));
+                    }
+                    if spec.runtime == ContainerRuntime::Docker {
+                        // Docker's bridge gateway needs an explicit host alias.
+                        args.push("--add-host".into());
+                        args.push("host.docker.internal:host-gateway".into());
+                    }
                 }
             }
         }
         SandboxNetworkMode::ProxyEnforced => {
             args.push("--network".into());
             args.push("none".into());
-            if let Some(dir) = spec.proxy_dir {
-                // Read-only relay socket transport (WI#155). Only this
-                // directory is visible besides the proxy env: no direct
-                // egress path exists anywhere, including localhost.
-                args.extend(["-v".into(), format!("{}:/run/lunarwing-proxy:ro,z", dir)]);
-            }
-            for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
-                args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
-            }
+            // Only the read-only relay directory is visible besides the proxy
+            // env: no direct egress path exists anywhere, including localhost.
+            add_proxy_relay_args(&mut args, spec.proxy_dir);
             // A caller-supplied bypass cannot accidentally disable proxy use.
             args.extend([
                 "-e".into(),
@@ -528,10 +540,10 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         spec.image.into(),
         "-c".into(),
     ]);
-    if spec.network == SandboxNetworkMode::ProxyEnforced {
+    if uses_proxy_relay(spec.runtime, spec.network) {
         // Python relay wrapper (argv-separated: the untrusted command is a
         // single argv value, never interpolated into the wrapper). Missing
-        // Python 3 fails closed rather than dropping the command unsandboxed.
+        // Python 3 fails closed rather than running without proxy transport.
         args.extend([
             "command -v python3 >/dev/null || { echo 'lunarwing-proxy-relay: Python 3 required' >&2; exit 125; }; exec python3 -I -c \"$1\" \"$2\"".into(),
             "lunarwing-proxy-relay".into(),
@@ -873,9 +885,9 @@ impl CliRunner {
 
     /// Execute a command in a fresh hardened container and collect its output.
     ///
-    /// Proxy-enforced setup (WI#155) fails closed before any container is
-    /// created: the running proxy/relay prerequisites are verified up front
-    /// so a misconfigured run can never degrade to direct egress.
+    /// Relay-backed proxy setup fails closed before any container is created:
+    /// the running proxy/relay prerequisites are verified up front so a
+    /// misconfigured run never executes without its proxy transport.
     pub async fn execute(&self, params: ExecParams<'_>) -> Result<ContainerOutput> {
         self.execute_with_name(
             params,
@@ -961,9 +973,9 @@ impl CliRunner {
         }
         fail_if_writable_root_docker(self.runtime, policy, self.docker_rootless, &self.user)?;
 
-        let relay = if network == SandboxNetworkMode::ProxyEnforced {
-            // Start before container creation; a failed relay never degrades
-            // to advisory or direct egress (fail closed).
+        let relay = if uses_proxy_relay(self.runtime, network) {
+            // Start before container creation; a failed relay never runs the
+            // command without its proxy transport.
             Some(crate::sandbox::proxy::relay::ProxyRelay::start(proxy_port).await?)
         } else {
             None
@@ -1936,29 +1948,43 @@ mod tests {
     }
 
     #[test]
-    fn args_proxy_mode_sets_podman_host_alias_env() {
-        let args = build_run_args(&spec(
-            ContainerRuntime::Podman,
-            KeepIdMode::Plain,
-            SandboxPolicy::WorkspaceWrite,
-            SandboxNetworkMode::Proxy,
-            3128,
-        ));
+    fn args_proxy_mode_podman_uses_loopback_relay() {
+        let args = build_run_args(&RunSpec {
+            proxy_dir: Some("/private/channel"),
+            ..spec(
+                ContainerRuntime::Podman,
+                KeepIdMode::Plain,
+                SandboxPolicy::WorkspaceWrite,
+                SandboxNetworkMode::Proxy,
+                3128,
+            )
+        });
         for var in ["http_proxy=", "https_proxy=", "HTTP_PROXY=", "HTTPS_PROXY="] {
             let entry = args
                 .iter()
                 .find(|a| a.starts_with(var))
                 .unwrap_or_else(|| panic!("missing {var}"));
-            assert!(
-                entry.ends_with("http://host.containers.internal:3128"),
-                "{entry}"
-            );
+            assert!(entry.ends_with("http://127.0.0.1:3128"), "{entry}");
         }
+        assert!(args.contains(&"/private/channel:/run/lunarwing-proxy:ro,z".to_string()));
+        assert!(!args.iter().any(|a| a.contains("host.containers.internal")));
         assert!(!args.contains(&"--add-host".to_string()));
+        assert!(!args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(!args.contains(&"NO_PROXY=".to_string()));
+        assert!(!args.contains(&"no_proxy=".to_string()));
+
+        let image_idx = args
+            .iter()
+            .position(|a| a == "lunarwing-worker:latest")
+            .unwrap();
+        let tail = &args[image_idx + 1..];
+        assert_eq!(tail[2], "lunarwing-proxy-relay");
+        assert!(tail[3].contains("lunarwing-proxy-relay:"));
+        assert_eq!(tail.last(), Some(&"echo hi".to_string()));
     }
 
     #[test]
-    fn args_proxy_mode_docker_uses_host_gateway_alias() {
+    fn args_proxy_mode_docker_keeps_host_gateway_alias() {
         let args = build_run_args(&spec(
             ContainerRuntime::Docker,
             KeepIdMode::Off,
@@ -1976,6 +2002,8 @@ mod tests {
         );
         let idx = args.iter().position(|a| a == "--add-host").unwrap();
         assert_eq!(args[idx + 1], "host.docker.internal:host-gateway");
+        assert!(!args.iter().any(|a| a.contains("/run/lunarwing-proxy")));
+        assert_eq!(args.last(), Some(&"echo hi".to_string()));
     }
 
     #[test]

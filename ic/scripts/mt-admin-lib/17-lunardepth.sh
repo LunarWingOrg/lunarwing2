@@ -290,8 +290,8 @@ lunardepth_preflight() {
 }
 
 build_lunardepth_worker() {
-  local no_cache="${1:-false}" with_toolchains="${2:-false}" source_root="${3:-$LUNARWING_ROOT}" release_ref="${4:-}"
-  _prepare_worker_build_source "$source_root" lunardepth4lunarwing "$release_ref"
+  local no_cache="${1:-false}" with_toolchains="${2:-false}" source_root="${3:-$LUNARWING_ROOT}" release_ref="${4:-}" selected_commit="${5:-}"
+  _prepare_worker_build_source "$source_root" lunardepth4lunarwing "$release_ref" Dockerfile "$selected_commit"
   source_root="$WORKER_BUILD_SOURCE_ROOT"
   local lane_dir="$source_root/lunardepth4lunarwing" source_revision="$WORKER_BUILD_SOURCE_REVISION"
   [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin

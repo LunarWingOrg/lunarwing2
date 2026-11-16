@@ -336,6 +336,8 @@ chmod 0600 "$FIXTURE/pm1.env"
   awk '/^health_env_reconcile_line\(\) \{/,/^\}/' \
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
   # The launcher step embeds the library checks with `declare -f`.
+  awk '/^health_lib_refusal_text\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
   awk '/^health_lib_validate_root_owned_directory\(\) \{/,/^\}/' \
     "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/00-common.sh"
   awk '/^health_lib_tree_require_safe\(\) \{/,/^\}/' \

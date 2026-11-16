@@ -428,8 +428,8 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 49. [x] (H) DONE - clean scratch on wt
 50. [x] (H) Rares exp
 51. [x] (H) Review operator notes after work items are cleared out some more
-52. [x] (H) Close out work items that are genuinely finished up~
-53. [x] (H) RESERVED to masta
+52. [x] (H) Close out work items that are genuinely finished up
+53. [x] (H) END OF AN ERA - RETIRE GOALS DOC
 54. [x] (H) RESERVED
 55. [x] (S) RESERVED
 56. [x] (S) RESERVED

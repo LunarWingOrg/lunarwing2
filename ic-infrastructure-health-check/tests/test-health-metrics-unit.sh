@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Static + systemd-analyze validation of the healthpoint metrics listener's
-# systemd unit (ic/systemd/lunarwing-health-metrics.service).
+# Static + parser validation of the healthpoint metrics listener's units.
 #
-# The listener is loopback-only by construction in the binary; the unit must
-# keep that contract: read-only filesystem, dynamic user, optional env file,
-# no committed tokens, no write paths. systemd-analyze verify runs only when
-# the tool exists (this suite is also green on OpenRC-only hosts).
+# The listener is loopback-only by construction in the binary; both units must
+# run it without privileges, embed no tokens, and suggest no wildcard binds.
+# systemd-analyze verify runs only when the tool exists (this suite is also
+# green on OpenRC-only hosts).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UNIT="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.service"
+OPENRC_UNIT="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.openrc"
 CONFD="$ROOT_DIR/ic/systemd/lunarwing-health-metrics.confd"
+INSTALLER="$ROOT_DIR/ic/scripts/install-health-metrics-listener.sh"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/health-metrics-unit-test.XXXXXX")"
 listener_pid=""
@@ -84,6 +85,110 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     fi
 else
     ok "SKIP: systemd-analyze unavailable (unit parse check skipped)"
+fi
+
+# OpenRC parity: a dedicated user, no capabilities, no new privileges, and a
+# pid file that only root can reach.
+assert_contains "$OPENRC_UNIT" 'command_user="lunarwing-metrics:lunarwing-metrics"' \
+    "OpenRC listener uses its dedicated unprivileged user"
+assert_contains "$OPENRC_UNIT" 'supervisor="supervise-daemon"' \
+    "OpenRC listener uses the privilege-aware supervisor"
+assert_contains "$OPENRC_UNIT" 'capabilities="^"' \
+    "OpenRC listener has an empty capability set"
+assert_contains "$OPENRC_UNIT" 'no_new_privs="yes"' \
+    "OpenRC listener cannot gain privileges"
+assert_contains "$OPENRC_UNIT" 'checkpath -f -m 0640 -o "${command_user}" "${output_log}" "${error_log}"' \
+    "OpenRC log files are writable by the listener"
+assert_contains "$OPENRC_UNIT" 'respawn_delay="5"' \
+    "OpenRC listener restarts after a failure"
+assert_absent "$OPENRC_UNIT" 'command_background=' \
+    "OpenRC does not bypass supervise-daemon"
+assert_absent "$OPENRC_UNIT" '0.0.0.0' \
+    "OpenRC unit never suggests a wildcard bind"
+if sh -n "$OPENRC_UNIT"; then
+    ok "OpenRC unit passes shell syntax validation"
+else
+    bad "OpenRC unit passes shell syntax validation" "shell parser rejected the init script"
+fi
+
+# The root supervisor creates the pid file at start and signals the pid it
+# names at stop, so nothing on that path may belong to the service account:
+# an account that can replace the file can make root kill or overwrite.
+pidfile="$(sed -n 's/^pidfile="\([^"]*\)"$/\1/p' "$OPENRC_UNIT")"
+pidfile_dir="$(dirname "${pidfile:-.}")"
+if [[ "$pidfile" == "/run/lunarwing-health-metrics.pid" ]]; then
+    ok "OpenRC pidfile lives directly in root-owned /run"
+else
+    bad "OpenRC pidfile lives directly in root-owned /run" "found: ${pidfile:-none}"
+fi
+if grep -E '^[[:space:]]*checkpath' "$OPENRC_UNIT" | grep -qF -- "${pidfile_dir}/"; then
+    bad "no account-owned directory on the pid file path" \
+        "a checkpath line names ${pidfile_dir}/"
+else
+    ok "no account-owned directory on the pid file path"
+fi
+assert_absent "$OPENRC_UNIT" 'checkpath -d' \
+    "OpenRC creates no account-owned runtime directory"
+
+# The OpenRC installer creates the account used by the unit, and keeps an
+# operator's existing conf.d instead of resetting port, token and base dir.
+assert_contains "$INSTALLER" 'groupadd --system lunarwing-metrics' \
+    "installer creates the dedicated system group"
+assert_contains "$INSTALLER" 'useradd --system --no-create-home --home-dir /var/empty' \
+    "installer creates a home-free nologin system user"
+assert_contains "$INSTALLER" '--gid lunarwing-metrics lunarwing-metrics' \
+    "installer assigns the dedicated primary group"
+if awk '/^install_openrc_confd\(\) \{/,/^\}/' "$INSTALLER" \
+    | grep -qF '[[ -e "$OPENRC_CONFD" ]] ||'; then
+    ok "installer installs conf.d only when none exists"
+else
+    bad "installer installs conf.d only when none exists" \
+        "conf.d guard missing from install_openrc_confd"
+fi
+
+# Exercise that helper against an installed conf.d. A second installer run is
+# the upgrade path, so the operator's settings must survive it untouched.
+CONFD_HELPER="$TMP/install-openrc-confd.sh"
+{
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'install() {\n'
+    printf '  local src="" dest=""\n'
+    printf '  while [[ $# -gt 0 ]]; do\n'
+    printf '    case "$1" in -o|-g|-m) shift 2 ;; *) src="$dest"; dest="$1"; shift ;; esac\n'
+    printf '  done\n'
+    printf '  cp -- "$src" "$dest"\n'
+    printf '}\n'
+    printf 'IC_DIR=%q\nOPENRC_CONFD=$1\n' "$ROOT_DIR/ic"
+    awk '/^install_openrc_confd\(\) \{/,/^\}/' "$INSTALLER"
+    printf 'install_openrc_confd\n'
+} >"$CONFD_HELPER"
+mkdir -p "$TMP/kept" "$TMP/fresh"
+KEPT_CONFD="$TMP/kept/lunarwing-health-metrics"
+cat >"$KEPT_CONFD" <<'EOF'
+export HEALTH_METRICS_LISTEN="127.0.0.1:50123"
+export HEALTH_METRICS_TOKEN="keep-token"
+EOF
+chmod 0640 "$KEPT_CONFD"
+cp "$KEPT_CONFD" "$TMP/kept-reference"
+if bash "$CONFD_HELPER" "$KEPT_CONFD"; then
+    if cmp -s "$KEPT_CONFD" "$TMP/kept-reference"; then
+        ok "re-running the installer keeps the operator's conf.d"
+    else
+        bad "re-running the installer keeps the operator's conf.d" "file content changed"
+    fi
+    if [[ "$(stat -c '%a' "$KEPT_CONFD" 2>/dev/null || stat -f '%Lp' "$KEPT_CONFD")" == 640 ]]; then
+        ok "an existing conf.d keeps its permissions"
+    else
+        bad "an existing conf.d keeps its permissions" "expected mode 640"
+    fi
+else
+    bad "re-running the installer keeps the operator's conf.d" "helper returned non-zero"
+fi
+FRESH_CONFD="$TMP/fresh/lunarwing-health-metrics"
+if bash "$CONFD_HELPER" "$FRESH_CONFD" && [[ -f "$FRESH_CONFD" ]]; then
+    ok "a fresh install writes the committed conf.d defaults"
+else
+    bad "a fresh install writes the committed conf.d defaults" "conf.d was not created"
 fi
 
 # confd contract: documented listen default stays loopback; token ships empty.

@@ -1,7 +1,7 @@
-//! Background job monitor that forwards Claude Code output to the main agent loop.
+//! Background job monitor that forwards worker output to the main agent loop.
 //!
-//! When the main agent kicks off a sandbox job (especially Claude Code), this
-//! monitor subscribes to the broadcast event channel and injects relevant
+//! When the main agent kicks off a sandbox job, this monitor subscribes to the
+//! broadcast event channel and injects relevant
 //! assistant messages back into the channel manager's stream. This lets the
 //! main agent see what the sub-agent is producing and surface it to the user.
 //!
@@ -109,7 +109,7 @@ pub fn spawn_job_monitor_with_context(
                             let mut msg = IncomingMessage::new(
                                 route.channel.clone(),
                                 route.user_id.clone(),
-                                format!("[Job {}] Claude Code: {}", short_id, content),
+                                format!("[Job {}] Worker: {}", short_id, content),
                             )
                             .into_internal();
                             if let Some(ref thread_id) = route.thread_id {
@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(msg.channel, "cli");
         assert_eq!(msg.user_id, "user-1");
         assert_eq!(msg.thread_id, Some("thread-1".to_string()));
-        assert!(msg.content.contains("I found a bug"));
+        assert_eq!(
+            msg.content,
+            format!("[Job {}] Worker: I found a bug", &job_id.to_string()[..8])
+        );
         assert!(msg.is_internal, "monitor messages must be marked internal");
     }
 

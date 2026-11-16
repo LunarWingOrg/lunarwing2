@@ -5,15 +5,33 @@
 
 description="LunarWing healthpoint metrics exporter (loopback listener)"
 command="/usr/local/lib/lunarwing-health/lunarwing-health-metrics"
-command_background="yes"
+command_user="lunarwing-metrics:lunarwing-metrics"
+supervisor="supervise-daemon"
+# The root supervisor owns the pid file: it creates the file at start and
+# signals the pid it names at stop. Keep it directly in root-owned /run. A pid
+# path inside a directory the service account could write would let a
+# compromised listener make root kill an unrelated process, or overwrite an
+# unrelated file through a link kept at that path.
 pidfile="/run/lunarwing-health-metrics.pid"
 output_log="/var/log/lunarwing-health-metrics.log"
 error_log="/var/log/lunarwing-health-metrics.log"
+capabilities="^"
+no_new_privs="yes"
+respawn_delay="5"
+respawn_max="5"
+respawn_period="60"
+required_files="${command}"
 
 # No reload command on purpose: the daemon is configured purely via
-# environment and installs no SIGHUP handler, so a HUP "reload" would kill it
-# (default disposition) with nothing supervising a restart. Use restart.
+# environment and installs no SIGHUP handler. Use restart.
 extra_commands="healthcheck"
+
+start_pre() {
+	# The log file stays a file owned by the account inside root-owned
+	# /var/log. The listener needs no runtime directory of its own: root
+	# writes the pid file straight into /run.
+	checkpath -f -m 0640 -o "${command_user}" "${output_log}" "${error_log}" || return 1
+}
 
 depend() {
 	need localmount

@@ -24,35 +24,105 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn_err() { printf 'error: %s\n' "$*" >&2; }
 
+HEALTH_LIB_UNSAFE_COMPONENT=""
+
+# The text of a refusal, without the "error: " prefix. <what> says which tree
+# failed: the installed library (the default), or a contract source that is not
+# the library. The repair differs, so the text must not offer the wrong one:
+# an entry or the tree itself is replaced from a trusted checkout when it is the
+# library and corrected where it lies when it is a checkout; a parent directory
+# of the library is repaired in place, and no reinstall can do that; a parent
+# of a contract source belongs to that checkout's owner, so no command is
+# printed for it. `link` is the library path that is itself a symbolic link:
+# the install replaces the link, so the reinstall is the repair whatever the
+# link's target looks like. An entry name is chosen by whoever can write the
+# tree, so it is printed quoted: a line break in it must not start a line.
+health_lib_refusal_text() {  # <path> [tree|entry|link] [library|source]
+  local path="$1" kind="${2:-tree}" what="${3:-library}"
+  local component="${HEALTH_LIB_UNSAFE_COMPONENT:-$1}" name="health library"
+  local reinstall="reinstall from a trusted checkout with: ic/scripts/lunarwing-mt-admin.sh reinstall-health-library <trusted-checkout>"
+  local must="must be root-owned, symlink-free, and not group/other-writable"
+  local elsewhere="run mt-admin from a clean root-owned checkout (reinstalling the health library does not change it)"
+  [[ "$what" != source ]] || name="health contract source"
+  if [[ "$kind" == link ]]; then
+    printf 'refusing %s %s: it is a symbolic link to %s, which is not a safe root-owned tree; %s' \
+      "$name" "$path" "$component" "$reinstall"
+  elif [[ "$kind" == entry ]]; then
+    printf 'refusing %s entry %q: symbolic link, non-root owner, group/other write, set-ID bits on a regular file, or a non-regular file type; ' \
+      "$name" "$component"
+    if [[ "$what" == source ]]; then
+      printf 'correct or remove it in that checkout, or %s' "$elsewhere"
+    else
+      printf '%s' "$reinstall"
+    fi
+  elif [[ -e "$component" ]] && ! "${HEALTH_LIB_STAT:-stat}" -c '%u' "$component" >/dev/null 2>&1; then
+    printf 'refusing %s %s: owner and mode of %s could not be read with %s' \
+      "$name" "$path" "$component" "${HEALTH_LIB_STAT:-stat}"
+  elif [[ "$component" != "$path" && -L "$component" ]]; then
+    printf 'refusing %s %s: parent directory %s %s; it is a symbolic link: replace it with a real root-owned directory (chown and chmod would change only its target)' \
+      "$name" "$path" "$component" "$must"
+  elif [[ "$component" != "$path" && "$what" == source ]]; then
+    printf 'refusing %s %s: parent directory %s %s; correct that directory if it is meant to be root-owned, or %s' \
+      "$name" "$path" "$component" "$must" "$elsewhere"
+  elif [[ "$component" != "$path" ]]; then
+    printf 'refusing %s %s: parent directory %s %s; repair that parent (not the library tree) with: chown root:root -- %q && chmod go-w -- %q' \
+      "$name" "$path" "$component" "$must" "$component" "$component"
+  elif [[ "$what" == source ]]; then
+    printf 'refusing %s %s: path component %s %s; correct its owner and mode, or run mt-admin from a clean root-owned checkout' \
+      "$name" "$path" "$component" "$must"
+  else
+    printf 'refusing %s %s: path component %s %s; %s' \
+      "$name" "$path" "$component" "$must" "$reinstall"
+  fi
+}
+
 health_lib_validate_root_owned_directory() {
   local path="$1" rest component current="/" owner mode
+  local stat_bin="${HEALTH_LIB_STAT:-stat}"
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   [[ "$path" == /* && -d "$path" ]] || return 1
   rest="${path#/}"
   while :; do
+    HEALTH_LIB_UNSAFE_COMPONENT="$current"
     [[ -d "$current" && ! -L "$current" ]] || return 1
-    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
-    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    owner="$("$stat_bin" -c '%u' "$current" 2>/dev/null || true)"
+    mode="$("$stat_bin" -c '%a' "$current" 2>/dev/null || true)"
     [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
     (( (8#$mode & 0022) == 0 )) || return 1
     [[ -n "$rest" ]] || break
     component="${rest%%/*}"
-    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    if [[ -z "$component" || "$component" == . || "$component" == .. ]]; then
+      HEALTH_LIB_UNSAFE_COMPONENT="$path"
+      return 1
+    fi
     current="${current%/}/$component"
     if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
   done
+  HEALTH_LIB_UNSAFE_COMPONENT=""
   return 0
 }
 
-health_lib_tree_require_safe() {
-  local path="${1:-}" unsafe
+# A root-owned directory with no group/other write grants a set-group-ID bit
+# nothing: the bit only changes the group of new entries, and nobody else can
+# create any. It is inherited from a set-group-ID parent (chmod 0755 does not
+# clear it), so refusing it on directories would stop an install, a snapshot
+# load and every command of a checkout that live under such a parent. Set-ID
+# bits are therefore refused on regular files only, where they do change what
+# the file does when it runs.
+health_lib_tree_require_safe() {  # <path> [library|source]
+  local path="${1:-}" what="${2:-library}" unsafe name="health library"
+  local find_bin="${HEALTH_LIB_FIND:-find}"
+  [[ "$what" != source ]] || name="health contract source"
+  HEALTH_LIB_UNSAFE_COMPONENT="$path"
   if [[ "$path" == / ]] || ! health_lib_validate_root_owned_directory "$path"; then
-    printf 'error: refusing health library %s: path and parents must be root-owned, symlink-free, and not group/other-writable\n' "$path" >&2
+    printf 'error: %s\n' "$(health_lib_refusal_text "$path" tree "$what")" >&2
     return 1
   fi
-  unsafe="$(find "$path" \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
-    || { printf 'error: refusing health library %s: ownership and permissions could not be inspected\n' "$path" >&2; return 1; }
+  unsafe="$("$find_bin" "$path" \( -type l -o ! -uid 0 -o -perm /022 -o \( -type f -a -perm /6000 \) -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null)" \
+    || { printf 'error: refusing %s %s: ownership, file types, and permissions could not be inspected\n' "$name" "$path" >&2; return 1; }
   if [[ -n "$unsafe" ]]; then
-    printf 'error: refusing health library entry %s: symbolic link, non-root owner, or group/other-writable\n' "$unsafe" >&2
+    HEALTH_LIB_UNSAFE_COMPONENT="$unsafe"
+    printf 'error: %s\n' "$(health_lib_refusal_text "$path" entry "$what")" >&2
     return 1
   fi
   return 0

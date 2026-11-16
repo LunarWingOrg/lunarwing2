@@ -1,8 +1,9 @@
 //! Per-execution Unix transport to the host's loopback HTTP proxy.
 //!
-//! The container retains `--network none`. Only this socket's directory is
-//! mounted; neither the container runtime socket nor any host TCP listener is
-//! exposed.
+//! Enforced containers retain `--network none`; legacy Podman containers keep
+//! their normal advisory network. Only this socket's directory is mounted for
+//! proxy transport; neither the container runtime socket nor the host proxy's
+//! TCP listener is exposed to the container.
 //!
 //! # Socket placement (!1044 review finding 1)
 //!
@@ -61,7 +62,7 @@ impl ProxyRelay {
     #[cfg(not(target_os = "linux"))]
     pub async fn start(_port: u16) -> Result<Self> {
         Err(SandboxError::Config {
-            reason: "proxy-enforced requires a local Linux container runtime".into(),
+            reason: "the proxy relay requires a local Linux container runtime".into(),
         })
     }
 
