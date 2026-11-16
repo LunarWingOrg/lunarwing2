@@ -28,6 +28,16 @@ client.
 Russh's optional `rsa` feature remains disabled, and the `rsa` crate remains out
 of LunarWing's dependency graph.
 
+### mt-admin upgrades install the operator checkout's target (WI#708, WI#723)
+
+Update the operator checkout and fetch the intended target before running
+`upgrade-tenant`, whether through mt-admin or `ic/scripts/upgrade-tenant.sh`.
+The target must resolve in that operator checkout; the upgrade checks out and
+builds the operator-selected commit for the sandbox image and every enabled
+worker lane. It no longer resolves the build revision from the tenant's clone.
+For a named branch, `refs/remotes/origin/<name>` takes precedence over a local
+branch, so a stale local branch cannot silently select an older installation.
+
 ## Security and upgrade actions
 
 ### Legacy `proxy` mode now injects the LunarWing Cloud key (WI#655, WI#721)

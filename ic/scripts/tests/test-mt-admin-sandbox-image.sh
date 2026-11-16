@@ -301,15 +301,33 @@ else
   bad "sandbox build used an untrusted Dockerfile: $build_dockerfile"
 fi
 promote_candidate_sandbox_image tenant-a
+rollback_file="$(_promote_rollback_file tenant-a)"
 if [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$new_id" \
-    && "$(awk -F '\t' '$1 == "sandbox" {print $2}' "$(_promote_rollback_file tenant-a)")" == sandbox-old ]]; then
-  ok 'promotion moves latest to the candidate and records the previous ID'
+    && "$(awk -F '\t' '$1 == "sandbox" {print $2}' "$rollback_file")" == sandbox-old \
+    && "$(awk -F '\t' '$1 == "sandbox" {print $3}' "$rollback_file")" == "$new_id" ]]; then
+  ok 'promotion records both the previous and promoted sandbox image IDs'
 else
   bad 'sandbox promotion or rollback record is incorrect'
 fi
+
+# WI#642: tenant B can promote after tenant A but before A's failed upgrade
+# rolls back. A must leave B's tag alone; with A's own promoted ID restored to
+# latest, the ordinary rollback still succeeds from the same record.
+register_image "$SANDBOX_IMAGE_TAG" sandbox-other-tenant outdated
+: >"$warnings"
+( restore_promoted_workers tenant-a ) >/dev/null 2>&1 \
+  && interleaved_rc=0 || interleaved_rc=$?
+if [[ "$interleaved_rc" -ne 0 \
+    && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-other-tenant ]] \
+    && grep -Fq 'another promotion replaced' "$warnings"; then
+  ok 'rollback leaves a tag promoted by another tenant unchanged'
+else
+  bad "rollback replaced another tenant's tag: $(cat "$warnings")"
+fi
+register_image "$SANDBOX_IMAGE_TAG" "$new_id" "$current_digest"
 restore_promoted_workers tenant-a
 if [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-old ]]; then
-  ok 'upgrade rollback restores the previous sandbox image ID'
+  ok 'upgrade rollback restores the previous sandbox image ID when its promoted ID is current'
 else
   bad 'sandbox rollback did not restore the previous image ID'
 fi
@@ -322,9 +340,10 @@ CALLS=()
 if build_candidate_workers tenant-a false false false false false '' false auto \
     && [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == sandbox-old ]] \
     && [[ ! -s "$candidate_marker" ]] \
+    && [[ "$(cat "$(tenant_sandbox_image_status_file tenant-a)")" == previous ]] \
     && grep -Fq 'keeping the previous lunarwing-sandbox:latest' "$warnings" \
     && grep -Fq 'build-sandbox-image tenant-a' "$warnings"; then
-  ok 'failed candidate keeps the old image and continues with recovery guidance'
+  ok 'real candidate builder records and reports the retained previous image'
 else
   bad "failed candidate changed latest or aborted the upgrade: ${CALLS[*]}"
 fi
@@ -403,6 +422,30 @@ else
   bad "Docker candidate path used the wrong store or network: ${CALLS[*]}"
 fi
 
+# WI#642: losing a candidate before promotion has the same non-fatal contract
+# as a failed build, and the retained-image note survives until the summary.
+register_image "$SANDBOX_IMAGE_TAG" docker-old outdated
+build_candidate_sandbox_image tenant-a always
+docker rmi "$candidate_ref" >/dev/null
+: >"$warnings"
+if promote_candidate_sandbox_image tenant-a \
+    && [[ "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == docker-old ]] \
+    && [[ "$(cat "$(tenant_sandbox_image_status_file tenant-a)")" == previous ]] \
+    && grep -Fq 'candidate image' "$warnings"; then
+  ok 'missing sandbox candidate is non-fatal and records the retained image'
+else
+  bad "missing sandbox candidate aborted or changed latest: ${CALLS[*]}"
+fi
+: >"$warnings"
+report_retained_sandbox_image tenant-a
+if grep -Fq 'sandbox image:' "$warnings" \
+    && grep -Fq 'remains on the previous lunarwing-sandbox:latest' "$warnings" \
+    && [[ ! -e "$(tenant_sandbox_image_status_file tenant-a)" ]]; then
+  ok 'closing report names the previous sandbox image and clears its status'
+else
+  bad 'closing report omitted the retained sandbox image'
+fi
+
 # shellcheck disable=SC2034  # read by sandbox_debian_snapshot in sourced mt-admin
 LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT=20260101T000000Z
 if [[ "$(sandbox_image_input_digest "$candidate_source")" != "$current_digest" ]]; then
@@ -411,6 +454,101 @@ else
   bad 'Debian snapshot override was omitted from the input digest'
 fi
 unset LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT
+
+# WI#708: the operator checkout resolves the target separately from the tenant.
+# A clean older tenant HEAD is not the selected revision, and none of the
+# tenant-driven sandbox paths or the shared worker helper may build it.
+printf '# newer operator-selected revision\n' \
+  >>"$operator_repo/ic/docker/sandbox.Dockerfile"
+git -C "$operator_repo" add ic/docker/sandbox.Dockerfile
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Newer operator revision'
+selected_head="$(git -C "$operator_repo" rev-parse HEAD)"
+operator_release_ref="$(git -C "$operator_repo" symbolic-ref HEAD)"
+operator_branch="${operator_release_ref#refs/heads/}"
+[[ "$(git -C "$tenant_repo" rev-parse HEAD)" != "$selected_head" ]]
+_resolve_operator_upgrade_target "$operator_branch"
+[[ "$OPERATOR_UPGRADE_TARGET_COMMIT" == "$selected_head" ]]
+for source_mode in upgrade add worker; do
+  before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
+  expected_rc=1
+  expected_message='does not match selected operator revision'
+  pass_message="$source_mode refuses an older clean tenant HEAD before building"
+  message_file="$fixture/older-head.out"
+  : >"$warnings"
+  rm -f "$fixture/last-build-dockerfile"
+  case "$source_mode" in
+    upgrade)
+      expected_rc=0
+      pass_message='real candidate builder forwards the selected commit to the sandbox image'
+      ( build_candidate_workers tenant-a false false false false false \
+          "$OPERATOR_UPGRADE_TARGET_REF" false always "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+    add)
+      expected_rc=2
+      expected_message='is behind the operator checkout'
+      pass_message='add-tenant helper distinguishes a behind tenant from a build failure'
+      message_file="$warnings"
+      ( ensure_sandbox_image_current_from_tenant tenant-a always ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+    worker)
+      ( _prepare_worker_build_source "$tenant_repo" ic/docker "$OPERATOR_UPGRADE_TARGET_REF" sandbox.Dockerfile "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
+        >"$fixture/older-head.out" 2>&1 && older_head_rc=0 || older_head_rc=$?
+      ;;
+  esac
+  if [[ "$older_head_rc" -eq "$expected_rc" && ! -e "$fixture/last-build-dockerfile" \
+      && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
+      && grep -Fq "$expected_message" "$message_file"; then
+    ok "$pass_message"
+  else
+    bad "$source_mode accepted or misclassified an older clean tenant HEAD (rc=$older_head_rc): $(cat "$fixture/older-head.out")"
+  fi
+done
+
+# The wrapper's idempotent add-tenant reprovision inherits the upgrade target,
+# so it does not replace that target with the operator checkout's current HEAD.
+wrapper_target="$(git -C "$tenant_repo" rev-parse HEAD)"
+rm -f "$fixture/last-build-dockerfile"
+(
+  export LUNARWING_MT_UPGRADE_RELEASE_REF="$wrapper_target"
+  export LUNARWING_MT_UPGRADE_SELECTED_COMMIT="$wrapper_target"
+  ensure_sandbox_image_current_from_tenant tenant-a always \
+    && printf '%s\n' "${IMAGE_INPUTS[${IMAGE_IDS[$SANDBOX_IMAGE_TAG]}]:-}" >"$fixture/reprovision.digest"
+) >"$fixture/reprovision.out" 2>&1 && reprovision_rc=0 || reprovision_rc=$?
+if [[ "$reprovision_rc" -eq 0 && -e "$fixture/last-build-dockerfile" \
+    && "$(cat "$fixture/reprovision.digest")" == "$current_digest" ]]; then
+  ok 'wrapper reprovision reuses the selected target instead of operator HEAD'
+else
+  bad "wrapper reprovision lost the selected target: $(cat "$fixture/reprovision.out")"
+fi
+
+# A tenant-owned target name may resolve to an operator object that is not on
+# the operator's release ref. Resolving the same name on the operator side must
+# select the release commit instead; the mismatched tenant HEAD builds nothing.
+git -C "$operator_repo" checkout -q -b off-release
+printf '# off-release tenant choice\n' >>"$operator_repo/ic/docker/sandbox.Dockerfile"
+git -C "$operator_repo" add ic/docker/sandbox.Dockerfile
+git -C "$operator_repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm 'Off-release commit'
+off_release_head="$(git -C "$operator_repo" rev-parse HEAD)"
+git -C "$operator_repo" checkout -q "$operator_branch"
+git -C "$tenant_repo" fetch -q "$operator_repo" off-release
+git -C "$tenant_repo" checkout -q -B "$operator_branch" "$off_release_head"
+_resolve_operator_upgrade_target "$operator_branch"
+[[ "$OPERATOR_UPGRADE_TARGET_COMMIT" == "$selected_head" ]]
+before_id="${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}"
+rm -f "$fixture/last-build-dockerfile"
+( build_candidate_sandbox_image tenant-a always "$OPERATOR_UPGRADE_TARGET_REF" "$OPERATOR_UPGRADE_TARGET_COMMIT" ) \
+  >"$fixture/off-release-head.out" 2>&1 && off_release_rc=0 || off_release_rc=$?
+if [[ "$off_release_rc" -ne 0 && ! -e "$fixture/last-build-dockerfile" \
+    && "${IMAGE_IDS[$SANDBOX_IMAGE_TAG]:-}" == "$before_id" ]] \
+    && grep -Fq 'does not match selected operator revision' "$fixture/off-release-head.out"; then
+  ok 'operator target resolution never builds the tenant off-release commit'
+else
+  bad "tenant off-release commit reached the build: $(cat "$fixture/off-release-head.out")"
+fi
 
 # Exercise the actual start_tenant recovery path without touching systemd,
 # OpenRC, a tenant account, or a container store. A failed distribution warns
