@@ -37,7 +37,9 @@ install_knowledge_sync_admin_snapshot() {
     die "could not stage a complete Study Notes sync release under $releases; $root/current was not changed"
   fi
   current_tmp="$root/.current.$$"
-  if ! { ln -s -- "$release" "$current_tmp" && mv -fT -- "$current_tmp" "$root/current"; }; then
+  # -fT: a stale link of the same pid (a killed earlier run) is replaced, not
+  # followed into the old release it points at.
+  if ! { ln -sfT -- "$release" "$current_tmp" && mv -fT -- "$current_tmp" "$root/current"; }; then
     rm -f -- "$current_tmp"
     rm -rf -- "$release"
     die "could not publish the Study Notes sync release $release; $root/current was not changed"
@@ -66,9 +68,9 @@ _stage_knowledge_sync_release() {  # <new release dir>
   # configure-study-mcp --enable-knowledge-sync.
   source_commit="$(knowledge_sync_checkout_commit)"
   {
-    printf 'commit=%s\n' "${source_commit:-unknown}"
-    printf 'source=%s\n' "$SCRIPT_DIR"
-    printf 'staged_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'commit=%s\n' "${source_commit:-unknown}" \
+      && printf 'source=%s\n' "$SCRIPT_DIR" \
+      && printf 'staged_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$release/STAGED-FROM" || return 1
   chmod 0644 -- "$release/STAGED-FROM" || return 1
   [[ -x "$release/lunarwing-mt-admin.sh" ]] || return 1
@@ -91,8 +93,9 @@ _prune_knowledge_sync_snapshots() {  # <releases dir> <retained release path>
   ((count <= KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 1)) && return 0
   while IFS= read -r file; do
     [[ "$file" != "$retained" ]] || continue
+    # stderr: the staging's stdout is the entrypoint its caller captures.
     rm -rf -- "$file" 2>/dev/null \
-      || say "WARNING: could not prune old knowledge sync snapshot: $file"
+      || say "WARNING: could not prune old knowledge sync snapshot: $file" >&2
   done < <(find "$releases" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KNOWLEDGE_SYNC_SNAPSHOT_KEEP")
   return 0
 }
@@ -147,11 +150,16 @@ knowledge_sync_scheduler_installed() {
 # not undo. On systemd, the enabled state is the standing intent (a stopped but
 # enabled timer is repaired); on OpenRC, an entry in the managed crontab block
 # that cron would run is: a block whose line an operator commented out is a
-# schedule switched off. A host with no init manager detected reports "not
-# live", so an upgrade only ever refreshes files there.
+# schedule switched off. Only a complete block counts, and in it only a line
+# that starts like a schedule entry: a block without its END line would make
+# root's later jobs look like this schedule, and an environment or option line
+# is not an entry. A host with no init manager detected reports "not live", so
+# an upgrade only ever refreshes files there.
 knowledge_sync_scheduler_live() {
   local init unit_dir command begin='# BEGIN lunarwing-study-notes-sync managed block'
-  local end='# END lunarwing-study-notes-sync managed block' line inside=0 live=1
+  local end='# END lunarwing-study-notes-sync managed block' line inside=0 entries=0 live=1
+  # cron: a digit, `*` or `@`; fcron also `&` and `%`.
+  local entry_re='^[[:space:]]*[0-9*@&%]'
   init="${INIT_SYSTEM:-}"
   if [[ -z "$init" ]]; then
     init="$(detect_init_system 2>/dev/null)" || return 1
@@ -168,11 +176,14 @@ knowledge_sync_scheduler_live() {
       command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
       [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
       [[ -n "$command" ]] || return 1
-      while IFS= read -r line; do
-        if [[ "$line" == "$begin" ]]; then inside=1; continue; fi
-        if [[ "$line" == "$end" ]]; then inside=0; continue; fi
-        ((inside)) || continue
-        [[ "$line" =~ ^[[:space:]]*(#|$) ]] || live=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$begin" ]]; then inside=1; entries=0; continue; fi
+        if [[ "$line" == "$end" ]]; then
+          if ((inside && entries)); then live=0; fi
+          inside=0
+          continue
+        fi
+        if ((inside)) && [[ "$line" =~ $entry_re ]]; then entries=1; fi
       done < <("$command" -l 2>/dev/null)
       return "$live"
       ;;
@@ -206,8 +217,10 @@ refresh_deployed_knowledge_sync_scheduler() {
     # install. Contain die(): the staging exits on a refused source, and
     # ensure_knowledge_source_scheduler on a missing systemctl/crontab; neither
     # may turn a completed upgrade into a failure. bash ignores errexit inside
-    # this `||`, so both functions check their own steps and stop before any
-    # unit or cron line is written (WI#736).
+    # this `||`, so the staging and the installers check their own steps: a
+    # failed staging stops before any unit or cron line is written, and a
+    # failed write in an installer leaves the old unit or crontab in place
+    # (WI#736).
     ( set -e; ensure_knowledge_source_scheduler ) || restage_rc=$?
   else
     # The snapshot outlived its schedule: the unit files are gone, the timer is
@@ -217,23 +230,28 @@ refresh_deployed_knowledge_sync_scheduler() {
     say "knowledge sync scheduler: hourly schedule is not active on this host; refreshing the staged copy without re-arming it"
     ( set -e; install_knowledge_sync_admin_snapshot >/dev/null ) || restage_rc=$?
   fi
+  current_after="$(readlink -- "$root/current" 2>/dev/null || true)"
   if (( restage_rc != 0 )); then
-    say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the reason is printed above. The schedule was left as it was, and the hourly job keeps running the previous staged copy"
+    if [[ -n "$current_after" && "$current_after" != "$current_before" ]]; then
+      # The staging delivered; a later step of the schedule install failed.
+      say "WARNING: the root Study Notes sync snapshot was restaged, but the hourly schedule could not be repaired (exit $restage_rc); the reason is printed above"
+    else
+      say "WARNING: could not restage the root Study Notes sync snapshot (exit $restage_rc); the reason is printed above. The schedule and the previous staged copy were left as they were"
+    fi
     return 0
   fi
   # A restage that could not replace the release — a read-only releases
   # directory, a full disk — must not be reported as delivered (review ADV-1).
   restaged_commit="$(knowledge_sync_staged_commit "$root")"
   if [[ -n "$checkout_commit" && "$restaged_commit" != "$checkout_commit" ]]; then
-    say "WARNING: the Study Notes sync snapshot still names '${restaged_commit:-nothing}' after restaging from $checkout_commit; check that $root/releases is writable"
+    say "WARNING: the Study Notes sync snapshot still names '${restaged_commit:-nothing}' after restaging from $checkout_commit; $root/current was not switched to a release staged from this checkout"
     return 0
   fi
   # Every staging publishes a new release directory, so an unchanged link means
   # nothing was delivered. This also holds for a checkout without git metadata,
   # where there is no commit to compare.
-  current_after="$(readlink -- "$root/current" 2>/dev/null || true)"
   if [[ -z "$current_after" || "$current_after" == "$current_before" ]]; then
-    say "WARNING: the Study Notes sync snapshot was not replaced: $root/current still points at '${current_before:-nothing}'; check that $root/releases is writable"
+    say "WARNING: the Study Notes sync snapshot was not replaced: $root/current still points at '${current_before:-nothing}'"
     return 0
   fi
   say "knowledge sync scheduler: restaged from ${checkout_commit:-an unknown checkout}"
@@ -273,7 +291,7 @@ report_knowledge_sync_scheduler_status() {
 # every hour (WI#736). Checked in each installer as well as in their caller, so
 # the property does not depend on how they are reached.
 _require_knowledge_sync_entrypoint() {  # <entrypoint>
-  [[ "${1:-}" =~ ^/[A-Za-z0-9._/-]+$ && -x "$1" ]] \
+  [[ "${1:-}" =~ ^/[A-Za-z0-9._/-]+$ && -f "$1" && -x "$1" ]] \
     || die "refusing to schedule the Study Notes source refresh with '${1:-}': the command must be the absolute path of an existing executable"
 }
 
@@ -285,8 +303,15 @@ _install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
   _require_knowledge_sync_entrypoint "$entrypoint"
   command -v systemctl >/dev/null 2>&1 \
     || die "systemctl not found; cannot install Study Notes source scheduler"
-  mkdir -p "$unit_dir"
-  cat >"$service" <<EOF
+  mkdir -p "$unit_dir" || die "cannot create $unit_dir"
+  # Each unit is written beside its place and renamed over it. The caller may
+  # run this with errexit ignored (WI#736), and a write that fails half-way
+  # (a full disk) must leave the unit root's timer runs as it was, not empty.
+  # systemd does not read the temporary names: they end in no unit suffix.
+  local service_tmp timer_tmp
+  service_tmp="$(mktemp "$service.XXXXXX")" \
+    || die "cannot create a temporary file beside $service"
+  cat >"$service_tmp" <<EOF || { rm -f -- "$service_tmp"; die "could not write $service; the unit was left as it was"; }
 [Unit]
 Description=Publish fresh Study Notes checkout generations for LunarWing tenants
 After=network-online.target
@@ -297,7 +322,9 @@ Type=oneshot
 ExecStart=$entrypoint sync-knowledge-sources
 TimeoutStartSec=30min
 EOF
-  cat >"$timer" <<'EOF'
+  timer_tmp="$(mktemp "$timer.XXXXXX")" \
+    || { rm -f -- "$service_tmp"; die "cannot create a temporary file beside $timer"; }
+  cat >"$timer_tmp" <<'EOF' || { rm -f -- "$service_tmp" "$timer_tmp"; die "could not write $timer; the units were left as they were"; }
 [Unit]
 Description=Refresh LunarWing Study Notes source generations hourly
 
@@ -311,6 +338,11 @@ Unit=lunarwing-study-notes-sync.service
 [Install]
 WantedBy=timers.target
 EOF
+  if ! { chmod 0644 -- "$service_tmp" "$timer_tmp" \
+    && mv -f -- "$service_tmp" "$service" && mv -f -- "$timer_tmp" "$timer"; }; then
+    rm -f -- "$service_tmp" "$timer_tmp"
+    die "could not put the Study Notes source units in place under $unit_dir"
+  fi
   systemctl daemon-reload >/dev/null \
     || die "failed to reload systemd after installing Study Notes source timer"
   systemctl enable --now lunarwing-study-notes-sync.timer >/dev/null \
@@ -322,24 +354,43 @@ _install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
   local entrypoint="${1:-}"
   local command="" begin="# BEGIN lunarwing-study-notes-sync managed block"
   local end="# END lunarwing-study-notes-sync managed block" tmp
+  local listing kept="" line inside=0
   _require_knowledge_sync_entrypoint "$entrypoint"
   command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
   [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
   [[ -n "$command" ]] \
     || die "fcrontab/crontab not found; cannot schedule Study Notes source refresh"
-  tmp="$(mktemp)"
-  "$command" -l 2>/dev/null | sed "/^${begin}$/,/^${end}$/d" >"$tmp" || true
-  {
-    printf '%s\n' "$begin"
-    printf '17 * * * * %s sync-knowledge-sources\n' "$entrypoint"
-    printf '%s\n' "$end"
-  } >>"$tmp"
+  # The new table replaces root's whole crontab, so it is built whole first.
+  # The caller may run this with errexit ignored (WI#736): every step is
+  # checked, and a failure leaves the crontab as it was.
+  listing="$("$command" -l 2>/dev/null || true)"
+  if [[ -n "$listing" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$begin" ]]; then inside=1; continue; fi
+      if [[ "$line" == "$end" ]]; then inside=0; continue; fi
+      ((inside)) || kept+="$line"$'\n'
+    done <<<"$listing"
+  fi
+  # Dropping "everything after BEGIN" would take root's other jobs with it.
+  ((inside == 0)) \
+    || die "root's crontab has a '$begin' line without its END line; repair the block by hand, then schedule again"
+  tmp="$(mktemp)" || die "cannot create a temporary file for the Study Notes source schedule"
+  if ! {
+    printf '%s' "$kept" \
+      && printf '%s\n' "$begin" \
+      && printf '17 * * * * %s sync-knowledge-sources\n' "$entrypoint" \
+      && printf '%s\n' "$end"
+  } >"$tmp" || [[ "$(tail -n 1 -- "$tmp")" != "$end" ]]; then
+    rm -f -- "$tmp"
+    die "could not write the new Study Notes source schedule; root's crontab was left as it was"
+  fi
   if ! "$command" "$tmp"; then
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     die "failed to install Study Notes source schedule with $command"
   fi
-  rm -f "$tmp"
-  _ensure_cron_runlevel "$([[ "$command" == "fcrontab" ]] && echo fcron)"
+  rm -f -- "$tmp"
+  _ensure_cron_runlevel "$([[ "$command" == "fcrontab" ]] && echo fcron)" \
+    || die "the Study Notes source schedule is installed, but the cron service could not be enabled and started; the reason is printed above"
   say "Study Notes source refresh scheduled with $command (hourly at :17)"
 }
 
