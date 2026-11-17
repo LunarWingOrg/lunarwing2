@@ -25,7 +25,10 @@ cron_stub() {
       fail-silent) return 1 ;;
       fail-message) printf 'spool temporarily locked\n' >&2; return 1 ;;
       partial) head -n 1 -- "$TOOL_TABLE"; printf 'read interrupted\n' >&2; return 1 ;;
-      missing-fcron) printf '2026-11-17 06:10:00  INFO user root has no fcrontab.\n' >&2; return 0 ;;
+      missing-fcron)
+        printf "2026-11-17 06:10:00  INFO listing root\x27s fcrontab\n" >&2
+        printf '2026-11-17 06:10:00  INFO user root has no fcrontab.\n' >&2
+        return 0 ;;
       missing-cronie) printf 'no crontab for root\n' >&2; return 1 ;;
       missing-dcron) printf 'no crontab for root\n' >&2; return 0 ;;
       missing-busybox) printf "crontab: can't open 'root': No such file or directory\n" >&2; return 1 ;;
@@ -154,6 +157,10 @@ for check in \
   if _cron_listing_says_no_table "$message"; then actual=accept; else actual=refuse; fi
   assert "tool-signature $check behavior $expected (actual $actual)" test "$expected" = "$actual"
 done
+
+# The real fcron 3.3.1 output stamps both lines, as measured on 2026-11-17.
+fcron_real=$'2026-11-17 06:10:00  INFO listing root\x27s fcrontab\n2026-11-17 06:10:00  INFO user root has no fcrontab.'
+if _cron_listing_says_no_table "$fcron_real"; then pass 'real timestamped fcrontab output is a missing table'; else fail 'real timestamped fcrontab output is a missing table'; fi
 
 if (( failures != 0 )); then
   printf 'RESULT: %s failure(s)\n' "$failures"

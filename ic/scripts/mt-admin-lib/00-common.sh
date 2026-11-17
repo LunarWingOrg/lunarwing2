@@ -747,9 +747,14 @@ _cron_listing_says_no_table() {  # <stderr text>
   local err="$1" line kept="" body
   [[ -n "$err" ]] || return 1
   while IFS= read -r line; do
-    # fcron prefixes its log lines; only they are allowed beside the message.
-    [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ +INFO\  ]] && continue
-    [[ -n "$line" ]] && kept+="$line"$'\n'
+    [[ -n "$line" ]] || continue
+    # fcron stamps each of its log lines; strip the stamp so the message can
+    # be compared. Its ordinary "listing ..." line is not a message.
+    if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ +INFO\ +(.*)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+    fi
+    [[ "$line" == "listing root's fcrontab" ]] && continue
+    kept+="$line"$'\n'
   done <<<"$err"
   body="${kept%$'\n'}"
   # Exactly one line, and one of the measured messages: anything else — no
