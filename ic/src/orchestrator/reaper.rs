@@ -368,13 +368,23 @@ pub async fn sweep_cli_sandboxes_once(config: &ReaperConfig) {
 /// even `podman ps` from the hardened daemon can invalidate live pause state.
 /// On OpenRC the shared spawner retains its process-group fallback. Preserve
 /// the sweep deadline, stopping the whole service/tree on timeout or cancellation.
+fn runtime_cli_command(
+    spawner: &WorkloadSpawner,
+    bin: &str,
+    args: &[&str],
+) -> tokio::process::Command {
+    let mut cmd = spawner.command(bin, args);
+    crate::sandbox::cli_runner::apply_container_runtime_path(&mut cmd);
+    cmd
+}
+
 async fn runtime_cli_output(
     spawner: &WorkloadSpawner,
     bin: &str,
     args: &[&str],
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = spawner.command(bin, args);
+    let mut cmd = runtime_cli_command(spawner, bin, args);
     let spec = spawner.prepare_service(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -537,6 +547,26 @@ fn container_name(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    #[test]
+    fn runtime_cli_path_includes_sbin() {
+        let spawner = WorkloadSpawner::direct();
+        let cmd = runtime_cli_command(&spawner, "podman", &["ps"]);
+        let path = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "PATH" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("container runtime PATH");
+        for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
+            assert!(path.split(':').any(|part| part == directory));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
