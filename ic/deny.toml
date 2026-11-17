@@ -169,10 +169,11 @@ ignore = [
     # `unmaintained = "workspace"` reports, so neither notice can be left
     # unaccepted. Neither names a
     # vulnerability and both declare `patched = []` (all versions
-    # affected), so a version bump cannot clear them and no [bans] floor
-    # can narrow the acceptance — these are the first entries here that a
-    # floor cannot confine, and the ID-keyed ignore therefore also covers
-    # any future direct chrono/chrono-tz dependency in another lock root.
+    # affected), so a version bump cannot clear them. They are the first
+    # acceptances here for a registry crate with `patched = []`: a [bans]
+    # floor can only narrow a range that has a safe side, and there is
+    # none, so the ID-keyed ignore covers every version and also any
+    # future direct chrono/chrono-tz dependency in another lock root.
     # Clearing means migrating off chrono/chrono-tz to jiff or time (137
     # source files at acceptance time); that migration is a separate
     # dependency item, not part of WI#749.
