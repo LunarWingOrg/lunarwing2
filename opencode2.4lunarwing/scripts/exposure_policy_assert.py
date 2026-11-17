@@ -210,7 +210,7 @@ def check_managed_policy(lane: pathlib.Path) -> None:
              "for both the bare and the account-qualified resource (WI#665)")
         return
     check(f"{source} denies the {MANAGED_POLICY_INTEGRATION} integration and "
-          "allows the six upstream policy actions in the managed layer")
+          "allows the seven upstream policy actions in the managed layer")
 
 
 def _managed_directory_extras(
