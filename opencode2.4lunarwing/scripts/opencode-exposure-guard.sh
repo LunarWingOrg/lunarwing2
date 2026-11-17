@@ -44,7 +44,8 @@
 # one-token lookahead would be desynced by `auth --log-level DEBUG login
 # <url>`. Once `login` is seen, every remaining token is checked for an
 # http:/https: scheme (case-insensitively): the target is positional, so it
-# cannot hide behind a flag.
+# cannot hide behind a flag. The scan errs toward refusing: a `run` prompt
+# whose unquoted tokens happen to read `auth login <url>` is refused too.
 #
 # Everything else execs the real binary with its argv unchanged. Server-backed
 # commands can spawn that binary without passing through this wrapper;
