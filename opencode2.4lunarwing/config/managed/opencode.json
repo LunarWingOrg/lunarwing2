@@ -1,0 +1,13 @@
+{
+  "policies": [
+    { "action": "integration.use", "resource": "*", "effect": "allow" },
+    { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
+    { "action": "integration.connect", "resource": "*", "effect": "allow" },
+    { "action": "provider.use", "resource": "*", "effect": "allow" },
+    { "action": "tool.use", "resource": "*", "effect": "allow" },
+    { "action": "mcp.use", "resource": "*", "effect": "allow" },
+    { "action": "skill.use", "resource": "*", "effect": "allow" },
+    { "action": "websearch.use", "resource": "*", "effect": "allow" },
+    { "action": "plugin.use", "resource": "*", "effect": "allow" }
+  ]
+}

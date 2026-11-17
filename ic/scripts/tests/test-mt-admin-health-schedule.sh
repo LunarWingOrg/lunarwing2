@@ -46,7 +46,7 @@ CRONTAB_INSTALLS="$fixture/crontab.installs"
 
 fcrontab() {
   if [[ "${1:-}" == "-l" ]]; then
-    [[ -e "$CRONTAB_STATE" ]] || return 1
+    [[ -e "$CRONTAB_STATE" ]] || { printf 'user root has no fcrontab.\n' >&2; return 0; }
     command cat -- "$CRONTAB_STATE"
     [[ -z "${FCRONTAB_PARTIAL_READ:-}" ]] || return 1
     return 0
@@ -64,7 +64,7 @@ fcrontab() {
 PLAIN_CRONTAB_STATE="$fixture/plain-crontab"
 crontab() {
   if [[ "${1:-}" == "-l" ]]; then
-    [[ -e "$PLAIN_CRONTAB_STATE" ]] || return 1
+    [[ -e "$PLAIN_CRONTAB_STATE" ]] || { printf 'no crontab for root\n' >&2; return 1; }
     command cat -- "$PLAIN_CRONTAB_STATE"
     return 0
   fi

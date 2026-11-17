@@ -50,6 +50,10 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 
 ## Component operations
 
+- [PostgreSQL version inventory](POSTGRESQL-VERSION-INVENTORY.md) — which
+  version each surface uses, the 15 daemon floor versus the 16.16 tenant
+  security floor, and the per-host check commands. Security background:
+  [2026-11-12 CVE audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md).
 - [Nanocode removal and migration](NANOCODE-REMOVAL.md)
 - [Predelegated subtree cgroups](PREDELEGATED_SUBTREE_CGROUPS.md)
 

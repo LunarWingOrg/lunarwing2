@@ -572,7 +572,8 @@ printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
 chmod 755 "$fixture/real-opencode"
 opencode2_rootfs="$fixture/opencode2-rootfs"
 mkdir -p "$opencode2_rootfs/app/node_modules" "$opencode2_rootfs/usr/bin" \
-  "$opencode2_rootfs/usr/local/bin" "$opencode2_rootfs/usr/local/lib/opencode2"
+  "$opencode2_rootfs/usr/local/bin" "$opencode2_rootfs/usr/local/lib/opencode2" \
+  "$opencode2_rootfs/etc/opencode"
 cp -a "$repo/opencode2.4lunarwing/scripts" "$opencode2_rootfs/app/scripts"
 cp -a "$repo/opencode2.4lunarwing/config" "$opencode2_rootfs/app/config"
 cp -a "$repo/opencode2.4lunarwing/entrypoint.sh" \
@@ -583,12 +584,17 @@ cp -a "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" \
   "$opencode2_rootfs/usr/local/bin/opencode"
 cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/local/lib/opencode2/opencode"
 cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/bin/tini"
+# WI#665: the image installs the managed Console policy root:root 0444 and the
+# out-of-band verifier requires it; the fake export below sets the owner.
+cp "$repo/opencode2.4lunarwing/config/managed/opencode.json" \
+  "$opencode2_rootfs/etc/opencode/opencode.json"
 find "$opencode2_rootfs" -type d -exec chmod 755 {} +
 find "$opencode2_rootfs" -type f -exec chmod 644 {} +
 chmod 755 "$opencode2_rootfs/app/entrypoint.sh" \
   "$opencode2_rootfs/usr/local/bin/opencode" \
   "$opencode2_rootfs/usr/local/lib/opencode2/opencode" \
   "$opencode2_rootfs/usr/bin/tini"
+chmod 444 "$opencode2_rootfs/etc/opencode/opencode.json"
 printf 'fixture\n' >"$repo/README"
 git_fx=(git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false)
 "${git_fx[@]}" init -q

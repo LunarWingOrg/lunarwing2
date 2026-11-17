@@ -157,6 +157,30 @@ ignore = [
     # 0.6.2 dev-dep edge, which removes atty from the lock; the JH-2
     # review extends WI#367's summary and acceptance criteria to atty).
     { id = "RUSTSEC-2021-0145", reason = "atty 0.2.14 unsound (Windows-only unaligned read, no patched release); dev-graph only via vendored libsignal-protocol dev-dep env_logger 0.6.2; production-graph absence enforced by check-lockfile-only-advisories.sh no-dev; [bans] restricts atty to env_logger and env_logger <0.10.0 to libsignal-protocol; clearing owner WI#367" },
+
+    # chrono and chrono-tz — unmaintained (informational, no vulnerability).
+    # WI#749 (2026-11-17): RustSec assigned RUSTSEC-2026-0543 (chrono
+    # 0.4.45) and RUSTSEC-2026-0555 (chrono-tz 0.10.4) by advisory-db
+    # backfill (database commit 233155b4) against the upstream announcement
+    # in chronotope/chrono issue 1768; no dependency changed, so a tree
+    # green for weeks started failing both advisories gates at once. Both
+    # crates are direct dependencies of the ic workspace (ic/Cargo.toml and
+    # the two crate manifests under ic/crates), which is the scope
+    # `unmaintained = "workspace"` reports, so neither notice can be left
+    # unaccepted. Neither names a
+    # vulnerability and both declare `patched = []` (all versions
+    # affected), so a version bump cannot clear them. failure, rental and
+    # atty above also have `patched = []`, but they come only through the
+    # vendored libsignal-protocol path dependency, and [bans] keeps atty to
+    # that chain. chrono and chrono-tz are direct dependencies of three
+    # manifests, so nothing narrows these two: the ID-keyed ignores cover
+    # every version and also any future direct chrono/chrono-tz dependency
+    # in another lock root. No migration off chrono/chrono-tz is planned
+    # (the maintainer's decision of 2026-11-17); the acceptance stands until
+    # one is decided. Clearing would mean moving to jiff or time (137 source
+    # files at acceptance time).
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (informational, no vulnerability, patched = [] so no bump or floor clears it); direct dependency of ic, lunarwing_engine and lunarwing_skills, compiled into every feature set; no migration off chrono is planned (maintainer decision 2026-11-17), clearing would require moving to jiff or time; accepted 2026-11-17 against advisory-db 233155b4; clearing owner WI#749" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz 0.10.4 unmaintained (informational, no vulnerability, patched = []); direct dependency of ic and lunarwing_engine, compiled into every feature set; no migration planned, as for RUSTSEC-2026-0543; accepted 2026-11-17 against advisory-db 233155b4; clearing owner WI#749" },
 ]
 
 [licenses]

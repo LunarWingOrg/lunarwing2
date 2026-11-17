@@ -559,6 +559,20 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90  # 1-600 seconds
 # SANDBOX_TUNNEL_DNS stays unset; use NetBird nameserver groups instead.
 ```
 
+**Upgrade note for a NetBird tenant already on `SANDBOX_NETWORK=tunnel`.**
+Before 2.2.0.0, which moved NetBird sandboxes to NetBird's managed resolver,
+such a tenant's sandbox resolved public names through the runtime resolver its
+uplink still allowed. That allowance is gone: the firewall now accepts port 53
+only to NetBird's `wt0` listener. At the tenant's first start after the
+upgrade, a sandbox without a NetBird **primary** nameserver group resolves no
+public names — `example.com`, package mirrors, and every other public name
+fail. It still resolves peer names, and with a match-domain group the names
+under that group's domains. Before upgrading, create a primary nameserver group
+whose upstream is reachable through the overlay to keep public names, or accept
+that the tenant resolves only peer and match-domain names. Nothing else in the
+tenant configuration changes: `upgrade-tenant` preserves the existing
+`SANDBOX_NETWORK` value verbatim.
+
 WireGuard can instead use overlay resolvers for joined runs and an optional
 WireGuard-only canary:
 

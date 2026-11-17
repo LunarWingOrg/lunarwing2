@@ -499,7 +499,9 @@ for failing in mktemp printf; do
         mktemp() { return 1; }
       else
         printf() {
-          [[ "$1" != '17 * * * * %s sync-knowledge-sources\n' ]] || return 1
+          [[ "$1" != "%s\n" || "$2" != "17 * * * * /safe/staged/mt-admin.sh sync-knowledge-sources" ]] || return 1
+          [[ "$1" != "%s\n" || "$2" != '17 * * * * %s sync-knowledge-sources' ]] || return 1
+          [[ "$2" != *" sync-knowledge-sources" ]] || return 1
           builtin printf "$@"
         }
       fi
