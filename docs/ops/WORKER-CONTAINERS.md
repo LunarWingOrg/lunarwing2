@@ -2776,8 +2776,24 @@ web-search provider IDs are unchanged. The wildcard control must remove all
 web search; each control must remove the lane provider, or the result is
 inconclusive. Runs 2 and 5 still verify both Console resource forms. The
 tool run now seeds an ordinary permission deny as well as an ask; neither
-may be lifted. Built-image results for the corrected submitted head belong
-in the MR acceptance table, not in the historical seven-run result above.
+may be lifted. The historical seven-run result above is not evidence for the
+nine-statement policy.
+
+**Built-image result for the merged head (recorded on !2512, not re-run for
+this record).** The candidate image was built at `686973e0a` (image ID
+`968f675c81d8c961d5943f58e2822fa94e470db70ce6853d9079b2266c0a8a84`); its
+in-image ownership, mode, content and one-file-directory assertions passed,
+and all eleven evaluation runs exited 0 under `--network=none`. Runs 8/9
+(Console `integration.use` deny `*`) and 10/11 (deny `tensorzero*`) each had
+a control that removed the lane provider — the wildcard control also removed
+every web-search provider — while the guarded run kept `tensorzero` listed,
+kept the web-search provider IDs (`exa, firecrawl, parallel, tavily,
+tinyfish`) unchanged, and received no Console skill, provider or MCP server.
+Run 7 kept the Console's `provider.use`/`tool.use` statements neutralized,
+with an ordinary permission deny still `deny` and an unsaved `ask` still
+`ask`. The guarded runs still issued the three Console `GET` requests
+(below). The image was not rebuilt at the target's merge commit `63c18eeef`.
+
 The other actions go through the same `ManagedPolicy.decision` path. A Console `allow` grants nothing by itself;
 the managed allows are what make the Console's statements ineffective. The
 harness fails when any part of this behaviour regresses.
