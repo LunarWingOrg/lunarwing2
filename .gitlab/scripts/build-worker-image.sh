@@ -82,6 +82,7 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # tool-proxy relay/plugin/bridge sources plus every bun suite the
         # Dockerfile self-test chain executes (KL-13).
         input_files='opencode2.4lunarwing/Dockerfile
+opencode2.4lunarwing/config/managed/opencode.json
 opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts

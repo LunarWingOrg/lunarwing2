@@ -239,6 +239,13 @@ class TarFixture:
                 else:
                     self.add_file(name, path.read_bytes(), mode=0o444)
         self.add_file("usr/local/bin/opencode", WRAPPER.read_bytes(), mode=0o755)
+        # WI#665: the image installs the managed Console policy here.
+        self.add_dir("etc/opencode")
+        self.add_file(
+            "etc/opencode/opencode.json",
+            (lane / "config" / "managed" / "opencode.json").read_bytes(),
+            mode=0o444,
+        )
         self.add_file(
             "usr/local/lib/opencode2/opencode", b"\x7fELF clean pinned build", mode=0o755,
         )
@@ -343,6 +350,49 @@ class FilesystemExportTests(unittest.TestCase):
         self.fixture.add_file("usr/local/bin/opencode", b"#!/bin/sh\n# tampered\n", mode=0o755)
         self.fixture.write(self.archive)
         self.assert_refused("out-of-band filesystem verification FAILED")
+
+    def test_tampered_managed_policy_is_refused(self):
+        # WI#665: the deny only holds while the *installed* file is the
+        # reviewed one, so an archive carrying a different policy is refused.
+        self.fixture.add_file(
+            "etc/opencode/opencode.json",
+            b'{"policies":[{"action":"integration.use","resource":"*","effect":"allow"}]}',
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("differs from config/managed/opencode.json")
+
+    def test_writable_managed_policy_is_refused(self):
+        self.fixture.add_file(
+            "etc/opencode/opencode.json",
+            (self.lane / "config" / "managed" / "opencode.json").read_bytes(),
+            mode=0o644,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("must be read-only")
+
+    def test_second_managed_document_is_refused(self):
+        # WI#665 (review AEP-3): upstream also loads `opencode.jsonc` from the
+        # managed directory, above `opencode.json`, so a sibling that allows
+        # the integration lifts the reviewed deny while that file is intact.
+        self.fixture.add_file(
+            "etc/opencode/opencode.jsonc",
+            b'{"policies":[{"action":"integration.use","resource":"opencode*","effect":"allow"}]}',
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected managed-config entry etc/opencode/opencode.jsonc")
+
+    def test_managed_directory_subdirectory_is_refused(self):
+        # The managed directory is scanned as config too: a skill there would
+        # be a managed skill that no check has read.
+        self.fixture.add_file(
+            "etc/opencode/skill/x/SKILL.md",
+            b"---\nname: x\ndescription: x\n---\nbody\n",
+            mode=0o444,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected managed-config entry etc/opencode/skill")
 
     def test_tampered_checkout_owned_entrypoint_is_refused(self):
         path = self.lane / "entrypoint.sh"

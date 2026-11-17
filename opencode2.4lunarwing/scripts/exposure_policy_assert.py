@@ -47,6 +47,16 @@ Assertions (opencode2 lane):
      --image-env-file from the actual image config. Host ownership and the CI
      job's own environment are never treated as image facts; the CI driver
      separately pins the complete runtime config, including PATH order.
+  8. WI#665: config/managed/opencode.json carries the single
+     `integration.use` deny that withholds the OpenCode Console Library, and
+     nothing else (a managed document outranks every other config layer, so
+     any other key there would shadow the lane's own); its resource pattern
+     covers both forms upstream builds (the bare integration ID for an
+     environment credential and `<integration>#<account>` for a saved login);
+     the installed /etc/opencode/opencode.json is root-owned, read-only,
+     under non-writable parents, and byte-identical to the checkout's copy;
+     and it is the only entry of /etc/opencode (upstream also loads a sibling
+     `opencode.jsonc` from the managed directory, above `opencode.json`).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1 has no service mode or
@@ -94,6 +104,189 @@ WRAPPER_CODE_DIGEST = "cc551f2668957ba4c1354b79dd3723b7f3b8b97246f9f18ac7ca78481
 # its last two lines mean. The wrapper needs none of them. Dot-sourcing is
 # refused wherever it appears, not only at a line start.
 WRAPPER_FORBIDDEN_RE = re.compile(r"\b(alias|eval|source)\b|<<|(^|[;&|\s])\.\s")
+
+# WI#665: the managed Console policy. opencode loads /etc/opencode as MANAGED
+# settings above every project, global and explicit document, and evaluates a
+# managed document's `policies` first, so this deny also holds when the real
+# binary is started without the wrapper. `resource: "opencode*"` covers both
+# forms upstream builds for `integration.use`: the bare integration ID for an
+# environment credential (no stored account) and `<integration>#<account>` for
+# a saved Console login. Upstream's bare-ID pattern would match the first only.
+MANAGED_POLICY_INSTALLED = pathlib.Path("/etc/opencode/opencode.json")
+MANAGED_POLICY_SOURCE = pathlib.Path("config/managed") / "opencode.json"
+MANAGED_POLICY_INTEGRATION = "opencode"
+MANAGED_POLICY_RESOURCE = "opencode*"
+# A managed config document outranks every other layer for ordinary settings,
+# so the shipped file may carry `policies` and nothing else: an `experimental`
+# or `model` key there would shadow the lane's own values.
+MANAGED_POLICY_ONLY_KEYS = frozenset({"policies"})
+
+
+def _managed_policy_covers(pattern: str) -> bool:
+    """True when `pattern` denies both `integration.use` resource forms.
+
+    Mirrors upstream's matcher (packages/core/src/util/wildcard.ts): `*` and
+    `?` are the only metacharacters, everything else is literal, and the whole
+    resource must match. Kept in the checker so the assertion tests what
+    upstream will actually match, not the string we happen to ship.
+    """
+    def matches(resource: str) -> bool:
+        escaped = re.sub(r"([.+^${}()|\[\]\\])", r"\\\1", pattern)
+        escaped = escaped.replace("*", ".*").replace("?", ".")
+        # Upstream's own special case: a pattern ending in " .*" also matches
+        # without the trailing group.
+        if escaped.endswith(" .*"):
+            escaped = escaped[: -len(" .*")] + "( .*)?"
+        return re.fullmatch(escaped, resource, re.DOTALL) is not None
+
+    return matches(MANAGED_POLICY_INTEGRATION) and matches(f"{MANAGED_POLICY_INTEGRATION}#org_01")
+
+
+def check_managed_policy(lane: pathlib.Path) -> None:
+    """WI#665: the shipped managed policy denies the `opencode` integration."""
+    source = lane / MANAGED_POLICY_SOURCE
+    try:
+        document = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"{source} does not parse: {error}")
+        return
+    if not isinstance(document, dict):
+        fail(f"{source} must contain a JSON object (got {type(document).__name__})")
+        return
+    extra = sorted(set(document) - MANAGED_POLICY_ONLY_KEYS)
+    if extra:
+        fail(f"{source} must carry only {sorted(MANAGED_POLICY_ONLY_KEYS)} — a managed "
+             f"document outranks every other config layer, so {extra} there would shadow "
+             "the lane's own settings (WI#665)")
+        return
+    statements = document.get("policies")
+    if not isinstance(statements, list) or not statements:
+        fail(f"{source} must carry a non-empty \"policies\" array (WI#665)")
+        return
+    denying = [
+        statement.get("resource")
+        for statement in statements
+        if isinstance(statement, dict)
+        and statement.get("action") == "integration.use"
+        and statement.get("effect") == "deny"
+        and isinstance(statement.get("resource"), str)
+    ]
+    covering = [resource for resource in denying if _managed_policy_covers(resource)]
+    if not covering:
+        fail(f"{source} must deny integration.use for {MANAGED_POLICY_RESOURCE!r} — "
+             f"every Console Library surface arrives through that integration (WI#665); "
+             f"got resources {denying}")
+    else:
+        check(f"{source} denies the {MANAGED_POLICY_INTEGRATION} integration "
+              "for both the bare and the account-qualified resource")
+
+
+def _managed_directory_extras(
+    policy_path: pathlib.Path,
+    image_root: pathlib.Path | None,
+    records: dict[str, dict[str, int]] | None,
+) -> list[str]:
+    """Every entry of the managed directory other than the reviewed file.
+
+    In-image this lists the directory. Out of band it reads the tar-header
+    records, because the verifier materializes only the files it compares:
+    names are relative to the directory and cover every depth.
+    """
+    directory = policy_path.parent
+    if records is None:
+        names = os.listdir(directory)
+    else:
+        if image_root is None:
+            raise OSError("tar-header metadata requires an image root")
+        try:
+            relative = pathlib.Path(os.path.abspath(directory)).relative_to(
+                pathlib.Path(os.path.abspath(image_root))
+            )
+        except ValueError as error:
+            raise OSError(f"path {directory} escapes image root {image_root}") from error
+        prefix = f"{relative.as_posix()}/"
+        names = [name[len(prefix):] for name in records if name.startswith(prefix)]
+    return sorted(name for name in names if name != policy_path.name)
+
+
+def check_installed_managed_policy(
+    lane: pathlib.Path,
+    policy_path: pathlib.Path = MANAGED_POLICY_INSTALLED,
+    *,
+    owner_uid: int = 0,
+    parent_root: pathlib.Path | None = None,
+    image_root: pathlib.Path | None = None,
+    image_metadata: dict[str, dict[str, int]] | None = None,
+) -> None:
+    """WI#665: the installed policy is root-owned, read-only, unchanged, alone.
+
+    The build copies the checkout's file here, so an installed copy that no
+    longer matches it, one the task user could rewrite, or a second managed
+    document beside it would silently lift the deny. Checked in-image and
+    from a tar export, like the wrapper.
+    """
+    try:
+        metadata = _path_metadata(policy_path, image_root, image_metadata)
+    except OSError as error:
+        fail(f"managed policy {policy_path} is missing or unreadable: {error} (WI#665)")
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"managed policy {policy_path} must be a regular file, not a symlink "
+             "or special file (WI#665)")
+        return
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid != owner_uid:
+        fail(f"managed policy {policy_path} must be owned by uid {owner_uid} "
+             f"(got uid {metadata.st_uid}) (WI#665)")
+        return
+    if mode & 0o222:
+        fail(f"managed policy {policy_path} must be read-only (mode {mode:o}) — "
+             "the task user must not be able to lift the Console deny (WI#665)")
+        return
+    _check_parent_directories(
+        "managed policy",
+        policy_path,
+        owner_uid=owner_uid,
+        parent_root=parent_root,
+        image_root=image_root,
+        image_metadata=image_metadata,
+    )
+    # Upstream reads two names from the managed directory, `opencode.json` and
+    # `opencode.jsonc` (packages/core/src/config/discovery.ts:12 and
+    # config.ts:270-277 at the v2.2.7 pin), and the second one's policies
+    # outrank the first's (config.ts:313-325), so a sibling document can lift
+    # the reviewed deny while the reviewed file is untouched. The directory
+    # is also a config directory entry (config.ts:275), the kind upstream
+    # scans for skills and plugins. It must therefore hold the one reviewed
+    # file and nothing else.
+    try:
+        extras = _managed_directory_extras(policy_path, image_root, image_metadata)
+    except OSError as error:
+        fail(f"managed directory {policy_path.parent} cannot be listed: {error} (WI#665)")
+        return
+    if extras:
+        fail(f"managed directory {policy_path.parent} must hold only "
+             f"{policy_path.name} (also found {extras}) — everything there is "
+             "managed config, and a sibling opencode.jsonc outranks the reviewed "
+             "deny (WI#665)")
+    else:
+        check(f"managed directory {policy_path.parent} holds only {policy_path.name}")
+    try:
+        installed = policy_path.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"managed policy {policy_path} is missing or unreadable: {error} (WI#665)")
+        return
+    try:
+        expected = (lane / MANAGED_POLICY_SOURCE).read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"managed policy source is unreadable: {error} (WI#665)")
+        return
+    if installed != expected:
+        fail(f"managed policy {policy_path} differs from {MANAGED_POLICY_SOURCE} — "
+             "the installed deny is not the reviewed one (WI#665)")
+    else:
+        check(f"installed managed policy {policy_path} is root-owned, read-only "
+              "and matches the checkout")
 
 failures: list[str] = []
 
@@ -766,6 +959,7 @@ def main() -> int:
     check_entrypoint(lane, is_v2)
     if is_v2:
         check_wrapper(lane)
+        check_managed_policy(lane)
     if args.binary is not None:
         check_binary(args.binary)
     if args.image_filesystem:
@@ -773,6 +967,18 @@ def main() -> int:
             lane, image_root=args.image_root, image_metadata=image_metadata
         )
         if is_v2:
+            installed_policy = (
+                args.image_root / "etc/opencode/opencode.json"
+                if args.image_root is not None
+                else MANAGED_POLICY_INSTALLED
+            )
+            check_installed_managed_policy(
+                lane,
+                installed_policy,
+                parent_root=args.image_root,
+                image_root=args.image_root,
+                image_metadata=image_metadata,
+            )
             if args.image_root is not None:
                 check_installed_wrapper(
                     lane,

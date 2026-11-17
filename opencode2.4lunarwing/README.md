@@ -104,19 +104,64 @@ instructions and skills when it has both a Console credential and egress to
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
-spellings are accepted). With a usable credential and allowed egress, this
-opt-in enables the Library surface too: no shipped setting separately withholds
-Console-authored instructions or skills. Startup messages name the variable but
-never print its value.
+spellings are accepted). Acknowledging the credential does not make Console
+instructions, skills, providers or MCP servers reach the session: the managed
+policy below withholds them either way. The Console's own policies still apply
+(see below). Startup messages name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
-session; they bypass this gate and may survive container restarts. The tenant
-egress allowlist remains the boundary against a compromised worker. WI#665's
-root-owned managed-policy evaluation and image enforcement are still pending;
-this change does not claim that Console content is blocked after opt-in or login.
+session; they bypass this gate and may survive container restarts. The managed
+Console deny below is the control that covers them.
+
+## Managed Console policy (WI#665)
+
+The image ships a root-owned, read-only managed policy at
+`/etc/opencode/opencode.json` (source: `config/managed/opencode.json`):
+
+```json
+{ "policies": [ { "action": "integration.use", "resource": "opencode*", "effect": "deny" } ] }
+```
+
+opencode loads `/etc/opencode` as managed settings above every project, global
+and explicit document, and evaluates a managed document's policies first. The
+deny therefore holds for a saved Console login, for a workspace `opencode.json`
+that allows the integration, and for the real binary started without the
+wrapper. It withholds Console instructions and skills, and the Console config
+document's providers, remote MCP servers and web-search selection.
+
+It does **not** withhold the Console document's own `policies`. Upstream keeps
+a policies-only copy of a denied integration's document
+(`packages/core/src/config.ts:343-349` at the pin; the comment at `:233-235`
+says why: "denying an integration never lifts the restrictions it carries"),
+and those policies rank right after the managed ones and above the lane's own
+config. Policy enforcement only removes or denies
+(`packages/core/src/config/plugin/policy.ts:56-113`), so with a Console
+credential and egress the Console can still switch off a provider of the
+worker (measured) and, read from the same code, a tool, MCP server, skill or
+web-search provider, and a plugin (`packages/core/src/plugin/module.ts:53`);
+it cannot instruct the worker or add anything to it. This is a known residual
+(review finding AEP-2 on !2502): neutralizing Console policies would be a
+design change and was left out of WI#665. The evaluation asserts the
+behaviour as it is, so a bump that changes it is noticed.
+
+What it does **not** do is stop the requests. On a built image at the pin,
+with a saved Console credential, the plugin still fetches
+`/api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`; the deny is
+applied to what comes back. The tenant egress allowlist remains the only
+control on outbound traffic. The evaluation that established this, and how to
+repeat it, is in `docs/ops/WORKER-CONTAINERS.md` and
+`scripts/console_policy_eval.py`.
+
+Managed settings outrank every other layer for ordinary settings too, so the
+file carries `policies` and nothing else — an `experimental` or `model` key
+there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
+enforces that, the exact resource pattern, the installed copy's owner and
+mode, and that `/etc/opencode` holds nothing but that file: upstream also
+loads a sibling `opencode.jsonc` from the managed directory, above
+`opencode.json`.
 See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
-for the conditions and remaining work.
+for the conditions and the evaluation log.
 
 ## Do not configure both lanes on one tenant during the transition
 
