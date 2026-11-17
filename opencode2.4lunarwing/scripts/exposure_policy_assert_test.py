@@ -494,6 +494,25 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("every argv token", result.stderr)
 
+    def test_wrapper_without_the_auth_login_refusal_fails(self) -> None:
+        # WI#750: the shape check must name the refusal, not only carry it
+        # inside the digest — a rewrite that drops the state machine or the
+        # http(s) test has to be reported as missing guard shape.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        for removed, what in (
+            ("    auth) want_login=1 ;;\n", "track the 'auth' subcommand"),
+            ("      login) in_login=1; want_login=0 ;;\n", "track 'auth login'"),
+            ('    is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
+            ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme"),
+        ):
+            with self.subTest(what=what):
+                wrapper.write_text(text.replace(removed, "", 1), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(what, result.stderr)
+        wrapper.write_text(text, encoding="utf-8")
+
     def test_non_loopback_default_fails(self) -> None:
         entrypoint = self.lane / "entrypoint.sh"
         entrypoint.write_text(
@@ -717,6 +736,42 @@ class ExposureGuardWrapperTests(unittest.TestCase):
                 result = self.run_wrapper(*form)
                 self.assertEqual(result.returncode, 77, (form, result.stderr))
                 self.assertIn("self-upgrade", result.stderr)
+
+    def test_auth_login_with_a_remote_target_refused(self) -> None:
+        # WI#750: `auth login <http(s) url>` registers a well-known
+        # remote-config origin in the worker's own state (upstream
+        # WellKnown.add), whose document outranks the user/project layers and
+        # whose integration.use resource (the origin URL) the managed
+        # `opencode*` deny does not match. Refuse it wherever the tokens sit
+        # among global flags, case-insensitively.
+        for form in (
+            ("auth", "login", "https://example.invalid"),
+            ("auth", "login", "http://example.invalid"),
+            ("auth", "login", "https://example.invalid", "--method", "key", "--answer", "key=x"),
+            ("--log-level=DEBUG", "auth", "login", "http://example.invalid"),
+            ("--print-logs", "auth", "login", "https://example.invalid"),
+            ("auth", "--print-logs", "login", "https://example.invalid"),
+            ("auth", "login", "HTTP://example.invalid"),
+            ("auth", "login", "http:example.invalid"),
+        ):
+            with self.subTest(form=form):
+                result = self.run_wrapper(*form)
+                self.assertEqual(result.returncode, 77, (form, result.stderr))
+                self.assertIn("refused 'opencode auth login", result.stderr)
+                self.assertIn("well-known remote-config origins", result.stderr)
+
+    def test_auth_without_a_remote_target_passes_through(self) -> None:
+        # WI#750 acceptance: the rest of `auth` still reaches the real binary.
+        for form in (
+            ("auth", "list"),
+            ("auth", "logout"),
+            ("auth", "login", "my-integration"),
+            ("--log-level=DEBUG", "auth", "login", "provider-name"),
+        ):
+            with self.subTest(form=form):
+                result = self.run_wrapper(*form)
+                self.assertEqual(result.returncode, 0, (form, result.stderr))
+                self.assertEqual(result.stdout.strip(), " ".join(form))
 
     def test_leading_global_flag_bypass_forms_refused(self) -> None:
         # run-79 EI-2 / run-84 EU-2: the v2 CLI takes global/root flags before
