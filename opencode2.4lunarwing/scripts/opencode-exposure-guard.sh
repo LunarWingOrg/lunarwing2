@@ -26,6 +26,22 @@
 #   opencode ... --hostname <non-loopback>
 #                             the worker's server must stay on loopback
 #                             (every --hostname occurrence is checked)
+#   opencode auth login <http(s) target>
+#                             registers a "well-known" remote-config origin
+#                             in the worker's own state (WI#750, upstream
+#                             WellKnown.add). Its config document outranks
+#                             the user and project layers, and its
+#                             integration.use resource is the origin URL,
+#                             which the managed `opencode*` deny does not
+#                             match. Only an http:/https: target registers
+#                             an origin, so `auth list`, `auth logout` and
+#                             `auth login <integration-id|name>` still pass.
+#
+# `auth` and `login` may be separated by flags, so the scan keeps two
+# one-token states. Once `login` is seen, every remaining token is checked
+# for an http:/https: scheme (case-insensitively): the target is positional,
+# so it cannot hide behind a flag, and the refusal does not depend on it
+# being the token immediately after `login`.
 #
 # Everything else execs the real binary with its argv unchanged. Server-backed
 # commands can spawn that binary without passing through this wrapper;
@@ -78,11 +94,32 @@ is_loopback() {
   esac
 }
 
+is_http_url() {
+  case "$1" in
+    [Hh][Tt][Tt][Pp]:* | [Hh][Tt][Tt][Pp][Ss]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 want_host=0
+want_login=0
+in_login=0
 for arg in "$@"; do
   if [ "$want_host" = 1 ]; then
     want_host=0
     is_loopback "$arg" || refuse "--hostname $arg" "the worker's opencode server must bind loopback only"
+    continue
+  fi
+  if [ "$want_login" = 1 ]; then
+    case "$arg" in
+      login) in_login=1; want_login=0 ;;
+      -*) ;;
+      *) want_login=0 ;;
+    esac
+    continue
+  fi
+  if [ "$in_login" = 1 ]; then
+    is_http_url "$arg" && refuse "auth login $arg" "well-known remote-config origins are disabled in LunarWing worker images"
     continue
   fi
   case "$arg" in
@@ -92,6 +129,7 @@ for arg in "$@"; do
     --service | --service=*) refuse "serve --service" "explicit service commands are disabled by the worker wrapper" ;;
     --hostname) want_host=1 ;;
     --hostname=*) is_loopback "${arg#--hostname=}" || refuse "--hostname ${arg#--hostname=}" "the worker's opencode server must bind loopback only" ;;
+    auth) want_login=1 ;;
   esac
 done
 [ "$want_host" = 0 ] || refuse "--hostname" "missing value — the worker's opencode server must bind loopback only"
