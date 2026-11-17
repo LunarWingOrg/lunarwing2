@@ -555,7 +555,13 @@ mod tests {
         let path = cmd
             .as_std()
             .get_envs()
-            .find_map(|(key, value)| (key == "PATH").then(|| value?.to_string_lossy().into_owned()))
+            .find_map(|(key, value)| {
+                if key == "PATH" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
             .expect("container runtime PATH");
         for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
             assert!(path.split(':').any(|part| part == directory));
