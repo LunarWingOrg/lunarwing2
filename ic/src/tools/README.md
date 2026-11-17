@@ -59,6 +59,20 @@ a settled `"process-group"` fallback, `"process-group-retrying"` between and
 during transient retries, `"probing"` during the first probe, or `"unprobed"`
 before the first workload. Reading status neither starts nor waits for a probe.
 
+### Container runtime PATH (WI#663)
+
+Service-mode workloads receive only the variables their caller set; every other
+variable of the user manager is unset, including its `PATH`. `PATH` is where
+rootless Podman finds its helpers, and sbin is where Gentoo installs `pasta`,
+so a run unit without those directories fails every command with "could not
+find pasta, the network namespace can't be configured". `sandbox::runtime_path`
+owns that single policy: it restores `/usr/local/sbin`, `/usr/sbin`, and `/sbin`
+ahead of the daemon's `PATH` and is applied to every site that resolves the
+runtime — the `which` lookup that selects it, the podman version and docker
+rootless probes, the sandbox runner's run/status/output/detached spawns, and the
+reaper's sweep. A runtime installed only under sbin is therefore selectable as
+well as executable.
+
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
 The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through capabilities files.
