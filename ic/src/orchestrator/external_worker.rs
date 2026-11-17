@@ -1721,13 +1721,17 @@ impl ExternalTaskStatus {
     /// Map a worker-reported `task_result` status onto the daemon's outcome
     /// vocabulary.
     ///
-    /// Wire values are `"success"`, `"failed"`, `"cancelled"` and
-    /// `"timed_out"`. `"error"` is accepted as an alias for `"failed"`: the
-    /// daemon's own `tool_result` replies use `"success" | "error" | "denied"`
-    /// (see `tool_result_envelope`), and worker lanes emit `"error"` for
-    /// honest failures (WI#751). Tolerating the alias keeps older workers
-    /// interoperable instead of logging an "unrecognized status" warning
-    /// that hides the worker's real error.
+    /// The wire values are `"success"`, `"error"`, `"cancelled"` and
+    /// `"timed_out"`: every worker lane sends `"error"` for an honest failure,
+    /// and each lane's `agent_comm_protocol.json` lists those four. `"error"`
+    /// is also the failure term the daemon's own `tool_result` replies use
+    /// (see `tool_result_envelope`).
+    ///
+    /// `"failed"` is accepted as well. It is the word the daemon stores and
+    /// reports a failed result under — `Display for ExternalTaskStatus` writes
+    /// `"failed"` and serde serialises the enum in lower case — so it is the
+    /// daemon's own outcome vocabulary, not an older worker's word. Both
+    /// values map to `Failed`.
     ///
     /// Any other value is logged and treated as `Failed` (WI#543).
     fn from_worker_status(status: &str, job_id: Uuid, worker_name: &str) -> Self {
@@ -1735,7 +1739,8 @@ impl ExternalTaskStatus {
             "success" => Self::Success,
             // WI#751: `"error"` is a first-class failure term in the daemon's
             // own tool-result protocol and what worker lanes report for
-            // honest failures — a recognized failure, not an unknown value.
+            // honest failures; `"failed"` is the word the daemon itself
+            // stores and reports. Both are recognized.
             "failed" | "error" => Self::Failed,
             "cancelled" => Self::Cancelled,
             "timed_out" => Self::TimedOut,
@@ -3909,9 +3914,11 @@ fn preview(value: &str, max_chars: usize) -> String {
 
 /// Build the daemon → worker reply for a `tool_call`. `status` is
 /// "success" | "error" | "denied" — a denied call is a hard reject, never a
-/// silent empty result. This is the tool-result vocabulary; on the worker →
-/// daemon `task_result` side "error" is accepted as an alias for "failed"
-/// (see [`ExternalTaskStatus::from_worker_status`]).
+/// silent empty result. This is the tool-result vocabulary. On the worker →
+/// daemon `task_result` side the lanes send "success" | "error" |
+/// "cancelled" | "timed_out", and "failed" is additionally accepted — it is
+/// the word the daemon stores and reports a failed result under (see
+/// [`ExternalTaskStatus::from_worker_status`]).
 fn tool_result_envelope(
     call_id: &str,
     status: &str,
