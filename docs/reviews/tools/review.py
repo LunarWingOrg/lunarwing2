@@ -434,7 +434,7 @@ def main():
     p.add_argument("iid")
     p.add_argument("note_id", type=int)
     p.add_argument("--at", help="created_at (default now)")
-    p.add_argument("--head", help="head sha to store if the entry has none")
+    p.add_argument("--head", help="the head that was reviewed (overwrites any recorded head)")
     p.set_defaults(func=cmd_note_id)
 
     p = sub.add_parser("merge-state", help="merge a run fragment into the state file")
