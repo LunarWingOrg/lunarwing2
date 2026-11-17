@@ -2658,16 +2658,16 @@ without printing the credential. This gate checks only the environment variable.
 Credentials saved by `opencode auth login` inside a session bypass it and can
 survive a container restart. Opt-in no longer means Console instructions,
 skills, providers or MCP servers reach the session: the image's managed policy
-withholds them either way (see the evaluation below). It does not withhold the
-Console's own `policies` (known residual below) and it does not withhold the
-requests, so the managed tenant's egress allowlist remains the boundary against
-a compromised worker.
+withholds them either way (see the evaluation below). Since WI#745 the managed
+layer also outranks the Console's own `policies`, so those change nothing in the
+worker. It does not stop the requests, so the managed tenant's egress allowlist
+remains the boundary against a compromised worker.
 
 **Scope:** WI#665's surface record and environment-credential gate are covered;
 the root-owned managed-policy control is **evaluated on a built image and
-shipped** (see the next section). Acceptance item 3's two halves did not come
-out the same way: the content half holds, except for the Console's own policies
-(known residual below); the "no request goes to the Console" half does not. No
+shipped** (see the next section). Acceptance item 3's content half holds,
+including the Console's own policies since WI#745; the "no request goes to the
+Console" half does not. No
 live Console request, live Console credential or tenant rollout is claimed —
 the Console in the evaluation was a loopback fake.
 
@@ -2779,15 +2779,17 @@ loads from the Console first and applies the policy to what it supplies
 (`packages/core/src/plugin/provider/opencode.ts:318-336,362-366` at the pin),
 so acceptance item 3's "no request goes to the Console" does **not** hold. The
 tenant egress allowlist stays the only control on that traffic; the policy's
-value is that no Console instruction, skill, provider or MCP server reaches the
-session, whatever the egress path or the credential's provenance. The Console's
-own policies still do (known residual above).
+value is that no Console instruction, skill, provider, MCP server or policy
+statement changes the session, whatever the egress path or the credential's
+provenance.
 
 **Shipped (item 4).** `config/managed/opencode.json` is installed to
 `/etc/opencode/opencode.json` as root:root 0444 in a root:root 0755 directory
 by a Dockerfile `RUN` that also asserts both. `scripts/exposure_policy_assert.py`
-checks the source file's shape (only `policies`; an `integration.use` deny whose
-pattern covers both the bare integration ID and `<integration>#<account>` under
+checks the source file's shape (only `policies`; the exact reviewed statement
+set, including the `integration.use` deny and the seven managed wildcard
+allows, whose deny pattern covers both the bare integration ID and
+`<integration>#<account>` under
 upstream's wildcard rules) and, under `--image-filesystem`, the installed copy's
 owner, mode, non-writable parents and byte-identity to the checkout.
 `.gitlab/scripts/verify-opencode2-exposure-out-of-band.py` treats the installed
