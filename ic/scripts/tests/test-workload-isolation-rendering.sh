@@ -20,7 +20,13 @@ ADMIN_SCRIPT="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # CI containers have no init-system markers (/run/systemd/system,
 # /run/openrc/softlevel) and detect_init_system() dies without one. Pin the
 # override so the renderers are deterministic everywhere. "systemd" keeps the
-# OpenRC babysitter renderer a no-op, as on any systemd host.
+# OpenRC babysitter renderer a no-op, as on any systemd host. WI#730: pin the
+# host probe too — an override that contradicts a real host is refused.
+INIT_MARKER_FIXTURE="$(mktemp -d)"
+trap 'rm -rf "$INIT_MARKER_FIXTURE"' EXIT
+export LUNARWING_MT_SYSTEMD_MARKER="$INIT_MARKER_FIXTURE/systemd"
+export LUNARWING_MT_OPENRC_MARKER="$INIT_MARKER_FIXTURE/openrc"
+mkdir -p "$LUNARWING_MT_SYSTEMD_MARKER"
 export LUNARWING_SERVICE_MANAGER=systemd
 
 # shellcheck source=../lunarwing-mt-admin.sh
@@ -72,7 +78,7 @@ assert_files_equal() { # <label> <expected> <actual>
 
 # ── Fixture ──────────────────────────────────────────────────────────────────
 MT_FIXTURE="$(mktemp -d)"
-trap 'rm -rf "$MT_FIXTURE"' EXIT
+trap 'rm -rf "$MT_FIXTURE" "$INIT_MARKER_FIXTURE"' EXIT
 
 tenant_home()        { echo "$MT_FIXTURE/$1"; }
 tenant_repo()        { echo "$MT_FIXTURE/$1/lunarwing/ic"; }
