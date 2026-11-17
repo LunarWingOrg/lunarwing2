@@ -48,8 +48,11 @@ _manager_probe_path() {
 # be available on a host whose registered tenants are managed by the other one
 # (WI#730 — the health pipeline would silently stop checking them).
 _registered_tenants_under_manager() {
-  local manager="$1" registry="${PORTS_REGISTRY:-}" name
+  local manager="$1" registry="${PORTS_REGISTRY:-}" name tenants
   [[ -n "$registry" && -f "$registry" ]] || return 1
+  # Fail closed: an unreadable registry is treated as tenants present, so a
+  # broken jq can never unlock the forcing switch.
+  tenants="$(jq -r '.tenants | keys[]?' "$registry" 2>/dev/null)" || return 0
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     case "$manager" in
@@ -60,7 +63,7 @@ _registered_tenants_under_manager() {
         [[ -e "$OPENRC_INITD_DIR/lunarwing-${name}" ]] && return 0
         ;;
     esac
-  done < <(jq -r '.tenants | keys[]?' "$registry" 2>/dev/null || true)
+  done <<< "$tenants"
   return 1
 }
 
