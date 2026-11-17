@@ -112,7 +112,10 @@ name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
-session; they bypass this gate and may survive container restarts. The managed
+session; they bypass this gate and may survive container restarts. The exposure
+wrapper refuses `opencode auth login <http(s) url>`, which is the command that
+would also register a well-known remote-config origin (WI#750), but a login
+with an integration ID or name is still possible. The managed
 Console deny below is the control that covers them.
 
 ## Managed Console policy (WI#665)

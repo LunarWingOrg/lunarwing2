@@ -22,8 +22,9 @@ Assertions (opencode2 lane):
      disables implicit service startup and re-derives the runtime config
      from /app/config at boot (controls 2+4; expected startup-shape checks).
   5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
-     service/pair subcommands, the --service flag, and every --hostname
-     occurrence (control 2, wrapper layer). It also forces
+     service/pair subcommands, the --service flag, every --hostname
+     occurrence, and `auth login` with an http(s) target (the well-known
+     remote-config registration, WI#750) (control 2, wrapper layer). It also forces
      OPENCODE_FLAGS=-console_watches right before it execs the real binary
      (WI#609, !2398 AAV-1): those two statements must be the last two code
      lines, and no other code line may launch the binary or touch the
@@ -101,7 +102,7 @@ REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
 # SHA-256 over the wrapper's code lines (comments and blank lines stripped),
 # so ANY code edit — including one the shape checks below do not name — needs
 # a review of this checker in the same commit (WI#609 ABH-2).
-WRAPPER_CODE_DIGEST = "cc551f2668957ba4c1354b79dd3723b7f3b8b97246f9f18ac7ca78481830ba0d"
+WRAPPER_CODE_DIGEST = "41b862b4dea2e62da9db8232375b01767cdf03b566fe8d3964881eab7d547a99"
 # Shell features that can make the wrapper's tail unreachable or change what
 # its last two lines mean. The wrapper needs none of them. Dot-sourcing is
 # refused wherever it appears, not only at a line start.
@@ -524,13 +525,19 @@ def check_wrapper(lane: pathlib.Path) -> None:
         ("--service | --service=*) refuse", "refuse the --service flag"),
         ('--hostname=*) is_loopback', "check every --hostname=value occurrence"),
         ('[ "$want_host" = 0 ]', "refuse a dangling --hostname"),
+        ("auth) want_login=1", "track the 'auth' subcommand"),
+        ('elif [ "$want_login" = 1 ]', "look for 'login' across interleaved flags"),
+        ("login) want_login=0; in_login=1", "track 'auth login'"),
+        ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
+        ('is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
+        ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme, case-insensitively"),
     )
     missing = [what for fragment, what in required_fragments if fragment not in text]
     if missing:
         fail(f"{wrapper} lost required guard shape: {missing} — the wrapper must "
              "scan every argv token, not only $1")
     else:
-        check("wrapper scans every argv token (service/pair/--service/--hostname)")
+        check("wrapper scans every argv token (service/pair/--service/--hostname/auth login url)")
     # WI#609 AAV-1 / ABE-3 / ABH-2: the pin only holds if every start of the
     # real binary passes through it. This is a shape check on a reviewed
     # file, strict about the text instead of clever about the shell: the

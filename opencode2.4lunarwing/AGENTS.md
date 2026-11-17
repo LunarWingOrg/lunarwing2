@@ -168,7 +168,9 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   by WI#745 in `docs/ops/WORKER-CONTAINERS.md`.
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
-  or a non-loopback `serve`; never enable session sharing (`share` stays
+  or a non-loopback `serve`; never register a well-known remote-config
+  origin (`opencode auth login <http(s) url>`, refused by the wrapper since
+  WI#750); never enable session sharing (`share` stays
   `"disabled"`) or self-update. The `update` pin in the lane config is *not*
   the guard (the updater reads only the global config dir, never
   `OPENCODE_CONFIG`); the live controls are the image env
@@ -206,7 +208,7 @@ candidate smoke; `scripts/runtime_smoke.py` also runs against a live container.
 
 ## Key Files (this policy)
 
-- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` (naive-use guard).
+- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` and for `auth login` with an `http:`/`https:` target (the well-known remote-config registration, WI#750; `auth list`, `auth logout` and `auth login <integration-id|name>` still pass) (naive-use guard).
 - `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` checks installed ownership/modes, all three wrapper execute bits, real-binary metadata, and bounded parent directories. `--image-root` uses explicit tar-header metadata and image-environment JSON rather than host ownership or the CI job environment.
 - `scripts/image_config_policy.py` — checkout-owned allowlist for the complete image `Env` (PATH order included), `Entrypoint`, `Cmd`, `User`, `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`, with `OnBuild`, `Volumes`, and `Shell` required empty; shared by the protected tar verifier and mt-admin. The verifier normalizes Docker's `Config.Healthcheck` and Podman's top-level `Healthcheck` before applying this policy.
 - `../.gitlab/go/dockerfile-parse` — required BuildKit-parser Dockerfile policy; the old bash grammar is retired. Keep its Go tests and divergence fixtures current, and preserve the pinned Go CI job.

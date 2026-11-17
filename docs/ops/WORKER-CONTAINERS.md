@@ -1173,13 +1173,23 @@ Enforced controls (opencode2 lane unless noted):
    worker's state with a key credential saved for it, and egress to that
    origin, so on every bump re-read that path and record whether anything
    now registers an origin without the operator.
-   **WI#745 / AEU-4 wrapper check (2026-11-17):** the committed exposure
-   wrapper does NOT refuse `opencode auth login <url>`: those tokens pass
-   through to the real binary. A fake executable run confirms the unchanged
-   argv reaches it. This is not a well-known-config control; the managed
-   `integration.use` wildcard allow also permits non-Console origins. Do not
-   treat the Console deny as covering this adjacent remote-config path; its
-   remaining boundary is the tenant egress allowlist. Re-check on each bump.
+   **WI#750 / AEU-4 wrapper check (2026-11-17, updated in WI#750):** the
+   committed exposure wrapper refuses `opencode auth login <http(s) target>`
+   with exit 77, because that command registers a well-known remote-config
+   origin in the worker's own state (upstream `WellKnown.add`); only an
+   `http:` or `https:` target does so. The scan tracks `auth` -> `login`
+   across interleaved global flags and refuses any token carrying an http(s)
+   scheme, case-insensitively; `auth list`, `auth logout` and
+   `auth login <integration-id|name>` still reach the real binary. The
+   refusal is a required fragment in `scripts/exposure_policy_assert.py` and
+   is covered by its wrapper tests. This is still a naive-use guard, not a
+   well-known-config control: the same registration through the server's
+   `experimental.integration.wellknown.add` API does not pass through the
+   wrapper, and the managed `integration.use` wildcard allow also permits
+   non-Console origins. Do not treat the Console deny as covering this
+   adjacent remote-config path; its remaining boundary is the tenant egress
+   allowlist, and an origin the worker cannot reach supplies nothing (it
+   also needs a saved key credential). Re-check on each bump.
    **Feature flags:** the wrapper's `-console_watches` pin is
    only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
    is ignored without a word, and upstream ships a feature by deleting its
