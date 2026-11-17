@@ -718,8 +718,47 @@ tenant_voice_enabled() {
 # then installs it. Both are reached from callers that may run with errexit
 # ignored, so they return nonzero and print the reason instead of exiting; the
 # caller decides whether that is fatal (WI#740). The Study Notes sync scheduler
-# (14-knowledge-sync.sh) writes the same two shapes with its own copy from
-# WI#736 and its failure-injection harness; it can move onto these later.
+# (14-knowledge-sync.sh) uses the same writers (WI#743).
+
+# How each supported cron tool reports "root has no crontab", measured with
+# LC_ALL=C on a real tool (2026-11-17). Only one of these lines means the empty
+# table a block may be added to; any other failing listing is refused:
+#
+#   fcrontab 3.3.1        exit 0, no stdout, stderr "user root has no fcrontab."
+#   crontab (cronie)      exit 1, no stdout, stderr "no crontab for root"
+#   crontab (dcron 4.5+)  exit 0, no stdout, stderr "no crontab for root"
+#   busybox crontab       exit 1, no stdout, stderr
+#                         "crontab: can't open 'root': No such file or directory"
+#                         (a missing spool directory says instead
+#                          "crontab: can't change directory to '...'")
+#
+# An existing but empty table never prints one of them (fcron prints "listing
+# root's fcrontab" and exits 0). `/dev/null` is not used for stderr, so a tool
+# that fails for another reason is reported with its own message instead of
+# being taken for an empty crontab (WI#743).
+_cron_listing_detail() {  # <stderr text>
+  local detail="$1"
+  detail="${detail//$'\n'/ }"
+  detail="${detail%% }"
+  [[ -n "$detail" ]] && printf ' (%s)' "$detail"
+}
+
+_cron_listing_says_no_table() {  # <stderr text>
+  local err="$1" line kept="" body
+  while IFS= read -r line; do
+    # fcron prefixes its log lines; only they are allowed beside the message.
+    [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ +INFO\  ]] && continue
+    [[ -n "$line" ]] && kept+="$line"$'\n'
+  done <<<"$err"
+  body="${kept%$'\n'}"
+  # Exactly one line, and one of the measured messages: anything else — no
+  # output at all, a second error line, a wrapper's own complaint — is a
+  # failed listing, not proof that root has no crontab.
+  [[ "$body" != *$'\n'* ]] || return 1
+  [[ "$body" =~ ^no\ crontab\ for\ [^[:space:]]+$ ]] && return 0
+  [[ "$body" =~ ^user\ [^[:space:]]+\ has\ no\ fcrontab\.$ ]] && return 0
+  [[ "$body" =~ ^crontab:\ can\'t\ open\ \'[^\']+\':\ No\ such\ file\ or\ directory$ ]]
+}
 
 # Print, on stdout, the table root's crontab must become: every line of the
 # current table outside the managed block, byte for byte, then the block —
@@ -730,20 +769,33 @@ tenant_voice_enabled() {
 # line before the first one's END line. Dropping "everything from BEGIN to the
 # end of the file" would take root's later jobs with it, so the caller must
 # leave the crontab as it was. The same holds when the listing cannot be read
-# back in completely. An END line with no BEGIN line above it belongs
+# back in completely, or when it fails without positively reporting that root
+# has no crontab. An END line with no BEGIN line above it belongs
 # to root's own jobs and is kept. A root without a crontab is not an error:
 # only the block is printed.
 _managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
   local command="$1" begin="$2" end="$3" listing line inside=0 kept="" read_rc=0
+  local err_file read_err=""
   shift 3
-  listing="$("$command" -l 2>/dev/null)" || read_rc=$?
+  err_file="$(mktemp 2>/dev/null)" \
+    || { warn_err "could not create a temporary file to read root's crontab with $command; the crontab was left as it was"; return 1; }
+  listing="$(LC_ALL=C "$command" -l 2>"$err_file")" || read_rc=$?
+  read_err="$(<"$err_file")" || read_err=""
+  rm -f -- "$err_file"
   if (( read_rc != 0 )); then
     if [[ -n "$listing" ]]; then
-      warn_err "could not read root's crontab with $command: it failed (exit $read_rc) after printing part of the table; the crontab was left as it was"
+      warn_err "could not read root's crontab with $command: it failed (exit $read_rc) after printing part of the table; the crontab was left as it was$(_cron_listing_detail "$read_err")"
       return 1
     fi
-    # `-l` exits nonzero for a root without a crontab, and that is the empty
-    # table the block is added to.
+    if ! _cron_listing_says_no_table "$read_err"; then
+      warn_err "could not read root's crontab with $command: it failed (exit $read_rc) without reporting that root has no crontab; the crontab was left as it was$(_cron_listing_detail "$read_err")"
+      return 1
+    fi
+    # The tool positively reported a missing table: that is the empty table the
+    # block is added to.
+    listing=""
+  elif [[ -z "$listing" ]] && _cron_listing_says_no_table "$read_err"; then
+    # fcron and dcron exit 0 and report a missing table on stderr.
     listing=""
   fi
   if [[ -n "$listing" ]]; then
