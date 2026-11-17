@@ -11,14 +11,21 @@
 //! that selects it, and to the version/rootless probes that classify it. This
 //! module owns that single policy so detection, execution, and the reaper all
 //! see the same directories.
+//!
+//! The policy is Unix-only: Windows has no sbin convention and separates
+//! `PATH` with `;`, so the mutators are no-ops there and detection keeps the
+//! inherited environment.
 
 /// Runtime `PATH` used when the daemon has none at all.
+#[cfg(unix)]
 pub(crate) const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+#[cfg(unix)]
 const RUNTIME_SBIN_DIRECTORIES: [&str; 3] = ["/usr/local/sbin", "/usr/sbin", "/sbin"];
 
 /// Prepend the sbin directories `inherited` lacks, keeping its own order and
 /// any custom runtime locations it names.
+#[cfg(unix)]
 pub(crate) fn container_runtime_path(inherited: &str) -> String {
     let missing = RUNTIME_SBIN_DIRECTORIES
         .into_iter()
@@ -33,6 +40,7 @@ pub(crate) fn container_runtime_path(inherited: &str) -> String {
 }
 
 /// The daemon's `PATH` with the sbin directories restored.
+#[cfg(unix)]
 pub(crate) fn search_path() -> String {
     let inherited =
         std::env::var("PATH").unwrap_or_else(|_| DEFAULT_CONTAINER_RUNTIME_PATH.to_string());
@@ -45,11 +53,16 @@ pub(crate) fn search_path() -> String {
 /// variables the caller set into the unit, and unsets every other variable of
 /// the user manager, so an unset `PATH` would otherwise reach the unit as no
 /// `PATH` at all.
+#[cfg(unix)]
 pub(crate) fn apply(cmd: &mut tokio::process::Command) {
     cmd.env("PATH", search_path());
 }
 
+#[cfg(not(unix))]
+pub(crate) fn apply(_cmd: &mut tokio::process::Command) {}
+
 /// Same as [`apply`] for a command that is spawned directly.
+#[cfg(unix)]
 pub(crate) fn apply_std(cmd: &mut std::process::Command) {
     cmd.env("PATH", search_path());
 }
@@ -80,8 +93,10 @@ fn lookup_command(bin: &str) -> std::process::Command {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn container_runtime_path_restores_missing_sbin_directories() {
         assert_eq!(
@@ -101,8 +116,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_lookup_uses_the_sbin_search_path() {
-        let cmd = lookup_command("podman");
-        let path = cmd
+        let lookup = lookup_command("podman");
+        let path = lookup
             .get_envs()
             .find_map(|(key, value)| {
                 if key == "PATH" {
