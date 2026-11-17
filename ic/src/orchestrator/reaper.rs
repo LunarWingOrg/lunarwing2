@@ -548,6 +548,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+    #[test]
+    fn runtime_cli_path_includes_sbin() {
+        let spawner = WorkloadSpawner::direct();
+        let cmd = runtime_cli_command(&spawner, "podman", &["ps"]);
+        let path = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "PATH").then(|| value?.to_string_lossy().into_owned()))
+            .expect("container runtime PATH");
+        for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
+            assert!(path.split(':').any(|part| part == directory));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn runtime_cli_output_uses_selected_isolation_and_captures_stdout() {
