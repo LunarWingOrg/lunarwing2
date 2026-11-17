@@ -4,7 +4,7 @@
 Runs the lane's real opencode binary inside the image against a fake OpenCode
 Console on loopback. A credential whose `metadata.server` names the fake makes
 the plugin talk to it, so nothing leaves the container (`--network=none`).
-Seven runs:
+Eleven runs:
 
   1. control: an empty directory in place of `/etc/opencode`;
   2. the image's own managed policy;
@@ -16,6 +16,8 @@ Seven runs:
   6. control with the Console's own policy statements (`provider.use` deny
      for the lane's own provider and `tool.use` deny for a shell command);
   7. the image's policy with those same Console statements.
+  8–9. control/guarded with a Console `integration.use` deny for `*`;
+  10–11. control/guarded with that deny for the lane's provider.
 
 The questions are answered by observation, not by reading:
 
@@ -29,7 +31,7 @@ The questions are answered by observation, not by reading:
     statements rank immediately below the managed ones. WI#745 ships managed
     allows for every action upstream enforces, so the recorded answer is no:
     the content is withheld and the Console's `provider.use` and `tool.use`
-    denies do not remove the lane's provider or block its tool call. Run 6
+    denies do not remove the lane's provider or block its tool call. Run 7
     fails if a Console statement starts applying again.
 
 Instructions and skills share one gate upstream
@@ -238,7 +240,7 @@ def _organization_verdict(control: dict, guarded: dict) -> tuple[int, str]:
 def _console_policy_verdict(
     control: dict, guarded: dict, console_policy: dict, provider: str,
 ) -> tuple[int, str]:
-    """Run 6: managed allows neutralize the Console's own statements (WI#745)."""
+    """Runs 6/7: managed allows neutralize the Console's own statements (WI#745)."""
     if control.get("consoleToolEffect") != "deny":
         return 2, (
             "RESULT: INCONCLUSIVE for a Console tool policy — without the managed "
@@ -285,6 +287,8 @@ def _console_policy_verdict(
             f"the runner reported `consoleToolAskEffect={ask_effect!r}`; a managed "
             "allow must preserve the lower layer's ask and never grant it"
         )
+    if console_policy.get("consoleToolDenyEffect") != "deny":
+        return 1, "RESULT: A MANAGED ALLOW LIFTED AN ORDINARY PERMISSION DENY"
     if provider not in console_policy.get("providerIDs", []):
         return 1, (
             "RESULT: THE CONSOLE PROVIDER POLICY STILL APPLIES — the Console's "
@@ -298,6 +302,24 @@ def _console_policy_verdict(
         f"/api/config lists the integration document as "
         f"{json.dumps(console_policy.get('integrationDocuments'))}"
     )
+
+
+def _integration_policy_verdict(control: dict, guarded: dict, baseline: dict,
+                                provider: str, resource: str) -> tuple[int, str]:
+    """Observe both the provider and web-search catalog, not just policy text."""
+    if any(run.get("consolePolicyDeniesIntegration") != resource for run in (control, guarded)):
+        return 2, f"RESULT: INCONCLUSIVE — integration.use {resource!r} was not exercised"
+    if provider in control.get("providerIDs", []):
+        return 2, "RESULT: INCONCLUSIVE — integration.use control did not remove the lane provider"
+    baseline_search = baseline.get("websearchIDs", [])
+    if not baseline_search:
+        return 2, "RESULT: INCONCLUSIVE — baseline has no web-search provider"
+    if resource == "*" and control.get("websearchIDs"):
+        return 2, "RESULT: INCONCLUSIVE — wildcard integration.use control did not remove web search"
+    if (provider not in guarded.get("providerIDs", [])
+            or guarded.get("websearchIDs") != baseline_search or _console_content(guarded)):
+        return 1, f"RESULT: integration.use {resource!r} changed provider/web search or lifted Console deny"
+    return 0, f"RESULT: integration.use {resource!r} NEUTRALIZED — lane provider and web search unchanged"
 
 
 def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
@@ -316,6 +338,10 @@ def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
         "organization_guarded": f"guarded, credential for {ORGANIZATION}",
         "console_policy_control": f"control, Console policy denies provider {provider} and a tool",
         "console_policy": f"guarded, Console policy denies provider {provider} and a tool",
+        "integration_all_control": "control, integration.use deny *",
+        "integration_all": "guarded, integration.use deny *",
+        "integration_provider_control": f"control, integration.use deny {provider}*",
+        "integration_provider": f"guarded, integration.use deny {provider}*",
     }
 
     for name, label in labels.items():
@@ -327,6 +353,9 @@ def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
             f"console_providers={run.get('consoleProviders', [])} "
             f"console_mcp={run.get('consoleMcpServers', [])} "
             f"lane_provider_listed={provider in run.get('providerIDs', [])}"
+            f" websearch={run.get('websearchIDs', [])}"
+            f" tool={run.get('consoleToolEffect')} ask={run.get('consoleToolAskEffect')}"
+            f" permission_deny={run.get('consoleToolDenyEffect')}"
         )
         if run.get("error"):
             lines.append(f"  error: {run['error']}")
@@ -396,6 +425,8 @@ def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
         _document_verdict(control, guarded),
         _organization_verdict(runs["organization_control"], runs["organization_guarded"]),
         _console_policy_verdict(runs["console_policy_control"], guarded, runs["console_policy"], provider),
+        _integration_policy_verdict(runs["integration_all_control"], runs["integration_all"], guarded, provider, "*"),
+        _integration_policy_verdict(runs["integration_provider_control"], runs["integration_provider"], guarded, provider, f"{provider}*"),
     ):
         lines.append(line)
         # A failed deny (1) outranks an inconclusive control (2), which
@@ -443,6 +474,10 @@ def main() -> int:
         runs["console_policy"] = _run_container(
             args.image, root, control=False, switches=console_deny,
         )
+        for label, resource in (("integration_all", "*"), ("integration_provider", f"{provider}*")):
+            switches = {"WI745_EVAL_DENY_INTEGRATION": resource}
+            runs[f"{label}_control"] = _run_container(args.image, root, control=True, switches=switches)
+            runs[label] = _run_container(args.image, root, control=False, switches=switches)
 
     status, lines = _verdict(runs, provider)
     print("\n".join(lines))

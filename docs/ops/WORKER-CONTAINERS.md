@@ -1173,6 +1173,13 @@ Enforced controls (opencode2 lane unless noted):
    worker's state with a key credential saved for it, and egress to that
    origin, so on every bump re-read that path and record whether anything
    now registers an origin without the operator.
+   **WI#745 / AEU-4 wrapper check (2026-11-17):** the committed exposure
+   wrapper does NOT refuse `opencode auth login <url>`: those tokens pass
+   through to the real binary. A fake executable run confirms the unchanged
+   argv reaches it. This is not a well-known-config control; the managed
+   `integration.use` wildcard allow also permits non-Console origins. Do not
+   treat the Console deny as covering this adjacent remote-config path; its
+   remaining boundary is the tenant egress allowlist. Re-check on each bump.
    **Feature flags:** the wrapper's `-console_watches` pin is
    only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
    is ignored without a word, and upstream ships a feature by deleting its
@@ -2700,7 +2707,9 @@ provider is gone. Run 7 is the required result: the same Console document no
 longer changes the session, the tool assertion evaluates `allow`, and a
 seeded unsaved `ask` for the same command stays `ask`.
 
-**WI#745 evaluation on a built image (2026-11-17).** The image was built
+**Historical WI#745 evaluation before AEU-1 (2026-11-17).** This seven-run
+result did not exercise `integration.use`; it is not acceptance evidence for
+the corrected nine-statement policy. The image was built
 locally at `32a4ff350` with `podman build --network=host` and the Dockerfile's
 in-image assertion passed; `scripts/console_policy_eval.py` then ran all seven
 runs with `--network=none` and exited 0. The guarded run reported
@@ -2725,15 +2734,16 @@ Runs 4 and 5 store a credential whose metadata names the organization
 `org_01`: the control gets the skill, the provider and the MCP server, and the
 image policy withholds all three.
 
-**Console policies are neutralized by the managed layer (run 6, WI#745;
+**Console policies are neutralized by the managed layer (run 7, WI#745;
 closes the WI#665 residual AEP-2).** Upstream keeps a policies-only copy of a
 denied integration's document (`packages/core/src/config.ts:343-349` at the
 pin), and those policies rank right after the managed ones and above the lane's
 own config (`config.ts:331-332,367-375`). WI#745 adds one managed wildcard
-allow for every action upstream enforces: `integration.use` is not in that
-list because the integration deny is the control; the allows are
+allow for every action upstream enforces, including `integration.use`;
+its wildcard allow is BEFORE the `opencode*` deny so the last match still
+withholds Console content. The other allows are
 `integration.connect`, `provider.use`, `tool.use`, `mcp.use`, `skill.use`,
-`websearch.use` and `plugin.use`. Run 6 now carries a Console `provider.use`
+`websearch.use` and `plugin.use`. Run 7 carries a Console `provider.use`
 deny for `tensorzero` and a Console `tool.use` deny for
 `shell:wi745-console-policy *`; with the image policy in place the Console's
 skill, provider and MCP server are withheld, the lane's provider stays listed,
@@ -2752,12 +2762,23 @@ evaluation's seeded-ask run checks.
 **What the managed allows outrank.** They outrank every lower layer's deny for
 their action, not just the Console's, because upstream has no separate Console
 policy rank. The lane config carries no policies, so this does not change its
-settings; the practical consequence is that a lower-layer tool `deny` cannot
-block a tool covered by the managed allow. That is deliberate and recorded
+settings; the practical consequence is that a lower-layer `tool.use` policy
+deny cannot block a tool covered by the managed allow. Ordinary permission
+denies remain denied (the evaluation now seeds one alongside its ask).
+That is deliberate and recorded
 here so a future change is not mistaken for a Console-only override.
 
-Only the provider and tool cases are measured; the other actions go through the
-same `ManagedPolicy.decision` path. A Console `allow` grants nothing by itself;
+The original seven-run evaluation measured only provider/tool policies. The
+corrected harness adds runs 8/9 (control/guarded `integration.use` deny `*`)
+and 10/11 (control/guarded deny `tensorzero*`). Both guarded catalogs must
+match the ordinary guarded run: the lane provider stays present and the
+web-search provider IDs are unchanged. The wildcard control must remove all
+web search; each control must remove the lane provider, or the result is
+inconclusive. Runs 2 and 5 still verify both Console resource forms. The
+tool run now seeds an ordinary permission deny as well as an ask; neither
+may be lifted. Built-image results for the corrected submitted head belong
+in the MR acceptance table, not in the historical seven-run result above.
+The other actions go through the same `ManagedPolicy.decision` path. A Console `allow` grants nothing by itself;
 the managed allows are what make the Console's statements ineffective. The
 harness fails when any part of this behaviour regresses.
 
@@ -2771,7 +2792,7 @@ integration's document as a plain document without one and without a `path`.
 The repaired probe reads the documents listed without a `path`. In the control
 run that document carries the Console's `providers` and `mcp`; with the image
 policy it is still listed, reduced to `{}` (run 2) or to its `policies` with
-the Console's statement (run 6).
+the Console's statement (run 7).
 
 **What the policy does not do.** The guarded runs still issued
 `GET /api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`. The plugin
@@ -2787,7 +2808,7 @@ provenance.
 `/etc/opencode/opencode.json` as root:root 0444 in a root:root 0755 directory
 by a Dockerfile `RUN` that also asserts both. `scripts/exposure_policy_assert.py`
 checks the source file's shape (only `policies`; the exact reviewed statement
-set, including the `integration.use` deny and the seven managed wildcard
+set, including the `integration.use` deny and the eight managed wildcard
 allows, whose deny pattern covers both the bare integration ID and
 `<integration>#<account>` under
 upstream's wildcard rules) and, under `--image-filesystem`, the installed copy's

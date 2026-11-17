@@ -17,7 +17,7 @@
 //                      as a plain document, with no integration ID to match
 //                      on, and every file-backed document has a path.
 //
-// Two switches, set by the driver through the container environment:
+// Switches, set by the driver through the container environment:
 //
 //   WI665_EVAL_ORG            — the saved credential names this organization.
 //                               The `integration.use` resource is then
@@ -31,6 +31,7 @@
 //                               `action:resource`. The harness executes the
 //                               matching permission assertion and reports
 //                               whether it succeeded.
+//   WI745_EVAL_DENY_INTEGRATION — Console integration.use deny resource.
 //
 // Nothing leaves the container: the fake listens on 127.0.0.1 and the caller
 // runs the container with --network=none. Instructions and skills travel
@@ -46,12 +47,15 @@ type Reported = {
   consoleProviders: string[];
   consoleMcpServers: string[];
   providerIDs: string[];
+  websearchIDs: string[];
+  consolePolicyDeniesIntegration: string;
   integrationDocuments: unknown[];
   credentialOrganization: string;
   consolePolicyDeniesProvider: string;
   consolePolicyDeniesTool: string;
   consoleToolEffect: string;
   consoleToolAskEffect: string;
+  consoleToolDenyEffect: string;
   managedPolicyPresent: boolean;
   error?: string;
 };
@@ -63,6 +67,7 @@ const PASSWORD = "wi665-eval-password";
 const EVAL_ORG = process.env.WI665_EVAL_ORG ?? "";
 const EVAL_DENY_PROVIDER = process.env.WI665_EVAL_DENY_PROVIDER ?? "";
 const EVAL_DENY_TOOL = process.env.WI665_EVAL_DENY_TOOL ?? "";
+const EVAL_DENY_INTEGRATION = process.env.WI745_EVAL_DENY_INTEGRATION ?? "";
 const INSTRUCTION = {
   id: "wi665-eval-instruction",
   content: "Console-authored instruction from the WI#665 evaluation harness.",
@@ -90,7 +95,7 @@ const SKILL_BUNDLE = {
 // the deny holds. With WI665_EVAL_DENY_PROVIDER it also carries a policy
 // statement: upstream keeps a denied integration's policies
 // (packages/core/src/config.ts:343-349 at the v2.2.7 pin), so that statement
-// is expected to apply while everything else in the document is withheld.
+// applies in the control but must be neutralized by the managed allows.
 const CONSOLE_PROVIDER = "wi665-console-provider";
 const CONSOLE_MCP = "wi665-console-mcp";
 const CONSOLE_CONFIG = {
@@ -105,6 +110,9 @@ const CONSOLE_CONFIG = {
   mcp: { servers: { [CONSOLE_MCP]: { type: "remote", url: "http://127.0.0.1:9/mcp" } } },
   ...(() => {
     const policies = [
+      ...(EVAL_DENY_INTEGRATION
+        ? [{ action: "integration.use", resource: EVAL_DENY_INTEGRATION, effect: "deny" }]
+        : []),
       ...(EVAL_DENY_PROVIDER
         ? [{ action: "provider.use", resource: EVAL_DENY_PROVIDER, effect: "deny" }]
         : []),
@@ -144,6 +152,7 @@ async function evaluate(): Promise<Reported> {
   delete serverEnv.WI665_EVAL_ORG;
   delete serverEnv.WI665_EVAL_DENY_PROVIDER;
   delete serverEnv.WI665_EVAL_DENY_TOOL;
+  delete serverEnv.WI745_EVAL_DENY_INTEGRATION;
   const child = Bun.spawn([BIN, "serve", "--port", String(SERVE_PORT), "--hostname", "127.0.0.1"], {
     cwd: "/eval/workdir",
     env: serverEnv,
@@ -218,6 +227,7 @@ async function evaluate(): Promise<Reported> {
   };
   const toolEffect = await assertTool();
   let toolAskEffect = "absent";
+  let toolDenyEffect = "absent";
   if (EVAL_DENY_TOOL) {
     const updated = await fetch(`${base}/api/session/${sessionID}`, {
       method: "PATCH",
@@ -226,6 +236,13 @@ async function evaluate(): Promise<Reported> {
     });
     if (!updated.ok) throw new Error(`session ask seed failed: ${updated.status} ${await updated.text()}`);
     toolAskEffect = await assertTool();
+    const denied = await fetch(`${base}/api/session/${sessionID}`, {
+      method: "PATCH",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ permissions: [{ action: EVAL_DENY_TOOL.split(":")[0], resource: "*", effect: "deny" }] }),
+    });
+    if (!denied.ok) throw new Error(`session deny seed failed: ${denied.status} ${await denied.text()}`);
+    toolDenyEffect = await assertTool();
   }
 
   const skills = (await get(`/api/skill?location[directory]=${location}`)) as {
@@ -240,6 +257,9 @@ async function evaluate(): Promise<Reported> {
   const providerList = Array.isArray(providers) ? providers : (providers.data ?? []);
   const mcpList = Array.isArray(mcp) ? mcp : (mcp.data ?? []);
   const providerIDs = providerList.map((provider) => provider.id ?? "").filter((id) => id !== "");
+  const search = await get(`/api/websearch/provider?location[directory]=${location}`) as
+    { data?: { id: string }[] } | { id: string }[];
+  const websearchIDs = (Array.isArray(search) ? search : (search.data ?? [])).map((p) => p.id).sort();
   const config = (await get(`/api/config?location[directory]=${location}`)) as
     | { type?: string; path?: string; info?: unknown }[]
     | { data?: { type?: string; path?: string; info?: unknown }[] };
@@ -266,12 +286,15 @@ async function evaluate(): Promise<Reported> {
       .map((server) => server.name ?? "")
       .filter((name) => name.includes("wi665")),
     providerIDs,
+    websearchIDs,
+    consolePolicyDeniesIntegration: EVAL_DENY_INTEGRATION,
     integrationDocuments,
     credentialOrganization: EVAL_ORG,
     consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
     consolePolicyDeniesTool: EVAL_DENY_TOOL,
     consoleToolEffect: toolEffect,
     consoleToolAskEffect: toolAskEffect,
+    consoleToolDenyEffect: toolDenyEffect,
     managedPolicyPresent,
   };
 }
@@ -287,12 +310,15 @@ try {
     consoleProviders: [],
     consoleMcpServers: [],
     providerIDs: [],
+    websearchIDs: [],
+    consolePolicyDeniesIntegration: EVAL_DENY_INTEGRATION,
     integrationDocuments: [],
     credentialOrganization: EVAL_ORG,
     consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
     consolePolicyDeniesTool: EVAL_DENY_TOOL,
     consoleToolEffect: "",
     consoleToolAskEffect: "",
+    consoleToolDenyEffect: "",
     managedPolicyPresent: false,
     error: error instanceof Error ? error.message : String(error),
   };

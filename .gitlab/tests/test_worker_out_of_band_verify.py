@@ -371,6 +371,13 @@ class FilesystemExportTests(unittest.TestCase):
         self.fixture.write(self.archive)
         self.assert_refused("must be read-only")
 
+    def test_reordered_managed_policy_is_refused(self):
+        policy = json.loads((self.lane / "config/managed/opencode.json").read_text())
+        policy["policies"].reverse()
+        self.fixture.add_file("etc/opencode/opencode.json", json.dumps(policy).encode(), mode=0o444)
+        self.fixture.write(self.archive)
+        self.assert_refused("differs from config/managed/opencode.json")
+
     def test_second_managed_document_is_refused(self):
         # WI#665 (review AEP-3): upstream also loads `opencode.jsonc` from the
         # managed directory, above `opencode.json`, so a sibling that allows

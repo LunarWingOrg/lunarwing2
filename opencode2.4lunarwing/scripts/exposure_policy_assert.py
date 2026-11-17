@@ -126,6 +126,7 @@ MANAGED_POLICY_RESOURCE = "opencode*"
 # precedence: a managed allow is the last match, so it wins. An allow never
 # grants a permission the caller did not already have.
 MANAGED_POLICY_ALLOW_ACTIONS = (
+    "integration.use",
     "integration.connect",
     "provider.use",
     "tool.use",
@@ -203,6 +204,13 @@ def check_managed_policy(lane: pathlib.Path) -> None:
         fail(f"{source} must carry exactly the reviewed policy set (WI#745): "
              f"missing {missing}, unexpected {extra_statements}, duplicated {duplicates}")
         return
+    # Statements within a document keep their order; the LAST match wins.
+    # The wildcard allow must not lift the Console-specific deny.
+    if found.index(("integration.use", "*", "allow")) > found.index(
+        ("integration.use", MANAGED_POLICY_RESOURCE, "deny")
+    ):
+        fail(f"{source} integration.use wildcard allow must precede the Console deny (WI#745)")
+        return
     denying = [resource for action, resource, effect in found
                if action == "integration.use" and effect == "deny"]
     if not all(_managed_policy_covers(resource) for resource in denying):
@@ -210,7 +218,7 @@ def check_managed_policy(lane: pathlib.Path) -> None:
              "for both the bare and the account-qualified resource (WI#665)")
         return
     check(f"{source} denies the {MANAGED_POLICY_INTEGRATION} integration and "
-          "allows the seven upstream policy actions in the managed layer")
+          "allows the eight upstream policy actions in the managed layer")
 
 
 def _managed_directory_extras(

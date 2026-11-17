@@ -105,6 +105,9 @@ opencode2.4lunarwing/scripts/lunarwing_tool_plugin_test.ts
 opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
 opencode2.4lunarwing/scripts/exposure_policy_assert.py
 opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
+opencode2.4lunarwing/scripts/console_policy_eval.py
+opencode2.4lunarwing/scripts/console_policy_eval_runner.ts
+opencode2.4lunarwing/scripts/console_policy_eval_test.py
 opencode2.4lunarwing/scripts/image_config_policy.py
 opencode2.4lunarwing/scripts/image_config_policy_test.py
 opencode2.4lunarwing/scripts/entrypoint_config_test.py

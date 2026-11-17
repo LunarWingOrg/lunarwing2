@@ -1,5 +1,6 @@
 {
   "policies": [
+    { "action": "integration.use", "resource": "*", "effect": "allow" },
     { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
     { "action": "integration.connect", "resource": "*", "effect": "allow" },
     { "action": "provider.use", "resource": "*", "effect": "allow" },

@@ -122,6 +122,7 @@ The image ships a root-owned, read-only managed policy at
 
 ```json
 { "policies": [
+  { "action": "integration.use", "resource": "*", "effect": "allow" },
   { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
   { "action": "integration.connect", "resource": "*", "effect": "allow" },
   { "action": "provider.use", "resource": "*", "effect": "allow" },
@@ -143,21 +144,22 @@ document's providers, remote MCP servers and web-search selection.
 **WI#745 — Console statements have no effect.** Upstream keeps a policies-only
 copy of a denied integration's document (`packages/core/src/config.ts:343-349`
 at the pin), and those policies rank immediately below the managed ones. The
-seven managed wildcard allows above therefore outrank every Console statement
+eight managed wildcard allows above therefore outrank every Console statement
 for the actions upstream enforces at this pin, so a Console `integration.use`,
 `integration.connect`, `provider.use`, `tool.use`, `mcp.use`, `skill.use`,
 `websearch.use` or `plugin.use` deny no longer changes what the worker has or
-can connect to. `provider.use` and `tool.use` are measured on a built image by
-`scripts/console_policy_eval.py`; the rest go through the same managed-policy
-decision path.
+can connect to. The `integration.use` wildcard allow MUST precede the
+`opencode*` deny: the last match within a file wins. The evaluation includes
+control/guarded pairs for wildcard and lane-provider `integration.use` denies,
+and checks both provider and web-search catalogs alongside the Library tests.
 
 **What else they outrank.** A managed allow outranks *every* lower layer's
 deny for that action, not only the Console's, and it does so by design: there
 is no way in upstream's policy model to rank Console statements separately. The
-lane's own config and ordinary permission rules are unaffected except that the
-worker's own tool permission `deny` rules can no longer block a tool when the
-managed wildcard allow covers it; an `ask` is preserved, never turned into a
-grant. All six actions use the same last-match rule from
+lane's ordinary permission rules still apply: a permission `deny` stays denied
+and an `ask` stays `ask`, never turned into a grant. What is overridden is a
+lower-layer `tool.use` policy deny, not a permission rule. All eight actions
+use the same last-match rule from
 `ManagedPolicy.statements`/`match` (`packages/core/src/managed-policy.ts`), so
 the managed allow, loaded earliest, is the final match and wins. No upstream
 patch is applied.
@@ -165,7 +167,8 @@ patch is applied.
 Managed settings outrank every other layer for ordinary settings too, so the
 file carries `policies` and nothing else — an `experimental` or `model` key
 there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
-enforces the exact eight-statement set, the installed copy's owner and mode,
+enforces the exact nine-statement set and the integration allow-before-deny
+order, the installed copy's owner and mode,
 and that `/etc/opencode` holds nothing but that file: upstream also loads a
 sibling `opencode.jsonc` from the managed directory, above `opencode.json`.
 

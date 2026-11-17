@@ -42,6 +42,7 @@ ROLE_BOUNDARY = 'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
 # WI#665: the managed policy the image installs at /etc/opencode/opencode.json.
 MANAGED_POLICY = {
     "policies": [
+        {"action": "integration.use", "resource": "*", "effect": "allow"},
         {"action": "integration.use", "resource": "opencode*", "effect": "deny"},
         *(
             {"action": action, "resource": "*", "effect": "allow"}
@@ -201,6 +202,9 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             "missing managed allow": {
                 "policies": [statement for statement in MANAGED_POLICY["policies"]
                              if statement["action"] != "websearch.use"],
+            },
+            "wildcard allow after Console deny": {
+                "policies": list(reversed(MANAGED_POLICY["policies"])),
             },
             "extra managed statement": {
                 "policies": [*MANAGED_POLICY["policies"],
