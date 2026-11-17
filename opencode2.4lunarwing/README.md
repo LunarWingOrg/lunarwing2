@@ -138,11 +138,12 @@ and those policies rank right after the managed ones and above the lane's own
 config. Policy enforcement only removes or denies
 (`packages/core/src/config/plugin/policy.ts:56-113`), so with a Console
 credential and egress the Console can still switch off a provider of the
-worker (measured) and, by the same code, a tool, MCP server, skill or plugin;
+worker (measured) and, read from the same code, a tool, MCP server, skill or
+web-search provider, and a plugin (`packages/core/src/plugin/module.ts:53`);
 it cannot instruct the worker or add anything to it. This is a known residual
-(review finding AEP-2 on !2502): the maintainer decided not to neutralize
-Console policies. The evaluation asserts the behaviour as it is, so a bump
-that changes it is noticed.
+(review finding AEP-2 on !2502): neutralizing Console policies would be a
+design change and was left out of WI#665. The evaluation asserts the
+behaviour as it is, so a bump that changes it is noticed.
 
 What it does **not** do is stop the requests. On a built image at the pin,
 with a saved Console credential, the plugin still fetches

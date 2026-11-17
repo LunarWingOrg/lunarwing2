@@ -151,9 +151,10 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   of a denied integration's document, ranked right after the managed policies
   and above the lane config, so the Console can still switch off a provider,
   tool, MCP server, skill or plugin of the worker. A policy only removes or
-  denies; it cannot instruct the worker. The maintainer decided not to
-  neutralize Console policies (known residual, WI#665 record in
-  `docs/ops/WORKER-CONTAINERS.md`). The managed policy does not stop the
+  denies; it cannot instruct the worker. Neutralizing Console policies would
+  be a design change and was left out of WI#665 (known residual, WI#665
+  record in `docs/ops/WORKER-CONTAINERS.md`). The managed policy does not
+  stop the
   plugin's own requests to the Console either, so it is not an egress
   control. Keep `config/managed/opencode.json` at exactly one
   `integration.use` deny with no other key (a managed document outranks every

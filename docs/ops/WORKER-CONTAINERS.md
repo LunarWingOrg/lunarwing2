@@ -2715,12 +2715,13 @@ statement (run 2) it is listed. The same result was measured in review run 457
 on an image built at `c6ad6ff49`. Policy enforcement only removes or denies
 (`packages/core/src/config/plugin/policy.ts:56-113`): with a Console credential
 and egress the Console can switch off a provider of the worker and, by the same
-code, a tool, MCP server, skill or plugin; it cannot instruct the worker or add
+code, a tool, MCP server, skill or web-search provider, and a plugin
+(`packages/core/src/plugin/module.ts:53`); it cannot instruct the worker or add
 anything to it. A Console `allow` statement grants nothing by itself: it can
 only outrank a `deny` policy statement of a lower layer, and the lane's own
 config carries no `policies`. Only the provider case is measured; the rest is
-read from the source. The maintainer decided not to neutralize Console
-policies. The harness asserts the behaviour as it is and exits non-zero when
+read from the source. Neutralizing Console policies would be a design change
+and was left out of WI#665. The harness asserts the behaviour as it is and exits non-zero when
 the Console's statement stops applying, so a bump that changes it is noticed
 and this record is updated.
 
