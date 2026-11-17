@@ -821,10 +821,22 @@ manager. A foreground conversation/session change does not own or recreate
 this scheduler. Goal 42's [investigation](../ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md)
 records the build and cron interpretation behind the WI#311 follow-up reports.
 An externally incomplete or malformed mission document is still dropped rather
-than reactivated with schema defaults. Its boot WARN carries the validated
-mission id, operator path, `error_kind`, and a `missing_field` that names the
-field only when it is in the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown`
-otherwise;
+than reactivated with invented values, but the two cases are now distinct
+(WI#576). A record is only required to carry the eight fields that identify it
+and give it meaning — `id`, `project_id`, `name`, `goal`, `status`, `cadence`,
+`created_at`, `updated_at`; every other field, including the evolving state
+fields and each scalar of a partial `retry_policy` object, has a serde default,
+so a document written by an older binary loads instead of being lost. A record
+that truly cannot be deserialized is dropped and its exact bytes are copied
+byte-for-byte to `backups/<mission path>.unparseable-<UTC>-<UUID>`. Like the
+unloadable-default-project snapshot, that is a workspace document under the
+reserved, chunk-free backup namespace, so the project boot scan never revisits
+it and a second failing boot adds a copy instead of overwriting the first. The
+original stays in place, so the drop repeats only until an operator repairs or
+deliberately moves it. A failed copy warns and does not abort the boot.
+The boot WARN carries the validated mission id, operator path, `error_kind`, the
+quarantine path, and a `missing_field` that names the field only when it is in
+the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown` otherwise;
 unknown variants, invalid values, and full parse errors are confined to DEBUG so
 user-authored goal text cannot leak into ordinary logs (WI#576).
 
