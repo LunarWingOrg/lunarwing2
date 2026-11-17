@@ -74,15 +74,6 @@ RUN bun run build || echo "WARNING: @opencode/client build reported errors (impo
 WORKDIR /build/opencode/packages/cli
 COPY scripts/prepare_reproducible_build.py /build/prepare_reproducible_build.py
 COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py
-COPY scripts/apply_managed_policy_precedence.py /build/apply_managed_policy_precedence.py
-COPY scripts/apply_managed_policy_precedence_test.py /build/apply_managed_policy_precedence_test.py
-COPY patches/ /build/lunarwing/patches/
-# WI#745: a managed allow must neutralize a Console tool deny as it does every
-# other policy action. The reviewed patch adds managed provenance to policy
-# statements and honours it only in the tool hook; an allow preserves an
-# existing "ask" and never grants access. Its inputs are digest-pinned, only
-# those three files may change, and upstream's policy suite must pass here.
-RUN python3 /build/apply_managed_policy_precedence.py /build/opencode
 # Single-bundle source compilation avoids per-build chunk IDs/bytecode in the
 # executable. Fail closed if the pinned upstream build options have drifted.
 RUN python3 /build/prepare_reproducible_build.py script/build.ts

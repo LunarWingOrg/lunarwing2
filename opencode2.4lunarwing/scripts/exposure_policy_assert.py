@@ -122,9 +122,9 @@ MANAGED_POLICY_RESOURCE = "opencode*"
 # managed ones, so a Console `deny` would otherwise remove the lane's provider,
 # tools, MCP servers, skills, web search or plugins. Every action upstream
 # enforces at the pin gets one managed wildcard allow, which outranks the
-# Console document. The tool hook is patched at build time
-# (scripts/apply_managed_policy_precedence.py) to honour managed allows while
-# preserving an underlying `ask`; the other five already do.
+# Console document. All actions go through the same earliest-loaded policy
+# precedence: a managed allow is the last match, so it wins. An allow never
+# grants a permission the caller did not already have.
 MANAGED_POLICY_ALLOW_ACTIONS = (
     "integration.connect",
     "provider.use",

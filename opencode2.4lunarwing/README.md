@@ -157,11 +157,10 @@ is no way in upstream's policy model to rank Console statements separately. The
 lane's own config and ordinary permission rules are unaffected except that the
 worker's own tool permission `deny` rules can no longer block a tool when the
 managed wildcard allow covers it; an `ask` is preserved, never turned into a
-grant. The tool arm needed a build-time correction because upstream's
-`tool.use` hook searches every layer for a deny; `scripts/apply_managed_policy_precedence.py`
-applies the reviewed, digest-pinned patch that lets only a *managed* allow lift
-a lower layer's deny. The other five actions already honour managed allows
-through `ManagedPolicy.decision` in `packages/core/src/config/plugin/policy.ts`.
+grant. All six actions use the same last-match rule from
+`ManagedPolicy.statements`/`match` (`packages/core/src/managed-policy.ts`), so
+the managed allow, loaded earliest, is the final match and wins. No upstream
+patch is applied.
 
 Managed settings outrank every other layer for ordinary settings too, so the
 file carries `policies` and nothing else — an `experimental` or `model` key

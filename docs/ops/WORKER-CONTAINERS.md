@@ -2722,17 +2722,13 @@ the denied tool assertion evaluates to `allow`, and an unsaved `ask` for the
 same command stays `ask`. Without the managed policy (control) the provider is
 gone, the tool evaluates `deny`, and the ask is denied.
 
-The tool arm needed a build-time correction. Upstream's `tool.use` hook
-(`packages/core/src/config/plugin/policy.ts` at the pin) searches every layer
-for a deny and does not consult a managed allow, unlike the other actions which
-all go through `ManagedPolicy.decision`. `apply_managed_policy_precedence.py`
-applies the reviewed, digest-pinned patch
-(`patches/wi745-managed-policy-precedence.patch`) that tags managed statements
-and honours a managed allow in the tool hook only. It returns the existing
-decision rather than granting anything, so an `ask` stays an `ask` and an
-ordinary permission rule is not overridden; the patch is applied to three
-digest-pinned files, must leave exactly those three modified, and upstream's
-own `packages/core/test/config/policy.test.ts` runs in the image build.
+All actions use the same rule. `ManagedPolicy.statements` lists entries
+earliest-loaded last and `match` takes `findLast`, so the managed allow is the
+final matching statement and wins over the Console document. The tool hook in
+`packages/core/src/config/plugin/policy.ts` uses that same `findLast` over all
+layers, so no upstream patch is applied. An allow only restores an existing
+decision: an `ask` stays an `ask` and is never turned into a grant, which the
+evaluation's seeded-ask run checks.
 
 **What the managed allows outrank.** They outrank every lower layer's deny for
 their action, not just the Console's, because upstream has no separate Console

@@ -150,11 +150,10 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   also carries managed wildcard allows for every action upstream enforces
   (`integration.use`, `integration.connect`, `provider.use`, `tool.use`,
   `mcp.use`, `skill.use`, `websearch.use`, `plugin.use`), so a Console policy
-  statement no longer changes what the worker has or can connect to. The tool
-  hook needed a reviewed build-time correction
-  (`scripts/apply_managed_policy_precedence.py`): only a *managed* allow lifts
-  a lower layer's tool deny, and an `ask` is preserved rather than granted.
-  These allows outrank every lower layer's deny for their action by design, so
+  statement no longer changes what the worker has or can connect to. All six
+  actions use the same last-match policy rule, so the managed allow wins and an
+  `ask` is preserved rather than granted. These allows outrank every lower
+  layer's deny for their action by design, so
   keep the managed file at exactly the reviewed eight statements with no other
   key, install it root:root 0444, put nothing else in `/etc/opencode` (a
   sibling `opencode.jsonc` outranks it; both checks refuse any other entry),
