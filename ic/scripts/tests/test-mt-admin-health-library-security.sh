@@ -616,7 +616,14 @@ assert_cli_source_refused() {  # <label> <cli> <component> <which tree the refus
   else
     pass "$label: the unsafe contract is not sourced"
   fi
-  if LUNARWING_SERVICE_MANAGER=openrc bash "$cli" list-tenants >"$stdout" 2>"$stderr"; then
+  # WI#730: simulate an OpenRC host so the override does not contradict the
+  # real host's PID-1 markers.
+  local openrc_marker="$TEST_ROOT/openrc-marker"
+  mkdir -p "$openrc_marker"
+  if LUNARWING_SERVICE_MANAGER=openrc \
+      LUNARWING_MT_OPENRC_MARKER="$openrc_marker" \
+      LUNARWING_MT_SYSTEMD_MARKER="$TEST_ROOT/no-systemd-marker" \
+      bash "$cli" list-tenants >"$stdout" 2>"$stderr"; then
     fail "$label: an OpenRC command ran without the contract"
   else
     pass "$label: an OpenRC command is refused"
