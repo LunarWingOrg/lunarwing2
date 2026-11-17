@@ -4,7 +4,7 @@
 Runs the lane's real opencode binary inside the image against a fake OpenCode
 Console on loopback. A credential whose `metadata.server` names the fake makes
 the plugin talk to it, so nothing leaves the container (`--network=none`).
-Six runs:
+Seven runs:
 
   1. control: an empty directory in place of `/etc/opencode`;
   2. the image's own managed policy;
@@ -13,8 +13,9 @@ Six runs:
   4. control with a credential that names an organization, so the policy
      resource is `opencode#<org>` (the form a saved Console login takes);
   5. the image's policy with that credential;
-  6. the image's policy while the Console's config also carries a policy
-     statement (`provider.use` deny for the lane's own provider).
+  6. control with the Console's own policy statements (`provider.use` deny
+     for the lane's own provider and `tool.use` deny for a shell command);
+  7. the image's policy with those same Console statements.
 
 The questions are answered by observation, not by reading:
 
@@ -24,9 +25,12 @@ The questions are answered by observation, not by reading:
   * what is left of the Console's config document in `/api/config`?
   * does a policy statement in the Console's config still apply? Upstream
     keeps a denied integration's `policies` on purpose
-    (`packages/core/src/config.ts:343-349` at the v2.2.7 pin), so the recorded
-    answer is yes: the content is withheld, the policy applies. Run 6 asserts
-    that behaviour as it is, so a bump that changes it is noticed.
+    (`packages/core/src/config.ts:343-349` at the v2.2.7 pin), and those
+    statements rank immediately below the managed ones. WI#745 ships managed
+    allows for every action upstream enforces, so the recorded answer is no:
+    the content is withheld and the Console's `provider.use` and `tool.use`
+    denies do not remove the lane's provider or block its tool call. Run 6
+    fails if a Console statement starts applying again.
 
 Instructions and skills share one gate upstream
 (`syncInstructionsAndSkills(allowed)`), and the skill list is the half the
@@ -59,6 +63,10 @@ LANE_CONFIG = LANE_ROOT / "config" / "opencode2.json"
 SKILL_MARKER = "wi665-console-eval"
 # The organization the saved credential names in runs 4 and 5.
 ORGANIZATION = "org_01"
+# The tool action:resource run 6's Console policy denies. Its control run
+# (the same deny with an empty managed directory) must observe "deny", or the
+# managed-allow result proves nothing.
+CONSOLE_TOOL_DENY = "shell:wi745-console-policy *"
 
 
 def _lane_provider() -> str:
@@ -227,8 +235,22 @@ def _organization_verdict(control: dict, guarded: dict) -> tuple[int, str]:
     )
 
 
-def _console_policy_verdict(guarded: dict, console_policy: dict, provider: str) -> tuple[int, str]:
-    """Run 6: the known residual, asserted as it is today."""
+def _console_policy_verdict(
+    control: dict, guarded: dict, console_policy: dict, provider: str,
+) -> tuple[int, str]:
+    """Run 6: managed allows neutralize the Console's own statements (WI#745)."""
+    if control.get("consoleToolEffect") != "deny":
+        return 2, (
+            "RESULT: INCONCLUSIVE for a Console tool policy — without the managed "
+            f"policy the runner reported `consoleToolEffect={control.get('consoleToolEffect')!r}`, "
+            "so it did not observe the deny the managed allow is meant to neutralize"
+        )
+    if provider in control.get("providerIDs", []):
+        return 2, (
+            "RESULT: INCONCLUSIVE for a Console provider policy — without the managed "
+            f"policy the lane's provider {provider!r} is still listed, so the deny the "
+            "managed allow is meant to neutralize was not observed"
+        )
     if console_policy.get("consolePolicyDeniesProvider") != provider:
         return 2, (
             "RESULT: INCONCLUSIVE for a Console policy — the runner did not report a "
@@ -244,18 +266,37 @@ def _console_policy_verdict(guarded: dict, console_policy: dict, provider: str) 
             f"RESULT: INCONCLUSIVE for a Console policy — the lane's provider {provider!r} "
             "is not listed without one either, so its absence would prove nothing"
         )
-    if provider in console_policy.get("providerIDs", []):
+    tool_effect = console_policy.get("consoleToolEffect")
+    if tool_effect == "deny":
         return 1, (
-            "RESULT: CHANGED — A CONSOLE POLICY NO LONGER APPLIES: the Console's "
-            f"`provider.use` deny left the lane's provider {provider!r} listed. The "
-            "recorded residual (docs/ops/WORKER-CONTAINERS.md, WI#665) says it applies; "
-            "re-read upstream and update the record"
+            "RESULT: THE CONSOLE TOOL POLICY STILL APPLIES — the runner reported "
+            "`consoleToolEffect='deny'`; the managed allow does not neutralize a "
+            "Console `tool.use` deny (WI#745)"
+        )
+    if tool_effect != "allow":
+        return 2, (
+            "RESULT: INCONCLUSIVE for a Console tool policy — the runner reported "
+            f"`consoleToolEffect={tool_effect!r}`, so it did not observe the decision"
+        )
+    ask_effect = console_policy.get("consoleToolAskEffect")
+    if ask_effect != "ask":
+        return 1, (
+            "RESULT: A MANAGED ALLOW CHANGED AN UNSAVED ASK — "
+            f"the runner reported `consoleToolAskEffect={ask_effect!r}`; a managed "
+            "allow must preserve the lower layer's ask and never grant it"
+        )
+    if provider not in console_policy.get("providerIDs", []):
+        return 1, (
+            "RESULT: THE CONSOLE PROVIDER POLICY STILL APPLIES — the Console's "
+            f"`provider.use` deny removed the lane's provider {provider!r}; the managed "
+            "allow does not neutralize it (WI#745)"
         )
     return 0, (
-        "RESULT: KNOWN RESIDUAL, AS RECORDED — the Console's skill, provider and MCP "
-        f"server were withheld, but its `provider.use` deny applied: the lane's provider "
-        f"{provider!r} is listed without that statement and gone with it; /api/config "
-        f"lists the integration document as {json.dumps(console_policy.get('integrationDocuments'))}"
+        "RESULT: CONSOLE POLICIES NEUTRALIZED BY THE MANAGED LAYER — the Console's "
+        f"`provider.use` deny left the lane's provider {provider!r} listed, the "
+        "`tool.use` deny did not block its assertion, and an ordinary `ask` survives; "
+        f"/api/config lists the integration document as "
+        f"{json.dumps(console_policy.get('integrationDocuments'))}"
     )
 
 
@@ -273,7 +314,8 @@ def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
         "project_allow": "guarded + project allow",
         "organization_control": f"control, credential for {ORGANIZATION}",
         "organization_guarded": f"guarded, credential for {ORGANIZATION}",
-        "console_policy": f"guarded, Console policy denies provider {provider}",
+        "console_policy_control": f"control, Console policy denies provider {provider} and a tool",
+        "console_policy": f"guarded, Console policy denies provider {provider} and a tool",
     }
 
     for name, label in labels.items():
@@ -353,7 +395,7 @@ def _verdict(runs: dict[str, dict], provider: str) -> tuple[int, list[str]]:
     for extra_status, line in (
         _document_verdict(control, guarded),
         _organization_verdict(runs["organization_control"], runs["organization_guarded"]),
-        _console_policy_verdict(guarded, runs["console_policy"], provider),
+        _console_policy_verdict(runs["console_policy_control"], guarded, runs["console_policy"], provider),
     ):
         lines.append(line)
         # A failed deny (1) outranks an inconclusive control (2), which
@@ -376,6 +418,10 @@ def main() -> int:
         return 1
     provider = _lane_provider()
     organization = {"WI665_EVAL_ORG": ORGANIZATION}
+    console_deny = {
+        "WI665_EVAL_DENY_PROVIDER": provider,
+        "WI665_EVAL_DENY_TOOL": CONSOLE_TOOL_DENY,
+    }
 
     runs = {}
     with tempfile.TemporaryDirectory(prefix="wi665-eval-") as temporary:
@@ -391,8 +437,11 @@ def main() -> int:
         runs["organization_guarded"] = _run_container(
             args.image, root, control=False, switches=organization,
         )
+        runs["console_policy_control"] = _run_container(
+            args.image, root, control=True, switches=console_deny,
+        )
         runs["console_policy"] = _run_container(
-            args.image, root, control=False, switches={"WI665_EVAL_DENY_PROVIDER": provider},
+            args.image, root, control=False, switches=console_deny,
         )
 
     status, lines = _verdict(runs, provider)

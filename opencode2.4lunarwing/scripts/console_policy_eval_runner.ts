@@ -26,6 +26,11 @@
 //   WI665_EVAL_DENY_PROVIDER  — the fake Console's config also carries the
 //                               policy statement `provider.use` deny for this
 //                               provider ID.
+//   WI665_EVAL_DENY_TOOL      — the fake Console's config also carries the
+//                               policy statement `tool.use` deny for this
+//                               `action:resource`. The harness executes the
+//                               matching permission assertion and reports
+//                               whether it succeeded.
 //
 // Nothing leaves the container: the fake listens on 127.0.0.1 and the caller
 // runs the container with --network=none. Instructions and skills travel
@@ -44,6 +49,9 @@ type Reported = {
   integrationDocuments: unknown[];
   credentialOrganization: string;
   consolePolicyDeniesProvider: string;
+  consolePolicyDeniesTool: string;
+  consoleToolEffect: string;
+  consoleToolAskEffect: string;
   managedPolicyPresent: boolean;
   error?: string;
 };
@@ -54,6 +62,7 @@ const BIN = "/usr/local/lib/opencode2/opencode";
 const PASSWORD = "wi665-eval-password";
 const EVAL_ORG = process.env.WI665_EVAL_ORG ?? "";
 const EVAL_DENY_PROVIDER = process.env.WI665_EVAL_DENY_PROVIDER ?? "";
+const EVAL_DENY_TOOL = process.env.WI665_EVAL_DENY_TOOL ?? "";
 const INSTRUCTION = {
   id: "wi665-eval-instruction",
   content: "Console-authored instruction from the WI#665 evaluation harness.",
@@ -97,6 +106,9 @@ const CONSOLE_CONFIG = {
   ...(EVAL_DENY_PROVIDER
     ? { policies: [{ action: "provider.use", resource: EVAL_DENY_PROVIDER, effect: "deny" }] }
     : {}),
+  ...(EVAL_DENY_TOOL
+    ? { policies: [{ action: "tool.use", resource: EVAL_DENY_TOOL, effect: "deny" }] }
+    : {}),
 };
 
 const requests: string[] = [];
@@ -126,6 +138,7 @@ async function evaluate(): Promise<Reported> {
   // The switches steer the harness, not the binary under evaluation.
   delete serverEnv.WI665_EVAL_ORG;
   delete serverEnv.WI665_EVAL_DENY_PROVIDER;
+  delete serverEnv.WI665_EVAL_DENY_TOOL;
   const child = Bun.spawn([BIN, "serve", "--port", String(SERVE_PORT), "--hostname", "127.0.0.1"], {
     cwd: "/eval/workdir",
     env: serverEnv,
@@ -172,6 +185,44 @@ async function evaluate(): Promise<Reported> {
   // background; give both a bounded moment before reading.
   await Bun.sleep(8_000);
 
+  // Exercise the real tool hook: create a session and assert the exact
+  // `action:resource` the Console policy denies. A granted assertion returns
+  // 204; a refusal is an error response, so the status is the observation.
+  const createdSession = await fetch(`${base}/api/session`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ title: "WI#745 managed-policy evaluation" }),
+  });
+  const sessionBody = await createdSession.text();
+  if (!createdSession.ok) throw new Error(`session create failed: ${createdSession.status} ${sessionBody}`);
+  const sessionID = (JSON.parse(sessionBody) as { data?: { id?: string } }).data?.id;
+  if (!sessionID) throw new Error("session create returned no id");
+  const assertTool = async (): Promise<string> => {
+    if (!EVAL_DENY_TOOL) return "absent";
+    const [action, ...rest] = EVAL_DENY_TOOL.split(":");
+    const asserted = await fetch(`${base}/api/session/${sessionID}/permission`, {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ action, resources: [rest.join(":")], save: [] }),
+    });
+    const text = await asserted.text();
+    if (!asserted.ok) throw new Error(`permission evaluate failed: ${asserted.status} ${text}`);
+    const effect = (JSON.parse(text) as { data?: { effect?: string } }).data?.effect;
+    if (!effect) throw new Error(`permission evaluate returned no effect: ${text}`);
+    return effect;
+  };
+  const toolEffect = await assertTool();
+  let toolAskEffect = "absent";
+  if (EVAL_DENY_TOOL) {
+    const updated = await fetch(`${base}/api/session/${sessionID}`, {
+      method: "PATCH",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ permissions: [{ action: EVAL_DENY_TOOL.split(":")[0], resource: "*", effect: "ask" }] }),
+    });
+    if (!updated.ok) throw new Error(`session ask seed failed: ${updated.status} ${await updated.text()}`);
+    toolAskEffect = await assertTool();
+  }
+
   const skills = (await get(`/api/skill?location[directory]=${location}`)) as {
     data?: { id?: string; name?: string; path?: string }[];
   };
@@ -213,6 +264,9 @@ async function evaluate(): Promise<Reported> {
     integrationDocuments,
     credentialOrganization: EVAL_ORG,
     consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
+    consolePolicyDeniesTool: EVAL_DENY_TOOL,
+    consoleToolEffect: toolEffect,
+    consoleToolAskEffect: toolAskEffect,
     managedPolicyPresent,
   };
 }
@@ -231,6 +285,9 @@ try {
     integrationDocuments: [],
     credentialOrganization: EVAL_ORG,
     consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
+    consolePolicyDeniesTool: EVAL_DENY_TOOL,
+    consoleToolEffect: "",
+    consoleToolAskEffect: "",
     managedPolicyPresent: false,
     error: error instanceof Error ? error.message : String(error),
   };
