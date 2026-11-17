@@ -745,6 +745,7 @@ _cron_listing_detail() {  # <stderr text>
 
 _cron_listing_says_no_table() {  # <stderr text>
   local err="$1" line kept="" body
+  [[ -n "$err" ]] || return 1
   while IFS= read -r line; do
     # fcron prefixes its log lines; only they are allowed beside the message.
     [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ +INFO\  ]] && continue
@@ -755,9 +756,11 @@ _cron_listing_says_no_table() {  # <stderr text>
   # output at all, a second error line, a wrapper's own complaint — is a
   # failed listing, not proof that root has no crontab.
   [[ "$body" != *$'\n'* ]] || return 1
-  [[ "$body" =~ ^no\ crontab\ for\ [^[:space:]]+$ ]] && return 0
-  [[ "$body" =~ ^user\ [^[:space:]]+\ has\ no\ fcrontab\.$ ]] && return 0
-  [[ "$body" =~ ^crontab:\ can\'t\ open\ \'[^\']+\':\ No\ such\ file\ or\ directory$ ]]
+  # These writers run as root and only replace root's table. A response for
+  # another account cannot prove that root's old table may safely be replaced.
+  [[ "$body" == 'no crontab for root' ]] && return 0
+  [[ "$body" == 'user root has no fcrontab.' ]] && return 0
+  [[ "$body" == "crontab: can't open 'root': No such file or directory" ]]
 }
 
 # Print, on stdout, the table root's crontab must become: every line of the
