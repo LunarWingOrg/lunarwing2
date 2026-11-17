@@ -1718,10 +1718,25 @@ pub enum ExternalTaskStatus {
 }
 
 impl ExternalTaskStatus {
+    /// Map a worker-reported `task_result` status onto the daemon's outcome
+    /// vocabulary.
+    ///
+    /// Wire values are `"success"`, `"failed"`, `"cancelled"` and
+    /// `"timed_out"`. `"error"` is accepted as an alias for `"failed"`: the
+    /// daemon's own `tool_result` replies use `"success" | "error" | "denied"`
+    /// (see `tool_result_envelope`), and worker lanes emit `"error"` for
+    /// honest failures (WI#751). Tolerating the alias keeps older workers
+    /// interoperable instead of logging an "unrecognized status" warning
+    /// that hides the worker's real error.
+    ///
+    /// Any other value is logged and treated as `Failed` (WI#543).
     fn from_worker_status(status: &str, job_id: Uuid, worker_name: &str) -> Self {
         match status {
             "success" => Self::Success,
-            "failed" => Self::Failed,
+            // WI#751: `"error"` is a first-class failure term in the daemon's
+            // own tool-result protocol and what worker lanes report for
+            // honest failures — a recognized failure, not an unknown value.
+            "failed" | "error" => Self::Failed,
             "cancelled" => Self::Cancelled,
             "timed_out" => Self::TimedOut,
             _ => {
@@ -3894,7 +3909,9 @@ fn preview(value: &str, max_chars: usize) -> String {
 
 /// Build the daemon → worker reply for a `tool_call`. `status` is
 /// "success" | "error" | "denied" — a denied call is a hard reject, never a
-/// silent empty result.
+/// silent empty result. This is the tool-result vocabulary; on the worker →
+/// daemon `task_result` side "error" is accepted as an alias for "failed"
+/// (see [`ExternalTaskStatus::from_worker_status`]).
 fn tool_result_envelope(
     call_id: &str,
     status: &str,
@@ -5118,6 +5135,7 @@ mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
     use lunarwing_common::PromptContextRole;
+    use tracing_test::traced_test;
 
     #[test]
     fn tool_allowlist_gate_is_deny_by_default() {
@@ -6711,6 +6729,8 @@ mod tests {
         for (raw, expected) in [
             ("success", ExternalTaskStatus::Success),
             ("failed", ExternalTaskStatus::Failed),
+            // WI#751: worker lanes report honest failures as "error".
+            ("error", ExternalTaskStatus::Failed),
             ("cancelled", ExternalTaskStatus::Cancelled),
             ("timed_out", ExternalTaskStatus::TimedOut),
         ] {
@@ -6726,6 +6746,33 @@ mod tests {
                 ExternalTaskStatus::Failed
             );
         }
+    }
+
+    /// WI#751 acceptance: an `"error"` task result parses as `Failed` with no
+    /// "Unrecognized" warning, while a genuinely unknown status still warns
+    /// and still fails closed.
+    #[test]
+    #[traced_test]
+    fn worker_task_status_error_alias_is_quiet_but_unknown_statuses_warn() {
+        let job_id = Uuid::nil();
+
+        assert_eq!(
+            ExternalTaskStatus::from_worker_status("error", job_id, "test-worker"),
+            ExternalTaskStatus::Failed
+        );
+        assert!(
+            !logs_contain("Unrecognized external worker task status"),
+            "\"error\" is a recognized failure term, not an unknown status"
+        );
+
+        assert_eq!(
+            ExternalTaskStatus::from_worker_status("partial", job_id, "test-worker"),
+            ExternalTaskStatus::Failed
+        );
+        assert!(
+            logs_contain("Unrecognized external worker task status"),
+            "a genuinely unknown status must still warn"
+        );
     }
 
     #[test]
