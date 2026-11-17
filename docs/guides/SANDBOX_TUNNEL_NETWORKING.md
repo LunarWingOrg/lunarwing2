@@ -522,17 +522,31 @@ podman build -t localhost/lunarwing-tunnel-wireguard:latest \
 The host kernel's WireGuard module must already be loaded (normally automatic).
 Interface creation happens in the sidecar's user-namespace-owned netns, without
 host capabilities or host route changes. A peerless config is ready when `wg0`
-exists (the lifecycle e2e shape). With peers, readiness requires a nonzero
-WireGuard handshake no more than 180 seconds old. An un-handshaked or stale peer
-returns `sandbox_unavailable` within the bounded recovery described above, and
-later commands inside the 30-second back-off fail immediately instead of timing
-out. Without a canary, a peered config is valid only when at least one peer sets
-`PersistentKeepalive` from 1 through 60 seconds; this requests periodic
-handshakes but cannot guarantee that the remote peer answers. Alternatively set
-`SANDBOX_TUNNEL_WIREGUARD_CANARY` to an ICMP-reachable overlay address. Its
-probe generates handshake traffic and is repeated after the egress firewall is
-installed, so a response through the host uplink cannot make the sidecar
-healthy. Application-level reachability still depends on routes and services.
+exists (the lifecycle e2e shape).
+
+### Handshake health
+
+A config with at least one peer is ready only when a peer has a nonzero
+WireGuard handshake no more than **180 seconds** old. The probe runs
+`wg show wg0 latest-handshakes` inside the sidecar as one of the seven
+10-second probes in the per-command chain, so it runs before every command and
+again after recovery. Three answers fail closed: no peer with a nonzero
+timestamp (`WireGuard handshake probe found no completed handshake`), a stale
+timestamp (`WireGuard handshake is Ns old, exceeding the 180s liveness
+budget`), and a timestamp ahead of the local clock (`WireGuard handshake probe
+returned a future timestamp`). An un-handshaked or stale peer returns
+`sandbox_unavailable` within the bounded recovery described above, and later
+commands inside the 30-second back-off fail immediately instead of timing out.
+
+Without a canary, a peered config is valid only when at least one peer sets
+`PersistentKeepalive` from 1 through 60 seconds. That requests periodic
+handshakes but cannot guarantee that the remote peer answers. Alternatively
+set `SANDBOX_TUNNEL_WIREGUARD_CANARY` to an ICMP-reachable overlay address; the
+image then needs `ping`. Its `ping -c 1 -W 2 <address>` probe generates
+handshake traffic and is repeated after the egress firewall is installed, so a
+response through the host uplink cannot make the sidecar healthy. When a canary
+is set, its result replaces the handshake-timestamp check. Application-level
+reachability still depends on routes and services.
 
 For these health-relevant fields, LunarWing follows `wg` parsing: `#` starts a
 comment, whitespace is removed, and section names are case-insensitive, so
@@ -541,6 +555,8 @@ accepts `off` or digits only from 0 through 65535, and the last value in each
 peer wins; the health-gate requirement remains 1–60 on at least one peer.
 Semicolons are not comments. Malformed sections and health-relevant values are
 rejected with a line number rather than silently degrading to a peerless probe.
+
+### Firewall mark
 
 After `wg-quick up` the daemon reads the device fwmark: a config that set none
 gets `0x4c57`; a full-route config keeps the mark wg-quick assigned (its
@@ -569,21 +585,13 @@ commands reach `10.231.0.0/16` only. For full outbound routing use `AllowedIPs
 leaves IPv6 dropped rather than routed. `wg-quick` policy routing, MTU,
 endpoint reachability and DNS remain operator responsibilities: `DNS =` in the
 config needs `openresolv` in the image. Without `SANDBOX_TUNNEL_DNS`, joined
-commands resolve names through the sidecar's runtime resolvers over the uplink
-(port 53 only).
+commands use the runtime-resolver channel described under Custom DNS.
 
-Setting `SANDBOX_TUNNEL_DNS` does **not** pass `--dns` to the sidecar: provider
-bootstrap and hostname endpoints initially use runtime DNS. Instead, LunarWing
-atomically installs a non-secret mode-`0644` resolver file in its private
-runtime directory. Every joined run mounts it at `/etc/resolv.conf` with `ro,z`
-because Podman and Docker reject `--dns` together with `--network container`;
-the shared SELinux label is safe for concurrent runs and the mode works with
-all supported keep-id mappings. The file is refreshed on start and every health
-check and removed by `SandboxManager::shutdown()`. All direct uplink DNS rules
-are removed; use resolvers reachable through `wg0`, including for joined-run
-name resolution after reconnection. Those rules also deny the sidecar's own
-post-bootstrap lookups. Stock `wg-quick` resolves its endpoint once at start,
-but any later re-resolve script is affected. NetBird rejects this setting during
+Setting `SANDBOX_TUNNEL_DNS` is also described under Custom DNS: joined runs
+mount the staged resolver file `ro,z` while the sidecar keeps its runtime
+resolver for bootstrap, and all direct uplink DNS rules are removed. Stock
+`wg-quick` resolves its endpoint once at start, but any later re-resolve script
+is affected by those removed rules. NetBird rejects this setting during
 validation rather than attempting hostname reconnects without a resolver path.
 
 ## Rotation and lifecycle
