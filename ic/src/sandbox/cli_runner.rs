@@ -1356,7 +1356,7 @@ fn container_runtime_path(inherited: &str) -> String {
     path
 }
 
-fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
+pub(crate) fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
     // systemd's default service PATH omits sbin, where Gentoo installs pasta.
     // Preserve custom runtime locations and add missing system sbin directories
     // before prepare_service so rootless Podman works in service mode.
