@@ -743,9 +743,8 @@ _cron_listing_detail() {  # <stderr text>
   [[ -n "$detail" ]] && printf ' (%s)' "$detail"
 }
 
-_cron_listing_says_no_table() {  # <stderr text>
-  local err="$1" line kept="" body
-  [[ -n "$err" ]] || return 1
+_cron_listing_messages() {  # <stderr text>: omit only known benign fcron INFO
+  local err="$1" line kept=""
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     # fcron stamps each of its log lines; strip the stamp so the message can
@@ -755,8 +754,19 @@ _cron_listing_says_no_table() {  # <stderr text>
     fi
     [[ "$line" == "listing root's fcrontab" ]] && continue
     kept+="$line"$'\n'
-  done <<<"$err"
-  body="${kept%$'\n'}"
+  done <<<"$err" || return 1
+  printf '%s' "${kept%$'\n'}"
+}
+
+_cron_listing_is_clean() {  # <stderr text>
+  local messages
+  messages="$(_cron_listing_messages "$1")" || return 1
+  [[ -z "$messages" ]]
+}
+
+_cron_listing_says_no_table() {  # <stderr text>
+  local body
+  body="$(_cron_listing_messages "$1")" || return 1
   # Exactly one line, and one of the measured messages: anything else — no
   # output at all, a second error line, a wrapper's own complaint — is a
   # failed listing, not proof that root has no crontab.
@@ -805,6 +815,11 @@ _managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
   elif [[ -z "$listing" ]] && _cron_listing_says_no_table "$read_err"; then
     # fcron and dcron exit 0 and report a missing table on stderr.
     listing=""
+  elif ! _cron_listing_is_clean "$read_err"; then
+    # fcrontab can exit 0 after an ERROR, with empty or partial stdout. Only
+    # its measured listing INFO is benign; unknown diagnostics fail closed.
+    warn_err "could not read root's crontab with $command: it reported unexpected diagnostics despite exit 0; the crontab was left as it was$(_cron_listing_detail "$read_err")"
+    return 1
   fi
   if [[ -n "$listing" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do

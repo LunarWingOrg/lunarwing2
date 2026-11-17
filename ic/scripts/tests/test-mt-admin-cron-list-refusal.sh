@@ -18,6 +18,8 @@ assert_matches() {
   if [[ "$text" == *"$pattern"* ]]; then pass "$label"; else fail "$label (actual=<$text>)"; fi
 }
 
+not_scheduled() { [[ "$1" != *scheduled* ]]; }
+
 
 cron_stub() {
   if [[ "${1:-}" == "-l" ]]; then
@@ -25,6 +27,19 @@ cron_stub() {
       fail-silent) return 1 ;;
       fail-message) printf 'spool temporarily locked\n' >&2; return 1 ;;
       partial) head -n 1 -- "$TOOL_TABLE"; printf 'read interrupted\n' >&2; return 1 ;;
+      zero-error|zero-error-partial|zero-error-full)
+        printf "2026-11-17 06:10:00  INFO listing root\x27s fcrontab\n" >&2
+        if [[ "$TOOL_BEHAVIOR" == zero-error-partial ]]; then head -n 1 -- "$TOOL_TABLE"; fi
+        if [[ "$TOOL_BEHAVIOR" == zero-error-full ]]; then cat -- "$TOOL_TABLE"; fi
+        printf '2026-11-17 06:10:00  ERROR open_as_user(): file root.orig is not a regular file: No such file or directory\n' >&2
+        printf '2026-11-17 06:10:00  ERROR User root could not read file "root.orig": No error information\n' >&2
+        printf '2026-11-17 06:10:00  ERROR fcron child aborted\n' >&2
+        return 0 ;;
+      zero-unknown) printf 'spool temporarily locked\n' >&2; return 0 ;;
+      existing-info|empty-info)
+        printf "2026-11-17 06:10:00  INFO listing root\x27s fcrontab\n" >&2
+        if [[ "$TOOL_BEHAVIOR" == existing-info ]]; then cat -- "$TOOL_TABLE"; fi
+        return 0 ;;
       missing-fcron)
         printf "2026-11-17 06:10:00  INFO listing root\x27s fcrontab\n" >&2
         printf '2026-11-17 06:10:00  INFO user root has no fcrontab.\n' >&2
@@ -104,11 +119,15 @@ run_case() {
   fi
 
   if [[ "$operation" != health-remove ]]; then
-    assert "$operation $command $behavior not scheduled" test "$output" != *scheduled*
+    assert "$operation $command $behavior not scheduled" not_scheduled "$output"
     assert "$operation $command $behavior preserves root jobs" cmp -s "$TOOL_TABLE.before" "$TOOL_TABLE"
   fi
-  if [[ "$behavior" == fail-message ]]; then
+  if [[ "$behavior" == fail-message || "$behavior" == zero-unknown ]]; then
     assert_matches "$behavior prints the tool message" "$output" 'spool temporarily locked'
+  fi
+  if [[ "$behavior" == zero-error* ]]; then
+    assert_matches "$operation $behavior prints the zero-status refusal" "$output" 'despite exit 0'
+    assert_matches "$operation $behavior prints the tool error" "$output" 'ERROR User root could not read file "root.orig"'
   fi
 }
 
@@ -119,6 +138,34 @@ for operation in health-install study-install; do
 done
 for behavior in fail-silent fail-message; do
   run_case health-remove "$behavior" fcrontab
+done
+
+# AET-1: fcron 3.3.1 reports these read failures with status 0. No replacement
+# is safe, whether stdout is empty, partial, or apparently complete.
+for operation in health-install health-remove study-install; do
+  for behavior in zero-error zero-error-partial zero-error-full zero-unknown; do
+    run_case "$operation" "$behavior" fcrontab
+  done
+done
+
+# AET-2: pin the negative assertion itself, so a literal string comparison
+# cannot silently accept a scheduling success message again.
+for message in 'scheduled health pipeline via fcrontab' 'Study Notes source refresh scheduled'; do
+  if not_scheduled "$message"; then fail 'not_scheduled accepted a success message'; else pass 'not_scheduled rejects a success message'; fi
+done
+
+# Real successful fcron listings print the INFO line too. Empty *existing*
+# tables and nonempty tables must still be accepted without a no-table message.
+for behavior in existing-info empty-info; do
+  TOOL_BEHAVIOR="$behavior"
+  output=""
+  rc=0
+  output="$(_managed_cron_table fcrontab '# BEGIN test' '# END test' '17 * * * * /safe/job' 2>&1)" || rc=$?
+  assert "$behavior listing with INFO is accepted" test "$rc" -eq 0
+  assert_matches "$behavior adds the managed block" "$output" '# END test'
+  if [[ "$behavior" == existing-info ]]; then
+    assert_matches 'existing fcron jobs survive INFO' "$output" '/usr/local/bin/nightly-backup'
+  fi
 done
 
 # Half of the table must never become its complete replacement.
