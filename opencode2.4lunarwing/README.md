@@ -104,19 +104,84 @@ instructions and skills when it has both a Console credential and egress to
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
-spellings are accepted). With a usable credential and allowed egress, this
-opt-in enables the Library surface too: no shipped setting separately withholds
-Console-authored instructions or skills. Startup messages name the variable but
-never print its value.
+spellings are accepted). Acknowledging the credential does not make Console
+instructions, skills, providers or MCP servers reach the session, and the
+Console's own policy statements have no effect either: the managed policy below
+withholds the content and outranks every Console statement. Startup messages
+name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
-session; they bypass this gate and may survive container restarts. The tenant
-egress allowlist remains the boundary against a compromised worker. WI#665's
-root-owned managed-policy evaluation and image enforcement are still pending;
-this change does not claim that Console content is blocked after opt-in or login.
+session; they bypass this gate and may survive container restarts. The managed
+Console deny below is the control that covers them.
+
+## Managed Console policy (WI#665)
+
+The image ships a root-owned, read-only managed policy at
+`/etc/opencode/opencode.json` (source: `config/managed/opencode.json`):
+
+```json
+{ "policies": [
+  { "action": "integration.use", "resource": "*", "effect": "allow" },
+  { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
+  { "action": "integration.connect", "resource": "*", "effect": "allow" },
+  { "action": "provider.use", "resource": "*", "effect": "allow" },
+  { "action": "tool.use", "resource": "*", "effect": "allow" },
+  { "action": "mcp.use", "resource": "*", "effect": "allow" },
+  { "action": "skill.use", "resource": "*", "effect": "allow" },
+  { "action": "websearch.use", "resource": "*", "effect": "allow" },
+  { "action": "plugin.use", "resource": "*", "effect": "allow" }
+] }
+```
+
+opencode loads `/etc/opencode` as managed settings above every project, global
+and explicit document, and evaluates a managed document's policies first. The
+deny therefore holds for a saved Console login, for a workspace `opencode.json`
+that allows the integration, and for the real binary started without the
+wrapper. It withholds Console instructions and skills, and the Console config
+document's providers, remote MCP servers and web-search selection.
+
+**WI#745 — Console statements have no effect.** Upstream keeps a policies-only
+copy of a denied integration's document (`packages/core/src/config.ts:343-349`
+at the pin), and those policies rank immediately below the managed ones. The
+eight managed wildcard allows above therefore outrank every Console statement
+for the actions upstream enforces at this pin, so a Console `integration.use`,
+`integration.connect`, `provider.use`, `tool.use`, `mcp.use`, `skill.use`,
+`websearch.use` or `plugin.use` deny no longer changes what the worker has or
+can connect to. The `integration.use` wildcard allow MUST precede the
+`opencode*` deny: the last match within a file wins. The evaluation includes
+control/guarded pairs for wildcard and lane-provider `integration.use` denies,
+and checks both provider and web-search catalogs alongside the Library tests.
+
+**What else they outrank.** A managed allow outranks *every* lower layer's
+deny for that action, not only the Console's, and it does so by design: there
+is no way in upstream's policy model to rank Console statements separately. The
+lane's ordinary permission rules still apply: a permission `deny` stays denied
+and an `ask` stays `ask`, never turned into a grant. What is overridden is a
+lower-layer `tool.use` policy deny, not a permission rule. All eight actions
+use the same last-match rule from
+`ManagedPolicy.statements`/`match` (`packages/core/src/managed-policy.ts`), so
+the managed allow, loaded earliest, is the final match and wins. No upstream
+patch is applied.
+
+Managed settings outrank every other layer for ordinary settings too, so the
+file carries `policies` and nothing else — an `experimental` or `model` key
+there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
+enforces the exact nine-statement set and the integration allow-before-deny
+order, the installed copy's owner and mode,
+and that `/etc/opencode` holds nothing but that file: upstream also loads a
+sibling `opencode.jsonc` from the managed directory, above `opencode.json`.
+
+What it does **not** do is stop the requests. On a built image at the pin,
+with a saved Console credential, the plugin still fetches
+`/api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`; the deny is
+applied to what comes back. The tenant egress allowlist remains the only
+control on outbound traffic. The evaluation that established this, and how to
+repeat it, is in `docs/ops/WORKER-CONTAINERS.md` and
+`scripts/console_policy_eval.py`.
+
 See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
-for the conditions and remaining work.
+for the conditions and the evaluation log.
 
 ## Do not configure both lanes on one tenant during the transition
 

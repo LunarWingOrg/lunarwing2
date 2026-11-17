@@ -348,6 +348,23 @@ RUN set -eu; \
       /app/health_server.py /app/agent_comm_protocol.json \
       -type f -exec cat -- {} + >/dev/null
 
+# WI#665: managed Console-policy. opencode loads /etc/opencode as MANAGED
+# settings, above every project, global and explicit config document
+# (packages/core/src/config/discovery.ts:27-32, :63-67 at the v2.2.7 pin), and
+# splits a managed document's `policies` off to load first so they keep final
+# authority (packages/core/src/config.ts:305-325). The single
+# `integration.use` deny below therefore holds when the real binary is started
+# without the wrapper, from a workspace config, or with a saved Console login.
+# A managed config document also OUTRANKS every other layer for ordinary
+# settings, so this file carries `policies` and nothing else: an `experimental`
+# or `model` block here would shadow the lane's own. The content check lives in
+# scripts/exposure_policy_assert.py (WI#665) so `/app/config/managed/opencode.json`
+# and the installed copy cannot drift apart silently.
+RUN install -D -m 0444 -o 0 -g 0 \
+        /app/config/managed/opencode.json /etc/opencode/opencode.json \
+    && test "$(stat -c '%u:%g:%a' /etc/opencode/opencode.json)" = "0:0:444" \
+    && test "$(stat -c '%u:%g:%a' /etc/opencode)" = "0:0:755"
+
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
 # lane config must pin share/update off, the entrypoint must not invoke
@@ -428,6 +445,7 @@ RUN set -eu; \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/console_policy_eval_test.py \
     && python3 scripts/image_config_policy_test.py \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \

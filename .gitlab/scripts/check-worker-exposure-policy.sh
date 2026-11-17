@@ -34,6 +34,8 @@ run_nested "opencode4lunarwing (profile opencode-v1)" \
     python3 "$lane/scripts/exposure_policy_assert.py" --lane "$v1_lane" --profile opencode-v1
 run_nested opencode2.4lunarwing/scripts/exposure_policy_assert_test.py \
     python3 -u "$lane/scripts/exposure_policy_assert_test.py" -v
+run_nested opencode2.4lunarwing/scripts/console_policy_eval_test.py \
+    python3 -u "$lane/scripts/console_policy_eval_test.py" -v
 run_nested opencode2.4lunarwing/scripts/image_config_policy_test.py \
     python3 -u "$lane/scripts/image_config_policy_test.py" -v
 run_nested opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py \
