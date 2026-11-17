@@ -104,9 +104,10 @@ instructions and skills when it has both a Console credential and egress to
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
-spellings are accepted). Acknowledging the credential does not make the Console
-content reach the session: the managed policy below withholds it either way.
-Startup messages name the variable but never print its value.
+spellings are accepted). Acknowledging the credential does not make Console
+instructions, skills, providers or MCP servers reach the session: the managed
+policy below withholds them either way. The Console's own policies still apply
+(see below). Startup messages name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
@@ -126,9 +127,22 @@ opencode loads `/etc/opencode` as managed settings above every project, global
 and explicit document, and evaluates a managed document's policies first. The
 deny therefore holds for a saved Console login, for a workspace `opencode.json`
 that allows the integration, and for the real binary started without the
-wrapper. It withholds everything the `opencode` integration supplies:
-Console instructions and skills, and the Console config document's providers,
-remote MCP servers, policies and web-search selection.
+wrapper. It withholds Console instructions and skills, and the Console config
+document's providers, remote MCP servers and web-search selection.
+
+It does **not** withhold the Console document's own `policies`. Upstream keeps
+a policies-only copy of a denied integration's document
+(`packages/core/src/config.ts:343-349` at the pin; the comment at `:233-235`
+says why: "denying an integration never lifts the restrictions it carries"),
+and those policies rank right after the managed ones and above the lane's own
+config. Policy enforcement only removes or denies
+(`packages/core/src/config/plugin/policy.ts:56-113`), so with a Console
+credential and egress the Console can still switch off a provider of the
+worker (measured) and, by the same code, a tool, MCP server, skill or plugin;
+it cannot instruct the worker or add anything to it. This is a known residual
+(review finding AEP-2 on !2502): the maintainer decided not to neutralize
+Console policies. The evaluation asserts the behaviour as it is, so a bump
+that changes it is noticed.
 
 What it does **not** do is stop the requests. On a built image at the pin,
 with a saved Console credential, the plugin still fetches

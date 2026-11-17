@@ -2643,39 +2643,89 @@ split role dispatches unless the operator explicitly sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1`; an acknowledged startup warns
 without printing the credential. This gate checks only the environment variable.
 Credentials saved by `opencode auth login` inside a session bypass it and can
-survive a container restart. Opt-in no longer means Console content reaches the
-session: the image's managed policy withholds the instructions, the skills and
-the config merge either way (see the evaluation below). It does not withhold the
+survive a container restart. Opt-in no longer means Console instructions,
+skills, providers or MCP servers reach the session: the image's managed policy
+withholds them either way (see the evaluation below). It does not withhold the
+Console's own `policies` (known residual below) and it does not withhold the
 requests, so the managed tenant's egress allowlist remains the boundary against
 a compromised worker.
 
 **Scope:** WI#665's surface record and environment-credential gate are covered;
 the root-owned managed-policy control is **evaluated on a built image and
 shipped** (see the next section). Acceptance item 3's two halves did not come
-out the same way: the content half holds, the "no request goes to the Console"
-half does not. No live Console request, live Console credential or tenant
-rollout is claimed — the Console in the evaluation was a loopback fake.
+out the same way: the content half holds, except for the Console's own policies
+(known residual below); the "no request goes to the Console" half does not. No
+live Console request, live Console credential or tenant rollout is claimed —
+the Console in the evaluation was a loopback fake.
 
-**Managed-policy evaluation (WI#665 item 3, 2026-11-16).** Run on a locally
-built candidate image of this lane at the pin (`podman build`, then
-`podman run --network=none`), with `scripts/console_policy_eval.py`. Each run
-starts the image's real `/usr/local/lib/opencode2/opencode` server, stores a
-**saved** credential for the `opencode` integration (the path that bypasses the
-entrypoint's `OPENCODE_API_KEY` gate) whose `metadata.server` names a fake
-Console on loopback, and reads back what the session holds. Three runs per
-evaluation:
+**Managed-policy evaluation (WI#665 item 3, 2026-11-16; extended 2026-11-17
+after the review of !2502).** Run on a locally built candidate image of this
+lane at the pin (`podman build`, then `podman run --network=none`), with
+`scripts/console_policy_eval.py`. Each run starts the image's real
+`/usr/local/lib/opencode2/opencode` server, stores a **saved** credential for
+the `opencode` integration (the path that bypasses the entrypoint's
+`OPENCODE_API_KEY` gate) whose `metadata.server` names a fake Console on
+loopback, and reads back what the session holds. Six runs per evaluation. Runs
+1 to 3 are the evaluation of 2026-11-16. Runs 4 to 6, the "lane's own provider"
+column and the `/api/config` reading were added after the review and measured
+on 2026-11-17 on an image built at `2d09343ea`, all six runs in one pass; the
+harness runs from the checkout, not from the image.
 
-| run | Console skill | Console provider | Console MCP server | Console requests |
-|---|---|---|---|---|
-| control, `/etc/opencode` empty | `wi665-console-eval` present | present | present | config, instructions, skills, skill bundle |
-| image policy | absent | absent | absent | config, instructions, skills |
-| image policy + project `opencode.json` allow | absent | absent | absent | config, instructions, skills |
+| run | Console skill | Console provider | Console MCP server | lane's own provider | Console requests |
+|---|---|---|---|---|---|
+| 1 control, `/etc/opencode` empty | `wi665-console-eval` present | present | present | listed | config, instructions, skills, skill bundle |
+| 2 image policy | absent | absent | absent | listed | config, instructions, skills |
+| 3 image policy + project `opencode.json` allow | absent | absent | absent | listed | config, instructions, skills |
+| 4 control, credential with an organization | `wi665-console-eval` present | present | present | listed | config, instructions, skills, skill bundle |
+| 5 image policy, credential with an organization | absent | absent | absent | listed | config, instructions, skills |
+| 6 image policy, Console config carries `provider.use` deny `tensorzero` | absent | absent | absent | **gone** | config, instructions, skills |
 
 The control run proves the harness works (a Console-authored skill, provider
 and MCP server all arrived). With the policy in place none of the three did,
-the `opencode` integration document was absent from `/api/config`, and a
-project document that *allows* `integration.use` for the same resource did not
-lift the deny — the managed statement is decisive, as the source says.
+and a project document that *allows* `integration.use` for the same resource
+did not lift the deny — the managed statement is decisive, as the source says.
+
+**The credential form a saved login takes (runs 4 and 5, review AEP-4).** The
+credential of runs 1 to 3 names no organization, so its `integration.use`
+resource is the bare `opencode`. A saved Console login resolves to
+`opencode#<account>` (`packages/core/src/managed-policy.ts:42-57` at the pin).
+Runs 4 and 5 store a credential whose metadata names the organization
+`org_01`: the control gets the skill, the provider and the MCP server, and the
+image policy withholds all three.
+
+**Known residual: the Console's own policies still apply (run 6, review
+AEP-2).** Upstream keeps a policies-only copy of a denied integration's
+document (`packages/core/src/config.ts:343-349` at the pin; the comment at
+`:233-235` says "denying an integration never lifts the restrictions it
+carries"), and those policies rank right after the managed ones and above the
+lane's own config (`config.ts:331-332,367-375`). Run 6 shows it: with the image
+policy in place and a Console config that also carries `provider.use` deny
+`tensorzero`, the Console's skill, provider and MCP server are withheld and the
+lane's own provider `tensorzero` disappears from `/api/provider`; without that
+statement (run 2) it is listed. The same result was measured in review run 457
+on an image built at `c6ad6ff49`. Policy enforcement only removes or denies
+(`packages/core/src/config/plugin/policy.ts:56-113`): with a Console credential
+and egress the Console can switch off a provider of the worker and, by the same
+code, a tool, MCP server, skill or plugin; it cannot instruct the worker or add
+anything to it. A Console `allow` statement grants nothing by itself: it can
+only outrank a `deny` policy statement of a lower layer, and the lane's own
+config carries no `policies`. Only the provider case is measured; the rest is
+read from the source. The maintainer decided not to neutralize Console
+policies. The harness asserts the behaviour as it is and exits non-zero when
+the Console's statement stops applying, so a bump that changes it is noticed
+and this record is updated.
+
+**What `/api/config` shows.** An earlier version of this record said the
+`opencode` integration document "was absent from `/api/config`" with the policy
+in place. The harness's probe returned nothing in the control run as well
+(measured in review run 457 on an image built at `c6ad6ff49`), so it showed
+nothing either way. Measured on 2026-11-17 on an image built at `2d09343ea`:
+the probe matched on an `integrationID` field, and `/api/config` lists the
+integration's document as a plain document without one and without a `path`.
+The repaired probe reads the documents listed without a `path`. In the control
+run that document carries the Console's `providers` and `mcp`; with the image
+policy it is still listed, reduced to `{}` (run 2) or to its `policies` with
+the Console's statement (run 6).
 
 **What the policy does not do.** The guarded runs still issued
 `GET /api/v2/config`, `/api/v2/instructions` and `/api/v2/skills`. The plugin
@@ -2683,8 +2733,9 @@ loads from the Console first and applies the policy to what it supplies
 (`packages/core/src/plugin/provider/opencode.ts:318-336,362-366` at the pin),
 so acceptance item 3's "no request goes to the Console" does **not** hold. The
 tenant egress allowlist stays the only control on that traffic; the policy's
-value is that nothing arriving from the Console reaches the session, whatever
-the egress path or the credential's provenance.
+value is that no Console instruction, skill, provider or MCP server reaches the
+session, whatever the egress path or the credential's provenance. The Console's
+own policies still do (known residual above).
 
 **Shipped (item 4).** `config/managed/opencode.json` is installed to
 `/etc/opencode/opencode.json` as root:root 0444 in a root:root 0755 directory
