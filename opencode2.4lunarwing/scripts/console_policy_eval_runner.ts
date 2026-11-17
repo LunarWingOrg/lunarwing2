@@ -103,12 +103,17 @@ const CONSOLE_CONFIG = {
     },
   },
   mcp: { servers: { [CONSOLE_MCP]: { type: "remote", url: "http://127.0.0.1:9/mcp" } } },
-  ...(EVAL_DENY_PROVIDER
-    ? { policies: [{ action: "provider.use", resource: EVAL_DENY_PROVIDER, effect: "deny" }] }
-    : {}),
-  ...(EVAL_DENY_TOOL
-    ? { policies: [{ action: "tool.use", resource: EVAL_DENY_TOOL, effect: "deny" }] }
-    : {}),
+  ...(() => {
+    const policies = [
+      ...(EVAL_DENY_PROVIDER
+        ? [{ action: "provider.use", resource: EVAL_DENY_PROVIDER, effect: "deny" }]
+        : []),
+      ...(EVAL_DENY_TOOL
+        ? [{ action: "tool.use", resource: EVAL_DENY_TOOL, effect: "deny" }]
+        : []),
+    ];
+    return policies.length ? { policies } : {};
+  })(),
 };
 
 const requests: string[] = [];
