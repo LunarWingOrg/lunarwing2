@@ -126,6 +126,21 @@ for direction in "systemd:openrc" "openrc:systemd"; do
   else
     pass "add-tenant left the registry untouched"
   fi
+
+  # The same refusal at the CLI boundary: main dispatch reaches add_tenant and
+  # exits non-zero. Root and lock are stubbed so this exercises the command,
+  # not the host's privilege state.
+  rc=0
+  (
+    simulate_host "$host"
+    require_root() { :; }
+    openrc_dispatch_preflight() { return 0; }
+    with_tenant_lifecycle_lock() { shift; "$@"; }
+    LUNARWING_SERVICE_MANAGER="$asked" main add-tenant probe --llm-base-url http://fixture.invalid
+  ) >"$fixture/cli-$asked.log" 2>&1 || rc=$?
+  assert_nonzero "add-tenant command exits non-zero for a $asked override on $host" "$rc"
+  assert_contains "command refusal names the ask" "$(<"$fixture/cli-$asked.log")" "LUNARWING_SERVICE_MANAGER=$asked"
+  assert_contains "command refusal names the host" "$(<"$fixture/cli-$asked.log")" "this host runs $host"
 done
 
 printf '=== forcing switch ===\n'
