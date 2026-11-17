@@ -828,12 +828,14 @@ and give it meaning — `id`, `project_id`, `name`, `goal`, `status`, `cadence`,
 fields and each scalar of a partial `retry_policy` object, has a serde default,
 so a document written by an older binary loads instead of being lost. A record
 that truly cannot be deserialized is dropped and its exact bytes are copied
-byte-for-byte to `backups/<mission path>.unparseable-<UTC>-<UUID>`. Like the
-unloadable-default-project snapshot, that is a workspace document under the
-reserved, chunk-free backup namespace, so the project boot scan never revisits
-it and a second failing boot adds a copy instead of overwriting the first. The
-original stays in place, so the drop repeats only until an operator repairs or
-deliberately moves it. A failed copy warns and does not abort the boot.
+byte-for-byte to `backups/<mission path>.unparseable-<SHA-256 of the bytes>`.
+Like the unloadable-default-project snapshot, that is a workspace document
+under the reserved, chunk-free backup namespace, so the project boot scan never
+revisits it. Because the copy is named by its content, a record whose bytes
+stay the same from boot to boot keeps one copy, and a record that changed and
+still fails gets a copy of its own; nothing prunes these copies, so a name per
+boot would grow without bound. The original stays in place, so the drop repeats only until an operator repairs or deliberately
+moves it. A failed copy warns and does not abort the boot.
 The boot WARN carries the validated mission id, operator path, `error_kind`, the
 quarantine path, and a `missing_field` that names the field only when it is in
 the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown` otherwise;

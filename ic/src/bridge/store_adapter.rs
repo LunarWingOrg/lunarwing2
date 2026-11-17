@@ -1110,13 +1110,18 @@ impl HybridStore {
     /// namespace (WI#576, note 17058 point 3).
     ///
     /// A record that fails `from_value::<Mission>` is dropped from the loaded
-    /// set, but the file itself stays on disk and is read again at every boot,
-    /// so the loss repeats with no material an operator can inspect. The copy
-    /// keeps the exact bytes that failed. It lands under `backups/` — reserved
-    /// and chunk-free, same namespace as the unloadable-default-project
-    /// snapshot — so the project boot scan (`engine/projects/*/missions/*`)
-    /// never revisits it. A UUID suffix means a second boot adds a second copy
-    /// instead of overwriting the first.
+    /// set, but the document itself stays in the workspace and is read again
+    /// at every boot, so the loss repeats with no material an operator can
+    /// inspect. The copy keeps the exact bytes that failed. It lands under
+    /// `backups/` — reserved and chunk-free, same namespace as the
+    /// unloadable-default-project snapshot — so the project boot scan
+    /// (`engine/projects/*/missions/*`) never revisits it.
+    ///
+    /// The copy is named by the SHA-256 of those bytes. A record whose bytes
+    /// stay the same from boot to boot therefore keeps one copy, rewritten in
+    /// place, instead of gaining one per boot; nothing prunes these copies,
+    /// so a per-boot name would grow without bound. A record that changed
+    /// and still fails gets a copy of its own.
     ///
     /// Evidence collection must never fail a boot: a failed copy warns and
     /// returns `None`, and the caller still drops the record.
@@ -1126,11 +1131,7 @@ impl HybridStore {
         path: &str,
         content: &str,
     ) -> Option<String> {
-        let quarantine_path = format!(
-            "backups/{path}.unparseable-{}-{}",
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
-            Uuid::new_v4()
-        );
+        let quarantine_path = unparseable_mission_copy_path(path, content);
         match ws.write_backup_snapshot(&quarantine_path, content).await {
             Ok(()) => Some(quarantine_path),
             Err(error) => {
@@ -1570,6 +1571,15 @@ fn record_id_hint(content: &str) -> RecordIds {
             .then(|| record_uuid_field(record, "thread_id"))
             .flatten(),
     }
+}
+
+/// Workspace path of the quarantine copy of an unparseable `mission.json`
+/// (WI#576): the same bytes always map to the same path, so a record that
+/// keeps failing keeps one copy.
+fn unparseable_mission_copy_path(path: &str, content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    format!("backups/{path}.unparseable-{}", hex::encode(digest))
 }
 
 /// Never echo an unvalidated stored identifier at `warn!` (WI#321 OF-1).
@@ -3141,7 +3151,7 @@ mod tests {
         );
 
         let quarantined = quarantined_copies(&workspace, &path).await;
-        assert_eq!(quarantined.len(), 1, "one copy per failed boot");
+        assert_eq!(quarantined.len(), 1, "one copy for these bytes");
         assert_eq!(
             workspace
                 .read_primary(&quarantined[0])
@@ -3168,10 +3178,12 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn each_failed_boot_quarantines_a_distinct_copy() {
-        // A second boot must add evidence, not overwrite the first copy: the
-        // two boots can land in the same clock tick, so the UUID suffix is
-        // what keeps them apart.
+    async fn repeated_failed_boots_keep_one_copy_per_distinct_content() {
+        // WI#576 (review AEX-1): a record whose bytes stay the same must not
+        // gain a copy per boot, because nothing prunes these copies. Two
+        // boots over the same bytes leave one copy;
+        // a record that changed and still fails gets a second one, and the
+        // first stays as it was.
         let (db, _temp_dir) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("mission-quarantine-twice", db));
         let store = HybridStore::new(Some(Arc::clone(&workspace)));
@@ -3215,20 +3227,47 @@ mod tests {
             let quarantined = quarantined_copies(&workspace, &path).await;
             assert_eq!(
                 quarantined.len(),
-                boot,
-                "boot {boot} must retain every earlier copy"
+                1,
+                "boot {boot} over the same bytes must keep exactly one copy"
             );
-            for copy in quarantined {
-                assert_eq!(
-                    workspace
-                        .read_primary(&copy)
-                        .await
-                        .expect("read quarantine copy")
-                        .content,
-                    corrupt
-                );
-            }
+            assert_eq!(
+                workspace
+                    .read_primary(&quarantined[0])
+                    .await
+                    .expect("read quarantine copy")
+                    .content,
+                corrupt
+            );
         }
+
+        raw["cadence"] = serde_json::json!("still-not-a-cadence");
+        let changed = raw.to_string();
+        workspace
+            .write(&path, &changed)
+            .await
+            .expect("change the corrupt mission");
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        let mut contents = Vec::new();
+        for copy in quarantined_copies(&workspace, &path).await {
+            contents.push(
+                workspace
+                    .read_primary(&copy)
+                    .await
+                    .expect("read quarantine copy")
+                    .content,
+            );
+        }
+        contents.sort();
+        let mut expected = vec![corrupt, changed];
+        expected.sort();
+        assert_eq!(
+            contents, expected,
+            "a changed record gets its own copy and the first one stays"
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -3269,7 +3308,7 @@ mod tests {
             .expect("reload engine state");
 
         let quarantined = quarantined_copies(&workspace, &path).await;
-        assert_eq!(quarantined.len(), 1, "one copy per failed boot");
+        assert_eq!(quarantined.len(), 1, "one copy for these bytes");
         assert_eq!(
             workspace
                 .read_primary(&quarantined[0])
