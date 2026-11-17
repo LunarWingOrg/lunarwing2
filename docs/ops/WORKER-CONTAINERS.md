@@ -2691,7 +2691,14 @@ harness runs from the checkout, not from the image.
 | 3 image policy + project `opencode.json` allow | absent | absent | absent | listed | config, instructions, skills |
 | 4 control, credential with an organization | `wi665-console-eval` present | present | present | listed | config, instructions, skills, skill bundle |
 | 5 image policy, credential with an organization | absent | absent | absent | listed | config, instructions, skills |
-| 6 image policy, Console config carries `provider.use` deny `tensorzero` | absent | absent | absent | **gone** | config, instructions, skills |
+| 6 control, `/etc/opencode` empty, Console carries `provider.use` deny `tensorzero` and `tool.use` deny `shell:wi745-console-policy *` | see note | present | present | **gone** | config, instructions, skills |
+| 7 image policy, same Console statements | absent | absent | absent | listed | config, instructions, skills |
+
+Run 6's control is the observation that the Console statements *would* apply
+without the managed layer: the tool assertion evaluates `deny` and the
+provider is gone. Run 7 is the required result: the same Console document no
+longer changes the session, the tool assertion evaluates `allow`, and a
+seeded unsaved `ask` for the same command stays `ask`.
 
 The control run proves the harness works (a Console-authored skill, provider
 and MCP server all arrived). With the policy in place none of the three did,
