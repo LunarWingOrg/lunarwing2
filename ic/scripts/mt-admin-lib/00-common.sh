@@ -729,7 +729,8 @@ tenant_voice_enabled() {
 # cannot be delimited — a BEGIN line with no later END line, or a second BEGIN
 # line before the first one's END line. Dropping "everything from BEGIN to the
 # end of the file" would take root's later jobs with it, so the caller must
-# leave the crontab as it was. An END line with no BEGIN line above it belongs
+# leave the crontab as it was. The same holds when the listing cannot be read
+# back in completely. An END line with no BEGIN line above it belongs
 # to root's own jobs and is kept. A root without a crontab is not an error:
 # only the block is printed.
 _managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
@@ -764,7 +765,14 @@ _managed_cron_table() {  # <crontab command> <begin> <end> [<block line>...]
         continue
       fi
       (( inside )) || kept+="$line"$'\n'
-    done <<<"$listing"
+    done <<<"$listing" || {
+      # bash keeps a here-string larger than its pipe size (64 KiB) in a
+      # temporary file. When that file cannot be written, the redirection
+      # fails and the loop above does not run at all: the table would read as
+      # empty, and the block alone would replace every job root has.
+      warn_err "could not read the whole listing of root's crontab ($command -l) back in: the shell could not buffer it (is ${TMPDIR:-/tmp} full?); the crontab was left as it was"
+      return 1
+    }
   fi
   if (( inside )); then
     warn_err "root's crontab has the line '$begin' without a later line that reads exactly '$end'; repair the block with '$command -e', then schedule again; the crontab was left as it was"

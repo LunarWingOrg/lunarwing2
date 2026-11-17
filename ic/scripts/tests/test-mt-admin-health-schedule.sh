@@ -156,6 +156,50 @@ assert_contains "refused install: the reason names the scheduler" "$BLOCKED_INST
   "could not hand the new root crontab to fcrontab"
 assert_not_contains "refused install: not reported as scheduled" "$BLOCKED_INSTALL_OUTPUT" "scheduled health pipeline"
 
+# A table too large for bash to pass to its own loop through a pipe: bash keeps
+# a here-string above its pipe size (64 KiB) in a temporary file, and when that
+# file cannot be written the loop that copies root's jobs does not run at all.
+# Such a table must not be taken for an empty one — the block alone would then
+# replace every job root has. The file size limit stands in for a temporary
+# directory without room for the table; it holds for the subshell only.
+write_large_table() {  # <file> <line>... : root's jobs around many filler jobs
+  local file="$1" i
+  shift
+  {
+    printf '%s\n' "$job_before"
+    for ((i = 0; i < 1500; i++)); do
+      printf '7 3 * * * /usr/bin/true filler-job-%04d-with-padding-to-pass-the-pipe-size\n' "$i"
+    done
+    printf '%s\n' "$@"
+  } >"$file"
+}
+same_bytes() { if cmp -s -- "$1" "$2"; then printf 'same'; else printf 'differs'; fi; }
+write_large_table "$CRONTAB_STATE" "$begin" '*/9 * * * * /usr/local/sbin/lunarwing-mt-health' "$end" "$job_after"
+command cp -- "$CRONTAB_STATE" "$fixture/cron.before"
+large_lines="$(wc -l <"$CRONTAB_STATE")"
+assert_eq "large table: the fixture is larger than bash's pipe size" "1" \
+  "$(( $(wc -c <"$CRONTAB_STATE") > 65536 ))"
+installs_before="$(install_count)"
+run_blocked_install 'ulimit -f 32'
+assert_eq "large table, no room to buffer it: the installer fails" "1" "$BLOCKED_INSTALL_STATUS"
+assert_eq "large table, no room to buffer it: the crontab is unchanged" "same" \
+  "$(same_bytes "$fixture/cron.before" "$CRONTAB_STATE")"
+assert_eq "large table, no room to buffer it: every line is still there" "$large_lines" \
+  "$(wc -l <"$CRONTAB_STATE")"
+assert_eq "large table, no room to buffer it: no install was attempted" "$installs_before" "$(install_count)"
+assert_contains "large table, no room to buffer it: the reason is printed" "$BLOCKED_INSTALL_OUTPUT" \
+  "could not read the whole listing of root's crontab"
+assert_not_contains "large table, no room to buffer it: not reported as scheduled" "$BLOCKED_INSTALL_OUTPUT" \
+  "scheduled health pipeline"
+
+# The same table with room for it is rebuilt completely, so the refusal above
+# is about the missing room and not about the size.
+_install_health_cron >/dev/null
+write_large_table "$fixture/expected" "$job_after" "$begin" "$sched" "$end"
+assert_eq "large table with room: every job is kept and only the block is replaced" "same" \
+  "$(same_bytes "$fixture/expected" "$CRONTAB_STATE")"
+assert_eq "large table with room: one install" "$((installs_before + 1))" "$(install_count)"
+
 # A BEGIN line with no later END line: the block cannot be delimited, so the
 # table is not rebuilt at all — every other job is left where it was.
 printf '%s\n' "$job_before" "$begin" "$sched" "$job_after" >"$CRONTAB_STATE"
