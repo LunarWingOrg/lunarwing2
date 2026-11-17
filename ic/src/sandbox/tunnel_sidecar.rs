@@ -1432,14 +1432,22 @@ impl TunnelSidecar {
         let hash = self.current_hash(recovery_deadline, true).await?;
         if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy(reprobe_timeout).await {
-                Ok(()) => match self.host_resolver_ready(None).await {
-                    Ok(()) => return Ok(()),
-                    Err(error) => tracing::warn!(
-                        container = %self.container_name,
-                        error = %error,
-                        "Sandbox tunnel sidecar failed its joined-run resolver gate; recreating"
-                    ),
-                },
+                // The verified policy already carries the `wt0` listener, so the
+                // joined-run gate reuses it instead of asking NetBird a second
+                // time on every adopt (WI#732 ADT-4).
+                Ok(policy) => {
+                    match self
+                        .host_resolver_ready(policy.resolvers.first().copied())
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) => tracing::warn!(
+                            container = %self.container_name,
+                            error = %error,
+                            "Sandbox tunnel sidecar failed its joined-run resolver gate; recreating"
+                        ),
+                    }
+                }
                 Err(error) => tracing::warn!(
                     container = %self.container_name,
                     error = %error,
@@ -1688,7 +1696,9 @@ impl TunnelSidecar {
         }
     }
 
-    async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
+    /// Return the verified egress policy so callers can reuse the `wt0`
+    /// listener it already asked NetBird for (WI#732 ADT-4).
+    async fn wait_healthy(&self, timeout: Duration) -> Result<EgressPolicy> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut cleanup = SidecarStartCleanup::new(self.clone());
         let result = self.wait_healthy_until(deadline, timeout).await;
@@ -1703,7 +1713,7 @@ impl TunnelSidecar {
         &self,
         deadline: tokio::time::Instant,
         timeout: Duration,
-    ) -> Result<()> {
+    ) -> Result<EgressPolicy> {
         let mut used_final_attempt = false;
         let mut last_error = None;
         loop {
@@ -1715,7 +1725,7 @@ impl TunnelSidecar {
                     return match tokio::time::timeout_at(deadline, self.check_egress_firewall())
                         .await
                     {
-                        Ok(result) => result.map(|_policy| ()),
+                        Ok(result) => result,
                         Err(_) => Err(self.health_firewall_timeout_error(timeout)),
                     };
                 }
@@ -3629,6 +3639,7 @@ mod tests {
         base: PathBuf,
         removals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         hash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        listener_queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(unix)]
@@ -3640,6 +3651,7 @@ mod tests {
         let instance = instance_id_for(&base);
         let removals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hash = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let listener_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listing = listing_for(&EgressPolicy {
             tunnel_mark: NETBIRD_CONTROL_PLANE_MARK,
             resolvers: vec!["9.9.9.9".parse().unwrap()],
@@ -3647,10 +3659,12 @@ mod tests {
         let runtime = crate::sandbox::cli_runner::TestRuntime::new({
             let removals = removals.clone();
             let hash = hash.clone();
+            let listener_queries = listener_queries.clone();
             move |args, _stdin| {
                 let instance = instance.clone();
                 let removals = removals.clone();
                 let hash = hash.clone();
+                let listener_queries = listener_queries.clone();
                 let listing = listing.clone();
                 async move {
                     let first = args.first().map(String::as_str);
@@ -3671,6 +3685,10 @@ mod tests {
                             )
                         }
                         Some("exec") => {
+                            if args.iter().any(|arg| arg == "--ipv4") {
+                                listener_queries
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                             let reply = successful_netbird_health(
                                 args.get(2).map(String::as_str),
                                 &listing,
@@ -3704,6 +3722,7 @@ mod tests {
             base,
             removals,
             hash,
+            listener_queries,
         }
     }
 
@@ -3756,6 +3775,34 @@ mod tests {
             1,
             "adoption must remove the sidecar whose host resolver file is missing"
         );
+        std::fs::remove_dir_all(gate.base).unwrap();
+    }
+
+    /// WI#732 ADT-4: the adopt path must ask NetBird for the `wt0` listener
+    /// once. Before the fix `wait_healthy` discarded the verified egress policy
+    /// and the joined-run gate queried `netbird status --ipv4` again, so this
+    /// test fails on that second query.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopting_a_sidecar_asks_netbird_for_the_listener_once() {
+        let gate = resolver_gate_fixture("adopt-once");
+        let hash = gate.sidecar.current_hash(None, false).await.unwrap();
+        *gate.hash.lock().unwrap() = Some(hash);
+        let path = gate.sidecar.resolv_conf_path().unwrap().unwrap();
+        std::fs::write(&path, "nameserver 9.9.9.9\n").unwrap();
+
+        gate.sidecar
+            .start_or_adopt(Duration::from_secs(6), Duration::from_secs(6), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            gate.listener_queries
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "adoption must reuse the wt0 listener from the verified egress policy"
+        );
+        assert_eq!(gate.removals.load(std::sync::atomic::Ordering::SeqCst), 0);
         std::fs::remove_dir_all(gate.base).unwrap();
     }
 
