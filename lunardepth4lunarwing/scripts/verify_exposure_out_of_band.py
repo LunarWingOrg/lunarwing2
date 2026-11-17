@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from image_config_policy import validate_config  # noqa: E402
 
+CHECKED_CLOSURE_PREFIXES = ("app/", "opt/lunardepth")
+
 
 def digest_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -59,6 +61,39 @@ def source_inventory(root: Path, compiled_root: Path | None = None) -> dict[str,
     return files
 
 
+def check_closure_member(member: tarfile.TarInfo, name: str, closure_regular: set[str]) -> None:
+    """Apply the application-closure rules to one archive member.
+
+    A tar hard-link member is a second name for an inode of the same archive.
+    `podman export` and BuildKit both write the first path of a shared inode as
+    a regular member and every later path as a link to it, so a hard link
+    cannot redirect a read or a write outside the carried tree the way a
+    symlink can: it names another member, and its own owner, mode, and name are
+    checked here like any other. It is accepted only when the target is an
+    earlier regular file under the checked roots, so the closure gains no path
+    whose bytes are not already present in it. Symlinks, links to anything
+    outside the checked roots, links to a member that is not a regular file,
+    and links that name a path not yet seen stay rejected.
+    """
+    if member.uid != 0 or member.gid != 0 or member.mode & 0o222:
+        raise ValueError(f"writable or non-root-owned image input: {name}")
+    if member.mode & 0o6000:
+        raise ValueError(f"setuid/setgid image input: {name}")
+    if member.issym():
+        raise ValueError(f"symlink in application closure: {name} -> {member.linkname}")
+    if member.islnk():
+        target = normalized(member.linkname)
+        if not target.startswith(CHECKED_CLOSURE_PREFIXES):
+            raise ValueError(
+                f"link in application closure leaves the checked roots: {name} -> {member.linkname}"
+            )
+        if target not in closure_regular:
+            raise ValueError(
+                "link in application closure is not a second name for an earlier "
+                f"regular closure file: {name} -> {member.linkname}"
+            )
+
+
 def validate_archive(
     archive_path: Path,
     config_path: Path,
@@ -73,6 +108,7 @@ def validate_archive(
     validate_config(document)
     inventory = source_inventory(lane_root, compiled_root)
     seen = set()
+    closure_regular = set()
     with tarfile.open(archive_path, "r:*") as archive:
         for member in archive:
             name = normalized(member.name)
@@ -91,15 +127,12 @@ def validate_archive(
                 if digest_bytes(content) != digest_file(inventory[name]):
                     raise ValueError(f"checkout/image content drift: {name}")
                 seen.add(name)
-            if name.startswith(("app/", "opt/lunardepth")):
-                if member.uid != 0 or member.gid != 0 or member.mode & 0o222:
-                    raise ValueError(f"writable or non-root-owned image input: {name}")
-                if member.mode & 0o6000:
-                    raise ValueError(f"setuid/setgid image input: {name}")
-                if member.issym() or member.islnk():
-                    raise ValueError(f"unexpected link in application closure: {name}")
+            if name.startswith(CHECKED_CLOSURE_PREFIXES):
+                check_closure_member(member, name, closure_regular)
+                if member.isreg():
+                    closure_regular.add(name)
             lowered = name.lower()
-            lane_owned = name.startswith(("app/", "opt/lunardepth"))
+            lane_owned = name.startswith(CHECKED_CLOSURE_PREFIXES)
             if lane_owned and any(part in lowered for part in ("/.git/", "/__tests__/", "/tests/", "/.cache/", "/.npm/")):
                 raise ValueError(f"build residue in image: {name}")
             if name.startswith(("root/.cache/", "root/.npm/", "home/lunardepth/.cache/", "home/lunardepth/.npm/")):

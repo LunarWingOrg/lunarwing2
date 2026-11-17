@@ -59,6 +59,9 @@ _ensure_cron_runlevel() {
   say "WARNING: no cron daemon init script found; install fcron/cronie/dcron so the schedule runs"
 }
 
+# Returns 1 when the schedule was not installed, and 2 when it is installed but
+# the cron service could not be enabled and started. ensure_health_pipeline
+# tells the two apart: after a 2 it must not say that the schedule is missing.
 _install_health_cron() {
   local sched="*/${HEALTH_INTERVAL_MIN} * * * * $HEALTH_LAUNCHER"
   local begin="# BEGIN lunarwing-mt-health managed block"
@@ -68,18 +71,20 @@ _install_health_cron() {
   [[ -z "$cmd" ]] && command -v crontab >/dev/null 2>&1 && cmd="crontab"
   if [[ -z "$cmd" ]]; then
     say "WARNING: no fcrontab/crontab found — cannot schedule the pipeline. Install a cron daemon or run $HEALTH_LAUNCHER periodically."
-    return 0
+    return 1
   fi
-  local tmp; tmp="$(mktemp)"
-  "$cmd" -l 2>/dev/null | sed "/^${begin}$/,/^${end}$/d" > "$tmp" || true
-  { printf '%s\n' "$begin" "$sched" "$end"; } >> "$tmp"
-  if "$cmd" "$tmp" 2>/dev/null; then
-    say "scheduled health pipeline via $cmd: every ${HEALTH_INTERVAL_MIN} min"
-  else
-    say "WARNING: failed to install $cmd schedule"
+  # Root's whole crontab is replaced, so the new table is built and checked
+  # first: an unreadable table, a managed block that cannot be delimited, or a
+  # write that fails leaves every other job exactly as it was (WI#740).
+  if ! _install_managed_cron_block "$cmd" "$begin" "$end" "$sched"; then
+    say "WARNING: the health pipeline schedule was not installed; root's crontab was left as it was (reason above)"
+    return 1
   fi
-  rm -f "$tmp"
-  _ensure_cron_runlevel "$([[ "$cmd" == "fcrontab" ]] && echo fcron)"
+  say "scheduled health pipeline via $cmd: every ${HEALTH_INTERVAL_MIN} min"
+  if ! _ensure_cron_runlevel "$([[ "$cmd" == "fcrontab" ]] && echo fcron)"; then
+    say "WARNING: the health pipeline schedule is installed, but the cron service could not be enabled and started (reason above)"
+    return 2
+  fi
 }
 
 _install_health_systemd_timer() {
@@ -87,48 +92,57 @@ _install_health_systemd_timer() {
   # provides the missed-run catch-up fcron gives on OpenRC; system-level (not
   # --user) because one run remediates many tenants' user units via sudo.
   local unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
-  local svc="$unit_dir/lunarwing-mt-health.service"
-  local tmr="$unit_dir/lunarwing-mt-health.timer"
   # Bound a single run: systemd's default TimeoutStartSec (~90s on many
   # distros) can kill a legitimate multi-tenant remediation mid-restart, while
   # a wedged tenant bus must never stall the pipeline forever. Floor of 900s,
   # otherwise one full interval; Persistent=true replays a killed run.
   local run_timeout=$(( HEALTH_INTERVAL_MIN * 60 > 900 ? HEALTH_INTERVAL_MIN * 60 : 900 ))
+  local svc_body tmr_body
   if ! command -v systemctl >/dev/null 2>&1; then
     say "WARNING: systemctl not found — cannot schedule the pipeline on systemd."
-    return 0
+    return 1
   fi
-  cat >"$svc" <<UNITEOF
-[Unit]
-Description=LunarWing MT health-check + self-heal pipeline
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-TimeoutStartSec=$run_timeout
-ExecStart=$HEALTH_LAUNCHER
-UNITEOF
-  cat >"$tmr" <<UNITEOF
-[Unit]
-Description=Schedule LunarWing MT health/self-heal pipeline (every ${HEALTH_INTERVAL_MIN} min)
-
-[Timer]
-OnBootSec=5min
-OnCalendar=*:0/${HEALTH_INTERVAL_MIN}
-Persistent=true
-AccuracySec=30s
-Unit=lunarwing-mt-health.service
-
-[Install]
-WantedBy=timers.target
-UNITEOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  if systemctl enable --now lunarwing-mt-health.timer >/dev/null 2>&1; then
-    say "scheduled health pipeline via systemd timer: every ${HEALTH_INTERVAL_MIN} min"
-  else
-    say "WARNING: failed to enable lunarwing-mt-health.timer"
+  # Both units are replaced only together and only once both are complete, so
+  # a write that fails half-way (a full disk) leaves the units root's timer
+  # runs as they were, and a unit an operator masked (a symbolic link) is not
+  # silently replaced by a regular file (WI#740).
+  printf -v svc_body '%s\n' \
+    '[Unit]' \
+    'Description=LunarWing MT health-check + self-heal pipeline' \
+    'After=network-online.target' \
+    'Wants=network-online.target' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    "TimeoutStartSec=$run_timeout" \
+    "ExecStart=$HEALTH_LAUNCHER"
+  printf -v tmr_body '%s\n' \
+    '[Unit]' \
+    "Description=Schedule LunarWing MT health/self-heal pipeline (every ${HEALTH_INTERVAL_MIN} min)" \
+    '' \
+    '[Timer]' \
+    'OnBootSec=5min' \
+    "OnCalendar=*:0/${HEALTH_INTERVAL_MIN}" \
+    'Persistent=true' \
+    'AccuracySec=30s' \
+    'Unit=lunarwing-mt-health.service' \
+    '' \
+    '[Install]' \
+    'WantedBy=timers.target'
+  if ! _install_unit_pair "$unit_dir" lunarwing-mt-health.service lunarwing-mt-health.timer \
+    "$svc_body" "$tmr_body"; then
+    say "WARNING: the health pipeline timer was not installed; its unit files were left as they were (reason above)"
+    return 1
   fi
+  if ! systemctl daemon-reload >/dev/null 2>&1; then
+    say "WARNING: systemd was not reloaded after installing the health pipeline timer; the units are in place but the timer is not armed"
+    return 1
+  fi
+  if ! systemctl enable --now lunarwing-mt-health.timer >/dev/null 2>&1; then
+    say "WARNING: failed to enable lunarwing-mt-health.timer; the units are in place but the timer is not armed"
+    return 1
+  fi
+  say "scheduled health pipeline via systemd timer: every ${HEALTH_INTERVAL_MIN} min"
 }
 
 # Reconcile one KEY=VALUE line in the host-global health env file, creating it
@@ -643,12 +657,25 @@ LAUNCHEOF
   chmod 0755 "$HEALTH_LAUNCHER"
   say "wrote $HEALTH_LAUNCHER"
 
-  # 5) Schedule it (per init system).
+  # 5) Schedule it (per init system). The schedule replaces files root's
+  # scheduler runs, so a refusal or a failed write leaves the previous schedule
+  # as it was. That is reported here and is not fatal: the library and the
+  # launcher are already in place, and an operator who masked the unit or left
+  # a block unrepairable must still be able to add or upgrade tenants (WI#740).
+  local sched_rc=0
   case "$INIT_SYSTEM" in
-    openrc)  _install_health_cron ;;
-    systemd) _install_health_systemd_timer ;;
+    openrc)  _install_health_cron || sched_rc=$? ;;
+    systemd) _install_health_systemd_timer || sched_rc=$? ;;
   esac
-  say "health pipeline ready (every ${HEALTH_INTERVAL_MIN} min; covers all tenants)"
+  if (( sched_rc == 0 )); then
+    say "health pipeline ready (every ${HEALTH_INTERVAL_MIN} min; covers all tenants)"
+  elif (( sched_rc == 2 )); then
+    # Only _install_health_cron returns 2: root's crontab holds the block, and
+    # the cron service is what could not be enabled and started.
+    say "WARNING: the health pipeline files and schedule are installed, but the schedule may NOT be running; repair the reason above and rerun add-tenant or upgrade-tenant to enable and start the cron service"
+  else
+    say "WARNING: the health pipeline files are installed, but the schedule is NOT; repair the reason above and rerun add-tenant or upgrade-tenant to schedule it"
+  fi
 }
 
 # Upgrade only an already-installed host-global pipeline. Removal leaves the
@@ -666,10 +693,26 @@ remove_health_pipeline() {
   ensure_init_system
   local begin="# BEGIN lunarwing-mt-health managed block"
   local end="# END lunarwing-mt-health managed block"
+  # A block that could not be removed still runs the launcher, so the launcher
+  # is then kept: root's cron entry must never point at a file that is gone.
+  local retire_launcher=1
   case "$INIT_SYSTEM" in
     openrc)
-      command -v fcrontab >/dev/null 2>&1 && fcrontab -l 2>/dev/null | sed "/^${begin}$/,/^${end}$/d" | fcrontab - 2>/dev/null || true
-      command -v crontab  >/dev/null 2>&1 && crontab  -l 2>/dev/null | sed "/^${begin}$/,/^${end}$/d" | crontab  - 2>/dev/null || true
+      # The block is removed from the table of every cron tool that exists,
+      # not only from the one the installer would pick today: a host that was
+      # scheduled while only crontab existed and got fcron later still holds
+      # the block in crontab's table. Removal rewrites a table too, so each
+      # one goes through the same checked path: a table that cannot be read,
+      # or a block that cannot be delimited, leaves root's other jobs as they
+      # were (WI#740). One table that keeps its block keeps the launcher.
+      local cmd
+      for cmd in fcrontab crontab; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        if ! _install_managed_cron_block "$cmd" "$begin" "$end"; then
+          say "WARNING: could not remove the health pipeline block from root's $cmd table; its other jobs, its schedule, and the launcher were left as they were"
+          retire_launcher=0
+        fi
+      done
       ;;
     systemd)
       if command -v systemctl >/dev/null 2>&1; then
@@ -681,7 +724,9 @@ remove_health_pipeline() {
       ;;
     *) return 0 ;;
   esac
-  rm -f "$HEALTH_LAUNCHER"
-  say "retired host-global health pipeline schedule (no tenants remain)"
+  if (( retire_launcher )); then
+    rm -f -- "$HEALTH_LAUNCHER"
+    say "retired host-global health pipeline schedule (no tenants remain)"
+  fi
   # $HEALTH_LIB_DIR + $HEALTH_ENV_FILE left in place (harmless; preserves config/state).
 }
