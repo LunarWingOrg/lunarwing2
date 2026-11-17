@@ -2700,6 +2700,18 @@ provider is gone. Run 7 is the required result: the same Console document no
 longer changes the session, the tool assertion evaluates `allow`, and a
 seeded unsaved `ask` for the same command stays `ask`.
 
+**WI#745 evaluation on a built image (2026-11-17).** The image was built
+locally at `32a4ff350` with `podman build --network=host` and the Dockerfile's
+in-image assertion passed; `scripts/console_policy_eval.py` then ran all seven
+runs with `--network=none` and exited 0. The guarded run reported
+`providerIDs=['tensorzero']`, `consoleToolEffect=allow`,
+`consoleToolAskEffect=ask`, no Console skill/provider/MCP server, and the
+integration document reduced to its two Console policy statements. The control
+with the same Console statements reported `providerIDs` without `tensorzero`,
+`consoleToolEffect=deny`, `consoleToolAskEffect=deny`, and the Console
+provider and MCP server present. The guarded runs still issued the three
+`GET` requests, so the egress allowlist remains the outbound control.
+
 The control run proves the harness works (a Console-authored skill, provider
 and MCP server all arrived). With the policy in place none of the three did,
 and a project document that *allows* `integration.use` for the same resource
