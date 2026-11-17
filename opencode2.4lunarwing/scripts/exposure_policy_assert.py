@@ -102,7 +102,7 @@ REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
 # SHA-256 over the wrapper's code lines (comments and blank lines stripped),
 # so ANY code edit — including one the shape checks below do not name — needs
 # a review of this checker in the same commit (WI#609 ABH-2).
-WRAPPER_CODE_DIGEST = "8d34c3e33262857c22c5cdf2daf8355753b3bb7ca64888f0c6505a862762376b"
+WRAPPER_CODE_DIGEST = "41b862b4dea2e62da9db8232375b01767cdf03b566fe8d3964881eab7d547a99"
 # Shell features that can make the wrapper's tail unreachable or change what
 # its last two lines mean. The wrapper needs none of them. Dot-sourcing is
 # refused wherever it appears, not only at a line start.
@@ -526,7 +526,9 @@ def check_wrapper(lane: pathlib.Path) -> None:
         ('--hostname=*) is_loopback', "check every --hostname=value occurrence"),
         ('[ "$want_host" = 0 ]', "refuse a dangling --hostname"),
         ("auth) want_login=1", "track the 'auth' subcommand"),
-        ("login) in_login=1", "track 'auth login'"),
+        ('elif [ "$want_login" = 1 ]', "look for 'login' across interleaved flags"),
+        ("login) want_login=0; in_login=1", "track 'auth login'"),
+        ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
         ('is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
         ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme, case-insensitively"),
     )

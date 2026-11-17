@@ -502,11 +502,13 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         text = wrapper.read_text(encoding="utf-8")
         for removed, what in (
             ("    auth) want_login=1 ;;\n", "track the 'auth' subcommand"),
-            ("      login) in_login=1; want_login=0 ;;\n", "track 'auth login'"),
+            ('  elif [ "$want_login" = 1 ]; then\n', "look for 'login' across interleaved flags"),
+            ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
             ('    is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
             ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme"),
         ):
             with self.subTest(what=what):
+                self.assertIn(removed, text)
                 wrapper.write_text(text.replace(removed, "", 1), encoding="utf-8")
                 result = run_assert("--lane", str(self.lane))
                 self.assertEqual(result.returncode, 1, result.stdout)
@@ -751,6 +753,8 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             ("--log-level=DEBUG", "auth", "login", "http://example.invalid"),
             ("--print-logs", "auth", "login", "https://example.invalid"),
             ("auth", "--print-logs", "login", "https://example.invalid"),
+            ("auth", "--auto", "login", "http://example.invalid"),
+            ("auth", "--log-level", "DEBUG", "login", "https://example.invalid"),
             ("auth", "login", "HTTP://example.invalid"),
             ("auth", "login", "http:example.invalid"),
         ):
@@ -767,6 +771,8 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             ("auth", "logout"),
             ("auth", "login", "my-integration"),
             ("--log-level=DEBUG", "auth", "login", "provider-name"),
+            ("auth", "list", "--json"),
+            ("run", "auth", "https://example.com/docs"),
         ):
             with self.subTest(form=form):
                 result = self.run_wrapper(*form)

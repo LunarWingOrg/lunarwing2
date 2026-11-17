@@ -37,11 +37,14 @@
 #                             an origin, so `auth list`, `auth logout` and
 #                             `auth login <integration-id|name>` still pass.
 #
-# `auth` and `login` may be separated by flags, so the scan keeps two
-# one-token states. Once `login` is seen, every remaining token is checked
-# for an http:/https: scheme (case-insensitively): the target is positional,
-# so it cannot hide behind a flag, and the refusal does not depend on it
-# being the token immediately after `login`.
+# `auth` and `login` may be separated by flags (with or without a separate
+# value), so the scan does not assume `login` follows `auth` immediately: it
+# stays in the "looking for login" state across any token that is not
+# `login`, and only a literal `login` token turns the target scan on. A
+# one-token lookahead would be desynced by `auth --log-level DEBUG login
+# <url>`. Once `login` is seen, every remaining token is checked for an
+# http:/https: scheme (case-insensitively): the target is positional, so it
+# cannot hide behind a flag.
 #
 # Everything else execs the real binary with its argv unchanged. Server-backed
 # commands can spawn that binary without passing through this wrapper;
@@ -110,17 +113,12 @@ for arg in "$@"; do
     is_loopback "$arg" || refuse "--hostname $arg" "the worker's opencode server must bind loopback only"
     continue
   fi
-  if [ "$want_login" = 1 ]; then
-    case "$arg" in
-      login) in_login=1; want_login=0 ;;
-      -*) ;;
-      *) want_login=0 ;;
-    esac
-    continue
-  fi
   if [ "$in_login" = 1 ]; then
     is_http_url "$arg" && refuse "auth login $arg" "well-known remote-config origins are disabled in LunarWing worker images"
-    continue
+  elif [ "$want_login" = 1 ]; then
+    case "$arg" in
+      login) want_login=0; in_login=1; continue ;;
+    esac
   fi
   case "$arg" in
     service) refuse "service" "explicit service commands are disabled by the worker wrapper" ;;
