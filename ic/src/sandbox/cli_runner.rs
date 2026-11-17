@@ -27,6 +27,9 @@ use crate::sandbox::config::{
 };
 use crate::sandbox::container::ContainerOutput;
 use crate::sandbox::error::{Result, SandboxError};
+#[cfg(test)]
+use crate::sandbox::runtime_path::container_runtime_path;
+use crate::sandbox::runtime_path::{apply as apply_container_runtime_path, binary_on_path};
 
 /// Label key the generic sandbox stamps on every container it starts.
 ///
@@ -1341,30 +1344,6 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
     })
 }
 
-const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-
-fn container_runtime_path(inherited: &str) -> String {
-    let missing = ["/usr/local/sbin", "/usr/sbin", "/sbin"]
-        .into_iter()
-        .filter(|directory| !inherited.split(':').any(|part| part == *directory))
-        .collect::<Vec<_>>();
-    let mut path = missing.join(":");
-    if !path.is_empty() && !inherited.is_empty() {
-        path.push(':');
-    }
-    path.push_str(inherited);
-    path
-}
-
-pub(crate) fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
-    // systemd's default service PATH omits sbin, where Gentoo installs pasta.
-    // Preserve custom runtime locations and add missing system sbin directories
-    // before prepare_service so rootless Podman works in service mode.
-    let inherited =
-        std::env::var("PATH").unwrap_or_else(|_| DEFAULT_CONTAINER_RUNTIME_PATH.to_string());
-    cmd.env("PATH", container_runtime_path(&inherited));
-}
-
 /// Run a quick status probe through the workload spawner (WI#181: container
 /// lifecycle probes must execute in the same manager-forked context as `run` —
 /// the hardened daemon's context breaks podman's rootless user-namespace
@@ -1472,7 +1451,11 @@ pub(crate) async fn output_detached_isolated(
 
 /// Capture the client version without joining or modifying rootless namespaces.
 async fn probe_podman_version() -> Option<(u32, u32)> {
-    let output = tokio::process::Command::new("podman")
+    let mut cmd = tokio::process::Command::new("podman");
+    // The daemon's service PATH omits sbin; the probe must reach a runtime
+    // installed only there, exactly as the run path now does (WI#663).
+    apply_container_runtime_path(&mut cmd);
+    let output = cmd
         .args(crate::sandbox::detect::PODMAN_VERSION_ARGS)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1493,10 +1476,12 @@ async fn probe_podman_version() -> Option<(u32, u32)> {
 /// read-only policy work and the execute-time guard fail writable workspaces
 /// closed under a root daemon.
 async fn probe_docker_rootless() -> bool {
+    let mut probe = tokio::process::Command::new("docker");
+    probe.args(["info", "--format", "{{.SecurityOptions}}"]);
+    apply_container_runtime_path(&mut probe);
     let output = tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new("docker")
-            .args(["info", "--format", "{{.SecurityOptions}}"])
+        probe
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -1511,20 +1496,6 @@ async fn probe_docker_rootless() -> bool {
         }
         _ => false,
     }
-}
-
-/// Check a binary exists on PATH (`which` on Unix, `where` on Windows).
-fn binary_on_path(bin: &str) -> bool {
-    #[cfg(unix)]
-    let lookup = "which";
-    #[cfg(windows)]
-    let lookup = "where";
-    std::process::Command::new(lookup)
-        .arg(bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

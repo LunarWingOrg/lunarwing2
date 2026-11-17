@@ -366,18 +366,22 @@ pub async fn sweep_cli_sandboxes_once(config: &ReaperConfig) {
 
 /// The reaper needs the same manager-forked context as sandbox execution:
 /// even `podman ps` from the hardened daemon can invalidate live pause state.
-/// On OpenRC the shared spawner retains its process-group fallback. Preserve
-/// the sweep deadline, stopping the whole service/tree on timeout or cancellation.
+/// On OpenRC the shared spawner retains its process-group fallback.
+///
+/// The runtime `PATH` comes from the same policy as the runner's, so the
+/// runtime and its own helpers resolve from an sbin-only install (WI#663).
 fn runtime_cli_command(
     spawner: &WorkloadSpawner,
     bin: &str,
     args: &[&str],
 ) -> tokio::process::Command {
     let mut cmd = spawner.command(bin, args);
-    crate::sandbox::cli_runner::apply_container_runtime_path(&mut cmd);
+    crate::sandbox::runtime_path::apply(&mut cmd);
     cmd
 }
 
+/// Preserve the sweep deadline, stopping the whole service/tree on timeout or
+/// cancellation.
 async fn runtime_cli_output(
     spawner: &WorkloadSpawner,
     bin: &str,
