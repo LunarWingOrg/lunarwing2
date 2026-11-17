@@ -126,6 +126,7 @@ pub mod error;
 pub mod manager;
 pub mod mount_guard;
 pub mod proxy;
+pub(crate) mod runtime_path;
 pub mod tunnel_sidecar;
 
 pub use cli_runner::{

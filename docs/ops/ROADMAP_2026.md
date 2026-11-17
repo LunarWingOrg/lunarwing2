@@ -1,6 +1,6 @@
 # Roadmap
 
-## Official LunarWing2 Roadmap:
+## Official LunarWing2 Roadmap (targets are subject to change):
 | Feature | Target |
 |---------|--------|
 | Lunardepth and lunardepth integration polish | v2.2.1.0 |

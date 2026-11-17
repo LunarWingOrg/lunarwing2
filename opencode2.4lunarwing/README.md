@@ -100,7 +100,7 @@ follow-ups.
 
 The upstream `opencode` integration can fetch a hosted Console Library of
 instructions and skills when it has both a Console credential and egress to
-`opencode.ai`. At the pinned v2.2.6, its bundled catalog names
+`opencode.ai`. At the pinned v2.2.7, its bundled catalog names
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
@@ -112,7 +112,10 @@ name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
-session; they bypass this gate and may survive container restarts. The managed
+session; they bypass this gate and may survive container restarts. The exposure
+wrapper refuses `opencode auth login <http(s) url>`, which is the command that
+would also register a well-known remote-config origin (WI#750), but a login
+with an integration ID or name is still possible. The managed
 Console deny below is the control that covers them.
 
 ## Managed Console policy (WI#665)
