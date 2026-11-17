@@ -184,6 +184,13 @@ def _document_verdict(control: dict, guarded: dict) -> tuple[int, str]:
             "RESULT: INTEGRATION DOCUMENT NOT REDUCED — with the image policy /api/config "
             f"still lists it with {extra}"
         )
+    if not guarded_documents:
+        return 1, (
+            "RESULT: CHANGED — THE INTEGRATION DOCUMENT IS NO LONGER LISTED: with the image "
+            "policy /api/config lists no path-less document. The record "
+            "(docs/ops/WORKER-CONTAINERS.md, WI#665) says a policies-only copy stays; "
+            "re-read upstream and update the record"
+        )
     return 0, (
         "RESULT: INTEGRATION DOCUMENT REDUCED TO ITS POLICIES — the control's document "
         "carried the Console's providers and MCP servers; with the image policy "
