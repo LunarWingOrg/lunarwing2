@@ -1066,7 +1066,11 @@ ${pg_dep_requires}
 Type=simple
 WorkingDirectory=$repo
 EnvironmentFile=$env_dir/lunarwing.env
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/${name}/.cargo/bin
+# WI#663: sbin is where Gentoo installs pasta; rootless podman resolves it by
+# name, so a daemon PATH without sbin fails every sandbox run. The sandbox also
+# restores these directories on each runtime command (sandbox::runtime_path),
+# which covers transient workload units that inherit no PATH at all.
+Environment=PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/home/${name}/.cargo/bin
 ExecStart=${relay_exec_prefix}$repo/target/${PROFILE}/lunarwing --no-onboard run
 Restart=always
 RestartSec=5
