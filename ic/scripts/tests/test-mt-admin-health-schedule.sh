@@ -332,6 +332,66 @@ assert_eq "block left in fcrontab's table: the launcher is kept" "1" "$(launcher
 assert_contains "block left in fcrontab's table: the warning names the tool" "$output" \
   "could not remove the health pipeline block from root's fcrontab table"
 
+# ── OpenRC: what ensure_health_pipeline reports after the installer ─────────
+# The crontab is installed but the cron service cannot be enabled and started:
+# the installer says the schedule is installed, so the line that
+# ensure_health_pipeline adds must not say that it is not. The installer's
+# status tells the two results apart (1: not installed, 2: installed, and the
+# cron service is in doubt).
+printf '%s\n' "$job_before" >"$CRONTAB_STATE"
+run_blocked_install '_ensure_cron_runlevel() { return 1; }'
+assert_eq "cron service not enabled: the installer's status is not the refusal's" "2" "$BLOCKED_INSTALL_STATUS"
+printf '%s\n' "$job_before" "$begin" "*/15 * * * * $HEALTH_LAUNCHER" "$end" >"$fixture/expected"
+assert_same_file "cron service not enabled: the crontab holds the block" "$fixture/expected" "$CRONTAB_STATE"
+
+run_health_pipeline() {  # <function override> : ensure_health_pipeline inside the fixture
+  local status=0
+  # shellcheck disable=SC2034,SC2329  # paths and stand-ins are consumed by the sourced ensure_health_pipeline
+  PIPELINE_OUTPUT="$(
+    (
+      HEALTH_SRC_DIR="$fixture/pipeline/source"
+      HEALTH_LIB_DIR="$fixture/pipeline/lib"
+      HEALTH_BASE_DIR="$fixture/pipeline/base"
+      HEALTH_ENV_FILE="$fixture/pipeline/config/health.env"
+      PORTS_REGISTRY="$fixture/pipeline/ports.json"
+      OPENRC_CONFD_DIR="$fixture/pipeline/conf.d"
+      HEALTH_GOTIFY_URL=""
+      HEALTH_GOTIFY_TOKEN=""
+      mkdir -p -- "$HEALTH_SRC_DIR"
+      # Installing the library is test-mt-admin-health-library-security.sh's
+      # subject; this case reads only what is said about the schedule.
+      sync_health_pipeline_library() { :; }
+      ensure_container_runtime() { return 1; }
+      eval "$1"
+      ensure_health_pipeline
+    ) 2>&1
+  )" || status=$?
+  PIPELINE_STATUS="$status"
+}
+
+printf '%s\n' "$job_before" >"$CRONTAB_STATE"
+run_health_pipeline '_ensure_cron_runlevel() { return 1; }'
+assert_eq "cron service not enabled: the pipeline install goes on" "0" "$PIPELINE_STATUS"
+assert_eq "cron service not enabled: the pipeline's crontab holds the block" "1" \
+  "$(grep -cFx -- "$begin" "$CRONTAB_STATE")"
+assert_contains "cron service not enabled: the installer says the schedule is installed" "$PIPELINE_OUTPUT" \
+  "the health pipeline schedule is installed, but the cron service could not be enabled and started"
+assert_contains "cron service not enabled: the closing line says it may not be running" "$PIPELINE_OUTPUT" \
+  "files and schedule are installed, but the schedule may NOT be running"
+assert_not_contains "cron service not enabled: the closing line does not call the schedule missing" \
+  "$PIPELINE_OUTPUT" "but the schedule is NOT;"
+assert_not_contains "cron service not enabled: not reported as ready" "$PIPELINE_OUTPUT" "health pipeline ready"
+
+# A refused schedule (an unterminated block) keeps the other closing line:
+# there the schedule is missing.
+printf '%s\n' "$job_before" "$begin" "$sched" >"$CRONTAB_STATE"
+run_health_pipeline ':'
+assert_eq "schedule refused: the pipeline install goes on" "0" "$PIPELINE_STATUS"
+assert_contains "schedule refused: the closing line says the schedule is not installed" "$PIPELINE_OUTPUT" \
+  "files are installed, but the schedule is NOT;"
+assert_not_contains "schedule refused: the closing line does not call the schedule installed" \
+  "$PIPELINE_OUTPUT" "files and schedule are installed"
+
 # ── systemd: the unit pair ──────────────────────────────────────────────────
 
 sd="$fixture/systemd"

@@ -59,6 +59,9 @@ _ensure_cron_runlevel() {
   say "WARNING: no cron daemon init script found; install fcron/cronie/dcron so the schedule runs"
 }
 
+# Returns 1 when the schedule was not installed, and 2 when it is installed but
+# the cron service could not be enabled and started. ensure_health_pipeline
+# tells the two apart: after a 2 it must not say that the schedule is missing.
 _install_health_cron() {
   local sched="*/${HEALTH_INTERVAL_MIN} * * * * $HEALTH_LAUNCHER"
   local begin="# BEGIN lunarwing-mt-health managed block"
@@ -80,7 +83,7 @@ _install_health_cron() {
   say "scheduled health pipeline via $cmd: every ${HEALTH_INTERVAL_MIN} min"
   if ! _ensure_cron_runlevel "$([[ "$cmd" == "fcrontab" ]] && echo fcron)"; then
     say "WARNING: the health pipeline schedule is installed, but the cron service could not be enabled and started (reason above)"
-    return 1
+    return 2
   fi
 }
 
@@ -666,6 +669,10 @@ LAUNCHEOF
   esac
   if (( sched_rc == 0 )); then
     say "health pipeline ready (every ${HEALTH_INTERVAL_MIN} min; covers all tenants)"
+  elif (( sched_rc == 2 )); then
+    # Only _install_health_cron returns 2: root's crontab holds the block, and
+    # the cron service is what could not be enabled and started.
+    say "WARNING: the health pipeline files and schedule are installed, but the schedule may NOT be running; repair the reason above and rerun add-tenant or upgrade-tenant to enable and start the cron service"
   else
     say "WARNING: the health pipeline files are installed, but the schedule is NOT; repair the reason above and rerun add-tenant or upgrade-tenant to schedule it"
   fi
