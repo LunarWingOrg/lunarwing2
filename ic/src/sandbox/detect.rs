@@ -21,6 +21,8 @@
 //!   so detection also probes `docker version`/`docker info` via CLI if the
 //!   named pipe is unavailable.
 
+use crate::sandbox::runtime_path;
+
 /// Docker daemon availability status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerStatus {
@@ -144,7 +146,7 @@ pub async fn check_docker() -> DockerDetection {
 fn docker_binary_exists() -> bool {
     #[cfg(unix)]
     {
-        binary_on_path("docker")
+        runtime_path::binary_on_path("docker")
     }
     #[cfg(windows)]
     {
@@ -155,20 +157,6 @@ fn docker_binary_exists() -> bool {
             .status()
             .is_ok_and(|s| s.success())
     }
-}
-
-/// Check whether a binary exists on PATH (`which` on Unix, `where` on Windows).
-fn binary_on_path(bin: &str) -> bool {
-    #[cfg(unix)]
-    let lookup = "which";
-    #[cfg(windows)]
-    let lookup = "where";
-    std::process::Command::new(lookup)
-        .arg(bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 // The `version` subcommand bypasses Podman's rootless namespace constructor.
@@ -188,15 +176,19 @@ pub(super) const PODMAN_VERSION_ARGS: [&str; 3] =
 pub async fn check_podman() -> DockerDetection {
     let platform = Platform::current();
 
-    if !binary_on_path("podman") {
+    if !runtime_path::binary_on_path("podman") {
         return DockerDetection {
             status: DockerStatus::NotInstalled,
             platform,
         };
     }
 
-    let output = tokio::process::Command::new("podman")
-        .args(PODMAN_VERSION_ARGS)
+    // A runtime installed only in an sbin directory must still answer its
+    // version probe; the daemon's service PATH can omit sbin (WI#663).
+    let mut probe = tokio::process::Command::new("podman");
+    probe.args(PODMAN_VERSION_ARGS);
+    runtime_path::apply(&mut probe);
+    let output = probe
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()

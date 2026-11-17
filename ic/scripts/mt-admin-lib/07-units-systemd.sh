@@ -1066,7 +1066,14 @@ ${pg_dep_requires}
 Type=simple
 WorkingDirectory=$repo
 EnvironmentFile=$env_dir/lunarwing.env
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/${name}/.cargo/bin
+# WI#663: sbin is where Gentoo installs pasta, and rootless podman resolves it
+# by name. The sandbox adds these directories to every runtime command itself
+# (sandbox::runtime_path); this line is for whatever else the daemon starts by
+# name, and it is the PATH those runtime commands inherit. Two rules of order:
+# the bin directories stay first, because on a host where /usr/sbin is a link
+# to /usr/bin, sbin in front would put /usr/bin ahead of /usr/local/bin; and
+# sbin stays ahead of the tenant-writable cargo directory.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/${name}/.cargo/bin
 ExecStart=${relay_exec_prefix}$repo/target/${PROFILE}/lunarwing --no-onboard run
 Restart=always
 RestartSec=5

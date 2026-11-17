@@ -59,6 +59,29 @@ a settled `"process-group"` fallback, `"process-group-retrying"` between and
 during transient retries, `"probing"` during the first probe, or `"unprobed"`
 before the first workload. Reading status neither starts nor waits for a probe.
 
+### Container runtime PATH (WI#663)
+
+Service-mode workloads receive only the variables their caller set; every other
+variable of the user manager is unset, including its `PATH`. `PATH` is where
+rootless Podman finds its helpers, and sbin is where Gentoo installs `pasta`,
+so a run unit without those directories fails every command with "could not
+find pasta, the network namespace can't be configured". `sandbox::runtime_path`
+owns that single policy: it adds `/usr/local/sbin`, `/usr/sbin`, and `/sbin`
+after the daemon's own `PATH` entries and is applied to every site that resolves
+the runtime — the `which` lookup that selects it, the podman version and docker
+rootless probes, the sandbox runner's run/status/output/detached spawns, and the
+reaper's sweep. A runtime installed only under sbin is therefore selectable as
+well as executable.
+
+The module adds the sbin directories after the entries it inherits, on purpose:
+a name the daemon already resolves must keep resolving to the same file. On a
+host where `/usr/sbin` is a link to `/usr/bin`, sbin in front would put
+`/usr/bin` ahead of `/usr/local/bin`. The tenant unit's own `PATH`
+(`mt-admin-lib/07-units-systemd.sh`) keeps the bin directories first for the
+same reason and lists sbin before the tenant-writable `~/.cargo/bin`, so on a
+re-rendered unit every system directory precedes the tenant's own in the `PATH`
+the runtime commands inherit.
+
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
 The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through capabilities files.
