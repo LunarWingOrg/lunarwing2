@@ -722,10 +722,26 @@ required.
    recreated peer dead while checking the 6-second re-probe, 20-second fresh
    provider cap, and sub-second cached failure through the manager. The peerless
    config still does not test peer encryption or NetBird's control plane.
-5. The NetBird lane requires an isolated throwaway management deployment, one
-   dedicated reusable setup key, and an image containing NetBird, `nft`, `nc`,
-   and `wget`. The lane starts its own plain second peer with that key. Store
-   the key in a mode-`0600` file and do not print it or the tenant env file:
+5. For the NetBird end-to-end lane, follow NetBird live validation below.
+6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
+   sandbox to an allowed private service. Then run a temporary high-port
+   listener in the sandbox and attempt to connect from another overlay peer:
+   the inbound attempt must fail. Remove the temporary listener afterward.
+
+### NetBird live validation (WI#592)
+
+This lane is the only test that proves the NetBird half of the boundary end to
+end. A skip is not a live-validation pass: the test returns without doing
+anything unless all three gates are `1` and every provider setting is present.
+
+1. Prepare an isolated, throwaway NetBird management deployment and one
+   dedicated reusable setup key. Use an image containing NetBird, `nft`, `nc`,
+   and `wget`; the lane starts its own plain second peer with the same key. Do
+   not point this at the production management server or reuse the
+   gateway-exposure peer and key from `docs/guides/NETBIRD_TUNNEL.md`.
+2. Store the setup key in a mode-`0600` file outside the repository. Do not
+   print the key, the key file, or the tenant env file while debugging.
+3. Run the gated lane:
 
    ```bash
    LUNARWING_E2E_PODMAN_TESTS=1 LUNARWING_E2E_TUNNEL_TESTS=1 \
@@ -737,19 +753,33 @@ required.
      podman_tunnel_sidecar_netbird_live -- --exact --nocapture --test-threads=1
    ```
 
-   It checks startup and detailed peer connectivity, a real joined run with
-   `wt0`, peer-hosted HTTP and peer-name DNS, the mode-`0644` resolver file and
-   its read-only mount, exactly one `0x1bd00` mark accept, only the `wt0` DNS
-   allowances, refusal of every former resolver, public-IP and metadata denial,
-   management reconnect, and ingress refusal with a proven-live loopback
-   listener. Its identity check stops the sidecar, deletes the runtime-directory
-   label salt to model a reboot, and requires the same peer IP and state volume
-   after recreation. To restart the throwaway management deployment instead of
-   only reconnecting the client, set `LUNARWING_E2E_NETBIRD_SERVER_CONTAINER` to
-   a space-separated server/proxy list; the lane requires stable health and
-   another joined command afterward.
-
-   For an in-overlay nameserver group, also set
+4. Read the lane in the order it asserts:
+   1. **Fresh start.** The sidecar starts under the configured startup budget;
+      the lane prints `LUNARWING-NETBIRD-FRESH-START-SECONDS` for comparison
+      with the 20-second per-run provider cap.
+   2. **Peer connectivity.** The plain peer is up and detailed peer status
+      shows management, signal, and relay connected.
+   3. **Firewall and join.** Exactly one `0x1bd00` control-plane mark accept and
+      only the `wt0` DNS allowances; then a real joined command sees `wt0`,
+      reaches peer-hosted HTTP, resolves the peer name, and observes the
+      mode-`0644` resolver file mounted read-only. It also proves refusal of
+      every former resolver and denies public-IP and metadata destinations.
+   4. **Identity.** Stopping the sidecar and deleting the runtime-directory
+      label salt models a reboot; recreation must return the same peer IP and
+      the same state volume.
+   5. **Reconnect.** Management reconnect is followed by another joined
+      command, so DNS and firewall expectations are re-derived rather than
+      cached.
+   6. **Ingress refusal.** An attempt against a proven-live loopback listener
+      in the sidecar must fail.
+   7. **Per-run recovery.** The lane kills the sidecar and requires
+      `container_for_run()` to replace it inside the per-run budget, printing
+      `LUNARWING-NETBIRD-RUN-RECOVERY-SECONDS`.
+5. To restart the throwaway management deployment instead of only reconnecting
+   the client, set `LUNARWING_E2E_NETBIRD_SERVER_CONTAINER` to a space-separated
+   server/proxy list. The lane requires stable health and another joined
+   command afterward.
+6. For an in-overlay nameserver group, also set
    `LUNARWING_E2E_NETBIRD_DNS_NAME=probe.lwtest` and
    `LUNARWING_E2E_NETBIRD_DNS_ADDRESS=10.99.0.1`, then distribute that group to
    the sidecar and plain peer with the plain peer's overlay IP as its upstream.
@@ -759,28 +789,21 @@ required.
    domain; the lane then requires `example.com` to resolve to that address too.
    A match-only group omits the public-address variable. These are optional live
    fixtures, not operator configuration through `SANDBOX_TUNNEL_DNS`.
-
-   Without `LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS` the lane also runs the ADN-1
+7. Without `LUNARWING_E2E_NETBIRD_PUBLIC_ADDRESS` the lane also runs the ADN-1
    negative probe: it asks the listener for `example.com` and requires that the
    lookup not resolve (`LUNARWING-NETBIRD-PUBLIC-DNS-LEAK` must be absent). This
    covers the one path where an old uplink DNS channel could survive — NetBird's
    last-resort upstream taken from the backup file, which is dropped only
    because the client opens that socket unmarked. Pair the probe with a
    host-side capture of the uplink port 53 in the same run; it must stay at
-   zero packets. Copy the capture count and the lane summary into the work
-   item.
-
-   The lane never runs without all three gates and provider settings; a skip is
-   not a live-validation pass. WI#600's 2026-11-11 local run passed the main
-   lane against NetBird 0.82.0, captured the custom-DNS failure that led to the
-   WI#603 rejection, and used an uplink `tcpdump` to check for forbidden
+   zero packets.
+8. Record the fresh-start seconds, the recovery seconds, the lane summary, and
+   the capture count in the work item. WI#600's 2026-11-11 local run passed the
+   main lane against NetBird 0.82.0, captured the custom-DNS failure that led to
+   the WI#603 rejection, and used an uplink `tcpdump` to check for forbidden
    destinations. Any podman-capable CI job with protected masked credentials
    remains future work; neither provider lane currently runs in CI, and no
    public-cloud run is claimed.
-6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
-   sandbox to an allowed private service. Then run a temporary high-port
-   listener in the sandbox and attempt to connect from another overlay peer:
-   the inbound attempt must fail. Remove the temporary listener afterward.
 
 ## Troubleshooting
 
@@ -796,5 +819,8 @@ required.
 | a fresh provider exceeds the 20-second per-run cap | restart the daemon so recreation uses the full cold-start budget; investigate why the provider is slow |
 | names do not resolve in the sandbox | for NetBird, check that managed DNS is enabled, the staged file names only `wt0`, and the nameserver group is reachable through the overlay; for WireGuard, check the mounted file and overlay resolver reachability, or the runtime resolvers when custom DNS is unset |
 | `the tunnel resolver file joined runs mount is missing; recovery restages it` or `... no longer names NetBird's wt0 listener; recovery restages it` | the host file joined runs mount was deleted or rewritten after the sidecar started (a re-stage under an adopted sidecar, a stop that left the container, or NetBird writing the runtime resolver back, typically after DNS management was turned off on the server). The daemon refuses the run and recreates the sidecar so the file is staged again; if it recurs, check whether managed DNS is still enabled for the peer |
+| `sandbox_unavailable` naming the WireGuard handshake | no peer completed a handshake within 180 seconds: check peer keys, the remote endpoint, and `PersistentKeepalive = 1..=60` on at least one peer, or configure `SANDBOX_TUNNEL_WIREGUARD_CANARY`; a timestamp ahead of the local clock also fails the probe |
+| `sandbox_unavailable` naming the WireGuard canary | the `ping` probe to `SANDBOX_TUNNEL_WIREGUARD_CANARY` failed: confirm `ping` exists in the image, the canary address is routed through `wg0`, and the peer answers ICMP |
+| a healthy sidecar is recreated after an image rebuild | expected: the resolved local image ID is part of the drift hash, so re-pointing or rebuilding the tag deliberately replaces credentials and network state |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |
