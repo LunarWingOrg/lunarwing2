@@ -8,7 +8,24 @@
 //   consoleRequests  — every request the plugin made, so "no request goes to
 //                      the Console" can be answered rather than assumed;
 //   consoleSkills    — whether a Console-authored skill was registered;
-//   configDocument   — the `opencode` integration document from /api/config.
+//   providerIDs      — every provider the session lists, the lane's own and
+//                      the Console's, so a provider the Console adds and a
+//                      provider a Console policy removes are both visible;
+//   integrationDocuments — the `info` of every config document /api/config
+//                      lists without a `path`. In this harness that is the
+//                      Console integration's document: the API serializes it
+//                      as a plain document, with no integration ID to match
+//                      on, and every file-backed document has a path.
+//
+// Two switches, set by the driver through the container environment:
+//
+//   WI665_EVAL_ORG            — the saved credential names this organization.
+//                               The `integration.use` resource is then
+//                               `opencode#<org>` (the form a saved Console
+//                               login takes), not the bare integration ID;
+//   WI665_EVAL_DENY_PROVIDER  — the fake Console's config also carries the
+//                               policy statement `provider.use` deny for this
+//                               provider ID.
 //
 // Nothing leaves the container: the fake listens on 127.0.0.1 and the caller
 // runs the container with --network=none. Instructions and skills travel
@@ -23,7 +40,10 @@ type Reported = {
   consoleSkills: string[];
   consoleProviders: string[];
   consoleMcpServers: string[];
-  configDocument: unknown;
+  providerIDs: string[];
+  integrationDocuments: unknown[];
+  credentialOrganization: string;
+  consolePolicyDeniesProvider: string;
   managedPolicyPresent: boolean;
   error?: string;
 };
@@ -32,6 +52,8 @@ const CONSOLE_PORT = 9912;
 const SERVE_PORT = 4097;
 const BIN = "/usr/local/lib/opencode2/opencode";
 const PASSWORD = "wi665-eval-password";
+const EVAL_ORG = process.env.WI665_EVAL_ORG ?? "";
+const EVAL_DENY_PROVIDER = process.env.WI665_EVAL_DENY_PROVIDER ?? "";
 const INSTRUCTION = {
   id: "wi665-eval-instruction",
   content: "Console-authored instruction from the WI#665 evaluation harness.",
@@ -56,7 +78,10 @@ const SKILL_BUNDLE = {
 };
 // A Console config document that supplies a provider and an MCP server, so the
 // merge surface is observable as well as the Library: both must be absent when
-// the deny holds.
+// the deny holds. With WI665_EVAL_DENY_PROVIDER it also carries a policy
+// statement: upstream keeps a denied integration's policies
+// (packages/core/src/config.ts:343-349 at the v2.2.7 pin), so that statement
+// is expected to apply while everything else in the document is withheld.
 const CONSOLE_PROVIDER = "wi665-console-provider";
 const CONSOLE_MCP = "wi665-console-mcp";
 const CONSOLE_CONFIG = {
@@ -69,6 +94,9 @@ const CONSOLE_CONFIG = {
     },
   },
   mcp: { servers: { [CONSOLE_MCP]: { type: "remote", url: "http://127.0.0.1:9/mcp" } } },
+  ...(EVAL_DENY_PROVIDER
+    ? { policies: [{ action: "provider.use", resource: EVAL_DENY_PROVIDER, effect: "deny" }] }
+    : {}),
 };
 
 const requests: string[] = [];
@@ -89,12 +117,15 @@ const consoleServer = Bun.serve({
 const auth = { authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}` };
 
 async function evaluate(): Promise<Reported> {
-  const serverEnv = {
+  const serverEnv: Record<string, string | undefined> = {
     ...process.env,
     OPENCODE_CONFIG: "/eval/workdir/opencode2.json",
     OPENCODE_CONFIG_DIR: "/eval/config-dir",
     OPENCODE_SERVER_PASSWORD: PASSWORD,
   };
+  // The switches steer the harness, not the binary under evaluation.
+  delete serverEnv.WI665_EVAL_ORG;
+  delete serverEnv.WI665_EVAL_DENY_PROVIDER;
   const child = Bun.spawn([BIN, "serve", "--port", String(SERVE_PORT), "--hostname", "127.0.0.1"], {
     cwd: "/eval/workdir",
     env: serverEnv,
@@ -127,7 +158,10 @@ async function evaluate(): Promise<Reported> {
       value: {
         type: "key",
         key: "wi665-eval-key",
-        metadata: { server: `http://127.0.0.1:${CONSOLE_PORT}` },
+        metadata: {
+          server: `http://127.0.0.1:${CONSOLE_PORT}`,
+          ...(EVAL_ORG ? { orgID: EVAL_ORG } : {}),
+        },
       },
     }),
   });
@@ -149,13 +183,14 @@ async function evaluate(): Promise<Reported> {
   } | { name?: string }[];
   const providerList = Array.isArray(providers) ? providers : (providers.data ?? []);
   const mcpList = Array.isArray(mcp) ? mcp : (mcp.data ?? []);
-  const config = (await get(`/api/config?location[directory]=${location}`)) as {
-    data?: { type?: string; integrationID?: string; info?: unknown }[];
-  };
+  const providerIDs = providerList.map((provider) => provider.id ?? "").filter((id) => id !== "");
+  const config = (await get(`/api/config?location[directory]=${location}`)) as
+    | { type?: string; path?: string; info?: unknown }[]
+    | { data?: { type?: string; path?: string; info?: unknown }[] };
   const entries = Array.isArray(config) ? config : (config.data ?? []);
-  const document =
-    entries.find((entry) => entry?.integrationID === "opencode") ??
-    (Array.isArray(entries) ? entries.find((entry) => JSON.stringify(entry).includes("Config.IntegrationDocument")) : undefined);
+  const integrationDocuments = entries
+    .filter((entry) => entry?.type === "document" && entry.path === undefined)
+    .map((entry) => entry.info ?? {});
 
   let managedPolicyPresent = false;
   try {
@@ -170,13 +205,14 @@ async function evaluate(): Promise<Reported> {
     ok: true,
     consoleRequests: requests,
     consoleSkills: (skills.data ?? []).map((skill) => `${skill.id} ${skill.path ?? ""}`.trim()),
-    consoleProviders: providerList
-      .map((provider) => provider.id ?? "")
-      .filter((id) => id.includes("wi665")),
+    consoleProviders: providerIDs.filter((id) => id.includes("wi665")),
     consoleMcpServers: mcpList
       .map((server) => server.name ?? "")
       .filter((name) => name.includes("wi665")),
-    configDocument: document ?? null,
+    providerIDs,
+    integrationDocuments,
+    credentialOrganization: EVAL_ORG,
+    consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
     managedPolicyPresent,
   };
 }
@@ -191,7 +227,10 @@ try {
     consoleSkills: [],
     consoleProviders: [],
     consoleMcpServers: [],
-    configDocument: null,
+    providerIDs: [],
+    integrationDocuments: [],
+    credentialOrganization: EVAL_ORG,
+    consolePolicyDeniesProvider: EVAL_DENY_PROVIDER,
     managedPolicyPresent: false,
     error: error instanceof Error ? error.message : String(error),
   };
