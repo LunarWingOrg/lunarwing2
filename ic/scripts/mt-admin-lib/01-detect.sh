@@ -21,18 +21,87 @@
 
 # ── Init system detection ────────────────────────────────────────────────────
 
+# PID-1 artifacts that name the host's real service manager. Harness tests may
+# point these at fixtures; production always reads the /run paths.
+OPENRC_HOST_MARKER="${LUNARWING_MT_OPENRC_MARKER:-/run/openrc/softlevel}"
+SYSTEMD_HOST_MARKER="${LUNARWING_MT_SYSTEMD_MARKER:-/run/systemd/system}"
+
+# Print the manager the host's init really runs, from the PID-1 markers only, or
+# nothing when neither exists (chroot, image build, container). This is
+# deliberately narrower than the command-existence ladder below: a chroot can
+# carry systemctl/rc-service without any init running.
+probe_host_service_manager() {
+  if [[ -e "$OPENRC_HOST_MARKER" ]]; then printf 'openrc'; return 0; fi
+  if [[ -e "$SYSTEMD_HOST_MARKER" ]]; then printf 'systemd'; return 0; fi
+  return 0
+}
+
+_manager_probe_path() {
+  case "$1" in
+    openrc)  printf '%s' "$OPENRC_HOST_MARKER" ;;
+    systemd) printf '%s' "$SYSTEMD_HOST_MARKER" ;;
+  esac
+}
+
+# True when the port registry holds a tenant whose units are installed under
+# <manager>. Only the forcing switch consults this: forcing a manager must not
+# be available on a host whose registered tenants are managed by the other one
+# (WI#730 — the health pipeline would silently stop checking them).
+_registered_tenants_under_manager() {
+  local manager="$1" registry="${PORTS_REGISTRY:-}" name
+  [[ -n "$registry" && -f "$registry" ]] || return 1
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    case "$manager" in
+      systemd)
+        [[ -e "$(tenant_home "$name")/.config/systemd/user/lunarwing-${name}.service" ]] && return 0
+        ;;
+      openrc)
+        [[ -e "$OPENRC_INITD_DIR/lunarwing-${name}" ]] && return 0
+        ;;
+    esac
+  done < <(jq -r '.tenants | keys[]?' "$registry" 2>/dev/null || true)
+  return 1
+}
+
+# The manager the host's own health pipeline may record. A positive host probe
+# always wins, even under LUNARWING_SERVICE_MANAGER_FORCE, so no tenant command
+# can point the pipeline at a manager the host does not run (WI#730).
+health_service_manager_of_record() {
+  local probed
+  probed="$(probe_host_service_manager)"
+  printf '%s' "${probed:-$INIT_SYSTEM}"
+}
+
 detect_init_system() {
-  local override="${LUNARWING_SERVICE_MANAGER:-}"
+  local override="${LUNARWING_SERVICE_MANAGER:-}" wanted="" detected=""
   if [[ -n "$override" ]]; then
     case "${override,,}" in
-      systemd|systemd-user) printf 'systemd'; return 0 ;;
-      openrc)               printf 'openrc';  return 0 ;;
+      systemd|systemd-user) wanted="systemd" ;;
+      openrc)               wanted="openrc" ;;
       *) die "unsupported service manager override '$override'; use systemd or openrc" ;;
     esac
+
+    # An override must not contradict the host's PID-1 markers. The check is
+    # the markers only (not the command ladder), so a chroot or image build
+    # without either marker is not treated as a contradiction.
+    detected="$(probe_host_service_manager)"
+    if [[ -n "$detected" && "$detected" != "$wanted" ]]; then
+      if [[ "${LUNARWING_SERVICE_MANAGER_FORCE:-}" != "1" ]]; then
+        die "LUNARWING_SERVICE_MANAGER=$override asks for $wanted, but this host runs $detected ($(_manager_probe_path "$detected") exists); refusing to write $wanted units on a $detected host. Unset LUNARWING_SERVICE_MANAGER, or set LUNARWING_SERVICE_MANAGER_FORCE=1 only for an image build or chroot"
+      fi
+      if _registered_tenants_under_manager "$detected"; then
+        die "LUNARWING_SERVICE_MANAGER_FORCE=1 cannot force $wanted on this $detected host: it already has tenants registered under $detected, and forcing $wanted would drop them from the health pipeline's unit checks"
+      fi
+      say "WARNING: LUNARWING_SERVICE_MANAGER_FORCE=1 forcing $wanted on a $detected host (image build/chroot); the health pipeline will keep recording $detected" >&2
+    elif [[ -z "$detected" ]]; then
+      say "WARNING: LUNARWING_SERVICE_MANAGER=$override with no host init marker ($OPENRC_HOST_MARKER, $SYSTEMD_HOST_MARKER); assuming an image build/chroot" >&2
+    fi
+    printf '%s' "$wanted"; return 0
   fi
 
-  if [[ -e /run/openrc/softlevel ]]; then printf 'openrc'; return 0; fi
-  if [[ -e /run/systemd/system ]];   then printf 'systemd'; return 0; fi
+  if [[ -e "$OPENRC_HOST_MARKER" ]]; then printf 'openrc'; return 0; fi
+  if [[ -e "$SYSTEMD_HOST_MARKER" ]];   then printf 'systemd'; return 0; fi
 
   if command -v rc-service >/dev/null 2>&1 && ! command -v systemctl >/dev/null 2>&1; then
     printf 'openrc'; return 0
