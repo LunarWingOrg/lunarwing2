@@ -1164,7 +1164,16 @@ Enforced controls (opencode2 lane unless noted):
    (`packages/core/src/plugin/provider/opencode.ts`). Read the upstream diff under
    `packages/core/src` as well as `packages/{cli,server,schema}/src`: the
    v2.2.7 Console event watches live there and the first pass of that bump
-   missed them. **Feature flags:** the wrapper's `-console_watches` pin is
+   missed them. **Well-known remote config (adjacent to WI#665, no control
+   here):** upstream also merges remote config from every registered
+   "well-known" origin (`packages/core/src/wellknown.ts`,
+   `packages/core/src/config.ts:182-229,352-366` at the v2.2.7 pin); its
+   `integration.use` resource is the origin's URL, which the managed policy's
+   `opencode*` pattern does not match. It takes an origin registered in the
+   worker's state with a key credential saved for it, and egress to that
+   origin, so on every bump re-read that path and record whether anything
+   now registers an origin without the operator.
+   **Feature flags:** the wrapper's `-console_watches` pin is
    only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
    is ignored without a word, and upstream ships a feature by deleting its
    flag. The builder stage therefore anchors the pin
