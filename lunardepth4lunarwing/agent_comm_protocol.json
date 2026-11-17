@@ -49,6 +49,7 @@
   },
   "task_result": {
     "statuses": ["success", "error", "cancelled", "timed_out"],
+    "status_note": "The values a worker sends are the four above. The daemon also accepts status \"failed\" and stores and reports a failed result as \"failed\"; an unrecognized status is logged and treated as failed.",
     "max_output_bytes": 15728640,
     "exactly_one": true,
     "partial_output_on_cancel_or_timeout": true
