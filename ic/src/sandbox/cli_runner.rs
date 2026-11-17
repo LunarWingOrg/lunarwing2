@@ -1452,7 +1452,7 @@ pub(crate) async fn output_detached_isolated(
 /// Capture the client version without joining or modifying rootless namespaces.
 async fn probe_podman_version() -> Option<(u32, u32)> {
     let mut cmd = tokio::process::Command::new("podman");
-    // The daemon's service PATH omits sbin; the probe must reach a runtime
+    // The daemon's service PATH can omit sbin; the probe must reach a runtime
     // installed only there, exactly as the run path now does (WI#663).
     apply_container_runtime_path(&mut cmd);
     let output = cmd
@@ -2337,7 +2337,7 @@ mod tests {
             assert!(path.split(':').any(|part| part == directory));
         }
         let custom = container_runtime_path("/custom/bin:/usr/sbin");
-        assert_eq!(custom, "/usr/local/sbin:/sbin:/custom/bin:/usr/sbin");
+        assert_eq!(custom, "/custom/bin:/usr/sbin:/usr/local/sbin:/sbin");
         assert_eq!(custom.matches("/usr/sbin").count(), 1);
         assert_eq!(
             container_runtime_path("/usr/local/sbin:/usr/sbin:/sbin"),

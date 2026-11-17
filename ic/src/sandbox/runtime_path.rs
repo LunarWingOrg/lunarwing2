@@ -1,7 +1,7 @@
 //! PATH policy for locating the container runtime and its helpers (WI#663).
 //!
 //! systemd's default user-service `PATH` omits sbin, where Gentoo installs
-//! pasta. mt-admin likewise renders a tenant unit whose `PATH` names only bin
+//! pasta, and a tenant unit rendered before this work item names only bin
 //! directories. Rootless Podman resolves pasta by name, so a runtime started
 //! with that `PATH` fails every run with "could not find pasta, the network
 //! namespace can't be configured".
@@ -23,19 +23,25 @@ pub(crate) const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin
 #[cfg(unix)]
 const RUNTIME_SBIN_DIRECTORIES: [&str; 3] = ["/usr/local/sbin", "/usr/sbin", "/sbin"];
 
-/// Prepend the sbin directories `inherited` lacks, keeping its own order and
+/// Append the sbin directories `inherited` lacks, keeping its own order and
 /// any custom runtime locations it names.
+///
+/// They go last so that every name the daemon already resolves keeps resolving
+/// to the same file: on hosts where `/usr/sbin` is a link to `/usr/bin`, sbin
+/// in front would put `/usr/bin` ahead of `/usr/local/bin`. A helper that
+/// exists only under sbin is found either way.
 #[cfg(unix)]
 pub(crate) fn container_runtime_path(inherited: &str) -> String {
-    let missing = RUNTIME_SBIN_DIRECTORIES
-        .into_iter()
-        .filter(|directory| !inherited.split(':').any(|part| part == *directory))
-        .collect::<Vec<_>>();
-    let mut path = missing.join(":");
-    if !path.is_empty() && !inherited.is_empty() {
-        path.push(':');
+    let mut path = inherited.to_string();
+    for directory in RUNTIME_SBIN_DIRECTORIES {
+        if inherited.split(':').any(|part| part == directory) {
+            continue;
+        }
+        if !path.is_empty() {
+            path.push(':');
+        }
+        path.push_str(directory);
     }
-    path.push_str(inherited);
     path
 }
 
@@ -101,16 +107,45 @@ mod tests {
     fn container_runtime_path_restores_missing_sbin_directories() {
         assert_eq!(
             container_runtime_path("/usr/local/bin:/usr/bin:/bin"),
-            "/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin"
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
         );
         // Custom runtime locations survive, and no directory is repeated.
         let custom = container_runtime_path("/custom/bin:/usr/sbin");
-        assert_eq!(custom, "/usr/local/sbin:/sbin:/custom/bin:/usr/sbin");
+        assert_eq!(custom, "/custom/bin:/usr/sbin:/usr/local/sbin:/sbin");
         assert_eq!(custom.matches("/usr/sbin").count(), 1);
         assert_eq!(
             container_runtime_path("/usr/local/sbin:/usr/sbin:/sbin"),
             "/usr/local/sbin:/usr/sbin:/sbin"
         );
+        assert_eq!(
+            container_runtime_path(""),
+            "/usr/local/sbin:/usr/sbin:/sbin"
+        );
+        // The tenant unit's own `PATH` names all three already: nothing is
+        // added, so the runtime commands get the unit's order unchanged.
+        let unit =
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/tenant/.cargo/bin";
+        assert_eq!(container_runtime_path(unit), unit);
+    }
+
+    /// !2522 AFD-1: on a host where `/usr/sbin` is a link to `/usr/bin`, sbin
+    /// in front lets `/usr/bin` shadow `/usr/local/bin`. The inherited entries
+    /// therefore stay in front, in their own order, whatever is added.
+    #[cfg(unix)]
+    #[test]
+    fn container_runtime_path_keeps_inherited_entries_first() {
+        for inherited in [
+            "/usr/local/bin:/usr/bin:/bin",
+            "/usr/local/bin:/usr/bin:/bin:/home/tenant/.cargo/bin",
+            "/opt/runtime/bin:/usr/sbin:/usr/local/bin",
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        ] {
+            let path = container_runtime_path(inherited);
+            assert!(
+                path == inherited || path.starts_with(&format!("{inherited}:")),
+                "{path} does not keep the inherited entries {inherited} in front"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -152,10 +187,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn binary_on_path_finds_a_runtime_in_sbin() {
-        // Every supported host ships `sh`; the point of the assertion is that
-        // lookup succeeds through the augmented paths rather than that a
-        // particular sbin directory is populated.
+    fn binary_on_path_tells_present_from_absent() {
+        // Every supported host ships `sh`. This shows only that the lookup
+        // runs and tells present from absent; the sbin directories on its
+        // `PATH` are pinned by `runtime_lookup_uses_the_sbin_search_path`.
         assert!(binary_on_path("sh"));
         assert!(!binary_on_path("lunarwing-no-such-runtime-binary"));
     }

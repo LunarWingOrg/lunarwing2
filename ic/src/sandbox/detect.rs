@@ -184,7 +184,7 @@ pub async fn check_podman() -> DockerDetection {
     }
 
     // A runtime installed only in an sbin directory must still answer its
-    // version probe; the daemon's service PATH omits sbin (WI#663).
+    // version probe; the daemon's service PATH can omit sbin (WI#663).
     let mut probe = tokio::process::Command::new("podman");
     probe.args(PODMAN_VERSION_ARGS);
     runtime_path::apply(&mut probe);
