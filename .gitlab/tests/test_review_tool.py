@@ -93,14 +93,18 @@ class ReviewToolTests(unittest.TestCase):
             {"target_branch": "aragents/kimil00p/v2.2.0.0"},
             {"target_branch": "aragents/kimil00p/v2.2.0.0"},
             {"target_branch": "aragents/kimil00p/v2.2.0.0", "draft": True},
+            # Any branch under the target's prefix is a reason to doubt the target,
+            # not only another release branch (runbook §4.1).
+            {"target_branch": "aragents/kimil00p/wi232-health-refresh"},
             {"target_branch": "master"},
         ]
         warnings = self.tool.target_warnings(
             target, "2026-11-16T00:00:00.000+00:00", "2026-11-16T12:00:00.000+00:00", others
         )
-        self.assertEqual(len(warnings), 1, warnings)
+        self.assertEqual(len(warnings), 2, warnings)
         self.assertIn("2 open non-draft MR(s) target aragents/kimil00p/v2.2.0.0", warnings[0])
         self.assertIn(target, warnings[0])
+        self.assertIn("1 open non-draft MR(s) target aragents/kimil00p/wi232-health-refresh", warnings[1])
 
     def test_stale_target_is_named_by_the_age_of_its_head(self):
         target = "aragents/kimil00p/v2.1.8.0"
