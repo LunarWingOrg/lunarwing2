@@ -1106,6 +1106,44 @@ impl HybridStore {
         }
     }
 
+    /// Preserve an unparseable `mission.json` in the reserved `backups/`
+    /// namespace (WI#576, note 17058 point 3).
+    ///
+    /// A record that fails `from_value::<Mission>` is dropped from the loaded
+    /// set, but the file itself stays on disk and is read again at every boot,
+    /// so the loss repeats with no material an operator can inspect. The copy
+    /// keeps the exact bytes that failed. It lands under `backups/` — reserved
+    /// and chunk-free, same namespace as the unloadable-default-project
+    /// snapshot — so the project boot scan (`engine/projects/*/missions/*`)
+    /// never revisits it. A UUID suffix means a second boot adds a second copy
+    /// instead of overwriting the first.
+    ///
+    /// Evidence collection must never fail a boot: a failed copy warns and
+    /// returns `None`, and the caller still drops the record.
+    async fn quarantine_unparseable_mission(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        content: &str,
+    ) -> Option<String> {
+        let quarantine_path = format!(
+            "backups/{path}.unparseable-{}-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+            Uuid::new_v4()
+        );
+        match ws.write_backup_snapshot(&quarantine_path, content).await {
+            Ok(()) => Some(quarantine_path),
+            Err(error) => {
+                warn!(
+                    path = ?path,
+                    %error,
+                    "could not quarantine unparseable mission.json"
+                );
+                None
+            }
+        }
+    }
+
     /// Load missions from within each project directory.
     ///
     /// Scans `engine/projects/*/missions/*/mission.json`.
@@ -1157,11 +1195,15 @@ impl HybridStore {
                             // text or newlines (OF-1).
                             let mission_id = record_uuid_field(&raw, "id")
                                 .unwrap_or_else(|| "unknown".to_owned());
+                            let quarantine = self
+                                .quarantine_unparseable_mission(ws, &mission_file, &doc.content)
+                                .await;
                             warn!(
                                 path = ?mission_file,
                                 mission_id = %mission_id,
                                 error_kind = %parse_error_kind(&e),
                                 missing_field = mission_missing_field(&e).unwrap_or("unknown"),
+                                quarantine = ?quarantine,
                                 line = e.line(),
                                 column = e.column(),
                                 "dropping mission: failed to parse"
@@ -1174,10 +1216,14 @@ impl HybridStore {
                         }
                     },
                     Err(e) => {
+                        let quarantine = self
+                            .quarantine_unparseable_mission(ws, &mission_file, &doc.content)
+                            .await;
                         warn!(
                             path = ?mission_file,
                             record_id = "unknown",
                             error_kind = %parse_error_kind(&e),
+                            quarantine = ?quarantine,
                             line = e.line(),
                             column = e.column(),
                             "dropping mission: failed to parse mission.json"
@@ -3011,6 +3057,238 @@ mod tests {
             assert_no_log_carries_at_or_above(&without_paths, &mission.name, "WARN")?;
             assert_no_log_carries_at_or_above(lines, &goal, "WARN")?;
             assert_no_log_carries_at_or_above(lines, "not-a-cadence", "WARN")
+        });
+    }
+
+    /// Paths the boot scan quarantined for `mission_path` under `backups/`.
+    async fn quarantined_copies(workspace: &Workspace, mission_path: &str) -> Vec<String> {
+        let prefix = format!("backups/{mission_path}.unparseable-");
+        workspace
+            .list_all()
+            .await
+            .expect("list workspace")
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(&prefix))
+            .collect()
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn unparseable_mission_json_is_quarantined_under_backups_at_boot() {
+        // WI#576 (note 17058 point 3): a record that fails to deserialize used
+        // to leave nothing behind but a warn line, so the doomed file dropped
+        // again at every boot with no material to inspect. The bytes that
+        // failed must be copied into the reserved `backups/` namespace, and
+        // the warn must name the copy so an operator can find it. The drop
+        // itself is unchanged — the copy is evidence, not a repair.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("mission-quarantine", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "quarantine project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "safetylayer-watch",
+            "keep watching",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        // Schema-invalid but parseable: a legacy value the struct rejects.
+        raw["cadence"] = serde_json::json!("not-a-cadence");
+        let corrupt = raw.to_string();
+        workspace
+            .write(&path, &corrupt)
+            .await
+            .expect("corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .expect("load")
+                .is_none(),
+            "the drop itself is unchanged: the record is still not loaded"
+        );
+        assert_eq!(
+            workspace
+                .read_primary(&path)
+                .await
+                .expect("the original must stay for the operator to repair")
+                .content,
+            corrupt
+        );
+
+        let quarantined = quarantined_copies(&workspace, &path).await;
+        assert_eq!(quarantined.len(), 1, "one copy per failed boot");
+        assert_eq!(
+            workspace
+                .read_primary(&quarantined[0])
+                .await
+                .expect("read quarantine copy")
+                .content,
+            corrupt,
+            "the quarantined copy must carry the exact bytes that failed"
+        );
+        let quarantine = quarantined[0].clone();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &path,
+                    &quarantine,
+                    "error_kind=data",
+                ],
+            )
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn each_failed_boot_quarantines_a_distinct_copy() {
+        // A second boot must add evidence, not overwrite the first copy: the
+        // two boots can land in the same clock tick, so the UUID suffix is
+        // what keeps them apart.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("mission-quarantine-twice", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "quarantine twice", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "twice-dropped",
+            "keep watching",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        raw["cadence"] = serde_json::json!("not-a-cadence");
+        let corrupt = raw.to_string();
+        workspace
+            .write(&path, &corrupt)
+            .await
+            .expect("corrupt mission");
+
+        for boot in 1..=2 {
+            let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+            reloaded
+                .load_state_from_workspace()
+                .await
+                .expect("reload engine state");
+            let quarantined = quarantined_copies(&workspace, &path).await;
+            assert_eq!(
+                quarantined.len(),
+                boot,
+                "boot {boot} must retain every earlier copy"
+            );
+            for copy in quarantined {
+                assert_eq!(
+                    workspace
+                        .read_primary(&copy)
+                        .await
+                        .expect("read quarantine copy")
+                        .content,
+                    corrupt
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn syntactically_broken_mission_json_is_quarantined_at_boot() {
+        // The outer from_str arm does carry a real line/column, but it drops
+        // the record just the same, so it needs the same evidence copy.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("mission-quarantine-syntax", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "quarantine syntax", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "truncated-mission",
+            "keep watching",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let corrupt = "{\"id\": ".to_owned();
+        workspace
+            .write(&path, &corrupt)
+            .await
+            .expect("truncate mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        let quarantined = quarantined_copies(&workspace, &path).await;
+        assert_eq!(quarantined.len(), 1, "one copy per failed boot");
+        assert_eq!(
+            workspace
+                .read_primary(&quarantined[0])
+                .await
+                .expect("read quarantine copy")
+                .content,
+            corrupt
+        );
+        let quarantine = quarantined[0].clone();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse mission.json",
+                    &path,
+                    &quarantine,
+                ],
+            )
         });
     }
 
