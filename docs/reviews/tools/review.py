@@ -2,6 +2,7 @@
 """Harness-agnostic helpers for the open-MR review loop (see ../REVIEW-RUNBOOK.md).
 
 Subcommands:
+  init                   create an empty state file (first run on a fresh checkout)
   status                 open MRs against the target vs the state file (NEW/CHANGED/UNCHANGED)
   jobs PIPELINE          job counts and every non-success job of one pipeline
   post IID FILE          post a staged note file as a new discussion thread on an MR
@@ -29,7 +30,12 @@ HERE = Path(__file__).resolve().parent
 STATE_DEFAULT = HERE.parent / "open-mr-review-state.json"
 URL_DEFAULT = os.environ.get("GITLAB_URL", "https://git.lunarwing.org")
 PROJECT_DEFAULT = os.environ.get("GITLAB_PROJECT", "lunarwing/lunarwing2")
-TARGET_DEFAULT = os.environ.get("REVIEW_TARGET", "aragents/kimil00p/v2.1.8.0")
+# The release branch under review. It moves at every release: bump it in the same
+# change that opens the next release branch (runbook 4.5), or `status` on defaults
+# reports "to review: none" while the open MRs sit on the new branch.
+TARGET_DEFAULT = os.environ.get("REVIEW_TARGET", "aragents/kimil00p/v2.2.0.0")
+# `status` warns when the target's head is this much older than master's.
+STALE_TARGET_DAYS = 7
 
 
 def now_iso():
@@ -96,18 +102,28 @@ class Api:
     def post(self, path, **data):
         return self.call("POST", path, None, data)
 
+    def branch_commit(self, name):
+        return self.get("/repository/branches/" + urllib.parse.quote(name, safe=""))["commit"]
+
     def branch_head(self, name):
-        return self.get("/repository/branches/" + urllib.parse.quote(name, safe=""))["commit"]["id"]
+        return self.branch_commit(name)["id"]
 
 
 # ---------------------------------------------------------------- state file
 
 
-def load_state(path):
+EMPTY_STATE = {"last_run": 0, "next_prefix": "AA", "mrs": {}, "runs": [],
+               "target_heads": {}, "previous_reports": []}
+
+
+def load_state(path, missing_ok=False):
+    """Read the state file. With missing_ok a missing file reads as None (only `status` asks for that)."""
     try:
         return json.loads(Path(path).read_text())
     except FileNotFoundError:
-        die(f"state file not found: {path}")
+        if missing_ok:
+            return None
+        die(f"state file not found: {path} (a fresh checkout has none: create it with `review.py init`)")
     except json.JSONDecodeError as exc:
         die(f"state file is not valid JSON: {exc}")
 
@@ -138,24 +154,74 @@ def record_note(state_path, iid, note_id, created_at, head_sha=None):
 
 
 def next_prefix(prefix):
-    if len(prefix) != 2 or not prefix.isalpha() or not prefix.isupper():
-        die(f"next_prefix in the state file is not two capital letters: {prefix!r}")
-    first, second = prefix
-    if second != "Z":
-        return first + chr(ord(second) + 1)
-    if first == "Z":
-        die("prefix space exhausted at ZZ")
-    return chr(ord(first) + 1) + "A"
+    """AA, AB, ... AZ, BA, ... ZZ, AAA, AAB, ...: the sequence never ends and never repeats."""
+    if (not isinstance(prefix, str) or len(prefix) < 2
+            or not prefix.isascii() or not prefix.isalpha() or not prefix.isupper()):
+        die(f"next_prefix in the state file is not two or more capital letters: {prefix!r}")
+    letters = list(prefix)
+    for pos in range(len(letters) - 1, -1, -1):
+        if letters[pos] != "Z":
+            letters[pos] = chr(ord(letters[pos]) + 1)
+            return "".join(letters)
+        letters[pos] = "A"
+    return "A" * (len(prefix) + 1)
+
+
+def release_family(branch):
+    """`aragents/kimil00p/v2.2.0.0` -> `aragents/kimil00p/`; a branch without a slash has no family."""
+    return branch.rsplit("/", 1)[0] + "/" if "/" in branch else None
+
+
+def target_warnings(target, target_date, master_date, out_of_scope):
+    """Reasons to doubt that `target` is still the release branch under review.
+
+    target_date and master_date are the committed dates (ISO 8601) of the two heads;
+    out_of_scope is the list of open MRs that `status` did not count. A stale default
+    target is silent otherwise: the run reads "to review: none" and posts nothing.
+    """
+    warnings = []
+    family = release_family(target)
+    elsewhere = Counter(
+        mr["target_branch"] for mr in out_of_scope
+        if family and mr["target_branch"] != target and mr["target_branch"].startswith(family)
+        and not (mr.get("draft") or mr.get("work_in_progress"))
+    )
+    for branch, count in sorted(elsewhere.items()):
+        warnings.append(f"{count} open non-draft MR(s) target {branch}, not the review target {target}: "
+                        "is the target stale? (set REVIEW_TARGET or pass --target)")
+    try:
+        behind = datetime.fromisoformat(master_date) - datetime.fromisoformat(target_date)
+    except (TypeError, ValueError):
+        behind = None
+    if behind is not None and behind.days >= STALE_TARGET_DAYS:
+        warnings.append(f"the head of {target} is {behind.days} days older than master's: "
+                        "is the target stale? (set REVIEW_TARGET or pass --target)")
+    return warnings
 
 
 # ---------------------------------------------------------------- commands
 
 
+def cmd_init(args):
+    path = Path(args.state)
+    if path.exists():
+        die(f"refused: {path} exists; `init` never overwrites a state file", 3)
+    try:
+        save_state(path, EMPTY_STATE)
+    except OSError as exc:
+        die(f"cannot create {path}: {exc.strerror}")
+    print(f"created {path}: last_run=0 next_prefix=AA (never commit this file)")
+
+
 def cmd_status(args):
     api = Api(args.url, args.project)
-    state = load_state(args.state)
+    state = load_state(args.state, missing_ok=True)
+    state_missing = state is None
+    if state_missing:
+        state = {}
     known = state.get("mrs", {})
-    heads = {name: api.branch_head(name) for name in (args.target, "master")}
+    commits = {name: api.branch_commit(name) for name in (args.target, "master")}
+    heads = {name: commit["id"] for name, commit in commits.items()}
     open_mrs = api.get("/merge_requests", state="opened", per_page=100)
 
     rows, other = [], []
@@ -190,10 +256,16 @@ def cmd_status(args):
             "updated": mr["updated_at"],
         })
     rows.sort(key=lambda r: -r["iid"])
+    warnings = target_warnings(args.target, commits[args.target].get("committed_date"),
+                               commits["master"].get("committed_date"), other)
+    if state_missing:
+        warnings.append(f"state file not found ({args.state}): every open MR shows as NEW; "
+                        "create it with `review.py init` before the first run")
 
     if args.json:
         print(json.dumps({"checked_at": now_iso(), "target": args.target, "heads": heads,
                           "last_run": state.get("last_run"), "next_prefix": state.get("next_prefix"),
+                          "warnings": warnings,
                           "mrs": rows,
                           "out_of_scope": [{"iid": int(m["iid"]), "target": m["target_branch"],
                                             "source": m["source_branch"], "draft": bool(m.get("draft"))}
@@ -202,6 +274,8 @@ def cmd_status(args):
 
     print(f"{now_iso()}  state: last_run={state.get('last_run')} next_prefix={state.get('next_prefix')}")
     print(f"target {args.target} {short(heads[args.target])}   master {short(heads['master'])}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
     print(f"{'IID':<6}{'STATUS':<11}{'HEAD':<11}{'KNOWN':<11}{'PFX':<5}{'RUN':<5}{'MERGE':<13}{'PIPELINE':<16}{'AUTHOR':<12}SOURCE | TITLE")
     for r in rows:
         pipe = f"{r['pipeline']} {r['pipeline_status']}" if r["pipeline"] else "-"
@@ -238,6 +312,8 @@ def cmd_post(args):
         die(f"{args.file} is empty")
     if not args.head and not args.any_head:
         die("pass --head SHA (the head you reviewed) or --any-head to skip the check")
+    if args.record and not args.dry_run:
+        load_state(args.state)  # fail before posting, not after: a posted note cannot be taken back
     api = Api(args.url, args.project)
     mr = api.get(f"/merge_requests/{args.iid}")
     if mr["state"] != "opened":
@@ -332,6 +408,9 @@ def main():
     parser.add_argument("--project", default=PROJECT_DEFAULT, help="project path ($GITLAB_PROJECT)")
     parser.add_argument("--target", default=TARGET_DEFAULT, help="review target branch ($REVIEW_TARGET)")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="create an empty state file; refuses when one exists")
+    p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("status", help="open MRs against the target vs the state file")
     p.add_argument("--json", action="store_true")
