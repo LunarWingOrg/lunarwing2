@@ -84,6 +84,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/config/managed/opencode.json
 opencode2.4lunarwing/entrypoint.sh
+opencode2.4lunarwing/patches/wi745-managed-policy-precedence.patch
+opencode2.4lunarwing/scripts/apply_managed_policy_precedence.py
+opencode2.4lunarwing/scripts/apply_managed_policy_precedence_test.py
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/opencode_result_test.ts
