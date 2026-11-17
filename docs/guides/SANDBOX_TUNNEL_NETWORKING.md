@@ -200,30 +200,133 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 60
 # SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53
 ```
 
+### Settings reference
+
+| Variable | Default | Accepted values |
+|---|---|---|
+| `SANDBOX_NETWORK` | `proxy-enforced` on Linux, `none` elsewhere | `tunnel` enables everything on this page |
+| `SANDBOX_TUNNEL_PROVIDER` | `netbird` | `netbird` or `wireguard` |
+| `SANDBOX_TUNNEL_IMAGE` | NetBird 0.82.0 digest index; `localhost/lunarwing-tunnel-wireguard:latest` | any image reference; digest form must be `image@sha256:<64 hex characters>` |
+| `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` | `90` | integer from 1 through 600 |
+| `SANDBOX_TUNNEL_DNS` | unset | comma-separated unicast IPs; WireGuard only |
+| `SANDBOX_TUNNEL_WIREGUARD_CONFIG` | unset, required for `wireguard` | regular, non-symlink file, at most 1 MiB, no group/other permission bits (normally `0600`), nonempty `PrivateKey` |
+| `SANDBOX_TUNNEL_WIREGUARD_CANARY` | unset | one unicast IP; WireGuard only |
+| `SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL` | unset, required for `netbird` | `https://` URL without userinfo, query, or fragment |
+| `SANDBOX_TUNNEL_NETBIRD_SETUP_KEY` | unset, required for `netbird` | one token without whitespace; secret |
+| `SANDBOX_AUTO_PULL` | `true` in the daemon; `false` in mt-admin tenants | boolean |
+
+The `SANDBOX_TUNNEL_*` values are validated only when `SANDBOX_NETWORK=tunnel`.
+On any other network they are read but unused, so a bad tunnel value does not
+stop a `proxy-enforced` tenant, and it takes effect at the next start once the
+network mode changes.
+
+DNS and canary addresses must be specified unicast IPs. Loopback, link-local,
+broadcast, unspecified, and multicast addresses are rejected: none is a valid
+overlay health target, and loopback would share a listener or fake canary with
+other commands in the tenant namespace.
+
+## Per-instance sidecar isolation (WI#592)
+
+A daemon owns exactly one tunnel sidecar. Its name is
+`lunarwing-sandbox-tunnel-<instance>`, where `<instance>` is the first 16
+hexadecimal characters of SHA-256 over the daemon's `LUNARWING_BASE_DIR` path
+string. On a multi-tenant host `mt-admin` gives each tenant its own
+`LUNARWING_BASE_DIR` (`$state_dir`), so tenants do not share a sidecar even when
+their container stores, uids, or ports collide.
+
+The container carries three labels: `lunarwing.sandbox-tunnel` (provider),
+`lunarwing.sandbox-tunnel-hash` (the salted configuration drift hash), and
+`lunarwing.sandbox-tunnel-instance` (the instance id above). A start adopts an
+existing container only when it is running, its hash label matches the current
+salted hash, and its instance label matches this daemon. Removal applies the
+same ownership test, so one daemon can neither adopt nor remove another
+daemon's sidecar. Startup, recreation, stop, and cancelled-start cleanup are
+serialized by a fair lifecycle lock keyed by container name, and every run
+joins the exact container ID that passed health and firewall verification —
+never a name, and never a container created after verification. If recreation
+removes that ID first, the run fails closed instead of joining a new,
+not-yet-filtered namespace.
+
+On systemd service mode the detached `run` client's network helpers stay in the
+transient unit `lunarwing-tunnel-<instance>`, so the sidecar reuses that unit
+name; a start that finds the unit still loaded fails closed rather than racing
+it, and one instance never signals another instance's unit. On a Docker bridge
+fallback there is no systemd helper unit; the same names and labels still keep
+instances apart.
+
+`podman ps --filter label=lunarwing.sandbox-tunnel` should show one sidecar per
+daemon instance. The pre-WI#592 fixed-name container and its volumes are not
+removed automatically; see the upgrade note below.
+
+## Image identity
+
 `SANDBOX_TUNNEL_IMAGE` overrides the provider default. Digest references use
 `image@sha256:<64 hex characters>` and are recommended for registry images.
 Mutable tags remain accepted for operator-controlled local images, but startup
 logs a warning when auto-pull is enabled with a non-digest reference. NetBird's
 default is digest-pinned; WireGuard's default remains the locally built
 `localhost/lunarwing-tunnel-wireguard:latest`, with resolved-image-ID hashing
-providing drift detection rather than registry immutability. Prefer a digest for
-production overrides.
+providing drift detection rather than registry immutability. Prefer a digest
+for production overrides.
+
+The reference alone does not identify the image. Every start and health check
+runs `image inspect --format {{.Id}}` locally, requires a well-formed `sha256:`
+ID, and feeds that resolved ID into the salted drift hash. Re-pointing a tag,
+rebuilding the local tag in place, or otherwise changing what the reference
+resolves to therefore recreates the sidecar instead of reusing credentials and
+network state from the previous image. The hash covers the provider, image
+reference, resolved image ID, resolver and canary settings, the WireGuard
+config path and contents, the management URL, and the setup key; the published
+label is salted, so it is a drift marker rather than a digest of the key. The
+startup timeout and `SANDBOX_AUTO_PULL` are not hashed: changing either applies
+at the next start without recreating a healthy sidecar.
 
 Pre-build or pre-pull the image for the same tenant's container store. Every
-image must include `nftables`; startup deliberately fails if it is absent. The
-daemon inspects the local image ID at every start and health check and includes
-it in the drift hash, so re-pointing a tag recreates rather than reuses the
-sidecar. A dedicated mt-admin `build-tunnel-image` step is intentionally not
-added in WI#592: provider images are operator-specific and already have a
-manual per-tenant build/load path, while `SANDBOX_AUTO_PULL=false` fails closed
-if that step was skipped. On multi-tenant hosts `mt-admin` renders no tunnel
+image must include `nftables`; startup deliberately fails if it is absent, and
+the error names `nftables` rather than falling back to host networking. A
+dedicated mt-admin `build-tunnel-image` step is intentionally not added in
+WI#592: provider images are operator-specific and already have a manual
+per-tenant build/load path, while `SANDBOX_AUTO_PULL=false` fails closed if
+that step was skipped. The health path never pulls either (WI#651): a missing
+image fails fast and the single-flight recovery performs the one pull under
+its per-run budget. On multi-tenant hosts `mt-admin` renders no tunnel
 defaults and preserves every operator-set `SANDBOX_TUNNEL_*` value verbatim on
 re-render (`docs/ops/TENANT-CONFIGURATION.md`).
 
-DNS and canary addresses must be specified unicast IPs. Loopback, link-local,
-broadcast, unspecified, and multicast addresses are rejected: none is a valid
-overlay health target, and loopback would share a listener or fake canary with
-other commands in the tenant namespace.
+## Custom DNS
+
+`SANDBOX_TUNNEL_DNS` is WireGuard-only and takes a comma-separated list of
+unicast resolver addresses. NetBird rejects a nonempty value during
+configuration validation and uses its managed resolver instead: its firewall
+accepts port 53 only to the `wt0` listener, and upstreams are configured as
+NetBird nameserver groups reachable through the overlay. There is no
+runtime-resolver fallback for NetBird, so an outside upstream fails closed.
+
+With WireGuard and the setting unset (the default), joined commands resolve
+names through the sidecar's runtime resolvers over the uplink. Only port 53 to
+those resolvers is accepted, and that remains the residual DNS channel
+described above: a recursive resolver can carry query-based exfiltration even
+though arbitrary uplink connections are dropped.
+
+Setting it changes both halves of the path:
+
+- Joined runs mount a daemon-staged resolver file read-only at
+  `/etc/resolv.conf`.
+- Every direct uplink DNS accept is removed, including the rule that would
+  otherwise let the sidecar's own post-bootstrap lookups out. The sidecar keeps
+  its runtime resolver file so provider bootstrap and hostname endpoints still
+  resolve before the firewall is installed.
+
+The file is `<container>.resolv.conf` in the daemon's private runtime
+directory, mode `0644`, written atomically from a temp name and refreshed on
+start and every health check. `SandboxManager::shutdown()` stops the sidecar
+and removes it. Joined runs mount it `ro,z` because Podman and Docker reject
+`--dns` together with `--network container`; the shared SELinux label is safe
+for concurrent runs and the mode works with every supported keep-id mapping.
+Use resolvers reachable through `wg0`, including after a reconnect, because
+stock `wg-quick` resolves its endpoint only at start. A later re-resolve script
+is affected too. Do not expect NetBird to accept this setting during a
+hostname-based reconnect; it is rejected up front instead.
 
 ## NetBird
 
