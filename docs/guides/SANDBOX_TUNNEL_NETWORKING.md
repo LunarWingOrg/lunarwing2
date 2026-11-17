@@ -351,14 +351,15 @@ count them as a second layer behind LunarWing's input chain — there is none.
 Do not reuse the gateway-exposure NetBird peer or setup key from
 `docs/guides/NETBIRD_TUNNEL.md`; that is a separate, inbound gateway feature.
 
-**Operator fact.** Without a NetBird nameserver group whose upstream is
-reachable through the overlay, a NetBird sandbox resolves peer names only:
-`example.com`, package mirrors, and every other public name fail. A tenant that
-already runs `SANDBOX_NETWORK=tunnel` with NetBird loses public-name resolution
-at its first start after upgrading to this release, because the runtime-resolver
-allowance it used until then is gone. Configure a nameserver group (match
-domain or primary) with an overlay-reachable upstream before upgrading, or
-accept peer-only resolution.
+**Operator fact.** Without a NetBird **primary** nameserver group whose
+upstream is reachable through the overlay, a NetBird sandbox resolves no public
+names: `example.com`, package mirrors, and every other public name fail. It
+still resolves peer names, and with a match-domain group the names under that
+group's domains. A tenant that already runs `SANDBOX_NETWORK=tunnel` with
+NetBird loses public-name resolution at its first start after upgrading to this
+release, because the runtime-resolver allowance it used until then is gone.
+Configure a primary nameserver group with an overlay-reachable upstream before
+upgrading to keep public names, or accept peer and match-domain names only.
 
 ### NetBird bump checklist
 
