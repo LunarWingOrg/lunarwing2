@@ -54,3 +54,6 @@ node_modules/
 
 # Executable fallback for the worker-egress shell harness when temp mounts are noexec.
 .worker-egress-test.*/
+
+# Review loop state (docs/reviews/REVIEW-RUNBOOK.md §2): one per host, never committed
+docs/reviews/open-mr-review-state.json

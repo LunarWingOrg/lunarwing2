@@ -2,7 +2,9 @@
 
 This is the harness-agnostic description of the recurring review loop for `lunarwing/lunarwing2`. Any agent (a Claude Code, opencode or kimi session, a cron job, a person) should be able to run one iteration from this file, the two tools in `docs/reviews/tools/`, a shell, git and a GitLab token. Nothing here depends on a particular model, MCP server, scratch directory or memory system; everything a run needs to know from earlier runs is in the state file and the reports.
 
-The loop was run 334 times between 2026-10-03 and 2026-11-05 before this version of the runbook was written; the rules below are the ones that survived.
+The loop was run 458 times between 2026-10-03 and 2026-11-17 before this version of the runbook was written; the rules below are the ones that survived.
+
+**Work is handed out through work items.** Until 2026-11-16 it was handed out through a goals document (`docs/ops/AGENT_GOALS_<ver>.md`), and MRs were titled "Item #N". That document is retired. An MR is now titled "WI #N: …", its author is the work item's assignee, and the work item is the specification a review reads. §12 says what the old words meant, for the MRs, notes and reports that still use them.
 
 ## 0. Conventions used below
 
@@ -12,10 +14,10 @@ The shell snippets use four variables. Set them once per session; the defaults a
 |---|---|---|
 | `REVIEW_CHECKOUT` | `/var/lib/paseo/wt` | the shared checkout (usually on the target branch, often dirty; read-only for a review) |
 | `REVIEW_SCRATCH` | `/var/lib/paseo/.paseo/tmp` | where per-run working files go (`$REVIEW_SCRATCH/run<N>/`); any private, writable directory works |
-| `REVIEW_TARGET` | `aragents/kimil00p/v2.1.8.0` | the release branch under review (also `review.py --target`) |
+| `REVIEW_TARGET` | `aragents/kimil00p/v2.2.0.0` | the release branch under review (also `review.py --target`); the default moves at each release (§4.5) |
 | `GITLAB_TOKEN_FILE` | (none) | a file holding an `api`-scope token (`GITLAB_TOKEN` in the environment also works) |
 
-"Background" means whatever the harness offers: a background job of the harness, `tmux new-session -d`, or `nohup … &`. Record the PID of anything started in the background so it can be stopped by PID. "The operator" is the maintainer who runs the agent; "the agents" are the autonomous authors of the MRs (Applejack, Rarity, SweetieBot).
+"Background" means whatever the harness offers: a background job of the harness, `tmux new-session -d`, or `nohup … &`. Record the PID of anything started in the background so it can be stopped by PID. "The operator" is the maintainer who runs the agent; "the agents" are the autonomous authors of the MRs (Applejack, Rarity and SweetieBot when this was written; the maintainer adds and pauses agents).
 
 ## 1. What a run is
 
@@ -26,7 +28,7 @@ One run = one bounded pass over the open merge requests that target the current 
 - a 20-minute watch for pushes that arrive during the run;
 - a report file and an updated state file at the end.
 
-Scope: non-draft MRs whose `target_branch` is the review target. MRs against `master` are out of scope: SweetieBot's `sweetiebot/test-*` inttest MRs, the maintainer's `wip:` branches, the old drafts. The target moves at each release (`v2.1.5.0` → `v2.1.6.0` → `v2.1.7.0` → `v2.1.8.0`); the review prefix sequence continues across releases.
+Scope: non-draft MRs whose `target_branch` is the review target. MRs against `master` are out of scope: SweetieBot's `sweetiebot/test-*` inttest MRs, the maintainer's `wip:` branches, the old drafts. The target moves at each release (`v2.1.5.0` → `v2.1.6.0` → `v2.1.7.0` → `v2.1.8.0` → `v2.1.9.0` → `v2.2.0.0`); the review prefix sequence continues across releases.
 
 The deliverable the maintainer reads is the GitLab note. The report and state file are for the next run, whoever runs it.
 
@@ -34,9 +36,9 @@ The deliverable the maintainer reads is the GitLab note. The report and state fi
 
 | Path | Tracked? | Purpose |
 |---|---|---|
-| `docs/reviews/open-mr-review-state.json` | no (never commit) | the state file (§7): per-MR reviewed head, prefix, verdict, note ids; per-run entries; `last_run`, `next_prefix`, `target_heads` |
+| `docs/reviews/open-mr-review-state.json` | no (never commit; listed in `.gitignore`) | the state file (§7): per-MR reviewed head, prefix, verdict, note ids; per-run entries; `last_run`, `next_prefix`, `target_heads` |
 | `docs/reviews/OPEN-MR-ADVERSARIAL-REVIEW-<date>-run<N>.md` | no | the run report (§6) |
-| `docs/reviews/tools/review.py` | yes | GitLab + state-file helper (`status`, `jobs`, `post`, `note-id`, `merge-state`, `prefix`) |
+| `docs/reviews/tools/review.py` | yes | GitLab + state-file helper (`init`, `status`, `jobs`, `post`, `note-id`, `merge-state`, `prefix`); its tests are `.gitlab/tests/test_review_tool.py` |
 | `docs/reviews/tools/watch-refs.sh` | yes | bounded ref watcher |
 | `$REVIEW_SCRATCH/run<N>/` | no | per-run working set: `start.txt`, `baseline.txt`, `watch.log`, `diff<iid>.patch`, `note<iid>.md`, `fragment.json` |
 
@@ -53,15 +55,19 @@ The deliverable the maintainer reads is the GitLab note. The report and state fi
 
 ### 4.1 Open
 
+A fresh checkout has no state file, because the file is never committed. `docs/reviews/tools/review.py init` creates an empty one (`last_run` 0, `next_prefix` `AA`) and refuses when one exists. If an earlier session's state file is still on another host or in a backup, copy that one in instead: the reviewed heads, the prefixes and the note ids of every review are in it, and a run started from an empty state reviews every open MR again.
+
 ```bash
 cd "${REVIEW_CHECKOUT:-/var/lib/paseo/wt}"
 N=$(( $(python3 -c "import json;print(json.load(open('docs/reviews/open-mr-review-state.json'))['last_run'])") + 1 ))
 S="${REVIEW_SCRATCH:-/var/lib/paseo/.paseo/tmp}/run$N" && mkdir -p "$S"
 date -u +%FT%TZ | tee "$S/start.txt"                       # run start; the window is 20 min from here
-git fetch -q origin && git ls-remote origin "refs/heads/${REVIEW_TARGET:-aragents/kimil00p/v2.1.8.0}" refs/heads/master
+git fetch -q origin && git ls-remote origin "refs/heads/${REVIEW_TARGET:-aragents/kimil00p/v2.2.0.0}" refs/heads/master
 docs/reviews/tools/review.py status                        # NEW / CHANGED / UNCHANGED per open MR
 docs/reviews/tools/watch-refs.sh -m 20 "$S/baseline.txt" > "$S/watch.log" 2>&1 &   # in the background; keep the PID
 ```
+
+Read every `WARNING:` line that `status` prints before going on. It warns when open non-draft MRs target another release branch of the same family, when the target's head is seven or more days older than master's, and when there is no state file. "to review: none" on a stale target is an empty run that nobody notices: no note, no report entry, no signal.
 
 Record the run start, the target and master heads, the baseline time and ref count (first line of `watch.log`), and the to-review list. The watcher's exit code tells the story: 0 = change (the moved refs are printed), 124 = quiet window, 2 = error. Since the watcher's polls happen in the background, do not sleep waiting for it: review, draft and verify meanwhile, and read `watch.log` when the harness reports the process finished (or when the window's end time has passed).
 
@@ -69,20 +75,24 @@ If a previous run left posting-ready notes or an unmerged fragment (§7), finish
 
 ### 4.2 Review each NEW or CHANGED MR
 
-One two-letter prefix per MR **per review** (`review.py prefix 3` shows the next three; they are consumed when the fragment is merged). A re-review of a moved head is a new review with the next prefix. Findings are numbered `<prefix>-<n>`.
+One prefix per MR **per review**: two letters up to `ZZ`, then three (`AAA`, `AAB`, …), and so on (`review.py prefix 3` shows the next three; they are consumed when the fragment is merged). A re-review of a moved head is a new review with the next prefix. Findings are numbered `<prefix>-<n>`.
 
 For every MR:
 
-1. **Context.** `git fetch origin refs/merge-requests/<iid>/head:refs/mr/<iid>` (or the source branch), `git merge-base origin/<target> <head>`, export `git diff <mb> <head> > $S/diff<iid>.patch`, read the commit list. "Item #N" MRs implement one item of `docs/ops/AGENT_GOALS_<ver>.md` and usually one work item (`GET /issues/<wi>`): read both, and check the **lane rule** (item number mod 3: 1 = Rarity, 2 = Applejack, 0 = SweetieBot; the author must match) and the trail's credit line (a trail that credits the wrong agent is an Info finding).
-2. **Re-attempts and moved heads.** If the MR re-implements a closed MR, find the closed MR's review note and disposition every prior finding ID: FIXED / PARTIAL / UNADDRESSED, each with `file:line`. Scope the work with a head-to-head diff: `git diff <old-mr-head> <new-mr-head> -- ic/ docs/` lists exactly the files that changed since the reviewed code; everything else is byte-identical to what was already verified and needs only a light re-check. Compare per commit with `git patch-id --stable` when the trail claims a replay. The same applies to a head that moved during a run: review the delta since the reviewed head, then disposition the previous prefix's findings.
+1. **Context.** `git fetch origin refs/merge-requests/<iid>/head:refs/mr/<iid>` (or the source branch), `git merge-base origin/<target> <head>`, export `git diff <mb> <head> > $S/diff<iid>.patch`, read the commit list. Then **read the work item** the MR names ("WI #N: …"): its description, its acceptance boxes and every note (`GET /issues/<wi>`, `GET /issues/<wi>/notes`). The work item is the specification. Judge the MR against its required outcome and against each acceptance box, and say in the note which boxes the MR meets and which it cannot meet (a box that needs evidence from a host, a tenant or a master pipeline stays open after the merge).
+   - **Assignment.** The author is normally the work item's assignee; on 2026-11-17 that held for 68 of 68 sampled branches (WI#741, note 18376). A mismatch, or an MR for an item nobody is assigned to, is an Info line for the maintainer and not a defect of the change. A missing goals item, tick or trail is not a finding.
+   - **Closing words.** The release branch is not the project's default branch, so "Closes #N" in a description closes nothing at the merge (`GET /merge_requests/<iid>/closes_issues` is empty for such an MR). When the item must stay open after the merge, ask for "Relates to #N" so that the record is true; do not present it as a risk of the item closing by accident.
+   - **Credit.** A description or note that credits the wrong agent for the work is an Info finding.
+   - An MR from before 2026-11-16 may still be titled "Item #N": see §12.
+2. **Re-attempts and moved heads.** A re-attempt usually arrives under a **new work item that replaces the old one**: the maintainer closes the MR unmerged and its item with it, and the new item quotes the old description and sends the author to the closed MR's comments (WI#724 for WI#695, WI#732 for WI#724, WI#745 for WI#665). If the MR re-implements a closed MR, find the closed MR's review note and its addenda and disposition every prior finding ID: FIXED / PARTIAL / UNADDRESSED, each with `file:line`. Scope the work with a head-to-head diff: `git diff <old-mr-head> <new-mr-head> -- ic/ docs/` lists exactly the files that changed since the reviewed code; everything else is byte-identical to what was already verified and needs only a light re-check. Compare per commit with `git patch-id --stable` when the trail claims a replay. The same applies to a head that moved during a run: review the delta since the reviewed head, then disposition the previous prefix's findings.
 3. **Read the whole diff**, then the surrounding code at the head. Trace trust boundaries end to end (config precedence, first-run paths, auth gates before side effects, lock ordering, generation/ownership keys). When a change claims behaviour of another component ("the TUI replaces the text", "XMPP never sees this"), read that component at the head: every `match` on the changed enum, every consumer of the changed event, the client's reducer. Severity scale: Blocker, High, Medium, Low, Info.
-4. **Verify claims independently.** Pins via `git ls-remote <upstream>` and the registry's referrers API for signatures (a Sigstore bundle's certificate names the signing workflow; no cosign needed); lock-file integrity against the registry; CI claims via the job log, not the trail; "every pipeline since X is green" via the pipelines list; conflicts via `git merge-tree --write-tree --merge-base=<target> <a> <b>` pairwise with every other open MR (goals-file-only conflicts are trivial rebases; say so in the merge order). A suggested regex or classifier is tested against a real job log before it is posted (BuildKit escapes the inner quotes of a `RUN` command as `\"` in its trace; a naive `[^"]*` never matches).
+4. **Verify claims independently.** Pins via `git ls-remote <upstream>` and the registry's referrers API for signatures (a Sigstore bundle's certificate names the signing workflow; no cosign needed); lock-file integrity against the registry; CI claims via the job log, not the trail; "every pipeline since X is green" via the pipelines list; conflicts via `git merge-tree --write-tree --merge-base=<target> <a> <b>` pairwise with every other open MR. Before the merge order says anything about shared files, compute it: `git diff --name-only <target>...<head>` for every open MR, look for duplicates, and simulate the merges in the order you propose (a clean `merge-tree` is not a build: when two MRs share a file, read the merged file). A suggested regex or classifier is tested against a real job log before it is posted (BuildKit escapes the inner quotes of a `RUN` command as `\"` in its trace; a naive `[^"]*` never matches).
 5. **Re-verify before posting** every High or Blocker claim and every "this defect does not exist" claim against the tree, with `file:line`. If a subagent did the reading, re-verify its claims yourself; findings without a file:line anchor do not get posted.
 6. **CI.** `review.py jobs <pipeline>` for the head pipeline; it prints only the non-success jobs and truncates the list, so when its counts exceed its rows, list the jobs through the API (`/pipelines/<id>/jobs?per_page=100&include_retried=true`) and read the log of **every** failed job. Infrastructure failures are named as such and never attributed to the MR: `snapshot.debian.org` apt stalls (a worker-image `RUN` killed with "exit code: 137" or "124"), GitHub release downloads answering 504 (`curl: (22)` right after `$ bash .gitlab/scripts/bootstrap-sccache.sh`, which fails three jobs at once and skips the tests behind `rust-check-libsql`), a RustSec advisory that reds `satellite-advisory-sweep` on every pipeline after its publication time. The check that settles it: the same job passed on the target's and master's latest pipelines, and the MR did not touch the relevant inputs. Suggest a retry; retrying is the operator's click.
-7. **Recurring checks** that have produced findings more than once: a new tenant env knob needs a `_env_existing` preservation line in `ic/scripts/mt-admin-lib/06-env-generation.sh` plus lines in `docs/ops/TENANT-CONFIGURATION.md` and `ic/.env.example` (the renderer regenerates `lunarwing.env` and drops unlisted keys); every relative link and `#anchor` in changed Markdown resolves at the head; release-notes claims are checked against the merged tree **and** against the approved-but-unmerged MRs (a "known limitation" that an approved MR removes must be sequenced after that MR); a goals trail that ran cargo with more than `taskset -c 0-11 -j12` is an Info finding (`AGENTS.md`).
+7. **Recurring checks** that have produced findings more than once: a new tenant env knob needs a `_env_existing` preservation line in `ic/scripts/mt-admin-lib/06-env-generation.sh` plus lines in `docs/ops/TENANT-CONFIGURATION.md` and `ic/.env.example` (the renderer regenerates `lunarwing.env` and drops unlisted keys); every relative link and `#anchor` in changed Markdown resolves at the head; release-notes claims are checked against the merged tree **and** against the approved-but-unmerged MRs (a "known limitation" that an approved MR removes must be sequenced after that MR); an MR description or a work-item note that reports cargo runs with more than `taskset -c 0-11 -j12` is an Info finding (`AGENTS.md`).
 8. **Draft the note** as `$S/note<iid>.md` in the format of §5, with `date -u` taken right before posting for any timestamp in it.
 
-What no review does: check out the head in the shared checkout; run a full debug build; trust a goals-trail "verified" claim without the artifact it names; edit `AGENT_GOALS_*.md` (only when the operator explicitly asks for a goals edit); click the GitLab approve button; retry a pipeline; close or merge anything.
+What no review does: check out the head in the shared checkout; run a full debug build; trust a "verified" claim in an MR description or a work-item note without the artifact it names; edit `AGENT_GOALS_*.md` (retired; kept as history); tick a work item's boxes, close an item or change its assignee; click the GitLab approve button; retry a pipeline; close or merge anything. §11 says what changes when the operator orders direct work.
 
 Local verification that is cheap and safe: `python3 -s -m unittest discover -s .gitlab/tests -p '<file>.py'` from an export (six `test_main_*` cases of `test_goal1_ci.py` need a real git checkout and fail in any export, on the target too); mt-admin harnesses (`ic/scripts/tests/test-*.sh`) from an export of `ic/scripts` **and** `ic-infrastructure-health-check` (the OpenRC library sources `$HEALTH_SRC_DIR/openrc-proxy-unit-contract.sh`); `bash -n`, `shellcheck -S warning`, `python3 -m py_compile`, `validate_config.py`, `verify_release_version.py --self-test`, `git diff --check`. `git archive` aborts the whole export when any listed path does not exist at that commit.
 
@@ -114,6 +124,21 @@ Then re-arm the watcher on a **fresh baseline file** for the remainder of the wi
 5. Delete the heavy scratch; keep the notes and fragment until the merge is confirmed.
 6. Tell the operator: what was reviewed, verdicts and note ids, what was skipped, the merge order, and anything unusual (a tool that failed, a window that was unwatched, an addendum deferred).
 
+**At a release.** When the maintainer opens the next release branch, change the default target in one commit: `TARGET_DEFAULT` in `review.py`, the table in §0, the shell in §4.1 and the list of targets in §1. Until that commit is on the target, export `REVIEW_TARGET` in every session. The default stayed at `v2.1.8.0` through two releases, until 2026-11-17; a session that ran the tool without the variable then saw "to review: none" while three MRs were open (measured on WI#741, note 18376).
+
+### 4.6 Work items
+
+The loop reads work items in every review (§4.2 step 1) and writes to them in four cases.
+
+- **A finding that no open MR owns.** File a work item when it is a defect of the product or of an operator's tool, a security or isolation weakness (a security check whose test passes when the check is removed counts), anything Medium or above, or a false statement in a document. Do not file test polish, such as a surviving mutant or a missing negative case: say it in the MR note. Before filing, measure the defect at the target's head, and search the open items for it.
+- **How an item is written.** Where it is in the tree (`file:line` taken from the file, not from a diff), what can happen, what was measured and on what, the required outcome, acceptance boxes, references. State the outcome as a property ("a failed listing leaves the crontab as it was") and name its scope (which providers, which init systems, which tools). Name a mechanism only after checking that it works, and say so; an author who implements an unchecked suggestion to the letter ships the reviewer's mistake.
+- **After a merge whose item stays open,** post on the item which boxes are met, with the evidence, and what is left and who can supply it. This is the operator's to order (§11); in a review-only run, say it in the MR note.
+- **A correction.** When a statement the loop posted on an item turns out wrong, correct it there in a new note; do not leave it to the report.
+
+Closing an item is the maintainer's, item by item and by name. The loop offers; it does not close. On request it does a **close-out audit**: a read-only pass over every open item (boxes, related MRs, newest notes, the tree where the item names code) that sorts them into "close now", "close if you agree", "one step from closing", "work left" and "later releases", written to `docs/reviews/WI-CLOSEOUT-AUDIT-<date>.md`. Re-verify every "close now" at the target's head before presenting it.
+
+Items filed by others (the study lane, security hunters) are checked for validity when a run touches them, and the result goes into the report. A confidential item's text is never copied into a note, a report or another item.
+
 ## 5. Note format
 
 ```
@@ -122,7 +147,7 @@ Then re-arm the watcher on a **fresh baseline file** for the remainder of the wi
 **Verdict: APPROVE | APPROVE WITH NOTES | APPROVE WITH NITS | REQUEST CHANGES (narrow) for PP-1 | REQUEST CHANGES | BLOCK.**
 One paragraph: the one-line reason, the CI state, the merge condition.
 
-Scope: commits, files, +/-; what the MR does; lane rule; merge-tree result against the target and every open sibling.
+Scope: commits, files, +/-; what the MR does; the work item and which of its acceptance boxes this MR meets; merge-tree result against the target and every open sibling.
 
 ### Verified            (for re-attempts and moved heads: disposition table of every prior finding ID first)
 - bullets with file:line anchors
@@ -141,7 +166,7 @@ Severities are strict by request of the operator: a Blocker is something that mu
 
 ## 6. Report format
 
-Header line with run number, times, target and master heads. Then: scope paragraph (what changed since the last run, what is out of scope), next prefix, a summary table (MR, item/WI, author and branch, head and whether it changed, verdict with run and note ids, merge status, pipeline), one section per reviewed MR (scope, verified, disposition, findings, verdict, note id, time), one short section per skipped MR (head, standing verdict, pipeline change since), **merge order** (sequential, with conditions), CI on the target and master, the window (start, baseline time and count, alerts, exit code, final snapshot), and whether any harness safety check fired. Quiet runs still get a report (runs 325, 327 and 334 are small examples; runs 324 and 330 are large ones).
+Header line with run number, times, target and master heads. Then: scope paragraph (what changed since the last run, what is out of scope), next prefix, a summary table (MR, work item, author and branch, head and whether it changed, verdict with run and note ids, merge status, pipeline), one section per reviewed MR (scope, verified, disposition, findings, verdict, note id, time), one short section per skipped MR (head, standing verdict, pipeline change since), **merge order** (sequential, with conditions), CI on the target and master, work items (filed, marked, corrected; validity of items filed by others), the window (start, baseline time and count, alerts, exit code, final snapshot), and whether any harness safety check fired. Quiet runs still get a report (runs 325, 327 and 334 are small examples; runs 324 and 330 are large ones).
 
 ## 7. The state file and the run fragment
 
@@ -153,18 +178,19 @@ Header line with run number, times, target and master heads. Then: scope paragra
 |---|---|---|
 | `last_run` (int) | `merge-state` | the number of the last closed run; the next run is `last_run + 1` |
 | `last_run_at`, `report` (str) | `merge-state` | close time (`YYYY-MM-DDTHH:MMZ`) and report path of that run |
-| `next_prefix` (two capitals) | `merge-state` | the prefix the next review consumes; `AA`…`ZZ`, continuing across releases |
+| `next_prefix` (two or more capitals) | `merge-state` | the prefix the next review consumes; `AA`…`ZZ`, then `AAA`…, continuing across releases |
 | `target_heads` (`{"run<N>": sha9}`) | `merge-state` | the target head at each run's close |
 | `previous_reports` (list) | `merge-state` | every report path, oldest first |
 | `mrs.<iid>.head_sha` (full sha) | `post --head --record`, `note-id --head`, fragment | **the head that was last fully reviewed**; `status` compares it with the MR's head: equal = UNCHANGED (skip), different = CHANGED (re-review), absent = NEW |
 | `mrs.<iid>.prefix`, `.run`/`.posted_run`, `.verdict`, `.findings`, `.pipeline`/`.ci` | fragment | the last review's prefix, run, verdict line, one-line finding summary, pipeline summary |
 | `mrs.<iid>.posted_note_ids` (list), `.posted_note_id`, `.posted_at` | `post --record`, `note-id`, fragment (unioned) | every note the loop posted on the MR, the first one, the last time |
-| `mrs.<iid>.item`, `.title`, `.author`, `.source`/`.source_branch`, `.target` | fragment | identification |
+| `mrs.<iid>.item`, `.title`, `.author`, `.source`/`.source_branch`, `.target` | fragment | identification; `item` is free text, `WI#741` today (entries from before 2026-11-16 hold a goals item number) |
 | `mrs.<iid>.rebased`, `.merged`, `.closed` | fragment or hand edit | free text for what the operator did with the MR (who, when, which sha) |
 | `runs[]` | `merge-state` (append) | one entry per run: `run`, `start`, `end`, `target`, `master`, `window`, `mrs_reviewed`, `mrs_skipped`, `open_mrs`, `out_of_scope`, `notes_posted`, `prefixes_used`, `verdicts`, `ci`, `merge_order`, `follow_ups`, `auto_mode_block` |
 
 Rules the tools enforce:
 
+- `init` creates the state file once and never overwrites one. `status` on a missing file runs with an empty state and says so; every other subcommand refuses and names `init`. `post --record` checks that the state file is there before it posts, because a posted note cannot be taken back.
 - `merge-state` refuses a fragment whose `last_run` is not exactly `state.last_run + 1` (double merge, or a missing run) unless `--force` is given; even with `--force` it refuses a second `runs` entry for the same run number. To add to an already-merged run, edit the state by hand (back it up first).
 - `merge-state` merges `mrs.<iid>` **key by key** (a fragment entry with only `pipeline` and `notes` touches nothing else), unions `posted_note_ids`, appends `runs_entry`, sets the scalars that are present, and records `target_heads[run<N>]` from `target_head`.
 - `post --head <sha> --record` sets `head_sha` to the MR's head (which `--head` has just verified equals the reviewed one). `post --any-head --record` records the note only. `note-id --head <sha>` sets `head_sha` too.
@@ -179,19 +205,19 @@ The run's state changes are written to one JSON file and merged with `review.py 
 ```json
 {
   "_howto": "merged at run close",
-  "last_run": 333, "last_run_at": "2026-11-05T15:57Z",
-  "report": "docs/reviews/OPEN-MR-ADVERSARIAL-REVIEW-2026-11-05-run333.md",
-  "next_prefix": "VX", "target_head": "89f197538",
+  "last_run": 457, "last_run_at": "2026-11-16T23:02Z",
+  "report": "docs/reviews/OPEN-MR-ADVERSARIAL-REVIEW-2026-11-16-run457.md",
+  "next_prefix": "AES", "target_head": "4473ae365",
   "mrs": {
-    "2212": {"item": "42 (WI#546 …)", "author": "sweetiebot", "source_branch": "sweetiebot/kimi-42-20261105-1351",
-             "head": "bd7f78407", "head_sha": "<full sha>", "prefix": "VW", "run": 333,
-             "verdict": "APPROVE", "notes": [14090, 14092, 14095], "pipeline": "7234 …", "findings": "VW-1 Info …"}
+    "2503": {"item": "WI#576", "author": "rares", "source_branch": "rarity/kimi-wi576-20261116-2230",
+             "head": "2b50a3141", "head_sha": "<full sha>", "prefix": "AEQ", "run": 457,
+             "verdict": "APPROVE WITH NOTES", "notes": [18338], "pipeline": "8003 …", "findings": "AEQ-1 …"}
   },
-  "runs_entry": {"run": 333, "start": "2026-11-05T15:35:47Z", "end": "2026-11-05T15:57Z",
-                 "target": "aragents/kimil00p/v2.1.8.0 89f197538", "master": "41f7a9bd9", "window": "…",
-                 "mrs_reviewed": [2212], "mrs_skipped": [], "open_mrs": 1, "out_of_scope": ["…"],
-                 "notes_posted": {"2212": [14092, 14095]}, "prefixes_used": {"2212": "VW"},
-                 "verdicts": {"2212": "APPROVE"}, "ci": "…", "merge_order": ["…"], "follow_ups": ["…"],
+  "runs_entry": {"run": 457, "start": "2026-11-16T20:42:58Z", "end": "2026-11-16T23:02Z",
+                 "target": "aragents/kimil00p/v2.2.0.0 4473ae365", "master": "9f8201622", "window": "…",
+                 "mrs_reviewed": [2503], "mrs_skipped": [], "open_mrs": 1, "out_of_scope": ["…"],
+                 "notes_posted": {"2503": [18338]}, "prefixes_used": {"2503": "AEQ"},
+                 "verdicts": {"2503": "APPROVE WITH NOTES"}, "ci": "…", "merge_order": ["…"], "follow_ups": ["…"],
                  "auto_mode_block": "did not fire"}
 }
 ```
@@ -212,8 +238,12 @@ These were stated by the maintainer in review threads or to the operator; they d
 - opencode v1 stays (2026-11-01); do not review toward retiring it.
 - `mt-admin` is root-only by design; root cron must never source operator-checkout paths.
 - Commits authored "Paseo Lunarwing" are the operator's own agents; provenance is not a finding, and such a commit may land on another agent's branch.
-- The standing "latest master pipeline" goals item changes state at the maintainer's hand; its MRs are the maintainer's.
-- The opencode2 candidate lane is hands-off; a CI fix there is proven only by a green protected pipeline on master.
+- Work is handed out by assigning the work item (all agents since 2026-11-15; the goals document was retired on 2026-11-16). A missing goals item, tick or trail is not a finding.
+- Closing a work item is the maintainer's, item by item.
+- The opencode2 lane may be changed again (2026-11-13; it was hands-off before). A CI fix there is still proven only by a green protected pipeline on master.
+- SweetieBot's account is an instance administrator by design (2026-11-16); not a finding. Role-based rules do not bound that account, so a review names the gate that does.
+- Agents may create, play and delete temporary pipeline schedules to produce evidence; not a finding. The run they cite is still checked.
+- `docs/releases/RELEASE-v2.2.0.0.md` was removed by the maintainer; a missing release note for 2.2.0.0 is not a finding.
 - Kimi's in-image `npm test` gate is known to be load-sensitive (`lunarwing_bridge_test.js`, NQ-3); a flake there is a retry, not an MR finding.
 
 ## 9. Hazards that cost runs
@@ -221,7 +251,8 @@ These were stated by the maintainer in review threads or to the operator; they d
 - **Harness safety classifiers.** Some harnesses have a content-triggered safety check that, once tripped, blocks tool calls for the rest of the session. In run 309 (three sessions in a row) it blocked the shell, then the GitLab tools (reads too), then file edits, each time after the review had read the opencode worker exposure/tunnel material; the identical post went through the moment the operator switched the harness's automatic mode off. So: do the shell and GitLab work early in a run, keep every draft on disk, write the fragment as you go, and when it fires ask the operator to change the harness setting rather than starting a fresh session (which re-trips as soon as it re-reads the material). Report in the run report whether it fired.
 - **Two sessions on one run.** Check `ls -la docs/reviews/` timestamps before writing, use the run number in every filename, merge the state file.
 - **Heads move right after an MR opens.** Agent pairs push fixes within minutes; `post --head` exists for this. A head that moves during the window gets the next prefix and a disposition table.
-- **Trails overclaim.** "Verified", "all green", "carries upstream commit X", "the TUI replaces the text" are checked, not copied: in run 309 the "carries `61845b0`" claim was a content-equivalent backport, not an ancestor; in run 332 the TUI claim had no `tui/` change behind it.
+- **Descriptions and notes overclaim.** "Verified", "all green", "carries upstream commit X", "the TUI replaces the text", "already merged on master as X" are checked, not copied: in run 309 the "carries `61845b0`" claim was a content-equivalent backport, not an ancestor; in run 332 the TUI claim had no `tui/` change behind it; in run 457 a note on a work item said a test was on master under a commit that changes a README.
+- **A stale default target.** See §4.1 and §4.5. The tool's default is only as new as its last edit; `status` warns, and the warning has to be read.
 - **Infrastructure reds look like MR reds.** See §4.2 step 6. Three jobs failing at the same minute on `curl: (22)` is a download outage; a worker build killed at an apt step is the snapshot service. Name the cause, cite the passing sibling pipelines, suggest a retry.
 - **Exports are not checkouts.** `git archive` output has no `.git`: tests that call `git` fail there (the six `test_main_*` cases of `test_goal1_ci.py`), and mt-admin harnesses need `ic-infrastructure-health-check` exported beside `ic/scripts`.
 - **Cold cargo.** A full test run on a cold target dir takes 30-40 minutes and competes with the operator's builds; CI's logs plus targeted read-only gates (`check_no_panics.py`, boundaries grep, `rustfmt --check` on an exported module) usually suffice. Never two cargo processes at once.
@@ -231,25 +262,41 @@ These were stated by the maintainer in review threads or to the operator; they d
 ## 10. Tool reference
 
 ```
-review.py status [--json]                  open MRs vs state: NEW / CHANGED / UNCHANGED, merge status, head pipeline
+review.py init                             create an empty state file; refuses when one exists
+review.py status [--json]                  open MRs vs state: NEW / CHANGED / UNCHANGED, merge status, head pipeline;
+                                           WARNING lines (a `warnings` list with --json) for a stale target or a missing state file
 review.py jobs <pipeline>                  status counts + non-success jobs (truncated: use the API for the full list)
 review.py post <iid> <file> --head <sha> [--record] [--dry-run]   new discussion thread; refuses a moved head;
                                                                   --record stores the note id and the reviewed head
 review.py post <iid> <file> --any-head [--record]                 e.g. a CI addendum; --record stores the note id only
 review.py note-id <iid> <note_id> [--at T] [--head SHA]           record an id posted by other means
 review.py merge-state <fragment> [--dry-run] [--force]
-review.py prefix [N]
+review.py prefix [N]                       the next N prefixes (AA … ZZ, AAA …); does not consume them
 watch-refs.sh [-m MIN] [-i SEC] [-r REPO] <baseline>              exit 0 change / 124 quiet / 2 error
 ```
 
-`--state <path>`, `--url`, `--project` and `--target` are global options and go **before** the subcommand (`review.py --state s.json status`). Environment: `GITLAB_TOKEN` or `GITLAB_TOKEN_FILE`; optional `GITLAB_URL` (default `https://git.lunarwing.org`), `GITLAB_PROJECT` (default `lunarwing/lunarwing2`), `REVIEW_TARGET` (default the current target branch), `WATCH_IGNORE_REGEX` (a `grep -E` pattern over `<sha>\t<ref>` lines; the default ignores `testing/*`, the maintainer's `goal<N>cmc`, `cmcgoal<N>` and `vibetui*` branches and the wip MRs !1792/!1799; add `sweetiebot/test-` for the inttest MRs).
+`--state <path>`, `--url`, `--project` and `--target` are global options and go **before** the subcommand (`review.py --state s.json status`). Environment: `GITLAB_TOKEN` or `GITLAB_TOKEN_FILE`; optional `GITLAB_URL` (default `https://git.lunarwing.org`), `GITLAB_PROJECT` (default `lunarwing/lunarwing2`), `REVIEW_TARGET` (default `aragents/kimil00p/v2.2.0.0`, moved at each release, §4.5), `WATCH_IGNORE_REGEX` (a `grep -E` pattern over `<sha>\t<ref>` lines; the default ignores `testing/*`, the maintainer's `goal<N>cmc`, `cmcgoal<N>` and `vibetui*` branches and the wip MRs !1792/!1799; add `sweetiebot/test-` for the inttest MRs).
 
 ## 11. When the operator asks for direct work
 
 The loop is review-only: notes only, the operator merges. The operator sometimes declares a bounded phase of direct work ("direct work mode", "rebase !NNNN for me", "merge these"). Rules that held across those phases:
 
 - Only what was asked, on the branch that was named; the phase ends when the operator says so.
-- Rebases happen in a private bare repository with alternates (never in the shared checkout): fetch the target to `refs/base/target` and the branch, `git worktree add`, `rebase`, resolve goals-file conflicts item by item (keep the side that changed the item), verify the non-goals diff with `git patch-id --stable` before and after, run the `ci-config` gates on the result, push with `--force-with-lease=<ref>:<reviewed sha>`, post a short rebase note on the MR, and set `head_sha` in the state so the next run does not re-review an unchanged change.
+- Rebases happen in a private bare repository with alternates (never in the shared checkout): fetch the target to `refs/base/target` and the branch, `git worktree add`, `rebase`, verify the diff with `git patch-id --stable` before and after (a branch from before 2026-11-16 can still conflict in the goals file: resolve it item by item and keep the side that changed the item), run the `ci-config` gates on the result, push with `--force-with-lease=<ref>:<reviewed sha>`, post a short rebase note on the MR, and set `head_sha` in the state so the next run does not re-review an unchanged change.
 - Merges go through the API with the `sha` pinned to the reviewed head, in the order the review gave; a merge right after a push can answer 405/409 while GitLab is "checking", so re-read and retry.
-- Commits made by the agent carry the operator's chosen author identity and the trailers the harness prescribes; the goals file is edited only on an explicit request, in the operator's own wording ("last attempt was on <MR> but has some issues - please go through the review comments on the closed MR and re-attempt according to the review").
+- Commits made by the agent carry the operator's chosen author identity and the trailers the harness prescribes.
+- A fix on an agent's branch is written in a scratch work tree from the review note. A second reader looks at it before every push: a fresh agent for the reviewer's own fix, the reviewer for a helper's. The push carries a lease on the reviewed head, and the merge waits for a green pipeline at the pushed head. Say up front how long that takes (on 2026-11-17 a small fix with its second read and one pipeline took an hour to an hour and a quarter, a large one more than two hours), and do not make the push wait on a local run of the whole `.gitlab/tests` suite, which takes about an hour on the operator's host.
+- After a merge, mark the work item at once: which boxes are met, with the evidence, and what is left. Close an item only when the operator names it, with a closing note first; then post a status note on the related items that stay open.
+- A failed attempt is re-filed on the operator's order as a new work item. Close the MR unmerged with a note that lists what was pushed and what was and was not checked; close the old item with a note that points at the new one; and write the new item so that it stands alone: a "Read first" section that sends the author to the closed MR's comments, where the work stands (branch and head), what is left, the points that are the maintainer's to decide, the acceptance boxes, and the old description quoted in full. Keep the labels and the assignee unless told otherwise. (Before 2026-11-16 the same was done by a line in the goals file.)
 - The review state records what happened (`rebased`, `merged`, `closed` on the MR entry) so the next run's summary can say it.
+
+## 12. Before 2026-11-16: the goals era
+
+Notes, reports and state entries from before 2026-11-16 use words that have no meaning any more. This is what they meant.
+
+- **Goals document, goals item.** `docs/ops/AGENT_GOALS_<ver>.md` was a numbered checklist per release, and work was handed out by its items. The file for 2.2.0.0 is still in the tree; its last real item, 54, reads "no longer using goals file". Nothing is assigned through it, and the loop does not edit it.
+- **"Item #N" MRs.** An MR implemented one goals item and usually one work item. Its title was "Item #N: …" and its branch carried the item number (`rarity/kimi-42-…`). Today the title is "WI #N: …" and the branch carries the work item's number (`rarity/kimi-wi576-…`).
+- **Lane rule.** The goals item's number decided the author: item number mod 3, 1 = Rarity, 2 = Applejack, 0 = SweetieBot. It does not apply to work-item numbers: in the sample of 2026-11-17 (WI#741, note 18376) only 20 of 68 branches matched it, and 68 of 68 matched the item's assignee.
+- **Trail.** The dated bullets an agent wrote under a goals item: what was done, on which branch, which gates passed. An MR's description and the notes on its work item have taken that place, and they are read with the same doubt.
+- **Tick, untick, requeue.** The maintainer ticked a goals item when its MR was merged and reopened it for a re-attempt, sometimes with the line "last attempt was on <MR> but has some issues". Closing and re-filing a work item has taken that place (§11).
+- **"The standing latest-master-pipeline item."** A goals item the maintainer kept open to track master's CI. It has no successor; master's pipelines are checked at every close (§4.5).
