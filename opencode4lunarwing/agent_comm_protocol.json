@@ -98,6 +98,7 @@
       },
       "task_result": {
         "description": "Worker → Agent: final result after completion",
+        "status_note": "The daemon also accepts status \"failed\" and stores and reports a failed result as \"failed\"; an unrecognized status is logged and treated as failed. The values a worker sends are the four above.",
         "payload": {
           "task_id":     "string",
           "status":      "string — success | error | cancelled | timed_out",
