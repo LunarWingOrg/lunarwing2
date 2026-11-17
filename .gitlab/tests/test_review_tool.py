@@ -6,6 +6,7 @@ release behind, a fresh checkout without a state file, and a prefix sequence
 that ended at ZZ.
 """
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "docs" / "reviews" / "tools" / "review.py"
@@ -66,18 +68,24 @@ class ReviewToolTests(unittest.TestCase):
 
     def test_default_target_is_a_release_branch_and_overridable(self):
         # The built-in default is only a fallback, but it is what a session that
-        # "just runs the tool" gets, so it must name a release branch.
-        self.assertRegex(self.tool.TARGET_DEFAULT, r"^aragents/kimil00p/v\d+\.\d+\.\d+\.\d+$")
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import importlib.util, sys;"
-             "s = importlib.util.spec_from_file_location('t', sys.argv[1]);"
-             "m = importlib.util.module_from_spec(s); s.loader.exec_module(m);"
-             "print(m.TARGET_DEFAULT)", str(TOOL)],
-            capture_output=True, text=True, timeout=60, check=False,
-            env={"PATH": "/usr/bin:/bin:/usr/local/bin", "REVIEW_TARGET": "some/other/branch"},
-        )
-        self.assertEqual(result.stdout.strip(), "some/other/branch", result.stderr)
+        # "just runs the tool" gets, so it must name a release branch. It is read in
+        # a child process with a scrubbed environment: §4.5 tells every session to
+        # export REVIEW_TARGET, and reading the module in this process would see it.
+        def target_with(env):
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util, sys;"
+                 "s = importlib.util.spec_from_file_location('t', sys.argv[1]);"
+                 "m = importlib.util.module_from_spec(s); s.loader.exec_module(m);"
+                 "print(m.TARGET_DEFAULT)", str(TOOL)],
+                capture_output=True, text=True, timeout=60, check=False,
+                env={"PATH": "/usr/bin:/bin:/usr/local/bin", **env},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        self.assertRegex(target_with({}), r"^aragents/kimil00p/v\d+\.\d+\.\d+\.\d+$")
+        self.assertEqual(target_with({"REVIEW_TARGET": "some/other/branch"}), "some/other/branch")
 
     def test_stale_target_is_named_by_open_merge_requests_elsewhere(self):
         target = "aragents/kimil00p/v2.1.8.0"
@@ -142,6 +150,55 @@ class ReviewToolTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stdout)
                     self.assertIn("review.py init", result.stderr)
                     self.assertFalse(state.exists())
+
+    def test_post_record_checks_the_state_file_before_it_posts(self):
+        # A posted note cannot be taken back, so `post --record` must refuse a
+        # missing state file before the API is touched: no token is set here, and
+        # the tool must fail on the state file, not on the missing token.
+        with tempfile.TemporaryDirectory() as temporary:
+            state = pathlib.Path(temporary) / "absent.json"
+            note = pathlib.Path(temporary) / "note.md"
+            note.write_text("## review\n")
+            result = run_tool("--state", str(state), "post", "1", str(note),
+                              "--head", "a" * 9, "--record")
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("review.py init", result.stderr)
+            self.assertNotIn("set GITLAB_TOKEN", result.stderr)
+            self.assertFalse(state.exists())
+
+    def test_status_on_a_missing_state_file_runs_and_names_it(self):
+        # `status` is the first command of a run and a fresh checkout has no state
+        # file: it lists every open MR as NEW and warns, instead of refusing.
+        with tempfile.TemporaryDirectory() as temporary:
+            state = pathlib.Path(temporary) / "absent.json"
+
+            class FakeApi:
+                def __init__(self, url, project):
+                    pass
+
+                def branch_commit(self, name):
+                    return {"id": "a" * 40, "committed_date": "2026-11-17T00:00:00+00:00"}
+
+                def get(self, path, **params):
+                    if path == "/merge_requests":
+                        return [{"iid": 7, "target_branch": "rel/1.0", "draft": False,
+                                 "source_branch": "agent/wi1", "title": "WI #1: x",
+                                 "author": {"username": "agent"},
+                                 "updated_at": "2026-11-17T00:00:00Z"}]
+                    return {"iid": 7, "sha": "b" * 40, "detailed_merge_status": "mergeable",
+                            "head_pipeline": None}
+
+            args = argparse.Namespace(url="https://example.invalid", project="p/p",
+                                      state=str(state), target="rel/1.0", json=False)
+            stdout = io.StringIO()
+            with mock.patch.object(self.tool, "Api", FakeApi):
+                with contextlib.redirect_stdout(stdout):
+                    self.tool.cmd_status(args)
+            out = stdout.getvalue()
+            self.assertIn("state file not found", out)
+            self.assertIn("review.py init", out)
+            self.assertIn("to review: !7", out)
+            self.assertFalse(state.exists())
 
     def test_the_first_run_after_init_merges_without_force(self):
         with tempfile.TemporaryDirectory() as temporary:
