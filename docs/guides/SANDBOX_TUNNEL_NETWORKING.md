@@ -12,6 +12,11 @@ host, LAN, cloud metadata service, or public internet through the sidecar's own
 uplink. Design and alternatives:
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
+The WI#592 residual-hardening contract has four operator-facing parts, each
+with its own section below: per-instance sidecar isolation, image identity,
+custom DNS, and WireGuard handshake health. The end-to-end NetBird procedure is
+under NetBird live validation in Verification.
+
 WI#537 selects `proxy-enforced` as the Linux default; other platforms default
 to `none`, and `tunnel` remains an explicit opt-in. Existing `none` /
 `proxy-enforced` / `proxy` behavior and all per-command sandbox hardening are
@@ -247,12 +252,12 @@ never a name, and never a container created after verification. If recreation
 removes that ID first, the run fails closed instead of joining a new,
 not-yet-filtered namespace.
 
-On systemd service mode the detached `run` client's network helpers stay in the
-transient unit `lunarwing-tunnel-<instance>`, so the sidecar reuses that unit
-name; a start that finds the unit still loaded fails closed rather than racing
-it, and one instance never signals another instance's unit. On a Docker bridge
-fallback there is no systemd helper unit; the same names and labels still keep
-instances apart.
+Where the workload spawner uses systemd services, the detached `run` client's
+network helpers stay in the transient unit `lunarwing-tunnel-<instance>`, so
+the sidecar reuses that unit name; a start that finds the unit still loaded
+fails closed rather than racing it, and one instance never signals another
+instance's unit. Without systemd service mode there is no helper unit; the
+names and labels still keep instances apart.
 
 `podman ps --filter label=lunarwing.sandbox-tunnel` should show one sidecar per
 daemon instance. The pre-WI#592 fixed-name container and its volumes are not
@@ -603,14 +608,9 @@ URL, setup key, WireGuard path, or WireGuard file contents causes recreation
 instead of stale reuse. Restart the tenant after rotating the external peer/key
 and revoking the old one.
 
-The container name is `lunarwing-sandbox-tunnel-<instance>`, where the suffix is
-derived from `LUNARWING_BASE_DIR`. An instance ownership label prevents one
-daemon from removing another daemon's sidecar, even when two daemons share a
-uid. `podman ps --filter label=lunarwing.sandbox-tunnel` should show one sidecar
-per daemon instance. Startup and recreation are serialized per instance, and a
-run joins the exact container ID that passed health and firewall verification;
-if recreation removes that ID first, the run fails instead of joining a new,
-not-yet-filtered namespace.
+The instance-scoped names, ownership labels, verified-container-ID join, and
+per-instance lifecycle lock are documented under Per-instance sidecar
+isolation.
 
 `SandboxManager::shutdown()` marks active recovery stopping and performs the
 bounded waits described above before removing only its own sidecar; start checks
@@ -767,9 +767,9 @@ anything unless all three gates are `1` and every provider setting is present.
    4. **Identity.** Stopping the sidecar and deleting the runtime-directory
       label salt models a reboot; recreation must return the same peer IP and
       the same state volume.
-   5. **Reconnect.** Management reconnect is followed by another joined
-      command, so DNS and firewall expectations are re-derived rather than
-      cached.
+   5. **Reconnect.** A `netbird down`/`up` cycle, or the optional server
+      restart, is followed by three consecutive full health checks and another
+      joined command.
    6. **Ingress refusal.** An attempt against a proven-live loopback listener
       in the sidecar must fail.
    7. **Per-run recovery.** The lane kills the sidecar and requires
