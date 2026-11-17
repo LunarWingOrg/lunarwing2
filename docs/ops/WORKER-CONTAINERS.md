@@ -3479,6 +3479,8 @@ whole-image builds remain the protected worker publication gate.
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
 
+The terminal `task_result` status vocabulary is `success`, `failed`, `cancelled`, and `timed_out`. `error` is accepted as an alias for `failed`: worker lanes report honest failures with it, and it is the same term the daemon's own `tool_result` replies use. Any other status is logged as unrecognized and still treated as `failed`.
+
 ### Gateway delegation recovery: wait for the job id (WI#478)
 
 A rejected model draft is **not necessarily a terminal turn failure**. In
