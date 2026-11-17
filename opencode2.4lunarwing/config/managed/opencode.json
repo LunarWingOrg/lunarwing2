@@ -1,5 +1,11 @@
 {
   "policies": [
-    { "action": "integration.use", "resource": "opencode*", "effect": "deny" }
+    { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
+    { "action": "provider.use", "resource": "*", "effect": "allow" },
+    { "action": "tool.use", "resource": "*", "effect": "allow" },
+    { "action": "mcp.use", "resource": "*", "effect": "allow" },
+    { "action": "skill.use", "resource": "*", "effect": "allow" },
+    { "action": "websearch.use", "resource": "*", "effect": "allow" },
+    { "action": "plugin.use", "resource": "*", "effect": "allow" }
   ]
 }

@@ -43,6 +43,17 @@ ROLE_BOUNDARY = 'if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then'
 MANAGED_POLICY = {
     "policies": [
         {"action": "integration.use", "resource": "opencode*", "effect": "deny"},
+        *(
+            {"action": action, "resource": "*", "effect": "allow"}
+            for action in (
+                "provider.use",
+                "tool.use",
+                "mcp.use",
+                "skill.use",
+                "websearch.use",
+                "plugin.use",
+            )
+        ),
     ]
 }
 
@@ -186,6 +197,22 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             "other integration": {
                 "policies": [{"action": "integration.use", "resource": "anthropic*", "effect": "deny"}],
             },
+            "missing managed allow": {
+                "policies": [statement for statement in MANAGED_POLICY["policies"]
+                             if statement["action"] != "websearch.use"],
+            },
+            "extra managed statement": {
+                "policies": [*MANAGED_POLICY["policies"],
+                             {"action": "integration.connect", "resource": "*", "effect": "deny"}],
+            },
+            "duplicate managed statement": {
+                "policies": [*MANAGED_POLICY["policies"], MANAGED_POLICY["policies"][-1]],
+            },
+            "non-wildcard allow": {
+                "policies": [*MANAGED_POLICY["policies"][:-1],
+                             {"action": "plugin.use", "resource": "some-plugin", "effect": "allow"}],
+            },
+            "malformed statement": {"policies": [*MANAGED_POLICY["policies"], "deny everything"]},
         }
         for name, document in cases.items():
             with self.subTest(case=name):
@@ -333,7 +360,7 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         )
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("must deny integration.use", result.stderr)
+        self.assertIn("must carry exactly the reviewed policy set", result.stderr)
         source.unlink()
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 1, result.stdout)

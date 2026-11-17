@@ -116,10 +116,32 @@ MANAGED_POLICY_INSTALLED = pathlib.Path("/etc/opencode/opencode.json")
 MANAGED_POLICY_SOURCE = pathlib.Path("config/managed") / "opencode.json"
 MANAGED_POLICY_INTEGRATION = "opencode"
 MANAGED_POLICY_RESOURCE = "opencode*"
+# WI#745: a denied integration's policies-only document ranks right after the
+# managed ones, so a Console `deny` would otherwise remove the lane's provider,
+# tools, MCP servers, skills, web search or plugins. Every action upstream
+# enforces at the pin gets one managed wildcard allow, which outranks the
+# Console document. The tool hook is patched at build time
+# (scripts/apply_managed_policy_precedence.py) to honour managed allows while
+# preserving an underlying `ask`; the other five already do.
+MANAGED_POLICY_ALLOW_ACTIONS = (
+    "provider.use",
+    "tool.use",
+    "mcp.use",
+    "skill.use",
+    "websearch.use",
+    "plugin.use",
+)
 # A managed config document outranks every other layer for ordinary settings,
 # so the shipped file may carry `policies` and nothing else: an `experimental`
 # or `model` key there would shadow the lane's own values.
 MANAGED_POLICY_ONLY_KEYS = frozenset({"policies"})
+# The complete reviewed statement set. A managed allow outranks every lower
+# layer's deny for its action, so it must be present deliberately, once, with
+# the wildcard resource, and nothing else may be added.
+MANAGED_POLICY_STATEMENTS = frozenset(
+    {("integration.use", MANAGED_POLICY_RESOURCE, "deny")}
+    | {(action, "*", "allow") for action in MANAGED_POLICY_ALLOW_ACTIONS}
+)
 
 
 def _managed_policy_covers(pattern: str) -> bool:
@@ -163,22 +185,29 @@ def check_managed_policy(lane: pathlib.Path) -> None:
     if not isinstance(statements, list) or not statements:
         fail(f"{source} must carry a non-empty \"policies\" array (WI#665)")
         return
-    denying = [
-        statement.get("resource")
+    malformed = [statement for statement in statements if not isinstance(statement, dict)]
+    if malformed:
+        fail(f"{source} must carry only policy objects, got {malformed} (WI#745)")
+        return
+    found = [
+        (statement.get("action"), statement.get("resource"), statement.get("effect"))
         for statement in statements
-        if isinstance(statement, dict)
-        and statement.get("action") == "integration.use"
-        and statement.get("effect") == "deny"
-        and isinstance(statement.get("resource"), str)
     ]
-    covering = [resource for resource in denying if _managed_policy_covers(resource)]
-    if not covering:
-        fail(f"{source} must deny integration.use for {MANAGED_POLICY_RESOURCE!r} — "
-             f"every Console Library surface arrives through that integration (WI#665); "
-             f"got resources {denying}")
-    else:
-        check(f"{source} denies the {MANAGED_POLICY_INTEGRATION} integration "
-              "for both the bare and the account-qualified resource")
+    duplicates = sorted({item for item in found if found.count(item) > 1}, key=str)
+    missing = sorted(MANAGED_POLICY_STATEMENTS - set(found), key=str)
+    extra_statements = sorted(set(found) - MANAGED_POLICY_STATEMENTS, key=str)
+    if duplicates or missing or extra_statements or len(found) != len(MANAGED_POLICY_STATEMENTS):
+        fail(f"{source} must carry exactly the reviewed policy set (WI#745): "
+             f"missing {missing}, unexpected {extra_statements}, duplicated {duplicates}")
+        return
+    denying = [resource for action, resource, effect in found
+               if action == "integration.use" and effect == "deny"]
+    if not all(_managed_policy_covers(resource) for resource in denying):
+        fail(f"{source} integration.use deny must cover {MANAGED_POLICY_RESOURCE!r} "
+             "for both the bare and the account-qualified resource (WI#665)")
+        return
+    check(f"{source} denies the {MANAGED_POLICY_INTEGRATION} integration and "
+          "allows the six upstream policy actions in the managed layer")
 
 
 def _managed_directory_extras(
