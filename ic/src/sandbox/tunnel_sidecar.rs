@@ -3686,8 +3686,7 @@ mod tests {
                         }
                         Some("exec") => {
                             if args.iter().any(|arg| arg == "--ipv4") {
-                                listener_queries
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                listener_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             let reply = successful_netbird_health(
                                 args.get(2).map(String::as_str),
