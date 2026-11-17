@@ -30,8 +30,12 @@ def load_tool():
 
 
 def run_tool(*args):
+    # A scrubbed environment: a session that exported GITLAB_TOKEN_FILE or
+    # REVIEW_TARGET, as the runbook tells it to, must not change what the
+    # tool does under test (review AEW-2 on !2514).
     return subprocess.run(
-        [sys.executable, str(TOOL), *args], capture_output=True, text=True, timeout=60, check=False
+        [sys.executable, str(TOOL), *args], capture_output=True, text=True, timeout=60, check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
     )
 
 

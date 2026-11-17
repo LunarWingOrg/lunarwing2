@@ -128,7 +128,7 @@ Then re-arm the watcher on a **fresh baseline file** for the remainder of the wi
 
 ### 4.6 Work items
 
-The loop reads work items in every review (§4.2 step 1) and writes to them in three cases. The fourth bullet below is a rule for how an item is written, not a fourth case.
+The loop reads work items in every review (§4.2 step 1) and writes to them in three cases. The second bullet below is a rule for how an item is written, not a case.
 
 - **A finding that no open MR owns.** File a work item when it is a defect of the product or of an operator's tool, a security or isolation weakness (a security check whose test passes when the check is removed counts), anything Medium or above, or a false statement in a document. Do not file test polish, such as a surviving mutant or a missing negative case: say it in the MR note. Before filing, measure the defect at the target's head, and search the open items for it.
 - **How an item is written.** Where it is in the tree (`file:line` taken from the file, not from a diff), what can happen, what was measured and on what, the required outcome, acceptance boxes, references. State the outcome as a property ("a failed listing leaves the crontab as it was") and name its scope (which providers, which init systems, which tools). Name a mechanism only after checking that it works, and say so; an author who implements an unchecked suggestion to the letter ships the reviewer's mistake.
