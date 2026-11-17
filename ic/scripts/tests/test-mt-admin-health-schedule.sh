@@ -55,6 +55,21 @@ fcrontab() {
   [[ -z "${FCRONTAB_FAIL_INSTALL:-}" ]] || return 1
   command cp -- "$1" "$CRONTAB_STATE"
 }
+
+# The second cron tool, with a table of its own. The installer picks fcrontab
+# when both exist, but removal looks at every tool that exists, so this
+# stand-in is defined before any case runs: without it a removal case would
+# reach the real crontab of a host that has one. Its table is absent (`-l`
+# exits 1) until a case writes it.
+PLAIN_CRONTAB_STATE="$fixture/plain-crontab"
+crontab() {
+  if [[ "${1:-}" == "-l" ]]; then
+    [[ -e "$PLAIN_CRONTAB_STATE" ]] || return 1
+    command cat -- "$PLAIN_CRONTAB_STATE"
+    return 0
+  fi
+  command cp -- "$1" "$PLAIN_CRONTAB_STATE"
+}
 _ensure_cron_runlevel() { :; }
 
 # shellcheck disable=SC2034  # consumed by the sourced installers
@@ -255,6 +270,67 @@ assert_eq "unterminated removal: the launcher is kept" "1" \
   "$([[ -e "$HEALTH_LAUNCHER" ]] && printf 1 || printf 0)"
 assert_contains "unterminated removal: the reason is printed" "$output" \
   "could not remove the health pipeline block"
+
+# Both cron tools exist and the block is in crontab's table: a host that was
+# scheduled while only crontab existed and got fcron later. The installer would
+# pick fcrontab today, but the block must be removed from the table it is in —
+# retiring the launcher while crontab's table still runs it leaves root with a
+# job for a file that is gone.
+launcher_exists() { if [[ -e "$HEALTH_LAUNCHER" ]]; then printf 1; else printf 0; fi; }
+write_launcher() {
+  printf '#!/bin/bash\n' >"$HEALTH_LAUNCHER"
+  chmod 0755 "$HEALTH_LAUNCHER"
+}
+write_launcher
+printf '%s\n' "$job_before" >"$CRONTAB_STATE"
+printf '%s\n' "$job_after" "$begin" "$sched" "$end" >"$PLAIN_CRONTAB_STATE"
+remove_health_pipeline >/dev/null
+printf '%s\n' "$job_after" >"$fixture/expected"
+assert_same_file "both tools, block in crontab's table: the block is removed there" \
+  "$fixture/expected" "$PLAIN_CRONTAB_STATE"
+printf '%s\n' "$job_before" >"$fixture/expected"
+assert_same_file "both tools, block in crontab's table: fcrontab's jobs are kept" \
+  "$fixture/expected" "$CRONTAB_STATE"
+assert_eq "both tools, block in crontab's table: the launcher is retired" "0" "$(launcher_exists)"
+
+# The block is in both tables and only fcrontab's can be removed: crontab's
+# table still runs the launcher, so the launcher stays, and the warning names
+# the tool whose table kept the block.
+write_launcher
+printf '%s\n' "$job_before" "$begin" "$sched" "$end" >"$CRONTAB_STATE"
+printf '%s\n' "$begin" "$sched" "$job_after" >"$PLAIN_CRONTAB_STATE"
+command cp -- "$PLAIN_CRONTAB_STATE" "$fixture/cron.before"
+status=0
+output="$(remove_health_pipeline 2>&1)" || status=$?
+assert_eq "block left in crontab's table: reported as success" "0" "$status"
+printf '%s\n' "$job_before" >"$fixture/expected"
+assert_same_file "block left in crontab's table: fcrontab's block is removed" "$fixture/expected" "$CRONTAB_STATE"
+assert_same_file "block left in crontab's table: crontab's table is unchanged" \
+  "$fixture/cron.before" "$PLAIN_CRONTAB_STATE"
+assert_eq "block left in crontab's table: the launcher is kept" "1" "$(launcher_exists)"
+assert_contains "block left in crontab's table: the warning names the tool" "$output" \
+  "could not remove the health pipeline block from root's crontab table"
+assert_not_contains "block left in crontab's table: not reported as retired" "$output" \
+  "retired host-global health pipeline schedule"
+
+# The other way round: fcrontab's block cannot be removed. crontab's table is
+# still cleaned — one tool's refusal does not end the removal — and the
+# launcher stays for the block that is left.
+write_launcher
+printf '%s\n' "$job_before" "$begin" "$sched" >"$CRONTAB_STATE"
+command cp -- "$CRONTAB_STATE" "$fixture/cron.before"
+printf '%s\n' "$begin" "$sched" "$end" "$job_after" >"$PLAIN_CRONTAB_STATE"
+status=0
+output="$(remove_health_pipeline 2>&1)" || status=$?
+assert_eq "block left in fcrontab's table: reported as success" "0" "$status"
+assert_same_file "block left in fcrontab's table: fcrontab's table is unchanged" \
+  "$fixture/cron.before" "$CRONTAB_STATE"
+printf '%s\n' "$job_after" >"$fixture/expected"
+assert_same_file "block left in fcrontab's table: crontab's block is removed" \
+  "$fixture/expected" "$PLAIN_CRONTAB_STATE"
+assert_eq "block left in fcrontab's table: the launcher is kept" "1" "$(launcher_exists)"
+assert_contains "block left in fcrontab's table: the warning names the tool" "$output" \
+  "could not remove the health pipeline block from root's fcrontab table"
 
 # ── systemd: the unit pair ──────────────────────────────────────────────────
 

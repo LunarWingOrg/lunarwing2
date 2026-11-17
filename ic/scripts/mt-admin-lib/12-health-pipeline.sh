@@ -691,16 +691,21 @@ remove_health_pipeline() {
   local retire_launcher=1
   case "$INIT_SYSTEM" in
     openrc)
-      local cmd=""
-      command -v fcrontab >/dev/null 2>&1 && cmd="fcrontab"
-      [[ -z "$cmd" ]] && command -v crontab >/dev/null 2>&1 && cmd="crontab"
-      # Removal rewrites the table too, so it goes through the same checked
-      # path: a table that cannot be read, or a block that cannot be delimited,
-      # leaves root's other jobs as they were (WI#740).
-      if [[ -n "$cmd" ]] && ! _install_managed_cron_block "$cmd" "$begin" "$end"; then
-        say "WARNING: could not remove the health pipeline block from root's crontab; its other jobs, its schedule, and the launcher were left as they were"
-        retire_launcher=0
-      fi
+      # The block is removed from the table of every cron tool that exists,
+      # not only from the one the installer would pick today: a host that was
+      # scheduled while only crontab existed and got fcron later still holds
+      # the block in crontab's table. Removal rewrites a table too, so each
+      # one goes through the same checked path: a table that cannot be read,
+      # or a block that cannot be delimited, leaves root's other jobs as they
+      # were (WI#740). One table that keeps its block keeps the launcher.
+      local cmd
+      for cmd in fcrontab crontab; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        if ! _install_managed_cron_block "$cmd" "$begin" "$end"; then
+          say "WARNING: could not remove the health pipeline block from root's $cmd table; its other jobs, its schedule, and the launcher were left as they were"
+          retire_launcher=0
+        fi
+      done
       ;;
     systemd)
       if command -v systemctl >/dev/null 2>&1; then
