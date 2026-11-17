@@ -34,17 +34,18 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   final-answer recovery, operator-controlled worker source archives, protocol-1
   REPL hardening, and filesystem health monitoring. See
   `docs/releases/RELEASE-v2.1.9.0.md` for that compatibility baseline.
-- The v2.2.0.0 pre-release checklist (`docs/ops/AGENT_GOALS_2.2.0.0.md`) is the
-  authoritative freeze list. Owned crates are at 2.2.0; the sandbox now defaults
+- The v2.2.0.0 pre-release checklist (`docs/ops/AGENT_GOALS_2.2.0.0.md`) was the
+  authoritative freeze list until it was retired on 2026-11-16; it is kept as
+  history. Owned crates are at 2.2.0; the sandbox now defaults
   to kernel-enforced `proxy-enforced` on Linux and has an opt-in egress-only
   tunnel tier; Multica startup diagnostics, relay-password rotation, OpenRC
   identity checks, storage errors, mission-log redaction, retry budgets, and
   legacy steering have also landed. These remain Tier 3 areas even after merge.
-- At this review, the LunarDepth design/lane (items 5–6, with item 6 blocked on
-  item 5), the CI gauntlet (item 15), and the WI#592/WI#590 re-attempts
-  (items 17–18) remain open. Do not rely on an older work-item list copied into
-  onboarding text: check the goals file and linked work items before opening an
-  MR in one of those areas.
+- Since 2026-11-16 work is handed out through work items, not through the
+  goals file: an item's assignee does the work, and the MR is titled
+  "WI #N: …". Do not rely on a work-item list copied into onboarding text:
+  check the open work items labelled for the release, their assignees and
+  their notes before opening an MR.
 - Engine internals, `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`, gateway,
   sandboxing, approvals, external workers, and CI/security controls remain
   Tier 3 by default (§3). OpenRC and systemd user-manager validation are both
