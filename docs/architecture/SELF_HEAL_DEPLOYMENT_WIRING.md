@@ -116,6 +116,15 @@ of tenant provisioning (unless `--no-health` is passed). This function:
    - **OpenRC**: installs a managed `fcron`/`crontab` entry every 15 min
      (managed block).
 
+   Both health-block install/removal and Study Notes scheduling use the shared
+   checked crontab writer. A zero exit status alone does not prove that a listing
+   succeeded: fcron 3.3.1 can print ERROR diagnostics and exit 0. The writer
+   accepts only the known benign fcron listing INFO and exact no-table responses;
+   unexpected diagnostics refuse the replacement even with nonempty stdout.
+   Root's jobs remain unchanged, and a refused removal retains the launcher.
+   Differently formatted diagnostics from other cron versions fail closed and
+   are printed for the operator rather than being treated as an empty table.
+
    Both init systems default to 15 min. Set
    `LUNARWING_MT_HEALTH_INTERVAL_MIN=N` in `/etc/lunarwing/health.env` to
    persist a different cadence across tenant additions, upgrades, and

@@ -357,44 +357,21 @@ EOF
 _install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
   local entrypoint="${1:-}"
   local command="" begin="# BEGIN lunarwing-study-notes-sync managed block"
-  local end="# END lunarwing-study-notes-sync managed block" tmp
-  local listing kept="" line inside=0
+  local end="# END lunarwing-study-notes-sync managed block" sched
   _require_knowledge_sync_entrypoint "$entrypoint"
   command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
   [[ -n "$command" ]] || { command -v crontab >/dev/null 2>&1 && command="crontab"; }
   [[ -n "$command" ]] \
     || die "fcrontab/crontab not found; cannot schedule Study Notes source refresh"
+  sched="$(printf '17 * * * * %s sync-knowledge-sources' "$entrypoint")" \
+    || die "could not build the Study Notes source schedule"
   # The new table replaces root's whole crontab, so it is built whole first.
-  # The caller may run this with errexit ignored (WI#736): every step up to
-  # the install is checked, and a failure before it leaves the crontab as it
-  # was.
-  listing="$("$command" -l 2>/dev/null || true)"
-  if [[ -n "$listing" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" == "$begin" ]]; then inside=1; continue; fi
-      if [[ "$line" == "$end" ]]; then inside=0; continue; fi
-      ((inside)) || kept+="$line"$'\n'
-    done <<<"$listing" \
-      || die "could not read back the listing of root's crontab; the crontab was left as it was"
-  fi
-  # Dropping "everything after BEGIN" would take root's other jobs with it.
-  ((inside == 0)) \
-    || die "root's crontab has the line '$begin' without a later line that reads exactly '$end'; repair the block with '$command -e', then schedule again"
-  tmp="$(mktemp)" || die "cannot create a temporary file for the Study Notes source schedule"
-  if ! {
-    printf '%s' "$kept" \
-      && printf '%s\n' "$begin" \
-      && printf '17 * * * * %s sync-knowledge-sources\n' "$entrypoint" \
-      && printf '%s\n' "$end"
-  } >"$tmp" || [[ "$(tail -n 1 -- "$tmp")" != "$end" ]]; then
-    rm -f -- "$tmp"
-    die "could not write the new Study Notes source schedule; root's crontab was left as it was"
-  fi
-  if ! "$command" "$tmp"; then
-    rm -f -- "$tmp"
-    die "failed to install Study Notes source schedule with $command"
-  fi
-  rm -f -- "$tmp"
+  # The shared writer refuses a failed or partial listing, including one with
+  # empty output that does not positively report a missing crontab (WI#743).
+  # Its return is still fatal here (WI#736), however the caller's errexit state
+  # is set.
+  _install_managed_cron_block "$command" "$begin" "$end" "$sched" \
+    || die "could not write the new Study Notes source schedule; root's crontab was left as it was"
   _ensure_cron_runlevel "$([[ "$command" == "fcrontab" ]] && echo fcron)" \
     || die "the Study Notes source schedule is installed, but the cron service could not be enabled and started; the reason is printed above"
   say "Study Notes source refresh scheduled with $command (hourly at :17)"
