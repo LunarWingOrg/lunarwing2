@@ -105,9 +105,10 @@ instructions and skills when it has both a Console credential and egress to
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
 spellings are accepted). Acknowledging the credential does not make Console
-instructions, skills, providers or MCP servers reach the session: the managed
-policy below withholds them either way. The Console's own policies still apply
-(see below). Startup messages name the variable but never print its value.
+instructions, skills, providers or MCP servers reach the session, and the
+Console's own policy statements have no effect either: the managed policy below
+withholds the content and outranks every Console statement. Startup messages
+name the variable but never print its value.
 
 This startup gate covers only the environment variable. Upstream prefers saved
 credentials, including credentials saved by `opencode auth login` during a
@@ -120,7 +121,16 @@ The image ships a root-owned, read-only managed policy at
 `/etc/opencode/opencode.json` (source: `config/managed/opencode.json`):
 
 ```json
-{ "policies": [ { "action": "integration.use", "resource": "opencode*", "effect": "deny" } ] }
+{ "policies": [
+  { "action": "integration.use", "resource": "opencode*", "effect": "deny" },
+  { "action": "integration.connect", "resource": "*", "effect": "allow" },
+  { "action": "provider.use", "resource": "*", "effect": "allow" },
+  { "action": "tool.use", "resource": "*", "effect": "allow" },
+  { "action": "mcp.use", "resource": "*", "effect": "allow" },
+  { "action": "skill.use", "resource": "*", "effect": "allow" },
+  { "action": "websearch.use", "resource": "*", "effect": "allow" },
+  { "action": "plugin.use", "resource": "*", "effect": "allow" }
+] }
 ```
 
 opencode loads `/etc/opencode` as managed settings above every project, global
@@ -130,20 +140,35 @@ that allows the integration, and for the real binary started without the
 wrapper. It withholds Console instructions and skills, and the Console config
 document's providers, remote MCP servers and web-search selection.
 
-It does **not** withhold the Console document's own `policies`. Upstream keeps
-a policies-only copy of a denied integration's document
-(`packages/core/src/config.ts:343-349` at the pin; the comment at `:233-235`
-says why: "denying an integration never lifts the restrictions it carries"),
-and those policies rank right after the managed ones and above the lane's own
-config. Policy enforcement only removes or denies
-(`packages/core/src/config/plugin/policy.ts:56-113`), so with a Console
-credential and egress the Console can still switch off a provider of the
-worker (measured) and, read from the same code, a tool, MCP server, skill or
-web-search provider, and a plugin (`packages/core/src/plugin/module.ts:53`);
-it cannot instruct the worker or add anything to it. This is a known residual
-(review finding AEP-2 on !2502): neutralizing Console policies would be a
-design change and was left out of WI#665. The evaluation asserts the
-behaviour as it is, so a bump that changes it is noticed.
+**WI#745 — Console statements have no effect.** Upstream keeps a policies-only
+copy of a denied integration's document (`packages/core/src/config.ts:343-349`
+at the pin), and those policies rank immediately below the managed ones. The
+seven managed wildcard allows above therefore outrank every Console statement
+for the actions upstream enforces at this pin, so a Console `integration.use`,
+`integration.connect`, `provider.use`, `tool.use`, `mcp.use`, `skill.use`,
+`websearch.use` or `plugin.use` deny no longer changes what the worker has or
+can connect to. `provider.use` and `tool.use` are measured on a built image by
+`scripts/console_policy_eval.py`; the rest go through the same managed-policy
+decision path.
+
+**What else they outrank.** A managed allow outranks *every* lower layer's
+deny for that action, not only the Console's, and it does so by design: there
+is no way in upstream's policy model to rank Console statements separately. The
+lane's own config and ordinary permission rules are unaffected except that the
+worker's own tool permission `deny` rules can no longer block a tool when the
+managed wildcard allow covers it; an `ask` is preserved, never turned into a
+grant. The tool arm needed a build-time correction because upstream's
+`tool.use` hook searches every layer for a deny; `scripts/apply_managed_policy_precedence.py`
+applies the reviewed, digest-pinned patch that lets only a *managed* allow lift
+a lower layer's deny. The other five actions already honour managed allows
+through `ManagedPolicy.decision` in `packages/core/src/config/plugin/policy.ts`.
+
+Managed settings outrank every other layer for ordinary settings too, so the
+file carries `policies` and nothing else — an `experimental` or `model` key
+there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
+enforces the exact eight-statement set, the installed copy's owner and mode,
+and that `/etc/opencode` holds nothing but that file: upstream also loads a
+sibling `opencode.jsonc` from the managed directory, above `opencode.json`.
 
 What it does **not** do is stop the requests. On a built image at the pin,
 with a saved Console credential, the plugin still fetches
@@ -153,13 +178,6 @@ control on outbound traffic. The evaluation that established this, and how to
 repeat it, is in `docs/ops/WORKER-CONTAINERS.md` and
 `scripts/console_policy_eval.py`.
 
-Managed settings outrank every other layer for ordinary settings too, so the
-file carries `policies` and nothing else — an `experimental` or `model` key
-there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
-enforces that, the exact resource pattern, the installed copy's owner and
-mode, and that `/etc/opencode` holds nothing but that file: upstream also
-loads a sibling `opencode.jsonc` from the managed directory, above
-`opencode.json`.
 See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
 for the conditions and the evaluation log.
 

@@ -145,25 +145,24 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   document merge hands it providers, remote MCP servers, policies and the
   web-search selection; the flag pin does not cover any of that (WI#665).
   The image's managed policy at `/etc/opencode/opencode.json` denies the
-  `opencode` integration. That withholds the instructions, the skills, the
-  providers, the MCP servers and the web-search selection. It does not
-  withhold the Console's own `policies`: upstream keeps a policies-only copy
-  of a denied integration's document, ranked right after the managed policies
-  and above the lane config, so the Console can still switch off a provider,
-  tool, MCP server, skill or plugin of the worker. A policy only removes or
-  denies; it cannot instruct the worker. Neutralizing Console policies would
-  be a design change and was left out of WI#665 (known residual, WI#665
-  record in `docs/ops/WORKER-CONTAINERS.md`). The managed policy does not
-  stop the
-  plugin's own requests to the Console either, so it is not an egress
-  control. Keep `config/managed/opencode.json` at exactly one
-  `integration.use` deny with no other key (a managed document outranks every
-  other layer, so any other key there would shadow the lane config), keep the
-  Dockerfile install root:root 0444, put nothing else into `/etc/opencode`
-  (a sibling `opencode.jsonc` there outranks the shipped file; both checks
-  refuse any other entry), and re-run `scripts/console_policy_eval.py` on
-  every bump: the deny depends on upstream's managed-discovery and policy
-  ordering.
+  `opencode` integration, which withholds the instructions, skills, providers,
+  MCP servers, policies and web-search selection it supplies. Since WI#745 it
+  also carries managed wildcard allows for every action upstream enforces
+  (`integration.use`, `integration.connect`, `provider.use`, `tool.use`,
+  `mcp.use`, `skill.use`, `websearch.use`, `plugin.use`), so a Console policy
+  statement no longer changes what the worker has or can connect to. The tool
+  hook needed a reviewed build-time correction
+  (`scripts/apply_managed_policy_precedence.py`): only a *managed* allow lifts
+  a lower layer's tool deny, and an `ask` is preserved rather than granted.
+  These allows outrank every lower layer's deny for their action by design, so
+  keep the managed file at exactly the reviewed eight statements with no other
+  key, install it root:root 0444, put nothing else in `/etc/opencode` (a
+  sibling `opencode.jsonc` outranks it; both checks refuse any other entry),
+  and re-run `scripts/console_policy_eval.py` on every bump.
+  The managed policy does not stop the plugin's requests to the Console, so it
+  is not an egress control; the tenant egress allowlist remains the boundary.
+  The earlier WI#665 record of Console policies as a known residual is closed
+  by WI#745 in `docs/ops/WORKER-CONTAINERS.md`.
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays

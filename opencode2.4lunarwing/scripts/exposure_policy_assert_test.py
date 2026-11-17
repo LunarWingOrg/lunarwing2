@@ -46,6 +46,7 @@ MANAGED_POLICY = {
         *(
             {"action": action, "resource": "*", "effect": "allow"}
             for action in (
+                "integration.connect",
                 "provider.use",
                 "tool.use",
                 "mcp.use",

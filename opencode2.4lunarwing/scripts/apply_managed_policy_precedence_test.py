@@ -32,7 +32,7 @@ class ApplyManagedPolicyPrecedenceTests(unittest.TestCase):
             subject.apply(root, run_tests=False)
             self.assertIn("policy.managed", (root / "packages/core/src/config/plugin/policy.ts").read_text())
             result = subprocess.run(
-                ["git", "apply", "--check", "--reverse", str(subject.PATCH)],
+                ["git", "apply", "--check", "--reverse", str(subject._patch_path())],
                 cwd=root, capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

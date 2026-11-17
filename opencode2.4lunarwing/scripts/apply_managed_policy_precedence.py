@@ -14,7 +14,21 @@ import pathlib
 import subprocess
 import sys
 
-PATCH = pathlib.Path(__file__).resolve().parent.parent / "patches" / "wi745-managed-policy-precedence.patch"
+PATCH_NAME = "wi745-managed-policy-precedence.patch"
+# The image copies the script to /build and the patch tree to
+# /build/lunarwing/patches; a checkout keeps it beside scripts/.
+PATCH_CANDIDATES = (
+    pathlib.Path("/build/lunarwing/patches") / PATCH_NAME,
+    pathlib.Path("/build/patches") / PATCH_NAME,
+    pathlib.Path(__file__).resolve().parent.parent / "patches" / PATCH_NAME,
+)
+
+
+def _patch_path() -> pathlib.Path:
+    for candidate in PATCH_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    raise SystemExit(f"managed-policy patch is missing; looked in {[str(path) for path in PATCH_CANDIDATES]}")
 PATCH_DIGEST = "af75e9900b53123bb4b95e6f3bbb978a052cf7ac485eb5770732bec1d307a58c"
 SOURCES = {
     "packages/core/src/config/plugin/policy.ts":
@@ -45,8 +59,9 @@ def _run(command: list[str], cwd: pathlib.Path) -> None:
 
 
 def apply(root: pathlib.Path, *, run_tests: bool = True) -> None:
-    _run(["git", "apply", "--check", str(PATCH)], root)
-    _run(["git", "apply", str(PATCH)], root)
+    patch = _patch_path()
+    _run(["git", "apply", "--check", str(patch)], root)
+    _run(["git", "apply", str(patch)], root)
     result = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
         cwd=root,
@@ -73,10 +88,7 @@ def _verify_inputs(root: pathlib.Path) -> None:
                 f"managed-policy patch input {relative} has sha256 {actual}, expected {expected}; "
                 "re-read the upstream policy precedence before changing the patch"
             )
-    try:
-        actual = hashlib.sha256(PATCH.read_bytes()).hexdigest()
-    except OSError as error:
-        raise SystemExit(f"managed-policy patch is missing: {error}") from error
+    actual = hashlib.sha256(_patch_path().read_bytes()).hexdigest()
     if actual != PATCH_DIGEST:
         raise SystemExit(f"managed-policy patch content changed: {actual}; review its tests and update both digests")
 

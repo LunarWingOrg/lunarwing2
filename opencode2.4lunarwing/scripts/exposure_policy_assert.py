@@ -47,16 +47,18 @@ Assertions (opencode2 lane):
      --image-env-file from the actual image config. Host ownership and the CI
      job's own environment are never treated as image facts; the CI driver
      separately pins the complete runtime config, including PATH order.
-  8. WI#665: config/managed/opencode.json carries the single
-     `integration.use` deny that withholds the OpenCode Console Library, and
-     nothing else (a managed document outranks every other config layer, so
-     any other key there would shadow the lane's own); its resource pattern
-     covers both forms upstream builds (the bare integration ID for an
-     environment credential and `<integration>#<account>` for a saved login);
-     the installed /etc/opencode/opencode.json is root-owned, read-only,
-     under non-writable parents, and byte-identical to the checkout's copy;
-     and it is the only entry of /etc/opencode (upstream also loads a sibling
-     `opencode.jsonc` from the managed directory, above `opencode.json`).
+  8. WI#665/WI#745: config/managed/opencode.json carries the exact reviewed
+     policy set — the `integration.use` deny that withholds the OpenCode
+     Console Library, and managed wildcard allows for every action upstream
+     enforces — and nothing else (a managed document outranks every other
+     config layer, so any other key there would shadow the lane's own); its
+     resource pattern covers both forms upstream builds (the bare integration
+     ID for an environment credential and `<integration>#<account>` for a
+     saved login); the installed /etc/opencode/opencode.json is root-owned,
+     read-only, under non-writable parents, and byte-identical to the
+     checkout's copy; and it is the only entry of /etc/opencode (upstream also
+     loads a sibling `opencode.jsonc` from the managed directory, above
+     `opencode.json`).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1 has no service mode or
@@ -124,6 +126,7 @@ MANAGED_POLICY_RESOURCE = "opencode*"
 # (scripts/apply_managed_policy_precedence.py) to honour managed allows while
 # preserving an underlying `ask`; the other five already do.
 MANAGED_POLICY_ALLOW_ACTIONS = (
+    "integration.connect",
     "provider.use",
     "tool.use",
     "mcp.use",

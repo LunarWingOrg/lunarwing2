@@ -2706,28 +2706,45 @@ Runs 4 and 5 store a credential whose metadata names the organization
 `org_01`: the control gets the skill, the provider and the MCP server, and the
 image policy withholds all three.
 
-**Known residual: the Console's own policies still apply (run 6, review
-AEP-2).** Upstream keeps a policies-only copy of a denied integration's
-document (`packages/core/src/config.ts:343-349` at the pin; the comment at
-`:233-235` says "denying an integration never lifts the restrictions it
-carries"), and those policies rank right after the managed ones and above the
-lane's own config (`config.ts:331-332,367-375`). Run 6 shows it: with the image
-policy in place and a Console config that also carries `provider.use` deny
-`tensorzero`, the Console's skill, provider and MCP server are withheld and the
-lane's own provider `tensorzero` disappears from `/api/provider`; without that
-statement (run 2) it is listed. The same result was measured in review run 457
-on an image built at `c6ad6ff49`. Policy enforcement only removes or denies
-(`packages/core/src/config/plugin/policy.ts:56-113`): with a Console credential
-and egress the Console can switch off a provider of the worker and, by the same
-code, a tool, MCP server, skill or web-search provider, and a plugin
-(`packages/core/src/plugin/module.ts:53`); it cannot instruct the worker or add
-anything to it. A Console `allow` statement grants nothing by itself: it can
-only outrank a `deny` policy statement of a lower layer, and the lane's own
-config carries no `policies`. Only the provider case is measured; the rest is
-read from the source. Neutralizing Console policies would be a design change
-and was left out of WI#665. The harness asserts the behaviour as it is and exits non-zero when
-the Console's statement stops applying, so a bump that changes it is noticed
-and this record is updated.
+**Console policies are neutralized by the managed layer (run 6, WI#745;
+closes the WI#665 residual AEP-2).** Upstream keeps a policies-only copy of a
+denied integration's document (`packages/core/src/config.ts:343-349` at the
+pin), and those policies rank right after the managed ones and above the lane's
+own config (`config.ts:331-332,367-375`). WI#745 adds one managed wildcard
+allow for every action upstream enforces: `integration.use` is not in that
+list because the integration deny is the control; the allows are
+`integration.connect`, `provider.use`, `tool.use`, `mcp.use`, `skill.use`,
+`websearch.use` and `plugin.use`. Run 6 now carries a Console `provider.use`
+deny for `tensorzero` and a Console `tool.use` deny for
+`shell:wi745-console-policy *`; with the image policy in place the Console's
+skill, provider and MCP server are withheld, the lane's provider stays listed,
+the denied tool assertion evaluates to `allow`, and an unsaved `ask` for the
+same command stays `ask`. Without the managed policy (control) the provider is
+gone, the tool evaluates `deny`, and the ask is denied.
+
+The tool arm needed a build-time correction. Upstream's `tool.use` hook
+(`packages/core/src/config/plugin/policy.ts` at the pin) searches every layer
+for a deny and does not consult a managed allow, unlike the other actions which
+all go through `ManagedPolicy.decision`. `apply_managed_policy_precedence.py`
+applies the reviewed, digest-pinned patch
+(`patches/wi745-managed-policy-precedence.patch`) that tags managed statements
+and honours a managed allow in the tool hook only. It returns the existing
+decision rather than granting anything, so an `ask` stays an `ask` and an
+ordinary permission rule is not overridden; the patch is applied to three
+digest-pinned files, must leave exactly those three modified, and upstream's
+own `packages/core/test/config/policy.test.ts` runs in the image build.
+
+**What the managed allows outrank.** They outrank every lower layer's deny for
+their action, not just the Console's, because upstream has no separate Console
+policy rank. The lane config carries no policies, so this does not change its
+settings; the practical consequence is that a lower-layer tool `deny` cannot
+block a tool covered by the managed allow. That is deliberate and recorded
+here so a future change is not mistaken for a Console-only override.
+
+Only the provider and tool cases are measured; the other actions go through the
+same `ManagedPolicy.decision` path. A Console `allow` grants nothing by itself;
+the managed allows are what make the Console's statements ineffective. The
+harness fails when any part of this behaviour regresses.
 
 **What `/api/config` shows.** An earlier version of this record said the
 `opencode` integration document "was absent from `/api/config`" with the policy
