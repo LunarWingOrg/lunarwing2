@@ -243,9 +243,9 @@ The container carries three labels: `lunarwing.sandbox-tunnel` (provider),
 `lunarwing.sandbox-tunnel-hash` (the salted configuration drift hash), and
 `lunarwing.sandbox-tunnel-instance` (the instance id above). A start adopts an
 existing container only when it is running, its hash label matches the current
-salted hash, and its instance label matches this daemon. Removal applies the
-same ownership test, so one daemon can neither adopt nor remove another
-daemon's sidecar. Startup, recreation, stop, and cancelled-start cleanup are
+salted hash, and its instance label matches this daemon. Removal requires that
+instance label, so one daemon can neither adopt nor remove another daemon's
+sidecar. Startup, recreation, stop, and cancelled-start cleanup are
 serialized by a fair lifecycle lock keyed by container name, and every run
 joins the exact container ID that passed health and firewall verification —
 never a name, and never a container created after verification. If recreation
@@ -324,10 +324,11 @@ Setting it changes both halves of the path:
 
 The file is `<container>.resolv.conf` in the daemon's private runtime
 directory, mode `0644`, written atomically from a temp name and refreshed on
-start and every health check. `SandboxManager::shutdown()` stops the sidecar
-and removes it. Joined runs mount it `ro,z` because Podman and Docker reject
-`--dns` together with `--network container`; the shared SELinux label is safe
-for concurrent runs and the mode works with every supported keep-id mapping.
+start and every health check. `SandboxManager::shutdown()` stops the sidecar,
+and the stop removes the file. Joined runs mount it `ro,z` because Podman and
+Docker reject `--dns` together with `--network container`; the shared SELinux
+label is safe for concurrent runs and the mode works with every supported
+keep-id mapping.
 Use resolvers reachable through `wg0`, including after a reconnect, because
 stock `wg-quick` resolves its endpoint only at start. A later re-resolve script
 is affected too. Do not expect NetBird to accept this setting during a
