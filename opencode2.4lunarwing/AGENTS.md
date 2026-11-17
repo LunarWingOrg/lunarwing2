@@ -23,7 +23,7 @@ internal opencode headless server.
 - `scripts/task_runner.ts` / `scripts/task_runner_client.ts` — Bounded Unix task dispatch, cancellation and ping health. The task runner creates cron directories. Reject grants before delegation; jobs sharing this task container share authority. Keep the parser, image config and exported-source fixtures in sync with split identity ENV and boot files.
 - `entrypoint.sh` — Three modes: websocket, cli, acp. Split images require an explicit websocket role; managed split-task runs setup, serve and the runner, split-bridge dispatches to the private launcher. Host legacy paths remain for build/config fixtures. The v2.2.6 CLI `run` path is bounded by `OPENCODE_RUN_TIMEOUT_MS` (default one hour) with SIGTERM cancellation preserved for background jobs; the WebSocket bridge does not receive CLI `background_wait` events. Full lifecycle and migration contract: `docs/ops/WORKER-CONTAINERS.md`.
 - `config/opencode2.json` — Mounted into container; controls LLM provider, MCP servers. v2 config shape (`providers`, `settings.baseURL`, `package`).
-- `config/managed/opencode.json` — WI#665: installed by the Dockerfile to `/etc/opencode/opencode.json` (root:root 0444). Managed settings outrank every other config layer, so it carries one `integration.use` deny for `opencode*` and nothing else. It withholds the Console Library (instructions, skills) and the Console config merge's providers, MCP servers and web-search selection; it does not withhold the Console's own `policies` (upstream keeps them for a denied integration, and a policy can only switch something off) and it does not stop the plugin's requests. Evaluation: `scripts/console_policy_eval.py`; assertions: `scripts/exposure_policy_assert.py` (`check_managed_policy`, `check_installed_managed_policy`).
+- `config/managed/opencode.json` — WI#665: installed by the Dockerfile to `/etc/opencode/opencode.json` (root:root 0444). Managed settings outrank every other config layer, so it carries one `integration.use` deny for `opencode*` and nothing else. It withholds the Console Library (instructions, skills) and the Console config merge's providers, MCP servers and web-search selection; it does not withhold the Console's own `policies` (upstream keeps them for a denied integration, and a policy can only switch something off) and it does not stop the plugin's requests. `/etc/opencode` must hold this one file and nothing else: upstream also loads a sibling `opencode.jsonc` from the managed directory, above `opencode.json`. Evaluation: `scripts/console_policy_eval.py`; assertions: `scripts/exposure_policy_assert.py` (`check_managed_policy`, `check_installed_managed_policy`) and the out-of-band verifier's member check.
 
 ## Protocol Compatibility
 
@@ -158,9 +158,11 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   control. Keep `config/managed/opencode.json` at exactly one
   `integration.use` deny with no other key (a managed document outranks every
   other layer, so any other key there would shadow the lane config), keep the
-  Dockerfile install root:root 0444, and re-run
-  `scripts/console_policy_eval.py` on every bump: the deny depends on
-  upstream's managed-discovery and policy ordering.
+  Dockerfile install root:root 0444, put nothing else into `/etc/opencode`
+  (a sibling `opencode.jsonc` there outranks the shipped file; both checks
+  refuse any other entry), and re-run `scripts/console_policy_eval.py` on
+  every bump: the deny depends on upstream's managed-discovery and policy
+  ordering.
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays

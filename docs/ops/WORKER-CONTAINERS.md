@@ -2748,6 +2748,20 @@ owner, mode, non-writable parents and byte-identity to the checkout.
 file as a required member of the tar export, so the out-of-band verifier sees
 it too. The managed policy is in the lane's `input_files` hash list.
 
+**The managed directory holds that one file and nothing else (review AEP-3).**
+Upstream reads two names from the managed directory, `opencode.json` and
+`opencode.jsonc` (`packages/core/src/config/discovery.ts:12`,
+`config.ts:270-277` at the pin), and the second one's policies outrank the
+first's (`config.ts:313-325`). Measured in review run 457 on an image built at
+`c6ad6ff49`: with the shipped `opencode.json` and an `opencode.jsonc` beside it
+that allows the integration, the Console skill, provider and MCP server all
+arrived; in the same review the out-of-band verifier accepted its own fixture
+with that file added, and with a skill under `etc/opencode/skill/`. Both checks
+now refuse any other entry of `/etc/opencode`, a sibling file or a subdirectory
+such as `skill/`: the in-image assertion lists the directory (from the
+tar-header records when it runs out of band), and the out-of-band verifier
+refuses any other tar member under `etc/opencode`.
+
 Only `policies` is shipped from the managed layer: a managed document outranks
 every other layer for ordinary settings, so an `experimental` or `model` key
 there would shadow the lane's own config. The assertion fails if one appears.

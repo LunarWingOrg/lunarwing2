@@ -155,8 +155,10 @@ repeat it, is in `docs/ops/WORKER-CONTAINERS.md` and
 Managed settings outrank every other layer for ordinary settings too, so the
 file carries `policies` and nothing else — an `experimental` or `model` key
 there would shadow the lane's own config. `scripts/exposure_policy_assert.py`
-enforces that, the exact resource pattern, and the installed copy's owner and
-mode.
+enforces that, the exact resource pattern, the installed copy's owner and
+mode, and that `/etc/opencode` holds nothing but that file: upstream also
+loads a sibling `opencode.jsonc` from the managed directory, above
+`opencode.json`.
 See the [bump record](../docs/ops/WORKER-CONTAINERS.md#opencode-console-library-wi665)
 for the conditions and the evaluation log.
 
