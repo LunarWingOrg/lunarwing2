@@ -133,8 +133,11 @@ for direction in "systemd:openrc" "openrc:systemd"; do
   rc=0
   (
     simulate_host "$host"
+    # shellcheck disable=SC2329  # stubs invoked indirectly by main
     require_root() { :; }
+    # shellcheck disable=SC2329  # stub invoked indirectly by main
     openrc_dispatch_preflight() { return 0; }
+    # shellcheck disable=SC2329  # stub invoked indirectly by main
     with_tenant_lifecycle_lock() { shift; "$@"; }
     LUNARWING_SERVICE_MANAGER="$asked" main add-tenant probe --llm-base-url http://fixture.invalid
   ) >"$fixture/cli-$asked.log" 2>&1 || rc=$?
