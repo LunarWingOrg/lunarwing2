@@ -100,7 +100,7 @@ follow-ups.
 
 The upstream `opencode` integration can fetch a hosted Console Library of
 instructions and skills when it has both a Console credential and egress to
-`opencode.ai`. At the pinned v2.2.6, its bundled catalog names
+`opencode.ai`. At the pinned v2.2.7, its bundled catalog names
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
