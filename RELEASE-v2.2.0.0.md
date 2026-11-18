@@ -14,7 +14,7 @@
 
 Umioto listened; Kaitei held. **Shinkai goes past the floor.** This release commissions LunarDepth as a new external worker, gives the Podman sandbox a kernel-enforced default egress tier and an opt-in tunnel tier, and closes the RSA advisory by removing RSA from the SSH path entirely. Around those three, tenant upgrades become image-aware and fail-closed, the sandbox image carries a full Python development suite, secret-history scanning becomes blocking, and the crate, worker and documentation baselines advance together.
 
-**Draft status.** This is the second draft of the v2.2.0.0 notes, built from the 2.2.0.0 goals board and the merged work on the integration head. Since the first draft it adds the runtime `PATH` fix and the mt-admin service-manager guard, records the tunnel guide's expansion and its corrections, the worker protocol vocabulary, and the secret-history acceptance evidence. Before the release tag, re-check every version pin, pipeline citation and known limitation against the exact release tree.
+**Draft status.** This is the third draft of the v2.2.0.0 notes, built from the 2.2.0.0 work items and the merged work on the integration head. Since the second draft it corrects the OpenRC `PATH` description, the auth-login guard's token reading and the service-manager marker clause; records the dead-user-manager handling (WI#731, WI#758); and adds the hardened lock tree (WI#762), the health pipeline's no-cron-daemon failure (WI#765), the gone-account removal rules (WI#707) and the relay-socket diagnosis (WI#641). Before the release tag, re-check every version pin, pipeline citation and known limitation against the exact release tree.
 
 ## Highlights
 
