@@ -421,9 +421,24 @@ public-only validating proxy:
   workload namespace both share `/run/user/<uid>`.
 - relay interior: Python-in-container `--network none` runs a loopback-only
   socket server bound to `127.0.0.1:3128` and forwards to the host-side proxy.
-  Only the socket directory is bind-mounted (`:ro,z`), Python runs in isolated
+  Only the socket directory is bind-mounted (read-only), Python runs in isolated
   mode (`python3 -I`), and a failed relay fails closed — it never degrades to
   advisory or direct egress.
+- relay labels (WI#641): a Unix socket the host created is only reachable from
+  the confined container when its inode carries `container_file_t` with a
+  category-free level (`s0`), which every container's MCS pair dominates. When
+  SELinux is enforcing the relay sets that type itself (type-only, read back
+  and verified) and drops the engine's `:z` relabel; otherwise `:ro,z` is kept,
+  because a skipped or second relabel leaves the socket at its host type
+  (`user_tmp_t`) or pins it to one container's category pair and every
+  `connect()` fails with `EACCES`. Label writes are best-effort: on any failure
+  the mount stays on `:ro,z`, exactly as before.
+- relay failure text: `lunarwing-proxy-relay: <errno>; euid=… <mount node
+  modes/owners> <selinux state>` is emitted only by the startup probe and is
+  what maps to `sandbox:proxy_error`. Mid-run transport failures use
+  `lunarwing-proxy-relay transport: …` so they are attributable without hiding
+  a command's exit status. To confirm an SELinux denial on a Fedora host:
+  `ausearch -m AVC,USER_AVC -ts recent | grep -E 'connectto|proxy.sock'`.
 - destination policy: the proxy rejects non-public destinations (private,
   loopback, link-local, multicast, CGNAT, and IPv4-mapped forms) and pins DNS
   to the resolved public addresses for both HTTP forwarding and CONNECT.
