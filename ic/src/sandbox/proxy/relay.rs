@@ -268,16 +268,19 @@ fn level_is_category_free(level: &str) -> bool {
 /// be trusted: an unverified label means the mount keeps the engine relabel.
 #[cfg(target_os = "linux")]
 fn label_node(path: &Path) -> bool {
-    let Some(updated) = selinux_context(path)
-        .as_deref()
-        .and_then(with_container_file_type)
-    else {
+    let Some(current) = selinux_context(path) else {
+        return false;
+    };
+    let Some(updated) = with_container_file_type(&current) else {
         return false;
     };
     if !write_selinux_context(path, &updated) {
         return false;
     }
-    match selinux_context(path).as_deref().and_then(context_fields) {
+    let Some(verified) = selinux_context(path) else {
+        return false;
+    };
+    match context_fields(&verified) {
         Some((_, _, kind, level)) => kind == "container_file_t" && level_is_category_free(level),
         None => false,
     }
