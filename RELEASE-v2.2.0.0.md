@@ -2,7 +2,7 @@
 
 ## Codename: Shinkai (深海, しんかい) — The Deep Sea
 
-**Release Date:** Unreleased
+**Release Date:** 2026-11-18
 
 > Three releases sank.<br>
 > Umioto, Kaitei, then —<br>
@@ -10,11 +10,7 @@
 
 *The surface moves. The seabed carries it. Past the seabed, the water keeps going.*
 
-*Shinkai verses: Applejack's ledger, WI#591.*
-
-Umioto listened; Kaitei held. **Shinkai goes past the floor.** This release commissions LunarDepth as a new external worker, gives the Podman sandbox a kernel-enforced default egress tier and an opt-in tunnel tier, and closes the RSA advisory by removing RSA from the SSH path entirely. Around those three, tenant upgrades become image-aware and fail-closed, the sandbox image carries a full Python development suite, secret-history scanning becomes blocking, and the crate, worker and documentation baselines advance together.
-
-**Draft status.** This is the third draft of the v2.2.0.0 notes, built from the 2.2.0.0 work items and the merged work on the integration head. Since the second draft it corrects the OpenRC `PATH` description, the auth-login guard's token reading and the service-manager marker clause; records the dead-user-manager handling (WI#731, WI#758); and adds the hardened lock tree (WI#762), the health pipeline's no-cron-daemon failure (WI#765), the gone-account removal rules (WI#707) and the relay-socket diagnosis (WI#641). Before the release tag, re-check every version pin, pipeline citation and known limitation against the exact release tree.
+Umioto listened; Kaitei held. **Shinkai goes past the floor.** This release commissions LunarDepth as a new external worker, gives the Podman sandbox a kernel-enforced default egress tier and an opt-in tunnel tier, and closes the RSA advisory by removing RSA from the SSH path entirely. Around those three, tenant upgrades become image-aware and fail-closed, the sandbox image carries a full Python development suite, secret-history scanning becomes blocking, and the crate, worker and documentation baselines advance together
 
 ## Highlights
 
@@ -100,14 +96,14 @@ The sandbox now has four explicit tiers, and the platform default is no longer "
 - **Remove-tenant (WI#638).** Both purge modes stop every lane in the same order as `stop-tenant`, remove supported bridge and task containers and their IPC volumes, uninstall OpenRC task units and clear runlevels, and stop systemd task services and reload removed Quadlets before container deletion.
 - **Gone-account removal (WI#707).** `remove-tenant` completes on a rootless host when the tenant's OS account is already gone, once it has proven from `/proc` that no process or thread of the recorded uid or its subordinate uids remains; otherwise it refuses before changing anything. `--purge` removes the former home and reaps `/run/user/<uid>`; without it the home stays, the removal warns, and the identity record is kept so a later `--purge` can still prove the uid idle. `add-tenant` warns when the target home already exists and belongs to a different uid.
 - **Cron and schedule writers (WI#740, WI#743, WI#765).** Root health scheduling uses shared checked writers for the cron block and unit pair, refuses partial or unbufferable crontab listings instead of treating them as empty, and recognises an installed schedule whose cron service is merely not enabled. A host with no cron daemon init script now fails that step, so the pipeline is not reported ready when nothing would run the schedule.
-- **CI and worker flake (WI#608).** The Kimi bridge installs its first-message listener before the socket can open, so the immediate `ready` frame cannot be lost, and every explicit event wait in its test has a named deadline.
+- **CI and worker flake (WI#608).** The Kimi bridge installs its first-message listener before the socket can open, so the immediate `ready` frame cannot be lost, and every explicit event wait in its test has a named deadline
 
 ## Documentation
 
 - **Documentation sweep.** All current architecture and guide documents were revalidated, with nftables prerequisites, worker egress audits, sandbox storage and tunnel guidance, registry versions, OpenRC identity safeguards and the startup banner brought in line with the code. Archived procedures are marked historical and point at maintained replacements.
 - **Tunnel guide expansion (WI#667, WI#760).** `docs/guides/SANDBOX_TUNNEL_NETWORKING.md` gained a settings and defaults reference plus sections for per-instance sidecar isolation, image identity, custom DNS, WireGuard handshake health and an ordered NetBird live-validation procedure that follows the test assertion order. The statements its review found wrong were corrected: an image change keeps the provider identity and its credentials, retention is tied to the volume's identity hash, the page says which tunnel settings are parsed in every network mode, the NetBird lane's skip, fail and peer checks match the code, and the WireGuard re-resolve causality and provider value list are stated correctly. The docs index entry is updated with it.
 - **Worker protocol vocabulary (WI#751, WI#755).** `docs/ops/WORKER-CONTAINERS.md` now names `success`, `error`, `cancelled` and `timed_out` as the statuses the lanes send, with `error` as the lanes' failure word and the daemon's `tool_result` term; the daemon accepts `failed` as well and stores and reports a failed result under it. Each lane's `agent_comm_protocol.json` carries the same note, and any other status is logged as unrecognized and still treated as failed.
-- **New operator material.** `docs/guides/SANDBOX_TUNNEL_NETWORKING.md`, `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`, `docs/proposals/LUNARDEPTH_WORKER_LANE.md`, the LunarDepth section of `docs/ops/WORKER-CONTAINERS.md`, and the PostgreSQL version inventory under `docs/ops/` record the new contracts.
+- **New operator material.** `docs/guides/SANDBOX_TUNNEL_NETWORKING.md`, `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`, `docs/proposals/LUNARDEPTH_WORKER_LANE.md`, the LunarDepth section of `docs/ops/WORKER-CONTAINERS.md`, and the PostgreSQL version inventory under `docs/ops/` record the new contracts
 - **Audits.** `docs/ops/v2.2.0.0_CARGO_DENY_AUDIT.md` covers all 27 tracked non-vendor lockfiles, 4,130 registry pins and the retained acceptances. The release index links this draft.
 
 ## Compatibility
@@ -146,7 +142,7 @@ Registry bumps require rebuilt WASM artifacts. Rebuild every enabled worker imag
 
 ## Known Limitations
 
-- **NetBird custom DNS is unsupported (WI#603).** Setting `SANDBOX_TUNNEL_DNS` with NetBird is refused before any container-runtime call. Use NetBird nameserver groups reachable through the overlay; an upstream outside the overlay fails closed because its resolver sockets are unmarked.
+- **NetBird custom DNS is unsupported (WI#603).** Setting `SANDBOX_TUNNEL_DNS` with NetBird is refused before any container-runtime call. Use NetBird nameserver groups reachable through the overlay; an upstream outside the overlay fails closed because its resolver sockets are unmarked
 - **Tunnel live coverage is narrower than the code paths.** The gated tunnel suite was exercised on rootless Podman 5.8.2, including NetBird 0.82.0 and a real WireGuard peer. Docker fallback is harness-covered, not live-tested; no public-cloud, CI or systemd-service-mode tunnel run is claimed. Detached systemd user-manager checks report their existing skip on hosts without a user manager.
 - **LunarDepth acceptance remains partly tenant-side.** The full task path was exercised against an isolated model endpoint in a disposable tenant. Real upstream inference approved by a tenant and a live systemd host remain deployment checks; the protected promotion digest gate is a CI step, not a local test claim. Local Podman image IDs differ between builds even when every rootfs entry matches.
 - **Sandbox proxy tiers fail under enforcing SELinux (WI#641).** On a host with SELinux in enforcing mode, SELinux refuses the sandbox container's connection to the daemon's relay socket: the audit log shows `avc: denied { connectto }` on `unix_stream_socket`, from the container's `container_t` to the daemon's `unconfined_t`. Sandbox runs then fail closed at relay startup with `sandbox:proxy_error` and `[Errno 13] Permission denied`. This was measured on one Fedora host with rootless Podman in the legacy `proxy` tier. `proxy-enforced`, the Linux default, uses the same relay and is expected to fail the same way; it was not measured. The denial does not occur on hosts that do not enforce SELinux. This release does not fix it and has no supported workaround; `sudo ic/scripts/lunarwing-sandbox-proxy-diag.sh <tenant> --watch` shows the denial.
@@ -155,7 +151,6 @@ Registry bumps require rebuilt WASM artifacts. Rebuild every enabled worker imag
 - **Runtime discovery only widens `PATH`.** The shared policy appends `/usr/local/sbin`, `/usr/sbin` and `/sbin`; it does not search elsewhere. The rendered systemd tenant unit sets a fixed `PATH` without host-specific directories such as `/opt/bin`. On the tested OpenRC build, a host-specific directory reached the service only when OpenRC supplied it; the init script only adds missing sbin directories. Gentoo's OpenRC package was not tested. Windows keeps its own lookup.
 - **Wingtip socket work is still M4.** The daemon Unix socket supports protocol 1, but Wingtip's own socket transport and reconnect suite remain future work. A missing or replaced daemon socket is logged without automatic rebind.
 - **RSA policy stops at the shared client.** Worker-mode OpenSSH and `ssh_git`'s post-pin OpenSSH transport retain their own host-key algorithm policies. RSA private keys are rejected on every LunarWing SSH path; RSA host keys are unsupported only on the shared russh paths.
-- **Chrono notices are accepted, not fixed.** `chrono 0.4.45` and `chrono-tz 0.10.4` are unmaintained with no patched release. No migration off chrono is planned (maintainer decision, 2026-11-17); both are informational and compiled into every feature set.
 - **Some advisory acceptances cover opt-in builds only.** The libsql-remote-replica legacy chain retains its standing acceptances under WI#418; default and PostgreSQL builds exclude it by the feature gate. A green default build is not a claim that the opt-in graph is advisory-free.
 
 > Her own light, her own.<br>
