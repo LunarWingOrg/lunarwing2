@@ -1146,7 +1146,7 @@ EOF
 _user_manager_cache_prune() {  # <parent-dir>
   local parent="$1" dir name pid
   for dir in "$parent"/.usermgr-*-* "$parent"/lunarwing-mt-admin-usermgr-*-*; do
-    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || continue
     name="${dir##*/}"
     pid="${name#.usermgr-}"
     pid="${pid#lunarwing-mt-admin-usermgr-}"
@@ -1194,8 +1194,11 @@ _user_manager_cache_ready() {
 _user_manager_cache_read() {  # <name> <state|notice>
   local dir file value
   dir="$(_user_manager_cache_dir)"
+  # Only our own directory and a plain file may answer; a directory or file
+  # placed here by another user must not decide whether a manager is dead.
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || return 1
   file="$dir/$(sanitize_name "$1").$2"
-  [[ -f "$file" && ! -L "$file" ]] || return 1
+  [[ -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
   IFS= read -r value <"$file" 2>/dev/null || return 1
   printf '%s\n' "$value"
 }
