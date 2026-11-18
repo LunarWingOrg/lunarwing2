@@ -210,7 +210,7 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 60
 | Variable | Default | Accepted values |
 |---|---|---|
 | `SANDBOX_NETWORK` | `proxy-enforced` on Linux, `none` elsewhere | `tunnel` enables everything on this page |
-| `SANDBOX_TUNNEL_PROVIDER` | `netbird` | `netbird` or `wireguard` |
+| `SANDBOX_TUNNEL_PROVIDER` | `netbird` | `netbird` or `wireguard` (`wg` also accepted); case-insensitive |
 | `SANDBOX_TUNNEL_IMAGE` | NetBird 0.82.0 digest index; `localhost/lunarwing-tunnel-wireguard:latest` | any image reference; digest form must be `image@sha256:<64 hex characters>` |
 | `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` | `90` | integer from 1 through 600 |
 | `SANDBOX_TUNNEL_DNS` | unset | comma-separated unicast IPs; WireGuard only |
@@ -341,9 +341,11 @@ and the stop removes the file. Joined runs mount it `ro,z` because Podman and
 Docker reject `--dns` together with `--network container`; the shared SELinux
 label is safe for concurrent runs and the mode works with every supported
 keep-id mapping.
-Use resolvers reachable through `wg0`, including after a reconnect, because
-stock `wg-quick` resolves its endpoint only at start. A later re-resolve script
-is affected too. Do not expect NetBird to accept this setting during a
+Use resolvers reachable through `wg0`, including after a reconnect. Stock
+`wg-quick` resolves its endpoint once at start, when the sidecar still has its
+runtime resolver file, but a later re-resolve script — or anything else that
+re-resolves the endpoint after the firewall is installed — is affected by the
+removed uplink DNS rules. Do not expect NetBird to accept this setting during a
 hostname-based reconnect; it is rejected up front instead.
 
 ## NetBird
