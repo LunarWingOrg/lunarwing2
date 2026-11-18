@@ -122,6 +122,10 @@ fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::Uni
         .prefix("lw-proxy-")
         .tempdir_in(&base)
         .map_err(|error| at_path("cannot create relay directory in", &base, error))?;
+    // `tempfile` creates at 0777 & ~umask; only the `channel` child is meant to
+    // be reachable by another uid, so the parent stays private.
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| at_path("cannot set relay directory mode", directory.path(), error))?;
     let channel = directory.path().join("channel");
     std::fs::create_dir(&channel)
         .map_err(|error| at_path("cannot create relay channel", &channel, error))?;
