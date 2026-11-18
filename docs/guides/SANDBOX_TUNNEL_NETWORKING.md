@@ -290,9 +290,10 @@ resolves to therefore recreates the sidecar: the container, its network
 namespace, and its firewall rules are rebuilt from the image the reference now
 resolves to. Provider identity does not live in the image, so it survives that
 recreation: a NetBird sidecar mounts its existing state volume and keeps the
-enrolled peer (see NetBird below), and a WireGuard sidecar mounts the same host
-config file with the same private key. The hash covers the provider, image
-reference, resolved image ID, resolver and canary settings, the WireGuard
+enrolled peer, because the image is not part of that volume's identity (see
+NetBird below), and a WireGuard sidecar mounts the same host config file with
+the same private key. The hash covers the provider,
+image reference, resolved image ID, resolver and canary settings, the WireGuard
 config path and contents, the management URL, and the setup key; the published
 label is salted, so it is a drift marker rather than a digest of the key. The
 startup timeout and `SANDBOX_AUTO_PULL` are not hashed: changing either applies
