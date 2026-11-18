@@ -1257,6 +1257,12 @@ keeps a user only while one of its units is active, so a lingering tenant whose
 record is gone falls back to logind's own marker,
 `/var/lib/systemd/linger/<name>`.
 
+`LUNARWING_MT_USER_MANAGER_CACHE_DIR` and `LUNARWING_MT_LINGER_DIR` are
+test-only seams for the harness. The first replaces the cache directory and
+carries no per-process tag, so an answer written there outlives the run that
+wrote it; the second replaces logind's marker directory. Do not set either on a
+host.
+
 Only the parts that need the user bus are skipped. A worker started under the
 system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
 `--restart unless-stopped`) outlives the user manager, so `stop-worker` still
