@@ -1244,6 +1244,19 @@ continuing; if the manager does not come back they exit non-zero with the line.
 tenant's user units as down (the dead manager already took them down);
 `remove-tenant` still removes the unit files and the account.
 
+The probe runs once per tenant per mt-admin process. Its answer and the
+"already said" flag are kept in a per-process file, so a caller that reads the
+wrapper through a command substitution does not re-probe and does not print a
+second line. The answer does not trust `loginctl show-user` alone: logind keeps
+a user only while one of its units is active, so a lingering tenant whose record
+is gone falls back to logind's own marker, `/var/lib/systemd/linger/<name>`.
+
+Only the parts that need the user bus are skipped. A worker started under the
+system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
+`--restart unless-stopped`) outlives the user manager, so `stop-worker` still
+asks the runtime to stop the worker and its task container. `status` with a dead
+manager prints the line, the tenant header, and exits 0.
+
 ### Services don't start after reboot
 
 - systemd: Verify linger is enabled: `loginctl show-user <tenant> | grep Linger`
