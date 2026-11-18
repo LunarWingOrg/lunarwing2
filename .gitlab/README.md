@@ -770,7 +770,9 @@ missing pending-findings file, is refused before scanning. Test secrets are
 constructed at runtime and scanner output is checked for complete redaction. The
 blocking `secret-history-regression` job runs this harness on merge-request
 pipelines so scanner or isolation regressions cannot first appear on a release
-tag.
+tag. The group-level classification of the pre-rule historical pins is recorded
+under *Historical baseline triage closure* in
+`.gitlab/gitleaks-history-dispositions.md`.
 
 After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
 the history baseline from a non-shallow full mirror. Fetch the complete ref

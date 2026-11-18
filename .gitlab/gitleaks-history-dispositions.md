@@ -28,3 +28,40 @@ For a true positive, revocation or rotation must be complete before acceptance.
 | 2026-11-12 | `68d8b44ec03ec0e6a2095ce47840ba389eb4242f:lunardepth4lunarwing/scripts/lunarwing_bridge_test.ts:generic-api-key:24` | False positive | The same line as the `f690d3638` row above, re-reported at the commit that last touched the file. Line 24 is byte-identical at both commits (MD5 of the line, `67dbdfad9c0fe2a665875da92be63dd0`, is the same), so the evidence is unchanged: an RFC 6455 section 1.3 example `Sec-WebSocket-Key` nonce that authenticates nothing. Found by a local full-history scan on 2026-11-12 in branch `sweetiebot/kimi-24-20261111-0905`, which is not reachable from any remote ref; pinning it keeps the baseline a superset if that branch is ever pushed. |
 
 No new fingerprints were accepted by the change that introduced this log.
+
+## Historical baseline triage closure (WI#575)
+
+The committed baseline was reviewed as a whole before the per-row acceptance
+rule above existed. This section is its durable, non-confidential disposition
+record; it names no finding value and no matched content, and every path and
+rule it counts is already visible in `.gitlab/gitleaks-history-ignore`.
+
+Snapshot of that file on 2026-11-18: **1,918 exact pins across 52 commits** —
+**1,854 under `ic/vendor/`** in 194 crate directories and **64 outside it**.
+Rule mix: `generic-api-key` 1,295, `private-key` 589, `jwt` 16,
+`square-access-token` 5, `gcp-api-key` 4, `curl-auth-user` 3,
+`discord-api-token` 3, `stripe-access-token` 2, `gitlab-pat` 1.
+
+- **Vendored pins (1,854): false positive.** Third-party crate sources, their
+  cargo checksum manifests, and the upstream test keys and example tokens that
+  ship with them. No LunarWing system trusts them; the history scan still
+  covers `ic/vendor/`, and every new pin, vendor or not, still needs its own row
+  above.
+- **Other pins (64): false positive.** Test vectors and fixtures in
+  `ic/crates/lunarwing_safety` and `ic/tests`, the SSH-key fixtures under
+  `ic/src/bridge` and `ic/src/orchestrator`, WASM and DarkIRC test strings,
+  HTML test pages, documentation and template examples, one digest constant in
+  `opencode4lunarwing/Dockerfile`, and the empty-string `local` declaration in
+  `lunarwing-mt-admin.sh` already recorded above.
+- **The `gitlab-pat` row:** the token-shaped example at `59b4247c2` was proven
+  not to be a token on this instance by the administrator lookup recorded
+  above (HTTP 404). No value was extracted or replayed.
+- **No true positive was found**, so no revocation or rotation was required.
+
+Review evidence: the real-scanner harness passes in the CI-pinned Gitleaks
+v8.30.1 image; scheduled job **174508** (pipeline **7727**) ran the blocking
+`secret-history` job green with `allow_failure: false` over 11,524 commits and
+2.07 GB and reported no leaks; the merge-request `secret-history-regression`
+job runs the same harness. The temporary schedule behind that run was removed,
+so the next protected release tag supplies the tag-pipeline evidence and
+creating the recommended weekly schedule remains an operator action.
