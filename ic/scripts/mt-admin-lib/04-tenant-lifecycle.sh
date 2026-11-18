@@ -818,6 +818,12 @@ remove_tenant() {
   say "=== Removing tenant: $name ==="
   say ""
 
+  # WI#731: say the one line before the first user-bus call (retire, stop and
+  # uninstall below) so removal is not silently blind to a dead manager.
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    _tenant_user_manager_gate "$name" report || true
+  fi
+
   # WI#688: refresh the identity record while the account exists, so a rerun
   # after `userdel` below can still prove the old uid idle. Without the account
   # a rootless store is unreachable; every step below then skips it, and that
@@ -1025,6 +1031,14 @@ start_tenant() {
     || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing start"
 
   say "=== Starting tenant: $name ==="
+
+  # WI#731: PostgreSQL, vision/voice and the unit start below all need the
+  # tenant's user bus. Detect a dead user manager once here, before the first
+  # `systemctl --user` call, and either restore it or stop with one named line.
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _tenant_user_manager_gate "$name" recover || return 1
+  fi
 
   local darkirc_config
   darkirc_config="$(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
@@ -1466,6 +1480,13 @@ validate_migration_export_boundary() {
 
 restart_tenant() {
   local name="$1"
+  # WI#731: both halves need the tenant's user bus; recover it once up front
+  # (and print the one line either way) instead of letting the stop phase fail
+  # per unit against a dead manager.
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _tenant_user_manager_gate "$name" recover || return 1
+  fi
   stop_tenant "$name"
   start_tenant "$name"
 }
@@ -2318,6 +2339,11 @@ status_tenant() {
   say ""
   say "Services ($INIT_SYSTEM):"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    # WI#731: one named line for a dead user manager; per-unit state is
+    # unknowable without its bus, so do not print a line per unit.
+    if ! _tenant_user_manager_gate "$name" report; then
+      return 0
+    fi
     local svcs=("lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" \
                 "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
     if tenant_darkirc_enabled "$name"; then
