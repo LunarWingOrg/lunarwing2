@@ -23,13 +23,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 
+fixture="$(mktemp -d)"
+trap 'rm -rf "$fixture"' EXIT
+# WI#730: simulate a systemd host (PID-1 markers) so the documented override
+# does not contradict the real host's markers; CI containers have none.
+export LUNARWING_MT_SYSTEMD_MARKER="$fixture/systemd-host"
+export LUNARWING_MT_OPENRC_MARKER="$fixture/openrc-host"
+mkdir -p "$LUNARWING_MT_SYSTEMD_MARKER"
+
 export LUNARWING_SERVICE_MANAGER=systemd
 
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
-fixture="$(mktemp -d)"
-trap 'rm -rf "$fixture"' EXIT
 failures=0
 
 pass() { printf 'PASS: %s\n' "$1"; }

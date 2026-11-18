@@ -561,6 +561,11 @@ add_tenant() {
       die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/lunardepth-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
+  # WI#730: a service-manager override that contradicts this host must stop the
+  # add before the account, the registry or anything under /etc is written. The
+  # lifecycle-lock wrapper suppresses errexit, so propagate the refusal here.
+  ensure_init_system || return 1
+
   # WI#330: never render an unreachable built-in endpoint; require a real one.
   require_tenant_llm_endpoint "$tensorzero_url" "$llm_base_url" "$enable_proxy"
 

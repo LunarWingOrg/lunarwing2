@@ -1054,7 +1054,8 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc` |
+| `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc`. An override that contradicts the host's PID-1 markers (`/run/systemd/system`, `/run/openrc/softlevel`) is refused before any write. |
+| `LUNARWING_SERVICE_MANAGER_FORCE` | unset | Set to `1` only for an image build or chroot: permit an override that contradicts a host PID-1 marker. Still refused when the host has registered tenants under the manager it actually runs. |
 | `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman`; an explicit choice is persisted in `/etc/lunarwing/container-runtime` |
 | `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |
 | `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit Cargo job cap for tenant builds |
@@ -1193,7 +1194,14 @@ paths). `LUNARWING_MT_HEALTH_ENABLED=false` disables new auto-installs, not
 refreshes of an already-installed host-global pipeline.
 
 Force init detection only when necessary with
-`LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
+`LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`. The
+override is checked against the host's PID-1 marker and refused, before any
+account or `/etc` write, when it names the other manager; the refusal names both
+the requested and the detected value. Image builds and chroots without either
+marker are accepted with a warning, and `LUNARWING_SERVICE_MANAGER_FORCE=1`
+permits a contradicted override only while the host has no tenants registered
+under its real manager. `health.env` always records the manager the host
+actually runs, never a forced value.
 
 ## Routine System Improvements
 

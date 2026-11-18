@@ -756,7 +756,12 @@ Commands:
                                    (stop the tenant daemon first)
 
 Environment:
-  LUNARWING_SERVICE_MANAGER        Override: systemd or openrc
+  LUNARWING_SERVICE_MANAGER        Override: systemd or openrc. Refused when it
+                                   contradicts the host's PID-1 markers.
+  LUNARWING_SERVICE_MANAGER_FORCE  Set to 1 only for an image build or chroot:
+                                   allow that override on a contradicting host.
+                                   Still refused when the host has tenants
+                                   registered under the manager it runs.
   LUNARWING_CONTAINER_RUNTIME      Override: docker or podman (persisted to /etc/lunarwing/container-runtime on first explicit use; later runs need no env var)
   LUNARWING_MT_PROFILE             Build profile: release (default) or debug
   LUNARWING_MT_SOURCE_REPO         Path to source repo to clone from

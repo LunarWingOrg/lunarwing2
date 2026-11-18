@@ -460,7 +460,12 @@ check_fleet_script_names_the_contract() {
   mkdir -p "$root/bin" "$root/initd"
   printf '#!/bin/sh\nprintf "0\\n"\n' >"$root/bin/id"
   chmod +x "$root/bin/id"
+  # WI#730: simulate an OpenRC host so the override does not contradict the
+  # real host's PID-1 markers.
+  mkdir -p "$root/openrc-marker"
   output="$(PATH="$root/bin:$PATH" LUNARWING_SERVICE_MANAGER=openrc \
+    LUNARWING_MT_OPENRC_MARKER="$root/openrc-marker" \
+    LUNARWING_MT_SYSTEMD_MARKER="$root/no-systemd-marker" \
     LUNARWING_MT_OPENRC_INITD_DIR="$root/initd" \
     bash "$root/ic/scripts/enable-health-fleet.sh" --dry-run --yes --allow-down 2>&1)" || status=$?
   assert_eq "fleet script, refused contract on OpenRC: stops" "1" "$status"
