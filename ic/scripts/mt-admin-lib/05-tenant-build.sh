@@ -975,7 +975,7 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
 # appending a file inside tenant-writable space follows tenant symlinks (WI#446
 # class), so the markers are kept root-owned alongside the build lock.
 _tenant_marker_dir() {
-  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}/locks}"
 }
 
 tenant_build_stage_file() {
@@ -1022,10 +1022,9 @@ report_retained_sandbox_image() {  # <tenant>
 _ensure_marker_dir() {
   local dir
   dir="$(_tenant_marker_dir)"
-  [[ ! -L "$dir" ]] || die "unsafe marker directory $dir (symlink)"
-  install -d -o root -g root -m 0700 "$dir"
-  [[ "$(stat -c '%u:%a' "$dir" 2>/dev/null)" == "0:700" ]] \
-    || die "unsafe marker directory $dir (must be root-owned mode 0700)"
+  # WI#762: assert before creating; install -d re-owns a foreign directory and
+  # hides who made it.
+  _lw_lock_dir_prepare "$dir" 700
 }
 
 _build_stage_log_path() {  # <name>
@@ -1118,6 +1117,8 @@ build_tenant() {
   [[ -d "$repo" ]] || die "repo not found at $repo; run add-tenant first"
 
   say "acquiring build lock (only one tenant builds at a time) ..."
+  local build_lock_fd build_rc=0
+  _lw_lock_open_fd "$BUILD_LOCK" build_lock_fd
   (
     flock -x 200
     # Fresh per-run marker ("start" = nothing built yet, distinguishable from an
@@ -1167,7 +1168,9 @@ build_tenant() {
     say ""
     say "Reminder: set your LLM provider API key (if applicable to your backend) in $(tenant_env_dir "$name")/lunarwing.env"
     say "  e.g.  LLM_API_KEY=sk-..."
-  ) 200>"$BUILD_LOCK" || return $?
+  ) 200>&"$build_lock_fd" || build_rc=$?
+  eval "exec $build_lock_fd>&-"
+  ((build_rc == 0)) || return "$build_rc"
 
   if [[ "$with_pebble" == "true" ]]; then
     say ""
@@ -1874,6 +1877,8 @@ build_darkirc() {
   reject_legacy_darkirc_path_overrides
 
   say "acquiring build lock for darkirc ..."
+  local build_lock_fd build_rc=0
+  _lw_lock_open_fd "$BUILD_LOCK" build_lock_fd
   (
     flock -x 200
     [[ "$DARKIRC_REV" == "$DARKIRC_APPROVED_REV" ]] \
@@ -1982,7 +1987,9 @@ build_darkirc() {
     say "darkirc build complete: $release_dir"
     sudo -u "$test_user" "$DARKIRC_RELEASE_DAEMON" --version \
       || say "(darkirc --version not supported, skipping)"
-  ) 200>"$BUILD_LOCK"
+  ) 200>&"$build_lock_fd" || build_rc=$?
+  eval "exec $build_lock_fd>&-"
+  return "$build_rc"
 }
 
 ensure_darkirc_release() {

@@ -38,9 +38,18 @@ install() { command mkdir -p "${!#}"; }
 stat() {
   if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then
     command stat "$@"
-  else
-    printf '0:700\n'
+    return
   fi
+  # WI#762: the lock helpers ask for mode, owner, link count, and dev:inode
+  # separately; answer the requested format instead of a fixed 0:700.
+  case "$*" in
+    *%d:%i*)  printf '1:1\n' ;;
+    *%u:%a*)  printf '0:700\n' ;;
+    *%a*)     printf '700\n' ;;
+    *%u*)     printf '0\n' ;;
+    *%h*)     printf '1\n' ;;
+    *)        printf '0:700\n' ;;
+  esac
 }
 
 fixture="$(mktemp -d)"

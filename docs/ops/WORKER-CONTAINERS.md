@@ -1779,7 +1779,7 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   failure reverted (run-300 TO-4).
 - `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
   a root-owned marker file in the tenant lifecycle lock directory
-  (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
+  (`/run/lunarwing/mt-admin/locks/<tenant>-build-stages` by default; WI#762), never in
   tenant-writable state; the directory is created with the same hardened
   no-symlink, root-owned 0700 sequence as the lifecycle locks. Each run starts
   with a `start` sentinel, so "nothing built yet" is distinguishable from an

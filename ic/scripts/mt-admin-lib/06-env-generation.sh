@@ -1997,7 +1997,7 @@ validate_darkirc_scope_id() {
 }
 
 darkirc_writer_lock() {
-  local name="$1" scope_id lock_file mode owner links enabled current_scope current_enabled
+  local name="$1" scope_id lock_file enabled current_scope current_enabled
   [[ "$PORTS_LOCK_HELD" != "true" ]] \
     || die "DarkIRC writer lock must be acquired before registry lock"
   acquire_ports_lock
@@ -2014,23 +2014,7 @@ darkirc_writer_lock() {
   require_cmd flock
   darkirc_path_components_safe "$(dirname "$DARKIRC_WRITER_LOCK_DIR")" \
     || die "unsafe DarkIRC writer lock parent"
-  install -d -o root -g root -m 0700 "$DARKIRC_WRITER_LOCK_DIR"
-  mode="$(stat -c '%a' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
-  owner="$(stat -c '%u' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
-  [[ "$mode" == 700 && "$owner" == 0 && ! -L "$DARKIRC_WRITER_LOCK_DIR" ]] \
-    || die "unsafe DarkIRC writer lock directory"
   lock_file="$DARKIRC_WRITER_LOCK_DIR/$scope_id.lock"
-  [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] \
-    || die "unsafe DarkIRC writer lock file"
-  if [[ ! -e "$lock_file" ]]; then
-    (umask 077; : >"$lock_file")
-  fi
-  chmod 0600 "$lock_file"
-  owner="$(stat -c '%u' "$lock_file" 2>/dev/null || true)"
-  mode="$(stat -c '%a' "$lock_file" 2>/dev/null || true)"
-  links="$(stat -c '%h' "$lock_file" 2>/dev/null || true)"
-  [[ "$owner" == 0 && "$mode" == 600 && "$links" == 1 ]] \
-    || die "unsafe DarkIRC writer lock file"
   if [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}" ]]; then
     local inherited_fd="$LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD"
     local inherited_scope="${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}"
@@ -2041,7 +2025,9 @@ darkirc_writer_lock() {
     DARKIRC_WRITER_LOCK_FD="$inherited_fd"
     DARKIRC_WRITER_LOCK_INHERITED="true"
   else
-    exec {DARKIRC_WRITER_LOCK_FD}>"$lock_file"
+    # WI#762: assert the directory before creating it, then open the lock file
+    # without following a link and without truncation (this used `>`).
+    _lw_lock_open_fd "$lock_file" DARKIRC_WRITER_LOCK_FD
     flock -x -w 10 "$DARKIRC_WRITER_LOCK_FD" \
       || die "DarkIRC config update is busy for tenant '$name'"
   fi

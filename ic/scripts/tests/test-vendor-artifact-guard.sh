@@ -213,7 +213,18 @@ check 'path-like profile names are rejected' test "$rc" -ne 0
   TENANT_LIFECYCLE_LOCK_DIR="$fixture/locks"
   mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
   install() { command mkdir -p "${!#}"; }
-  stat() { printf '0:700\n'; }
+  # WI#762: the lock helpers ask for mode, owner, link count, and dev:inode
+  # separately; answer the requested format instead of a fixed 0:700.
+  stat() {
+    case "$*" in
+      *%d:%i*)  printf '1:1\n' ;;
+      *%u:%a*)  printf '0:700\n' ;;
+      *%a*)     printf '700\n' ;;
+      *%u*)     printf '0\n' ;;
+      *%h*)     printf '1\n' ;;
+      *)        printf '0:700\n' ;;
+    esac
+  }
   tenant_repo() { printf '%s\n' "$ic"; }
   tenant_env_dir() { printf '%s/env\n' "$fixture"; }
   flock() { return 0; }

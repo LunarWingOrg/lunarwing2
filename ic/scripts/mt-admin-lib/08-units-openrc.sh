@@ -1236,6 +1236,13 @@ start_pre() {
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_state_dir}"
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_log_dir}"
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_runtime_dir}"
+    # WI#762: root lock tree, created by a privileged unit before any local
+    # account can act (the leaves are root-only; /run/lock is 1777 on Debian).
+    checkpath -d -m 0755 -o root:root /run/lunarwing
+    checkpath -d -m 0755 -o root:root /run/lunarwing/mt-admin
+    checkpath -d -m 0700 -o root:root /run/lunarwing/mt-admin/locks
+    checkpath -d -m 0700 -o root:root /run/lunarwing/mt-admin/build
+    checkpath -d -m 0700 -o root:root /run/lunarwing/mt-admin/darkirc
     checkpath -f -m 0640 -o "\${lunarwing_user}:\${lunarwing_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${lunarwing_user}:\${lunarwing_group}" "\${error_log}"
     # Postgres is brought up by the dedicated lunarwing-pg-${name} service, which
@@ -1359,8 +1366,8 @@ start_pre() {
     # is spawned; an inherited fd would keep the flock held for the daemon
     # lifetime and orphan the lock when mt-admin dies inside the section.
     for _lw_lock_dir in \
-        "\${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}" \
-        "\${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"; do
+        "\${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lunarwing/mt-admin/locks}" \
+        "\${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lunarwing/mt-admin/darkirc}"; do
         [ -d "\${_lw_lock_dir}" ] || continue
         _lw_lock_id=\$(stat -Lc '%d:%i' "\${_lw_lock_dir}" 2>/dev/null || true)
         [ -n "\${_lw_lock_id}" ] || continue
