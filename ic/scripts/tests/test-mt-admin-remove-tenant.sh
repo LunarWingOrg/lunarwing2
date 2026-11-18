@@ -2,6 +2,9 @@
 # WI#638, WI#650, WI#672, WI#688, WI#699, WI#707 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
+# Let the case-naming ERR trap below follow the harness into its functions and
+# subshells (WI#764).
+set -E
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
@@ -23,6 +26,20 @@ UNIT_LANES=(nanocode pebble opencode opencode2 lunardepth kimi vision voice)
 
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
+# WI#764: a case that dies in its own fixture names itself, so the run reads as
+# a failure of that case instead of a bare `ln` error from a leftover path.
+CASE_LABEL=""
+case_fixture_abort() {
+  local status="$1" line="$2"
+  [[ -n "$CASE_LABEL" ]] || return 0
+  # Bash clears errexit while an ERR trap runs, but SHELLOPTS still records
+  # whether it was live for the failed command. A step that mt-admin runs
+  # under `set +e` and handles itself is not an abort, so it stays quiet.
+  [[ ":$SHELLOPTS:" == *:errexit:* ]] || return 0
+  printf 'FAIL: case %s (dir %s) aborted in a fixture step (status %s, line %s): %s\n' \
+    "$CASE_LABEL" "${CASE_DIR:-<none>}" "$status" "$line" "$BASH_COMMAND" >&2
+}
+trap 'case_fixture_abort "$?" "$LINENO"' ERR
 assert_true() {
   if [[ "$1" == true ]]; then pass "$2"; else fail "$2"; fi
 }
@@ -372,7 +389,13 @@ seed_unit() {
 
 setup_case() {
   local init="$1" lane svc
-  CASE_DIR="$fixture/$init-$2-$RANDOM"
+  # WI#764: allocate the case directory instead of drawing a $RANDOM suffix.
+  # Labels repeat (`openrc false` runs many times), and a reused directory
+  # already held the earlier case's fixtures, so seeding it again aborted the
+  # harness on a duplicate `ln -s`. mktemp makes the name unique by
+  # construction, whatever the labels are.
+  CASE_DIR="$(mktemp -d "$fixture/$init-$2.XXXXXX")"
+  CASE_LABEL="$init $2"
   RUNTIME_DIR="$CASE_DIR/runtime"
   CALL_LOG="$CASE_DIR/calls.log"
   OPENRC_INITD_DIR="$CASE_DIR/init.d"
@@ -1547,6 +1570,9 @@ run_keeper_identity_case inspect-fails 'cannot identify the namespace keeper'
 run_keeper_identity_case count-inspect-fails 'cannot identify the namespace keeper'
 run_keeper_identity_case infra-inspect-fails 'cannot identify the namespace keeper'
 run_keeper_identity_case empty-infra 'cannot identify the namespace keeper'
+
+# No case is running now, so a late abort must not be blamed on the last one.
+CASE_LABEL=""
 
 if ((failures > 0)); then
   printf '\n%d failure(s)\n' "$failures" >&2
