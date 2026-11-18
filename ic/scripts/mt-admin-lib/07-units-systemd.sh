@@ -1148,8 +1148,13 @@ declare -gA _USER_MANAGER_NOTICE_SHOWN=()
 # system-bus unit state (`failed`, `inactive`, ...), `no-bus` or `unknown`.
 # Read-only: safe to call from any verb before its first user-bus call.
 _user_manager_probe() {
-  local name="$1" uid unit state
+  local name="$1" uid unit state linger
   uid="$(id -u "$name" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  # This failure mode is specific to a *lingering* tenant, where the manager is
+  # supposed to be up for the whole session. A non-lingering account's
+  # user@<uid>.service being down is normal and says nothing about the tenant.
+  linger="$(loginctl show-user "$name" --property=Linger --value 2>/dev/null)" || linger=''
+  [[ "$linger" == yes ]] || { printf 'unknown\n'; return 0; }
   unit="user@${uid}.service"
   state="$(systemctl is-active "$unit" 2>/dev/null)" || true
   case "$state" in
