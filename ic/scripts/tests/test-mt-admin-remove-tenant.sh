@@ -379,7 +379,13 @@ seed_unit() {
 
 setup_case() {
   local init="$1" lane svc
-  CASE_DIR="$fixture/$init-$2-$RANDOM"
+  # WI#764: allocate the case directory instead of drawing a $RANDOM suffix.
+  # Labels repeat (`openrc false` runs many times), and a reused directory
+  # already held the earlier case's fixtures, so seeding it again aborted the
+  # harness on a duplicate `ln -s`. mktemp makes the name unique by
+  # construction, whatever the labels are.
+  CASE_DIR="$(mktemp -d "$fixture/$init-$2.XXXXXX")"
+  CASE_LABEL="$init $2"
   RUNTIME_DIR="$CASE_DIR/runtime"
   CALL_LOG="$CASE_DIR/calls.log"
   OPENRC_INITD_DIR="$CASE_DIR/init.d"
