@@ -302,6 +302,15 @@ BUS_UP=true
 capture tenant_writers_active "$TENANT"
 assert_eq "healthy manager: an active writer unit is still detected" "$CAPTURED_RC" "0"
 
+# --- 8b. a transitional unit is fine while the bus answers ----------------
+
+reset_gate
+USER_MANAGER_STATE=inactive
+BUS_UP=true
+capture _tenant_user_manager_gate "$TENANT" report
+assert_eq "bus up: a transitional manager unit passes the gate" "$CAPTURED_RC" "0"
+assert_eq "bus up: no line for a transitional manager" "$CAPTURED_OUT" ""
+
 # --- 9. a non-lingering account is never declared dead --------------------
 
 reset_gate

@@ -1155,25 +1155,25 @@ _user_manager_probe() {
   # user@<uid>.service being down is normal and says nothing about the tenant.
   linger="$(loginctl show-user "$name" --property=Linger --value 2>/dev/null)" || linger=''
   [[ "$linger" == yes ]] || { printf 'unknown\n'; return 0; }
+  # The bus is authoritative: a just-enabled manager can still be starting
+  # while its unit state is transitional. A failed probe is only a dead
+  # manager when it carries systemd's own bus-connection signature — a
+  # sudo/account failure must not be mistaken for one.
+  state="$(_systemctl_user_raw "$name" is-system-running 2>&1)" || true
+  case "$state" in
+    *"Failed to connect to user scope bus"*|*"Connection refused"*|*"No such file or directory"*) ;;
+    '') ;;
+    *) printf 'ok\n'; return 0 ;;
+  esac
   unit="user@${uid}.service"
   state="$(systemctl is-active "$unit" 2>/dev/null)" || true
   case "$state" in
-    active|activating|reloading|deactivating) ;;
     # Only a known down state proves the manager dead. Anything else (no
     # systemd answer, an unrecognized probe output) is unknown and must fall
     # through to the real call rather than invent a dead manager.
-    failed|inactive|dead|maintenance) printf '%s\n' "$state"; return 0 ;;
-    *) printf 'unknown\n'; return 0 ;;
-  esac
-  # The unit claims to be up; only an answer from the bus proves it is alive.
-  # A failed probe is only a dead manager when it carries systemd's own
-  # bus-connection signature — a sudo/account failure must not be mistaken for
-  # one (it says nothing about the manager).
-  state="$(_systemctl_user_raw "$name" is-system-running 2>&1)" || true
-  case "$state" in
-    '') printf 'unknown\n' ;;
-    *"Failed to connect to user scope bus"*|*"Connection refused"*) printf 'no-bus\n' ;;
-    *) printf 'ok\n' ;;
+    failed|inactive|dead|maintenance) printf '%s\n' "$state" ;;
+    '') printf 'no-bus\n' ;;
+    *) printf 'unknown\n' ;;
   esac
 }
 
