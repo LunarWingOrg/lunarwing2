@@ -1186,6 +1186,9 @@ _user_manager_cache_parent_pick() {
 _user_manager_cache_parent_pick
 
 _user_manager_cache_dir() {
+  # Test-only seam (the harness at ic/scripts/tests/). Unlike the default
+  # place, this path has no per-process tag, so an answer written there
+  # outlives the run that wrote it. Nothing outside the harness sets it.
   if [[ -n "${LUNARWING_MT_USER_MANAGER_CACHE_DIR:-}" ]]; then
     printf '%s\n' "$LUNARWING_MT_USER_MANAGER_CACHE_DIR"
   else
@@ -1241,6 +1244,7 @@ _tenant_linger_enabled() {
     yes) return 0 ;;
     no) return 1 ;;
   esac
+  # Test-only seam: the harness replaces logind's marker directory (AFR-3).
   [[ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$name" ]]
 }
 
