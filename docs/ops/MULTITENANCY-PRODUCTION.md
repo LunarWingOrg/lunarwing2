@@ -1013,6 +1013,22 @@ All container operations use the detected runtime — no Docker-specific command
 
 Only one tenant builds at a time, enforced by an flock on `/run/lunarwing/mt-admin/build/lunarwing-build.lock` (WI#762: a root-created tree, not `/run/lock`, which Debian creates 1777). This prevents OOM on memory-constrained hosts when multiple tenants need to compile Rust.
 
+### Root lock tree (WI#762)
+
+Every privileged mt-admin lock lives under one root-created tree:
+
+```
+/run/lunarwing/mt-admin/           0755 root
+├── build/lunarwing-build.lock     0700 dir, <tenant>.upgrade siblings
+├── darkirc/<scope>.lock           0700 dir (DarkIRC writer locks)
+└── locks/<tenant>.lock            0700 dir (lifecycle locks, build-stage markers)
+```
+
+- `sudo scripts/lunarwing-mt-admin.sh init-lock-tree` creates the tree; on systemd it also writes `/etc/tmpfiles.d/lunarwing-mt-admin.conf` so the tree exists at boot before any tenant account can act. OpenRC tenant units repeat the creation in `start_pre`, and `add-tenant` / every lock acquisition re-assert it.
+- A pre-existing directory or lock file that is not root-owned `0700`/`0600`, or that is a symlink, is refused with one line naming the path and the way out (`rm -rf '<path>'` as root, then rerun). Root never follows a link when it opens a lock file and never truncates one: lock opens use `<>` plus a descriptor/path identity check.
+- `LUNARWING_MT_LOCK_ROOT` (and the per-lock `LUNARWING_MT_BUILD_LOCK`, `LUNARWING_MT_LIFECYCLE_LOCK_DIR`, `LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR`) override the paths, and overrides are validated by the same checks rather than trusted.
+- Hosts upgraded from an older mt-admin keep their stale `/run/lock/...` directories; the locks are flock-only, so nothing migrates, but a command still running from the old version holds the old path until it exits. Reboot or wait for it to finish before upgrading.
+
 ```bash
 # Build one tenant
 sudo scripts/lunarwing-mt-admin.sh build-tenant ruffles
@@ -1076,6 +1092,9 @@ This is a compact operator reference, not the parser's exhaustive help. Run
 backup, migration, DarkIRC, and configuration subcommand.
 
 ```
+init-lock-tree                   Create /run/lunarwing/mt-admin (root 0755,
+                                 leaves 0700) and, on systemd, the
+                                 tmpfiles.d drop-in that recreates it at boot
 add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                  generate env, render and install services
 add-tenants <names> [options]    Apply the same options to comma-separated names
