@@ -1154,15 +1154,22 @@ _user_manager_probe() {
   state="$(systemctl is-active "$unit" 2>/dev/null)" || true
   case "$state" in
     active|activating|reloading|deactivating) ;;
-    '') printf 'unknown\n'; return 0 ;;
-    *) printf '%s\n' "$state"; return 0 ;;
+    # Only a known down state proves the manager dead. Anything else (no
+    # systemd answer, an unrecognized probe output) is unknown and must fall
+    # through to the real call rather than invent a dead manager.
+    failed|inactive|dead|maintenance) printf '%s\n' "$state"; return 0 ;;
+    *) printf 'unknown\n'; return 0 ;;
   esac
   # The unit claims to be up; only an answer from the bus proves it is alive.
-  if [[ -n "$(_systemctl_user_raw "$name" is-system-running 2>/dev/null)" ]]; then
-    printf 'ok\n'
-  else
-    printf 'no-bus\n'
-  fi
+  # A failed probe is only a dead manager when it carries systemd's own
+  # bus-connection signature — a sudo/account failure must not be mistaken for
+  # one (it says nothing about the manager).
+  state="$(_systemctl_user_raw "$name" is-system-running 2>&1)" || true
+  case "$state" in
+    '') printf 'unknown\n' ;;
+    *"Failed to connect to user scope bus"*|*"Connection refused"*) printf 'no-bus\n' ;;
+    *) printf 'ok\n' ;;
+  esac
 }
 
 # Print the single operator line for a dead manager, at most once per tenant
@@ -1205,7 +1212,7 @@ _user_manager_state() {
 _user_manager_usable() {
   local name="$1" state
   state="$(_user_manager_state "$name")"
-  if [[ "$state" == ok ]]; then
+  if [[ "$state" == ok || "$state" == unknown ]]; then
     return 0
   fi
   _user_manager_notice "$name" "$state" report
@@ -1273,16 +1280,17 @@ _user_manager_settle() {
 _tenant_user_manager_gate() {  # <name> <report|recover>
   local name="$1" mode="$2" state uid
   state="$(_user_manager_state "$name")"
-  if [[ "$state" == ok ]]; then
+  if [[ "$state" == ok || "$state" == unknown ]]; then
+    return 0
+  fi
+  # Without a resolvable account there is no user@<uid>.service to name or
+  # start; leave the caller's own account handling to fail as it did before.
+  uid="$(id -u "$name" 2>/dev/null)" || uid=''
+  if [[ ! "$uid" =~ ^[0-9]+$ ]]; then
     return 0
   fi
   if [[ "$mode" != recover ]]; then
     _user_manager_notice "$name" "$state" report
-    return 1
-  fi
-  uid="$(id -u "$name" 2>/dev/null)" || uid=''
-  if [[ ! "$uid" =~ ^[0-9]+$ ]]; then
-    _user_manager_notice "$name" "$state" recover-failed
     return 1
   fi
   systemctl start --no-block "user@${uid}.service" >/dev/null 2>&1 || true
