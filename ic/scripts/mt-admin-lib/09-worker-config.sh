@@ -252,6 +252,12 @@ stop_worker_task_container() {
   local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
+  # WI#731: a dead tenant user manager has nothing loaded or running in the
+  # tenant's slice, and its bus cannot answer LoadState. The verb already
+  # printed the one line naming the manager; skip instead of failing the stop.
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
+    return 0
+  fi
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
     _openrc_stop_worker_nondestructive "$task_container"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
@@ -3164,6 +3170,14 @@ stop_worker() {
   if tenant_rootless_account_gone "$name"; then
     _tenant_stop_skips_missing_account "$name" "$worker" || return 1
     say "skipped $worker task container stop for $name: the tenant account is gone and its former identity is proven idle"
+    return 0
+  fi
+
+  # WI#731: with the tenant's user manager dead there is no bus and no unit
+  # left to stop; the manager's death already took its slice down with it, and
+  # the verb's leading gate printed the one line. Do not fall through to
+  # container stops that fail on a dead rootless store.
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
     return 0
   fi
 
