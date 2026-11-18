@@ -506,6 +506,15 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
             ('    is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
             ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme"),
+            # WI#754: upstream's URL parser also decides with a trimmed form,
+            # so the check must name the normalisation, not only the scheme.
+            ("normalise_target() {\n", "normalise the auth login target"),
+            ("tr -d '\\011\\012\\015'", "drop tab, line feed and carriage return"),
+            (
+                "sed -e 's/^[[:cntrl:] ]*//' -e 's/[[:cntrl:] ]*$//'",
+                "trim leading and trailing controls and space",
+            ),
+            ('$(normalise_target "$1")', "match the scheme against the normalised target"),
         ):
             with self.subTest(what=what):
                 self.assertIn(removed, text)
@@ -746,6 +755,11 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         # whose integration.use resource (the origin URL) the managed
         # `opencode*` deny does not match. Refuse it wherever the tokens sit
         # among global flags, case-insensitively.
+        # WI#754: upstream decides with a URL parser, which trims leading and
+        # trailing C0 controls and space and drops tab, LF and CR anywhere, so
+        # a target the wrapper does not prefix-match is still an http(s) URL
+        # to upstream. Every form below is refused; the flag/value form fails
+        # a wrapper that checks only the first token after `login`.
         for form in (
             ("auth", "login", "https://example.invalid"),
             ("auth", "login", "http://example.invalid"),
@@ -757,6 +771,19 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             ("auth", "--log-level", "DEBUG", "login", "https://example.invalid"),
             ("auth", "login", "HTTP://example.invalid"),
             ("auth", "login", "http:example.invalid"),
+            ("auth", "login", " https://example.invalid"),
+            ("auth", "login", "\thttps://example.invalid"),
+            ("auth", "login", "\nhttps://example.invalid"),
+            ("auth", "login", "\x01https://example.invalid"),
+            ("auth", "login", "\x1fhttps://example.invalid"),
+            ("auth", "login", " https://example.invalid "),
+            ("auth", "login", "https://example.invalid\t"),
+            ("auth", "login", "ht\ttps://example.invalid"),
+            ("auth", "login", "ht\ntps://example.invalid"),
+            ("auth", "login", "ht\rtps://example.invalid"),
+            ("auth", "login", "https\t://example.invalid"),
+            ("auth", "login", "--method", "key", "https://example.invalid"),
+            ("auth", "login", "--method", "key", " https://example.invalid"),
         ):
             with self.subTest(form=form):
                 result = self.run_wrapper(*form)
