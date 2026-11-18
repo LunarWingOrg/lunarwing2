@@ -80,7 +80,13 @@ host where `/usr/sbin` is a link to `/usr/bin`, sbin in front would put
 (`mt-admin-lib/07-units-systemd.sh`) keeps the bin directories first for the
 same reason and lists sbin before the tenant-writable `~/.cargo/bin`, so on a
 re-rendered unit every system directory precedes the tenant's own in the `PATH`
-the runtime commands inherit.
+the runtime commands inherit. On OpenRC (`mt-admin-lib/08-units-openrc.sh`) the
+rendered init script applies the same append-only rule to the host `PATH` at
+start: the missing sbin directories are appended, and directories the host
+already names keep their place and are never repeated. The systemd unit states
+the full list because a user unit's inherited `PATH` is minimal and not the
+host's; OpenRC inherits the host's, so replacing it would drop host-specific
+entries such as `/opt/bin`.
 
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 

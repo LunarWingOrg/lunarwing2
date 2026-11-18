@@ -1017,6 +1017,24 @@ description="LunarWing AI assistant ($name)"
 : "\${lunarwing_respawn_period:=60}"
 : "\${lunarwing_retry:=SIGTERM/30/KILL/5}"
 
+# WI#663: the systemd tenant unit names the search PATH explicitly
+# (Environment=PATH=... in mt-admin-lib/07-units-systemd.sh). This is the
+# OpenRC half of the same policy, so both inits resolve a container runtime
+# and its helpers (pasta, conmon) from the same directories. OpenRC services
+# usually inherit a host PATH that already carries sbin, but that is the
+# host's choice rather than a contract — append the sbin directories only when
+# they are missing, keeping the host's own entries and order, which is the
+# same append-only rule src/sandbox/runtime_path.rs applies to runtime
+# commands.
+for _lw_sbin in /usr/local/sbin /usr/sbin /sbin; do
+    case ":\${PATH}:" in
+        *":\${_lw_sbin}:"*) ;;
+        *) PATH="\${PATH:+\${PATH}:}\${_lw_sbin}" ;;
+    esac
+done
+unset _lw_sbin
+export PATH
+
 # Work item #54: hard cgroup v2 ceilings — the OpenRC equivalent of the
 # systemd daemon-unit caps plus lunarwing-workloads.slice (BUG-005). OpenRC
 # has no transient scopes, so the daemon and its agent-spawned workloads share
