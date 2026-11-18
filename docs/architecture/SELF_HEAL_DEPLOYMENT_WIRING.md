@@ -95,7 +95,11 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 2. Creates the host-level report/state dir.
 3. Writes `/etc/lunarwing/health.env` (mode 0600) if absent, including the base
    dir, init system, registry path, `SELF_HEAL_SYSTEMD_SCOPE=system`, disabled
-   NetBird probing, and MT flags. Re-renders preserve operator edits while
+   NetBird probing, and MT flags. The init-system line records the manager the
+   host's PID-1 marker reports (WI#730/WI#757); only a host with neither marker
+   (image build/chroot) falls back to `LUNARWING_SERVICE_MANAGER`, so an
+   override cannot drop existing tenants' unit checks from the pipeline.
+   Re-renders preserve operator edits while
    reconciling `LUNARWING_SERVICE_MANAGER`, `SELF_HEAL_TENANTS_FILE`,
    `HEALTH_WORKER_EGRESS_RUNTIME`, and `HEALTH_WORKER_EGRESS_ROOTLESS`.
    A stale `LUNARWING_MT_ADMIN` checkout path is removed: root cron runs the

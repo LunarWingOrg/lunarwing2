@@ -21,18 +21,89 @@
 
 # ── Init system detection ────────────────────────────────────────────────────
 
+# PID-1 artifacts that name the host's real service manager. The two
+# LUNARWING_MT_*_MARKER variables are a documented test-only seam (named in
+# --help and docs/ops/MULTITENANCY-PRODUCTION.md): they replace the /run path
+# the probe reads, which also decides which manager counts as the host's, so
+# setting either switches off the refusal of a contradicting
+# LUNARWING_SERVICE_MANAGER and changes the manager health.env records for that
+# host. Never set them outside a test.
+OPENRC_HOST_MARKER="${LUNARWING_MT_OPENRC_MARKER:-/run/openrc/softlevel}"
+SYSTEMD_HOST_MARKER="${LUNARWING_MT_SYSTEMD_MARKER:-/run/systemd/system}"
+
+# Print the manager the host's init really runs, from the PID-1 markers only, or
+# nothing when neither exists (chroot, image build, container). This is
+# deliberately narrower than the command-existence ladder below: a chroot can
+# carry systemctl/rc-service without any init running.
+probe_host_service_manager() {
+  if [[ -e "$OPENRC_HOST_MARKER" ]]; then printf 'openrc'; return 0; fi
+  if [[ -e "$SYSTEMD_HOST_MARKER" ]]; then printf 'systemd'; return 0; fi
+  return 0
+}
+
+_manager_probe_path() {
+  case "$1" in
+    openrc)  printf '%s' "$OPENRC_HOST_MARKER" ;;
+    systemd) printf '%s' "$SYSTEMD_HOST_MARKER" ;;
+  esac
+}
+
+# True when the port registry holds any tenant at all. Only the forcing switch
+# consults this: forcing a manager must not be available on a host that runs
+# another manager (WI#730 — the health pipeline would silently stop checking
+# its tenants). A registry entry alone counts, with no unit-file check: a
+# failed add-tenant can leave an entry without a unit, and that shape must not
+# unlock the switch (WI#757 AFI-6).
+_host_has_registered_tenants() {
+  local registry="${PORTS_REGISTRY:-}" name tenants
+  [[ -n "$registry" && -f "$registry" ]] || return 1
+  # Fail closed: an unreadable registry is treated as tenants present, so a
+  # broken jq can never unlock the forcing switch.
+  tenants="$(jq -r '.tenants | keys[]?' "$registry" 2>/dev/null)" || return 0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && return 0
+  done <<< "$tenants"
+  return 1
+}
+
+# The manager the host's own health pipeline may record. A positive host probe
+# always wins, even under LUNARWING_SERVICE_MANAGER_FORCE, so no tenant command
+# can point the pipeline at a manager the host does not run (WI#730).
+health_service_manager_of_record() {
+  local probed
+  probed="$(probe_host_service_manager)"
+  printf '%s' "${probed:-$INIT_SYSTEM}"
+}
+
 detect_init_system() {
-  local override="${LUNARWING_SERVICE_MANAGER:-}"
+  local override="${LUNARWING_SERVICE_MANAGER:-}" wanted="" detected=""
   if [[ -n "$override" ]]; then
     case "${override,,}" in
-      systemd|systemd-user) printf 'systemd'; return 0 ;;
-      openrc)               printf 'openrc';  return 0 ;;
+      systemd|systemd-user) wanted="systemd" ;;
+      openrc)               wanted="openrc" ;;
       *) die "unsupported service manager override '$override'; use systemd or openrc" ;;
     esac
+
+    # An override must not contradict the host's PID-1 markers. The check is
+    # the markers only (not the command ladder), so a chroot or image build
+    # without either marker is not treated as a contradiction.
+    detected="$(probe_host_service_manager)"
+    if [[ -n "$detected" && "$detected" != "$wanted" ]]; then
+      if [[ "${LUNARWING_SERVICE_MANAGER_FORCE:-}" != "1" ]]; then
+        die "LUNARWING_SERVICE_MANAGER=$override asks for $wanted, but this host runs $detected ($(_manager_probe_path "$detected") exists); refusing to write $wanted units on a host that runs $detected. Unset LUNARWING_SERVICE_MANAGER, or set LUNARWING_SERVICE_MANAGER_FORCE=1 only for an image build or chroot"
+      fi
+      if _host_has_registered_tenants; then
+        die "LUNARWING_SERVICE_MANAGER_FORCE=1 cannot force $wanted on this $detected host: it already has tenants registered under $detected, and forcing $wanted would drop them from the health pipeline's unit checks"
+      fi
+      say "WARNING: LUNARWING_SERVICE_MANAGER_FORCE=1 forcing $wanted on a $detected host (image build/chroot); the health pipeline will keep recording $detected" >&2
+    elif [[ -z "$detected" ]]; then
+      say "WARNING: LUNARWING_SERVICE_MANAGER=$override with no host init marker ($OPENRC_HOST_MARKER, $SYSTEMD_HOST_MARKER); assuming an image build/chroot" >&2
+    fi
+    printf '%s' "$wanted"; return 0
   fi
 
-  if [[ -e /run/openrc/softlevel ]]; then printf 'openrc'; return 0; fi
-  if [[ -e /run/systemd/system ]];   then printf 'systemd'; return 0; fi
+  if [[ -e "$OPENRC_HOST_MARKER" ]]; then printf 'openrc'; return 0; fi
+  if [[ -e "$SYSTEMD_HOST_MARKER" ]];   then printf 'systemd'; return 0; fi
 
   if command -v rc-service >/dev/null 2>&1 && ! command -v systemctl >/dev/null 2>&1; then
     printf 'openrc'; return 0

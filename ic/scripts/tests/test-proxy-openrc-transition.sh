@@ -3,10 +3,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../lunarwing-mt-admin.sh
-source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# WI#730: simulate an OpenRC host (PID-1 markers) so the documented override
+# does not contradict the real host's markers; CI containers have none.
+export LUNARWING_MT_OPENRC_MARKER="$fixture/openrc-host"
+export LUNARWING_MT_SYSTEMD_MARKER="$fixture/systemd-host"
+mkdir -p "$LUNARWING_MT_OPENRC_MARKER"
+# shellcheck source=../lunarwing-mt-admin.sh
+source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 export INIT_SYSTEM=openrc
