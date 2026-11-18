@@ -19,8 +19,18 @@ PORTS_REGISTRY="/etc/lunarwing/ports.json"
 PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
-BUILD_LOCK="/var/lock/lunarwing-build.lock"
-TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+# WI#762: root lock state lives under a root-created tree beneath /run (0755
+# root), never under /run/lock, which Debian creates 1777. An account that made
+# a lock directory before root's first command could choose what root's later
+# lock-file opens reached (measured: one truncation of a root-owned file
+# outside the directory). Legacy /run/lock paths remain reachable only through
+# an explicit override, and every override is validated by the lock helpers in
+# mt-admin-lib/00-common.sh rather than trusted. The tree and its leaves are
+# created by `init-lock-tree` (root helper; tmpfiles.d on systemd, start_pre on
+# OpenRC) and re-asserted by every lock acquisition.
+LUNARWING_MT_LOCK_ROOT="${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}"
+BUILD_LOCK="${LUNARWING_MT_BUILD_LOCK:-$LUNARWING_MT_LOCK_ROOT/build/lunarwing-build.lock}"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-$LUNARWING_MT_LOCK_ROOT/locks}"
 unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
@@ -58,7 +68,7 @@ DARKIRC_RELEASE_ROOT="${LUNARWING_MT_DARKIRC_RELEASE_ROOT:-/usr/local/lib/lunarw
 DARKIRC_RELEASES_DIR="$DARKIRC_RELEASE_ROOT/releases"
 DARKIRC_RELEASE_SELECTOR="$DARKIRC_RELEASE_ROOT/current"
 DARKIRC_RELEASE_DAEMON="$DARKIRC_RELEASE_SELECTOR/darkirc"
-DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
+DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-$LUNARWING_MT_LOCK_ROOT/darkirc}"
 DARKIRC_WRITER_LOCK_HELD="false"
 DARKIRC_WRITER_LOCK_FD=""
 DARKIRC_WRITER_SCOPE=""
@@ -295,6 +305,10 @@ Production multi-tenant administration for LunarWing.
 Manages OS users, port allocation, per-tenant services, and builds.
 
 Commands:
+  init-lock-tree                   Create the root-owned lock tree
+                                   (/run/lunarwing/mt-admin) and, on systemd,
+                                   the tmpfiles.d drop-in that recreates it at
+                                   boot (WI#762; run at install time)
   reinstall-health-library <trusted-checkout>
                                    Replace the installed health library from a separate
                                    trusted checkout; allowed while the OpenRC contract is refused
@@ -855,6 +869,12 @@ main() {
   [[ -z "${LUNARWING_CONTAINER_RUNTIME:-}" ]] || ensure_container_runtime
 
   case "$command_name" in
+    init-lock-tree)
+      require_root
+      [[ $# -eq 0 ]] || die "usage: init-lock-tree"
+      ensure_init_system
+      init_lock_tree_command
+      ;;
     reinstall-health-library)
       require_root
       [[ $# -eq 1 ]] || die "usage: reinstall-health-library <trusted-checkout>"

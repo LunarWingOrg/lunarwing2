@@ -166,6 +166,187 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# ── WI#762: privileged lock paths ────────────────────────────────────────────
+# Root lock state lives under LUNARWING_MT_LOCK_ROOT (/run/lunarwing/mt-admin),
+# a root-created tree beneath /run (0755 root), not under /run/lock, which some
+# distributions create world-writable: an account that made the lock directory
+# before root's first command chose what root's later lock-file opens reached.
+# Every privileged lock goes through the helpers below:
+#   - the directory is asserted BEFORE it is created, because install -d on an
+#     existing directory re-owns it and hides who made it;
+#   - a link in place of a lock file is refused by name;
+#   - the file is opened with `<>` (O_RDWR|O_CREAT, bash never adds O_TRUNC),
+#     never `>`, followed by a descriptor/path identity check, so a link swapped
+#     in behind the pre-check fails instead of being followed and truncated.
+# A failure names the path and the way out, and leaves everything else alone.
+
+_lw_lstat_id() {
+  local id
+  id="$(stat -c '%d:%i' "$1" 2>/dev/null)" || return 1
+  printf '%s' "$id"
+}
+
+# Describe why an existing lock directory is unsafe; print nothing when it is.
+_lw_lock_dir_refusal() {  # <dir> [expected-mode]
+  local dir="$1" want="${2:-700}" owner mode
+  [[ -e "$dir" || -L "$dir" ]] || return 0
+  if [[ -L "$dir" ]]; then printf 'it is a symlink'; return 0; fi
+  if [[ ! -d "$dir" ]]; then printf 'it is not a directory'; return 0; fi
+  mode="$(stat -c '%a' "$dir" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$dir" 2>/dev/null || true)"
+  if [[ "$mode" != "$want" ]]; then
+    printf 'it has mode %s, not %s' "${mode:-unknown}" "$want"
+    return 0
+  fi
+  if ((EUID == 0)) && [[ "$owner" != 0 ]]; then
+    printf 'it is owned by uid %s, not root' "${owner:-unknown}"
+  fi
+}
+
+# Refuse a lock directory whose existing ancestors are links or are writable by
+# another account without the sticky bit: such a parent lets that account
+# replace the directory between the check and the mkdir. A sticky parent
+# (/tmp, and /run/lock on Debian) cannot be used to replace a root-owned
+# directory, so it is allowed; the final directory check above still applies.
+_lw_lock_parent_chain_safe() {  # <dir>
+  local dir="$1" component current="" mode
+  local IFS=/
+  for component in ${dir#/}; do
+    current="$current/$component"
+    [[ "$current" == "$dir" ]] && break
+    if [[ -L "$current" ]]; then return 1; fi
+    [[ -e "$current" ]] || continue
+    [[ -d "$current" ]] || return 1
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    if (( (8#$mode & 0022) != 0 && (8#$mode & 01000) == 0 )); then
+      return 1
+    fi
+  done
+}
+
+_lw_lock_dir_remediation() {  # <path>
+  printf "remove it as root and rerun the command: rm -rf '%s'" "$1"
+}
+
+# Assert, create, and re-assert a root lock directory. An existing directory is
+# never re-owned or re-moded: a foreign one fails closed before that can hide
+# the evidence.
+_lw_lock_dir_prepare() {  # <dir> [expected-mode]
+  local dir="$1" want="${2:-700}" refusal prev_umask
+  [[ "$dir" == /* ]] || die "unsafe lock directory $dir: not an absolute path"
+  refusal="$(_lw_lock_dir_refusal "$dir" "$want")"
+  [[ -z "$refusal" ]] || die "unsafe lock directory $dir: $refusal; $(_lw_lock_dir_remediation "$dir")"
+  if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+    _lw_lock_parent_chain_safe "$dir" \
+      || die "unsafe lock directory $dir: a parent is a symlink or writable by another account; move the lock path under ${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin} or fix the parent"
+    prev_umask="$(umask)"
+    umask 077
+    if ! mkdir -- "$dir" 2>/dev/null; then
+      umask "$prev_umask"
+      refusal="$(_lw_lock_dir_refusal "$dir" "$want")"
+      [[ -z "$refusal" ]] || die "unsafe lock directory $dir: $refusal; $(_lw_lock_dir_remediation "$dir")"
+      return 0
+    fi
+    umask "$prev_umask"
+    # mkdir made it root-owned (mt-admin runs as root); never touch a directory
+    # that already existed.
+    chown root:root -- "$dir" 2>/dev/null || true
+    chmod "$want" -- "$dir" 2>/dev/null || true
+  fi
+  refusal="$(_lw_lock_dir_refusal "$dir" "$want")"
+  [[ -z "$refusal" ]] || die "unsafe lock directory $dir: $refusal; $(_lw_lock_dir_remediation "$dir")"
+  _lw_lstat_id "$dir" >/dev/null || die "cannot read lock directory $dir"
+}
+
+# Describe why an open lock descriptor is unsafe; print nothing when it is.
+_lw_lock_file_refusal() {  # <fd> <path>
+  local fd="$1" path="$2" fd_id path_id links mode owner
+  fd_id="$(stat -Lc '%d:%i' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  path_id="$(_lw_lstat_id "$path" || true)"
+  links="$(stat -Lc '%h' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  mode="$(stat -Lc '%a' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  owner="$(stat -Lc '%u' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  if [[ -z "$fd_id" || "$fd_id" != "$path_id" ]]; then
+    printf 'it is a symlink or was replaced during open'
+    return 0
+  fi
+  if [[ "$links" != 1 ]]; then
+    printf 'it has %s hard links, not 1' "${links:-unknown}"
+    return 0
+  fi
+  if [[ ! "$mode" =~ ^[0-7]+$ ]] || (( (8#$mode & 0022) != 0 )); then
+    printf 'it has mode %s, which is group- or other-writable' "${mode:-unknown}"
+    return 0
+  fi
+  if ((EUID == 0)) && [[ "$owner" != 0 ]]; then
+    printf 'it is owned by uid %s, not root' "${owner:-unknown}"
+  fi
+}
+
+# Open a privileged lock file without following a link and without truncating.
+_lw_lock_open_fd() {  # <path> <fd-var> [lock-dir-mode]
+  local path="$1" fd_var="$2" dir_mode="${3:-700}" dir="${1%/*}" fd refusal prev_umask
+  [[ "$path" == /* && -n "$dir" && "$dir" != "$path" ]] \
+    || die "unsafe lock file $path: not an absolute path"
+  _lw_lock_dir_prepare "$dir" "$dir_mode"
+  [[ ! -L "$path" ]] \
+    || die "refusing lock file $path: it is a symlink; $(_lw_lock_dir_remediation "$path")"
+  [[ ! -e "$path" || -f "$path" ]] \
+    || die "refusing lock file $path: it is not a regular file; $(_lw_lock_dir_remediation "$path")"
+  prev_umask="$(umask)"
+  umask 077
+  if ! exec {fd}<>"$path"; then
+    umask "$prev_umask"
+    die "cannot open lock file $path"
+  fi
+  umask "$prev_umask"
+  refusal="$(_lw_lock_file_refusal "$fd" "$path")"
+  if [[ -n "$refusal" ]]; then
+    eval "exec $fd>&-"
+    die "refusing lock file $path: $refusal; $(_lw_lock_dir_remediation "$path")"
+  fi
+  printf -v "$fd_var" '%s' "$fd"
+}
+
+# WI#762: create the whole root lock tree (suggestion: a root helper, run at
+# install/boot via init-lock-tree, owns the directories before any tenant
+# account exists). Parents are 0755 so tenant-side fd backstops can stat the
+# leaf directories; the leaves are 0700 and hold all lock files.
+lw_lock_tree_init() {
+  local root="${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}"
+  _lw_lock_dir_prepare "$(dirname "$root")" 755
+  _lw_lock_dir_prepare "$root" 755
+  _lw_lock_dir_prepare "$root/locks"
+  _lw_lock_dir_prepare "$root/build"
+  _lw_lock_dir_prepare "$root/darkirc"
+}
+
+# WI#762: `init-lock-tree` — the root helper that creates the lock tree before
+# any tenant account exists. On systemd it also renders the tmpfiles.d drop-in
+# that recreates the tree at boot ahead of tenant logins; OpenRC tenant units
+# create it in start_pre, and every lock acquisition re-asserts it.
+init_lock_tree_command() {
+  local root="${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}"
+  local tmpfiles=/etc/tmpfiles.d/lunarwing-mt-admin.conf
+  lw_lock_tree_init
+  if [[ "${INIT_SYSTEM:-}" == systemd ]]; then
+    cat >"$tmpfiles" <<EOF
+# WI#762: root lock state, created before tenant accounts can run anything.
+# /run/lock is 1777 on Debian; a lock directory another account made first
+# would choose what root's later lock-file opens reach.
+d $(dirname "$root") 0755 root root -
+d $root 0755 root root -
+d $root/locks 0700 root root -
+d $root/build 0700 root root -
+d $root/darkirc 0700 root root -
+EOF
+    chmod 0644 "$tmpfiles"
+    say "rendered $tmpfiles"
+  fi
+  say "root lock tree ready under $root"
+}
+
 acquire_ports_lock() {
   local registry_dir
   [[ "$PORTS_LOCK_HELD" == "true" ]] && return 0
@@ -291,13 +472,13 @@ _lock_file_live_inheritor_pids() {
 # dead original acquirer from /proc/locks.
 _lock_held_preflight() {
   local kind="$1" lock_file="$2" probe_fd holder_pids
-  exec {probe_fd}>"$lock_file" || return 1
+  _lw_lock_open_fd "$lock_file" probe_fd
   if flock -x -n "$probe_fd"; then
     flock -u "$probe_fd" || true
-    exec {probe_fd}>&-
+    eval "exec $probe_fd>&-"
     return 0
   fi
-  exec {probe_fd}>&-
+  eval "exec $probe_fd>&-"
   holder_pids="$(_lock_file_live_inheritor_pids "$lock_file")"
   die "tenant $kind lock is already held${holder_pids:+ by live inheritor pids: $holder_pids}; wait for the competing mt-admin command to finish, or stop leftover tenant daemons if they inherited the descriptor (WI#505)"
 }
@@ -323,10 +504,9 @@ with_tenant_lifecycle_lock() {
   [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
     || die "invalid tenant name for lifecycle lock"
   require_cmd flock
-  [[ ! -L "$TENANT_LIFECYCLE_LOCK_DIR" ]]
-  install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
-  [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
-    || die "unsafe tenant lifecycle lock directory"
+  # WI#762: assert the directory before creating it, then open the lock file
+  # without following a link and without truncation.
+  _lw_lock_dir_prepare "$TENANT_LIFECYCLE_LOCK_DIR"
   local lock_fd result caller_errexit=false owns_lock=false active_lock_set=false
   [[ $- != *e* ]] || caller_errexit=true
   if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
@@ -346,9 +526,9 @@ with_tenant_lifecycle_lock() {
     # WI#505: fail fast (naming any live inheritor pids) instead of blocking
     # forever on a lock orphaned by a die inside an earlier locked section.
     _lifecycle_lock_preflight "$name"
-    exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+    _lw_lock_open_fd "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" lock_fd
     if ! flock -x "$lock_fd"; then
-      exec {lock_fd}>&-
+      eval "exec $lock_fd>&-"
       return 1
     fi
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
