@@ -1224,6 +1224,26 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 
 ## Troubleshooting
 
+### A tenant's systemd user manager is dead
+
+On systemd, a lingering tenant's `user@<uid>.service` can die (a SIGKILL leaves
+it `failed`; the unit has `Restart=no`, and linger only starts it at boot). All
+of its user units go with it, and `systemctl --user` then fails with
+`Failed to connect to user scope bus`. mt-admin detects this once per verb,
+before its first `systemctl --user` call, and prints one line naming the unit
+and the recovery command instead of a line per unit:
+
+```
+ERROR: tenant 'spitfire': systemd user manager user@1011.service is failed and its user bus is unreachable; its user units are treated as down. Recover with: systemctl start user@1011.service
+```
+
+`start-tenant` and `restart-tenant` run that `systemctl start` themselves, wait
+for the bus, and let the units the manager starts on its own settle before
+continuing; if the manager does not come back they exit non-zero with the line.
+`stop-tenant`, `status` and `remove-tenant` report the line once and treat the
+tenant's user units as down (the dead manager already took them down);
+`remove-tenant` still removes the unit files and the account.
+
 ### Services don't start after reboot
 
 - systemd: Verify linger is enabled: `loginctl show-user <tenant> | grep Linger`
