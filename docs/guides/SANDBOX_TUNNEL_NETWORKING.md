@@ -744,19 +744,23 @@ required.
 ### NetBird live validation (WI#592)
 
 This lane is the only test that proves the NetBird half of the boundary end to
-end. A skip is not a live-validation pass: the test returns without doing
-anything unless all three gates are `1` and every provider setting is present.
+end. The test returns without doing anything only when one of the three gates is
+closed; each gate accepts `1` or `true` in any case. With all three open it
+fails rather than skipping when `LUNARWING_E2E_NETBIRD_IMAGE`,
+`LUNARWING_E2E_NETBIRD_MANAGEMENT_URL`, or the setup-key file is missing or
+unusable. A skip is not a live-validation pass.
 
 1. Prepare an isolated, throwaway NetBird management deployment and one
    dedicated reusable setup key. Use an image containing NetBird, `nft`, `nc`,
-   and `wget`; the lane starts its own plain second peer with the same key. Do
-   not point this at the production management server or reuse the
-   gateway-exposure peer and key from `docs/guides/NETBIRD_TUNNEL.md`.
+   `wget`, `ping`, and `nslookup`; the lane starts its own plain second peer
+   with the same key. Do not point this at the production management server or
+   reuse the gateway-exposure peer and key from `docs/guides/NETBIRD_TUNNEL.md`.
 2. Store the setup key in a mode-`0600` file outside the repository. Do not
    print the key, the key file, or the tenant env file while debugging.
 3. Run the gated lane:
 
    ```bash
+   cd ic
    LUNARWING_E2E_PODMAN_TESTS=1 LUNARWING_E2E_TUNNEL_TESTS=1 \
    LUNARWING_E2E_NETBIRD_TESTS=1 \
    LUNARWING_E2E_NETBIRD_IMAGE=<netbird-image> \
@@ -770,8 +774,11 @@ anything unless all three gates are `1` and every provider setting is present.
    1. **Fresh start.** The sidecar starts under the configured startup budget;
       the lane prints `LUNARWING-NETBIRD-FRESH-START-SECONDS` for comparison
       with the 20-second per-run provider cap.
-   2. **Peer connectivity.** The plain peer is up and detailed peer status
-      shows management, signal, and relay connected.
+   2. **Peer connectivity.** The lane pings both overlay addresses, then runs
+      `netbird status -d` in each container and requires the other peer's block —
+      the one that names that peer's overlay IP — to carry a `Status: Connected`
+      line. `Connected` on the `Management:` block alone does not count; the
+      lane's own unit test rejects a block without the peer IP.
    3. **Firewall and join.** Exactly one `0x1bd00` control-plane mark accept and
       only the `wt0` DNS allowances; then a real joined command sees `wt0`,
       reaches peer-hosted HTTP, resolves the peer name, and observes the
