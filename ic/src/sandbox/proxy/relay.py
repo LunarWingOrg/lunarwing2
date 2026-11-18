@@ -34,12 +34,17 @@ BENIGN = frozenset((errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF))
 
 
 def _node(path):
-    """Mode and ownership of one mount node, or the lstat error."""
+    """Mode, ownership and SELinux type of one mount node, or the lstat error."""
     try:
         info = os.lstat(path)
     except OSError as error:
         return f"{path}: {error.strerror}"
-    return f"{path}: mode={oct(info.st_mode & 0o7777)} uid={info.st_uid} gid={info.st_gid}"
+    node = f"{path}: mode={oct(info.st_mode & 0o7777)} uid={info.st_uid} gid={info.st_gid}"
+    try:
+        label = os.getxattr(path, b"security.selinux").decode("ascii", "replace").rstrip("\0")
+    except OSError:
+        return node
+    return f"{node} selinux={label}"
 
 
 def _security_state():
@@ -152,7 +157,7 @@ def main():
         return 125
     with relay:
         threading.Thread(target=relay.serve_forever, daemon=True).start()
-        result = subprocess.run(["/bin/sh", "-c", sys.argv[1]], check=False)
+        result = subprocess.run(["sh", "-c", sys.argv[1]], check=False)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 

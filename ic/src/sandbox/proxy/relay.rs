@@ -132,10 +132,9 @@ fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::Uni
         .map_err(|error| at_path("cannot bind relay socket", &socket, error))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
         .map_err(|error| at_path("cannot set relay socket mode", &socket, error))?;
-    // A socket that cannot be connected to locally can never be connected to
-    // from the container; fail before the command is launched.
-    std::os::unix::net::UnixStream::connect(&socket)
-        .map_err(|error| at_path("relay socket refused its own probe", &socket, error))?;
+    // A container-side connect failure is a labelling or DAC problem, not a
+    // missing socket — never connect from the host to prove the socket exists,
+    // because that would queue a client the accept loop then proxies.
     let container_label_ready = label_for_containers(&channel, &socket);
     tracing::debug!(
         socket = %socket.display(),
