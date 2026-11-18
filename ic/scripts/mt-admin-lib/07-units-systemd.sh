@@ -1130,7 +1130,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# WI#731: tenant user-manager liveness.
+# WI#731 / WI#758: tenant user-manager liveness.
 #
 # A lingering tenant's `user@<uid>.service` can die (SIGKILL leaves it failed;
 # the unit has Restart=no and linger only starts it at boot). Every
