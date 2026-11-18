@@ -74,7 +74,9 @@ fn uses_proxy_relay(runtime: ContainerRuntime, network: SandboxNetworkMode) -> b
 
 fn add_proxy_relay_args(args: &mut Vec<String>, proxy_dir: Option<&str>) {
     if let Some(dir) = proxy_dir {
-        args.extend(["-v".into(), format!("{}:/run/lunarwing-proxy:ro,z", dir)]);
+        // `z` is shared SELinux relabeling for the mounted inodes, not a
+        // change to the listening Unix socket's own security context.
+        args.extend(["-v".into(), format!("{dir}:/run/lunarwing-proxy:ro,z")]);
     }
     for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
         args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
@@ -2213,6 +2215,23 @@ mod tests {
         }
     }
 
+    /// WI#641: a mid-run relay line must never be mistaken for the startup
+    /// failure — that mapping discards a command's own exit status.
+    #[test]
+    fn relay_transport_lines_do_not_become_proxy_failures() {
+        let transport = "lunarwing-proxy-relay transport: [Errno 13] Permission denied";
+        assert!(classify_run_failure(transport, "image", 0).is_none());
+        assert!(classify_run_failure(transport, "image", 125).is_none());
+        assert!(matches!(
+            classify_run_failure(
+                "lunarwing-proxy-relay: [Errno 13] Permission denied",
+                "image",
+                125
+            ),
+            Some(SandboxError::ProxyError { .. })
+        ));
+    }
+
     #[test]
     fn enforced_proxy_args_are_confined() {
         for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
@@ -2252,11 +2271,9 @@ mod tests {
             assert_eq!(tail[2], "lunarwing-proxy-relay");
             assert!(tail[3].contains("lunarwing-proxy-relay:"));
             assert_eq!(tail.last(), Some(&"echo hi".to_string()));
-            assert!(
-                !args
-                    .iter()
-                    .any(|a| a.contains("host-gateway") || a.contains("unconfined"))
-            );
+            assert!(!args.iter().any(|a| a.contains("host-gateway")
+                || a.contains("unconfined")
+                || a == "label=disable"));
         }
     }
 

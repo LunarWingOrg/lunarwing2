@@ -421,9 +421,33 @@ public-only validating proxy:
   workload namespace both share `/run/user/<uid>`.
 - relay interior: Python-in-container `--network none` runs a loopback-only
   socket server bound to `127.0.0.1:3128` and forwards to the host-side proxy.
-  Only the socket directory is bind-mounted (`:ro,z`), Python runs in isolated
+  Only the socket directory is bind-mounted (read-only), Python runs in isolated
   mode (`python3 -I`), and a failed relay fails closed — it never degrades to
   advisory or direct egress.
+- relay labels (WI#641): the runtime still mounts only the channel with
+  `:ro,z`. Lowercase `:z` applies a shared SELinux label to mounted inodes;
+  uppercase `:Z` is the private relabel. SELinux may separately require
+  `sock_file` access to the socket inode and `unix_stream_socket connectto`
+  permission to the listening socket's security context. A shared inode
+  label does not change the listener's context or prove a connect is allowed.
+  The daemon does not relabel the channel itself or change SELinux policy.
+- relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
+  `sandbox:proxy_error`. A failed transport probe reports the errno, container
+  UID/GID, mount and socket metadata, and available SELinux state. The probe
+  makes one bounded attempt before running the command. Mid-run failures use
+  `lunarwing-proxy-relay transport: …` so they do not hide the command's exit
+  status.
+- diagnosing WI#641: `EACCES` alone does not establish a cause. From a trusted
+  checkout on the affected host, run
+  `sudo ic/scripts/lunarwing-sandbox-proxy-diag.sh <tenant> [--watch]` while
+  reproducing the failure. It reads the configured network mode from the
+  mt-admin tenant env as the tenant, reports the daemon's process context and
+  relay inode metadata, and shows candidate AVC denials. Match the time and
+  contexts to the failed call, and use the denied permission and object class
+  to distinguish inode access from `connectto`. A label or an empty audit
+  result on its own is not proof of the cause. This is a diagnostics change;
+  resolving WI#641 requires the affected host's evidence and a successful
+  sandbox shell check there while keeping confinement intact.
 - destination policy: the proxy rejects non-public destinations (private,
   loopback, link-local, multicast, CGNAT, and IPv4-mapped forms) and pins DNS
   to the resolved public addresses for both HTTP forwarding and CONNECT.
