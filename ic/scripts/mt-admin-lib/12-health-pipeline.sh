@@ -47,16 +47,25 @@ warn_if_adapter_deps_missing() {
 
 _ensure_cron_runlevel() {
   # Ensure a cron daemon is enabled at boot + running so the schedule fires.
+  # OPENRC_INITD_DIR is the host/test override the composition root and the
+  # container/worker renderers already share.
   local want="${1:-}" cron
+  local initd="${OPENRC_INITD_DIR:-/etc/init.d}"
   for cron in ${want:+$want} fcron cronie dcron crond busybox-cron; do
-    if [[ -x "/etc/init.d/$cron" ]]; then
+    if [[ -x "$initd/$cron" ]]; then
       _openrc_update add "$cron" default || return 1
       _openrc_service "$cron" start || return 1
       say "cron daemon '$cron' enabled + running"
       return 0
     fi
   done
+  # No cron daemon at all is a failure, not a note: the crontab block is
+  # written but nothing will ever run it, so the loop's fall-through must not
+  # look like success. Status 1 reaches the status-2 report in
+  # _install_health_cron, so the host is never told the pipeline is ready
+  # (WI#765).
   say "WARNING: no cron daemon init script found; install fcron/cronie/dcron so the schedule runs"
+  return 1
 }
 
 # Returns 1 when the schedule was not installed, and 2 when it is installed but
