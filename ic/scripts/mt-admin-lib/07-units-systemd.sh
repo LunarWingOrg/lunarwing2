@@ -1142,12 +1142,14 @@ EOF
 # ---------------------------------------------------------------------------
 
 # Drop cache directories left by runs that no longer exist. Names carry the
-# owning pid, so liveness is a cheap test; only our own prefix is touched.
+# owning pid, so liveness is a cheap test; only our own prefixes are touched.
 _user_manager_cache_prune() {  # <parent-dir>
-  local parent="$1" dir pid
-  for dir in "$parent"/.usermgr-*-*; do
+  local parent="$1" dir name pid
+  for dir in "$parent"/.usermgr-*-* "$parent"/lunarwing-mt-admin-usermgr-*-*; do
     [[ -d "$dir" && ! -L "$dir" ]] || continue
-    pid="${dir##*/.usermgr-}"
+    name="${dir##*/}"
+    pid="${name#.usermgr-}"
+    pid="${pid#lunarwing-mt-admin-usermgr-}"
     pid="${pid%%-*}"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ "$pid" == "$$" ]] && continue
@@ -1205,15 +1207,6 @@ _user_manager_cache_write() {  # <name> <state|notice> <value>
   file="$dir/$(sanitize_name "$1").$2"
   [[ -L "$file" ]] && return 0
   printf '%s\n' "$3" >"$file" 2>/dev/null || true
-}
-
-# Drop one tenant's cached probe and notice flag (used by the harness between
-# cases, and by a caller that must re-probe after changing the manager).
-_user_manager_cache_forget() {
-  local dir base
-  dir="$(_user_manager_cache_dir)"
-  base="$dir/$(sanitize_name "$1")"
-  rm -f -- "$base.state" "$base.notice" 2>/dev/null || true
 }
 
 # Whether logind keeps this tenant's user manager up for the whole session.
