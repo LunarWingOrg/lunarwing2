@@ -172,9 +172,37 @@ ensure_tenant_wasm_toolchain() {
   return 0
 }
 
+# WI#707: `useradd --create-home` is a no-op when the home already exists, so a
+# tenant that reuses the orphaned uid of a removed tenant inherits whatever the
+# previous one left there: its rootless store, .env and workspace. Say whose
+# tree it is before the new account gets it; the operator decides whether to
+# remove it. A home owned by the account itself is the ordinary re-add case and
+# stays silent.
+_warn_foreign_tenant_home() {
+  local name="$1" home owner_uid owner_name owner
+  home="$(tenant_home "$name")"
+  [[ -d "$home" ]] || return 0
+  owner_uid="$(stat -c %u -- "$home" 2>/dev/null)" || return 0
+  [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 0
+  owner_name="$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1)" || owner_name=""
+  [[ "$owner_name" != "$name" ]] || return 0
+  if [[ -n "$owner_name" ]]; then
+    owner="account '$owner_name' (uid $owner_uid)"
+  else
+    owner="the orphaned uid $owner_uid"
+  fi
+  say "" >&2
+  say "WARNING: the home $home of tenant '$name' already exists and belongs to $owner, not to '$name'." >&2
+  say "         useradd --create-home leaves an existing home in place, so this tenant would inherit whatever is in it (a previous tenant's rootless store, .env and workspace)." >&2
+  say "         Inspect it and remove it before adding the tenant: rm -rf -- $home" >&2
+  say "" >&2
+}
+
 create_tenant_user() {
   local name="$1"
   local add_docker_group="${2:-false}"
+
+  _warn_foreign_tenant_home "$name"
 
   if id "$name" &>/dev/null; then
     say "user '$name' already exists"
