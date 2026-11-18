@@ -1472,6 +1472,9 @@ run_keeper_identity_case count-inspect-fails 'cannot identify the namespace keep
 run_keeper_identity_case infra-inspect-fails 'cannot identify the namespace keeper'
 run_keeper_identity_case empty-infra 'cannot identify the namespace keeper'
 
+# No case is running now, so a late abort must not be blamed on the last one.
+CASE_LABEL=""
+
 if ((failures > 0)); then
   printf '\n%d failure(s)\n' "$failures" >&2
   exit 1
