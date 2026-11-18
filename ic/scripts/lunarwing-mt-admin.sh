@@ -766,8 +766,8 @@ Environment:
                                    PID-1 marker instead of /run/openrc/softlevel.
                                    It changes which manager the host probe
                                    reports, so it also switches off the override
-                                   refusal for that manager. Never set outside a
-                                   test.
+                                   refusal and changes the manager health.env
+                                   records. Never set outside a test.
   LUNARWING_MT_SYSTEMD_MARKER      Test-only seam: same for the systemd marker
                                    instead of /run/systemd/system.
   LUNARWING_CONTAINER_RUNTIME      Override: docker or podman (persisted to /etc/lunarwing/container-runtime on first explicit use; later runs need no env var)

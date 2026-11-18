@@ -1056,7 +1056,7 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 |----------|---------|-------------|
 | `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc`. An override that contradicts the host's PID-1 markers (`/run/systemd/system`, `/run/openrc/softlevel`) is refused before any write. |
 | `LUNARWING_SERVICE_MANAGER_FORCE` | unset | Set to `1` only for an image build or chroot: permit an override that contradicts a host PID-1 marker. Still refused when the ports registry holds any tenant (an entry alone counts, even without its unit file). |
-| `LUNARWING_MT_OPENRC_MARKER` | `/run/openrc/softlevel` | **Test-only.** Treat this path as the OpenRC PID-1 marker. It changes which manager the host probe reports, so it also switches off the contradicting-override refusal for that manager. Never set outside a test. |
+| `LUNARWING_MT_OPENRC_MARKER` | `/run/openrc/softlevel` | **Test-only.** Treat this path as the OpenRC PID-1 marker. It changes which manager the host probe reports, so it also switches off the contradicting-override refusal and changes the manager `health.env` records for that host. Never set outside a test. |
 | `LUNARWING_MT_SYSTEMD_MARKER` | `/run/systemd/system` | **Test-only.** Same for the systemd marker. Never set outside a test. |
 | `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman`; an explicit choice is persisted in `/etc/lunarwing/container-runtime` |
 | `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |

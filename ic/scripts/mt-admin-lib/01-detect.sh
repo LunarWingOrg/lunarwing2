@@ -24,9 +24,10 @@
 # PID-1 artifacts that name the host's real service manager. The two
 # LUNARWING_MT_*_MARKER variables are a documented test-only seam (named in
 # --help and docs/ops/MULTITENANCY-PRODUCTION.md): they replace the /run path
-# the probe reads, which also changes which manager counts as the host's, so
+# the probe reads, which also decides which manager counts as the host's, so
 # setting either switches off the refusal of a contradicting
-# LUNARWING_SERVICE_MANAGER for that manager. Never set them outside a test.
+# LUNARWING_SERVICE_MANAGER and changes the manager health.env records for that
+# host. Never set them outside a test.
 OPENRC_HOST_MARKER="${LUNARWING_MT_OPENRC_MARKER:-/run/openrc/softlevel}"
 SYSTEMD_HOST_MARKER="${LUNARWING_MT_SYSTEMD_MARKER:-/run/systemd/system}"
 
