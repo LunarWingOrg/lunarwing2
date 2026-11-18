@@ -275,11 +275,16 @@ providing drift detection rather than registry immutability. Prefer a digest
 for production overrides.
 
 The reference alone does not identify the image. Every start and health check
-runs `image inspect --format {{.Id}}` locally, requires a well-formed `sha256:`
-ID, and feeds that resolved ID into the salted drift hash. Re-pointing a tag,
+runs `image inspect --format {{.Id}}` locally, requires the resolved ID to be 64
+hexadecimal characters (the `sha256:` prefix is accepted but optional), and
+feeds that resolved ID into the salted drift hash. Re-pointing a tag,
 rebuilding the local tag in place, or otherwise changing what the reference
-resolves to therefore recreates the sidecar instead of reusing credentials and
-network state from the previous image. The hash covers the provider, image
+resolves to therefore recreates the sidecar: the container, its network
+namespace, and its firewall rules are rebuilt from the image the reference now
+resolves to. Provider identity does not live in the image, so it survives that
+recreation: a NetBird sidecar mounts its existing state volume and keeps the
+enrolled peer (see NetBird below), and a WireGuard sidecar mounts the same host
+config file with the same private key. The hash covers the provider, image
 reference, resolved image ID, resolver and canary settings, the WireGuard
 config path and contents, the management URL, and the setup key; the published
 label is salted, so it is a drift marker rather than a digest of the key. The
@@ -822,6 +827,6 @@ anything unless all three gates are `1` and every provider setting is present.
 | `the tunnel resolver file joined runs mount is missing; recovery restages it` or `... no longer names NetBird's wt0 listener; recovery restages it` | the host file joined runs mount was deleted or rewritten after the sidecar started (a re-stage under an adopted sidecar, a stop that left the container, or NetBird writing the runtime resolver back, typically after DNS management was turned off on the server). The daemon refuses the run and recreates the sidecar so the file is staged again; if it recurs, check whether managed DNS is still enabled for the peer |
 | `sandbox_unavailable` naming the WireGuard handshake | no peer completed a handshake within 180 seconds: check peer keys, the remote endpoint, and `PersistentKeepalive = 1..=60` on at least one peer, or configure `SANDBOX_TUNNEL_WIREGUARD_CANARY`; a timestamp ahead of the local clock also fails the probe |
 | `sandbox_unavailable` naming the WireGuard canary | the `ping` probe to `SANDBOX_TUNNEL_WIREGUARD_CANARY` failed: confirm `ping` exists in the image, the canary address is routed through `wg0`, and the peer answers ICMP |
-| a healthy sidecar is recreated after an image rebuild | expected: the resolved local image ID is part of the drift hash, so re-pointing or rebuilding the tag deliberately replaces credentials and network state |
+| a healthy sidecar is recreated after an image rebuild | expected: the resolved local image ID is part of the drift hash, so re-pointing or rebuilding the tag rebuilds the container, its network namespace, and its firewall; the NetBird peer identity and the WireGuard private key are retained |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |
