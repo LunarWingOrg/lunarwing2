@@ -282,18 +282,24 @@ stop_tenant_writers() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    while IFS= read -r service; do
-      rc=0
-      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
-      case "$state" in
-        active|activating|reloading|deactivating)
-          _systemctl_user "$name" stop "${service}.service" >/dev/null \
-            || die "failed to stop writer ${service}.service" ;;
-        inactive|dead|failed|maintenance) ;;
-        unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
-        *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
-      esac
-    done < <(tenant_writer_services "$name")
+    # WI#731: a dead user manager owns no running unit (systemd tears the user
+    # slice down with it), and its bus cannot answer is-active. Skip the unit
+    # half instead of failing per writer; the container half below stays
+    # authoritative.
+    if _tenant_user_manager_gate "$name" report; then
+      while IFS= read -r service; do
+        rc=0
+        state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+        case "$state" in
+          active|activating|reloading|deactivating)
+            _systemctl_user "$name" stop "${service}.service" >/dev/null \
+              || die "failed to stop writer ${service}.service" ;;
+          inactive|dead|failed|maintenance) ;;
+          unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
+          *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
+        esac
+      done < <(tenant_writer_services "$name")
+    fi
   else
     while IFS= read -r service; do
       # stop_worker handles worker units AND removes their supervisor's boot
@@ -362,16 +368,20 @@ tenant_writers_active() {
   tenant_exists_in_registry "$name" || return 2
   ensure_init_system || return 2
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    while IFS= read -r service; do
-      rc=0
-      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
-      case "$state" in
-        active|activating|reloading|deactivating) return 0 ;;
-        inactive|dead|failed|maintenance) ;;
-        unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
-        *) [[ "$rc" -eq 4 ]] || return 2 ;;
-      esac
-    done < <(tenant_writer_services "$name")
+    # WI#731: a dead user manager's units are gone with it, so the unit half
+    # has nothing active to report; the container half below decides.
+    if _tenant_user_manager_gate "$name" report; then
+      while IFS= read -r service; do
+        rc=0
+        state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+        case "$state" in
+          active|activating|reloading|deactivating) return 0 ;;
+          inactive|dead|failed|maintenance) ;;
+          unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
+          *) [[ "$rc" -eq 4 ]] || return 2 ;;
+        esac
+      done < <(tenant_writer_services "$name")
+    fi
   else
     while IFS= read -r service; do
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue

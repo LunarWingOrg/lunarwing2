@@ -274,7 +274,25 @@ assert_contains "status still prints the tenant header" "$status_body" "=== Tena
 assert_not_contains "status prints no per-unit state for a dead bus" "$status_body" "lunarwing-spitfire.service:"
 assert_not_contains "status prints no raw bus error" "$status_body$status_error" "Failed to connect"
 
-# --- 8. healthy manager is unchanged --------------------------------------
+# --- 8. writer checks skip the unit half on a dead manager -----------------
+
+tenant_writer_services() { printf 'lunarwing-spitfire.service\n'; }
+detect_container_runtime() { return 1; }
+
+reset_gate
+USER_MANAGER_STATE=failed
+BUS_UP=false
+capture tenant_writers_active "$TENANT"
+assert_eq "dead manager: writer check finds no unit writers" "$CAPTURED_RC" "1"
+assert_eq "dead manager: writer check still says the one line once" "$(count_lines "$CAPTURED_OUT")" "1"
+
+reset_gate
+USER_MANAGER_STATE=active
+BUS_UP=true
+capture tenant_writers_active "$TENANT"
+assert_eq "healthy manager: an active writer unit is still detected" "$CAPTURED_RC" "0"
+
+# --- 9. healthy manager is unchanged --------------------------------------
 
 reset_gate
 USER_MANAGER_STATE=active
