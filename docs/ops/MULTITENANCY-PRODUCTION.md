@@ -1245,11 +1245,17 @@ tenant's user units as down (the dead manager already took them down);
 `remove-tenant` still removes the unit files and the account.
 
 The probe runs once per tenant per mt-admin process. Its answer and the
-"already said" flag are kept in a per-process file, so a caller that reads the
-wrapper through a command substitution does not re-probe and does not print a
-second line. The answer does not trust `loginctl show-user` alone: logind keeps
-a user only while one of its units is active, so a lingering tenant whose record
-is gone falls back to logind's own marker, `/var/lib/systemd/linger/<name>`.
+"already said" flag are kept in a per-process directory, so a caller that
+reads the wrapper through a command substitution does not re-probe and does
+not print a second line. A call that sends stderr to `/dev/null` does not use
+the line up; the next call that keeps stderr prints it. Where that directory
+lives is chosen once, when mt-admin starts: inside the lifecycle lock
+directory when mt-admin owns it with mode 0700 and it is not a link, otherwise
+in `TMPDIR` (so the first run after a boot, before the lock directory exists,
+uses `TMPDIR`). The answer does not trust `loginctl show-user` alone: logind
+keeps a user only while one of its units is active, so a lingering tenant whose
+record is gone falls back to logind's own marker,
+`/var/lib/systemd/linger/<name>`.
 
 Only the parts that need the user bus are skipped. A worker started under the
 system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with

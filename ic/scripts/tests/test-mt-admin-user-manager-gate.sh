@@ -92,7 +92,9 @@ export LUNARWING_MT_USER_MANAGER_CACHE_DIR="$CACHE_DIR"
 PROBE_COUNT_FILE="$(mktemp)"
 LINGER_MARKER_DIR="$(mktemp -d)"
 export LUNARWING_MT_LINGER_DIR="$LINGER_MARKER_DIR"
-trap 'rm -rf -- "$CACHE_DIR" "$PROBE_COUNT_FILE" "$LINGER_MARKER_DIR"' EXIT
+# Case 19 picks the cache's parent directory itself (AFR-2).
+PICK_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$CACHE_DIR" "$PROBE_COUNT_FILE" "$LINGER_MARKER_DIR" "$PICK_DIR"' EXIT
 
 # The gate's bounded waits use `sleep`; their loop logic is what matters here.
 sleep() { :; }
@@ -565,6 +567,77 @@ out="$CAPTURED_OUT"
 assert_eq "marker file alone proves a lingering tenant" "$CAPTURED_RC" "1"
 assert_contains "marker file case names the manager" "$out" "user@1011.service"
 LINGER_VALUE=yes
+
+# --- 18. a caller that discards stderr does not use up the line (AFR-1) -----
+#
+# Most wrapper call sites send stderr to /dev/null. The first of them must not
+# print the line into /dev/null and mark it said; the next call that keeps
+# stderr prints it, once.
+
+reset_gate
+USER_MANAGER_STATE=failed
+BUS_UP=false
+_systemctl_user "$TENANT" daemon-reload 2>/dev/null
+discarded_rc=$?
+capture _systemctl_user "$TENANT" start lunarwing-kimi-spitfire.service
+out="$CAPTURED_OUT"
+assert_eq "a call with stderr discarded still fails on a dead manager" "$discarded_rc" "1"
+assert_eq "the next call that keeps stderr prints the one line" "$(count_lines "$out")" "1"
+assert_contains "that line names the manager" "$out" "user@1011.service"
+capture _systemctl_user "$TENANT" is-active lunarwing-kimi-spitfire.service
+assert_eq "once printed, the line is not repeated" "$(count_lines "$CAPTURED_OUT")" "0"
+assert_eq "the discarded call and the two after it probe once" "$(probe_count)" "1"
+
+# --- 19. the cache's parent is a directory of our own, or TMPDIR (AFR-2) ----
+#
+# The lifecycle lock directory may hold the cache only when this user owns it,
+# its mode is 0700 and it is not a link. The choice is made once per process.
+
+saved_lock_dir="${TENANT_LIFECYCLE_LOCK_DIR:-}"
+mkdir -m 0700 "$PICK_DIR/lock"
+TENANT_LIFECYCLE_LOCK_DIR="$PICK_DIR/lock"
+_user_manager_cache_parent_pick
+assert_eq "an owned 0700 lock directory holds the cache" \
+  "$_USER_MANAGER_CACHE_PARENT" "$PICK_DIR/lock"
+chmod 0775 "$PICK_DIR/lock"
+_user_manager_cache_parent_pick
+assert_eq "a lock directory others can write to is not used" \
+  "$_USER_MANAGER_CACHE_PARENT" "${TMPDIR:-/tmp}"
+chmod 0700 "$PICK_DIR/lock"
+ln -s "$PICK_DIR/lock" "$PICK_DIR/lock.link"
+TENANT_LIFECYCLE_LOCK_DIR="$PICK_DIR/lock.link"
+_user_manager_cache_parent_pick
+assert_eq "a link to a lock directory is not used" \
+  "$_USER_MANAGER_CACHE_PARENT" "${TMPDIR:-/tmp}"
+
+# Once per process: a lock directory that appears after the pick (the first
+# verb after a boot creates it) does not move the cache mid-run.
+unset LUNARWING_MT_USER_MANAGER_CACHE_DIR
+TENANT_LIFECYCLE_LOCK_DIR="$PICK_DIR/later"
+_user_manager_cache_parent_pick
+place_before="$(_user_manager_cache_dir)"
+mkdir -m 0700 "$PICK_DIR/later"
+assert_eq "a lock directory made after the pick does not move the cache" \
+  "$(_user_manager_cache_dir)" "$place_before"
+assert_eq "before the lock directory exists the cache is in TMPDIR" \
+  "$place_before" "${TMPDIR:-/tmp}/lunarwing-mt-admin-usermgr-$_USER_MANAGER_CACHE_TAG"
+
+# The default place (no LUNARWING_MT_USER_MANAGER_CACHE_DIR) keeps "once" too.
+TENANT_LIFECYCLE_LOCK_DIR="$PICK_DIR/lock"
+_user_manager_cache_parent_pick
+reset_gate
+USER_MANAGER_STATE=failed
+BUS_UP=false
+sub_a="$( _tenant_user_manager_gate "$TENANT" report 2>&1 )" || true
+sub_b="$( _tenant_user_manager_gate "$TENANT" report 2>&1 )" || true
+assert_eq "default cache place: two reads through substitutions probe once" "$(probe_count)" "1"
+assert_eq "default cache place: the one line is printed once" \
+  "$(count_lines "$sub_a$sub_b")" "1"
+assert_eq "default cache place: the cache sits in the owned lock directory" \
+  "$(_user_manager_cache_dir)" "$PICK_DIR/lock/.usermgr-$_USER_MANAGER_CACHE_TAG"
+export LUNARWING_MT_USER_MANAGER_CACHE_DIR="$CACHE_DIR"
+TENANT_LIFECYCLE_LOCK_DIR="$saved_lock_dir"
+_user_manager_cache_parent_pick
 
 (( failures == 0 )) || exit 1
 printf 'ALL TESTS PASSED\n'

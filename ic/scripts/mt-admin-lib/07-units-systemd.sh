@@ -1161,19 +1161,36 @@ _user_manager_cache_prune() {  # <parent-dir>
 # The probe result and the "line already printed" flag must survive a command
 # substitution: `state="$(func)"` runs in a subshell, where an assignment to a
 # shell array is lost. A per-process directory carries both across those
-# subshells. It lives in the root-only lifecycle lock directory when that
-# exists; TMPDIR is the fallback for a non-root harness. The name carries a
-# per-sourcing random tag so a reused pid cannot read a dead run's answer.
+# subshells. The name carries a per-sourcing random tag so a reused pid cannot
+# read a dead run's answer.
 _USER_MANAGER_CACHE_TAG="$$-${RANDOM}${RANDOM}"
+
+# Where that directory lives is decided once, when mt-admin is sourced, so
+# every subshell of the process uses the same place (!2543 AFR-2). The
+# lifecycle lock directory is used only when this user owns it, its mode is
+# 0700 and it is not a link. A directory another account made first (possible
+# where /run/lock is writable by everyone) must not hold root's answer: that
+# account could replace it. Otherwise TMPDIR, where the 0700 directory and the
+# owner checks below keep the cache private.
+_user_manager_cache_parent_pick() {
+  local lock_dir="${TENANT_LIFECYCLE_LOCK_DIR:-}"
+  if [[ -n "$lock_dir" && -d "$lock_dir" && ! -L "$lock_dir" && -O "$lock_dir" \
+      && "$(stat -c '%a' -- "$lock_dir" 2>/dev/null)" == 700 ]]; then
+    _USER_MANAGER_CACHE_PARENT="$lock_dir"
+    _USER_MANAGER_CACHE_PREFIX=.usermgr-
+  else
+    _USER_MANAGER_CACHE_PARENT="${TMPDIR:-/tmp}"
+    _USER_MANAGER_CACHE_PREFIX=lunarwing-mt-admin-usermgr-
+  fi
+}
+_user_manager_cache_parent_pick
 
 _user_manager_cache_dir() {
   if [[ -n "${LUNARWING_MT_USER_MANAGER_CACHE_DIR:-}" ]]; then
     printf '%s\n' "$LUNARWING_MT_USER_MANAGER_CACHE_DIR"
-  elif [[ -n "${TENANT_LIFECYCLE_LOCK_DIR:-}" && -d "$TENANT_LIFECYCLE_LOCK_DIR" \
-      && -w "$TENANT_LIFECYCLE_LOCK_DIR" ]]; then
-    printf '%s/.usermgr-%s\n' "$TENANT_LIFECYCLE_LOCK_DIR" "$_USER_MANAGER_CACHE_TAG"
   else
-    printf '%s/lunarwing-mt-admin-usermgr-%s\n' "${TMPDIR:-/tmp}" "$_USER_MANAGER_CACHE_TAG"
+    printf '%s/%s%s\n' "$_USER_MANAGER_CACHE_PARENT" "$_USER_MANAGER_CACHE_PREFIX" \
+      "$_USER_MANAGER_CACHE_TAG"
   fi
 }
 
@@ -1263,9 +1280,15 @@ _user_manager_probe() {
 # per process. `recover-*` modes report the outcome of an attempted start.
 # The flag is a file, not a shell variable, so a caller that reaches this
 # through a command substitution still prints only once.
+#
+# A caller that sends stderr to /dev/null (73 of the wrapper's call sites do)
+# must not use the line up: it would be printed nowhere and then count as
+# said, and a verb without a gate of its own would report nothing at all
+# (!2543 AFR-1). The next call that keeps stderr prints it.
 _user_manager_notice() {  # <name> <state> <report|recover-ok|recover-failed>
   local name="$1" state="$2" mode="$3" uid unit
   [[ -z "$(_user_manager_cache_read "$name" notice 2>/dev/null)" ]] || return 0
+  [[ /dev/stderr -ef /dev/null ]] && return 0
   _user_manager_cache_write "$name" notice 1
   uid="$(id -u "$name" 2>/dev/null)" || uid='?'
   unit="user@${uid}.service"
