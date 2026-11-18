@@ -282,18 +282,24 @@ stop_tenant_writers() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    while IFS= read -r service; do
-      rc=0
-      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
-      case "$state" in
-        active|activating|reloading|deactivating)
-          _systemctl_user "$name" stop "${service}.service" >/dev/null \
-            || die "failed to stop writer ${service}.service" ;;
-        inactive|dead|failed|maintenance) ;;
-        unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
-        *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
-      esac
-    done < <(tenant_writer_services "$name")
+    # WI#731: a dead user manager owns no running unit (systemd tears the user
+    # slice down with it), and its bus cannot answer is-active. Skip the unit
+    # half instead of failing per writer; the container half below stays
+    # authoritative.
+    if _tenant_user_manager_gate "$name" report; then
+      while IFS= read -r service; do
+        rc=0
+        state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+        case "$state" in
+          active|activating|reloading|deactivating)
+            _systemctl_user "$name" stop "${service}.service" >/dev/null \
+              || die "failed to stop writer ${service}.service" ;;
+          inactive|dead|failed|maintenance) ;;
+          unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
+          *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
+        esac
+      done < <(tenant_writer_services "$name")
+    fi
   else
     while IFS= read -r service; do
       # stop_worker handles worker units AND removes their supervisor's boot
@@ -362,16 +368,20 @@ tenant_writers_active() {
   tenant_exists_in_registry "$name" || return 2
   ensure_init_system || return 2
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    while IFS= read -r service; do
-      rc=0
-      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
-      case "$state" in
-        active|activating|reloading|deactivating) return 0 ;;
-        inactive|dead|failed|maintenance) ;;
-        unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
-        *) [[ "$rc" -eq 4 ]] || return 2 ;;
-      esac
-    done < <(tenant_writer_services "$name")
+    # WI#731: a dead user manager's units are gone with it, so the unit half
+    # has nothing active to report; the container half below decides.
+    if _tenant_user_manager_gate "$name" report; then
+      while IFS= read -r service; do
+        rc=0
+        state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+        case "$state" in
+          active|activating|reloading|deactivating) return 0 ;;
+          inactive|dead|failed|maintenance) ;;
+          unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
+          *) [[ "$rc" -eq 4 ]] || return 2 ;;
+        esac
+      done < <(tenant_writer_services "$name")
+    fi
   else
     while IFS= read -r service; do
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
@@ -560,6 +570,11 @@ add_tenant() {
     pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|opencode2-*|lunardepth-*|weechat-*)
       die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/lunardepth-/weechat-/weechat-adapter-); choose another name" ;;
   esac
+
+  # WI#730: a service-manager override that contradicts this host must stop the
+  # add before the account, the registry or anything under /etc is written. The
+  # lifecycle-lock wrapper suppresses errexit, so propagate the refusal here.
+  ensure_init_system || return 1
 
   # WI#330: never render an unreachable built-in endpoint; require a real one.
   require_tenant_llm_endpoint "$tensorzero_url" "$llm_base_url" "$enable_proxy"
@@ -818,6 +833,12 @@ remove_tenant() {
   say "=== Removing tenant: $name ==="
   say ""
 
+  # WI#731: say the one line before the first user-bus call (retire, stop and
+  # uninstall below) so removal is not silently blind to a dead manager.
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    _tenant_user_manager_gate "$name" report || true
+  fi
+
   # WI#688: refresh the identity record while the account exists, so a rerun
   # after `userdel` below can still prove the old uid idle. Without the account
   # a rootless store is unreachable; every step below then skips it, and that
@@ -1025,6 +1046,14 @@ start_tenant() {
     || die "cannot record the uid of tenant '$name' in $TENANT_IDENTITY_DIR; refusing start"
 
   say "=== Starting tenant: $name ==="
+
+  # WI#731: PostgreSQL, vision/voice and the unit start below all need the
+  # tenant's user bus. Detect a dead user manager once here, before the first
+  # `systemctl --user` call, and either restore it or stop with one named line.
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _tenant_user_manager_gate "$name" recover || return 1
+  fi
 
   local darkirc_config
   darkirc_config="$(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
@@ -1466,6 +1495,13 @@ validate_migration_export_boundary() {
 
 restart_tenant() {
   local name="$1"
+  # WI#731: both halves need the tenant's user bus; recover it once up front
+  # (and print the one line either way) instead of letting the stop phase fail
+  # per unit against a dead manager.
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _tenant_user_manager_gate "$name" recover || return 1
+  fi
   stop_tenant "$name"
   start_tenant "$name"
 }
@@ -2318,6 +2354,11 @@ status_tenant() {
   say ""
   say "Services ($INIT_SYSTEM):"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    # WI#731: one named line for a dead user manager; per-unit state is
+    # unknowable without its bus, so do not print a line per unit.
+    if ! _tenant_user_manager_gate "$name" report; then
+      return 0
+    fi
     local svcs=("lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" \
                 "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
     if tenant_darkirc_enabled "$name"; then

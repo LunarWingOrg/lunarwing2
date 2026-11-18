@@ -20,7 +20,13 @@ ADMIN_SCRIPT="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # CI containers have no init-system markers (/run/systemd/system,
 # /run/openrc/softlevel) and detect_init_system() dies without one. Pin the
 # override so the renderers are deterministic everywhere. "systemd" keeps the
-# OpenRC babysitter renderer a no-op, as on any systemd host.
+# OpenRC babysitter renderer a no-op, as on any systemd host. WI#730: pin the
+# host probe too — an override that contradicts a real host is refused.
+INIT_MARKER_FIXTURE="$(mktemp -d)"
+trap 'rm -rf "$INIT_MARKER_FIXTURE"' EXIT
+export LUNARWING_MT_SYSTEMD_MARKER="$INIT_MARKER_FIXTURE/systemd"
+export LUNARWING_MT_OPENRC_MARKER="$INIT_MARKER_FIXTURE/openrc"
+mkdir -p "$LUNARWING_MT_SYSTEMD_MARKER"
 export LUNARWING_SERVICE_MANAGER=systemd
 
 # shellcheck source=../lunarwing-mt-admin.sh
@@ -72,7 +78,7 @@ assert_files_equal() { # <label> <expected> <actual>
 
 # ── Fixture ──────────────────────────────────────────────────────────────────
 MT_FIXTURE="$(mktemp -d)"
-trap 'rm -rf "$MT_FIXTURE"' EXIT
+trap 'rm -rf "$MT_FIXTURE" "$INIT_MARKER_FIXTURE"' EXIT
 
 tenant_home()        { echo "$MT_FIXTURE/$1"; }
 tenant_repo()        { echo "$MT_FIXTURE/$1/lunarwing/ic"; }
@@ -124,6 +130,14 @@ assert_contains "daemon unit cap"     "$unit_dir/lunarwing-t1.service" "MemoryMa
 assert_contains "daemon unit high"    "$unit_dir/lunarwing-t1.service" "MemoryHigh=1536M"
 assert_contains "daemon unit tasks"   "$unit_dir/lunarwing-t1.service" "TasksMax=512"
 
+# WI#663: rootless podman resolves pasta by name, and pasta lives under sbin on
+# hosts that put it there. Both init systems must hand the daemon a PATH that
+# can see those directories; the systemd unit states it, and the OpenRC unit
+# appends the missing ones to the host PATH at start.
+echo "== WI#663 daemon PATH =="
+daemon_path="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/t1/.cargo/bin"
+assert_contains "systemd daemon PATH" "$unit_dir/lunarwing-t1.service" "Environment=PATH=$daemon_path"
+
 echo "== operator overrides =="
 export WORKLOAD_MEMORY_MAX=12G
 export DAEMON_MEMORY_MAX=3G
@@ -158,6 +172,23 @@ assert_contains "OpenRC conf.d documents knobs" "$daemon_confd" "lunarwing_cgrou
 assert_contains "OpenRC conf.d opt-out" "$daemon_confd" "lunarwing_cgroup_limits_enabled"
 assert_contains "OpenRC conf.d keeps ulimit fallback" "$daemon_confd" "rc_ulimit"
 assert_not_contains "OpenRC has no systemd-only knobs" "$daemon_confd" "MemoryMax"
+
+# The rendered loop is executed, not just matched: a PATH that lacks the sbin
+# directories gains them, and one that already names them keeps its own order
+# without duplicates.
+rendered_path_with() { # <initial PATH>
+  (
+    PATH="$1"
+    eval "$(sed -n '/^for _lw_sbin in /,/^export PATH$/p' "$daemon_unit")"
+    printf '%s' "$PATH"
+  )
+}
+assert_eq "OpenRC daemon PATH fills sbin" \
+  "/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin" \
+  "$(rendered_path_with /usr/bin:/bin)"
+assert_eq "OpenRC daemon PATH keeps host entries" \
+  "/opt/bin:/usr/sbin:/bin:/usr/local/sbin:/sbin" \
+  "$(rendered_path_with /opt/bin:/usr/sbin:/bin)"
 
 cat >>"$daemon_confd" <<'CONFD'
 # operator settings must survive render-units and upgrades

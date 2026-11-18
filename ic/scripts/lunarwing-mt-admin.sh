@@ -756,7 +756,20 @@ Commands:
                                    (stop the tenant daemon first)
 
 Environment:
-  LUNARWING_SERVICE_MANAGER        Override: systemd or openrc
+  LUNARWING_SERVICE_MANAGER        Override: systemd or openrc. Refused when it
+                                   contradicts the host's PID-1 markers.
+  LUNARWING_SERVICE_MANAGER_FORCE  Set to 1 only for an image build or chroot:
+                                   allow that override on a contradicting host.
+                                   Still refused when the host has tenants
+                                   registered under the manager it runs.
+  LUNARWING_MT_OPENRC_MARKER       Test-only seam: treat this path as the OpenRC
+                                   PID-1 marker instead of /run/openrc/softlevel.
+                                   It changes which manager the host probe
+                                   reports, so it also switches off the override
+                                   refusal and changes the manager health.env
+                                   records. Never set outside a test.
+  LUNARWING_MT_SYSTEMD_MARKER      Test-only seam: same for the systemd marker
+                                   instead of /run/systemd/system.
   LUNARWING_CONTAINER_RUNTIME      Override: docker or podman (persisted to /etc/lunarwing/container-runtime on first explicit use; later runs need no env var)
   LUNARWING_MT_PROFILE             Build profile: release (default) or debug
   LUNARWING_MT_SOURCE_REPO         Path to source repo to clone from
@@ -789,6 +802,21 @@ EOF
 
 # ── Main dispatcher ──────────────────────────────────────────────────────────
 
+# A contradicting service-manager override must stop every command before its
+# first write, not only add-tenant (WI#757 AFI-2). Detection runs here, in the
+# main shell: `die` inside `INIT_SYSTEM="$(detect_init_system)"` ends only the
+# substitution, and with_tenant_lifecycle_lock runs its command with errexit
+# off, so a refusal deeper in a handler would print and carry on. A successful
+# detection caches INIT_SYSTEM, so the forced / marker-less warnings print once
+# in the command's own output (AFI-3). help writes nothing and stays open.
+service_manager_override_preflight() {
+  local command_name="$1"
+  [[ -n "${LUNARWING_SERVICE_MANAGER:-}" ]] || return 0
+  case "$command_name" in
+    help|--help|-h) return 0 ;;
+  esac
+  INIT_SYSTEM="$(detect_init_system)" || return 1
+}
 
 main() {
   local command_name="${1:-}" preflight_status=0
@@ -797,6 +825,8 @@ main() {
     exit 1
   fi
   shift || true
+
+  service_manager_override_preflight "$command_name" || exit 1
 
   openrc_dispatch_preflight "$command_name" "$@" || preflight_status=$?
   if (( preflight_status != 0 )); then

@@ -1054,7 +1054,10 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc` |
+| `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc`. An override that contradicts the host's PID-1 markers (`/run/systemd/system`, `/run/openrc/softlevel`) is refused before any write. |
+| `LUNARWING_SERVICE_MANAGER_FORCE` | unset | Set to `1` only for an image build or chroot: permit an override that contradicts a host PID-1 marker. Still refused when the ports registry holds any tenant (an entry alone counts, even without its unit file). |
+| `LUNARWING_MT_OPENRC_MARKER` | `/run/openrc/softlevel` | **Test-only.** Treat this path as the OpenRC PID-1 marker. It changes which manager the host probe reports, so it also switches off the contradicting-override refusal and changes the manager `health.env` records for that host. Never set outside a test. |
+| `LUNARWING_MT_SYSTEMD_MARKER` | `/run/systemd/system` | **Test-only.** Same for the systemd marker. Never set outside a test. |
 | `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman`; an explicit choice is persisted in `/etc/lunarwing/container-runtime` |
 | `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |
 | `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit Cargo job cap for tenant builds |
@@ -1193,7 +1196,19 @@ paths). `LUNARWING_MT_HEALTH_ENABLED=false` disables new auto-installs, not
 refreshes of an already-installed host-global pipeline.
 
 Force init detection only when necessary with
-`LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
+`LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`. The
+override is checked against the host's PID-1 marker before any command runs and
+refused, with no account or `/etc` write, when it names the other manager; the
+refusal names both the requested and the detected value, and it stops commands
+that run under the tenant lifecycle lock as well. Image builds and chroots
+without either marker are accepted with one warning line,
+and `LUNARWING_SERVICE_MANAGER_FORCE=1` permits a contradicted override only
+while the ports registry holds no tenant; a forced run prints its warning once.
+`health.env` records the manager the host probe reports; only a host with
+neither marker (image build/chroot) falls back to the override. The
+`LUNARWING_MT_OPENRC_MARKER` and `LUNARWING_MT_SYSTEMD_MARKER` variables are a
+test-only seam: they replace the probe paths and therefore also switch off the
+refusal for the manager they name.
 
 ## Routine System Improvements
 
@@ -1208,6 +1223,45 @@ All tenants benefit from the routine resilience features:
 These mechanisms prevent a single failed routine from permanently blocking itself due to a stale `running` status in the database.
 
 ## Troubleshooting
+
+### A tenant's systemd user manager is dead
+
+On systemd, a lingering tenant's `user@<uid>.service` can die (a SIGKILL leaves
+it `failed`; the unit has `Restart=no`, and linger only starts it at boot). All
+of its user units go with it, and `systemctl --user` then fails with
+`Failed to connect to user scope bus`. mt-admin detects this once per verb,
+before its first `systemctl --user` call, and prints one line naming the unit
+and the recovery command instead of a line per unit:
+
+```
+ERROR: tenant 'spitfire': systemd user manager user@1011.service is failed and its user bus is unreachable; its user units are treated as down. Recover with: systemctl start user@1011.service
+```
+
+`start-tenant` and `restart-tenant` run that `systemctl start` themselves, wait
+for the bus, and let the units the manager starts on its own settle before
+continuing; if the manager does not come back they exit non-zero with the line.
+`stop-tenant`, `status` and `remove-tenant` report the line once and treat the
+tenant's user units as down (the dead manager already took them down);
+`remove-tenant` still removes the unit files and the account.
+
+The probe runs once per tenant per mt-admin process. Its answer and the
+"already said" flag are kept in a per-process directory, so a caller that
+reads the wrapper through a command substitution does not re-probe and does
+not print a second line. A call that sends stderr to `/dev/null` does not use
+the line up; the next call that keeps stderr prints it. Where that directory
+lives is chosen once, when mt-admin starts: inside the lifecycle lock
+directory when mt-admin owns it with mode 0700 and it is not a link, otherwise
+in `TMPDIR` (so the first run after a boot, before the lock directory exists,
+uses `TMPDIR`). The answer does not trust `loginctl show-user` alone: logind
+keeps a user only while one of its units is active, so a lingering tenant whose
+record is gone falls back to logind's own marker,
+`/var/lib/systemd/linger/<name>`.
+
+Only the parts that need the user bus are skipped. A worker started under the
+system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
+`--restart unless-stopped`) outlives the user manager, so `stop-worker` still
+asks the runtime to stop the worker and its task container. `status` with a dead
+manager prints the line, the tenant header, and exits 0.
 
 ### Services don't start after reboot
 

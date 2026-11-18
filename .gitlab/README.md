@@ -749,11 +749,12 @@ with all branches, tags, and `refs/merge-requests/*`.
 
 A weekly schedule on a protected branch is recommended so a missing pin is found
 before a release tag. Pipeline schedules are GitLab project settings, not
-version-controlled job definitions, and this repository change does not create
-or modify one; that remains a project-operator action under **CI/CD > Schedules**.
-No scheduled run is claimed here. Protected release tags remain the only
-automatic trigger guaranteed by the committed YAML until an operator adds and
-verifies that weekly schedule.
+version-controlled job definitions, so creating a durable one remains a
+project-operator action under **CI/CD > Schedules**. The acceptance evidence in
+the dispositions log's closure section came from a temporary schedule that was
+removed after one green blocking run; no durable schedule exists as of
+2026-11-18. Until an operator adds and verifies one, protected release tags
+remain the only committed trigger.
 
 Historical suppressions live separately in
 `.gitlab/gitleaks-history-ignore` and must be exact
@@ -769,7 +770,9 @@ missing pending-findings file, is refused before scanning. Test secrets are
 constructed at runtime and scanner output is checked for complete redaction. The
 blocking `secret-history-regression` job runs this harness on merge-request
 pipelines so scanner or isolation regressions cannot first appear on a release
-tag.
+tag. The group-level classification of the pre-rule historical pins is recorded
+under *Historical baseline triage closure* in
+`.gitlab/gitleaks-history-dispositions.md`.
 
 After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
 the history baseline from a non-shallow full mirror. Fetch the complete ref

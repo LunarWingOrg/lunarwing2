@@ -210,7 +210,7 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 60
 | Variable | Default | Accepted values |
 |---|---|---|
 | `SANDBOX_NETWORK` | `proxy-enforced` on Linux, `none` elsewhere | `tunnel` enables everything on this page |
-| `SANDBOX_TUNNEL_PROVIDER` | `netbird` | `netbird` or `wireguard` |
+| `SANDBOX_TUNNEL_PROVIDER` | `netbird` | `netbird` or `wireguard` (`wg` also accepted); case-insensitive |
 | `SANDBOX_TUNNEL_IMAGE` | NetBird 0.82.0 digest index; `localhost/lunarwing-tunnel-wireguard:latest` | any image reference; digest form must be `image@sha256:<64 hex characters>` |
 | `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` | `90` | integer from 1 through 600 |
 | `SANDBOX_TUNNEL_DNS` | unset | comma-separated unicast IPs; WireGuard only |
@@ -220,10 +220,17 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 60
 | `SANDBOX_TUNNEL_NETBIRD_SETUP_KEY` | unset, required for `netbird` | one token without whitespace; secret |
 | `SANDBOX_AUTO_PULL` | `true` in the daemon; `false` in mt-admin tenants | boolean |
 
-The `SANDBOX_TUNNEL_*` values are validated only when `SANDBOX_NETWORK=tunnel`.
-On any other network they are read but unused, so a bad tunnel value does not
-stop a `proxy-enforced` tenant, and it takes effect at the next start once the
-network mode changes.
+Three tunnel settings are parsed in every network mode, before the mode is
+consulted: `SANDBOX_TUNNEL_DNS` must be a comma-separated list of valid IPv4 or
+IPv6 addresses, `SANDBOX_TUNNEL_WIREGUARD_CANARY` must be one valid IPv4 or IPv6
+address, and `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` must be an integer of at most
+600. A value that fails one of those checks is a configuration error at startup
+even on a `proxy-enforced` or `none` tenant. The other five — provider,
+image reference, management URL, setup key, and WireGuard config path/file —
+and the remaining semantic checks (non-unicast resolver or canary addresses,
+`SANDBOX_TUNNEL_DNS` with NetBird, a canary without WireGuard, and a timeout of
+zero) run only when `SANDBOX_NETWORK=tunnel`. A bad value there takes effect at
+the next start once the network mode changes.
 
 DNS and canary addresses must be specified unicast IPs. Loopback, link-local,
 broadcast, unspecified, and multicast addresses are rejected: none is a valid
@@ -275,12 +282,18 @@ providing drift detection rather than registry immutability. Prefer a digest
 for production overrides.
 
 The reference alone does not identify the image. Every start and health check
-runs `image inspect --format {{.Id}}` locally, requires a well-formed `sha256:`
-ID, and feeds that resolved ID into the salted drift hash. Re-pointing a tag,
+runs `image inspect --format {{.Id}}` locally, requires the resolved ID to be 64
+hexadecimal characters (the `sha256:` prefix is accepted but optional), and
+feeds that resolved ID into the salted drift hash. Re-pointing a tag,
 rebuilding the local tag in place, or otherwise changing what the reference
-resolves to therefore recreates the sidecar instead of reusing credentials and
-network state from the previous image. The hash covers the provider, image
-reference, resolved image ID, resolver and canary settings, the WireGuard
+resolves to therefore recreates the sidecar: the container, its network
+namespace, and its firewall rules are rebuilt from the image the reference now
+resolves to. Provider identity does not live in the image, so it survives that
+recreation: a NetBird sidecar mounts its existing state volume and keeps the
+enrolled peer, because the image is not part of that volume's identity (see
+NetBird below), and a WireGuard sidecar mounts the same host config file with
+the same private key. The hash covers the provider,
+image reference, resolved image ID, resolver and canary settings, the WireGuard
 config path and contents, the management URL, and the setup key; the published
 label is salted, so it is a drift marker rather than a digest of the key. The
 startup timeout and `SANDBOX_AUTO_PULL` are not hashed: changing either applies
@@ -329,9 +342,11 @@ and the stop removes the file. Joined runs mount it `ro,z` because Podman and
 Docker reject `--dns` together with `--network container`; the shared SELinux
 label is safe for concurrent runs and the mode works with every supported
 keep-id mapping.
-Use resolvers reachable through `wg0`, including after a reconnect, because
-stock `wg-quick` resolves its endpoint only at start. A later re-resolve script
-is affected too. Do not expect NetBird to accept this setting during a
+Use resolvers reachable through `wg0`, including after a reconnect. Stock
+`wg-quick` resolves its endpoint once at start, when the sidecar still has its
+runtime resolver file, but a later re-resolve script — or anything else that
+re-resolves the endpoint after the firewall is installed — is affected by the
+removed uplink DNS rules. Do not expect NetBird to accept this setting during a
 hostname-based reconnect; it is rejected up front instead.
 
 ## NetBird
@@ -732,19 +747,23 @@ required.
 ### NetBird live validation (WI#592)
 
 This lane is the only test that proves the NetBird half of the boundary end to
-end. A skip is not a live-validation pass: the test returns without doing
-anything unless all three gates are `1` and every provider setting is present.
+end. The test returns without doing anything only when one of the three gates is
+closed; each gate accepts `1` or `true` in any case. With all three open it
+fails rather than skipping when `LUNARWING_E2E_NETBIRD_IMAGE`,
+`LUNARWING_E2E_NETBIRD_MANAGEMENT_URL`, or the setup-key file is missing or
+unusable. A skip is not a live-validation pass.
 
 1. Prepare an isolated, throwaway NetBird management deployment and one
    dedicated reusable setup key. Use an image containing NetBird, `nft`, `nc`,
-   and `wget`; the lane starts its own plain second peer with the same key. Do
-   not point this at the production management server or reuse the
-   gateway-exposure peer and key from `docs/guides/NETBIRD_TUNNEL.md`.
+   `wget`, `ping`, and `nslookup`; the lane starts its own plain second peer
+   with the same key. Do not point this at the production management server or
+   reuse the gateway-exposure peer and key from `docs/guides/NETBIRD_TUNNEL.md`.
 2. Store the setup key in a mode-`0600` file outside the repository. Do not
    print the key, the key file, or the tenant env file while debugging.
 3. Run the gated lane:
 
    ```bash
+   cd ic
    LUNARWING_E2E_PODMAN_TESTS=1 LUNARWING_E2E_TUNNEL_TESTS=1 \
    LUNARWING_E2E_NETBIRD_TESTS=1 \
    LUNARWING_E2E_NETBIRD_IMAGE=<netbird-image> \
@@ -758,8 +777,11 @@ anything unless all three gates are `1` and every provider setting is present.
    1. **Fresh start.** The sidecar starts under the configured startup budget;
       the lane prints `LUNARWING-NETBIRD-FRESH-START-SECONDS` for comparison
       with the 20-second per-run provider cap.
-   2. **Peer connectivity.** The plain peer is up and detailed peer status
-      shows management, signal, and relay connected.
+   2. **Peer connectivity.** The lane pings both overlay addresses, then runs
+      `netbird status -d` in each container and requires the other peer's block —
+      the one that names that peer's overlay IP — to carry a `Status: Connected`
+      line. `Connected` on the `Management:` block alone does not count; the
+      lane's own unit test rejects a block without the peer IP.
    3. **Firewall and join.** Exactly one `0x1bd00` control-plane mark accept and
       only the `wt0` DNS allowances; then a real joined command sees `wt0`,
       reaches peer-hosted HTTP, resolves the peer name, and observes the
@@ -822,6 +844,6 @@ anything unless all three gates are `1` and every provider setting is present.
 | `the tunnel resolver file joined runs mount is missing; recovery restages it` or `... no longer names NetBird's wt0 listener; recovery restages it` | the host file joined runs mount was deleted or rewritten after the sidecar started (a re-stage under an adopted sidecar, a stop that left the container, or NetBird writing the runtime resolver back, typically after DNS management was turned off on the server). The daemon refuses the run and recreates the sidecar so the file is staged again; if it recurs, check whether managed DNS is still enabled for the peer |
 | `sandbox_unavailable` naming the WireGuard handshake | no peer completed a handshake within 180 seconds: check peer keys, the remote endpoint, and `PersistentKeepalive = 1..=60` on at least one peer, or configure `SANDBOX_TUNNEL_WIREGUARD_CANARY`; a timestamp ahead of the local clock also fails the probe |
 | `sandbox_unavailable` naming the WireGuard canary | the `ping` probe to `SANDBOX_TUNNEL_WIREGUARD_CANARY` failed: confirm `ping` exists in the image, the canary address is routed through `wg0`, and the peer answers ICMP |
-| a healthy sidecar is recreated after an image rebuild | expected: the resolved local image ID is part of the drift hash, so re-pointing or rebuilding the tag deliberately replaces credentials and network state |
+| a healthy sidecar is recreated after an image rebuild | expected: the resolved local image ID is part of the drift hash, so re-pointing or rebuilding the tag rebuilds the container, its network namespace, and its firewall; the NetBird peer identity and the WireGuard private key are retained |
 | `wg0` exists but private service is unreachable | peer keys/endpoint/AllowedIPs, NAT keepalive, MTU, DNS, service authentication |
 | command fails after a firewall change | the daemon recreates a drifted sidecar once; if the drift returns, find what edits the table (another agent, a host tool) and stop it |

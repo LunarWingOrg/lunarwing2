@@ -316,6 +316,17 @@ chmod 0600 "$FIXTURE/pm1.env"
   printf 'ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }\n'
   printf '_install_health_cron() { :; }\n'
   printf '_install_health_systemd_timer() { :; }\n'
+  # WI#757 AFI-5: the host probe says openrc while INIT_SYSTEM is a forced
+  # systemd, so the service-manager line written below must come from the
+  # probe. Carry the probe helpers (AFI-1: ensure_health_pipeline calls them)
+  # and the marker variables they read.
+  : >"$FIXTURE/pm1-openrc-marker"
+  printf 'OPENRC_HOST_MARKER=%q\n' "$FIXTURE/pm1-openrc-marker"
+  printf 'SYSTEMD_HOST_MARKER=%q\n' "$FIXTURE/pm1-systemd-marker"
+  awk '/^probe_host_service_manager\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/01-detect.sh"
+  awk '/^health_service_manager_of_record\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/01-detect.sh"
   # The library install hands the tree to root (WI#687), which this
   # unprivileged fixture cannot do; test-mt-admin-health-library-security.sh
   # covers it. PM-1 reads health.env and the launch mode, so an empty
@@ -354,6 +365,10 @@ if bash "$PIPELINE_RUN"; then
     "ensure_health_pipeline rewrites a stale rootless value (PM-1)"
   assert_contains "$env_text" 'GOTIFY_TOKEN=operator-secret' \
     "ensure_health_pipeline preserves operator credentials (PM-1)"
+  assert_contains "$env_text" 'LUNARWING_SERVICE_MANAGER=openrc' \
+    "ensure_health_pipeline records the probed host manager, never a forced INIT_SYSTEM (AFI-5)"
+  assert_absent "$env_text" 'LUNARWING_SERVICE_MANAGER=systemd' \
+    "ensure_health_pipeline never writes the forced manager (AFI-5)"
   assert_eq "$(stat -c '%a' "$FIXTURE/pm1.env")" "600" \
     "health.env keeps its 0600 mode through the reconcile (PM-1)"
 else
