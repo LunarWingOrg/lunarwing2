@@ -1434,8 +1434,7 @@ upgrade_wrapper_boundary_locked() {
   # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
   # leaked descriptors in tenant daemons started under the lock.
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
-  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
-    || die "failed to open tenant upgrade lock"
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" upgrade_lock_fd
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
   LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD="$upgrade_lock_fd"
   if tenant_darkirc_enabled "$name"; then
@@ -1691,8 +1690,7 @@ _upgrade_tenant_lifecycle_locked() {
   # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
   # leaked descriptors in tenant daemons started under the lock.
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
-  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
-    || die "failed to open tenant upgrade lock"
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" upgrade_lock_fd
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
   # Track the descriptor so OpenRC service starts inside the locked section
   # close it before exec; an inherited fd would orphan the lock on a die.
@@ -1778,11 +1776,11 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
     return
   fi
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade" || return 1
-  exec {lock_fd}>"${BUILD_LOCK}.${name}.upgrade" || return 1
-  flock -x "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" lock_fd || return 1
+  flock -x "$lock_fd" || { eval "exec $lock_fd>&-"; return 1; }
   "$@" || rc=$?
   flock -u "$lock_fd" || rc=1
-  exec {lock_fd}>&-
+  eval "exec $lock_fd>&-"
   return "$rc"
 }
 
@@ -1929,7 +1927,8 @@ upgrade_tenant_locked() {
   # run-294 TJ-12: fail fast instead of blocking silently on an inherited build
   # lock (WI#526 class) while other tenants wait.
   _lock_held_preflight "candidate build for '$name'" "$BUILD_LOCK"
-  exec {build_lock_fd}>"$BUILD_LOCK" || die "failed to open build lock for checkout"
+  _lw_lock_open_fd "$BUILD_LOCK" build_lock_fd \
+    || die "failed to open build lock for checkout"
   flock -x "$build_lock_fd" || die "failed to acquire build lock for checkout"
   prepare_tenant_checkout "$name" "$lw_root" "$target_commit"
   migrations_type="$("${tgit[@]}" cat-file -t "${target_commit}:ic/migrations" 2>/dev/null || true)"
