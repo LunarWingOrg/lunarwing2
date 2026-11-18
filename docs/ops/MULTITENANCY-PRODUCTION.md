@@ -258,11 +258,14 @@ on a rootless host once it has proven from `/proc` that no process or thread of
 the tenant's recorded uid or subordinate uids remains; otherwise it refuses
 before changing anything. Stop a lingering `user@<uid>.service` and the
 tenant's OpenRC `supervise-daemon` units first. It then skips the unreachable
-rootless store and its network namespace (nothing there is removed or flushed)
-and, when the former home still exists, warns that it is owned by the orphaned
-uid and must be removed before the next `add-tenant`. The rules and the manual record for tenants added before WI#688
-are in `docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is
-gone").
+rootless store and its network namespace (nothing there is removed or flushed).
+With `--purge` it removes the former home, reaps `/run/user/<uid>` and says that
+it did; without it the home stays owned by the orphaned uid, the removal warns,
+and the identity record is kept so that a later
+`remove-tenant <name> --purge` can still prove the former uid idle. `add-tenant`
+warns when the target home already exists and belongs to a different uid. The
+rules and the manual record for tenants added before WI#688 are in
+`docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is gone").
 
 ### Viewing logs
 
@@ -1011,7 +1014,23 @@ All container operations use the detected runtime — no Docker-specific command
 
 ## Build Serialization
 
-Only one tenant builds at a time, enforced by an flock on `/var/lock/lunarwing-build.lock`. This prevents OOM on memory-constrained hosts when multiple tenants need to compile Rust.
+Only one tenant builds at a time, enforced by an flock on `/run/lunarwing/mt-admin/build/lunarwing-build.lock` (WI#762: a root-created tree, not `/run/lock`, which Debian creates 1777). This prevents OOM on memory-constrained hosts when multiple tenants need to compile Rust.
+
+### Root lock tree (WI#762)
+
+Every privileged mt-admin lock lives under one root-created tree:
+
+```
+/run/lunarwing/mt-admin/           0755 root
+├── build/lunarwing-build.lock     0700 dir, <tenant>.upgrade siblings
+├── darkirc/<scope>.lock           0700 dir (DarkIRC writer locks)
+└── locks/<tenant>.lock            0700 dir (lifecycle locks, build-stage markers)
+```
+
+- `sudo scripts/lunarwing-mt-admin.sh init-lock-tree` creates the tree; on systemd it also writes `/etc/tmpfiles.d/lunarwing-mt-admin.conf` so the tree exists at boot before any tenant account can act. OpenRC tenant units repeat the creation in `start_pre`, and `add-tenant` / every lock acquisition re-assert it.
+- A pre-existing directory or lock file that is not root-owned `0700`/`0600`, or that is a symlink, is refused with one line naming the path and the way out (`rm -rf '<path>'` as root, then rerun). Root never follows a link when it opens a lock file and never truncates one: lock opens use `<>` plus a descriptor/path identity check.
+- `LUNARWING_MT_LOCK_ROOT` (and the per-lock `LUNARWING_MT_BUILD_LOCK`, `LUNARWING_MT_LIFECYCLE_LOCK_DIR`, `LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR`) override the paths, and overrides are validated by the same checks rather than trusted.
+- Hosts upgraded from an older mt-admin keep their stale `/run/lock/...` directories; the locks are flock-only, so nothing migrates, but a command still running from the old version holds the old path until it exits. Reboot or wait for it to finish before upgrading.
 
 ```bash
 # Build one tenant
@@ -1076,6 +1095,9 @@ This is a compact operator reference, not the parser's exhaustive help. Run
 backup, migration, DarkIRC, and configuration subcommand.
 
 ```
+init-lock-tree                   Create /run/lunarwing/mt-admin (root 0755,
+                                 leaves 0700) and, on systemd, the
+                                 tmpfiles.d drop-in that recreates it at boot
 add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                  generate env, render and install services
 add-tenants <names> [options]    Apply the same options to comma-separated names
@@ -1095,7 +1117,8 @@ add-tenants <names> [options]    Apply the same options to comma-separated names
   --no-weechat-bootstrap         Skip relay auto-bootstrap
 
 remove-tenant <name>             Stop services and deallocate ports
-  --purge                        Also delete the OS user and home
+  --purge                        Also delete the OS user and home, including a
+                                 former home left by an already-gone account
 
 build-tenant <name>              Build one tenant (flock-serialized)
 build-all                        Build registered tenants sequentially
@@ -1257,6 +1280,12 @@ keeps a user only while one of its units is active, so a lingering tenant whose
 record is gone falls back to logind's own marker,
 `/var/lib/systemd/linger/<name>`.
 
+`LUNARWING_MT_USER_MANAGER_CACHE_DIR` and `LUNARWING_MT_LINGER_DIR` are
+test-only seams for the harness. The first replaces the cache directory and
+carries no per-process tag, so an answer written there outlives the run that
+wrote it; the second replaces logind's marker directory. Do not set either on a
+host.
+
 Only the parts that need the user bus are skipped. A worker started under the
 system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
 `--restart unless-stopped`) outlives the user manager, so `stop-worker` still
@@ -1275,7 +1304,7 @@ manager prints the line, the tenant header, and exits 0.
 
 ### Build fails with OOM
 
-- The flock on `/var/lock/lunarwing-build.lock` ensures only one tenant build at a time.
+- The flock on `/run/lunarwing/mt-admin/build/lunarwing-build.lock` (WI#762) ensures only one tenant build at a time.
 - Keep `LUNARWING_MT_PROFILE=release`; do not switch to a full debug build.
 - Set `LUNARWING_MT_BUILD_JOBS=6` or lower to cap tenant Cargo jobs, and increase swap if the host still runs out of memory.
 

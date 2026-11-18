@@ -913,7 +913,21 @@ remove_tenant() {
   say ""
 
   remove_tenant_user "$name" "$purge" || die "user removal failed for '$name'"
-  rm -f -- "$(tenant_identity_path "$name")"
+  # WI#707: when the account is gone and its former home survives (a non-purge
+  # removal, or `userdel -r` failing on a busy mount), the record is what ties
+  # that orphaned tree to its uid. Deleting it here would make the follow-up
+  # `remove-tenant '<name>' --purge` refuse for a missing record, so keep it
+  # unless the account is still present. Re-check instead of trusting the state
+  # read before the removal: it changes on this path. A lookup that cannot tell
+  # (exit 1) keeps the record too — keeping it costs nothing, losing it strands
+  # the home.
+  local state_after=0
+  tenant_account_state "$name" || state_after=$?
+  if ((state_after != 0)) && [[ -d "$(tenant_home "$name")" ]]; then
+    say "kept the identity record $(tenant_identity_path "$name") so a later --purge can prove the former uid idle"
+  else
+    rm -f -- "$(tenant_identity_path "$name")"
+  fi
   say ""
 
   # Drop the pre-delegated cgroup subtree and re-render the boot-time setup
@@ -1434,8 +1448,7 @@ upgrade_wrapper_boundary_locked() {
   # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
   # leaked descriptors in tenant daemons started under the lock.
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
-  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
-    || die "failed to open tenant upgrade lock"
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" upgrade_lock_fd
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
   LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD="$upgrade_lock_fd"
   if tenant_darkirc_enabled "$name"; then
@@ -1691,8 +1704,7 @@ _upgrade_tenant_lifecycle_locked() {
   # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
   # leaked descriptors in tenant daemons started under the lock.
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
-  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
-    || die "failed to open tenant upgrade lock"
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" upgrade_lock_fd
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
   # Track the descriptor so OpenRC service starts inside the locked section
   # close it before exec; an inherited fd would orphan the lock on a die.
@@ -1778,11 +1790,11 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
     return
   fi
   _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade" || return 1
-  exec {lock_fd}>"${BUILD_LOCK}.${name}.upgrade" || return 1
-  flock -x "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+  _lw_lock_open_fd "${BUILD_LOCK}.${name}.upgrade" lock_fd || return 1
+  flock -x "$lock_fd" || { eval "exec $lock_fd>&-"; return 1; }
   "$@" || rc=$?
   flock -u "$lock_fd" || rc=1
-  exec {lock_fd}>&-
+  eval "exec $lock_fd>&-"
   return "$rc"
 }
 
@@ -1929,7 +1941,8 @@ upgrade_tenant_locked() {
   # run-294 TJ-12: fail fast instead of blocking silently on an inherited build
   # lock (WI#526 class) while other tenants wait.
   _lock_held_preflight "candidate build for '$name'" "$BUILD_LOCK"
-  exec {build_lock_fd}>"$BUILD_LOCK" || die "failed to open build lock for checkout"
+  _lw_lock_open_fd "$BUILD_LOCK" build_lock_fd \
+    || die "failed to open build lock for checkout"
   flock -x "$build_lock_fd" || die "failed to acquire build lock for checkout"
   prepare_tenant_checkout "$name" "$lw_root" "$target_commit"
   migrations_type="$("${tgit[@]}" cat-file -t "${target_commit}:ic/migrations" 2>/dev/null || true)"

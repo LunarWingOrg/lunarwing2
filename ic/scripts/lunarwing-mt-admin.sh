@@ -19,8 +19,18 @@ PORTS_REGISTRY="/etc/lunarwing/ports.json"
 PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
-BUILD_LOCK="/var/lock/lunarwing-build.lock"
-TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+# WI#762: root lock state lives under a root-created tree beneath /run (0755
+# root), never under /run/lock, which Debian creates 1777. An account that made
+# a lock directory before root's first command could choose what root's later
+# lock-file opens reached (measured: one truncation of a root-owned file
+# outside the directory). Legacy /run/lock paths remain reachable only through
+# an explicit override, and every override is validated by the lock helpers in
+# mt-admin-lib/00-common.sh rather than trusted. The tree and its leaves are
+# created by `init-lock-tree` (root helper; tmpfiles.d on systemd, start_pre on
+# OpenRC) and re-asserted by every lock acquisition.
+LUNARWING_MT_LOCK_ROOT="${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}"
+BUILD_LOCK="${LUNARWING_MT_BUILD_LOCK:-$LUNARWING_MT_LOCK_ROOT/build/lunarwing-build.lock}"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-$LUNARWING_MT_LOCK_ROOT/locks}"
 unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
@@ -58,7 +68,7 @@ DARKIRC_RELEASE_ROOT="${LUNARWING_MT_DARKIRC_RELEASE_ROOT:-/usr/local/lib/lunarw
 DARKIRC_RELEASES_DIR="$DARKIRC_RELEASE_ROOT/releases"
 DARKIRC_RELEASE_SELECTOR="$DARKIRC_RELEASE_ROOT/current"
 DARKIRC_RELEASE_DAEMON="$DARKIRC_RELEASE_SELECTOR/darkirc"
-DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
+DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-$LUNARWING_MT_LOCK_ROOT/darkirc}"
 DARKIRC_WRITER_LOCK_HELD="false"
 DARKIRC_WRITER_LOCK_FD=""
 DARKIRC_WRITER_SCOPE=""
@@ -295,6 +305,10 @@ Production multi-tenant administration for LunarWing.
 Manages OS users, port allocation, per-tenant services, and builds.
 
 Commands:
+  init-lock-tree                   Create the root-owned lock tree
+                                   (/run/lunarwing/mt-admin) and, on systemd,
+                                   the tmpfiles.d drop-in that recreates it at
+                                   boot (WI#762; run at install time)
   reinstall-health-library <trusted-checkout>
                                    Replace the installed health library from a separate
                                    trusted checkout; allowed while the OpenRC contract is refused
@@ -386,7 +400,9 @@ Commands:
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
-    --purge                        Also delete OS user and home directory
+    --purge                        Also delete OS user and home directory,
+                                   including a former home left behind by an
+                                   account that is already gone
 
   build-tenant <name>             Build binaries for one tenant (OOM-safe flock)
     --with-wasm                    Also build WASM extensions
@@ -855,6 +871,12 @@ main() {
   [[ -z "${LUNARWING_CONTAINER_RUNTIME:-}" ]] || ensure_container_runtime
 
   case "$command_name" in
+    init-lock-tree)
+      require_root
+      [[ $# -eq 0 ]] || die "usage: init-lock-tree"
+      ensure_init_system
+      init_lock_tree_command
+      ;;
     reinstall-health-library)
       require_root
       [[ $# -eq 1 ]] || die "usage: reinstall-health-library <trusted-checkout>"
@@ -862,6 +884,9 @@ main() {
       ;;
     add-tenant)
       require_root
+      # WI#762: own the root lock tree before this command creates the first
+      # tenant account, so no local account can ever pre-create a lock path.
+      lw_lock_tree_init
       local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -934,6 +959,8 @@ main() {
 
     add-tenants)
       require_root
+      # WI#762: own the root lock tree before the first tenant account exists.
+      lw_lock_tree_init
       local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"
       # On its own line: next to the variable above, the secret scanner reads the
       # pair as an assigned API key.

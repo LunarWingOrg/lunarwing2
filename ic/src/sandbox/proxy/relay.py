@@ -4,8 +4,17 @@ The enforced container has no external network interface. Legacy Podman keeps
 its normal advisory network. Both forward proxy traffic only to the mounted
 Unix socket, whose host endpoint reaches the validating HTTP proxy. The command
 is a separate argv value, never interpolated into this program.
+
+WI#641: the host maps stderr containing "lunarwing-proxy-relay:" to a
+structured proxy error and discards the command's own exit status, so only the
+startup failure may use that exact prefix. A bare errno cannot distinguish a
+missing mount from a directory the container's UID cannot traverse from an
+SELinux denial, so the startup failure carries the mount's nodes, the
+container's IDs, and the container's MAC state.
 """
 
+import errno
+import os
 import select
 import socket
 import socketserver
@@ -14,6 +23,51 @@ import sys
 import threading
 
 SOCKET = "/run/lunarwing-proxy/proxy.sock"
+MOUNT = "/run/lunarwing-proxy"
+# Client disconnects are routine; only genuine transport failures are logged.
+BENIGN = frozenset((errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF))
+
+
+def _node(path):
+    """Mode, ownership and SELinux type of one mount node, or the lstat error."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return f"{path}: {error.strerror}"
+    node = f"{path}: mode={oct(info.st_mode & 0o7777)} uid={info.st_uid} gid={info.st_gid}"
+    try:
+        label = os.getxattr(path, b"security.selinux").decode("ascii", "replace").rstrip("\0")
+    except OSError:
+        return node
+    return f"{node} selinux={label}"
+
+
+def _security_state():
+    """Facts that separate a DAC refusal from a MAC denial."""
+    try:
+        with open("/sys/fs/selinux/enforce", encoding="ascii") as handle:
+            enforce = handle.read().strip()
+    except OSError:
+        return "selinux=not-mounted"
+    try:
+        with open("/proc/self/attr/current", encoding="ascii") as handle:
+            label = handle.read().strip()
+    except OSError:
+        label = "unknown"
+    return f"selinux=enforce:{enforce} container-label={label}"
+
+
+def _probe():
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(5)
+        probe.connect(SOCKET)
+
+
+def _startup_error(error):
+    return (
+        f"lunarwing-proxy-relay: {error}; euid={os.geteuid()} egid={os.getegid()} "
+        f"{_node(MOUNT)} {_node(SOCKET)} {_security_state()}"
+    )
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -23,7 +77,11 @@ class Handler(socketserver.BaseRequestHandler):
             self.request.settimeout(30)
             try:
                 upstream.connect(SOCKET)
-                peers = {self.request: upstream, upstream: self.request}
+            except OSError as error:
+                self._report(error)
+                return
+            peers = {self.request: upstream, upstream: self.request}
+            try:
                 while peers:
                     ready, _, _ = select.select(list(peers), [], [], 30)
                     if not ready:
@@ -34,8 +92,15 @@ class Handler(socketserver.BaseRequestHandler):
                             peers[source].sendall(data)
                         else:
                             peers.pop(source).shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            except OSError as error:
+                self._report(error)
+
+    def _report(self, error):
+        if error.errno in BENIGN:
+            return
+        # Never the startup prefix: the host would report a proxy failure and
+        # hide the command's real exit status.
+        print(f"lunarwing-proxy-relay transport: {error}", file=sys.stderr)
 
 
 class Relay(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -60,12 +125,14 @@ class Relay(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main():
+    # Establish transport before starting the untrusted command. A missing
+    # socket, wrong image, or denied mount prevents the command from running.
     try:
-        # Establish transport before starting the untrusted command. A missing
-        # socket, wrong image, or denied mount prevents the command from running.
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-            probe.settimeout(5)
-            probe.connect(SOCKET)
+        _probe()
+    except OSError as error:
+        print(_startup_error(error), file=sys.stderr)
+        return 125
+    try:
         relay = Relay(("127.0.0.1", 3128), Handler)
     except OSError as error:
         print(f"lunarwing-proxy-relay: {error}", file=sys.stderr)
