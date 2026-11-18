@@ -44,8 +44,14 @@
 # one-token lookahead would be desynced by `auth --log-level DEBUG login
 # <url>`. Once `login` is seen, every remaining token is checked for an
 # http:/https: scheme (case-insensitively): the target is positional, so it
-# cannot hide behind a flag. The scan errs toward refusing: a `run` prompt
-# whose unquoted tokens happen to read `auth login <url>` is refused too.
+# cannot hide behind a flag. The check normalises each token the way
+# upstream's URL parser does before it matches the scheme — leading and
+# trailing C0 controls and space trimmed, tab, line feed and carriage return
+# dropped anywhere — so a leading space, tab or other control character, a
+# tab, LF or CR inside the scheme, and a trailing space are all refused too,
+# not only a token that starts with the bare scheme (WI#754). The scan errs
+# toward refusing: a `run` prompt whose unquoted tokens happen to read
+# `auth login <url>` is refused too.
 #
 # Everything else execs the real binary with its argv unchanged. Server-backed
 # commands can spawn that binary without passing through this wrapper;
@@ -98,8 +104,20 @@ is_loopback() {
   esac
 }
 
+# Upstream decides whether a target registers a well-known origin with a URL
+# parser (URL.canParse plus an http:/https: protocol test), and that parser
+# trims leading and trailing C0 controls and space and drops tab, line feed
+# and carriage return anywhere in its input. Reproduce that normalisation
+# first, so ` https://…`, `\thttps://…`, `\001https://…`, `ht\ttps://…` and a
+# trailing space cannot pass this wrapper while upstream still reads an
+# http(s) URL (WI#754).
+normalise_target() {
+  printf '%s' "$1" | tr -d '\011\012\015' |
+    sed -e 's/^[[:cntrl:] ]*//' -e 's/[[:cntrl:] ]*$//'
+}
+
 is_http_url() {
-  case "$1" in
+  case "$(normalise_target "$1")" in
     [Hh][Tt][Tt][Pp]:* | [Hh][Tt][Tt][Pp][Ss]:*) return 0 ;;
     *) return 1 ;;
   esac
