@@ -188,12 +188,13 @@ _lw_lstat_id() {
 
 # Describe why an existing lock directory is unsafe; print nothing when it is.
 _lw_lock_dir_refusal() {  # <dir> [expected-mode]
-  local dir="$1" want="${2:-700}" owner mode
+  local dir="$1" want="${2:-700}" owner mode rest
   [[ -e "$dir" || -L "$dir" ]] || return 0
   if [[ -L "$dir" ]]; then printf 'it is a symlink'; return 0; fi
   if [[ ! -d "$dir" ]]; then printf 'it is not a directory'; return 0; fi
-  mode="$(stat -c '%a' "$dir" 2>/dev/null || true)"
-  owner="$(stat -c '%u' "$dir" 2>/dev/null || true)"
+  rest="$(stat -c '%u:%a' "$dir" 2>/dev/null || true)"
+  owner="${rest%%:*}"
+  mode="${rest#*:}"
   if [[ "$mode" != "$want" ]]; then
     printf 'it has mode %s, not %s' "${mode:-unknown}" "$want"
     return 0

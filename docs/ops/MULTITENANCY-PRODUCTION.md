@@ -1011,7 +1011,7 @@ All container operations use the detected runtime — no Docker-specific command
 
 ## Build Serialization
 
-Only one tenant builds at a time, enforced by an flock on `/var/lock/lunarwing-build.lock`. This prevents OOM on memory-constrained hosts when multiple tenants need to compile Rust.
+Only one tenant builds at a time, enforced by an flock on `/run/lunarwing/mt-admin/build/lunarwing-build.lock` (WI#762: a root-created tree, not `/run/lock`, which Debian creates 1777). This prevents OOM on memory-constrained hosts when multiple tenants need to compile Rust.
 
 ```bash
 # Build one tenant
@@ -1275,7 +1275,7 @@ manager prints the line, the tenant header, and exits 0.
 
 ### Build fails with OOM
 
-- The flock on `/var/lock/lunarwing-build.lock` ensures only one tenant build at a time.
+- The flock on `/run/lunarwing/mt-admin/build/lunarwing-build.lock` (WI#762) ensures only one tenant build at a time.
 - Keep `LUNARWING_MT_PROFILE=release`; do not switch to a full debug build.
 - Set `LUNARWING_MT_BUILD_JOBS=6` or lower to cap tenant Cargo jobs, and increase swap if the host still runs out of memory.
 

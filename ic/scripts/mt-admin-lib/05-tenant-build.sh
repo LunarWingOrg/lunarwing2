@@ -905,7 +905,7 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
 # appending a file inside tenant-writable space follows tenant symlinks (WI#446
 # class), so the markers are kept root-owned alongside the build lock.
 _tenant_marker_dir() {
-  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin}/locks}"
 }
 
 tenant_build_stage_file() {
