@@ -882,6 +882,9 @@ main() {
       ;;
     add-tenant)
       require_root
+      # WI#762: own the root lock tree before this command creates the first
+      # tenant account, so no local account can ever pre-create a lock path.
+      lw_lock_tree_init
       local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home="" with_lunardepth="false" lunardepth_model="" lunardepth_base_url="" lunardepth_api_key="" lunardepth_allow_insecure="false" lunardepth_allow_placeholder="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in

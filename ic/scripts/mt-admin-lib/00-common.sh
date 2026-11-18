@@ -240,6 +240,11 @@ _lw_lock_dir_prepare() {  # <dir> [expected-mode]
   if [[ ! -e "$dir" && ! -L "$dir" ]]; then
     _lw_lock_parent_chain_safe "$dir" \
       || die "unsafe lock directory $dir: a parent is a symlink or writable by another account; move the lock path under ${LUNARWING_MT_LOCK_ROOT:-/run/lunarwing/mt-admin} or fix the parent"
+    # After a reboot /run is empty; recreate the missing parts of the root tree
+    # (0755 root) so the leaf can be made. Each level is checked the same way.
+    if [[ "$dir" != / && ! -d "$(dirname "$dir")" ]]; then
+      _lw_lock_dir_prepare "$(dirname "$dir")" 755
+    fi
     prev_umask="$(umask)"
     umask 077
     if ! mkdir -- "$dir" 2>/dev/null; then
@@ -373,7 +378,13 @@ inherited_lock_fd_is_held() {
     && -f "$lock_file" && ! -L "$lock_file" \
     && "$(stat -Lc '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
       == "$(stat -c '%d:%i' "$lock_file" 2>/dev/null)" ]] || return 1
-  exec {probe_fd}>"$lock_file" || return 1
+  # WI#762: `<>` never truncates and the identity check refuses a link that
+  # replaced the file after the pre-check above.
+  exec {probe_fd}<>"$lock_file" || return 1
+  if [[ -n "$(_lw_lock_file_refusal "$probe_fd" "$lock_file")" ]]; then
+    eval "exec $probe_fd>&-"
+    return 1
+  fi
   if flock -x -n "$probe_fd"; then
     flock -u "$probe_fd" || true
     exec {probe_fd}>&-

@@ -374,6 +374,122 @@ else
   fail "env-exec keeps fds that do not point into a lock directory (rc=$unrelated_rc out='$unrelated_out')"
 fi
 
+# ── 8. WI#762: a lock directory another account made first is refused ───────
+# A harness cannot be another account, so simulate the pre-made directory with
+# the wrong mode (0755 instead of 0700). Nothing outside it may change, and the
+# refusal must be one line naming the directory and the way out.
+foreign_dir="$fixture_dir/w762-foreign-locks"
+mkdir -m 755 "$foreign_dir"
+sentinel="$fixture_dir/w762-outside-sentinel"
+printf 'untouched\n' >"$sentinel"
+foreign_rc=0
+foreign_out="$( (TENANT_LIFECYCLE_LOCK_DIR="$foreign_dir"; with_tenant_lifecycle_lock alice true) 2>&1 )" \
+  || foreign_rc=$?
+if [[ "$foreign_rc" -eq 0 ]]; then
+  fail "a pre-made lifecycle lock directory with the wrong mode is refused"
+else
+  pass "a pre-made lifecycle lock directory with the wrong mode is refused"
+fi
+assert "the refusal names the lock directory" bash -c '[[ "$1" == *"$2"* ]]' _ "$foreign_out" "$foreign_dir"
+assert "the refusal names the way out" bash -c '[[ "$1" == *"rm -rf"* ]]' _ "$foreign_out"
+assert "the refusal is one line" bash -c '[[ "$(printf "%s\n" "$1" | wc -l)" -eq 1 ]]' _ "$foreign_out"
+assert "the refusal changes nothing outside the directory" \
+  test "$(cat "$sentinel")" = untouched
+assert "the foreign directory keeps its mode" test "$(stat -c '%a' "$foreign_dir")" = 755
+
+# ── 9. WI#762: a link in place of <tenant>.lock is refused, not followed ────
+link_dir="$fixture_dir/w762-link-locks"
+mkdir -m 700 "$link_dir"
+link_target="$fixture_dir/w762-root-owned-outside"
+printf 'must-survive\n' >"$link_target"
+ln -s "$link_target" "$link_dir/alice.lock"
+link_rc=0
+link_out="$( (TENANT_LIFECYCLE_LOCK_DIR="$link_dir"; with_tenant_lifecycle_lock alice true) 2>&1 )" \
+  || link_rc=$?
+if [[ "$link_rc" -eq 0 ]]; then
+  fail "a link in place of the lifecycle lock file is refused"
+else
+  pass "a link in place of the lifecycle lock file is refused"
+fi
+assert "the link refusal names the lock file" bash -c '[[ "$1" == *"alice.lock"* ]]' _ "$link_out"
+assert "the link target is not truncated" test "$(cat "$link_target")" = must-survive
+assert "the link is still a link" test -L "$link_dir/alice.lock"
+
+# ── 10. WI#762: the build lock and its .upgrade siblings have the same shape ─
+# The build lock sits in a root-only directory now, but an override still goes
+# through the same checks: a foreign directory and a planted link both refuse.
+build_dir="$fixture_dir/w762-build"
+mkdir -m 700 "$build_dir"
+build_target="$fixture_dir/w762-build-outside"
+printf 'build-target\n' >"$build_target"
+ln -s "$build_target" "$build_dir/lunarwing-build.lock"
+ln -s "$build_target" "$build_dir/lunarwing-build.lock.alice.upgrade"
+for build_case in "$build_dir/lunarwing-build.lock" "$build_dir/lunarwing-build.lock.alice.upgrade"; do
+  build_rc=0
+  build_out="$( (_lock_held_preflight "candidate build for 'alice'" "$build_case") 2>&1 )" || build_rc=$?
+  if [[ "$build_rc" -eq 0 ]]; then
+    fail "a link in place of $build_case is refused"
+  else
+    pass "a link in place of $build_case is refused"
+  fi
+  assert "the build-lock refusal names $build_case" \
+    bash -c '[[ "$1" == *"$2"* ]]' _ "$build_out" "$build_case"
+done
+assert "the build-lock target is not truncated" test "$(cat "$build_target")" = build-target
+
+build_foreign="$fixture_dir/w762-build-foreign"
+mkdir -m 755 "$build_foreign"
+build_foreign_rc=0
+build_foreign_out="$( (_lock_held_preflight "candidate build for 'alice'" "$build_foreign/lunarwing-build.lock") 2>&1 )" \
+  || build_foreign_rc=$?
+if [[ "$build_foreign_rc" -eq 0 ]]; then
+  fail "a pre-made build lock directory with the wrong mode is refused"
+else
+  pass "a pre-made build lock directory with the wrong mode is refused"
+fi
+assert "the build-lock directory refusal names it" \
+  bash -c '[[ "$1" == *"$2"* ]]' _ "$build_foreign_out" "$build_foreign"
+
+# ── 11. WI#762: the DarkIRC writer lock file has the same shape ─────────────
+dk_dir="$fixture_dir/w762-darkirc"
+mkdir -m 700 "$dk_dir"
+dk_scope="0123456789abcdef0123456789abcdef"
+dk_target="$fixture_dir/w762-dk-outside"
+printf 'dk-target\n' >"$dk_target"
+ln -s "$dk_target" "$dk_dir/$dk_scope.lock"
+dk_rc=0
+dk_out="$( (_lw_lock_open_fd "$dk_dir/$dk_scope.lock" dk_fd) 2>&1 )" || dk_rc=$?
+if [[ "$dk_rc" -eq 0 ]]; then
+  fail "a link in place of the DarkIRC writer lock file is refused"
+else
+  pass "a link in place of the DarkIRC writer lock file is refused"
+fi
+assert "the DarkIRC lock refusal names the lock file" \
+  bash -c '[[ "$1" == *"$2"* ]]' _ "$dk_out" "$dk_scope.lock"
+assert "the DarkIRC lock target is not truncated" test "$(cat "$dk_target")" = dk-target
+
+dk_foreign="$fixture_dir/w762-darkirc-foreign"
+mkdir -m 755 "$dk_foreign"
+dk_foreign_rc=0
+dk_foreign_out="$( (_lw_lock_open_fd "$dk_foreign/$dk_scope.lock" dk_fd) 2>&1 )" || dk_foreign_rc=$?
+if [[ "$dk_foreign_rc" -eq 0 ]]; then
+  fail "a pre-made DarkIRC lock directory with the wrong mode is refused"
+else
+  pass "a pre-made DarkIRC lock directory with the wrong mode is refused"
+fi
+
+# ── 12. WI#762: the root lock tree helper creates root-only leaves ─────────
+tree_root="$fixture_dir/w762-tree/root"
+( LUNARWING_MT_LOCK_ROOT="$tree_root"; lw_lock_tree_init ) || fail "lock tree init succeeds"
+( LUNARWING_MT_LOCK_ROOT="$tree_root"; lw_lock_tree_init ) || fail "lock tree init is idempotent"
+assert "lock tree parent is 0755" test "$(stat -c '%a' "$tree_root")" = 755
+for tree_leaf in locks build darkirc; do
+  assert "lock tree leaf $tree_leaf is 0700" test "$(stat -c '%a' "$tree_root/$tree_leaf")" = 700
+done
+tree_probe_out="$( _lw_lock_open_fd "$tree_root/locks/tree-probe.lock" tree_probe_fd \
+  && stat -c '%a' "$tree_root/locks/tree-probe.lock" )" || tree_probe_out=""
+assert "a lock opened in the tree is 0600" test "$tree_probe_out" = 600
+
 printf '\n'
 if [[ "$failures" -eq 0 ]]; then
   printf 'ALL TESTS PASSED (%s skipped)\n' "$skips"
