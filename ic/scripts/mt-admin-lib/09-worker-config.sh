@@ -249,18 +249,20 @@ start_worker_task_container() {
 }
 
 stop_worker_task_container() {
-  local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false
+  local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false manager_ok=true
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
-  # WI#731: a dead tenant user manager has nothing loaded or running in the
-  # tenant's slice, and its bus cannot answer LoadState. The verb already
-  # printed the one line naming the manager; skip instead of failing the stop.
+  # WI#758 (AFK-1): a dead tenant user manager owns no running unit, and its
+  # bus cannot answer LoadState — but only the *unit* half depends on that.
+  # A container the manager did not start (MT_ROOTLESS=false: Docker or
+  # rootful podman, `--restart unless-stopped`) outlives it and must still be
+  # stopped. Skip the Quadlet stop alone; the runtime stop below decides.
   if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
-    return 0
+    manager_ok=false
   fi
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
     _openrc_stop_worker_nondestructive "$task_container"
-  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" && "$manager_ok" == "true" ]] \
       && podman_supports_quadlet; then
     load_state="$(_systemctl_user "$name" show --value -p LoadState "${task_container}.service" 2>/dev/null)" \
       || return 1
@@ -3185,15 +3187,17 @@ stop_worker() {
     return 0
   fi
 
-  # WI#731: with the tenant's user manager dead there is no bus and no unit
-  # left to stop; the manager's death already took its slice down with it, and
-  # the verb's leading gate printed the one line. Do not fall through to
-  # container stops that fail on a dead rootless store.
+  # WI#758 (AFK-1): a dead user manager owns no running unit, so the Unit half
+  # of the stop below has nothing to do and no bus to ask. Only that half is
+  # skipped: with MT_ROOTLESS=false (Docker or rootful podman) the container
+  # was started by the system runtime and outlives the manager, so the runtime
+  # stop still has to happen.
+  local manager_ok=true
   if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
-    return 0
+    manager_ok=false
   fi
 
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" && "$manager_ok" == "true" ]] \
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
       || _ctr "$name" stop "$container" >/dev/null 2>&1 \
