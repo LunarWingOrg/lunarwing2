@@ -209,6 +209,9 @@ for command in render-units stop-tenant; do
       require_root() { :; }
       # shellcheck disable=SC2034  # read by with_tenant_lifecycle_lock
       TENANT_LIFECYCLE_LOCK_DIR="$lock_dir"
+      # The lifecycle lock runs its command with errexit off; the refusal must
+      # end the process regardless of the caller's errexit state.
+      set +e
       LUNARWING_SERVICE_MANAGER="$asked" main "$command" probe
     ) >"$fixture/$command-$asked.log" 2>&1 || rc=$?
     assert_nonzero "$command refuses a $asked override on a $host host" "$rc"
