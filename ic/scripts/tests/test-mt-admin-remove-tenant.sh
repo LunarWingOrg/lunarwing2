@@ -2,6 +2,9 @@
 # WI#638, WI#650, WI#672, WI#688, WI#699 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
+# Let the case-naming ERR trap below follow the harness into its functions and
+# subshells (WI#764).
+set -E
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
@@ -23,6 +26,20 @@ UNIT_LANES=(nanocode pebble opencode opencode2 lunardepth kimi vision voice)
 
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
+# WI#764: a case that dies in its own fixture names itself, so the run reads as
+# a failure of that case instead of a bare `ln` error from a leftover path.
+CASE_LABEL=""
+case_fixture_abort() {
+  local status="$1" line="$2"
+  [[ -n "$CASE_LABEL" ]] || return 0
+  # Bash clears errexit while an ERR trap runs, but SHELLOPTS still records
+  # whether it was live for the failed command. A step that mt-admin runs
+  # under `set +e` and handles itself is not an abort, so it stays quiet.
+  [[ ":$SHELLOPTS:" == *:errexit:* ]] || return 0
+  printf 'FAIL: case %s (dir %s) aborted in a fixture step (status %s, line %s): %s\n' \
+    "$CASE_LABEL" "${CASE_DIR:-<none>}" "$status" "$line" "$BASH_COMMAND" >&2
+}
+trap 'case_fixture_abort "$?" "$LINENO"' ERR
 assert_true() {
   if [[ "$1" == true ]]; then pass "$2"; else fail "$2"; fi
 }
