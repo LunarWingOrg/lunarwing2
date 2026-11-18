@@ -125,6 +125,16 @@ id() {
   command id "$@"
 }
 
+loginctl() {
+  # Every real mt-admin tenant is lingering; a non-lingering account is not
+  # this failure mode and the probe must stay silent for it.
+  if [[ "${1:-}" == show-user ]]; then
+    printf '%s\n' "${LINGER_VALUE:-yes}"
+    return 0
+  fi
+  return 1
+}
+
 _systemctl_user_raw() {
   local name="$1"
   shift
@@ -292,7 +302,18 @@ BUS_UP=true
 capture tenant_writers_active "$TENANT"
 assert_eq "healthy manager: an active writer unit is still detected" "$CAPTURED_RC" "0"
 
-# --- 9. healthy manager is unchanged --------------------------------------
+# --- 9. a non-lingering account is never declared dead --------------------
+
+reset_gate
+USER_MANAGER_STATE=inactive
+BUS_UP=false
+LINGER_VALUE=no
+capture _tenant_user_manager_gate "$TENANT" report
+assert_eq "non-lingering tenant passes the gate" "$CAPTURED_RC" "0"
+assert_eq "non-lingering tenant prints nothing" "$CAPTURED_OUT" ""
+LINGER_VALUE=yes
+
+# --- 10. healthy manager is unchanged -------------------------------------
 
 reset_gate
 USER_MANAGER_STATE=active
