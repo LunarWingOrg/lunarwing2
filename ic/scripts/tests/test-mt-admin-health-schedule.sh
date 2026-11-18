@@ -392,6 +392,67 @@ assert_contains "schedule refused: the closing line says the schedule is not ins
 assert_not_contains "schedule refused: the closing line does not call the schedule installed" \
   "$PIPELINE_OUTPUT" "files and schedule are installed"
 
+# ── OpenRC: no cron daemon init script at all (WI#765) ─────────────────────
+# The schedule is written either way, but with no cron init script nothing
+# ever runs it: that must not be reported as a ready pipeline. The crontab
+# cases above neutralize _ensure_cron_runlevel, so the real probe is loaded
+# back from the module. OPENRC_INITD_DIR is the host override the composition
+# root already carries; an empty directory stands in for a host with none of
+# the daemons installed.
+# shellcheck source=../mt-admin-lib/12-health-pipeline.sh
+source "$TEST_DIR/../mt-admin-lib/12-health-pipeline.sh"
+
+NO_CRON_INITD="$fixture/no-cron-initd"
+mkdir -p -- "$NO_CRON_INITD"
+
+status=0
+output="$(OPENRC_INITD_DIR="$NO_CRON_INITD" _ensure_cron_runlevel 2>&1)" || status=$?
+assert_eq "no cron daemon: the probe fails" "1" "$status"
+assert_contains "no cron daemon: the reason is printed" "$output" "no cron daemon init script found"
+assert_not_contains "no cron daemon: nothing is reported enabled" "$output" "enabled + running"
+
+# The installer still installs the block, but its status is 2, not 0: the
+# schedule is in place and the daemon that would run it is in doubt.
+printf '%s\n' "$job_before" >"$CRONTAB_STATE"
+run_blocked_install "OPENRC_INITD_DIR='$NO_CRON_INITD'"
+assert_eq "no cron daemon: the installer's status puts the daemon in doubt" "2" "$BLOCKED_INSTALL_STATUS"
+printf '%s\n' "$job_before" "$begin" "*/15 * * * * $HEALTH_LAUNCHER" "$end" >"$fixture/expected"
+assert_same_file "no cron daemon: the crontab holds the block" "$fixture/expected" "$CRONTAB_STATE"
+assert_contains "no cron daemon: the installer names the cron service" "$BLOCKED_INSTALL_OUTPUT" \
+  "the cron service could not be enabled and started"
+
+# …and ensure_health_pipeline must not call that a ready pipeline.
+run_health_pipeline "OPENRC_INITD_DIR='$NO_CRON_INITD'"
+assert_eq "no cron daemon: the pipeline install still completes" "0" "$PIPELINE_STATUS"
+assert_contains "no cron daemon: the closing line says the schedule may not run" "$PIPELINE_OUTPUT" \
+  "files and schedule are installed, but the schedule may NOT be running"
+assert_not_contains "no cron daemon: not reported as ready" "$PIPELINE_OUTPUT" "health pipeline ready"
+
+# A daemon that is present is still enabled, started, and reported ready.
+CRON_INITD="$fixture/cron-initd"
+mkdir -p -- "$CRON_INITD"
+printf '#!/bin/sh\n' >"$CRON_INITD/cronie"
+chmod 0755 "$CRON_INITD/cronie"
+RC_LOG="$fixture/rc.log"
+: >"$RC_LOG"
+status=0
+output="$(
+  (
+    _openrc_update() { printf 'update %s\n' "$*" >>"$RC_LOG"; }
+    _openrc_service() { printf 'service %s\n' "$*" >>"$RC_LOG"; }
+    OPENRC_INITD_DIR="$CRON_INITD" _ensure_cron_runlevel
+  ) 2>&1
+)" || status=$?
+assert_eq "cron daemon present: the probe succeeds" "0" "$status"
+assert_contains "cron daemon present: reported enabled + running" "$output" "cron daemon 'cronie' enabled + running"
+assert_eq "cron daemon present: enabled at boot" "1" "$(grep -cFx 'update add cronie default' "$RC_LOG")"
+assert_eq "cron daemon present: started" "1" "$(grep -cFx 'service cronie start' "$RC_LOG")"
+
+printf '%s\n' "$job_before" >"$CRONTAB_STATE"
+run_health_pipeline "OPENRC_INITD_DIR='$CRON_INITD'; _openrc_update() { :; }; _openrc_service() { :; }"
+assert_eq "cron daemon present: the pipeline install succeeds" "0" "$PIPELINE_STATUS"
+assert_contains "cron daemon present: the pipeline is reported ready" "$PIPELINE_OUTPUT" "health pipeline ready"
+
 # ── systemd: the unit pair ──────────────────────────────────────────────────
 
 sd="$fixture/systemd"
