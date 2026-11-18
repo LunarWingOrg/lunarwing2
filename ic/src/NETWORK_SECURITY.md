@@ -438,7 +438,10 @@ public-only validating proxy:
   what maps to `sandbox:proxy_error`. Mid-run transport failures use
   `lunarwing-proxy-relay transport: …` so they are attributable without hiding
   a command's exit status. To confirm an SELinux denial on a Fedora host:
-  `ausearch -m AVC,USER_AVC -ts recent | grep -E 'connectto|proxy.sock'`.
+  `ausearch -m AVC,USER_AVC -ts recent | grep -E 'connectto|proxy.sock'`, or run
+  `scripts/lunarwing-sandbox-proxy-diag.sh <tenant> [--watch]` as root for the
+  SELinux mode, the tenant's relay mode, the live socket's mode and type, and
+  the denial line itself.
 - destination policy: the proxy rejects non-public destinations (private,
   loopback, link-local, multicast, CGNAT, and IPv4-mapped forms) and pins DNS
   to the resolved public addresses for both HTTP forwarding and CONNECT.
