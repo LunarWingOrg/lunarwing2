@@ -243,10 +243,15 @@ BUS_UP=false
 tenant_exists_in_registry() { return 0; }
 ports_get() { printf '10000\n'; }
 ensure_container_runtime() {
+  # shellcheck disable=SC2034  # Consumed by the sourced mt-admin functions.
   CONTAINER_RT=podman
+  # shellcheck disable=SC2034  # Consumed by the sourced mt-admin functions.
   MT_ROOTLESS=false
 }
-ensure_init_system() { INIT_SYSTEM=systemd; }
+ensure_init_system() {
+  # shellcheck disable=SC2034  # Consumed by the sourced mt-admin functions.
+  INIT_SYSTEM=systemd
+}
 podman_supports_quadlet() { return 1; }
 _ctr_inspect() { return 1; }
 _ctr() { return 1; }
