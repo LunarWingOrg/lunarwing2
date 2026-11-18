@@ -21,8 +21,12 @@
 
 # ── Init system detection ────────────────────────────────────────────────────
 
-# PID-1 artifacts that name the host's real service manager. Harness tests may
-# point these at fixtures; production always reads the /run paths.
+# PID-1 artifacts that name the host's real service manager. The two
+# LUNARWING_MT_*_MARKER variables are a documented test-only seam (named in
+# --help and docs/ops/MULTITENANCY-PRODUCTION.md): they replace the /run path
+# the probe reads, which also changes which manager counts as the host's, so
+# setting either switches off the refusal of a contradicting
+# LUNARWING_SERVICE_MANAGER for that manager. Never set them outside a test.
 OPENRC_HOST_MARKER="${LUNARWING_MT_OPENRC_MARKER:-/run/openrc/softlevel}"
 SYSTEMD_HOST_MARKER="${LUNARWING_MT_SYSTEMD_MARKER:-/run/systemd/system}"
 
@@ -43,26 +47,20 @@ _manager_probe_path() {
   esac
 }
 
-# True when the port registry holds a tenant whose units are installed under
-# <manager>. Only the forcing switch consults this: forcing a manager must not
-# be available on a host whose registered tenants are managed by the other one
-# (WI#730 — the health pipeline would silently stop checking them).
-_registered_tenants_under_manager() {
-  local manager="$1" registry="${PORTS_REGISTRY:-}" name tenants
+# True when the port registry holds any tenant at all. Only the forcing switch
+# consults this: forcing a manager must not be available on a host that runs
+# another manager (WI#730 — the health pipeline would silently stop checking
+# its tenants). A registry entry alone counts, with no unit-file check: a
+# failed add-tenant can leave an entry without a unit, and that shape must not
+# unlock the switch (WI#757 AFI-6).
+_host_has_registered_tenants() {
+  local registry="${PORTS_REGISTRY:-}" name tenants
   [[ -n "$registry" && -f "$registry" ]] || return 1
   # Fail closed: an unreadable registry is treated as tenants present, so a
   # broken jq can never unlock the forcing switch.
   tenants="$(jq -r '.tenants | keys[]?' "$registry" 2>/dev/null)" || return 0
   while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    case "$manager" in
-      systemd)
-        [[ -e "$(tenant_home "$name")/.config/systemd/user/lunarwing-${name}.service" ]] && return 0
-        ;;
-      openrc)
-        [[ -e "$OPENRC_INITD_DIR/lunarwing-${name}" ]] && return 0
-        ;;
-    esac
+    [[ -n "$name" ]] && return 0
   done <<< "$tenants"
   return 1
 }
@@ -91,9 +89,9 @@ detect_init_system() {
     detected="$(probe_host_service_manager)"
     if [[ -n "$detected" && "$detected" != "$wanted" ]]; then
       if [[ "${LUNARWING_SERVICE_MANAGER_FORCE:-}" != "1" ]]; then
-        die "LUNARWING_SERVICE_MANAGER=$override asks for $wanted, but this host runs $detected ($(_manager_probe_path "$detected") exists); refusing to write $wanted units on a $detected host. Unset LUNARWING_SERVICE_MANAGER, or set LUNARWING_SERVICE_MANAGER_FORCE=1 only for an image build or chroot"
+        die "LUNARWING_SERVICE_MANAGER=$override asks for $wanted, but this host runs $detected ($(_manager_probe_path "$detected") exists); refusing to write $wanted units on a host that runs $detected. Unset LUNARWING_SERVICE_MANAGER, or set LUNARWING_SERVICE_MANAGER_FORCE=1 only for an image build or chroot"
       fi
-      if _registered_tenants_under_manager "$detected"; then
+      if _host_has_registered_tenants; then
         die "LUNARWING_SERVICE_MANAGER_FORCE=1 cannot force $wanted on this $detected host: it already has tenants registered under $detected, and forcing $wanted would drop them from the health pipeline's unit checks"
       fi
       say "WARNING: LUNARWING_SERVICE_MANAGER_FORCE=1 forcing $wanted on a $detected host (image build/chroot); the health pipeline will keep recording $detected" >&2
