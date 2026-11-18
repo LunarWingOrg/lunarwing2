@@ -1098,7 +1098,8 @@ add-tenants <names> [options]    Apply the same options to comma-separated names
   --no-weechat-bootstrap         Skip relay auto-bootstrap
 
 remove-tenant <name>             Stop services and deallocate ports
-  --purge                        Also delete the OS user and home
+  --purge                        Also delete the OS user and home, including a
+                                 former home left by an already-gone account
 
 build-tenant <name>              Build one tenant (flock-serialized)
 build-all                        Build registered tenants sequentially

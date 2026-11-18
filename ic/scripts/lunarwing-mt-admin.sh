@@ -386,7 +386,9 @@ Commands:
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
-    --purge                        Also delete OS user and home directory
+    --purge                        Also delete OS user and home directory,
+                                   including a former home left behind by an
+                                   account that is already gone
 
   build-tenant <name>             Build binaries for one tenant (OOM-safe flock)
     --with-wasm                    Also build WASM extensions
