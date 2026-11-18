@@ -234,17 +234,24 @@ fn write_selinux_context(path: &Path, context: &str) -> bool {
     }
 }
 
-/// Replace the type field of a context, keeping user, role and level.
+/// Split `user:role:type:level` into its four fields.
 #[cfg(target_os = "linux")]
-fn with_container_file_type(context: &str) -> Option<String> {
+fn context_fields(context: &str) -> Option<(&str, &str, &str, &str)> {
     let mut fields = context.splitn(4, ':');
     let user = fields.next()?;
     let role = fields.next()?;
-    let _type = fields.next()?;
+    let kind = fields.next()?;
     let level = fields.next()?;
-    if user.is_empty() || role.is_empty() || level.is_empty() {
+    if user.is_empty() || role.is_empty() || kind.is_empty() || level.is_empty() {
         return None;
     }
+    Some((user, role, kind, level))
+}
+
+/// Replace the type field of a context, keeping user, role and level.
+#[cfg(target_os = "linux")]
+fn with_container_file_type(context: &str) -> Option<String> {
+    let (user, role, _kind, level) = context_fields(context)?;
     Some(format!("{user}:{role}:container_file_t:{level}"))
 }
 
@@ -255,8 +262,29 @@ fn level_is_category_free(level: &str) -> bool {
     matches!(level, "s0" | "s0-s0")
 }
 
-/// Give the relay nodes the shared container type so `connect()` does not
-/// depend on the engine relabeling a socket it may treat as already labelled.
+/// Give one relay node the shared container type, then prove it by read-back.
+///
+/// A write the policy refuses, or a label that reads back different, must not
+/// be trusted: an unverified label means the mount keeps the engine relabel.
+#[cfg(target_os = "linux")]
+fn label_node(path: &Path) -> bool {
+    let Some(updated) = selinux_context(path)
+        .as_deref()
+        .and_then(with_container_file_type)
+    else {
+        return false;
+    };
+    if !write_selinux_context(path, &updated) {
+        return false;
+    }
+    match selinux_context(path).as_deref().and_then(context_fields) {
+        Some((_, _, kind, level)) => kind == "container_file_t" && level_is_category_free(level),
+        None => false,
+    }
+}
+
+/// Make the relay reachable from the confined container without depending on
+/// the engine's relabel of a socket it may treat as already labelled.
 ///
 /// `true` only when a read-back proves both nodes carry `container_file_t`
 /// with a category-free level. Any failure leaves the caller on the engine's
@@ -266,30 +294,15 @@ fn label_for_containers(channel: &Path, socket: &Path) -> bool {
     if !selinux_enforcing() {
         return false;
     }
-    for path in [channel, socket] {
-        let Some(current) = selinux_context(path) else {
-            return false;
-        };
-        let Some(updated) = with_container_file_type(&current) else {
-            return false;
-        };
-        if !write_selinux_context(path, &updated) {
-            return false;
-        }
-        let Some(verified) = selinux_context(path) else {
-            return false;
-        };
-        let mut fields = verified.splitn(4, ':');
-        let (Some(_user), Some(_role), Some(kind), Some(level)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return false;
-        };
-        if kind != "container_file_t" || !level_is_category_free(level) {
-            return false;
-        }
+    let ready = label_node(channel) && label_node(socket);
+    if !ready {
+        tracing::warn!(
+            channel = %channel.display(),
+            "the relay socket has no verified container-readable SELinux label; \
+             leaving the mount on the engine's :z relabel"
+        );
     }
-    true
+    ready
 }
 
 impl Drop for ProxyRelay {
