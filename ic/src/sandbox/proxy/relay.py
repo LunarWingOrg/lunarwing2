@@ -21,14 +21,9 @@ import socketserver
 import subprocess
 import sys
 import threading
-import time
 
 SOCKET = "/run/lunarwing-proxy/proxy.sock"
 MOUNT = "/run/lunarwing-proxy"
-# A just-started container can race the host-side relabel of the mount; a
-# short retry turns that into a success instead of a dead execution.
-START_ATTEMPTS = 3
-START_RETRY_SECONDS = 0.2
 # Client disconnects are routine; only genuine transport failures are logged.
 BENIGN = frozenset((errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF))
 
@@ -129,25 +124,12 @@ class Relay(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self.slots.release()
 
 
-def _connect_probe():
-    """Probe the transport, retrying the mount/relabel race at container start."""
-    error = None
-    for attempt in range(START_ATTEMPTS):
-        try:
-            _probe()
-            return None
-        except OSError as current:
-            error = current
-            if attempt + 1 < START_ATTEMPTS:
-                time.sleep(START_RETRY_SECONDS)
-    return error
-
-
 def main():
     # Establish transport before starting the untrusted command. A missing
     # socket, wrong image, or denied mount prevents the command from running.
-    error = _connect_probe()
-    if error is not None:
+    try:
+        _probe()
+    except OSError as error:
         print(_startup_error(error), file=sys.stderr)
         return 125
     try:

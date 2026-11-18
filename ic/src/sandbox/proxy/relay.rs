@@ -20,17 +20,11 @@
 //!
 //! # SELinux (WI#641)
 //!
-//! A socket the host created is only reachable from the confined container
-//! when its inode carries a type the container domain can `connectto` — in
-//! practice `container_file_t` — and a level no container's MCS pair has to
-//! dominate. The engine's `:z` relabel produces exactly that, but a relabel
-//! the engine skips or cannot apply leaves the socket at its host type and
-//! every `connect()` fails with `EACCES`, which is what the tenant saw. When
-//! SELinux is enforcing we therefore try to set the type ourselves and verify
-//! it by read-back; only a verified label lets the caller drop `:z` (a second
-//! relabel would pin the socket to one container's category pair). Every
-//! failure path keeps `:z`, so non-SELinux hosts and unprivileged daemons
-//! behave exactly as before.
+//! The runtime applies the shared `:z` label to the channel and socket inode.
+//! Inode permissions (`sock_file`) and permission to reach the listening
+//! socket (`unix_stream_socket connectto`) are separate SELinux checks. An
+//! inode relabel does not change the listening socket's context. The cause of
+//! the reported `EACCES` needs host audit evidence; do not change policy here.
 
 use std::path::{Path, PathBuf};
 
@@ -39,16 +33,13 @@ use crate::sandbox::error::{Result, SandboxError};
 pub(crate) struct ProxyRelay {
     _directory: tempfile::TempDir,
     channel: PathBuf,
-    /// Set when [`relay_setup`] proved that the mounted nodes already carry a
-    /// container-readable SELinux type and category-free level.
-    container_label_ready: bool,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ProxyRelay {
     #[cfg(target_os = "linux")]
     pub async fn start(port: u16) -> Result<Self> {
-        let (directory, channel, listener, container_label_ready) =
+        let (directory, channel, listener) =
             relay_setup().map_err(|e| SandboxError::ProxyError {
                 reason: format!("cannot create isolated proxy transport: {e}"),
             })?;
@@ -72,7 +63,6 @@ impl ProxyRelay {
         Ok(Self {
             _directory: directory,
             channel,
-            container_label_ready,
             task,
         })
     }
@@ -87,15 +77,6 @@ impl ProxyRelay {
     pub fn path(&self) -> &Path {
         // The parent directory is retained until the execution supervisor ends.
         &self.channel
-    }
-
-    /// Whether the bind mount must still ask the container engine for `:z`.
-    ///
-    /// `false` only when the relay directory already carries a verified
-    /// container-readable SELinux label, where a second relabel would replace
-    /// it with one container's MCS pair and lock every other execution out.
-    pub fn mount_relabel(&self) -> bool {
-        !self.container_label_ready
     }
 }
 
@@ -114,7 +95,7 @@ fn at_path(context: &str, path: &Path, error: std::io::Error) -> std::io::Error 
 /// keep-id user and a Docker-spawned UID can both traverse it), and a
 /// world-connectable socket inside it.
 #[cfg(target_os = "linux")]
-fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::UnixListener, bool)> {
+fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::UnixListener)> {
     use std::os::unix::fs::PermissionsExt;
 
     let base = relay_parent_dir()?;
@@ -136,18 +117,15 @@ fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::Uni
         .map_err(|error| at_path("cannot bind relay socket", &socket, error))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
         .map_err(|error| at_path("cannot set relay socket mode", &socket, error))?;
-    // A container-side connect failure is a labelling or DAC problem, not a
-    // missing socket — never connect from the host to prove the socket exists,
-    // because that would queue a client the accept loop then proxies.
-    let container_label_ready = label_for_containers(&channel, &socket);
+    // A host connect would queue an upstream client without testing the
+    // container's mount, UID mapping or security context.
     tracing::debug!(
         socket = %socket.display(),
         channel_mode = %format!("{:04o}", mode_of(&channel)),
         socket_mode = %format!("{:04o}", mode_of(&socket)),
-        container_label_ready = container_label_ready,
         "proxy relay ready"
     );
-    Ok((directory, channel, listener, container_label_ready))
+    Ok((directory, channel, listener))
 }
 
 #[cfg(target_os = "linux")]
@@ -180,136 +158,6 @@ pub(crate) fn relay_parent_dir() -> std::io::Result<PathBuf> {
         }
     }
     Ok(std::env::temp_dir())
-}
-
-/// Is SELinux enforcing on this host? Absent `/sys/fs/selinux` means no.
-#[cfg(target_os = "linux")]
-fn selinux_enforcing() -> bool {
-    std::fs::read_to_string("/sys/fs/selinux/enforce")
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
-}
-
-/// The `security.selinux` context of one node, or `None` when unlabelled.
-#[cfg(target_os = "linux")]
-fn selinux_context(path: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut buffer = [0u8; 256];
-    // SAFETY: the path and attribute name are valid NUL-terminated strings,
-    // and the buffer pointer/length describe the same live allocation.
-    let read = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            c"security.selinux".as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
-    if read <= 0 {
-        return None;
-    }
-    let bytes = &buffer[..read as usize];
-    let text = std::str::from_utf8(bytes).ok()?.trim_end_matches('\0');
-    Some(text.to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn write_selinux_context(path: &Path, context: &str) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let Ok(value) = std::ffi::CString::new(context) else {
-        return false;
-    };
-    // SAFETY: both pointers are valid NUL-terminated strings for the call and
-    // the size excludes the terminator.
-    unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            c"security.selinux".as_ptr(),
-            value.as_ptr().cast(),
-            value.as_bytes().len(),
-            0,
-        ) == 0
-    }
-}
-
-/// Split `user:role:type:level` into its four fields.
-#[cfg(target_os = "linux")]
-fn context_fields(context: &str) -> Option<(&str, &str, &str, &str)> {
-    let mut fields = context.splitn(4, ':');
-    let user = fields.next()?;
-    let role = fields.next()?;
-    let kind = fields.next()?;
-    let level = fields.next()?;
-    if user.is_empty() || role.is_empty() || kind.is_empty() || level.is_empty() {
-        return None;
-    }
-    Some((user, role, kind, level))
-}
-
-/// Replace the type field of a context, keeping user, role and level.
-#[cfg(target_os = "linux")]
-fn with_container_file_type(context: &str) -> Option<String> {
-    let (user, role, _kind, level) = context_fields(context)?;
-    Some(format!("{user}:{role}:container_file_t:{level}"))
-}
-
-/// Labels every container's MCS pair dominates. A category-carrying level is
-/// only reachable from one container, so it must not count as ready.
-#[cfg(target_os = "linux")]
-fn level_is_category_free(level: &str) -> bool {
-    matches!(level, "s0" | "s0-s0")
-}
-
-/// Give one relay node the shared container type, then prove it by read-back.
-///
-/// A write the policy refuses, or a label that reads back different, must not
-/// be trusted: an unverified label means the mount keeps the engine relabel.
-#[cfg(target_os = "linux")]
-fn label_node(path: &Path) -> bool {
-    let Some(current) = selinux_context(path) else {
-        return false;
-    };
-    let Some(updated) = with_container_file_type(&current) else {
-        return false;
-    };
-    if !write_selinux_context(path, &updated) {
-        return false;
-    }
-    let Some(verified) = selinux_context(path) else {
-        return false;
-    };
-    match context_fields(&verified) {
-        Some((_, _, kind, level)) => kind == "container_file_t" && level_is_category_free(level),
-        None => false,
-    }
-}
-
-/// Make the relay reachable from the confined container without depending on
-/// the engine's relabel of a socket it may treat as already labelled.
-///
-/// `true` only when a read-back proves both nodes carry `container_file_t`
-/// with a category-free level. Any failure leaves the caller on the engine's
-/// `:z` relabel, i.e. the previous behaviour (WI#641).
-#[cfg(target_os = "linux")]
-fn label_for_containers(channel: &Path, socket: &Path) -> bool {
-    if !selinux_enforcing() {
-        return false;
-    }
-    let ready = label_node(channel) && label_node(socket);
-    if !ready {
-        tracing::warn!(
-            channel = %channel.display(),
-            "the relay socket has no verified container-readable SELinux label; \
-             leaving the mount on the engine's :z relabel"
-        );
-    }
-    ready
 }
 
 impl Drop for ProxyRelay {
@@ -350,8 +198,8 @@ mod tests {
     }
 
     /// WI#641: the container connects as an unmapped UID, so the channel must
-    /// stay traversable and the socket connectable regardless of its owner,
-    /// and only an unverified SELinux label may request an engine relabel.
+    /// stay traversable and the socket connectable under DAC regardless of
+    /// its owner, without broadening access to the private host parent.
     #[tokio::test]
     async fn relay_channel_is_world_traversable_and_socket_world_connectable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -375,33 +223,5 @@ mod tests {
             std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        if !selinux_enforcing() {
-            assert!(
-                relay.mount_relabel(),
-                "an unlabelled host must keep the engine's :z relabel"
-            );
-        }
-    }
-
-    #[test]
-    fn container_type_replaces_only_the_type_field() {
-        assert_eq!(
-            with_container_file_type("unconfined_u:object_r:user_tmp_t:s0").as_deref(),
-            Some("unconfined_u:object_r:container_file_t:s0")
-        );
-        assert_eq!(
-            with_container_file_type("system_u:object_r:tmp_t:s0:c1,c2").as_deref(),
-            Some("system_u:object_r:container_file_t:s0:c1,c2")
-        );
-        assert_eq!(with_container_file_type("broken"), None);
-        assert_eq!(with_container_file_type("u:r:t:"), None);
-    }
-
-    #[test]
-    fn only_a_category_free_level_counts_as_container_ready() {
-        assert!(level_is_category_free("s0"));
-        assert!(level_is_category_free("s0-s0"));
-        assert!(!level_is_category_free("s0:c1,c2"));
-        assert!(!level_is_category_free("s0-s0:c0.c1023"));
     }
 }

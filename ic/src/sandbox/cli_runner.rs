@@ -72,14 +72,11 @@ fn uses_proxy_relay(runtime: ContainerRuntime, network: SandboxNetworkMode) -> b
         || (network == SandboxNetworkMode::Proxy && runtime == ContainerRuntime::Podman)
 }
 
-fn add_proxy_relay_args(args: &mut Vec<String>, proxy_dir: Option<&str>, relabel: bool) {
+fn add_proxy_relay_args(args: &mut Vec<String>, proxy_dir: Option<&str>) {
     if let Some(dir) = proxy_dir {
-        // `z` asks the engine to relabel a host-created socket. It is skipped
-        // only when the relay already verified a container-readable SELinux
-        // label: a second relabel would pin the socket to one container's MCS
-        // pair and lock out every other execution (WI#641).
-        let options = if relabel { "ro,z" } else { "ro" };
-        args.extend(["-v".into(), format!("{dir}:/run/lunarwing-proxy:{options}")]);
+        // `z` is shared SELinux relabeling for the mounted inodes, not a
+        // change to the listening Unix socket's own security context.
+        args.extend(["-v".into(), format!("{dir}:/run/lunarwing-proxy:ro,z")]);
     }
     for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
         args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
@@ -348,10 +345,6 @@ pub(crate) struct RunSpec<'a> {
     /// (proxy-enforced and legacy Podman proxy modes). Bind-mounted read-only
     /// at `/run/lunarwing-proxy`.
     pub proxy_dir: Option<&'a str>,
-    /// Ask the container engine to relabel the relay mount (`z`). `false` only
-    /// when the relay verified a container-readable SELinux label itself
-    /// (WI#641); a second relabel would pin the socket to one container.
-    pub proxy_relabel: bool,
     /// Per-container process limit (`--pids-limit`).
     pub pids_limit: u32,
     /// Empty host directory used to shadow protected subdirectories of the
@@ -487,7 +480,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         SandboxNetworkMode::Proxy => {
             if spec.proxy_port > 0 && spec.policy.is_sandboxed() {
                 if uses_proxy_relay(spec.runtime, spec.network) {
-                    add_proxy_relay_args(&mut args, spec.proxy_dir, spec.proxy_relabel);
+                    add_proxy_relay_args(&mut args, spec.proxy_dir);
                 } else {
                     let host = spec.runtime.host_alias();
                     let proxy_url = format!("http://{host}:{}", spec.proxy_port);
@@ -508,7 +501,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
             args.push("none".into());
             // Only the read-only relay directory is visible besides the proxy
             // env: no direct egress path exists anywhere, including localhost.
-            add_proxy_relay_args(&mut args, spec.proxy_dir, spec.proxy_relabel);
+            add_proxy_relay_args(&mut args, spec.proxy_dir);
             // A caller-supplied bypass cannot accidentally disable proxy use.
             args.extend([
                 "-e".into(),
@@ -996,7 +989,6 @@ impl CliRunner {
             .as_ref()
             .map(|relay| relay.path().to_string_lossy().into_owned());
         let proxy_dir_ref = proxy_dir.as_deref();
-        let proxy_relabel = relay.as_ref().is_none_or(|relay| relay.mount_relabel());
 
         let spec = RunSpec {
             runtime: self.runtime,
@@ -1014,7 +1006,6 @@ impl CliRunner {
             proxy_port,
             tunnel,
             proxy_dir: proxy_dir_ref,
-            proxy_relabel,
             pids_limit: default_pids_limit(),
             masked: &masked_destinations,
             mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
@@ -1546,7 +1537,6 @@ mod tests {
             proxy_port,
             tunnel: None,
             proxy_dir: None,
-            proxy_relabel: true,
             pids_limit: 256,
             masked: &[],
             mask_dir: None,
@@ -1992,26 +1982,6 @@ mod tests {
         assert_eq!(tail.last(), Some(&"echo hi".to_string()));
     }
 
-    /// WI#641: once the relay verified a container-readable SELinux label, the
-    /// mount must not ask for a second relabel — it would pin the socket to one
-    /// container's MCS pair.
-    #[test]
-    fn args_proxy_relay_skips_engine_relabel_when_label_is_verified() {
-        let args = build_run_args(&RunSpec {
-            proxy_dir: Some("/private/channel"),
-            proxy_relabel: false,
-            ..spec(
-                ContainerRuntime::Podman,
-                KeepIdMode::UidPinned,
-                SandboxPolicy::WorkspaceWrite,
-                SandboxNetworkMode::ProxyEnforced,
-                3128,
-            )
-        });
-        assert!(args.contains(&"/private/channel:/run/lunarwing-proxy:ro".to_string()));
-        assert!(!args.contains(&"/private/channel:/run/lunarwing-proxy:ro,z".to_string()));
-    }
-
     #[test]
     fn args_proxy_mode_docker_keeps_host_gateway_alias() {
         let args = build_run_args(&spec(
@@ -2301,11 +2271,9 @@ mod tests {
             assert_eq!(tail[2], "lunarwing-proxy-relay");
             assert!(tail[3].contains("lunarwing-proxy-relay:"));
             assert_eq!(tail.last(), Some(&"echo hi".to_string()));
-            assert!(
-                !args
-                    .iter()
-                    .any(|a| a.contains("host-gateway") || a.contains("unconfined"))
-            );
+            assert!(!args.iter().any(|a| a.contains("host-gateway")
+                || a.contains("unconfined")
+                || a == "label=disable"));
         }
     }
 

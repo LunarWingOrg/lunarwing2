@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
 # Read-only host diagnosis for the sandbox proxy relay (WI#641).
 #
-# Reports only the facts that distinguish the failure modes of
-# `lunarwing-proxy-relay: [Errno 13] Permission denied` inside the sandbox:
-# SELinux mode, whether the tenant's sandbox network mode uses the relay at
-# all, the relay socket's DAC mode/owner and SELinux type, and any recent
-# denial that names the socket. It changes nothing and prints no tenant
-# environment beyond the two values named below.
+# Collects SELinux mode, the tenant's sandbox network mode and daemon context,
+# relay mount metadata, and candidate AVC denials. Does not change policy,
+# start services, or print arbitrary tenant environment values.
 #
 # Run as root on the tenant host (ausearch needs the audit log) while the
 # sandbox is idle, then trigger one failing sandbox shell call and run again
 # with --watch to catch the denial.
 set -euo pipefail
+export LC_ALL=C
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/lunarwing-sandbox-proxy-diag.sh <tenant>
-  scripts/lunarwing-sandbox-proxy-diag.sh <tenant> --watch
+  sudo ic/scripts/lunarwing-sandbox-proxy-diag.sh <tenant> [--watch]
 
 Environment:
-  LUNARWING_ETC      default: /etc/lunarwing
-  SANDBOX_NETWORK    overrides the value read from the tenant env
+  SANDBOX_NETWORK    overrides the diagnostic reading of SANDBOX_NETWORK
+                     from /home/<tenant>/lunarwing/env/lunarwing.env
 
 Options:
   --watch            after the snapshot, stream SELinux denials for 60s so a
@@ -29,11 +26,57 @@ Options:
 
 Exit:
   0  snapshot printed (a denied connect is reported, not treated as an error)
-  1  the tenant or its env file is missing
+  1  invalid arguments or unknown tenant account
 EOF
 }
 
 say() { printf '%s\n' "$*"; }
+
+tenant_network() (
+  # Reuse mt-admin's canonical path and per-key reader. Sourcing it in a
+  # subshell loads the helpers without running its dispatcher. The reader
+  # opens the file as the tenant, never sources it, and refuses unsafe paths.
+  # shellcheck source=ic/scripts/lunarwing-mt-admin.sh
+  source "$(dirname -- "${BASH_SOURCE[0]}")/lunarwing-mt-admin.sh" || exit 1
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" SANDBOX_NETWORK
+)
+
+report_network() {
+  local network="${SANDBOX_NETWORK:-}"
+  if [[ -z "$network" ]] && ! network="$(tenant_network "$1")"; then
+    say "SANDBOX_NETWORK=unavailable (could not safely read tenant env)"
+    return
+  fi
+  # Only print known modes, not arbitrary values from a tenant-writable file.
+  case "${network,,}" in
+    "")
+      say "SANDBOX_NETWORK=unset (Linux default is proxy-enforced unless settings override it)"
+      ;;
+    proxy-enforced | proxy_enforced)
+      say "SANDBOX_NETWORK=proxy-enforced (Unix relay; --network none)"
+      ;;
+    proxy | allowlist)
+      say "SANDBOX_NETWORK=proxy (legacy; Unix relay on Podman only)"
+      ;;
+    none | off)
+      say "SANDBOX_NETWORK=none (no relay)"
+      ;;
+    tunnel)
+      say "SANDBOX_NETWORK=tunnel (no proxy relay)"
+      ;;
+    *)
+      say "SANDBOX_NETWORK=unrecognized (value omitted)"
+      ;;
+  esac
+}
+
+relay_denials() {
+  # An audit event can also include syscall, PATH, and command line records.
+  # Keep only AVC lines. connectto may not have a path, so those are host-wide
+  # candidates and must be correlated by time and contexts, not assumed ours.
+  grep --line-buffered -E '^(node=[^ ]+ )?type=(AVC|USER_AVC) .*avc:[[:space:]]+denied' \
+    | grep --line-buffered -E 'lw-proxy-|proxy\.sock|\{[^}]*\bconnectto\b[^}]*\}.*\btclass=unix_stream_socket\b'
+}
 
 tenant=""
 watch=false
@@ -45,7 +88,7 @@ for arg in "$@"; do
       ;;
     --watch) watch=true ;;
     -*)
-      say "error: unknown option $arg" >&2
+      say "error: unknown option" >&2
       exit 1
       ;;
     *)
@@ -58,107 +101,82 @@ for arg in "$@"; do
   esac
 done
 
-if [[ -z "$tenant" ]]; then
-  usage >&2
+if [[ ! "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+  say "error: expected a lowercase mt-admin tenant name (letters, digits, internal hyphens)" >&2
   exit 1
 fi
 
-ETC="${LUNARWING_ETC:-/etc/lunarwing}"
-env_file="$ETC/tenants/$tenant/lunarwing.env"
-if [[ ! -r "$env_file" ]]; then
-  say "error: cannot read $env_file" >&2
+if ! tenant_uid="$(id -u -- "$tenant" 2>/dev/null)" || [[ ! "$tenant_uid" =~ ^[1-9][0-9]*$ ]]; then
+  say "error: no non-root account for tenant '$tenant'" >&2
   exit 1
 fi
 
 say "== 1. SELinux mode"
-if command -v getenforce >/dev/null 2>&1; then
-  mode="$(getenforce)"
+if mode="$(getenforce 2>/dev/null)"; then
   say "getenforce: $mode"
   if [[ "$mode" == "Permissive" || "$mode" == "Disabled" ]]; then
-    say "  -> SELinux attribution is ruled out for a connect() EACCES."
+    say "  -> SELinux is not enforcing; check DAC and other security controls."
   fi
 elif [[ -r /sys/fs/selinux/enforce ]]; then
   say "selinuxfs enforce=$(cat /sys/fs/selinux/enforce)"
 else
-  say "SELinux not mounted; check AppArmor separately (aa-status)."
+  say "SELinux mode unavailable; check AppArmor separately (aa-status)."
 fi
 
 say ""
-say "== 2. Sandbox network mode (decides whether the relay is in the path)"
-network="${SANDBOX_NETWORK:-}"
-if [[ -z "$network" ]]; then
-  while IFS='=' read -r key value; do
-    [[ "$key" == "SANDBOX_NETWORK" ]] && network="$value"
-  done <"$env_file"
-fi
-network="$(printf '%s' "$network" | tr -d "\"'")"
-network="${network:-unset}"
-say "SANDBOX_NETWORK=${network:-unset}"
-case "$network" in
-  unset | "" | proxy-enforced | proxy)
-    say "  -> the per-execution Unix relay is used; the socket below matters."
-    ;;
-  none)
-    say "  -> no network and no relay; a relay error cannot come from this tenant."
-    ;;
-  tunnel)
-    say "  -> tunnel mode; relay errors are not expected here."
-    ;;
-  *)
-    say "  -> unrecognised value; check SANDBOX_NETWORK parsing."
-    ;;
-esac
+say "== 2. Configured sandbox network mode (not the running process environment)"
+report_network "$tenant"
 
 say ""
-say "== 3. Relay sockets currently on disk"
-runtime_dirs=()
-for dir in /run/user/*/lw-proxy-*; do
-  [[ -d "$dir" ]] && runtime_dirs+=("$dir")
-done
-if [[ ${#runtime_dirs[@]} -eq 0 ]]; then
-  say "no /run/user/*/lw-proxy-* directory: no execution is in flight right now."
+say "== 3. Tenant daemon SELinux context (PID, context, command name)"
+if daemons="$(ps -u "$tenant_uid" -o pid=,label=,comm= 2>/dev/null | awk '$NF == "lunarwing"')" \
+  && [[ -n "$daemons" ]]; then
+  say "$daemons"
 else
-  for dir in "${runtime_dirs[@]}"; do
-    channel="$dir/channel"
-    socket="$channel/proxy.sock"
-    ls -ldZ "$dir" "$channel" 2>/dev/null || true
-    if [[ -e "$socket" ]]; then
-      ls -lZ "$socket"
-      say "  -> the channel must be mode 0711 and typed container_file_t for"
-      say "     the container's uid to traverse it and connect; a type of"
-      say "     tmp_t/user_tmp_t is the WI#641 denial."
-    else
-      say "  -> channel has no proxy.sock (relay already exited)."
-    fi
-  done
+  say "no lunarwing process context available for uid $tenant_uid."
 fi
 
 say ""
-say "== 4. Recent denials naming the socket"
+runtime_dir="/run/user/$tenant_uid"
+say "== 4. Relay sockets under $runtime_dir"
+found=false
+for dir in "$runtime_dir"/lw-proxy-*; do
+  [[ ! -L "$dir" && -d "$dir" ]] || continue
+  found=true
+  ls -ldZ -- "$dir" 2>/dev/null || true
+  channel="$dir/channel"
+  socket="$channel/proxy.sock"
+  if [[ ! -L "$channel" && -d "$channel" ]]; then
+    ls -ldZ -- "$channel" 2>/dev/null || true
+    if [[ ! -L "$socket" && -S "$socket" ]]; then
+      ls -ldZ -- "$socket" 2>/dev/null || true
+      continue
+    fi
+  fi
+  say "  -> no relay socket visible in this channel."
+done
+if [[ "$found" == false ]]; then
+  say "none visible in the standard runtime dir (the relay may be idle or using a different temp dir)."
+fi
+say "  -> inode labels do not establish permission to connect to the listening socket."
+
+say ""
+say "== 5. Recent candidate SELinux denials (match time and contexts to the failing call)"
 if command -v ausearch >/dev/null 2>&1; then
-  found=false
-  while IFS= read -r line; do
-    found=true
-    say "$line"
-  done < <(ausearch -m AVC,USER_AVC -ts recent 2>/dev/null \
-    | grep -E 'connectto|lw-proxy-|proxy\.sock' || true)
-  if [[ "$found" == false ]]; then
-    say "none in the retained audit window."
-    say "If a denial is expected but nothing appears, dontaudit rules may hide"
-    say "it: run 'semodule -DB', repeat the failing call, then 'semodule -B'."
+  if ! ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials; then
+    say "no matching AVC returned (log unavailable or no match); this does not determine the cause."
   fi
 else
-  say "ausearch not installed (policycoreutils); skipped."
+  say "ausearch not installed; skipped."
 fi
 
 if [[ "$watch" == true ]]; then
   say ""
-  say "== 5. Watching for 60s; trigger one failing sandbox shell call now"
+  say "== 6. Watching for candidate denials for 60s; trigger one failing sandbox shell call now"
   if [[ ! -r /var/log/audit/audit.log ]]; then
     say "cannot read /var/log/audit/audit.log; run as root to watch."
   else
-    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null \
-      | grep --line-buffered -E 'connectto|lw-proxy-|proxy\.sock' || true
+    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null | relay_denials || true
     say "watch finished."
   fi
 fi
