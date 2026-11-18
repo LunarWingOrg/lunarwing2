@@ -404,6 +404,7 @@ link_target="$fixture_dir/w762-root-owned-outside"
 printf 'must-survive\n' >"$link_target"
 ln -s "$link_target" "$link_dir/alice.lock"
 link_rc=0
+# shellcheck disable=SC2034  # TENANT_LIFECYCLE_LOCK_DIR is read by the sourced lock helper.
 link_out="$( (TENANT_LIFECYCLE_LOCK_DIR="$link_dir"; with_tenant_lifecycle_lock alice true) 2>&1 )" \
   || link_rc=$?
 if [[ "$link_rc" -eq 0 ]]; then
@@ -477,10 +478,13 @@ if [[ "$dk_foreign_rc" -eq 0 ]]; then
 else
   pass "a pre-made DarkIRC lock directory with the wrong mode is refused"
 fi
+assert "the DarkIRC lock directory refusal names it" \
+  bash -c '[[ "$1" == *"$2"* ]]' _ "$dk_foreign_out" "$dk_foreign"
 
 # ── 12. WI#762: the root lock tree helper creates root-only leaves ─────────
 tree_root="$fixture_dir/w762-tree/root"
 ( LUNARWING_MT_LOCK_ROOT="$tree_root"; lw_lock_tree_init ) || fail "lock tree init succeeds"
+# shellcheck disable=SC2034  # LUNARWING_MT_LOCK_ROOT is read by the sourced tree helper.
 ( LUNARWING_MT_LOCK_ROOT="$tree_root"; lw_lock_tree_init ) || fail "lock tree init is idempotent"
 assert "lock tree parent is 0755" test "$(stat -c '%a' "$tree_root")" = 755
 for tree_leaf in locks build darkirc; do
