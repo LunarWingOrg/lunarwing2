@@ -1141,20 +1141,106 @@ EOF
 # operator line that names the unit and the recovery command.
 # ---------------------------------------------------------------------------
 
-declare -gA _USER_MANAGER_STATE_CACHE=()
-declare -gA _USER_MANAGER_NOTICE_SHOWN=()
+# Drop cache directories left by runs that no longer exist. Names carry the
+# owning pid, so liveness is a cheap test; only our own prefix is touched.
+_user_manager_cache_prune() {  # <parent-dir>
+  local parent="$1" dir pid
+  for dir in "$parent"/.usermgr-*-*; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    pid="${dir##*/.usermgr-}"
+    pid="${pid%%-*}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == "$$" ]] && continue
+    kill -0 "$pid" 2>/dev/null || rm -rf -- "$dir" 2>/dev/null || true
+  done
+  return 0
+}
+
+# The probe result and the "line already printed" flag must survive a command
+# substitution: `state="$(func)"` runs in a subshell, where an assignment to a
+# shell array is lost. A per-process directory carries both across those
+# subshells. It lives in the root-only lifecycle lock directory when that
+# exists; TMPDIR is the fallback for a non-root harness. The name carries a
+# per-sourcing random tag so a reused pid cannot read a dead run's answer.
+_USER_MANAGER_CACHE_TAG="$$-${RANDOM}${RANDOM}"
+
+_user_manager_cache_dir() {
+  if [[ -n "${LUNARWING_MT_USER_MANAGER_CACHE_DIR:-}" ]]; then
+    printf '%s\n' "$LUNARWING_MT_USER_MANAGER_CACHE_DIR"
+  elif [[ -n "${TENANT_LIFECYCLE_LOCK_DIR:-}" && -d "$TENANT_LIFECYCLE_LOCK_DIR" \
+      && -w "$TENANT_LIFECYCLE_LOCK_DIR" ]]; then
+    printf '%s/.usermgr-%s\n' "$TENANT_LIFECYCLE_LOCK_DIR" "$_USER_MANAGER_CACHE_TAG"
+  else
+    printf '%s/lunarwing-mt-admin-usermgr-%s\n' "${TMPDIR:-/tmp}" "$_USER_MANAGER_CACHE_TAG"
+  fi
+}
+
+# Create the cache directory 0700 and refuse anything that is not a directory
+# owned by this user, so a pre-made symlink cannot redirect a root write.
+# Failure only loses the cache, never the probe itself.
+_user_manager_cache_ready() {
+  local dir parent
+  dir="$(_user_manager_cache_dir)"
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] && return 0
+  [[ -e "$dir" || -L "$dir" ]] && return 1
+  parent="$(dirname -- "$dir")"
+  _user_manager_cache_prune "$parent"
+  (umask 077 && mkdir "$dir" 2>/dev/null) || true
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]]
+}
+
+_user_manager_cache_read() {  # <name> <state|notice>
+  local dir file value
+  dir="$(_user_manager_cache_dir)"
+  file="$dir/$(sanitize_name "$1").$2"
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  IFS= read -r value <"$file" 2>/dev/null || return 1
+  printf '%s\n' "$value"
+}
+
+_user_manager_cache_write() {  # <name> <state|notice> <value>
+  local dir file
+  dir="$(_user_manager_cache_dir)"
+  _user_manager_cache_ready || return 0
+  file="$dir/$(sanitize_name "$1").$2"
+  [[ -L "$file" ]] && return 0
+  printf '%s\n' "$3" >"$file" 2>/dev/null || true
+}
+
+# Drop one tenant's cached probe and notice flag (used by the harness between
+# cases, and by a caller that must re-probe after changing the manager).
+_user_manager_cache_forget() {
+  local dir base
+  dir="$(_user_manager_cache_dir)"
+  base="$dir/$(sanitize_name "$1")"
+  rm -f -- "$base.state" "$base.notice" 2>/dev/null || true
+}
+
+# Whether logind keeps this tenant's user manager up for the whole session.
+# `loginctl show-user` can fail once logind has dropped the user record — it
+# keeps a lingering user only while one of the user's own units is active — so
+# fall back to the marker file logind itself reads. That file does not depend
+# on the user record, and a lingering tenant with no open session still has it.
+_tenant_linger_enabled() {
+  local name="$1" linger
+  linger="$(loginctl show-user "$name" --property=Linger --value 2>/dev/null)" || linger=''
+  case "$linger" in
+    yes) return 0 ;;
+    no) return 1 ;;
+  esac
+  [[ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$name" ]]
+}
 
 # Print `ok` when the tenant's user manager and bus answer; otherwise the
 # system-bus unit state (`failed`, `inactive`, ...), `no-bus` or `unknown`.
 # Read-only: safe to call from any verb before its first user-bus call.
 _user_manager_probe() {
-  local name="$1" uid unit state linger
+  local name="$1" uid unit state
   uid="$(id -u "$name" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
   # This failure mode is specific to a *lingering* tenant, where the manager is
   # supposed to be up for the whole session. A non-lingering account's
   # user@<uid>.service being down is normal and says nothing about the tenant.
-  linger="$(loginctl show-user "$name" --property=Linger --value 2>/dev/null)" || linger=''
-  [[ "$linger" == yes ]] || { printf 'unknown\n'; return 0; }
+  _tenant_linger_enabled "$name" || { printf 'unknown\n'; return 0; }
   # The bus is authoritative: a just-enabled manager can still be starting
   # while its unit state is transitional. A failed probe is only a dead
   # manager when it carries systemd's own bus-connection signature — a
@@ -1179,12 +1265,12 @@ _user_manager_probe() {
 
 # Print the single operator line for a dead manager, at most once per tenant
 # per process. `recover-*` modes report the outcome of an attempted start.
+# The flag is a file, not a shell variable, so a caller that reaches this
+# through a command substitution still prints only once.
 _user_manager_notice() {  # <name> <state> <report|recover-ok|recover-failed>
   local name="$1" state="$2" mode="$3" uid unit
-  if [[ -n "${_USER_MANAGER_NOTICE_SHOWN[$name]:-}" ]]; then
-    return 0
-  fi
-  _USER_MANAGER_NOTICE_SHOWN["$name"]=1
+  [[ -z "$(_user_manager_cache_read "$name" notice 2>/dev/null)" ]] || return 0
+  _user_manager_cache_write "$name" notice 1
   uid="$(id -u "$name" 2>/dev/null)" || uid='?'
   unit="user@${uid}.service"
   case "$mode" in
@@ -1201,12 +1287,15 @@ _user_manager_notice() {  # <name> <state> <report|recover-ok|recover-failed>
 }
 
 # Cached manager state for this process (one probe per tenant per invocation).
+# The answer is a file because every caller reads this through a command
+# substitution, where an array assignment would be lost and each of the 118
+# `_systemctl_user` call sites would re-probe.
 _user_manager_state() {
   local name="$1" cached
-  cached="${_USER_MANAGER_STATE_CACHE[$name]:-}"
+  cached="$(_user_manager_cache_read "$name" state 2>/dev/null)" || cached=''
   if [[ -z "$cached" ]]; then
     cached="$(_user_manager_probe "$name")"
-    _USER_MANAGER_STATE_CACHE["$name"]="$cached"
+    _user_manager_cache_write "$name" state "$cached"
   fi
   printf '%s\n' "$cached"
 }
@@ -1252,7 +1341,7 @@ _wait_user_manager_bus() {  # <name> [attempts]
   for ((i = 1; i <= attempts; i++)); do
     state="$(_user_manager_probe "$name")"
     if [[ "$state" == ok ]]; then
-      _USER_MANAGER_STATE_CACHE["$name"]=ok
+      _user_manager_cache_write "$name" state ok
       return 0
     fi
     sleep 0.5
@@ -1261,15 +1350,18 @@ _wait_user_manager_bus() {  # <name> [attempts]
 }
 
 # A manager that starts begins its enabled units by itself (observed:
-# PostgreSQL, workers, vision/voice activating). Wait, bounded, until none of
-# the tenant's units is mid-transition, so restart-tenant's own stop/start
-# order does not race that burst.
+# PostgreSQL, workers, vision/voice activating). Wait, bounded, until the job
+# queue has drained and none of the tenant's units is mid-transition, so
+# restart-tenant's own stop/start order does not race that burst. Reading the
+# queue matters: a start job still queued shows its unit `inactive`.
 _user_manager_settle() {
-  local name="$1" i units tenant_units
+  local name="$1" i jobs units tenant_units
   for ((i = 0; i < 30; i++)); do
+    jobs="$(_systemctl_user_raw "$name" list-jobs --no-legend --no-pager --plain 2>/dev/null || true)"
     units="$(_systemctl_user_raw "$name" list-units --all --no-legend --no-pager --plain 2>/dev/null || true)"
     tenant_units="$(grep -F -- "-${name}.service" <<<"$units" || true)"
-    if ! grep -Eq '(^|[[:space:]])(activating|reloading|deactivating)([[:space:]]|$)' <<<"$tenant_units"; then
+    if ! grep -Fq -- "-${name}." <<<"$jobs" \
+        && ! grep -Eq '(^|[[:space:]])(activating|reloading|deactivating)([[:space:]]|$)' <<<"$tenant_units"; then
       return 0
     fi
     sleep 1
