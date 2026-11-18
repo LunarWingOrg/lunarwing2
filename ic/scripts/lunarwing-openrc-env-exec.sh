@@ -41,8 +41,8 @@ links="$(stat -c '%h' "$env_file" 2>/dev/null || true)"
 # each fd's target against the directory's dev:inode after resolving the fd's
 # own path.
 for lifecycle_lock_dir in \
-  "${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}" \
-  "${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"; do
+  "${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lunarwing/mt-admin/locks}" \
+  "${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lunarwing/mt-admin/darkirc}"; do
   [[ -d "$lifecycle_lock_dir" ]] || continue
   lock_dir_id="$(stat -Lc '%d:%i' "$lifecycle_lock_dir" 2>/dev/null || true)"
   [[ -n "$lock_dir_id" ]] || continue
@@ -62,7 +62,7 @@ done
 # target's parent to be the same directory as BUILD_LOCK by dev:inode. The
 # kernel resolves symlinks in fd targets, so match the basename rather than an
 # unresolved path such as /var/lock when it points to /run/lock.
-build_lock_base="${BUILD_LOCK:-/var/lock/lunarwing-build.lock}"
+build_lock_base="${BUILD_LOCK:-/run/lunarwing/mt-admin/build/lunarwing-build.lock}"
 build_lock_dir="${build_lock_base%/*}"
 if [[ "$build_lock_base" == /* && -d "$build_lock_dir" ]]; then
   build_lock_dir_id="$(stat -Lc '%d:%i' "$build_lock_dir" 2>/dev/null || true)"
