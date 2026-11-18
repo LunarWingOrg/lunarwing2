@@ -210,9 +210,13 @@ _lw_lock_dir_refusal() {  # <dir> [expected-mode]
 # (/tmp, and /run/lock on Debian) cannot be used to replace a root-owned
 # directory, so it is allowed; the final directory check above still applies.
 _lw_lock_parent_chain_safe() {  # <dir>
-  local dir="$1" component current="" mode
-  local IFS=/
-  for component in ${dir#/}; do
+  local dir="$1" rest component current="" mode
+  [[ "$dir" == /* ]] || return 1
+  rest="${dir#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
     current="$current/$component"
     [[ "$current" == "$dir" ]] && break
     if [[ -L "$current" ]]; then return 1; fi
