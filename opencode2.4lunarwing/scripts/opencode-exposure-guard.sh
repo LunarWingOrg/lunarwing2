@@ -44,14 +44,15 @@
 # one-token lookahead would be desynced by `auth --log-level DEBUG login
 # <url>`. Once `login` is seen, every remaining token is checked for an
 # http:/https: scheme (case-insensitively): the target is positional, so it
-# cannot hide behind a flag. The check normalises each token the way
-# upstream's URL parser does before it matches the scheme — leading and
-# trailing C0 controls and space trimmed, tab, line feed and carriage return
-# dropped anywhere — so a leading space, tab or other control character, a
-# tab, LF or CR inside the scheme, and a trailing space are all refused too,
-# not only a token that starts with the bare scheme (WI#754). The scan errs
-# toward refusing: a `run` prompt whose unquoted tokens happen to read
-# `auth login <url>` is refused too.
+# cannot hide behind a flag. The check skips control characters and spaces
+# while it reads the start of the token, which covers everything upstream's
+# URL parser ignores there (leading C0 controls and space; tab, line feed and
+# carriage return anywhere): a leading space, tab or other control character
+# and a tab, LF or CR inside the scheme are refused too, not only a token
+# that starts with the bare scheme (WI#754). It uses shell built-ins only, so
+# no state of PATH can switch it off. The scan errs toward refusing: a `run`
+# prompt whose unquoted tokens happen to read `auth login <url>` is refused
+# too.
 #
 # Everything else execs the real binary with its argv unchanged. Server-backed
 # commands can spawn that binary without passing through this wrapper;
@@ -107,18 +108,38 @@ is_loopback() {
 # Upstream decides whether a target registers a well-known origin with a URL
 # parser (URL.canParse plus an http:/https: protocol test), and that parser
 # trims leading and trailing C0 controls and space and drops tab, line feed
-# and carriage return anywhere in its input. Reproduce that normalisation
-# first, so ` https://…`, `\thttps://…`, `\001https://…`, `ht\ttps://…` and a
-# trailing space cannot pass this wrapper while upstream still reads an
-# http(s) URL (WI#754).
-normalise_target() {
-  printf '%s' "$1" | tr -d '\011\012\015' |
-    sed -e 's/^[[:cntrl:] ]*//' -e 's/[[:cntrl:] ]*$//'
-}
-
+# and carriage return anywhere in its input. So ` https://…`, `\thttps://…`,
+# `\001https://…` and `ht\ttps://…` are http(s) URLs to upstream (WI#754).
+# Read the first six significant characters of the token, skipping every
+# control character and space on the way, and match the scheme on those. That
+# refuses a little more than upstream reads as a URL (a space inside the
+# scheme, DEL in front), which is the safe direction.
+#
+# Shell built-ins only (!2536 AFL-1): an external program such as tr or sed
+# is looked up through the caller's PATH, and a check that passes every token
+# when one is missing fails open. Do not take the first character with
+# ${rest%"${rest#?}"} either: that expansion is quadratic in dash for every
+# token, so an ordinary long prompt would take minutes. One cost is left: each
+# pass below copies the rest of the token, so a long run of skipped characters
+# is slow (a token of 128 kB of spaces takes about half a minute under dash).
+# Only the caller waits, and the verdict stays right.
 is_http_url() {
-  case "$(normalise_target "$1")" in
-    [Hh][Tt][Tt][Pp]:* | [Hh][Tt][Tt][Pp][Ss]:*) return 0 ;;
+  rest=$1
+  lead=
+  while [ "${#lead}" -lt 6 ]; do
+    case "$rest" in
+      [[:cntrl:]\ ]*) ;;
+      [Hh]*) lead=${lead}h ;;
+      [Tt]*) lead=${lead}t ;;
+      [Pp]*) lead=${lead}p ;;
+      [Ss]*) lead=${lead}s ;;
+      :*) lead=${lead}: ;;
+      *) break ;;
+    esac
+    rest=${rest#?}
+  done
+  case "$lead" in
+    http:* | https:*) return 0 ;;
     *) return 1 ;;
   esac
 }

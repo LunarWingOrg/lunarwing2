@@ -505,16 +505,13 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             ('  elif [ "$want_login" = 1 ]; then\n', "look for 'login' across interleaved flags"),
             ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
             ('    is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
-            ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme"),
+            ("http:* | https:*) return 0 ;;", "recognise an http(s) URL scheme"),
             # WI#754: upstream's URL parser also decides with a trimmed form,
-            # so the check must name the normalisation, not only the scheme.
-            ("normalise_target() {\n", "normalise the auth login target"),
-            ("tr -d '\\011\\012\\015'", "drop tab, line feed and carriage return"),
-            (
-                "sed -e 's/^[[:cntrl:] ]*//' -e 's/[[:cntrl:] ]*$//'",
-                "trim leading and trailing controls and space",
-            ),
-            ('$(normalise_target "$1")', "match the scheme against the normalised target"),
+            # so the check must name the skipping of control characters and
+            # spaces, not only the scheme.
+            ('while [ "${#lead}" -lt 6 ]; do', "read the first six significant characters"),
+            ("[[:cntrl:]\\ ]*) ;;", "skip control characters and spaces"),
+            ("[Hh]*) lead=${lead}h ;;", "fold the scheme letters to lower case"),
         ):
             with self.subTest(what=what):
                 self.assertIn(removed, text)
@@ -805,6 +802,39 @@ class ExposureGuardWrapperTests(unittest.TestCase):
                 result = self.run_wrapper(*form)
                 self.assertEqual(result.returncode, 0, (form, result.stderr))
                 self.assertEqual(result.stdout.strip(), " ".join(form))
+
+    def test_auth_login_refusal_needs_no_external_program(self) -> None:
+        # !2536 AFL-1: the scheme check must not depend on a program found
+        # through PATH. With tr and sed in a pipeline the wrapper passed
+        # every URL when either was missing, and the guard's no-git lane in
+        # .gitlab/tests/test_worker_exposure_policy.py has neither. An empty
+        # directory as PATH leaves the shell its built-ins only.
+        shell = shutil.which("sh")
+        self.assertIsNotNone(shell)
+        with tempfile.TemporaryDirectory() as empty:
+            env = {"PATH": empty, "LUNARWING_REAL_OPENCODE": "/bin/echo"}
+
+            def run(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [shell, str(WRAPPER), *args],
+                    capture_output=True, text=True, env=env, timeout=60,
+                )
+
+            for form in (
+                ("auth", "login", "https://example.invalid"),
+                ("auth", "login", " https://example.invalid"),
+                ("auth", "login", "ht\ttps://example.invalid"),
+                ("auth", "login", "--method", "key", "\nHTTP://example.invalid"),
+            ):
+                with self.subTest(form=form):
+                    result = run(*form)
+                    self.assertEqual(result.returncode, 77, (form, result.stderr))
+                    self.assertNotIn("not found", result.stderr)
+            for form in (("auth", "login", "my-integration"), ("auth", "list")):
+                with self.subTest(form=form):
+                    result = run(*form)
+                    self.assertEqual(result.returncode, 0, (form, result.stderr))
+                    self.assertEqual(result.stdout.strip(), " ".join(form))
 
     def test_leading_global_flag_bypass_forms_refused(self) -> None:
         # run-79 EI-2 / run-84 EU-2: the v2 CLI takes global/root flags before

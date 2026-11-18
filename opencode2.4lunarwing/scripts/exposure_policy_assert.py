@@ -102,7 +102,7 @@ REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
 # SHA-256 over the wrapper's code lines (comments and blank lines stripped),
 # so ANY code edit — including one the shape checks below do not name — needs
 # a review of this checker in the same commit (WI#609 ABH-2).
-WRAPPER_CODE_DIGEST = "0ee04be541336ff91074bd7d2c9e28c6e5946eee48d60af31d22d51803716e0d"
+WRAPPER_CODE_DIGEST = "ade0df974608bf2ca1f43a6d0c8ccaf7efe68398038e4f2061048bb47013952e"
 # Shell features that can make the wrapper's tail unreachable or change what
 # its last two lines mean. The wrapper needs none of them. Dot-sourcing is
 # refused wherever it appears, not only at a line start.
@@ -530,14 +530,10 @@ def check_wrapper(lane: pathlib.Path) -> None:
         ("login) want_login=0; in_login=1", "track 'auth login'"),
         ('[ "$in_login" = 1 ]', "check every token after 'auth login'"),
         ('is_http_url "$arg" && refuse', "refuse an http(s) auth login target"),
-        ("[Hh][Tt][Tt][Pp]:*", "recognise an http(s) URL scheme, case-insensitively"),
-        ("normalise_target() {", "normalise the auth login target the way upstream's URL parser does"),
-        ("tr -d '\\011\\012\\015'", "drop tab, line feed and carriage return from the target"),
-        (
-            "sed -e 's/^[[:cntrl:] ]*//' -e 's/[[:cntrl:] ]*$//'",
-            "trim leading and trailing controls and space from the target",
-        ),
-        ('$(normalise_target "$1")', "match the scheme against the normalised target"),
+        ("http:* | https:*) return 0 ;;", "recognise an http(s) URL scheme, case-insensitively"),
+        ('while [ "${#lead}" -lt 6 ]; do', "read the first six significant characters of the target"),
+        ("[[:cntrl:]\\ ]*) ;;", "skip control characters and spaces in the target"),
+        ("[Hh]*) lead=${lead}h ;;", "fold the scheme letters to lower case"),
     )
     missing = [what for fragment, what in required_fragments if fragment not in text]
     if missing:

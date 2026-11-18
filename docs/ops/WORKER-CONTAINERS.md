@@ -1179,15 +1179,19 @@ Enforced controls (opencode2 lane unless noted):
    well-known remote-config origin in the worker's own state (upstream
    `WellKnown.add`); only an `http:` or `https:` target does so. The scan
    tracks `auth` -> `login` across interleaved global flags and refuses any
-   token after `login` whose form after upstream's URL-parser normalisation
-   carries an http(s) scheme, case-insensitively. The normalisation matches
-   what makes `URL.canParse` true: leading and trailing C0 controls and
-   space trimmed, tab, line feed and carriage return dropped anywhere, so a
-   leading space, tab or other control character, and a tab/LF/CR inside
-   the scheme, are refused as well as the bare form (WI#754). `auth list`,
-   `auth logout` and `auth login <integration-id|name>` still reach the real
-   binary. The refusal and its normalisation are required fragments in
-   `scripts/exposure_policy_assert.py` and are covered by its wrapper tests.
+   token after `login` that starts with an http(s) scheme, case-insensitively,
+   once control characters and spaces are skipped. That is at least as wide
+   as what makes upstream's `URL.canParse` true (leading and trailing C0
+   controls and space trimmed, tab, line feed and carriage return dropped
+   anywhere), so a leading space, tab or other control character, and a
+   tab/LF/CR inside the scheme, are refused as well as the bare form
+   (WI#754). The check uses shell built-ins only: no program is looked up
+   through `PATH`, so a missing or replaced `tr` or `sed` cannot switch it
+   off. `auth list`, `auth logout` and `auth login <integration-id|name>`
+   still reach the real binary. The refusal and the skipping are required
+   fragments in `scripts/exposure_policy_assert.py` and are covered by its
+   wrapper tests, one of which runs the wrapper with an empty directory as
+   `PATH`.
    This is still a naive-use guard, not a
    well-known-config control: the same registration through the server's
    `experimental.integration.wellknown.add` API does not pass through the
