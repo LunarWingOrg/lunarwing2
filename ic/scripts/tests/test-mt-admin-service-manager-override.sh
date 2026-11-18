@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# WI#730: `LUNARWING_SERVICE_MANAGER` must not override the host it runs on.
+# WI#730/WI#757: `LUNARWING_SERVICE_MANAGER` must not override the host it runs on.
 #
 # Pins both acceptance directions (openrc on a systemd host, systemd on an
 # OpenRC host): detection refuses before anything is written, and add-tenant
-# never reaches the account/registry/other mutators. Also pins the forcing
-# switch (refused while the host has tenants under the manager it runs) and the
-# health pipeline's manager-of-record (always the probe, never a forced value).
+# never reaches the account/registry/other mutators. WI#757 adds the dispatcher
+# gate: every command, including render-units and stop-tenant under the real
+# lifecycle lock, stops at the same one line before its first write; a forced
+# run and a marker-less run each print their warning once in the command's
+# output. Also pins the forcing switch (refused while the registry holds any
+# tenant) and the health pipeline's manager-of-record (the probe, never a
+# forced value).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
