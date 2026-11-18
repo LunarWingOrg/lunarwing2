@@ -1224,6 +1224,45 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 
 ## Troubleshooting
 
+### A tenant's systemd user manager is dead
+
+On systemd, a lingering tenant's `user@<uid>.service` can die (a SIGKILL leaves
+it `failed`; the unit has `Restart=no`, and linger only starts it at boot). All
+of its user units go with it, and `systemctl --user` then fails with
+`Failed to connect to user scope bus`. mt-admin detects this once per verb,
+before its first `systemctl --user` call, and prints one line naming the unit
+and the recovery command instead of a line per unit:
+
+```
+ERROR: tenant 'spitfire': systemd user manager user@1011.service is failed and its user bus is unreachable; its user units are treated as down. Recover with: systemctl start user@1011.service
+```
+
+`start-tenant` and `restart-tenant` run that `systemctl start` themselves, wait
+for the bus, and let the units the manager starts on its own settle before
+continuing; if the manager does not come back they exit non-zero with the line.
+`stop-tenant`, `status` and `remove-tenant` report the line once and treat the
+tenant's user units as down (the dead manager already took them down);
+`remove-tenant` still removes the unit files and the account.
+
+The probe runs once per tenant per mt-admin process. Its answer and the
+"already said" flag are kept in a per-process directory, so a caller that
+reads the wrapper through a command substitution does not re-probe and does
+not print a second line. A call that sends stderr to `/dev/null` does not use
+the line up; the next call that keeps stderr prints it. Where that directory
+lives is chosen once, when mt-admin starts: inside the lifecycle lock
+directory when mt-admin owns it with mode 0700 and it is not a link, otherwise
+in `TMPDIR` (so the first run after a boot, before the lock directory exists,
+uses `TMPDIR`). The answer does not trust `loginctl show-user` alone: logind
+keeps a user only while one of its units is active, so a lingering tenant whose
+record is gone falls back to logind's own marker,
+`/var/lib/systemd/linger/<name>`.
+
+Only the parts that need the user bus are skipped. A worker started under the
+system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
+`--restart unless-stopped`) outlives the user manager, so `stop-worker` still
+asks the runtime to stop the worker and its task container. `status` with a dead
+manager prints the line, the tenant header, and exits 0.
+
 ### Services don't start after reboot
 
 - systemd: Verify linger is enabled: `loginctl show-user <tenant> | grep Linger`

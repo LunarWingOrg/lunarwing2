@@ -113,6 +113,12 @@ start_tenant_postgres() {
   # so skip the imperative `_ctr run` below; keep the pg_isready gate (via exec).
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    # WI#731: the Quadlet start below is a `systemctl --user` call. With a dead
+    # user manager it fails, and the health poll that follows can then read a
+    # container state left over from before the manager died and print
+    # "PostgreSQL ready" for a unit that never started. Recover or stop with
+    # the one named line before starting anything.
+    _tenant_user_manager_gate "$name" recover || return 1
     _wait_user_manager "$name"
     render_pg_quadlet "$name"
     _systemctl_user "$name" daemon-reload 2>/dev/null || true

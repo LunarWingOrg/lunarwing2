@@ -249,12 +249,20 @@ start_worker_task_container() {
 }
 
 stop_worker_task_container() {
-  local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false
+  local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false manager_ok=true
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
+  # WI#758 (AFK-1): a dead tenant user manager owns no running unit, and its
+  # bus cannot answer LoadState — but only the *unit* half depends on that.
+  # A container the manager did not start (MT_ROOTLESS=false: Docker or
+  # rootful podman, `--restart unless-stopped`) outlives it and must still be
+  # stopped. Skip the Quadlet stop alone; the runtime stop below decides.
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
+    manager_ok=false
+  fi
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
     _openrc_stop_worker_nondestructive "$task_container"
-  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" && "$manager_ok" == "true" ]] \
       && podman_supports_quadlet; then
     load_state="$(_systemctl_user "$name" show --value -p LoadState "${task_container}.service" 2>/dev/null)" \
       || return 1
@@ -1301,6 +1309,13 @@ _stop_nanocode_supervision() {
   fi
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+    # WI#731: a dead user manager owns no running unit (it took the tenant's
+    # slice down with it), and its bus cannot answer LoadState/stop. The verb
+    # already printed the one line naming the manager; skip the stop and let
+    # the file removal below proceed.
+    if id -u "$name" >/dev/null 2>&1 && ! _user_manager_usable "$name"; then
+      return 0
+    fi
     if id -u "$name" >/dev/null 2>&1; then
       load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null || true)"
       if [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
@@ -1370,8 +1385,13 @@ _remove_nanocode_supervision() {
     "$(tenant_home "$name")/.config/systemd/user/default.target.wants/${container}.service" \
     "$(_hash_dir "$name")/${container}.hash"
   if [[ "$INIT_SYSTEM" == "systemd" ]] && id -u "$name" >/dev/null 2>&1; then
-    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 \
-      || { say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2; true; }
+    # WI#731: with the tenant's user manager dead there is nothing loaded to
+    # reload. A "could not reload" warning would only dilute the one line the
+    # verb's gate printed, so skip the reload instead of warning about it.
+    if _user_manager_usable "$name" \
+        && ! _systemctl_user "$name" daemon-reload >/dev/null 2>&1; then
+      say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2
+    fi
   fi
 
   for svc in "${container}-sup" "$container"; do
@@ -3167,7 +3187,17 @@ stop_worker() {
     return 0
   fi
 
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+  # WI#758 (AFK-1): a dead user manager owns no running unit, so the Unit half
+  # of the stop below has nothing to do and no bus to ask. Only that half is
+  # skipped: with MT_ROOTLESS=false (Docker or rootful podman) the container
+  # was started by the system runtime and outlives the manager, so the runtime
+  # stop still has to happen.
+  local manager_ok=true
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && ! _user_manager_usable "$name"; then
+    manager_ok=false
+  fi
+
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" && "$manager_ok" == "true" ]] \
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
       || _ctr "$name" stop "$container" >/dev/null 2>&1 \

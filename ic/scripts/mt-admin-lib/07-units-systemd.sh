@@ -1129,7 +1129,210 @@ EOF
   say "rendered systemd units for $name in $user_unit_dir"
 }
 
-_systemctl_user() {
+# ---------------------------------------------------------------------------
+# WI#731 / WI#758: tenant user-manager liveness.
+#
+# A lingering tenant's `user@<uid>.service` can die (SIGKILL leaves it failed;
+# the unit has Restart=no and linger only starts it at boot). Every
+# `systemctl --user` call then fails with "Failed to connect to user scope
+# bus", and stop_tenant_systemd reported one "could not classify" line per
+# unit without ever naming the cause. Probe the manager once per process,
+# before trusting any `systemctl --user` call, and reduce the state to one
+# operator line that names the unit and the recovery command.
+# ---------------------------------------------------------------------------
+
+# Drop cache directories left by runs that no longer exist. Names carry the
+# owning pid, so liveness is a cheap test; only our own prefixes are touched.
+_user_manager_cache_prune() {  # <parent-dir>
+  local parent="$1" dir name pid
+  for dir in "$parent"/.usermgr-*-* "$parent"/lunarwing-mt-admin-usermgr-*-*; do
+    [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || continue
+    name="${dir##*/}"
+    pid="${name#.usermgr-}"
+    pid="${pid#lunarwing-mt-admin-usermgr-}"
+    pid="${pid%%-*}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == "$$" ]] && continue
+    kill -0 "$pid" 2>/dev/null || rm -rf -- "$dir" 2>/dev/null || true
+  done
+  return 0
+}
+
+# The probe result and the "line already printed" flag must survive a command
+# substitution: `state="$(func)"` runs in a subshell, where an assignment to a
+# shell array is lost. A per-process directory carries both across those
+# subshells. The name carries a per-sourcing random tag so a reused pid cannot
+# read a dead run's answer.
+_USER_MANAGER_CACHE_TAG="$$-${RANDOM}${RANDOM}"
+
+# Where that directory lives is decided once, when mt-admin is sourced, so
+# every subshell of the process uses the same place (!2543 AFR-2). The
+# lifecycle lock directory is used only when this user owns it, its mode is
+# 0700 and it is not a link. A directory another account made first (possible
+# where /run/lock is writable by everyone) must not hold root's answer: that
+# account could replace it. Otherwise TMPDIR, where the 0700 directory and the
+# owner checks below keep the cache private.
+_user_manager_cache_parent_pick() {
+  local lock_dir="${TENANT_LIFECYCLE_LOCK_DIR:-}"
+  if [[ -n "$lock_dir" && -d "$lock_dir" && ! -L "$lock_dir" && -O "$lock_dir" \
+      && "$(stat -c '%a' -- "$lock_dir" 2>/dev/null)" == 700 ]]; then
+    _USER_MANAGER_CACHE_PARENT="$lock_dir"
+    _USER_MANAGER_CACHE_PREFIX=.usermgr-
+  else
+    _USER_MANAGER_CACHE_PARENT="${TMPDIR:-/tmp}"
+    _USER_MANAGER_CACHE_PREFIX=lunarwing-mt-admin-usermgr-
+  fi
+}
+_user_manager_cache_parent_pick
+
+_user_manager_cache_dir() {
+  if [[ -n "${LUNARWING_MT_USER_MANAGER_CACHE_DIR:-}" ]]; then
+    printf '%s\n' "$LUNARWING_MT_USER_MANAGER_CACHE_DIR"
+  else
+    printf '%s/%s%s\n' "$_USER_MANAGER_CACHE_PARENT" "$_USER_MANAGER_CACHE_PREFIX" \
+      "$_USER_MANAGER_CACHE_TAG"
+  fi
+}
+
+# Create the cache directory 0700 and refuse anything that is not a directory
+# owned by this user, so a pre-made symlink cannot redirect a root write.
+# Failure only loses the cache, never the probe itself.
+_user_manager_cache_ready() {
+  local dir parent
+  dir="$(_user_manager_cache_dir)"
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] && return 0
+  [[ -e "$dir" || -L "$dir" ]] && return 1
+  parent="$(dirname -- "$dir")"
+  _user_manager_cache_prune "$parent"
+  (umask 077 && mkdir "$dir" 2>/dev/null) || true
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]]
+}
+
+_user_manager_cache_read() {  # <name> <state|notice>
+  local dir file value
+  dir="$(_user_manager_cache_dir)"
+  # Only our own directory and a plain file may answer; a directory or file
+  # placed here by another user must not decide whether a manager is dead.
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || return 1
+  file="$dir/$(sanitize_name "$1").$2"
+  [[ -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
+  IFS= read -r value <"$file" 2>/dev/null || return 1
+  printf '%s\n' "$value"
+}
+
+_user_manager_cache_write() {  # <name> <state|notice> <value>
+  local dir file
+  dir="$(_user_manager_cache_dir)"
+  _user_manager_cache_ready || return 0
+  file="$dir/$(sanitize_name "$1").$2"
+  [[ -L "$file" ]] && return 0
+  printf '%s\n' "$3" >"$file" 2>/dev/null || true
+}
+
+# Whether logind keeps this tenant's user manager up for the whole session.
+# `loginctl show-user` can fail once logind has dropped the user record — it
+# keeps a lingering user only while one of the user's own units is active — so
+# fall back to the marker file logind itself reads. That file does not depend
+# on the user record, and a lingering tenant with no open session still has it.
+_tenant_linger_enabled() {
+  local name="$1" linger
+  linger="$(loginctl show-user "$name" --property=Linger --value 2>/dev/null)" || linger=''
+  case "$linger" in
+    yes) return 0 ;;
+    no) return 1 ;;
+  esac
+  [[ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$name" ]]
+}
+
+# Print `ok` when the tenant's user manager and bus answer; otherwise the
+# system-bus unit state (`failed`, `inactive`, ...), `no-bus` or `unknown`.
+# Read-only: safe to call from any verb before its first user-bus call.
+_user_manager_probe() {
+  local name="$1" uid unit state
+  uid="$(id -u "$name" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  # This failure mode is specific to a *lingering* tenant, where the manager is
+  # supposed to be up for the whole session. A non-lingering account's
+  # user@<uid>.service being down is normal and says nothing about the tenant.
+  _tenant_linger_enabled "$name" || { printf 'unknown\n'; return 0; }
+  # The bus is authoritative: a just-enabled manager can still be starting
+  # while its unit state is transitional. A failed probe is only a dead
+  # manager when it carries systemd's own bus-connection signature — a
+  # sudo/account failure must not be mistaken for one.
+  state="$(_systemctl_user_raw "$name" is-system-running 2>&1)" || true
+  case "$state" in
+    *"Failed to connect to user scope bus"*|*"Connection refused"*|*"No such file or directory"*) ;;
+    '') ;;
+    *) printf 'ok\n'; return 0 ;;
+  esac
+  unit="user@${uid}.service"
+  state="$(systemctl is-active "$unit" 2>/dev/null)" || true
+  case "$state" in
+    # Only a known down state proves the manager dead. Anything else (no
+    # systemd answer, an unrecognized probe output) is unknown and must fall
+    # through to the real call rather than invent a dead manager.
+    failed|inactive|dead|maintenance) printf '%s\n' "$state" ;;
+    '') printf 'no-bus\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# Print the single operator line for a dead manager, at most once per tenant
+# per process. `recover-*` modes report the outcome of an attempted start.
+# The flag is a file, not a shell variable, so a caller that reaches this
+# through a command substitution still prints only once.
+#
+# A caller that sends stderr to /dev/null (73 of the wrapper's call sites do)
+# must not use the line up: it would be printed nowhere and then count as
+# said, and a verb without a gate of its own would report nothing at all
+# (!2543 AFR-1). The next call that keeps stderr prints it.
+_user_manager_notice() {  # <name> <state> <report|recover-ok|recover-failed>
+  local name="$1" state="$2" mode="$3" uid unit
+  [[ -z "$(_user_manager_cache_read "$name" notice 2>/dev/null)" ]] || return 0
+  [[ /dev/stderr -ef /dev/null ]] && return 0
+  _user_manager_cache_write "$name" notice 1
+  uid="$(id -u "$name" 2>/dev/null)" || uid='?'
+  unit="user@${uid}.service"
+  case "$mode" in
+    recover-ok)
+      say "WARNING: tenant '$name': systemd user manager $unit was $state; started it (systemctl start $unit) and its user bus is back" >&2
+      ;;
+    recover-failed)
+      say "ERROR: tenant '$name': systemd user manager $unit is $state; 'systemctl start $unit' did not restore its user bus, so its user units are unavailable" >&2
+      ;;
+    *)
+      say "ERROR: tenant '$name': systemd user manager $unit is $state and its user bus is unreachable; its user units are treated as down. Recover with: systemctl start $unit" >&2
+      ;;
+  esac
+}
+
+# Cached manager state for this process (one probe per tenant per invocation).
+# The answer is a file because every caller reads this through a command
+# substitution, where an array assignment would be lost and each of the 118
+# `_systemctl_user` call sites would re-probe.
+_user_manager_state() {
+  local name="$1" cached
+  cached="$(_user_manager_cache_read "$name" state 2>/dev/null)" || cached=''
+  if [[ -z "$cached" ]]; then
+    cached="$(_user_manager_probe "$name")"
+    _user_manager_cache_write "$name" state "$cached"
+  fi
+  printf '%s\n' "$cached"
+}
+
+# Returns 0 when `systemctl --user` can be trusted for this tenant. On a dead
+# manager it prints the one line and fails the call instead of letting systemd
+# spray "Failed to connect to user scope bus" per unit.
+_user_manager_usable() {
+  local name="$1" state
+  state="$(_user_manager_state "$name")"
+  if [[ "$state" == ok || "$state" == unknown ]]; then
+    return 0
+  fi
+  _user_manager_notice "$name" "$state" report
+  return 1
+}
+
+_systemctl_user_raw() {
   local name="$1"
   shift
   local uid
@@ -1141,6 +1344,79 @@ _systemctl_user() {
   # this is defense-in-depth for the systemd path.)
   with_tracked_lock_fds_closed \
     sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+}
+
+# WI#731: the sole tenant `systemctl --user` path, gated by the cached probe.
+_systemctl_user() {
+  local name="$1"
+  shift
+  _user_manager_usable "$name" || return 1
+  _systemctl_user_raw "$name" "$@"
+}
+
+# Wait, bounded, for the user bus after starting the manager; updates the cache.
+_wait_user_manager_bus() {  # <name> [attempts]
+  local name="$1" attempts="${2:-40}" i state
+  for ((i = 1; i <= attempts; i++)); do
+    state="$(_user_manager_probe "$name")"
+    if [[ "$state" == ok ]]; then
+      _user_manager_cache_write "$name" state ok
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# A manager that starts begins its enabled units by itself (observed:
+# PostgreSQL, workers, vision/voice activating). Wait, bounded, until the job
+# queue has drained and none of the tenant's units is mid-transition, so
+# restart-tenant's own stop/start order does not race that burst. Reading the
+# queue matters: a start job still queued shows its unit `inactive`.
+_user_manager_settle() {
+  local name="$1" i jobs units tenant_units
+  for ((i = 0; i < 30; i++)); do
+    jobs="$(_systemctl_user_raw "$name" list-jobs --no-legend --no-pager --plain 2>/dev/null || true)"
+    units="$(_systemctl_user_raw "$name" list-units --all --no-legend --no-pager --plain 2>/dev/null || true)"
+    tenant_units="$(grep -F -- "-${name}.service" <<<"$units" || true)"
+    if ! grep -Fq -- "-${name}." <<<"$jobs" \
+        && ! grep -Eq '(^|[[:space:]])(activating|reloading|deactivating)([[:space:]]|$)' <<<"$tenant_units"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 0
+}
+
+# The one place a tenant verb learns whether the tenant's user manager is
+# alive. `report` prints the single line and returns 1 (the caller treats the
+# tenant's user units as down); `recover` also starts user@<uid>.service,
+# waits for its bus, and lets the units it auto-starts settle, returning 0
+# only when the bus is back.
+_tenant_user_manager_gate() {  # <name> <report|recover>
+  local name="$1" mode="$2" state uid
+  state="$(_user_manager_state "$name")"
+  if [[ "$state" == ok || "$state" == unknown ]]; then
+    return 0
+  fi
+  # Without a resolvable account there is no user@<uid>.service to name or
+  # start; leave the caller's own account handling to fail as it did before.
+  uid="$(id -u "$name" 2>/dev/null)" || uid=''
+  if [[ ! "$uid" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  if [[ "$mode" != recover ]]; then
+    _user_manager_notice "$name" "$state" report
+    return 1
+  fi
+  systemctl start --no-block "user@${uid}.service" >/dev/null 2>&1 || true
+  if _wait_user_manager_bus "$name"; then
+    _user_manager_notice "$name" "$state" recover-ok
+    _user_manager_settle "$name"
+    return 0
+  fi
+  _user_manager_notice "$name" "$state" recover-failed
+  return 1
 }
 
 # Best-effort wait for the tenant's `systemd --user` manager + bus to be ready,
@@ -1158,6 +1434,7 @@ _wait_user_manager() {
 
 start_tenant_systemd() {
   local name="$1"
+  _tenant_user_manager_gate "$name" recover || return 1
   _systemctl_user "$name" daemon-reload
   if tenant_darkirc_enabled "$name"; then
     darkirc_service_uses_release_selector "$name" \
@@ -1211,6 +1488,13 @@ stop_tenant_systemd() {
     say "skipped systemd unit stop for $name: the account is unavailable; rootful container stops continue"
     return 0
   }
+  # WI#731: with the tenant's user manager dead there is no bus to classify
+  # or stop units on; the manager's death already took them down with it. The
+  # gate prints the one line naming the unit and the recovery command instead
+  # of a "could not classify" line per unit.
+  if ! _tenant_user_manager_gate "$name" report; then
+    return 0
+  fi
   local -a services=(
     "lunarwing-${name}.service" "xmpp-bridge-${name}.service"
     "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service"
@@ -1277,10 +1561,11 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-kimi-task-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container" \
         "$qdir/lunarwing-voice-${name}.container"
-  if id -u "$name" >/dev/null 2>&1; then
+  if id -u "$name" >/dev/null 2>&1 && _user_manager_usable "$name"; then
     # The generated task units have Restart=on-failure. Forget every removed
     # Quadlet before deleting its container so systemd cannot resurrect it into
-    # the egress teardown window.
+    # the egress teardown window. A dead manager has nothing loaded to forget
+    # (WI#731), so removal must not fail on the reload.
     _systemctl_user "$name" daemon-reload || return 1
   fi
   # WI#688: a rootful store needs no account; a rootless one without its
