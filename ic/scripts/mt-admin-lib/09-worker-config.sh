@@ -1307,6 +1307,13 @@ _stop_nanocode_supervision() {
   fi
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+    # WI#731: a dead user manager owns no running unit (it took the tenant's
+    # slice down with it), and its bus cannot answer LoadState/stop. The verb
+    # already printed the one line naming the manager; skip the stop and let
+    # the file removal below proceed.
+    if id -u "$name" >/dev/null 2>&1 && ! _user_manager_usable "$name"; then
+      return 0
+    fi
     if id -u "$name" >/dev/null 2>&1; then
       load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null || true)"
       if [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
@@ -1376,8 +1383,13 @@ _remove_nanocode_supervision() {
     "$(tenant_home "$name")/.config/systemd/user/default.target.wants/${container}.service" \
     "$(_hash_dir "$name")/${container}.hash"
   if [[ "$INIT_SYSTEM" == "systemd" ]] && id -u "$name" >/dev/null 2>&1; then
-    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 \
-      || { say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2; true; }
+    # WI#731: with the tenant's user manager dead there is nothing loaded to
+    # reload. A "could not reload" warning would only dilute the one line the
+    # verb's gate printed, so skip the reload instead of warning about it.
+    if _user_manager_usable "$name" \
+        && ! _systemctl_user "$name" daemon-reload >/dev/null 2>&1; then
+      say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2
+    fi
   fi
 
   for svc in "${container}-sup" "$container"; do
