@@ -92,6 +92,7 @@ export LUNARWING_MT_USER_MANAGER_CACHE_DIR="$CACHE_DIR"
 PROBE_COUNT_FILE="$(mktemp)"
 LINGER_MARKER_DIR="$(mktemp -d)"
 export LUNARWING_MT_LINGER_DIR="$LINGER_MARKER_DIR"
+trap 'rm -rf -- "$CACHE_DIR" "$PROBE_COUNT_FILE" "$LINGER_MARKER_DIR"' EXIT
 
 # The gate's bounded waits use `sleep`; their loop logic is what matters here.
 sleep() { :; }
