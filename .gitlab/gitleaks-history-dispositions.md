@@ -47,21 +47,27 @@ Rule mix: `generic-api-key` 1,295, `private-key` 589, `jwt` 16,
   ship with them. No LunarWing system trusts them; the history scan still
   covers `ic/vendor/`, and every new pin, vendor or not, still needs its own row
   above.
-- **Other pins (64): false positive.** Test vectors and fixtures in
-  `ic/crates/lunarwing_safety` and `ic/tests`, the SSH-key fixtures under
-  `ic/src/bridge` and `ic/src/orchestrator`, WASM and DarkIRC test strings,
-  HTML test pages, documentation and template examples, one digest constant in
-  `opencode4lunarwing/Dockerfile`, and the empty-string `local` declaration in
-  `lunarwing-mt-admin.sh` already recorded above.
-- **The `gitlab-pat` row:** the token-shaped example at `59b4247c2` was proven
-  not to be a token on this instance by the administrator lookup recorded
-  above (HTTP 404). No value was extracted or replayed.
+- **Other pins (64): false positives.** Examples include test and fuzz fixtures,
+  public keys and a public WebSocket nonce used in tests, saved public web
+  pages, documentation and template examples, a hook comment, a build digest,
+  and the empty-key declaration in `lunarwing-mt-admin.sh` recorded above.
+- **The `gitlab-pat` row:** the administrator lookup recorded above found no
+  token on this instance for the example at `59b4247c2` (HTTP 404). The
+  administrator sent the value only to this instance's token-information
+  endpoint for the lookup; it was never used to authenticate.
 - **No true positive was found**, so no revocation or rotation was required.
 
-Review evidence: the real-scanner harness passes in the CI-pinned Gitleaks
-v8.30.1 image; scheduled job **174508** (pipeline **7727**) ran the blocking
-`secret-history` job green with `allow_failure: false` over 11,524 commits and
-2.07 GB and reported no leaks; the merge-request `secret-history-regression`
-job runs the same harness. The temporary schedule behind that run was removed,
-so the next protected release tag supplies the tag-pipeline evidence and
-creating the recommended weekly schedule remains an operator action.
+### Scheduled-run evidence
+
+On 2026-11-12, [`secret-history` job 174508](https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/174508)
+passed in scheduled pipeline 7727 on branch `sweetiebot/kimi-18-20261112-1005`
+at commit `085886814`. The job ran with `allow_failure: false` and reported no
+leaks after scanning 11,524 commits (about 2.07 GB). The overall pipeline was
+canceled; the scan job itself succeeded.
+
+The temporary schedule was later removed. This run is evidence for that
+feature branch, not a fresh scheduled run on the merge target. The protected
+release-tag run still needs to be verified, and creating and verifying the
+recommended weekly schedule remains an operator action. The merge-request
+`secret-history-regression` job exercises the harness on synthetic histories in
+the CI-pinned Gitleaks v8.30.1 image; it does not replace either full scan.
