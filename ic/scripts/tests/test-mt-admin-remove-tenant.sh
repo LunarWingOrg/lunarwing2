@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WI#638, WI#650, WI#672, WI#688, WI#699 — hermetic remove-tenant worker/egress harness.
+# WI#638, WI#650, WI#672, WI#688, WI#699, WI#707 — hermetic remove-tenant worker/egress harness.
 # shellcheck disable=SC1091,SC2034,SC2317
 set -euo pipefail
 
@@ -77,8 +77,9 @@ reset_tenant_postgres() {
 getent() {
   # The tenant: an entry, or "not found" (2). Like glibc, a backend that is
   # down (GETENT_FAIL: sssd or LDAP unreachable) also answers 2; only the
-  # local files database tells the two apart.
-  if [[ "${1:-}" == passwd && "${2:-}" == alpha ]]; then
+  # local files database tells the two apart. The uid lookup answers the same
+  # entry: the fixture's tenant is uid 1000.
+  if [[ "${1:-}" == passwd && ( "${2:-}" == alpha || "${2:-}" == 1000 ) ]]; then
     # GETENT_RC: a getent that fails some other way (127: not installed).
     [[ -z "${GETENT_RC:-}" ]] || return "$GETENT_RC"
     [[ "${GETENT_FAIL:-false}" != true ]] || return 2
@@ -91,6 +92,15 @@ getent() {
     return 0
   fi
   command getent "$@"
+}
+# The foreign-home guard reads the home's owner uid; a test fixture cannot
+# chown, so HOME_OWNER_UID stands in for `stat -c %u` when it is set.
+stat() {
+  if [[ "${1:-}" == -c && "${2:-}" == %u && -n "${HOME_OWNER_UID:-}" ]]; then
+    printf '%s\n' "$HOME_OWNER_UID"
+    return 0
+  fi
+  command stat "$@"
 }
 ports_deallocate() { record "ports-deallocate:$1"; }
 remove_tenant_user() { record "remove-user:$1:$2"; }
@@ -837,9 +847,12 @@ run_missing_account_case() {
       fail "$init purge=$purge keep=true claims to have changed the unreachable store"
     fi
   fi
-  [[ ! -e "$TENANT_IDENTITY_DIR/alpha" ]] \
-    && pass "$init purge=$purge keep=$keep drops the identity record at the end" \
-    || fail "$init purge=$purge keep=$keep left the identity record"
+  # The stubbed user removal never deletes the home, and the record is what ties
+  # an already-gone account's home to its uid, so it stays while the home does
+  # (WI#707). run_two_call_purge_case covers the real purge that ends both.
+  [[ -f "$TENANT_IDENTITY_DIR/alpha" ]] \
+    && pass "$init purge=$purge keep=$keep keeps the identity record while the former home stays" \
+    || fail "$init purge=$purge keep=$keep dropped the identity record while the former home stays"
   assert_no_unit_left
 }
 
@@ -1053,22 +1066,31 @@ run_direct_proof_callers_case() {
 }
 
 # After a removal without the account the former home stays, owned by the
-# orphaned uid that the next useradd may reuse; the operator is told so. A
-# failed account lookup removes nothing.
+# orphaned uid that the next useradd may reuse; the operator is told so, and
+# --purge removes the tree and says it did. A failed account lookup removes
+# nothing.
 run_orphan_home_warning_case() {
   local rc=0
   setup_case openrc orphan-home
   seed_identity
-  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user.out" 2>&1 || rc=$?
-  if [[ "$rc" -eq 0 ]] \
+  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha false) >"$CASE_DIR/user.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 && -d "$CASE_DIR/home" ]] \
       && grep -Fq "WARNING: tenant account 'alpha' was already gone; its former home $CASE_DIR/home stays, owned by the orphaned uid 61000" "$CASE_DIR/user.out" \
       && grep -Fq 'remove the home before the next add-tenant' "$CASE_DIR/user.out"; then
-    pass 'removal without the account warns about the orphaned home and its uid'
+    pass 'removal without purge keeps the orphaned home and warns about its uid'
   else
-    fail "removal without the account did not warn about the orphaned home (rc=$rc): $(command cat "$CASE_DIR/user.out")"
+    fail "non-purge removal without the account did not keep and warn (rc=$rc): $(command cat "$CASE_DIR/user.out")"
   fi
   rc=0
-  command rm -rf -- "$CASE_DIR/home"
+  (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-purge.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 && ! -d "$CASE_DIR/home" ]] \
+      && grep -Fq "removed the former home $CASE_DIR/home of the gone tenant account 'alpha'" "$CASE_DIR/user-purge.out" \
+      && ! grep -q 'stays, owned by the orphaned uid' "$CASE_DIR/user-purge.out"; then
+    pass 'purge removes the former home of the gone account and reports it'
+  else
+    fail "purge of the gone account left the former home (rc=$rc): $(command cat "$CASE_DIR/user-purge.out")"
+  fi
+  rc=0
   (MISSING_ACCOUNT=true; real_remove_tenant_user alpha true) >"$CASE_DIR/user-nohome.out" 2>&1 || rc=$?
   if [[ "$rc" -eq 0 ]] && ! grep -q WARNING "$CASE_DIR/user-nohome.out" \
       && grep -Fq "tenant account 'alpha' and its former home were already gone" "$CASE_DIR/user-nohome.out"; then
@@ -1083,6 +1105,81 @@ run_orphan_home_warning_case() {
     pass 'a failed account lookup does not count as an already removed account'
   else
     fail "a failed account lookup was taken as gone (rc=$rc): $(command cat "$CASE_DIR/user-nss.out")"
+  fi
+}
+
+# WI#707: a plain (non-purge) removal of a gone account keeps the former home,
+# so the identity record must survive with it — the documented follow-up
+# `remove-tenant --purge` proves the former uid idle from that record. Deleting
+# the record unconditionally made the second call refuse with "no uid was
+# recorded", which was the only remaining way to finish such a removal.
+run_two_call_purge_case() {
+  local rc=0
+  setup_case openrc two-call-purge
+  seed_identity
+  (MISSING_ACCOUNT=true
+    remove_tenant_user() { real_remove_tenant_user "$@"; }
+    remove_tenant alpha false) >"$CASE_DIR/first.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 && -d "$CASE_DIR/home" && -f "$TENANT_IDENTITY_DIR/alpha" ]] \
+      && grep -Fq "kept the identity record $TENANT_IDENTITY_DIR/alpha" "$CASE_DIR/first.out"; then
+    pass 'a non-purge removal of a gone account keeps the home and the record that ties it to its uid'
+  else
+    fail "non-purge removal of a gone account lost the home or the record (rc=$rc): $(command cat "$CASE_DIR/first.out")"
+  fi
+  rc=0
+  (MISSING_ACCOUNT=true
+    remove_tenant_user() { real_remove_tenant_user "$@"; }
+    remove_tenant alpha true) >"$CASE_DIR/second.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 && ! -d "$CASE_DIR/home" && ! -e "$TENANT_IDENTITY_DIR/alpha" ]] \
+      && grep -Fq "removed the former home $CASE_DIR/home" "$CASE_DIR/second.out" \
+      && ! grep -q 'no uid was recorded' "$CASE_DIR/second.out"; then
+    pass 'the follow-up purge after a non-purge removal finishes the removal'
+  else
+    fail "the follow-up purge was refused or left the home (rc=$rc): $(command cat "$CASE_DIR/second.out")"
+  fi
+}
+
+# WI#707: `useradd --create-home` keeps an existing home, so add-tenant must say
+# when the target home belongs to someone else — an orphaned uid from a removed
+# tenant, or another account — before the new tenant inherits it.
+run_add_tenant_foreign_home_case() {
+  local rc=0
+  setup_case openrc foreign-home
+  (HOME_OWNER_UID=1000; _warn_foreign_tenant_home alpha) >"$CASE_DIR/own.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && ! grep -q WARNING "$CASE_DIR/own.out"; then
+    pass 'add-tenant stays quiet when the existing home belongs to the tenant itself'
+  else
+    fail "add-tenant warned about the tenant's own home (rc=$rc): $(command cat "$CASE_DIR/own.out")"
+  fi
+  rc=0
+  (HOME_OWNER_UID=61000; _warn_foreign_tenant_home alpha) >"$CASE_DIR/orphan.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] \
+      && grep -Fq "the home $CASE_DIR/home of tenant 'alpha' already exists and belongs to the orphaned uid 61000" "$CASE_DIR/orphan.out" \
+      && grep -Fq "rm -rf -- $CASE_DIR/home" "$CASE_DIR/orphan.out"; then
+    pass 'add-tenant warns that an existing home belongs to an orphaned uid'
+  else
+    fail "add-tenant did not warn about an orphaned-uid home (rc=$rc): $(command cat "$CASE_DIR/orphan.out")"
+  fi
+  rc=0
+  (HOME_OWNER_UID=61000; HELD_UID=61000; _warn_foreign_tenant_home alpha) >"$CASE_DIR/foreign.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] \
+      && grep -Fq "belongs to account 'bob' (uid 61000)" "$CASE_DIR/foreign.out"; then
+    pass "add-tenant warns that an existing home belongs to another account"
+  else
+    fail "add-tenant did not name the foreign home's account (rc=$rc): $(command cat "$CASE_DIR/foreign.out")"
+  fi
+  rc=0
+  command rm -rf -- "$CASE_DIR/home"
+  (HOME_OWNER_UID=61000; _warn_foreign_tenant_home alpha) >"$CASE_DIR/nohome.out" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]] && ! grep -q WARNING "$CASE_DIR/nohome.out"; then
+    pass 'add-tenant does not warn when the target home does not exist'
+  else
+    fail "add-tenant warned without a home (rc=$rc): $(command cat "$CASE_DIR/nohome.out")"
+  fi
+  if declare -f create_tenant_user | grep -q '_warn_foreign_tenant_home "\$name"'; then
+    pass 'add-tenant checks the existing home before creating the account'
+  else
+    fail 'add-tenant does not check the existing home'
   fi
 }
 
@@ -1430,6 +1527,8 @@ run_exited_task_case
 run_undetected_init_cgroup_case
 run_direct_proof_callers_case
 run_orphan_home_warning_case
+run_two_call_purge_case
+run_add_tenant_foreign_home_case
 run_missing_account_teardown_refusal
 run_rootful_docker_case false
 run_rootful_docker_case true

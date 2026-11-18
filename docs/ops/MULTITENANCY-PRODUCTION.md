@@ -258,11 +258,14 @@ on a rootless host once it has proven from `/proc` that no process or thread of
 the tenant's recorded uid or subordinate uids remains; otherwise it refuses
 before changing anything. Stop a lingering `user@<uid>.service` and the
 tenant's OpenRC `supervise-daemon` units first. It then skips the unreachable
-rootless store and its network namespace (nothing there is removed or flushed)
-and, when the former home still exists, warns that it is owned by the orphaned
-uid and must be removed before the next `add-tenant`. The rules and the manual record for tenants added before WI#688
-are in `docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is
-gone").
+rootless store and its network namespace (nothing there is removed or flushed).
+With `--purge` it removes the former home, reaps `/run/user/<uid>` and says that
+it did; without it the home stays owned by the orphaned uid, the removal warns,
+and the identity record is kept so that a later
+`remove-tenant <name> --purge` can still prove the former uid idle. `add-tenant`
+warns when the target home already exists and belongs to a different uid. The
+rules and the manual record for tenants added before WI#688 are in
+`docs/ops/WORKER-CONTAINERS.md` ("Removal after the tenant account is gone").
 
 ### Viewing logs
 
@@ -1095,7 +1098,8 @@ add-tenants <names> [options]    Apply the same options to comma-separated names
   --no-weechat-bootstrap         Skip relay auto-bootstrap
 
 remove-tenant <name>             Stop services and deallocate ports
-  --purge                        Also delete the OS user and home
+  --purge                        Also delete the OS user and home, including a
+                                 former home left by an already-gone account
 
 build-tenant <name>              Build one tenant (flock-serialized)
 build-all                        Build registered tenants sequentially

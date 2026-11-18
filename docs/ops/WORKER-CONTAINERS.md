@@ -360,7 +360,8 @@ any of them. `add-tenant`, `start-tenant`, `upgrade-tenant`, and every
 `remove-tenant` while the account exists record or refresh the uid and the
 subordinate uid ranges in root-owned
 `/var/lib/lunarwing/tenant-identity/<tenant>` (mode 0644); a finished removal
-deletes it. Start and upgrade therefore backfill tenants added before WI#688.
+(one that leaves no former home) deletes it. Start and upgrade therefore
+backfill tenants added before WI#688.
 
 "Gone" means that the account is absent from `/etc/passwd` (useradd's local
 files database, which mt-admin creates tenants in) and that the full `getent
@@ -435,10 +436,19 @@ tenant's rootless network namespace, which needs the account to enter and in
 which no process is left (another runtime's host-side chains are flushed as
 usual). The network and keeper definitions and the PostgreSQL data volume stay
 in the store under the former home. When that home still exists it is owned by
-the orphaned uid, which the next `useradd` may hand to a new account: the
-removal prints a warning, and the operator removes the home before the next
-`add-tenant`. A rootful runtime needs no account: its stops and removals still
-run against root's store.
+the orphaned uid, which the next `useradd` may hand to a new account.
+`remove-tenant <tenant> --purge` deletes the former home and reaps
+`/run/user/<uid>` from the recorded uid, and says that it did. A removal
+without `--purge` keeps the home, prints the orphaned-uid warning, and keeps the
+identity record so that the documented follow-up
+`remove-tenant <tenant> --purge` can still prove the former uid idle; deleting
+the record there would make that purge refuse for want of a uid. `add-tenant`
+warns when the target home already exists and belongs to a different uid (an
+orphaned uid from a removed tenant, or another account), because
+`useradd --create-home` leaves an existing home in place and the new tenant
+would inherit what is in it; remove the home before adding the tenant. A
+rootful runtime needs no account: its stops and removals still run against
+root's store.
 
 For a tenant without a record:
 

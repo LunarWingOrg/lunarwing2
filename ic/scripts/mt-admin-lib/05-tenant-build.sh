@@ -172,9 +172,37 @@ ensure_tenant_wasm_toolchain() {
   return 0
 }
 
+# WI#707: `useradd --create-home` is a no-op when the home already exists, so a
+# tenant that reuses the orphaned uid of a removed tenant inherits whatever the
+# previous one left there: its rootless store, .env and workspace. Say whose
+# tree it is before the new account gets it; the operator decides whether to
+# remove it. A home owned by the account itself is the ordinary re-add case and
+# stays silent.
+_warn_foreign_tenant_home() {
+  local name="$1" home owner_uid owner_name owner
+  home="$(tenant_home "$name")"
+  [[ -d "$home" ]] || return 0
+  owner_uid="$(stat -c %u -- "$home" 2>/dev/null)" || return 0
+  [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 0
+  owner_name="$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1)" || owner_name=""
+  [[ "$owner_name" != "$name" ]] || return 0
+  if [[ -n "$owner_name" ]]; then
+    owner="account '$owner_name' (uid $owner_uid)"
+  else
+    owner="the orphaned uid $owner_uid"
+  fi
+  say "" >&2
+  say "WARNING: the home $home of tenant '$name' already exists and belongs to $owner, not to '$name'." >&2
+  say "         useradd --create-home leaves an existing home in place, so this tenant would inherit whatever is in it (a previous tenant's rootless store, .env and workspace)." >&2
+  say "         Inspect it and remove it before adding the tenant: rm -rf -- $home" >&2
+  say "" >&2
+}
+
 create_tenant_user() {
   local name="$1"
   local add_docker_group="${2:-false}"
+
+  _warn_foreign_tenant_home "$name"
 
   if id "$name" &>/dev/null; then
     say "user '$name' already exists"
@@ -608,6 +636,50 @@ _tenant_scan_former_uids() {
   done
 }
 
+# WI#707: an account that is already gone leaves nothing for userdel, so the
+# former home, with the rootless store inside it, is owned by the orphaned uid
+# and only this path can remove it. --purge means "delete the user and the
+# home", so it removes the tree; a removal without purge keeps it and warns,
+# because a later re-add may want the data. The removal itself succeeds either
+# way when it cannot take the tree: it reports what it could not do instead of
+# overclaiming. Purging also reaps /run/user/<uid>; the account is gone, so the
+# uid comes from the identity record, with the same uid>=1000 and no-holder
+# guards the account-present purge path uses.
+_remove_gone_tenant_user_home() {
+  local name="$1" purge="$2"
+  local home former_uid
+  if [[ -z "$name" ]]; then
+    say "ERROR: empty tenant name; refusing to touch a home directory" >&2
+    return 1
+  fi
+  home="$(tenant_home "$name")"
+  former_uid="$(tenant_identity_uid "$name")"
+  if [[ -d "$home" ]]; then
+    if [[ "$purge" != "true" ]]; then
+      say "WARNING: tenant account '$name' was already gone; its former home $home stays, owned by the orphaned uid ${former_uid:-(unrecorded)}. The next useradd may reuse that uid: remove the home before the next add-tenant." >&2
+      return 0
+    fi
+    if rm -rf -- "$home" && [[ ! -d "$home" ]]; then
+      say "removed the former home $home of the gone tenant account '$name'"
+    else
+      say "WARNING: could not remove the former home $home of the gone tenant account '$name' (busy mounts?); remove it manually: rm -rf -- $home" >&2
+    fi
+  else
+    say "tenant account '$name' and its former home were already gone"
+  fi
+  [[ "$purge" == "true" ]] || return 0
+  if [[ "$former_uid" =~ ^[0-9]+$ ]] && ((former_uid >= 1000)) \
+     && ! getent passwd "$former_uid" >/dev/null 2>&1 \
+     && [[ -d "/run/user/$former_uid" ]]; then
+    rm -rf "/run/user/$former_uid" 2>/dev/null || true
+    if [[ -d "/run/user/$former_uid" ]]; then
+      say "WARNING: could not fully remove rootless runtime dir /run/user/$former_uid (busy mounts?); remove manually once released" >&2
+    else
+      say "reaped stale rootless runtime dir /run/user/$former_uid"
+    fi
+  fi
+}
+
 remove_tenant_user() {
   local name="$1"
   local purge="${2:-false}"
@@ -615,16 +687,14 @@ remove_tenant_user() {
   # WI#688: an account that is already gone leaves nothing for userdel. Its
   # former home, with the rootless store inside it, stays owned by the orphaned
   # uid, which the next useradd may hand to a new account.
-  local state=0 former_uid home
+  local state=0
+  if [[ -z "$name" ]]; then
+    say "ERROR: empty tenant name; refusing user removal" >&2
+    return 1
+  fi
   tenant_account_state "$name" || state=$?
   if ((state == 2)); then
-    home="$(tenant_home "$name")"
-    if [[ -d "$home" ]]; then
-      former_uid="$(tenant_identity_uid "$name")"
-      say "WARNING: tenant account '$name' was already gone; its former home $home stays, owned by the orphaned uid ${former_uid:-(unrecorded)}. The next useradd may reuse that uid: remove the home before the next add-tenant." >&2
-    else
-      say "tenant account '$name' and its former home were already gone"
-    fi
+    _remove_gone_tenant_user_home "$name" "$purge" || return 1
     return 0
   elif ((state != 0)); then
     say "ERROR: cannot look up the account of tenant '$name'; not removing it" >&2

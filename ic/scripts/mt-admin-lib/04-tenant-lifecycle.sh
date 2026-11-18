@@ -913,7 +913,21 @@ remove_tenant() {
   say ""
 
   remove_tenant_user "$name" "$purge" || die "user removal failed for '$name'"
-  rm -f -- "$(tenant_identity_path "$name")"
+  # WI#707: when the account is gone and its former home survives (a non-purge
+  # removal, or `userdel -r` failing on a busy mount), the record is what ties
+  # that orphaned tree to its uid. Deleting it here would make the follow-up
+  # `remove-tenant '<name>' --purge` refuse for a missing record, so keep it
+  # unless the account is still present. Re-check instead of trusting the state
+  # read before the removal: it changes on this path. A lookup that cannot tell
+  # (exit 1) keeps the record too — keeping it costs nothing, losing it strands
+  # the home.
+  local state_after=0
+  tenant_account_state "$name" || state_after=$?
+  if ((state_after != 0)) && [[ -d "$(tenant_home "$name")" ]]; then
+    say "kept the identity record $(tenant_identity_path "$name") so a later --purge can prove the former uid idle"
+  else
+    rm -f -- "$(tenant_identity_path "$name")"
+  fi
   say ""
 
   # Drop the pre-delegated cgroup subtree and re-render the boot-time setup
