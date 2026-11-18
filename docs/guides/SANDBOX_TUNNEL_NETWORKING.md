@@ -220,10 +220,17 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90   # must be greater than zero, at most 60
 | `SANDBOX_TUNNEL_NETBIRD_SETUP_KEY` | unset, required for `netbird` | one token without whitespace; secret |
 | `SANDBOX_AUTO_PULL` | `true` in the daemon; `false` in mt-admin tenants | boolean |
 
-The `SANDBOX_TUNNEL_*` values are validated only when `SANDBOX_NETWORK=tunnel`.
-On any other network they are read but unused, so a bad tunnel value does not
-stop a `proxy-enforced` tenant, and it takes effect at the next start once the
-network mode changes.
+Three tunnel settings are parsed in every network mode, before the mode is
+consulted: `SANDBOX_TUNNEL_DNS` must be a comma-separated list of valid IPv4 or
+IPv6 addresses, `SANDBOX_TUNNEL_WIREGUARD_CANARY` must be one valid IPv4 or IPv6
+address, and `SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS` must be an integer of at most
+600. A value that fails one of those checks is a `[sandbox:config]` startup
+error even on a `proxy-enforced` or `none` tenant. The other five — provider,
+image reference, management URL, setup key, and WireGuard config path/file —
+and the remaining semantic checks (non-unicast resolver or canary addresses,
+`SANDBOX_TUNNEL_DNS` with NetBird, a canary without WireGuard, and a timeout of
+zero) run only when `SANDBOX_NETWORK=tunnel`. A bad value there takes effect at
+the next start once the network mode changes.
 
 DNS and canary addresses must be specified unicast IPs. Loopback, link-local,
 broadcast, unspecified, and multicast addresses are rejected: none is a valid
