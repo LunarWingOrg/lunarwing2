@@ -8,7 +8,7 @@ mascot plays the matching sprite animation instead of staying static.
 The whole feature is presentation-layer only: no message content, agent
 behavior, or session state is affected.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The emote parser,
+**Revalidated against source 2026-11-19 (v2.2.1.0).** The emote parser,
 sprite allowlist (`Emote::ALL_SPRITES`), wire contract, and mascot widget match
 `ic/src/channels/web/emote.rs` and `ic/src/channels/web/static/mascot.js`. All
 eight sprites, including `lunar_sup.gif` and `lunar_fiery.gif`, remain present
