@@ -2311,6 +2311,20 @@ environment flags are not passed. `2.6.1`/`2.6.2` were patch releases inside
 their windows at the previous attempt; `2.6.3` supersedes them and was taken
 directly, so no intermediate pin was ever deployed.
 
+The 2.6.0–2.6.3 release notes were read for anything that adds a channel or a
+host. There is no server, pairing, sharing, tunnel or service-mode change. Three
+items were checked against the lane and are no-ops: (1) 2.6.3 fixes the
+external **`Stop` hook** not running after each reply — the lane registers only
+one `[[hooks]]` entry, `PreToolUse` with a `Bash` matcher, and defines no `Stop`
+hook, so nothing new executes; (2) 2.6.2 adds optional `search_url` and
+`feedback_url` fields to **custom registry (`api.json`) providers**, and the
+lane's provider is a plain `openai`-type TensorZero entry in
+`config/config.toml`, not a custom registry entry, so the fields are never
+read; (3) 2.6.3's repeated-front-shell-output fix is a TUI frontend change and
+print mode does not use it. The executor still parses the same
+`--output-format stream-json` lines and matches `turn.step.retrying`, which the
+contract gate above re-verified against the real binary.
+
 **Gate re-verification on the fresh v2.3.2 clone (`c0ad18b40`).**
 
 - compile-out: `packages/cli/src/services/remote-tunnel.ts` keeps its path and
