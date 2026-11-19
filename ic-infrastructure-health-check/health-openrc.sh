@@ -360,7 +360,9 @@ done
 # all silently stop — while every per-service probe above still reads healthy.
 # Report-only (the scheduler is never listed in .metrics.services[], so
 # self-heal will not try to restart a pseudo-service) and degraded at worst:
-# it never masks or downgrades a real per-service outage.
+# it never masks or downgrades a real per-service outage. `.installed` names
+# the scheduler init script so self-heal's openrc@scheduler escalation can
+# carry a concrete recovery command (WI#789).
 
 # Cron hook directories to inspect for an installed watchdog hook.
 # Space-separated; overridable so the test suite can point at a fake tree.
@@ -399,9 +401,14 @@ watchdog_cron_hook_installed() {
   return 1
 }
 
-# Sets globals SCHED_STATUS (absent|healthy|degraded) and SCHED_RUNNING.
+# Sets globals SCHED_STATUS (absent|healthy|degraded), SCHED_RUNNING and
+# SCHED_INSTALLED. SCHED_INSTALLED names the first scheduler init script present
+# even when it is not running, so self-heal's escalation can carry a concrete
+# `rc-service <sched> start` recovery (WI#789). Both stay empty when none is
+# installed — the page then names the issue text only.
 check_scheduler() {
   SCHED_RUNNING=""
+  SCHED_INSTALLED=""
   if ! watchdog_cron_hook_installed; then
     SCHED_STATUS="absent"
     return 0
@@ -409,6 +416,7 @@ check_scheduler() {
   local cron
   for cron in $SCHEDULER_CANDIDATES; do
     [ -x "$INITD_DIR/$cron" ] || continue
+    [ -n "$SCHED_INSTALLED" ] || SCHED_INSTALLED="$cron"
     probe_status "$cron"
     if [ "$STATUS_RC" -eq 0 ] && echo "$STATUS_OUT" | grep -qi "started"; then
       SCHED_RUNNING="$cron"
@@ -440,6 +448,10 @@ sched_running=null
 if [ -n "$SCHED_RUNNING" ]; then
   sched_running="\"$SCHED_RUNNING\""
 fi
+sched_installed=null
+if [ -n "$SCHED_INSTALLED" ]; then
+  sched_installed="\"$SCHED_INSTALLED\""
+fi
 
 # An incomplete sweep is a monitoring-coverage failure, not a service outage:
 # degrade at worst, never mask a worse per-service verdict, and never report
@@ -469,6 +481,7 @@ cat <<EOF
     "scheduler": {
       "hook_installed": $sched_hook,
       "running": $sched_running,
+      "installed": $sched_installed,
       "status": "$SCHED_STATUS"
     }
   },
