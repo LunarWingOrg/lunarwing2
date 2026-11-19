@@ -1285,6 +1285,22 @@ carries no per-process tag, so an answer written there outlives the run that
 wrote it; the second replaces logind's marker directory. Do not set either on a
 host.
 
+The health pipeline reports the condition independently of mt-admin.
+`health-systemd.sh` records one `metrics.instances[]` entry per lingering
+tenant and judges the manager from `user@<uid>.service` on the system bus. A
+down manager (`failed`, `inactive`, `maintenance`) leaves the tenant with zero
+observable units, so self-heal targets the synthetic monitor-only identity
+`systemd@<tenant>` instead of a unit: it grace-tracks, pages once through the
+normal cooldown and notifier, and restarts nothing. `HEALTHCHECK_NOTIFY` stays
+off on multi-tenant hosts — the escalation is the page. The page names
+`systemd@<tenant>` and carries the recovery command
+(`systemctl start user@<uid>.service`); once the manager is back, the next
+healthy instance clears the escalation state. Only a known down state counts as
+dead: a tenant whose bus refuses while `user@<uid>.service` is `active` keeps a
+healthy instance, and if the component is degraded with no unit and no failing
+instance self-heal pages the bare `systemd` identity instead — that shape needs
+manual triage, and the report's issues name the tenant and the probe failure.
+
 Only the parts that need the user bus are skipped. A worker started under the
 system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
 `--restart unless-stopped`) outlives the user manager, so `stop-worker` still
