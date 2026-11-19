@@ -153,6 +153,15 @@ must keep 60 s, give the runners a separate entry point with the 30m value and
 an address allowlist. Also raise the omnibus `registry_nginx` body/proxy
 timeouts per `REGISTRY_PUSH_499.md`. Leave request buffering off.
 
+The default is still in force as of 2026-11-19: a rate-limited upload through
+the edge is cut at 61.18 s every time, and the cut answer is `HTTP/2 502` with
+an 11-byte `Bad Gateway` body and no `server` header — the edge's own error
+page, not omnibus nginx. The boundary has been measured with 12 MiB at
+100 KiB/s and with 25 MiB at 400 KiB/s (both stop at 61.18 s), so it is a time
+limit, not a size limit. After the change, the same probe must end `201` in
+about 125 s; the exact commands are in `REGISTRY_PUSH_499.md`
+§Verification.
+
 Until the edge change is live, runner 17 (the slow `laptop`/`rainova43`
 runner) no longer carries the `container-build` tag, so it cannot take the
 candidate jobs. See `REGISTRY_PUSH_499.md` for the exact change and the
