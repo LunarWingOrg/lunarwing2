@@ -1295,7 +1295,10 @@ normal cooldown and notifier, and restarts nothing. `HEALTHCHECK_NOTIFY` stays
 off on multi-tenant hosts — the escalation is the page. The page names
 `systemd@<tenant>` and carries the recovery command
 (`systemctl start user@<uid>.service`); once the manager is back, the next
-healthy instance clears the escalation state. Only a known down state counts as
+healthy instance clears the escalation state. A unit that has hit its start
+limit refuses `start` ("start request repeated too quickly") until
+`systemctl reset-failed user@<uid>.service`; the recovery command alone is not
+enough for that shape. Only a known down state counts as
 dead: a tenant whose bus refuses while `user@<uid>.service` is `active` keeps a
 healthy instance, and if the component is degraded with no unit and no failing
 instance self-heal pages the bare `systemd` identity instead — that shape needs
