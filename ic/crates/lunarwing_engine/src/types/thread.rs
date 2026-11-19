@@ -290,10 +290,7 @@ impl Default for ThreadConfig {
             no_progress_failure_threshold: std::env::var("ENGINE_V2_NO_PROGRESS_THRESHOLD")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok())
-                .map(|value| value.clamp(
-                    NO_PROGRESS_THRESHOLD_MIN,
-                    NO_PROGRESS_THRESHOLD_MAX,
-                ))
+                .map(|value| value.clamp(NO_PROGRESS_THRESHOLD_MIN, NO_PROGRESS_THRESHOLD_MAX))
                 .unwrap_or(DEFAULT_NO_PROGRESS_FAILURE_THRESHOLD),
             max_budget_usd: None,
             model_context_limit: 128_000,
