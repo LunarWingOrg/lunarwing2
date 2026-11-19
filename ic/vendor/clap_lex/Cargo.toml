@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "clap_lex"
-version = "1.1.1"
+version = "1.1.2"
 build = false
 include = [
     "/build.rs",
@@ -75,7 +75,7 @@ file = "CHANGELOG.md"
 search = "<!-- next-url -->"
 replace = """
 <!-- next-url -->
-[Unreleased]: https://github.com/clap-rs/clap/compare/{{tag_name}}...HEAD"""
+[Unreleased]: {{repository}}/compare/{{tag_name}}...HEAD"""
 exactly = 1
 
 [[package.metadata.release.pre-release-replacements]]
@@ -91,7 +91,7 @@ path = "src/lib.rs"
 bench = false
 
 [dev-dependencies.automod]
-version = "1.0.16"
+version = "1.0.17"
 
 [lints.clippy]
 assigning_clones = "allow"

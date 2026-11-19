@@ -64,6 +64,8 @@ mod error;
 #[cfg(feature = "ring")]
 mod ring_algs;
 mod rpk_entity;
+/// Processing of certificate transparency SCTs.
+pub mod sct;
 mod signed_data;
 mod subject_name;
 mod time;
@@ -96,6 +98,9 @@ pub use {
         RequiredEkuNotFoundContext, VerifiedPath,
     },
 };
+
+#[cfg(feature = "alloc")]
+pub use trust_anchor::spki_for_anchor;
 
 #[cfg(feature = "alloc")]
 pub use crl::{OwnedCertRevocationList, OwnedRevokedCert};

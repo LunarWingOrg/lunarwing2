@@ -116,6 +116,11 @@ pub enum ArmArchitecture {
 pub enum Aarch64Architecture {
     Aarch64,
     Aarch64be,
+    /// AArch64 with ILP32 ABI (32-bit pointers, 64-bit registers and ISA).
+    /// Used by Apple Watch from Series 4 onward via the `arm64_32-apple-watchos`
+    /// target. The `_32` suffix is part of Apple/LLVM's architecture name.
+    #[allow(non_camel_case_types)]
+    Arm64_32,
 }
 
 // #[cfg_attr(feature = "rust_1_40", non_exhaustive)]
@@ -352,7 +357,9 @@ impl Aarch64Architecture {
     /// Test if this architecture uses the Thumb instruction set.
     pub fn is_thumb(self) -> bool {
         match self {
-            Aarch64Architecture::Aarch64 | Aarch64Architecture::Aarch64be => false,
+            Aarch64Architecture::Aarch64
+            | Aarch64Architecture::Aarch64be
+            | Aarch64Architecture::Arm64_32 => false,
         }
     }
 
@@ -363,10 +370,13 @@ impl Aarch64Architecture {
     /// Return the pointer bit width of this target's architecture.
     ///
     /// This function is only aware of the CPU architecture so it is not aware
-    /// of ilp32 ABIs.
+    /// of ilp32 ABIs in general — but Apple's `arm64_32` is treated as its own
+    /// architecture variant rather than via an environment, so it does report
+    /// `U32` here.
     pub fn pointer_width(self) -> PointerWidth {
         match self {
             Aarch64Architecture::Aarch64 | Aarch64Architecture::Aarch64be => PointerWidth::U64,
+            Aarch64Architecture::Arm64_32 => PointerWidth::U32,
         }
     }
 
@@ -375,6 +385,7 @@ impl Aarch64Architecture {
         match self {
             Aarch64Architecture::Aarch64 => Endianness::Little,
             Aarch64Architecture::Aarch64be => Endianness::Big,
+            Aarch64Architecture::Arm64_32 => Endianness::Little,
         }
     }
 
@@ -385,6 +396,7 @@ impl Aarch64Architecture {
         match self {
             Aarch64 => Cow::Borrowed("aarch64"),
             Aarch64be => Cow::Borrowed("aarch64_be"),
+            Arm64_32 => Cow::Borrowed("arm64_32"),
         }
     }
 }
@@ -718,6 +730,7 @@ pub enum OperatingSystem {
     Hermit,
     Horizon,
     Hurd,
+    Hyperlight,
     Illumos,
     IOS(Option<DeploymentTarget>),
     L4re,
@@ -746,6 +759,7 @@ pub enum OperatingSystem {
     Windows,
     /// An alternate name for [visionOS][Self::VisionOS].
     XROS(Option<DeploymentTarget>),
+    Zos,
 }
 
 impl OperatingSystem {
@@ -784,6 +798,7 @@ impl OperatingSystem {
             Hermit => Cow::Borrowed("hermit"),
             Horizon => Cow::Borrowed("horizon"),
             Hurd => Cow::Borrowed("hurd"),
+            Hyperlight => Cow::Borrowed("hyperlight"),
             Illumos => Cow::Borrowed("illumos"),
             IOS(deployment_target) => darwin_version("ios", deployment_target),
             L4re => Cow::Borrowed("l4re"),
@@ -807,6 +822,7 @@ impl OperatingSystem {
             WatchOS(deployment_target) => darwin_version("watchos", deployment_target),
             Windows => Cow::Borrowed("windows"),
             XROS(deployment_target) => darwin_version("xros", deployment_target),
+            Zos => Cow::Borrowed("zos"),
         }
     }
 
@@ -931,6 +947,7 @@ pub enum BinaryFormat {
     Macho,
     Wasm,
     Xcoff,
+    Goff,
 }
 
 impl BinaryFormat {
@@ -945,6 +962,7 @@ impl BinaryFormat {
             Macho => Cow::Borrowed("macho"),
             Wasm => Cow::Borrowed("wasm"),
             Xcoff => Cow::Borrowed("xcoff"),
+            Goff => Cow::Borrowed("goff"),
         }
     }
 }
@@ -1121,6 +1139,7 @@ pub(crate) fn default_binary_format(triple: &Triple) -> BinaryFormat {
         OperatingSystem::Aix => BinaryFormat::Xcoff,
         os if os.is_like_darwin() => BinaryFormat::Macho,
         OperatingSystem::Windows => BinaryFormat::Coff,
+        OperatingSystem::Zos => BinaryFormat::Goff,
         OperatingSystem::Nebulet
         | OperatingSystem::Emscripten
         | OperatingSystem::VxWorks
@@ -1260,6 +1279,7 @@ impl FromStr for Aarch64Architecture {
             "aarch64" => Aarch64,
             "arm64" => Aarch64,
             "aarch64_be" => Aarch64be,
+            "arm64_32" => Arm64_32,
             _ => return Err(()),
         })
     }
@@ -1637,6 +1657,7 @@ impl FromStr for OperatingSystem {
             "hermit" => Hermit,
             "horizon" => Horizon,
             "hurd" => Hurd,
+            "hyperlight" => Hyperlight,
             "illumos" => Illumos,
             "l4re" => L4re,
             "linux" => Linux,
@@ -1654,6 +1675,7 @@ impl FromStr for OperatingSystem {
             "wasip1" => WasiP1,
             "wasip2" => WasiP2,
             "windows" => Windows,
+            "zos" => Zos,
             "espidf" => Espidf,
             _ => return Err(()),
         })
@@ -1732,6 +1754,7 @@ impl FromStr for BinaryFormat {
             "macho" => Macho,
             "wasm" => Wasm,
             "xcoff" => Xcoff,
+            "goff" => Goff,
             _ => return Err(()),
         })
     }
@@ -1771,6 +1794,7 @@ mod tests {
             "aarch64-unknown-freebsd",
             "aarch64-unknown-fuchsia",
             "aarch64-unknown-hermit",
+            "aarch64-unknown-hyperlight",
             "aarch64-unknown-illumos",
             "aarch64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu_ilp32",
@@ -1786,7 +1810,7 @@ mod tests {
             "aarch64-unknown-uefi",
             "aarch64-uwp-windows-msvc",
             "aarch64-wrs-vxworks",
-            //"arm64_32-apple-watchos", // TODO
+            "arm64_32-apple-watchos",
             //"arm64e-apple-darwin", // TODO
             "amdgcn-amd-amdhsa",
             "amdgcn-amd-amdhsa-amdgiz",
@@ -1936,6 +1960,7 @@ mod tests {
             "riscv64gc-unknown-openbsd",
             "riscv64imac-unknown-none-elf",
             "riscv64-linux-android",
+            "s390x-ibm-zos",
             "s390x-unknown-linux-gnu",
             "s390x-unknown-linux-musl",
             "sparc64-unknown-linux-gnu",
@@ -1996,6 +2021,7 @@ mod tests {
             "x86_64-unknown-haiku",
             "x86_64-unknown-hermit-kernel", // Changed to x86_64-unknown-none-hermitkernel in 1.53.0
             "x86_64-unknown-hermit",
+            "x86_64-unknown-hyperlight",
             "x86_64-unknown-illumos",
             "x86_64-unknown-l4re-uclibc",
             "x86_64-unknown-linux-gnu",

@@ -1,4 +1,4 @@
-FROM rust:1.99@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+FROM rust:1.100@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31
 
 # Match a typical host Linux UID/GID (override in devcontainer.json "build" -> "args" if needed)
 ARG USERNAME=vscode

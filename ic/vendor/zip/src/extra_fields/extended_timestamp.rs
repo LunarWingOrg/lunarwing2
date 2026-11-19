@@ -1,11 +1,12 @@
 //! Extended Timestamp extra field
 //! Defined in <https://libzip.org/specifications/extrafld.txt>
 
+use crate::extra_fields::UsedExtraField;
 use crate::result::invalid;
 use crate::result::{ZipError, ZipResult};
 use crate::unstable::LittleEndianReadExt;
 use core::mem;
-use std::io::Read;
+use std::io::{Read, Write};
 
 /// `ExtendedTimestamp` Flags
 #[rustfmt::skip]
@@ -37,6 +38,8 @@ impl From<ExtendedTimestampFlags> for u8 {
 /// Extended timestamp, as described in <https://libzip.org/specifications/extrafld.txt>
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtendedTimestamp {
+    // Central-directory flags describe the local header, including local-only timestamps.
+    flags: u8,
     modified: Option<u32>,
     accessed: Option<u32>,
     created: Option<u32>,
@@ -47,6 +50,17 @@ impl ExtendedTimestamp {
         + mem::size_of::<u32>()
         + mem::size_of::<u32>()
         + mem::size_of::<u32>()) as u16;
+
+    const fn local_flags(&self) -> u8 {
+        (self.modified.is_some() as u8 * ExtendedTimestampFlags::Modified as u8)
+            | (self.accessed.is_some() as u8 * ExtendedTimestampFlags::Accessed as u8)
+            | (self.created.is_some() as u8 * ExtendedTimestampFlags::Created as u8)
+    }
+
+    pub(crate) fn update_local_header_flags(&mut self) {
+        self.flags = self.local_flags();
+    }
+
     /// creates an extended timestamp struct by reading the required bytes from the reader.
     ///
     /// This method assumes that the length has already been read, therefore
@@ -75,7 +89,7 @@ impl ExtendedTimestamp {
             return Self::parse_local_header(reader, len, flags, bytes_to_read);
         }
         // the flags field refer to the local header
-        Self::parse_central_header(reader, bytes_to_read)
+        Self::parse_central_header(reader, flags[0], bytes_to_read)
     }
 
     /// parse the local header
@@ -160,6 +174,7 @@ impl ExtendedTimestamp {
         }
 
         Ok(Self {
+            flags,
             modified,
             accessed,
             created,
@@ -167,7 +182,11 @@ impl ExtendedTimestamp {
     }
 
     /// parse the central header
-    fn parse_central_header<R: Read>(reader: &mut R, mut bytes_to_read: usize) -> ZipResult<Self> {
+    fn parse_central_header<R: Read>(
+        reader: &mut R,
+        flags: u8,
+        mut bytes_to_read: usize,
+    ) -> ZipResult<Self> {
         let modified = if bytes_to_read >= mem::size_of::<u32>() {
             bytes_to_read -= mem::size_of::<u32>();
             Some(reader.read_u32_le()?)
@@ -185,6 +204,7 @@ impl ExtendedTimestamp {
             }
         }
         Ok(Self {
+            flags,
             modified,
             accessed: None,
             created: None,
@@ -208,6 +228,79 @@ impl ExtendedTimestamp {
     pub fn cr_time(&self) -> Option<u32> {
         self.created
     }
+
+    /// Creates a new `ExtendedTimestamp` extra field with optional modification, access,
+    /// and creation timestamps (in UNIX epoch seconds).
+    #[must_use]
+    pub const fn new(modified: Option<u32>, accessed: Option<u32>, created: Option<u32>) -> Self {
+        let mut new_self = Self {
+            flags: 0,
+            modified,
+            accessed,
+            created,
+        };
+        new_self.flags = new_self.local_flags();
+        new_self
+    }
+
+    /// Creates a new `ExtendedTimestamp` extra field with only the modification timestamp set.
+    #[must_use]
+    pub const fn from_mod_time(modified: u32) -> Self {
+        Self::new(Some(modified), None, None)
+    }
+
+    /// Number of timestamps the serialized field contains.
+    ///
+    /// The central header only stores the modification time, so the access and
+    /// creation times are left out there.
+    fn time_count(&self, is_local_header: bool) -> usize {
+        let mut count = usize::from(self.modified.is_some());
+        if is_local_header {
+            count += usize::from(self.accessed.is_some());
+            count += usize::from(self.created.is_some());
+        }
+        count
+    }
+
+    /// Size of the serialized extra field, including its 4-byte extra field
+    /// header (tag and data size).
+    pub(crate) fn full_size(&self, is_local_header: bool) -> usize {
+        mem::size_of::<u16>() // magic
+            + mem::size_of::<u16>() // length
+            + self.size(is_local_header)
+    }
+
+    /// Size of the serialized extra field
+    pub(crate) fn size(&self, is_local_header: bool) -> usize {
+        mem::size_of::<u8>() + mem::size_of::<u32>() * self.time_count(is_local_header)
+    }
+
+    /// Serializes the extra field, including its tag and data size.
+    ///
+    /// This keeps the timestamps of a copied entry, whose local header would
+    /// otherwise only carry the rounded, local-time DOS date-time.
+    pub(crate) fn write<W: Write>(&self, write: &mut W, is_local_header: bool) -> ZipResult<()> {
+        write.write_all(&UsedExtraField::ExtendedTimestamp.as_u16().to_le_bytes())?;
+        write.write_all(&(self.size(is_local_header) as u16).to_le_bytes())?;
+        let flags = if is_local_header {
+            self.local_flags()
+        } else {
+            self.flags
+        };
+        write.write_all(&[flags])?;
+        if let Some(modified) = self.modified {
+            write.write_all(&modified.to_le_bytes())?;
+        }
+        if is_local_header {
+            if let Some(accessed) = self.accessed {
+                write.write_all(&accessed.to_le_bytes())?;
+            }
+            if let Some(created) = self.created {
+                write.write_all(&created.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +308,62 @@ mod tests {
     use super::ExtendedTimestamp;
 
     use std::io::Cursor;
+
+    #[test]
+    fn write_extended_timestamp() {
+        for flags in 0u8..8 {
+            let timestamp = ExtendedTimestamp {
+                flags,
+                modified: (flags & 1 != 0).then_some(1_715_000_001),
+                accessed: (flags & 2 != 0).then_some(1_715_000_003),
+                created: (flags & 4 != 0).then_some(1_715_000_005),
+            };
+            for is_local_header in [true, false] {
+                let field = crate::ExtraField::ExtendedTimestamp(timestamp.clone());
+                let mut bytes = Vec::new();
+                field.write(&mut bytes, is_local_header).unwrap();
+                let count = if is_local_header {
+                    flags.count_ones() as usize
+                } else {
+                    usize::from(timestamp.modified.is_some())
+                };
+                assert_eq!(bytes.len(), 5 + count * 4);
+                assert_eq!(field.size(is_local_header), bytes.len());
+                assert_eq!(&bytes[..2], &[0x55, 0x54]);
+                assert_eq!(
+                    u16::from_le_bytes([bytes[2], bytes[3]]) as usize,
+                    bytes.len() - 4
+                );
+                assert_eq!(bytes[4], flags);
+                let parsed = ExtendedTimestamp::try_from_reader(
+                    &mut Cursor::new(&bytes[4..]),
+                    (bytes.len() - 4) as u16,
+                    is_local_header,
+                )
+                .unwrap();
+                assert_eq!(parsed.modified, timestamp.modified);
+                assert_eq!(
+                    parsed.accessed,
+                    if is_local_header {
+                        timestamp.accessed
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(
+                    parsed.created,
+                    if is_local_header {
+                        timestamp.created
+                    } else {
+                        None
+                    }
+                );
+                let mut rewritten = Vec::new();
+                parsed.write(&mut rewritten, is_local_header).unwrap();
+                assert_eq!(rewritten, bytes);
+            }
+        }
+    }
 
     /// Ensure we don't panic or read garbage data if the field body is empty
     #[test]
@@ -323,7 +472,6 @@ mod tests {
 
     #[test]
     fn test_extended_timestamp() {
-        // in the central header
         let mut cursor = Cursor::new(&[0b0000_0111_u8, 0x00, 0x00, 0x00, 0x01]);
         let result = ExtendedTimestamp::try_from_reader(&mut cursor, 5, true).unwrap();
         assert_eq!(result.mod_time(), Some(1 << 24));
@@ -381,6 +529,96 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         let result = ExtendedTimestamp::try_from_reader(&mut cursor, 9, false).unwrap();
         assert_eq!(result.mod_time(), Some(1700000000));
+        assert_eq!(result.ac_time(), None); // not in central
+        assert_eq!(result.cr_time(), None); // not in central
         assert_eq!(cursor.position(), 9);
+
+        let mut cursor = Cursor::new(&[
+            0b0000_0111_u8,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x03,
+        ]);
+        let result = ExtendedTimestamp::try_from_reader(&mut cursor, 13, false).unwrap();
+        assert_eq!(result.mod_time(), Some(1 << 24));
+        assert_eq!(result.ac_time(), None); // not in central
+        assert_eq!(result.cr_time(), None); // not in central
+    }
+
+    #[test]
+    fn test_constructors() {
+        let ts = ExtendedTimestamp::new(Some(12345), Some(67890), None);
+        assert_eq!(ts.mod_time(), Some(12345));
+        assert_eq!(ts.ac_time(), Some(67890));
+        assert_eq!(ts.cr_time(), None);
+
+        let ts_mod = ExtendedTimestamp::from_mod_time(99999);
+        assert_eq!(ts_mod.mod_time(), Some(99999));
+        assert_eq!(ts_mod.ac_time(), None);
+        assert_eq!(ts_mod.cr_time(), None);
+    }
+
+    /// A copied entry must be able to serialize the field again, with the same
+    /// timestamps and flags that the source advertised.
+    #[test]
+    fn test_write_local_header() {
+        let field = [
+            0b0000_0111_u8,
+            0x01,
+            0xF1,
+            0x53,
+            0x65,
+            0x02,
+            0xF1,
+            0x53,
+            0x65,
+            0x03,
+            0xF1,
+            0x53,
+            0x65,
+        ];
+        let mut cursor = Cursor::new(&field);
+        let timestamp = ExtendedTimestamp::try_from_reader(&mut cursor, 13, true).unwrap();
+        let mut serialized = Vec::new();
+        timestamp.write(&mut serialized, true).unwrap();
+        assert_eq!(serialized.len(), 4 + field.len());
+        assert_eq!(&serialized[4..], &field[..]);
+    }
+
+    /// The central header stores the modification time only and the flags reflects
+    /// the local header
+    #[test]
+    fn test_write_central_header() {
+        let field = [
+            0b0000_0111_u8,
+            0x01,
+            0xF1,
+            0x53,
+            0x65,
+            0x02,
+            0xF1,
+            0x53,
+            0x65,
+            0x03,
+            0xF1,
+            0x53,
+            0x65,
+        ];
+        let mut cursor = Cursor::new(&field);
+        let timestamp = ExtendedTimestamp::try_from_reader(&mut cursor, 13, true).unwrap();
+        let mut serialized = Vec::new();
+        timestamp.write(&mut serialized, false).unwrap();
+        assert_eq!(serialized.len(), (2 + 2) + (1 + 4)); // magic, length, flag, date
+        // central header only keeps the modification
+        assert_eq!(&serialized[4..], &[0b0000_0111, 0x01, 0xF1, 0x53, 0x65]);
     }
 }

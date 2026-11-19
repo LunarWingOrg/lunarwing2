@@ -989,14 +989,14 @@ pub struct ISOWeekDate {
 }
 
 impl ISOWeekDate {
-    /// The maximum representable ISO week date.
+    /// The minimum representable ISO week date.
     pub const MIN: ISOWeekDate = ISOWeekDate {
         year: b::ISOYear::MIN,
         week: b::ISOWeek::MIN,
         weekday: Weekday::Monday,
     };
 
-    /// The minimum representable ISO week date.
+    /// The maximum representable ISO week date.
     pub const MAX: ISOWeekDate = ISOWeekDate {
         year: b::ISOYear::MAX,
         // Technical max is 52, but 9999 is not a leap year.
@@ -1070,9 +1070,9 @@ impl ISOWeekDate {
         if week < 1 {
             rbail!(b::ISOWeek::error());
         }
-        if week == 53 && !civil::is_long_iso_week_year(year) {
-            week = 52;
-        }
+        let weeks_in_year =
+            if civil::is_long_iso_week_year(year) { 53 } else { 52 };
+        week = if week <= weeks_in_year { week } else { weeks_in_year };
         if year == b::ISOYear::MAX
             && week == 52
             && weekday.to_monday_zero_offset()
@@ -1403,6 +1403,14 @@ mod tests {
 
     fn week_date(year: i16, week: i8, weekday: Weekday) -> ISOWeekDate {
         ISOWeekDate::new(year, week, weekday).unwrap()
+    }
+
+    #[test]
+    fn iso_week_date_new_constrain() {
+        assert_eq!(
+            ISOWeekDate::new_constrain(2024, 60, Weekday::Monday).unwrap(),
+            week_date(2024, 52, Weekday::Monday),
+        );
     }
 
     #[test]

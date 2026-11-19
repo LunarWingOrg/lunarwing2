@@ -411,6 +411,9 @@ impl<A: Read + Write + Seek> ZipWriter<A> {
     pub fn new_append_with_config(config: Config, mut readwriter: A) -> ZipResult<ZipWriter<A>> {
         readwriter.seek(SeekFrom::Start(0))?;
         let metadata = ZipArchive::get_metadata(config, &mut readwriter)?;
+        // `ZipArchive::get_metadata` leaves `readwriter` at the end of the central directory;
+        // seek back to its start so appended entries overwrite it instead of leaving a second one.
+        readwriter.seek(SeekFrom::Start(metadata.shared.dir_start))?;
         Ok(ZipWriter {
             inner: GenericZipWriter::Storer(MaybeEncrypted::Unencrypted(readwriter)),
             files: metadata.shared.files,
@@ -561,7 +564,7 @@ impl<A: Read + Write + Seek> ZipWriter<A> {
     /// # }
     ///```
     pub fn finish_into_readable(mut self) -> ZipResult<ZipArchive<A>> {
-        let central_start = self.finalize()?;
+        let (last_file_end, central_start) = self.finalize()?;
         let inner = self.close_writer()?;
         let comment = mem::take(&mut self.comment);
         let zip64_extensible_data_sector = mem::take(&mut self.zip64_extensible_data_sector);
@@ -571,6 +574,7 @@ impl<A: Read + Write + Seek> ZipWriter<A> {
             comment,
             zip64_extensible_data_sector,
             inner,
+            last_file_end,
             central_start,
         ))
     }
@@ -749,6 +753,8 @@ impl<W: Write + Seek> ZipWriter<W> {
             compressed_size: 0,
             uncompressed_size: 0,
             language_encoding: None,
+            encrypted_with_descriptor: None,
+            file_comment_raw: None,
         });
         if options.extended_options.validate_extra_fields()
             && let Some(extra_fields) = options.extended_options.extra_fields()
@@ -805,6 +811,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             }
             file.file_comment = comment;
         }
+        file.file_comment_raw = raw_values.file_comment_raw;
         if let Some(language_encoding) = raw_values.language_encoding {
             file.flags
                 .set(ZipFlags::LanguageEncoding, language_encoding);
@@ -813,6 +820,12 @@ impl<W: Write + Seek> ZipWriter<W> {
             && file.is_non_dir_based_on_unix_mode()
         {
             file.flags |= ZipFlags::UsingDataDescriptor.as_u16();
+        }
+        // A raw copy of an encrypted entry keeps the encrypted and data descriptor
+        // flags it was read with, whatever the default above picked.
+        if let Some(descriptor) = raw_values.encrypted_with_descriptor {
+            file.flags.set(ZipFlags::Encrypted, true);
+            file.flags.set(ZipFlags::UsingDataDescriptor, descriptor);
         }
         file.version_made_by = file.version_made_by.max(file.version_needed() as u8);
         let index = self.insert_file_data(file_name_raw, file)?;
@@ -1265,7 +1278,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         file: ZipFile<'_, R>,
         name: S,
     ) -> ZipResult<()> {
-        let options = Self::raw_copy_options(&file)?;
+        let options = Self::raw_copy_options(&file, true)?;
         let file_name = name.to_string();
         self.raw_copy_file_rename_internal(file, file_name.as_bytes(), options, None)
     }
@@ -1273,12 +1286,19 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// The options a raw copy writes `file` with: its own, plus its comment and extra fields.
     fn raw_copy_options<R: Read>(
         file: &ZipFile<'_, R>,
+        preserve_timestamp: bool,
     ) -> ZipResult<FullFileOptions<'static, 'static>> {
         let mut options = file.options().into_full_options();
         if !file.comment().is_empty() {
             options = options.with_file_comment(file.comment());
         }
         for one_extra in file.extra_data_fields() {
+            if let ExtraField::ExtendedTimestamp(timestamp) = one_extra {
+                if preserve_timestamp {
+                    options = options.with_extended_timestamp(timestamp.mod_time(), None, None)?;
+                }
+                continue;
+            }
             let mut buff = Cursor::new(Vec::new());
             one_extra.write(&mut buff, false)?;
             let buff = buff.into_inner();
@@ -1295,7 +1315,13 @@ impl<W: Write + Seek> ZipWriter<W> {
     }
 
     /// `language_encoding` is the copied entry's own flag when `name` is its
-    /// stored name, or `None` for a new name, which derives the flag from it.
+    /// stored name, which keeps its comment as stored too, or `None` for a new
+    /// name, which derives the flag from it and writes the comment as UTF-8.
+    ///
+    /// An encrypted entry keeps its encrypted and data descriptor flags, and
+    /// gets a data descriptor after its bytes when it had one, so it decrypts as
+    /// before: the ZipCrypto header (or AES salt, verifier, and MAC) is in those
+    /// bytes, and neither scheme binds the name.
     fn raw_copy_file_rename_internal<R: Read, T: FileOptionExtension>(
         &mut self,
         mut file: ZipFile<'_, R>,
@@ -1308,6 +1334,10 @@ impl<W: Write + Seek> ZipWriter<W> {
             compressed_size: file.compressed_size(),
             uncompressed_size: file.size(),
             language_encoding,
+            encrypted_with_descriptor: file
+                .encrypted()
+                .then(|| file.flags().is_using_data_descriptor()),
+            file_comment_raw: language_encoding.and_then(|_| file.data.file_comment_raw.clone()),
         };
 
         self.start_entry(name, options, Some(raw_values))?;
@@ -1315,6 +1345,18 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.writing_raw = true;
 
         io::copy(&mut file.take_raw_reader()?, self)?;
+        // `finish_file` writes no data descriptor for a raw entry.
+        let auto_large_file = self.auto_large_file;
+        let result = (|| -> ZipResult<()> {
+            let writer = self.inner.try_inner_mut()?;
+            if let Some((_, file)) = self.files.last()
+                && file.is_using_data_descriptor()
+            {
+                file.write_data_descriptor(writer, auto_large_file)?;
+            }
+            Ok(())
+        })();
+        self.ok_or_abort_file(result)?;
         self.finish_file()
     }
 
@@ -1337,7 +1379,8 @@ impl<W: Write + Seek> ZipWriter<W> {
     ///
     /// The name is copied as stored: the same bytes, under the same language encoding flag. So a
     /// name in a legacy code page (Shift-JIS, GBK, CP866, ...) stays readable by tools that decode
-    /// it, where re-encoding the CP437 reading of [`ZipFile::name`] as UTF-8 would garble it.
+    /// it, where re-encoding the CP437 reading of [`ZipFile::name`] as UTF-8 would garble it. The
+    /// comment is copied as stored too (see [`ZipFile::comment_raw`]).
     ///
     /// ```no_run
     /// use std::fs::File;
@@ -1359,7 +1402,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// }
     /// ```
     pub fn raw_copy_file<R: Read>(&mut self, file: ZipFile<'_, R>) -> ZipResult<()> {
-        let options = Self::raw_copy_options(&file)?;
+        let options = Self::raw_copy_options(&file, true)?;
         let file_name_raw = file.name_raw().to_owned();
         let language_encoding = file.flags().matching(ZipFlags::LanguageEncoding);
         self.raw_copy_file_rename_internal(file, &file_name_raw, options, Some(language_encoding))
@@ -1369,6 +1412,9 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// modified date and unix mode. This allows faster copies of the `ZipFile` since there is no need
     /// to decompress and compress it again. Any `ZipFile` metadata other than the last modified date
     /// and the unix mode is copied and not checked, for example the file CRC.
+    ///
+    /// A ZipCrypto entry with a data descriptor checks its password against the high byte of its
+    /// last modified time, so a new time with a different high byte makes the password look wrong.
     ///
     /// ```no_run
     /// use std::io::{Read, Seek, Write};
@@ -1394,7 +1440,8 @@ impl<W: Write + Seek> ZipWriter<W> {
         last_modified_time: DateTime,
         unix_mode: Option<u32>,
     ) -> ZipResult<()> {
-        let mut options = Self::raw_copy_options(&file)?;
+        // Do not let the old extended timestamp override the requested modification time.
+        let mut options = Self::raw_copy_options(&file, false)?;
 
         options = options.last_modified_time(last_modified_time);
 
@@ -1551,6 +1598,8 @@ impl<W: Write + Seek> ZipWriter<W> {
             compressed_size,
             uncompressed_size,
             language_encoding: None,
+            encrypted_with_descriptor: None,
+            file_comment_raw: None,
         };
 
         self.start_entry(&file_name, options, Some(raw_values))?;
@@ -1610,12 +1659,13 @@ impl<W: Write + Seek> ZipWriter<W> {
         Ok(())
     }
 
-    fn finalize(&mut self) -> ZipResult<u64> {
+    fn finalize(&mut self) -> ZipResult<(u64, u64)> {
         /// Longest stale tail that [`Self::finalize`] blanks in place rather than moving the footer.
         const STALE_FILL_MAX_LEN: u64 = 0xFF00;
         self.finish_file()?;
 
-        let (central_start, is_zip64) = self.write_central_and_footer()?;
+        let (last_file_end, is_zip64) = self.write_central_and_footer()?;
+        let mut central_start = last_file_end;
         if self.seek_possible {
             let writer = self.inner.try_inner_mut()?;
             let footer_end = writer.stream_position()?;
@@ -1637,7 +1687,7 @@ impl<W: Write + Seek> ZipWriter<W> {
                 // Data from an aborted file is past the end of the footer.
 
                 // Overwrite the magic so the footer is no longer valid.
-                writer.seek(SeekFrom::Start(central_start))?;
+                writer.seek(SeekFrom::Start(last_file_end))?;
                 writer.write_all(&0_u32.to_le_bytes())?;
                 let start_zip32_cde = footer_end
                     - (size_of::<Magic>() + size_of::<Zip32CDEBlock>()) as u64
@@ -1666,7 +1716,8 @@ impl<W: Write + Seek> ZipWriter<W> {
                 let central_and_footer_size = footer_end - central_start;
                 writer.seek(SeekFrom::End(-(central_and_footer_size as i64)))?;
                 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-                let (_, new_is_zip64) = self.write_central_and_footer()?;
+                let (new_central_start, new_is_zip64) = self.write_central_and_footer()?;
+                central_start = new_central_start;
                 #[cfg(debug_assertions)]
                 {
                     let archive_end = if new_is_zip64 && new_is_zip64 != is_zip64 {
@@ -1690,7 +1741,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             }
         }
 
-        Ok(central_start)
+        Ok((last_file_end, central_start))
     }
 
     fn write_central_and_footer(&mut self) -> Result<(u64, bool), ZipError> {
@@ -3152,7 +3203,7 @@ impl ZipFileData {
                 .map_err(std::io::Error::other)?,
             extra_field_length,
             file_comment_length: self
-                .file_comment
+                .file_comment_raw()
                 .len()
                 .try_into()
                 .map_err(std::io::Error::other)?,
@@ -3170,7 +3221,7 @@ impl ZipFileData {
             one_extra_field.write(writer, false)?;
         }
         // file comment
-        writer.write_all(self.file_comment.as_bytes())?;
+        writer.write_all(self.file_comment_raw())?;
         Ok(())
     }
 
@@ -3283,6 +3334,10 @@ impl ZipFileData {
         #[cfg(feature = "aes-crypto")]
         let mut bytes_written = 0;
         for one_extra_field in local_extra_fields {
+            if let ExtraField::ExtendedTimestamp(timestamp) = one_extra_field {
+                // The central flags must describe this new local header, including on deep copies.
+                timestamp.update_local_header_flags();
+            }
             one_extra_field.write(&mut *writer, true)?;
             #[cfg(feature = "aes-crypto")]
             {
@@ -3748,6 +3803,31 @@ mod tests {
             assert_eq!(archive.len(), 1, "comment_len {comment_len}");
             assert_eq!(archive.comment().len(), comment_len);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn finish_into_readable_reports_relocated_central_directory_start() -> ZipResult<()> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["a", "b"] {
+            writer.start_file(
+                name,
+                SimpleFileOptions {
+                    compression_method: Stored,
+                    ..Default::default()
+                },
+            )?;
+            writer.write_all(name.as_bytes())?;
+        }
+
+        let mut writer = ZipWriter::new_append(writer.finish()?)?;
+        writer.abort_file()?;
+        let archive = writer.finish_into_readable()?;
+        let central_start = archive.central_directory_start();
+        let bytes = archive.into_inner().into_inner();
+        let parsed = ZipArchive::new(Cursor::new(bytes))?;
+
+        assert_eq!(central_start, parsed.central_directory_start());
         Ok(())
     }
 
@@ -5809,6 +5889,172 @@ mod tests {
                 .matching(crate::format::flags::ZipFlags::LanguageEncoding);
             assert_eq!(flagged, language_encoding, "{name}");
         }
+        Ok(())
+    }
+
+    fn decrypted(bytes: Vec<u8>, password: &[u8]) -> ZipResult<Vec<u8>> {
+        use std::io::Read;
+        let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+        let mut file = archive.by_index_decrypt(0, password)?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
+    }
+
+    #[test]
+    fn raw_copy_file_keeps_a_zipcrypto_entry_decryptable() -> ZipResult<()> {
+        // The writer gives ZipCrypto a data descriptor and checks the password
+        // against the DOS time's high byte, the shape Info-ZIP's `zip -e` writes.
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default()
+            .compression_method(Stored)
+            .last_modified_time(DateTime::from_date_and_time(2024, 5, 6, 13, 26, 52)?)
+            .with_deprecated_encryption(b"Password");
+        writer.start_file("secret.txt", options)?;
+        writer.write_all(b"secret contents")?;
+        let source = ZipArchive::new(Cursor::new(writer.finish()?.into_inner()))?;
+        for rename in [false, true] {
+            let bytes = copied(source.clone(), |writer, file| {
+                if rename {
+                    writer.raw_copy_file_rename(file, "moved.txt")
+                } else {
+                    writer.raw_copy_file(file)
+                }
+            })?;
+            let mut archive = ZipArchive::new(Cursor::new(bytes.clone()))?;
+            let flags = archive.by_index_raw(0)?.flags();
+            assert!(flags.is_encrypted(), "rename: {rename}");
+            assert!(flags.is_using_data_descriptor(), "rename: {rename}");
+            assert_eq!(
+                decrypted(bytes, b"Password")?,
+                b"secret contents",
+                "rename: {rename}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `写真` in Shift-JIS, as Japanese Windows tools store it: no language
+    /// encoding flag, so [`ZipFile::comment`] reads it as CP437.
+    const SHIFT_JIS_COMMENT: &[u8] = b"\x8e\xca\x90\x5e";
+
+    /// The mojibake [`ZipFile::comment`] returns for [`SHIFT_JIS_COMMENT`]: the Shift-JIS
+    /// bytes `8E CA 90 5E` reinterpreted as CP437 (`Ä`, `╩`, `É`, `^`), then converted to
+    /// UTF-8. A copy under a new name stores these UTF-8 bytes, under the language encoding flag.
+    const MOJIBAKE_COMMENT: &str = "Ä╩É^";
+
+    /// One stored entry named `a.txt` whose comment is `comment_raw` with the
+    /// language encoding flag clear, made by patching an ASCII placeholder.
+    fn archive_with_unflagged_comment(
+        comment_raw: &[u8],
+    ) -> ZipResult<ZipArchive<Cursor<Vec<u8>>>> {
+        let placeholder = "x".repeat(comment_raw.len());
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file(
+            "a.txt",
+            FullFileOptions::default()
+                .compression_method(Stored)
+                .with_file_comment(&*placeholder),
+        )?;
+        writer.write_all(b"data")?;
+        let mut bytes = writer.finish()?.into_inner();
+        let start = bytes
+            .windows(comment_raw.len())
+            .position(|window| window == placeholder.as_bytes())
+            .expect("the comment sits in the central directory");
+        bytes[start..start + comment_raw.len()].copy_from_slice(comment_raw);
+        ZipArchive::new(Cursor::new(bytes))
+    }
+
+    fn comment_raw_and_language_encoding(bytes: Vec<u8>) -> ZipResult<(Vec<u8>, bool)> {
+        let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+        let file = archive.by_index_raw(0)?;
+        let language_encoding = file
+            .flags()
+            .matching(crate::format::flags::ZipFlags::LanguageEncoding);
+        Ok((file.comment_raw().to_vec(), language_encoding))
+    }
+
+    #[test]
+    fn comment_raw_is_the_comment_as_stored() -> ZipResult<()> {
+        let mut archive = archive_with_unflagged_comment(SHIFT_JIS_COMMENT)?;
+        let file = archive.by_index_raw(0)?;
+        assert_eq!(file.comment(), MOJIBAKE_COMMENT);
+        assert_eq!(file.comment_raw(), SHIFT_JIS_COMMENT);
+        drop(file);
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file(
+            "a.txt",
+            FullFileOptions::default()
+                .compression_method(Stored)
+                .with_file_comment("写真"),
+        )?;
+        let mut archive = ZipArchive::new(writer.finish()?)?;
+        assert_eq!(archive.by_index_raw(0)?.comment_raw(), "写真".as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_copy_file_keeps_a_legacy_code_page_comment_as_stored() -> ZipResult<()> {
+        let bytes = copied(
+            archive_with_unflagged_comment(SHIFT_JIS_COMMENT)?,
+            |writer, file| writer.raw_copy_file(file),
+        )?;
+        assert_eq!(
+            comment_raw_and_language_encoding(bytes)?,
+            (SHIFT_JIS_COMMENT.to_vec(), false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_copy_file_touch_keeps_the_comment_as_stored() -> ZipResult<()> {
+        let bytes = copied(
+            archive_with_unflagged_comment(SHIFT_JIS_COMMENT)?,
+            |writer, file| writer.raw_copy_file_touch(file, DateTime::default(), None),
+        )?;
+        assert_eq!(
+            comment_raw_and_language_encoding(bytes)?,
+            (SHIFT_JIS_COMMENT.to_vec(), false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_copy_file_rename_writes_the_comment_as_utf8() -> ZipResult<()> {
+        let bytes = copied(
+            archive_with_unflagged_comment(SHIFT_JIS_COMMENT)?,
+            |writer, file| writer.raw_copy_file_rename(file, "b.txt"),
+        )?;
+        assert_eq!(
+            comment_raw_and_language_encoding(bytes)?,
+            (MOJIBAKE_COMMENT.as_bytes().to_vec(), true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_append_keeps_a_legacy_code_page_comment_as_stored() -> ZipResult<()> {
+        let source = archive_with_unflagged_comment(SHIFT_JIS_COMMENT)?;
+        let mut writer = ZipWriter::new_append(source.into_inner())?;
+        writer.deep_copy_file("a.txt", "b.txt")?;
+        let mut archive = ZipArchive::new(writer.finish()?)?;
+        let file = archive.by_name("a.txt")?;
+        assert_eq!(file.comment_raw(), SHIFT_JIS_COMMENT);
+        assert!(
+            !file
+                .flags()
+                .matching(crate::format::flags::ZipFlags::LanguageEncoding)
+        );
+        drop(file);
+        // A copy under a new name writes its comment as UTF-8, like its name.
+        let file = archive.by_name("b.txt")?;
+        assert_eq!(file.comment_raw(), MOJIBAKE_COMMENT.as_bytes());
+        assert!(
+            file.flags()
+                .matching(crate::format::flags::ZipFlags::LanguageEncoding)
+        );
         Ok(())
     }
 

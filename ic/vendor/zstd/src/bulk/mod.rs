@@ -48,9 +48,13 @@ pub fn compress(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
 ///
 /// [`crate::decompressed_size()`] says how big the result will be, when the
 /// frame records it - there is no need to store the size alongside the data
-/// yourself. Passing a `Vec` instead of a slice works too, and then it is the
-/// `Vec`'s *capacity* that bounds the output, so `reserve` what you need
-/// rather than `resize`.
+/// yourself.
+///
+/// Only as many bytes as returned at the start of `destination` are
+/// meaningful: zstd may overwrite the rest, even if it was zero-filled
+/// beforehand. This function only takes a slice; to decompress into a `Vec`
+/// and have its length set to the output size, use
+/// [`Decompressor::decompress_to_buffer`].
 pub fn decompress_to_buffer(
     source: &[u8],
     destination: &mut [u8],
@@ -62,10 +66,19 @@ pub fn decompress_to_buffer(
 ///
 /// The decompressed data should be at most `capacity` bytes, or an error will
 /// be returned - so `capacity` is the most you are willing to allocate for
-/// this, not a guess that has to be right. When the frame records its size,
-/// only that much is allocated however large a `capacity` you allow.
+/// this, not a guess that has to be right.
 ///
-/// [`crate::decompressed_size()`] gives you that size up front, if you would
+/// The output buffer is allocated once, before decompressing, so that zstd
+/// can decompress straight into it. Its size is:
+///
+/// * the decompressed size, when every frame records it - however large a
+///   `capacity` you allow;
+/// * otherwise, with the `experimental` feature, zstd's upper bound for the
+///   data, when it is smaller than `capacity`;
+/// * otherwise, `capacity` itself, even if the data then turns out to be
+///   invalid. So only pass a `capacity` you can afford to allocate.
+///
+/// [`crate::decompressed_size()`] gives you the size up front, if you would
 /// rather decide for yourself.
 pub fn decompress(data: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
     Decompressor::new()?.decompress(data, capacity)

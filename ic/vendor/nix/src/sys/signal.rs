@@ -442,25 +442,25 @@ libc_bitflags! {
         /// When catching a [`Signal::SIGCHLD`] signal, the signal will be
         /// generated only when a child process exits, not when a child process
         /// stops.
-        SA_NOCLDSTOP as SaFlags_t;
+        SA_NOCLDSTOP;
         /// When catching a [`Signal::SIGCHLD`] signal, the system will not
         /// create zombie processes when children of the calling process exit.
         #[cfg(not(target_os = "hurd"))]
-        SA_NOCLDWAIT as SaFlags_t;
+        SA_NOCLDWAIT;
         /// Further occurrences of the delivered signal are not masked during
         /// the execution of the handler.
-        SA_NODEFER as SaFlags_t;
+        SA_NODEFER;
         /// The system will deliver the signal to the process on a signal stack,
         /// specified by each thread with sigaltstack(2).
-        SA_ONSTACK as SaFlags_t;
+        SA_ONSTACK;
         /// The handler is reset back to the default at the moment the signal is
         /// delivered.
-        SA_RESETHAND as SaFlags_t;
+        SA_RESETHAND;
         /// Requests that certain system calls restart if interrupted by this
         /// signal.  See the man page for complete details.
-        SA_RESTART as SaFlags_t;
+        SA_RESTART;
         /// This flag is controlled internally by Nix.
-        SA_SIGINFO as SaFlags_t;
+        SA_SIGINFO;
     }
 }
 
@@ -942,12 +942,12 @@ pub unsafe fn sigaction(signal: Signal, sigaction: &SigAction) -> Result<SigActi
 /// Installs `handler` for the given `signal`, returning the previous signal
 /// handler. `signal` should only be used following another call to `signal` or
 /// if the current handler is the default. The return value of `signal` is
-/// undefined after setting the handler with [`sigaction`][SigActionFn].
+/// undefined after setting the handler with [`sigaction`].
 ///
 /// # Safety
 ///
 /// If the pointer to the previous signal handler is invalid, undefined
-/// behavior could be invoked when casting it back to a [`SigAction`][SigActionStruct].
+/// behavior could be invoked when casting it back to a [`SigAction`].
 ///
 /// # Examples
 ///
@@ -980,15 +980,13 @@ pub unsafe fn sigaction(signal: Signal, sigaction: &SigAction) -> Result<SigActi
 /// # Errors
 ///
 /// Returns [`Error(Errno::EOPNOTSUPP)`](Errno::EOPNOTSUPP) if `handler` is
-/// [`SigAction`][SigActionStruct]. Use [`sigaction`][SigActionFn] instead.
+/// [`SigAction`]. Use [`sigaction`] instead.
 ///
 /// `signal` also returns any error from `libc::signal`, such as when an attempt
 /// is made to catch a signal that cannot be caught or to ignore a signal that
 /// cannot be ignored.
 ///
 /// [`Error::UnsupportedOperation`]: ../../enum.Error.html#variant.UnsupportedOperation
-/// [SigActionStruct]: struct.SigAction.html
-/// [sigactionFn]: fn.sigaction.html
 pub unsafe fn signal(signal: Signal, handler: SigHandler) -> Result<SigHandler> {
     let signal = signal as libc::c_int;
     let res = match handler {

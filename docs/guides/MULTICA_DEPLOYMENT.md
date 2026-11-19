@@ -7,9 +7,9 @@ LunarWing ships two registry extensions for Multica/Lunartica:
 
 This integration is available on the current LunarWing source tree; it is not tied to the retired `1.1.0-new-lunartica` branch.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The channel registry is
-`0.1.20`, the bridge registry/capability version is `0.1.10`, and the WASM
-channel crate is `2.2.0`. The 30-second `poll_interval_ms` clamp, token-presence
+**Revalidated against source 2026-11-19 (v2.2.1.0).** The channel registry is
+`0.1.21`, the bridge registry/capability version is `0.1.11`, and the WASM
+channel crate is `2.2.1`. The 30-second `poll_interval_ms` clamp, token-presence
 polling gate, required-field validation, and redacted runtime-startup status
 match `ic/channels-src/multica/src/lib.rs` and the extension manager. Referenced
 skill, manifests, and smoke-test scripts are present.
