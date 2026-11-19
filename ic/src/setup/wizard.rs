@@ -3181,16 +3181,12 @@ impl SetupWizard {
             }
             Ok(crate::service::SetupServiceAvailability::Refused { reason }) => {
                 println!();
-                print_warning(&format!(
-                    "Not offering to install a background service: {reason}"
-                ));
+                print_warning(&service_refusal_notice(&reason));
             }
             Ok(crate::service::SetupServiceAvailability::NotApplicable) => {}
             Err(err) => {
                 println!();
-                print_warning(&format!(
-                    "Could not check whether a background service can be installed: {err:#}"
-                ));
+                print_warning(&service_lookup_notice(&err));
             }
         }
 
@@ -3230,6 +3226,16 @@ impl SetupWizard {
 
         Ok(())
     }
+}
+
+/// One line the wizard prints when the installer would refuse a service.
+fn service_refusal_notice(reason: &str) -> String {
+    format!("Not offering to install a background service: {reason}")
+}
+
+/// One line the wizard prints when the service availability check fails.
+fn service_lookup_notice(err: &anyhow::Error) -> String {
+    format!("Could not check whether a background service can be installed: {err:#}")
 }
 
 impl Default for SetupWizard {
@@ -3797,6 +3803,27 @@ mod tests {
     fn test_should_offer_service_install_for_full_setup() {
         let wizard = SetupWizard::with_config(SetupConfig::default());
         assert!(wizard.should_offer_service_install());
+    }
+
+    #[test]
+    fn test_service_refusal_notice_names_the_reason_and_way_out() {
+        let reason = "Refusing to configure the systemd user service to run as root. Run the \
+                      installer as the intended service account without sudo, or set \
+                      LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon.";
+        let notice = service_refusal_notice(reason);
+        assert!(notice.contains("Not offering"));
+        assert!(notice.contains("service account"));
+        assert!(notice.contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+    }
+
+    #[test]
+    fn test_service_lookup_notice_keeps_the_lookup_error() {
+        let err = anyhow::anyhow!("service user 'nobody' does not exist")
+            .context("failed to resolve the OpenRC service identity");
+        let notice = service_lookup_notice(&err);
+        assert!(notice.contains("Could not check"));
+        assert!(notice.contains("failed to resolve the OpenRC service identity"));
+        assert!(notice.contains("service user 'nobody' does not exist"));
     }
 
     #[test]
