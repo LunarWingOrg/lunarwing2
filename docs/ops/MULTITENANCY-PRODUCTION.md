@@ -1303,8 +1303,8 @@ worker-egress: kept namespace keeper lw-egress-keeper-spitfire on purpose: syste
 
 The kept pod keeps running, not just as a stopped record: its infra container
 is up after the stop, so the tenant's Podman store shows
-`lw-egress-keeper-<tenant>` as `Running` until the next start (measured on a
-Fedora host with systemd and rootless Podman). The next
+`lw-egress-keeper-<tenant>` as `Running` until the next start (measured on
+Arch Linux with systemd and rootless Podman). The next
 `start-tenant`/`restart-tenant` validates the surviving keeper
 (`validate_keeper` in `ic/scripts/lunarwing-worker-egress-guard.sh`) before
 starting or adopting it, so a keeper left by such a stop is never used
@@ -1313,8 +1313,8 @@ started manager's bus is back — Podman may print one cleanup line for the
 stale netns — and the start then creates a fresh keeper; a following
 `mt-admin worker-egress <tenant>` reports that keeper's containers attached
 and the filter live. If the surviving keeper no longer starts, the guard fails
-closed and names it. Before manually removing it, recover the user manager, stop the
-tenant's workers, and confirm the pod is the managed keeper (label
+closed and names it. Before manually removing it, recover the user manager,
+stop the tenant's workers, and confirm the pod is the managed keeper (label
 `lunarwing.purpose=worker-egress-keeper`, with only its infra container). Use
 the tenant's own Podman store, as mt-admin does, then retry the start:
 
