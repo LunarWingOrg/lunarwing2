@@ -58,6 +58,10 @@ Rule mix: `generic-api-key` 1,295, `private-key` 589, `jwt` 16,
 `square-access-token` 5, `gcp-api-key` 4, `curl-auth-user` 3,
 `discord-api-token` 3, `stripe-access-token` 2, `gitlab-pat` 1.
 
+WI#778 later added the ten rows above for commit `7e9d6d633`, taking the file
+to 1,928 pins across 53 commits; the counts in this section remain the
+2026-11-18 snapshot.
+
 - **Vendored pins (1,854): false positive.** Third-party crate sources, their
   cargo checksum manifests, and the upstream test keys and example tokens that
   ship with them. No LunarWing system trusts them; the history scan still
