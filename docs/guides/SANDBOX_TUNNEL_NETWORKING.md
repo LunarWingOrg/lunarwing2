@@ -770,7 +770,7 @@ unusable. A skip is not a live-validation pass.
    LUNARWING_E2E_NETBIRD_MANAGEMENT_URL=https://nbtest.example.org \
    LUNARWING_E2E_NETBIRD_SETUP_KEY_FILE="$HOME/.nbtest-setup-key" \
      taskset -c 0-11 cargo test -j12 --test podman_sandbox_tunnel_integration \
-     podman_tunnel_sidecar_netbird_live -- --exact --nocapture --test-threads=1
+     tunnel_sidecar_netbird_live -- --exact --nocapture --test-threads=1
    ```
 
 4. Read the lane in the order it asserts:
