@@ -4,7 +4,7 @@ Supervised mode is LunarWing's human-in-the-loop setting for tool execution. Whe
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-**Revalidated against source 2026-11-11 (v2.2.0.0).** The `--supervised` CLI
+**Revalidated against source 2026-11-19 (v2.2.1.0).** The `--supervised` CLI
 flag and `AGENT_SUPERVISED_MODE` are resolved once at startup; either source can
 enable supervised mode. Where it applies, supervised mode takes precedence over
 global auto-approval.
@@ -36,11 +36,12 @@ and whether the CLI, environment, or both enabled it.
 
 ## Scope
 
-- Only Engine V2 foreground threads carry the setting.
+- The startup setting applies to Engine V2 foreground threads. Research child
+  threads created by `rlm_query()` inherit their parent's supervision setting.
 - Mission-spawned threads are not supervised: they are built from
   `ThreadConfig::default()`. One approved `mission_create`, `mission_fire` or
-  `mission_resume` starts runs that execute without per-action approval (see
-  the mission sections of `docs/architecture/ENGINE-V2.md`).
+  `mission_resume` can start runs that execute without per-action approval
+  (see the mission sections of [Engine V2](../architecture/ENGINE-V2.md)).
 - The legacy V1 agent loop under `ic/src/agent/` has no supervised handling.
   Channels that are still served by V1 are not gated by this setting.
 

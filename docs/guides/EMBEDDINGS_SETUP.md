@@ -2,7 +2,7 @@
 
 Embeddings are optional and disabled by default. When enabled, LunarWing uses them for vector-backed workspace memory search.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** Environment knobs
+**Revalidated against source 2026-11-19 (v2.2.1.0).** Environment knobs
 (`EMBEDDING_ENABLED/PROVIDER/MODEL/BASE_URL/DIMENSION/CACHE_SIZE`,
 `OLLAMA_BASE_URL`), the 10 000-entry default cache, the `>= 1` cache-size
 floor, provider list, and shared outbound URL validation match
@@ -17,7 +17,9 @@ The authenticated Configuration view exposes:
 - `embeddings.model`
 - `embeddings.base_url` for `openai_compatible`
 
-These values are database-backed settings. LunarWing no longer uses a standalone `settings.json` file for this configuration.
+The web UI saves these settings to the database. At startup, LunarWing can also
+read legacy `settings.json` and the TOML configuration before loading database
+settings. Use the web UI rather than editing legacy JSON for normal operation.
 
 The web UI offers `openai`, `lunarwing_cloud`, and `openai_compatible`. The backend also supports `ollama` when configured through the environment.
 
