@@ -710,8 +710,8 @@ worker_egress_stop_keeper() {  # <name> [keep]
   if _worker_egress_user_manager_dead "$name"; then
     unit="$(_worker_egress_user_manager_unit "$name")"
     if [[ "$mode" == keep ]]; then
-      printf 'worker-egress: kept namespace keeper %s on purpose: systemd user manager %s is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use\n' \
-        "$keeper" "$unit"
+      printf 'worker-egress: kept namespace keeper %s on purpose: systemd user manager %s is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use; recover with: systemctl start %s\n' \
+        "$keeper" "$unit" "$unit"
       return 0
     fi
     printf 'worker-egress: cannot release namespace keeper %s: systemd user manager %s is down and rootless podman cannot reach the pod without its user bus; recover with: systemctl start %s\n' \
