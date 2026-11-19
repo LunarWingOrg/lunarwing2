@@ -61,7 +61,7 @@ When `opencode serve` fails a request with its bare HTTP 500 wrapper
 ("Unexpected server error. Check server logs for details."), the task error
 returned to LunarWing automatically includes the real root cause, read from
 serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/
-opencode.log`; at the pinned v1.19.5 that is where the server's error
+opencode.log`; at the pinned v1.19.6 that is where the server's error
 middleware logs the cause — container stdout does not carry it). Only
 `level=ERROR` lines (the formatter uppercases the level token) appended
 after the task started are considered, and enrichment is fail-closed on a
@@ -93,11 +93,13 @@ against a hostile agent on the same uid.
 > crashes in `SystemPrompt.environment` (`undefined is not an object
 > (evaluating 'a.name')`) while building the prompt, before any model call.
 > v1.18.29 shipped two further regressions (see the Dockerfile pin note).
-> **The v1.19.5 bump (WI#531) does not fix this:** the `sys.environment(model)`
-> call site and its surrounding prompt assembly are unchanged between the two
-> tags, so the crash path is carried forward untested — no live dispatch has
-> been run at v1.19.5. Neither v1.18.29 regression is verified fixed at
-> v1.19.5 either; both are open risks carried with this pin. The opencode2
+> **The v1.19.6 bump (WI#531, WI#775) does not fix this:** the
+> `sys.environment(model)` call site and its surrounding prompt assembly are
+> byte-identical across v1.18.25, v1.19.5 and v1.19.6 (v1.19.6 differs from
+> v1.19.5 in one server file only, image bounding in `message-v2.ts`), so the
+> crash path is carried forward untested — no live dispatch has been run.
+> Neither v1.18.29 regression is verified fixed at v1.19.6 either; both are
+> open risks carried with this pin. The opencode2
 > worker (`mode: "opencode2"`) remains the working lane, and the v1 lane is
 > expected to be retired (goals item 34). Run one live v1 dispatch on a test
 > tenant after the first master candidate build to settle both. The
@@ -123,7 +125,7 @@ turn. Set `wait: true` only for short tasks that must return synchronously.
 ## Health Endpoints
 
 - `GET /health` — Worker status, uptime, version, and `opencode_ref` (release
-  plus immutable upstream commit, currently `v1.19.5@810c0eba…`)
+  plus immutable upstream commit, currently `v1.19.6@f4e363c8…`)
 - `GET /ready` — WebSocket readiness and connection count
 
 ## Protocol
