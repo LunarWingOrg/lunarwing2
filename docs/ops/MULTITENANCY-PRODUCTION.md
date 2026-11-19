@@ -1264,8 +1264,10 @@ ERROR: tenant 'spitfire': systemd user manager user@1011.service is failed and i
 for the bus, and let the units the manager starts on its own settle before
 continuing; if the manager does not come back they exit non-zero with the line.
 `stop-tenant`, `status` and `remove-tenant` report the line once and treat the
-tenant's user units as down (the dead manager already took them down);
-`remove-tenant` still removes the unit files and the account.
+tenant's user units as down (the dead manager already took them down).
+`remove-tenant` removes the unit files when it can, but it refuses rather than
+claim success while a later step needs the user bus (see the keeper below);
+recover the manager and rerun — removal is idempotent.
 
 The probe runs once per tenant per mt-admin process. Its answer and the
 "already said" flag are kept in a per-process directory, so a caller that
@@ -1291,6 +1293,27 @@ system runtime (`MT_ROOTLESS=false`, i.e. Docker or rootful podman, with
 `--restart unless-stopped`) outlives the user manager, so `stop-worker` still
 asks the runtime to stop the worker and its task container. `status` with a dead
 manager prints the line, the tenant header, and exits 0.
+
+With rootless Podman, `stop-tenant` cannot release the worker egress namespace
+keeper (`lw-egress-keeper-<tenant>`) while the manager is down: `pod rm` needs
+the user bus, and without it Podman prints its own bus errors and leaves the
+pod. The keeper is therefore kept on purpose, and the stop says so in one line,
+with the recovery command, and still exits 0:
+
+```
+worker-egress: kept namespace keeper lw-egress-keeper-spitfire on purpose: systemd user manager user@1011.service is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use; recover with: systemctl start user@1011.service
+```
+
+The next `start-tenant`/`restart-tenant` validates the surviving keeper
+(`validate_keeper` in `ic/scripts/lunarwing-worker-egress-guard.sh`) before
+starting or adopting it, so a keeper left by such a stop is never used
+unvalidated. If the surviving keeper no longer starts, the guard fails closed
+and names it; remove it as the tenant (`sudo -u <tenant> podman pod rm -f
+lw-egress-keeper-<tenant>`) and start again. `remove-tenant` in that state
+refuses before touching the egress network: the keeper, its network and the
+rendered egress state are unchanged, the one line names the recovery, and
+removal aborts non-zero instead of removing the account from under a surviving
+keeper. Recover the manager and rerun the removal.
 
 ### Services don't start after reboot
 
