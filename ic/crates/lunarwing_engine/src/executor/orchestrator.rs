@@ -2563,6 +2563,8 @@ fn build_orchestrator_inputs(
         "model_recovery_max_attempts": thread.config.model_recovery_max_attempts,
         "model_recovery_total_attempts": thread.config.model_recovery_total_attempts,
         "max_consecutive_errors": thread.config.max_consecutive_errors,
+        "no_progress_failure_threshold": thread.config.no_progress_failure_threshold,
+        "tool_async_timeout_secs": thread.config.tool_async_timeout_secs,
         "max_tokens_total": thread.config.max_tokens_total,
         "max_budget_usd": thread.config.max_budget_usd,
         "model_context_limit": thread.config.model_context_limit,

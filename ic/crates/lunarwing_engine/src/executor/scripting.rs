@@ -1936,6 +1936,9 @@ async fn handle_rlm_query(
         supervised_mode: parent_thread.config.supervised_mode,
         shared_conversation: parent_thread.config.shared_conversation,
         supervised_timeout_secs: parent_thread.config.supervised_timeout_secs,
+        // WI#640: a child of a thread configured for weaker models keeps the
+        // parent's no-progress tolerance instead of reverting to the default.
+        no_progress_failure_threshold: parent_thread.config.no_progress_failure_threshold,
         ..crate::types::thread::ThreadConfig::default()
     };
 

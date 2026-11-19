@@ -207,6 +207,14 @@ pub struct ThreadConfig {
     /// Maximum consecutive steps with errors before termination.
     /// Resets to 0 on any successful step (matching official RLM behavior).
     pub max_consecutive_errors: Option<u32>,
+    /// Consecutive steps with no successful tool or code work before the one
+    /// no-progress warning turn. Clamped to 2..=10 in the orchestrator.
+    /// Default: 3. Env override: ENGINE_V2_NO_PROGRESS_THRESHOLD (read when a
+    /// thread config is created). WI#640: weak local models can burn the
+    /// default on transient tool failures, so the knob is explicit and the
+    /// terminal error names it with the effective value.
+    #[serde(default = "default_no_progress_failure_threshold")]
+    pub no_progress_failure_threshold: u32,
     /// Model context limit in tokens (for compaction threshold calculation).
     /// Default: 128,000. Used to trigger compaction at 85% usage.
     pub model_context_limit: usize,
@@ -279,6 +287,14 @@ impl Default for ThreadConfig {
                 .unwrap_or(300),
             max_tokens_total: None,
             max_consecutive_errors: None,
+            no_progress_failure_threshold: std::env::var("ENGINE_V2_NO_PROGRESS_THRESHOLD")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|value| value.clamp(
+                    NO_PROGRESS_THRESHOLD_MIN,
+                    NO_PROGRESS_THRESHOLD_MAX,
+                ))
+                .unwrap_or(DEFAULT_NO_PROGRESS_FAILURE_THRESHOLD),
             max_budget_usd: None,
             model_context_limit: 128_000,
             enable_compaction: false,
@@ -311,6 +327,17 @@ fn default_model_recovery_max_attempts() -> u32 {
 
 fn default_model_recovery_total_attempts() -> u32 {
     4
+}
+
+/// Consecutive no-success steps before the one no-progress warning turn.
+const DEFAULT_NO_PROGRESS_FAILURE_THRESHOLD: u32 = 3;
+/// Lower clamp: 0/1 would end a turn on the first transient tool failure.
+const NO_PROGRESS_THRESHOLD_MIN: u32 = 2;
+/// Upper clamp keeps the warning turn reachable inside `max_iterations`.
+const NO_PROGRESS_THRESHOLD_MAX: u32 = 10;
+
+fn default_no_progress_failure_threshold() -> u32 {
+    DEFAULT_NO_PROGRESS_FAILURE_THRESHOLD
 }
 
 // ── Thread ──────────────────────────────────────────────────
@@ -781,6 +808,12 @@ mod tests {
         let config: ThreadConfig =
             serde_json::from_value(legacy).expect("legacy config must deserialize");
         assert!(config.channel_context.is_none());
+        // WI#640: the no-progress knob postdates persisted configs; a thread
+        // saved before it must keep the compiled default, not fail to load.
+        assert_eq!(
+            config.no_progress_failure_threshold,
+            DEFAULT_NO_PROGRESS_FAILURE_THRESHOLD
+        );
     }
 
     #[test]
