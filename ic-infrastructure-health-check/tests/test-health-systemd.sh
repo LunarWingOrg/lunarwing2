@@ -60,6 +60,17 @@ case "$sub" in
       LastTriggerUSec) printf '%s\n' "$EL";; NextElapseUSecRealtime) printf '%s\n' "$NE";;
       *) printf '\n';;
     esac; done ;;
+  is-active)
+    # WI#766: the tenant user manager lives on the SYSTEM bus. Keyed by uid so
+    # it is independent of HS_TENANT_USER (which only the sudo mock sets).
+    # Default is `active`; a `<ROOT>/user-manager/<uid>` fixture overrides it.
+    unit="${1:-}"
+    if [ "${unit#user@}" != "$unit" ]; then
+      uid="${unit#user@}"; uid="${uid%.service}"
+      if [ -f "$ROOT/user-manager/$uid" ]; then cat "$ROOT/user-manager/$uid"; else echo active; fi
+      exit 0
+    fi
+    exit 1 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -79,6 +90,8 @@ EOF
 #!/usr/bin/env bash
 [ "${1:-}" = "-u" ] && {
   [ -n "${HS_MISSING_USER:-}" ] && [ "${2:-}" = "$HS_MISSING_USER" ] && exit 1
+  # Per-user uid fixture (WI#766: two tenants must not share user@<uid>).
+  if [ -f "${HS_UNIT_DIR:?}/uid/${2:-}" ]; then cat "$HS_UNIT_DIR/uid/${2:-}"; exit 0; fi
   echo 1000
   exit 0
 }
@@ -91,12 +104,27 @@ user="${HS_TENANT_USER:-}"
 container="${@: -1}"
 cat "$ROOT/$user/$container.container-health" 2>/dev/null
 EOF
+    # Mock loginctl: linger state per user from <ROOT>/linger/<user>; absent user
+    # (exit 1) leaves health-systemd to its LUNARWING_MT_LINGER_DIR seam.
+    cat > "$bin/loginctl" <<'EOF'
+#!/usr/bin/env bash
+ROOT="${HS_UNIT_DIR:?}"
+user=""
+for a in "$@"; do case "$a" in -*) ;; *) user="$a";; esac; done
+[ -n "$user" ] && [ -f "$ROOT/linger/$user" ] && { cat "$ROOT/linger/$user"; exit 0; }
+exit 1
+EOF
     chmod +x "$bin"/*
 }
 
 unit_set() { printf '%s\n' "$3" > "$1/units/$2"; }   # <sb> <unit> "<ls> <as> <ss> <nr> <uf>"
 unit_set_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3"; }
 container_health_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3.container-health"; }
+# WI#766 fixtures: linger state per user, system-bus user-manager state per uid,
+# and a per-user uid override (all tenants share the mock's default uid).
+linger_set() { mkdir -p "$1/units/linger"; printf '%s\n' "$3" > "$1/units/linger/$2"; }
+mgr_set()    { mkdir -p "$1/units/user-manager"; printf '%s\n' "$3" > "$1/units/user-manager/$2"; }
+uid_set()    { mkdir -p "$1/units/uid"; printf '%s\n' "$3" > "$1/units/uid/$2"; }
 
 run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd.sh JSON on stdout
     local sb="$1" t="$2" u="$3" w="${4:-absent}"
@@ -431,5 +459,59 @@ unit_set "$x" lunarwing-mt-health.timer "loaded inactive dead 0 enabled"
 oX="$(run_hs_single "$x" UNITS=lunarwing-mt-health.timer)"; rcX=$?
 assert_eq "$(ustat "$oX" lunarwing-mt-health.timer)" "critical" "X1: inactive timer -> critical"
 assert_eq "$rcX" "2" "X2: exit code 2 (critical)"
+
+# ── Y: dead tenant user manager (WI#766) ─────────────────────────────────────
+# A lingering tenant's user@<uid>.service down means every tenant unit is
+# unobservable. That must surface as a per-tenant instance (so self-heal can
+# build a systemd@<tenant> monitor-only target) and a named issue, not just as
+# "zero units".
+echo "=== Section Y: dead tenant user manager -> named instance (WI#766) ==="
+y="$(sb)"; mk_hs_mock "$y"; write_two_tenant_registry "$y"
+linger_set "$y" acme yes; linger_set "$y" beta yes
+uid_set "$y" acme 1001; uid_set "$y" beta 1002
+mgr_set "$y" 1001 failed; mgr_set "$y" 1002 active
+unit_set_user "$y" beta lunarwing-beta.service "loaded active running 0 enabled"
+oY="$(run_hs_registry "$y" HS_FAIL_USER=acme)"
+assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .status' <<<"$oY")" \
+    "degraded" "Y1: dead manager -> degraded acme instance"
+assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .manager_state' <<<"$oY")" \
+    "failed" "Y2: manager unit state surfaced"
+assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .manager_unit' <<<"$oY")" \
+    "user@1001.service" "Y3: manager unit named"
+assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="beta") | .status' <<<"$oY")" \
+    "healthy" "Y4: healthy peer manager still reported"
+assert_contains "$oY" "user@1001.service is failed" "Y5: dead manager named with its unit"
+assert_contains "$oY" "systemctl start user@1001.service" "Y6: recovery command in the issue"
+assert_eq "$(oall "$oY")" "degraded" "Y7: dead manager degrades the component"
+assert_eq "$(ustat "$oY" lunarwing-beta.service)" "healthy" "Y8: peer tenant units still probed"
+
+# ── Z: same dead manager on a NON-lingering tenant is not a tenant fault ─────
+# A non-lingering account's user manager being down is normal and says nothing
+# about the tenant (the same rule mt-admin's _user_manager_probe applies).
+echo "=== Section Z: non-lingering tenant's manager is not judged (WI#766) ==="
+z="$(sb)"; mk_hs_mock "$z"; write_two_tenant_registry "$z"
+linger_set "$z" acme no
+uid_set "$z" acme 1001; uid_set "$z" beta 1002
+mgr_set "$z" 1001 failed; mgr_set "$z" 1002 active
+oZ="$(run_hs_registry "$z" HS_FAIL_USER=acme)"
+assert_absent "$oZ" "user manager" "Z1: non-lingering manager never reported"
+assert_absent "$oZ" "user@1001.service" "Z2: no synthetic manager instance for non-lingering tenant"
+assert_eq "$(jq -r '[.metrics.instances[]? | select(.tenant=="acme")] | length' <<<"$oZ")" \
+    "0" "Z3: no instance record for a non-lingering tenant"
+
+# ── AA: manager state inconclusive (no answer) -> unknown, never "dead" ──────
+# Only a known down state proves the manager dead; an empty answer must not
+# invent one, and the instance stays non-actionable.
+echo "=== Section AA: inconclusive manager probe -> unknown instance ==="
+aa="$(sb)"; mk_hs_mock "$aa"
+linger_set "$aa" acme yes
+uid_set "$aa" acme 1001
+mgr_set "$aa" 1001 ""
+unit_set_user "$aa" acme lunarwing-acme.service "loaded active running 0 enabled"
+oAA="$(run_hs "$aa" acme acme)"
+assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .status' <<<"$oAA")" \
+    "unknown" "AA1: no manager answer -> unknown instance"
+assert_absent "$oAA" "user manager user@1000.service is" "AA2: unknown state never called dead"
+assert_eq "$(oall "$oAA")" "healthy" "AA3: inconclusive manager alone does not degrade"
 
 finish

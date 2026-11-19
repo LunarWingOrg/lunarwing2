@@ -267,7 +267,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
         mt_degrade "tenant $tname ($tuser): user manager user@${tuid}.service is ${_mgstate}; all tenant units are unobservable (recover: systemctl start user@${tuid}.service)"
         instance_results+=("$(jq -n --arg t "$tname" --arg u "$tuser" \
           --arg unit "user@${tuid}.service" --arg st "$_mgstate" \
-          '{tenant:$t, status:"critical", user:$u, manager_unit:$unit, manager_state:$st}')")
+          '{tenant:$t, status:"degraded", user:$u, manager_unit:$unit, manager_state:$st}')")
         continue
         ;;
       ok)
