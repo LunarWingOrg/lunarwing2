@@ -133,7 +133,9 @@ assert_contains "daemon unit tasks"   "$unit_dir/lunarwing-t1.service" "TasksMax
 # WI#663: rootless podman resolves pasta by name, and pasta lives under sbin on
 # hosts that put it there. Both init systems must hand the daemon a PATH that
 # can see those directories; the systemd unit states it, and the OpenRC unit
-# appends the missing ones to the host PATH at start.
+# appends the missing ones to the PATH OpenRC supplies at start (measured on
+# OpenRC 0.62.6 Alpine 3.22 and 0.63.3 Gentoo 2.18: that PATH already carried
+# them, so the loop added nothing there).
 echo "== WI#663 daemon PATH =="
 daemon_path="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/t1/.cargo/bin"
 assert_contains "systemd daemon PATH" "$unit_dir/lunarwing-t1.service" "Environment=PATH=$daemon_path"

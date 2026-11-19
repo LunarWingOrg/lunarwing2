@@ -81,12 +81,19 @@ host where `/usr/sbin` is a link to `/usr/bin`, sbin in front would put
 same reason and lists sbin before the tenant-writable `~/.cargo/bin`, so on a
 re-rendered unit every system directory precedes the tenant's own in the `PATH`
 the runtime commands inherit. On OpenRC (`mt-admin-lib/08-units-openrc.sh`) the
-rendered init script applies the same append-only rule to the host `PATH` at
-start: the missing sbin directories are appended, and directories the host
-already names keep their place and are never repeated. The systemd unit states
-the full list because a user unit's inherited `PATH` is minimal and not the
-host's; OpenRC inherits the host's, so replacing it would drop host-specific
-entries such as `/opt/bin`.
+rendered init script applies the same append-only rule to the `PATH` OpenRC
+supplies at start: the missing sbin directories are appended, and directories
+already named keep their place and are never repeated. That `PATH` is OpenRC's,
+not the caller's: measured on OpenRC 0.62.6 (Alpine 3.22) and 0.63.3
+(Gentoo 2.18), a service receives a fixed list beginning with OpenRC's own
+entries that already carries `/usr/local/sbin`, `/usr/sbin` and `/sbin`. The
+caller's `PATH` is dropped unless `rc_env_allow="PATH"` names it, and then lands
+behind those entries; `/etc/profile.env` always supplies a `PATH` when the
+caller's is gone, which is how a host-specific directory such as Gentoo's
+`/opt/bin` reaches the service. The loop added nothing on both builds, so it is
+a safeguard for an OpenRC that leaves a directory out, not something the
+measured releases need. The systemd unit states the full list because a user
+unit's inherited `PATH` is minimal.
 
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
