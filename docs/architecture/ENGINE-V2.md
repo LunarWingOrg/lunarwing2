@@ -549,15 +549,28 @@ that safe class and fixed recovery text, never provider-supplied diagnostics.
   truncation at `warn` (model, budget, token counts) so it is visible in the
   daemon log.
 - Reaching `max_iterations` schedules one final tool-capable model request before
-  returning `ThreadOutcome::MaxIterations`.
-- Three consecutive code steps or structured action batches with no successful
-  work schedule one no-progress warning. Repeating failure on warning turn
-  returns `ThreadFailureKind::NoProgress`; successful work resets detector.
+  returning `ThreadOutcome::MaxIterations`; the channel response names
+  `AGENT_MAX_TOOL_ITERATIONS` as the knob that raises the bound.
+- `no_progress_failure_threshold` consecutive code steps or structured action
+  batches with no successful work schedule one no-progress warning. Repeating
+  failure on the warning turn returns `ThreadFailureKind::NoProgress`;
+  successful work resets the detector. The thread config field defaults to 3
+  and is clamped to 2..=10 in the orchestrator
+  (`ENGINE_V2_NO_PROGRESS_THRESHOLD` sets the default for newly created thread
+  configs; rlm children inherit their parent's value). WI#640: the warning turn
+  names the actions that kept failing and tells the model not to repeat an
+  identical call, and the terminal error lists the failing actions plus the
+  effective `no_progress_failure_threshold`, `max_iterations`,
+  `max_consecutive_errors`, model-recovery attempts, and
+  `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS` values, so an operator can tell whether
+  the loop ended on a capability denial, a slow tool host, or a genuinely
+  stuck model. Defaults are unchanged from the fixed threshold of 3.
 - Missing/exhausted capability leases and policy denials return actionable model
   observations naming allowed next steps instead of opaque denial strings.
 
 One-shot accounting lives in `state["_failure_recovery"]` with pending and active
-warning states. It is written before recovery request, consumed only after
+warning states, plus the bounded `last_failed_actions` names used by the WI#640
+guidance. It is written before recovery request, consumed only after
 successful model response, and retained when approval/authentication resume
 discards rest of live checkpoint. Terminal cleanup removes it with normal
 runtime checkpoint state.
