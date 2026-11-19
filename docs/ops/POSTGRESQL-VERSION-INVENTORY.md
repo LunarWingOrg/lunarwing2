@@ -159,6 +159,13 @@ tenants were already recorded in the WI#777 section above. Any host not named
 in this document therefore stays **uninspected** — not patched, and not
 covered by this host's result.
 
+The open question on this item about the `colgatev` row — whether that host
+really holds a tenant `antelope`, since the 2026-11-13 audit listed only
+`dash` and `mcpvalidation` — cannot be settled from `ajhermes-z`. The
+`antelope` rows here and in the WI#777 section are separate tenants on
+separate hosts; if the `colgatev` row is wrong, that host's registry read must
+be redone by an operator with access there, not inferred from this host.
+
 ## How to check
 
 ```bash
