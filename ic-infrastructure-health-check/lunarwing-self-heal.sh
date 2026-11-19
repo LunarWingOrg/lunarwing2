@@ -524,12 +524,21 @@ fi
 # per-tenant user-manager instances (a dead user@<uid>.service leaves the
 # tenant with zero units and no restartable target). Real per-unit systemd
 # failures still route through step 2 and are never treated as diagnostic.
+# WI#789: `openrc` joins for the OpenRC parity of that shape. A component-wide
+# degrade that names no failing service (cron hook installed with no scheduler
+# running, an incomplete sweep, a lost init.d fleet) otherwise reaches no
+# target at all: step 1 drops it for having no SERVICE_MAP entry, and it had no
+# step 1b registration. Its scheduler blind spot gets its own
+# `openrc@scheduler` instance; a bare `openrc` identity covers the rest. Real
+# per-service OpenRC failures still route through step 2 — the component
+# fallback is guarded so one is never paged twice.
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
     [worker_egress]=1
     [disk]=1
     [systemd]=1
+    [openrc]=1
 )
 
 # WI#766: a monitor-only identity can carry the command an operator needs to
@@ -564,6 +573,13 @@ service_is_monitor_only() {
         # degraded, critical or unknown). It names no unit; real units always
         # reach here with a dotted suffix.
         systemd) return 0 ;;
+        # WI#789: OpenRC parity. `openrc@scheduler` names the cron blind spot
+        # (nothing to restart through this script — starting the scheduler is
+        # an operator action carried in the escalation's recovery field), and
+        # bare `openrc` is the component-level fallback. Real OpenRC services
+        # are bare init.d names (lunarwing-acme, xmpp-bridge), never these.
+        openrc@*) return 0 ;;
+        openrc) return 0 ;;
     esac
     # Tenant-scoped init units: lunarwing-voice-<tenant>[-sup].
     case "$svc" in
@@ -1141,7 +1157,7 @@ main() {
     # component-level verdict (coverage notes must not page per instance).
     local diag_comp inst_name inst_status diag_id diag_cstatus diag_recovery
     local -a diag_bad=()
-    for diag_comp in runtime knowledge worker_egress disk systemd; do
+    for diag_comp in runtime knowledge worker_egress disk systemd openrc; do
         diag_bad=()
         while IFS=$'\t' read -r inst_name inst_status diag_recovery; do
             [[ -n "$inst_name" ]] || continue
@@ -1157,11 +1173,13 @@ main() {
                     seen[$diag_id]=1
                     diag_bad+=("$diag_id")
                     targets+=("$diag_comp:$diag_id")
-                    # WI#766: a dead tenant user manager names the unit that
-                    # must be restarted. Carry it into the escalation so the
-                    # page states the command, not only the identity.
+                    # WI#766/WI#789: the third column is the operator command
+                    # that recovers a dead instance (a tenant user manager on
+                    # systemd, the cron scheduler on OpenRC). Carry it into the
+                    # escalation so the page states the command, not only the
+                    # identity.
                     if [[ -n "$diag_recovery" ]]; then
-                        TARGET_RECOVERY[$diag_id]="systemctl start $diag_recovery"
+                        TARGET_RECOVERY[$diag_id]="$diag_recovery"
                     fi
                     ;;
                 *) ;;
@@ -1173,7 +1191,21 @@ main() {
                 | "\(.mount // "default")\t\(.status // "unknown")\t"
               elif $comp == "systemd" then
                 (.metrics.instances // [])[]
-                | "\(.tenant // "default")\t\(.status // "unknown")\t\(.manager_unit // "")"
+                | "\(.tenant // "default")\t\(.status // "unknown")\t"
+                  + (if (.manager_unit // "") == "" then ""
+                     else "systemctl start \(.manager_unit)" end)
+              elif $comp == "openrc" then
+                # WI#789: OpenRC owns no per-tenant manager units. Its only
+                # diagnostic instance is the cron blind spot: the hook is
+                # installed but no scheduler is running, so watchdog, health
+                # pipeline and self-heal all silently stop while every
+                # per-service probe still reads healthy.
+                (.metrics.scheduler // {}) as $sched
+                | ($sched.status // "absent") as $st
+                | select($st == "healthy" or $st == "degraded" or $st == "critical")
+                | "scheduler\t\($st)\t"
+                  + (if ($sched.installed // "") == "" then ""
+                     else "rc-service \($sched.installed) start" end)
               else
                 (.metrics.instances // [])[]
                 | "\(.tenant // "default")\t\(.status // "unknown")\t"
@@ -1187,16 +1219,31 @@ main() {
         diag_cstatus="$(jq -r --arg comp "$diag_comp" \
             '[.components[] | select(.component == $comp) | .status] | first // "absent"' \
             "$report" 2>/dev/null || true)"
-        # WI#766: the systemd component also carries real per-unit failures,
-        # which step 2 already targets. Its component-level fallback exists only
-        # for the "no unit observable at all" shape (a dead tenant user manager
-        # or a broken discovery sweep), so a failing unit is never paged twice.
-        if [[ "$diag_comp" == "systemd" ]]; then
-            local diag_unit_count
-            diag_unit_count="$(jq -r '[.components[] | select(.component == "systemd")
-                | (.metrics.units // [])[]] | length' "$report" 2>/dev/null || echo 0)"
-            [[ "$diag_unit_count" == "0" ]] || diag_cstatus=""
-        fi
+        # WI#766/WI#789: these components also report real per-unit failures,
+        # which step 2 already targets. Their component-level fallback exists
+        # only for the "no unit observable at all" shape (a dead tenant user
+        # manager, a broken discovery sweep, a dead cron scheduler), so a
+        # failing unit is never paged twice.
+        case "$diag_comp" in
+            systemd)
+                local diag_unit_count
+                diag_unit_count="$(jq -r '[.components[] | select(.component == "systemd")
+                    | (.metrics.units // [])[]] | length' "$report" 2>/dev/null || echo 0)"
+                [[ "$diag_unit_count" == "0" ]] || diag_cstatus=""
+                ;;
+            openrc)
+                # Every non-healthy, non-skipped OpenRC service already has a
+                # step-2 restart target. `skipped` is intentional (tenant not
+                # started, worker stopped, optional backend disabled) and must
+                # not keep the component fallback silent.
+                local diag_failing_svc_count
+                diag_failing_svc_count="$(jq -r '[.components[] | select(.component == "openrc")
+                    | (.metrics.services // [])[]
+                    | select((.status // "unknown") != "healthy" and (.status // "unknown") != "skipped")]
+                    | length' "$report" 2>/dev/null || echo 0)"
+                [[ "$diag_failing_svc_count" == "0" ]] || diag_cstatus=""
+                ;;
+        esac
         if [[ ${#diag_bad[@]} -eq 0 ]] && [[ "$diag_cstatus" == degraded || "$diag_cstatus" == critical || "$diag_cstatus" == unknown ]]; then
             [[ -n "${seen[$diag_comp]:-}" ]] && continue
             seen[$diag_comp]=1
