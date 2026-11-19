@@ -100,9 +100,15 @@ Host `colgatev` (OpenRC `0.63.3`, rootless Podman `6.1.4`), read-only
 
 `dash` is the WI#664 row that was left uninspected: it was below the `160016`
 floor and still carried a floating reference, so it was exposed to the CVEs
-fixed between 16.15 and 16.16 until this refresh. `hermes` and `ajhermes-z`
-were not reachable from this host; their 16.14 record remains unverified and
-is a per-host follow-up (WI#780), not an assumed closure.
+fixed between 16.15 and 16.16 until this refresh.
+
+`antelope` in this table is the tenant of that name as this re-verification
+recorded it on `colgatev`; the 2026-11-13 audit of that host listed only
+`dash` and `mcpvalidation`. `ajhermes-z` has its own tenant named `antelope`
+(the 2026-11-17 table above). The two rows describe different hosts, and the
+`ajhermes-z` rows are not re-verified here: that host was not reachable from
+`colgatev`. The 16.14 record of `hermes` there remains unverified and is a
+per-host follow-up (WI#780), not an assumed closure.
 
 The pgvector extension question is answered with evidence in
 [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verification-2026-11-19-wi777):
