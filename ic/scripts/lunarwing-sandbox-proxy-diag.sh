@@ -78,6 +78,22 @@ relay_denials() {
     | grep --line-buffered -E 'lw-proxy-|proxy\.sock|\{[^}]*\bconnectto\b[^}]*\}.*\btclass=unix_stream_socket\b'
 }
 
+interpret_denials() {
+  # The denied permission alone does not say what to change: a missing allow
+  # rule and a policy constraint (`mlsconstrain`, e.g. a level comparison) are
+  # refused identically but need different fixes. audit2why names which one.
+  if [[ ! -s "$1" ]]; then
+    say "no matching AVC returned (log unavailable or no match); this does not determine the cause."
+    return
+  fi
+  if command -v audit2why >/dev/null 2>&1; then
+    say "audit2why:"
+    audit2why <"$1" 2>&1 | sed 's/^/  /' || say "  (audit2why could not interpret the record)"
+  else
+    say "audit2why not installed; read the denied permission and the two contexts above."
+  fi
+}
+
 tenant=""
 watch=false
 for arg in "$@"; do
@@ -162,13 +178,13 @@ say "  -> inode labels do not establish permission to connect to the listening s
 
 say ""
 say "== 5. Recent candidate SELinux denials (match time and contexts to the failing call)"
+denials="$(mktemp)"
+trap 'rm -f -- "$denials"' EXIT
 if command -v ausearch >/dev/null 2>&1; then
-  if ! ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials; then
-    say "no matching AVC returned (log unavailable or no match); this does not determine the cause."
-  fi
-else
-  say "ausearch not installed; skipped."
+  ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials >"$denials" || true
 fi
+cat "$denials" 2>/dev/null || true
+interpret_denials "$denials"
 
 if [[ "$watch" == true ]]; then
   say ""
@@ -176,7 +192,10 @@ if [[ "$watch" == true ]]; then
   if [[ ! -r /var/log/audit/audit.log ]]; then
     say "cannot read /var/log/audit/audit.log; run as root to watch."
   else
-    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null | relay_denials || true
+    : >"$denials"
+    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null | relay_denials | tee "$denials" || true
+    say ""
+    interpret_denials "$denials"
     say "watch finished."
   fi
 fi

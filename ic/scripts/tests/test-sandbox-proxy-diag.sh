@@ -135,5 +135,27 @@ server.assert_not_called()
 command.assert_not_called()
 assert stderr.getvalue().startswith("lunarwing-proxy-relay: [Errno 13] Permission denied;")
 assert "euid=" in stderr.getvalue() and "proxy.sock" in stderr.getvalue()
+# WI#641 note 19288: an EACCES on this path is the SELinux connectto check
+# against the listener's own context, not a file-permission problem.
+assert "connectto" in stderr.getvalue()
+assert "self-label=" in stderr.getvalue()
 print("PASS: a failed relay probe reports diagnostics and never starts the command")
+
+# WI#641 note 19288: container runtimes do not mount selinuxfs, so the
+# container's own label (the denial's source context) must be read from
+# /proc and reported without an enforce node.
+def fake_open(path, *args, **kwargs):
+    if path.endswith("/attr/current"):
+        return io.StringIO("system_u:system_r:container_t:s0:c533,c991\n")
+    raise FileNotFoundError(2, "No such file or directory", path)
+
+with mock.patch("builtins.open", fake_open):
+    assert relay._self_label() == "system_u:system_r:container_t:s0:c533,c991"
+    with mock.patch.object(relay, "_node", return_value="node"):
+        state = relay._security_state()
+assert "self-label=system_u:system_r:container_t:s0:c533,c991" in state, state
+
+# A non-EACCES startup failure must not claim the SELinux cause.
+assert "connectto" not in relay._startup_error(FileNotFoundError(2, "No such file or directory"))
+print("PASS: the container's own label is reported without selinuxfs")
 PY
