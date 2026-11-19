@@ -703,21 +703,22 @@ mod tests {
         assert!(socket.is_dir(), "cleanup must not replace the obstacle");
     }
 
-    /// WI#641 (AGK-1): a permissive (or missing) enforce node binds exactly as
-    /// before the labeling work and never touches the create context.
+    /// WI#641 (AGK-1): a host without selinuxfs — AppArmor, or none — binds
+    /// exactly as before the labeling work and never touches the create
+    /// context. A permissive `0` still counts as SELinux and is labeled, so a
+    /// host that later switches to enforcing cannot regress.
     #[tokio::test]
-    async fn a_permissive_enforce_node_skips_labeling_entirely() {
+    async fn a_host_without_selinuxfs_skips_labeling_entirely() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("proxy.sock");
         let attribute = directory.path().join("sockcreate");
         let nodes = LabelNodes::at(directory.path().join("enforce"), &attribute);
-        std::fs::write(&nodes.enforce, "0").unwrap();
 
         let (_listener, label) = bind_relay_listener_at(&nodes, &socket).unwrap();
-        assert_eq!(label, None, "a permissive host needs no label");
+        assert_eq!(label, None, "a host without SELinux needs no label");
         assert!(
             !attribute.exists(),
-            "no label attempt may start without SELinux enforcing"
+            "no label attempt may start without selinuxfs"
         );
     }
 

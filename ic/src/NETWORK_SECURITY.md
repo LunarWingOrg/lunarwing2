@@ -469,7 +469,9 @@ public-only validating proxy:
   without SELinux: `sandbox::proxy::relay` tests cover the first-candidate
   bind with the attribute cleared afterwards, one reason per refused
   candidate with no socket left behind, a kernel-refused labeled bind, and
-  the unlabeled fallback for a permissive or missing enforce node. What no
+  the unlabeled fallback on a host without selinuxfs. A permissive `0`
+  counts as SELinux and is labeled like `1`, so a host that later switches
+  to enforcing cannot regress. What no
   test can cover is the kernel's own policy decision; that stays with the run
   on an enforcing host.
 - relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
