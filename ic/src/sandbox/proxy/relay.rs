@@ -402,10 +402,7 @@ mod tests {
             0o666
         );
         if !selinux_enabled() {
-            assert_eq!(
-                label, None,
-                "a host without SELinux keeps the daemon label"
-            );
+            assert_eq!(label, None, "a host without SELinux keeps the daemon label");
         }
         // A plain client still reaches the listener after either path, so the
         // fallback cannot leave a half-built socket behind.
