@@ -14,7 +14,7 @@ The shell snippets use four variables. Set them once per session; the defaults a
 |---|---|---|
 | `REVIEW_CHECKOUT` | `/var/lib/paseo/wt` | the shared checkout (usually on the target branch, often dirty; read-only for a review) |
 | `REVIEW_SCRATCH` | `/var/lib/paseo/.paseo/tmp` | where per-run working files go (`$REVIEW_SCRATCH/run<N>/`); any private, writable directory works |
-| `REVIEW_TARGET` | `aragents/kimil00p/v2.2.0.0` | the release branch under review (also `review.py --target`); the default moves at each release (§4.5) |
+| `REVIEW_TARGET` | `aragents/kimil00p/v2.2.1.0` | the release branch under review (also `review.py --target`); the default moves at each release (§4.5) |
 | `GITLAB_TOKEN_FILE` | (none) | a file holding an `api`-scope token (`GITLAB_TOKEN` in the environment also works) |
 
 "Background" means whatever the harness offers: a background job of the harness, `tmux new-session -d`, or `nohup … &`. Record the PID of anything started in the background so it can be stopped by PID. "The operator" is the maintainer who runs the agent; "the agents" are the autonomous authors of the MRs (Applejack, Rarity and SweetieBot when this was written; the maintainer adds and pauses agents).
@@ -28,7 +28,7 @@ One run = one bounded pass over the open merge requests that target the current 
 - a 20-minute watch for pushes that arrive during the run;
 - a report file and an updated state file at the end.
 
-Scope: non-draft MRs whose `target_branch` is the review target. MRs against `master` are out of scope: SweetieBot's `sweetiebot/test-*` inttest MRs, the maintainer's `wip:` branches, the old drafts. The target moves at each release (`v2.1.5.0` → `v2.1.6.0` → `v2.1.7.0` → `v2.1.8.0` → `v2.1.9.0` → `v2.2.0.0`); the review prefix sequence continues across releases.
+Scope: non-draft MRs whose `target_branch` is the review target. MRs against `master` are out of scope: SweetieBot's `sweetiebot/test-*` inttest MRs, the maintainer's `wip:` branches, the old drafts. The target moves at each release (`v2.1.5.0` → `v2.1.6.0` → `v2.1.7.0` → `v2.1.8.0` → `v2.1.9.0` → `v2.2.0.0` → `v2.2.1.0`); the review prefix sequence continues across releases.
 
 The deliverable the maintainer reads is the GitLab note. The report and state file are for the next run, whoever runs it.
 
@@ -62,7 +62,7 @@ cd "${REVIEW_CHECKOUT:-/var/lib/paseo/wt}"
 N=$(( $(python3 -c "import json;print(json.load(open('docs/reviews/open-mr-review-state.json'))['last_run'])") + 1 ))
 S="${REVIEW_SCRATCH:-/var/lib/paseo/.paseo/tmp}/run$N" && mkdir -p "$S"
 date -u +%FT%TZ | tee "$S/start.txt"                       # run start; the window is 20 min from here
-git fetch -q origin && git ls-remote origin "refs/heads/${REVIEW_TARGET:-aragents/kimil00p/v2.2.0.0}" refs/heads/master
+git fetch -q origin && git ls-remote origin "refs/heads/${REVIEW_TARGET:-aragents/kimil00p/v2.2.1.0}" refs/heads/master
 docs/reviews/tools/review.py status                        # NEW / CHANGED / UNCHANGED per open MR
 docs/reviews/tools/watch-refs.sh -m 20 "$S/baseline.txt" > "$S/watch.log" 2>&1 &   # in the background; keep the PID
 ```
