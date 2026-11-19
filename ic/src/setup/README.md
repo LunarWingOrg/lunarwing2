@@ -211,6 +211,20 @@ refusal is reported as "not offering"; an unknown service user or an
 unresolvable primary group is a real error, and the wizard prints the lookup
 error rather than skipping the service step silently.
 
+What the wizard prints in place of an offer:
+
+| Case | Line |
+|---|---|
+| The installer would refuse a root daemon: systemd or launchd run as root, or on OpenRC a runtime identity named `root`, with uid 0 or with primary gid 0, each without the opt-in | `Not offering to install a background service: <the installer's reason>` |
+| The check itself failed: on OpenRC the service user does not exist or cannot be looked up, or its primary group cannot be resolved; `LUNARWING_SERVICE_MANAGER` holds an unsupported value; or the path of the running executable cannot be resolved for the OpenRC `sudo` hint | `Could not check whether a background service can be installed: <the error>` |
+| The host has no supported service manager (a Linux host without systemd and without OpenRC, such as most containers), or the platform is neither macOS nor Linux | nothing |
+
+On a host without a supported service manager there is nothing to offer, so
+the wizard stays quiet and only writes a debug log line. `lunarwing service
+install` and `lunarwing doctor` still report that case ("Could not detect a
+supported Linux service manager…"). Setting `LUNARWING_SERVICE_MANAGER` on such
+a host selects a manager and brings the offer back.
+
 The watchdog installer follows the same service-manager split:
 
 ```bash

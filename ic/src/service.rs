@@ -83,28 +83,39 @@ pub enum SetupServiceAvailability {
     Offer(SetupServiceOffer),
     /// The installer would refuse the service; `reason` says why and the way out.
     Refused { reason: String },
-    /// No supported service manager exists on this platform.
+    /// No supported service manager exists on this platform or host, so there
+    /// is nothing to offer and nothing to report.
     NotApplicable,
 }
 
 /// Marker for a root-daemon refusal, so callers can tell it apart from an
 /// identity lookup failure, which must surface as a real error.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
 struct RootServiceRefused {
     message: String,
 }
 
-impl std::fmt::Display for RootServiceRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RootServiceRefused {}
-
 fn is_root_service_refusal(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.downcast_ref::<RootServiceRefused>().is_some())
+}
+
+/// Marker for "this Linux host has no supported service manager", so the setup
+/// wizard can stay quiet there while `lunarwing service` and `lunarwing doctor`
+/// keep reporting it. An unsupported override is a different error and is not
+/// marked.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Could not detect a supported Linux service manager. \
+     Set LUNARWING_SERVICE_MANAGER=systemd or LUNARWING_SERVICE_MANAGER=openrc \
+     (legacy IRONCLAW_SERVICE_MANAGER is also supported)."
+)]
+struct NoServiceManagerDetected;
+
+fn is_no_service_manager_detected(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<NoServiceManagerDetected>().is_some())
 }
 
 // ── Public dispatch ─────────────────────────────────────────────
@@ -134,16 +145,41 @@ pub fn setup_service_offer() -> Result<SetupServiceAvailability> {
         return Ok(SetupServiceAvailability::NotApplicable);
     }
 
-    let manager = detected_service_manager()?;
-    setup_service_offer_with_identity(
-        manager,
+    setup_service_offer_for_detection(
+        detected_service_manager(),
         is_effective_root(),
         root_service_allowed(),
         current_service_identity,
     )
 }
 
-fn setup_service_offer_with_identity<F>(
+/// Turn the result of service manager detection into what the setup wizard
+/// should say. A host with no supported service manager is not an error for
+/// the wizard: there is nothing to offer, so the outcome is `NotApplicable`
+/// and the wizard prints nothing. Every other detection failure, such as an
+/// unsupported `LUNARWING_SERVICE_MANAGER` override, is passed on so that the
+/// person sees it.
+fn setup_service_offer_for_detection<F>(
+    detection: Result<ServiceManager>,
+    effective_root: bool,
+    allow_root: bool,
+    openrc_identity: F,
+) -> Result<SetupServiceAvailability>
+where
+    F: FnOnce() -> Result<(String, String)>,
+{
+    let manager = match detection {
+        Ok(manager) => manager,
+        Err(err) if is_no_service_manager_detected(&err) => {
+            tracing::debug!("Not offering a background service: {err}");
+            return Ok(SetupServiceAvailability::NotApplicable);
+        }
+        Err(err) => return Err(err),
+    };
+    setup_service_offer_with_identity(manager, effective_root, allow_root, openrc_identity)
+}
+
+pub(crate) fn setup_service_offer_with_identity<F>(
     manager: ServiceManager,
     effective_root: bool,
     allow_root: bool,
@@ -1237,11 +1273,7 @@ fn detect_linux_service_manager_from_probe(
         return Ok(ServiceManager::OpenRc);
     }
 
-    bail!(
-        "Could not detect a supported Linux service manager. \
-         Set LUNARWING_SERVICE_MANAGER=systemd or LUNARWING_SERVICE_MANAGER=openrc \
-         (legacy IRONCLAW_SERVICE_MANAGER is also supported)."
-    )
+    Err(anyhow::Error::new(NoServiceManagerDetected))
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -1469,6 +1501,58 @@ mod tests {
         })
         .expect_err("an identity lookup failure must surface as an error");
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn missing_service_manager_is_not_applicable_for_setup() {
+        let detection = detect_linux_service_manager_from_probe(&LinuxServiceProbe::default());
+        let err = detection
+            .as_ref()
+            .expect_err("a host without any service manager marker must not detect one");
+        assert!(is_no_service_manager_detected(err));
+        assert!(
+            err.to_string()
+                .contains("Could not detect a supported Linux service manager")
+        );
+
+        let availability = setup_service_offer_for_detection(detection, false, false, || {
+            unreachable!("identity lookup must not run without a service manager")
+        })
+        .expect("a host without a service manager is a quiet outcome, not an error");
+        assert!(matches!(
+            availability,
+            SetupServiceAvailability::NotApplicable
+        ));
+    }
+
+    #[test]
+    fn unsupported_service_manager_override_is_still_reported_for_setup() {
+        let detection = detect_linux_service_manager_from_probe(&LinuxServiceProbe {
+            override_value: Some("launchctl"),
+            ..Default::default()
+        });
+        let err = setup_service_offer_for_detection(detection, false, false, || {
+            unreachable!("identity lookup must not run for an unsupported override")
+        })
+        .expect_err("an unsupported override must surface as an error");
+        assert!(!is_no_service_manager_detected(&err));
+        assert!(
+            err.to_string()
+                .contains("Unsupported service manager override")
+        );
+    }
+
+    #[test]
+    fn detected_service_manager_still_reaches_the_refusal_checks_for_setup() {
+        let availability =
+            setup_service_offer_for_detection(Ok(ServiceManager::SystemdUser), true, false, || {
+                unreachable!("OpenRC identity lookup must not run for user services")
+            })
+            .expect("a root refusal is a reportable outcome, not an error");
+        assert!(matches!(
+            availability,
+            SetupServiceAvailability::Refused { .. }
+        ));
     }
 
     #[test]

@@ -3175,19 +3175,13 @@ impl SetupWizard {
     }
 
     fn offer_service_install(&self) -> Result<(), SetupError> {
-        match crate::service::setup_service_offer() {
-            Ok(crate::service::SetupServiceAvailability::Offer(offer)) => {
-                self.prompt_service_install(&offer)?;
-            }
-            Ok(crate::service::SetupServiceAvailability::Refused { reason }) => {
-                println!();
-                print_warning(&service_refusal_notice(&reason));
-            }
-            Ok(crate::service::SetupServiceAvailability::NotApplicable) => {}
-            Err(err) => {
-                println!();
-                print_warning(&service_lookup_notice(&err));
-            }
+        let outcome = crate::service::setup_service_offer();
+        if let Some(notice) = service_unavailable_notice(&outcome) {
+            println!();
+            print_warning(&notice);
+        }
+        if let Ok(crate::service::SetupServiceAvailability::Offer(offer)) = &outcome {
+            self.prompt_service_install(offer)?;
         }
 
         Ok(())
@@ -3225,6 +3219,22 @@ impl SetupWizard {
         }
 
         Ok(())
+    }
+}
+
+/// What the wizard prints when it has no background service to offer: the
+/// installer's refusal, or the error that stopped the check. `None` means it
+/// prints nothing here: an offer has its own prompt, and a platform or host
+/// without a supported service manager has nothing to report.
+fn service_unavailable_notice(
+    outcome: &anyhow::Result<crate::service::SetupServiceAvailability>,
+) -> Option<String> {
+    use crate::service::SetupServiceAvailability;
+
+    match outcome {
+        Ok(SetupServiceAvailability::Offer(_) | SetupServiceAvailability::NotApplicable) => None,
+        Ok(SetupServiceAvailability::Refused { reason }) => Some(service_refusal_notice(reason)),
+        Err(err) => Some(service_lookup_notice(err)),
     }
 }
 
@@ -3824,6 +3834,55 @@ mod tests {
         assert!(notice.contains("Could not check"));
         assert!(notice.contains("failed to resolve the OpenRC service identity"));
         assert!(notice.contains("service user 'nobody' does not exist"));
+    }
+
+    #[test]
+    fn test_service_unavailable_notice_reports_a_root_refusal() {
+        let outcome = crate::service::setup_service_offer_with_identity(
+            crate::service::ServiceManager::SystemdUser,
+            true,
+            false,
+            || unreachable!("OpenRC identity lookup must not run for a user service"),
+        );
+        let notice = service_unavailable_notice(&outcome)
+            .expect("the wizard must say why it offers no service to root");
+        assert!(notice.starts_with("Not offering to install a background service: "));
+        assert!(notice.contains("systemd user service to run as root"));
+        assert!(notice.contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+    }
+
+    #[test]
+    fn test_service_unavailable_notice_reports_an_openrc_lookup_error() {
+        let outcome = crate::service::setup_service_offer_with_identity(
+            crate::service::ServiceManager::OpenRc,
+            true,
+            false,
+            || anyhow::bail!("service user 'nobody' does not exist"),
+        );
+        let notice = service_unavailable_notice(&outcome)
+            .expect("the wizard must show an identity lookup error");
+        assert!(
+            notice.starts_with("Could not check whether a background service can be installed: ")
+        );
+        assert!(notice.contains("service user 'nobody' does not exist"));
+    }
+
+    #[test]
+    fn test_service_unavailable_notice_is_silent_without_a_refusal_or_error() {
+        let offer = crate::service::setup_service_offer_with_identity(
+            crate::service::ServiceManager::SystemdUser,
+            false,
+            false,
+            || unreachable!("OpenRC identity lookup must not run for a user service"),
+        );
+        assert!(matches!(
+            offer,
+            Ok(crate::service::SetupServiceAvailability::Offer(_))
+        ));
+        assert_eq!(service_unavailable_notice(&offer), None);
+
+        let not_applicable = Ok(crate::service::SetupServiceAvailability::NotApplicable);
+        assert_eq!(service_unavailable_notice(&not_applicable), None);
     }
 
     #[test]
