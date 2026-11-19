@@ -80,13 +80,14 @@ mt_degrade() {
 # emit a minimal degraded report by hand and exit — never a healthy blank.
 if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" != "true" ] \
   && ! command -v jq >/dev/null 2>&1; then
-  printf '{\n  "component": "systemd",\n  "status": "degraded",\n  "timestamp": "%s",\n  "metrics": {"units": []},\n  "issues": ["multi-tenant discovery unavailable: %s"]\n}\n' \
+  printf '{\n  "component": "systemd",\n  "status": "degraded",\n  "timestamp": "%s",\n  "metrics": {"units": [], "instances": []},\n  "issues": ["multi-tenant discovery unavailable: %s"]\n}\n' \
     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$MT_DISCOVERY_NOTE"
   exit 1
 fi
 
 issues=()
 unit_results=()
+instance_results=()
 overall_status="healthy"
 overall_exit=0
 
@@ -197,6 +198,37 @@ _tenant_probe_failures=0
 _tenant_discovery_failures=0
 _sweep_incomplete=false
 if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
+  # WI#766: a lingering tenant's user manager (user@<uid>.service) is supposed
+  # to stay up for the whole session. When it is dead the tenant's user bus is
+  # gone and every tenant unit is unobservable — `_tenant_uctl` collapses that
+  # into one exit 1 and the report was left with zero units and no actionable
+  # target. Identify a dead manager with the system manager itself, the same
+  # authoritative test mt-admin's `_user_manager_probe` uses: only for
+  # lingering tenants, and only a known down state proves the manager dead
+  # (sudo/account failures and unrecognized output are not a dead manager).
+  _tenant_linger_enabled() {  # <user> -> 0 when linger keeps the manager up
+    local u="$1" linger
+    if command -v loginctl >/dev/null 2>&1; then
+      linger=$(loginctl show-user "$u" --property=Linger --value 2>/dev/null) || linger=''
+      case "$linger" in
+        yes) return 0 ;;
+        no) return 1 ;;
+      esac
+    fi
+    # Same test-only seam as mt-admin (_tenant_linger_enabled).
+    [ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$u" ]
+  }
+  _tenant_manager_state() {  # <user> <uid> -> ok|dead:<state>|no-bus|unknown|not-lingering
+    local u="$1" uid="$2" state
+    _tenant_linger_enabled "$u" || { printf 'not-lingering\n'; return 0; }
+    state=$(systemctl is-active "user@${uid}.service" 2>/dev/null) || true
+    case "$state" in
+      active) printf 'ok\n' ;;
+      failed|inactive|dead|maintenance) printf 'dead:%s\n' "$state" ;;
+      '') printf 'no-bus\n' ;;
+      *) printf 'unknown\n' ;;
+    esac
+  }
   _tenant_uctl() {  # <user> <uid> <args...> -> bounded systemctl --user output
     local u="$1" uid="$2"; shift 2
     timeout -k 2 5 sudo -n -u "$u" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null
@@ -223,6 +255,32 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       issues+=("tenant $tname: OS user $tuser not found")
       continue
     fi
+    # WI#766: record the user manager itself as a per-tenant instance. A dead
+    # manager is a tenant-wide outage that otherwise only shows up as "zero
+    # units" — self-heal needs an explicit identity to grace-track and
+    # escalate (monitor-only: there are no units to restart). Probing further
+    # would only burn the sweep deadline on a bus that cannot answer.
+    tmanager="$(_tenant_manager_state "$tuser" "$tuid")"
+    case "$tmanager" in
+      dead:*)
+        _mgstate="${tmanager#dead:}"
+        mt_degrade "tenant $tname ($tuser): user manager user@${tuid}.service is ${_mgstate}; all tenant units are unobservable (recover: systemctl start user@${tuid}.service)"
+        instance_results+=("$(jq -n --arg t "$tname" --arg u "$tuser" \
+          --arg unit "user@${tuid}.service" --arg st "$_mgstate" \
+          '{tenant:$t, status:"critical", user:$u, manager_unit:$unit, manager_state:$st}')")
+        continue
+        ;;
+      ok)
+        instance_results+=("$(jq -n --arg t "$tname" --arg u "$tuser" --arg unit "user@${tuid}.service" \
+          '{tenant:$t, status:"healthy", user:$u, manager_unit:$unit}')")
+        ;;
+      no-bus|unknown)
+        instance_results+=("$(jq -n --arg t "$tname" --arg u "$tuser" \
+          --arg unit "user@${tuid}.service" --arg st "$tmanager" \
+          '{tenant:$t, status:"unknown", user:$u, manager_unit:$unit, manager_state:$st}')")
+        ;;
+      *) ;;  # not-lingering: a down manager says nothing about the tenant
+    esac
     _tenant_loaded_before=$_tenant_units_loaded
     _tenant_sweep_cut_short=false
     # Is this tenant "started"? Its primary daemon being active means every other
@@ -393,13 +451,19 @@ fi
 
 units_json=$(printf '%s\n' "${unit_results[@]}" | jq -s .)
 
+instances_json="[]"
+if [ ${#instance_results[@]} -gt 0 ]; then
+  instances_json=$(printf '%s\n' "${instance_results[@]}" | jq -s .)
+fi
+
 cat <<EOF
 {
   "component": "systemd",
   "status": "$overall_status",
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "metrics": {
-    "units": $units_json
+    "units": $units_json,
+    "instances": $instances_json
   },
   "issues": $issues_json
 }
