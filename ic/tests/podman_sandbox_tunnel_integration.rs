@@ -7,10 +7,15 @@
 //! runtime gates is refused rather than guessed. LUNARWING_E2E_TUNNEL_RUNTIME
 //! (`podman` or `docker`) must agree with the open gate when it is set.
 //!
-//! The detached-helper checks need systemd service mode. On any other host
-//! they print a skip; set LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 to turn that
-//! skip into a failure, which is how a systemd-service-mode run proves the
-//! checks actually executed (WI#771).
+//! The detached-helper checks need systemd service mode and rootless Podman.
+//! Podman leaves its network helpers (conmon, pasta) in the detached `run`
+//! client's transient unit, so the unit stays loaded and can be observed.
+//! Docker's `docker run -d` client leaves nothing in its unit, so on Docker no
+//! unit outlives the client and the checks print a skip. On a host without
+//! systemd service mode they also print a skip; set
+//! LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 to turn a skip into a failure, which
+//! is how a systemd-service-mode run proves the checks actually executed
+//! (WI#771, WI#782).
 //!
 //! NetBird additionally requires LUNARWING_E2E_NETBIRD_TESTS=1, a real
 //! management service, a reusable key file, and an image containing NetBird,
@@ -277,14 +282,14 @@ async fn wait_container_absent(name: &str) -> Result<(), String> {
     ))
 }
 
-/// Every container carrying the tunnel labels, so a run can prove it left
-/// nothing behind rather than only that one name is gone.
-async fn tunnel_labeled_containers() -> Result<Vec<String>, String> {
+/// Container names carrying one label. Sidecars carry
+/// `lunarwing.sandbox-tunnel`; joined runs carry `lunarwing.sandbox`.
+async fn labeled_containers(label: &str) -> Result<Vec<String>, String> {
     let output = runtime_output(&[
         "ps",
         "-a",
         "--filter",
-        "label=lunarwing.sandbox-tunnel",
+        &format!("label={label}"),
         "--format",
         "{{.Names}}",
     ])
@@ -300,19 +305,43 @@ async fn tunnel_labeled_containers() -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Fails closed on any leftover tunnel container, sidecar or run.
-async fn assert_tunnel_containers_absent(context: &str) -> Result<(), String> {
+/// Sidecars and the joined runs that use them, each by its own label.
+async fn tunnel_and_joined_containers() -> Result<Vec<String>, String> {
+    let mut names = labeled_containers("lunarwing.sandbox-tunnel").await?;
+    names.extend(labeled_containers("lunarwing.sandbox").await?);
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
+/// Snapshot taken before a lane starts a sidecar. The teardown assertion
+/// counts only containers the lane created, so a long-lived sidecar of another
+/// daemon does not fail it.
+async fn leftover_baseline() -> Result<Vec<String>, String> {
+    tunnel_and_joined_containers().await
+}
+
+fn containers_new_since(current: &[String], baseline: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|name| !baseline.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// Fails closed when any sidecar or joined run created by the lane remains.
+async fn assert_tunnel_containers_absent(context: &str, baseline: &[String]) -> Result<(), String> {
     for _ in 0..225 {
-        let remaining = tunnel_labeled_containers().await?;
-        if remaining.is_empty() {
+        let current = tunnel_and_joined_containers().await?;
+        if containers_new_since(&current, baseline).is_empty() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let remaining = tunnel_labeled_containers().await?;
+    let current = tunnel_and_joined_containers().await?;
     Err(format!(
         "tunnel containers remained after {context}: {}",
-        remaining.join(", ")
+        containers_new_since(&current, baseline).join(", ")
     ))
 }
 
@@ -357,6 +386,30 @@ async fn systemd_service_mode() -> bool {
         .uses_systemd_services()
 }
 
+/// The detached helper unit can only be observed where the runtime keeps the
+/// helper in the client's transient unit. Rootless Podman does: the detached
+/// `run -d` client exits but leaves conmon and pasta in the unit's cgroup, so
+/// the unit stays loaded. Docker does not: `docker run -d` also just asks the
+/// daemon and leaves no process in the client's unit, so the unit is collected
+/// before it could be listed and nothing about it is proven.
+fn detached_unit_check_applies(what: &str) -> bool {
+    if tunnel_runtime() == ContainerRuntime::Podman {
+        return true;
+    }
+    if systemd_required() {
+        panic!(
+            "LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 cannot be met on Docker for {what}: the \
+             `docker run -d` client leaves no process in its transient unit, so no unit \
+             outlives the client and nothing about the unit is proven"
+        );
+    }
+    eprintln!(
+        "skipping {what}: Docker's `docker run -d` client leaves no process in its transient \
+         unit, so no unit outlives the client"
+    );
+    false
+}
+
 /// The detached-helper checks only mean anything in systemd service mode.
 /// Without it they report a skip; with `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1`
 /// that skip becomes a failure so a service-mode run cannot pass vacuously.
@@ -399,8 +452,12 @@ async fn user_unit_listing() -> Option<String> {
 }
 
 /// The helper unit must exist while the sidecar runs, otherwise the
-/// "unit is gone afterwards" check proves nothing.
+/// "unit is gone afterwards" check proves nothing. Applies to rootless Podman
+/// only; see [`detached_unit_check_applies`].
 async fn assert_detached_helper_used(container_name: &str) {
+    if !detached_unit_check_applies("the detached-unit-in-use check") {
+        return;
+    }
     if !systemd_service_mode().await {
         skip_or_fail_without_service_mode("the detached-unit-in-use check");
         return;
@@ -414,6 +471,9 @@ async fn assert_detached_helper_used(container_name: &str) {
 }
 
 async fn assert_detached_helper_stopped(container_name: &str) {
+    if !detached_unit_check_applies("the detached-unit cleanup check") {
+        return;
+    }
     if !systemd_service_mode().await {
         skip_or_fail_without_service_mode("the detached-unit cleanup check");
         return;
@@ -435,10 +495,7 @@ async fn assert_detached_helper_stopped(container_name: &str) {
         "detached unit remains:\n{listing}"
     );
     // Rootless Podman leaves a conmon/pasta helper if the unit was only half
-    // released. Docker has no pasta, so the scan is Podman-only.
-    if tunnel_runtime() != ContainerRuntime::Podman {
-        return;
-    }
+    // released. Only this path reaches here: Docker returns above.
     for process in std::fs::read_dir("/proc").expect("procfs").flatten() {
         let path = process.path();
         if !path
@@ -830,6 +887,9 @@ async fn tunnel_concurrent_first_commands_keep_firewall_stable() {
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
+    let baseline = leftover_baseline()
+        .await
+        .expect("tunnel container baseline");
     let private_key = generate_wg_private_key(&image)
         .await
         .expect("generate a WireGuard key");
@@ -859,22 +919,22 @@ async fn tunnel_concurrent_first_commands_keep_firewall_stable() {
     let first = manager.execute("sleep 3; echo FIRST", &workdir, HashMap::new());
     let second = manager.execute("echo SECOND", &workdir, HashMap::new());
     let (first, second) = tokio::join!(first, second);
-    assert_detached_helper_used(&name).await;
-    let _ = done.send(true);
-    let monitored = monitor.await.expect("firewall monitor task");
-    manager.shutdown().await;
-    assert_detached_helper_stopped(&name).await;
-    assert_tunnel_containers_absent("the concurrent-command lane")
-        .await
-        .expect("no tunnel containers left behind");
-    let _ = std::fs::remove_dir_all(&workdir);
-
     let first = first.expect("first concurrent sandbox command");
     let second = second.expect("second concurrent sandbox command");
     assert_eq!(first.exit_code, 0, "{}{}", first.stdout, first.stderr);
     assert_eq!(second.exit_code, 0, "{}{}", second.stdout, second.stderr);
     assert!(first.stdout.contains("FIRST"));
     assert!(second.stdout.contains("SECOND"));
+    assert_detached_helper_used(&name).await;
+    let _ = done.send(true);
+    let monitored = monitor.await.expect("firewall monitor task");
+    manager.shutdown().await;
+    assert_detached_helper_stopped(&name).await;
+    assert_tunnel_containers_absent("the concurrent-command lane", &baseline)
+        .await
+        .expect("no tunnel containers left behind");
+    let _ = std::fs::remove_dir_all(&workdir);
+
     monitored.expect("firewall stayed complete and unchanged during concurrent first commands");
 }
 
@@ -888,6 +948,9 @@ async fn tunnel_sidecar_wireguard_lifecycle_and_join() {
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
+    let baseline = leftover_baseline()
+        .await
+        .expect("tunnel container baseline");
     let private_key = generate_wg_private_key(&image)
         .await
         .expect("generate a WireGuard key");
@@ -932,6 +995,8 @@ async fn tunnel_sidecar_wireguard_lifecycle_and_join() {
             .ensure_healthy()
             .await
             .map_err(|error| error.to_string())?;
+        assert_detached_helper_used(other.container_name()).await;
+        assert_detached_helper_used(sidecar.container_name()).await;
         other.stop().await;
         sidecar
             .ensure_healthy()
@@ -942,13 +1007,13 @@ async fn tunnel_sidecar_wireguard_lifecycle_and_join() {
     .await;
     sidecar.stop().await;
     other.stop().await;
+    result.expect("real WireGuard sidecar lifecycle and egress-only namespace");
     assert_detached_helper_stopped(sidecar.container_name()).await;
     assert_detached_helper_stopped(other.container_name()).await;
-    assert_tunnel_containers_absent("the WireGuard lifecycle lane")
+    assert_tunnel_containers_absent("the WireGuard lifecycle lane", &baseline)
         .await
         .expect("no tunnel containers left behind");
     let _ = std::fs::remove_dir_all(&workdir);
-    result.expect("real WireGuard sidecar lifecycle and egress-only namespace");
 }
 
 #[tokio::test]
@@ -1701,6 +1766,30 @@ fn netbird_peer_status_requires_the_same_peer_block() {
     ));
 }
 
+#[test]
+fn leftover_check_counts_only_containers_the_lane_created() {
+    let baseline = vec![
+        "lunarwing-sandbox-tunnel-other".to_string(),
+        "lunarwing-sandbox-other-run".to_string(),
+    ];
+    let current = vec![
+        "lunarwing-sandbox-other-run".to_string(),
+        "lunarwing-sandbox-tunnel-other".to_string(),
+    ];
+    assert!(containers_new_since(&current, &baseline).is_empty());
+
+    let mut leaked = current.clone();
+    leaked.push("lunarwing-sandbox-tunnel-lane".to_string());
+    leaked.push("lunarwing-sandbox-lane-run".to_string());
+    assert_eq!(
+        containers_new_since(&leaked, &baseline),
+        vec![
+            "lunarwing-sandbox-tunnel-lane".to_string(),
+            "lunarwing-sandbox-lane-run".to_string(),
+        ]
+    );
+}
+
 async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(), String> {
     for _ in 0..30 {
         let primary_ip = netbird_ipv4(primary).await?;
@@ -2231,6 +2320,9 @@ async fn tunnel_sidecar_netbird_live() {
         ))
     })();
     let (image, management_url, setup_key) = settings.expect("NetBird live settings");
+    let baseline = leftover_baseline()
+        .await
+        .expect("tunnel container baseline");
     let workdir = std::env::temp_dir().join(format!("lw-netbird-live-{}", std::process::id()));
     let primary_dir = workdir.join("primary");
     let runtime_dir = workdir.join("runtime");
@@ -2274,6 +2366,7 @@ async fn tunnel_sidecar_netbird_live() {
         start_plain_netbird_peer(&image, &peer_name, &peer_env).await?;
         start_netbird_dns_fixture(&peer_name).await?;
         assert_netbird_peers_connected(primary.container_name(), &peer_name).await?;
+        assert_detached_helper_used(primary.container_name()).await;
         assert_netbird_mark_rule(&primary).await?;
         assert_netbird_joined_run(&primary, &image, &workdir, &peer_name).await?;
         let primary_volume = netbird_volume(&primary).await?;
@@ -2303,7 +2396,7 @@ async fn tunnel_sidecar_netbird_live() {
     remove_netbird_volumes(&volume_prefix).await;
     let _ = runtime_success(&["volume", "rm", &peer_name]).await;
     assert_detached_helper_stopped(primary.container_name()).await;
-    assert_tunnel_containers_absent("the NetBird live lane")
+    assert_tunnel_containers_absent("the NetBird live lane", &baseline)
         .await
         .expect("no tunnel containers left behind");
     let _ = std::fs::remove_file(peer_env);
