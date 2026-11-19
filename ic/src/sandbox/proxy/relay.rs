@@ -28,16 +28,13 @@
 //! cannot change it.
 //!
 //! The listener is therefore created under the context a container's own
-//! sockets carry ([`RELAY_SOCKET_CONTEXT`]), so the container's connect is the
-//! same-type check stock policy already allows, at a level every container
-//! level dominates. That grants no permission a container does not already
-//! have for its own sockets, and the sandbox is never made unconfined.
-//!
-//! The daemon's half of that arrangement (`connectto`, `accept`, and one byte
-//! each way) is proved by [`relay_self_test`] before the container starts. A
-//! refusal, an unwritable create-context node, or a host without SELinux
-//! falls back to the previous unlabeled socket, so this can only add a
-//! working path; the container's own startup error reports the rest.
+//! sockets carry ([`RELAY_SOCKET_CONTEXTS`]), so the container's connect is the
+//! same-type check stock policy already allows. Before any container starts,
+//! [`probe_labeled_connection`] replays that connect from a socket created
+//! under a container-shaped source context — including the MLS constraint on
+//! the level — and a refusal falls back to the previous unlabeled socket.
+//! That grants no permission a container does not already have for its own
+//! sockets, and the sandbox is never made unconfined.
 
 use std::path::{Path, PathBuf};
 
@@ -107,13 +104,31 @@ fn at_path(context: &str, path: &Path, error: std::io::Error) -> std::io::Error 
 // SELinux listener labeling (WI#641)
 // ---------------------------------------------------------------------------
 
-/// Context a container's own sockets carry: the stock container type at the
-/// base level. `container_t` may `connectto` sockets of its own type at a
-/// level it dominates, and every container level dominates `s0` (no
-/// categories), so no per-run category pair — and no new policy rule — is
-/// needed.
+/// Contexts a sandbox container's own sockets carry, in the order tried: the
+/// stock container type at the base level, then at the full category range.
+///
+/// The base level suffices when the policy constrains only the type. The full
+/// range is the one a run's per-container category pair (`s0:c533,c991`)
+/// cannot refuse on a level comparison, so it covers a policy whose MLS
+/// constraint requires the listener's level to dominate the connecting
+/// socket's level. Both are levels every container level either equals or is
+/// dominated by, and neither grants more than a container already has for its
+/// own sockets.
 #[cfg(target_os = "linux")]
-const RELAY_SOCKET_CONTEXT: &str = "system_u:system_r:container_t:s0";
+const RELAY_SOCKET_CONTEXTS: [&str; 2] = [
+    "system_u:system_r:container_t:s0",
+    "system_u:system_r:container_t:s0:c0.c1023",
+];
+
+/// Source contexts the self-test connects from: a runtime-assigned category
+/// pair, then the base level. The self-test therefore exercises the
+/// container's own `connectto` (source socket label, target listener label,
+/// including the MLS constraint) before any container can fail on it.
+#[cfg(target_os = "linux")]
+const SIMULATED_CLIENT_CONTEXTS: [&str; 2] = [
+    "system_u:system_r:container_t:s0:c533,c991",
+    "system_u:system_r:container_t:s0",
+];
 
 /// Per-task SELinux create context. `/proc/thread-self` addresses the calling
 /// thread exactly; `/proc/self` is the fallback for older `/proc` mounts.
@@ -138,8 +153,8 @@ fn selinux_enabled() -> bool {
 /// Pin the calling thread's next socket to `context`.
 ///
 /// The attribute belongs to the task, not the process, so no other thread in
-/// the daemon can pick it up; the caller clears it as soon as the listener is
-/// bound.
+/// the daemon can pick it up; [`LabelProbe`] clears it as soon as the socket
+/// exists.
 #[cfg(target_os = "linux")]
 fn set_socket_create_context(context: &str) -> std::io::Result<()> {
     let mut last = std::io::Error::from(std::io::ErrorKind::NotFound);
@@ -164,8 +179,20 @@ fn clear_socket_create_context() {
     }
 }
 
-/// Bind the relay socket under whatever create context is current, and make it
-/// connectable by an unmapped container uid.
+/// Run `create` with this thread's socket create context pinned to `context`,
+/// clearing the attribute afterwards even when creation fails.
+#[cfg(target_os = "linux")]
+fn with_socket_context<T>(
+    context: &str,
+    create: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    set_socket_create_context(context)?;
+    let created = create();
+    clear_socket_create_context();
+    created
+}
+
+/// Bind the relay socket and make it connectable by an unmapped container uid.
 #[cfg(target_os = "linux")]
 fn bind_relay_socket(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
@@ -177,28 +204,23 @@ fn bind_relay_socket(socket: &Path) -> std::io::Result<std::os::unix::net::UnixL
     Ok(listener)
 }
 
-#[cfg(target_os = "linux")]
-fn to_tokio(
-    listener: std::os::unix::net::UnixListener,
-) -> std::io::Result<tokio::net::UnixListener> {
-    listener.set_nonblocking(true)?;
-    tokio::net::UnixListener::from_std(listener)
-}
-
-/// Prove the daemon's own half of the container path under the pinned context:
-/// `connectto` to the labeled listener, `accept` on it, and one byte each way
-/// through the accepted stream. Each is an SELinux check against the
+/// Prove one candidate listener answers the connect a sandbox container will
+/// make: `connectto` from a socket created under `client_context`, `accept`,
+/// and one byte each way. Every step is an SELinux check against the
 /// listener's own context, so a refusal here means a labeled socket would
-/// break the relay instead of fixing the container.
+/// break the relay instead of fixing it.
 #[cfg(target_os = "linux")]
-fn relay_self_test(
+fn probe_labeled_connection(
     socket: &Path,
     listener: &std::os::unix::net::UnixListener,
+    client_context: &str,
 ) -> std::io::Result<()> {
     use std::io::{Read, Write};
 
     let timeout = std::time::Duration::from_secs(2);
-    let mut client = std::os::unix::net::UnixStream::connect(socket)?;
+    let mut client = with_socket_context(client_context, || {
+        std::os::unix::net::UnixStream::connect(socket)
+    })?;
     client.set_read_timeout(Some(timeout))?;
     client.set_write_timeout(Some(timeout))?;
     let (mut server, _) = listener.accept()?;
@@ -212,7 +234,8 @@ fn relay_self_test(
     Ok(())
 }
 
-/// Bind the relay listener, labeled for containers when the host allows it.
+/// Bind the listener, labeled for containers, on a dedicated thread so the
+/// per-task create context can never leak onto a runtime worker.
 ///
 /// Returns the listener and the context it was created under, or `None` when
 /// the default context was kept.
@@ -220,40 +243,64 @@ fn relay_self_test(
 fn bind_relay_listener(
     socket: &Path,
 ) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
-    if selinux_enabled() {
-        let context = RELAY_SOCKET_CONTEXT;
-        let pinned = match set_socket_create_context(context) {
-            Ok(()) => {
-                let bound = bind_relay_socket(socket);
-                clear_socket_create_context();
-                Some(bound?)
-            }
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    context,
-                    "cannot create the relay socket under the container label"
-                );
-                None
-            }
-        };
-        if let Some(listener) = pinned {
-            match relay_self_test(socket, &listener) {
-                Ok(()) => return Ok((to_tokio(listener)?, Some(context))),
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        context,
-                        "SELinux refused the relay socket self-test; keeping the unlabeled socket"
-                    );
-                    drop(listener);
-                    std::fs::remove_file(socket)
-                        .map_err(|error| at_path("cannot replace relay socket", socket, error))?;
-                }
-            }
-        }
+    let owned = socket.to_path_buf();
+    let labeled = std::thread::Builder::new()
+        .name("relay-label".into())
+        .spawn(move || bind_labeled(&owned))
+        .map_err(|error| std::io::Error::other(format!("cannot start relay label probe: {error}")))?
+        .join()
+        .map_err(|_| std::io::Error::other("relay label probe thread panicked"))??;
+    match labeled {
+        Some((listener, context)) => Ok((to_tokio(listener)?, Some(context))),
+        None => Ok((to_tokio(bind_relay_socket(socket)?)?, None)),
     }
-    Ok((to_tokio(bind_relay_socket(socket)?)?, None))
+}
+
+/// Try each candidate context on the calling thread (the dedicated probe
+/// thread), keeping the first that survives a container-shaped connect.
+#[cfg(target_os = "linux")]
+fn bind_labeled(
+    socket: &Path,
+) -> std::io::Result<Option<(std::os::unix::net::UnixListener, &'static str)>> {
+    if !selinux_enabled() {
+        return Ok(None);
+    }
+    for context in RELAY_SOCKET_CONTEXTS {
+        if set_socket_create_context(context).is_err() {
+            continue;
+        }
+        let bound = bind_relay_socket(socket);
+        clear_socket_create_context();
+        // A refusal to create under this context is the same fallback as an
+        // unwritable attribute; the unlabeled attempt reports real errors.
+        let Ok(listener) = bound else {
+            let _ = std::fs::remove_file(socket);
+            continue;
+        };
+        if let Err(error) = SIMULATED_CLIENT_CONTEXTS
+            .iter()
+            .try_for_each(|client| probe_labeled_connection(socket, &listener, client))
+        {
+            tracing::warn!(
+                %error,
+                context,
+                "SELinux refused the relay socket self-test; trying the next label"
+            );
+            drop(listener);
+            let _ = std::fs::remove_file(socket);
+            continue;
+        }
+        return Ok(Some((listener, context)));
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn to_tokio(
+    listener: std::os::unix::net::UnixListener,
+) -> std::io::Result<tokio::net::UnixListener> {
+    listener.set_nonblocking(true)?;
+    tokio::net::UnixListener::from_std(listener)
 }
 
 /// Build the isolated relay socket directory: a unique private parent dir, a
@@ -282,7 +329,7 @@ fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::Uni
     let (listener, label) = bind_relay_listener(&socket)?;
     // A host connect would queue an upstream client without testing the
     // container's mount, UID mapping or security context; that is what
-    // `relay_self_test` checks instead, when a label was applied.
+    // `probe_labeled_connection` replays instead, when a label was applied.
     tracing::debug!(
         socket = %socket.display(),
         channel_mode = %format!("{:04o}", mode_of(&channel)),
