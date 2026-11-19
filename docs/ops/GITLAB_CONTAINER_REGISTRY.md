@@ -163,6 +163,12 @@ to a time limit rather than a size limit. After the change, the same probe
 must end `201` in about 125 s; see [Verification](REGISTRY_PUSH_499.md#verification)
 for the commands.
 
+The token-free check for the same setting is
+`python3 .gitlab/scripts/edge-read-timeout-probe.py --hold 90`: it holds an
+unfinished request open and must print `OPEN` on both hosts after the change.
+Run on 2026-11-19 it reported `CUT` at 60.07 s on `git.lunarwing.org` and on
+`registry.git.lunarwing.org`.
+
 Until the edge change is live, runner 17 (the slow `laptop`/`rainova43`
 runner) no longer carries the `container-build` tag, so it cannot take the
 candidate jobs. See `REGISTRY_PUSH_499.md` for the exact change and the

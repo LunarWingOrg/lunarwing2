@@ -94,6 +94,26 @@ reachable from this box (SSH lands in GitLab-shell). WI#706 acceptance box 1
 still needs that line from the host administrator; the pre-fix half of box 2
 is now recorded above.
 
+### Read-side check without a token, 2026-11-19
+
+Traefik's `readTimeout` bounds reading the request whether or not it carries a
+body, so an unfinished request probes the same setting with no credentials and
+no upload. `.gitlab/scripts/edge-read-timeout-probe.py` opens one TLS
+connection per host, sends a request head, and dribbles one header line every
+five seconds without completing the request. Run against both hosts on
+2026-11-19 between 23:06Z and 23:07Z, the edge closed each connection at
+**60.07 s**:
+
+| Host | Result |
+|---|---|
+| `git.lunarwing.org` | EOF at 60.07 s |
+| `registry.git.lunarwing.org` | EOF at 60.07 s |
+
+Requests that are allowed to complete answer normally (`302` on the main
+host, `401` on `/v2/`), so the close is the read timeout firing, not the
+request being refused. This is the fastest check after the setting is raised;
+it does not replace the rate-limited upload for acceptance box 2.
+
 The 60-second cut matches **Traefik `respondingTimeouts.readTimeout`**, which
 has defaulted to 60 seconds since Traefik 2.11.2 and 3.0. It bounds the whole
 request, body included, and it is the component common to both
@@ -261,6 +281,11 @@ been done from the dev box — see “Live confirmation” above.
 
 ## Verification
 
+The quick check, if the old cut is still present, needs no token:
+`python3 .gitlab/scripts/edge-read-timeout-probe.py --hold 90` must report
+`OPEN` on both hosts after the change. The rate-limited upload probe below is
+still the acceptance evidence for box 2.
+
 1. **The go/no-go probe** — a rate-limited upload through the edge, run from
    a workstation with Bash and curl 7.55.0 or newer. Use a dedicated, standing
    **private probe project** on this GitLab instance. Use its numeric project
@@ -331,6 +356,9 @@ been done from the dev box — see “Live confirmation” above.
   (`GITLAB_CONTAINER_REGISTRY.md` §1f); the value there today is the
   recommendation, not the live setting.
 - **Run the go/no-go probe** after the change (expect `201` in ~125 s).
+- **Quick re-check without a token:** `python3
+  .gitlab/scripts/edge-read-timeout-probe.py --hold 90` must report `OPEN` on
+  both hosts; before the change it reports `CUT` at 60.07 s (2026-11-19).
 - **Re-add `container-build` to runner 17** only after the probe passes.
 
 ## Rollback
