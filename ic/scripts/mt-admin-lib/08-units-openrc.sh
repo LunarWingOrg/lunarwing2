@@ -1020,12 +1020,14 @@ description="LunarWing AI assistant ($name)"
 # WI#663: the systemd tenant unit names the search PATH explicitly
 # (Environment=PATH=... in mt-admin-lib/07-units-systemd.sh). This is the
 # OpenRC half of the same policy, so both inits resolve a container runtime
-# and its helpers (pasta, conmon) from the same directories. OpenRC services
-# usually inherit a host PATH that already carries sbin, but that is the
-# host's choice rather than a contract — append the sbin directories only when
-# they are missing, keeping the host's own entries and order, which is the
-# same append-only rule src/sandbox/runtime_path.rs applies to runtime
-# commands.
+# and its helpers (pasta, conmon) from the same directories. OpenRC does not
+# hand a service the caller's PATH: openrc-run drops it unless rc_env_allow
+# names it, then adds /etc/profile.env and prepends its own fixed list, which
+# already carried /usr/local/sbin, /usr/sbin and /sbin on both measured builds
+# (OpenRC 0.62.6 on Alpine 3.22; OpenRC 0.63.3 on Gentoo 2.18), so the loop
+# below added nothing there. It stays as a safeguard for an OpenRC build whose
+# fixed list leaves a directory out, under the same append-only rule
+# src/sandbox/runtime_path.rs applies to runtime commands.
 for _lw_sbin in /usr/local/sbin /usr/sbin /sbin; do
     case ":\${PATH}:" in
         *":\${_lw_sbin}:"*) ;;
