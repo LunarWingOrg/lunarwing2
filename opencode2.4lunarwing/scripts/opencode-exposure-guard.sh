@@ -61,7 +61,7 @@
 # naive-use guard.
 #
 # One environment variable is forced on every start (WI#609, !2398 AAV-1):
-# OPENCODE_FLAGS=-console_watches. v2.2.7 ships Console event watches, a way
+# OPENCODE_FLAGS=-console_watches. v2.2.7 and v2.3.2 ship Console event watches, a way
 # to steer a session from OpenCode Console (a hosted third party), behind the
 # feature flag `console_watches`. Upstream resolves a flag from OPENCODE_FLAGS
 # first, then from `experimental.<key>` in the highest-priority config

@@ -89,7 +89,7 @@ OPENTUNNEL_MARKERS = (b"opentunnel.xyz", b"@opentunnel/client", b"@opentunnel/pr
 # sync with sessionPermissions() in scripts/opencode_task_executor.ts.
 REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair", "serve"))
 
-# WI#609, !2398 AAV-1: opencode v2.2.7 ships Console event watches, a remote
+# WI#609, !2398 AAV-1: opencode v2.2.7 (still at v2.3.2) ships Console event watches, a remote
 # steering channel through OpenCode Console, behind the feature flag
 # `console_watches`. The lane keeps it off in two places. The lane config must
 # not turn it on (`experimental.all_flags` turns every flag on). And the
@@ -294,10 +294,10 @@ def check_installed_managed_policy(
     )
     # Upstream reads two names from the managed directory, `opencode.json` and
     # `opencode.jsonc` (packages/core/src/config/discovery.ts:12 and
-    # config.ts:270-277 at the v2.2.7 pin), and the second one's policies
-    # outrank the first's (config.ts:313-325), so a sibling document can lift
+    # config.ts:270-277 at the v2.3.2 pin), and the second one's policies
+    # outrank the first's (config.ts:315-328), so a sibling document can lift
     # the reviewed deny while the reviewed file is untouched. The directory
-    # is also a config directory entry (config.ts:275), the kind upstream
+    # is also a config directory entry (config.ts:277), the kind upstream
     # scans for skills and plugins. It must therefore hold the one reviewed
     # file and nothing else.
     try:
