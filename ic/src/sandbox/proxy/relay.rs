@@ -149,11 +149,45 @@ const SOCKCREATE_NODE: &str = "/proc/thread-self/attr/sockcreate";
 #[cfg(target_os = "linux")]
 const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 
+/// The two host nodes that decide whether a labeled listener is possible: the
+/// selinuxfs `enforce` value and this task's socket create context.
+///
+/// Injectable so the labeling path itself — candidate order, the cleanup after
+/// a refused candidate, and the unlabeled fallback — runs in tests on a host
+/// without SELinux ([`LabelNodes::at`] names ordinary files instead). The
+/// daemon always uses [`LabelNodes::defaults`].
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct LabelNodes {
+    enforce: PathBuf,
+    sockcreate: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LabelNodes {
+    fn defaults() -> Self {
+        Self {
+            enforce: PathBuf::from(SELINUX_ENFORCE),
+            sockcreate: PathBuf::from(SOCKCREATE_NODE),
+        }
+    }
+
+    /// Another pair of nodes, so the labeling path can be tested on a host
+    /// without SELinux.
+    #[cfg(test)]
+    fn at(enforce: impl Into<PathBuf>, sockcreate: impl Into<PathBuf>) -> Self {
+        Self {
+            enforce: enforce.into(),
+            sockcreate: sockcreate.into(),
+        }
+    }
+}
+
 /// Whether SELinux is enabled on this host (`0` permissive, `1` enforcing).
 /// A host without selinuxfs — AppArmor, or none — keeps the old socket.
 #[cfg(target_os = "linux")]
-fn selinux_enabled() -> bool {
-    selinux_enabled_at(Path::new(SELINUX_ENFORCE))
+fn selinux_enabled(nodes: &LabelNodes) -> bool {
+    selinux_enabled_at(&nodes.enforce)
 }
 
 /// [`selinux_enabled`] for a given enforce node.
@@ -171,28 +205,29 @@ fn selinux_enabled_at(enforce: &Path) -> bool {
 /// the daemon can pick it up; [`with_socket_context`] clears it as soon as the
 /// socket exists.
 #[cfg(target_os = "linux")]
-fn set_socket_create_context(context: &str) -> std::io::Result<()> {
-    std::fs::write(SOCKCREATE_NODE, context)
+fn set_socket_create_context(nodes: &LabelNodes, context: &str) -> std::io::Result<()> {
+    std::fs::write(&nodes.sockcreate, context)
 }
 
 /// Restore the default create context on the calling thread. A newline is the
 /// kernel's "no context specified" form; an empty write may never reach the
 /// attribute handler.
 #[cfg(target_os = "linux")]
-fn clear_socket_create_context() {
-    let _ = std::fs::write(SOCKCREATE_NODE, "\n");
+fn clear_socket_create_context(nodes: &LabelNodes) {
+    let _ = std::fs::write(&nodes.sockcreate, "\n");
 }
 
 /// Run `create` with this thread's socket create context pinned to `context`,
 /// clearing the attribute afterwards even when creation fails.
 #[cfg(target_os = "linux")]
 fn with_socket_context<T>(
+    nodes: &LabelNodes,
     context: &str,
     create: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    set_socket_create_context(context)?;
+    set_socket_create_context(nodes, context)?;
     let created = create();
-    clear_socket_create_context();
+    clear_socket_create_context(nodes);
     created
 }
 
@@ -215,6 +250,7 @@ fn bind_relay_socket(socket: &Path) -> std::io::Result<std::os::unix::net::UnixL
 /// break the relay instead of fixing it.
 #[cfg(target_os = "linux")]
 fn probe_labeled_connection(
+    nodes: &LabelNodes,
     socket: &Path,
     listener: &std::os::unix::net::UnixListener,
     client_context: &str,
@@ -222,7 +258,7 @@ fn probe_labeled_connection(
     use std::io::{Read, Write};
 
     let timeout = std::time::Duration::from_secs(2);
-    let mut client = with_socket_context(client_context, || {
+    let mut client = with_socket_context(nodes, client_context, || {
         std::os::unix::net::UnixStream::connect(socket)
     })?;
     client.set_read_timeout(Some(timeout))?;
@@ -252,8 +288,21 @@ fn probe_labeled_connection(
 fn bind_relay_listener(
     socket: &Path,
 ) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
-    if selinux_enabled()
-        && let Some((listener, context)) = bind_labeled_on_own_thread(socket)
+    bind_relay_listener_at(&LabelNodes::defaults(), socket)
+}
+
+/// [`bind_relay_listener`] against an explicit pair of label nodes.
+///
+/// The decisions — whether labeling is attempted at all, which candidate wins,
+/// and where every refusal ends — are the same for any pair; the injectable
+/// pair is what lets a host without SELinux exercise them.
+#[cfg(target_os = "linux")]
+fn bind_relay_listener_at(
+    nodes: &LabelNodes,
+    socket: &Path,
+) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
+    if selinux_enabled(nodes)
+        && let Some((listener, context)) = bind_labeled_on_own_thread(nodes, socket)
     {
         return Ok((to_tokio(listener)?, Some(context)));
     }
@@ -267,12 +316,14 @@ fn bind_relay_listener(
 /// is reported like the others and the caller keeps the unlabeled socket.
 #[cfg(target_os = "linux")]
 fn bind_labeled_on_own_thread(
+    nodes: &LabelNodes,
     socket: &Path,
 ) -> Option<(std::os::unix::net::UnixListener, &'static str)> {
-    let owned = socket.to_path_buf();
+    let owned_socket = socket.to_path_buf();
+    let owned_nodes = nodes.clone();
     let outcome = match std::thread::Builder::new()
         .name("relay-label".into())
-        .spawn(move || bind_labeled(&owned))
+        .spawn(move || bind_labeled(&owned_nodes, &owned_socket))
     {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
             // The thread may have bound a candidate before it died.
@@ -299,16 +350,17 @@ fn bind_labeled_on_own_thread(
 /// with the kernel's own error. A refused candidate leaves no socket behind.
 #[cfg(target_os = "linux")]
 fn bind_labeled(
+    nodes: &LabelNodes,
     socket: &Path,
 ) -> std::result::Result<(std::os::unix::net::UnixListener, &'static str), Vec<String>> {
     let mut refused = Vec::with_capacity(RELAY_SOCKET_CONTEXTS.len());
     for context in RELAY_SOCKET_CONTEXTS {
-        if let Err(error) = set_socket_create_context(context) {
+        if let Err(error) = set_socket_create_context(nodes, context) {
             refused.push(format!("{context}: cannot set sockcreate: {error}"));
             continue;
         }
         let bound = bind_relay_socket(socket);
-        clear_socket_create_context();
+        clear_socket_create_context(nodes);
         // A refusal to create under this context is the same fallback as an
         // unwritable attribute; the unlabeled attempt reports real errors.
         let listener = match bound {
@@ -321,7 +373,7 @@ fn bind_labeled(
         };
         match SIMULATED_CLIENT_CONTEXTS
             .iter()
-            .try_for_each(|client| probe_labeled_connection(socket, &listener, client))
+            .try_for_each(|client| probe_labeled_connection(nodes, socket, &listener, client))
         {
             Ok(()) => return Ok((listener, context)),
             Err(error) => {
@@ -538,7 +590,7 @@ mod tests {
     fn labeled_bind_reports_one_reason_per_refused_candidate() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("proxy.sock");
-        match bind_labeled(&socket) {
+        match bind_labeled(&LabelNodes::defaults(), &socket) {
             Ok((_listener, context)) => {
                 assert!(RELAY_SOCKET_CONTEXTS.contains(&context));
                 assert!(socket.exists());
@@ -562,6 +614,113 @@ mod tests {
         }
     }
 
+    /// WI#641 (AGK-1): the choices of the labeling path itself, on a host
+    /// without SELinux. The first candidate must be the one bound and
+    /// returned, the create context must be cleared afterwards, and the
+    /// socket must stay world-connectable.
+    #[tokio::test]
+    async fn labeled_path_binds_under_the_first_candidate_and_clears_the_attribute() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        let attribute = directory.path().join("sockcreate");
+        std::fs::write(&attribute, "").unwrap();
+        let nodes = LabelNodes::at(directory.path().join("enforce"), &attribute);
+        std::fs::write(&nodes.enforce, "1").unwrap();
+
+        let (listener, label) = bind_relay_listener_at(&nodes, &socket).unwrap();
+        assert_eq!(
+            label,
+            Some(RELAY_SOCKET_CONTEXTS[0]),
+            "the first candidate is the one tried first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&attribute).unwrap(),
+            "\n",
+            "a successful labeled bind must clear the create context"
+        );
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+            0o666
+        );
+        let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+        client.write_all(b"x").await.unwrap();
+    }
+
+    /// WI#641 (AGK-1): the fallback is decided by the node values, not by the
+    /// host: an unwritable attribute refuses every candidate, each with its
+    /// own reason, and the old unlabeled socket is bound in their place.
+    #[tokio::test]
+    async fn a_refused_label_falls_back_to_the_unlabeled_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        // A node under a missing directory: every write fails, so both
+        // candidates refuse before any socket is attempted.
+        let nodes = LabelNodes::at(
+            directory.path().join("enforce"),
+            directory.path().join("missing").join("sockcreate"),
+        );
+        std::fs::write(&nodes.enforce, "1").unwrap();
+
+        let reasons = bind_labeled(&nodes, &socket).unwrap_err();
+        assert_eq!(reasons.len(), RELAY_SOCKET_CONTEXTS.len());
+        for (reason, context) in reasons.iter().zip(RELAY_SOCKET_CONTEXTS) {
+            assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
+            assert!(reason.contains("cannot set sockcreate"), "{reason}");
+        }
+        assert!(!socket.exists(), "a refused candidate must not leave a socket");
+
+        let (listener, label) = bind_relay_listener_at(&nodes, &socket).unwrap();
+        assert_eq!(label, None, "a refused label must keep the daemon socket");
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+            0o666
+        );
+        let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+        client.write_all(b"x").await.unwrap();
+    }
+
+    /// WI#641 (AGK-1): a label the kernel accepts but that cannot own a socket
+    /// is refused with the kernel's error, and the obstacle is not replaced.
+    #[test]
+    fn a_refused_labeled_bind_reports_the_kernel_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        // bind() on an existing directory fails for root and unprivileged
+        // users alike, so this is not a permissions-dependent fixture.
+        std::fs::create_dir(&socket).unwrap();
+        let attribute = directory.path().join("sockcreate");
+        let nodes = LabelNodes::at(directory.path().join("enforce"), &attribute);
+        std::fs::write(&nodes.enforce, "1").unwrap();
+
+        let reasons = bind_labeled(&nodes, &socket).unwrap_err();
+        assert_eq!(reasons.len(), RELAY_SOCKET_CONTEXTS.len());
+        for (reason, context) in reasons.iter().zip(RELAY_SOCKET_CONTEXTS) {
+            assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
+            assert!(reason.contains("labeled bind refused"), "{reason}");
+        }
+        assert!(socket.is_dir(), "cleanup must not replace the obstacle");
+    }
+
+    /// WI#641 (AGK-1): a permissive (or missing) enforce node binds exactly as
+    /// before the labeling work and never touches the create context.
+    #[tokio::test]
+    async fn a_permissive_enforce_node_skips_labeling_entirely() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        let attribute = directory.path().join("sockcreate");
+        let nodes = LabelNodes::at(directory.path().join("enforce"), &attribute);
+        std::fs::write(&nodes.enforce, "0").unwrap();
+
+        let (_listener, label) = bind_relay_listener_at(&nodes, &socket).unwrap();
+        assert_eq!(label, None, "a permissive host needs no label");
+        assert!(
+            !attribute.exists(),
+            "no label attempt may start without SELinux enforcing"
+        );
+    }
+
     /// WI#641: the refusal warning is raised once; later refusals are not.
     #[test]
     fn label_refusal_is_announced_once() {
@@ -582,7 +741,7 @@ mod tests {
             std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
             0o666
         );
-        if !selinux_enabled() {
+        if !selinux_enabled(&LabelNodes::defaults()) {
             assert_eq!(label, None, "a host without SELinux keeps the daemon label");
         }
         // A plain client still reaches the listener after either path, so the
