@@ -195,15 +195,35 @@ background-service installation when the resolved identity is permitted:
 Every installer refuses a root daemon before writing service files unless
 `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set. systemd and launchd run the
 daemon as the invoking user, so run their installers as the intended service
-account without `sudo`; a direct-root invocation is refused. The wizard does
-not offer an installation that these checks would refuse.
+account without `sudo`; a direct-root invocation is refused.
+
+The wizard does not offer an installation that these checks would refuse.
+Instead it prints one line that says no background service is offered, the
+installer's reason, and the way out: run as the intended service account, or set
+`LUNARWING_ALLOW_ROOT_SERVICE=1`. `lunarwing service install` reports the same
+reason when run directly.
 
 OpenRC installation derives the daemon's runtime user from `SUDO_USER`, then
 `USER`, and resolves that account's actual primary group. Run the installer
 through `sudo` from the intended non-root service account. A uid-0 runtime
-identity or primary gid 0 requires the same explicit opt-in. An unknown service
-user or unresolvable primary group also aborts installation rather than
-generating an invalid service configuration.
+identity or primary gid 0 requires the same explicit opt-in. Only that root
+refusal is reported as "not offering"; an unknown service user or an
+unresolvable primary group is a real error, and the wizard prints the lookup
+error rather than skipping the service step silently.
+
+What the wizard prints in place of an offer:
+
+| Case | Line |
+|---|---|
+| The installer would refuse a root daemon: systemd or launchd run as root, or on OpenRC a runtime identity named `root`, with uid 0 or with primary gid 0, each without the opt-in | `Not offering to install a background service: <the installer's reason>` |
+| The check itself failed: on OpenRC the service user does not exist or cannot be looked up, or its primary group cannot be resolved; `LUNARWING_SERVICE_MANAGER` holds an unsupported value; or the path of the running executable cannot be resolved for the OpenRC `sudo` hint | `Could not check whether a background service can be installed: <the error>` |
+| The host has no supported service manager (a Linux host without systemd and without OpenRC, such as most containers), or the platform is neither macOS nor Linux | nothing |
+
+On a host without a supported service manager there is nothing to offer, so
+the wizard stays quiet and only writes a debug log line. `lunarwing service
+install` and `lunarwing doctor` still report that case ("Could not detect a
+supported Linux service manager…"). Setting `LUNARWING_SERVICE_MANAGER` on such
+a host selects a manager and brings the offer back.
 
 The watchdog installer follows the same service-manager split:
 
