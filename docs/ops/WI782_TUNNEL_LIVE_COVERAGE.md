@@ -59,12 +59,32 @@ This development host is an **OpenRC** machine (PID 1 is `init`, no
 `systemctl`) with **rootless Podman 6.1.4 (crun)** and **no Docker binary**.
 That is the same class of host the v2.2.0.0 limitation was measured on.
 
-- **Podman suite run: recorded below.**
+- **Podman suite run at this head: passed, 10 of 10.** On this host,
+  `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1
+  LUNARWING_E2E_TUNNEL_BASE_IMAGE=quay.io/libpod/alpine:latest` with
+  `--test podman_sandbox_tunnel_integration -- --nocapture --test-threads=1`
+  reported `test result: ok. 10 passed; 0 failed; 0 ignored` in 625.16 s. The
+  NetBird test skipped because its gate was closed. Afterwards
+  `podman ps -a` reported no containers and `podman volume ls` no `lunarwing`
+  volume, so the scoped leftover check ran and passed rather than being
+  vacuous. The detached-unit checks printed their service-mode skip, as
+  designed on this host.
+- **Service-mode requirement verified, not just wired.** Re-running
+  `tunnel_concurrent_first_commands_keep_firewall_stable` on this host with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails at
+  `tests/podman_sandbox_tunnel_integration.rs:418` with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the workload spawner is not in
+  systemd service mode, so the detached-unit-in-use check cannot run`
+  (`test result: FAILED. 0 passed; 1 failed; … 9 filtered out`), so a host
+  without service mode cannot record a pass by accident. Without the flag the
+  same lanes print the skip and pass.
 - **Docker fallback: not run live here.** No host with the Docker CLI was
   reachable to this agent. The Docker lane exists and is gated; the matching
   acceptance box stays open for the maintainer. The run is
   `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1` against
-  `--test podman_sandbox_tunnel_integration`.
+  `--test podman_sandbox_tunnel_integration`. On Docker the detached-unit
+  checks print a skip by design (AGJ-1), and
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails there with that reason.
 - **systemd service mode: not run live here.** This host has no user manager,
   so the detached-unit checks report their skip; with
   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` they fail by design. A service-mode
@@ -78,13 +98,13 @@ That is the same class of host the v2.2.0.0 limitation was measured on.
 
 > **Tunnel live coverage.** The gated tunnel suite has been run on rootless
 > Podman only: 9 of 9 tests on Podman 5.8.2 (2026-11-11), including NetBird
-> 0.82.0 and a real WireGuard peer, and one test of nine
-> (`tunnel_sidecar_wireguard_lifecycle_and_join`) on Podman 6.1.4
-> (2026-11-19). A Docker CLI lane (`LUNARWING_E2E_DOCKER_TESTS=1`) exists and is
-> off by default, but **no Docker run is claimed**. The detached systemd
-> helper-unit checks are bound to rootless Podman in systemd service mode: they
-> first prove the transient unit `lunarwing-tunnel-<instance>` exists before
-> requiring its removal, so they cannot pass vacuously there. On Docker no unit
-> outlives the `docker run -d` client, so those checks print a skip and nothing
-> about the unit is proven. **No service-mode run, no tenant-unit tunnel run, no
-> public-cloud run and no CI tunnel job is claimed by this release.**
+> 0.82.0 and a real WireGuard peer, and **10 of 10 at the WI#782 head on Podman
+> 6.1.4 (2026-11-19)** with the NetBird gate closed. A Docker CLI lane
+> (`LUNARWING_E2E_DOCKER_TESTS=1`) exists and is off by default, but **no Docker
+> run is claimed**. The detached systemd helper-unit checks are bound to
+> rootless Podman in systemd service mode: they first prove the transient unit
+> `lunarwing-tunnel-<instance>` exists before requiring its removal, so they
+> cannot pass vacuously there. On Docker no unit outlives the `docker run -d`
+> client, so those checks print a skip and nothing about the unit is proven.
+> **No service-mode run, no tenant-unit tunnel run, no public-cloud run and no
+> CI tunnel job is claimed by this release.**

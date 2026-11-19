@@ -699,7 +699,7 @@ is harness-covered or unclaimed, not proven.
 | Surface | Runtime / host | Status |
 |---|---|---|
 | Full gated suite (all WireGuard lanes, including per-run recovery, peer death, and firewall cases) | rootless Podman 5.8.2 (2026-11-11) | live, 9 of 9 |
-| WireGuard lifecycle and joining (one test of the suite) | rootless Podman 6.1.4 (2026-11-19, WI#771/WI#782) | live, 1 of 9; recovery was not exercised on 6.1.4 |
+| Full gated suite at the WI#782 head (all WireGuard lanes) | rootless Podman 6.1.4, OpenRC host (2026-11-19, WI#782) | live, 10 passed / 0 failed; NetBird gate closed |
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
 | The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; **no live run recorded** (WI#771, WI#782) |
 | Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, rootless Podman, service mode | lane gates it; **no service-mode live run recorded** (WI#771, WI#782) |
@@ -751,7 +751,10 @@ default.
    `LUNARWING_E2E_TUNNEL_RUNTIME=podman|docker` (optional) must agree with the
    open gate; opening both runtime gates is refused, and a lane whose
    `CliRunner` resolves to the other runtime fails rather than silently
-   switching. The test builds an Alpine image with `nftables` unless
+   switching. In a whole-workspace run `LUNARWING_E2E_DOCKER_TESTS=1` also
+   opens other Docker e2e tests (for example the orchestrator reaper's), so
+   name this test target when only the tunnel lane is wanted. The test builds
+   an Alpine image with `nftables` unless
    `LUNARWING_E2E_TUNNEL_IMAGE` names a suitable existing image;
    `LUNARWING_E2E_TUNNEL_BASE_IMAGE` (or the older
    `LUNARWING_E2E_PODMAN_IMAGE`) picks the base it builds from. It checks real
