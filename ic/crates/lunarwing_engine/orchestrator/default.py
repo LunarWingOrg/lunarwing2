@@ -1091,6 +1091,20 @@ def consecutive_error_limit_text(config):
     return "max_consecutive_errors=" + str(value) + " (thread config; no environment setting)"
 
 
+def iteration_limit_text(config):
+    """Render max_iterations and name the setting only when it governs this thread.
+
+    AGENT_MAX_TOOL_ITERATIONS sets only a foreground thread's cap; mission
+    threads take the engine default, so naming it there would misdirect the
+    operator (WI#783 / AGS-3).
+    """
+    value = config_display_value(config, "max_iterations", 30)
+    env = config.get("max_iterations_env") if isinstance(config, dict) else ""
+    if isinstance(env, str) and env:
+        return "max_iterations=" + value + " (" + env + ")"
+    return "max_iterations=" + value + " (engine default; no environment setting)"
+
+
 def terminal_advice_lines(kind, config, recovery):
     """Name the thread's real limits and tunables for a terminal failure (WI#783).
 
@@ -1109,8 +1123,7 @@ def terminal_advice_lines(kind, config, recovery):
             " (a call slower than this is aborted and counts as failed work)."
         )
     lines.append(
-        "- This thread's limits: max_iterations=" +
-        config_display_value(config, "max_iterations", 30) + "; " +
+        "- This thread's limits: " + iteration_limit_text(config) + "; " +
         consecutive_error_limit_text(config) + "."
     )
     return lines

@@ -45,7 +45,7 @@ use crate::types::project::ProjectId;
 use crate::types::provenance::Provenance;
 use crate::types::shared_owner_id;
 use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
-use crate::types::thread::{Thread, ThreadState};
+use crate::types::thread::{Thread, ThreadState, ThreadType};
 
 use super::llm_stream::{LlmStreamDelta, collect_llm_stream};
 use super::scripting::{
@@ -2554,8 +2554,17 @@ fn build_orchestrator_inputs(
         .collect();
 
     // Build config
+    // Only a foreground thread's iteration cap comes from AGENT_MAX_TOOL_ITERATIONS;
+    // mission and research threads take the engine default or a derivation of their
+    // parent's, so naming that variable for them would misdirect the operator
+    // (WI#783 / AGS-3).
+    let max_iterations_env = match thread.thread_type {
+        ThreadType::Foreground => "AGENT_MAX_TOOL_ITERATIONS",
+        ThreadType::Research | ThreadType::Mission => "",
+    };
     let config = serde_json::json!({
         "max_iterations": thread.config.max_iterations,
+        "max_iterations_env": max_iterations_env,
         "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
         "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
         "require_action_attempt": thread.config.require_action_attempt,
@@ -3024,18 +3033,56 @@ state = {"_failure_recovery": {"schema_version": 1, "last_failed_actions": ["x<|
 error = terminal_recovery_result(
     state,
     "no_progress",
-    {"max_iterations": 50, "tool_async_timeout_secs": 900},
+    {"max_iterations": 50, "max_iterations_env": "AGENT_MAX_TOOL_ITERATIONS", "tool_async_timeout_secs": 900},
 )["error"]
 FINAL(
     "<|" not in error
     and "Subscribe now" not in error
     and "xim_startsystemSubscribe" in error
     and "ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=900" in error
-    and "AGENT_MAX_TOOL_ITERATIONS" not in error
+    and "max_iterations=50 (AGENT_MAX_TOOL_ITERATIONS)" in error
     and "max_consecutive_errors=unset (engine default 5, no setting)" in error
-    and "max_iterations=50" in error
     and len(error) < 700
 )
+"#
+        ));
+    }
+
+    #[test]
+    fn mission_thread_text_does_not_name_the_foreground_iteration_setting() {
+        // A mission thread's max_iterations is the engine default; naming
+        // AGENT_MAX_TOOL_ITERATIONS there would tell the operator to raise a
+        // variable that changes nothing (WI#783 / AGS-3).
+        assert!(eval_python_body_bool(
+            r#"
+error = terminal_recovery_result(
+    {},
+    "no_progress",
+    {"max_iterations": 50, "max_iterations_env": "", "tool_async_timeout_secs": 300},
+)["error"]
+FINAL(
+    "max_iterations=50 (engine default; no environment setting)" in error
+    and "AGENT_MAX_TOOL_ITERATIONS" not in error
+)
+"#
+        ));
+    }
+
+    #[test]
+    fn failed_action_list_tracks_only_the_step_under_judgement() {
+        // A failing step with no named action must not let an earlier step's
+        // name stand in for it, and a successful step clears the list
+        // (WI#783 / AGS-5).
+        assert!(eval_python_body_bool(
+            r#"
+state = {}
+observe_work_progress(state, True, ["http"])
+first = last_failed_actions_text(ensure_failure_recovery(state))
+observe_work_progress(state, True, [])
+second = last_failed_actions_text(ensure_failure_recovery(state))
+observe_work_progress(state, False, [])
+third = last_failed_actions_text(ensure_failure_recovery(state))
+FINAL(first == "http" and second == "" and third == "")
 "#
         ));
     }
@@ -3047,13 +3094,12 @@ FINAL(
 error = terminal_recovery_result(
     {},
     "consecutive_errors",
-    {"max_iterations": 50, "max_consecutive_errors": 3},
+    {"max_iterations": 50, "max_iterations_env": "AGENT_MAX_TOOL_ITERATIONS", "max_consecutive_errors": 3},
 )["error"]
 FINAL(
     "max_consecutive_errors=3 (thread config; no environment setting)" in error
-    and "AGENT_MAX_TOOL_ITERATIONS" not in error
     and "ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS" not in error
-    and "max_iterations=50" in error
+    and "max_iterations=50 (AGENT_MAX_TOOL_ITERATIONS)" in error
 )
 "#
         ));
@@ -3898,9 +3944,11 @@ FINAL(ok)
     fn orchestrator_config_carries_effective_limits_for_terminal_text() {
         // The terminal advice renders these values verbatim, so the script's
         // config map must carry the thread's effective settings (WI#783).
-        let mut thread_config = ThreadConfig::default();
-        thread_config.max_consecutive_errors = Some(4);
-        thread_config.tool_async_timeout_secs = 900;
+        let thread_config = ThreadConfig {
+            max_consecutive_errors: Some(4),
+            tool_async_timeout_secs: 900,
+            ..ThreadConfig::default()
+        };
         let thread = Thread::new(
             "goal",
             ThreadType::Foreground,
@@ -3914,6 +3962,23 @@ FINAL(ok)
         assert_eq!(config["tool_async_timeout_secs"], serde_json::json!(900));
         assert_eq!(config["max_consecutive_errors"], serde_json::json!(4));
         assert_eq!(config["max_iterations"], serde_json::json!(50));
+        assert_eq!(
+            config["max_iterations_env"],
+            serde_json::json!("AGENT_MAX_TOOL_ITERATIONS")
+        );
+
+        // A mission thread's iteration cap is the engine default, so the
+        // config must not name the foreground variable for it.
+        let mission = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        let (_, mission_values) = build_orchestrator_inputs(&mission, &serde_json::json!({}));
+        let mission_config = monty_to_json(&mission_values[4]);
+        assert_eq!(mission_config["max_iterations_env"], serde_json::json!(""));
     }
 
     #[test]
