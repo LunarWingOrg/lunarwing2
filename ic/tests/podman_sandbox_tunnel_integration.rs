@@ -360,15 +360,14 @@ async fn systemd_service_mode() -> bool {
 /// The detached-helper checks only mean anything in systemd service mode.
 /// Without it they report a skip; with `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1`
 /// that skip becomes a failure so a service-mode run cannot pass vacuously.
-fn skip_or_fail_without_service_mode(what: &str) -> bool {
+fn skip_or_fail_without_service_mode(what: &str) {
     if systemd_required() {
         panic!(
             "LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the workload spawner is not in systemd \
-             service mode, so {what} cannot be checked"
+             service mode, so {what} cannot run"
         );
     }
     eprintln!("skipping {what}: the workload spawner is not in systemd service mode");
-    false
 }
 
 fn helper_unit_for(container_name: &str) -> String {
