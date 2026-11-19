@@ -231,6 +231,39 @@ b24b="$(sb)"; report "$b24b" '{components:[{component:"systemd",status:"degraded
 oB24b="$(run_dry "$b24b" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oB24b" "ESCALATING: systemd (monitor_only" "B24: zero-unit/zero-instance degrade still escalates"
 
+# B25 — WI#766 review AGL-2: the page for a dead manager carries the recovery
+# command, not only the identity. The instance's manager_unit becomes
+# `systemctl start <unit>` in the escalation object handed to the notifier.
+b25="$(sb)"; report "$b25" '{components:[{component:"systemd",status:"degraded",metrics:{units:[],instances:[
+  {tenant:"acme",status:"degraded",manager_unit:"user@1011.service",manager_state:"failed"}]}}]}'
+b25tool="$(mk_tool "$b25")"
+{ echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$b25/captured.json\""; } > "$b25/capture-notifier"
+chmod +x "$b25/capture-notifier"
+env LUNARWING_BASE_DIR="$b25" SELF_HEAL_STATE_DIR="$b25/self-heal" GOTIFY_TOKEN='' \
+    SELF_HEAL_NOTIFY_SCRIPT="$b25/capture-notifier" \
+    LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
+    "$b25tool/lunarwing-self-heal.sh" --report "$b25/report.json" --backoff 0 >/dev/null 2>&1
+assert_eq "$(jq -r '.service'  "$b25/captured.json" 2>/dev/null)" "systemd@acme" \
+    "B25: escalation object names the tenant identity"
+assert_eq "$(jq -r '.recovery' "$b25/captured.json" 2>/dev/null)" "systemctl start user@1011.service" \
+    "B25: escalation object carries the recovery command"
+
+# B26 — a monitor-only identity with no recovery hint (worker egress) keeps the
+# escalation object free of an empty recovery field.
+b26="$(sb)"; report "$b26" '{components:[{component:"worker_egress",status:"critical",metrics:{instances:[
+  {tenant:"acme",status:"critical"}]}}]}'
+b26tool="$(mk_tool "$b26")"
+{ echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$b26/captured.json\""; } > "$b26/capture-notifier"
+chmod +x "$b26/capture-notifier"
+env LUNARWING_BASE_DIR="$b26" SELF_HEAL_STATE_DIR="$b26/self-heal" GOTIFY_TOKEN='' \
+    SELF_HEAL_NOTIFY_SCRIPT="$b26/capture-notifier" \
+    LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
+    "$b26tool/lunarwing-self-heal.sh" --report "$b26/report.json" --backoff 0 >/dev/null 2>&1
+assert_eq "$(jq -r '.service' "$b26/captured.json" 2>/dev/null)" "worker_egress@acme" \
+    "B26: unrelated monitor-only identity still escalates"
+assert_eq "$(jq -r 'has("recovery")' "$b26/captured.json" 2>/dev/null)" "false" \
+    "B26: no recovery field when no hint exists"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},

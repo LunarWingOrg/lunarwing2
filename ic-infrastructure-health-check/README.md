@@ -434,7 +434,7 @@ wedge it.
 | knowledge | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `knowledge@<tenant>`; escalates with tenant attribution, never restarts | health-knowledge.sh |
 | worker_egress | _(none — monitor-only diagnostic)_ `worker_egress@<tenant>`; pages without changing firewall policy | health-worker-egress.sh |
 | disk | _(none — monitor-only diagnostic)_ `disk@<mount>` per filesystem; pages without restarting or deleting anything | health-disk.sh |
-| systemd (user manager) | _(none — monitor-only diagnostic)_ `systemd@<tenant>` per tenant whose `user@<uid>.service` is down; pages with tenant attribution (the page names `systemd@<tenant>`; the unit and the recovery command are in the health report's issue), never restarts | health-systemd.sh |
+| systemd (user manager) | _(none — monitor-only diagnostic)_ `systemd@<tenant>` per tenant whose `user@<uid>.service` is down; pages with tenant attribution and the recovery command (`systemctl start user@<uid>.service`), never restarts | health-systemd.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`, `knowledge`, `worker_egress`, and `disk` failures become synthetic
@@ -454,13 +454,13 @@ reports each lingering tenant's user manager. A dead (or otherwise down)
 `user@<uid>.service` leaves the tenant with zero observable units, so it has
 no unit to target — the failure escalates as `systemd@<tenant>` through the
 same monitor-only path. The page carries the identity `systemd@<tenant>`, the
-reason and the retry count; the unit name and the `systemctl start
-user@<uid>.service` recovery command are in the health report's issue, not in
-the page. Real systemd unit failures still take the step-2 restart path. The
-component-level bare `systemd` identity is used when the report holds no unit
-and no failing instance while the component is degraded, critical or unknown:
-for example when every tenant bus refuses although the managers are up, when
-the check itself timed out, or when the registry lists no tenant. It is itself
+reason, the retry count and the recovery command (`systemctl start
+user@<uid>.service`), derived from the instance's `manager_unit`. Real systemd
+unit failures still take the step-2 restart path. The component-level bare
+`systemd` identity is used when the report holds no unit and no failing
+instance while the component is degraded, critical or unknown: for example
+when every tenant bus refuses although the managers are up, when the check
+itself timed out, or when the registry lists no tenant. It is itself
 monitor-only. Non-lingering tenants are never judged: a down manager there is
 normal and says nothing about the tenant. Linger is read from logind's marker
 file (`/var/lib/systemd/linger/<user>`), so the check does not depend on

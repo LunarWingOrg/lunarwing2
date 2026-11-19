@@ -54,6 +54,7 @@ if [ -n "$report_file" ] && [ -f "$report_file" ]; then
             "🚨 Service escalation — manual intervention\n" +
             "Service: " + (.service // "?") + "\n" +
             "Reason:  " + (.reason // "?") + "\n" +
+            (if (.recovery // "") != "" then "Recovery: " + .recovery + "\n" else "" end) +
             "Retries: " + ((.retries // 0) | tostring) + "\n" +
             "Action:  " + (.action // "manual_intervention_required") + "\n" +
             "Time:    " + (.timestamp // "?")
