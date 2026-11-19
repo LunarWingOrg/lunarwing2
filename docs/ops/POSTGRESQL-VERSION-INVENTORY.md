@@ -47,7 +47,11 @@ other. The digest resolves to PostgreSQL 16.16 (Debian 16.16-1.pgdg12+1) and
 pgvector 0.8.7; the pull-and-report evidence is in
 [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#scope-and-image-verification).
 
-## Live inventory on this host
+## Live inventory on this host, 2026-11-17 snapshot
+
+This is the point-in-time row set from the WI#744 survey, not the current
+state. `hermes` was refreshed and a third tenant appeared afterwards; the
+current rows are in [the 2026-11-19 re-verification](#re-verification-2026-11-19-wi780).
 
 Tenants come from `/etc/lunarwing/ports.json`; both were inspected read-only
 with mt-admin.
@@ -64,9 +68,9 @@ transition.
 
 ### Findings
 
-1. **`hermes` needs `refresh-pg-image`.** Its quadlet and container still use
+1. **`hermes` needed `refresh-pg-image`.** Its quadlet and container still used
    the legacy floating `pg16` tag, so it was never moved onto the reviewed
-   digest and is running 16.14 with pgvector 0.8.6. Refresh is deliberately
+   digest and was running 16.14 with pgvector 0.8.6. Refresh is deliberately
    explicit: the quadlet fixture asserts that a legacy floating reference is
    retained, not silently switched to the pin
    (`ic/scripts/tests/test-mt-admin-pg-quadlet-image.sh:44`). A fresh
@@ -108,12 +112,52 @@ recorded it on `colgatev`; the 2026-11-13 audit of that host listed only
 (the 2026-11-17 table above). The two rows describe different hosts, and the
 `ajhermes-z` rows are not re-verified here: that host was not reachable from
 `colgatev`. The 16.14 record of `hermes` there remains unverified and is a
-per-host follow-up (WI#780), not an assumed closure.
+per-host follow-up (WI#780), not an assumed closure. That follow-up is
+recorded in [the WI#780 section](#re-verification-2026-11-19-wi780).
 
 The pgvector extension question is answered with evidence in
 [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verification-2026-11-19-wi777):
 a 0.8.6 catalog survives the image swap on the new library, and the shipped
 `ALTER EXTENSION vector UPDATE` path changes catalog comments only.
+
+## Re-verification 2026-11-19 (WI#780)
+
+Host `ajhermes-z` (Arch Linux, systemd `262.2-1-arch`, kernel `6.18.54-2-lts`,
+rootless Podman `6.2.0`, systemd user units). Tenant list from
+`/etc/lunarwing/ports.json`: `hermes`, `antelope`, `barracuda`. Each was
+inspected with `pg-image-status`, `psql`, and the rendered Quadlet; the
+before/after rows below come from `pg-image-status` and
+`SHOW server_version_num` plus `pg_extension`.
+
+| Tenant | Before | After | Disposition |
+|---|---|---|---|
+| `hermes` | 16.14 / `160014`, floating `pgvector/pgvector:pg16`, image `8e5355e9ff39…`, pgvector 0.8.6 | 16.16 / `160016`, pinned `…@sha256:484e8380…`, image `b0108689bf51…`, pgvector installed 0.8.6 / available 0.8.7 | `refresh-pg-image hermes` on 2026-11-19; daemon and PostgreSQL were active before and after, and the named volume `lunarwing-pg-hermes` was retained |
+| `antelope` | 16.16 / `160016`, pinned digest, image `b0108689bf51…`, pgvector 0.8.7 | unchanged | already at the reviewed pin; no refresh needed. Registry `created_at` is `2026-11-19T03:15:13Z`, so this row is newer than the 2026-11-17 snapshot above |
+| `barracuda` | 16.16 / `160016`, pinned digest, image `b0108689bf51…`, pgvector 0.8.7 | unchanged | not present at the 2026-11-17 survey (registry `created_at` `2026-11-19T15:15:56Z`); already on the reviewed pin, no refresh needed |
+
+All three Quadlet units now name the reviewed digest
+(`docker.io/pgvector/pgvector:pg16@sha256:484e8380…`); no tenant on this host
+keeps a floating `pg16` reference. The `hermes` data directory survived the
+swap on the same volume: `public` still had 35 tables and `memory_chunks` 9
+rows, the container mounts `lunarwing-pg-hermes` at
+`/var/lib/postgresql/data`, and the daemon's `/health` returned `200`.
+
+`refresh-pg-image` does not run `ALTER EXTENSION vector UPDATE`, and it was
+not run here: `hermes` keeps a 0.8.6 catalog while the replacement image
+packages 0.8.7, which [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verification-2026-11-19-wi777)
+showed loads the new `vector.so` and needs the SQL step only for catalog
+comments. That step stays operator-run, after backup, per tenant.
+
+### Other hosts
+
+No other host was verified in this run. From `ajhermes-z` there is no fleet
+host registry: `/etc/lunarwing/ports.json` describes only this host,
+`lunarwing-mt-admin.sh` has no cross-host enumeration, and no remote mt-admin
+access (SSH key or `LUNARWING_MT_ADMIN` target) is configured. `colgatev`
+resolves over the NetBird mesh but refuses the available SSH identity, and its
+tenants were already recorded in the WI#777 section above. Any host not named
+in this document therefore stays **uninspected** — not patched, and not
+covered by this host's result.
 
 ## How to check
 
