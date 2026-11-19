@@ -49,11 +49,17 @@ Use the current distribution guide:
 
 MT admin installs a tenant-local Rust toolchain when needed, so a host-level rustup installation is not required merely to add a tenant.
 
-For Podman, the tenant PostgreSQL image is fully qualified and digest-pinned, so
-the default needs no short-name resolution. Configure approved short-name
-resolution only if you override it with a short name via `LUNARWING_MT_PG_IMAGE`;
-the package guides describe the registry configuration. Do not accept an
-interactive image source during unattended setup.
+For Podman, the default tenant PostgreSQL image is fully qualified and
+digest-pinned; it does not need short-name resolution. If you set
+`LUNARWING_MT_PG_IMAGE`, prefer a fully qualified reference there too.
+
+Local LunarVision and LunarVoice image builds still use the short base-image
+names `rust` and `debian`. Before building either sidecar, verify that Podman's
+shipped short-name aliases map them to `docker.io/library/rust` and
+`docker.io/library/debian`, or configure equivalent approved resolution if the
+aliases are absent. This matters during `add-tenant` when a local LunarVision
+image is missing, and when building or installing LunarVoice. Do not rely on an
+interactive registry choice during unattended setup.
 
 ## 2. Check the Host
 

@@ -80,19 +80,24 @@ sudo emerge app-containers/podman net-firewall/nftables
 # command required by mt-admin's external-worker egress enforcement.
 ```
 
-`lunarwing-mt-admin.sh` hardcodes a fully-qualified, digest-pinned image,
+`lunarwing-mt-admin.sh` defaults to a fully qualified, digest-pinned image for
+new tenants:
 `docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f`
-(PostgreSQL 16.16 / pgvector 0.8.7, reviewed 2026-11-12), so the default needs no
-unqualified-search registry. If you override it with a short name via
-`LUNARWING_MT_PG_IMAGE`, point Podman's search at Docker Hub so it resolves without a TTY prompt:
+(PostgreSQL 16.16 / pgvector 0.8.7, reviewed 2026-11-12). This PostgreSQL
+reference needs no `unqualified-search-registries` setting. Prefer a fully
+qualified reference for `LUNARWING_MT_PG_IMAGE` too; if you intentionally use
+an unaliased short name on Docker Hub, configure approved resolution before
+unattended provisioning:
 
 ```bash
 echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
-# Optional pre-pull. Pull the same digest mt-admin pins, or the tag may resolve
-# to a different image and the pre-pull saves nothing:
-sudo podman pull docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
 ```
+
+See [MT-admin quickstart](MT-ADMIN-QUICKSTART.md#1-install-host-prerequisites)
+for the separate short-name aliases needed by local sidecar builds. Let
+mt-admin fetch PostgreSQL into the tenant's store. A `sudo podman pull`
+populates root's store, not the rootless tenant's store.
 
 (Docker alternative: `app-containers/docker` + `app-containers/docker-cli`, added to a runlevel.)
 
@@ -209,8 +214,6 @@ sudo emerge \
   dev-python/rich dev-python/questionary dev-python/pyyaml \
   dev-python/fastapi dev-python/uvicorn dev-python/websockets \
   dev-python/pydantic dev-python/httpx
-echo 'unqualified-search-registries = ["docker.io"]' \
-  | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
 ```
 
 `rustup` and the `wasm32-wasip2` target are handled per-tenant by `add-tenant`, so they're

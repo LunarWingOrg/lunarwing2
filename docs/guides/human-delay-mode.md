@@ -36,11 +36,12 @@ and whether the CLI, environment, or both enabled it.
 
 ## Scope
 
-- Only Engine V2 foreground threads carry the setting.
+- The startup setting applies to Engine V2 foreground threads. Research child
+  threads created by `rlm_query()` inherit their parent's supervision setting.
 - Mission-spawned threads are not supervised: they are built from
   `ThreadConfig::default()`. One approved `mission_create`, `mission_fire` or
-  `mission_resume` starts runs that execute without per-action approval (see
-  the mission sections of `docs/architecture/ENGINE-V2.md`).
+  `mission_resume` can start runs that execute without per-action approval
+  (see the mission sections of [Engine V2](../architecture/ENGINE-V2.md)).
 - The legacy V1 agent loop under `ic/src/agent/` has no supervised handling.
   Channels that are still served by V1 are not gated by this setting.
 

@@ -28,8 +28,8 @@ still requires a manager restart and a new conversation.
 
    The bridge loads workspace instructions once when it initializes the thread
    manager (`ic/src/bridge/router.rs`). A new conversation alone cannot refresh
-   an already initialized manager. Existing/persisted threads keep their System
-   message even after a restart (`executor/loop_engine.rs`).
+   an already initialized manager. Existing threads keep their saved system
+   message even after a restart (`ic/crates/lunarwing_engine/src/executor/loop_engine.rs`).
 
 | Source | Purpose |
 |---|---|

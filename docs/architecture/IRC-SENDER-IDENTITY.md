@@ -43,8 +43,8 @@ For example, `Alice`, `ALICE`, and `alice` all map to
 darkirc:dm:v2:darkirc:nick:<case-folded-nick>
 ```
 
-The original nick remains in channel metadata and is used only for the adapter
-reply target. Pairing requests use the normalized principal. Legacy pairing and
+The original nick remains the displayed sender name and the adapter reply
+target. Pairing requests use the normalized principal. Legacy pairing and
 allow-list entries containing a bare nick are still accepted after the same
 case fold.
 
@@ -97,11 +97,11 @@ values are the exact emitted principal, such as `account:libera:alice`,
 Only messages whose sender principal matches the configured owner actor may
 replace owner-scoped proactive routing metadata. WeeChat persists the complete
 `irc.<network>.<target>` buffer; DarkIRC persists one validated DM nick. Invalid
-or ambiguous targets are rejected before persistence. Stored owner routing is
-restored after restart. Heartbeat, routine, mission, and message-tool fallbacks
-address the LunarWing owner scope; they do not pass the actor principal as a
-protocol target. The channel wrapper translates the owner scope through the
-stored protocol metadata.
+or ambiguous targets are rejected before persistence. When a settings store is
+available, saved owner routing is restored after restart. Heartbeat, routine,
+mission, and message-tool fallbacks address the LunarWing owner scope; they do
+not pass the actor principal as a protocol target. The channel wrapper
+translates the owner scope through the stored protocol metadata.
 
 ## Migration And Retention
 

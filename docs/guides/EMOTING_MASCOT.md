@@ -29,8 +29,8 @@ static/mascot.js               sprite state machine + draggable widget
 
 ## Emote parser (`ic/src/channels/web/emote.rs`)
 
-- Extracts italic roleplay action spans (`*stamps hooves*`) — single
-  asterisks, one-line, ≤ 120 chars.
+- Extracts nonempty roleplay action spans delimited by `*` (`*stamps hooves*`)
+  on one line, up to 120 bytes after trimming.
 - Case-insensitive keyword table maps a phrase to one `Emote`
   (`greet`, `love`, `rage`, `jump`, `walk`, `sleep`, `alert`, `fiery`);
   first table match wins.
@@ -58,7 +58,8 @@ canonical names (`greet`, `love`, `rage`, `jump`, `walk`, `sleep`, `alert`,
 - State machine: `idle` (`lunar_sleep.gif`) → `working` (`lunar_walk.gif`)
   while the agent thinks/runs tools → `emote` plays queued emote sprites
   (~2.6 s each, FIFO) → settles back to working/idle. Errors flash
-  `lunar_rage.gif`; connecting plays a one-time `lunar_greet.gif`.
+  `lunar_rage.gif`; the first connection, or a reconnection while idle, plays
+  `lunar_greet.gif`.
 - Draggable via pointer events; position persists in
   `localStorage["lunar.mascot.pos"]`. The `×` button hides the widget
   (`localStorage["lunar.mascot.hidden"]`) and a small restore chip brings it
