@@ -209,7 +209,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   _tenant_linger_enabled() {  # <user> -> 0 when linger keeps the manager up
     local u="$1" linger
     if command -v loginctl >/dev/null 2>&1; then
-      linger=$(loginctl show-user "$u" --property=Linger --value 2>/dev/null) || linger=''
+      linger=$(timeout -k 2 5 loginctl show-user "$u" --property=Linger --value 2>/dev/null) || linger=''
       case "$linger" in
         yes) return 0 ;;
         no) return 1 ;;
@@ -221,7 +221,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   _tenant_manager_state() {  # <user> <uid> -> ok|dead:<state>|no-bus|unknown|not-lingering
     local u="$1" uid="$2" state
     _tenant_linger_enabled "$u" || { printf 'not-lingering\n'; return 0; }
-    state=$(systemctl is-active "user@${uid}.service" 2>/dev/null) || true
+    state=$(timeout -k 2 5 systemctl is-active "user@${uid}.service" 2>/dev/null) || true
     case "$state" in
       active) printf 'ok\n' ;;
       failed|inactive|dead|maintenance) printf 'dead:%s\n' "$state" ;;

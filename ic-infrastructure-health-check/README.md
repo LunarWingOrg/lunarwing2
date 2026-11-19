@@ -126,7 +126,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` **and the tenant's actual feature enablement** (`KNOWLEDGE_SYNC_ENABLED` default false, `KNOWLEDGE_SWEEP_ENABLED` default true, plus cadences, from the tenant env file) | `sync_enabled`, `sweep_enabled`, `sync_cadence_hours`, `sweep_cadence_hours`, `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — disabled features ignore their (possibly stale) state; enabled-but-never-observed degrades only past the startup grace period; overdue derives from the configured cadence |
 | worker_egress | health-worker-egress.sh | Root-owned egress state, live tenant network policy, and worker attachments | per-tenant `instances[]`; monitor-only, no firewall repair |
 | disk | health-disk.sh | Host, container-store, tenant, and operator-extra filesystems, deduplicated by followed device; block and inode use with bounded `df`/`stat` and an overall sweep deadline | per-mount `filesystems[]`: `size_bytes`, `free_bytes`, `used_pct`, `inodes_used_pct` (`null` when untracked), `status`, `available`, `present` (absent discovered paths stay healthy); monitor-only, never cleans up |
-| systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
+| systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant); `metrics.instances` in `systemd` reports each tenant's user manager (`user@<uid>.service`) on MT hosts | `metrics.units` / `.services` / `.agents`, plus systemd `metrics.instances` |
 
 A check that cannot reach its target generally reports `critical`; several
 checks can instead be **disabled** so they report `healthy` with
@@ -434,6 +434,7 @@ wedge it.
 | knowledge | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `knowledge@<tenant>`; escalates with tenant attribution, never restarts | health-knowledge.sh |
 | worker_egress | _(none — monitor-only diagnostic)_ `worker_egress@<tenant>`; pages without changing firewall policy | health-worker-egress.sh |
 | disk | _(none — monitor-only diagnostic)_ `disk@<mount>` per filesystem; pages without restarting or deleting anything | health-disk.sh |
+| systemd (user manager) | _(none — monitor-only diagnostic)_ `systemd@<tenant>` per tenant whose `user@<uid>.service` is down; pages with tenant attribution and the recovery command, never restarts | health-systemd.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`, `knowledge`, `worker_egress`, and `disk` failures become synthetic
@@ -447,6 +448,17 @@ instance report clears their state through the report-as-truth path. Unprobed
 instances (coverage notes) never page per instance. See
 [the disk operator runbook](../docs/ops/DISK_HEALTH_RUNBOOK.md) for manual
 cleanup triage.
+
+WI#766 adds one more diagnostic instance: on MT hosts `health-systemd.sh`
+reports each lingering tenant's user manager. A dead (or otherwise down)
+`user@<uid>.service` leaves the tenant with zero observable units, so it has
+no unit to target — the failure escalates as `systemd@<tenant>` through the
+same monitor-only path, with the unit name and the `systemctl start
+user@<uid>.service` recovery command in the issue. Real systemd unit failures
+still take the step-2 restart path; the component-level bare `systemd`
+identity is only used when there are no units and no instances at all, and is
+itself monitor-only. Non-lingering tenants are never judged: a down manager
+there is normal and says nothing about the tenant.
 
 Logical mappings use configured base names. Init sub-units retain names reported
 by service-manager checks (including `.service`); per-tenant systemd units are
@@ -501,6 +513,7 @@ is not valid JSON).
 | — | `SELF_HEAL_LOG` | `<state-dir>/actions.log` | Action log path |
 | — | `SELF_HEAL_HEALTH_CHECK_DIR` | script dir | Where the `health-*.sh` verify scripts live |
 | — | `SELF_HEAL_TENANTS_FILE` | see below | Multi-tenant registry for per-tenant remediation |
+| — | `LUNARWING_MT_LINGER_DIR` | `/var/lib/systemd/linger` | Linger marker directory used by `health-systemd.sh` (and mt-admin) when `loginctl` cannot answer; test-only seam — a dead user manager is only judged for lingering tenants |
 
 `SELF_HEAL_TENANTS_FILE` defaults to `$LUNARWING_BASE_DIR/tenants/ports.json`
 when that file exists, otherwise `/etc/lunarwing/ports.json`. (The data-volume
