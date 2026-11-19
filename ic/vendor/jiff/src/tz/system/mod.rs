@@ -105,6 +105,35 @@ impl Cache {
     const fn empty() -> Cache {
         Cache { tz: None, expiration: Expiration::expired() }
     }
+
+    /// Retrieve the cached system time zone if it exists and isn't expired.
+    fn get(&self) -> Option<TimeZone> {
+        if let Some(ref tz) = self.tz {
+            if !self.expiration.is_expired() {
+                return Some(tz.clone());
+            }
+        }
+        None
+    }
+
+    /// Set the given time zone in the cache.
+    fn set(&mut self, tz: TimeZone) {
+        self.tz = Some(tz);
+        self.expiration = Expiration::after(TTL);
+    }
+
+    /// Resets the cache back to its initial state.
+    fn reset(&mut self) {
+        *self = Cache::empty();
+    }
+}
+
+/// Clears the system time zone cache.
+///
+/// The next request for the system time zone will be forced to re-fetch it.
+pub(crate) fn reset() {
+    let mut cache = CACHE.write().unwrap();
+    cache.reset();
 }
 
 /// Retrieve the "system" time zone.
@@ -123,28 +152,26 @@ impl Cache {
 pub(crate) fn get(db: &TimeZoneDatabase) -> Result<TimeZone, Error> {
     {
         let cache = CACHE.read().unwrap();
-        if let Some(ref tz) = cache.tz {
-            if !cache.expiration.is_expired() {
-                return Ok(tz.clone());
-            }
+        if let Some(tz) = cache.get() {
+            return Ok(tz);
         }
     }
     let tz = get_force(db)?;
     {
+        let tz = tz.clone();
         // It's okay that we race here. We basically assume that any
         // sufficiently close but approximately simultaneous detection of
         // "system" time will lead to the same result. Of course, this is not
         // strictly true, but since we invalidate the cache after a TTL, it
         // will eventually be true in any sane environment.
         let mut cache = CACHE.write().unwrap();
-        cache.tz = Some(tz.clone());
-        cache.expiration = Expiration::after(TTL);
+        cache.set(tz);
     }
     Ok(tz)
 }
 
 /// Always attempt retrieve the system time zone. This never uses a cache.
-pub(crate) fn get_force(db: &TimeZoneDatabase) -> Result<TimeZone, Error> {
+fn get_force(db: &TimeZoneDatabase) -> Result<TimeZone, Error> {
     match get_env_tz(db) {
         Ok(Some(tz)) => {
             debug!("checked `TZ` environment variable and found {tz:?}");

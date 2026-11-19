@@ -13,9 +13,9 @@
 edition = "2018"
 rust-version = "1.75.0"
 name = "filetime"
-version = "0.2.29"
+version = "0.2.30"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
-build = false
+build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
@@ -50,4 +50,7 @@ version = "0.2.27"
 [lints.rust.unexpected_cfgs]
 level = "warn"
 priority = 0
-check-cfg = ["cfg(emulate_second_only_system)"]
+check-cfg = [
+    "cfg(emulate_second_only_system)",
+    "cfg(rust_199)",
+]

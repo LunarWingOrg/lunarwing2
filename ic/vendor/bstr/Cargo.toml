@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.65"
 name = "bstr"
-version = "1.13.1"
+version = "1.14.0"
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 build = false
 exclude = [
@@ -27,7 +27,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "A string type that is not required to be valid UTF-8."
-homepage = "https://github.com/BurntSushi/bstr"
 documentation = "https://docs.rs/bstr"
 readme = "README.md"
 keywords = [

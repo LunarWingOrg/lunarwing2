@@ -2,7 +2,7 @@
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 name = "zstd-safe"
 build = "build.rs"
-version = "8.2.0"
+version = "8.3.0"
 description = "Safe low-level bindings for the zstd compression library."
 keywords = ["zstd", "zstandard", "compression"]
 categories = ["api-bindings", "compression"]
@@ -17,7 +17,7 @@ exclude = ["update_consts.sh"]
 features = ["experimental", "arrays", "std", "zdict_builder", "doc-cfg"]
 
 [dependencies]
-zstd-sys = { path = "zstd-sys", version = "2.1.2", default-features = false }
+zstd-sys = { path = "zstd-sys", version = "2.1.3", default-features = false }
 
 [features]
 default = ["legacy", "arrays", "zdict_builder"]
@@ -28,7 +28,8 @@ experimental = ["zstd-sys/experimental"]
 legacy = ["zstd-sys/legacy"]
 pkg-config = ["zstd-sys/pkg-config"]
 vendored = ["zstd-sys/vendored"]
-std = ["zstd-sys/std"] # Implements WriteBuf for std types like Cursor and Vec.
+alloc = [] # Implements WriteBuf for Vec.
+std = ["alloc", "zstd-sys/std"] # Also implements WriteBuf for Cursor.
 zstdmt = ["zstd-sys/zstdmt"]
 thin = ["zstd-sys/thin"]
 arrays = []
@@ -37,6 +38,7 @@ no_asm = ["zstd-sys/no_asm"]
 doc-cfg = []
 zdict_builder = ["zstd-sys/zdict_builder"]
 seekable = ["zstd-sys/seekable"]
+rust-backend = ["zstd-sys/rust-backend"] # Use the libzstd-rs-sys Rust port instead of the C library.
 # Route every allocation zstd makes for contexts and dictionaries through
 # Rust's global allocator instead of the C runtime's malloc/free.
 # Needs the `_advanced` constructors, hence `experimental`.

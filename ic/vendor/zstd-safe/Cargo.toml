@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.64"
 name = "zstd-safe"
-version = "8.2.0"
+version = "8.3.0"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 exclude = ["update_consts.sh"]
@@ -46,6 +46,7 @@ features = [
 ]
 
 [features]
+alloc = []
 arrays = []
 bindgen = ["zstd-sys/bindgen"]
 cmake = ["zstd-sys/cmake"]
@@ -61,8 +62,12 @@ fat-lto = ["zstd-sys/fat-lto"]
 legacy = ["zstd-sys/legacy"]
 no_asm = ["zstd-sys/no_asm"]
 pkg-config = ["zstd-sys/pkg-config"]
+rust-backend = ["zstd-sys/rust-backend"]
 seekable = ["zstd-sys/seekable"]
-std = ["zstd-sys/std"]
+std = [
+    "alloc",
+    "zstd-sys/std",
+]
 thin = ["zstd-sys/thin"]
 thin-lto = ["zstd-sys/thin-lto"]
 vendored = ["zstd-sys/vendored"]
@@ -79,10 +84,6 @@ name = "with_rust_allocator"
 path = "tests/with_rust_allocator.rs"
 
 [[test]]
-name = "with_rust_allocator_clones"
-path = "tests/with_rust_allocator_clones.rs"
-
-[[test]]
 name = "with_rust_allocator_dictionaries"
 path = "tests/with_rust_allocator_dictionaries.rs"
 
@@ -91,7 +92,7 @@ name = "with_rust_allocator_one_shot"
 path = "tests/with_rust_allocator_one_shot.rs"
 
 [dependencies.zstd-sys]
-version = "2.1.2"
+version = "2.1.3"
 default-features = false
 
 [lints.rust]

@@ -337,6 +337,7 @@ fn compile_zstd() {
     let need_wasm_shim = !cfg!(feature = "no_wasm_shim")
         && env::var("TARGET").map_or(false, |target| {
             target == "wasm32-unknown-unknown"
+                || target == "wasm64-unknown-unknown"
                 || target.starts_with("wasm32-wasi")
         });
 
@@ -354,10 +355,22 @@ fn compile_zstd() {
 
     config.define("ZSTD_LIB_DEPRECATED", Some("0"));
 
+    // No -fmerge-all-constants: it saves a few hundred bytes, and with GCC 13
+    // it makes AddressSanitizer report a false stack-use-after-scope (#398).
     config
         .flag_if_supported("-ffunction-sections")
-        .flag_if_supported("-fdata-sections")
-        .flag_if_supported("-fmerge-all-constants");
+        .flag_if_supported("-fdata-sections");
+    // The default RISC-V targets (riscv64gc) do not assume the vector
+    // extension, and code using it would not run on CPUs without it: only use
+    // it when the Rust code is built for it too.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_features =
+        env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    if target_arch == "riscv64"
+        && target_features.split(',').any(|feature| feature == "v")
+    {
+        config.flag_if_supported("-march=rv64gcv");
+    }
 
     if cfg!(feature = "fat-lto") {
         config.flag_if_supported("-flto");
@@ -480,12 +493,20 @@ fn main() {
         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    if target_arch == "wasm32" || target_os == "hermit" {
+    if target_arch.starts_with("wasm") || target_os == "hermit" {
         cargo_print(&"rustc-cfg=feature=\"std\"");
     }
 
     // println!("cargo:rustc-link-lib=zstd");
-    let (defs, headerpaths) = if (cfg!(feature = "pkg-config")
+    let (defs, headerpaths) = if cfg!(feature = "rust-backend") {
+        // libzstd-rs-sys provides the symbols; the vendored headers still
+        // describe the API our bindings are generated from.
+        let manifest_dir = PathBuf::from(
+            env::var_os("CARGO_MANIFEST_DIR")
+                .expect("Manifest dir is always set by cargo"),
+        );
+        (vec![], vec![manifest_dir.join("zstd/lib")])
+    } else if (cfg!(feature = "pkg-config")
         && !cfg!(feature = "vendored"))
         || env::var_os("ZSTD_SYS_USE_PKG_CONFIG").is_some()
     {

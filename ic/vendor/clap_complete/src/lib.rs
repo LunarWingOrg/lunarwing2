@@ -44,7 +44,7 @@
 //! }
 //! ```
 
-#![doc(html_logo_url = "https://raw.githubusercontent.com/clap-rs/clap/master/assets/clap.png")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/clap-rs/clap/main/assets/clap.png")]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]

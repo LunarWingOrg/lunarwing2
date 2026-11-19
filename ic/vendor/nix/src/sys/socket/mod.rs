@@ -47,6 +47,7 @@ pub use self::addr::{AddressFamily, UnixAddr};
     target_os = "cygwin",
 )))]
 #[cfg(feature = "net")]
+#[cfg_attr(docsrs, doc(cfg(feature = "net")))]
 pub use self::addr::{LinkAddr, SockaddrIn, SockaddrIn6};
 #[cfg(any(
     solarish,
@@ -56,13 +57,14 @@ pub use self::addr::{LinkAddr, SockaddrIn, SockaddrIn6};
     target_os = "cygwin",
 ))]
 #[cfg(feature = "net")]
+#[cfg_attr(docsrs, doc(cfg(feature = "net")))]
 pub use self::addr::{SockaddrIn, SockaddrIn6};
 
 #[cfg(linux_android)]
 pub use crate::sys::socket::addr::alg::AlgAddr;
 #[cfg(linux_android)]
 pub use crate::sys::socket::addr::netlink::NetlinkAddr;
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 #[cfg(feature = "ioctl")]
 pub use crate::sys::socket::addr::sys_control::SysControlAddr;
 #[cfg(any(linux_android, apple_targets))]
@@ -123,8 +125,7 @@ impl TryFrom<i32> for SockType {
     }
 }
 
-/// Constants used in [`socket`](fn.socket.html) and [`socketpair`](fn.socketpair.html)
-/// to specify the protocol to use.
+/// Constants used in [`socket`] and [`socketpair`] to specify the protocol to use.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -137,7 +138,7 @@ pub enum SockProtocol {
     Raw = libc::IPPROTO_RAW,
     /// Allows applications to configure and control a KEXT
     /// ([ref](https://developer.apple.com/library/content/documentation/Darwin/Conceptual/NKEConceptual/control/control.html))
-    #[cfg(apple_targets)]
+    #[cfg(target_os = "macos")]
     KextControl = libc::SYSPROTO_CONTROL,
     /// Receives routing and link updates and may be used to modify the routing tables (both IPv4 and IPv6), IP addresses, link
     // parameters, neighbor setups, queueing disciplines, traffic classes and packet classifiers
@@ -930,6 +931,19 @@ pub enum ControlMessageOwned {
     #[cfg(any(linux_android, target_os = "fuchsia"))]
     RxqOvfl(u32),
 
+    /// The kernel-set `skb->mark` (i.e. the value `SO_MARK` writes on
+    /// outgoing packets, or that nftables / tc set via `meta mark`) of a
+    /// received packet, delivered as a `(SOL_SOCKET, SO_MARK)` ancillary
+    /// message.
+    ///
+    /// To receive this cmsg the socket must have the `SO_RCVMARK`
+    /// socket option enabled (Linux 5.19+; older kernels return
+    /// `ENOPROTOOPT` from `setsockopt`). Unlike the send-side `SO_MARK`,
+    /// `SO_RCVMARK` is unprivileged: any process may read marks set by
+    /// privileged components elsewhere on the system.
+    #[cfg(target_os = "linux")]
+    SoMark(u32),
+
     /// Socket error queue control messages read with the `MSG_ERRQUEUE` flag.
     #[cfg(linux_android)]
     #[cfg(feature = "net")]
@@ -1099,6 +1113,11 @@ impl ControlMessageOwned {
             (libc::SOL_SOCKET, libc::SO_RXQ_OVFL) => {
                 let drop_counter = unsafe { ptr::read_unaligned(p as *const u32) };
                 ControlMessageOwned::RxqOvfl(drop_counter)
+            },
+            #[cfg(target_os = "linux")]
+            (libc::SOL_SOCKET, libc::SO_MARK) => {
+                let mark = unsafe { ptr::read_unaligned(p as *const u32) };
+                ControlMessageOwned::SoMark(mark)
             },
             #[cfg(linux_android)]
             #[cfg(feature = "net")]
@@ -1744,7 +1763,7 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
 }
 
 
-/// An extension of `sendmsg` that allows the caller to transmit multiple
+/// An extension of [`sendmsg`] that allows the caller to transmit multiple
 /// messages on a socket using a single system call. This has performance
 /// benefits for some applications.
 ///
@@ -1758,9 +1777,6 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
 ///
 /// # Returns
 /// `Vec` with numbers of sent bytes on each sent message.
-///
-/// # References
-/// [`sendmsg`](fn.sendmsg.html)
 #[cfg(any(linux_android, target_os = "freebsd", target_os = "netbsd"))]
 pub fn sendmmsg<'a, XS, AS, C, I, S>(
     fd: RawFd,
@@ -2340,10 +2356,10 @@ pub fn bind(fd: RawFd, addr: &dyn SockaddrLike) -> Result<()> {
 /// Accept a connection on a socket
 ///
 /// [Further reading](https://pubs.opengroup.org/onlinepubs/9699919799/functions/accept.html)
-pub fn accept(sockfd: RawFd) -> Result<RawFd> {
-    let res = unsafe { libc::accept(sockfd, ptr::null_mut(), ptr::null_mut()) };
+pub fn accept<Fd: AsFd>(sockfd: Fd) -> Result<OwnedFd> {
+    let res = unsafe { libc::accept(sockfd.as_fd().as_raw_fd(), ptr::null_mut(), ptr::null_mut()) };
 
-    Errno::result(res)
+    Errno::result(res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Accept a connection on a socket
@@ -2365,12 +2381,12 @@ pub fn accept(sockfd: RawFd) -> Result<RawFd> {
     solarish,
     target_os = "linux",
 ))]
-pub fn accept4(sockfd: RawFd, flags: SockFlag) -> Result<RawFd> {
+pub fn accept4<Fd: AsFd>(sockfd: Fd, flags: SockFlag) -> Result<OwnedFd> {
     let res = unsafe {
-        libc::accept4(sockfd, ptr::null_mut(), ptr::null_mut(), flags.bits())
+        libc::accept4(sockfd.as_fd().as_raw_fd(), ptr::null_mut(), ptr::null_mut(), flags.bits())
     };
 
-    Errno::result(res)
+    Errno::result(res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Initiate a connection on a socket
@@ -2410,7 +2426,7 @@ pub fn recvfrom<T: SockaddrLike>(
 ) -> Result<(usize, Option<T>)> {
     unsafe {
         let mut addr = mem::MaybeUninit::<T>::uninit();
-        let mut len = mem::size_of_val(&addr) as socklen_t;
+        let mut len = T::size();
 
         let ret = Errno::result(libc::recvfrom(
             sockfd,
@@ -2421,7 +2437,7 @@ pub fn recvfrom<T: SockaddrLike>(
             &mut len as *mut socklen_t,
         ))? as usize;
 
-        Ok((ret, T::from_raw(addr.assume_init().as_ptr(), Some(len))))
+        Ok((ret, T::from_raw(addr.as_ptr().cast(), Some(len))))
     }
 }
 
@@ -2524,7 +2540,7 @@ pub fn getpeername<T: SockaddrLike>(fd: RawFd) -> Result<T> {
 
         Errno::result(ret)?;
 
-        T::from_raw(addr.assume_init().as_ptr(), Some(len)).ok_or(Errno::EINVAL)
+        T::from_raw(addr.as_ptr().cast(), Some(len)).ok_or(Errno::EINVAL)
     }
 }
 
@@ -2540,7 +2556,7 @@ pub fn getsockname<T: SockaddrLike>(fd: RawFd) -> Result<T> {
 
         Errno::result(ret)?;
 
-        T::from_raw(addr.assume_init().as_ptr(), Some(len)).ok_or(Errno::EINVAL)
+        T::from_raw(addr.as_ptr().cast(), Some(len)).ok_or(Errno::EINVAL)
     }
 }
 

@@ -5,7 +5,9 @@ use nix::sys::socket::{
     SockProtocol, SockType,
 };
 use rand::{rng, Rng};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(linux_android)]
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 // NB: FreeBSD supports LOCAL_PEERCRED for SOCK_SEQPACKET, but OSX does not.
 #[cfg(freebsdlike)]
@@ -203,8 +205,7 @@ fn test_so_tcp_maxseg() {
 
     connect(ssock.as_raw_fd(), &sock_addr).unwrap();
 
-    let rsess = accept(rsock.as_raw_fd()).unwrap();
-    let rsess = unsafe { OwnedFd::from_raw_fd(rsess) };
+    let rsess = accept(&rsock).unwrap();
 
     cfg_if! {
         if #[cfg(apple_targets)] {
@@ -903,7 +904,7 @@ fn test_ktls() {
     .unwrap();
     connect(ssock.as_raw_fd(), &sock_addr).unwrap();
 
-    let _rsess = accept(rsock.as_raw_fd()).unwrap();
+    let _rsess = accept(&rsock).unwrap();
 
     match setsockopt(&ssock, sockopt::TcpUlp::default(), b"tls") {
         Ok(()) => (),
@@ -951,7 +952,7 @@ fn test_ktls() {
 }
 
 #[test]
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 fn test_utun_ifname() {
     skip_if_not_root!("test_utun_ifname");
 
@@ -1269,4 +1270,22 @@ pub fn test_so_attach_reuseport_cbpf() {
     setsockopt(&fd, sockopt::AttachReusePortCbpf, &fp).unwrap_or_else(|e| {
         assert_eq!(e, nix::errno::Errno::ENOPROTOOPT);
     });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_tcp_cork() {
+    let fd = socket(
+        AddressFamily::Inet,
+        SockType::Stream,
+        SockFlag::empty(),
+        SockProtocol::Tcp,
+    )
+    .unwrap();
+
+    setsockopt(&fd, sockopt::TcpCork, &true).unwrap();
+    assert!(getsockopt(&fd, sockopt::TcpCork).unwrap());
+
+    setsockopt(&fd, sockopt::TcpCork, &false).unwrap();
+    assert!(!getsockopt(&fd, sockopt::TcpCork).unwrap());
 }

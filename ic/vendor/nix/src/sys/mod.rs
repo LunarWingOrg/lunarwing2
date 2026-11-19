@@ -39,6 +39,7 @@ feature! {
     linux_android,
     solarish,
     target_os = "fuchsia",
+    target_os = "haiku",
     target_os = "redox",
     target_os = "cygwin",
 ))]
@@ -64,7 +65,7 @@ feature! {
     pub mod personality;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(linux_android)]
 feature! {
     #![feature = "process"]
     pub mod prctl;

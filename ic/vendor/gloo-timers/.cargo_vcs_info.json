@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "c8feeb18bf5dde6b7aed80c749e1aef89b34fb52"
+    "sha1": "74e5ff6cb542a1d63200d8dea77c88926b203eb7"
   },
   "path_in_vcs": "crates/timers"
 }

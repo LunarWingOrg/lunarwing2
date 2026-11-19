@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.123.20"
+version = "0.123.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "019bfe57e970cf56fd9ad9ea45e4290457eb1ceb9bea954646abbe9d657a4a61"
+checksum = "b8a8d504f1c49cf5b3c59166fa77c990d6618987baa16095a8adbc125218a710"
 dependencies = [
  "serde",
  "serde_derive",
@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-entity"
-version = "0.123.20"
+version = "0.123.21"
 dependencies = [
  "cranelift-bitset",
  "serde",

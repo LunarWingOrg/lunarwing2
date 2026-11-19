@@ -358,6 +358,10 @@ impl NodeRef {
         let mut buf = String::with_capacity(bytes.len());
         let mut valid_up_to = 0;
         for index in iter {
+            // Catch the case where a '\' is the last or penultimate char.
+            if index >= bytes.len() - 2 {
+                break;
+            }
             buf.push_str(&self.0[valid_up_to..index]);
             match hex_to_char([bytes[index + 1], bytes[index + 2]]) {
                 Ok(char) => {
@@ -375,6 +379,40 @@ impl NodeRef {
         }
 
         Ok(Cow::Owned(buf))
+    }
+}
+
+impl NodePart {
+    /// Implements XEP-0106 escape algorithm.
+    pub fn from_unescaped(node: &str) -> Result<NodePart, Error> {
+        if node.starts_with(' ') || node.ends_with(' ') {
+            return Err(Error::NodePrep);
+        }
+        let mut out = String::with_capacity(node.len());
+
+        // TODO: Use Iterator::map_windows() once it is stabilized to clean up this mess.
+        let iter1 = node.chars();
+        let mut iter2 = iter1.clone().chain("\0".chars());
+        iter2.next();
+        let mut iter3 = iter2.clone().chain("\0".chars());
+        iter3.next();
+        for (c, (n1, n2)) in iter1.zip(iter2.zip(iter3)) {
+            match (c, n1, n2) {
+                (' ', _, _) => out.push_str(r"\20"),
+                ('"', _, _) => out.push_str(r"\22"),
+                ('&', _, _) => out.push_str(r"\26"),
+                ('\'', _, _) => out.push_str(r"\27"),
+                ('/', _, _) => out.push_str(r"\2f"),
+                (':', _, _) => out.push_str(r"\3a"),
+                ('<', _, _) => out.push_str(r"\3c"),
+                ('>', _, _) => out.push_str(r"\3e"),
+                ('@', _, _) => out.push_str(r"\40"),
+                ('\\', '5', 'c') => out.push_str(r"\5c"),
+                _ => out.push(c),
+            }
+        }
+
+        NodePart::from_str(&out)
     }
 }
 
@@ -528,6 +566,12 @@ mod tests {
         let node = NodePart::new("foo\\40bar").unwrap();
         assert_eq!(node.unescape().unwrap(), "foo@bar");
 
+        let node = NodePart::new("\\22\\26\\27\\2f\\20\\3a\\3c\\3e\\40\\").unwrap();
+        assert_eq!(node.unescape().unwrap(), "\"&'/ :<>@\\");
+
+        let node = NodePart::new("\\22\\26\\27\\2f\\20\\3a\\3c\\3e\\40\\5").unwrap();
+        assert_eq!(node.unescape().unwrap(), "\"&'/ :<>@\\5");
+
         let node = NodePart::new("\\22\\26\\27\\2f\\20\\3a\\3c\\3e\\40\\5c").unwrap();
         assert_eq!(node.unescape().unwrap(), "\"&'/ :<>@\\");
 
@@ -569,6 +613,48 @@ mod tests {
                 alloc::format!("{}@example.com", node.unescape().unwrap()),
                 unescaped
             );
+        }
+    }
+
+    #[test]
+    fn from_unescaped() {
+        let node = NodePart::from_unescaped("foo@bar").unwrap();
+        assert_eq!(node.0, r"foo\40bar");
+
+        let node = NodePart::from_unescaped("\"&'/ :<>@\\").unwrap();
+        assert_eq!(node.0, r"\22\26\27\2f\20\3a\3c\3e\40\");
+
+        NodePart::from_unescaped(" foo").unwrap_err();
+        NodePart::from_unescaped("foo ").unwrap_err();
+
+        // Those come from section 5.1 from the XEP.
+        let data = [
+            ("space cadet@example.com", "space\\20cadet@example.com"),
+            (
+                "call me \"ishmael\"@example.com",
+                "call\\20me\\20\\22ishmael\\22@example.com",
+            ),
+            ("at&t guy@example.com", "at\\26t\\20guy@example.com"),
+            ("d'artagnan@example.com", "d\\27artagnan@example.com"),
+            ("/.fanboy@example.com", "\\2f.fanboy@example.com"),
+            ("::foo::@example.com", "\\3a\\3afoo\\3a\\3a@example.com"),
+            ("<foo>@example.com", "\\3cfoo\\3e@example.com"),
+            ("user@host@example.com", "user\\40host@example.com"),
+            ("c:\\net@example.com", "c\\3a\\net@example.com"),
+            ("c:\\\\net@example.com", "c\\3a\\\\net@example.com"),
+            (
+                "c:\\cool stuff@example.com",
+                "c\\3a\\cool\\20stuff@example.com",
+            ),
+            ("c:\\5commas@example.com", "c\\3a\\5c5commas@example.com"),
+        ];
+        let domain = DomainPart::new("example.com.").unwrap();
+        for (unescaped, escaped) in data {
+            let node = unescaped.rsplit_once('@').unwrap().0;
+            let node = NodePart::from_unescaped(node).unwrap();
+            let jid1 = BareJid::from_parts(Some(&node), &domain);
+            let jid2 = BareJid::new(escaped).unwrap();
+            assert_eq!(jid1, jid2);
         }
     }
 }
