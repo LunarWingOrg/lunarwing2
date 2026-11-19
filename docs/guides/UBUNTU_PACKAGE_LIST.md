@@ -60,7 +60,9 @@ sudo apt install podman uidmap fuse-overlayfs slirp4netns nftables
 > for the tenant PostgreSQL container, but 24.04+ (Podman 4.9+) is strongly recommended;
 > alternatively use the upstream Podman packages.
 
-`lunarwing-mt-admin.sh` uses the fully-qualified `docker.io/pgvector/pgvector:pg16` image, so
+`lunarwing-mt-admin.sh` uses the fully-qualified, digest-pinned
+`docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f`
+image (PostgreSQL 16.16 / pgvector 0.8.7, reviewed 2026-11-12), so
 no `unqualified-search-registries` config is strictly required. If you override to a short
 name via `LUNARWING_MT_PG_IMAGE`, add the search registry to avoid a TTY prompt under
 rootless podman:
@@ -68,7 +70,9 @@ rootless podman:
 ```bash
 echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
-sudo podman pull pgvector/pgvector:pg16   # optional pre-pull; add-tenant does it otherwise
+# Optional pre-pull. Pull the same digest mt-admin pins, or the tag may resolve
+# to a different image and the pre-pull saves nothing:
+sudo podman pull docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
 ```
 
 (Docker alternative: `apt install docker.io`, then `systemctl enable --now docker`.)
