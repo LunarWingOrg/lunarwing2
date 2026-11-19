@@ -674,13 +674,50 @@ worker_egress_flush() {
   done
 }
 
-worker_egress_stop_keeper() {
-  local name="$1" keeper purpose
+# WI#769: rootless Podman needs the tenant's systemd user bus for the cgroup
+# and netns work behind `pod rm`. With `user@<uid>.service` dead, podman prints
+# its own bus errors and leaves the pod. True only for a known-dead manager:
+# `unknown` means the probe could not tell, and must not invent one (WI#731).
+_worker_egress_user_manager_dead() {  # <name>
+  local name="$1" state
+  [[ "${INIT_SYSTEM:-}" == systemd ]] || return 1
+  state="$(_user_manager_state "$name")"
+  [[ "$state" != ok && "$state" != unknown ]]
+}
+
+# The unit a dead-manager line names, for the recovery command.
+_worker_egress_user_manager_unit() {  # <name>
+  local uid
+  uid="$(id -u "$1" 2>/dev/null)" || uid='?'
+  printf 'user@%s.service\n' "$uid"
+}
+
+# Release the keeper pod. With the tenant's systemd user manager dead there is
+# no means that skips the user bus, so the caller chooses the deliberate
+# outcome instead: `stop-tenant` passes `keep` and a stop keeps the pod on
+# purpose with one line and exit 0 (the guard validates any existing keeper
+# before the next start uses it), while a teardown (remove-tenant) passes
+# nothing and gets one line and a failure — it must not report a tenant
+# removed while its keeper survives. Podman is never called in that state:
+# its own bus errors would leak to the operator, which is WI#769's symptom.
+worker_egress_stop_keeper() {  # <name> [keep]
+  local name="$1" mode="${2:-release}" keeper purpose unit
   _worker_egress_validate_name "$name"
   worker_egress_enabled "$name" || return 0
   ensure_container_runtime
   [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
   keeper="lw-egress-keeper-$name"
+  if _worker_egress_user_manager_dead "$name"; then
+    unit="$(_worker_egress_user_manager_unit "$name")"
+    if [[ "$mode" == keep ]]; then
+      printf 'worker-egress: kept namespace keeper %s on purpose: systemd user manager %s is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use\n' \
+        "$keeper" "$unit"
+      return 0
+    fi
+    printf 'worker-egress: cannot release namespace keeper %s: systemd user manager %s is down and rootless podman cannot reach the pod without its user bus; recover with: systemctl start %s\n' \
+      "$keeper" "$unit" "$unit" >&2
+    return 1
+  fi
   _ctr "$name" pod exists "$keeper" || return 0
   purpose="$(
     _ctr "$name" pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper"
@@ -763,7 +800,7 @@ worker_egress_assert_detached() {
 # Check before releasing the keeper so an attachment refusal preserves both the
 # rootless namespace and its chains. Once clear, flush before dropping them.
 worker_egress_teardown() {
-  local name="$1" network network_rm_out
+  local name="$1" network network_rm_out unit
   _worker_egress_validate_name "$name"
   # WI#688: without the account the rootless store, its network and keeper
   # cannot be asked. Nothing can be attached when no process of the former
@@ -784,6 +821,18 @@ worker_egress_teardown() {
     _worker_egress_remove_state "$name"
     printf 'worker-egress: removed the rendered egress state of %s\n' "$name"
     return 0
+  fi
+  # WI#769: with the tenant's systemd user manager dead, every step below
+  # (attachment check, keeper release, network removal) needs the rootless
+  # store's user bus and would only spray Podman's own bus errors. Refuse
+  # before the first such call: the keeper, its network and the rendered state
+  # stay untouched, and remove-tenant aborts instead of reporting a tenant
+  # removed while its keeper survives.
+  if _worker_egress_user_manager_dead "$name"; then
+    unit="$(_worker_egress_user_manager_unit "$name")"
+    printf 'worker-egress: cannot tear down the egress state of %s: systemd user manager %s is down and rootless podman needs its user bus; keeper, network and rendered state are unchanged; recover with: systemctl start %s\n' \
+      "$name" "$unit" "$unit" >&2
+    return 1
   fi
   worker_egress_assert_detached "$name" || return 1
   worker_egress_flush "$name"
