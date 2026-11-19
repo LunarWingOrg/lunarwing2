@@ -76,6 +76,37 @@ pub struct SetupServiceOffer {
     pub install_command: Option<String>,
 }
 
+/// What the setup wizard should say about installing a background service.
+#[derive(Debug, Clone)]
+pub enum SetupServiceAvailability {
+    /// A service manager is present and an install would be accepted.
+    Offer(SetupServiceOffer),
+    /// The installer would refuse the service; `reason` says why and the way out.
+    Refused { reason: String },
+    /// No supported service manager exists on this platform.
+    NotApplicable,
+}
+
+/// Marker for a root-daemon refusal, so callers can tell it apart from an
+/// identity lookup failure, which must surface as a real error.
+#[derive(Debug)]
+struct RootServiceRefused {
+    message: String,
+}
+
+impl std::fmt::Display for RootServiceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RootServiceRefused {}
+
+fn is_root_service_refusal(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<RootServiceRefused>().is_some())
+}
+
 // ── Public dispatch ─────────────────────────────────────────────
 
 pub fn detected_service_manager() -> Result<ServiceManager> {
@@ -98,9 +129,9 @@ pub fn service_installation() -> Result<ServiceInstallation> {
     Ok(ServiceInstallation { manager, path })
 }
 
-pub fn setup_service_offer() -> Result<Option<SetupServiceOffer>> {
+pub fn setup_service_offer() -> Result<SetupServiceAvailability> {
     if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
-        return Ok(None);
+        return Ok(SetupServiceAvailability::NotApplicable);
     }
 
     let manager = detected_service_manager()?;
@@ -117,19 +148,30 @@ fn setup_service_offer_with_identity<F>(
     effective_root: bool,
     allow_root: bool,
     openrc_identity: F,
-) -> Result<Option<SetupServiceOffer>>
+) -> Result<SetupServiceAvailability>
 where
     F: FnOnce() -> Result<(String, String)>,
 {
     match manager {
         ServiceManager::Launchd | ServiceManager::SystemdUser => {
-            if ensure_root_service_allowed(manager, effective_root, allow_root, None).is_err() {
-                return Ok(None);
+            if let Err(err) = ensure_root_service_allowed(manager, effective_root, allow_root, None)
+            {
+                return Ok(SetupServiceAvailability::Refused {
+                    reason: err.to_string(),
+                });
             }
         }
         ServiceManager::OpenRc => {
-            if openrc_identity().is_err() {
-                return Ok(None);
+            if let Err(err) = openrc_identity() {
+                // Only the root refusal means "the installer would refuse".
+                // An unknown user or unresolvable group is a real error that
+                // the person has to see, so let it propagate.
+                if !is_root_service_refusal(&err) {
+                    return Err(err);
+                }
+                return Ok(SetupServiceAvailability::Refused {
+                    reason: err.to_string(),
+                });
             }
         }
     }
@@ -144,7 +186,7 @@ where
         Some(openrc_command_hint("install")?)
     };
 
-    Ok(Some(SetupServiceOffer {
+    Ok(SetupServiceAvailability::Offer(SetupServiceOffer {
         manager,
         can_install_now,
         install_command,
@@ -1057,11 +1099,13 @@ fn ensure_root_service_allowed(
             "Run the installer as the intended service account without sudo"
         }
     };
-    bail!(
-        "Refusing to configure the {} service to run as root{detail}. {guidance}, or set \
-         LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon.",
-        manager.display_name()
-    )
+    Err(anyhow::Error::new(RootServiceRefused {
+        message: format!(
+            "Refusing to configure the {} service to run as root{detail}. {guidance}, or set \
+             LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon.",
+            manager.display_name()
+        ),
+    }))
 }
 
 fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
@@ -1374,30 +1418,57 @@ mod tests {
     }
 
     #[test]
-    fn root_refusal_suppresses_user_service_setup_offer() {
+    fn root_refusal_reports_user_service_setup_refusal() {
         for manager in [ServiceManager::SystemdUser, ServiceManager::Launchd] {
-            let offer = setup_service_offer_with_identity(manager, true, false, || {
+            let availability = setup_service_offer_with_identity(manager, true, false, || {
                 unreachable!("OpenRC identity lookup must not run for user services")
             })
-            .expect("root refusal should be represented as no offer");
-            assert!(offer.is_none());
+            .expect("a root refusal is a reportable outcome, not an error");
+            match availability {
+                SetupServiceAvailability::Refused { reason } => {
+                    assert!(reason.contains(manager.display_name()));
+                    assert!(reason.contains("without sudo"));
+                    assert!(reason.contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
 
-            let offer = setup_service_offer_with_identity(manager, true, true, || {
+            let availability = setup_service_offer_with_identity(manager, true, true, || {
                 unreachable!("OpenRC identity lookup must not run for user services")
             })
-            .expect("explicit opt-in should be representable")
-            .expect("explicit opt-in should retain the offer");
-            assert!(offer.can_install_now);
+            .expect("explicit opt-in should be representable");
+            match availability {
+                SetupServiceAvailability::Offer(offer) => assert!(offer.can_install_now),
+                other => panic!("expected an offer, got {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn openrc_identity_refusal_suppresses_setup_offer() {
-        let offer = setup_service_offer_with_identity(ServiceManager::OpenRc, true, false, || {
-            bail!("root service identity refused")
+    fn openrc_root_refusal_reports_setup_refusal() {
+        let availability =
+            setup_service_offer_with_identity(ServiceManager::OpenRc, true, false, || {
+                ensure_openrc_service_identity("root", false)?;
+                Ok(("root".to_string(), "root".to_string()))
+            })
+            .expect("the root refusal must be reported, not returned as an error");
+        match availability {
+            SetupServiceAvailability::Refused { reason } => {
+                assert!(reason.contains("run as root"));
+                assert!(reason.contains("sudo"));
+                assert!(reason.contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openrc_identity_lookup_error_is_not_silenced() {
+        let err = setup_service_offer_with_identity(ServiceManager::OpenRc, true, false, || {
+            bail!("service user 'nobody' does not exist")
         })
-        .expect("OpenRC refusal should be represented as no offer");
-        assert!(offer.is_none());
+        .expect_err("an identity lookup failure must surface as an error");
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[test]
