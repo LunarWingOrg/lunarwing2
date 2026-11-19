@@ -4,7 +4,10 @@ Status: **diagnosed 2026-08-22, extended 2026-11-19 (WI#706); the server-side
 fix must be applied on the GitLab host — it cannot be done from the dev box /
 this repo.** CI-side retry mitigations are already in
 `.gitlab/ci/containers.yml`. The interim runner mitigation for WI#706 is
-applied (see “Artifact uploads” below).
+applied (see “Artifact uploads” below). On 2026-11-19 the 60-second cut was
+reproduced on demand from the dev box and the edge's own error page was
+fingerprinted (see “Live confirmation” below); only the edge's access-log line
+and the timeout change itself still need the host administrator.
 
 ## Symptom
 
@@ -48,6 +51,48 @@ write tcp 172.17.0.9:53410->104.36.84.181:443: write: connection reset by peer
 The same archive passes from runners 13, 15 and 16 in 12–18 s. This is a time
 limit, not a size limit: 279 MiB in >60 s is under 5 MB/s, while the other
 runners reach 16–23 MB/s.
+
+### Live confirmation, 2026-11-19
+
+The cut was reproduced on demand from the dev box with rate-limited uploads to
+a throwaway private project's `/uploads` endpoint. No runner is involved, so
+the result separates the edge from runner 17's uplink:
+
+| Upload | Sent when cut | Elapsed | Result |
+|---|---|---|---|
+| 1 KiB control, unthrottled | 1 KiB | 0.82 s | `201 Created` |
+| 12 MiB at 100 KiB/s | 6.0 MiB | 61.18 s | `502` |
+| 12 MiB at 100 KiB/s, repeated | 6.0 MiB | 61.18 s | `502` |
+| 25 MiB at 400 KiB/s | 23.8 MiB | 61.18 s | `502` |
+
+Two different sizes at two different rates stop at the same 61.18 s, from a
+third network, with a control upload passing in under a second: the limit is
+time, not size, and it is not runner 17.
+
+The response names the culprit. It is `HTTP/2 502`, `content-length: 11`,
+body `Bad Gateway`, and **no `server` header**:
+
+```
+HTTP/2 502
+content-length: 11
+date: Thu, 19 Nov 2026 18:08:52 GMT
+
+Bad Gateway
+```
+
+Omnibus nginx stamps every response it generates with `server: nginx` (the
+plain `https://git.lunarwing.org/` front page carries it), so an 11-byte
+`Bad Gateway` without that header is the edge's own error page — the same
+component that produces the runner's `499`/`504`. That fits
+`entryPoints.websecure.transport.respondingTimeouts.readTimeout` (60 s default
+since Traefik 2.11.2/3.0), which both hosts use. The status moving from `499`
+and `504` to a clean `502` changes nothing about the cause: all three are the
+edge abandoning the request at the same boundary.
+
+Only the access-log line remains unseen, because the edge host has no shell
+reachable from this box (SSH lands in GitLab-shell). WI#706 acceptance box 1
+still needs that line from the host administrator; the pre-fix half of box 2
+is now recorded above.
 
 The 60-second cut matches **Traefik `respondingTimeouts.readTimeout`**, which
 has defaulted to 60 seconds since Traefik 2.11.2 and 3.0. It bounds the whole
@@ -200,20 +245,51 @@ Runner 17 keeps its other tags and still takes untagged jobs. The
 `.worker-candidate` jobs in `.gitlab/ci/containers.yml` require
 `container-build`, so runner 17 can no longer take the large-upload job;
 runners 13, 15 and 16 still carry that tag (7 and 8 do as well). Re-add
-`container-build` to runner 17 only after a rate-limited upload that takes
-more than 60 seconds succeeds from it.
+`container-build` to runner 17 only after the go/no-go probe in
+“Verification” returns `201` through the edge (the probe makes the
+`>60 s` test reproducible from any workstation; it does not have to come
+from runner 17 itself, because the cut is at the shared edge entry point).
 
-The edge host is not reachable from the dev box. The Traefik config change,
-the access-log line, and the live >60 s upload test therefore stay with the
-host administrator.
+The edge host is not reachable from the dev box (SSH lands in GitLab-shell).
+The Traefik config change and the access-log line therefore stay with the
+host administrator. The *pre-fix* half of the rate-limited upload test has
+been done from the dev box — see “Live confirmation” above.
 
 ## Verification
 
-1. Rate-limited upload through the edge: send a body that takes more than
-   60 seconds (for example `curl --limit-rate` against a throwaway project's
-   upload API or a scratch job artifact) and confirm it completes with `201`
-   instead of `499`/`504`/reset. Record the edge access-log line with its
-   duration and status.
+1. **The go/no-go probe** — a rate-limited upload through the edge, run from
+   any workstation. Create a throwaway private project, upload 12 MiB at
+   100 KiB/s (about 123 s of body), then delete the project:
+
+   ```bash
+   TOKEN=...    # PAT with `api` scope; keep it out of logs and files
+   PROBE=$(curl -sS -X POST 'https://git.lunarwing.org/api/v4/projects' \
+     -H "PRIVATE-TOKEN: $TOKEN" \
+     --data-urlencode 'name=edge-timeout-probe' \
+     --data-urlencode 'visibility=private' \
+     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+   head -c 12582912 /dev/urandom > /tmp/probe.bin
+   curl -sS --limit-rate 100k --max-time 280 \
+     -o /tmp/probe.out \
+     -w 'status=%{http_code} elapsed=%{time_total}s sent=%{size_upload}B\n' \
+     -X POST "https://git.lunarwing.org/api/v4/projects/$PROBE/uploads" \
+     -H "PRIVATE-TOKEN: $TOKEN" -F 'file=@/tmp/probe.bin'
+
+   curl -sS -X DELETE "https://git.lunarwing.org/api/v4/projects/$PROBE" \
+     -H "PRIVATE-TOKEN: $TOKEN"
+   ```
+
+   **Before the fix** this ends at about 61 s with `status=502` and `sent`
+   well under 12 MiB (measured 2026-11-19: 61.18 s, 6.0 MiB). **After the
+   fix** it must trickle the whole 12 MiB, end with `status=201`, and take
+   about 125 s. A cut at ~61 s means the timeout is still live; a completed
+   upload in under 90 s means the probe never crossed the boundary, so raise
+   the file size. This exercises the same `websecure` entry point as artifact
+   uploads and registry pushes — Traefik applies `readTimeout` per entry
+   point, not per router, so one probe covers both hosts. Record the edge
+   access-log line for the same request with its duration and status (WI#706
+   acceptance box 1); the pre-fix line is not obtainable from the dev box.
 2. Re-run the manual `worker-opencode-image` job (largest image).
    Expect: no `499` retries in the push phase.
 3. Re-run `worker-opencode2-candidate` and confirm it can pass on runner 17
