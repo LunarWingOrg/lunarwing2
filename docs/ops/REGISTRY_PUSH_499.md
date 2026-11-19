@@ -33,7 +33,7 @@ attempt:
 |---|---|---|---|
 | 179088 | 17 | 60 s, 61 s, 60 s, 63 s | reset, 504, reset, 499 |
 | 179011 | 17 | 60 s, 61 s, 62 s | 499, 499, 499 |
-| 178891 | 17 | 60 s, 61 s, 60 s | 499, 499, 499 |
+| 178891 | 17 | 60 s, 61 s, 62 s | 499, 499, 499 |
 
 These are from the job traces (`POST /api/v4/jobs/<id>/artifacts`); an excerpt
 from job 179088's attempts:
@@ -109,14 +109,16 @@ entryPoints:
     transport:
       respondingTimeouts:
         readTimeout: "30m"    # bounded — do NOT set 0
-        writeTimeout: "0s"    # response writes are short; not the upload bound
+        writeTimeout: "0s"    # Traefik's default; idleTimeout covers dead connections
         idleTimeout: "180s"   # inactivity timeout only — keep
 ```
 
 `readTimeout` bounds reading the whole request including the body. `30m` is
-well above the worst observed upload (66 s) and is still finite. **Do not set
-it to `0`**: the timeout is also the protection against a client that sends
-its body slowly. `idleTimeout` still protects against dead connections.
+the recommended value: it is well above the cuts observed (60 to 66 s; no
+completed upload from runner 17 was timed) and is still finite. Nobody with
+access to the edge has applied it yet. **Do not set it to `0`**: the timeout
+is also the protection against a client that sends its body slowly.
+`idleTimeout` still protects against dead connections.
 
 This entry point serves every site behind this Traefik, so the change is
 instance-wide. Traefik sets the timeout per entry point, not per router. If
@@ -201,10 +203,9 @@ runners 13, 15 and 16 still carry that tag (7 and 8 do as well). Re-add
 `container-build` to runner 17 only after a rate-limited upload that takes
 more than 60 seconds succeeds from it.
 
-The edge host remains unreachable from the dev box: `ssh root@104.36.84.181`
-returns `Permission denied (publickey)`, and SSH to `git.lunarwing.org` lands
-in GitLab Shell. The Traefik config change, the access-log line, and the live
->60 s upload test therefore stay with the host administrator.
+The edge host is not reachable from the dev box. The Traefik config change,
+the access-log line, and the live >60 s upload test therefore stay with the
+host administrator.
 
 ## Verification
 

@@ -132,7 +132,7 @@ realm `https://git.lunarwing.org/jwt/auth`.)
 - **499, 504 or connection reset on a large upload (blob `PATCH` or job
   artifacts):** a 60-second proxy timeout firing mid-upload on large worker
   images or artifacts. Needs the Traefik/omnibus timeout changes on this host
-  — chosen value and exact config in `REGISTRY_PUSH_499.md`.
+  — recommended value and exact config in `REGISTRY_PUSH_499.md`.
 - **Wrong token realm / scheme mismatch on `docker login`:** the
   `registry_nginx['proxy_set_headers']` block is missing.
 
@@ -145,7 +145,7 @@ seconds with `499`, `504` or `connection reset by peer` means a timeout fired.
 The edge setting is
 `entryPoints.websecure.transport.respondingTimeouts.readTimeout`, which
 defaults to **60 s** since Traefik 2.11.2 / 3.0 and bounds the whole request
-including its body. The chosen value for both `git.lunarwing.org` and
+including its body. The recommended value for both `git.lunarwing.org` and
 `registry.git.lunarwing.org` is **`30m`**, bounded rather than `0` (the
 timeout also protects against clients that send a body slowly). This is
 static configuration, so Traefik must be restarted; if the public entry point
