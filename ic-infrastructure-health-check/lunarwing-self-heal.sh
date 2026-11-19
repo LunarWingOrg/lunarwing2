@@ -532,6 +532,11 @@ declare -A DIAGNOSTIC_COMPONENTS=(
     [systemd]=1
 )
 
+# WI#766: a monitor-only identity can carry the command an operator needs to
+# recover it (a dead tenant user manager's `systemctl start user@<uid>.service`).
+# Keyed by synthetic identity; targets without a known recovery stay empty.
+declare -A TARGET_RECOVERY=()
+
 # Service identities that inherit monitor-only treatment regardless of which
 # component reported them (WI#180 F6): the logical lunarvoice component is
 # monitor-only, but the same underlying service reported under openrc/systemd
@@ -863,10 +868,15 @@ _send_notification() {
     [[ "$delivered" == true ]]
 }
 
-# escalate_service <svc> <retries> [reason]   (retries passed explicitly — no $STATE)
+# escalate_service <svc> <retries> [reason] [recovery]
+# (retries passed explicitly — no $STATE; recovery is an optional operator command)
 escalate_service() {
-    local svc="$1" retries="${2:-0}" reason="${3:-max_retries}"
-    log "ESCALATING: $svc ($reason, retries=$retries)"
+    local svc="$1" retries="${2:-0}" reason="${3:-max_retries}" recovery="${4:-}"
+    if [[ -n "$recovery" ]]; then
+        log "ESCALATING: $svc ($reason, retries=$retries, recovery=$recovery)"
+    else
+        log "ESCALATING: $svc ($reason, retries=$retries)"
+    fi
     log_action "ESCALATE target=$svc retries=$retries reason=$reason"
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] would send escalation notification for $svc"
@@ -876,8 +886,9 @@ escalate_service() {
     local esc_report esc_key
     esc_key="$(_service_file_key "$svc")" || esc_key="unknown.$$"
     esc_report="$(mktemp "$SELF_HEAL_STATE_DIR/escalation-$(date +%Y%m%d%H%M%S)-${esc_key}.json.XXXXXX")"
-    jq -n --arg svc "$svc" --arg now "$(timestamp)" --arg reason "$reason" --argjson retries "$retries" \
-        '{escalated: true, service: $svc, timestamp: $now, retries: $retries, reason: $reason, action: "manual_intervention_required"}' \
+    jq -n --arg svc "$svc" --arg now "$(timestamp)" --arg reason "$reason" --argjson retries "$retries" --arg recovery "$recovery" \
+        '{escalated: true, service: $svc, timestamp: $now, retries: $retries, reason: $reason, action: "manual_intervention_required"}
+         + (if $recovery == "" then {} else {recovery: $recovery} end)' \
         > "$esc_report"
 
     local notify_rc
@@ -891,10 +902,10 @@ escalate_service() {
 }
 
 escalate_and_update_state() {
-    local state="$1" svc="$2" retries="$3" reason="$4"
+    local state="$1" svc="$2" retries="$3" reason="$4" recovery="${5:-}"
     if [[ "$DRY_RUN" == true ]]; then
-        escalate_service "$svc" "$retries" "$reason" || true
-    elif escalate_service "$svc" "$retries" "$reason"; then
+        escalate_service "$svc" "$retries" "$reason" "$recovery" || true
+    elif escalate_service "$svc" "$retries" "$reason" "$recovery"; then
         state="$(mark_escalated "$state" "$svc")"
     else
         log "ESCALATION PENDING: page for $svc not delivered; will retry next tick"
@@ -978,7 +989,7 @@ remediate_component() {
         fi
 
         if [[ "${MONITOR_ONLY[$comp]:-}" == "1" ]] || service_is_monitor_only "$svc"; then
-            state="$(escalate_and_update_state "$state" "$svc" "$retries" "monitor_only")"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "monitor_only" "${TARGET_RECOVERY[$svc]:-}")"
             continue
         fi
 
@@ -1128,11 +1139,11 @@ main() {
     # when MT logical remediation is disabled. Healthy instances clear state
     # through report-as-truth; unprobed/unknown instances are left to the
     # component-level verdict (coverage notes must not page per instance).
-    local diag_comp inst_name inst_status diag_id diag_cstatus
+    local diag_comp inst_name inst_status diag_id diag_cstatus diag_recovery
     local -a diag_bad=()
     for diag_comp in runtime knowledge worker_egress disk systemd; do
         diag_bad=()
-        while IFS=$'\t' read -r inst_name inst_status; do
+        while IFS=$'\t' read -r inst_name inst_status diag_recovery; do
             [[ -n "$inst_name" ]] || continue
             if [[ "$inst_name" == "default" ]]; then
                 diag_id="$diag_comp"
@@ -1146,6 +1157,12 @@ main() {
                     seen[$diag_id]=1
                     diag_bad+=("$diag_id")
                     targets+=("$diag_comp:$diag_id")
+                    # WI#766: a dead tenant user manager names the unit that
+                    # must be restarted. Carry it into the escalation so the
+                    # page states the command, not only the identity.
+                    if [[ -n "$diag_recovery" ]]; then
+                        TARGET_RECOVERY[$diag_id]="systemctl start $diag_recovery"
+                    fi
                     ;;
                 *) ;;
             esac
@@ -1153,10 +1170,13 @@ main() {
             .components[] | select(.component == $comp)
             | if $comp == "disk" then
                 (.metrics.filesystems // [])[]
-                | "\(.mount // "default")\t\(.status // "unknown")"
+                | "\(.mount // "default")\t\(.status // "unknown")\t"
+              elif $comp == "systemd" then
+                (.metrics.instances // [])[]
+                | "\(.tenant // "default")\t\(.status // "unknown")\t\(.manager_unit // "")"
               else
                 (.metrics.instances // [])[]
-                | "\(.tenant // "default")\t\(.status // "unknown")"
+                | "\(.tenant // "default")\t\(.status // "unknown")\t"
               end
         ' "$report" 2>/dev/null || true)
         # Component-level failure with no failing instance (invalid registry,
