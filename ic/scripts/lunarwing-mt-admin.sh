@@ -304,6 +304,11 @@ Usage:
 Production multi-tenant administration for LunarWing.
 Manages OS users, port allocation, per-tenant services, and builds.
 
+A flag that takes a value must be followed by one. A value that looks like a
+flag (two dashes, then lowercase letters, digits and hyphens, as in
+--with-kimi or --target=main) is refused, so a forgotten value never swallows
+the next flag.
+
 Commands:
   init-lock-tree                   Create the root-owned lock tree
                                    (/run/lunarwing/mt-admin) and, on systemd,
@@ -891,12 +896,12 @@ main() {
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
-          --xmpp-jid)        xmpp_jid="$2"; shift 2 ;;
+          --xmpp-jid)        need_value "$@"; xmpp_jid="$2"; shift 2 ;;
           --no-health)       HEALTH_OPT_OUT=true; shift ;;
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
-          --darkirc-scope-id) [[ $# -ge 2 ]] || die "--darkirc-scope-id requires a value"; darkirc_scope_override="$2"; shift 2 ;;
+          --darkirc-scope-id) need_value "$@"; darkirc_scope_override="$2"; shift 2 ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
@@ -904,30 +909,30 @@ main() {
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-lunardepth) with_lunardepth="true"; shift ;;
-          --lunardepth-model) [[ $# -ge 2 ]] || die "--lunardepth-model requires a value"; lunardepth_model="$2"; shift 2 ;;
-          --lunardepth-base-url) [[ $# -ge 2 ]] || die "--lunardepth-base-url requires a value"; lunardepth_base_url="$2"; shift 2 ;;
-          --lunardepth-api-key-file) lunardepth_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+          --lunardepth-model) need_value "$@"; lunardepth_model="$2"; shift 2 ;;
+          --lunardepth-base-url) need_value "$@"; lunardepth_base_url="$2"; shift 2 ;;
+          --lunardepth-api-key-file) need_value "$@"; lunardepth_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
           --lunardepth-allow-insecure-http) lunardepth_allow_insecure="true"; shift ;;
           --lunardepth-allow-unauthenticated-gateway) lunardepth_allow_placeholder="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
-          --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
-          --xmpp-password)   xmpp_password="$2"; shift 2 ;;
-          --llm-api-key)     llm_api_key="$2"; shift 2 ;;
-          --llm-base-url)    llm_base_url="$2"; shift 2 ;;
-          --tensorzero-url)  tz_url="$2"; shift 2 ;;
-          --gotify-url)      gotify_url="$2"; shift 2 ;;
-          --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --opencode-model)    opencode_model="$2"; shift 2 ;;
-          --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
-          --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
-          --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
-          --kimi-model)        kimi_model="$2"; shift 2 ;;
-          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
-          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --study-mcp-home)  need_value "$@"; study_mcp_home="$2"; shift 2 ;;
+          --xmpp-password)   need_value "$@"; xmpp_password="$2"; shift 2 ;;
+          --llm-api-key)     need_value "$@"; llm_api_key="$2"; shift 2 ;;
+          --llm-base-url)    need_value "$@"; llm_base_url="$2"; shift 2 ;;
+          --tensorzero-url)  need_value "$@"; tz_url="$2"; shift 2 ;;
+          --gotify-url)      need_value "$@"; gotify_url="$2"; shift 2 ;;
+          --gotify-title)    need_value "$@"; gotify_title="$2"; shift 2 ;;
+          --opencode-model)    need_value "$@"; opencode_model="$2"; shift 2 ;;
+          --opencode-base-url) need_value "$@"; opencode_base_url="$2"; shift 2 ;;
+          --opencode2-model)    need_value "$@"; opencode2_model="$2"; shift 2 ;;
+          --opencode2-base-url) need_value "$@"; opencode2_base_url="$2"; shift 2 ;;
+          --kimi-model)        need_value "$@"; kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     need_value "$@"; kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key-file) need_value "$@"; kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
           --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
-          --llm-model)         llm_model="$2"; shift 2 ;;
-          --gateway-host)      gateway_host="$2"; shift 2 ;;
-          --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
+          --llm-model)         need_value "$@"; llm_model="$2"; shift 2 ;;
+          --gateway-host)      need_value "$@"; gateway_host="$2"; shift 2 ;;
+          --xmpp-allow-from)   need_value "$@"; xmpp_allow_from="$2"; shift 2 ;;
           -*)                die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -968,7 +973,7 @@ main() {
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
-          --xmpp-domain)     xmpp_domain="$2"; shift 2 ;;
+          --xmpp-domain)     need_value "$@"; xmpp_domain="$2"; shift 2 ;;
           --no-health)       HEALTH_OPT_OUT=true; shift ;;
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
@@ -980,30 +985,30 @@ main() {
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-lunardepth) with_lunardepth="true"; shift ;;
-          --lunardepth-model) [[ $# -ge 2 ]] || die "--lunardepth-model requires a value"; lunardepth_model="$2"; shift 2 ;;
-          --lunardepth-base-url) [[ $# -ge 2 ]] || die "--lunardepth-base-url requires a value"; lunardepth_base_url="$2"; shift 2 ;;
-          --lunardepth-api-key-file) lunardepth_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
-          --lunardepth-api-key-dir) [[ $# -ge 2 ]] || die "--lunardepth-api-key-dir requires a value"; lunardepth_api_key_dir="$2"; shift 2 ;;
+          --lunardepth-model) need_value "$@"; lunardepth_model="$2"; shift 2 ;;
+          --lunardepth-base-url) need_value "$@"; lunardepth_base_url="$2"; shift 2 ;;
+          --lunardepth-api-key-file) need_value "$@"; lunardepth_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+          --lunardepth-api-key-dir) need_value "$@"; lunardepth_api_key_dir="$2"; shift 2 ;;
           --lunardepth-allow-insecure-http) lunardepth_allow_insecure="true"; shift ;;
           --lunardepth-allow-unauthenticated-gateway) lunardepth_allow_placeholder="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
-          --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
-          --llm-api-key)     llm_api_key="$2"; shift 2 ;;
-          --llm-base-url)    llm_base_url="$2"; shift 2 ;;
-          --tensorzero-url)  tz_url="$2"; shift 2 ;;
-          --gotify-url)      gotify_url="$2"; shift 2 ;;
-          --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --opencode-model)    opencode_model="$2"; shift 2 ;;
-          --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
-          --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
-          --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
-          --kimi-model)        kimi_model="$2"; shift 2 ;;
-          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
-          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --study-mcp-home)  need_value "$@"; study_mcp_home="$2"; shift 2 ;;
+          --llm-api-key)     need_value "$@"; llm_api_key="$2"; shift 2 ;;
+          --llm-base-url)    need_value "$@"; llm_base_url="$2"; shift 2 ;;
+          --tensorzero-url)  need_value "$@"; tz_url="$2"; shift 2 ;;
+          --gotify-url)      need_value "$@"; gotify_url="$2"; shift 2 ;;
+          --gotify-title)    need_value "$@"; gotify_title="$2"; shift 2 ;;
+          --opencode-model)    need_value "$@"; opencode_model="$2"; shift 2 ;;
+          --opencode-base-url) need_value "$@"; opencode_base_url="$2"; shift 2 ;;
+          --opencode2-model)    need_value "$@"; opencode2_model="$2"; shift 2 ;;
+          --opencode2-base-url) need_value "$@"; opencode2_base_url="$2"; shift 2 ;;
+          --kimi-model)        need_value "$@"; kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     need_value "$@"; kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key-file) need_value "$@"; kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
           --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
-          --llm-model)         llm_model="$2"; shift 2 ;;
-          --gateway-host)      gateway_host="$2"; shift 2 ;;
-          --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
+          --llm-model)         need_value "$@"; llm_model="$2"; shift 2 ;;
+          --gateway-host)      need_value "$@"; gateway_host="$2"; shift 2 ;;
+          --xmpp-allow-from)   need_value "$@"; xmpp_allow_from="$2"; shift 2 ;;
           -*)                die "unknown flag: $1" ;;
           *)
             if [[ -z "$names_csv" ]]; then names_csv="$1"; shift
@@ -1128,7 +1133,7 @@ main() {
       local darkirc_tenant=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --tenant) darkirc_tenant="$2"; shift 2 ;;
+          --tenant) need_value "$@"; darkirc_tenant="$2"; shift 2 ;;
           -*)       die "unknown flag: $1" ;;
           *)        die "unexpected argument: $1" ;;
         esac
@@ -1216,7 +1221,7 @@ main() {
         case "$1" in
           --no-cache)          no_cache="true"; shift ;;
           --with-toolchains)   with_toolchains="true"; shift ;;
-          --kimi-code-version) kimi_code_version="$2"; shift 2 ;;
+          --kimi-code-version) need_value "$@"; kimi_code_version="$2"; shift 2 ;;
           -*)                  die "unknown flag: $1" ;;
           *)                   die "unexpected argument: $1" ;;
         esac
@@ -1314,11 +1319,11 @@ main() {
           --with-kimi)      cand_kimi="true"; shift ;;
           --with-opencode2) cand_oc2="true"; shift ;;
           --with-lunardepth) cand_lunardepth="true"; shift ;;
-          --target)         cand_target="$2"; shift 2 ;;
+          --target)         need_value "$@"; cand_target="$2"; shift 2 ;;
           --target=*)       cand_target="${1#*=}"; shift ;;
-          --selected-commit) [[ $# -ge 2 ]] || die "--selected-commit requires a value"; cand_selected_commit="$2"; shift 2 ;;
+          --selected-commit) need_value "$@"; cand_selected_commit="$2"; shift 2 ;;
           --selected-commit=*) cand_selected_commit="${1#*=}"; shift ;;
-          --sandbox-image)  cand_sandbox_policy="$2"; shift 2 ;;
+          --sandbox-image)  need_value "$@"; cand_sandbox_policy="$2"; shift 2 ;;
           --sandbox-image=*) cand_sandbox_policy="${1#*=}"; shift ;;
           -*)               die "unknown flag: $1" ;;
           *)
@@ -1390,11 +1395,11 @@ main() {
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --url)
-            [[ $# -ge 2 ]] || die "--url requires an HTTPS origin"
+            need_value "$@"
             _vision_url="$2"; shift 2
             ;;
           --token-file)
-            [[ $# -ge 2 ]] || die "--token-file requires a path"
+            need_value "$@"
             _vision_token_file="$2"; shift 2
             ;;
           -*) die "unknown flag: $1" ;;
@@ -1431,7 +1436,7 @@ main() {
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --model-manifest)
-            [[ $# -ge 2 ]] || die "--model-manifest requires a path"
+            need_value "$@"
             _voice_manifest="$2"; shift 2
             ;;
           -*) die "unknown flag: $1" ;;
@@ -1476,7 +1481,7 @@ main() {
           -*) die "unknown flag: $1" ;;
           *) die "unexpected argument: $1" ;;
         esac
-        [[ $# -ge 2 ]] || die "$1 requires a value"
+        need_value "$@"
         _voice_value="$2"
         _voice_settings+=("${_voice_key}=${_voice_value}")
         shift 2
@@ -1685,11 +1690,11 @@ main() {
       local sandbox_policy="$SANDBOX_IMAGE_POLICY"
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --target)      target="$2"; shift 2 ;;
-          --source-repo) source_repo="$2"; shift 2 ;;
+          --target)      need_value "$@"; target="$2"; shift 2 ;;
+          --source-repo) need_value "$@"; source_repo="$2"; shift 2 ;;
           --no-backup)   do_backup="false"; shift ;;
           --skip-render) do_render="false"; shift ;;
-          --sandbox-image) sandbox_policy="$2"; shift 2 ;;
+          --sandbox-image) need_value "$@"; sandbox_policy="$2"; shift 2 ;;
           --sandbox-image=*) sandbox_policy="${1#*=}"; shift ;;
           -*)            die "unknown flag: $1" ;;
           *)
@@ -1867,9 +1872,9 @@ main() {
       local name="" nanogpt_key="" pebble_model="" pebble_base_url=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --nanogpt-api-key) nanogpt_key="$2"; shift 2 ;;
-          --model)           pebble_model="$2"; shift 2 ;;
-          --base-url)        pebble_base_url="$2"; shift 2 ;;
+          --nanogpt-api-key) need_value "$@"; nanogpt_key="$2"; shift 2 ;;
+          --model)           need_value "$@"; pebble_model="$2"; shift 2 ;;
+          --base-url)        need_value "$@"; pebble_base_url="$2"; shift 2 ;;
           -*)                die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1893,8 +1898,8 @@ main() {
       local name="" oc_model="" oc_base_url=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --model)    oc_model="$2"; shift 2 ;;
-          --base-url) oc_base_url="$2"; shift 2 ;;
+          --model)    need_value "$@"; oc_model="$2"; shift 2 ;;
+          --base-url) need_value "$@"; oc_base_url="$2"; shift 2 ;;
           -*)         die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1912,8 +1917,8 @@ main() {
       local name="" oc2_model="" oc2_base_url=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --model)    oc2_model="$2"; shift 2 ;;
-          --base-url) oc2_base_url="$2"; shift 2 ;;
+          --model)    need_value "$@"; oc2_model="$2"; shift 2 ;;
+          --base-url) need_value "$@"; oc2_base_url="$2"; shift 2 ;;
           -*)         die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1931,9 +1936,9 @@ main() {
       local name="" lunar_model="" lunar_base_url="" lunar_api_key="" lunar_insecure="preserve" lunar_placeholder="preserve"
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --model)    lunar_model="$2"; shift 2 ;;
-          --base-url) lunar_base_url="$2"; shift 2 ;;
-          --api-key-file) lunar_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+          --model)    need_value "$@"; lunar_model="$2"; shift 2 ;;
+          --base-url) need_value "$@"; lunar_base_url="$2"; shift 2 ;;
+          --api-key-file) need_value "$@"; lunar_api_key="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
           --allow-insecure-http) lunar_insecure="true"; shift ;;
           --disallow-insecure-http) lunar_insecure="false"; shift ;;
           --allow-unauthenticated-gateway) lunar_placeholder="true"; shift ;;
@@ -1955,9 +1960,9 @@ main() {
       local name="" kimi_model="" kimi_base_url="" kimi_api_key=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --model)    kimi_model="$2"; shift 2 ;;
-          --base-url) kimi_base_url="$2"; shift 2 ;;
-          --api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --model)    need_value "$@"; kimi_model="$2"; shift 2 ;;
+          --base-url) need_value "$@"; kimi_base_url="$2"; shift 2 ;;
+          --api-key-file) need_value "$@"; kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
           --api-key)  die "--api-key was removed; use --api-key-file" ;;
           -*)         die "unknown flag: $1" ;;
           *)
@@ -1982,8 +1987,8 @@ main() {
       local name="" study_home="" study_state_home="" study_allow_write="false" study_sync="false" knowledge_sync_mode=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --home) study_home="$2"; shift 2 ;;
-          --state-home) study_state_home="$2"; shift 2 ;;
+          --home) need_value "$@"; study_home="$2"; shift 2 ;;
+          --state-home) need_value "$@"; study_state_home="$2"; shift 2 ;;
           --allow-write) study_allow_write="true"; shift ;;
           --sync) study_sync="true"; shift ;;
           --enable-knowledge-sync)
@@ -2045,8 +2050,8 @@ main() {
       local name="" ssh_host="" ssh_user=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --host) ssh_host="$2"; shift 2 ;;
-          --user) ssh_user="$2"; shift 2 ;;
+          --host) need_value "$@"; ssh_host="$2"; shift 2 ;;
+          --user) need_value "$@"; ssh_user="$2"; shift 2 ;;
           -*)     die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -2135,7 +2140,7 @@ main() {
       local name="" old_scope="default"
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --from) old_scope="$2"; shift 2 ;;
+          --from) need_value "$@"; old_scope="$2"; shift 2 ;;
           -*)     die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
