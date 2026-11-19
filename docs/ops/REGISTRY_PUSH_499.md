@@ -69,7 +69,7 @@ Two different sizes at two different rates stop at the same 61.18 s, from a
 third network, with a control upload passing in under a second: the limit is
 time, not size, and it is not runner 17.
 
-The response names the culprit. It is `HTTP/2 502`, `content-length: 11`,
+The response points to the edge. It is `HTTP/2 502`, `content-length: 11`,
 body `Bad Gateway`, and **no `server` header**:
 
 ```
@@ -80,14 +80,14 @@ date: Thu, 19 Nov 2026 18:08:52 GMT
 Bad Gateway
 ```
 
-Omnibus nginx stamps every response it generates with `server: nginx` (the
-plain `https://git.lunarwing.org/` front page carries it), so an 11-byte
-`Bad Gateway` without that header is the edge's own error page — the same
-component that produces the runner's `499`/`504`. That fits
+Normal responses from omnibus nginx carry `server: nginx` (for example, the
+`https://git.lunarwing.org/` front page). The 11-byte `Bad Gateway` without
+that header supports an edge-generated `502` for this probe. That fits
 `entryPoints.websecure.transport.respondingTimeouts.readTimeout` (60 s default
-since Traefik 2.11.2/3.0), which both hosts use. The status moving from `499`
-and `504` to a clean `502` changes nothing about the cause: all three are the
-edge abandoning the request at the same boundary.
+since Traefik 2.11.2/3.0). The runner's `499`, `504` and resets line up with
+the same timeout, but the runner trace alone does not identify which hop
+produced a status. Omnibus nginx can log a `499` when Traefik, its client,
+abandons the request; that log entry is distinct from what the runner receives.
 
 Only the access-log line remains unseen, because the edge host has no shell
 reachable from this box (SSH lands in GitLab-shell). WI#706 acceptance box 1
@@ -134,9 +134,10 @@ Two timeout layers are the realistic suspects, in order:
 1. **Traefik `websecure` entrypoint `respondingTimeouts`** — `readTimeout`
    bounds the *total* time to read the client request body, and its default
    has been **60 seconds** since Traefik 2.11.2 and 3.0. A long blob or
-   artifact upload is aborted mid-stream at that boundary. The omnibus nginx
-   in front of the registry then logs `499` because its client (Traefik) went
-   away, and the runner sees `499`, `504` or a connection reset.
+   artifact upload can be aborted mid-stream at that boundary. Omnibus nginx
+   can then log `499` because Traefik closed the upstream request. The probe
+   received an apparent edge `502`; the runner's `499`, `504` and resets have
+   not been correlated with the edge and nginx logs for those requests.
 2. **omnibus `registry_nginx`** — `client_body_timeout` (nginx default **60
    s** between successive body reads) and `proxy_read_timeout`/`proxy_send_timeout`.
    A slow runner uplink stretching a multi-GB layer read past one of these
@@ -218,13 +219,16 @@ docker exec gitlab grep -rE 'client_body_timeout|proxy_read_timeout|proxy_send_t
 # Traefik static config in effect
 docker inspect traefik --format '{{json .Args}}'    # or read its static yaml
 
-# during a failing push, watch which hop records the 499
+# during a failing push, correlate the same request across the two logs
 docker logs -f traefik                               # access log status codes
 docker exec gitlab tail -f /var/log/gitlab/nginx/gitlab_registry_access.log
 ```
 
-Whichever component logs the 499 first is where the upstream peer disappeared;
-the timeout to raise belongs to the component *in front of* it.
+Compare the timestamps, request path, duration and status for the same upload.
+With Traefik JSON access logs, distinguish `DownstreamStatus` (sent to the
+client) from `OriginStatus` (outcome of the upstream request). An nginx `499`
+means its client disconnected, not that nginx sent `499` to the runner or
+that nginx's own timeout fired.
 
 ## Interim mitigation — runner 17 (applied 2026-11-19)
 
@@ -258,27 +262,43 @@ been done from the dev box — see “Live confirmation” above.
 ## Verification
 
 1. **The go/no-go probe** — a rate-limited upload through the edge, run from
-   any workstation. Create a throwaway private project, upload 12 MiB at
-   100 KiB/s (about 123 s of body), then delete the project:
+   a workstation with Bash and curl 7.55.0 or newer. Use a dedicated, standing
+   **private probe project** on this GitLab instance. Use its numeric project
+   ID and a short-lived **project access token** with `api` scope and the least
+   project role that permits uploads. Do not use an administrator's personal
+   token. The probe uploads 12 MiB at 100 KiB/s (about 123 s of body). Run
+   this block in a terminal; it prompts without echoing the token:
 
    ```bash
-   TOKEN=...    # PAT with `api` scope; keep it out of logs and files
-   PROBE=$(curl -sS -X POST 'https://git.lunarwing.org/api/v4/projects' \
-     -H "PRIVATE-TOKEN: $TOKEN" \
-     --data-urlencode 'name=edge-timeout-probe' \
-     --data-urlencode 'visibility=private' \
-     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+   (
+     set +ax # Do not auto-export or trace the token.
+     set -euo pipefail
+     unset probe_token
+     umask 077
+     probe_id='REPLACE_WITH_PRIVATE_PROBE_PROJECT_ID'
+     [[ "$probe_id" =~ ^[1-9][0-9]*$ ]] || { echo 'Set the numeric probe project ID.' >&2; exit 1; }
 
-   head -c 12582912 /dev/urandom > /tmp/probe.bin
-   curl -sS --limit-rate 100k --max-time 280 \
-     -o /tmp/probe.out \
-     -w 'status=%{http_code} elapsed=%{time_total}s sent=%{size_upload}B\n' \
-     -X POST "https://git.lunarwing.org/api/v4/projects/$PROBE/uploads" \
-     -H "PRIVATE-TOKEN: $TOKEN" -F 'file=@/tmp/probe.bin'
+     scratch=$(mktemp -d)
+     trap 'rm -f -- "$scratch/probe.bin" "$scratch/probe.out"; rmdir -- "$scratch"' EXIT
+     CDPATH='' cd -- "$scratch"
+     scratch=$PWD
+     head -c 12582912 /dev/urandom > probe.bin
 
-   curl -sS -X DELETE "https://git.lunarwing.org/api/v4/projects/$PROBE" \
-     -H "PRIVATE-TOKEN: $TOKEN"
+     IFS= read -rs -p 'Probe project access token: ' probe_token </dev/tty
+     printf '\n' >&2
+     [[ -n "$probe_token" && "$probe_token" != *[[:space:][:cntrl:]]* ]] || exit 1
+     builtin printf 'PRIVATE-TOKEN: %s\n' "$probe_token" |
+       curl --disable --silent --show-error --limit-rate 100k --max-time 280 \
+         --header @- --form 'file=@probe.bin' --output probe.out \
+         --write-out 'status=%{http_code} elapsed=%{time_total}s sent=%{size_upload}B\n' \
+         "https://git.lunarwing.org/api/v4/projects/$probe_id/uploads"
+   )
    ```
+
+   The token goes to curl on standard input, not in its arguments or a file.
+   Local scratch files are removed on exit. Successful uploads stay in the
+   probe project; have a project Maintainer periodically remove them via the
+   [Markdown uploads API](https://docs.gitlab.com/api/project_markdown_uploads/).
 
    **Before the fix** this ends at about 61 s with `status=502` and `sent`
    well under 12 MiB (measured 2026-11-19: 61.18 s, 6.0 MiB). **After the

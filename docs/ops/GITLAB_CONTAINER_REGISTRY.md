@@ -155,12 +155,13 @@ timeouts per `REGISTRY_PUSH_499.md`. Leave request buffering off.
 
 The default is still in force as of 2026-11-19: a rate-limited upload through
 the edge is cut at 61.18 s every time, and the cut answer is `HTTP/2 502` with
-an 11-byte `Bad Gateway` body and no `server` header — the edge's own error
-page, not omnibus nginx. The boundary has been measured with 12 MiB at
-100 KiB/s and with 25 MiB at 400 KiB/s (both stop at 61.18 s), so it is a time
-limit, not a size limit. After the change, the same probe must end `201` in
-about 125 s; the exact commands are in `REGISTRY_PUSH_499.md`
-§Verification.
+an 11-byte `Bad Gateway` body and no `server` header, consistent with an
+edge-generated error rather than an omnibus nginx response. This is separate
+from an upstream nginx `499` log entry when Traefik disconnects. Uploads of
+12 MiB at 100 KiB/s and 25 MiB at 400 KiB/s both stopped at 61.18 s, pointing
+to a time limit rather than a size limit. After the change, the same probe
+must end `201` in about 125 s; see [Verification](REGISTRY_PUSH_499.md#verification)
+for the commands.
 
 Until the edge change is live, runner 17 (the slow `laptop`/`rainova43`
 runner) no longer carries the `container-build` tag, so it cannot take the
