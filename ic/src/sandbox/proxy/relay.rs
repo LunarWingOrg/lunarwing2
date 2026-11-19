@@ -668,7 +668,10 @@ mod tests {
             assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
             assert!(reason.contains("cannot set sockcreate"), "{reason}");
         }
-        assert!(!socket.exists(), "a refused candidate must not leave a socket");
+        assert!(
+            !socket.exists(),
+            "a refused candidate must not leave a socket"
+        );
 
         let (listener, label) = bind_relay_listener_at(&nodes, &socket).unwrap();
         assert_eq!(label, None, "a refused label must keep the daemon socket");
