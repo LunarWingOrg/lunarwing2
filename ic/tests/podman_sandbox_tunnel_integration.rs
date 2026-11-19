@@ -1,11 +1,22 @@
-//! Real-Podman tunnel sidecar coverage (WI#248, WI#592, WI#600, WI#602, WI#603, WI#604, WI#614, and WI#695).
+//! Live tunnel sidecar coverage on Podman or Docker (WI#248, WI#592, WI#600,
+//! WI#602, WI#603, WI#604, WI#614, WI#695, and WI#771).
 //!
-//! WireGuard is double-gated by LUNARWING_E2E_PODMAN_TESTS=1 and
-//! LUNARWING_E2E_TUNNEL_TESTS=1. NetBird additionally requires
-//! LUNARWING_E2E_NETBIRD_TESTS=1, a real management service, a reusable key
-//! file, and an image containing NetBird, nftables, nc, wget, ping, and nslookup.
-//! Optional settings cover management-server restart and an in-overlay DNS
-//! fixture. NetBird custom DNS is rejected by the unit-level configuration gate.
+//! The lane is gated by LUNARWING_E2E_TUNNEL_TESTS=1 plus exactly one runtime
+//! gate: LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1 (the
+//! same Docker flag the generic sandbox acceptance lane uses). Opening both
+//! runtime gates is refused rather than guessed. LUNARWING_E2E_TUNNEL_RUNTIME
+//! (`podman` or `docker`) must agree with the open gate when it is set.
+//!
+//! The detached-helper checks need systemd service mode. On any other host
+//! they print a skip; set LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 to turn that
+//! skip into a failure, which is how a systemd-service-mode run proves the
+//! checks actually executed (WI#771).
+//!
+//! NetBird additionally requires LUNARWING_E2E_NETBIRD_TESTS=1, a real
+//! management service, a reusable key file, and an image containing NetBird,
+//! nftables, nc, wget, ping, and nslookup. Optional settings cover
+//! management-server restart and an in-overlay DNS fixture. NetBird custom DNS
+//! is rejected by the unit-level configuration gate.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -24,22 +35,86 @@ use secrecy::SecretString;
 
 const E2E_IMAGE: &str = "localhost/lw-tunnel-e2e:latest";
 const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
-const JOINED_PROBE: &str = "cat /etc/resolv.conf; \
+
+/// Joined-run probe. The host-escape case resolves the runtime host alias
+/// first (`host.containers.internal` on Podman, `host.docker.internal` on
+/// Docker) and falls back to the uplink gateway, so the assertion is not
+/// vacuous on a runtime whose alias is absent.
+fn joined_probe() -> String {
+    "cat /etc/resolv.conf; \
      ip -o link show wg0 >/dev/null && echo LUNARWING-TUNNEL-JOIN-OK; \
      wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-UPLINK-OPEN; \
      wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-METADATA-OPEN; \
-     H=$(getent hosts host.containers.internal | cut -d' ' -f1); \
+     H=$(getent hosts host.containers.internal host.docker.internal 2>/dev/null | cut -d' ' -f1 | head -1); \
+     [ -z \"$H\" ] && H=$(ip route show default 2>/dev/null | cut -d' ' -f3); \
      if [ -n \"$H\" ] && nc -z -w 2 \"$H\" 22 >/dev/null 2>&1; then echo LUNARWING-TUNNEL-HOST-OPEN; fi; \
      nslookup example.com 2>&1 || true; \
      nslookup example.com >/dev/null 2>&1 && echo LUNARWING-TUNNEL-DNS-OK; \
-     true";
+     true"
+    .to_string()
+}
 
 fn gate_open(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
-async fn podman_output(args: &[&str]) -> Result<Output, String> {
-    tokio::process::Command::new("podman")
+/// Runtime the lane drives. The tunnel gate plus exactly one runtime gate
+/// opens the lane; anything else keeps it closed.
+fn tunnel_runtime() -> ContainerRuntime {
+    let podman = gate_open("LUNARWING_E2E_PODMAN_TESTS");
+    let docker = gate_open("LUNARWING_E2E_DOCKER_TESTS");
+    assert!(
+        podman != docker,
+        "open exactly one of LUNARWING_E2E_PODMAN_TESTS and LUNARWING_E2E_DOCKER_TESTS for the tunnel lane"
+    );
+    let gate_runtime = if docker {
+        ContainerRuntime::Docker
+    } else {
+        ContainerRuntime::Podman
+    };
+    let Ok(selected) = std::env::var("LUNARWING_E2E_TUNNEL_RUNTIME") else {
+        return gate_runtime;
+    };
+    let selected = match selected.trim().to_ascii_lowercase().as_str() {
+        "" => return gate_runtime,
+        "podman" => ContainerRuntime::Podman,
+        "docker" => ContainerRuntime::Docker,
+        other => panic!("LUNARWING_E2E_TUNNEL_RUNTIME must be `podman` or `docker`, not {other:?}"),
+    };
+    assert_eq!(
+        selected, gate_runtime,
+        "LUNARWING_E2E_TUNNEL_RUNTIME contradicts the open runtime gate"
+    );
+    selected
+}
+
+fn tunnel_sandbox_runtime() -> SandboxRuntime {
+    match tunnel_runtime() {
+        ContainerRuntime::Podman => SandboxRuntime::Podman,
+        ContainerRuntime::Docker => SandboxRuntime::Docker,
+    }
+}
+
+fn tunnel_lane_open() -> bool {
+    if !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        return false;
+    }
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") && !gate_open("LUNARWING_E2E_DOCKER_TESTS") {
+        return false;
+    }
+    let _ = tunnel_runtime();
+    true
+}
+
+/// `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` makes the detached-helper checks
+/// fail instead of skip when the workload spawner does not use systemd
+/// services.
+fn systemd_required() -> bool {
+    gate_open("LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD")
+}
+
+async fn runtime_output(args: &[&str]) -> Result<Output, String> {
+    tokio::process::Command::new(tunnel_runtime().binary())
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -47,13 +122,14 @@ async fn podman_output(args: &[&str]) -> Result<Output, String> {
         .map_err(|error| error.to_string())
 }
 
-async fn podman_success(args: &[&str]) -> Result<(), String> {
-    let output = podman_output(args).await?;
+async fn runtime_success(args: &[&str]) -> Result<(), String> {
+    let output = runtime_output(args).await?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "podman {} failed: {}",
+            "{} {} failed: {}",
+            tunnel_runtime().binary(),
             args.first().copied().unwrap_or("command"),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
@@ -64,7 +140,7 @@ async fn tunnel_image() -> Option<String> {
     if let Ok(image) = std::env::var("LUNARWING_E2E_TUNNEL_IMAGE") {
         return Some(image);
     }
-    let exists = podman_success(&["image", "exists", E2E_IMAGE])
+    let exists = runtime_success(&["image", "inspect", E2E_IMAGE])
         .await
         .is_ok();
     if exists || build_tunnel_image().await {
@@ -77,8 +153,9 @@ async fn tunnel_image() -> Option<String> {
 async fn build_tunnel_image() -> bool {
     let dir = std::env::temp_dir().join(format!("lw-tunnel-e2e-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    let containerfile = dir.join("Containerfile");
-    let alpine = std::env::var("LUNARWING_E2E_PODMAN_IMAGE")
+    let containerfile = dir.join("Dockerfile");
+    let alpine = std::env::var("LUNARWING_E2E_TUNNEL_BASE_IMAGE")
+        .or_else(|_| std::env::var("LUNARWING_E2E_PODMAN_IMAGE"))
         .unwrap_or_else(|_| "quay.io/libpod/alpine:latest".to_string());
     let written = std::fs::write(
         &containerfile,
@@ -88,7 +165,7 @@ async fn build_tunnel_image() -> bool {
     if !written {
         return false;
     }
-    let result = podman_success(&["build", "-t", E2E_IMAGE, dir.to_string_lossy().as_ref()]).await;
+    let result = runtime_success(&["build", "-t", E2E_IMAGE, dir.to_string_lossy().as_ref()]).await;
     let _ = std::fs::remove_dir_all(&dir);
     result.is_ok()
 }
@@ -96,19 +173,19 @@ async fn build_tunnel_image() -> bool {
 async fn rotate_tunnel_image(image: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("lw-tunnel-rotate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let containerfile = dir.join("Containerfile");
+    let containerfile = dir.join("Dockerfile");
     std::fs::write(
         &containerfile,
         format!("FROM {image}\nRUN echo wi592 > /etc/lunarwing-image-rotation\n"),
     )
     .map_err(|error| error.to_string())?;
-    let result = podman_success(&["build", "-t", image, dir.to_string_lossy().as_ref()]).await;
+    let result = runtime_success(&["build", "-t", image, dir.to_string_lossy().as_ref()]).await;
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
 async fn generate_wg_private_key(image: &str) -> Option<String> {
-    let output = podman_output(&["run", "--rm", image, "wg", "genkey"])
+    let output = runtime_output(&["run", "--rm", image, "wg", "genkey"])
         .await
         .ok()?;
     let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -116,7 +193,7 @@ async fn generate_wg_private_key(image: &str) -> Option<String> {
 }
 
 async fn generate_wg_keypair(image: &str) -> Option<(String, String)> {
-    let output = podman_output(&[
+    let output = runtime_output(&[
         "run",
         "--rm",
         image,
@@ -164,7 +241,7 @@ fn private_runtime_dir(workdir: &Path) -> PathBuf {
 }
 
 async fn tunnel_container_id(name: &str) -> Option<String> {
-    let output = podman_output(&["inspect", "--format", "{{.Id}}", name])
+    let output = runtime_output(&["inspect", "--format", "{{.Id}}", name])
         .await
         .ok()?;
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -175,7 +252,7 @@ async fn assert_no_unfiltered_sidecar(name: &str) -> Result<(), String> {
     if tunnel_container_id(name).await.is_none() {
         return Ok(());
     }
-    let listed = podman_success(&[
+    let listed = runtime_success(&[
         "exec",
         name,
         "nft",
@@ -197,6 +274,45 @@ async fn wait_container_absent(name: &str) -> Result<(), String> {
     }
     Err(format!(
         "sidecar {name} remained after cancelled-start cleanup"
+    ))
+}
+
+/// Every container carrying the tunnel labels, so a run can prove it left
+/// nothing behind rather than only that one name is gone.
+async fn tunnel_labeled_containers() -> Result<Vec<String>, String> {
+    let output = runtime_output(&[
+        "ps",
+        "-a",
+        "--filter",
+        "label=lunarwing.sandbox-tunnel",
+        "--format",
+        "{{.Names}}",
+    ])
+    .await?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Fails closed on any leftover tunnel container, sidecar or run.
+async fn assert_tunnel_containers_absent(context: &str) -> Result<(), String> {
+    for _ in 0..225 {
+        let remaining = tunnel_labeled_containers().await?;
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let remaining = tunnel_labeled_containers().await?;
+    Err(format!(
+        "tunnel containers remained after {context}: {}",
+        remaining.join(", ")
     ))
 }
 
@@ -222,7 +338,7 @@ fn manager_with_sidecar(
     SandboxManager::new_with_tunnel_sidecar(
         SandboxConfig {
             image: image.to_string(),
-            runtime: SandboxRuntime::Podman,
+            runtime: tunnel_sandbox_runtime(),
             network: SandboxNetworkMode::Tunnel,
             tunnel: Some(config.clone()),
             protected_paths: Vec::new(),
@@ -233,19 +349,35 @@ fn manager_with_sidecar(
     )
 }
 
-async fn assert_detached_helper_stopped(container_name: &str) {
+/// True when the daemon's workload spawner runs in systemd service mode, so
+/// the detached `run` client gets a transient unit.
+async fn systemd_service_mode() -> bool {
+    lunarwing::tools::process::workload_spawner()
+        .await
+        .uses_systemd_services()
+}
+
+/// The detached-helper checks only mean anything in systemd service mode.
+/// Without it they report a skip; with `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1`
+/// that skip becomes a failure so a service-mode run cannot pass vacuously.
+fn skip_or_fail_without_service_mode(what: &str) {
+    if systemd_required() {
+        panic!(
+            "LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the workload spawner is not in systemd \
+             service mode, so {what} cannot run"
+        );
+    }
+    eprintln!("skipping {what}: the workload spawner is not in systemd service mode");
+}
+
+fn helper_unit_for(container_name: &str) -> String {
     let instance = container_name
         .strip_prefix("lunarwing-sandbox-tunnel-")
         .expect("instance-specific sidecar name");
-    let unit = format!("lunarwing-tunnel-{instance}");
-    let manager = tokio::process::Command::new("systemctl")
-        .args(["--user", "show", "--property=Version"])
-        .output()
-        .await;
-    if !matches!(manager, Ok(output) if output.status.success()) {
-        eprintln!("skipping detached-unit check: no systemd user manager");
-        return;
-    }
+    format!("lunarwing-tunnel-{instance}")
+}
+
+async fn user_unit_listing() -> Option<String> {
     let output = tokio::process::Command::new("systemctl")
         .args([
             "--user",
@@ -257,14 +389,56 @@ async fn assert_detached_helper_stopped(container_name: &str) {
             "--full",
         ])
         .output()
-        .await
-        .expect("list user units");
-    assert!(output.status.success());
-    let listing = String::from_utf8_lossy(&output.stdout);
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The helper unit must exist while the sidecar runs, otherwise the
+/// "unit is gone afterwards" check proves nothing.
+async fn assert_detached_helper_used(container_name: &str) {
+    if !systemd_service_mode().await {
+        skip_or_fail_without_service_mode("the detached-unit-in-use check");
+        return;
+    }
+    let unit = helper_unit_for(container_name);
+    let listing = user_unit_listing().await.expect("list systemd user units");
+    assert!(
+        listing.contains(&format!("{unit}.service")),
+        "the sidecar started without its helper unit {unit}.service:\n{listing}"
+    );
+}
+
+async fn assert_detached_helper_stopped(container_name: &str) {
+    if !systemd_service_mode().await {
+        skip_or_fail_without_service_mode("the detached-unit cleanup check");
+        return;
+    }
+    let unit = helper_unit_for(container_name);
+    let manager = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", "--property=Version"])
+        .output()
+        .await;
+    if !matches!(manager, Ok(output) if output.status.success()) {
+        panic!(
+            "the workload spawner is in systemd service mode but no user manager answered; \
+             {unit} cannot be checked"
+        );
+    }
+    let listing = user_unit_listing().await.expect("list user units");
     assert!(
         !listing.contains(&format!("{unit}.service")),
         "detached unit remains:\n{listing}"
     );
+    // Rootless Podman leaves a conmon/pasta helper if the unit was only half
+    // released. Docker has no pasta, so the scan is Podman-only.
+    if tunnel_runtime() != ContainerRuntime::Podman {
+        return;
+    }
     for process in std::fs::read_dir("/proc").expect("procfs").flatten() {
         let path = process.path();
         if !path
@@ -290,7 +464,7 @@ async fn assert_detached_helper_stopped(container_name: &str) {
 }
 
 async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
-    let output = podman_output(&[
+    let output = runtime_output(&[
         "exec",
         name,
         "nft",
@@ -349,12 +523,12 @@ async fn tamper_chain(name: &str, chain: &str, rule: &[&str]) -> Result<(), Stri
         chain,
     ];
     args.extend_from_slice(rule);
-    podman_success(&args).await
+    runtime_success(&args).await
 }
 
 async fn sidecar_resolv_conf(sidecar: &TunnelSidecar) -> Result<String, String> {
     let output =
-        podman_output(&["exec", sidecar.container_name(), "cat", "/etc/resolv.conf"]).await?;
+        runtime_output(&["exec", sidecar.container_name(), "cat", "/etc/resolv.conf"]).await?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
@@ -401,7 +575,7 @@ async fn assert_joined_run(
     dns: &[IpAddr],
 ) -> Result<(), String> {
     let sidecar_dns =
-        podman_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
+        runtime_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
     assert_eq!(
         sidecar_dns.status.success(),
         dns.is_empty(),
@@ -424,9 +598,14 @@ async fn assert_joined_run(
         .ensure_healthy()
         .await
         .map_err(|error| error.to_string())?;
-    let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
+    let runner = CliRunner::detect(tunnel_sandbox_runtime(), image.to_string())
         .await
         .map_err(|error| error.to_string())?;
+    assert_eq!(
+        runner.runtime(),
+        tunnel_runtime(),
+        "the joined run must drive the lane's runtime, not a fallback"
+    );
     let limits = ResourceLimits {
         timeout: Duration::from_secs(120),
         ..ResourceLimits::default()
@@ -444,7 +623,10 @@ async fn assert_joined_run(
             & 0o777;
         assert_eq!(mode, 0o644);
     }
-    let command = format!("{JOINED_PROBE}\ncat /proc/self/mountinfo\n{old_resolver_probe}\ntrue");
+    let command = format!(
+        "{probe}\ncat /proc/self/mountinfo\n{old_resolver_probe}\ntrue",
+        probe = joined_probe()
+    );
     let output = runner
         .execute(ExecParams {
             command: &command,
@@ -609,7 +791,7 @@ async fn monitor_stable_firewall(
                 .map(|_| ())
                 .ok_or_else(|| "no complete firewall listing was observed".into());
         }
-        let output = podman_output(&[
+        let output = runtime_output(&[
             "exec",
             name,
             "nft",
@@ -639,9 +821,12 @@ async fn monitor_stable_firewall(
 }
 
 #[tokio::test]
-async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_concurrent_first_commands_keep_firewall_stable() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -659,7 +844,7 @@ async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
     };
     let runtime_dir = private_runtime_dir(&workdir);
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config.clone(),
         &workdir,
         &runtime_dir,
@@ -674,10 +859,14 @@ async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
     let first = manager.execute("sleep 3; echo FIRST", &workdir, HashMap::new());
     let second = manager.execute("echo SECOND", &workdir, HashMap::new());
     let (first, second) = tokio::join!(first, second);
+    assert_detached_helper_used(&name).await;
     let _ = done.send(true);
     let monitored = monitor.await.expect("firewall monitor task");
     manager.shutdown().await;
     assert_detached_helper_stopped(&name).await;
+    assert_tunnel_containers_absent("the concurrent-command lane")
+        .await
+        .expect("no tunnel containers left behind");
     let _ = std::fs::remove_dir_all(&workdir);
 
     let first = first.expect("first concurrent sandbox command");
@@ -690,9 +879,12 @@ async fn podman_tunnel_concurrent_first_commands_keep_firewall_stable() {
 }
 
 #[tokio::test]
-async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_sidecar_wireguard_lifecycle_and_join() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -710,14 +902,14 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
     };
     let runtime_dir = private_runtime_dir(&workdir);
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config.clone(),
         &workdir,
         &runtime_dir,
     );
     let other_dir = workdir.join("other-instance");
     let other = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config,
         &other_dir,
         &runtime_dir,
@@ -752,14 +944,20 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
     other.stop().await;
     assert_detached_helper_stopped(sidecar.container_name()).await;
     assert_detached_helper_stopped(other.container_name()).await;
+    assert_tunnel_containers_absent("the WireGuard lifecycle lane")
+        .await
+        .expect("no tunnel containers left behind");
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("real WireGuard sidecar lifecycle and egress-only namespace");
 }
 
 #[tokio::test]
-async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_sidecar_custom_dns_closes_uplink() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -771,7 +969,7 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
     let dns = vec!["10.231.99.53".parse().unwrap()];
     let runtime_dir = private_runtime_dir(&workdir);
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
             image: Some(image.clone()),
@@ -790,9 +988,12 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
 }
 
 #[tokio::test]
-async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -822,7 +1023,7 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
     }
     let runtime_dir = private_runtime_dir(&workdir);
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
             image: Some(image),
@@ -841,7 +1042,7 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
         if start.is_finished() {
             break;
         }
-        if let Ok(output) = podman_output(&["exec", &name, "wg", "show", "wg0", "endpoints"]).await
+        if let Ok(output) = runtime_output(&["exec", &name, "wg", "show", "wg0", "endpoints"]).await
             && output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains("51820")
         {
@@ -850,9 +1051,9 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let resolver_conf = podman_output(&["exec", &name, "cat", "/etc/resolv.conf"]).await;
+    let resolver_conf = runtime_output(&["exec", &name, "cat", "/etc/resolv.conf"]).await;
     let result = start.await.expect("sidecar start task");
-    let _ = podman_success(&["rm", "-f", &name]).await;
+    let _ = runtime_success(&["rm", "-f", &name]).await;
     let _ = std::fs::remove_dir_all(&workdir);
     let error = result.expect_err("an unreachable peer must fail the handshake gate");
     assert_eq!(error.kind(), "sandbox_unavailable");
@@ -878,7 +1079,7 @@ async fn assert_cancelled_start_cleans_up(
             .map_err(|error| error.to_string())?;
     }
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         config,
         instance_dir,
         &runtime_dir,
@@ -924,9 +1125,12 @@ async fn assert_cancelled_start_cleans_up(
 }
 
 #[tokio::test]
-async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_dead_peer_fails_fast_through_manager() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -975,7 +1179,7 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
         ..TunnelSidecarConfig::default()
     };
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config.clone(),
         &instance_dir,
         &runtime_dir,
@@ -984,7 +1188,7 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
     let manager = SandboxManager::new_with_tunnel_sidecar(
         SandboxConfig {
             image,
-            runtime: SandboxRuntime::Podman,
+            runtime: tunnel_sandbox_runtime(),
             network: SandboxNetworkMode::Tunnel,
             tunnel: Some(tunnel_config.clone()),
             protected_paths: Vec::new(),
@@ -1040,16 +1244,19 @@ async fn build_delayed_tunnel_image(base: &str) -> Result<String, String> {
              printf '#!/bin/sh\\nsleep 25\\nexec /usr/local/bin/wg-quick-real \"$@\"\\n' > \"$WG_QUICK\" && \\\n\
              chmod 0755 \"$WG_QUICK\"\n"
     );
-    std::fs::write(dir.join("Containerfile"), containerfile).map_err(|error| error.to_string())?;
-    let result = podman_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
+    std::fs::write(dir.join("Dockerfile"), containerfile).map_err(|error| error.to_string())?;
+    let result = runtime_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
     let _ = std::fs::remove_dir_all(&dir);
     result.map(|()| image)
 }
 
 #[tokio::test]
-async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_cold_start_uses_the_configured_provider_budget() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let sandbox_image = tunnel_image().await.expect("WireGuard-capable image");
@@ -1081,7 +1288,7 @@ async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
         ..TunnelSidecarConfig::default()
     };
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config.clone(),
         &instance_dir,
         &runtime_dir,
@@ -1089,7 +1296,7 @@ async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
     let manager = SandboxManager::new_with_tunnel_sidecar(
         SandboxConfig {
             image: sandbox_image,
-            runtime: SandboxRuntime::Podman,
+            runtime: tunnel_sandbox_runtime(),
             network: SandboxNetworkMode::Tunnel,
             tunnel: Some(tunnel_config),
             protected_paths: Vec::new(),
@@ -1102,7 +1309,7 @@ async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
     let result = manager.execute("true", &workspace, HashMap::new()).await;
     let elapsed = started.elapsed();
     manager.shutdown().await;
-    let _ = podman_success(&["image", "rm", "-f", &delayed_image]).await;
+    let _ = runtime_success(&["image", "rm", "-f", &delayed_image]).await;
     let _ = std::fs::remove_dir_all(&workdir);
     let output = result.expect("a provider taking about 25 seconds must start");
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
@@ -1175,8 +1382,8 @@ async fn build_dual_peer_image(base: &str, peer_config: &Path) -> Result<String,
              cp /usr/local/bin/lunarwing-wg-quick \"$WG_QUICK\" && \\\n\
              chmod 0755 \"$WG_QUICK\" && chmod 0600 /etc/wireguard/wg1.conf\n"
     );
-    std::fs::write(dir.join("Containerfile"), containerfile).map_err(|error| error.to_string())?;
-    let result = podman_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
+    std::fs::write(dir.join("Dockerfile"), containerfile).map_err(|error| error.to_string())?;
+    let result = runtime_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
     let _ = std::fs::remove_dir_all(&dir);
     result.map(|()| image)
 }
@@ -1190,10 +1397,10 @@ async fn disable_recreated_peer(
         if tunnel_container_id(name)
             .await
             .is_some_and(|id| id != previous_id)
-            && podman_success(&["exec", name, "touch", "/tmp/lunarwing-peer-disabled"])
+            && runtime_success(&["exec", name, "touch", "/tmp/lunarwing-peer-disabled"])
                 .await
                 .is_ok()
-            && podman_success(&[
+            && runtime_success(&[
                 "exec",
                 name,
                 "wg",
@@ -1260,9 +1467,12 @@ fn write_live_peer_configs(
 }
 
 #[tokio::test]
-async fn podman_tunnel_healthy_peer_death_uses_bounded_reprobe() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
-        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+async fn tunnel_healthy_peer_death_uses_bounded_reprobe() {
+    if !tunnel_lane_open() {
+        eprintln!(
+            "skipping: set LUNARWING_E2E_TUNNEL_TESTS=1 and one runtime gate \
+             (LUNARWING_E2E_PODMAN_TESTS=1 or LUNARWING_E2E_DOCKER_TESTS=1)"
+        );
         return;
     }
     let image = tunnel_image().await.expect("WireGuard-capable image");
@@ -1290,7 +1500,7 @@ async fn podman_tunnel_healthy_peer_death_uses_bounded_reprobe() {
         ..TunnelSidecarConfig::default()
     };
     let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         tunnel_config.clone(),
         &workdir,
         &runtime_dir,
@@ -1312,8 +1522,8 @@ async fn podman_tunnel_healthy_peer_death_uses_bounded_reprobe() {
             .map_err(|error| error.to_string())?;
         assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
 
-        podman_success(&["exec", &name, "wg-quick", "down", "/etc/wireguard/wg1.conf"]).await?;
-        podman_success(&[
+        runtime_success(&["exec", &name, "wg-quick", "down", "/etc/wireguard/wg1.conf"]).await?;
+        runtime_success(&[
             "exec",
             &name,
             "wg",
@@ -1352,7 +1562,7 @@ async fn podman_tunnel_healthy_peer_death_uses_bounded_reprobe() {
     }
     .await;
     sidecar.stop().await;
-    let _ = podman_success(&["image", "rm", "-f", &dual_image]).await;
+    let _ = runtime_success(&["image", "rm", "-f", &dual_image]).await;
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("a real handshake followed by peer death must fail through bounded recovery");
 }
@@ -1376,7 +1586,7 @@ fn required_netbird_setup_key() -> Result<String, String> {
 }
 
 async fn netbird_ipv4(container: &str) -> Result<IpAddr, String> {
-    let output = podman_output(&["exec", container, "netbird", "status", "--ipv4"]).await?;
+    let output = runtime_output(&["exec", container, "netbird", "status", "--ipv4"]).await?;
     if !output.status.success() {
         return Err("netbird status --ipv4 failed".into());
     }
@@ -1388,7 +1598,7 @@ async fn netbird_ipv4(container: &str) -> Result<IpAddr, String> {
 
 async fn wait_netbird_ready(container: &str) -> Result<(), String> {
     for _ in 0..60 {
-        if podman_success(&["exec", container, "netbird", "status", "--check", "startup"])
+        if runtime_success(&["exec", container, "netbird", "status", "--check", "startup"])
             .await
             .is_ok()
         {
@@ -1425,7 +1635,7 @@ fn write_peer_env_file(workdir: &Path, url: &str, key: &str) -> Result<PathBuf, 
 async fn start_plain_netbird_peer(image: &str, name: &str, env_file: &Path) -> Result<(), String> {
     let env_file = env_file.to_string_lossy().into_owned();
     let state_volume = format!("{name}:/var/lib/netbird");
-    let started = podman_success(&[
+    let started = runtime_success(&[
         "run",
         "-d",
         "--rm",
@@ -1460,7 +1670,7 @@ async fn start_plain_netbird_peer(image: &str, name: &str, env_file: &Path) -> R
 }
 
 async fn netbird_status_detail(container: &str) -> Result<String, String> {
-    let output = podman_output(&["exec", container, "netbird", "status", "-d"]).await?;
+    let output = runtime_output(&["exec", container, "netbird", "status", "-d"]).await?;
     if !output.status.success() {
         return Err("netbird status -d failed".into());
     }
@@ -1495,7 +1705,7 @@ async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(),
     for _ in 0..30 {
         let primary_ip = netbird_ipv4(primary).await?;
         let peer_ip = netbird_ipv4(peer).await?;
-        let _ = podman_success(&[
+        let _ = runtime_success(&[
             "exec",
             primary,
             "ping",
@@ -1506,7 +1716,7 @@ async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(),
             &peer_ip.to_string(),
         ])
         .await;
-        let _ = podman_success(&[
+        let _ = runtime_success(&[
             "exec",
             peer,
             "ping",
@@ -1532,7 +1742,7 @@ async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(),
 async fn netbird_volume(sidecar: &TunnelSidecar) -> Result<String, String> {
     let format =
         "{{range .Mounts}}{{if eq .Destination \"/var/lib/netbird\"}}{{.Name}}{{end}}{{end}}";
-    let output = podman_output(&["inspect", "--format", format, sidecar.container_name()]).await?;
+    let output = runtime_output(&["inspect", "--format", format, sidecar.container_name()]).await?;
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if output.status.success() && !name.is_empty() {
         Ok(name)
@@ -1573,10 +1783,10 @@ async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String>
     let mut restart = vec!["restart"];
     restart.extend(servers.split_whitespace());
     if restart.len() > 1 {
-        podman_success(&restart).await?;
+        runtime_success(&restart).await?;
     } else {
-        podman_success(&["exec", name, "netbird", "down"]).await?;
-        podman_success(&["exec", name, "netbird", "up"]).await?;
+        runtime_success(&["exec", name, "netbird", "down"]).await?;
+        runtime_success(&["exec", name, "netbird", "up"]).await?;
     }
     wait_netbird_ready(name).await?;
     sidecar
@@ -1599,7 +1809,7 @@ async fn assert_netbird_reconnect(sidecar: &TunnelSidecar) -> Result<(), String>
 }
 
 async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String> {
-    let output = podman_output(&[
+    let output = runtime_output(&[
         "exec",
         sidecar.container_name(),
         "nft",
@@ -1632,13 +1842,13 @@ async fn assert_netbird_mark_rule(sidecar: &TunnelSidecar) -> Result<(), String>
 }
 
 async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
-    if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+    if runtime_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
         .await
         .is_ok()
     {
         return Ok(());
     }
-    podman_success(&[
+    runtime_success(&[
         "exec",
         "-d",
         peer,
@@ -1651,7 +1861,7 @@ async fn start_netbird_http_server(peer: &str) -> Result<(), String> {
     ])
     .await?;
     for _ in 0..30 {
-        if podman_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
+        if runtime_success(&["exec", peer, "nc", "-z", "-w", "1", "127.0.0.1", "8080"])
             .await
             .is_ok()
         {
@@ -1685,12 +1895,13 @@ async fn assert_netbird_resolver_policy(sidecar: &TunnelSidecar) -> Result<Strin
             "NetBird resolver file does not contain only its wt0 listener:\n{resolv_conf}"
         ));
     }
-    let backup = podman_output(&["exec", name, "cat", "/etc/resolv.conf.original.netbird"]).await?;
+    let backup =
+        runtime_output(&["exec", name, "cat", "/etc/resolv.conf.original.netbird"]).await?;
     if !backup.status.success() {
         return Err("NetBird's original resolver backup is missing".into());
     }
     let backup = String::from_utf8_lossy(&backup.stdout).into_owned();
-    let listing = podman_output(&[
+    let listing = runtime_output(&[
         "exec",
         name,
         "nft",
@@ -1788,8 +1999,8 @@ async fn start_netbird_dns_fixture(peer: &str) -> Result<(), String> {
         .parse::<IpAddr>()
         .map_err(|_| "invalid NetBird DNS test address".to_string())?;
     let peer_ip = netbird_ipv4(peer).await?;
-    podman_success(&["exec", peer, "netbird", "down"]).await?;
-    podman_success(&[
+    runtime_success(&["exec", peer, "netbird", "down"]).await?;
+    runtime_success(&[
         "exec",
         peer,
         "netbird",
@@ -1818,12 +2029,12 @@ async fn start_netbird_dns_fixture(peer: &str) -> Result<(), String> {
         args.push(format!("--address=/example.com/{public}"));
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    podman_success(&refs).await?;
+    runtime_success(&refs).await?;
     let peer_ip = peer_ip.to_string();
     let expected = expected.to_string();
     for _ in 0..30 {
         if let Ok(output) =
-            podman_output(&["exec", peer, "nslookup", "-type=a", &name, &peer_ip]).await
+            runtime_output(&["exec", peer, "nslookup", "-type=a", &name, &peer_ip]).await
             && output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains(&expected)
         {
@@ -1864,7 +2075,7 @@ async fn assert_netbird_joined_run(
             & 0o777;
         assert_eq!(mode, 0o644, "joined resolver file is not readable");
     }
-    let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
+    let runner = CliRunner::detect(tunnel_sandbox_runtime(), image.to_string())
         .await
         .map_err(|error| error.to_string())?;
     let limits = ResourceLimits {
@@ -1938,7 +2149,7 @@ async fn assert_netbird_joined_run(
 
 async fn wait_local_listener(sidecar: &TunnelSidecar) -> Result<(), String> {
     for _ in 0..30 {
-        if podman_success(&[
+        if runtime_success(&[
             "exec",
             sidecar.container_name(),
             "nc",
@@ -1961,7 +2172,7 @@ async fn wait_local_listener(sidecar: &TunnelSidecar) -> Result<(), String> {
 async fn assert_netbird_ingress_denied(primary: &TunnelSidecar, peer: &str) -> Result<(), String> {
     assert_netbird_peers_connected(primary.container_name(), peer).await?;
     let primary_ip = netbird_ipv4(primary.container_name()).await?;
-    podman_success(&[
+    runtime_success(&[
         "exec",
         "-d",
         primary.container_name(),
@@ -1971,7 +2182,7 @@ async fn assert_netbird_ingress_denied(primary: &TunnelSidecar, peer: &str) -> R
     ])
     .await?;
     wait_local_listener(primary).await?;
-    let output = podman_output(&[
+    let output = runtime_output(&[
         "exec",
         peer,
         "nc",
@@ -1990,7 +2201,7 @@ async fn assert_netbird_ingress_denied(primary: &TunnelSidecar, peer: &str) -> R
 }
 
 async fn remove_netbird_volumes(prefix: &str) {
-    if let Ok(output) = podman_output(&["volume", "ls", "--format", "{{.Name}}"]).await
+    if let Ok(output) = runtime_output(&["volume", "ls", "--format", "{{.Name}}"]).await
         && output.status.success()
     {
         for name in String::from_utf8_lossy(&output.stdout)
@@ -1998,18 +2209,18 @@ async fn remove_netbird_volumes(prefix: &str) {
             .map(str::trim)
             .filter(|name| name.starts_with(prefix))
         {
-            let _ = podman_success(&["volume", "rm", name]).await;
+            let _ = runtime_success(&["volume", "rm", name]).await;
         }
     }
 }
 
 #[tokio::test]
-async fn podman_tunnel_sidecar_netbird_live() {
-    if !gate_open("LUNARWING_E2E_PODMAN_TESTS")
-        || !gate_open("LUNARWING_E2E_TUNNEL_TESTS")
-        || !gate_open("LUNARWING_E2E_NETBIRD_TESTS")
-    {
-        eprintln!("skipping: set podman, tunnel, and NetBird e2e gates to 1");
+async fn tunnel_sidecar_netbird_live() {
+    if !tunnel_lane_open() || !gate_open("LUNARWING_E2E_NETBIRD_TESTS") {
+        eprintln!(
+            "skipping: set the tunnel lane gates (LUNARWING_E2E_TUNNEL_TESTS=1 and one \
+             runtime gate) plus LUNARWING_E2E_NETBIRD_TESTS=1"
+        );
         return;
     }
     let settings: Result<(String, String, String), String> = (|| {
@@ -2032,7 +2243,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
             .expect("private runtime dir");
     }
     let primary = TunnelSidecar::for_instance_with_runtime_dir(
-        ContainerRuntime::Podman,
+        tunnel_runtime(),
         TunnelSidecarConfig {
             provider: TunnelProvider::Netbird,
             image: Some(image.clone()),
@@ -2075,7 +2286,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
         assert_netbird_ingress_denied(&primary, &peer_name).await?;
         // WI#604 ZT-1: the per-run recovery path (sidecar-owned attempt plus
         // the single lifecycle lock) must replace a killed sidecar in time.
-        let killed = podman_success(&["kill", primary.container_name()]).await;
+        let killed = runtime_success(&["kill", primary.container_name()]).await;
         let recovery = std::time::Instant::now();
         let recovered = primary.container_for_run().await;
         eprintln!(
@@ -2088,9 +2299,13 @@ async fn podman_tunnel_sidecar_netbird_live() {
     }
     .await;
     primary.stop().await;
-    let _ = podman_success(&["rm", "-f", &peer_name]).await;
+    let _ = runtime_success(&["rm", "-f", &peer_name]).await;
     remove_netbird_volumes(&volume_prefix).await;
-    let _ = podman_success(&["volume", "rm", &peer_name]).await;
+    let _ = runtime_success(&["volume", "rm", &peer_name]).await;
+    assert_detached_helper_stopped(primary.container_name()).await;
+    assert_tunnel_containers_absent("the NetBird live lane")
+        .await
+        .expect("no tunnel containers left behind");
     let _ = std::fs::remove_file(peer_env);
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("live NetBird connectivity, joined-run, reconnect, identity, and ingress checks");
