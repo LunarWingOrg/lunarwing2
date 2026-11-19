@@ -686,6 +686,22 @@ required.
 
 ## Verification
 
+### What is live-tested, on which runtime
+
+The tier's live claims are scoped to what was actually run. Anything not listed
+is harness-covered or unclaimed, not proven.
+
+| Surface | Runtime / host | Status |
+|---|---|---|
+| WireGuard lifecycle, joining, firewall tamper, image rotation, per-run recovery | rootless Podman 5.8.2 (2026-11-11) | live |
+| NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
+| The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; no live run recorded yet (WI#771) |
+| Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, service mode | live once a service-mode host runs it with `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` (WI#771) |
+| Docker and systemd service mode on this development host | OpenRC host, no Docker CLI | not claimed — WI#771 keeps those boxes open |
+
+No public-cloud and no CI run is claimed by any row. Gated lanes stay off by
+default.
+
 1. Start the tenant and check that the daemon logs sidecar started/healthy,
    with no credential values.
 2. Inspect both chains from the trusted host:
@@ -710,16 +726,26 @@ required.
    `/etc/wireguard`, NetBird state, and sidecar credentials are not mounted.
    Then ask it to run `wget -T 3 http://169.254.169.254/` and
    `wget -T 3 http://1.1.1.1/`: both must fail.
-4. For WireGuard's gated lifecycle test:
+4. For the gated WireGuard lifecycle suite, open the tunnel gate and exactly one
+   runtime gate. Both runtimes drive the same lane:
 
    ```bash
    cd ic
-   LUNARWING_E2E_PODMAN_TESTS=1 LUNARWING_E2E_TUNNEL_TESTS=1 \
+   # Podman
+   LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1 \
+     taskset -c 0-11 cargo test -j12 --test podman_sandbox_tunnel_integration \
+     -- --nocapture --test-threads=1
+
+   # Docker fallback
+   LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1 \
      taskset -c 0-11 cargo test -j12 --test podman_sandbox_tunnel_integration \
      -- --nocapture --test-threads=1
    ```
 
-   The test builds an Alpine image with `nftables` unless
+   `LUNARWING_E2E_TUNNEL_RUNTIME=podman|docker` (optional) must agree with the
+   open gate; opening both runtime gates is refused, and a lane whose
+   `CliRunner` resolves to the other runtime fails rather than silently
+   switching. The test builds an Alpine image with `nftables` unless
    `LUNARWING_E2E_TUNNEL_IMAGE` names a suitable existing image. It checks real
    namespace joining by verified container ID, stable reuse, clean recreation
    after independent input/output tamper cases, image-ID rotation with a clean
@@ -738,6 +764,20 @@ required.
    recreated peer dead while checking the 6-second re-probe, 20-second fresh
    provider cap, and sub-second cached failure through the manager. The peerless
    config still does not test peer encryption or NetBird's control plane.
+
+   The lifecycle and concurrent-start lanes end by requiring that the runtime
+   reports no container carrying `lunarwing.sandbox-tunnel` — the sidecar and
+   every joined run are gone — in addition to the helper-unit check.
+
+   **Detached-helper checks need systemd service mode.** They read the transient
+   unit `lunarwing-tunnel-<instance>` through `systemctl --user`. On a host
+   where the daemon's workload spawner is not in systemd service mode they print
+   a skip; set `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` to turn that skip into a
+   failure. The lane also asserts the unit *exists* while the sidecar runs, so
+   the "gone afterwards" check cannot pass vacuously, and it reports a failure
+   (not a skip) when service mode is active but no user manager answers. The
+   `pasta`-in-unit scan is Podman-only; Docker's helper is the `docker run`
+   client and is covered by the unit check alone.
 5. For the NetBird end-to-end lane, follow NetBird live validation below.
 6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
    sandbox to an allowed private service. Then run a temporary high-port
@@ -764,7 +804,7 @@ unusable. A skip is not a live-validation pass.
 
    ```bash
    cd ic
-   LUNARWING_E2E_PODMAN_TESTS=1 LUNARWING_E2E_TUNNEL_TESTS=1 \
+   LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1 \
    LUNARWING_E2E_NETBIRD_TESTS=1 \
    LUNARWING_E2E_NETBIRD_IMAGE=<netbird-image> \
    LUNARWING_E2E_NETBIRD_MANAGEMENT_URL=https://nbtest.example.org \
@@ -772,6 +812,10 @@ unusable. A skip is not a live-validation pass.
      taskset -c 0-11 cargo test -j12 --test podman_sandbox_tunnel_integration \
      tunnel_sidecar_netbird_live -- --exact --nocapture --test-threads=1
    ```
+
+   Substitute `LUNARWING_E2E_DOCKER_TESTS=1` for the Podman gate to drive the
+   same lane on Docker; the NetBird image must then contain `nft`, `nc`,
+   `wget`, `ping` and `nslookup` for the Docker CLI too.
 
 4. Read the lane in the order it asserts:
    1. **Fresh start.** The sidecar starts under the configured startup budget;
