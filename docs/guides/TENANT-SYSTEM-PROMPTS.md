@@ -4,7 +4,7 @@ Available in v2.1.4.0 (WI#220). Open the tenant's web gateway, authenticate,
 and select **Settings → System Prompt**. The displayed **Workspace scope** is
 the database scope selected by your token, not necessarily the OS account name.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The prompt-editor
+**Revalidated against source 2026-11-19 (v2.2.1.0).** The prompt-editor
 handlers, workspace preview composition, and Engine V2 initialization snapshot
 match the current tree. Routes still resolve in the gateway's web channel and
 `system_prompt_for_context_tz` remains the preview entry point; activation
@@ -28,8 +28,8 @@ still requires a manager restart and a new conversation.
 
    The bridge loads workspace instructions once when it initializes the thread
    manager (`ic/src/bridge/router.rs`). A new conversation alone cannot refresh
-   an already initialized manager. Existing/persisted threads keep their System
-   message even after a restart (`executor/loop_engine.rs`).
+   an already initialized manager. Existing threads keep their saved system
+   message even after a restart (`ic/crates/lunarwing_engine/src/executor/loop_engine.rs`).
 
 | Source | Purpose |
 |---|---|

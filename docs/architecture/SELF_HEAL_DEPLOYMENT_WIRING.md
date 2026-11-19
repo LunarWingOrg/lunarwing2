@@ -297,6 +297,12 @@ changing the pipeline structure documented above:
   `runtime@<tenant>` / `knowledge@<tenant>` — never a restart, no
   `SERVICE_MAP` lookup. Healthy instances clear state via report-as-truth;
   component-level gaps escalate bare; unprobed instances never page per tenant.
+- **Dead tenant user manager (WI#766):** `health-systemd.sh` records one
+  `metrics.instances[]` entry per lingering tenant. A down `user@<uid>.service`
+  leaves no unit to target, so self-heal escalates it as monitor-only
+  `systemd@<tenant>`; the page carries `systemctl start user@<uid>.service`,
+  and nothing is restarted. A tenant whose bus refuses while its manager is
+  `active` keeps a healthy instance and only the bare component identity pages.
 - **Gateway hardening:** absent legacy sessions dir is healthy-with-note (not a
   degradation), stale lock and oversized session issues are now detected, and
   the `gateway` suite validates the stale-lock/oversized-session checks.

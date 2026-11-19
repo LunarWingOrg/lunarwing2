@@ -32,9 +32,10 @@
 //! same-type check stock policy already allows. Before any container starts,
 //! [`probe_labeled_connection`] replays that connect from a socket created
 //! under a container-shaped source context, under the host's own policy
-//! (levels included), and a refusal falls back to the previous unlabeled
-//! socket. A host without selinuxfs starts no label thread and binds exactly
-//! as before. The sandbox is never made unconfined and no policy is changed.
+//! (levels included). A refusal advances to the next candidate; if none
+//! passes, the daemon binds an unlabeled socket. A host without selinuxfs
+//! starts no label thread and binds exactly as before. The sandbox is never
+//! made unconfined and no policy is changed.
 //!
 //! What the label opens: at the SELinux layer, on the targeted policy, any
 //! process of type `container_t`, at any level, passes the socket check for
@@ -149,50 +150,60 @@ const SOCKCREATE_NODE: &str = "/proc/thread-self/attr/sockcreate";
 #[cfg(target_os = "linux")]
 const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 
+/// The SELinux attribute I/O used by the relay. The daemon uses only
+/// [`HostLabelNodes`], which reads and writes fixed kernel paths.
+///
+/// Tests can script individual `sockcreate` refusals and observe the writes;
+/// the Unix bind, self-connect and fallback still run on real sockets.
+#[cfg(target_os = "linux")]
+trait LabelNodes {
+    fn read_enforce(&self) -> std::io::Result<String>;
+    fn write_sockcreate(&self, value: &str) -> std::io::Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+struct HostLabelNodes;
+
+#[cfg(target_os = "linux")]
+impl LabelNodes for HostLabelNodes {
+    fn read_enforce(&self) -> std::io::Result<String> {
+        std::fs::read_to_string(SELINUX_ENFORCE)
+    }
+
+    fn write_sockcreate(&self, value: &str) -> std::io::Result<()> {
+        std::fs::write(SOCKCREATE_NODE, value)
+    }
+}
+
 /// Whether SELinux is enabled on this host (`0` permissive, `1` enforcing).
 /// A host without selinuxfs — AppArmor, or none — keeps the old socket.
 #[cfg(target_os = "linux")]
-fn selinux_enabled() -> bool {
-    selinux_enabled_at(Path::new(SELINUX_ENFORCE))
-}
-
-/// [`selinux_enabled`] for a given enforce node.
-#[cfg(target_os = "linux")]
-fn selinux_enabled_at(enforce: &Path) -> bool {
-    std::fs::read_to_string(enforce)
+fn selinux_enabled(nodes: &impl LabelNodes) -> bool {
+    nodes
+        .read_enforce()
         .map(|value| matches!(value.trim(), "0" | "1"))
         .unwrap_or(false)
-}
-
-/// Pin the calling thread's next socket to `context`. The error is the
-/// kernel's own answer for this thread's attribute.
-///
-/// The attribute belongs to the task, not the process, so no other thread in
-/// the daemon can pick it up; [`with_socket_context`] clears it as soon as the
-/// socket exists.
-#[cfg(target_os = "linux")]
-fn set_socket_create_context(context: &str) -> std::io::Result<()> {
-    std::fs::write(SOCKCREATE_NODE, context)
 }
 
 /// Restore the default create context on the calling thread. A newline is the
 /// kernel's "no context specified" form; an empty write may never reach the
 /// attribute handler.
 #[cfg(target_os = "linux")]
-fn clear_socket_create_context() {
-    let _ = std::fs::write(SOCKCREATE_NODE, "\n");
+fn clear_socket_create_context(nodes: &impl LabelNodes) {
+    let _ = nodes.write_sockcreate("\n");
 }
 
 /// Run `create` with this thread's socket create context pinned to `context`,
 /// clearing the attribute afterwards even when creation fails.
 #[cfg(target_os = "linux")]
 fn with_socket_context<T>(
+    nodes: &impl LabelNodes,
     context: &str,
     create: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    set_socket_create_context(context)?;
+    nodes.write_sockcreate(context)?;
     let created = create();
-    clear_socket_create_context();
+    clear_socket_create_context(nodes);
     created
 }
 
@@ -215,6 +226,7 @@ fn bind_relay_socket(socket: &Path) -> std::io::Result<std::os::unix::net::UnixL
 /// break the relay instead of fixing it.
 #[cfg(target_os = "linux")]
 fn probe_labeled_connection(
+    nodes: &impl LabelNodes,
     socket: &Path,
     listener: &std::os::unix::net::UnixListener,
     client_context: &str,
@@ -222,7 +234,7 @@ fn probe_labeled_connection(
     use std::io::{Read, Write};
 
     let timeout = std::time::Duration::from_secs(2);
-    let mut client = with_socket_context(client_context, || {
+    let mut client = with_socket_context(nodes, client_context, || {
         std::os::unix::net::UnixStream::connect(socket)
     })?;
     client.set_read_timeout(Some(timeout))?;
@@ -243,8 +255,8 @@ fn probe_labeled_connection(
 ///
 /// SELinux is checked here, on the calling thread, so a host without
 /// selinuxfs starts no thread and binds exactly as it did before WI#641.
-/// Every refusal of the labeled attempt, a label thread that cannot be
-/// started included, ends at the same unlabeled bind.
+/// If no candidate passes the self-connect probe, or the label thread cannot
+/// run, the daemon falls back to the same unlabeled bind.
 ///
 /// Returns the listener and the context it was created under, or `None` when
 /// the default context was kept.
@@ -252,8 +264,17 @@ fn probe_labeled_connection(
 fn bind_relay_listener(
     socket: &Path,
 ) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
-    if selinux_enabled()
-        && let Some((listener, context)) = bind_labeled_on_own_thread(socket)
+    bind_relay_listener_with(HostLabelNodes, socket)
+}
+
+/// Run the relay bind with the supplied SELinux attribute I/O.
+#[cfg(target_os = "linux")]
+fn bind_relay_listener_with(
+    nodes: impl LabelNodes + Send + 'static,
+    socket: &Path,
+) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
+    if selinux_enabled(&nodes)
+        && let Some((listener, context)) = bind_labeled_on_own_thread(nodes, socket)
     {
         return Ok((to_tokio(listener)?, Some(context)));
     }
@@ -267,12 +288,13 @@ fn bind_relay_listener(
 /// is reported like the others and the caller keeps the unlabeled socket.
 #[cfg(target_os = "linux")]
 fn bind_labeled_on_own_thread(
+    nodes: impl LabelNodes + Send + 'static,
     socket: &Path,
 ) -> Option<(std::os::unix::net::UnixListener, &'static str)> {
-    let owned = socket.to_path_buf();
+    let owned_socket = socket.to_path_buf();
     let outcome = match std::thread::Builder::new()
         .name("relay-label".into())
-        .spawn(move || bind_labeled(&owned))
+        .spawn(move || bind_labeled(&nodes, &owned_socket))
     {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
             // The thread may have bound a candidate before it died.
@@ -299,16 +321,17 @@ fn bind_labeled_on_own_thread(
 /// with the kernel's own error. A refused candidate leaves no socket behind.
 #[cfg(target_os = "linux")]
 fn bind_labeled(
+    nodes: &impl LabelNodes,
     socket: &Path,
 ) -> std::result::Result<(std::os::unix::net::UnixListener, &'static str), Vec<String>> {
     let mut refused = Vec::with_capacity(RELAY_SOCKET_CONTEXTS.len());
     for context in RELAY_SOCKET_CONTEXTS {
-        if let Err(error) = set_socket_create_context(context) {
+        if let Err(error) = nodes.write_sockcreate(context) {
             refused.push(format!("{context}: cannot set sockcreate: {error}"));
             continue;
         }
         let bound = bind_relay_socket(socket);
-        clear_socket_create_context();
+        clear_socket_create_context(nodes);
         // A refusal to create under this context is the same fallback as an
         // unwritable attribute; the unlabeled attempt reports real errors.
         let listener = match bound {
@@ -321,7 +344,7 @@ fn bind_labeled(
         };
         match SIMULATED_CLIENT_CONTEXTS
             .iter()
-            .try_for_each(|client| probe_labeled_connection(socket, &listener, client))
+            .try_for_each(|client| probe_labeled_connection(nodes, socket, &listener, client))
         {
             Ok(()) => return Ok((listener, context)),
             Err(error) => {
@@ -462,10 +485,100 @@ impl Drop for ProxyRelay {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    const SCRIPTED_REFUSAL: &str = "scripted sockcreate refusal";
+
+    struct SockcreateWrite {
+        value: String,
+        socket_exists: bool,
+        thread: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingLabelNodes {
+        enforce: Option<&'static str>,
+        socket: PathBuf,
+        // One-based write numbers, including clears: a listener and a client
+        // can use the same context string.
+        refused_writes: &'static [usize],
+        writes: Arc<Mutex<Vec<SockcreateWrite>>>,
+    }
+
+    impl RecordingLabelNodes {
+        fn new(socket: &Path, enforce: Option<&'static str>) -> Self {
+            Self {
+                enforce,
+                socket: socket.to_owned(),
+                refused_writes: &[],
+                writes: Arc::default(),
+            }
+        }
+
+        fn refusing(mut self, writes: &'static [usize]) -> Self {
+            self.refused_writes = writes;
+            self
+        }
+
+        fn assert_label_thread_writes(&self, expected: &[(&str, bool)]) {
+            let writes = self.writes.lock().unwrap();
+            let trace: Vec<_> = writes
+                .iter()
+                .map(|write| {
+                    (
+                        write.value.as_str(),
+                        write.socket_exists,
+                        write.thread.as_deref(),
+                    )
+                })
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|&(value, socket_exists)| (value, socket_exists, Some("relay-label")))
+                .collect();
+            assert_eq!(trace, expected, "unexpected sockcreate write sequence");
+        }
+    }
+
+    impl LabelNodes for RecordingLabelNodes {
+        fn read_enforce(&self) -> std::io::Result<String> {
+            self.enforce
+                .map(str::to_owned)
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+
+        fn write_sockcreate(&self, value: &str) -> std::io::Result<()> {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push(SockcreateWrite {
+                value: value.to_owned(),
+                socket_exists: self.socket.exists(),
+                thread: std::thread::current().name().map(str::to_owned),
+            });
+            if self.refused_writes.contains(&writes.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    SCRIPTED_REFUSAL,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    async fn assert_relay_connectable(socket: &Path, listener: &tokio::net::UnixListener) {
+        assert_eq!(mode_of(socket), 0o666);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut client = tokio::net::UnixStream::connect(socket).await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            client.write_all(b"x").await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), b'x');
+        })
+        .await
+        .expect("the returned relay listener must accept a new client");
+    }
 
     #[tokio::test]
     async fn relay_drop_removes_socket_and_closes_live_connections() {
@@ -518,48 +631,178 @@ mod tests {
         );
     }
 
-    /// WI#641: only a readable enforce node holding `0` or `1` means SELinux
-    /// is enabled. Anything else must keep the label thread from starting.
     #[test]
     fn selinux_is_enabled_only_by_an_enforce_node_holding_0_or_1() {
         let directory = tempfile::tempdir().unwrap();
-        let node = directory.path().join("enforce");
-        assert!(!selinux_enabled_at(&node), "a missing node is not SELinux");
-        for (content, expected) in [("1", true), ("0\n", true), ("", false), ("2", false)] {
-            std::fs::write(&node, content).unwrap();
-            assert_eq!(selinux_enabled_at(&node), expected, "enforce={content:?}");
+        let socket = directory.path().join("proxy.sock");
+        for (enforce, expected) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("0\n"), true),
+            (Some(""), false),
+            (Some("2"), false),
+        ] {
+            let nodes = RecordingLabelNodes::new(&socket, enforce);
+            assert_eq!(selinux_enabled(&nodes), expected, "enforce={enforce:?}");
         }
     }
 
-    /// WI#641: a refused labeled attempt names every candidate with its own
-    /// reason, in the order tried, and leaves no socket behind. The outcome
-    /// itself depends on the kernel and its policy, so both are accepted.
-    #[test]
-    fn labeled_bind_reports_one_reason_per_refused_candidate() {
+    // AGY-2: pin the actual context values and the write/clear order on the
+    // label thread, for both enforce values. The listener's clear must see
+    // the new socket; a later probe's clear is not a substitute.
+    #[tokio::test]
+    async fn labeled_bind_and_both_probes_set_and_clear_on_the_label_thread() {
+        for enforce in ["1", "0\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("proxy.sock");
+            let nodes = RecordingLabelNodes::new(&socket, Some(enforce));
+
+            let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+            let base = "system_u:system_r:container_t:s0";
+            assert_eq!(label, Some(base), "enforce={enforce:?}");
+            nodes.assert_label_thread_writes(&[
+                (base, false),
+                ("\n", true),
+                ("system_u:system_r:container_t:s0:c533,c991", true),
+                ("\n", true),
+                (base, true),
+                ("\n", true),
+            ]);
+            assert_relay_connectable(&socket, &listener).await;
+        }
+    }
+
+    // AGY-1: let the first client through, then refuse the second client's
+    // context write. The first listener must still be discarded.
+    #[tokio::test]
+    async fn refused_self_connect_probe_removes_the_listener_before_trying_the_next_label() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("proxy.sock");
-        match bind_labeled(&socket) {
-            Ok((_listener, context)) => {
-                assert!(RELAY_SOCKET_CONTEXTS.contains(&context));
-                assert!(socket.exists());
-            }
-            Err(reasons) => {
-                assert_eq!(reasons.len(), RELAY_SOCKET_CONTEXTS.len());
-                for (reason, context) in reasons.iter().zip(RELAY_SOCKET_CONTEXTS) {
-                    assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
-                }
-                assert!(
-                    !socket.exists(),
-                    "a refused candidate must not leave a socket"
-                );
-                let summary = label_refusal_summary(&reasons);
-                assert!(
-                    reasons
-                        .iter()
-                        .all(|reason| summary.contains(reason.as_str()))
-                );
-            }
+        let nodes = RecordingLabelNodes::new(&socket, Some("1")).refusing(&[5]);
+        let [first, second] = RELAY_SOCKET_CONTEXTS;
+        let [client_with_categories, client_base] = SIMULATED_CLIENT_CONTEXTS;
+
+        let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+        assert_eq!(label, Some(second));
+        nodes.assert_label_thread_writes(&[
+            (first, false),
+            ("\n", true),
+            (client_with_categories, true),
+            ("\n", true),
+            (client_base, true), // refused
+            (second, false),
+            ("\n", true),
+            (client_with_categories, true),
+            ("\n", true),
+            (client_base, true),
+            ("\n", true),
+        ]);
+        assert_relay_connectable(&socket, &listener).await;
+    }
+
+    async fn assert_unlabeled_fallback(
+        refused_writes: &'static [usize],
+        failed_step: &str,
+        trace: &[(&str, bool)],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        let script = || RecordingLabelNodes::new(&socket, Some("1")).refusing(refused_writes);
+
+        // Inspect the refusal and cleanup before fallback, using only fake
+        // attribute I/O. Then replay on the label thread with a fresh trace.
+        let reasons = bind_labeled(&script(), &socket).unwrap_err();
+        let expected = RELAY_SOCKET_CONTEXTS
+            .map(|context| format!("{context}: {failed_step}: {SCRIPTED_REFUSAL}"));
+        assert_eq!(reasons, expected);
+        assert_eq!(label_refusal_summary(&reasons), expected.join("; "));
+        assert!(
+            !socket.exists(),
+            "refused candidates must leave no socket before the unlabeled bind"
+        );
+
+        let nodes = script();
+        let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+        assert_eq!(label, None);
+        nodes.assert_label_thread_writes(trace);
+        assert_relay_connectable(&socket, &listener).await;
+    }
+
+    #[tokio::test]
+    async fn both_probe_refusals_leave_no_socket_and_fall_back_unlabeled() {
+        let [first, second] = RELAY_SOCKET_CONTEXTS;
+        let client = SIMULATED_CLIENT_CONTEXTS[0];
+        // Neither candidate's first client can set its context after bind.
+        assert_unlabeled_fallback(
+            &[3, 6],
+            "container-shaped connect refused",
+            &[
+                (first, false),
+                ("\n", true),
+                (client, true),
+                (second, false),
+                ("\n", true),
+                (client, true),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refused_listener_context_writes_fall_back_without_attempting_a_labeled_bind() {
+        let [first, second] = RELAY_SOCKET_CONTEXTS;
+        assert_unlabeled_fallback(
+            &[1, 2],
+            "cannot set sockcreate",
+            &[(first, false), (second, false)],
+        )
+        .await;
+    }
+
+    // AGY-3: this is a filesystem collision, not a kernel label refusal.
+    #[test]
+    fn a_directory_at_the_socket_path_refuses_both_binds() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        std::fs::create_dir(&socket).unwrap();
+        let nodes = RecordingLabelNodes::new(&socket, Some("1"));
+
+        let reasons = bind_labeled(&nodes, &socket).unwrap_err();
+        assert_eq!(reasons.len(), RELAY_SOCKET_CONTEXTS.len());
+        for (reason, context) in reasons.iter().zip(RELAY_SOCKET_CONTEXTS) {
+            assert!(
+                reason.starts_with(&format!(
+                    "{context}: labeled bind refused: cannot bind relay socket "
+                )),
+                "{reason}"
+            );
         }
+        assert!(socket.is_dir(), "remove_file cannot unlink a directory");
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_is_removed_after_a_refused_bind() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        // Closing a Unix listener does not remove its filesystem entry.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let nodes = RecordingLabelNodes::new(&socket, Some("1"));
+
+        let (listener, label) = bind_relay_listener_with(nodes, &socket).unwrap();
+        assert_eq!(label, Some(RELAY_SOCKET_CONTEXTS[1]));
+        assert_relay_connectable(&socket, &listener).await;
+    }
+
+    #[tokio::test]
+    async fn a_host_without_selinuxfs_skips_labeling_entirely() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        let nodes = RecordingLabelNodes::new(&socket, None);
+
+        let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+        assert_eq!(label, None, "a host without SELinux needs no label");
+        nodes.assert_label_thread_writes(&[]);
+        assert_relay_connectable(&socket, &listener).await;
     }
 
     /// WI#641: the refusal warning is raised once; later refusals are not.
@@ -578,17 +821,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("proxy.sock");
         let (listener, label) = bind_relay_listener(&socket).unwrap();
-        assert_eq!(
-            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
-            0o666
-        );
-        if !selinux_enabled() {
+        if !selinux_enabled(&HostLabelNodes) {
             assert_eq!(label, None, "a host without SELinux keeps the daemon label");
         }
         // A plain client still reaches the listener after either path, so the
         // fallback cannot leave a half-built socket behind.
-        let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        let (_accepted, _) = listener.accept().await.unwrap();
-        client.write_all(b"x").await.unwrap();
+        assert_relay_connectable(&socket, &listener).await;
     }
 }

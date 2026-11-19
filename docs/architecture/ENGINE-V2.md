@@ -553,6 +553,13 @@ that safe class and fixed recovery text, never provider-supplied diagnostics.
 - Three consecutive code steps or structured action batches with no successful
   work schedule one no-progress warning. Repeating failure on warning turn
   returns `ThreadFailureKind::NoProgress`; successful work resets detector.
+  A code step that also reaches the consecutive-error limit on the same step
+  still gets its warning turn first, so no terminal text claims a recovery
+  attempt that did not happen.
+- A no-progress or consecutive-error terminal text names the failing actions
+  (as short identifiers) and the thread's limits. Only settings that govern
+  the failing thread are named; a limit with no setting (for example
+  `max_consecutive_errors`) is shown as a value rather than as advice.
 - Missing/exhausted capability leases and policy denials return actionable model
   observations naming allowed next steps instead of opaque denial strings.
 
