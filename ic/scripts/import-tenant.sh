@@ -93,12 +93,28 @@ IMPORT_STAGE_ROOT="${KAWARIMI_IMPORT_STAGE_ROOT:-/var/lib/lunarwing-import-stage
 
 say()    { printf '%s\n' "$*"; }
 die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
-# need_value "$@" — same contract as the copy in mt-admin-lib/00-common.sh
-# (this script stands alone and does not source that library, WI#637).
+# need_value "$@" — the same function as in mt-admin-lib/00-common.sh, which
+# this stand-alone script does not source (WI#637). A flag needs a value, and
+# a value that has the shape of a flag (two dashes, then lowercase letters,
+# digits and hyphens, with or without =value) is refused, so a forgotten
+# value never swallows the next flag. Keep the body identical to the
+# library's; the rule is described there, and
+# test-mt-admin-flag-value-guards.sh compares the two.
 need_value() {
-  local flag="$1"
+  local flag="$1" name
   [[ $# -ge 2 ]] || die "$flag requires a value"
-  [[ ${2#--} == "$2" ]] || die "$flag requires a value (found another flag: $2)"
+  name="${2%%=*}"
+  case "$name" in
+    --[abcdefghijklmnopqrstuvwxyz0123456789]*) ;;
+    *) return 0 ;;
+  esac
+  [[ -z "${name//[abcdefghijklmnopqrstuvwxyz0123456789-]/}" ]] || return 0
+  case "$flag" in
+    --xmpp-password | --llm-api-key | --nanogpt-api-key)
+      die "$flag requires a value, and a value cannot look like a flag (the value given is not shown)"
+      ;;
+  esac
+  die "$flag requires a value, and a value cannot look like a flag (found: $name)"
 }
 _read_secret_file() {
   local path="$1" value

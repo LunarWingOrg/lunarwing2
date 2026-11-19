@@ -304,6 +304,11 @@ Usage:
 Production multi-tenant administration for LunarWing.
 Manages OS users, port allocation, per-tenant services, and builds.
 
+A flag that takes a value must be followed by one. A value that looks like a
+flag (two dashes, then lowercase letters, digits and hyphens, as in
+--with-kimi or --target=main) is refused, so a forgotten value never swallows
+the next flag.
+
 Commands:
   init-lock-tree                   Create the root-owned lock tree
                                    (/run/lunarwing/mt-admin) and, on systemd,

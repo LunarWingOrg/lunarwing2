@@ -25,14 +25,38 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn_err() { printf 'error: %s\n' "$*" >&2; }
 
 # need_value "$@" — call from a `case` arm with the arm's own positional
-# parameters. Proves that $1 (the flag) has a value in $2 which is not itself
-# a flag: a trailing flag with no value dies, and so does a neighbouring
-# --flag, which `[[ $# -ge 2 ]]` alone would swallow as the value and write
-# into the tenant env (WI#637). A single-dash value (-1, -) stays legal.
+# parameters. Proves that $1 (the flag) is followed by a value in $2 (WI#637).
+#   - A trailing flag with no value dies.
+#   - A value that has the shape of a flag dies: two dashes, a lowercase
+#     letter or digit, then only lowercase letters, digits and hyphens, with
+#     or without a value of its own after an equals sign (--with-kimi,
+#     --target=main). Every long flag of this tool has that shape, so this
+#     is the neighbouring flag that `[[ $# -ge 2 ]]` alone would swallow as
+#     the value and write into the tenant env.
+# Every other value is legal: the empty string, a single-dash value (-1, -),
+# a bare -- and a value that only begins with dashes (--Zq9pw, "-- title --").
+# The refusal names the swallowed flag without what follows its equals sign,
+# except after a flag whose value is a secret: there nothing of the value is
+# printed.
+# The letters and digits are spelled out because a range such as a-z also
+# takes in uppercase letters under some locales.
+# ic/scripts/import-tenant.sh carries the same function; keep the two bodies
+# identical (test-mt-admin-flag-value-guards.sh compares them).
 need_value() {
-  local flag="$1"
+  local flag="$1" name
   [[ $# -ge 2 ]] || die "$flag requires a value"
-  [[ ${2#--} == "$2" ]] || die "$flag requires a value (found another flag: $2)"
+  name="${2%%=*}"
+  case "$name" in
+    --[abcdefghijklmnopqrstuvwxyz0123456789]*) ;;
+    *) return 0 ;;
+  esac
+  [[ -z "${name//[abcdefghijklmnopqrstuvwxyz0123456789-]/}" ]] || return 0
+  case "$flag" in
+    --xmpp-password | --llm-api-key | --nanogpt-api-key)
+      die "$flag requires a value, and a value cannot look like a flag (the value given is not shown)"
+      ;;
+  esac
+  die "$flag requires a value, and a value cannot look like a flag (found: $name)"
 }
 
 HEALTH_LIB_UNSAFE_COMPONENT=""
