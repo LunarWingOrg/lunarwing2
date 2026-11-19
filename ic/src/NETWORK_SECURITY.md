@@ -463,6 +463,15 @@ public-only validating proxy:
   each refused candidate, and logs later refusals at debug level. An enforcing
   host whose policy denies a step of the attempt still records that denial in
   its audit log on every call.
+- relay label tests (WI#641): the two nodes that gate labeling (the selinuxfs
+  `enforce` value and this thread's `sockcreate` attribute) are named by a
+  `LabelNodes` value, so the decisions of the labeling path run on a host
+  without SELinux: `sandbox::proxy::relay` tests cover the first-candidate
+  bind with the attribute cleared afterwards, one reason per refused
+  candidate with no socket left behind, a kernel-refused labeled bind, and
+  the unlabeled fallback for a permissive or missing enforce node. What no
+  test can cover is the kernel's own policy decision; that stays with the run
+  on an enforcing host.
 - relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
   `sandbox:proxy_error`. A failed transport probe reports the errno, container
   UID/GID, mount and socket metadata, and available SELinux state. The probe
