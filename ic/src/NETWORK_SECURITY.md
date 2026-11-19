@@ -464,7 +464,9 @@ public-only validating proxy:
   its audit log on every call.
 - relay label tests (WI#641): `sandbox::proxy::relay` unit tests use a fake
   for the SELinux attribute I/O and real Unix sockets. They check the context
-  writes and clears on `relay-label` around the bind and both self-connects.
+  writes and clears on `relay-label`. The bind is shown to fall between the
+  listener's set and clear. For the two self-connects only the set-and-clear
+  pairs and their order are checked, not where the connect falls between them.
   A simulated refusal to set a client context exercises probe failure: the
   rejected socket is removed before retrying, the second candidate can win,
   and two probe refusals leave no socket before the unlabeled fallback. Other
