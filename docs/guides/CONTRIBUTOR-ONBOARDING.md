@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-11-10, target release 2.2.0.0):**
+**Current state (updated 2026-11-19, target release 2.2.1.0):**
 
 - v2.1.9.0 (Kaitei) shipped 2026-11-08 with safer response caching and malformed
   final-answer recovery, operator-controlled worker source archives, protocol-1
@@ -36,7 +36,8 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   `docs/releases/RELEASE-v2.1.9.0.md` for that compatibility baseline.
 - The v2.2.0.0 pre-release checklist (`docs/ops/AGENT_GOALS_2.2.0.0.md`) was the
   authoritative freeze list until it was retired on 2026-11-16; it is kept as
-  history. Owned crates are at 2.2.0; the sandbox now defaults
+  history. The v2.2.1.0 crate sweep moved every LunarWing-owned package and
+  path requirement to 2.2.1; the sandbox now defaults
   to kernel-enforced `proxy-enforced` on Linux and has an opt-in egress-only
   tunnel tier; Multica startup diagnostics, relay-password rotation, OpenRC
   identity checks, storage errors, mission-log redaction, retry budgets, and
@@ -142,4 +143,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-10 (v2.2.0.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-11-19 (v2.2.1.0 crate sweep). Update §2 whenever freeze status changes.*
