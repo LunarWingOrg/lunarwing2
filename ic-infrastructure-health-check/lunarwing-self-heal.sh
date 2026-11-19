@@ -520,11 +520,16 @@ fi
 # Without this registration, standard MT configuration
 # (SELF_HEAL_REMEDY_LOGICAL=false) silently skipped their critical results
 # because there was no service to map.
+# WI#766: `systemd` is registered for the same reason, but only for its
+# per-tenant user-manager instances (a dead user@<uid>.service leaves the
+# tenant with zero units and no restartable target). Real per-unit systemd
+# failures still route through step 2 and are never treated as diagnostic.
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
     [worker_egress]=1
     [disk]=1
+    [systemd]=1
 )
 
 # Service identities that inherit monitor-only treatment regardless of which
@@ -543,6 +548,17 @@ MONITOR_ONLY_SERVICE[lunarwing-voice-sup]=1
 service_is_monitor_only() {
     local svc="$1" bare
     [[ -n "${MONITOR_ONLY_SERVICE[$svc]:-}" ]] && return 0
+    # WI#766: synthetic per-tenant user-manager identity (systemd@<tenant>).
+    # It names no unit — there is nothing to restart when a tenant's user
+    # manager is dead — so it only ever escalates through the monitor path.
+    # Real systemd units never match this prefix.
+    case "$svc" in
+        systemd@*) return 0 ;;
+        # Bare component-level identity from the diagnostic fallback (WI#766:
+        # "zero units and zero instances — discovery broken"). It names no
+        # unit; real units always reach here with a dotted suffix.
+        systemd) return 0 ;;
+    esac
     # Tenant-scoped init units: lunarwing-voice-<tenant>[-sup].
     case "$svc" in
         lunarwing-voice-*) return 0 ;;
@@ -1113,7 +1129,7 @@ main() {
     # component-level verdict (coverage notes must not page per instance).
     local diag_comp inst_name inst_status diag_id diag_cstatus
     local -a diag_bad=()
-    for diag_comp in runtime knowledge worker_egress disk; do
+    for diag_comp in runtime knowledge worker_egress disk systemd; do
         diag_bad=()
         while IFS=$'\t' read -r inst_name inst_status; do
             [[ -n "$inst_name" ]] || continue
@@ -1150,6 +1166,16 @@ main() {
         diag_cstatus="$(jq -r --arg comp "$diag_comp" \
             '[.components[] | select(.component == $comp) | .status] | first // "absent"' \
             "$report" 2>/dev/null || true)"
+        # WI#766: the systemd component also carries real per-unit failures,
+        # which step 2 already targets. Its component-level fallback exists only
+        # for the "no unit observable at all" shape (a dead tenant user manager
+        # or a broken discovery sweep), so a failing unit is never paged twice.
+        if [[ "$diag_comp" == "systemd" ]]; then
+            local diag_unit_count
+            diag_unit_count="$(jq -r '[.components[] | select(.component == "systemd")
+                | (.metrics.units // [])[]] | length' "$report" 2>/dev/null || echo 0)"
+            [[ "$diag_unit_count" == "0" ]] || diag_cstatus=""
+        fi
         if [[ ${#diag_bad[@]} -eq 0 ]] && [[ "$diag_cstatus" == degraded || "$diag_cstatus" == critical || "$diag_cstatus" == unknown ]]; then
             [[ -n "${seen[$diag_comp]:-}" ]] && continue
             seen[$diag_comp]=1

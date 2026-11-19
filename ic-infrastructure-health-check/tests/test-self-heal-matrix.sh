@@ -186,6 +186,39 @@ assert_contains "$oB21" "ESCALATING: worker_egress@acme (monitor_only" "B21: mis
 assert_absent "$oB21" "no service mapping for component 'worker_egress'" "B21: worker egress has a diagnostic registration"
 assert_absent "$oB21" "would run: systemctl restart" "B21: missing egress never blindly restarts a service"
 
+# B22-B24 — WI#766: a dead tenant user manager produces no units at all. The
+# per-tenant instance must escalate monitor-only (there is nothing to restart)
+# and the component-level fallback must not double-page when units do exist.
+b22="$(sb)"; report "$b22" '{components:[{component:"systemd",status:"degraded",metrics:{units:[],instances:[
+  {tenant:"acme",status:"degraded",manager_unit:"user@1011.service",manager_state:"failed"}]}}]}'
+oB22="$(run_dry "$b22" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB22" "ESCALATING: systemd@acme (monitor_only" "B22: dead user manager escalates with tenant attribution (MT defaults)"
+assert_absent   "$oB22" "would run: systemctl restart"         "B22: a dead manager never restarts a unit"
+assert_absent   "$oB22" "no service mapping for component 'systemd'" "B22: systemd has a diagnostic registration"
+
+# B23 — a dead manager alongside a real failing unit: both are tracked, and
+# neither is paged twice through the component-level fallback.
+b23="$(sb)"; report "$b23" '{components:[{component:"systemd",status:"degraded",metrics:{units:[
+  {name:"lunarwing-beta.service",status:"critical"}],instances:[
+  {tenant:"acme",status:"degraded",manager_unit:"user@1011.service",manager_state:"failed"}]}}]}'
+oB23="$(run_dry "$b23" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB23" "ESCALATING: systemd@acme (monitor_only"          "B23: dead manager still attributed"
+assert_contains "$oB23" "would run: systemctl restart lunarwing-beta.service" "B23: real unit failure keeps its restart path"
+assert_absent   "$oB23" "ESCALATING: systemd (monitor_only"               "B23: no component-level double page while units exist"
+
+# B24 — healthy manager instances clear their synthetic state (report-as-truth),
+# and a component-level degrade with no instance and no failing unit still
+# escalates as the bare component (discovery broken entirely).
+b24="$(sb)"; report "$b24" '{components:[{component:"systemd",status:"healthy",metrics:{units:[],instances:[
+  {tenant:"acme",status:"healthy",manager_unit:"user@1011.service"}]}}]}'
+seed_state "$b24" '{"systemd@acme":{retries:1,consecutive_unhealthy:2}}'
+oB24="$(run_raw "$b24" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false -- --report "$b24/report.json" --backoff 0)"
+assert_contains "$oB24" "RECOVERED: cleared state for systemd@acme" "B24: recovered manager clears synthetic state"
+
+b24b="$(sb)"; report "$b24b" '{components:[{component:"systemd",status:"degraded",metrics:{units:[],instances:[]}}]}'
+oB24b="$(run_dry "$b24b" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB24b" "ESCALATING: systemd (monitor_only" "B24: zero-unit/zero-instance degrade still escalates"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},
