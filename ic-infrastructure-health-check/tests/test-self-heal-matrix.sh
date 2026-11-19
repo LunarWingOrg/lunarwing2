@@ -248,6 +248,33 @@ assert_eq "$(jq -r '.service'  "$b25/captured.json" 2>/dev/null)" "systemd@acme"
 assert_eq "$(jq -r '.recovery' "$b25/captured.json" 2>/dev/null)" "systemctl start user@1011.service" \
     "B25: escalation object carries the recovery command"
 
+# B25b — WI#766 review AGW-2: render the page itself. B25 replaces the notifier
+# with a stub that only copies the escalation object, so send-notification.sh
+# never runs there and a deleted Recovery line would pass. Run the real
+# renderer over that object with a stub sender and assert the line reaches the
+# outgoing message.
+b25bin="$b25/stub-bin"; mkdir -p "$b25bin"
+cat > "$b25bin/curl" <<'STUBCURL'
+#!/usr/bin/env bash
+# Stub sender: capture the -d payload and report success.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d) printf '%s' "$2" > "${CURL_STUB_OUT:?CURL_STUB_OUT unset}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '200'
+STUBCURL
+chmod +x "$b25bin/curl"
+oB25b="$(env PATH="$b25bin:$PATH" CURL_STUB_OUT="$b25/page.json" \
+    GOTIFY_URL='http://stub.invalid' GOTIFY_TOKEN='stub-token' \
+    "$LIB_DIR/../send-notification.sh" degraded "$b25/captured.json" 2>&1)"
+assert_contains "$oB25b" "Notification sent" "B25b: real notifier runs against the stub sender"
+b25page="$(jq -r '.message // ""' "$b25/page.json" 2>/dev/null || true)"
+assert_contains "$b25page" "Service: systemd@acme" "B25b: rendered page names the tenant identity"
+assert_contains "$b25page" "Recovery: systemctl start user@1011.service" \
+    "B25b: rendered page carries the recovery command"
+
 # B26 — a monitor-only identity with no recovery hint (worker egress) keeps the
 # escalation object free of an empty recovery field.
 b26="$(sb)"; report "$b26" '{components:[{component:"worker_egress",status:"critical",metrics:{instances:[
