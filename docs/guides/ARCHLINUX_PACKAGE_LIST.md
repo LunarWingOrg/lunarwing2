@@ -48,19 +48,23 @@ Unlike Gentoo there is **no USE-flag step**: Arch's `iptables` package is alread
 nftables-based variant that podman needs. The separate `nftables` package supplies `nft`,
 which mt-admin requires to enforce and audit per-tenant external-worker egress allowlists.
 
-`lunarwing-mt-admin.sh` uses the fully-qualified `docker.io/pgvector/pgvector:pg16` image, so no
+`lunarwing-mt-admin.sh` uses the fully-qualified, digest-pinned
+`docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f`
+image (PostgreSQL 16.16 / pgvector 0.8.7, reviewed 2026-11-12), so no
 `unqualified-search-registries` config is strictly required. If you override to a short name via
 `LUNARWING_MT_PG_IMAGE`, add the search registry to avoid a TTY prompt under rootless podman:
 
 ```bash
 echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
-sudo podman pull pgvector/pgvector:pg16   # optional pre-pull; add-tenant does it otherwise
+# Optional pre-pull. Pull the same digest mt-admin pins, or the tag may resolve
+# to a different image and the pre-pull saves nothing:
+sudo podman pull docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
 ```
 
 (Docker alternative: `pacman -S docker`, then `systemctl enable --now docker`.)
 
-> The `pgvector/pgvector:pg16` **container image** is pulled, not pacman-installed.
+> The `pgvector/pgvector` **container image** is pulled, not pacman-installed.
 
 > The Gentoo doc's "make `/` a shared mount" step is **not needed on Arch**: systemd mounts `/`
 > `rshared` at boot, so rootless podman is happy out of the box.
