@@ -1265,9 +1265,6 @@ for the bus, and let the units the manager starts on its own settle before
 continuing; if the manager does not come back they exit non-zero with the line.
 `stop-tenant`, `status` and `remove-tenant` report the line once and treat the
 tenant's user units as down (the dead manager already took them down).
-`remove-tenant` removes the unit files when it can, but it refuses rather than
-claim success while a later step needs the user bus (see the keeper below);
-recover the manager and rerun — removal is idempotent.
 
 The probe runs once per tenant per mt-admin process. Its answer and the
 "already said" flag are kept in a per-process directory, so a caller that
@@ -1308,12 +1305,31 @@ The next `start-tenant`/`restart-tenant` validates the surviving keeper
 (`validate_keeper` in `ic/scripts/lunarwing-worker-egress-guard.sh`) before
 starting or adopting it, so a keeper left by such a stop is never used
 unvalidated. If the surviving keeper no longer starts, the guard fails closed
-and names it; remove it as the tenant (`sudo -u <tenant> podman pod rm -f
-lw-egress-keeper-<tenant>`) and start again. `remove-tenant` in that state
-refuses before touching the egress network: the keeper, its network and the
-rendered egress state are unchanged, the one line names the recovery, and
-removal aborts non-zero instead of removing the account from under a surviving
-keeper. Recover the manager and rerun the removal.
+and names it. Before manually removing it, recover the user manager, stop the
+tenant's workers, and confirm the pod is the managed keeper (label
+`lunarwing.purpose=worker-egress-keeper`, with only its infra container). Use
+the tenant's own Podman store, as mt-admin does, then retry the start:
+
+```bash
+tenant='your-tenant' # Replace with the affected tenant name.
+(
+  cd / || exit 1
+  uid="$(id -u "$tenant")" || exit 1
+  home="$(getent passwd "$tenant" | cut -d: -f6)"
+  [ -n "$home" ] || exit 1
+  exec sudo -u "$tenant" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+    podman pod rm -f "lw-egress-keeper-$tenant"
+)
+```
+
+If `remove-tenant` reaches egress teardown with rootless Podman and the user
+manager is still down, it exits non-zero without changing the keeper, network,
+live egress chains or rendered egress state. At that point it has already
+removed the unit files, managed worker containers and IPC volumes, deallocated
+the ports, and run the PostgreSQL reset step if `--purge` was requested. The
+tenant account and home are still in place. Recover the manager and rerun
+`remove-tenant` to finish. This egress refusal does not apply to rootful Docker
+or rootful Podman; they do not need the tenant's user bus for teardown.
 
 ### Services don't start after reboot
 

@@ -676,10 +676,11 @@ worker_egress_flush() {
 
 # WI#769: rootless Podman needs the tenant's systemd user bus for the cgroup
 # and netns work behind `pod rm`. With `user@<uid>.service` dead, podman prints
-# its own bus errors and leaves the pod. True only for a known-dead manager:
-# `unknown` means the probe could not tell, and must not invent one (WI#731).
-_worker_egress_user_manager_dead() {  # <name>
+# its own bus errors and leaves the pod. Only rootless Podman on systemd needs
+# this gate. `unknown` must still fall through to the real call (WI#731).
+_worker_egress_rootless_bus_down() {  # <name>; call after runtime detection
   local name="$1" state
+  [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 1
   [[ "${INIT_SYSTEM:-}" == systemd ]] || return 1
   state="$(_user_manager_state "$name")"
   [[ "$state" != ok && "$state" != unknown ]]
@@ -707,7 +708,7 @@ worker_egress_stop_keeper() {  # <name> [keep]
   ensure_container_runtime
   [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
   keeper="lw-egress-keeper-$name"
-  if _worker_egress_user_manager_dead "$name"; then
+  if _worker_egress_rootless_bus_down "$name"; then
     unit="$(_worker_egress_user_manager_unit "$name")"
     if [[ "$mode" == keep ]]; then
       printf 'worker-egress: kept namespace keeper %s on purpose: systemd user manager %s is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use; recover with: systemctl start %s\n' \
@@ -822,13 +823,11 @@ worker_egress_teardown() {
     printf 'worker-egress: removed the rendered egress state of %s\n' "$name"
     return 0
   fi
-  # WI#769: with the tenant's systemd user manager dead, every step below
-  # (attachment check, keeper release, network removal) needs the rootless
-  # store's user bus and would only spray Podman's own bus errors. Refuse
-  # before the first such call: the keeper, its network and the rendered state
-  # stay untouched, and remove-tenant aborts instead of reporting a tenant
-  # removed while its keeper survives.
-  if _worker_egress_user_manager_dead "$name"; then
+  ensure_container_runtime
+  # WI#769: rootless Podman cannot release its keeper without the user bus.
+  # Refuse before inspecting attachments or flushing chains, keeping all
+  # egress state intact for retry. Rootful teardown does not need the bus.
+  if _worker_egress_rootless_bus_down "$name"; then
     unit="$(_worker_egress_user_manager_unit "$name")"
     printf 'worker-egress: cannot tear down the egress state of %s: systemd user manager %s is down and rootless podman needs its user bus; keeper, network and rendered state are unchanged; recover with: systemctl start %s\n' \
       "$name" "$unit" "$unit" >&2

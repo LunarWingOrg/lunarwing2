@@ -83,25 +83,29 @@ KEEPER="lw-egress-keeper-$TENANT"
 MANAGER_STATE=failed
 POD_EXISTS_RC=0
 POD_RM_RC=0
-CTR_LOG_FILE="$(mktemp)"
-STATE_LOG_FILE="$(mktemp)"
-trap 'rm -f -- "$CTR_LOG_FILE" "$STATE_LOG_FILE"' EXIT
-ctr_calls() { cat "$CTR_LOG_FILE"; }
-ctr_call_count() { wc -l <"$CTR_LOG_FILE" | tr -d ' '; }
+ATTACHMENTS=""
+CALL_LOG="$(mktemp)"
+trap 'rm -f -- "$CALL_LOG"' EXIT
+record() { printf '%s\n' "$*" >>"$CALL_LOG"; }
+ctr_calls() { sed -n 's/^ctr: //p' "$CALL_LOG"; }
+ctr_call_count() { ctr_calls | wc -l | tr -d ' '; }
 
 reset_runtime() {
-  : >"$CTR_LOG_FILE"
-  : >"$STATE_LOG_FILE"
+  : >"$CALL_LOG"
   CONTAINER_RT=podman
   MT_ROOTLESS=true
   INIT_SYSTEM=systemd
   MANAGER_STATE=failed
   POD_EXISTS_RC=0
   POD_RM_RC=0
+  ATTACHMENTS=""
 }
 
-# The gate's answer, without a probe: each case sets the state it needs.
-_user_manager_state() { printf '%s\n' "$MANAGER_STATE"; }
+# Log calls to the gate without contacting a real user manager.
+_user_manager_state() {
+  record "manager-state: $1"
+  printf '%s\n' "$MANAGER_STATE"
+}
 
 id() {
   if [[ "${1:-}" == -u && "${2:-}" == "$TENANT" ]]; then
@@ -116,7 +120,8 @@ ensure_container_runtime() { :; }
 worker_egress_enabled() { return 0; }
 tenant_exists_in_registry() { return 0; }
 tenant_rootless_account_gone() { return 1; }
-_worker_egress_remove_state() { printf 'state-removed\n' >>"$STATE_LOG_FILE"; }
+worker_egress_nft() { record "nft: $*"; }
+_worker_egress_remove_state() { record "state-removed: $1"; }
 
 # The stand-in for rootless Podman. `pod rm` refuses with the measured bus
 # errors when POD_RM_RC is non-zero; every call is recorded so a case can
@@ -124,8 +129,9 @@ _worker_egress_remove_state() { printf 'state-removed\n' >>"$STATE_LOG_FILE"; }
 _ctr() {
   local name="$1"
   shift
-  printf '%s\n' "$name $*" >>"$CTR_LOG_FILE"
+  record "ctr: $name $*"
   case "$1 $2" in
+    'ps --all') printf '%s\n' "$ATTACHMENTS" ;;
     'pod exists') return "${POD_EXISTS_RC:-0}" ;;
     'pod inspect') printf 'worker-egress-keeper\n' ;;
     'pod rm')
@@ -282,7 +288,44 @@ assert_contains "teardown: names the recovery command" "$out" \
   "recover with: systemctl start user@1009.service"
 assert_not_contains "teardown: no raw Podman bus error" "$out" "connection refused"
 assert_eq "teardown: never calls podman" "$(ctr_call_count)" "0"
-assert_not_contains "teardown: the rendered state is untouched" "$(cat "$STATE_LOG_FILE")" "state-removed"
+assert_eq "teardown: no egress changes after the manager check" "$(cat "$CALL_LOG")" \
+  "manager-state: $TENANT"
+
+# --- 7. a rootful teardown does not need the tenant's user bus (AGD-1) -------
+
+attachment_query="ctr: $TENANT ps --all --no-trunc --filter network=lw-egress-$TENANT --format {{.ID}} {{.Names}}"
+expected="$(printf '%s\n' \
+  "$attachment_query" \
+  "nft: $TENANT flush chain inet lunarwing_worker_egress fwd_$TENANT" \
+  "nft: $TENANT delete chain inet lunarwing_worker_egress fwd_$TENANT" \
+  "nft: $TENANT flush chain inet lunarwing_worker_egress in_$TENANT" \
+  "nft: $TENANT delete chain inet lunarwing_worker_egress in_$TENANT" \
+  "ctr: $TENANT network rm lw-egress-$TENANT" \
+  "state-removed: $TENANT")"
+for runtime in docker podman; do
+  for manager in ok failed; do
+    reset_runtime
+    CONTAINER_RT="$runtime"
+    MT_ROOTLESS=false
+    MANAGER_STATE="$manager"
+    capture worker_egress_teardown "$TENANT"
+    assert_eq "rootful $runtime ($manager): teardown exits 0" "$CAPTURED_RC" "0"
+    assert_eq "rootful $runtime ($manager): no refusal" "$CAPTURED_OUT" ""
+    assert_eq "rootful $runtime ($manager): same teardown without a manager probe or keeper" \
+      "$(cat "$CALL_LOG")" "$expected"
+  done
+
+  reset_runtime
+  CONTAINER_RT="$runtime"
+  MT_ROOTLESS=false
+  ATTACHMENTS="1234567890 remaining-worker"
+  capture worker_egress_teardown "$TENANT"
+  assert_eq "rootful $runtime (failed): attached container blocks teardown" "$CAPTURED_RC" "1"
+  assert_contains "rootful $runtime (failed): refusal names the attachment" "$CAPTURED_OUT" \
+    "refusing teardown: remaining-worker"
+  assert_eq "rootful $runtime (failed): attachment refusal does not change egress" \
+    "$(cat "$CALL_LOG")" "$attachment_query"
+done
 
 (( failures == 0 )) || exit 1
 printf 'ALL TESTS PASSED\n'
