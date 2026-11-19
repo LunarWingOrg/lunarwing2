@@ -129,21 +129,34 @@ realm `https://git.lunarwing.org/jwt/auth`.)
 - **502 on `PATCH .../blobs/uploads`:** not a missing backend — inspect the
   Traefik/nginx HTTP/2 path and registry logs. Rootless BuildKit replaced the
   archived Kaniko client, so old Kaniko-specific retry advice no longer applies.
-- **499 Client Closed Request on `PATCH .../blobs/uploads`:** a proxy timeout
-  firing mid-upload on multi-GB worker images. Needs Traefik/omnibus timeout
-  changes on this host — full diagnosis and exact config in
-  `REGISTRY_PUSH_499.md`.
+- **499, 504 or connection reset on a large upload (blob `PATCH` or job
+  artifacts):** a 60-second proxy timeout firing mid-upload on large worker
+  images or artifacts. Needs the Traefik/omnibus timeout changes on this host
+  — chosen value and exact config in `REGISTRY_PUSH_499.md`.
 - **Wrong token realm / scheme mismatch on `docker login`:** the
   `registry_nginx['proxy_set_headers']` block is missing.
 
-### 1f. Large-image notes for Traefik
+### 1f. Large-upload timeouts for Traefik
 
-Worker images can be multi-GB (especially opencode with toolchains). Traefik
-streams request bodies by default, which is fine; large layer pushes that die
-mid-`PATCH` with `499 Client Closed Request` mean a responding/forwarding
-timeout fired — raise `respondingTimeouts` on the `websecure` entrypoint and
-omnibus `registry_nginx` body/proxy timeouts per `REGISTRY_PUSH_499.md`.
-Leave request buffering off.
+Worker images and their artifacts can be multi-GB (the opencode2 candidate
+uploads a 279 MiB rootfs tar). Traefik streams request bodies by default,
+which is fine; a layer push or artifact upload that is cut after about 60
+seconds with `499`, `504` or `connection reset by peer` means a timeout fired.
+The edge setting is
+`entryPoints.websecure.transport.respondingTimeouts.readTimeout`, which
+defaults to **60 s** since Traefik 2.11.2 / 3.0 and bounds the whole request
+including its body. The chosen value for both `git.lunarwing.org` and
+`registry.git.lunarwing.org` is **`30m`**, bounded rather than `0` (the
+timeout also protects against clients that send a body slowly). This is
+static configuration, so Traefik must be restarted; if the public entry point
+must keep 60 s, give the runners a separate entry point with the 30m value and
+an address allowlist. Also raise the omnibus `registry_nginx` body/proxy
+timeouts per `REGISTRY_PUSH_499.md`. Leave request buffering off.
+
+Until the edge change is live, runner 17 (the slow `laptop`/`rainova43`
+runner) no longer carries the `container-build` tag, so it cannot take the
+candidate jobs. See `REGISTRY_PUSH_499.md` for the exact change and the
+condition for reverting it.
 
 ## 2. CI: build and push worker images
 
@@ -231,6 +244,7 @@ plus an integrity check (digest pin per release).
 - **`502 Bad Gateway` on `PATCH .../blobs/uploads/...`:** inspect BuildKit and
   proxy logs. Re-running creates a fresh candidate tag, so it cannot mutate the
   candidate already referenced by verification evidence.
-- **`499 Client Closed Request` on `PATCH .../blobs/uploads/...`:** proxy
-  timeout on large blobs, not fixable from CI — see `REGISTRY_PUSH_499.md`
-  for the GitLab-host Traefik/omnibus changes.
+- **`499`, `504` or reset on `PATCH .../blobs/uploads/...` or on a large
+  artifact upload:** proxy timeout on large bodies, not fixable from CI — see
+  `REGISTRY_PUSH_499.md` for the GitLab-host Traefik/omnibus changes and the
+  runner 17 interim mitigation.
