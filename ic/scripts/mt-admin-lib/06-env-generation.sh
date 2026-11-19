@@ -1476,6 +1476,8 @@ write_tenant_lunarwing_env() {
   engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
   engine_v2_stream_reasoning="$(_env_existing "$env_snapshot" ENGINE_V2_STREAM_REASONING)"
   engine_v2_stream_reasoning="${engine_v2_stream_reasoning:-false}"
+  engine_v2_no_progress_threshold="$(_env_existing "$env_snapshot" ENGINE_V2_NO_PROGRESS_THRESHOLD)"
+  engine_v2_no_progress_threshold="${engine_v2_no_progress_threshold:-3}"
   skill_self_improvement="$(_env_existing "$env_snapshot" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
   skill_prune_quarantine_days="$(_env_existing "$env_snapshot" SKILL_PRUNE_QUARANTINE_DAYS)"
   skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
@@ -1629,6 +1631,10 @@ ORCHESTRATOR_SELF_MODIFY=$orchestrator_self_modify
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=$engine_v2_model_recovery_attempts
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=$engine_v2_model_recovery_total_attempts
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=$engine_v2_tool_async_timeout_secs
+# Consecutive steps with no successful tool or code work before the one
+# no-progress warning turn (WI#640); clamped 2-10. A slow-host timeout counts
+# as a failed step, so weak local models may need 5 more. Preserved on render.
+ENGINE_V2_NO_PROGRESS_THRESHOLD=$engine_v2_no_progress_threshold
 # Per-call output budget (max_tokens) for Engine V2 model requests. Thinking
 # models count their reasoning against it; raise to 16384+ if turns end with
 # "used its entire output budget before producing visible text". Preserved on

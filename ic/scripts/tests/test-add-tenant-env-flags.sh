@@ -187,6 +187,10 @@ assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "2000
 assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
 assert_eq "default ENGINE_V2_STREAM_REASONING" "$(envval ENGINE_V2_STREAM_REASONING)" "false"
+# WI#640: weak local models can burn the default no-progress streak on a busy
+# host; the rendered knob lets an operator raise it without a rebuild.
+assert_eq "default ENGINE_V2_NO_PROGRESS_THRESHOLD" \
+  "$(envval ENGINE_V2_NO_PROGRESS_THRESHOLD)" "3"
 assert_eq "default ORCHESTRATOR_SELF_MODIFY" \
   "$(envval ORCHESTRATOR_SELF_MODIFY)" "true"
 # WI#291: new tenants get a lightweight-routine tool-round cap above the
@@ -356,6 +360,19 @@ done
 sed -i '/^ENGINE_V2_STREAM_REASONING=/d' "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
 assert_eq "older tenant defaults reasoning to false" "$(envval ENGINE_V2_STREAM_REASONING)" "false"
+
+echo "=== no-progress threshold preservation tests (WI#640) ==="
+for threshold in 5 10; do
+  sed -i "s/^ENGINE_V2_NO_PROGRESS_THRESHOLD=.*/ENGINE_V2_NO_PROGRESS_THRESHOLD=$threshold/" \
+    "$MT_FIXTURE/env/lunarwing.env"
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "rerun preserves no-progress threshold $threshold" \
+    "$(envval ENGINE_V2_NO_PROGRESS_THRESHOLD)" "$threshold"
+done
+sed -i '/^ENGINE_V2_NO_PROGRESS_THRESHOLD=/d' "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "older tenant defaults no-progress threshold to 3" \
+  "$(envval ENGINE_V2_NO_PROGRESS_THRESHOLD)" "3"
 
 echo "=== approval setting migration tests ==="
 # Canonical key must win even when a conflicting legacy value is present.
