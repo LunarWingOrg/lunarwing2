@@ -84,6 +84,31 @@ transition.
    fresh databases get the image's packaged 0.8.7. `refresh-pg-image`
    deliberately does **not** run `ALTER EXTENSION vector UPDATE`.
 
+## Re-verification 2026-11-19 (WI#777)
+
+The 2026-11-17 rows above were recorded on `ajhermes-z` and are not re-verified
+here. This section records what a second host could prove.
+
+Host `colgatev` (OpenRC `0.63.3`, rootless Podman `6.1.4`), read-only
+`pg-image-status` before any change:
+
+| Tenant | Before | After | Disposition |
+|---|---|---|---|
+| `dash` | 16.15, floating `pgvector/pgvector:pg16`, image `f1447071e6c8…`, pgvector 0.8.7 | 16.16, pinned `…@sha256:484e8380…`, image `b0108689bf51…`, pgvector 0.8.7 | `refresh-pg-image dash` on 2026-11-19; the daemon and PostgreSQL service were started before and after, and the named data volume was retained |
+| `antelope` | 16.16, pinned digest, image `b0108689bf51…`, pgvector 0.8.7 | unchanged | already at the reviewed pin; no refresh needed |
+| `mcpvalidation` | — | — | not present in `/etc/lunarwing/ports.json` at re-verification; recorded as removed, not left uninspected |
+
+`dash` is the WI#664 row that was left uninspected: it was below the `160016`
+floor and still carried a floating reference, so it was exposed to the CVEs
+fixed between 16.15 and 16.16 until this refresh. `hermes` and `ajhermes-z`
+were not reachable from this host; their 16.14 record remains unverified and
+is a per-host follow-up, not an assumed closure.
+
+The pgvector extension question is answered with evidence in
+[the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verification-2026-11-19-wi777):
+a 0.8.6 catalog survives the image swap on the new library, and the shipped
+`ALTER EXTENSION vector UPDATE` path changes catalog comments only.
+
 ## How to check
 
 ```bash
