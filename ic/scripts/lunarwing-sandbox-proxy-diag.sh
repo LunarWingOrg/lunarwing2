@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Read-only host diagnosis for the sandbox proxy relay (WI#641).
+# Host diagnosis for the sandbox proxy relay (WI#641).
 #
 # Collects SELinux mode, the tenant's sandbox network mode and daemon context,
 # relay mount metadata, and candidate AVC denials. Does not change policy,
-# start services, or print arbitrary tenant environment values.
+# start services, or print arbitrary tenant environment values. Its only write
+# is one temporary file (mktemp) that holds the matched AVC lines for
+# audit2why; it is removed on exit.
 #
 # Run as root on the tenant host (ausearch needs the audit log) while the
 # sandbox is idle, then trigger one failing sandbox shell call and run again
@@ -76,6 +78,22 @@ relay_denials() {
   # candidates and must be correlated by time and contexts, not assumed ours.
   grep --line-buffered -E '^(node=[^ ]+ )?type=(AVC|USER_AVC) .*avc:[[:space:]]+denied' \
     | grep --line-buffered -E 'lw-proxy-|proxy\.sock|\{[^}]*\bconnectto\b[^}]*\}.*\btclass=unix_stream_socket\b'
+}
+
+interpret_denials() {
+  # The denied permission alone does not say what to change: a missing allow
+  # rule and a policy constraint (`mlsconstrain`, e.g. a level comparison) are
+  # refused identically but need different fixes. audit2why names which one.
+  if [[ ! -s "$1" ]]; then
+    say "no matching AVC returned (log unavailable or no match); this does not determine the cause."
+    return
+  fi
+  if command -v audit2why >/dev/null 2>&1; then
+    say "audit2why:"
+    audit2why <"$1" 2>&1 | sed 's/^/  /' || say "  (audit2why could not interpret the record)"
+  else
+    say "audit2why not installed; read the denied permission and the two contexts above."
+  fi
 }
 
 tenant=""
@@ -162,10 +180,12 @@ say "  -> inode labels do not establish permission to connect to the listening s
 
 say ""
 say "== 5. Recent candidate SELinux denials (match time and contexts to the failing call)"
+denials="$(mktemp)"
+trap 'rm -f -- "$denials"' EXIT
 if command -v ausearch >/dev/null 2>&1; then
-  if ! ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials; then
-    say "no matching AVC returned (log unavailable or no match); this does not determine the cause."
-  fi
+  ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials >"$denials" || true
+  cat "$denials" 2>/dev/null || true
+  interpret_denials "$denials"
 else
   say "ausearch not installed; skipped."
 fi
@@ -176,7 +196,10 @@ if [[ "$watch" == true ]]; then
   if [[ ! -r /var/log/audit/audit.log ]]; then
     say "cannot read /var/log/audit/audit.log; run as root to watch."
   else
-    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null | relay_denials || true
+    : >"$denials"
+    timeout 60 tail -n 0 -F /var/log/audit/audit.log 2>/dev/null | relay_denials | tee "$denials" || true
+    say ""
+    interpret_denials "$denials"
     say "watch finished."
   fi
 fi

@@ -429,8 +429,40 @@ public-only validating proxy:
   uppercase `:Z` is the private relabel. SELinux may separately require
   `sock_file` access to the socket inode and `unix_stream_socket connectto`
   permission to the listening socket's security context. A shared inode
-  label does not change the listener's context or prove a connect is allowed.
-  The daemon does not relabel the channel itself or change SELinux policy.
+  label does not change the listener's context. The measured denial on an
+  enforcing Fedora host is the second check: `container_t` against the
+  daemon's `unconfined_t`, which no inode relabel can change.
+- relay listener label (WI#641): on a host with SELinux enabled, the listener
+  is created on a dedicated daemon thread whose `sockcreate` attribute is
+  pinned to `system_u:system_r:container_t:s0`, then to
+  `system_u:system_r:container_t:s0:c0.c1023`. The first makes the
+  container's connect a same-type check that stock container policy already
+  allows. The second is kept for a policy that also compares the two levels;
+  that such a policy accepts it was not verified against any policy source
+  (the Fedora targeted policy sources put no level constraint on
+  `unix_stream_socket connectto`), and the self-test decides it on each host.
+  Before a container starts, the daemon replays that connect from a client
+  socket created under a container-shaped source context (a runtime category
+  pair, then the base level) and checks `accept` plus one byte each way. Any
+  refusal, an unwritable `sockcreate` node, or a label thread that cannot be
+  started keeps the previous unlabeled socket, and a host without selinuxfs
+  starts no thread and binds exactly as before, so the change can only add a
+  working path.
+- what the relay label opens (WI#641): at the SELinux layer, on the targeted
+  policy, any process of type `container_t`, at any level, now passes the
+  socket check for this listener; before the label, no container did on an
+  enforcing host. What keeps other containers out is unchanged, and is the
+  same as on a host without SELinux: the private `0700` parent directory, and
+  that only this run mounts `channel`. Sandbox confinement is unchanged: no
+  `label=disable`, no permissive domain, and no permission a container does
+  not already have for its own sockets. The daemon does not relabel the
+  channel itself or change SELinux policy.
+- relay label refusals (WI#641): the labeled attempt is repeated on every
+  sandbox execution, so a corrected policy takes effect without a daemon
+  restart. The daemon warns once per process, with the kernel's own error for
+  each refused candidate, and logs later refusals at debug level. An enforcing
+  host whose policy denies a step of the attempt still records that denial in
+  its audit log on every call.
 - relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
   `sandbox:proxy_error`. A failed transport probe reports the errno, container
   UID/GID, mount and socket metadata, and available SELinux state. The probe
