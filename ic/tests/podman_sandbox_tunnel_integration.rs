@@ -2303,6 +2303,10 @@ async fn tunnel_sidecar_netbird_live() {
     let _ = runtime_success(&["rm", "-f", &peer_name]).await;
     remove_netbird_volumes(&volume_prefix).await;
     let _ = runtime_success(&["volume", "rm", &peer_name]).await;
+    assert_detached_helper_stopped(primary.container_name()).await;
+    assert_tunnel_containers_absent("the NetBird live lane")
+        .await
+        .expect("no tunnel containers left behind");
     let _ = std::fs::remove_file(peer_env);
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("live NetBird connectivity, joined-run, reconnect, identity, and ingress checks");
