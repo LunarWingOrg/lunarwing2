@@ -524,14 +524,11 @@ fi
 # per-tenant user-manager instances (a dead user@<uid>.service leaves the
 # tenant with zero units and no restartable target). Real per-unit systemd
 # failures still route through step 2 and are never treated as diagnostic.
-# WI#789: `openrc` joins for the OpenRC parity of that shape. A component-wide
-# degrade that names no failing service (cron hook installed with no scheduler
-# running, an incomplete sweep, a lost init.d fleet) otherwise reaches no
-# target at all: step 1 drops it for having no SERVICE_MAP entry, and it had no
-# step 1b registration. Its scheduler blind spot gets its own
-# `openrc@scheduler` instance; a bare `openrc` identity covers the rest. Real
-# per-service OpenRC failures still route through step 2 — the component
-# fallback is guarded so one is never paged twice.
+# WI#789: OpenRC component failures without a failing service row go through
+# step 1b: `openrc@scheduler` for a stopped scheduler observed during a run,
+# and bare `openrc` for other gaps such as an incomplete sweep. Reports with
+# failing service rows (including default rows when init.d discovery finds
+# nothing) already route those rows through step 2, without a bare fallback.
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
@@ -1219,11 +1216,10 @@ main() {
         diag_cstatus="$(jq -r --arg comp "$diag_comp" \
             '[.components[] | select(.component == $comp) | .status] | first // "absent"' \
             "$report" 2>/dev/null || true)"
-        # WI#766/WI#789: these components also report real per-unit failures,
-        # which step 2 already targets. Their component-level fallback exists
-        # only for the "no unit observable at all" shape (a dead tenant user
-        # manager, a broken discovery sweep, a dead cron scheduler), so a
-        # failing unit is never paged twice.
+        # WI#766/WI#789: keep the bare fallback separate from step 2's unit
+        # and service targets. Systemd needs zero unit rows; OpenRC needs zero
+        # failing service rows. A failed diagnostic instance also supersedes
+        # the bare fallback below.
         case "$diag_comp" in
             systemd)
                 local diag_unit_count

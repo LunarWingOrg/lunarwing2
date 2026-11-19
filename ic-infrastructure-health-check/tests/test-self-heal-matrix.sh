@@ -275,8 +275,9 @@ assert_absent   "$oB27" "nothing to do"                      "B27: zero-service 
 
 b27b="$(sb)"; report "$b27b" '{components:[{component:"openrc",status:"critical",metrics:{services:[]}}]}'
 mkdir -p "$b27b/initd"
-oB27b="$(run_dry "$b27b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b27b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+oB27b="$(run_dry "$b27b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b27b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=true)"
 assert_contains "$oB27b" "ESCALATING: openrc (monitor_only" "B27b: critical openrc with no service escalates too"
+assert_absent   "$oB27b" "no service mapping for component 'openrc'" "B27b: logical remediation skips the service lookup for openrc"
 
 # B28 — the cron blind spot: hook installed with no scheduler running degrades
 # the component while every service probe is healthy. It gets its own
@@ -326,17 +327,27 @@ oB30="$(run_raw "$b30" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INIT
 assert_contains "$oB30" "RECOVERED: cleared state for openrc@scheduler" "B30: healthy scheduler clears synthetic state"
 assert_eq "$(state_of "$b30")" '{}' "B30: recovered scheduler state cleared"
 
-# B31 — the escalation object handed to the notifier names the identity and the
-# recovery command (parity with B25, OpenRC scheduler shape).
+# B31 — simulate two manual observations of a stopped scheduler. From clean
+# state, the default grace defers the first; the second hands the notifier
+# the scheduler identity and the operator's recovery command.
 b31="$(sb)"; report "$b31" '{components:[{component:"openrc",status:"degraded",metrics:{
   scheduler:{hook_installed:true,running:null,installed:"fcron",status:"degraded"}}}]}'
 mkdir -p "$b31/initd"
+mk_mockbin "$b31"
 { echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$b31/captured.json\""; } > "$b31/capture-notifier"
 chmod +x "$b31/capture-notifier"
-env LUNARWING_BASE_DIR="$b31" SELF_HEAL_STATE_DIR="$b31/self-heal" GOTIFY_TOKEN='' \
-    SELF_HEAL_NOTIFY_SCRIPT="$b31/capture-notifier" LUNARWING_MT_OPENRC_INITD_DIR="$b31/initd" \
-    LUNARWING_SERVICE_MANAGER=openrc SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
-    "$SH" --report "$b31/report.json" --backoff 0 >/dev/null 2>&1
+b31_env=(
+    SELF_HEAL_NOTIFY_SCRIPT="$b31/capture-notifier" LUNARWING_MT_OPENRC_INITD_DIR="$b31/initd"
+    SELF_HEAL_GRACE_CHECKS= SELF_HEAL_VERIFY_HEALTH=false
+)
+oB31="$(run_chaos "$b31" openrc "${b31_env[@]}")"
+assert_contains "$oB31" "GRACE: openrc@scheduler unhealthy 1/2" "B31: first observation is deferred at default grace"
+if [[ -e "$b31/captured.json" ]]; then
+    bad "B31: first observation does not notify" "the notifier ran before the grace threshold"
+else
+    ok "B31: first observation does not notify"
+fi
+run_chaos "$b31" openrc "${b31_env[@]}" >/dev/null
 assert_eq "$(jq -r '.service'  "$b31/captured.json" 2>/dev/null)" "openrc@scheduler" \
     "B31: escalation object names the scheduler identity"
 assert_eq "$(jq -r '.recovery' "$b31/captured.json" 2>/dev/null)" "rc-service fcron start" \

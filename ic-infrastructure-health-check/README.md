@@ -435,7 +435,7 @@ wedge it.
 | worker_egress | _(none — monitor-only diagnostic)_ `worker_egress@<tenant>`; pages without changing firewall policy | health-worker-egress.sh |
 | disk | _(none — monitor-only diagnostic)_ `disk@<mount>` per filesystem; pages without restarting or deleting anything | health-disk.sh |
 | systemd (user manager) | _(none — monitor-only diagnostic)_ `systemd@<tenant>` per tenant whose `user@<uid>.service` is down; pages with tenant attribution and the recovery command (`systemctl start user@<uid>.service`), never restarts | health-systemd.sh |
-| openrc (scheduler / component) | _(none — monitor-only diagnostic)_ `openrc@scheduler` when the cron hook is installed but no scheduler is running (pages with `rc-service <sched> start`); bare `openrc` when the component degrades with no failing service; never restarts | health-openrc.sh |
+| openrc (scheduler / component) | _(none — monitor-only diagnostic)_ `openrc@scheduler` when a run sees an installed cron hook but no scheduler running (see manual runs below); bare `openrc` when the component degrades with no failing service; never restarts | health-openrc.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`, `knowledge`, `worker_egress`, and `disk` failures become synthetic
@@ -467,20 +467,30 @@ normal and says nothing about the tenant. Linger is read from logind's marker
 file (`/var/lib/systemd/linger/<user>`), so the check does not depend on
 logind answering.
 
-WI#789 adds the OpenRC parity. On a Gentoo/OpenRC host the component degrades
-in shapes that name no failing service — most visibly when the cron hook is
-installed but no scheduler daemon is running (watchdog, health pipeline and
-self-heal all stop firing while every service probe still reads healthy) — and
-step 1 could never route it. `health-openrc.sh` now also reports
-`.metrics.scheduler.installed` (the first scheduler init script present), the
-scheduler blind spot escalates as `openrc@scheduler` with the recovery command
-`rc-service <sched> start`, and a component-level degrade with no failing
-service escalates as the bare monitor-only `openrc` identity. Real per-service
-OpenRC failures keep their step-2 restart path; the bare component fallback is
-suppressed while any service is non-healthy and non-`skipped`, so a failing
-unit is never paged twice. `skipped` is intentional (tenant not started, worker
-stopped, optional backend disabled) and does not hide a component-level
-monitoring gap.
+WI#789 adds monitor-only escalation for OpenRC component failures without a
+failing service row. For example, an incomplete sweep can escalate as bare
+`openrc`. Failures with service rows, including the default `lunarwing` and
+`xmpp-bridge` rows when init-script discovery finds no units, already take the
+per-service path. The bare fallback is suppressed while any service is
+non-healthy and non-`skipped`, so those failures are not escalated twice.
+`skipped` rows (e.g. tenants not started or optional backends disabled) do not
+hide a component-level monitoring gap.
+
+**Stopped cron scheduler:** When a run sees an installed cron hook but no
+running scheduler, it tracks `openrc@scheduler` rather than bare `openrc`. The
+scheduled OpenRC pipeline depends on that same scheduler, so do not rely on a
+scheduled self-heal page to detect its outage. If an operator runs the installed
+health pipeline manually (normally `/usr/local/sbin/lunarwing-mt-health`), it
+can page after two consecutive unhealthy runs from clean state (the default
+`SELF_HEAL_GRACE_CHECKS=2`; dry runs do not advance state). The page includes
+`rc-service <sched> start` when `health-openrc.sh` reports an installed scheduler
+init script in `.metrics.scheduler.installed`. Self-heal does not run that command.
+
+For a scheduled host, use the shipped
+[`LunarWingHealthReportStale` rule](contrib/prometheus-rules-lunarwing-health.yml)
+to detect when reports stop updating. It fires when the last report is more
+than 40 minutes old for 5 minutes, provided Prometheus continues scraping the
+report timestamp and evaluates the rule.
 
 Logical mappings use configured base names. Init sub-units retain names reported
 by service-manager checks (including `.service`); per-tenant systemd units are
