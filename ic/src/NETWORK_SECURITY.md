@@ -443,11 +443,10 @@ public-only validating proxy:
   `unix_stream_socket connectto`), and the self-test decides it on each host.
   Before a container starts, the daemon replays that connect from a client
   socket created under a container-shaped source context (a runtime category
-  pair, then the base level) and checks `accept` plus one byte each way. Any
-  refusal, an unwritable `sockcreate` node, or a label thread that cannot be
-  started keeps the previous unlabeled socket, and a host without selinuxfs
-  starts no thread and binds exactly as before, so the change can only add a
-  working path.
+  pair, then the base level) and checks `accept` plus one byte each way. The
+  daemon tries the next candidate on refusal and binds an unlabeled socket if
+  neither candidate works or the label thread cannot run. A host without
+  selinuxfs starts no label thread and binds exactly as before.
 - what the relay label opens (WI#641): at the SELinux layer, on the targeted
   policy, any process of type `container_t`, at any level, now passes the
   socket check for this listener; before the label, no container did on an
@@ -463,17 +462,17 @@ public-only validating proxy:
   each refused candidate, and logs later refusals at debug level. An enforcing
   host whose policy denies a step of the attempt still records that denial in
   its audit log on every call.
-- relay label tests (WI#641): the two nodes that gate labeling (the selinuxfs
-  `enforce` value and this thread's `sockcreate` attribute) are named by a
-  `LabelNodes` value, so the decisions of the labeling path run on a host
-  without SELinux: `sandbox::proxy::relay` tests cover the first-candidate
-  bind with the attribute cleared afterwards, one reason per refused
-  candidate with no socket left behind, a kernel-refused labeled bind, and
-  the unlabeled fallback on a host without selinuxfs. A permissive `0`
-  counts as SELinux and is labeled like `1`, so a host that later switches
-  to enforcing cannot regress. What no
-  test can cover is the kernel's own policy decision; that stays with the run
-  on an enforcing host.
+- relay label tests (WI#641): `sandbox::proxy::relay` unit tests use a fake
+  for the SELinux attribute I/O and real Unix sockets. They check the context
+  writes and clears on `relay-label` around the bind and both self-connects.
+  A simulated refusal to set a client context exercises probe failure: the
+  rejected socket is removed before retrying, the second candidate can win,
+  and two probe refusals leave no socket before the unlabeled fallback. Other
+  cases cover listener-context write failures, filesystem bind collisions and
+  the unlabeled path with no selinuxfs. Both permissive `0` and enforcing `1`
+  trigger labeling, but these tests do not verify real SELinux context writes
+  or access decisions. WI#641 still needs the sandbox shell check on an
+  enforcing host.
 - relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
   `sandbox:proxy_error`. A failed transport probe reports the errno, container
   UID/GID, mount and socket metadata, and available SELinux state. The probe
