@@ -1658,7 +1658,7 @@ def run_loop(context, goal, actions, state, config):
                     "resume_output": gate.get("resume_output"),
                 }
 
-            step = advance_code_step_recovery(
+            code_step = advance_code_step_recovery(
                 state,
                 code_step_failed(result),
                 result.get("had_error", False),
@@ -1666,8 +1666,8 @@ def run_loop(context, goal, actions, state, config):
                 consecutive_errors,
                 max_consecutive_errors,
             )
-            consecutive_errors = step["consecutive_errors"]
-            progress = step["progress"]
+            consecutive_errors = code_step["consecutive_errors"]
+            progress = code_step["progress"]
             if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
                 return terminal_recovery_result(state, progress, config)
 
