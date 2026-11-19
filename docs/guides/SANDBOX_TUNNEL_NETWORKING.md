@@ -699,14 +699,15 @@ is harness-covered or unclaimed, not proven.
 | Surface | Runtime / host | Status |
 |---|---|---|
 | Full gated suite (all WireGuard lanes, including per-run recovery, peer death, and firewall cases) | rootless Podman 5.8.2 (2026-11-11) | live, 9 of 9 |
-| Full gated suite at the WI#782 head (all WireGuard lanes) | rootless Podman 6.1.4, OpenRC host (2026-11-19, WI#782) | live, 10 passed / 0 failed; NetBird gate closed |
+| Full gated suite before the WI#782 review follow-up (all WireGuard lanes) | rootless Podman 6.1.4, OpenRC host (2026-11-19, WI#782) | live, 10 reported passes / 0 failures; NetBird gate closed |
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
 | The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; **no live run recorded** (WI#771, WI#782) |
 | Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, rootless Podman, service mode | lane gates it; **no service-mode live run recorded** (WI#771, WI#782) |
-| Docker, systemd service mode, and a tenant-unit tunnel run on the WI#771/WI#782 development host | OpenRC host, no Docker CLI, no user manager; the `ajhermes-z` systemd host on the NetBird overlay refused this agent's SSH keys | not claimed; the three boxes stay open for the maintainer |
+| Tenant-unit sandbox command in tunnel mode | dedicated tenant on a systemd user-manager host | **no live run recorded** (WI#782) |
 
-No public-cloud and no CI run is claimed by any row. Gated lanes stay off by
-default.
+No approved Docker or systemd user-manager test host was available for the
+missing runs. WI#782 acceptance boxes 1–3 remain open for the maintainer. No
+public-cloud or CI live run is claimed, and gated lanes stay off by default.
 
 1. Start the tenant and check that the daemon logs sidecar started/healthy,
    with no credential values.
@@ -776,32 +777,35 @@ default.
    provider cap, and sub-second cached failure through the manager. The peerless
    config still does not test peer encryption or NetBird's control plane.
 
-   The lifecycle, concurrent-start, and NetBird lanes end by requiring that the
-   runtime reports no container that was not already there when the lane
-   started: none carrying `lunarwing.sandbox-tunnel` (a sidecar) and none
-   carrying `lunarwing.sandbox` (a joined run). Containers of another daemon
-   that existed before the lane are ignored.
+   **Run the live suite serially (`--test-threads=1`) from a dedicated test
+   account and container store with no live LunarWing daemon or other sandbox
+   runs.** The lifecycle, concurrent-start, and NetBird lanes compare
+   post-teardown container names against a pre-start baseline, using both
+   `lunarwing.sandbox-tunnel` and `lunarwing.sandbox`. The comparison ignores
+   containers already in the baseline but cannot tell who created a new one.
+   Do not run another invocation or the tenant-unit verification concurrently
+   in that store. The lanes await teardown and check for leftovers even after
+   a failed check or a test assertion panic.
 
-   **Detached-helper checks need systemd service mode and rootless Podman.**
+   **Detached-helper checks run for Podman in systemd service mode.**
    They read the transient unit `lunarwing-tunnel-<instance>` through
    `systemctl --user`. Rootless Podman keeps its network helpers in that unit's
    cgroup after the detached client exits, so the unit is observable; the
-   lifecycle, concurrent-start, and NetBird lanes therefore first assert the
-   unit *exists* while the sidecar runs, and their "gone afterwards" check
-   cannot pass vacuously. On a host where the daemon's workload spawner is not
-   in systemd service mode they print a skip; set
-   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` to turn that skip into a failure. A
-   service-mode host whose user manager does not answer fails rather than
-   skips, and the `pasta`-in-unit scan is Podman-only.
+   lifecycle, concurrent-start, and NetBird lanes require the unit to *exist*
+   while the sidecar runs and to be gone after teardown. On a host where the
+   workload spawner is not in systemd service mode they print a skip; set
+   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` to fail before starting a fixture
+   instead. If a service-mode host's user manager stops responding, the unit
+   check fails rather than skipping. The `pasta`-in-unit scan is Podman-only.
 
    **On Docker the unit checks do not apply.** A `docker run -d` client asks
    the daemon and leaves no process in its own transient unit, so the unit is
    collected as soon as the client exits: no unit outlives the client, and
    neither the existence nor the removal of the unit is proven by a Docker run.
    The lane prints a skip for those checks, and
-   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails on Docker because that
-   requirement cannot be met there. Docker coverage is the container-absence
-   and firewall/join assertions, not the unit checks.
+   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails before fixture startup on
+   Docker because that requirement cannot be met there. Docker coverage is the
+   container-absence and firewall/join assertions, not the unit checks.
 5. For the NetBird end-to-end lane, follow NetBird live validation below.
 6. On a real NetBird/WireGuard overlay, verify an outbound connection from the
    sandbox to an allowed private service. Then run a temporary high-port
@@ -817,7 +821,8 @@ fails rather than skipping when `LUNARWING_E2E_NETBIRD_IMAGE`,
 `LUNARWING_E2E_NETBIRD_MANAGEMENT_URL`, or the setup-key file is missing or
 unusable. A skip is not a live-validation pass.
 
-1. Prepare an isolated, throwaway NetBird management deployment and one
+1. Use the dedicated account and serial execution described above. Prepare an
+   isolated, throwaway NetBird management deployment and one
    dedicated reusable setup key. Use an image containing NetBird, `nft`, `nc`,
    `wget`, `ping`, and `nslookup`; the lane starts its own plain second peer
    with the same key. Do not point this at the production management server or
