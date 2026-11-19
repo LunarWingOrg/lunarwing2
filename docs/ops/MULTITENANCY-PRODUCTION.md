@@ -985,7 +985,7 @@ A replacement or health failure returns nonzero, retains the named volume, and l
 
 If ordinary start/upgrade refuses a Quadlet with a missing, empty, or ambiguous `Image=` line, run `sudo ic/scripts/lunarwing-mt-admin.sh refresh-pg-image <name>`. Its image preflight runs before stopping services; it then explicitly rewrites the unit with the configured image and performs the normal guarded refresh. It does not delete the data volume. Check the unit and recorded image first rather than silently falling back to a potentially different default.
 
-**Extension version:** replacement updates image libraries, not the database's installed extension catalog version. An existing pgvector 0.8.6 remains 0.8.6 even though this image offers 0.8.7. After a backup and a separately planned maintenance window, inspect with `mt-admin psql <name> -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'"`; if wanted, run `mt-admin psql <name> -v ON_ERROR_STOP=1 -c 'ALTER EXTENSION vector UPDATE'` and recheck. The refresh never performs this schema change implicitly.
+**Extension version:** replacement updates image libraries, not the database's installed extension catalog version. An existing pgvector 0.8.6 remains 0.8.6 even though this image offers 0.8.7. The server loads `vector.so` from the replacement image, so the packaged C library is the new one while the catalog still reads 0.8.6; that is what the package-level update covers, and it is the part the 2026-11-12 advisory is about. The image also ships `vector--0.8.6--0.8.7.sql`, and that script changes catalog comments only. Measured 2026-11-19 in a disposable rootless Podman pair: a database created by the 0.8.6 / PostgreSQL 16.15 image was moved onto the pinned 16.16 / 0.8.7 image on the same volume and reported `server_version_num=160016` with `vector 0.8.6`, answered a real `<=>` ordering query, then `ALTER EXTENSION vector UPDATE` moved the catalog to 0.8.7 with the same query result. The SQL-level update is therefore optional for the CVE fix but safe to run unattended, and it stays operator-run: the refresh never performs it implicitly. Inspect with `mt-admin psql <name> -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'"`; update with `mt-admin psql <name> -v ON_ERROR_STOP=1 -c 'ALTER EXTENSION vector UPDATE'` and recheck.
 
 **Minor-image rollback:** keep the previous reviewed image digest from the before record (the refresh does not prune it). Set `LUNARWING_MT_PG_IMAGE` to that digest and rerun `refresh-pg-image`. If emergency rollback requires a PostgreSQL 16 version below 16.16, the default security floor refuses it; explicitly acknowledge that tenant only:
 
@@ -997,7 +997,7 @@ sudo env LUNARWING_MT_PG_IMAGE='<previous-pg16-digest-reference>' \
 
 This warns at both version checks, retains the volume and still requires readiness and a working vector library. The acknowledgement cannot permit a pre-16 major at either the image preflight or the running-server gate. It reintroduces the fixed CVEs; isolate the tenant and restore the patched image promptly. This is not a major-version downgrade or an extension-schema rollback: if an extension update or schema migration has occurred, assess compatibility and use the backup recovery plan instead. Keep before/after records for rollback too.
 
-**Restore safety:** `pg_restore` runs inside the tenant container. Refresh that container to 16.16 or newer before restoring any dump received from another host or any archive whose provenance is not fully trusted. The five-byte `PGDMP` check is only a format check; it does not make a crafted archive safe. Do not use legacy rollback/restore helpers against an unrefreshed container for such archives.
+**Restore safety:** `pg_restore` runs inside the tenant container, and a crafted archive makes it run code as the user invoking it. The same class covers `pg_dump` tar-format output from a compromised source, which can execute through the restore script. Refresh that container to 16.16 or newer before restoring any dump received from another host or any archive whose provenance is not fully trusted. The five-byte `PGDMP` check is only a format check; it does not make a crafted archive safe. Do not use legacy rollback/restore helpers against an unrefreshed container for such archives. Host-side client tools carry the same exposure: refresh `psql`, `pg_dump` and `pg_restore` on hosts and workstations used outside the pinned container before handling untrusted or cross-host archives. LunarWing's own backups use `pg_dump -Fc` inside the tenant container, not incremental or physical base backups; an operator who runs those separately must take a new full backup and follow upstream's 2026-11-12 release announcement for the reindexing steps.
 
 The daemon still uses the cluster-superuser role `lunarwing`. WI#664 deliberately does not introduce a second role: migration, extension ownership, backups, and least-privilege SQL boundaries need a separate design and rollout. Until then, host root can issue arbitrary SQL through `mt-admin psql`, anyone with the tenant OS credential and loopback database access has the same role, and the daemon's fixed SQL runs with superuser authority. The built-in workspace search paths bind caller text as parameters and do not expose a general arbitrary-SQL tool; adding an SQL-capable MCP/shell extension changes this assessment and requires a new privilege review.
 
@@ -1301,12 +1301,20 @@ with the recovery command, and still exits 0:
 worker-egress: kept namespace keeper lw-egress-keeper-spitfire on purpose: systemd user manager user@1011.service is down and rootless podman cannot remove the pod without its user bus; the next start validates it before use; recover with: systemctl start user@1011.service
 ```
 
-The next `start-tenant`/`restart-tenant` validates the surviving keeper
+The kept pod keeps running, not just as a stopped record: its infra container
+is up after the stop, so the tenant's Podman store shows
+`lw-egress-keeper-<tenant>` as `Running` until the next start (measured on
+Arch Linux with systemd and rootless Podman). The next
+`start-tenant` validates the surviving keeper
 (`validate_keeper` in `ic/scripts/lunarwing-worker-egress-guard.sh`) before
 starting or adopting it, so a keeper left by such a stop is never used
-unvalidated. If the surviving keeper no longer starts, the guard fails closed
-and names it. Before manually removing it, recover the user manager, stop the
-tenant's workers, and confirm the pod is the managed keeper (label
+unvalidated. A `restart-tenant` removes it during the stop phase, once the
+started manager's bus is back — Podman may print one cleanup line for the
+stale netns — and the start then creates a fresh keeper; a following
+`mt-admin worker-egress <tenant>` reports that keeper's containers attached
+and the filter live. If the surviving keeper no longer starts, the guard fails
+closed and names it. Before manually removing it, recover the user manager,
+stop the tenant's workers, and confirm the pod is the managed keeper (label
 `lunarwing.purpose=worker-egress-keeper`, with only its infra container). Use
 the tenant's own Podman store, as mt-admin does, then retry the start:
 

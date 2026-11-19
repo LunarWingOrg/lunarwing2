@@ -2,8 +2,8 @@
 
 Use these checks to validate the SSH paths described in [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md). Setup and recovery procedures live in [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md).
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The four delivery paths
-(built-in `ssh`, `ssh_git`, WASM `ssh` registry `0.1.8`, and worker SSH), the
+**Revalidated against source 2026-11-19 (v2.2.1.0).** The four delivery paths
+(built-in `ssh`, `ssh_git`, WASM `ssh` registry `0.1.9`, and worker SSH), the
 `[[ssh.hosts]]` allowlist, and the WASM `ssh.allowed_hosts` capability match
 the current tree. Worker SSH is available only in task containers that receive
 the socket; Kimi deliberately receives no mount (WI#206).

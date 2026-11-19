@@ -181,6 +181,65 @@ ignore = [
     # files at acceptance time).
     { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (informational, no vulnerability, patched = [] so no bump or floor clears it); direct dependency of ic, lunarwing_engine and lunarwing_skills, compiled into every feature set; no migration off chrono is planned (maintainer decision 2026-11-17), clearing would require moving to jiff or time; accepted 2026-11-17 against advisory-db 233155b4; clearing owner WI#749" },
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz 0.10.4 unmaintained (informational, no vulnerability, patched = []); direct dependency of ic and lunarwing_engine, compiled into every feature set; no migration planned, as for RUSTSEC-2026-0543; accepted 2026-11-17 against advisory-db 233155b4; clearing owner WI#749" },
+
+    # wasmtime — two advisories that do not name the 36 line as affected.
+    # WI#781 (2026-11-19): advisory-db 7133866a added RUSTSEC-2026-0567
+    # (GHSA-2674-w29h-wqvj: process abort when a build without the `threads`
+    # cargo feature enables the threads proposal through
+    # `Config::wasm_features`) and RUSTSEC-2026-0573 (GHSA-wvgq-g5hf-6gm6:
+    # process abort when a GC heap that cannot move has a reservation that is
+    # not a multiple of the page size). Upstream rates both Low (CVSS 2.2) and
+    # lists as affected only `>= 39.0.0` for the first and `>= 47.0.0` for the
+    # second; the fixes are 48.0.9, 49.0.6 and 50.0.2. The RustSec records
+    # carry those patched versions and `unaffected = []`, so every older
+    # release matches, the locked 36.0.21 included, and no release of the 36
+    # line can clear the match (36.0.21 is the newest). No dependency changed:
+    # a tree that was green at 08:21Z failed both advisory gates at 08:44Z.
+    # The vendored 36.0.21 has neither `Config::wasm_features` nor the GC heap
+    # reservation settings the second advisory names. This build takes
+    # wasmtime with its default features (`threads` included) and both
+    # engines turn the threads proposal off; neither enables the GC proposal
+    # or sets a memory reservation (ic/src/tools/wasm/runtime.rs,
+    # ic/src/channels/wasm/runtime.rs).
+    # Accepted on the maintainer's order of 2026-11-19. The [bans] floor below
+    # (wasmtime >=36.0.0, <36.0.20) is unchanged. Clearing: either the RustSec
+    # records gain an unaffected range that covers the 36 line (cargo-deny then
+    # reports these two entries as advisory-not-detected and they are
+    # removed), or wasmtime moves to a patched line (48.0.9 or later), which
+    # is a semver-incompatible step with its own work item.
+    { id = "RUSTSEC-2026-0567", reason = "wasmtime 36.0.21 matches only because the RustSec record lists no unaffected range; upstream GHSA-2674-w29h-wqvj (Low) names >= 39.0.0 as affected and needs a build without the threads cargo feature plus Config::wasm_features, which 36.0.21 does not have; this build keeps the threads feature and turns the proposal off; no 36.x release can clear it; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0573", reason = "wasmtime 36.0.21 matches only because the RustSec record lists no unaffected range; upstream GHSA-wvgq-g5hf-6gm6 (Low) names >= 47.0.0 as affected and needs the GC proposal with a non-movable heap and an unaligned reservation, settings 36.0.21 does not have and neither engine uses; no 36.x release can clear it; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+
+    # heapless — nine unsound advisories on a crate this tree uses for two
+    # types only. WI#781 (2026-11-19): advisory-db 7133866a added
+    # RUSTSEC-2026-0574 to RUSTSEC-2026-0582 against heapless, all fixed in
+    # 0.9.4. `unsound = "all"` above makes them fail the gate although the
+    # crate is transitive. heapless 0.7.17 reaches ic/Cargo.lock and
+    # ic/bridges/xmpp-bridge/Cargo.lock by one path: monty 0.0.17 (a git
+    # dependency of lunarwing_engine) takes postcard 1.1.3 with its default
+    # features, and the default feature `heapless-cas` pulls it in. wasmtime
+    # takes postcard with `alloc` only. Outside its tests postcard uses
+    # heapless::Vec and heapless::String (ic/vendor/postcard/src/ser/flavors.rs,
+    # ic/vendor/postcard/src/max_size.rs); the advisories name
+    # sorted_linked_list, spsc, IndexMap, Deque, HistoryBuf and the pool
+    # types, and no file of postcard or monty names sorted_linked_list, spsc
+    # or zeroize. Reachability was judged by reading, not by a run.
+    # No bump clears them: postcard 1.x requires heapless 0.7. Accepted on the
+    # maintainer's order of 2026-11-19. The [bans] entry below keeps the
+    # acceptance to this graph position: only postcard may pull a heapless
+    # below 0.9.4. Clearing: heapless leaves the locks (monty takes postcard
+    # without default features) or moves to 0.9.4 or later (a postcard
+    # release on the new line); the entries then show as
+    # advisory-not-detected and are removed.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 unsound (sorted_linked_list FindMutView::pop use after free); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 unsound (spsc peek used Relaxed ordering); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 unsound (IndexMap::truncate inconsistent state); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 unsound (panicking Drop in clear/retain of Deque, HistoryBuf and IndexMap); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 unsound (SortedLinkedList zeroize inconsistent state); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 unsound (Deque TryFrom when the deque ends up full); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 unsound (treiber stack race in the pool types); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 unsound (Deque::make_contiguous broken invariants); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 unsound (IndexMap::insert on maps of u16::MAX elements); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
 ]
 
 [licenses]
@@ -252,6 +311,11 @@ deny = [
     # releases are banned too, which fails closed.
     { name = "atty", wrappers = ["env_logger"] },
     { name = "env_logger", version = "<0.10.0", wrappers = ["libsignal-protocol"] },
+    # WI#781: the nine heapless ignores (RUSTSEC-2026-0574 to -0582) are keyed
+    # by ID, so they would also accept heapless under any other parent. Only
+    # postcard, which uses heapless::Vec and heapless::String, may pull a
+    # release below the fixed 0.9.4.
+    { name = "heapless", version = "<0.9.4", wrappers = ["postcard"] },
 ]
 
 [sources]

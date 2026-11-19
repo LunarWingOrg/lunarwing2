@@ -101,7 +101,7 @@ Review the rendered service before enabling it. The committed systemd production
 
 For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands.
 
-Every service installer refuses a root daemon before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set (WI#574/WI#613). On systemd and launchd, run the installer as the intended unprivileged service account without `sudo`. On OpenRC, run it through `sudo` from that account; the resolved runtime identity must have both a non-zero uid and a non-zero primary gid. Prefer a dedicated unprivileged account and verify the resolved identity rather than relying on its name. The setup wizard does not offer an install that these checks would refuse.
+Every service installer refuses a root daemon before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set (WI#574/WI#613). On systemd and launchd, run the installer as the intended unprivileged service account without `sudo`. On OpenRC, run it through `sudo` from that account; the resolved runtime identity must have both a non-zero uid and a non-zero primary gid. Prefer a dedicated unprivileged account and verify the resolved identity rather than relying on its name. The setup wizard does not offer an install that these checks would refuse; it prints one line that says so and gives the installer's reason.
 
 If the watchdog is required, install the current init-appropriate assets after the main service is healthy:
 

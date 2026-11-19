@@ -11,6 +11,11 @@ startup failure may use that exact prefix. A bare errno cannot distinguish a
 missing mount from a directory the container's UID cannot traverse from an
 SELinux denial, so the startup failure carries the mount's nodes, the
 container's IDs, and the container's MAC state.
+
+The container's own label is the *source* context of an SELinux
+`unix_stream_socket connectto` denial, and container runtimes normally do not
+mount selinuxfs. It is therefore read from /proc unconditionally, never gated
+on /sys/fs/selinux being visible.
 """
 
 import errno
@@ -42,19 +47,30 @@ def _node(path):
     return f"{node} selinux={label}"
 
 
+def _self_label():
+    """The container's own MAC label, readable with or without selinuxfs.
+
+    This is the source context of an SELinux `connectto` denial. The
+    container runtime normally does not mount /sys/fs/selinux, so the label
+    must not be gated on the enforce node being visible.
+    """
+    for path in ("/proc/thread-self/attr/current", "/proc/self/attr/current"):
+        try:
+            with open(path, encoding="ascii") as handle:
+                return handle.read().strip() or "unknown"
+        except OSError:
+            continue
+    return "unreadable"
+
+
 def _security_state():
     """Facts that separate a DAC refusal from a MAC denial."""
     try:
         with open("/sys/fs/selinux/enforce", encoding="ascii") as handle:
-            enforce = handle.read().strip()
+            enforce = f"enforce:{handle.read().strip()}"
     except OSError:
-        return "selinux=not-mounted"
-    try:
-        with open("/proc/self/attr/current", encoding="ascii") as handle:
-            label = handle.read().strip()
-    except OSError:
-        label = "unknown"
-    return f"selinux=enforce:{enforce} container-label={label}"
+        enforce = "not-mounted"
+    return f"selinux={enforce} self-label={_self_label()}"
 
 
 def _probe():
@@ -64,9 +80,24 @@ def _probe():
 
 
 def _startup_error(error):
+    # EACCES on this connect has three possible causes, and the errno cannot
+    # tell them apart: the SELinux `unix_stream_socket connectto` check against
+    # the *listening socket's* own context (not the mount's :z inode label),
+    # the SELinux `sock_file` check on the socket inode, or a channel
+    # directory this UID cannot traverse. Name all three, so the host-side
+    # operator reads the audit log before changing permissions or labels.
+    hint = ""
+    if error.errno == errno.EACCES:
+        hint = (
+            " (EACCES has three possible causes: SELinux `unix_stream_socket"
+            " connectto` against the listener's own context, SELinux"
+            " `sock_file` access to the socket inode, or a channel directory"
+            " this uid cannot traverse; collect the denial with"
+            " ic/scripts/lunarwing-sandbox-proxy-diag.sh on the host)"
+        )
     return (
         f"lunarwing-proxy-relay: {error}; euid={os.geteuid()} egid={os.getegid()} "
-        f"{_node(MOUNT)} {_node(SOCKET)} {_security_state()}"
+        f"{_node(MOUNT)} {_node(SOCKET)} {_security_state()}{hint}"
     )
 
 

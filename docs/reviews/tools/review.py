@@ -33,7 +33,7 @@ PROJECT_DEFAULT = os.environ.get("GITLAB_PROJECT", "lunarwing/lunarwing2")
 # The release branch under review. It moves at every release: bump it in the same
 # change that opens the next release branch (runbook 4.5), or `status` on defaults
 # reports "to review: none" while the open MRs sit on the new branch.
-TARGET_DEFAULT = os.environ.get("REVIEW_TARGET", "aragents/kimil00p/v2.2.0.0")
+TARGET_DEFAULT = os.environ.get("REVIEW_TARGET", "aragents/kimil00p/v2.2.1.0")
 # `status` warns when the target's head is this much older than master's.
 STALE_TARGET_DAYS = 7
 
@@ -168,7 +168,7 @@ def next_prefix(prefix):
 
 
 def release_family(branch):
-    """`aragents/kimil00p/v2.2.0.0` -> `aragents/kimil00p/`; a branch without a slash has no family."""
+    """`aragents/kimil00p/v2.2.1.0` -> `aragents/kimil00p/`; a branch without a slash has no family."""
     return branch.rsplit("/", 1)[0] + "/" if "/" in branch else None
 
 

@@ -243,7 +243,6 @@ These were stated by the maintainer in review threads or to the operator; they d
 - The opencode2 lane may be changed again (2026-11-13; it was hands-off before). A CI fix there is still proven only by a green protected pipeline on master.
 - SweetieBot's account is an instance administrator by design (2026-11-16); not a finding. Role-based rules do not bound that account, so a review names the gate that does.
 - Agents may create, play and delete temporary pipeline schedules to produce evidence; not a finding. The run they cite is still checked.
-- `docs/releases/RELEASE-v2.2.0.0.md` was removed by the maintainer; a missing release note for 2.2.0.0 is not a finding.
 - Kimi's in-image `npm test` gate is known to be load-sensitive (`lunarwing_bridge_test.js`, NQ-3); a flake there is a retry, not an MR finding.
 
 ## 9. Hazards that cost runs
