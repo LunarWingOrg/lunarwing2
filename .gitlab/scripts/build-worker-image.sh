@@ -63,9 +63,9 @@ opencode4lunarwing/entrypoint-task-setup.sh
 opencode4lunarwing/config/opencode.json
 opencode4lunarwing/models-dev/api.json
 opencode4lunarwing/scripts/check_models_dev_snapshot.py'
-        source_ref=810c0eba1a7348036f8bdf61e6632d0c36c6876c
-        build_args="OPENCODE_VERSION=v1.19.5
-OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
+        source_ref=f4e363c8295fa90a03dddc451882fffe8fbce357
+        build_args="OPENCODE_VERSION=v1.19.6
+OPENCODE_REF=f4e363c8295fa90a03dddc451882fffe8fbce357
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -116,7 +116,7 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
 opencode2.4lunarwing/scripts/runtime_smoke.py
 opencode2.4lunarwing/scripts/runtime_smoke_test.py
 opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
-        source_ref=fedc6f208aa2bd54c1019227214568083f6380ad
+        source_ref=c0ad18b402eb2827fc1ee71c171b1177b3fc02d1
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
@@ -133,8 +133,8 @@ opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
         [ "${#wrapper_anchor}" -eq 64 ] || {
             echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
         }
-        build_args="OPENCODE_VERSION=v2.2.7
-OPENCODE_REF=fedc6f208aa2bd54c1019227214568083f6380ad
+        build_args="OPENCODE_VERSION=v2.3.2
+OPENCODE_REF=c0ad18b402eb2827fc1ee71c171b1177b3fc02d1
 WITH_TOOLCHAINS=false
 LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
@@ -193,8 +193,8 @@ kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
-        source_ref=2.5.3
-        build_args="KIMI_CODE_VERSION=2.5.3
+        source_ref=2.6.3
+        build_args="KIMI_CODE_VERSION=2.6.3
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
