@@ -80,15 +80,19 @@ def _probe():
 
 
 def _startup_error(error):
-    # A refused connect on an enforcing host is the SELinux
-    # `unix_stream_socket connectto` check against the *listening socket's*
-    # context, not against the mount's :z inode label. Name it so the host-side
-    # operator does not chase file permissions that are already correct.
+    # EACCES on this connect has three possible causes, and the errno cannot
+    # tell them apart: the SELinux `unix_stream_socket connectto` check against
+    # the *listening socket's* own context (not the mount's :z inode label),
+    # the SELinux `sock_file` check on the socket inode, or a channel
+    # directory this UID cannot traverse. Name all three, so the host-side
+    # operator reads the audit log before changing permissions or labels.
     hint = ""
     if error.errno == errno.EACCES:
         hint = (
-            " (EACCES: if SELinux is enforcing this is `unix_stream_socket"
-            " connectto` against the listener's own context; collect it with"
+            " (EACCES has three possible causes: SELinux `unix_stream_socket"
+            " connectto` against the listener's own context, SELinux"
+            " `sock_file` access to the socket inode, or a channel directory"
+            " this uid cannot traverse; collect the denial with"
             " ic/scripts/lunarwing-sandbox-proxy-diag.sh on the host)"
         )
     return (

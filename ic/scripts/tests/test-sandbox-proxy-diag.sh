@@ -109,6 +109,22 @@ for name in root no-such-tenant; do
 done
 printf 'PASS: invalid tenant names and accounts are refused before diagnosis\n'
 
+# A missing ausearch is named. It must not read as "searched, nothing matched".
+# The fixture's ausearch is set aside; a real one on this host is never run.
+mv "$DIAG_FIXTURE/bin/ausearch" "$DIAG_FIXTURE/ausearch.off"
+if command -v ausearch >/dev/null 2>&1; then
+  printf 'SKIP: a real ausearch is installed here; the missing-tool case is not run\n'
+else
+  bash "$diag" review-tenant >"$output" 2>"$DIAG_FIXTURE/no-ausearch.err"
+  grep -Fq 'ausearch not installed; skipped.' "$output"
+  if grep -Fq 'no matching AVC returned' "$output"; then
+    printf 'FAIL: a missing ausearch was reported as an empty search\n' >&2
+    exit 1
+  fi
+  printf 'PASS: a missing ausearch is named, not reported as an empty search\n'
+fi
+mv "$DIAG_FIXTURE/ausearch.off" "$DIAG_FIXTURE/bin/ausearch"
+
 python3 -I -B - "$DIAG_SCRIPTS/../src/sandbox/proxy/relay.py" <<'PY'
 import contextlib
 import errno
@@ -135,9 +151,13 @@ server.assert_not_called()
 command.assert_not_called()
 assert stderr.getvalue().startswith("lunarwing-proxy-relay: [Errno 13] Permission denied;")
 assert "euid=" in stderr.getvalue() and "proxy.sock" in stderr.getvalue()
-# WI#641 note 19288: an EACCES on this path is the SELinux connectto check
-# against the listener's own context, not a file-permission problem.
+# WI#641 note 19288: an EACCES on this path can be the SELinux connectto check
+# against the listener's own context. The errno has two other causes, so the
+# hint must name all three and must not claim one of them.
 assert "connectto" in stderr.getvalue()
+assert "sock_file" in stderr.getvalue()
+assert "cannot traverse" in stderr.getvalue()
+assert "three possible causes" in stderr.getvalue()
 assert "self-label=" in stderr.getvalue()
 print("PASS: a failed relay probe reports diagnostics and never starts the command")
 
@@ -155,7 +175,8 @@ with mock.patch("builtins.open", fake_open):
         state = relay._security_state()
 assert "self-label=system_u:system_r:container_t:s0:c533,c991" in state, state
 
-# A non-EACCES startup failure must not claim the SELinux cause.
-assert "connectto" not in relay._startup_error(FileNotFoundError(2, "No such file or directory"))
+# A non-EACCES startup failure must not carry the EACCES hint.
+other = relay._startup_error(FileNotFoundError(2, "No such file or directory"))
+assert "connectto" not in other and "possible causes" not in other
 print("PASS: the container's own label is reported without selinuxfs")
 PY

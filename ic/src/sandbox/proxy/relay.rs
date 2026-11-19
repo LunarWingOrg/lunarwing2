@@ -31,10 +31,17 @@
 //! sockets carry ([`RELAY_SOCKET_CONTEXTS`]), so the container's connect is the
 //! same-type check stock policy already allows. Before any container starts,
 //! [`probe_labeled_connection`] replays that connect from a socket created
-//! under a container-shaped source context — including the MLS constraint on
-//! the level — and a refusal falls back to the previous unlabeled socket.
-//! That grants no permission a container does not already have for its own
-//! sockets, and the sandbox is never made unconfined.
+//! under a container-shaped source context, under the host's own policy
+//! (levels included), and a refusal falls back to the previous unlabeled
+//! socket. A host without selinuxfs starts no label thread and binds exactly
+//! as before. The sandbox is never made unconfined and no policy is changed.
+//!
+//! What the label opens: at the SELinux layer, on the targeted policy, any
+//! process of type `container_t`, at any level, passes the socket check for
+//! this listener. Before the label, no container did on an enforcing host.
+//! Other containers are kept out by the same two facts as on a host without
+//! SELinux: the private `0700` parent directory, and that only this run
+//! mounts `channel`.
 
 use std::path::{Path, PathBuf};
 
@@ -107,13 +114,12 @@ fn at_path(context: &str, path: &Path, error: std::io::Error) -> std::io::Error 
 /// Contexts a sandbox container's own sockets carry, in the order tried: the
 /// stock container type at the base level, then at the full category range.
 ///
-/// The base level suffices when the policy constrains only the type. The full
-/// range is the one a run's per-container category pair (`s0:c533,c991`)
-/// cannot refuse on a level comparison, so it covers a policy whose MLS
-/// constraint requires the listener's level to dominate the connecting
-/// socket's level. Both are levels every container level either equals or is
-/// dominated by, and neither grants more than a container already has for its
-/// own sockets.
+/// On the targeted policy only the type decides `connectto`, so the first
+/// candidate is the one expected to be used. The second is kept for a policy
+/// that also compares the two levels. That such a policy accepts it was not
+/// verified against any policy source; [`probe_labeled_connection`] decides it
+/// on each host. Neither grants more than a container already has for its own
+/// sockets.
 #[cfg(target_os = "linux")]
 const RELAY_SOCKET_CONTEXTS: [&str; 2] = [
     "system_u:system_r:container_t:s0",
@@ -122,21 +128,23 @@ const RELAY_SOCKET_CONTEXTS: [&str; 2] = [
 
 /// Source contexts the self-test connects from: a runtime-assigned category
 /// pair, then the base level. The self-test therefore exercises the
-/// container's own `connectto` (source socket label, target listener label,
-/// including the MLS constraint) before any container can fail on it.
+/// container's own `connectto` (source socket label against listener label,
+/// under whatever the host's policy requires of the two levels) before any
+/// container can fail on it.
 #[cfg(target_os = "linux")]
 const SIMULATED_CLIENT_CONTEXTS: [&str; 2] = [
     "system_u:system_r:container_t:s0:c533,c991",
     "system_u:system_r:container_t:s0",
 ];
 
-/// Per-task SELinux create context. `/proc/thread-self` addresses the calling
-/// thread exactly; `/proc/self` is the fallback for older `/proc` mounts.
+/// Per-task SELinux create context of the calling thread.
+///
+/// `/proc/self/attr/sockcreate` is deliberately not tried as a second node:
+/// `/proc/self` names the thread-group leader, and the kernel lets a task
+/// write only its own attributes. From the label thread it always answers
+/// `EACCES`, which would replace this node's real error in the report.
 #[cfg(target_os = "linux")]
-const SOCKCREATE_NODES: [&str; 2] = [
-    "/proc/thread-self/attr/sockcreate",
-    "/proc/self/attr/sockcreate",
-];
+const SOCKCREATE_NODE: &str = "/proc/thread-self/attr/sockcreate";
 
 #[cfg(target_os = "linux")]
 const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
@@ -145,26 +153,26 @@ const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 /// A host without selinuxfs — AppArmor, or none — keeps the old socket.
 #[cfg(target_os = "linux")]
 fn selinux_enabled() -> bool {
-    std::fs::read_to_string(SELINUX_ENFORCE)
+    selinux_enabled_at(Path::new(SELINUX_ENFORCE))
+}
+
+/// [`selinux_enabled`] for a given enforce node.
+#[cfg(target_os = "linux")]
+fn selinux_enabled_at(enforce: &Path) -> bool {
+    std::fs::read_to_string(enforce)
         .map(|value| matches!(value.trim(), "0" | "1"))
         .unwrap_or(false)
 }
 
-/// Pin the calling thread's next socket to `context`.
+/// Pin the calling thread's next socket to `context`. The error is the
+/// kernel's own answer for this thread's attribute.
 ///
 /// The attribute belongs to the task, not the process, so no other thread in
 /// the daemon can pick it up; [`with_socket_context`] clears it as soon as the
 /// socket exists.
 #[cfg(target_os = "linux")]
 fn set_socket_create_context(context: &str) -> std::io::Result<()> {
-    let mut last = std::io::Error::from(std::io::ErrorKind::NotFound);
-    for node in SOCKCREATE_NODES {
-        match std::fs::write(node, context) {
-            Ok(()) => return Ok(()),
-            Err(error) => last = error,
-        }
-    }
-    Err(last)
+    std::fs::write(SOCKCREATE_NODE, context)
 }
 
 /// Restore the default create context on the calling thread. A newline is the
@@ -172,11 +180,7 @@ fn set_socket_create_context(context: &str) -> std::io::Result<()> {
 /// attribute handler.
 #[cfg(target_os = "linux")]
 fn clear_socket_create_context() {
-    for node in SOCKCREATE_NODES {
-        if std::fs::write(node, "\n").is_ok() {
-            return;
-        }
-    }
+    let _ = std::fs::write(SOCKCREATE_NODE, "\n");
 }
 
 /// Run `create` with this thread's socket create context pinned to `context`,
@@ -234,8 +238,13 @@ fn probe_labeled_connection(
     Ok(())
 }
 
-/// Bind the listener, labeled for containers, on a dedicated thread so the
-/// per-task create context can never leak onto a runtime worker.
+/// Bind the relay listener: labeled for containers where SELinux is enabled
+/// and a label is usable, unlabeled otherwise.
+///
+/// SELinux is checked here, on the calling thread, so a host without
+/// selinuxfs starts no thread and binds exactly as it did before WI#641.
+/// Every refusal of the labeled attempt, a label thread that cannot be
+/// started included, ends at the same unlabeled bind.
 ///
 /// Returns the listener and the context it was created under, or `None` when
 /// the default context was kept.
@@ -243,53 +252,80 @@ fn probe_labeled_connection(
 fn bind_relay_listener(
     socket: &Path,
 ) -> std::io::Result<(tokio::net::UnixListener, Option<&'static str>)> {
+    if selinux_enabled()
+        && let Some((listener, context)) = bind_labeled_on_own_thread(socket)
+    {
+        return Ok((to_tokio(listener)?, Some(context)));
+    }
+    Ok((to_tokio(bind_relay_socket(socket)?)?, None))
+}
+
+/// Run [`bind_labeled`] on a dedicated thread, so the per-task create context
+/// can never leak onto a runtime worker.
+///
+/// A thread that cannot be started, or that panics, is one more refusal: it
+/// is reported like the others and the caller keeps the unlabeled socket.
+#[cfg(target_os = "linux")]
+fn bind_labeled_on_own_thread(
+    socket: &Path,
+) -> Option<(std::os::unix::net::UnixListener, &'static str)> {
     let owned = socket.to_path_buf();
-    let labeled = std::thread::Builder::new()
+    let outcome = match std::thread::Builder::new()
         .name("relay-label".into())
         .spawn(move || bind_labeled(&owned))
-        .map_err(|error| std::io::Error::other(format!("cannot start relay label probe: {error}")))?
-        .join()
-        .map_err(|_| std::io::Error::other("relay label probe thread panicked"))??;
-    match labeled {
-        Some((listener, context)) => Ok((to_tokio(listener)?, Some(context))),
-        None => Ok((to_tokio(bind_relay_socket(socket)?)?, None)),
+    {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            // The thread may have bound a candidate before it died.
+            let _ = std::fs::remove_file(socket);
+            Err(vec!["the relay label thread panicked".to_string()])
+        }),
+        Err(error) => Err(vec![format!(
+            "cannot start the relay label thread: {error}"
+        )]),
+    };
+    match outcome {
+        Ok(labeled) => Some(labeled),
+        Err(reasons) => {
+            report_label_refusal(&reasons);
+            None
+        }
     }
 }
 
-/// Try each candidate context on the calling thread (the dedicated probe
+/// Try each candidate context on the calling thread (the dedicated label
 /// thread), keeping the first that survives a container-shaped connect.
 ///
-/// The reasons are collected and reported once per execution: a host whose
-/// policy refuses every label would otherwise warn on every shell call.
+/// `Err` holds one reason per refused candidate, in the order tried, each
+/// with the kernel's own error. A refused candidate leaves no socket behind.
 #[cfg(target_os = "linux")]
 fn bind_labeled(
     socket: &Path,
-) -> std::io::Result<Option<(std::os::unix::net::UnixListener, &'static str)>> {
-    if !selinux_enabled() {
-        return Ok(None);
-    }
-    let mut refused: Option<String> = None;
+) -> std::result::Result<(std::os::unix::net::UnixListener, &'static str), Vec<String>> {
+    let mut refused = Vec::with_capacity(RELAY_SOCKET_CONTEXTS.len());
     for context in RELAY_SOCKET_CONTEXTS {
         if let Err(error) = set_socket_create_context(context) {
-            refused = Some(format!("{context}: cannot set sockcreate: {error}"));
+            refused.push(format!("{context}: cannot set sockcreate: {error}"));
             continue;
         }
         let bound = bind_relay_socket(socket);
         clear_socket_create_context();
         // A refusal to create under this context is the same fallback as an
         // unwritable attribute; the unlabeled attempt reports real errors.
-        let Ok(listener) = bound else {
-            let _ = std::fs::remove_file(socket);
-            refused = Some(format!("{context}: cannot bind the labeled socket"));
-            continue;
+        let listener = match bound {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = std::fs::remove_file(socket);
+                refused.push(format!("{context}: labeled bind refused: {error}"));
+                continue;
+            }
         };
         match SIMULATED_CLIENT_CONTEXTS
             .iter()
             .try_for_each(|client| probe_labeled_connection(socket, &listener, client))
         {
-            Ok(()) => return Ok(Some((listener, context))),
+            Ok(()) => return Ok((listener, context)),
             Err(error) => {
-                refused = Some(format!(
+                refused.push(format!(
                     "{context}: container-shaped connect refused: {error}"
                 ));
                 drop(listener);
@@ -297,13 +333,47 @@ fn bind_labeled(
             }
         }
     }
-    if let Some(reason) = refused {
+    Err(refused)
+}
+
+/// One line for the log: every refused candidate with its reason.
+#[cfg(target_os = "linux")]
+fn label_refusal_summary(reasons: &[String]) -> String {
+    reasons.join("; ")
+}
+
+/// True for the first caller only.
+#[cfg(target_os = "linux")]
+fn first_refusal(reported: &std::sync::atomic::AtomicBool) -> bool {
+    !reported.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Report why no container label is usable: as a warning once per process,
+/// at debug level afterwards.
+///
+/// `relay_setup` runs for every sandbox execution, and the labeled attempt is
+/// repeated each time so that a corrected policy takes effect without a
+/// daemon restart. Only the warning is limited, because a host that refuses
+/// every label would otherwise log it on every shell call. An enforcing host
+/// whose policy denies a step still records that denial in its audit log on
+/// every call.
+#[cfg(target_os = "linux")]
+fn report_label_refusal(reasons: &[String]) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    let reasons = label_refusal_summary(reasons);
+    if first_refusal(&REPORTED) {
         tracing::warn!(
-            reason,
+            reasons = %reasons,
+            "no container label is usable for the relay socket; keeping the unlabeled socket \
+             (warned once per process; later refusals are logged at debug level)"
+        );
+    } else {
+        tracing::debug!(
+            reasons = %reasons,
             "no container label is usable for the relay socket; keeping the unlabeled socket"
         );
     }
-    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -446,6 +516,59 @@ mod tests {
             std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    /// WI#641: only a readable enforce node holding `0` or `1` means SELinux
+    /// is enabled. Anything else must keep the label thread from starting.
+    #[test]
+    fn selinux_is_enabled_only_by_an_enforce_node_holding_0_or_1() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = directory.path().join("enforce");
+        assert!(!selinux_enabled_at(&node), "a missing node is not SELinux");
+        for (content, expected) in [("1", true), ("0\n", true), ("", false), ("2", false)] {
+            std::fs::write(&node, content).unwrap();
+            assert_eq!(selinux_enabled_at(&node), expected, "enforce={content:?}");
+        }
+    }
+
+    /// WI#641: a refused labeled attempt names every candidate with its own
+    /// reason, in the order tried, and leaves no socket behind. The outcome
+    /// itself depends on the kernel and its policy, so both are accepted.
+    #[test]
+    fn labeled_bind_reports_one_reason_per_refused_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        match bind_labeled(&socket) {
+            Ok((_listener, context)) => {
+                assert!(RELAY_SOCKET_CONTEXTS.contains(&context));
+                assert!(socket.exists());
+            }
+            Err(reasons) => {
+                assert_eq!(reasons.len(), RELAY_SOCKET_CONTEXTS.len());
+                for (reason, context) in reasons.iter().zip(RELAY_SOCKET_CONTEXTS) {
+                    assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
+                }
+                assert!(
+                    !socket.exists(),
+                    "a refused candidate must not leave a socket"
+                );
+                let summary = label_refusal_summary(&reasons);
+                assert!(
+                    reasons
+                        .iter()
+                        .all(|reason| summary.contains(reason.as_str()))
+                );
+            }
+        }
+    }
+
+    /// WI#641: the refusal warning is raised once; later refusals are not.
+    #[test]
+    fn label_refusal_is_announced_once() {
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        assert!(first_refusal(&reported));
+        assert!(!first_refusal(&reported));
+        assert!(!first_refusal(&reported));
     }
 
     /// WI#641: the labeled path must keep the socket connectable at the same

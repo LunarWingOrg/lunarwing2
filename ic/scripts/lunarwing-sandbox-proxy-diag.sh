@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Read-only host diagnosis for the sandbox proxy relay (WI#641).
+# Host diagnosis for the sandbox proxy relay (WI#641).
 #
 # Collects SELinux mode, the tenant's sandbox network mode and daemon context,
 # relay mount metadata, and candidate AVC denials. Does not change policy,
-# start services, or print arbitrary tenant environment values.
+# start services, or print arbitrary tenant environment values. Its only write
+# is one temporary file (mktemp) that holds the matched AVC lines for
+# audit2why; it is removed on exit.
 #
 # Run as root on the tenant host (ausearch needs the audit log) while the
 # sandbox is idle, then trigger one failing sandbox shell call and run again
@@ -182,9 +184,11 @@ denials="$(mktemp)"
 trap 'rm -f -- "$denials"' EXIT
 if command -v ausearch >/dev/null 2>&1; then
   ausearch -m AVC,USER_AVC -ts recent --raw 2>/dev/null | relay_denials >"$denials" || true
+  cat "$denials" 2>/dev/null || true
+  interpret_denials "$denials"
+else
+  say "ausearch not installed; skipped."
 fi
-cat "$denials" 2>/dev/null || true
-interpret_denials "$denials"
 
 if [[ "$watch" == true ]]; then
   say ""
