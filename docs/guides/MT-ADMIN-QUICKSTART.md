@@ -49,7 +49,11 @@ Use the current distribution guide:
 
 MT admin installs a tenant-local Rust toolchain when needed, so a host-level rustup installation is not required merely to add a tenant.
 
-For Podman, configure approved short-name resolution before provisioning. The package guides describe the required registry configuration; do not accept an interactive image source during unattended setup.
+For Podman, the tenant PostgreSQL image is fully qualified and digest-pinned, so
+the default needs no short-name resolution. Configure approved short-name
+resolution only if you override it with a short name via `LUNARWING_MT_PG_IMAGE`;
+the package guides describe the registry configuration. Do not accept an
+interactive image source during unattended setup.
 
 ## 2. Check the Host
 
