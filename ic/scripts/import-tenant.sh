@@ -93,6 +93,13 @@ IMPORT_STAGE_ROOT="${KAWARIMI_IMPORT_STAGE_ROOT:-/var/lib/lunarwing-import-stage
 
 say()    { printf '%s\n' "$*"; }
 die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
+# need_value "$@" — same contract as the copy in mt-admin-lib/00-common.sh
+# (this script stands alone and does not source that library, WI#637).
+need_value() {
+  local flag="$1"
+  [[ $# -ge 2 ]] || die "$flag requires a value"
+  [[ ${2#--} == "$2" ]] || die "$flag requires a value (found another flag: $2)"
+}
 _read_secret_file() {
   local path="$1" value
   [[ -f "$path" && ! -L "$path" ]] || die "secret file must be a regular non-symlink file: $2"
@@ -103,7 +110,7 @@ _read_secret_file() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --name)          NAME_OVERRIDE="$2"; shift 2 ;;
+    --name)          need_value "$@"; NAME_OVERRIDE="$2"; shift 2 ;;
     --start)         DO_START=true; shift ;;
     --old-stopped)   OLD_STOPPED=true; shift ;;
     --docker-group)  WITH_DOCKER_GROUP=true; shift ;;
@@ -112,14 +119,14 @@ while [[ $# -gt 0 ]]; do
     --with-opencode)   WITH_OPENCODE=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
     --with-lunardepth) WITH_LUNARDEPTH=true; shift ;;
-    --lunardepth-model) LUNARDEPTH_MODEL="$2"; shift 2 ;;
-    --lunardepth-base-url) LUNARDEPTH_BASE_URL="$2"; shift 2 ;;
-    --lunardepth-api-key-file) LUNARDEPTH_API_KEY_FILE="$2"; LUNARDEPTH_API_KEY="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+    --lunardepth-model) need_value "$@"; LUNARDEPTH_MODEL="$2"; shift 2 ;;
+    --lunardepth-base-url) need_value "$@"; LUNARDEPTH_BASE_URL="$2"; shift 2 ;;
+    --lunardepth-api-key-file) need_value "$@"; LUNARDEPTH_API_KEY_FILE="$2"; LUNARDEPTH_API_KEY="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
     --lunardepth-allow-insecure-http) LUNARDEPTH_ALLOW_INSECURE=true; shift ;;
     --lunardepth-allow-unauthenticated-gateway) LUNARDEPTH_ALLOW_PLACEHOLDER=true; shift ;;
     --with-toolchains) WITH_TOOLCHAINS=true; shift ;;
     --with-vision)     WITH_VISION=true; shift ;;
-    --owner-scope)      OWNER_SCOPE="$2"; shift 2 ;;
+    --owner-scope)      need_value "$@"; OWNER_SCOPE="$2"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
     --yes|-y)        AUTO_YES=true; shift ;;
     --force)         FORCE=true; shift ;;
