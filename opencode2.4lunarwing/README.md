@@ -2,7 +2,7 @@
 
 WebSocket bridge that integrates [OpenCode 2](https://opencode.ai)
 (anomalyco/opencode, `v2` line) as a LunarWing external worker — the v2 lane
-alongside the proven v1 worker (`opencode4lunarwing/`, pinned v1.19.5).
+alongside the proven v1 worker (`opencode4lunarwing/`, pinned v1.19.6).
 See `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md` for the lane's rationale:
 v1 stays the default; v2 is opt-in per tenant until upstream's 2.0.x patch
 stack settles.
@@ -63,7 +63,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.19.5 (proven) | v2.2.7 (beta in practice) |
+| Pin | v1.19.6 (proven) | v2.3.2 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -75,14 +75,14 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.7 pin
-is `fedc6f208aa2bd54c1019227214568083f6380ad` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.3.2 pin
+is `c0ad18b402eb2827fc1ee71c171b1177b3fc02d1` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
 stays disabled. The wrapper also starts the binary with
-`OPENCODE_FLAGS=-console_watches`, which keeps v2.2.7's Console event
-watches off whatever the caller's environment or a workspace config says,
+`OPENCODE_FLAGS=-console_watches`, which keeps the Console event
+watches (WI#609) off whatever the caller's environment or a workspace config says,
 and the builder stage fails the image if the reviewed text behind that pin
 stops holding (a text tripwire, not a proof; re-read the flag code on every
 bump). The pin covers the event watches only: a worker that is given
@@ -100,7 +100,7 @@ follow-ups.
 
 The upstream `opencode` integration can fetch a hosted Console Library of
 instructions and skills when it has both a Console credential and egress to
-`opencode.ai`. At the pinned v2.2.7, its bundled catalog names
+`opencode.ai`. At the pinned v2.3.2, its bundled catalog names
 `OPENCODE_API_KEY`. The lane therefore refuses
 to start when that variable is present, even empty, unless the operator sets
 `LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL=1` (other conventional true/false
