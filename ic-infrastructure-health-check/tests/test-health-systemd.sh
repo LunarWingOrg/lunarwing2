@@ -30,6 +30,9 @@ ROOT="${HS_UNIT_DIR:?}"
 SD="$ROOT"
 [ -n "${HS_TENANT_USER:-}" ] && [ -d "$ROOT/$HS_TENANT_USER" ] && SD="$ROOT/$HS_TENANT_USER"
 sub="${1:-}"; shift || true
+# Every tenant user-bus call, as "<tenant user> <args>", before any injected failure.
+[ -n "${HS_BUS_LOG:-}" ] && [ -n "${HS_TENANT_USER:-}" ] && [ "$sub" = "--user" ] \
+  && printf '%s %s\n' "$HS_TENANT_USER" "$*" >> "$HS_BUS_LOG"
 [ -n "${HS_FAIL_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_USER" ] && exit 1
 case "$sub" in
   --user)
@@ -67,6 +70,8 @@ case "$sub" in
     unit="${1:-}"
     if [ "${unit#user@}" != "$unit" ]; then
       uid="${unit#user@}"; uid="${uid%.service}"
+      # A `<ROOT>/user-manager-delay/<uid>` fixture makes this answer slow.
+      [ -f "$ROOT/user-manager-delay/$uid" ] && sleep "$(cat "$ROOT/user-manager-delay/$uid")"
       if [ -f "$ROOT/user-manager/$uid" ]; then cat "$ROOT/user-manager/$uid"; else echo active; fi
       exit 0
     fi
@@ -104,14 +109,13 @@ user="${HS_TENANT_USER:-}"
 container="${@: -1}"
 cat "$ROOT/$user/$container.container-health" 2>/dev/null
 EOF
-    # Mock loginctl: linger state per user from <ROOT>/linger/<user>; absent user
-    # (exit 1) leaves health-systemd to its LUNARWING_MT_LINGER_DIR seam.
+    # Mock loginctl: health-systemd must not ask logind at all (linger comes from
+    # the marker file). Every call is recorded, and HS_LOGINCTL_SLEEP makes it a
+    # logind that does not answer.
     cat > "$bin/loginctl" <<'EOF'
 #!/usr/bin/env bash
-ROOT="${HS_UNIT_DIR:?}"
-user=""
-for a in "$@"; do case "$a" in -*) ;; *) user="$a";; esac; done
-[ -n "$user" ] && [ -f "$ROOT/linger/$user" ] && { cat "$ROOT/linger/$user"; exit 0; }
+[ -n "${HS_LOGINCTL_LOG:-}" ] && printf '%s\n' "$*" >> "$HS_LOGINCTL_LOG"
+sleep "${HS_LOGINCTL_SLEEP:-0}"
 exit 1
 EOF
     chmod +x "$bin"/*
@@ -120,10 +124,16 @@ EOF
 unit_set() { printf '%s\n' "$3" > "$1/units/$2"; }   # <sb> <unit> "<ls> <as> <ss> <nr> <uf>"
 unit_set_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3"; }
 container_health_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3.container-health"; }
-# WI#766 fixtures: linger state per user, system-bus user-manager state per uid,
-# and a per-user uid override (all tenants share the mock's default uid).
-linger_set() { mkdir -p "$1/units/linger"; printf '%s\n' "$3" > "$1/units/linger/$2"; }
+# WI#766 fixtures: linger marker per user (logind's own file, reached through
+# the LUNARWING_MT_LINGER_DIR seam the run helpers set), system-bus user-manager
+# state per uid with an optional answer delay, and a per-user uid override (all
+# tenants share the mock's default uid).
+linger_set() {  # <sb> <user> yes|no
+    mkdir -p "$1/units/linger"
+    if [ "$3" = yes ]; then : > "$1/units/linger/$2"; else rm -f "$1/units/linger/$2"; fi
+}
 mgr_set()    { mkdir -p "$1/units/user-manager"; printf '%s\n' "$3" > "$1/units/user-manager/$2"; }
+mgr_delay_set() { mkdir -p "$1/units/user-manager-delay"; printf '%s\n' "$3" > "$1/units/user-manager-delay/$2"; }
 uid_set()    { mkdir -p "$1/units/uid"; printf '%s\n' "$3" > "$1/units/uid/$2"; }
 
 run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd.sh JSON on stdout
@@ -133,19 +143,19 @@ run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd
     else
         jq -n --arg t "$t" --arg u "$u" --argjson w "$w" '{tenants:{($t):{user:$u, enable_weechat:$w}}}' > "$sb/ports.json"
     fi
-    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
+    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" LUNARWING_MT_LINGER_DIR="$sb/units/linger" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/ports.json" \
         bash "$HS" 2>/dev/null
 }
 run_hs_registry() {  # <sb> [ENV=VALUE ...] -> health-systemd.sh JSON on stdout
     local sb="$1"; shift
-    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
+    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" LUNARWING_MT_LINGER_DIR="$sb/units/linger" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/ports.json" \
         "$@" bash "$HS" 2>/dev/null
 }
 run_hs_single() {  # <sb> [ENV=VALUE ...] -> single-node base-unit report
     local sb="$1"; shift
-    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
+    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" LUNARWING_MT_LINGER_DIR="$sb/units/linger" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/no-registry.json" \
         UNITS=lunarwing.service "$@" bash "$HS" 2>/dev/null
 }
@@ -471,7 +481,8 @@ linger_set "$y" acme yes; linger_set "$y" beta yes
 uid_set "$y" acme 1001; uid_set "$y" beta 1002
 mgr_set "$y" 1001 failed; mgr_set "$y" 1002 active
 unit_set_user "$y" beta lunarwing-beta.service "loaded active running 0 enabled"
-oY="$(run_hs_registry "$y" HS_FAIL_USER=acme)"
+: > "$y/bus-calls"
+oY="$(run_hs_registry "$y" HS_FAIL_USER=acme HS_BUS_LOG="$y/bus-calls")"
 assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .status' <<<"$oY")" \
     "degraded" "Y1: dead manager -> degraded acme instance"
 assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .manager_state' <<<"$oY")" \
@@ -484,6 +495,8 @@ assert_contains "$oY" "user@1001.service is failed" "Y5: dead manager named with
 assert_contains "$oY" "systemctl start user@1001.service" "Y6: recovery command in the issue"
 assert_eq "$(oall "$oY")" "degraded" "Y7: dead manager degrades the component"
 assert_eq "$(ustat "$oY" lunarwing-beta.service)" "healthy" "Y8: peer tenant units still probed"
+assert_eq "$(grep -c '^acme ' "$y/bus-calls")" "0" "Y9: no user-bus call for the dead manager's tenant"
+assert_ne "$(grep -c '^beta ' "$y/bus-calls")" "0" "Y10: the peer tenant's user bus is still asked"
 
 # ── Z: same dead manager on a NON-lingering tenant is not a tenant fault ─────
 # A non-lingering account's user manager being down is normal and says nothing
@@ -511,7 +524,57 @@ unit_set_user "$aa" acme lunarwing-acme.service "loaded active running 0 enabled
 oAA="$(run_hs "$aa" acme acme)"
 assert_eq "$(jq -r '.metrics.instances[] | select(.tenant=="acme") | .status' <<<"$oAA")" \
     "unknown" "AA1: no manager answer -> unknown instance"
-assert_absent "$oAA" "user manager user@1000.service is" "AA2: unknown state never called dead"
+assert_absent "$oAA" "user manager user@1001.service is" "AA2: unknown state never called dead"
 assert_eq "$(oall "$oAA")" "healthy" "AA3: inconclusive manager alone does not degrade"
+
+# ── AB: a logind that does not answer costs the sweep nothing ────────────────
+# Linger is read from the marker file. With five healthy lingering tenants and
+# a loginctl that hangs, a sweep that still asked logind would spend five
+# seconds per tenant and report three of them at most.
+echo "=== Section AB: silent logind does not slow the sweep ==="
+ab="$(sb)"; mk_hs_mock "$ab"
+jq -n '{tenants:{t1:{user:"t1"},t2:{user:"t2"},t3:{user:"t3"},t4:{user:"t4"},t5:{user:"t5"}}}' > "$ab/ports.json"
+for n in 1 2 3 4 5; do
+    linger_set "$ab" "t$n" yes; uid_set "$ab" "t$n" "110$n"
+    unit_set_user "$ab" "t$n" "lunarwing-t$n.service" "loaded active running 0 enabled"
+done
+: > "$ab/loginctl-calls"
+ab_t0=$SECONDS
+oAB="$(run_hs_registry "$ab" HS_LOGINCTL_LOG="$ab/loginctl-calls" HS_LOGINCTL_SLEEP=30)"
+ab_elapsed=$((SECONDS - ab_t0))
+assert_eq "$(wc -l < "$ab/loginctl-calls" | tr -d ' ')" "0" "AB1: logind is never asked"
+assert_eq "$(oall "$oAB")" "healthy" "AB2: five healthy tenants stay healthy"
+assert_eq "$(jq -r '[.metrics.units[] | select(.status=="healthy")] | length' <<<"$oAB")" \
+    "5" "AB3: every tenant's unit is reported"
+assert_eq "$(jq -r '[.metrics.instances[] | select(.status=="healthy")] | length' <<<"$oAB")" \
+    "5" "AB4: every lingering tenant has a manager instance"
+assert_absent "$oAB" "tenant sweep incomplete" "AB5: the sweep is complete"
+assert_range "$ab_elapsed" 0 10 "AB6: the sweep finishes well inside its limit"
+
+# ── AC: the budget is checked between the manager probe and the daemon probe ─
+# The run starts 15 s into its budget (bash takes SECONDS from the environment)
+# and the manager answers after four more, so the deadline of 19 s has passed
+# when the user-bus probe would start. It must not start. The manager probe is
+# itself bounded at five seconds, so the delay cannot be longer and about three
+# seconds are left for everything the script does first. On a runner too slow
+# for that, the sweep ends one check earlier, before the manager probe: AC1,
+# AC2 and AC4 hold in both cases, and AC3 accepts both.
+echo "=== Section AC: deadline between the manager probe and the user-bus probe ==="
+ac="$(sb)"; mk_hs_mock "$ac"
+linger_set "$ac" acme yes; uid_set "$ac" acme 1001; mgr_delay_set "$ac" 1001 4
+unit_set_user "$ac" acme lunarwing-acme.service "loaded active running 0 enabled"
+jq -n '{tenants:{acme:{user:"acme"}}}' > "$ac/ports.json"
+: > "$ac/bus-calls"
+oAC="$(run_hs_registry "$ac" SECONDS=15 HS_BUS_LOG="$ac/bus-calls")"
+assert_contains "$oAC" "tenant sweep incomplete" "AC1: a late manager answer ends the sweep"
+assert_eq "$(wc -l < "$ac/bus-calls" | tr -d ' ')" "0" "AC2: no user-bus probe starts past the deadline"
+assert_range "$(jq -r '[.metrics.instances[]? | select(.tenant=="acme")] | length' <<<"$oAC")" \
+    0 1 "AC3: at most the manager instance is recorded (0 only on a very slow runner)"
+assert_eq "$(oall "$oAC")" "degraded" "AC4: an incomplete sweep is degraded, never healthy"
+# Control: the same slow manager with budget left is probed as usual.
+: > "$ac/bus-calls"
+oAC2="$(run_hs_registry "$ac" HS_BUS_LOG="$ac/bus-calls")"
+assert_ne "$(grep -c '^acme ' "$ac/bus-calls")" "0" "AC5: with budget left the user bus is asked"
+assert_eq "$(ustat "$oAC2" lunarwing-acme.service)" "healthy" "AC6: and the tenant's unit is reported"
 
 finish

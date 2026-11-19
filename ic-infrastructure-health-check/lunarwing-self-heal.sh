@@ -555,8 +555,9 @@ service_is_monitor_only() {
     case "$svc" in
         systemd@*) return 0 ;;
         # Bare component-level identity from the diagnostic fallback (WI#766:
-        # "zero units and zero instances — discovery broken"). It names no
-        # unit; real units always reach here with a dotted suffix.
+        # no unit in the report and no failing instance, with the component
+        # degraded, critical or unknown). It names no unit; real units always
+        # reach here with a dotted suffix.
         systemd) return 0 ;;
     esac
     # Tenant-scoped init units: lunarwing-voice-<tenant>[-sup].

@@ -194,7 +194,6 @@ b22="$(sb)"; report "$b22" '{components:[{component:"systemd",status:"degraded",
 oB22="$(run_dry "$b22" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
 assert_contains "$oB22" "ESCALATING: systemd@acme (monitor_only" "B22: dead user manager escalates with tenant attribution (MT defaults)"
 assert_absent   "$oB22" "would run: systemctl restart"         "B22: a dead manager never restarts a unit"
-assert_absent   "$oB22" "no service mapping for component 'systemd'" "B22: systemd has a diagnostic registration"
 
 # B23 — a dead manager alongside a real failing unit: both are tracked, and
 # neither is paged twice through the component-level fallback.
@@ -205,6 +204,19 @@ oB23="$(run_dry "$b23" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=
 assert_contains "$oB23" "ESCALATING: systemd@acme (monitor_only"          "B23: dead manager still attributed"
 assert_contains "$oB23" "would run: systemctl restart lunarwing-beta.service" "B23: real unit failure keeps its restart path"
 assert_absent   "$oB23" "ESCALATING: systemd (monitor_only"               "B23: no component-level double page while units exist"
+# Logical remediation is on here (the default), which is where an unregistered
+# component would print the warning.
+assert_absent   "$oB23" "no service mapping for component 'systemd'"     "B23: systemd has a diagnostic registration"
+
+# B23b — a failing unit with a healthy manager instance and no failing one: the
+# unit keeps its restart path, and the degraded component is not also paged as
+# the bare `systemd` identity (the unit-count guard).
+b23b="$(sb)"; report "$b23b" '{components:[{component:"systemd",status:"degraded",metrics:{units:[
+  {name:"lunarwing-beta.service",status:"critical"}],instances:[
+  {tenant:"acme",status:"healthy",manager_unit:"user@1011.service"}]}}]}'
+oB23b="$(run_dry "$b23b" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB23b" "would run: systemctl restart lunarwing-beta.service" "B23b: the failing unit keeps its restart path"
+assert_absent   "$oB23b" "ESCALATING: systemd (monitor_only"                  "B23b: a failing unit is not paged again as the bare component"
 
 # B24 — healthy manager instances clear their synthetic state (report-as-truth),
 # and a component-level degrade with no instance and no failing unit still

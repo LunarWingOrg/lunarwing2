@@ -206,17 +206,15 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   # authoritative test mt-admin's `_user_manager_probe` uses: only for
   # lingering tenants, and only a known down state proves the manager dead
   # (sudo/account failures and unrecognized output are not a dead manager).
+  # Linger is read from logind's own marker file and logind is not asked.
+  # `loginctl show-user --property=Linger` reports whether exactly this file
+  # exists, and mt-admin's _tenant_linger_enabled falls back to it when logind
+  # has dropped the user record. A file test is not a bounded call, so a
+  # logind that does not answer costs the sweep nothing (it cost up to seven
+  # seconds per tenant, which could push the sweep past its limit).
+  # LUNARWING_MT_LINGER_DIR is the same test-only seam as mt-admin's.
   _tenant_linger_enabled() {  # <user> -> 0 when linger keeps the manager up
-    local u="$1" linger
-    if command -v loginctl >/dev/null 2>&1; then
-      linger=$(timeout -k 2 5 loginctl show-user "$u" --property=Linger --value 2>/dev/null) || linger=''
-      case "$linger" in
-        yes) return 0 ;;
-        no) return 1 ;;
-      esac
-    fi
-    # Same test-only seam as mt-admin (_tenant_linger_enabled).
-    [ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$u" ]
+    [ -f "${LUNARWING_MT_LINGER_DIR:-/var/lib/systemd/linger}/$1" ]
   }
   _tenant_manager_state() {  # <user> <uid> -> ok|dead:<state>|no-bus|unknown|not-lingering
     local u="$1" uid="$2" state
@@ -244,6 +242,8 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   # component. Past the deadline we stop probing and emit a partial report.
   # A probe can consume up to seven seconds (`timeout -k 2 5`). Stop starting
   # new probes at 19s so final JSON still lands before the outer 30s timeout.
+  # That holds only while one bounded command runs between two checks, so the
+  # budget is checked again between the manager probe and the daemon probe.
   _deadline=19
   while IFS=$'\t' read -r tname tuser tweechat; do
     [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
@@ -281,6 +281,9 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
         ;;
       *) ;;  # not-lingering: a down manager says nothing about the tenant
     esac
+    # The manager probe above is one bounded command and the daemon probe
+    # below is the next: do not start it past the deadline.
+    [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
     _tenant_loaded_before=$_tenant_units_loaded
     _tenant_sweep_cut_short=false
     # Is this tenant "started"? Its primary daemon being active means every other
