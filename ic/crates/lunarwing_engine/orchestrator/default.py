@@ -33,6 +33,10 @@ MAX_ACTION_OUTPUT_CHARS = 8000
 RECOVERY_SCHEMA_VERSION = 1
 RECOVERY_STATE_KEY = "_failure_recovery"
 NO_PROGRESS_FAILURE_THRESHOLD = 3
+# Failed action names reach operator-facing error text and are chosen by the
+# model, so each one is cut to a short identifier (WI#783 / AGS-2).
+FAILED_ACTION_NAMES_MAX = 4
+FAILED_ACTION_NAME_MAX_CHARS = 48
 MAX_RECOVERY_ITERATIONS = 3
 RECOVERY_CONTEXT_MAX_CHARS = 24000
 
@@ -1018,19 +1022,122 @@ def model_failure_result(state, response):
     )
 
 
-def terminal_recovery_result(state, kind):
+def sanitize_action_name(name):
+    """Bound an untrusted action name to a short identifier for control text.
+
+    Action names are model output: an unknown action still fails under the name
+    the model emitted. Keep ASCII identifier characters only, cut to a short
+    length, and break role-token openers so a name cannot smuggle prompt
+    structure into a System message or the operator's error text.
+    """
+    raw = str(name) if name is not None else ""
+    kept = []
+    for char in raw:
+        is_ascii_letter = ("a" <= char <= "z") or ("A" <= char <= "Z")
+        is_digit = "0" <= char <= "9"
+        if is_ascii_letter or is_digit or char in "_.:-":
+            kept.append(char)
+        if len(kept) >= FAILED_ACTION_NAME_MAX_CHARS:
+            break
+    return neutralize_role_token_openers("".join(kept))
+
+
+def failed_action_names(results, limit=FAILED_ACTION_NAMES_MAX):
+    """Distinct bounded action names from failed results, for operator text."""
+    names = []
+    for result in results:
+        if not isinstance(result, dict) or not result.get("is_error", False):
+            continue
+        name = sanitize_action_name(result.get("action_name", ""))
+        if name and name not in names:
+            names.append(name)
+            if len(names) >= limit:
+                break
+    return names
+
+
+def last_failed_actions_text(recovery):
+    """Bounded comma list of the action names that kept failing, or ""."""
+    if not isinstance(recovery, dict):
+        return ""
+    failed = recovery.get("last_failed_actions")
+    if not isinstance(failed, list) or not failed:
+        return ""
+    names = []
+    for name in failed[:FAILED_ACTION_NAMES_MAX]:
+        text = sanitize_action_name(name)
+        if text:
+            names.append(text)
+    return ", ".join(names)
+
+
+def config_display_value(config, key, default):
+    """Render an effective config value for operator-facing guidance."""
+    value = config.get(key, default) if isinstance(config, dict) else default
+    if value is None:
+        return "unset (engine default " + str(default) + ")"
+    return str(value)
+
+
+def consecutive_error_limit_text(config):
+    """Render the consecutive-code-error limit as a fact, not as advice.
+
+    Nothing sets this counter outside the thread config, so the text must not
+    tell an operator to raise it (WI#783 / AGS-3).
+    """
+    value = config.get("max_consecutive_errors") if isinstance(config, dict) else None
+    if value is None:
+        return "max_consecutive_errors=unset (engine default 5, no setting)"
+    return "max_consecutive_errors=" + str(value) + " (thread config; no environment setting)"
+
+
+def terminal_advice_lines(kind, config, recovery):
+    """Name the thread's real limits and tunables for a terminal failure (WI#783).
+
+    WI#640 asked the terminal text to say which values to change. Only settings
+    that govern the failing thread are named; a value with no setting is shown
+    as a fact instead of as something to raise.
+    """
+    lines = []
+    failed = last_failed_actions_text(recovery)
+    if failed:
+        lines.append("- Failing: " + failed + ".")
+    if kind == "no_progress":
+        lines.append(
+            "- Raise if work is still progressing: ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=" +
+            config_display_value(config, "tool_async_timeout_secs", 300) +
+            " (a call slower than this is aborted and counts as failed work)."
+        )
+    lines.append(
+        "- This thread's limits: max_iterations=" +
+        config_display_value(config, "max_iterations", 30) + "; " +
+        consecutive_error_limit_text(config) + "."
+    )
+    return lines
+
+
+def with_terminal_advice(headline, advice):
+    """Append bounded remediation lines to a terminal failure headline."""
+    if not advice:
+        return headline
+    return headline + "\n" + "\n".join(advice)
+
+
+def terminal_recovery_result(state, kind, config):
     """Finalize a terminal condition after its warning turn was consumed."""
     if kind == "iteration_limit":
         __transition_to__("failed", "iteration limit reached after recovery")
         return complete_result(state, "max_iterations")
+    advice = terminal_advice_lines(kind, config, ensure_failure_recovery(state))
     if kind == "consecutive_errors":
         __transition_to__("failed", "consecutive code errors after recovery")
         return complete_result(
             state,
             "failed",
-            error=(
+            error=with_terminal_advice(
                 "Code execution kept failing after a final recovery attempt. "
-                "Change approach, parameters, or required capabilities, then retry."
+                "Change approach, parameters, or required capabilities, then retry.",
+                advice,
             ),
             extra={"failure_kind": "consecutive_errors"},
         )
@@ -1038,17 +1145,26 @@ def terminal_recovery_result(state, kind):
     return complete_result(
         state,
         "failed",
-        error=(
+        error=with_terminal_advice(
             "Execution made no progress after a final recovery attempt. Change "
-            "approach, enable the required capability, or retry with clearer constraints."
+            "approach, enable the required capability, or retry with clearer constraints.",
+            advice,
         ),
         extra={"failure_kind": "no_progress"},
     )
 
 
-def observe_work_progress(state, failed):
+def observe_work_progress(state, failed, failed_actions=None):
     """Track only consecutive failed work; successful work resets detection."""
     recovery = ensure_failure_recovery(state)
+    if not isinstance(failed_actions, list):
+        failed_actions = []
+    # Report only the names from the step under judgement: a step that failed
+    # without a named action must not let an earlier name stand in for it.
+    if failed:
+        recovery["last_failed_actions"] = failed_actions[:FAILED_ACTION_NAMES_MAX]
+    else:
+        recovery["last_failed_actions"] = []
     active = recovery.get("active_terminal")
     if active == "iteration_limit":
         recovery["active_terminal"] = None
@@ -1074,6 +1190,39 @@ def observe_work_progress(state, failed):
             repeated_failures=count):
         return "warning_scheduled"
     return "no_progress"
+
+
+def advance_code_step_recovery(state, step_failed, step_had_error, failed_actions,
+                               consecutive_errors, max_consecutive_errors):
+    """Fold one code step into both failure counters (WI#783).
+
+    A code step feeds the no-progress counter and the consecutive-error
+    counter. When both trip on the same step, the step that scheduled the
+    no-progress warning must still let that recovery turn run: the terminal
+    text promises a final recovery attempt, so every terminal class gets one.
+    Without the guard the consecutive-error branch refuses the second warning
+    and ends the turn before its warning turn is delivered.
+
+    Returns {"progress": ..., "consecutive_errors": ...} where progress is
+    "ok", "warning_scheduled", "iteration_limit", "no_progress", or
+    "consecutive_errors".
+    """
+    progress = observe_work_progress(state, step_failed, failed_actions)
+    if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
+        return {"progress": progress, "consecutive_errors": consecutive_errors}
+
+    if not step_had_error:
+        return {"progress": "ok", "consecutive_errors": 0}
+
+    count = consecutive_errors + 1
+    if count < max_consecutive_errors or progress == "warning_scheduled":
+        return {"progress": progress, "consecutive_errors": count}
+    if schedule_terminal_warning(
+            state,
+            "consecutive_errors",
+            repeated_failures=count):
+        return {"progress": "warning_scheduled", "consecutive_errors": count}
+    return {"progress": "consecutive_errors", "consecutive_errors": count}
 
 
 def code_step_failed(result):
@@ -1163,7 +1312,7 @@ def run_loop(context, goal, actions, state, config):
 
         recovery = ensure_failure_recovery(state)
         if recovery.get("active_terminal") is not None:
-            return terminal_recovery_result(state, recovery["active_terminal"])
+            return terminal_recovery_result(state, recovery["active_terminal"], config)
         if step >= max_iterations and recovery.get("pending_terminal") is None:
             if schedule_terminal_warning(
                     state,
@@ -1175,7 +1324,7 @@ def run_loop(context, goal, actions, state, config):
                     "compaction_count": state.get("compaction_count", 0),
                 })
             else:
-                return terminal_recovery_result(state, "iteration_limit")
+                return terminal_recovery_result(state, "iteration_limit", config)
 
         # 2. Check budget
         budget = __check_budget__()
@@ -1496,23 +1645,18 @@ def run_loop(context, goal, actions, state, config):
                     "resume_output": gate.get("resume_output"),
                 }
 
-            progress = observe_work_progress(state, code_step_failed(result))
+            step = advance_code_step_recovery(
+                state,
+                code_step_failed(result),
+                result.get("had_error", False),
+                failed_action_names(result.get("action_results", [])),
+                consecutive_errors,
+                max_consecutive_errors,
+            )
+            consecutive_errors = step["consecutive_errors"]
+            progress = step["progress"]
             if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
-                return terminal_recovery_result(state, progress)
-
-            # Track consecutive errors
-            if result.get("had_error"):
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    if schedule_terminal_warning(
-                            state,
-                            "consecutive_errors",
-                            repeated_failures=consecutive_errors):
-                        progress = "warning_scheduled"
-                    else:
-                        return terminal_recovery_result(state, "consecutive_errors")
-            else:
-                consecutive_errors = 0
+                return terminal_recovery_result(state, progress, config)
 
             __save_checkpoint__(state, {
                 "nudge_count": consecutive_nudges,
@@ -1581,9 +1725,13 @@ def run_loop(context, goal, actions, state, config):
                         "resume_output": gate.get("resume_output"),
                     }
 
-            progress = observe_work_progress(state, action_batch_failed(calls, results))
+            progress = observe_work_progress(
+                state,
+                action_batch_failed(calls, results),
+                failed_action_names(results),
+            )
             if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
-                return terminal_recovery_result(state, progress)
+                return terminal_recovery_result(state, progress, config)
 
             __save_checkpoint__(state, {
                 "nudge_count": consecutive_nudges,
@@ -1594,7 +1742,7 @@ def run_loop(context, goal, actions, state, config):
             if progress == "warning_scheduled":
                 continue
 
-    return terminal_recovery_result(state, "iteration_limit")
+    return terminal_recovery_result(state, "iteration_limit", config)
 
 
 # Entry point: call run_loop with injected context variables
