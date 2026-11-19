@@ -3826,6 +3826,36 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_config_carries_no_progress_diagnostics() {
+        // WI#640: the terminal error names these knobs, so they must reach the
+        // orchestrator config dict with the thread's effective values.
+        let config = ThreadConfig {
+            max_iterations: 12,
+            no_progress_failure_threshold: 5,
+            max_consecutive_errors: Some(4),
+            tool_async_timeout_secs: 120,
+            ..ThreadConfig::default()
+        };
+        let thread = Thread::new(
+            "long loop",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            config,
+        );
+
+        let (_, values) = build_orchestrator_inputs(&thread, &serde_json::json!({}));
+        let config = monty_to_json(&values[4]);
+        assert_eq!(
+            config["no_progress_failure_threshold"],
+            serde_json::json!(5)
+        );
+        assert_eq!(config["max_iterations"], serde_json::json!(12));
+        assert_eq!(config["max_consecutive_errors"], serde_json::json!(4));
+        assert_eq!(config["tool_async_timeout_secs"], serde_json::json!(120));
+    }
+
+    #[test]
     fn injected_message_reattaches_transient_parts_by_stable_id() {
         let mut thread = Thread::new(
             "running",
