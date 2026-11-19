@@ -209,6 +209,20 @@ capture worker_egress_stop_keeper "$TENANT" keep
 assert_eq "live manager: an absent keeper exits 0" "$CAPTURED_RC" "0"
 assert_eq "live manager: an absent keeper is probed once" "$(ctr_call_count)" "1"
 
+# The stand-in is what refuses `pod rm` with the measured bus errors. Prove it
+# does, so the dead-manager cases' "never calls podman" assertion is what keeps
+# that noise out — and show a live manager's failure still fails as today.
+reset_runtime
+MANAGER_STATE=ok
+POD_RM_RC=1
+capture worker_egress_stop_keeper "$TENANT" keep
+out="$CAPTURED_OUT"
+assert_eq "live manager: a failing pod rm still fails the keeper step" "$CAPTURED_RC" "1"
+assert_contains "live manager: a failing pod rm is reported" "$out" \
+  "cannot remove rootless namespace keeper $KEEPER"
+assert_contains "live manager: the stand-in refusal carries the measured bus error" "$out" \
+  "connect: connection refused"
+
 # --- 4. rootful runtimes and OpenRC keep today's calls ---------------------
 
 reset_runtime
