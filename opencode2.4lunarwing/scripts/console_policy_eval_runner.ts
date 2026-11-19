@@ -94,7 +94,7 @@ const SKILL_BUNDLE = {
 // merge surface is observable as well as the Library: both must be absent when
 // the deny holds. With WI665_EVAL_DENY_PROVIDER it also carries a policy
 // statement: upstream keeps a denied integration's policies
-// (packages/core/src/config.ts:343-349 at the v2.2.7 pin), so that statement
+// (packages/core/src/config.ts:344-349 at the v2.3.2 pin), so that statement
 // applies in the control but must be neutralized by the managed allows.
 const CONSOLE_PROVIDER = "wi665-console-provider";
 const CONSOLE_MCP = "wi665-console-mcp";

@@ -27,7 +27,7 @@ The questions are answered by observation, not by reading:
   * what is left of the Console's config document in `/api/config`?
   * does a policy statement in the Console's config still apply? Upstream
     keeps a denied integration's `policies` on purpose
-    (`packages/core/src/config.ts:343-349` at the v2.2.7 pin), and those
+    (`packages/core/src/config.ts:344-349` at the v2.3.2 pin), and those
     statements rank immediately below the managed ones. WI#745 ships managed
     allows for every action upstream enforces, so the recorded answer is no:
     the content is withheld and the Console's `provider.use` and `tool.use`
