@@ -615,6 +615,19 @@ fn failed_work_recovery(consecutive_failures: u32) -> FailedWorkRecovery {
     }
 }
 
+/// Bounded failing-tool names quoted back to the model and the operator
+/// (WI#640); the whole loop is capped so the message stays short.
+const FAILED_TOOL_NAMES_MAX: usize = 4;
+
+fn failed_tool_names_text(names: &[String]) -> String {
+    names
+        .iter()
+        .take(FAILED_TOOL_NAMES_MAX)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Detect post-work chatter: suggestions, follow-up offers, or XML tags
 /// that indicate the LLM finished the task but is looping on meta-content.
 fn is_post_work_chatter(text: &str) -> bool {
@@ -791,6 +804,9 @@ impl LoopDelegate for ContainerDelegate {
 
         // Execute tools sequentially (container context — no parallel execution)
         let mut any_succeeded = false;
+        // WI#640: name the tools that kept failing in the terminal message so a
+        // weak local model's repeated call is visible to the operator.
+        let mut failed_tool_names: Vec<String> = Vec::new();
 
         for tc in tool_calls {
             self.post_event(
@@ -842,6 +858,11 @@ impl LoopDelegate for ContainerDelegate {
             if let Ok(output) = &result {
                 any_succeeded = true;
                 *self.last_output.lock().await = output.clone();
+            } else if failed_tool_names.len() < FAILED_TOOL_NAMES_MAX {
+                let name = tc.name.clone();
+                if !name.is_empty() && !failed_tool_names.contains(&name) {
+                    failed_tool_names.push(name);
+                }
             }
 
             // Use shared result processing
@@ -867,15 +888,33 @@ impl LoopDelegate for ContainerDelegate {
                 tracing::warn!(
                     "3 consecutive iterations had no successful tool calls; scheduling recovery"
                 );
-                reason_ctx.messages.push(ChatMessage::system(
-                    "Tool failure warning: three consecutive tool rounds produced no successful work. This is the recovery turn. Do not repeat the same call unchanged; use different allowed tools or parameters, or state which capability or permission must be enabled and provide the best partial result.",
-                ));
+                let failing = failed_tool_names_text(&failed_tool_names);
+                let mut warning = String::from(
+                    "Tool failure warning: three consecutive tool rounds produced no successful work. This is the recovery turn.",
+                );
+                if !failing.is_empty() {
+                    warning.push_str(" Failing: ");
+                    warning.push_str(&failing);
+                    warning.push('.');
+                }
+                warning.push_str(
+                    " Do not repeat the same call unchanged; use different allowed tools or parameters, or state which capability or permission must be enabled and provide the best partial result.",
+                );
+                reason_ctx.messages.push(ChatMessage::system(&warning));
                 Ok(None)
             }
-            FailedWorkRecovery::Fail => Ok(Some(LoopOutcome::Failed(
-                "Tool calls kept failing after a recovery turn. Change approach or parameters, enable the required capability or permissions, then retry."
-                    .to_string(),
-            ))),
+            FailedWorkRecovery::Fail => {
+                let mut message = String::from(
+                    "Tool calls kept failing after a recovery turn. Change approach or parameters, enable the required capability or permissions, then retry.",
+                );
+                let failing = failed_tool_names_text(&failed_tool_names);
+                if !failing.is_empty() {
+                    message.push_str(" Failing: ");
+                    message.push_str(&failing);
+                    message.push('.');
+                }
+                Ok(Some(LoopOutcome::Failed(message)))
+            }
         }
     }
 
@@ -1093,5 +1132,17 @@ mod tests {
         assert_eq!(failed_work_recovery(2), FailedWorkRecovery::Continue);
         assert_eq!(failed_work_recovery(3), FailedWorkRecovery::Warn);
         assert_eq!(failed_work_recovery(4), FailedWorkRecovery::Fail);
+    }
+
+    #[test]
+    fn failed_tool_names_text_is_bounded() {
+        // WI#640: the failing-tool list quoted back to the model stays short
+        // even when a batch requested many tools.
+        let names: Vec<String> = (0..8).map(|i| format!("tool_{i}")).collect();
+        assert_eq!(
+            failed_tool_names_text(&names),
+            "tool_0, tool_1, tool_2, tool_3"
+        );
+        assert!(failed_tool_names_text(&[]).is_empty());
     }
 }
