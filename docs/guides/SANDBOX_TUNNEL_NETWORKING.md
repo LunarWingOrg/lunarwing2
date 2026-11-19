@@ -746,7 +746,9 @@ default.
    open gate; opening both runtime gates is refused, and a lane whose
    `CliRunner` resolves to the other runtime fails rather than silently
    switching. The test builds an Alpine image with `nftables` unless
-   `LUNARWING_E2E_TUNNEL_IMAGE` names a suitable existing image. It checks real
+   `LUNARWING_E2E_TUNNEL_IMAGE` names a suitable existing image;
+   `LUNARWING_E2E_TUNNEL_BASE_IMAGE` (or the older
+   `LUNARWING_E2E_PODMAN_IMAGE`) picks the base it builds from. It checks real
    namespace joining by verified container ID, stable reuse, clean recreation
    after independent input/output tamper cases, image-ID rotation with a clean
    firewall, distinct instance names, and helper-unit cleanup. Custom DNS checks

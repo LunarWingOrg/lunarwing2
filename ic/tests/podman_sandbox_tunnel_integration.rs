@@ -154,7 +154,8 @@ async fn build_tunnel_image() -> bool {
     let dir = std::env::temp_dir().join(format!("lw-tunnel-e2e-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let containerfile = dir.join("Dockerfile");
-    let alpine = std::env::var("LUNARWING_E2E_PODMAN_IMAGE")
+    let alpine = std::env::var("LUNARWING_E2E_TUNNEL_BASE_IMAGE")
+        .or_else(|_| std::env::var("LUNARWING_E2E_PODMAN_IMAGE"))
         .unwrap_or_else(|_| "quay.io/libpod/alpine:latest".to_string());
     let written = std::fs::write(
         &containerfile,
