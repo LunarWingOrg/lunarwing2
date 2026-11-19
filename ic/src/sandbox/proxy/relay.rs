@@ -153,8 +153,8 @@ fn selinux_enabled() -> bool {
 /// Pin the calling thread's next socket to `context`.
 ///
 /// The attribute belongs to the task, not the process, so no other thread in
-/// the daemon can pick it up; [`LabelProbe`] clears it as soon as the socket
-/// exists.
+/// the daemon can pick it up; [`with_socket_context`] clears it as soon as the
+/// socket exists.
 #[cfg(target_os = "linux")]
 fn set_socket_create_context(context: &str) -> std::io::Result<()> {
     let mut last = std::io::Error::from(std::io::ErrorKind::NotFound);
