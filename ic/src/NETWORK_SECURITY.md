@@ -429,8 +429,24 @@ public-only validating proxy:
   uppercase `:Z` is the private relabel. SELinux may separately require
   `sock_file` access to the socket inode and `unix_stream_socket connectto`
   permission to the listening socket's security context. A shared inode
-  label does not change the listener's context or prove a connect is allowed.
-  The daemon does not relabel the channel itself or change SELinux policy.
+  label does not change the listener's context. The measured denial on an
+  enforcing Fedora host is the second check: `container_t` against the
+  daemon's `unconfined_t`, which no inode relabel can change.
+- relay listener label (WI#641): on a host with SELinux enabled, the listener
+  is created with the daemon thread's `sockcreate` attribute pinned to
+  `system_u:system_r:container_t:s0`, then to
+  `system_u:system_r:container_t:s0:c0.c1023`. Both make the container's
+  connect a same-type check that stock container policy already allows; the
+  full category range covers an MLS constraint that requires the listener's
+  level to dominate the connecting socket's level. Before a container starts,
+  the daemon replays that connect from a client socket created under a
+  container-shaped source context (a runtime category pair, then the base
+  level) and checks `accept` plus one byte each way. Any refusal, an
+  unwritable `sockcreate` node, or a host without selinuxfs keeps the previous
+  unlabeled socket, so the change can only add a working path. Sandbox
+  confinement is unchanged: no `label=disable`, no permissive domain, and no
+  permission a container does not already have for its own sockets. The
+  daemon does not relabel the channel itself or change SELinux policy.
 - relay failure text: startup errors use `lunarwing-proxy-relay:` and map to
   `sandbox:proxy_error`. A failed transport probe reports the errno, container
   UID/GID, mount and socket metadata, and available SELinux state. The probe
