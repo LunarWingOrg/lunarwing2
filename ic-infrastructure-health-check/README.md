@@ -126,7 +126,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` **and the tenant's actual feature enablement** (`KNOWLEDGE_SYNC_ENABLED` default false, `KNOWLEDGE_SWEEP_ENABLED` default true, plus cadences, from the tenant env file) | `sync_enabled`, `sweep_enabled`, `sync_cadence_hours`, `sweep_cadence_hours`, `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — disabled features ignore their (possibly stale) state; enabled-but-never-observed degrades only past the startup grace period; overdue derives from the configured cadence |
 | worker_egress | health-worker-egress.sh | Root-owned egress state, live tenant network policy, and worker attachments | per-tenant `instances[]`; monitor-only, no firewall repair |
 | disk | health-disk.sh | Host, container-store, tenant, and operator-extra filesystems, deduplicated by followed device; block and inode use with bounded `df`/`stat` and an overall sweep deadline | per-mount `filesystems[]`: `size_bytes`, `free_bytes`, `used_pct`, `inodes_used_pct` (`null` when untracked), `status`, `available`, `present` (absent discovered paths stay healthy); monitor-only, never cleans up |
-| systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant); `metrics.instances` in `systemd` reports each tenant's user manager (`user@<uid>.service`) on MT hosts | `metrics.units` / `.services` / `.agents`, plus systemd `metrics.instances` |
+| systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant); `metrics.instances` in `systemd` reports each tenant's user manager (`user@<uid>.service`) on MT hosts; openrc `metrics.scheduler` reports the cron blind spot (`hook_installed`, `running`, `installed`, `status`) | `metrics.units` / `.services` / `.agents`, plus systemd `metrics.instances` and openrc `metrics.scheduler` |
 
 A check that cannot reach its target generally reports `critical`; several
 checks can instead be **disabled** so they report `healthy` with
@@ -435,6 +435,7 @@ wedge it.
 | worker_egress | _(none — monitor-only diagnostic)_ `worker_egress@<tenant>`; pages without changing firewall policy | health-worker-egress.sh |
 | disk | _(none — monitor-only diagnostic)_ `disk@<mount>` per filesystem; pages without restarting or deleting anything | health-disk.sh |
 | systemd (user manager) | _(none — monitor-only diagnostic)_ `systemd@<tenant>` per tenant whose `user@<uid>.service` is down; pages with tenant attribution and the recovery command (`systemctl start user@<uid>.service`), never restarts | health-systemd.sh |
+| openrc (scheduler / component) | _(none — monitor-only diagnostic)_ `openrc@scheduler` when the cron hook is installed but no scheduler is running (pages with `rc-service <sched> start`); bare `openrc` when the component degrades with no failing service; never restarts | health-openrc.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`, `knowledge`, `worker_egress`, and `disk` failures become synthetic
@@ -465,6 +466,21 @@ monitor-only. Non-lingering tenants are never judged: a down manager there is
 normal and says nothing about the tenant. Linger is read from logind's marker
 file (`/var/lib/systemd/linger/<user>`), so the check does not depend on
 logind answering.
+
+WI#789 adds the OpenRC parity. On a Gentoo/OpenRC host the component degrades
+in shapes that name no failing service — most visibly when the cron hook is
+installed but no scheduler daemon is running (watchdog, health pipeline and
+self-heal all stop firing while every service probe still reads healthy) — and
+step 1 could never route it. `health-openrc.sh` now also reports
+`.metrics.scheduler.installed` (the first scheduler init script present), the
+scheduler blind spot escalates as `openrc@scheduler` with the recovery command
+`rc-service <sched> start`, and a component-level degrade with no failing
+service escalates as the bare monitor-only `openrc` identity. Real per-service
+OpenRC failures keep their step-2 restart path; the bare component fallback is
+suppressed while any service is non-healthy and non-`skipped`, so a failing
+unit is never paged twice. `skipped` is intentional (tenant not started, worker
+stopped, optional backend disabled) and does not hide a component-level
+monitoring gap.
 
 Logical mappings use configured base names. Init sub-units retain names reported
 by service-manager checks (including `.service`); per-tenant systemd units are
