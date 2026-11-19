@@ -258,6 +258,9 @@ fn bind_relay_listener(
 
 /// Try each candidate context on the calling thread (the dedicated probe
 /// thread), keeping the first that survives a container-shaped connect.
+///
+/// The reasons are collected and reported once per execution: a host whose
+/// policy refuses every label would otherwise warn on every shell call.
 #[cfg(target_os = "linux")]
 fn bind_labeled(
     socket: &Path,
@@ -265,8 +268,10 @@ fn bind_labeled(
     if !selinux_enabled() {
         return Ok(None);
     }
+    let mut refused: Option<String> = None;
     for context in RELAY_SOCKET_CONTEXTS {
-        if set_socket_create_context(context).is_err() {
+        if let Err(error) = set_socket_create_context(context) {
+            refused = Some(format!("{context}: cannot set sockcreate: {error}"));
             continue;
         }
         let bound = bind_relay_socket(socket);
@@ -275,22 +280,28 @@ fn bind_labeled(
         // unwritable attribute; the unlabeled attempt reports real errors.
         let Ok(listener) = bound else {
             let _ = std::fs::remove_file(socket);
+            refused = Some(format!("{context}: cannot bind the labeled socket"));
             continue;
         };
-        if let Err(error) = SIMULATED_CLIENT_CONTEXTS
+        match SIMULATED_CLIENT_CONTEXTS
             .iter()
             .try_for_each(|client| probe_labeled_connection(socket, &listener, client))
         {
-            tracing::warn!(
-                %error,
-                context,
-                "SELinux refused the relay socket self-test; trying the next label"
-            );
-            drop(listener);
-            let _ = std::fs::remove_file(socket);
-            continue;
+            Ok(()) => return Ok(Some((listener, context))),
+            Err(error) => {
+                refused = Some(format!(
+                    "{context}: container-shaped connect refused: {error}"
+                ));
+                drop(listener);
+                let _ = std::fs::remove_file(socket);
+            }
         }
-        return Ok(Some((listener, context)));
+    }
+    if let Some(reason) = refused {
+        tracing::warn!(
+            reason,
+            "no container label is usable for the relay socket; keeping the unlabeled socket"
+        );
     }
     Ok(None)
 }
