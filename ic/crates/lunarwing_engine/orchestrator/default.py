@@ -32,7 +32,14 @@ MESSAGE_OVERHEAD_CHARS = 4
 MAX_ACTION_OUTPUT_CHARS = 8000
 RECOVERY_SCHEMA_VERSION = 1
 RECOVERY_STATE_KEY = "_failure_recovery"
+# Consecutive no-success steps before the one no-progress warning turn. The
+# thread config `no_progress_failure_threshold` overrides it per thread
+# (WI#640); the clamp keeps a misconfigured 0/1 from failing a turn on its
+# first transient tool error and bounds the wait before the warning.
 NO_PROGRESS_FAILURE_THRESHOLD = 3
+NO_PROGRESS_THRESHOLD_MIN = 2
+NO_PROGRESS_THRESHOLD_MAX = 10
+FAILED_ACTION_NAMES_MAX = 4
 MAX_RECOVERY_ITERATIONS = 3
 RECOVERY_CONTEXT_MAX_CHARS = 24000
 
@@ -818,6 +825,7 @@ def ensure_failure_recovery(state):
             "model_recovery_total_attempts": 0,
             "pending_model_error": None,
             "consecutive_failed_work": 0,
+            "last_failed_actions": [],
         }
         state[RECOVERY_STATE_KEY] = recovery
         return recovery
@@ -826,6 +834,8 @@ def ensure_failure_recovery(state):
         recovery["terminal_attempted"] = []
     if not isinstance(recovery.get("consecutive_failed_work"), int):
         recovery["consecutive_failed_work"] = 0
+    if not isinstance(recovery.get("last_failed_actions"), list):
+        recovery["last_failed_actions"] = []
     # Migrate the legacy one-shot boolean to the checkpointed counter.
     legacy_attempted = recovery.pop("model_recovery_attempted", None)
     if not isinstance(recovery.get("model_recovery_attempts"), int):
@@ -851,7 +861,20 @@ def schedule_terminal_warning(state, kind, limit=None, repeated_failures=None):
     return True
 
 
-def terminal_warning_instruction(observation):
+def last_failed_actions_text(recovery):
+    """Bounded comma list of the action names that kept failing, or \"\"."""
+    if not isinstance(recovery, dict):
+        return ""
+    failed = recovery.get("last_failed_actions")
+    if not isinstance(failed, list) or not failed:
+        return ""
+    names = []
+    for name in failed[:FAILED_ACTION_NAMES_MAX]:
+        names.append(str(name))
+    return ", ".join(names)
+
+
+def terminal_warning_instruction(observation, recovery=None):
     """Render only typed, bounded terminal facts into model control text."""
     kind = observation.get("kind") if isinstance(observation, dict) else ""
     if kind == "iteration_limit":
@@ -863,11 +886,19 @@ def terminal_warning_instruction(observation):
         )
     if kind == "no_progress":
         count = observation.get("repeated_failures", NO_PROGRESS_FAILURE_THRESHOLD)
-        return (
+        text = (
             "Loop warning: no progress after " + str(count) +
-            " consecutive failed tool or code steps. Change approach, use a "
-            "different allowed capability or parameters, or provide the best "
-            "final answer now."
+            " consecutive failed tool or code steps."
+        )
+        failed = last_failed_actions_text(recovery)
+        if failed:
+            text = text + " Failing: " + failed + "."
+        return (
+            text + " Do not repeat the same call unchanged: read the error text, "
+            "fix the parameters, or use a different advertised tool. If the error "
+            "says a capability is unavailable or denied, say which capability the "
+            "operator must enable instead of retrying it. Otherwise provide the "
+            "best final answer now."
         )
     if kind == "consecutive_errors":
         count = observation.get("repeated_failures", 1)
@@ -890,7 +921,7 @@ def messages_with_recovery_controls(state, working_messages):
             controls.append(instruction)
     terminal = recovery.get("pending_terminal")
     if isinstance(terminal, dict):
-        controls.append(terminal_warning_instruction(terminal))
+        controls.append(terminal_warning_instruction(terminal, recovery))
     if not controls:
         return working_messages
 
@@ -1018,8 +1049,98 @@ def model_failure_result(state, response):
     )
 
 
-def terminal_recovery_result(state, kind):
+def effective_no_progress_threshold(config):
+    """Thread-configured consecutive-failed-work threshold, clamped safely."""
+    value = config.get("no_progress_failure_threshold", NO_PROGRESS_FAILURE_THRESHOLD)
+    if not isinstance(value, int):
+        return NO_PROGRESS_FAILURE_THRESHOLD
+    if value < NO_PROGRESS_THRESHOLD_MIN:
+        return NO_PROGRESS_THRESHOLD_MIN
+    if value > NO_PROGRESS_THRESHOLD_MAX:
+        return NO_PROGRESS_THRESHOLD_MAX
+    return value
+
+
+def failed_action_names(results, limit=FAILED_ACTION_NAMES_MAX):
+    """Distinct bounded action names from failed results, for control text."""
+    names = []
+    for result in results:
+        if not isinstance(result, dict) or not result.get("is_error", False):
+            continue
+        name = str(result.get("action_name", "") or "")[:64]
+        if name and name not in names:
+            names.append(name)
+            if len(names) >= limit:
+                break
+    return names
+
+
+def config_display_value(config, key, default):
+    """Render an effective config value for operator-facing guidance."""
+    value = config.get(key, default)
+    if value is None:
+        return "unset (engine default " + str(default) + ")"
+    return str(value)
+
+
+def terminal_advice_lines(kind, config, recovery):
+    """Name the real tunables and current values for a terminal failure (WI#640).
+
+    Weak local models can exhaust a bounded loop on transient tool failures;
+    the terminal text must tell the operator which knob to change and what it
+    is set to now instead of only asking for a different approach.
+    """
+    lines = []
+    failed = last_failed_actions_text(recovery)
+    if failed:
+        lines.append("- Failing: " + failed + ".")
+    elif kind == "no_progress":
+        lines.append("- The last failed steps produced no successful tool call.")
+    if kind == "consecutive_errors":
+        lines.append(
+            "- Raise if work is still progressing: max_consecutive_errors=" +
+            config_display_value(config, "max_consecutive_errors", 5) +
+            ", max_iterations=" +
+            config_display_value(config, "max_iterations", 30) +
+            " (env AGENT_MAX_TOOL_ITERATIONS)."
+        )
+    if kind == "no_progress":
+        lines.append(
+            "- Raise if work is still progressing: no_progress_failure_threshold=" +
+            str(effective_no_progress_threshold(config)) +
+            " (thread config; env ENGINE_V2_NO_PROGRESS_THRESHOLD), max_iterations=" +
+            config_display_value(config, "max_iterations", 30) +
+            " (env AGENT_MAX_TOOL_ITERATIONS), max_consecutive_errors=" +
+            config_display_value(config, "max_consecutive_errors", 5) + "."
+        )
+        lines.append(
+            "- Model recovery: model_recovery_max_attempts=" +
+            config_display_value(config, "model_recovery_max_attempts", 1) +
+            " per streak / model_recovery_total_attempts=" +
+            config_display_value(config, "model_recovery_total_attempts", 4) +
+            " per thread (env ENGINE_V2_MODEL_RECOVERY_ATTEMPTS / " +
+            "ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)."
+        )
+    if kind in ("no_progress", "consecutive_errors"):
+        lines.append(
+            "- Slow tools on a busy host: ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=" +
+            config_display_value(config, "tool_async_timeout_secs", 300) +
+            "; a timed-out tool call counts as a failed step."
+        )
+    return lines
+
+
+def with_terminal_advice(headline, advice):
+    """Append bounded remediation lines to a terminal failure headline."""
+    if not advice:
+        return headline
+    return headline + "\n" + "\n".join(advice)
+
+
+def terminal_recovery_result(state, kind, config):
     """Finalize a terminal condition after its warning turn was consumed."""
+    recovery = ensure_failure_recovery(state)
+    advice = terminal_advice_lines(kind, config, recovery)
     if kind == "iteration_limit":
         __transition_to__("failed", "iteration limit reached after recovery")
         return complete_result(state, "max_iterations")
@@ -1028,9 +1149,10 @@ def terminal_recovery_result(state, kind):
         return complete_result(
             state,
             "failed",
-            error=(
+            error=with_terminal_advice(
                 "Code execution kept failing after a final recovery attempt. "
-                "Change approach, parameters, or required capabilities, then retry."
+                "Change approach, parameters, or required capabilities, then retry.",
+                advice,
             ),
             extra={"failure_kind": "consecutive_errors"},
         )
@@ -1038,15 +1160,17 @@ def terminal_recovery_result(state, kind):
     return complete_result(
         state,
         "failed",
-        error=(
+        error=with_terminal_advice(
             "Execution made no progress after a final recovery attempt. Change "
-            "approach, enable the required capability, or retry with clearer constraints."
+            "approach, enable the required capability, or retry with clearer constraints.",
+            advice,
         ),
         extra={"failure_kind": "no_progress"},
     )
 
 
-def observe_work_progress(state, failed):
+def observe_work_progress(state, failed, threshold=NO_PROGRESS_FAILURE_THRESHOLD,
+                          failed_actions=None):
     """Track only consecutive failed work; successful work resets detection."""
     recovery = ensure_failure_recovery(state)
     active = recovery.get("active_terminal")
@@ -1060,11 +1184,15 @@ def observe_work_progress(state, failed):
 
     if not failed:
         recovery["consecutive_failed_work"] = 0
+        recovery["last_failed_actions"] = []
         return None
+
+    if isinstance(failed_actions, list) and failed_actions:
+        recovery["last_failed_actions"] = failed_actions[:FAILED_ACTION_NAMES_MAX]
 
     count = recovery.get("consecutive_failed_work", 0) + 1
     recovery["consecutive_failed_work"] = count
-    if count < NO_PROGRESS_FAILURE_THRESHOLD:
+    if count < threshold:
         return None
 
     recovery["consecutive_failed_work"] = 0
@@ -1112,6 +1240,7 @@ def run_loop(context, goal, actions, state, config):
     max_consecutive_errors = config.get("max_consecutive_errors", 5)
     if max_consecutive_errors is None:
         max_consecutive_errors = 5
+    no_progress_threshold = effective_no_progress_threshold(config)
     obligation_enabled = config.get("require_action_attempt", False)
     max_obligation_nudges = config.get("max_action_requirement_nudges", 2)
     consecutive_nudges = 0
@@ -1163,7 +1292,7 @@ def run_loop(context, goal, actions, state, config):
 
         recovery = ensure_failure_recovery(state)
         if recovery.get("active_terminal") is not None:
-            return terminal_recovery_result(state, recovery["active_terminal"])
+            return terminal_recovery_result(state, recovery["active_terminal"], config)
         if step >= max_iterations and recovery.get("pending_terminal") is None:
             if schedule_terminal_warning(
                     state,
@@ -1175,7 +1304,7 @@ def run_loop(context, goal, actions, state, config):
                     "compaction_count": state.get("compaction_count", 0),
                 })
             else:
-                return terminal_recovery_result(state, "iteration_limit")
+                return terminal_recovery_result(state, "iteration_limit", config)
 
         # 2. Check budget
         budget = __check_budget__()
@@ -1496,9 +1625,14 @@ def run_loop(context, goal, actions, state, config):
                     "resume_output": gate.get("resume_output"),
                 }
 
-            progress = observe_work_progress(state, code_step_failed(result))
+            progress = observe_work_progress(
+                state,
+                code_step_failed(result),
+                no_progress_threshold,
+                failed_action_names(result.get("action_results", [])),
+            )
             if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
-                return terminal_recovery_result(state, progress)
+                return terminal_recovery_result(state, progress, config)
 
             # Track consecutive errors
             if result.get("had_error"):
@@ -1510,7 +1644,8 @@ def run_loop(context, goal, actions, state, config):
                             repeated_failures=consecutive_errors):
                         progress = "warning_scheduled"
                     else:
-                        return terminal_recovery_result(state, "consecutive_errors")
+                        return terminal_recovery_result(
+                            state, "consecutive_errors", config)
             else:
                 consecutive_errors = 0
 
@@ -1581,9 +1716,14 @@ def run_loop(context, goal, actions, state, config):
                         "resume_output": gate.get("resume_output"),
                     }
 
-            progress = observe_work_progress(state, action_batch_failed(calls, results))
+            progress = observe_work_progress(
+                state,
+                action_batch_failed(calls, results),
+                no_progress_threshold,
+                failed_action_names(results),
+            )
             if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
-                return terminal_recovery_result(state, progress)
+                return terminal_recovery_result(state, progress, config)
 
             __save_checkpoint__(state, {
                 "nudge_count": consecutive_nudges,
@@ -1594,7 +1734,7 @@ def run_loop(context, goal, actions, state, config):
             if progress == "warning_scheduled":
                 continue
 
-    return terminal_recovery_result(state, "iteration_limit")
+    return terminal_recovery_result(state, "iteration_limit", config)
 
 
 # Entry point: call run_loop with injected context variables
