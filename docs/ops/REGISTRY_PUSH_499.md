@@ -4,7 +4,10 @@ Status: **diagnosed 2026-08-22, extended 2026-11-19 (WI#706); the server-side
 fix must be applied on the GitLab host — it cannot be done from the dev box /
 this repo.** CI-side retry mitigations are already in
 `.gitlab/ci/containers.yml`. The interim runner mitigation for WI#706 is
-applied (see “Artifact uploads” below).
+applied (see “Artifact uploads” below). On 2026-11-19 the 60-second cut was
+reproduced on demand from the dev box and the edge's own error page was
+fingerprinted (see “Live confirmation” below); only the edge's access-log line
+and the timeout change itself still need the host administrator.
 
 ## Symptom
 
@@ -49,6 +52,48 @@ The same archive passes from runners 13, 15 and 16 in 12–18 s. This is a time
 limit, not a size limit: 279 MiB in >60 s is under 5 MB/s, while the other
 runners reach 16–23 MB/s.
 
+### Live confirmation, 2026-11-19
+
+The cut was reproduced on demand from the dev box with rate-limited uploads to
+a throwaway private project's `/uploads` endpoint. No runner is involved, so
+the result separates the edge from runner 17's uplink:
+
+| Upload | Sent when cut | Elapsed | Result |
+|---|---|---|---|
+| 1 KiB control, unthrottled | 1 KiB | 0.82 s | `201 Created` |
+| 12 MiB at 100 KiB/s | 6.0 MiB | 61.18 s | `502` |
+| 12 MiB at 100 KiB/s, repeated | 6.0 MiB | 61.18 s | `502` |
+| 25 MiB at 400 KiB/s | 23.8 MiB | 61.18 s | `502` |
+
+Two different sizes at two different rates stop at the same 61.18 s, from a
+third network, with a control upload passing in under a second: the limit is
+time, not size, and it is not runner 17.
+
+The response points to the edge. It is `HTTP/2 502`, `content-length: 11`,
+body `Bad Gateway`, and **no `server` header**:
+
+```
+HTTP/2 502
+content-length: 11
+date: Thu, 19 Nov 2026 18:08:52 GMT
+
+Bad Gateway
+```
+
+Normal responses from omnibus nginx carry `server: nginx` (for example, the
+`https://git.lunarwing.org/` front page). The 11-byte `Bad Gateway` without
+that header supports an edge-generated `502` for this probe. That fits
+`entryPoints.websecure.transport.respondingTimeouts.readTimeout` (60 s default
+since Traefik 2.11.2/3.0). The runner's `499`, `504` and resets line up with
+the same timeout, but the runner trace alone does not identify which hop
+produced a status. Omnibus nginx can log a `499` when Traefik, its client,
+abandons the request; that log entry is distinct from what the runner receives.
+
+Only the access-log line remains unseen, because the edge host has no shell
+reachable from this box (SSH lands in GitLab-shell). WI#706 acceptance box 1
+still needs that line from the host administrator; the pre-fix half of box 2
+is now recorded above.
+
 The 60-second cut matches **Traefik `respondingTimeouts.readTimeout`**, which
 has defaulted to 60 seconds since Traefik 2.11.2 and 3.0. It bounds the whole
 request, body included, and it is the component common to both
@@ -89,9 +134,10 @@ Two timeout layers are the realistic suspects, in order:
 1. **Traefik `websecure` entrypoint `respondingTimeouts`** — `readTimeout`
    bounds the *total* time to read the client request body, and its default
    has been **60 seconds** since Traefik 2.11.2 and 3.0. A long blob or
-   artifact upload is aborted mid-stream at that boundary. The omnibus nginx
-   in front of the registry then logs `499` because its client (Traefik) went
-   away, and the runner sees `499`, `504` or a connection reset.
+   artifact upload can be aborted mid-stream at that boundary. Omnibus nginx
+   can then log `499` because Traefik closed the upstream request. The probe
+   received an apparent edge `502`; the runner's `499`, `504` and resets have
+   not been correlated with the edge and nginx logs for those requests.
 2. **omnibus `registry_nginx`** — `client_body_timeout` (nginx default **60
    s** between successive body reads) and `proxy_read_timeout`/`proxy_send_timeout`.
    A slow runner uplink stretching a multi-GB layer read past one of these
@@ -173,13 +219,16 @@ docker exec gitlab grep -rE 'client_body_timeout|proxy_read_timeout|proxy_send_t
 # Traefik static config in effect
 docker inspect traefik --format '{{json .Args}}'    # or read its static yaml
 
-# during a failing push, watch which hop records the 499
+# during a failing push, correlate the same request across the two logs
 docker logs -f traefik                               # access log status codes
 docker exec gitlab tail -f /var/log/gitlab/nginx/gitlab_registry_access.log
 ```
 
-Whichever component logs the 499 first is where the upstream peer disappeared;
-the timeout to raise belongs to the component *in front of* it.
+Compare the timestamps, request path, duration and status for the same upload.
+With Traefik JSON access logs, distinguish `DownstreamStatus` (sent to the
+client) from `OriginStatus` (outcome of the upstream request). An nginx `499`
+means its client disconnected, not that nginx sent `499` to the runner or
+that nginx's own timeout fired.
 
 ## Interim mitigation — runner 17 (applied 2026-11-19)
 
@@ -200,20 +249,67 @@ Runner 17 keeps its other tags and still takes untagged jobs. The
 `.worker-candidate` jobs in `.gitlab/ci/containers.yml` require
 `container-build`, so runner 17 can no longer take the large-upload job;
 runners 13, 15 and 16 still carry that tag (7 and 8 do as well). Re-add
-`container-build` to runner 17 only after a rate-limited upload that takes
-more than 60 seconds succeeds from it.
+`container-build` to runner 17 only after the go/no-go probe in
+“Verification” returns `201` through the edge (the probe makes the
+`>60 s` test reproducible from any workstation; it does not have to come
+from runner 17 itself, because the cut is at the shared edge entry point).
 
-The edge host is not reachable from the dev box. The Traefik config change,
-the access-log line, and the live >60 s upload test therefore stay with the
-host administrator.
+The edge host is not reachable from the dev box (SSH lands in GitLab-shell).
+The Traefik config change and the access-log line therefore stay with the
+host administrator. The *pre-fix* half of the rate-limited upload test has
+been done from the dev box — see “Live confirmation” above.
 
 ## Verification
 
-1. Rate-limited upload through the edge: send a body that takes more than
-   60 seconds (for example `curl --limit-rate` against a throwaway project's
-   upload API or a scratch job artifact) and confirm it completes with `201`
-   instead of `499`/`504`/reset. Record the edge access-log line with its
-   duration and status.
+1. **The go/no-go probe** — a rate-limited upload through the edge, run from
+   a workstation with Bash and curl 7.55.0 or newer. Use a dedicated, standing
+   **private probe project** on this GitLab instance. Use its numeric project
+   ID and a short-lived **project access token** with `api` scope and the least
+   project role that permits uploads. Do not use an administrator's personal
+   token. The probe uploads 12 MiB at 100 KiB/s (about 123 s of body). Run
+   this block in a terminal; it prompts without echoing the token:
+
+   ```bash
+   (
+     set +ax # Do not auto-export or trace the token.
+     set -euo pipefail
+     unset probe_token
+     umask 077
+     probe_id='REPLACE_WITH_PRIVATE_PROBE_PROJECT_ID'
+     [[ "$probe_id" =~ ^[1-9][0-9]*$ ]] || { echo 'Set the numeric probe project ID.' >&2; exit 1; }
+
+     scratch=$(mktemp -d)
+     trap 'rm -f -- "$scratch/probe.bin" "$scratch/probe.out"; rmdir -- "$scratch"' EXIT
+     CDPATH='' cd -- "$scratch"
+     scratch=$PWD
+     head -c 12582912 /dev/urandom > probe.bin
+
+     IFS= read -rs -p 'Probe project access token: ' probe_token </dev/tty
+     printf '\n' >&2
+     [[ -n "$probe_token" && "$probe_token" != *[[:space:][:cntrl:]]* ]] || exit 1
+     builtin printf 'PRIVATE-TOKEN: %s\n' "$probe_token" |
+       curl --disable --silent --show-error --limit-rate 100k --max-time 280 \
+         --header @- --form 'file=@probe.bin' --output probe.out \
+         --write-out 'status=%{http_code} elapsed=%{time_total}s sent=%{size_upload}B\n' \
+         "https://git.lunarwing.org/api/v4/projects/$probe_id/uploads"
+   )
+   ```
+
+   The token goes to curl on standard input, not in its arguments or a file.
+   Local scratch files are removed on exit. Successful uploads stay in the
+   probe project; have a project Maintainer periodically remove them via the
+   [Markdown uploads API](https://docs.gitlab.com/api/project_markdown_uploads/).
+
+   **Before the fix** this ends at about 61 s with `status=502` and `sent`
+   well under 12 MiB (measured 2026-11-19: 61.18 s, 6.0 MiB). **After the
+   fix** it must trickle the whole 12 MiB, end with `status=201`, and take
+   about 125 s. A cut at ~61 s means the timeout is still live; a completed
+   upload in under 90 s means the probe never crossed the boundary, so raise
+   the file size. This exercises the same `websecure` entry point as artifact
+   uploads and registry pushes — Traefik applies `readTimeout` per entry
+   point, not per router, so one probe covers both hosts. Record the edge
+   access-log line for the same request with its duration and status (WI#706
+   acceptance box 1); the pre-fix line is not obtainable from the dev box.
 2. Re-run the manual `worker-opencode-image` job (largest image).
    Expect: no `499` retries in the push phase.
 3. Re-run `worker-opencode2-candidate` and confirm it can pass on runner 17
@@ -222,6 +318,20 @@ host administrator.
 4. If pushes still fail after both layers are raised, replay the manual job
    with `WORKER_IMAGE_NAME=worker-opencode-2080` (fresh repository) to rule
    out a wedged upload session/tag, per the registry doc's housekeeping notes.
+
+## Open items (WI#706, as of 2026-11-19)
+
+- **Edge access-log line** for one cut upload (duration ~61 s, status
+  `499`/`502`/`504`). Only the edge host has it; the dev box cannot reach a
+  shell there.
+- **Apply the timeout** on the `websecure` entry point that serves both hosts:
+  `readTimeout: "30m"` — static configuration, Traefik restart required. Do
+  not use `0`.
+- **Record the applied value and its date** beside the other edge settings
+  (`GITLAB_CONTAINER_REGISTRY.md` §1f); the value there today is the
+  recommendation, not the live setting.
+- **Run the go/no-go probe** after the change (expect `201` in ~125 s).
+- **Re-add `container-build` to runner 17** only after the probe passes.
 
 ## Rollback
 
