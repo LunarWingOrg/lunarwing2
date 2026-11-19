@@ -10,7 +10,7 @@ style as prepare_reproducible_build.py, which fails the build on drift):
 - Tunnel present (v2.0.26+): packages/cli/src/services/remote-tunnel.ts is
   replaced with a stub that fails closed (run/ensure die; hostname reports
   no tunnel so pairing degrades gracefully). The stub mirrors the v2.0.26
-  export surface, re-verified against the real v2.2.7 tree
+  export surface, re-verified against the real v2.3.2 tree
   (importers still use exactly run/ensure/hostname); if importers start
   using anything beyond it, or the module
   moves/renames (references remain but the expected path is gone), the build
@@ -26,7 +26,7 @@ packages/*/package.json. The runtime-stage binary marker scan remains the
 backstop if upstream drifts past even this.
 
 Second job, same stage and same fail-closed style (WI#609, !2398 ABE-2): the
-anchor for the wrapper's feature-flag pin. opencode v2.2.7 ships Console event
+anchor for the wrapper's feature-flag pin. opencode v2.3.2 ships Console event
 watches, a remote steering channel, behind the flag `console_watches`, and the
 lane's wrapper starts every opencode with OPENCODE_FLAGS=-console_watches.
 That pin is only as good as the pinned upstream source: an unknown entry in
@@ -104,17 +104,23 @@ CONSOLE_PLUGIN = pathlib.Path("packages/core/src/plugin/provider/opencode.ts")
 # watch surface, so the three files above must be where and what we expect.
 FLAG_SURFACE_MARKERS = ("OPENCODE_FLAGS", "console_watch")
 PINNED_OFF_FLAG = "console_watches"
-# The registry as reviewed at the v2.2.7 bump (docs/ops/WORKER-CONTAINERS.md).
+# The registry as reviewed at the v2.3.2 bump (docs/ops/WORKER-CONTAINERS.md).
 # Only PINNED_OFF_FLAG is forced off by the wrapper; the rest are off by
 # default. Change this list only together with a decision in the bump entry.
+# v2.3.2 removed `background_compaction` and `codemode_vm`, renamed
+# `schedules` to `automations` (the old name survives as an alias, so the
+# resolver still reads it), and added `mcp_events`, `video_generate` and the
+# opt-in-only `full_codemode`. `all`/`all_flags` no longer turn an opt-in-only
+# flag on, but every flag here stays off on the `latest` channel by default.
 REVIEWED_FLAGS = (
     "artifacts",
-    "background_compaction",
-    "codemode_vm",
+    "automations",
     "console_watches",
+    "full_codemode",
+    "mcp_events",
     "media_blob",
-    "schedules",
     "todo",
+    "video_generate",
 )
 REGISTRY_BLOCK_RE = re.compile(r"export const registry = \{(.*?)\n\} as const", re.S)
 REGISTRY_KEY_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_]*):", re.M)
@@ -126,8 +132,8 @@ REGISTRY_KEY_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_]*):", re.M)
 # flag code (bump checklist item 7) remains the decision. Success means
 # "anchor text unchanged", nothing more.
 FLAG_FILE_DIGESTS = {
-    "packages/core/src/flag.ts": "0656ecfb6ef72ef3947eb64e4d82cc8cb2b891e424181df4f6bdf1bf894e395d",
-    "packages/schema/src/config/flag.ts": "331addb3e50e742c4059b6051474e64cbe927820424a6a1c61afd65564ba530e",
+    "packages/core/src/flag.ts": "f696ed2d7dcb420b2a80df82057ae23cb8d2bfd80bf6c1207caa8e9f424a6527",
+    "packages/schema/src/config/flag.ts": "9718dd696542e67384d1d4c8531db84628e9acdb8d52685aa0e7992c3bf1497d",
 }
 # The gate in the Console plugin: the first line computes `watching` from the
 # flag; the second line is its only use.
@@ -135,7 +141,7 @@ WATCH_GATE_LINES = (
     'const watching = allowed && next.remote?.watches === true && (yield* flags.enabled("console_watches"))',
     "yield* syncWatches(watching ? next.connection : undefined)",
 )
-# Counts of scanned files that name the watch wiring at v2.2.7: the plugin
+# Counts of scanned files that name the watch wiring at v2.3.2: the plugin
 # definition plus its one consumer name `OpencodeWatches`, and no scanned
 # file uses the `Flag.Overrides` access form (the resolver's own
 # "@opencode/Flag/Overrides" reference string is pinned by its digest). A new
@@ -213,7 +219,7 @@ def check_flag_pin_anchor(root: pathlib.Path, sources: dict[pathlib.Path, str]) 
         actual = hashlib.sha256((root / relative).read_bytes()).hexdigest()
         if actual != expected:
             raise fail(
-                f"{relative} differs from the reviewed v2.2.7 text — the wrapper's "
+                f"{relative} differs from the reviewed v2.3.2 text — the wrapper's "
                 "OPENCODE_FLAGS pin is unverified for this source; re-read the flag code and "
                 f"update this anchor in the same commit (checklist item 7). "
                 f"{_registry_diagnosis(files[FLAG_REGISTRY])}"
