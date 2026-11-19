@@ -35,7 +35,7 @@ use crate::setup::channels::{
 };
 use crate::setup::prompts::{
     confirm, input, optional_input, print_banner, print_error, print_header, print_info,
-    print_step, print_success, secret_input, select_many, select_one,
+    print_step, print_success, print_warning, secret_input, select_many, select_one,
 };
 
 // unused const, keep commented for clarity / future use
@@ -3175,13 +3175,32 @@ impl SetupWizard {
     }
 
     fn offer_service_install(&self) -> Result<(), SetupError> {
-        let Some(offer) = crate::service::setup_service_offer().map_err(|e| {
-            SetupError::Config(format!("Failed to inspect service manager support: {}", e))
-        })?
-        else {
-            return Ok(());
-        };
+        match crate::service::setup_service_offer() {
+            Ok(crate::service::SetupServiceAvailability::Offer(offer)) => {
+                self.prompt_service_install(&offer)?;
+            }
+            Ok(crate::service::SetupServiceAvailability::Refused { reason }) => {
+                println!();
+                print_warning(&format!(
+                    "Not offering to install a background service: {reason}"
+                ));
+            }
+            Ok(crate::service::SetupServiceAvailability::NotApplicable) => {}
+            Err(err) => {
+                println!();
+                print_warning(&format!(
+                    "Could not check whether a background service can be installed: {err:#}"
+                ));
+            }
+        }
 
+        Ok(())
+    }
+
+    fn prompt_service_install(
+        &self,
+        offer: &crate::service::SetupServiceOffer,
+    ) -> Result<(), SetupError> {
         println!();
 
         if offer.can_install_now {
@@ -3200,7 +3219,7 @@ impl SetupWizard {
                     Err(err) => print_error(&format!("Service install failed: {}", err)),
                 }
             }
-        } else if let Some(command) = offer.install_command {
+        } else if let Some(command) = offer.install_command.as_deref() {
             print_info(&format!(
                 "{} detected. Installing the background service requires root.",
                 offer.manager.display_name()
