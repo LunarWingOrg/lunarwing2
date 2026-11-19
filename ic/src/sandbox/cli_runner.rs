@@ -74,8 +74,9 @@ fn uses_proxy_relay(runtime: ContainerRuntime, network: SandboxNetworkMode) -> b
 
 fn add_proxy_relay_args(args: &mut Vec<String>, proxy_dir: Option<&str>) {
     if let Some(dir) = proxy_dir {
-        // `z` is shared SELinux relabeling for the mounted inodes, not a
-        // change to the listening Unix socket's own security context.
+        // `z` is shared SELinux relabeling for the mounted inodes; the
+        // listening socket's own security context comes from the daemon that
+        // created it (see `proxy::relay`), not from this mount option.
         args.extend(["-v".into(), format!("{dir}:/run/lunarwing-proxy:ro,z")]);
     }
     for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
