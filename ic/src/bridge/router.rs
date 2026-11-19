@@ -156,7 +156,9 @@ pub(crate) fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String>
         ThreadOutcome::Completed { response } => Some(response.clone().unwrap_or_default()),
         ThreadOutcome::Stopped => Some(String::new()),
         ThreadOutcome::MaxIterations => Some(
-            "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
+            // WI#640: name the knob that raises the bound.
+            "Reached maximum iterations after a final recovery attempt. Retry with \
+             narrower scope or raise AGENT_MAX_TOOL_ITERATIONS."
                 .into(),
         ),
         ThreadOutcome::Failed {
@@ -11690,7 +11692,7 @@ pub(crate) mod tests {
         assert_eq!(
             thread_outcome_response(&ThreadOutcome::MaxIterations),
             Some(
-                "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
+                "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or raise AGENT_MAX_TOOL_ITERATIONS."
                     .into()
             )
         );

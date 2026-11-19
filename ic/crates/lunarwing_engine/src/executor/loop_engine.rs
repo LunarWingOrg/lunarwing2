@@ -2150,6 +2150,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_progress_terminal_error_names_tunables_and_failing_action() {
+        // WI#640: a spent no-progress streak must tell the operator which
+        // knobs exist and what they are set to, not only "change approach".
+        let responses = (0..5)
+            .map(|index| action_response("test_tool", &format!("call_{index}")))
+            .collect();
+        let results = (0..5)
+            .map(|index| {
+                Ok(ActionResult {
+                    call_id: format!("call_{index}"),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"error": "failed"}),
+                    is_error: true,
+                    duration: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let config = ThreadConfig {
+            max_iterations: 12,
+            no_progress_failure_threshold: 4,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop(responses, results, config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        let ThreadOutcome::Failed { kind, error } = outcome else {
+            panic!("expected a typed no-progress failure, got {outcome:?}");
+        };
+        assert_eq!(kind, ThreadFailureKind::NoProgress);
+        assert!(error.contains("no_progress_failure_threshold=4"), "{error}");
+        assert!(error.contains("max_iterations=12"), "{error}");
+        assert!(error.contains("ENGINE_V2_NO_PROGRESS_THRESHOLD"), "{error}");
+        assert!(error.contains("AGENT_MAX_TOOL_ITERATIONS"), "{error}");
+        assert!(error.contains("Failing: test_tool"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn configured_no_progress_threshold_fires_earlier_and_is_clamped() {
+        // threshold 2 warns after two failed batches; a misconfigured 1 is
+        // clamped to 2 by the orchestrator rather than failing on one error.
+        for threshold in [1_u32, 2] {
+            let responses = (0..3)
+                .map(|index| action_response("test_tool", &format!("call_{index}")))
+                .collect();
+            let results = (0..3)
+                .map(|index| {
+                    Ok(ActionResult {
+                        call_id: format!("call_{index}"),
+                        action_name: "test_tool".into(),
+                        output: serde_json::json!({"error": "failed"}),
+                        is_error: true,
+                        duration: Duration::from_millis(1),
+                    })
+                })
+                .collect();
+            let config = ThreadConfig {
+                no_progress_failure_threshold: threshold,
+                ..ThreadConfig::default()
+            };
+            let llm = Arc::new(MockLlm::new(responses));
+            let (mut exec, _tx) = make_loop_with_llm(llm.clone(), results, config).await;
+
+            let outcome = exec.run().await.unwrap();
+
+            assert!(matches!(
+                outcome,
+                ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::NoProgress,
+                    ..
+                }
+            ));
+            assert_eq!(llm.requests().len(), 3, "threshold={threshold}");
+        }
+    }
+
+    #[tokio::test]
     async fn stop_signal_exits() {
         // LLM would loop forever, but we send a stop signal
         let many_actions: Vec<LlmOutput> = (0..100)
