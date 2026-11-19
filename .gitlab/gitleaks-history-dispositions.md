@@ -91,3 +91,10 @@ release-tag run still needs to be verified, and creating and verifying the
 recommended weekly schedule remains an operator action. The merge-request
 `secret-history-regression` job exercises the harness on synthetic histories in
 the CI-pinned Gitleaks v8.30.1 image; it does not replace either full scan.
+
+On 2026-11-19, [`secret-history` job 192205](https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/192205)
+passed in scheduled pipeline 8252 on branch `aragents/kimil00p/v2.2.1.0` at
+commit `d91c6fd922` (WI#778), with the ten `7e9d6d633` rows above present. The
+job ran with `allow_failure: false` and reported no leaks after scanning 12,581
+commits (about 2.09 GB). The temporary schedule was removed after the run and
+no schedules remain.
