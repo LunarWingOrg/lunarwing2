@@ -402,7 +402,7 @@ async fn user_unit_listing() -> Option<String> {
 /// The helper unit must exist while the sidecar runs, otherwise the
 /// "unit is gone afterwards" check proves nothing.
 async fn assert_detached_helper_used(container_name: &str) {
-    if !systemd_service_mode() {
+    if !systemd_service_mode().await {
         skip_or_fail_without_service_mode("the detached-unit-in-use check");
         return;
     }
@@ -415,7 +415,7 @@ async fn assert_detached_helper_used(container_name: &str) {
 }
 
 async fn assert_detached_helper_stopped(container_name: &str) {
-    if !systemd_service_mode() {
+    if !systemd_service_mode().await {
         skip_or_fail_without_service_mode("the detached-unit cleanup check");
         return;
     }
