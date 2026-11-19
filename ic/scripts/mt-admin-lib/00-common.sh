@@ -24,6 +24,17 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn_err() { printf 'error: %s\n' "$*" >&2; }
 
+# need_value "$@" — call from a `case` arm with the arm's own positional
+# parameters. Proves that $1 (the flag) has a value in $2 which is not itself
+# a flag: a trailing flag with no value dies, and so does a neighbouring
+# --flag, which `[[ $# -ge 2 ]]` alone would swallow as the value and write
+# into the tenant env (WI#637). A single-dash value (-1, -) stays legal.
+need_value() {
+  local flag="$1"
+  [[ $# -ge 2 ]] || die "$flag requires a value"
+  [[ ${2#--} == "$2" ]] || die "$flag requires a value (found another flag: $2)"
+}
+
 HEALTH_LIB_UNSAFE_COMPONENT=""
 
 # The text of a refusal, without the "error: " prefix. <what> says which tree
