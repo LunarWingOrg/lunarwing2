@@ -1,12 +1,12 @@
 # v1.19.6 resolves to this reviewed commit. Both must move together.
 # v1.18.29 was reverted on 2026-09-07 because it shipped two regressions: the
 # provider/model metadata-shape crash ("a.name" TypeError) and a silent death
-# in the ai-sdk stream path. WI#531 moved to v1.19.5 and WI#775 to v1.19.6;
-# neither v1.18.29 regression was re-verified fixed at either pin and
-# no live dispatch has run, so both remain open risks on this pin. The lane is
-# expected to be retired (goals item 34); re-bump only after re-verifying the
-# bridge against the v1 server API, and run one live v1 dispatch on a test
-# tenant after the first master candidate build.
+# in the ai-sdk stream path. WI#531 moved to v1.19.5 on that WI's authorization
+# and WI#775 to v1.19.6 on its own; neither v1.18.29 regression was re-verified
+# fixed at either pin and no live dispatch has run, so both remain open risks on
+# this pin. The lane is expected to be retired (goals item 34); re-bump only
+# after re-verifying the bridge against the v1 server API, and run one live v1
+# dispatch on a test tenant after the first master candidate build.
 # The pin also carries the 61845b0 whitespace repair (content-equivalent
 # backport, not the commit itself), so the in-tree photon-node hunk repair is
 # gone.
