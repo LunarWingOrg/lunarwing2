@@ -1305,7 +1305,7 @@ The kept pod keeps running, not just as a stopped record: its infra container
 is up after the stop, so the tenant's Podman store shows
 `lw-egress-keeper-<tenant>` as `Running` until the next start (measured on
 Arch Linux with systemd and rootless Podman). The next
-`start-tenant`/`restart-tenant` validates the surviving keeper
+`start-tenant` validates the surviving keeper
 (`validate_keeper` in `ic/scripts/lunarwing-worker-egress-guard.sh`) before
 starting or adopting it, so a keeper left by such a stop is never used
 unvalidated. A `restart-tenant` removes it during the stop phase, once the
