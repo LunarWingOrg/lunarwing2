@@ -406,9 +406,7 @@ async fn assert_detached_helper_used(container_name: &str) {
         return;
     }
     let unit = helper_unit_for(container_name);
-    let listing = user_unit_listing()
-        .await
-        .expect("list systemd user units");
+    let listing = user_unit_listing().await.expect("list systemd user units");
     assert!(
         listing.contains(&format!("{unit}.service")),
         "the sidecar started without its helper unit {unit}.service:\n{listing}"
@@ -1897,7 +1895,8 @@ async fn assert_netbird_resolver_policy(sidecar: &TunnelSidecar) -> Result<Strin
             "NetBird resolver file does not contain only its wt0 listener:\n{resolv_conf}"
         ));
     }
-    let backup = runtime_output(&["exec", name, "cat", "/etc/resolv.conf.original.netbird"]).await?;
+    let backup =
+        runtime_output(&["exec", name, "cat", "/etc/resolv.conf.original.netbird"]).await?;
     if !backup.status.success() {
         return Err("NetBird's original resolver backup is missing".into());
     }
