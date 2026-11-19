@@ -421,6 +421,12 @@ ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2  # Total engine-level recovery attempt
                                         # time. Provisioned as 2 (one full context-overflow
                                         # ladder uses it up); daemon default when unset is 4;
                                         # clamped to 16; 0 disables all engine recovery.
+ENGINE_V2_NO_PROGRESS_THRESHOLD=3       # Consecutive steps with no successful tool or code
+                                        # work before Engine V2's one no-progress warning
+                                        # turn. Read when a thread config is created;
+                                        # clamped to 2-10, default 3. A timeout counts as a
+                                        # failed step, so weak local models on a busy host
+                                        # may need 5 or more (WI#640).
 ```
 
 The defaults are correct for normal operation. Raise
@@ -431,6 +437,15 @@ attempts only if brief upstream model errors should be retried more
 aggressively; note that supervised approval prompts are separately bounded by
 the fixed 300s `supervised_timeout_secs` fail-closed auto-deny, which has no
 env override.
+
+Engine V2 turns that still end with `Execution made no progress after a final
+recovery attempt` now list the actions that kept failing and the effective
+values of `no_progress_failure_threshold`, `max_iterations`
+(`AGENT_MAX_TOOL_ITERATIONS`), `max_consecutive_errors`, the two model-recovery
+attempts, and `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS` — change the named knob
+rather than retrying an identical turn unchanged. The values are carried in
+the thread config, so raising an env var affects newly created threads; a
+thread persisted before the field existed keeps the compiled default of 3.
 
 ### Live provider reasoning (WI#546)
 
