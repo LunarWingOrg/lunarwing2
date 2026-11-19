@@ -1102,30 +1102,29 @@ def terminal_advice_lines(kind, config, recovery):
             config_display_value(config, "max_consecutive_errors", 5) +
             ", max_iterations=" +
             config_display_value(config, "max_iterations", 30) +
-            " (env AGENT_MAX_TOOL_ITERATIONS)."
+            " (AGENT_MAX_TOOL_ITERATIONS)."
         )
     if kind == "no_progress":
         lines.append(
             "- Raise if work is still progressing: no_progress_failure_threshold=" +
             str(effective_no_progress_threshold(config)) +
-            " (thread config; env ENGINE_V2_NO_PROGRESS_THRESHOLD), max_iterations=" +
+            " (ENGINE_V2_NO_PROGRESS_THRESHOLD), max_iterations=" +
             config_display_value(config, "max_iterations", 30) +
-            " (env AGENT_MAX_TOOL_ITERATIONS), max_consecutive_errors=" +
+            " (AGENT_MAX_TOOL_ITERATIONS), max_consecutive_errors=" +
             config_display_value(config, "max_consecutive_errors", 5) + "."
         )
         lines.append(
-            "- Model recovery: model_recovery_max_attempts=" +
+            "- Model recovery: " +
             config_display_value(config, "model_recovery_max_attempts", 1) +
-            " per streak / model_recovery_total_attempts=" +
+            "/streak, " +
             config_display_value(config, "model_recovery_total_attempts", 4) +
-            " per thread (env ENGINE_V2_MODEL_RECOVERY_ATTEMPTS / " +
+            "/thread (ENGINE_V2_MODEL_RECOVERY_ATTEMPTS, " +
             "ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)."
         )
     if kind in ("no_progress", "consecutive_errors"):
         lines.append(
-            "- Slow tools on a busy host: ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=" +
-            config_display_value(config, "tool_async_timeout_secs", 300) +
-            "; a timed-out tool call counts as a failed step."
+            "- Slow tools count as failed work: ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=" +
+            config_display_value(config, "tool_async_timeout_secs", 300) + "."
         )
     return lines
 
