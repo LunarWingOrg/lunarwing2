@@ -291,6 +291,15 @@ assert_contains "$oB28" "recovery=rc-service cronie start"           "B28: sched
 assert_absent   "$oB28" "ESCALATING: openrc (monitor_only"           "B28: scheduler degrade does not also page the bare component"
 assert_absent   "$oB28" "would run: rc-service"                      "B28: scheduler is never restarted as a service"
 
+# B28b — degraded scheduler with an empty services[] list: one target, and the
+# component-level fallback does not page a second time alongside it.
+b28b="$(sb)"; report "$b28b" '{components:[{component:"openrc",status:"degraded",metrics:{
+  services:[],scheduler:{hook_installed:true,running:null,installed:"cronie",status:"degraded"}}}]}'
+mkdir -p "$b28b/initd"
+oB28b="$(run_dry "$b28b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b28b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB28b" "identified 1 target(s)"              "B28b: scheduler blind spot is the only target"
+assert_absent   "$oB28b" "ESCALATING: openrc (monitor_only"    "B28b: no bare-component double page beside the scheduler"
+
 # B29 — a real failing service keeps its step-2 restart path and the degraded
 # component is not paged again as the bare openrc identity (service-count guard).
 b29="$(sb)"; report "$b29" '{components:[{component:"openrc",status:"degraded",metrics:{
