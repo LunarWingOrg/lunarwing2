@@ -1470,7 +1470,9 @@ the owner's missions (fire, pause, and goal, focus, success-criteria or
 retry-policy updates) without
 asking. `rlm_query` children, by contrast, inherit the parent's
 `supervised_mode`/`shared_conversation`/`supervised_timeout_secs` into
-their config, so a supervised parent's child gates fail closed. Second, the
+their config, so a supervised parent's child gates fail closed, and they also
+inherit `no_progress_failure_threshold` (WI#640) so a parent tuned for a
+weaker model keeps that tolerance in its sub-tasks. Second, the
 mission verbs are owner-scoped, not thread-scoped: any Foreground or
 Mission thread may steer *any* of the owner's missions by name or UUID
 (`resolve_mission_id` carries no thread scoping), and the planner grants
