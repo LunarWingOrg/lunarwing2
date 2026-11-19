@@ -703,7 +703,7 @@ is harness-covered or unclaimed, not proven.
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
 | The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; **no live run recorded** (WI#771, WI#782) |
 | Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, rootless Podman, service mode | lane gates it; **no service-mode live run recorded** (WI#771, WI#782) |
-| Docker, systemd service mode, and a tenant-unit tunnel run on the WI#771/WI#782 development host | OpenRC host, no Docker CLI, no user manager | not claimed; boxes stay open |
+| Docker, systemd service mode, and a tenant-unit tunnel run on the WI#771/WI#782 development host | OpenRC host, no Docker CLI, no user manager; the `ajhermes-z` systemd host on the NetBird overlay refused this agent's SSH keys | not claimed; the three boxes stay open for the maintainer |
 
 No public-cloud and no CI run is claimed by any row. Gated lanes stay off by
 default.

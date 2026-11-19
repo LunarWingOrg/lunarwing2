@@ -89,8 +89,11 @@ That is the same class of host the v2.2.0.0 limitation was measured on.
   so the detached-unit checks report their skip; with
   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` they fail by design. A service-mode
   host must run with that flag set to record a pass. The `ajhermes-z` host
-  named in the work item is visible on the NetBird overlay but refused this
-  agent's SSH keys, so it could not be used.
+  named in the work item is connected on the NetBird overlay
+  (`ajhermes.netbird.selfhosted`, 100.88.11.142) and answers on port 22, but it
+  refused every key available to this agent (`sweetiebot`, `ajhermes`,
+  `hermes`, `root`; `id_ed25519`, `colgate`, `lw2_ed25519`) and the same for
+  every other connected peer tried, so it could not be used.
 - **Tenant-unit run with `SANDBOX_NETWORK=tunnel`: not possible here.** It
   needs the same systemd user-manager host.
 
