@@ -102,7 +102,7 @@ Host `colgatev` (OpenRC `0.63.3`, rootless Podman `6.1.4`), read-only
 floor and still carried a floating reference, so it was exposed to the CVEs
 fixed between 16.15 and 16.16 until this refresh. `hermes` and `ajhermes-z`
 were not reachable from this host; their 16.14 record remains unverified and
-is a per-host follow-up, not an assumed closure.
+is a per-host follow-up (WI#780), not an assumed closure.
 
 The pgvector extension question is answered with evidence in
 [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verification-2026-11-19-wi777):
