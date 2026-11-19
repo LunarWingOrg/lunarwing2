@@ -37,7 +37,8 @@ export function opencodeErrorMessage(error: unknown): string {
 // ("Unexpected server error. Check server logs for details." — WI#320 F4 /
 // WI#333 / WI#374) that names no cause. Verified at the pinned v1.18.25
 // (OPENCODE_REF cb7d8b2f5e44876ef98b661dc10590c915af3a9f) and re-verified at
-// the v1.19.5 pin (810c0eba1a7348036f8bdf61e6632d0c36c6876c, WI#531): the
+// the v1.19.6 pin (f4e363c8295fa90a03dddc451882fffe8fbce357, WI#775; the
+// error middleware is byte-identical to v1.19.5 810c0eba, WI#531): the
 // 500 wrapper still carries the `err_<uuid8>` ref and the middleware still
 // logs the cause with Effect.logError("failed", { ref, error, cause }) via
 // its structured file logger to
