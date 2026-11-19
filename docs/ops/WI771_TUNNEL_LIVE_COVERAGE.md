@@ -42,6 +42,18 @@ This development host is an **OpenRC** machine with **rootless Podman 6.1.4
 (crun)** and **no Docker binary** and **no `systemctl`**. That is the same class
 of host the v2.2.0.0 limitation was measured on. Consequently:
 
+- **Podman regression run (passed).**
+  `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1` with
+  `tunnel_sidecar_wireguard_lifecycle_and_join`: `1 passed; 0 failed …
+  finished in 92.61s`. Afterwards `podman ps -a --filter
+  label=lunarwing.sandbox-tunnel` reported no containers and no `lunarwing`
+  volumes remained. Purpose: show the refactor is neutral on the runtime the
+  previous release was validated on.
+- **Service-mode guard (verified).** Re-running the same lane with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the workload spawner is not in
+  systemd service mode`. The flag is therefore not a no-op: a host without
+  service mode cannot record a pass by accident.
 - **Docker fallback: not run live here.** The Docker lane exists and is gated,
   but no host with the Docker CLI was available. The matching acceptance box
   stays open for the maintainer; the run is
@@ -51,9 +63,8 @@ of host the v2.2.0.0 limitation was measured on. Consequently:
   so the detached-unit checks report their skip; with
   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` they fail by design. A service-mode
   host must run with that flag set to record a pass.
-- **Podman re-run:** recorded in the WI#771 note. Its purpose is to show the
-  refactor is neutral on the runtime the previous release was validated on, not
-  to claim new Docker coverage.
+- **Tenant-unit run with `SANDBOX_NETWORK=tunnel`: not possible here.** It
+  needs the same systemd user-manager host.
 
 ## Replacement paragraph for the v2.2.1.0 release notes
 

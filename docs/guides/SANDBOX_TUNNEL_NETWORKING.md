@@ -693,11 +693,11 @@ is harness-covered or unclaimed, not proven.
 
 | Surface | Runtime / host | Status |
 |---|---|---|
-| WireGuard lifecycle, joining, firewall tamper, image rotation, per-run recovery | rootless Podman 5.8.2 (2026-11-11) | live |
+| WireGuard lifecycle, joining, firewall tamper, image rotation, per-run recovery | rootless Podman 5.8.2 (2026-11-11) and Podman 6.1.4 (2026-11-19, WI#771) | live |
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
 | The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; no live run recorded yet (WI#771) |
-| Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, service mode | live once a service-mode host runs it with `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` (WI#771) |
-| Docker and systemd service mode on this development host | OpenRC host, no Docker CLI | not claimed — WI#771 keeps those boxes open |
+| Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, service mode | lane gates it; no service-mode live run recorded yet (WI#771) |
+| Docker, systemd service mode, and a tenant-unit tunnel run on the WI#771 development host | OpenRC host, no Docker CLI, no user manager | not claimed — WI#771 keeps those boxes open |
 
 No public-cloud and no CI run is claimed by any row. Gated lanes stay off by
 default.
