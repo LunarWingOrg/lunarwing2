@@ -1,17 +1,19 @@
-# WI#771 — Sandbox tunnel live coverage: Docker fallback and systemd service mode
+# WI#782 — Sandbox tunnel live coverage: Docker fallback and systemd service mode
 
-**Date:** 2026-11-19 (SweetieBot, branch `sweetiebot/kimi-wi771-20261119-0505`).
+**Date:** 2026-11-19 (SweetieBot, branch `sweetiebot/kimi-wi782-20261119-1905`).
 
-**Work item:** `lunarwing/lunarwing2#771`, carrying the v2.2.0.0 Known
-Limitation that the gated tunnel suite was only ever exercised on rootless
-Podman, with Docker fallback harness-covered and no systemd-service-mode run.
+**Work item:** `lunarwing/lunarwing2#782`, which continues `#771` and carries the
+v2.2.0.0 Known Limitation that the gated tunnel suite was only ever exercised
+on rootless Podman, with Docker fallback harness-covered and no
+systemd-service-mode run. It also carries the review findings AGJ-1 to AGJ-5 of
+merge request !2568, the first attempt, which was closed unmerged.
 
 ## What changed in the tree
 
 - `ic/tests/podman_sandbox_tunnel_integration.rs` is no longer Podman-only.
   The lane is opened by `LUNARWING_E2E_TUNNEL_TESTS=1` plus exactly one runtime
   gate: `LUNARWING_E2E_PODMAN_TESTS=1` (existing) or
-  `LUNARWING_E2E_DOCKER_TESTS=1` (new, the same flag
+  `LUNARWING_E2E_DOCKER_TESTS=1` (new for this suite, the same flag
   `generic_sandbox_acceptance.rs` already uses). Opening both gates is refused
   instead of guessed. `LUNARWING_E2E_TUNNEL_RUNTIME=podman|docker` may pin the
   runtime but must agree with the open gate. Every test function lost its
@@ -24,59 +26,65 @@ Podman, with Docker fallback harness-covered and no systemd-service-mode run.
   read. The joined-run host-escape probe now resolves
   `host.containers.internal` **and** `host.docker.internal`, then falls back to
   the default gateway, so the assertion is not vacuous on Docker.
-- Detached-helper checks are tied to real systemd service mode via
-  `WorkloadSpawner::uses_systemd_services()` instead of probing for a
-  `systemctl` binary. `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` turns the skip
-  into a failure. The lane now also asserts the transient unit
-  `lunarwing-tunnel-<instance>` **exists** while the sidecar runs, so the
-  "gone afterwards" check cannot pass vacuously; a service-mode host whose user
-  manager does not answer fails rather than skips. The `pasta`-in-unit scan is
-  Podman-only (Docker has no pasta helper).
-- "Nothing left behind" is now asserted, not assumed: the lifecycle and
-  concurrent-start lanes require that the runtime reports no container carrying
-  `lunarwing.sandbox-tunnel` after teardown.
+- **The detached-unit checks apply only where the runtime keeps the helper in
+  the client's unit (AGJ-1, AGJ-3).** `detached_unit_check_applies` returns true
+  for rootless Podman and false for Docker. Rootless Podman leaves `conmon` and
+  `pasta` in the detached `run` client's transient unit
+  `lunarwing-tunnel-<instance>`, so the unit stays loaded and is observable. A
+  `docker run -d` client leaves nothing in its unit, so the unit is collected
+  as soon as the client exits; on Docker the checks print a skip instead of
+  failing. `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` on Docker now fails with
+  that reason, because the requirement cannot be met there.
+- **Every test that requires the unit gone first requires it present.** The
+  lifecycle test asserts both sidecars' units exist while they run, the
+  concurrent-start test asserts its sidecar's unit exists, and the NetBird test
+  asserts the primary's unit exists. All three then check removal. So "gone
+  afterwards" cannot pass vacuously in any of them, not just in one (AGJ-3).
+- **"Nothing left behind" covers sidecars and joined runs, scoped to the lane
+  (AGJ-4).** `tunnel_and_joined_containers` queries `lunarwing.sandbox-tunnel`
+  (sidecars) and `lunarwing.sandbox` (joined runs) separately and unions the
+  results. Each lane takes a `leftover_baseline` before it creates anything and
+  fails only on containers that were not in that baseline, so a long-lived
+  sidecar of another daemon, or a second test running in parallel, cannot make
+  the check fail.
+- **A failed command is reported before the cleanup checks (AGJ-6).** The
+  concurrent-start test reads and asserts both command results *before* the
+  helper-unit and leftover checks, and the lifecycle test reads its `result`
+  before them, so a real lifecycle error is no longer reported as a missing
+  unit or a leftover container.
 
 ## What was run here, and what was not
 
-This development host is an **OpenRC** machine with **rootless Podman 6.1.4
-(crun)** and **no Docker binary** and **no `systemctl`**. That is the same class
-of host the v2.2.0.0 limitation was measured on. Consequently:
+This development host is an **OpenRC** machine (PID 1 is `init`, no
+`systemctl`) with **rootless Podman 6.1.4 (crun)** and **no Docker binary**.
+That is the same class of host the v2.2.0.0 limitation was measured on.
 
-- **Podman regression run (passed).**
-  `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1` with
-  `tunnel_sidecar_wireguard_lifecycle_and_join`: `1 passed; 0 failed …
-  finished in 92.61s`. Afterwards `podman ps -a --filter
-  label=lunarwing.sandbox-tunnel` reported no containers and no `lunarwing`
-  volumes remained. Purpose: show the refactor is neutral on the runtime the
-  previous release was validated on.
-- **Service-mode guard (verified).** Re-running the same lane with
-  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails with
-  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the workload spawner is not in
-  systemd service mode`. The flag is therefore not a no-op: a host without
-  service mode cannot record a pass by accident.
-- **Docker fallback: not run live here.** The Docker lane exists and is gated,
-  but no host with the Docker CLI was available. The matching acceptance box
-  stays open for the maintainer; the run is
+- **Podman suite run: recorded below.**
+- **Docker fallback: not run live here.** No host with the Docker CLI was
+  reachable to this agent. The Docker lane exists and is gated; the matching
+  acceptance box stays open for the maintainer. The run is
   `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1` against
   `--test podman_sandbox_tunnel_integration`.
 - **systemd service mode: not run live here.** This host has no user manager,
   so the detached-unit checks report their skip; with
   `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` they fail by design. A service-mode
-  host must run with that flag set to record a pass.
+  host must run with that flag set to record a pass. The `ajhermes-z` host
+  named in the work item is visible on the NetBird overlay but refused this
+  agent's SSH keys, so it could not be used.
 - **Tenant-unit run with `SANDBOX_NETWORK=tunnel`: not possible here.** It
   needs the same systemd user-manager host.
 
 ## Replacement paragraph for the v2.2.1.0 release notes
 
-> **Tunnel live coverage.** The gated tunnel suite runs on rootless Podman
-> (WI#592/WI#600 validation: Podman 5.8.2 with NetBird 0.82.0 and a real
-> WireGuard peer) and, since WI#771, on the Docker CLI fallback through a
-> separate `LUNARWING_E2E_DOCKER_TESTS` lane; both lanes are off by default.
-> Docker live results are recorded on WI#771 when a Docker host runs the lane.
-> The detached systemd helper-unit checks are now bound to real service mode and
-> can no longer pass vacuously: they fail under
-> `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` when service mode is absent, and they
-> first prove the transient unit exists before requiring its removal. A tenant
-> unit in service mode with `SANDBOX_NETWORK=tunnel` is a deployment check, not
-> a claimed CI result: no public-cloud run, no CI tunnel job and no
-> service-mode live run is claimed by this release.
+> **Tunnel live coverage.** The gated tunnel suite has been run on rootless
+> Podman only: 9 of 9 tests on Podman 5.8.2 (2026-11-11), including NetBird
+> 0.82.0 and a real WireGuard peer, and one test of nine
+> (`tunnel_sidecar_wireguard_lifecycle_and_join`) on Podman 6.1.4
+> (2026-11-19). A Docker CLI lane (`LUNARWING_E2E_DOCKER_TESTS=1`) exists and is
+> off by default, but **no Docker run is claimed**. The detached systemd
+> helper-unit checks are bound to rootless Podman in systemd service mode: they
+> first prove the transient unit `lunarwing-tunnel-<instance>` exists before
+> requiring its removal, so they cannot pass vacuously there. On Docker no unit
+> outlives the `docker run -d` client, so those checks print a skip and nothing
+> about the unit is proven. **No service-mode run, no tenant-unit tunnel run, no
+> public-cloud run and no CI tunnel job is claimed by this release.**
