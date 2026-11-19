@@ -154,8 +154,8 @@ const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 ///
 /// Injectable so the labeling path itself — candidate order, the cleanup after
 /// a refused candidate, and the unlabeled fallback — runs in tests on a host
-/// without SELinux ([`LabelNodes::at`] names ordinary files instead). The
-/// daemon always uses [`LabelNodes::defaults`].
+/// without SELinux (the test-only `at` constructor names ordinary files
+/// instead). The daemon always uses [`LabelNodes::defaults`].
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct LabelNodes {
