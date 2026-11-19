@@ -299,6 +299,20 @@ been done from the dev box — see “Live confirmation” above.
    with `WORKER_IMAGE_NAME=worker-opencode-2080` (fresh repository) to rule
    out a wedged upload session/tag, per the registry doc's housekeeping notes.
 
+## Open items (WI#706, as of 2026-11-19)
+
+- **Edge access-log line** for one cut upload (duration ~61 s, status
+  `499`/`502`/`504`). Only the edge host has it; the dev box cannot reach a
+  shell there.
+- **Apply the timeout** on the `websecure` entry point that serves both hosts:
+  `readTimeout: "30m"` — static configuration, Traefik restart required. Do
+  not use `0`.
+- **Record the applied value and its date** beside the other edge settings
+  (`GITLAB_CONTAINER_REGISTRY.md` §1f); the value there today is the
+  recommendation, not the live setting.
+- **Run the go/no-go probe** after the change (expect `201` in ~125 s).
+- **Re-add `container-build` to runner 17** only after the probe passes.
+
 ## Rollback
 
 The Traefik/omnibus changes are config-only: remove the added lines and
