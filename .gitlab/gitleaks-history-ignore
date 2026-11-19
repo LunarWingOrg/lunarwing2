@@ -907,6 +907,16 @@
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/log/.cargo-checksum.json:generic-api-key:1
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/wast/.cargo-checksum.json:generic-api-key:1
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/web-sys/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cranelift-assembler-x64/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/mio/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/regex-automata/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/ssh-key/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/syn/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1
+7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1
 80f57cdb35821955d0f4ebd3f52bd3fe2f80446c:ic/src/orchestrator/harness.rs:generic-api-key:1661
 8c634949e83f772b188b1e230eef04a36650f585:ic/crates/lunarwing_safety/src/log_scrubber.rs:generic-api-key:128
 8c634949e83f772b188b1e230eef04a36650f585:ic/crates/lunarwing_safety/src/log_scrubber.rs:generic-api-key:136
