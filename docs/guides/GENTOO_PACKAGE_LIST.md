@@ -80,18 +80,23 @@ sudo emerge app-containers/podman net-firewall/nftables
 # command required by mt-admin's external-worker egress enforcement.
 ```
 
-Then point Podman's unqualified image search at Docker Hub so the hardcoded
-`pgvector/pgvector:pg16` image resolves without a TTY prompt:
+`lunarwing-mt-admin.sh` hardcodes a fully-qualified, digest-pinned image,
+`docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f`
+(PostgreSQL 16.16 / pgvector 0.8.7, reviewed 2026-11-12), so the default needs no
+unqualified-search registry. If you override it with a short name via
+`LUNARWING_MT_PG_IMAGE`, point Podman's search at Docker Hub so it resolves without a TTY prompt:
 
 ```bash
 echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
-sudo podman pull pgvector/pgvector:pg16   # optional pre-pull; add-tenant does it otherwise
+# Optional pre-pull. Pull the same digest mt-admin pins, or the tag may resolve
+# to a different image and the pre-pull saves nothing:
+sudo podman pull docker.io/pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
 ```
 
 (Docker alternative: `app-containers/docker` + `app-containers/docker-cli`, added to a runlevel.)
 
-> The `pgvector/pgvector:pg16` **container image** is pulled, not emerged.
+> The `pgvector/pgvector` **container image** is pulled, not emerged.
 
 ## 3. Cron daemon (required for the health/self-heal schedule)
 
