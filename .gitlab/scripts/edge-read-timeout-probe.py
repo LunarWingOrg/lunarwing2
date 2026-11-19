@@ -30,6 +30,7 @@ DRIBBLE_INTERVAL_SECONDS = 5.0
 SOCKET_TIMEOUT_SECONDS = 30.0
 FINAL_RESPONSE_TIMEOUT_SECONDS = 15.0
 MAX_HOLD_SECONDS = 1800.0
+OBSERVED_BOUNDARY_SECONDS = 60.0
 READ_CHUNK = 4096
 
 
@@ -217,6 +218,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.hold <= OBSERVED_BOUNDARY_SECONDS:
+        print(
+            f"PASS (short hold): every host kept the request readable for "
+            f"{args.hold:g}s, but that does not cross the observed 60 s "
+            "boundary; use --hold 90 for the timeout check."
+        )
+        return 0
     print(
         "PASS: every host kept the request readable for the full hold; the "
         "60-second cut is no longer present."

@@ -139,6 +139,16 @@ class ProbeTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(self.probe.main(["--host", "a.test"]), 0)
 
+    def test_short_hold_pass_does_not_claim_the_boundary_is_gone(self) -> None:
+        opened = self.probe.Outcome("a.test", True, 1.0, "HTTP/1.1 302")
+        output = io.StringIO()
+        with mock.patch.object(self.probe, "probe_host", return_value=opened):
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    self.probe.main(["--host", "a.test", "--hold", "1"]), 0
+                )
+        self.assertIn("does not cross", output.getvalue())
+
     def test_main_rejects_an_unbounded_hold(self) -> None:
         with redirect_stderr(io.StringIO()):
             self.assertEqual(self.probe.main(["--hold", "0"]), 2)
