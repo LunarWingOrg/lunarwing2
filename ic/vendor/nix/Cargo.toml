@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.69"
 name = "nix"
-version = "0.31.3"
+version = "0.32.0"
 build = "build.rs"
 include = [
     "build.rs",
@@ -56,7 +56,7 @@ targets = [
 
 [features]
 acct = []
-aio = ["pin-utils"]
+aio = ["pin-project-lite"]
 default = []
 dir = ["fs"]
 env = []
@@ -128,8 +128,8 @@ features = ["extra_traits"]
 version = "0.9"
 optional = true
 
-[dependencies.pin-utils]
-version = "0.1.0"
+[dependencies.pin-project-lite]
+version = "0.2"
 optional = true
 
 [dev-dependencies.assert-impl]
@@ -148,7 +148,7 @@ version = "1.0.7"
 version = "3.7.1"
 
 [build-dependencies.cfg_aliases]
-version = "0.2.1"
+version = "0.2.2"
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dev-dependencies.caps]
 version = "0.5.3"

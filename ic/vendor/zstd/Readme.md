@@ -74,9 +74,11 @@ up front can record it:
 | a slice or a `Vec` | `bulk::compress` | `compress_sized_into` |
 | a file | `compress_file` | `compress_file_into` |
 | a `Read` whose length you know | `compress_sized` | `compress_sized_into` |
-| any other `Read` | `encode_all` *(no size)* | `copy_encode` *(no size)* |
+| any other `Read` | `encode_all` | `copy_encode` |
 
-Everything but the last row records the size. Reach for the `Write` column
+Everything but the last row records the size, whatever it is. The last row
+records it when the source turns out to be shorter than 128 KiB, and leaves it
+out beyond that. Reach for the `Write` column
 when the data is large enough that you would rather not hold a `Vec` of it -
 these stream straight through, so only the compressor's own buffers are in
 memory. For a source that is neither a file nor a slice, its length is the
@@ -143,6 +145,7 @@ The following change how the C library is obtained or built:
 | `pkg-config` | | Link against a system-installed libzstd instead of building the bundled source. |
 | `vendored` | | Always build the bundled source, even when `pkg-config` is also enabled. Useful to force a static build from a dependent crate. |
 | `cmake` | | Build the C library with zstd's own CMake files instead of the `cc` crate, which handles cross-compilation better. Needs `cmake`. |
+| `rust-backend` | | Use [libzstd-rs-sys], a Rust port of zstd, instead of the C library. Experimental, see [below](#using-the-rust-port-of-zstd). |
 
 The [zstd-sys readme] also covers the build-time environment variables, and
 what to do if the linker complains about a hidden zstd symbol being
@@ -197,6 +200,40 @@ but enabling this feature can change compression ratio, speed, and memory
 usage for prepared dictionaries, especially with large inputs and small
 dictionaries.
 
+# Using the Rust port of zstd
+
+The `rust-backend` feature replaces the C library with [libzstd-rs-sys], the
+Trifecta Tech Foundation's port of zstd to Rust. Nothing else changes: the port
+exports the same `ZSTD_*` functions that `zstd-sys` binds to, and this crate
+calls them the same way.
+
+```toml
+zstd = { version = "0.14", features = ["rust-backend"] }
+```
+
+Like the port itself, still a 0.0.1 prerelease, this is experimental:
+
+* The `seekable` format is not ported. Enabling both features is a compile
+  error.
+* The features that configure the C build (`thin`, `debug`, `no_asm`,
+  `fat-lto`, `thin-lto`, `cmake`, `pkg-config` and `vendored`) have no effect,
+  and neither does `ZSTD_SYS_USE_PKG_CONFIG`.
+* Multithreading and legacy decoding are always built into the port: `zstdmt`
+  only controls whether this crate exposes the multithreading API. The port
+  decodes legacy frames from zstd 0.5 to 0.7, whether or not `legacy` is
+  enabled, but not older ones.
+* The port allocates through Rust's global allocator, as `with-rust-allocator`
+  does for the C library.
+* It still needs a C compiler on x86-64 Unix, where the port assembles one
+  file, and it does not build for `wasm32-unknown-unknown`.
+* It needs Rust 1.89 or newer.
+* It is slower than the C library in most benchmarks: [the pull request that
+  added it][#389] has a chart. `bench/backends.sh` runs the same comparison on
+  your machine.
+
+[libzstd-rs-sys]: https://github.com/trifectatechfoundation/libzstd-rs-sys
+[#389]: https://github.com/gyscos/zstd-rs/pull/389
+
 # Build-time bindgen
 
 The `bindgen` feature requires Rust 1.71 or newer and `libclang`.
@@ -219,7 +256,9 @@ This implementation is largely inspired by bozaro's [lz4-rs].
 
 # License
 
-* The zstd C library is under a dual BSD/GPLv2 license.
+* The zstd C library is under a dual BSD/GPLv2 license. Its decoders for
+  legacy formats (the `legacy` feature, on by default) also include code under
+  the BSD-2-Clause license.
 * This zstd-rs binding library is under a [BSD-3-Clause](LICENSE) license.
 
 [zstd]: https://github.com/facebook/zstd

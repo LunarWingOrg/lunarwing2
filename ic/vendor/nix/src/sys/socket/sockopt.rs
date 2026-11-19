@@ -6,7 +6,7 @@ use crate::sys::time::TimeVal;
 use crate::{errno::Errno, Result};
 use cfg_if::cfg_if;
 use libc::{self, c_int, c_void, socklen_t};
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::ffi::{CStr, OsStr, OsString};
 use std::mem::{self, MaybeUninit};
@@ -1166,6 +1166,23 @@ sockopt_impl!(
     libc::SO_RXQ_OVFL,
     libc::c_int
 );
+#[cfg(target_os = "linux")]
+sockopt_impl!(
+    /// Enable delivery of the kernel-set `skb->mark` of received packets as a
+    /// `(SOL_SOCKET, SO_MARK)` ancillary message (decoded by nix as
+    /// [`ControlMessageOwned::SoMark`](super::ControlMessageOwned::SoMark)).
+    ///
+    /// Available since Linux 5.19; older kernels return `ENOPROTOOPT` from
+    /// `setsockopt`. Unlike the send-side [`Mark`] option (which sets
+    /// `skb->mark` on outgoing packets and requires `CAP_NET_ADMIN`),
+    /// `SO_RCVMARK` is unprivileged: any process may observe marks that
+    /// privileged components elsewhere on the system have set.
+    RcvMark,
+    Both,
+    libc::SOL_SOCKET,
+    libc::SO_RCVMARK,
+    bool
+);
 #[cfg(feature = "net")]
 sockopt_impl!(
     #[cfg_attr(docsrs, doc(cfg(feature = "net")))]
@@ -1280,7 +1297,7 @@ sockopt_impl!(
     libc::IPV6_DONTFRAG,
     bool
 );
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 #[cfg(feature = "net")]
 sockopt_impl!(
     /// Get the utun interface name.
@@ -1314,6 +1331,16 @@ sockopt_impl!(
     libc::SOL_SOCKET,
     libc::SO_ATTACH_REUSEPORT_CBPF,
     libc::sock_fprog
+);
+#[cfg(target_os = "linux")]
+sockopt_impl!(
+    /// Enable/disable TCP corking. If enabled all queued partial frames are
+    /// sent when the option is cleared again.
+    TcpCork,
+    Both,
+    libc::IPPROTO_TCP,
+    libc::TCP_CORK,
+    bool
 );
 
 #[allow(missing_docs)]
@@ -1978,14 +2005,14 @@ impl<'a> Set<'a, OsString> for SetOsString<'a> {
 }
 
 /// Getter for a `CString` value.
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 #[cfg(feature = "net")]
 struct GetCString<T: AsMut<[u8]>> {
     len: socklen_t,
     val: MaybeUninit<T>,
 }
 
-#[cfg(apple_targets)]
+#[cfg(target_os = "macos")]
 #[cfg(feature = "net")]
 impl<T: AsMut<[u8]>> Get<CString> for GetCString<T> {
     fn uninit() -> Self {

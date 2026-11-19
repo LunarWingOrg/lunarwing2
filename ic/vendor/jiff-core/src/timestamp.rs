@@ -240,11 +240,11 @@ impl Timestamp {
     }
 
     /// Returns the fractional second component of this timestamp in units of
-    /// microseconds.
+    /// milliseconds.
     ///
     /// The value returned is negative when the timestamp is negative. It is
     /// guaranteed that the range of the value returned is in the inclusive
-    /// range `-999_999..=999_999`.
+    /// range `-999..=999`.
     #[inline]
     pub const fn subsec_millisecond(&self) -> i32 {
         // OK because NANOS_PER_MILLI!={-1,0}.
@@ -252,11 +252,11 @@ impl Timestamp {
     }
 
     /// Returns the fractional second component of this timestamp in units of
-    /// milliseconds.
+    /// microseconds.
     ///
     /// The value returned is negative when the timestamp is negative. It is
     /// guaranteed that the range of the value returned is in the inclusive
-    /// range `-999..=999`.
+    /// range `-999_999..=999_999`.
     #[inline]
     pub const fn subsec_microsecond(&self) -> i32 {
         // OK because NANOS_PER_MICRO!={-1,0}.
@@ -420,9 +420,7 @@ impl Timestamp {
             let addsecs = nanos / c::NANOS_PER_SEC_32;
             seconds = match seconds.checked_add(addsecs as i64) {
                 Some(secs) => secs,
-                None => panic!(
-                    "nanoseconds overflowed seconds in SignedDuration::new"
-                ),
+                None => rbail!(b::UnixEpochSeconds::error()),
             };
             // Never wraps or panics because NANOS_PER_SEC!={0,-1}.
             nanos = nanos % c::NANOS_PER_SEC_32;
@@ -465,7 +463,9 @@ impl Timestamp {
     /// let min = Timestamp::MIN.as_second();
     /// assert!(ts.checked_sub(-min, 0).is_ok());
     /// assert!(ts.checked_sub(-(min - 1), 0).is_err());
-    /// assert!(ts.checked_sub(-min, 999_999_999).is_ok());
+    /// assert!(ts.checked_sub(-min, -999_999_999).is_ok());
+    /// assert!(ts.checked_sub(-min, 1).is_err());
+    /// assert!(ts.checked_sub(-min, 999_999_999).is_err());
     /// assert!(ts.checked_sub(-min, 1_000_000_000).is_err());
     /// ```
     #[inline]
@@ -484,9 +484,7 @@ impl Timestamp {
             let addsecs = nanos / c::NANOS_PER_SEC_32;
             seconds = match seconds.checked_sub(addsecs as i64) {
                 Some(secs) => secs,
-                None => panic!(
-                    "nanoseconds overflowed seconds in SignedDuration::new"
-                ),
+                None => rbail!(b::UnixEpochSeconds::error()),
             };
             // Never wraps or panics because NANOS_PER_SEC!={0,-1}.
             nanos = nanos % c::NANOS_PER_SEC_32;
@@ -507,23 +505,32 @@ impl Timestamp {
             -c::NANOS_PER_SEC_32 < nanos && nanos < c::NANOS_PER_SEC_32
         );
 
-        let mut second =
-            rtry!(b::UnixEpochSeconds::checked_add(self.as_second(), seconds));
+        // Delay the timestamp bounds check until after balancing nanoseconds,
+        // which can bring an out-of-range second back into range.
+        let Some(mut second) = self.as_second().checked_add(seconds) else {
+            rbail!(b::UnixEpochSeconds::error());
+        };
         // OK because we know both are in the inclusive range
         // [-999_999_999, 999_999_999] per above math.
         let mut nanosecond = self.nanosecond + nanos;
         // When the nanosecond component is zero, we can ignore it and just
         // return seconds as-is.
         if nanosecond == 0 {
-            return Ok(Timestamp { second, nanosecond });
+            return Timestamp::from_second(second);
         }
 
         if nanosecond >= c::NANOS_PER_SEC_32 {
             nanosecond -= c::NANOS_PER_SEC_32;
-            second = rtry!(b::UnixEpochSeconds::checked_add(second, 1));
+            second = match second.checked_add(1) {
+                Some(secs) => secs,
+                None => rbail!(b::UnixEpochSeconds::error()),
+            };
         } else if nanosecond <= -c::NANOS_PER_SEC_32 {
             nanosecond += c::NANOS_PER_SEC_32;
-            second = rtry!(b::UnixEpochSeconds::checked_add(second, -1));
+            second = match second.checked_sub(1) {
+                Some(secs) => secs,
+                None => rbail!(b::UnixEpochSeconds::error()),
+            };
         }
         if second != 0
             && nanosecond != 0
@@ -544,7 +551,11 @@ impl Timestamp {
                 nanosecond += c::NANOS_PER_SEC_32;
             }
         }
-        Ok(Timestamp { second, nanosecond })
+        let second = rtry!(b::UnixEpochSeconds::checkc(second));
+        if second == b::UnixEpochSeconds::MIN && nanosecond < 0 {
+            rbail!(b::UnixEpochSeconds::error());
+        }
+        Ok(Timestamp::new_unchecked(second, nanosecond))
     }
 
     /// Add the given number of seconds to this timestamp.
@@ -552,8 +563,9 @@ impl Timestamp {
     /// If this would result in a timestamp outside of its boundaries, then
     /// this returns an error.
     ///
-    /// The nanosecond component of the timestamp returned is guaranteed to
-    /// match the nanosecond component of `self`.
+    /// The result is normalized so that its non-zero seconds and nanoseconds
+    /// have the same sign. Crossing the Unix epoch may therefore change the
+    /// nanosecond component.
     ///
     /// # Examples
     ///
@@ -572,6 +584,11 @@ impl Timestamp {
     /// assert_eq!(ts.checked_add_seconds(1), Ok(mkts(124, 999_999_999)));
     /// assert_eq!(ts.checked_add_seconds(-1), Ok(mkts(122, 999_999_999)));
     ///
+    /// let ts = mkts(-1, -500_000_000);
+    /// assert_eq!(ts.checked_add_seconds(2), Ok(mkts(0, 500_000_000)));
+    /// let ts = mkts(1, 500_000_000);
+    /// assert_eq!(ts.checked_add_seconds(-2), Ok(mkts(0, -500_000_000)));
+    ///
     /// assert!(ts.checked_add_seconds(i64::MIN).is_err());
     /// assert!(ts.checked_add_seconds(i64::MAX).is_err());
     /// ```
@@ -580,9 +597,7 @@ impl Timestamp {
         self,
         seconds: i64,
     ) -> Result<Timestamp, RangeError> {
-        let second =
-            rtry!(b::UnixEpochSeconds::checked_add(self.as_second(), seconds));
-        Ok(Timestamp { second, ..self })
+        self.checked_add(seconds, 0)
     }
 
     /// Subtracts the given number of seconds from this timestamp.
@@ -712,7 +727,7 @@ impl core::ops::Sub<i64> for Timestamp {
 ///
 /// # Panics
 ///
-/// When adding would result in a value outside the boundaries of a
+/// When subtracting would result in a value outside the boundaries of a
 /// `Timestamp`.
 ///
 /// # Example
@@ -740,7 +755,7 @@ impl core::ops::Sub<(i64, i32)> for Timestamp {
 impl core::ops::SubAssign<i64> for Timestamp {
     #[inline]
     fn sub_assign(&mut self, rhs: i64) {
-        *self = *self + rhs;
+        *self = *self - rhs;
     }
 }
 
@@ -753,7 +768,7 @@ impl core::ops::SubAssign<i64> for Timestamp {
 impl core::ops::SubAssign<(i64, i32)> for Timestamp {
     #[inline]
     fn sub_assign(&mut self, rhs: (i64, i32)) {
-        *self = *self + rhs;
+        *self = *self - rhs;
     }
 }
 
@@ -850,6 +865,26 @@ mod tests {
         Offset::from_seconds(second).unwrap()
     }
 
+    // Regression test for: https://github.com/BurntSushi/jiff/pull/695
+    #[test]
+    fn sub_assign() {
+        for (rhs, expected) in [(400, 600), (-400, 1400), (0, 1000)] {
+            let mut ts = stamp(1000, 0);
+            ts -= rhs;
+            assert_eq!(ts, stamp(expected, 0));
+        }
+
+        for (rhs, expected) in [
+            ((400, 1), stamp(599, 999_999_999)),
+            ((-400, -1), stamp(1400, 1)),
+            ((0, 0), stamp(1000, 0)),
+        ] {
+            let mut ts = stamp(1000, 0);
+            ts -= rhs;
+            assert_eq!(ts, expected);
+        }
+    }
+
     #[test]
     fn new_ok() {
         let ts = stamp(0, 0);
@@ -924,6 +959,132 @@ mod tests {
 
         assert!(Timestamp::from_nanosecond(i128::MIN).is_err());
         assert!(Timestamp::from_nanosecond(i128::MAX).is_err());
+    }
+
+    // Regression tests for #696.
+    #[test]
+    fn checked_arithmetic_below_min() {
+        assert!(Timestamp::MIN.checked_add(0, -1).is_err());
+        assert!(Timestamp::MIN.checked_sub(0, 1).is_err());
+    }
+
+    #[test]
+    fn checked_arithmetic_overflow() {
+        for ts in [Timestamp::MIN, Timestamp::UNIX_EPOCH, Timestamp::MAX] {
+            for seconds in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+                for nanos in [i32::MIN, -1, 0, 1, i32::MAX] {
+                    assert!(ts.checked_add(seconds, nanos).is_err());
+                    assert!(ts.checked_sub(seconds, nanos).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_arithmetic_at_max() {
+        let ts = stamp(1, 0);
+        let seconds = Timestamp::MAX.as_second();
+        assert_eq!(ts.checked_add(seconds, -1), Ok(Timestamp::MAX));
+        assert_eq!(ts.checked_sub(-seconds, 1), Ok(Timestamp::MAX));
+        assert_eq!(ts + (seconds, -1), Timestamp::MAX);
+        assert_eq!(ts - (-seconds, 1), Timestamp::MAX);
+    }
+
+    // Regression tests for #703.
+    #[test]
+    fn checked_seconds_across_epoch() {
+        for (ts, seconds, expected) in [
+            (stamp(-1, -500_000_000), 2, stamp(0, 500_000_000)),
+            (stamp(1, 500_000_000), -2, stamp(0, -500_000_000)),
+            (stamp(-1, -1), 3, stamp(1, 999_999_999)),
+            (stamp(1, 1), -3, stamp(-1, -999_999_999)),
+            (stamp(0, -1), 1, stamp(0, 999_999_999)),
+            (stamp(0, 1), -1, stamp(0, -999_999_999)),
+        ] {
+            assert_eq!(ts.checked_add_seconds(seconds), Ok(expected));
+            assert_eq!(ts.checked_sub_seconds(-seconds), Ok(expected));
+            assert_eq!(ts + seconds, expected);
+            assert_eq!(ts - -seconds, expected);
+        }
+    }
+
+    #[test]
+    fn checked_arithmetic_boundaries() {
+        let min = Timestamp::MIN.as_second();
+        let max = Timestamp::MAX.as_second();
+        let timestamps = [
+            Timestamp::MIN,
+            stamp(min + 1, -999_999_999),
+            stamp(-1, -999_999_999),
+            stamp(-1, 0),
+            stamp(0, -1),
+            Timestamp::UNIX_EPOCH,
+            stamp(0, 1),
+            stamp(1, 0),
+            stamp(1, 999_999_999),
+            stamp(max, 999_999_998),
+            Timestamp::MAX,
+        ];
+        let seconds = [
+            i64::MIN,
+            min - max - 1,
+            min - max,
+            min - 1,
+            min,
+            min + 1,
+            -1,
+            0,
+            1,
+            max - 1,
+            max,
+            max + 1,
+            max - min,
+            max - min + 1,
+            i64::MAX,
+        ];
+        let nanos = [
+            i32::MIN,
+            -1_000_000_000,
+            -999_999_999,
+            -1,
+            0,
+            1,
+            999_999_999,
+            1_000_000_000,
+            i32::MAX,
+        ];
+        for ts in timestamps {
+            for seconds in seconds {
+                let delta = (seconds as i128) * (c::NANOS_PER_SEC as i128);
+                assert_eq!(
+                    ts.checked_add_seconds(seconds).ok(),
+                    Timestamp::from_nanosecond(ts.as_nanosecond() + delta)
+                        .ok(),
+                    "{ts:?} + {seconds}",
+                );
+                assert_eq!(
+                    ts.checked_sub_seconds(seconds).ok(),
+                    Timestamp::from_nanosecond(ts.as_nanosecond() - delta)
+                        .ok(),
+                    "{ts:?} - {seconds}",
+                );
+                for nanos in nanos {
+                    let delta = delta + (nanos as i128);
+                    let sum = ts.as_nanosecond() + delta;
+                    let difference = ts.as_nanosecond() - delta;
+                    assert_eq!(
+                        ts.checked_add(seconds, nanos).ok(),
+                        Timestamp::from_nanosecond(sum).ok(),
+                        "{ts:?} + ({seconds}, {nanos})",
+                    );
+                    assert_eq!(
+                        ts.checked_sub(seconds, nanos).ok(),
+                        Timestamp::from_nanosecond(difference).ok(),
+                        "{ts:?} - ({seconds}, {nanos})",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

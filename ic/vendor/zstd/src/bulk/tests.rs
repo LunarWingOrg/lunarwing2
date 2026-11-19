@@ -2,6 +2,17 @@ use super::{compress, decompress};
 
 const TEXT: &str = include_str!("../../assets/example.txt");
 
+/// Compresses `data` into a frame that does not record its size, as a
+/// streaming encoder that is never told the length produces.
+fn sizeless(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut encoder =
+        crate::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
 #[test]
 fn test_direct() {
     // Can we include_str!("assets/example.txt")?
@@ -55,9 +66,9 @@ fn test_upper_bound_single_frame() {
 
 #[test]
 fn test_upper_bound_without_a_recorded_size() {
-    // A streaming compressor is not told the length, so there is nothing to
-    // read out of the header.
-    let compressed = crate::encode_all(TEXT.as_bytes(), 1).unwrap();
+    // A streaming compressor that is not told the length has nothing to
+    // write in the header.
+    let compressed = sizeless(TEXT.as_bytes());
 
     assert_eq!(
         zstd_safe::get_frame_content_size(&compressed).unwrap(),
@@ -124,7 +135,7 @@ fn test_upper_bound_many_frames() {
 fn test_upper_bound_stops_at_a_frame_without_a_size() {
     // One good frame followed by one that records nothing: no total to give.
     let mut mixed = compress(TEXT.as_bytes(), 1).unwrap();
-    mixed.extend_from_slice(&crate::encode_all(TEXT.as_bytes(), 1).unwrap());
+    mixed.extend_from_slice(&sizeless(TEXT.as_bytes()));
 
     #[cfg(not(feature = "experimental"))]
     assert_eq!(super::Decompressor::upper_bound(&mixed), None);
@@ -179,7 +190,7 @@ fn test_decompress_capacity_below_the_known_size() {
 fn test_decompress_capacity_between_actual_and_bound() {
     // A frame that records nothing: only an over-estimate is available, and
     // refusing on that would reject this, which decompresses perfectly well.
-    let compressed = crate::encode_all(TEXT.as_bytes(), 1).unwrap();
+    let compressed = sizeless(TEXT.as_bytes());
     assert_eq!(
         zstd_safe::get_frame_content_size(&compressed).unwrap(),
         None
@@ -187,4 +198,80 @@ fn test_decompress_capacity_between_actual_and_bound() {
 
     let generous = TEXT.len() * 2;
     assert_eq!(decompress(&compressed, generous).unwrap().len(), TEXT.len());
+}
+
+/// A capacity that cannot be allocated is an error, not an abort or a panic.
+#[test]
+fn test_decompress_impossible_capacity() {
+    let error = super::decompress(&[0u8], usize::MAX).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+}
+
+/// A job that fails must not leave the compressor refusing to be set up for
+/// the next one.
+#[test]
+fn test_compressor_is_reusable_after_a_failed_job() {
+    let dictionary = crate::dict::EncoderDictionary::copy(b"another", 3);
+    let text = TEXT.as_bytes();
+
+    let mut compressor = super::Compressor::new(1).unwrap();
+    let fail = |compressor: &mut super::Compressor<'_>| {
+        let mut small = Vec::with_capacity(16);
+        compressor.compress_to_buffer(text, &mut small).unwrap_err();
+    };
+
+    fail(&mut compressor);
+    compressor
+        .set_pledged_src_size(Some(text.len() as u64))
+        .unwrap();
+    compressor.include_checksum(true).unwrap();
+    compressor.set_compression_level(3).unwrap();
+
+    fail(&mut compressor);
+    compressor.set_dictionary(3, b"some dictionary").unwrap();
+
+    fail(&mut compressor);
+    compressor.set_prepared_dictionary(&dictionary).unwrap();
+
+    fail(&mut compressor);
+    compressor.set_dictionary(1, &[]).unwrap();
+
+    let compressed = compressor.compress(text).unwrap();
+    assert_eq!(decompress(&compressed, text.len()).unwrap(), text);
+}
+
+/// With worker threads, a failed job may leave them reading the dictionary:
+/// replacing it right after waits for them.
+#[cfg(feature = "zstdmt")]
+#[test]
+fn test_multithreaded_compressor_after_a_failed_job() {
+    use crate::test_words as words;
+
+    let dictionary = words(1 << 20, 1);
+    let another = words(64 << 10, 2);
+    let input = words(24 << 20, 3);
+
+    for _ in 0..3 {
+        let mut compressor =
+            super::Compressor::with_dictionary(1, &dictionary).unwrap();
+        compressor.multithread(2).unwrap();
+        compressor
+            .compress_to_buffer(&input, &mut Vec::with_capacity(0))
+            .unwrap_err();
+        compressor.set_dictionary(1, &another).unwrap();
+        compressor.multithread(1).unwrap();
+
+        let compressed = compressor.compress(&input).unwrap();
+        let mut decompressor =
+            super::Decompressor::with_dictionary(&another).unwrap();
+        assert!(
+            decompressor.decompress(&compressed, input.len()).unwrap()
+                == input
+        );
+
+        // Dropping it in the middle of a failed job is fine too.
+        compressor
+            .compress_to_buffer(&input, &mut Vec::with_capacity(0))
+            .unwrap_err();
+    }
 }

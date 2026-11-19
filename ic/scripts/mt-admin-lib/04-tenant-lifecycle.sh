@@ -1324,7 +1324,10 @@ stop_tenant() {
 
   # WI#504: keep the rootless namespace alive through the final writer check,
   # then release its infra pod so the next start recreates a verified keeper.
-  worker_egress_stop_keeper "$name" \
+  # WI#769: with the tenant's systemd user manager dead a release is
+  # impossible without its user bus; the keeper is kept on purpose (one line,
+  # exit 0) and the next start validates it before use.
+  worker_egress_stop_keeper "$name" keep \
     || say "WARNING: could not release worker egress namespace keeper for '$name'" >&2
 
   # Shutdown must not be blocked by malformed legacy config or an unsafe

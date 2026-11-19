@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "clap"
-version = "4.6.7"
+version = "4.6.8"
 build = false
 include = [
     "/build.rs",
@@ -514,37 +514,37 @@ version = "=4.6.7"
 default-features = false
 
 [dependencies.clap_derive]
-version = "=4.6.7"
+version = "=4.6.8"
 optional = true
 
 [dev-dependencies.automod]
-version = "1.0.16"
+version = "1.0.17"
 
 [dev-dependencies.clap-cargo]
 version = "0.15.2"
 default-features = false
 
 [dev-dependencies.jiff]
-version = "0.2.23"
+version = "0.2.45"
 
 [dev-dependencies.rustversion]
-version = "1.0.22"
+version = "1.0.23"
 
 [dev-dependencies.semver]
-version = "1.0.27"
+version = "1.0.28"
 
 [dev-dependencies.shlex]
-version = "2.0.0"
+version = "2.0.1"
 
 [dev-dependencies.snapbox]
-version = "1.2.0"
+version = "1.2.2"
 features = ["term-svg"]
 
 [dev-dependencies.trybuild]
-version = "1.0.116"
+version = "1.0.119"
 
 [dev-dependencies.trycmd]
-version = "1.2.0"
+version = "1.2.1"
 features = [
     "color-auto",
     "diff",

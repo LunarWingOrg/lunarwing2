@@ -2,9 +2,7 @@
 
 use crate::compression::CompressionMethod;
 use crate::format::MagicPositionCache;
-use crate::format::blocks::{
-    FixedSizeBlock, Zip32CentralDirectoryEnd, ZipCentralEntryBlock, ZipLocalEntryBlock,
-};
+use crate::format::blocks::{Zip32CentralDirectoryEnd, ZipCentralEntryBlock, ZipLocalEntryBlock};
 use crate::format::find_central_directory_end;
 use crate::format::magic::Magic;
 use crate::read::config::Config;
@@ -34,6 +32,7 @@ pub struct ZipArchiveMetadata {
     /// The raw file count (before inserting in the IndexMap) - used to detect duplicates
     pub(crate) raw_file_count: usize,
     pub(crate) offset: u64,
+    pub(crate) last_file_end: Option<u64>,
     pub(crate) dir_start: u64,
     // This isn't yet used anywhere, but it is here for use cases in the future.
     #[allow(dead_code)]
@@ -76,7 +75,7 @@ pub(crate) struct SharedBuilder {
     pub(crate) files: FilesByNameMap,
     pub(crate) raw_file_count: usize,
     pub(super) offset: u64,
-    pub(super) dir_start: u64,
+    pub(crate) dir_start: u64,
     // This isn't yet used anywhere, but it is here for use cases in the future.
     #[allow(dead_code)]
     pub(super) config: Config,
@@ -93,6 +92,7 @@ impl SharedBuilder {
             raw_file_count: self.raw_file_count,
             offset: self.offset,
             dir_start: self.dir_start,
+            last_file_end: None,
             config: self.config,
             comment,
             zip64_extensible_data_sector,
@@ -147,6 +147,7 @@ impl<R> ZipArchive<R> {
         comment: Box<[u8]>,
         zip64_extensible_data_sector: Option<Box<[u8]>>,
         reader: R,
+        last_file_end: u64,
         central_start: u64,
     ) -> Self {
         for (name, file) in &mut files {
@@ -165,6 +166,7 @@ impl<R> ZipArchive<R> {
             files,
             raw_file_count,
             offset: initial_offset,
+            last_file_end: Some(last_file_end),
             dir_start: central_start,
             config: Config {
                 archive_offset: ArchiveOffset::Known(initial_offset),

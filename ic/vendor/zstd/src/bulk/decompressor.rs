@@ -78,14 +78,21 @@ impl<'a> Decompressor<'a> {
         Ok(())
     }
 
-    /// Deompress a single block of data to the given destination buffer.
+    /// Decompress a single block of data to the given destination buffer.
     ///
     /// Returns the number of bytes written, or an error if something happened
     /// (for instance if the destination buffer was too small).
+    ///
     /// [`crate::decompressed_size()`] says how big the result will be, when
     /// the frame records it - there is no need to keep the size alongside the
-    /// data yourself. For a `Vec` it is the *capacity* that bounds the output,
-    /// so `reserve` what you need rather than `resize`.
+    /// data yourself.
+    ///
+    /// Only as many bytes as returned at the start of `destination` are
+    /// meaningful: zstd may overwrite the rest, even if it was zero-filled
+    /// beforehand. A `Vec` avoids this: the output goes into its spare
+    /// capacity, and its length is then set to the number of bytes written.
+    /// The `Vec` is never re-allocated, so create it with `Vec::with_capacity`
+    /// (or `reserve`) for the full decompressed size.
     pub fn decompress_to_buffer<C: zstd_safe::WriteBuf + ?Sized>(
         &mut self,
         source: &[u8],
@@ -100,6 +107,9 @@ impl<'a> Decompressor<'a> {
     ///
     /// The decompressed data should be at most `capacity` bytes,
     /// or an error will be returned.
+    ///
+    /// The output buffer is allocated up front, and can be as large as
+    /// `capacity`: see [`crate::bulk::decompress()`] for its size.
     pub fn decompress(
         &mut self,
         data: &[u8],
@@ -134,7 +144,7 @@ impl<'a> Decompressor<'a> {
             None => bound_from_zstd(data).unwrap_or(capacity).min(capacity),
         };
 
-        let mut buffer = Vec::with_capacity(capacity);
+        let mut buffer = crate::vec_with_capacity(capacity)?;
         self.decompress_to_buffer(data, &mut buffer)?;
         Ok(buffer)
     }

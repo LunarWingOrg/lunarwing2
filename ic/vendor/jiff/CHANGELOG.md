@@ -1,5 +1,86 @@
 # CHANGELOG
 
+0.2.46 (2026-11-15)
+===================
+Bug fixes:
+
+* [#707](https://github.com/BurntSushi/jiff/issues/707):
+`jiff_core::util::ArrayStr` has an unsound API.
+
+Documentation:
+
+* [#709](https://github.com/BurntSushi/jiff/issues/709):
+Fix documentation inconsistencies.
+
+Performance:
+
+* [#708](https://github.com/BurntSushi/jiff/issues/708):
+Skip extension parsing for plain directives in strptime.
+
+
+0.2.45 (2026-11-14)
+===================
+Enhancements:
+
+* [#483](https://github.com/BurntSushi/jiff/issues/483):
+Support ECMAScript's "primary" time zone identifiers.
+
+Bug fixes:
+
+* [#701](https://github.com/BurntSushi/jiff/issues/701):
+Handle zero span multiplication.
+* [#702](https://github.com/BurntSushi/jiff/issues/702):
+Constrain ISO week numbers to the year's last week.
+* [#703](https://github.com/BurntSushi/jiff/issues/703):
+`Timestamp::checked_add_seconds` produces incorrect results across the Unix epoch.
+
+
+0.2.44 (2026-11-14)
+===================
+Enhancements:
+
+* [#697](https://github.com/BurntSushi/jiff/issues/697):
+Upgrade Jiff's bundled IANA Time Zone Database to tzdb `2026f`.
+* [#694](https://github.com/BurntSushi/jiff/issues/694):
+Make `jiff::civil::Weekday` methods `const` where possible.
+
+Bug fixes:
+
+* [#695](https://github.com/BurntSushi/jiff/issues/695):
+Timestamp subtraction assignment.
+* [#696](https://github.com/BurntSushi/jiff/issues/696):
+Correct some boundary conditions on `Timestamp`.
+
+
+0.2.43 (2026-11-11)
+===================
+This release includes a few new minor API additions.
+
+Enhancements:
+
+* [#651](https://github.com/BurntSushi/jiff/issues/651):
+Add `jiff::tz::reset_system_time_zone_cache`.
+* [#653](https://github.com/BurntSushi/jiff/issues/653):
+Expose `relative` builder option on `Span*` types.
+* [#689](https://github.com/BurntSushi/jiff/issues/689):
+Add `jiff_core::tz::posix::ParseError::is_missing_dst_transition_rule`
+predicate.
+
+
+0.2.42 (2026-11-09)
+===================
+This release includes a couple of bug fixes where panics could occur when they
+should not have been. Specifically in `Span::total` and `Span::checked_add`.
+
+Bug fixes:
+
+* [#683](https://github.com/BurntSushi/jiff/issues/683):
+Fix a panic in `Span::checked_add` when an internal addition would overflow
+a `SignedDuration`'s minimum/maximum values.
+* [#685](https://github.com/BurntSushi/jiff/issues/685):
+Fix a panic in `Span::total` when a time zone transition boundary was crossed.
+
+
 0.2.41 (2026-11-08)
 ===================
 This release includes a bug fix for time zone transition lookups for timestamps

@@ -13,12 +13,13 @@
 edition = "2018"
 rust-version = "1.64"
 name = "zstd"
-version = "0.14.3"
+version = "0.14.4"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = false
 exclude = [
     "assets/*.zst",
     "/.github",
+    "/bench",
 ]
 autolib = false
 autobins = false
@@ -64,6 +65,7 @@ fat-lto = ["zstd-safe/fat-lto"]
 legacy = ["zstd-safe/legacy"]
 no_asm = ["zstd-safe/no_asm"]
 pkg-config = ["zstd-safe/pkg-config"]
+rust-backend = ["zstd-safe/rust-backend"]
 thin = ["zstd-safe/thin"]
 thin-lto = ["zstd-safe/thin-lto"]
 vendored = ["zstd-safe/vendored"]
@@ -138,7 +140,7 @@ name = "with_rust_allocator_stream"
 path = "tests/with_rust_allocator_stream.rs"
 
 [dependencies.zstd-safe]
-version = "8.2.0"
+version = "8.3.0"
 features = ["std"]
 default-features = false
 

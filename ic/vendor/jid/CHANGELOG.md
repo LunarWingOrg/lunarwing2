@@ -1,5 +1,12 @@
 Version NEXT, release XXXX-XX-XX:
 
+Version 0.12.4, release 2026-11-18:
+  * Changes:
+    - Add a `NodePart::from_unescaped()` function, which creates a `NodePart`
+      following the XEP-0106 escape algorithm.
+    - Prevent panic in `NodePart::unescape()` when the `NodePart` ends with a
+      '\' or when the previous to last char is a '\'.
+
 Version 0.12.3, release 2026-06-11:
   * Changes:
     - Add a `DomainRef::with_node_str()` method, matching `with_resource_str()`
