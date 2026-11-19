@@ -2,7 +2,7 @@
 
 LunarWing emits structured events through `tracing`. Do not rely on source line numbers when diagnosing a release; log locations move as the runtime changes.
 
-**Revalidated against source through 2026-11-10 (v2.2.0.0).** The default filter
+**Revalidated against source through 2026-11-19 (v2.2.1.0).** The default filter
 (`lunarwing=info,tower_http=warn`), runtime level endpoints, write-time
 scrubbing, `SANDBOX_TENANT_LOGS`, and init-agnostic MT diagnostics path match
 the current tree. Since v2.2.0.0 (WI#579), every daemon startup also emits
