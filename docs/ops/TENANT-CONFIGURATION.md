@@ -432,6 +432,17 @@ aggressively; note that supervised approval prompts are separately bounded by
 the fixed 300s `supervised_timeout_secs` fail-closed auto-deny, which has no
 env override.
 
+When a turn ends with "Execution made no progress" or "Code execution kept
+failing", the error text after the headline names the failing actions (if any)
+and the thread's own limits. It names a setting only when that setting governs
+the thread that failed: `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS` for a no-progress
+failure, and the two recovery attempts variables when model calls fail. A
+counter with no setting, such as `max_consecutive_errors` (engine default 5)
+or a mission thread's `max_iterations` (engine default 50), is reported as a
+value, not as something to raise. `AGENT_MAX_TOOL_ITERATIONS` raises
+`max_iterations` for foreground threads only; a mission thread's limit is not
+set by it.
+
 ### Live provider reasoning (WI#546)
 
 `ENGINE_V2_STREAM_REASONING=false` is the default. Set it to `true` (or `1`)
