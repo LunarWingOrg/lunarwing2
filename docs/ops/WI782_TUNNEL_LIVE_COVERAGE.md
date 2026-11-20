@@ -1,6 +1,7 @@
 # WI#782 — Sandbox tunnel live coverage: Docker fallback and systemd service mode
 
-**Date:** 2026-11-19, with the merged-head live run added 2026-11-20
+**Date:** 2026-11-19, with the merged-head live run, the AHN-1 wording
+correction, and the Docker live run added 2026-11-20
 (SweetieBot; the tree landed from branch `sweetiebot/kimi-wi782-20261119-1905`
 as squash `afa2998a9`, and the run was recorded from branch
 `sweetiebot/kimi-wi782-20261120-0005`).
@@ -61,9 +62,13 @@ merge request !2568, the first attempt, which was closed unmerged.
 
 This development host is an **OpenRC** machine (PID 1 is `init`, no
 `systemctl`) with **rootless Podman 6.1.4 (crun 1.28)**, kernel
-6.18.54-gentoo, and **no Docker binary**. That is the same class of host the
-v2.2.0.0 limitation was measured on. The merged-head run below was taken at
-`0b411a697`; the test target has not changed since the squash `afa2998a9`.
+6.18.54-gentoo, and **no Docker binary in the base image**. That is the same
+class of host the v2.2.0.0 limitation was measured on. For the Docker lane a
+**rootless Docker 29.10.0** engine was started in the user account itself
+(overlayfs storage driver, `pasta` network driver, no cgroups because systemd
+is absent); it is a genuine `dockerd`, not a Docker-compatible shim over
+Podman. The merged-head Podman run below was taken at `0b411a697`; the Docker
+run was taken at `4192ee72b`, where the test file is unchanged.
 
 - **Merged-head Podman suite run: 14 passes (AHI-1, 2026-11-20).** The suite
   was run live at the head the branch carries, after the teardown rewrite that
@@ -121,28 +126,79 @@ v2.2.0.0 limitation was measured on. The merged-head run below was taken at
   panic. With stub container CLIs, both unsupported service-mode cases were
   rejected before the runtime was called. The live coverage that answers AHI-1
   at the merged head is the 14-pass run above, not this gate-closed check.
-- **Docker fallback: not run live here.** No approved Docker test host was
-  available. The Docker lane exists and is gated. The run is
-  `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1` against
-  `--test podman_sandbox_tunnel_integration`. On Docker the detached-unit
-  checks print a skip by design (AGJ-1), and
-  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails there with that reason.
+- **Docker fallback, live (2026-11-20).** The full gated suite was run against
+  rootless Docker 29.10.0 on this host:
+
+  ```
+  # PATH and DOCKER_HOST point at the rootless engine's CLI and socket.
+  LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1 \
+  LUNARWING_E2E_TUNNEL_RUNTIME=docker \
+  LUNARWING_E2E_TUNNEL_BASE_IMAGE=quay.io/libpod/alpine:latest \
+    taskset -c 0-17 cargo test -j18 --test podman_sandbox_tunnel_integration \
+    -- --nocapture --test-threads=1
+  ```
+
+  `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+  finished in 564.91s`. All seven live WireGuard lanes passed on the Docker
+  CLI: lifecycle and join, custom DNS closes uplink, hostname endpoint, dead
+  peer, healthy peer death, cold-start budget, and concurrent first commands,
+  together with the teardown wrapper's six runtime-free tests. The NetBird lane
+  skipped on its closed gate. The lifecycle lane therefore ran its real
+  Docker assertions: the joined run uses the verified container ID, the
+  sidecar's input/output firewall is listed and checked rule by rule, tampered
+  chains and a dead peer fail closed, image-ID rotation recreates the sidecar,
+  and the post-teardown check finds no leftover container. The suite built
+  `localhost/lw-tunnel-e2e:latest` from `quay.io/libpod/alpine:latest` with the
+  Docker builder, and its rotation case rebuilt the tag, so both Docker build
+  paths ran.
+- **Detached-unit checks on Docker: skipped, as AGJ-1 designed.** Both lanes
+  that reach them printed `skipping detached-unit checks: Docker's detached
+  run client leaves no process in its transient unit`. Re-running
+  `tunnel_concurrent_first_commands_keep_firewall_stable` with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` failed before any fixture started,
+  at `tests/podman_sandbox_tunnel_integration.rs:922`, with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the detached-unit checks cannot
+  run: Docker's detached `run` client leaves no process in its transient unit`
+  (`test result: FAILED. 0 passed; 1 failed; … 13 filtered out`, 0.00 s). A
+  Docker host therefore cannot record a unit pass, and the requirement is not
+  a no-op.
+- **Docker post-run state.** `docker ps -a` listed no container and
+  `docker volume ls` no volume afterwards; the scoped leftover assertions also
+  ran and passed inside the lanes. As on the Podman host, the lane builds
+  `localhost/lw-tunnel-e2e:latest` and its base image in the Docker store; the
+  temporary engine used for this run was removed afterwards.
+- **Gate-closed regression at the same build.** Without the gates the same
+  target reported `14 passed; … finished in 0.00s`, so no lane runs by default
+  and CI's shape is unchanged.
 - **systemd service mode and tenant-unit run: not run live here.** No approved
-  test host with a systemd user manager was available. Acceptance boxes 1–3
-  stay open for the maintainer.
+  test host with a systemd user manager was available. Acceptance boxes 2–3
+  stay open for the maintainer; box 1's Docker run is recorded above.
+- **Review follow-up, AHN-1 (2026-11-20).** The approval of !2600 noted that the
+  release paragraph below counted "14 of 14", which is the number of test
+  functions in the file, not live coverage: seven live WireGuard lanes, six
+  tests that need no runtime, and the NetBird lane, which skips while its gate
+  is closed. The paragraph and the guide's matrix row now say what ran — the
+  seven live WireGuard lanes and the six runtime-free tests passed at the
+  merged head, and NetBird was not run. No test code changed for this wording
+  correction, so the merged-head run still applies to the file as it stands.
 
 ## Replacement paragraph for the v2.2.1.0 release notes
 
 > **Tunnel live coverage.** The gated tunnel suite has been run on rootless
-> Podman only: 9 of 9 tests on Podman 5.8.2 (2026-11-11), including NetBird
-> 0.82.0 and a real WireGuard peer; **10 reported passes on Podman 6.1.4
-> (2026-11-19, before the WI#782 review follow-up)** with the NetBird gate
-> closed; and **14 of 14 at the merged head of WI#782 on Podman 6.1.4
-> (2026-11-20)**, after the teardown rewrite, with the same gate closed and the
-> detached-unit checks skipped for want of systemd service mode. A Docker CLI
-> lane (`LUNARWING_E2E_DOCKER_TESTS=1`) exists and is off by
-> default, but **no Docker run is claimed**. The detached systemd helper-unit
-> checks run for Podman in systemd service mode: they first prove the transient unit
+> Podman and on rootless Docker: 9 of 9 tests on Podman 5.8.2 (2026-11-11),
+> including NetBird 0.82.0 and a real WireGuard peer; **10 reported passes on
+> Podman 6.1.4 (2026-11-19, before the WI#782 review follow-up)** with the
+> NetBird gate closed; **the seven live WireGuard lanes passed at the merged
+> head of WI#782 on Podman 6.1.4 (2026-11-20)**, after the teardown rewrite,
+> together with the suite's six runtime-free tests, while **NetBird was not
+> run** (gate closed) and the detached-unit checks were skipped for want of
+> systemd service mode; and **the seven live WireGuard lanes and the six
+> runtime-free tests passed on rootless Docker 29.10.0 (2026-11-20)**, where
+> NetBird was not run and the detached-unit checks skipped because no unit
+> outlives a `docker run -d` client. Both WI#782 runs used
+> `--test-threads=1`.
+> The detached systemd helper-unit checks run for Podman in systemd service
+> mode: they first prove the transient unit
 > `lunarwing-tunnel-<instance>` exists before requiring its removal, so they
 > cannot pass vacuously there. On Docker no unit outlives the `docker run -d`
 > client, so those checks print a skip and nothing about the unit is proven.

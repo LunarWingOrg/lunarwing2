@@ -700,15 +700,17 @@ is harness-covered or unclaimed, not proven.
 |---|---|---|
 | Full gated suite (all WireGuard lanes, including per-run recovery, peer death, and firewall cases) | rootless Podman 5.8.2 (2026-11-11) | live, 9 of 9 |
 | Full gated suite before the WI#782 review follow-up (all WireGuard lanes) | rootless Podman 6.1.4, OpenRC host (2026-11-19, WI#782) | live, 10 reported passes / 0 failures; NetBird gate closed |
-| Full gated suite at the merged head, after the teardown rewrite (all WireGuard lanes and the teardown-wrapper regressions) | rootless Podman 6.1.4, OpenRC host (2026-11-20, WI#782 AHI-1) | live, 14 of 14; NetBird gate closed; detached-unit checks skipped by design |
+| Full gated suite at the merged head, after the teardown rewrite (all WireGuard lanes and the teardown-wrapper regressions) | rootless Podman 6.1.4, OpenRC host (2026-11-20, WI#782 AHI-1) | live: the 7 WireGuard lanes passed, plus the 6 runtime-free tests; NetBird not run (gate closed); detached-unit checks skipped by design |
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
-| The same lane on the Docker CLI fallback | gated `LUNARWING_E2E_DOCKER_TESTS` lane, on a Docker host | lane exists; **no live run recorded** (WI#771, WI#782) |
+| Full gated suite on the Docker CLI fallback | rootless Docker 29.10.0, OpenRC host (2026-11-20, WI#782) | live: the 7 WireGuard lanes and the 6 runtime-free tests passed; NetBird not run (gate closed); detached-unit checks skipped by design |
 | Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, rootless Podman, service mode | lane gates it; **no service-mode live run recorded** (WI#771, WI#782) |
 | Tenant-unit sandbox command in tunnel mode | dedicated tenant on a systemd user-manager host | **no live run recorded** (WI#782) |
 
-No approved Docker or systemd user-manager test host was available for the
-missing runs. WI#782 acceptance boxes 1–3 remain open for the maintainer. No
-public-cloud or CI live run is claimed, and gated lanes stay off by default.
+The Docker row was run against a user-level rootless Docker engine on the same
+development host, not a separately provisioned Docker host. No approved host
+with a systemd user manager was available, so WI#782 acceptance boxes 2–3
+remain open for the maintainer. No public-cloud or CI live run is claimed, and
+gated lanes stay off by default.
 
 1. Start the tenant and check that the daemon logs sidecar started/healthy,
    with no credential values.
@@ -753,7 +755,12 @@ public-cloud or CI live run is claimed, and gated lanes stay off by default.
    `LUNARWING_E2E_TUNNEL_RUNTIME=podman|docker` (optional) must agree with the
    open gate; opening both runtime gates is refused, and a lane whose
    `CliRunner` resolves to the other runtime fails rather than silently
-   switching. In a whole-workspace run `LUNARWING_E2E_DOCKER_TESTS=1` also
+   switching. The sidecar asks the runtime for `--cap-add=NET_ADMIN` and
+   `--sysctl net.ipv4.conf.all.src_valid_mark=1` in every mode, with the host's
+   `wireguard` module loaded; a Docker daemon configured to refuse either one
+   fails the sidecar start closed, so check that the daemon it will use permits
+   them before starting a run. In a whole-workspace run
+   `LUNARWING_E2E_DOCKER_TESTS=1` also
    opens other Docker e2e tests (for example the orchestrator reaper's), so
    name this test target when only the tunnel lane is wanted. The test builds
    an Alpine image with `nftables` unless
