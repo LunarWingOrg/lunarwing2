@@ -31,11 +31,16 @@ placeholder. Expect at least one more draft before the tag.
 
 - **WI#786 and WI#772** (standing pipeline checks). Process items; they change
   no file.
-- **WI#775, WI#768 and WI#771.** Each is a superseded first attempt, closed
-  unmerged; their second attempts are WI#785, WI#784 and WI#782 and are in
-  the notes under those numbers.
-- **WI#790** (agents use only hosts they were given an account on). Merged
-  after this branch's head and not on it; nothing of it is in this tree.
+- **WI#775, WI#768, WI#771 and WI#640.** Each is a first attempt closed
+  unmerged; their second attempts — WI#785, WI#784, WI#782 and WI#783 — are in
+  the notes under those numbers, so the work they asked for is described
+  there and not under the closed predecessor.
+- **WI#790** (agents use only hosts they were given an account on). An
+  agent-conduct rule for `AGENTS.md`, not product behaviour. At
+  `2e90802d6ba9` the rule text is not in `AGENTS.md` and the one inventory
+  sentence the item asked to remove is already absent
+  (`docs/ops/POSTGRESQL-VERSION-INVENTORY.md`), so there is nothing here to
+  describe as a release change.
 - **WI#684** (mt-admin snapshot died at load). Closed on 2026-11-15, before
   the `v2.2.0.0` tag this draft starts from.
 - **WI#735 and WI#689** (new agents). Repository and planning-housekeeping
@@ -257,7 +262,7 @@ placeholder. Expect at least one more draft before the tag.
   this branch, it is the version of the previous notes an operator reading
   Shinobi will see.
 
-## CI and release engineering
+### CI and release engineering
 
 - **Artifact retention is set per job and enforced (WI#791).** Candidate
   rootfs tars expire in two days, scan evidence in 90 days, promotion
