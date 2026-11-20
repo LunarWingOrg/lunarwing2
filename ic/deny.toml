@@ -210,11 +210,12 @@ ignore = [
     # types, and no file of postcard or monty names sorted_linked_list, spsc
     # or zeroize. Reachability was judged by reading, not by a run.
     # No bump clears them: postcard 1.x requires heapless 0.7. Accepted on the
-    # maintainer's order of 2026-11-19. The [bans] entry below keeps the
+    # maintainer's order of 2026-11-19. The [bans] entries below keep the
     # acceptance to this graph position: only postcard may pull a heapless
-    # below 0.9.4. Clearing: heapless leaves the locks (monty takes postcard
-    # without default features) or moves to 0.9.4 or later (a postcard
-    # release on the new line); the entries then show as
+    # below 0.9.4, and postcard below 2.0.0 may only be a direct dependency of
+    # the current parents (WI#788). Clearing: heapless leaves the locks (monty
+    # takes postcard without default features) or moves to 0.9.4 or later (a
+    # postcard release on the new line); the entries then show as
     # advisory-not-detected and are removed.
     { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 unsound (sorted_linked_list FindMutView::pop use after free); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
     { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 unsound (spsc peek used Relaxed ordering); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order against advisory-db 7133866a; clearing owner WI#781" },
@@ -301,6 +302,23 @@ deny = [
     # postcard, which uses heapless::Vec and heapless::String, may pull a
     # release below the fixed 0.9.4.
     { name = "heapless", version = "<0.9.4", wrappers = ["postcard"] },
+    # WI#788: the heapless line above pins heapless's direct parent only, so
+    # any future crate that takes postcard with default features would become
+    # a second heapless parent and inherit all nine acceptances with no
+    # lockfile change. Pin postcard's own parents too. wrappers is a direct-
+    # parent check, so every current parent must be listed: monty 0.0.17 takes
+    # postcard 1.1 with defaults (heapless-cas), while wasmtime,
+    # wasmtime-environ and wasmtime-internal-cache take it with
+    # default-features = false and never reach heapless
+    # (ic/vendor/monty/Cargo.toml, ic/vendor/postcard/Cargo.toml). A new
+    # parent fails closed; add it here only after confirming it does not
+    # enable postcard's default features.
+    { name = "postcard", version = "<2.0.0", wrappers = [
+        "monty",
+        "wasmtime",
+        "wasmtime-environ",
+        "wasmtime-internal-cache",
+    ] },
 ]
 
 [sources]
