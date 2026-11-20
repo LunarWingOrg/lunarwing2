@@ -1,11 +1,11 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
 **Audit date:** 2026-08-03; ported and hardened on v2.0.5.0, 2026-08-05.
-**Status:** Historical audit, with source/registration update for v2.2.0.0 on 2026-11-10.
+**Status:** Historical audit, with source/registration update for v2.2.1.0 on 2026-11-20.
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Current coverage (v2.2.0.0)
+## Current coverage (v2.2.1.0)
 
 `ic-infrastructure-health-check/tests/run-all.sh` registers **21 suites**. The
 current ordered list adds `worker-egress` (WI#424) and `disk` (WI#586) to the 19
