@@ -753,7 +753,12 @@ public-cloud or CI live run is claimed, and gated lanes stay off by default.
    `LUNARWING_E2E_TUNNEL_RUNTIME=podman|docker` (optional) must agree with the
    open gate; opening both runtime gates is refused, and a lane whose
    `CliRunner` resolves to the other runtime fails rather than silently
-   switching. In a whole-workspace run `LUNARWING_E2E_DOCKER_TESTS=1` also
+   switching. The sidecar asks the runtime for `--cap-add=NET_ADMIN` and
+   `--sysctl net.ipv4.conf.all.src_valid_mark=1` in every mode, with the host's
+   `wireguard` module loaded; a Docker daemon configured to refuse either one
+   fails the sidecar start closed, so check that the daemon it will use permits
+   them before starting a run. In a whole-workspace run
+   `LUNARWING_E2E_DOCKER_TESTS=1` also
    opens other Docker e2e tests (for example the orchestrator reaper's), so
    name this test target when only the tunnel lane is wanted. The test builds
    an Alpine image with `nftables` unless
