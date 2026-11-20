@@ -1,6 +1,10 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
-Status: **tool/approval slice implemented on `cmc/g10/v2.1.4.0`; later slices remain planned**.
+Status: **initial tool/contract slice shipped in v2.1.4.0; follow-up phases
+remain planned**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+closed that initial scope. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
+owns the successor phases and is the authoritative backlog and acceptance gate.
+
 Implementation contract: [`ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 The initial integration covers slices 0/1 and the approval-description portion
 of slice 3: per-user registry-owned learning, all three tool execution paths,
@@ -14,12 +18,13 @@ jobs are covered by this slice. Costs are only learned when actually reported,
 and are not displayed. See the
 [goal-10 evidence record](../ops/history/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
 
-Original plan reviewed against
-`wire-in-ema` at `05ddcc5cd` (2026-09-26). Tracker:
-[work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191).
-The work item says implementation starts **after the 2.1.3.0 release**; verify
-that milestone before executing this plan. This branch's base matching `master`
-does not, by itself, prove the release has happened.
+Original plan reviewed against `wire-in-ema` at `05ddcc5cd` (2026-09-26).
+The initial release gate has passed; execute remaining work according to #318:
+Phase A covers diagnostics, per-category gating, held-out evaluation and tenant
+rollout of the shipped tool hints. Phase B adds LLM logical-call timing and
+gate-wait analytics, Phase C bounded job and mission-run estimates, and Phase D
+a durable aggregate cache only if the evidence justifies it. Treat this document
+as design context, not as proof that any follow-up phase has shipped.
 
 ## Goal and non-goals
 
@@ -329,17 +334,21 @@ necessary identity/timing. Never add a synchronous DB write on the mission fire
 path or treat repeated cron/event fires, retries, gate pauses and the
 mission's whole lifetime as one run. If durability is justified, use a
 separately designed workspace-compatible aggregate or append-only metric,
-not a fake `agent_jobs` foreign key. Mission management currently has no
-general `/api/missions` REST CRUD path, only a webhook ingress; specify a
-real viewer before promising a new mission status field in the web gateway.
+not a fake `agent_jobs` foreign key. The web gateway now provides authenticated
+read-only mission list, summary and detail endpoints at `GET /api/missions`,
+`GET /api/missions/summary` and `GET /api/missions/{id}`. Use those views for any
+advisory run estimate; do not claim general mission CRUD or alter mission
+semantics as part of this plan.
 
 ### C. Diagnostics — optional read-only surface
 
-Aggregate top slow tool/model categories and calibration error with bounded
-cardinality. Expose only non-sensitive category keys and aggregate counts to
-authorized operators; no raw arguments, prompts, tokens, credentials or
-per-user cross-tenant data. This is useful for diagnosing bottlenecks, but
-not a reason to add synchronous DB writes to the hot path.
+Read-only diagnostics are a **required Phase A gate**, not an optional extra.
+Show only non-sensitive category keys, sample counts, current and error EMAs,
+confidence labels, and eligible/withheld/clipped/evicted counters. The shipped
+models are per-user, so gateway access must use existing authentication and
+expose only the caller's own models. Any cross-user operator view must be
+aggregate-only. Never expose raw arguments, prompts, tokens, credentials or
+cross-tenant data. No synchronous DB writes belong on the hot path.
 
 ## Persistence decision
 
