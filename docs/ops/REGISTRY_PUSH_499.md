@@ -96,31 +96,21 @@ is now recorded above.
 
 ### Read-side check without a token, 2026-11-19
 
-Traefik's `readTimeout` bounds reading the request whether or not it carries a
-body, so an unfinished request probes the same setting with no credentials and
-no upload. `.gitlab/scripts/edge-read-timeout-probe.py` opens one TLS
-connection per host, sends a request head, and dribbles one header line every
-five seconds without completing the request. Run against both hosts on
-2026-11-19 between 23:06Z and 23:07Z, the edge closed each connection at
-**60.07 s**:
+`.gitlab/scripts/edge-read-timeout-probe.py` measures how long the edge reads
+an unfinished HTTP request head. The edge has not selected a router yet, so
+this checks the entry-point deadline, not a matched router's body deadline.
+No credentials or upload body are sent. In the 2026-11-19 run, the edge closed
+each connection at **60.07 s**:
 
 | Host | Result |
 |---|---|
 | `git.lunarwing.org` | EOF at 60.07 s |
 | `registry.git.lunarwing.org` | EOF at 60.07 s |
 
-Requests that are allowed to complete answer normally (`302` on the main
-host, `401` on `/v2/`), so the close is the read timeout firing, not the
-request being refused. This is the fastest check after the setting is raised;
-it does not replace the rate-limited upload for acceptance box 2.
-
-The 60-second cut matches **Traefik `respondingTimeouts.readTimeout`**, which
-has defaulted to 60 seconds since Traefik 2.11.2 and 3.0. It bounds the whole
-request, body included, and it is the component common to both
-`git.lunarwing.org` (API/artifacts) and `registry.git.lunarwing.org` (blob
-pushes). The WI asks first for one cut line from the edge access log naming
-the proxy and its duration; that host is still unreachable from the dev box,
-so the log evidence remains an administrator action.
+A close near 60 seconds is consistent with Traefik's default entry-point
+`readTimeout`. An early response, connection error, or off-boundary close
+does not establish that deadline. The edge access-log entry for a cut upload
+still needs to come from the host administrator.
 
 ## What is confirmed (checked from the dev box, 2026-08-22)
 
@@ -165,32 +155,31 @@ Two timeout layers are the realistic suspects, in order:
 
 ## Fix — apply on the GitLab host
 
-### 1. Traefik: raise the `websecure` read timeout to a bounded value
+### 1. Traefik: choose a bounded timeout for the affected upload routes
 
-Static config (traefik.yaml or CLI flags on the container):
+Check the deployed version first. Traefik documents per-router
+[`respondingTimeouts` starting in v3.8.0](https://github.com/traefik/traefik/blob/master/docs/content/migrate/v3.md#router-responding-timeouts).
+Prefer a bounded body-read timeout on only the routes that need it. If the
+version does not support that override, prefer a separate, address-allowlisted
+CI entry point over raising the public deadline.
+
+Example static configuration for an entry-point-wide change (requires a
+Traefik restart or recreation):
 
 ```yaml
 entryPoints:
   websecure:
     transport:
       respondingTimeouts:
-        readTimeout: "30m"    # bounded — do NOT set 0
-        writeTimeout: "0s"    # Traefik's default; idleTimeout covers dead connections
-        idleTimeout: "180s"   # inactivity timeout only — keep
+        readTimeout: "30m"    # example, not the deployed setting; do NOT set 0
+        writeTimeout: "0s"    # Traefik's default
+        idleTimeout: "180s"   # applies between requests
 ```
 
-`readTimeout` bounds reading the whole request including the body. `30m` is
-the recommended value: it is well above the cuts observed (60 to 66 s; no
-completed upload from runner 17 was timed) and is still finite. Nobody with
-access to the edge has applied it yet. **Do not set it to `0`**: the timeout
-is also the protection against a client that sends its body slowly.
-`idleTimeout` still protects against dead connections.
-
-This entry point serves every site behind this Traefik, so the change is
-instance-wide. Traefik sets the timeout per entry point, not per router. If
-the public entry point must keep 60 seconds, add a dedicated CI entry point
-with `readTimeout: "30m"` and an address allowlist for the runners. Traefik
-must be restarted/recreated for static config to take effect.
+An entry-point change affects every site on that entry point and covers both
+the request head and body. Raising the deadline lets unauthenticated clients
+occupy connections longer before routing. Choose the shortest bounded value
+that admits the workload; `idleTimeout` does not replace this protection.
 
 Optionally, route-scoped hardening in `traefik-dynamic.yaml` (file provider,
 hot-reloads): attach a `serversTransport` with generous forwarding timeouts to
@@ -269,10 +258,8 @@ Runner 17 keeps its other tags and still takes untagged jobs. The
 `.worker-candidate` jobs in `.gitlab/ci/containers.yml` require
 `container-build`, so runner 17 can no longer take the large-upload job;
 runners 13, 15 and 16 still carry that tag (7 and 8 do as well). Re-add
-`container-build` to runner 17 only after the go/no-go probe in
-“Verification” returns `201` through the edge (the probe makes the
-`>60 s` test reproducible from any workstation; it does not have to come
-from runner 17 itself, because the cut is at the shared edge entry point).
+`container-build` to runner 17 only after a successful rate-limited upload
+through the affected route and entry point (see [Verification](#verification)).
 
 The edge host is not reachable from the dev box (SSH lands in GitLab-shell).
 The Traefik config change and the access-log line therefore stay with the
@@ -281,10 +268,14 @@ been done from the dev box — see “Live confirmation” above.
 
 ## Verification
 
-The quick check, if the old cut is still present, needs no token:
-`python3 .gitlab/scripts/edge-read-timeout-probe.py --hold 90` must report
-`OPEN` on both hosts after the change. The rate-limited upload probe below is
-still the acceptance evidence for box 2.
+The token-free probe is optional. `OPEN` with an HTTP response shows the
+unfinished head stayed open for the hold. For a hold beyond the observed
+60-second boundary, expect this after raising the tested entry point's
+deadline beyond the hold. That also allows unauthenticated connections to
+occupy resources longer. Without a response, the probe cannot confirm the
+completed head was read. A router-only body-timeout fix leaves the public
+entry-point deadline unchanged, so `CUT` near 60 s can still be expected.
+Neither result replaces a successful rate-limited upload for box 2.
 
 1. **The go/no-go probe** — a rate-limited upload through the edge, run from
    a workstation with Bash and curl 7.55.0 or newer. Use a dedicated, standing
@@ -327,14 +318,13 @@ still the acceptance evidence for box 2.
 
    **Before the fix** this ends at about 61 s with `status=502` and `sent`
    well under 12 MiB (measured 2026-11-19: 61.18 s, 6.0 MiB). **After the
-   fix** it must trickle the whole 12 MiB, end with `status=201`, and take
-   about 125 s. A cut at ~61 s means the timeout is still live; a completed
-   upload in under 90 s means the probe never crossed the boundary, so raise
-   the file size. This exercises the same `websecure` entry point as artifact
-   uploads and registry pushes — Traefik applies `readTimeout` per entry
-   point, not per router, so one probe covers both hosts. Record the edge
-   access-log line for the same request with its duration and status (WI#706
-   acceptance box 1); the pre-fix line is not obtainable from the dev box.
+   fix** the full 12 MiB must upload, the body transfer must take longer than
+   60 s, and the response must be `201`. Total elapsed time alone does not
+   establish the time spent sending the body. This is an example for the
+   project `/uploads` route. A `201` there does not verify artifact or registry
+   upload routes; run the long transfer on the affected route and entry point.
+   Record the edge access-log line for a cut upload with its duration and
+   status (WI#706 acceptance box 1).
 2. Re-run the manual `worker-opencode-image` job (largest image).
    Expect: no `499` retries in the push phase.
 3. Re-run `worker-opencode2-candidate` and confirm it can pass on runner 17
@@ -349,17 +339,13 @@ still the acceptance evidence for box 2.
 - **Edge access-log line** for one cut upload (duration ~61 s, status
   `499`/`502`/`504`). Only the edge host has it; the dev box cannot reach a
   shell there.
-- **Apply the timeout** on the `websecure` entry point that serves both hosts:
-  `readTimeout: "30m"` — static configuration, Traefik restart required. Do
-  not use `0`.
-- **Record the applied value and its date** beside the other edge settings
-  (`GITLAB_CONTAINER_REGISTRY.md` §1f); the value there today is the
-  recommendation, not the live setting.
-- **Run the go/no-go probe** after the change (expect `201` in ~125 s).
-- **Quick re-check without a token:** `python3
-  .gitlab/scripts/edge-read-timeout-probe.py --hold 90` must report `OPEN` on
-  both hosts; before the change it reports `CUT` at 60.07 s (2026-11-19).
-- **Re-add `container-build` to runner 17** only after the probe passes.
+- **Apply a bounded timeout** at the narrowest supported scope.
+- **Record the applied value, scope, date, and rationale** beside the other
+  edge settings (`GITLAB_CONTAINER_REGISTRY.md` §1f).
+- **Verify a successful rate-limited upload** whose body takes over 60 s on
+  the affected route and entry point. The optional head check may still
+  report `CUT` after a router-only fix.
+- **Re-add `container-build` to runner 17** only after the upload check passes.
 
 ## Rollback
 

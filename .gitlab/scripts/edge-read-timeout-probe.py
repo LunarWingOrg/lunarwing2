@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Measure whether the GitLab edge still cuts a long request at 60 seconds.
+"""Check how long the GitLab edge reads an unfinished HTTP request head.
 
-Both ``git.lunarwing.org`` (API, job artifacts) and
-``registry.git.lunarwing.org`` (blob pushes) sit behind the same Traefik
-``websecure`` entry point. Its ``transport.respondingTimeouts.readTimeout``
-defaults to 60 seconds since Traefik 2.11.2/3.0 and bounds the whole request
-read, body included. A client that sends its request slowly is therefore a
-token-free go/no-go for the timeout change in ``docs/ops/REGISTRY_PUSH_499.md``:
-before the fix the connection is closed near 60 s; after it, the request stays
-readable for ``--hold`` seconds and the completed request gets an HTTP response.
+The edge reads the request head before selecting a router. Raising the
+entry-point deadline can turn CUT into OPEN, but also lets unauthenticated
+connections occupy edge resources longer. A router-only body-timeout fix
+can leave CUT unchanged. Verify uploads with a successful rate-limited
+transfer on the affected route; see ``docs/ops/REGISTRY_PUSH_499.md``.
 
 The probe never authenticates, uploads no body, and opens one connection per
 host. Do not run it in a loop; it is an operator check, not a load test.
@@ -106,7 +103,7 @@ def probe_host(
     clock: Callable[[], float] = time.monotonic,
     interval: float = DRIBBLE_INTERVAL_SECONDS,
 ) -> Outcome:
-    """Dribble a request for ``hold`` seconds and report when the edge cut it."""
+    """Leave the request head unfinished for the hold and report what happened."""
     factory = transport_factory or TlsTransport
     transport = factory(host)
     start = clock()
@@ -157,18 +154,21 @@ def probe_host(
 def report(outcome: Outcome, hold: float) -> None:
     if outcome.survived:
         print(
-            f"OPEN  {outcome.host}: readable for {outcome.elapsed:.2f}s "
-            f"(hold {hold:g}s); upstream answered {outcome.detail}"
+            f"OPEN  {outcome.host}: probe reached the hold with the head unfinished "
+            f"after {outcome.elapsed:.2f}s (hold {hold:g}s); {outcome.detail}"
         )
     else:
-        print(f"CUT   {outcome.host}: {outcome.detail} after {outcome.elapsed:.2f}s")
+        print(
+            f"CUT   {outcome.host}: unfinished-head check stopped after "
+            f"{outcome.elapsed:.2f}s; {outcome.detail}"
+        )
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Hold an unfinished HTTP request open and report whether the GitLab "
-            "edge cuts it before --hold seconds (the Traefik readTimeout check)."
+            "Check the GitLab edge's read deadline for an unfinished HTTP "
+            "request head, not whether it accepts long uploads."
         )
     )
     parser.add_argument(
@@ -182,7 +182,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--hold",
         type=float,
         default=DEFAULT_HOLD_SECONDS,
-        help=f"seconds to keep the request readable (default: {DEFAULT_HOLD_SECONDS:g})",
+        help=f"seconds to leave the request head unfinished (default: {DEFAULT_HOLD_SECONDS:g})",
     )
     parser.add_argument(
         "--path",
@@ -213,21 +213,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         print(
-            "FAIL: the 60-second read timeout is still cutting long uploads on "
-            f"{failures} host(s); see docs/ops/REGISTRY_PUSH_499.md.",
+            f"Could not complete the unfinished-head check on {failures} host(s). "
+            "A router-only upload fix can leave CUT unchanged. Verify with a "
+            "successful rate-limited upload; see docs/ops/REGISTRY_PUSH_499.md.",
             file=sys.stderr,
         )
         return 1
     if args.hold <= OBSERVED_BOUNDARY_SECONDS:
         print(
-            f"PASS (short hold): every host kept the request readable for "
-            f"{args.hold:g}s, but that does not cross the observed 60 s "
-            "boundary; use --hold 90 for the timeout check."
+            f"HEAD CHECK ONLY (short hold): the probe reached {args.hold:g}s on "
+            "every host, but that does not cross the observed 60 s boundary. "
+            "Verify uploads separately."
         )
         return 0
     print(
-        "PASS: every host kept the request readable for the full hold; the "
-        "60-second cut is no longer present."
+        "HEAD CHECK ONLY: the probe reached the full hold on every host. "
+        "Raising the entry-point deadline can turn CUT into OPEN, but lets "
+        "unauthenticated connections occupy edge resources longer. A router-only "
+        "change does not affect this check. Verify uploads with a successful "
+        "rate-limited transfer; see docs/ops/REGISTRY_PUSH_499.md."
     )
     return 0
 
