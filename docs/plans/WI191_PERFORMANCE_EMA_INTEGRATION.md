@@ -1,6 +1,10 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
-Status: **tool/approval slice implemented on `cmc/g10/v2.1.4.0`; later slices remain planned**.
+Status: **tool/approval slice shipped in v2.1.4.0; Phase A rollout remains in
+progress**. Remaining implementation is tracked by
+[work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318);
+the completed wiring is tracked historically by
+[work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191).
 Implementation contract: [`ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 The initial integration covers slices 0/1 and the approval-description portion
 of slice 3: per-user registry-owned learning, all three tool execution paths,
@@ -14,12 +18,14 @@ jobs are covered by this slice. Costs are only learned when actually reported,
 and are not displayed. See the
 [goal-10 evidence record](../ops/history/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
 
-Original plan reviewed against
-`wire-in-ema` at `05ddcc5cd` (2026-09-26). Tracker:
-[work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191).
-The work item says implementation starts **after the 2.1.3.0 release**; verify
-that milestone before executing this plan. This branch's base matching `master`
-does not, by itself, prove the release has happened.
+Original plan reviewed against `wire-in-ema` at `05ddcc5cd` (2026-09-26).
+The original #191 prerequisite was satisfied by v2.1.4.0; it is no longer a
+reason to defer implementation. Phase A documentation and decisions are updated
+by SweetieBot (autonomous) under #318 on 2026-11-20 without changing runtime
+behavior. Read-only diagnostics and category gating must precede the real-tenant
+held-out evaluation, and only categories that pass that evaluation may receive
+hints. The still-open #318 umbrella remains open for those later phases; this
+plan is not an assertion that its closing acceptance criteria are met.
 
 ## Goal and non-goals
 
@@ -329,9 +335,12 @@ necessary identity/timing. Never add a synchronous DB write on the mission fire
 path or treat repeated cron/event fires, retries, gate pauses and the
 mission's whole lifetime as one run. If durability is justified, use a
 separately designed workspace-compatible aggregate or append-only metric,
-not a fake `agent_jobs` foreign key. Mission management currently has no
-general `/api/missions` REST CRUD path, only a webhook ingress; specify a
-real viewer before promising a new mission status field in the web gateway.
+not a fake `agent_jobs` foreign key. The authenticated read-only mission viewer
+at `GET /api/missions`, `/api/missions/summary` and `/api/missions/{id}`
+(`ic/src/channels/web/server.rs`) is the available current-run detail surface.
+It does not provide general mission-definition CRUD. Extend its run view
+additively for historical estimates rather than proposing an unrelated viewer;
+the webhook ingress remains separate.
 
 ### C. Diagnostics — optional read-only surface
 
@@ -447,18 +456,48 @@ Run focused tests first, then `taskset -c 0-11 cargo check -j12` and targeted
 full debug build for verification. Update relevant subsystem specs/API docs
 alongside behavior; this document does not claim implementation is complete.
 
-## Decisions to confirm before implementation
+## Decisions confirmed for Phase A
 
-1. Ship cold-start in-memory learning first (recommended) or require durable
-   coefficients on day one?
-2. Does the first UI show a clearly labeled cold-start baseline, or hide
-   ETA until five valid samples? Recommendation: hide unknown-tool ETA;
-   show explicitly provisional baseline only for intentionally configured
-   categories.
-3. Should later non-web approval notifications display the short duration,
-   or limit phase 3 to web pending-gate SSE/recovery while testing channel
-   message sizes and translations?
+Resolved by SweetieBot (autonomous) under #318 on 2026-11-20. These are rollout
+choices, not evidence that the real-tenant accuracy or overhead gates have run.
+
+1. **Cold start for the initial rollout; durable cache deferred.** The existing
+   per-registry in-memory model remains the initial store and must relearn after
+   a restart. Do not build durable EMA coefficients by default. Phase A's
+   held-out evaluation must measure accuracy after warmup and again during a
+   representative cold-start window, including the five-sample withheld period
+   plus enough subsequent calls to bound warmup error and coverage loss. Durable
+   aggregate snapshots are justified only if that measured loss materially
+   misses the accuracy/coverage goals in a category or materially worsens the
+   observed operational workload. If justified, reuse the bounded, non-sensitive,
+   per-tenant snapshot design above with no synchronous hot-path I/O; otherwise
+   record the no-cache decision and measurements in the rollout evidence.
+   A restart during evaluation resets the observation window rather than
+   silently mixing pre-restart and post-restart baselines.
+2. **Keep learned hints hidden until five valid completed samples, including
+   configured categories.** Do not display an unvalidated provisional baseline.
+   The category allowlist controls which warmed learned estimates may display;
+   it is not evidence that a static base duration is accurate. Cold-start
+   behavior remains visibly unknown or withheld, never a made-up precise ETA.
+   Held-out traces retain the unadjusted baseline for comparison even when no
+   user-facing prediction was eligible.
+3. **Initial hints remain web/WASM-only; native XMPP, Signal and REPL changes
+   are deferred.** These adapters currently omit the approval description.
+   When the initial category rollout has passed evaluation, the follow-up may
+   derive only a short plain-text duration from the trusted frozen estimate
+   snapshot, never from raw approval descriptions or parameters. The line is
+   `Typical tool runtime: ~Xs; excludes approval wait; not a deadline.` and is
+   capped at 120 UTF-8 bytes (truncate before adding an ellipsis if needed).
+   Enforce the existing per-channel parameter/message budgets; drop the optional
+   duration first and fail open to the existing prompt if the full hint would
+   exceed the budget. Never add approval details to shared-channel messages:
+   the existing XMPP groupchat-suppression guard must stay before any delivery,
+   and the other channels must retain their direct, owner-scoped status
+   routing. Add tests for the duration-only line, truncation and redaction, and
+   do not duplicate the hint where a channel already renders the description.
 
 All automatic timeout, scheduling, provider-selection, bid/value, and budget
 decisions based on these estimates are **out of scope** until accuracy and
-failure modes have been demonstrated separately.
+failure modes have been demonstrated separately. Changing any gate's authority,
+expiry, channel/request-ID binding, decision token or redaction contract is
+never a rollout mechanism.
