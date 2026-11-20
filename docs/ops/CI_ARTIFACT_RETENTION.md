@@ -90,9 +90,9 @@ Decision: keep job logs, do not add a scheduled cleanup.
 
 ## Ceiling and the 7-day check
 
-Ceiling: **10 GiB** of job artifacts for project 35 (the value suggested in
-WI#791; artifacts are the surface this change controls, and `job_artifacts_size`
-in the API includes job logs).
+Ceiling: **10 GiB** of job artifacts for project 35, the value suggested in
+WI#791. The API's `job_artifacts_size` counts job logs too, so this single
+number covers both surfaces the retention rules below control.
 
 Measurement on 2026-11-20, after this change was written and before it merged:
 
@@ -117,7 +117,7 @@ So the 7-day check has two legitimate outcomes:
    post-change-shaped, the 2-day expiries hold the line, and the check passes.
    This is the intended path.
 2. **Record the number and the reason.** If nobody re-runs it, storage stays
-   above 10 GiB until the pre-change 30-day artefacts age out, and the check
+   above 10 GiB until the pre-change 30-day artifacts age out, and the check
    cannot pass however good the gate is. Record that in WI#791 rather than
    loosening any `expire_in`.
 
