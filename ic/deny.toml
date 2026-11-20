@@ -304,8 +304,8 @@ deny = [
     { name = "heapless", version = "<0.9.4", wrappers = ["postcard"] },
     # WI#788: the heapless line above pins heapless's direct parent only, so
     # any future crate that takes postcard with default features would become
-    # a second heapless parent and inherit all nine acceptances with no
-    # lockfile change. Pin postcard's own parents too. wrappers is a direct-
+    # a second heapless parent and inherit all nine acceptances with no change
+    # to these pins. Pin postcard's own parents too. wrappers is a direct-
     # parent check, so every current parent must be listed: monty 0.0.17 takes
     # postcard 1.1 with defaults (heapless-cas), while wasmtime,
     # wasmtime-environ and wasmtime-internal-cache take it with
