@@ -3,11 +3,14 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** The current mt-admin `require_cmd` set
-was re-checked: cargo, chcon, curl, flock, git, jq, nft, od, passwd, python3,
-setpriv, sha256sum, tar, taskset, and useradd, plus podman/docker. WI#424
-worker egress enforcement needs `nft` from `net-firewall/nftables`, now listed
-explicitly below. Disk health reuses existing core utilities.
+**Revalidated 2026-11-20 (v2.2.1.0).** The mt-admin `require_cmd` set was
+re-checked: cargo, chcon, curl, flock, git, jq, nft, od, passwd, python3,
+setpriv, sha256sum, tar, taskset, and useradd, plus podman/docker; the
+digest-pinned PostgreSQL image in `lunarwing-mt-admin.sh` and the Python
+dependency sets of `ic/tests/e2e/pyproject.toml` and the onboard tools were
+re-checked too. WI#424 worker egress enforcement needs `nft` from
+`net-firewall/nftables`, listed explicitly below. Disk health reuses existing
+core utilities.
 
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).

@@ -4,11 +4,14 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Ubuntu 22.0
 24.04 LTS (or newer) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the
 infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
-probes were re-checked. External-worker egress enforcement (WI#424) requires
-the host `nft` command, so `nftables` is now explicit below. Disk health reuses
-`df`, `stat`, and `timeout` from the already-expected core utilities; no other
-new host package is required.
+**Revalidated 2026-11-20 (v2.2.1.0).** Package names, the doctor prerequisite
+probes in `mt-admin-lib/04-tenant-lifecycle.sh`, the digest-pinned PostgreSQL
+image in `lunarwing-mt-admin.sh`, and the Python dependency sets of
+`ic/tests/e2e/pyproject.toml`, `lunarwing_mt_onboard/requirements.txt` and
+`lunarwing_mt_onboard_web/requirements*.txt` were re-checked. External-worker
+egress enforcement (WI#424) still requires the host `nft` command, so `nftables`
+is explicit below. Disk health reuses `df`, `stat`, and `timeout` from the
+already-expected core utilities; no other new host package is required.
 
 This is the Ubuntu equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
