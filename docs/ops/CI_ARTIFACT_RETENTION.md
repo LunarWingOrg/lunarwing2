@@ -11,16 +11,20 @@ to 9.66 GiB. This document records the retention rules that now keep it there.
 
 ## Rules
 
-| Job / template | Artifacts | `expire_in` | Why |
-| --- | --- | --- | --- |
-| `.worker-candidate` (pebble, opencode, kimi, opencode2 base) | dotenv, image metadata, inputs hash, `opencode2-rootfs-export` | **2 days** | Read only by the scan, the out-of-band exposure verification, and promotion in the same pipeline. |
-| `worker-opencode2-candidate` | metadata plus `opencode2-rootfs.tar` | **2 days** | Rootfs tar ~250-280 MiB; pipeline-scoped. |
-| `worker-lunardepth-candidate` | metadata plus `lunardepth-rootfs.tar` | **2 days** | Rootfs tar; pipeline-scoped. |
-| `.worker-scan` | `worker-sbom.cdx.json`, `worker-vulnerabilities.json`, container-scanning report | **90 days** | Audit evidence for an image that a tenant may still be running. |
-| `.worker-promotion` | `worker-image-evidence.json` | **1 year** | Release evidence: the durable record of what was published. |
-| `python-unit`, `shell-harnesses` | JUnit reports | 7 days | Small test reports. |
-| `wasm-channel-test-artifacts` | wasm channel binaries | 1 day | Build output only. |
-| every other job | — | **7 days** via `default:artifacts:expire_in` | Backstop only. The validator still requires an explicit per-job value. |
+Audit of every `artifacts:` block before this change, and the value it has now
+(`.gitlab-ci.yml` declares none; `security.yml` uses `artifacts: false` in
+`needs` only):
+
+| Declaration | Jobs covered | Artifacts | Before | Now | Why |
+| --- | --- | --- | --- | --- | --- |
+| `.worker-candidate` | pebble, opencode, opencode2, kimi candidates | dotenv, image metadata, inputs hash, `opencode2-rootfs-export` | 30 days | **2 days** | Read only by the scan, the out-of-band exposure verification, and promotion in the same pipeline. |
+| `worker-opencode2-candidate` | opencode2 candidate | metadata plus `opencode2-rootfs.tar` | 30 days | **2 days** | Rootfs tar, ~250-280 MiB; pipeline-scoped. |
+| `worker-lunardepth-candidate` | lunardepth candidate | metadata plus `lunardepth-rootfs.tar` | 30 days | **2 days** | Rootfs tar; pipeline-scoped. |
+| `.worker-scan` | all four `worker-*-scan` jobs | `worker-sbom.cdx.json`, `worker-vulnerabilities.json`, container-scanning report | 30 days | **90 days** | Audit evidence for an image a tenant may still be running. |
+| `.worker-promotion` | all four `worker-*-promote` jobs | `worker-image-evidence.json` | 1 year | **1 year** | The only durable record of what was published. Comment added; value unchanged. |
+| `python-unit`, `shell-harnesses` | test reports | JUnit XML | 7 days | **7 days** | Small test reports. |
+| `wasm-channel-test-artifacts` | wasm channel binaries | 2 `.wasm` files | 1 day | **1 day** | Build output only. |
+| `default` | backstop for any job without its own value | — | none | **7 days** | New. Not a substitute for a per-job value. |
 
 GitLab applies `expire_in` per **job**, not per path: everything a job uploads
 shares one expiry. That is why the candidate jobs keep their small metadata
