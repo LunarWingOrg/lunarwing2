@@ -4,9 +4,10 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** Every referenced
-mt-admin subcommand and flag was checked against the current composition root
-and modules. New tenant envs default to `SANDBOX_NETWORK=proxy-enforced` on
+**Revalidated against source 2026-11-20 (v2.2.1.0).** Every referenced
+mt-admin subcommand and flag, the `tui-access` client-token registry rules in
+`mt-admin-lib/16-tui-access.sh`, and the port-drift pre-flight checks were
+checked against the current composition root and modules. New tenant envs default to `SANDBOX_NETWORK=proxy-enforced` on
 Linux; mt-admin fills the value only when unset and preserves `none`,
 `proxy-enforced`, `tunnel`, and legacy advisory `proxy` on re-render. The managed
 sandbox image includes the pinned Python development suite. Required LLM
