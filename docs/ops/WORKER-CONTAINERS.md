@@ -2269,8 +2269,10 @@ by the item: `pebble-dev/pebble` HEAD is `d8fd0b756854…` (pin
 **Pins, publication times and the 24-hour rule.** All three lanes were checked
 against upstream at **2026-11-19 06:06Z**. The rule is 24 hours after
 publication, taken from the `published_at` of the GitHub release (opencode) and
-from the npm `time` map (kimi). No release was withdrawn or superseded inside
-its window, so no replacement window applied.
+from the npm `time` map (kimi). None of the three taken releases was withdrawn
+or superseded inside its own window. One earlier release was: v2.3.1 was
+published 2026-11-18 00:17Z and superseded by v2.3.2 77 minutes later, so the
+table uses v2.3.2's own published_at and window.
 
 | Lane | Pin | Found by | Published | Window ended |
 |---|---|---|---|---|
@@ -2348,6 +2350,14 @@ read; (3) 2.6.3's repeated-front-shell-output fix is a TUI frontend change and
 print mode does not use it. The executor still parses the same
 `--output-format stream-json` lines and matches `turn.step.retrying`, which the
 contract gate above re-verified against the real binary.
+
+Two more 2.6.x items are named because they touch uploads, and both are out of
+reach of this lane: since **2.6.2** `/feedback` always attaches the session's
+files, and **2.6.3** bundles a codebase packager and uploader
+(nine new `feedback` source files under `app/auth`). Both are interactive and
+need the managed login, and the lane runs `kimi -p` with no login, no `TUI` and
+no `/feedback` command, so neither can run. The lane starts no server, so the
+2.6.0 server API/WebSocket changes are unused as well.
 
 **Gate re-verification on the fresh v2.3.2 clone (`c0ad18b40`).**
 
@@ -2970,9 +2980,18 @@ is an additional instruction and configuration source, not just outbound
 publication. The v2.2.7 entry above describes all six ("The flag is not the
 whole Console channel") and cites the upstream lines for the config merge and
 for the flag. The bundled catalog names `OPENCODE_API_KEY`;
-saved credentials take precedence over environment credentials. The v2.2.7
-`console_watches` flag is in this tree and the wrapper pins it off. It gates
-the event watches only and is not a Library control.
+saved credentials take precedence over environment credentials.
+
+At v2.3.2 the Library has a **seventh** item, the artifact publisher
+(`packages/core/src/plugin/provider/opencode-artifacts.ts`), and two further
+changes that shrink the six: the skill and instruction lists are only fetched
+when the `/api/v2/config` response carries the
+`x-opencode-instructions-skills` header (`listsHeader`), and the publisher
+needs the `x-opencode-artifacts` header as well as the `artifacts` flag. The
+v2.2.7 `console_watches` flag is in this tree and the wrapper pins it off,
+beside `mcp_events` and `artifacts` since WI#785 (AGN-2). That pin gates the
+event watches, the MCP push-event channel and the publisher; it is not a
+Library control, and the managed policy remains the control for all seven.
 
 **What was read at which pin.** This section was written at the v2.2.6 pin
 (`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`), before the lane moved. The
