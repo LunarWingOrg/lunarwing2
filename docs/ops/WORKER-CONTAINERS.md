@@ -2515,9 +2515,10 @@ still silences the updater, and `scripts/check_models_dev_snapshot.py` exits 0
 against v1.19.6's `script/generate.ts` with the committed snapshot, so the
 WI#467 pin needed no refresh.
 
-**Local image builds (WI#785 AGN-1, 2026-11-20).** Two lanes were built in
-full on this host with `mt-admin build-kimi-worker` and
-`mt-admin build-opencode2-worker` (rootful podman, slim profile):
+**Local image builds (WI#785 AGN-1, 2026-11-20).** All three lanes were built
+in full on this host with `mt-admin build-kimi-worker`,
+`mt-admin build-opencode2-worker` and `mt-admin build-opencode-worker`
+(rootful podman, slim profile):
 
 - **kimi:** 35/35 steps, `Successfully tagged
   localhost/lunarwing-worker-kimi:latest`; the in-image `kimi --version` is
@@ -2528,6 +2529,11 @@ full on this host with `mt-admin build-kimi-worker` and
   WI#425 out-of-band verification (**PASSED**: full Env and runtime config
   clean, checkout-owned files clean, shared tar/config exposure policy clean)
   as `lunarwing-worker-opencode2:latest`.
+- **opencode v1:** 18 builder steps plus the runtime stages, tagged
+  `localhost/lunarwing-worker-opencode:latest`; the builder's own smoke test
+  printed `Smoke test passed: v1.19.6` and the in-image
+  `/usr/local/bin/opencode --version` reports **v1.19.6**. This lane's build
+  function has no out-of-band step (that is opencode2 only).
 
 The first opencode2 attempt failed at `exposure_policy_assert.py
 --image-filesystem` because the build's `LUNARWING_WRAPPER_SHA256` anchor was
@@ -2557,9 +2563,8 @@ decode, so the managed file's nine statements are still exactly the enforced
 set.
 
 **Still not performed locally, left to CI/deployment acceptance.** No
-`build-opencode-worker` (v1 lane) ran in this pass, so v1.19.6 has no in-image
-build here; no candidate-vs-clean-rebuild digest comparison ran; and none of
-the protected `worker-*-candidate`/`worker-*-scan`/
+candidate-vs-clean-rebuild digest comparison ran for any lane, and none of the
+protected `worker-*-candidate`/`worker-*-scan`/
 `worker-opencode2-exposure-verify` jobs ran on this branch. No tenant rollout,
 no live-model dispatch and no v1.19.6 live dispatch ran.
 
