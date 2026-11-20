@@ -469,9 +469,13 @@ public-only validating proxy:
   pairs and their order are checked, not where the connect falls between them.
   A simulated refusal to set a client context exercises probe failure: the
   rejected socket is removed before retrying, the second candidate can win,
-  and two probe refusals leave no socket before the unlabeled fallback. Other
-  cases cover listener-context write failures, filesystem bind collisions and
-  the unlabeled path with no selinuxfs. Both permissive `0` and enforcing `1`
+  and two probe refusals leave no socket before the unlabeled fallback. A
+  refused bind is also checked to clear the create context, with the stale
+  entry still present when the clear is written, and a label thread that
+  panics after the bind is shown to leave the unlabeled socket connectable
+  (its orphaned entry is removed before the fallback). Other cases cover
+  listener-context write failures, filesystem bind collisions and the
+  unlabeled path with no selinuxfs. Both permissive `0` and enforcing `1`
   trigger labeling, but these tests do not verify real SELinux context writes
   or access decisions. WI#641 still needs the sandbox shell check on an
   enforcing host.

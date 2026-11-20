@@ -506,6 +506,10 @@ mod tests {
         // One-based write numbers, including clears: a listener and a client
         // can use the same context string.
         refused_writes: &'static [usize],
+        // A write number to die on, to model a label thread that panics after
+        // the bind. The write is recorded and the lock released first, so the
+        // trace stays readable and no mutex is poisoned.
+        panic_at: Option<usize>,
         writes: Arc<Mutex<Vec<SockcreateWrite>>>,
     }
 
@@ -515,12 +519,18 @@ mod tests {
                 enforce,
                 socket: socket.to_owned(),
                 refused_writes: &[],
+                panic_at: None,
                 writes: Arc::default(),
             }
         }
 
         fn refusing(mut self, writes: &'static [usize]) -> Self {
             self.refused_writes = writes;
+            self
+        }
+
+        fn panicking(mut self, write: usize) -> Self {
+            self.panic_at = Some(write);
             self
         }
 
@@ -552,13 +562,19 @@ mod tests {
         }
 
         fn write_sockcreate(&self, value: &str) -> std::io::Result<()> {
-            let mut writes = self.writes.lock().unwrap();
-            writes.push(SockcreateWrite {
-                value: value.to_owned(),
-                socket_exists: self.socket.exists(),
-                thread: std::thread::current().name().map(str::to_owned),
-            });
-            if self.refused_writes.contains(&writes.len()) {
+            let number = {
+                let mut writes = self.writes.lock().unwrap();
+                writes.push(SockcreateWrite {
+                    value: value.to_owned(),
+                    socket_exists: self.socket.exists(),
+                    thread: std::thread::current().name().map(str::to_owned),
+                });
+                writes.len()
+            };
+            if self.panic_at == Some(number) {
+                panic!("scripted sockcreate panic");
+            }
+            if self.refused_writes.contains(&number) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     SCRIPTED_REFUSAL,
@@ -780,6 +796,10 @@ mod tests {
         assert!(socket.is_dir(), "remove_file cannot unlink a directory");
     }
 
+    // AHH-2: the clear after a refused bind is asserted, with the stale
+    // entry still on disk when it is written. Without that write the daemon
+    // would bind the next candidate under no context at all, not under the
+    // next one.
     #[tokio::test]
     async fn a_stale_socket_is_removed_after_a_refused_bind() {
         let directory = tempfile::tempdir().unwrap();
@@ -787,9 +807,37 @@ mod tests {
         // Closing a Unix listener does not remove its filesystem entry.
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
         let nodes = RecordingLabelNodes::new(&socket, Some("1"));
+        let [first, second] = RELAY_SOCKET_CONTEXTS;
+        let [client_with_categories, client_base] = SIMULATED_CLIENT_CONTEXTS;
 
-        let (listener, label) = bind_relay_listener_with(nodes, &socket).unwrap();
-        assert_eq!(label, Some(RELAY_SOCKET_CONTEXTS[1]));
+        let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+        assert_eq!(label, Some(second));
+        nodes.assert_label_thread_writes(&[
+            (first, true), // the stale entry refuses this bind
+            ("\n", true),  // cleared before the cleanup runs
+            (second, false),
+            ("\n", true),
+            (client_with_categories, true),
+            ("\n", true),
+            (client_base, true),
+            ("\n", true),
+        ]);
+        assert_relay_connectable(&socket, &listener).await;
+    }
+
+    // AHH-3: a label thread that dies after binding leaves its socket file
+    // behind. Without the cleanup in `bind_labeled_on_own_thread`, the
+    // unlabeled fallback would fail with `EADDRINUSE` instead of recovering.
+    #[tokio::test]
+    async fn a_panicked_label_thread_falls_back_to_the_unlabeled_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("proxy.sock");
+        // The second write is the listener's clear, i.e. after the bind.
+        let nodes = RecordingLabelNodes::new(&socket, Some("1")).panicking(2);
+
+        let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
+        assert_eq!(label, None, "a dead label thread must not keep its label");
+        nodes.assert_label_thread_writes(&[(RELAY_SOCKET_CONTEXTS[0], false), ("\n", true)]);
         assert_relay_connectable(&socket, &listener).await;
     }
 
