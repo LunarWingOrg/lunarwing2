@@ -42,26 +42,44 @@ class ArtifactRetentionGateTests(unittest.TestCase):
 
     def test_unbounded_expiry_is_rejected_even_with_the_backstop(self):
         merged = {**BACKSTOP, "job": {"artifacts": {"expire_in": "never"}}}
-        self.assertTrue(any("job declares artifacts" in error for error in retention_errors(merged)))
+        errors = retention_errors(merged)
+        self.assertTrue(any("job declares artifacts" in error for error in errors))
 
     def test_rootfs_tar_must_expire_within_two_days(self):
-        for path in ("opencode2-rootfs.tar", "lunardepth-rootfs.tar", "opencode2-rootfs-export"):
+        rootfs_paths = (
+            "opencode2-rootfs.tar",
+            "lunardepth-rootfs.tar",
+            "opencode2-rootfs-export",
+        )
+        for path in rootfs_paths:
             with self.subTest(path=path):
-                merged = {**BACKSTOP, "candidate": {"artifacts": {"expire_in": "30 days", "paths": [path]}}}
+                merged = {
+                    **BACKSTOP,
+                    "candidate": {"artifacts": {"expire_in": "30 days", "paths": [path]}},
+                }
                 self.assertTrue(
                     any("rootfs tar" in error for error in retention_errors(merged))
                 )
-        ok = {**BACKSTOP, "candidate": {"artifacts": {"expire_in": "2 days", "paths": ["worker-rootfs.tar"]}}}
+        ok = {
+            **BACKSTOP,
+            "candidate": {"artifacts": {"expire_in": "2 days", "paths": ["worker-rootfs.tar"]}},
+        }
         self.assertEqual(retention_errors(ok), [])
 
     def test_evidence_must_be_kept_at_least_90_days(self):
         for evidence in config.EVIDENCE_ARTIFACT_NAMES:
             with self.subTest(evidence=evidence):
-                merged = {**BACKSTOP, "scan": {"artifacts": {"expire_in": "30 days", "paths": [evidence]}}}
+                merged = {
+                    **BACKSTOP,
+                    "scan": {"artifacts": {"expire_in": "30 days", "paths": [evidence]}},
+                }
                 self.assertTrue(
                     any("evidence" in error for error in retention_errors(merged))
                 )
-                kept = {**BACKSTOP, "scan": {"artifacts": {"expire_in": "90 days", "paths": [evidence]}}}
+                kept = {
+                    **BACKSTOP,
+                    "scan": {"artifacts": {"expire_in": "90 days", "paths": [evidence]}},
+                }
                 self.assertEqual(retention_errors(kept), [])
 
     def test_extends_inherits_a_bounded_expiry(self):
