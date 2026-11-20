@@ -15,6 +15,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
 * Updated on October 1st, 2026 for the v2.1.4.0 pre-release pass: indexed the new tenant system-prompts guide (WI#220); release index now points at v2.1.3.0 as latest.*
 * Updated on October 5th, 2026 for the v2.1.5.0 pre-release pass: release index now points at v2.1.4.0 as latest; new v2.1.5.0 ops docs (cargo-deny audit, open work-item status) indexed under [`ops/README.md`](ops/README.md).*
+* Updated on November 20th, 2026 for WI#794: [`plans/REORG.md`](plans/REORG.md) is now the active plan index; delivered and dated plans moved to [`plans/history/`](plans/history/README.md) with status banners, and inbound plan links updated.*
 
 ## Companion applications
 
