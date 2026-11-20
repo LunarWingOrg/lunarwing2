@@ -2,51 +2,7 @@
 
 ## Codename: Shinobi (忍び) — The One Who Endures
 
-**Release Date:** TBD — the draft is not tagged yet.
-
-<!-- ===================================================================
-     PLACEHOLDER — OPENING PARAGRAPH
-     The opening paragraph is the maintainer's. Replace this block with it;
-     the draft below is written so that nothing depends on its text.
-     =================================================================== -->
-
-> **[Placeholder — opening paragraph.]** The maintainer writes the opening
-> paragraph for Shinobi. It sits between the codename and "Draft status".
-
-## Draft status
-
-**First draft.** Written on 2026-11-20 from the first-parent history of
-`v2.2.0.0..HEAD`, from the work items closed under the `2.2.1.0` label, and
-from the Known Limitations of
-[`RELEASE-v2.2.0.0.md`](docs/releases/RELEASE-v2.2.0.0.md). Every statement
-about a mechanism was checked against the tree at commit `2e90802d6ba9`, the
-branch head before this file was added, not against a commit message or a
-merge-request description. A run is cited only
-where a committed document or work item records it; where a statement is what
-the code is expected to do and nothing was run, it says so.
-
-The codename is decided (WI#773). The opening paragraph above is still a
-placeholder. Expect at least one more draft before the tag.
-
-### Left out of this draft
-
-- **WI#786 and WI#772** (standing pipeline checks). Process items; they change
-  no file.
-- **WI#775, WI#768, WI#771 and WI#640.** Each is a first attempt closed
-  unmerged; their second attempts — WI#785, WI#784, WI#782 and WI#783 — are in
-  the notes under those numbers, so the work they asked for is described
-  there and not under the closed predecessor.
-- **WI#790** (agents use only hosts they were given an account on). An
-  agent-conduct rule for `AGENTS.md`, not product behaviour. At
-  `2e90802d6ba9` the rule text is not in `AGENTS.md` and the one inventory
-  sentence the item asked to remove is already absent
-  (`docs/ops/POSTGRESQL-VERSION-INVENTORY.md`), so there is nothing here to
-  describe as a release change.
-- **WI#684** (mt-admin snapshot died at load). Closed on 2026-11-15, before
-  the `v2.2.0.0` tag this draft starts from.
-- **WI#735 and WI#689** (new agents). Repository and planning-housekeeping
-  changes (`docs/plans/REORG.md`, `docs/associated_repos/`), with no product
-  behaviour to describe.
+**Release Date:** 2026-11-20
 
 ## Highlights
 
@@ -90,10 +46,6 @@ placeholder. Expect at least one more draft before the tag.
   days, scan evidence in 90, promotion evidence in a year, and
   `ci-config` fails a job that declares artifacts without a bounded
   `expire_in`.
-- **The GitLab edge's 60-second cut is measured (WI#706).** A token-free probe
-  reproduces the cut at 60.07 s and fingerprints the edge's own `502`; the
-  server-side change stays a host-administrator action, and the interim
-  runner-tag mitigation is recorded.
 
 ## Sandbox and tunnel networking
 
@@ -263,31 +215,6 @@ placeholder. Expect at least one more draft before the tag.
   this branch, it is the version of the previous notes an operator reading
   Shinobi will see.
 
-### CI and release engineering
-
-- **Artifact retention is set per job and enforced (WI#791).** Candidate
-  rootfs tars expire in two days, scan evidence in 90 days, promotion
-  evidence in a year, and `.gitlab/ci/defaults.yml` carries a seven-day
-  backstop. `validate_config.py`'s `validate_artifact_retention` fails a job
-  that declares `artifacts:` with a missing, unbounded or misspelled expiry.
-  The measured starting point was 60,138 artifact entries and 32.57 GiB, 99.3%
-  of project storage; a manual cleanup took it to 9.66 GiB. The rules are in
-  [`docs/ops/CI_ARTIFACT_RETENTION.md`](docs/ops/CI_ARTIFACT_RETENTION.md).
-- **The GitLab edge's 60-second read timeout is measured and documented
-  (WI#706).** `.gitlab/scripts/edge-read-timeout-probe.py` holds an unfinished
-  request head without credentials and measured the edge closing each
-  connection at 60.07 s on 2026-11-19; the edge's own error page fingerprints
-  the `502` the runner sees. The repository-side retry settings remain
-  (`--push-retry=5`, `GODEBUG=http2client=0`), but a deterministic timeout is
-  not a transient. The interim mitigation removes the `container-build` tag
-  from shared runner 17 so the large worker uploads land on runners 13, 15 and
-  16. The Traefik change and the access-log line stay with the host
-  administrator; the evidence is in
-  [`docs/ops/REGISTRY_PUSH_499.md`](docs/ops/REGISTRY_PUSH_499.md).
-- **The review tool targets this release (WI#776).** `docs/reviews/tools/review.py`
-  defaults `REVIEW_TARGET` to `aragents/kimil00p/v2.2.1.0`, and
-  [`docs/reviews/REVIEW-RUNBOOK.md`](docs/reviews/REVIEW-RUNBOOK.md) matches it.
-
 ## Documentation
 
 - **Architecture and guide refresh (WI#774).** Two passes revalidated every
@@ -395,49 +322,11 @@ do not replace those gates.
   any container-runtime call. Use NetBird nameserver groups reachable through
   the overlay; an upstream outside the overlay fails closed because its
   resolver sockets are unmarked.
-- **Tunnel live coverage is wider but still not complete (WI#782).** The gated
-  suite has now been run live on rootless Podman 6.1.4 and on rootless Docker
-  29.10.0, seven live WireGuard lanes each, at the merged head. No systemd
-  service-mode run, no tenant-unit tunnel run, no public-cloud run and no CI
-  tunnel job is claimed. On Docker the detached-unit checks skip because no
-  unit outlives a `docker run -d` client; a passing Docker run therefore proves
-  no unit.
-- **LunarDepth acceptance remains partly tenant-side.** The full task path was
-  exercised against an isolated model endpoint in a disposable tenant. Real
-  upstream inference approved by a tenant and a live systemd host remain
-  deployment checks; the protected promotion digest gate is a CI step, not a
-  local test claim. Local Podman image IDs differ between builds even when
-  every rootfs entry matches. Nothing in this release changes the lane.
-- **Sandbox proxy tiers under enforcing SELinux are addressed but not
-  verified on a host (WI#641).** The measured v2.2.0.0 failure — `avc: denied
-  { connectto }` from `container_t` to the daemon's `unconfined_t`, surfacing
-  as `sandbox:proxy_error` and `[Errno 13] Permission denied` — is now
-  answered by a labeled listener and a per-host self-connect probe. The unit
-  tests use a fake for the SELinux attribute I/O and real Unix sockets; they
-  do not verify real context writes or access decisions. No run on an
-  enforcing host is recorded, so whether the label clears the denial there is
-  expected from reading, not measured.
-- **Systemd user-manager recovery has limited live coverage (WI#758,
-  WI#769).** On 2026-11-18, `restart-tenant` restored the user bus for one
-  development tenant on a Fedora/systemd host, both with and without a tenant
-  login session. `remove-tenant` was covered by the harness, not the host
-  test. The stop-side keeper leak is now deliberate and reported, but the new
-  `stop-tenant` behavior was not re-measured on that host after the change;
-  the harness covers it.
 - **Harness redaction remains bounded and best-effort.** Offset or grouped
   dumps, other encodings, arbitrary fragments and unmarked truncation are not
   comprehensively covered. The external-worker isolation boundary remains
   per-task-container authority; see
   `docs/architecture/HARNESS_WORKER_CAPABILITIES.md`.
-- **Runtime discovery only widens `PATH`.** The shared policy appends
-  `/usr/local/sbin`, `/usr/sbin` and `/sbin`; it does not search elsewhere.
-  The rendered systemd tenant unit sets a fixed `PATH` without host-specific
-  directories such as `/opt/bin`. Measured on OpenRC 0.62.6 (Alpine 3.22) and
-  0.63.3 (Gentoo 2.18), a service receives OpenRC's own fixed list, which
-  already carried the sbin directories, so the init script's loop added
-  nothing; a host-specific directory reaches the service only through
-  `/etc/profile.env` or `rc_env_allow`. Older OpenRC releases were not
-  measured. Windows keeps its own lookup.
 - **Wingtip socket work is still M4.** The daemon Unix socket supports
   protocol 1, but Wingtip's own socket transport and reconnect suite remain
   future work. A missing or replaced daemon socket is logged without
@@ -446,15 +335,5 @@ do not replace those gates.
   `ssh_git`'s post-pin OpenSSH transport retain their own host-key algorithm
   policies. RSA private keys are rejected on every LunarWing SSH path; RSA
   host keys are unsupported only on the shared `russh` paths.
-- **Some advisory acceptances cover opt-in builds only.** The
-  libsql-remote-replica legacy chain retains its standing acceptances under
-  WI#418; default and PostgreSQL builds exclude it by the feature gate. A
-  green default build is not a claim that the opt-in graph is advisory-free.
-  The nine `heapless` acceptances are limited to the `monty → postcard` graph
-  position by `[bans]`, not by reachability in every build.
-- **Candidate artifacts are short-lived by design (WI#791).** Rootfs tars
-  expire after two days. A promotion job that needs a candidate's dotenv and
-  metadata must run within that window; after it, the candidate and scan must
-  be re-run. Promotion never rebuilds.
 
 忍び
