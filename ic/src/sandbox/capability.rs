@@ -242,20 +242,15 @@ impl CapabilityManifest {
                 ),
             ));
         }
-        self.network
-            .validate(config)
-            .and_then(|()| self.filesystem.validate(&config.policy))
-            .and_then(|()| {
-                if config.policy == SandboxPolicy::FullAccess {
-                    Err(manifest_error(
-                        "filesystem",
-                        "manifest execution does not support FullAccess; use the explicit compatibility policy",
-                    ))
-                } else {
-                    Ok(())
-                }
-            })
-            .and_then(|()| self.validate_secrets_and_extensions())
+        self.network.validate(config)?;
+        if config.policy == SandboxPolicy::FullAccess {
+            return Err(manifest_error(
+                "filesystem",
+                "manifest execution does not support FullAccess; use the explicit compatibility policy",
+            ));
+        }
+        self.filesystem.validate(&config.policy)?;
+        self.validate_secrets_and_extensions()
     }
 
     fn validate_secrets_and_extensions(&self) -> Result<()> {
@@ -403,7 +398,7 @@ impl FilesystemCapabilityRequest {
             .iter()
             .chain(&self.read_write)
             .collect::<Vec<_>>();
-        if requested.len() > 1 || requested.is_empty() && !self.read_only.is_empty() {
+        if requested.len() != 1 {
             return Err(manifest_error(
                 "filesystem",
                 "version 1 supports one virtual /workspace mount, not arbitrary host mounts",
@@ -797,6 +792,23 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn empty_workspace_mode_is_not_silently_broadened() {
+        for value in [
+            serde_json::json!({"manifest_version":1,"filesystem":{"read_only":[],"read_write":[]}}),
+            serde_json::json!({"manifest_version":1,"filesystem":{"read_only":[null],"read_write":[]}}),
+        ] {
+            let parsed = CapabilityManifest::from_value(value);
+            if let Ok(manifest) = parsed {
+                assert!(
+                    manifest
+                        .validate(&crate::sandbox::SandboxConfig::default())
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

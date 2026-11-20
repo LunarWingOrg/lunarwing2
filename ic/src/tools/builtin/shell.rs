@@ -719,13 +719,12 @@ impl ShellTool {
         timeout: Duration,
         manifest: Option<&crate::sandbox::CapabilityManifest>,
     ) -> Result<ShellCommandOutput, ToolError> {
-        let result = if let Some(manifest) = manifest {
-            sandbox
-                .execute_with_manifest(cmd, workdir, &manifest, std::collections::HashMap::new())
-                .await
-        } else {
-            // Override sandbox config timeout if needed
-            tokio::time::timeout(timeout, async {
+        let execute = async {
+            if let Some(manifest) = manifest {
+                sandbox
+                    .execute_with_manifest(cmd, workdir, manifest, std::collections::HashMap::new())
+                    .await
+            } else {
                 sandbox
                     .execute_with_policy(
                         cmd,
@@ -734,15 +733,14 @@ impl ShellTool {
                         std::collections::HashMap::new(),
                     )
                     .await
-            })
-            .await
-            .map_err(|_| {
-                ToolError::Sandbox(format!(
-                    "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
-                     the container was killed and nothing ran on the host"
-                ))
-            })?
+            }
         };
+        let result = tokio::time::timeout(timeout, execute).await.map_err(|_| {
+            ToolError::Sandbox(format!(
+                "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
+                     the container was killed and nothing ran on the host"
+            ))
+        })?;
 
         match result {
             Ok(output) => Ok(ShellCommandOutput::new(

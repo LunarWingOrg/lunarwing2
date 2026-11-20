@@ -142,6 +142,13 @@ can still carry its input token, but it belongs to the separate bridge
 container and is inaccessible from the task container. See the split
 contract below for IPC and shared-workspace limits.
 
+The separate generic shell's optional version-1 JSON capability manifest does
+not grant any of these worker tokens, worker credentials, container filesystem
+access, or public listener access. Host policy remains authoritative; its
+unsupported secret references, paths, providers, and extensions fail closed.
+See `docs/guides/SANDBOX_CAPABILITY_MANIFEST.md` and the scope boundary in
+`ic/src/NETWORK_SECURITY.md` before granting new capabilities.
+
 Each lane enforces the strip at its task-process boundary:
 
 - **Kimi** — the executor deletes `AGENT_AUTH_TOKEN` from the assembled
