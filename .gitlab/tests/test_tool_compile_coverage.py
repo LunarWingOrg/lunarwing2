@@ -21,11 +21,11 @@ spec.loader.exec_module(config)
 
 
 def deliverable(name="tool-x", status="production", manifest="ic/tools-src/x/Cargo.toml",
-                ci=("standalone-deliverables", "wasm-tools-check")):
+                ci=("standalone-deliverables", "wasm-tools-check"), triggers=("ic/tools-src/x/**",)):
     return {
         "name": name, "status": status, "owner": "tools", "manifest": manifest,
         "lockfile": manifest.replace("Cargo.toml", "Cargo.lock"),
-        "targets": [name], "ci": list(ci), "triggers": ["ic/tools-src/x/**"],
+        "targets": [name], "ci": list(ci), "triggers": list(triggers),
     }
 
 
@@ -125,6 +125,76 @@ class ToolCompileCoverageTests(unittest.TestCase):
         errors = []
         config.validate_tool_compile_coverage(merged, errors)
         self.assertEqual(errors, [])
+
+
+class WasmToolsCheckShapeTests(unittest.TestCase):
+    """The job itself must stay blocking, run the runner, and see every tool."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.inventory = self.root / "deliverables.json"
+        self.write_inventory([deliverable(triggers=["ic/tools-src/x/**"])])
+        self.job = {
+            "extends": ".rust-job",
+            "stage": "test",
+            "script": ["rustup target add --toolchain 1.96.1 wasm32-wasip2",
+                       "python3 .gitlab/scripts/wasm-tools-check.py"],
+            "rules": [
+                {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"',
+                 "changes": ["ic/tools-src/**"]},
+                {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+            ],
+        }
+        self.jobs = {".rust-job": {"before_script": ["bash .gitlab/scripts/bootstrap-rust.sh"]},
+                     "wasm-tools-check": self.job}
+
+    def write_inventory(self, entries):
+        self.inventory.write_text(json.dumps({"schema": 1, "deliverables": entries}), encoding="utf-8")
+
+    def errors(self):
+        errors = []
+        with mock.patch.object(config, "DELIVERABLES", self.inventory):
+            config.validate_wasm_tools_check_shape(self.jobs, errors)
+        return errors
+
+    def test_committed_shape_passes(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_missing_job_fails(self):
+        self.jobs.pop("wasm-tools-check")
+        self.assertTrue(any("job missing" in error for error in self.errors()))
+
+    def test_allow_failure_fails(self):
+        self.job["allow_failure"] = True
+        self.assertTrue(any("blocking" in error for error in self.errors()))
+
+    def test_runner_step_required(self):
+        self.job["script"] = ["echo nothing"]
+        errors = self.errors()
+        self.assertTrue(any("wasm-tools-check.py" in error for error in errors), errors)
+
+    def test_wasm_target_required(self):
+        self.job["script"] = ["python3 .gitlab/scripts/wasm-tools-check.py"]
+        self.assertTrue(any("wasm32-wasip2" in error for error in self.errors()))
+
+    def test_rust_bootstrap_required(self):
+        self.job.pop("extends")
+        self.assertTrue(any(".rust-job" in error for error in self.errors()))
+
+    def test_mr_rule_needs_changes_globs(self):
+        self.job["rules"] = [{"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'}]
+        self.assertTrue(any("changes: globs" in error for error in self.errors()))
+
+    def test_trigger_outside_the_changes_globs_fails(self):
+        self.write_inventory([deliverable(triggers=["darkirc_channel_for_lunarwing/**"])])
+        errors = self.errors()
+        self.assertTrue(any("do not cover trigger" in error for error in errors), errors)
+
+    def test_nested_trigger_glob_is_covered(self):
+        self.write_inventory([deliverable(triggers=["ic/tools-src/x/src/**"])])
+        self.assertEqual(self.errors(), [])
 
 
 if __name__ == "__main__":

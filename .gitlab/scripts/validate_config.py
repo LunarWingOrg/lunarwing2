@@ -2849,6 +2849,67 @@ def _script_text(script: object) -> str:
     return ""
 
 
+def pattern_covers(pattern: str, sample: str) -> bool:
+    """Whether a `changes:` glob admits a representative path from `pattern`.
+
+    A tool's `triggers` name its paths (``ic/tools-src/gitlab/**``); the job
+    must run when one of them changes. ``**`` is stood in for by a nested
+    path so both sides compare as plain globs.
+    """
+    return fnmatch.fnmatchcase(sample.replace("**", "x/x"), pattern)
+
+
+def validate_wasm_tools_check_shape(merged: dict, errors: list[str]) -> None:
+    """Pin wasm-tools-check so the gate cannot degrade silently (WI#809).
+
+    The job must be blocking, inherit the Rust bootstrap, run the plan-driven
+    runner in the test stage, and its MR `changes:` globs must cover every
+    production tool's declared triggers — otherwise a tool edit would skip
+    the very job meant to compile it.
+    """
+    job = merged.get(WASM_TOOL_PLAN_JOB)
+    if not isinstance(job, dict):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} job missing")
+        return
+    effective = resolve_extends(job, merged)
+    if effective.get("allow_failure") is True or effective.get(EXTENDS_TRUNCATED_KEY):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must be blocking")
+    if not extends_template(job, ".rust-job"):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must extend .rust-job for the pinned Rust bootstrap")
+    if effective.get("stage") != "test":
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must run in the test stage")
+    script = _script_text(effective.get("script"))
+    if WASM_TOOL_PLAN_RUNNER not in script:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must run {WASM_TOOL_PLAN_RUNNER}")
+    if "wasm32-wasip2" not in script:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must install the wasm32-wasip2 target")
+    changes: list[str] = []
+    for rule in effective.get("rules") or []:
+        if isinstance(rule, dict) and "merge_request_event" in str(rule.get("if", "")):
+            changes.extend(glob for glob in rule.get("changes") or [] if isinstance(glob, str))
+    if not changes:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} needs an MR rule with changes: globs")
+    if not DELIVERABLES.is_file():
+        return
+    try:
+        data = json.loads(DELIVERABLES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    for entry in data.get("deliverables", []):
+        if not isinstance(entry, dict) or entry.get("status") != "production":
+            continue
+        if WASM_TOOL_PLAN_JOB not in (entry.get("ci") or []):
+            continue
+        for trigger in entry.get("triggers") or []:
+            if not isinstance(trigger, str):
+                continue
+            if not any(pattern_covers(glob, trigger) for glob in changes):
+                errors.append(
+                    f"{WASM_TOOL_PLAN_JOB} changes: globs do not cover trigger "
+                    f"{trigger!r} of production tool {entry.get('name')!r}"
+                )
+
+
 def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
     if not DELIVERABLES.is_file():
         errors.append(".gitlab/deliverables.json missing")
@@ -3683,6 +3744,7 @@ def main() -> int:
     validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_tool_compile_coverage(merged_config, errors)
+    validate_wasm_tools_check_shape(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     validate_worker_snapshots(merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
