@@ -50,6 +50,18 @@ class WasmtimeSecurityFloorTests(unittest.TestCase):
             [entry["id"] for entry in policy["advisories"]["ignore"]],
         )
 
+    def test_policy_bans_wasi_releases_below_the_sandbox_escape_fix(self):
+        # RUSTSEC-2026-0587 names wasmtime-wasi and is fixed in 36.0.22.
+        policy = tomllib.loads((ROOT / "ic/deny.toml").read_text(encoding="utf-8"))
+        self.assertIn(
+            {"name": "wasmtime-wasi", "version": ">=36.0.0, <36.0.22"},
+            policy["bans"]["deny"],
+        )
+        self.assertNotIn(
+            "RUSTSEC-2026-0587",
+            [entry["id"] for entry in policy["advisories"]["ignore"]],
+        )
+
     def test_both_lockfiles_keep_the_patched_cache_and_zstd_chain(self):
         for relative in ("ic/Cargo.lock", "ic/bridges/xmpp-bridge/Cargo.lock"):
             with self.subTest(lockfile=relative):
@@ -58,6 +70,7 @@ class WasmtimeSecurityFloorTests(unittest.TestCase):
                 )["package"]
                 for name, floor in (
                     ("wasmtime", (36, 0, 20)),
+                    ("wasmtime-wasi", (36, 0, 22)),
                     ("zstd", (0, 14, 3)),
                     ("zstd-safe", (8, 2, 0)),
                 ):

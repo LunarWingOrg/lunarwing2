@@ -14,7 +14,7 @@
   records and 4,126 registry pins at `4192ee72b`.
 - **The advisory baseline is 23 acceptances (WI#781, WI#787, WI#788,
   WI#784).** The two Wasmtime IDs accepted on 2026-11-19 are gone: RustSec
-  corrected both records to `unaffected` for the locked `36.0.21` line, so
+  corrected both records to `unaffected` for the locked 36.0.x line, so
   `cargo-deny` reports them as not detected and WI#787 removed them. Nine
   `heapless` unsoundness advisories are accepted for one graph position only,
   and `[bans]` entries now pin both `heapless <0.9.4` and its `postcard`
@@ -127,9 +127,18 @@
 
 - **Wasmtime acceptances removed after the records changed (WI#787).**
   Advisory-db `074ea9a7` marked the records `unaffected` below `39.0.0` and
-  `47.0.0`; the locked `36.0.21` lies below both, so the entries showed as
+  `47.0.0`; the locked 36.0.x release lies below both, so the entries showed as
   `advisory-not-detected`. They are gone from `ic/deny.toml`, and the comment
   says that a re-broken record is a new maintainer decision, not a copy-paste.
+- **Wasmtime moved to `36.0.23` for RUSTSEC-2026-0587.** The advisory,
+  dated 2026-11-19 and in the RustSec database since 2026-11-20, is a WASI
+  filesystem sandbox escape on Windows through a drive-prefixed path
+  component in `wasmtime-wasi`, fixed in `36.0.22`. Both
+  lockfiles that carry Wasmtime moved from `36.0.21` to `36.0.23`, which is
+  `36.0.22` plus a fix to upstream's release workflow. The manifest floors
+  moved to `36.0.22`, the `wasmtime-internal-cache` patch was rebased onto
+  `36.0.23`, and `[bans]` now denies `wasmtime-wasi` below `36.0.22` within
+  the 36.x line. No advisory was accepted for it.
 - **The nine `heapless` advisories are accepted for one graph position
   (WI#781, WI#788).** `heapless 0.7.17` reaches the locks only through
   `postcard 1.1.3`'s default `heapless-cas` feature, pulled by `monty 0.0.17`;
@@ -244,7 +253,7 @@
 | Area | v2.2.1.0 |
 |---|---|
 | Owned packages / core Rust | Eleven packages at `2.2.1`; Rust 2024, MSRV `1.96.1` |
-| WASM runtime | Wasmtime/WASI `36.0.21` in `ic/Cargo.lock` (manifest floor `36.0.20`); the `wasmtime-internal-cache` patch stays on that line |
+| WASM runtime | Wasmtime/WASI `36.0.23` in `ic/Cargo.lock` (manifest floor `36.0.22`); the `wasmtime-internal-cache` patch stays on that line |
 | Channel registry | darkirc `0.1.17`, multica `0.1.21`, weechat `0.2.18`, xmpp `0.1.23` |
 | Tool registry | cavepony-tool `0.4.12`, gitlab `0.1.16`, gotify `0.1.8`, llm-context `0.1.10`, multica-bridge `0.1.11`, ssh `0.1.9`, vision-analyze `0.2.3`, voice-transcribe `0.1.9`, web-search `0.2.11` |
 | External workers | Kimi Code `2.6.3`, OpenCode `v1.19.6`, OpenCode 2 `v2.3.2`, Pebble `2d0f3786…`, LunarDepth `0472d115…` |
