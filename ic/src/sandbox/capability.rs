@@ -418,6 +418,15 @@ impl FilesystemCapabilityRequest {
 }
 
 fn validate_virtual_mount(path: &Path) -> Result<()> {
+    if path.as_os_str() != "/workspace" {
+        return Err(manifest_error(
+            "filesystem",
+            format!(
+                "refusing '{}': only the exact virtual path /workspace is supported; ambiguous or relative paths are not accepted",
+                path.display()
+            ),
+        ));
+    }
     let mut components = path.components();
     if components.next() != Some(Component::RootDir)
         || components.next() != Some(Component::Normal("workspace".as_ref()))
@@ -875,6 +884,19 @@ mod tests {
         )
         .unwrap();
         assert!(decision.evidence.filesystem.source.is_absolute());
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(temp.path().join("private")).unwrap();
+            std::os::unix::fs::symlink(temp.path().join("private"), temp.path().join("hostcwd"))
+                .unwrap();
+            let config = crate::sandbox::SandboxConfig {
+                protected_paths: vec![temp.path().join("private")],
+                ..crate::sandbox::SandboxConfig::default()
+            };
+            let error = authorize_manifest(&minimal(), &config, &temp.path().join("hostcwd"))
+                .expect_err("host symlink must be canonicalized and refused");
+            assert!(matches!(error, SandboxError::MountPathDenied { .. }));
+        }
         let destination = decision
             .evidence
             .filesystem
@@ -901,6 +923,34 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("secrets"), "{error}");
         }
+    }
+
+    #[test]
+    fn tunnel_provider_and_dns_must_match_the_host_policy() {
+        let tunnel = crate::sandbox::TunnelSidecarConfig::default();
+        let config = crate::sandbox::SandboxConfig {
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel),
+            ..crate::sandbox::SandboxConfig::default()
+        };
+        let tunnel_manifest = serde_json::from_value::<CapabilityManifest>(serde_json::json!({
+            "manifest_version":1,
+            "network":{"mode":"tunnel","overlay":"netbird","dns":"provider"}
+        }))
+        .unwrap();
+        assert!(tunnel_manifest.validate(&config).is_ok());
+        let mut conflict = tunnel_manifest.clone();
+        conflict.network.overlay = Some(NetworkProvider::Netbird);
+        assert!(
+            conflict
+                .validate(&crate::sandbox::SandboxConfig::default())
+                .is_err()
+        );
+        conflict.network.overlay = Some(NetworkProvider::Wireguard);
+        assert!(conflict.validate(&config).is_err());
+        let mut disabled = tunnel_manifest;
+        disabled.network.dns = DnsRequestMode::Disabled;
+        assert!(disabled.validate(&config).is_err());
     }
 
     #[test]

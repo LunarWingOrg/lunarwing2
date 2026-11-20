@@ -304,8 +304,9 @@ impl SandboxManager {
     pub fn authorize_manifest(
         &self,
         manifest: &crate::sandbox::CapabilityManifest,
-        cwd: &Path,
+        cwd: impl AsRef<Path>,
     ) -> Result<crate::sandbox::CapabilityDecision> {
+        let cwd = cwd.as_ref();
         crate::sandbox::authorize_manifest(manifest, &self.config, cwd)
     }
 
