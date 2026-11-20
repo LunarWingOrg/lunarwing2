@@ -3742,9 +3742,10 @@ auto-approval:
   (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
   `wipefs`, block-device writes), fork bombs, remote-content-piped-to-shell,
   recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
-  recursive/forced `rm` outside temp roots. Unparseable payloads deny.
-  `/app/config` and `/app/hooks` are read-only to the runtime user, so a
-  task cannot edit its own guard.
+  recursive/forced `rm` outside temp roots. Newlines split command segments,
+  and short `rm` recursive/force flags accept lowercase or uppercase spellings
+  (WI#795). Unparseable payloads deny. `/app/config` and `/app/hooks` are
+  read-only to the runtime user, so a task cannot edit its own guard.
 - `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
   that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD` or
   `KIMI_CODE_TRUST_WORKSPACE` (unsets both in CLI and bridge mode), and
