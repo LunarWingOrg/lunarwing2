@@ -702,7 +702,7 @@ is harness-covered or unclaimed, not proven.
 | Full gated suite before the WI#782 review follow-up (all WireGuard lanes) | rootless Podman 6.1.4, OpenRC host (2026-11-19, WI#782) | live, 10 reported passes / 0 failures; NetBird gate closed |
 | Full gated suite at the merged head, after the teardown rewrite (all WireGuard lanes and the teardown-wrapper regressions) | rootless Podman 6.1.4, OpenRC host (2026-11-20, WI#782 AHI-1) | live: the 7 WireGuard lanes passed, plus the 6 runtime-free tests; NetBird not run (gate closed); detached-unit checks skipped by design |
 | NetBird 0.82.0 control plane, overlay join, ingress refusal, DNS | rootless Podman 5.8.2, real WireGuard peer (WI#592 / WI#600) | live |
-| The same lane on the Docker CLI fallback | rootless Docker 29.10.0, OpenRC host (2026-11-20, WI#782) | live: the 7 WireGuard lanes and the 6 runtime-free tests passed; NetBird not run (gate closed); detached-unit checks skipped by design |
+| Full gated suite on the Docker CLI fallback | rootless Docker 29.10.0, OpenRC host (2026-11-20, WI#782) | live: the 7 WireGuard lanes and the 6 runtime-free tests passed; NetBird not run (gate closed); detached-unit checks skipped by design |
 | Detached helper unit created and released (`lunarwing-tunnel-<instance>`) | systemd user manager, rootless Podman, service mode | lane gates it; **no service-mode live run recorded** (WI#771, WI#782) |
 | Tenant-unit sandbox command in tunnel mode | dedicated tenant on a systemd user-manager host | **no live run recorded** (WI#782) |
 
