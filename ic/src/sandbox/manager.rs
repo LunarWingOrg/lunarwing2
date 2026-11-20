@@ -143,8 +143,12 @@ impl SandboxManager {
         ))
     }
 
-    /// Initialize the sandbox (detect runtime CLI, verify image, start proxy).
+    /// Initialize enabled host capabilities after manifest authorization.
     pub async fn initialize(&self) -> Result<()> {
+        self.initialize_for_network(self.config.network).await
+    }
+
+    async fn initialize_for_network(&self, network: SandboxNetworkMode) -> Result<()> {
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
@@ -177,7 +181,11 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        let tunnel_start = self.initialize_tunnel().await;
+        let tunnel_start = if network == SandboxNetworkMode::Tunnel {
+            self.initialize_tunnel().await
+        } else {
+            Ok(())
+        };
 
         // Start the network proxy for the proxy-backed egress modes —
         // advisory and enforced both need the validating proxy. The tunnel
@@ -186,7 +194,7 @@ impl SandboxManager {
         // FullAccess manager default with sandboxed per-call policies) use
         // the same never-relaxed proxy ACL.
         if matches!(
-            self.config.network,
+            network,
             SandboxNetworkMode::Proxy | SandboxNetworkMode::ProxyEnforced
         ) {
             let proxy = NetworkProxyBuilder::from_config(&self.config)
@@ -285,6 +293,57 @@ impl SandboxManager {
         policy: SandboxPolicy,
         env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
+        let mut config = self.config.clone();
+        config.policy = policy;
+        let decision = crate::sandbox::compatibility_decision(&config, cwd);
+        self.execute_decision(command, cwd, decision, env).await
+    }
+
+    /// Parse, authorize, and canonicalize a manifest before starting any egress
+    /// service or detecting a container runtime. Every execution reauthorizes.
+    pub fn authorize_manifest(
+        &self,
+        manifest: &crate::sandbox::CapabilityManifest,
+        cwd: &Path,
+    ) -> Result<crate::sandbox::CapabilityDecision> {
+        crate::sandbox::authorize_manifest(manifest, &self.config, cwd)
+    }
+
+    pub async fn execute_with_manifest(
+        &self,
+        command: &str,
+        cwd: &Path,
+        manifest: &crate::sandbox::CapabilityManifest,
+        env: HashMap<String, String>,
+    ) -> Result<ExecOutput> {
+        let decision = crate::sandbox::authorize_manifest(manifest, &self.config, cwd)?;
+        self.execute_decision(command, cwd, decision, env).await
+    }
+
+    async fn execute_decision(
+        &self,
+        command: &str,
+        cwd: &Path,
+        decision: crate::sandbox::CapabilityDecision,
+        env: HashMap<String, String>,
+    ) -> Result<ExecOutput> {
+        let crate::sandbox::CapabilityDecision {
+            policy,
+            network,
+            limits,
+            evidence,
+        } = decision;
+        let audit_json = crate::sandbox::audit_json(&evidence)?;
+        if network != self.config.network {
+            // A reduced request cannot leave a previously initialized wider
+            // transport or shared sidecar attached to this execution.
+            self.shutdown().await;
+        }
+        tracing::info!(capability_audit = %audit_json, "Sandbox capability decision authorized");
+        let declared = evidence.origin == crate::sandbox::capability::CapabilityOrigin::Declared;
+        let network_override = declared.then_some(network);
+        let limits_override = declared.then_some(limits);
+
         // FullAccess policy bypasses the sandbox entirely.
         // Double-check the allow_full_access guard at execution time as well,
         // in case the policy was overridden per-call via execute_with_policy().
@@ -311,7 +370,7 @@ impl SandboxManager {
 
         // Ensure we're initialized
         if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            self.initialize().await?;
+            self.initialize_for_network(network).await?;
         }
 
         // Retry transient container failures (Docker daemon glitches, container
@@ -332,7 +391,14 @@ impl SandboxManager {
             }
 
             match self
-                .try_execute_in_container(command, cwd, policy, env.clone())
+                .try_execute_in_container(
+                    command,
+                    cwd,
+                    policy,
+                    env.clone(),
+                    network_override,
+                    limits_override.as_ref(),
+                )
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -360,7 +426,10 @@ impl SandboxManager {
         cwd: &Path,
         policy: SandboxPolicy,
         env: HashMap<String, String>,
+        network_override: Option<SandboxNetworkMode>,
+        limits_override: Option<&ResourceLimits>,
     ) -> Result<ExecOutput> {
+        let network = network_override.unwrap_or(self.config.network);
         // Containment: the mounted directory is agent-chosen, so refuse any
         // path resolving into the tenant secret directory (or a bare secret
         // file) before the runtime is ever asked to mount it. Fail closed —
@@ -368,7 +437,7 @@ impl SandboxManager {
         let cwd =
             crate::sandbox::mount_guard::validate_mount_dir(cwd, &self.config.protected_paths)?;
 
-        let tunnel_run = if self.config.network == SandboxNetworkMode::Tunnel {
+        let tunnel_run = if network == SandboxNetworkMode::Tunnel {
             let tunnel = self.tunnel.read().await;
             let sidecar = tunnel
                 .as_ref()
@@ -406,12 +475,12 @@ impl SandboxManager {
                     reason: "container runtime not initialized".to_string(),
                 })?;
 
-        let limits = ResourceLimits {
+        let limits = limits_override.cloned().unwrap_or_else(|| ResourceLimits {
             memory_bytes: self.config.memory_limit_mb * 1024 * 1024,
             cpu_shares: self.config.cpu_shares,
             timeout: self.config.timeout,
             max_output_bytes: 64 * 1024,
-        };
+        });
 
         let container_output = runner
             .execute(ExecParams {
@@ -420,7 +489,7 @@ impl SandboxManager {
                 policy,
                 limits: &limits,
                 env: &env,
-                network: self.config.network,
+                network,
                 proxy_port,
                 tunnel: tunnel_run
                     .as_ref()
@@ -1310,6 +1379,142 @@ mod tests {
         second.stop().await;
         assert!(!lock_runtime_state(&state).started);
         std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn manifest_test_manager(
+        state: &std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        network: SandboxNetworkMode,
+    ) -> SandboxManager {
+        let state = state.clone();
+        let runtime = TestRuntime::new(move |args, _stdin| {
+            let state = state.clone();
+            async move {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(args.clone());
+                Ok(fake_output(true, String::new(), String::new()))
+            }
+        });
+        let mut manager = SandboxManager::new(SandboxConfig {
+            network,
+            auto_pull_image: false,
+            tenant_logs: crate::sandbox::config::TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        });
+        manager.test_runner = Some(Arc::new(CliRunner::for_test(
+            ContainerRuntime::Podman,
+            "localhost/sandbox-test:latest".into(),
+            runtime,
+        )));
+        manager
+    }
+
+    #[cfg(unix)]
+    fn manifest_arguments(decision: &crate::sandbox::CapabilityDecision) -> Vec<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = crate::sandbox::cli_runner::RunSpec {
+            runtime: ContainerRuntime::Podman,
+            keep_id: crate::sandbox::cli_runner::KeepIdMode::UidPinned,
+            user: "1000:1000",
+            image: "localhost/sandbox-test:latest",
+            name: "lunarwing-sandbox-manifest-test",
+            created_at_label: "2026-11-20T00:00:00Z",
+            command: "true",
+            working_dir: temp.path(),
+            policy: decision.policy,
+            limits: &decision.limits,
+            env: &HashMap::new(),
+            network: decision.network,
+            proxy_port: 0,
+            tunnel: None,
+            proxy_dir: None,
+            pids_limit: crate::sandbox::config::DEFAULT_PIDS_LIMIT,
+            masked: &[],
+            mask_dir: None,
+            masked_files: &[],
+            mask_file: None,
+            tenant_logs: None,
+        };
+        crate::sandbox::cli_runner::build_run_args(&spec)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_none_and_reduced_limits_reach_container_arguments() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = manifest_test_manager(&state, SandboxNetworkMode::Tunnel);
+        let temp = tempfile::tempdir().unwrap();
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "none"},
+                "resources": {"memory_bytes": 1048576, "cpu_shares": 64, "timeout_seconds": 1}
+            }))
+            .unwrap();
+        let decision = manager.authorize_manifest(&manifest, temp.path()).unwrap();
+        let run = manifest_arguments(&decision);
+        assert!(run.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(run.windows(2).any(|pair| pair == ["--memory", "1m"]));
+        assert!(run.windows(2).any(|pair| pair == ["--cpu-shares", "64"]));
+        assert!(!run.iter().any(|arg| arg.contains("container:")));
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_shutdown_releases_transport_without_side_effects() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = manifest_test_manager(&state, SandboxNetworkMode::None);
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = crate::sandbox::CapabilityManifest {
+            manifest_version: 1,
+            ..Default::default()
+        };
+        let decision = manager.authorize_manifest(&manifest, temp.path()).unwrap();
+        assert_eq!(decision.network, SandboxNetworkMode::None);
+        let _ = manager
+            .execute_with_manifest("true", temp.path(), &manifest, HashMap::new())
+            .await;
+        assert!(manager.is_initialized());
+        manager.shutdown().await;
+        assert!(!manager.is_initialized());
+        assert!(manager.proxy.read().await.is_none());
+        assert!(manager.tunnel.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn denied_manifest_and_retries_never_enter_runtime_cleanup() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = manifest_test_manager(&state, SandboxNetworkMode::None);
+        let temp = tempfile::tempdir().unwrap();
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"}
+            }))
+            .unwrap();
+        for _ in 0..2 {
+            let error = manager
+                .execute_with_manifest("echo denied", temp.path(), &manifest, HashMap::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), "capability_denied");
+            assert!(!is_transient_sandbox_error(&error));
+        }
+        assert!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(!manager.is_initialized());
+        assert_eq!(
+            crate::sandbox::mount_guard::masked_files_for_mount(temp.path(), &[]).len(),
+            0
+        );
+        manager.shutdown().await;
     }
 
     #[test]

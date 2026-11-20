@@ -392,6 +392,28 @@ remove commands with bounded execution and guarded process-tree cleanup. See
 > `lunarwing.job_id` labels). The two must not be wired together; the reaper
 > (`src/orchestrator/reaper.rs`) is the only shared component.
 
+### Declarative capability manifest (WI#797 / WI#752)
+
+The generic shell accepts an optional JSON version-1 `capability_manifest`;
+see [`docs/guides/SANDBOX_CAPABILITY_MANIFEST.md`](../../docs/guides/SANDBOX_CAPABILITY_MANIFEST.md)
+for the schema, owners, precedence, omitted-field rules, migration, and
+rollback. A present manifest defaults network and secrets to none and cannot
+select FullAccess or bypass an absent/disabled sandbox. The host policy decides
+whether to grant a network reduction, existing enforced network mode, or
+narrower resource limits before runtime or egress setup; unknown versions and
+keys, selector conflicts, and unsupported secret/extension requests fail closed.
+The canonical host workspace and protected-path checks are retained. Each
+decision emits secret-free `capability_audit` JSON and accepted shell calls
+return `capability_evidence`. They record effective limits and named capabilities,
+not secret values or permissions inferred for other lanes.
+
+The explicit `legacy:configured-worker-policy` compatibility decision preserves
+old calls that omit the manifest. This does not connect the generic shell to
+persistent worker containers or mt-admin external-worker credential and egress
+contracts. Existing worker tokens and approved job credential grants are
+unchanged; generic-shell named secret injection and arbitrary mounts or devices
+are not implemented.
+
 ### Network egress tiers
 
 Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via

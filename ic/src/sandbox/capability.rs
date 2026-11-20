@@ -162,11 +162,18 @@ pub struct EffectiveResourceCapability {
     pub disk_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretInjectionStatus {
+    None,
+    LegacyConfiguredMappings,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSecretCapability {
     pub names: Vec<String>,
-    pub injection: &'static str,
+    pub injection: SecretInjectionStatus,
 }
 
 /// The only part of a decision intended for logs, metadata, and snapshots.
@@ -499,7 +506,7 @@ fn authorize_validated(
         },
         secrets: EffectiveSecretCapability {
             names: Vec::new(),
-            injection: "none",
+            injection: SecretInjectionStatus::None,
         },
         extensions: Vec::new(),
     };
@@ -617,7 +624,7 @@ pub fn compatibility_decision(
             },
             secrets: EffectiveSecretCapability {
                 names: Vec::new(),
-                injection: "legacy-configured-mappings",
+                injection: SecretInjectionStatus::LegacyConfiguredMappings,
             },
             extensions: Vec::new(),
         },
@@ -928,7 +935,7 @@ mod tests {
         assert_eq!(decision.evidence.policy, "legacy:configured-worker-policy");
         assert_eq!(
             decision.evidence.secrets.injection,
-            "legacy-configured-mappings"
+            SecretInjectionStatus::LegacyConfiguredMappings
         );
         assert_eq!(minimal().network.mode, NetworkRequestMode::Disabled);
     }

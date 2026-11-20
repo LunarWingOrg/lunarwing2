@@ -717,31 +717,40 @@ impl ShellTool {
         cmd: &str,
         workdir: &Path,
         timeout: Duration,
+        manifest: Option<&crate::sandbox::CapabilityManifest>,
     ) -> Result<ShellCommandOutput, ToolError> {
-        // Override sandbox config timeout if needed
-        let result = tokio::time::timeout(timeout, async {
+        let result = if let Some(manifest) = manifest {
             sandbox
-                .execute_with_policy(
-                    cmd,
-                    workdir,
-                    self.sandbox_policy,
-                    std::collections::HashMap::new(),
-                )
+                .execute_with_manifest(cmd, workdir, &manifest, std::collections::HashMap::new())
                 .await
-        })
-        .await;
+        } else {
+            // Override sandbox config timeout if needed
+            tokio::time::timeout(timeout, async {
+                sandbox
+                    .execute_with_policy(
+                        cmd,
+                        workdir,
+                        self.sandbox_policy,
+                        std::collections::HashMap::new(),
+                    )
+                    .await
+            })
+            .await
+            .map_err(|_| {
+                ToolError::Sandbox(format!(
+                    "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
+                     the container was killed and nothing ran on the host"
+                ))
+            })?
+        };
 
         match result {
-            Ok(Ok(output)) => Ok(ShellCommandOutput::new(
+            Ok(output) => Ok(ShellCommandOutput::new(
                 output.output,
                 output.exit_code,
                 output.truncated,
             )),
-            Ok(Err(e)) => Err(sandbox_error_envelope(&e)),
-            Err(_) => Err(ToolError::Sandbox(format!(
-                "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
-                 the container was killed and nothing ran on the host"
-            ))),
+            Err(e) => Err(sandbox_error_envelope(&e)),
         }
     }
 
@@ -871,7 +880,18 @@ impl ShellTool {
         workdir: Option<&str>,
         timeout: Option<u64>,
         extra_env: &HashMap<String, String>,
+        capability_manifest: Option<crate::sandbox::CapabilityManifest>,
     ) -> Result<ShellCommandOutput, ToolError> {
+        if capability_manifest.is_some()
+            && self
+                .sandbox
+                .as_ref()
+                .is_none_or(|sandbox| !sandbox.config().enabled)
+        {
+            return Err(ToolError::Sandbox(
+                "[sandbox:capability_denied] manifest execution requires an enabled sandbox; no direct execution fallback exists".into(),
+            ));
+        }
         // Check for blocked commands
         if let Some(reason) = self.is_blocked(cmd) {
             return Err(ToolError::NotAuthorized(format!(
@@ -898,6 +918,17 @@ impl ShellTool {
 
         // Determine timeout
         let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
+        let timeout_duration = match (&self.sandbox, &capability_manifest) {
+            (Some(sandbox), Some(manifest)) => {
+                let decision = sandbox
+                    .authorize_manifest(manifest, &cwd)
+                    .map_err(|error| sandbox_error_envelope(&error))?;
+                timeout_duration.min(Duration::from_secs(
+                    decision.evidence.resources.timeout_seconds,
+                ))
+            }
+            _ => timeout_duration,
+        };
 
         // Use sandbox if configured; fail-closed (never silently fall through
         // to unsandboxed execution when sandbox was intended).
@@ -905,7 +936,13 @@ impl ShellTool {
             && (sandbox.is_initialized() || sandbox.config().enabled)
         {
             return self
-                .execute_sandboxed(sandbox, cmd, &cwd, timeout_duration)
+                .execute_sandboxed(
+                    sandbox,
+                    cmd,
+                    &cwd,
+                    timeout_duration,
+                    capability_manifest.as_ref(),
+                )
                 .await;
         }
 
@@ -938,7 +975,7 @@ impl Tool for ShellTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {
@@ -952,10 +989,13 @@ impl Tool for ShellTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in seconds (optional, default 120)"
-                }
+                },
+                // Versioned capability schema inserted below.
             },
             "required": ["command"]
-        })
+        });
+        schema["properties"]["capability_manifest"] = crate::sandbox::capability_manifest_schema();
+        schema
     }
 
     async fn execute(
@@ -966,11 +1006,40 @@ impl Tool for ShellTool {
         let command = require_str(&params, "command")?;
 
         let workdir = params.get("workdir").and_then(|v| v.as_str());
+        let capability_evidence = params
+            .get("capability_manifest")
+            .and_then(|value| self.sandbox.as_ref().map(|sandbox| (value, sandbox)))
+            .map(|(value, sandbox)| {
+                let manifest = crate::sandbox::CapabilityManifest::from_value(value.clone())
+                    .map_err(crate::tools::tool::ToolError::InvalidParameters)?;
+                let cwd = workdir
+                    .map(PathBuf::from)
+                    .or_else(|| self.working_dir.clone())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                sandbox
+                    .authorize_manifest(&manifest, &cwd)
+                    .map_err(|error| sandbox_error_envelope(&error))
+            })
+            .transpose()?;
+        let capability_manifest = params
+            .get("capability_manifest")
+            .cloned()
+            .map(crate::sandbox::CapabilityManifest::from_value)
+            .transpose()
+            .map_err(crate::tools::tool::ToolError::InvalidParameters)?;
         let timeout = params.get("timeout").and_then(|v| v.as_u64());
 
         let start = std::time::Instant::now();
         let output = self
-            .execute_command(command, workdir, timeout, &ctx.extra_env)
+            .execute_command(
+                command,
+                workdir,
+                timeout,
+                &ctx.extra_env,
+                capability_manifest,
+            )
             .await?;
         let duration = start.elapsed();
 
@@ -981,6 +1050,7 @@ impl Tool for ShellTool {
             "exit_code": output.exit_code,
             "success": output.exit_code == 0,
             "sandboxed": sandboxed,
+            "capability_evidence": capability_evidence.as_ref().map(|decision| &decision.evidence),
             "truncated": output.truncated,
             "warning": output.truncated.then_some(TRUNCATED_OUTPUT_WARNING),
         });
