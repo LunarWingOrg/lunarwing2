@@ -2270,7 +2270,7 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 ## Build & Test
 
 Run from `ic/`, using the vendored lockfile. These examples use the 12-thread
-cap that `AGENTS.md` sets for cargo on the development host.
+cap that the repository-root `AGENTS.md` sets for cargo on the development host.
 Use tmux for long runs and `cargo check` for compile verification.
 
 ```bash
