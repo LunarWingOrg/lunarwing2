@@ -28,6 +28,11 @@ with the tar for 2 days instead of splitting it out; anything that must outlive
 the pipeline is re-uploaded by the scan (SBOM) or promotion (evidence) job,
 which are cheap and small.
 
+Operational consequence: a manual `worker-*-promote` job downloads its
+candidate's dotenv and metadata. Play it from the pipeline that produced the
+candidate, within two days. If it has already expired, re-run the candidate and
+then the scan; the promotion never rebuilds, so that is the only recovery.
+
 `default:artifacts:expire_in: 7 days` in `.gitlab/ci/defaults.yml` is a
 backstop for a job that somehow ships without a value. It is not a substitute
 for one.

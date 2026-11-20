@@ -1096,7 +1096,9 @@ produced under weaker policies before relying on cached test results.
 Worker candidates use `needs: []`: on protected default-branch/release-tag pushes,
 play `worker-<name>-candidate` immediately, without waiting for the Rust matrix.
 Its scan runs automatically using that candidate's artifacts; there is no second
-manual scan step. On `master` these lanes remain optional. On release tags the
+manual scan step. Candidate artifacts expire after two days (WI#791 — the rootfs
+tars were most of the project's storage), so play a manual promotion from its
+own pipeline, within that window; otherwise re-run the candidate and scan first. On `master` these lanes remain optional. On release tags the
 candidate and scan remain blocking, and promotion remains manual and requires
 both. A failed candidate may still cause an optional scan to fail for missing
 artifacts; finish/retry the candidate first, then retry the scan if needed.
