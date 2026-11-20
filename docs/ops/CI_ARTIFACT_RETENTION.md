@@ -90,21 +90,49 @@ Decision: keep job logs, do not add a scheduled cleanup.
 
 ## Ceiling and the 7-day check
 
-Agreed ceiling: **10 GiB** of job artifacts and job logs for project 35.
+Ceiling: **10 GiB** of job artifacts for project 35 (the value suggested in
+WI#791; artifacts are the surface this change controls, and `job_artifacts_size`
+in the API includes job logs).
 
-On or shortly after **2026-11-27**, record the current usage in WI#791:
+Measurement on 2026-11-20, after this change was written and before it merged:
 
-- UI: **Settings > Usage Quotas > Storage** (Maintainer) shows `Job artifacts`
-  and `Job logs` separately.
-- API, with a Maintainer token:
-  `curl -sS -H "PRIVATE-TOKEN: <maintainer>" "https://git.lunarwing.org/api/v4/projects/35?statistics=true"`
-  and read `statistics.job_artifacts_size`.
-- The project settings object (`GET /api/v4/projects/35`) also reports
-  `keep_latest_artifact` and `ci_delete_pipelines_in_seconds`; both are part of
-  this contract, so a flip back to `true` is a regression, not a preference.
+```console
+$ curl -sS -H "PRIVATE-TOKEN: <maintainer>" \
+    "https://git.lunarwing.org/api/v4/projects/35?statistics=true" \
+  | jq '.statistics.job_artifacts_size'
+10971986940        # 10.22 GiB
+```
 
-The post-cleanup baseline was 9.66 GiB: about 5.26 GiB of artifacts from the
-last two days plus 4.39 GiB of job logs. If the check lands above 10 GiB while
-the artifact gate is green, the remaining gap is job logs; lower the pipeline
-deletion window or archive traces at the instance level and record that
-decision in WI#791 rather than loosening artifact expiries.
+That is **above** the ceiling, and the reason matters: the manual cleanup left
+9.66 GiB, pipelines have added about 0.5 GiB since, and **every artifact created
+before this change keeps the expiry it was created with** (30 days for the
+candidate jobs). Those pre-change artifacts keep growing and do not start
+expiring until 30 days after they were made. The new 2-day value only governs
+what is produced from here on.
+
+So the 7-day check has two legitimate outcomes:
+
+1. **Re-run the one-off cleanup once this is live.** Delete non-log artifacts
+   older than two days again, as was done on 2026-11-20. Everything left is then
+   post-change-shaped, the 2-day expiries hold the line, and the check passes.
+   This is the intended path.
+2. **Record the number and the reason.** If nobody re-runs it, storage stays
+   above 10 GiB until the pre-change 30-day artefacts age out, and the check
+   cannot pass however good the gate is. Record that in WI#791 rather than
+   loosening any `expire_in`.
+
+On or shortly after **2026-11-27**, record the number in WI#791 with:
+
+- UI: **Settings > Usage Quotas > Storage** (Maintainer), which splits
+  `Job artifacts` from `Job logs`.
+- API: the command above; `statistics.job_artifacts_size` is the total.
+
+The same `GET /api/v4/projects/35` response reports `keep_latest_artifact` and
+`ci_delete_pipelines_in_seconds`. Both are part of this contract, so a flip back
+to `keep_latest_artifact: true` is a regression, not a preference.
+
+If the check lands above 10 GiB with the artifact gate green and the pre-change
+artifacts already cleaned, the remaining gap is **job logs**: lower the pipeline
+deletion window or archive traces at the instance level and record that decision
+in WI#791 rather than loosening artifact expiries. The post-cleanup split was
+about 5.26 GiB of artifacts and 4.39 GiB of logs.
