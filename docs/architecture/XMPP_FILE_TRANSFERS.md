@@ -1,6 +1,6 @@
 # XMPP File Transfer Support
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** Transfer contracts live in
+**Source revalidated 2026-11-20 for v2.2.1.0.** Transfer contracts live in
 `ic/src/channels/xmpp/mod.rs`, the standalone bridge, the WASM channel/host,
 and `ic/src/vision_enrichment.rs`. Size limits described as MiB below use
 1024 × 1024 bytes; the 100,000-byte extracted-text cap is decimal.
