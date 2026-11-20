@@ -2256,6 +2256,16 @@ pre-upgrade state with the prior image if rollback is needed.
 
 ### v2.3.2 bump — WI#775 (2026-11-19)
 
+**Re-check on 2026-11-20 03:35Z (WI#785).** All three pins are unchanged and
+still the newest stable releases: npm `latest` is **2.6.3**, with **2.7.0**
+published 2026-11-19 11:24Z and its 24-hour window ending 2026-11-20 11:24Z —
+so this attempt, taken before that instant, keeps 2.6.3 by the item's own rule;
+`git ls-remote` still shows **v2.3.2** as the newest `v2.*` tag and **v1.19.6**
+as the newest `v1.*` tag. **Pebble and LunarDepth moved** and are out of scope
+by the item: `pebble-dev/pebble` HEAD is `d8fd0b756854…` (pin
+`2d0f3786cbeb…`), and the LunarDepth HEAD is `9eb615d8362b…` (pin
+`0472d115e529…`). A bump of either is its own item.
+
 **Pins, publication times and the 24-hour rule.** All three lanes were checked
 against upstream at **2026-11-19 06:06Z**. The rule is 24 hours after
 publication, taken from the `published_at` of the GitHub release (opencode) and
@@ -2396,22 +2406,26 @@ pass, as designed, and the registry was re-read by hand:
   `f696ed2d…6527` (`packages/core/src/flag.ts`) and `9718dd69…497d`
   (`packages/schema/src/config/flag.ts`), and `REVIEWED_FLAGS` now lists the
   v2.3.2 keys.
-- **New outbound surfaces in the same file.** v2.3.2 adds
+- **New outbound surfaces in the same file (decided: pinned off, WI#785
+  AGN-2).** v2.3.2 adds
   `packages/core/src/plugin/provider/opencode-artifacts.ts`, a Console artifact
   publisher reached from the same `publish` function through
-  `artifacts.sync(allowed && next.remote?.artifacts === true ? … , watching)`.
-  It is gated twice: it needs the Console `x-opencode-artifacts` header (so
-  Console must advertise it), and every publish path runs through
-  `Artifact.enabled`, which reads the **`artifacts`** flag. That flag is off in
-  the `latest` channel by default and is **not** pinned off by the wrapper, so
-  the wrapper's guarantee covers the event watches only — the same shape as
-  the pre-existing `opencode*` `integration.use` deny and Console Library
-  story (WI#665/WI#745). With a Console credential, egress to `opencode.ai`
-  and a workspace config that turns `artifacts` on, publishing is possible.
-  The managed policy at `/etc/opencode/opencode.json` still denies the
-  `opencode` integration, so Console supplies nothing; the tenant egress
-  allowlist remains the boundary. This is recorded as a residual, not a new
-  control.
+  `artifacts.sync(allowed && next.remote?.artifacts === true ? … , watching)`,
+  and it adds `mcp_events`, which declares event support to MCP servers and
+  offers `watch_mcp_event` so a server's push event can wake a session. Both
+  hang on a flag that a task-writable workspace config can turn on
+  (`experimental.artifacts`, `experimental.mcp_events`), which is exactly the
+  weak condition the v2.2.7 decision refused. **The decision here is the
+  v2.2.7 one: record the surfaces and pin them off.** The wrapper now starts
+  every opencode with `OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts`
+  (`OPENCODE_FLAGS` is comma-separated), which upstream resolves before every
+  config document. The checker's `PINNED_OFF_FLAGS` tuple drives the pin text
+  and the forbidden-`experimental` list, and `WRAPPER_CODE_DIGEST` was
+  re-reviewed with it. Layers that remain, in order: the managed policy at
+  `/etc/opencode/opencode.json` denies the `opencode` integration, so Console
+  supplies nothing; the publisher also needs a Console credential and egress to
+  `opencode.ai`; MCP events need a server that offers them and egress to it;
+  and the tenant egress allowlist is the boundary for all of it.
 - **Well-known remote config.** `packages/core/src/config.ts:182-229` (the
   credential-gated fetch) and `:345-366` (`supplies(…)`) still take an origin
   registered in the worker's state with a key credential saved for it; nothing
@@ -2452,8 +2466,9 @@ that do reach the lane are:
   requires an explicit top-level `warming` or a model/provider `cache.warming`;
   `config/opencode2.json` sets neither), so the lane still sends no background
   keep-alive requests.
-- **MCP events** are behind the new `mcp_events` flag, off by default and not
-  enabled by the lane, so no MCP push-event channel is opened. No MCP
+- **MCP events** are behind the new `mcp_events` flag. It is off by default,
+  not enabled by the lane, **and pinned off by the wrapper** (AGN-2 above), so
+  no MCP push-event channel is opened even from a workspace config. No MCP
   `pool: true`, `experimental.all_flags`, `experimental.codemode_vm` or
   `websearch.use` entry was added.
 - **SDK timing change from v2.2.7** (`agent.list`, `integration.list`,
@@ -2483,20 +2498,53 @@ still silences the updater, and `scripts/check_models_dev_snapshot.py` exits 0
 against v1.19.6's `script/generate.ts` with the committed snapshot, so the
 WI#467 pin needed no refresh.
 
-**Not performed locally, left to CI/deployment acceptance.** No full image
-build (`mt-admin build-kimi-worker` / `build-opencode2-worker` /
-`build-opencode-worker`) ran in this pass, so there is no in-image
-`opencode --version` or `kimi --version` marker, no candidate-vs-clean-rebuild
-digest comparison, and none of the protected
-`worker-*-candidate`/`worker-*-scan`/`worker-opencode2-exposure-verify` jobs ran
-on this branch. `scripts/console_policy_eval.py` needs a built candidate image
-and was therefore not run against one; its unit suite passes (**10/10**) and
-the enforced action list was re-read at v2.3.2 — the same eight actions
-(`provider.use`, `tool.use`, `integration.connect`, `integration.use`,
-`mcp.use`, `skill.use`, `plugin.use`, `websearch.use`) with the same last-match
-rule and the same legacy-prefix decode, so the managed file's nine statements
-are still exactly the enforced set. No tenant rollout, no live-model dispatch
-and no v1.19.6 live dispatch ran.
+**Local image builds (WI#785 AGN-1, 2026-11-20).** Two lanes were built in
+full on this host with `mt-admin build-kimi-worker` and
+`mt-admin build-opencode2-worker` (rootful podman, slim profile):
+
+- **kimi:** 35/35 steps, `Successfully tagged
+  localhost/lunarwing-worker-kimi:latest`; the in-image `kimi --version` is
+  **2.6.3** (printed both inside the build RUN and by running the image), and
+  the builder's test runner reported **179 pass / 0 fail** including the
+  real-CLI contract self-check ("kimi CLI contract self-check passed").
+- **opencode2:** 50/50 steps, tagged on the candidate ID and promoted after the
+  WI#425 out-of-band verification (**PASSED**: full Env and runtime config
+  clean, checkout-owned files clean, shared tar/config exposure policy clean)
+  as `lunarwing-worker-opencode2:latest`.
+
+The first opencode2 attempt failed at `exposure_policy_assert.py
+--image-filesystem` because the build's `LUNARWING_WRAPPER_SHA256` anchor was
+taken from the pre-edit wrapper while the build context carried the edited one;
+re-running from one tree built clean and the anchor matched. **The
+opencode2 in-image version marker is not asserted by that build** — the image
+has no `opencode --version` RUN — so the v2.3.2 binary is evidenced by the
+pinned `OPENCODE_REF` checkout (the Dockerfile tests
+`rev-parse FETCH_HEAD = OPENCODE_REF` after fetching `refs/tags/v2.3.2`) and by
+the candidate `/app`-side checks, not by a version print.
+
+**`console_policy_eval.py` against the built image (checklist item 7).** Run on
+the candidate image with `--network=none`. Its first run returned
+INCONCLUSIVE: v2.3.0+ gates the Console's skill and instruction lists behind
+an `x-opencode-instructions-skills` response header on `/api/v2/config`
+(`listsHeader` in `packages/core/src/plugin/provider/opencode.ts`), and the
+fake Console did not send it, so the control registered no skill. The runner
+was fixed to send the header, and the re-run reported every result as
+recorded, including **DENY HOLDS for Console content** (control 1 Console
+skill, guarded 0), **CONFIG MERGE WITHHELD**, **DENY HOLDS FOR AN ORGANIZATION
+CREDENTIAL**, and **CONSOLE POLICIES NEUTRALIZED BY THE MANAGED LAYER**. Its
+unit suite passes (**10/10**), and the enforced action list is unchanged at
+v2.3.2 — the same eight actions (`provider.use`, `tool.use`,
+`integration.connect`, `integration.use`, `mcp.use`, `skill.use`, `plugin.use`,
+`websearch.use`) with the same last-match rule and the same legacy-prefix
+decode, so the managed file's nine statements are still exactly the enforced
+set.
+
+**Still not performed locally, left to CI/deployment acceptance.** No
+`build-opencode-worker` (v1 lane) ran in this pass, so v1.19.6 has no in-image
+build here; no candidate-vs-clean-rebuild digest comparison ran; and none of
+the protected `worker-*-candidate`/`worker-*-scan`/
+`worker-opencode2-exposure-verify` jobs ran on this branch. No tenant rollout,
+no live-model dispatch and no v1.19.6 live dispatch ran.
 
 ### v2.2.7 bump — WI#609, item 39 (2026-11-12)
 
