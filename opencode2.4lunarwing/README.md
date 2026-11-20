@@ -81,8 +81,10 @@ ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
 stays disabled. The wrapper also starts the binary with
-`OPENCODE_FLAGS=-console_watches`, which keeps the Console event
-watches (WI#609) off whatever the caller's environment or a workspace config says,
+`OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts`, which keeps the
+Console event watches (WI#609) and the MCP push-event channel and Console
+artifact publisher (WI#785) off whatever the caller's environment or a
+workspace config says,
 and the builder stage fails the image if the reviewed text behind that pin
 stops holding (a text tripwire, not a proof; re-read the flag code on every
 bump). The pin covers the event watches only: a worker that is given

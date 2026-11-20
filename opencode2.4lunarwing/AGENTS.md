@@ -128,13 +128,15 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 - Turn on the Console event watches (flag `console_watches`, WI#609): they let
   OpenCode Console, a hosted third party, steer a session, which is a second
   instruction channel into the worker (WI#609, decision on !2398 AAV-1). The
-  wrapper forces `OPENCODE_FLAGS=-console_watches` on every start, because
+  wrapper forces `OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts` on
+  every start (the last two added by WI#785 AGN-2, same decision shape), because
   upstream resolves that variable before every config document, a project's
   own `opencode.json` in the workspace included. Never remove or weaken that
   line, never add a second way for the wrapper to start the binary, and never
-  set `experimental.console_watches` or `experimental.all_flags` in the lane
-  config (`exposure_policy_assert.py` fails the build on each, and any
-  wrapper code edit fails its reviewed digest). The builder stage trips on
+  set `experimental.console_watches`, `experimental.mcp_events`,
+  `experimental.artifacts` or `experimental.all_flags` in the lane config
+  (`exposure_policy_assert.py` fails the build on each, and any wrapper code
+  edit fails its reviewed digest). The builder stage trips on
   the pinned source (`compile_out_remote_tunnel.py`): a green anchor means
   only that its text is unchanged, so on every bump answer the questions of
   checklist item 7 in `docs/ops/WORKER-CONTAINERS.md` before touching

@@ -105,8 +105,9 @@ CONSOLE_PLUGIN = pathlib.Path("packages/core/src/plugin/provider/opencode.ts")
 FLAG_SURFACE_MARKERS = ("OPENCODE_FLAGS", "console_watch")
 PINNED_OFF_FLAG = "console_watches"
 # The registry as reviewed at the v2.3.2 bump (docs/ops/WORKER-CONTAINERS.md).
-# Only PINNED_OFF_FLAG is forced off by the wrapper; the rest are off by
-# default. Change this list only together with a decision in the bump entry.
+# PINNED_OFF_FLAG is the watch-gate flag this anchor reads; the wrapper
+# additionally pins `mcp_events` and `artifacts` off (WI#785 AGN-2). The rest
+# are off by default. Change this list only with a decision in the bump entry.
 # v2.3.2 removed `background_compaction` and `codemode_vm`, renamed
 # `schedules` to `automations` (the old name survives as an alias, so the
 # resolver still reads it), and added `mcp_events`, `video_generate` and the
