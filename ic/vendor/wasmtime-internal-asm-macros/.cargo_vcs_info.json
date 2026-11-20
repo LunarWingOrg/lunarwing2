@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "5186f2ce4dc021c37390ba7cfa54ddc2ccc33b02"
+    "sha1": "e187baafc10f3107e056fde95b1cbbcc3a64553a"
   },
   "path_in_vcs": "crates/asm-macros"
 }

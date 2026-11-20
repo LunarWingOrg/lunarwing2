@@ -144,10 +144,11 @@ open = "5"
 pgvector = { version = "0.4", features = ["postgres"], optional = true }
 
 # WASM sandbox for untrusted tool execution
-# >=36.0.20 required for RUSTSEC-2026-0424, in addition to the earlier
+# >=36.0.22 required for RUSTSEC-2026-0587 (wasmtime-wasi), in addition to
+# RUSTSEC-2026-0424 (fixed in 36.0.20) and the earlier
 # RUSTSEC-2026-0314/0316/0321/0322/0323/0352/0363/0379/0380 fixes.
-wasmtime = { version = "36.0.20", features = ["component-model"] }
-wasmtime-wasi = "36.0.20"  # WASI support for component model
+wasmtime = { version = "36.0.22", features = ["component-model"] }
+wasmtime-wasi = "36.0.22"  # WASI support for component model
 wasmparser = "0.220"  # WASM binary parsing for validation
 
 # Cryptography for secrets management
