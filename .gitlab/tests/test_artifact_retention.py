@@ -28,9 +28,15 @@ class ExpiryParsingTests(unittest.TestCase):
         self.assertEqual(config.artifact_expiry_seconds("2 days"), 2 * 86400)
         self.assertEqual(config.artifact_expiry_seconds("90 days"), 90 * 86400)
         self.assertEqual(config.artifact_expiry_seconds("1 year"), 365 * 86400)
+        self.assertEqual(config.artifact_expiry_seconds("1 week"), 604800)
+
+    def test_compound_durations_are_summed(self):
+        self.assertEqual(config.artifact_expiry_seconds("1 hour 30 minutes"), 5400)
+        self.assertEqual(config.artifact_expiry_seconds("1 day 12 hours"), 129600)
+        self.assertEqual(config.artifact_expiry_seconds("1 day and 12 hours"), None)
 
     def test_unbounded_or_unreadable_values_are_rejected(self):
-        for value in ("never", None, "", "two days", "2", 90):
+        for value in ("never", None, "", "two days", "2", "0 days", 90):
             with self.subTest(value=value):
                 self.assertIsNone(config.artifact_expiry_seconds(value))
 

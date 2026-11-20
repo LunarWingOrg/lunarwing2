@@ -3352,8 +3352,8 @@ ARTIFACT_EXPIRY_UNITS = {
     "month": 2592000,
     "year": 31536000,
 }
-ARTIFACT_EXPIRY_PATTERN = re.compile(
-    r"^(\d+)\s+(second|minute|hour|day|week|month|year)s?$"
+ARTIFACT_EXPIRY_TOKEN = re.compile(
+    r"\s*(\d+)\s*(second|minute|hour|day|week|month|year)s?"
 )
 ARTIFACT_MAX_EXPIRY_SECONDS = 365 * 86400
 ROOTFS_ARTIFACT_MAX_SECONDS = 2 * 86400
@@ -3376,16 +3376,26 @@ RESERVED_TOP_LEVEL_KEYS = {
 def artifact_expiry_seconds(value: object) -> int | None:
     """Seconds for a GitLab human duration, or None for unsupported values.
 
-    `never` and unrecognised units return None so the caller fails closed: an
-    artifact with no bounded expiry is exactly the WI#791 regression.
+    `never` and unrecognised text return None so the caller fails closed: an
+    artifact with no bounded expiry is exactly the WI#791 regression. GitLab
+    accepts compound durations ("1 hour 30 minutes"), so the whole string must
+    be consumed by `<amount> <unit>` tokens; any leftover text is unsupported.
     """
     if not isinstance(value, str):
         return None
-    match = ARTIFACT_EXPIRY_PATTERN.match(value.strip())
-    if not match:
+    text = value.strip().lower()
+    if not text:
         return None
-    amount, unit = match.groups()
-    return int(amount) * ARTIFACT_EXPIRY_UNITS[unit]
+    position = 0
+    total = 0
+    for match in ARTIFACT_EXPIRY_TOKEN.finditer(text):
+        if match.start() != position:
+            return None
+        total += int(match.group(1)) * ARTIFACT_EXPIRY_UNITS[match.group(2)]
+        position = match.end()
+    if position != len(text) or total <= 0:
+        return None
+    return total
 
 
 def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
