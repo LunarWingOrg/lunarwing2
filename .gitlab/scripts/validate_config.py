@@ -3421,6 +3421,15 @@ def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
         if name in RESERVED_TOP_LEVEL_KEYS or not isinstance(job, dict):
             continue
         effective = resolve_extends(job, merged)
+        if effective.get(EXTENDS_TRUNCATED_KEY):
+            # A cyclic or over-deep extends chain hides whatever the chain would
+            # have contributed, including an artifacts block or its expire_in.
+            # Refuse rather than certify only the keys visible at truncation.
+            errors.append(
+                f"{name} has an extends chain deeper than the budget; its "
+                "artifact retention cannot be verified (WI#791)"
+            )
+            continue
         artifacts = effective.get("artifacts")
         if not isinstance(artifacts, dict):
             continue

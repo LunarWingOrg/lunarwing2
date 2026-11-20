@@ -90,6 +90,18 @@ class ArtifactRetentionGateTests(unittest.TestCase):
         }
         self.assertEqual(retention_errors(merged), [])
 
+    def test_truncated_extends_chain_is_refused(self):
+        merged = {**BACKSTOP}
+        parent = "leaf"
+        merged[parent] = {}
+        for depth in range(config.EXTENDS_DEPTH_BUDGET + 2):
+            name = f".level{depth}"
+            merged[name] = {"extends": parent}
+            parent = name
+        merged["job"] = {"extends": parent}
+        errors = retention_errors(merged)
+        self.assertTrue(any("extends chain deeper" in error for error in errors))
+
     def test_missing_default_backstop_is_rejected(self):
         errors = retention_errors({"job": {"artifacts": {"expire_in": "2 days"}}})
         self.assertTrue(any("default:artifacts" in error for error in errors))
