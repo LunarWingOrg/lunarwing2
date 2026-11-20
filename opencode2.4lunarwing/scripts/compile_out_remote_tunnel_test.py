@@ -7,7 +7,7 @@ or a new RemoteTunnel export in use). The guard must pass the first, stub
 the second, and fail closed on every drift shape.
 
 The second half covers the flag pin anchor (WI#609 ABE-2): a tree with the
-v2.2.7 shape of the flag registry, the resolver and the Console plugin
+v2.3.2 shape of the flag registry, the resolver and the Console plugin
 passes, and every way upstream could take the meaning out of the wrapper's
 OPENCODE_FLAGS=-console_watches pin fails the build.
 """
@@ -70,31 +70,40 @@ FLAG_REGISTRY = "packages/schema/src/config/flag.ts"
 FLAG_RESOLVER = "packages/core/src/flag.ts"
 CONSOLE_PLUGIN = "packages/core/src/plugin/provider/opencode.ts"
 
-# The lines of the three upstream files at v2.2.7 that the anchor reads, with
+# The lines of the three upstream files at v2.3.2 that the anchor reads, with
 # their original line breaks.
 REGISTRY_SOURCE = '''\
 export * as ConfigFlag from "./flag.js"
 
-/** The `OPENCODE_FLAGS` entry that turns every flag on, as in `all,-media_blob`. It is not a flag key. */
+/** The `OPENCODE_FLAGS` entry that enables all flags except opt-in-only flags, as in `all,-media_blob`. */
 export const wildcard = "all"
 
 /**
- * Every feature flag, by key, with what it turns on. A flag is on in local and dev builds and off in released ones;
- * `experimental.<key>` in config and `OPENCODE_FLAGS` override that, and `OPENCODE_FLAGS=all` or
- * `experimental.all_flags: true` turn every flag on. Read one with Core's `Flag.enabled("<key>")`.
+ * Flags default to on in local and dev builds and off in releases, except for `optInOnly` flags, which must be
+ * named explicitly in `experimental.<key>` or `OPENCODE_FLAGS`. Read a flag with Core's `Flag.enabled("<key>")`.
  */
 export const registry = {
   todo: "Enable the experimental todowrite tool.",
-  background_compaction:
-    "Enable experimental background compaction: summarize the conversation in the background as it nears the compaction threshold, so automatic compaction does not wait for the summary. Background summaries that are never used still cost tokens.",
   media_blob: "Store new session media once in a deduplicated blob table instead of inline in every message row.",
-  schedules: "Enable experimental scheduled tasks that wake a session with a prompt.",
+  automations:
+    "Run a prompt or Code Mode action on a timer, or on a connected MCP server's push event when mcp_events is enabled.",
   artifacts: "Enable experimental artifacts backed by pluggable providers.",
-  codemode_vm: "Run the Code Mode execute tool on the experimental bytecode VM instead of the legacy interpreter.",
+  video_generate: "Enable the experimental video generation API.",
   console_watches:
     "Watch Slack threads, GitHub pull requests, issues, commits and Actions runs, and the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.",
+  mcp_events:
+    "Enable experimental MCP Events, a draft MCP extension: declare support to MCP servers and read the events of servers that offer them.",
+  full_codemode:
+    "Enable the full Code Mode work in progress. Off by default in every build, including local and dev; opt in with OPENCODE_FLAGS=full_codemode or experimental.full_codemode: true.",
 } as const satisfies Record<string, string>
 export type Key = keyof typeof registry
+
+export const optInOnly: ReadonlySet<Key> = new Set(["full_codemode"])
+
+/** Earlier names of a flag, still read from `experimental.<name>` and `OPENCODE_FLAGS` when the new key is unset. */
+export const aliases = {
+  schedules: "automations",
+} as const satisfies Record<string, Key>
 '''
 
 RESOLVER_SOURCE = '''\
@@ -124,8 +133,8 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Flag") {}
 
 /**
- * `OPENCODE_FLAGS`, a comma-separated list such as `schedules,-media_blob`; a leading `-` turns a flag off, and
- * `all` turns every flag on unless the same list opts one out, as in `all,-media_blob`.
+ * `OPENCODE_FLAGS`, a comma-separated list such as `automations,-media_blob`; a leading `-` turns a flag off, and
+ * `all` enables all flags except opt-in-only flags and any disabled in the same list, as in `all,-media_blob`.
  */
 export const Overrides = Context.Reference<string | undefined>("@opencode/Flag/Overrides", {
   defaultValue: () => process.env.OPENCODE_FLAGS,
@@ -135,10 +144,11 @@ export const Overrides = Context.Reference<string | undefined>("@opencode/Flag/O
 const onByDefault = (channel: string) => channel === "local" || channel === "dev"
 
 /**
- * Resolves every flag: `OPENCODE_FLAGS` (`-key`, then `all`), then `experimental.<key>` from the highest-priority
+ * Resolves every flag: `OPENCODE_FLAGS` (`key` or `-key`, then `all`), then `experimental.<key>` from the highest-priority
  * document that sets `experimental` (the same document every other `experimental` setting reads), then `all_flags: true`
  * from the highest-priority document that sets `all_flags`, so a global switch survives a project's own `experimental`
  * block, then on for local and dev builds. `all_flags: false` falls through rather than turning flags off.
+ * Opt-in-only flags skip both wildcards and default to off on every channel.
  * A remote kill switch belongs above `OPENCODE_FLAGS` here.
  */
 export function resolve(input: {
@@ -159,15 +169,19 @@ export function resolve(input: {
     input.entries.findLast(
       (entry): entry is Document => entry.type === "document" && entry.info.experimental?.all_flags !== undefined,
     )?.info.experimental?.all_flags === true
+  const names = Object.keys(ConfigFlag.aliases) as Array<keyof typeof ConfigFlag.aliases>
   return Record.map(ConfigFlag.registry, (_, key): State => {
-    const override = env.get(key) ?? (all ? true : undefined)
-    const configured = experimental?.[key] ?? (allFlags ? true : undefined)
+    const optInOnly = ConfigFlag.optInOnly.has(key)
+    const old = names.find((name) => ConfigFlag.aliases[name] === key)
+    const override = env.get(key) ?? (old === undefined ? undefined : env.get(old)) ?? (all && !optInOnly ? true : undefined)
+    const configured =
+      experimental?.[key] ?? (old === undefined ? undefined : experimental?.[old]) ?? (allFlags && !optInOnly ? true : undefined)
     const [enabled, source]: [boolean, State["source"]] =
       override !== undefined
         ? [override, "env"]
         : configured !== undefined
           ? [configured, "config"]
-          : [onByDefault(input.channel), "default"]
+          : [!optInOnly && onByDefault(input.channel), "default"]
     return { enabled, source }
   })
 }
@@ -407,15 +421,20 @@ class FlagPinAnchorTests(unittest.TestCase):
             "the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.\",\n",
             "",
         )
-        self.assert_fails("differs from the reviewed v2.2.7 text", "may predate the flag")
+        self.assert_fails("differs from the reviewed v2.3.2 text", "may predate the flag")
 
     def test_new_flag_fails_until_reviewed(self) -> None:
         self.edit(FLAG_REGISTRY, "  todo:", '  remote_control: "Let a hosted service drive the session.",\n  todo:')
-        self.assert_fails("differs from the reviewed v2.2.7 text", "remote_control")
+        self.assert_fails("differs from the reviewed v2.3.2 text", "remote_control")
 
     def test_removed_other_flag_fails_until_reviewed(self) -> None:
-        self.edit(FLAG_REGISTRY, '  schedules: "Enable experimental scheduled tasks that wake a session with a prompt.",\n', "")
-        self.assert_fails("differs from the reviewed v2.2.7 text", "schedules")
+        self.edit(
+            FLAG_REGISTRY,
+            '  automations:\n'
+            '    "Run a prompt or Code Mode action on a timer, or on a connected MCP server\'s push event when mcp_events is enabled.",\n',
+            "",
+        )
+        self.assert_fails("differs from the reviewed v2.3.2 text", "automations")
 
     def test_reshaped_registry_fails_closed(self) -> None:
         self.edit(FLAG_REGISTRY, "export const registry = {", "export const registry: Registry = {")
@@ -460,7 +479,7 @@ class FlagPinAnchorTests(unittest.TestCase):
                 (self.root / MODULE).write_text(REAL_MODULE, encoding="utf-8")
                 (self.root / FLAG_RESOLVER).write_text(RESOLVER_SOURCE, encoding="utf-8")
                 self.edit(FLAG_RESOLVER, old, new)
-                self.assert_fails("differs from the reviewed v2.2.7 text")
+                self.assert_fails("differs from the reviewed v2.3.2 text")
 
     def test_moved_flag_files_fail_closed(self) -> None:
         for relative in (FLAG_REGISTRY, FLAG_RESOLVER, CONSOLE_PLUGIN):
@@ -478,7 +497,7 @@ class FlagPinAnchorTests(unittest.TestCase):
             "Store new session media once in a deduplicated blob table",
             "Store media once in a table",
         )
-        self.assert_fails("differs from the reviewed v2.2.7 text")
+        self.assert_fails("differs from the reviewed v2.3.2 text")
 
     def test_watching_computed_but_unused_fails_closed(self) -> None:
         # `watching` is computed and then ignored: the flag no longer decides
@@ -541,7 +560,7 @@ class FlagPinAnchorTests(unittest.TestCase):
         )
         result = run_guard(self.root)
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("differs from the reviewed v2.2.7 text", result.stderr)
+        self.assertIn("differs from the reviewed v2.3.2 text", result.stderr)
         self.assertIn("may predate the flag", result.stderr)
         self.assertNotIn("always on", result.stderr)
 

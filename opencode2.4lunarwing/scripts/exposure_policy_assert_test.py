@@ -25,6 +25,10 @@ from unittest import mock
 LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASSERT = LANE_ROOT / "scripts" / "exposure_policy_assert.py"
 WRAPPER = LANE_ROOT / "scripts" / "opencode-exposure-guard.sh"
+_PINNED_OFF_FLAGS = ("console_watches", "mcp_events", "artifacts")
+# WI#785 AGN-2: the wrapper pins every flag named here off, so the fixtures
+# below move with the checker's own tuple instead of a copied literal.
+WRAPPER_PIN = 'export OPENCODE_FLAGS="' + ",".join("-" + flag for flag in _PINNED_OFF_FLAGS) + '"\n'
 
 CONSOLE_GUARD = '''case "${LUNARWING_ALLOW_OPENCODE_CONSOLE_CREDENTIAL:-0}" in
   1|true|TRUE|yes|YES|on|ON) console_credential_opt_in=true ;;
@@ -583,7 +587,7 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         # lines, and nothing else may launch the binary or touch the variable.
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")
-        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        pin = WRAPPER_PIN
         launch = 'exec "$REAL_OPENCODE" "$@"'
         self.assertTrue(text.endswith(pin + launch + "\n"))
         self.assertEqual(text.count(pin + launch), 1)
@@ -629,7 +633,7 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         # so the "last two code lines" check alone is not enough.
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")
-        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        pin = WRAPPER_PIN
         launch = 'exec "$REAL_OPENCODE" "$@"'
         for label, prefix in (
             ("&&", '[ "${1:-}" != "--version" ] &&\n'),
@@ -648,7 +652,7 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         # rule must not only look at line starts.
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")
-        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        pin = WRAPPER_PIN
         launch = 'exec "$REAL_OPENCODE" "$@"'
         wrapper.write_text(
             text.replace(pin + launch, '[ ! -r "$HOME/.rc" ] || . "$HOME/.rc"\n' + pin + launch),
@@ -671,7 +675,7 @@ class ExposurePolicyAssertTests(unittest.TestCase):
     def test_comments_around_the_flag_pin_do_not_fail(self) -> None:
         wrapper = self.lane / "scripts" / WRAPPER.name
         text = wrapper.read_text(encoding="utf-8")
-        pin = 'export OPENCODE_FLAGS="-console_watches"\n'
+        pin = WRAPPER_PIN
         launch = 'exec "$REAL_OPENCODE" "$@"'
         wrapper.write_text(
             text.replace(
@@ -916,8 +920,9 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), " ".join(form))
 
     def test_console_watches_flag_is_forced_off_for_the_real_binary(self) -> None:
-        # WI#609 AAV-1: whatever OPENCODE_FLAGS the caller holds, the real
-        # binary starts with exactly "-console_watches" and its argv intact.
+        # WI#609 AAV-1, WI#785 AGN-2: whatever OPENCODE_FLAGS the caller holds,
+        # the real binary starts with exactly the pinned-off list
+        # (-console_watches,-mcp_events,-artifacts) and its argv intact.
         # The fake binary is executed, and /tmp is noexec on some dev hosts,
         # so it lives on the repo tree like the other executable fixtures.
         with tempfile.TemporaryDirectory(dir=LANE_ROOT) as temporary:
@@ -953,7 +958,7 @@ class ExposureGuardWrapperTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(
                             result.stdout.splitlines(),
-                            ["flags=-console_watches", *(f"arg={arg}" for arg in form)],
+                            [f"flags={WRAPPER_PIN.split(chr(34))[1]}", *(f"arg={arg}" for arg in form)],
                         )
 
     def test_refused_commands_never_start_the_real_binary(self) -> None:

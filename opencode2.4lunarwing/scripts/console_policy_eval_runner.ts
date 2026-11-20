@@ -94,7 +94,7 @@ const SKILL_BUNDLE = {
 // merge surface is observable as well as the Library: both must be absent when
 // the deny holds. With WI665_EVAL_DENY_PROVIDER it also carries a policy
 // statement: upstream keeps a denied integration's policies
-// (packages/core/src/config.ts:343-349 at the v2.2.7 pin), so that statement
+// (packages/core/src/config.ts:343-349 at the v2.3.2 pin), so that statement
 // applies in the control but must be neutralized by the managed allows.
 const CONSOLE_PROVIDER = "wi665-console-provider";
 const CONSOLE_MCP = "wi665-console-mcp";
@@ -131,7 +131,13 @@ const consoleServer = Bun.serve({
   fetch(request) {
     const path = new URL(request.url).pathname;
     requests.push(`${request.method} ${path}`);
-    if (path === "/api/v2/config") return Response.json(CONSOLE_CONFIG);
+    if (path === "/api/v2/config")
+      // v2.3.0+ gates the skill and instruction lists behind this response
+      // header (`listsHeader` in packages/core/src/plugin/provider/opencode.ts);
+      // without it the Console's lists are never fetched at all.
+      return Response.json(CONSOLE_CONFIG, {
+        headers: { "x-opencode-instructions-skills": "1" },
+      });
     if (path === "/api/v2/instructions") return Response.json({ instructions: [INSTRUCTION] });
     if (path === "/api/v2/skills") return Response.json({ skills: [{ slug: SKILL_SLUG, version: "1" }] });
     if (path === `/api/v2/skills/${SKILL_SLUG}`) return Response.json(SKILL_BUNDLE);
