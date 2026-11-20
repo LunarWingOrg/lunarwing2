@@ -3744,6 +3744,9 @@ auto-approval:
   recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
   recursive/forced `rm` outside temp roots. For `rm`, the hook joins shell
   line continuations before splitting commands on LF and control operators.
+  Every backslash-newline pair is joined, whatever the quote state, because
+  an apostrophe in a heredoc body or `$'…'` is text to the shell; joining too
+  much only merges lines, where the `rm` is still found (WI#810).
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
