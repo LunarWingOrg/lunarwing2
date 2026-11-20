@@ -4,6 +4,12 @@ plan description: Skill confidence-based demotion/pruning (B-2) and cross-agent 
 plan status: delivered
 ---
 
+> **Historical; shipped in v2.0.1.0.** This retains the original delivered plan and
+> its then-open registry limitations. The subsequent lifecycle fixes, including
+> downloaded and approved update-content replacement, are recorded in the
+> [v2.0.1.0 release notes](../../releases/RELEASE-v2.0.1.0.md). Current behavior
+> is described by `ic/FEATURE_PARITY.md`; neither document is an execution backlog.
+
 # B-2 + B-3 — Skills ecosystem: demotion/pruning and cross-agent sharing
 
 Follow-on to **B-1** (self-improving skills, delivered — see
