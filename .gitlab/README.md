@@ -994,6 +994,19 @@ Open **Settings > CI/CD** and apply:
    `skip-version-check` MR label and a recorded reason.
 8. Under **Job token permissions**, keep the inbound/outbound allowlist limited
    to this project unless one reviewed dependency needs broader access.
+9. Under **Artifacts**, turn **Keep artifacts from most recent successful
+   jobs** off (WI#791). It keeps the newest artifact set of every ref forever,
+   whatever `expire_in` says, and one branch per work item makes that one pinned
+   artifact set per branch. Artifacts were 99.3% of project storage while it was
+   on. Every job's expiry and the ceiling live in
+   [`docs/ops/CI_ARTIFACT_RETENTION.md`](../docs/ops/CI_ARTIFACT_RETENTION.md).
+
+Artifact retention is per job, and `ci-config` fails a job that declares
+`artifacts:` without a bounded `expire_in` (longer than one year is refused;
+rootfs tars must expire within two days; SBOM and promotion evidence must be
+kept at least 90 days). A top-level `default:artifacts:expire_in` in
+`defaults.yml` is only a backstop. Change the YAML and the expected values in
+`.gitlab/tests/test_artifact_retention.py` together.
 
 Runner cache credentials, if a shared cache backend is used, stay in runner
 `config.toml`. Never expose them as merge-request CI variables. Merge requests,
