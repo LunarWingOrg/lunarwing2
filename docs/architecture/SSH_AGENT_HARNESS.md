@@ -460,8 +460,9 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-44 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
-`ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
+47 unit tests across the harness modules as of 2026-11-20, all in-module
+(`#[cfg(test)]`), none in `ic/tests/` (tool-specific `ssh` / `ssh_git` tests are
+additional):
 
 | File | Tests |
 |------|-------|
@@ -470,7 +471,7 @@ Known limitations / follow-ups:
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
 | `ssh_hostkeys.rs` | 15 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, legacy RSA pin warning, concurrent-first-key race |
 | `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
-| `ssh_client.rs` | 7 — output caps; mislabeled RSA client-key rejection; non-RSA host-key offers; RSA-only and mixed negotiation-error mapping |
+| `ssh_client.rs` | 10 — output caps; mislabeled RSA client-key rejection; non-RSA host-key offers; RSA-only and mixed negotiation-error mapping; host-key certificate refusal and no certificate algorithm offered |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
 Notable gaps: no test performs successful signing with a real key or the full
