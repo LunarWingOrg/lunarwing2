@@ -72,19 +72,19 @@ class ArtifactRetentionGateTests(unittest.TestCase):
         }
         self.assertEqual(retention_errors(ok), [])
 
-    def test_evidence_must_be_kept_at_least_90_days(self):
+    def test_evidence_must_be_kept_at_least_30_days(self):
         for evidence in config.EVIDENCE_ARTIFACT_NAMES:
             with self.subTest(evidence=evidence):
                 merged = {
                     **BACKSTOP,
-                    "scan": {"artifacts": {"expire_in": "30 days", "paths": [evidence]}},
+                    "scan": {"artifacts": {"expire_in": "7 days", "paths": [evidence]}},
                 }
                 self.assertTrue(
                     any("evidence" in error for error in retention_errors(merged))
                 )
                 kept = {
                     **BACKSTOP,
-                    "scan": {"artifacts": {"expire_in": "90 days", "paths": [evidence]}},
+                    "scan": {"artifacts": {"expire_in": "30 days", "paths": [evidence]}},
                 }
                 self.assertEqual(retention_errors(kept), [])
 
@@ -112,7 +112,7 @@ class ArtifactRetentionGateTests(unittest.TestCase):
         errors = retention_errors({"job": {"artifacts": {"expire_in": "2 days"}}})
         self.assertTrue(any("default:artifacts" in error for error in errors))
 
-    def test_deprecated_global_artifacts_is_a_bounded_backstop(self):
+    def test_top_level_artifacts_is_a_bounded_backstop(self):
         merged = {**BACKSTOP, "artifacts": {"paths": ["out"]}}
         self.assertTrue(
             any("top-level artifacts" in error for error in retention_errors(merged))
@@ -144,8 +144,8 @@ class CommittedRetentionTests(unittest.TestCase):
             ".worker-candidate": "2 days",
             "worker-opencode2-candidate": "2 days",
             "worker-lunardepth-candidate": "2 days",
-            ".worker-scan": "90 days",
-            ".worker-promotion": "1 year",
+            ".worker-scan": "30 days",
+            ".worker-promotion": "30 days",
         }
         for name, expire_in in expected.items():
             with self.subTest(job=name):
