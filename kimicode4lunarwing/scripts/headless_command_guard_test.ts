@@ -113,6 +113,21 @@ test("dangerous segment inside a compound command is denied", () => {
   assertBlocked("cat f | sudo tee /etc/hosts", "privilege")
 })
 
+test("recursive rm on separate command lines is denied outside temp roots", () => {
+  assertBlocked("rm -rf /home/kumo\nls", "rm")
+  assertBlocked("echo hi\nrm -rf /app/hooks\ntrue", "rm")
+  assertBlocked("echo hi\r\nrm -rf /workspace\r\ntrue", "rm")
+  assertAllowed("rm -rf /tmp/wi795-scratch\nls")
+})
+
+test("uppercase recursive and force rm flags are denied outside temp roots", () => {
+  assertBlocked("rm -R /home/user/project", "rm")
+  assertBlocked("rm -RF /app/config", "rm")
+  assertBlocked("rm -vR /home/kumo", "rm")
+  assertBlocked("rm -fR /home/kumo", "rm")
+  assertAllowed("rm -R /tmp/wi795-scratch")
+})
+
 test("unparseable or malformed payloads fail closed", () => {
   const notJson = runGuard("this is not json {{{")
   assert.equal(notJson.status, 2, "non-JSON payload must deny")
