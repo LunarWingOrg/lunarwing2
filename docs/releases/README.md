@@ -1,7 +1,9 @@
 # Release Notes
 
 The current release-notes draft is
-[v2.2.0.0 — Shinkai (深海)](../../RELEASE-v2.2.0.0.md).
+[v2.2.1.0 — Shinobi (忍び)](../../RELEASE-v2.2.1.0.md). It lives at the
+repository root until the release; the maintainer moves it here at the tag,
+as was done for v2.2.0.0.
 
 ## Released versions
 
@@ -12,6 +14,7 @@ are historical snapshots, not the current backlog.
 
 | Release | Codename | Date | Notes |
 |---------|----------|------|-------|
+| [v2.2.0.0](RELEASE-v2.2.0.0.md) | Shinkai (深海) | 2026-11-18 | LunarDepth worker lane, kernel-enforced sandbox egress, opt-in tunnel networking, RSA removal, image-aware tenant upgrades, PostgreSQL 16.16 security refresh |
 | [v2.1.8.0](RELEASE-v2.1.8.0.md) | Umioto (海音) | 2026-11-06 | Wingtip, Engine V2 recovery, silent-reply guards, tenant upgrade hardening, dependency and worker refresh |
 | [v2.1.7.0](RELEASE-v2.1.7.0.md) | Shiranui (不知火) | 2026-10-30 | External-worker isolation, Engine V2 ownership, tenant lifecycle hardening, dependency security refresh |
 | [v2.1.6.0](RELEASE-v2.1.6.0.md) | Tsuno (角) | 2026-10-24 | External-worker tool proxy and cron missions, credential boundaries, OpenRC proxy migration, dependency security refresh |

@@ -188,7 +188,7 @@ ignore = [
     # records in advisory-db 074ea9a7 ("wasmtime: mark versions before the
     # affected ranges as unaffected"), which gave them
     # `unaffected = ["< 39.0.0"]` and `unaffected = ["< 47.0.0"]`; the locked
-    # 36.0.21 lies below both, so neither record matches any crate in either
+    # 36.0.x release lies below both, so neither record matches any crate in either
     # lockfile and cargo-deny reported the entries as advisory-not-detected.
     # If either record changes back, the gate turns red again: that is the
     # correct signal, and re-accepting is a new maintainer decision — do not
@@ -259,6 +259,12 @@ deny = [
     # Ban downgrades within our supported 36.x line, not the patched versions.
     # No advisory ignore: other Wasmtime release lines retain RustSec coverage.
     { name = "wasmtime", version = ">=36.0.0, <36.0.20" },
+    # 2026-11-20: RUSTSEC-2026-0587 (WASI filesystem sandbox escape on Windows
+    # through a drive-prefixed path component) is fixed in wasmtime-wasi
+    # 36.0.22; the locks moved to 36.0.23. Same shape as the entry above: ban
+    # downgrades of the named crate within the 36.x line, and no advisory
+    # ignore.
+    { name = "wasmtime-wasi", version = ">=36.0.0, <36.0.22" },
     # Version floors protecting the patched copies of advisory-pinned crates
     # against silent downgrade (MR !1371 review A3): the advisory ignores
     # above are keyed by ID, which would not fire if a future lockfile
