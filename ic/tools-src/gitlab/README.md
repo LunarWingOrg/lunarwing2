@@ -11,9 +11,10 @@ injection, bounded errors, and approval gating.
   `list_issue_notes`, `create_issue_note`
 - Unified Work Items: `list_work_items`, `get_work_item` (Issues, Tasks, and
   hierarchy; `get_issue` automatically falls back when the classic endpoint 404s)
-- Merge requests: `list_merge_requests`, `get_merge_request`,
+- Merge requests: `list_merge_requests`, `get_merge_request`, `get_mr_changes`,
   `create_merge_request`, `update_merge_request`, `list_mr_notes`,
-  `create_mr_note`, `approve_merge_request`, `merge_merge_request`
+  `create_mr_note`, `approve_merge_request`, `unapprove_merge_request`,
+  `merge_merge_request`
 - Branches: `list_branches`, `get_branch`, `create_branch`, `delete_branch`
 - Files: `get_file_content`, `create_or_update_file`, `delete_file`
 - Search: `search_projects`, `search_issues`, `search_blobs`
@@ -25,9 +26,9 @@ number, and may also be spelled `project_id`. Issue, Work Item, and merge
 request `iid` values are project-local IDs shown by GitLab, not global IDs.
 `get_file_content` returns base64 to preserve arbitrary file bytes and
 accepts only `project`, `path`, and `ref` (no `branch` or `sha` spelling).
-`list_projects` filters by `search`, not `query`. Only `list_issues` and
-`list_work_items` accept `all_pages`; `list_merge_requests` and the other
-list actions return one page and paginate with `page`/`per_page`.
+`list_projects` filters by `search`, not `query`. `list_issues`,
+`list_work_items`, and `list_merge_requests` accept `all_pages`; the other list
+actions return one page and paginate with `page`/`per_page`.
 
 ### Parameters and branch-scoped search
 
@@ -93,6 +94,30 @@ stops at 20 pages, 2000 unique items, or 3 MiB of source JSON, whichever comes
 first. The merged `pagination` object reports `fetched_pages`, `returned_items`,
 `complete`, and `truncated`; when truncated it also carries `resume_page`, which
 can be passed as `page` to a normal paged `list_issues` call.
+
+`list_merge_requests` takes the same `all_pages` walk and adds
+`source_branch`/`target_branch` filters, so a review loop can inventory one
+integration lane without paging or client-side filtering. Branch values are
+overloaded by GitLab as refs, so they are validated as nonempty and
+percent-encoded.
+
+### Merge request review without a checkout
+
+`get_mr_changes` calls GitLab's `GET /projects/:id/merge_requests/:iid/changes`
+and returns the merge request with its `changes` array of per-file diffs
+(`old_path`, `new_path`, `diff`, and the `new_file`/`renamed_file`/
+`deleted_file` flags). This is the review path for hosts where the repository
+cannot be checked out or where the file list is not known in advance; without
+it, reviewing means guessing paths for `get_file_content`.
+
+A `changes` array is not automatically the whole diff. `overflow: true` means
+GitLab truncated the database-backed diff set and you should fall back to
+`get_file_content` at the diff refs or a local `git diff`. A `too_large` entry
+cannot be retrieved through the API at all, and a `collapsed` entry was omitted
+from this response. Check those markers per file before reporting that every
+change was reviewed. `unapprove_merge_request` removes only the configured
+token user's approval (`POST …/unapprove`) and needs no `sha`; it does not
+reset other reviewers' approvals.
 
 `list_jobs` returns a **flat** per-job surface rather than GitLab's full job
 object (which nests heavy `pipeline`, `commit`, `runner`, `user`, and
