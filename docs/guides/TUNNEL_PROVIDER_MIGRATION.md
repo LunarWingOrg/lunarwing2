@@ -5,7 +5,7 @@ custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale provider
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** `TUNNEL_URL` precedence,
+**Revalidated against source 2026-11-20 (v2.2.1.0).** `TUNNEL_URL` precedence,
 `TUNNEL_CUSTOM_COMMAND`, and the V24 settings scrub match
 `ic/src/config/tunnel.rs` and `ic/migrations/V24__remove_legacy_tunnel_settings.sql`.
 This guide concerns daemon/webhook exposure, not the separate opt-in sandbox
