@@ -1880,6 +1880,10 @@ d947ea04b058e5ec405db75e42eabd0ec9376bb4:ic/vendor/cranelift-assembler-x64/.carg
 d947ea04b058e5ec405db75e42eabd0ec9376bb4:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1
 d947ea04b058e5ec405db75e42eabd0ec9376bb4:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1
 d947ea04b058e5ec405db75e42eabd0ec9376bb4:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1
+da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/cranelift-assembler-x64/.cargo-checksum.json:generic-api-key:1
+da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1
+da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1
+da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/monty/.cargo-checksum.json:generic-api-key:1
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/ruff_python_ast/.cargo-checksum.json:generic-api-key:1
 df3b9e3122c5ceed13f732171460322e31b3bf8a:ic/vendor/ruff_python_parser/.cargo-checksum.json:generic-api-key:1
