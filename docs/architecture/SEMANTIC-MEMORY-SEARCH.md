@@ -2,7 +2,8 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** The database-backed workspace
+**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
+was checked. The database-backed workspace
 remains the shared document/chunk store for memory and native knowledge tools.
 Current changes at its boundaries include:
 
