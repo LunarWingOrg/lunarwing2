@@ -19,8 +19,9 @@
 `v2.2.0.0..HEAD`, from the work items closed under the `2.2.1.0` label, and
 from the Known Limitations of
 [`RELEASE-v2.2.0.0.md`](docs/releases/RELEASE-v2.2.0.0.md). Every statement
-about a mechanism was checked against the tree at commit `2e90802d6ba9`, not
-against a commit message or a merge-request description. A run is cited only
+about a mechanism was checked against the tree at commit `2e90802d6ba9`, the
+branch head before this file was added, not against a commit message or a
+merge-request description. A run is cited only
 where a committed document or work item records it; where a statement is what
 the code is expected to do and nothing was run, it says so.
 
