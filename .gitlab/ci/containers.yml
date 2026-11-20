@@ -23,7 +23,12 @@
     GIT_CONFIG_VALUE_0: "$CI_PROJECT_DIR"
   artifacts:
     when: always
-    expire_in: 30 days
+    # WI#791: short by design. These files are inputs to the scan, the
+    # out-of-band exposure verification, and promotion in this same pipeline;
+    # nothing outside the pipeline reads them. The big opencode2 rootfs export
+    # lives here too. Provenance that must outlive the pipeline is the scan
+    # SBOM (90 days) and worker-image-evidence.json on promotion (1 year).
+    expire_in: 2 days
     reports:
       dotenv: worker-image.env
     paths:
@@ -160,7 +165,9 @@
     - trivy_with_retry trivy image --config /dev/null --skip-version-check --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always
-    expire_in: 30 days
+    # WI#791: evidence, not build output. The SBOM and vulnerability report are
+    # what a later audit reads; keep them well past the pipeline that made them.
+    expire_in: 90 days
     reports:
       container_scanning: gl-container-scanning-report.json
     paths:
@@ -193,6 +200,8 @@
   script:
     - python3 .gitlab/scripts/promote-worker-image.py promote
   artifacts:
+    # WI#791: release evidence. One small JSON file per promoted image, and the
+    # only durable record of what was published; keep it for a year.
     expire_in: 1 year
     paths:
       - worker-image-evidence.json
@@ -252,7 +261,8 @@ worker-opencode2-candidate:
     - sh .gitlab/scripts/build-worker-image.sh opencode2
   artifacts:
     when: always
-    expire_in: 30 days
+    # WI#791: pipeline-scoped tar, two days (see .worker-candidate).
+    expire_in: 2 days
     reports:
       dotenv: worker-image.env
     paths:
@@ -260,6 +270,9 @@ worker-opencode2-candidate:
       - worker-image-metadata.json
       - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
+      # WI#791: the tar is a pipeline-scoped build output; two days is enough
+      # for the scan/exposure-verify jobs that follow. The byte-level
+      # provenance kept long-term is the scan SBOM and promotion evidence.
       - opencode2-rootfs.tar
 
 worker-opencode2-scan:
@@ -321,7 +334,8 @@ worker-lunardepth-candidate:
     - sh .gitlab/scripts/build-worker-image.sh lunardepth
   artifacts:
     when: always
-    expire_in: 30 days
+    # WI#791: pipeline-scoped tar, two days (see .worker-candidate).
+    expire_in: 2 days
     reports:
       dotenv: worker-image.env
     paths:
@@ -329,6 +343,7 @@ worker-lunardepth-candidate:
       - worker-image-metadata.json
       - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
+      # WI#791: pipeline-scoped build output, two days (see .worker-candidate).
       - lunardepth-rootfs.tar
 
 worker-lunardepth-exposure-verify:

@@ -1706,6 +1706,8 @@ The production closure is locked twice: the workspace install uses `pnpm install
 
 MR source/policy jobs do not receive publication credentials. Protected `worker-lunardepth-candidate` must produce an immutable candidate, run the real split-role smoke, export `lunardepth-rootfs.tar`, and match an uncached clean rebuild's whole-image digest. `worker-lunardepth-exposure-verify` independently validates tar ownership/modes and full image config, while `worker-lunardepth-scan` applies the CRITICAL vulnerability gate to the exact candidate digest. Manual `worker-lunardepth-promote` publishes that verified digest as `$CI_COMMIT_TAG-lunardepth`, never a rebuilt or `:latest` image. It hard-needs candidate, exposure verification, scan, `worker-exposure-policy-guard`, and the BuildKit parser guard. Local tests and an MR pipeline do not substitute for those protected or live acceptance gates.
 
+Candidate artifacts (including the rootfs tar) expire after **two days** (WI#791; they were most of the project's GitLab storage). Play a manual promote from the pipeline that produced its candidate, inside that window. If the artifacts are gone, re-run the candidate and then the scan first — promotion never rebuilds. Full retention rules: [`CI_ARTIFACT_RETENTION.md`](CI_ARTIFACT_RETENTION.md).
+
 For every LunarDepth version or security-input bump:
 
 1. Review the complete upstream diff for new exposure/publication surfaces and record the disposition of tunnels, relays, pairing, sharing, web listeners, public fetch/search, telemetry, DeepSeek account routes, remote plugins/MCP, settings/HMR, and self-update. Keep WI#357 egress enforcement unchanged.

@@ -1001,6 +1001,19 @@ Open **Settings > CI/CD** and apply:
    `skip-version-check` MR label and a recorded reason.
 8. Under **Job token permissions**, keep the inbound/outbound allowlist limited
    to this project unless one reviewed dependency needs broader access.
+9. Under **Artifacts**, turn **Keep artifacts from most recent successful
+   jobs** off (WI#791). It keeps the newest artifact set of every ref forever,
+   whatever `expire_in` says, and one branch per work item makes that one pinned
+   artifact set per branch. Artifacts were 99.3% of project storage while it was
+   on. Every job's expiry and the ceiling live in
+   [`docs/ops/CI_ARTIFACT_RETENTION.md`](../docs/ops/CI_ARTIFACT_RETENTION.md).
+
+Artifact retention is per job, and `ci-config` fails a job that declares
+`artifacts:` without a bounded `expire_in` (longer than one year is refused;
+rootfs tars must expire within two days; SBOM and promotion evidence must be
+kept at least 90 days). A top-level `default:artifacts:expire_in` in
+`defaults.yml` is only a backstop. Change the YAML and the expected values in
+`.gitlab/tests/test_artifact_retention.py` together.
 
 Runner cache credentials, if a shared cache backend is used, stay in runner
 `config.toml`. Never expose them as merge-request CI variables. Merge requests,
@@ -1090,7 +1103,10 @@ produced under weaker policies before relying on cached test results.
 Worker candidates use `needs: []`: on protected default-branch/release-tag pushes,
 play `worker-<name>-candidate` immediately, without waiting for the Rust matrix.
 Its scan runs automatically using that candidate's artifacts; there is no second
-manual scan step. On `master` these lanes remain optional. On release tags the
+manual scan step. Candidate artifacts expire after two days (WI#791 — the rootfs
+tars were most of the project's storage), so play a manual promotion from its
+own pipeline, within that window; otherwise re-run the candidate and scan first.
+On `master` these lanes remain optional. On release tags the
 candidate and scan remain blocking, and promotion remains manual and requires
 both. A failed candidate may still cause an optional scan to fail for missing
 artifacts; finish/retry the candidate first, then retry the scan if needed.

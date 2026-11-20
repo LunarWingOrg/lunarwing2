@@ -36,6 +36,9 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
   worker-image operations; [`REGISTRY_PUSH_499.md`](REGISTRY_PUSH_499.md)
   covers the host-side 60-second timeout on large uploads and the recommended
   edge settings.
+- [`CI_ARTIFACT_RETENTION.md`](CI_ARTIFACT_RETENTION.md) — job artifact and job
+  log retention, the project settings that back it, and the 10 GiB storage
+  ceiling.
 - [`GITHOOKS_HOW_TO.md`](GITHOOKS_HOW_TO.md) and
   [`RELEASE_COMMANDS.md`](RELEASE_COMMANDS.md) — repository and release
   operations.

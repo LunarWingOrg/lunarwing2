@@ -3331,6 +3331,149 @@ def validate_log_scrubber_test_support(errors: list[str]) -> None:
                     )
 
 
+# WI#791: artifacts were 99.3% of project storage because no job had a
+# retention short enough to matter and the project kept the latest successful
+# job's artifacts forever. Expiry is per job (GitLab has no per-path expiry), so
+# the validator enforces the decisions each job must state for itself:
+#   * every artifacts block has an explicit, bounded expire_in;
+#   * rootfs tars (hundreds of MiB, consumed only by later jobs in the same
+#     pipeline) expire within two days;
+#   * scan/release evidence (SBOM, vulnerability report, promotion evidence) is
+#     kept at least 90 days.
+# A top-level `default: artifacts: expire_in` is required as a backstop so an
+# artifacts block that somehow slips past still expires, but the backstop is not
+# accepted in place of a job-level value.
+ARTIFACT_EXPIRY_UNITS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "week": 604800,
+    "month": 2592000,
+    "year": 31536000,
+}
+ARTIFACT_EXPIRY_TOKEN = re.compile(
+    r"\s*(\d+)\s*(second|minute|hour|day|week|month|year)s?"
+)
+ARTIFACT_MAX_EXPIRY_SECONDS = 365 * 86400
+ROOTFS_ARTIFACT_MAX_SECONDS = 2 * 86400
+EVIDENCE_ARTIFACT_MIN_SECONDS = 90 * 86400
+EVIDENCE_ARTIFACT_NAMES = (
+    "worker-image-evidence.json",
+    "worker-sbom.cdx.json",
+    "worker-vulnerabilities.json",
+)
+# Top-level keys GitLab reserves; everything else mapping to a dict is a job or
+# a hidden job template. The deprecated global forms (a bare `artifacts:`,
+# `retry:`, ... at the top level) are listed so they cannot be mistaken for jobs.
+RESERVED_TOP_LEVEL_KEYS = {
+    "default", "include", "stages", "variables", "workflow",
+    "image", "services", "cache", "before_script", "after_script",
+    "artifacts", "retry", "timeout", "interruptible", "tags",
+}
+
+
+def artifact_expiry_seconds(value: object) -> int | None:
+    """Seconds for a GitLab human duration, or None for unsupported values.
+
+    `never` and unrecognised text return None so the caller fails closed: an
+    artifact with no bounded expiry is exactly the WI#791 regression. GitLab
+    accepts compound durations ("1 hour 30 minutes"), so the whole string must
+    be consumed by `<amount> <unit>` tokens; any leftover text is unsupported.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    position = 0
+    total = 0
+    for match in ARTIFACT_EXPIRY_TOKEN.finditer(text):
+        if match.start() != position:
+            return None
+        total += int(match.group(1)) * ARTIFACT_EXPIRY_UNITS[match.group(2)]
+        position = match.end()
+    if position != len(text) or total <= 0:
+        return None
+    return total
+
+
+def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
+    """WI#791: every artifact has an explicit, bounded, deliberate expiry."""
+    default_section = merged.get("default")
+    default_artifacts = (
+        default_section.get("artifacts") if isinstance(default_section, dict) else None
+    )
+    if not isinstance(default_artifacts, dict) or "expire_in" not in default_artifacts:
+        errors.append(
+            "defaults.yml default:artifacts must set expire_in as a retention "
+            "backstop (WI#791)"
+        )
+    else:
+        backstop = artifact_expiry_seconds(default_artifacts["expire_in"])
+        if backstop is None:
+            errors.append(
+                "defaults.yml default:artifacts expire_in "
+                f"{default_artifacts['expire_in']!r} is not a bounded duration (WI#791)"
+            )
+    # A bare top-level `artifacts:` is GitLab's deprecated global form. It is
+    # applied to every job, so it is a backstop too and needs the same bound.
+    global_artifacts = merged.get("artifacts")
+    if isinstance(global_artifacts, dict) and artifact_expiry_seconds(
+        global_artifacts.get("expire_in")
+    ) is None:
+        errors.append(
+            "top-level artifacts expire_in "
+            f"{global_artifacts.get('expire_in')!r} is not a bounded duration (WI#791)"
+        )
+
+    for name, job in merged.items():
+        if name in RESERVED_TOP_LEVEL_KEYS or not isinstance(job, dict):
+            continue
+        effective = resolve_extends(job, merged)
+        if effective.get(EXTENDS_TRUNCATED_KEY):
+            # A cyclic or over-deep extends chain hides whatever the chain would
+            # have contributed, including an artifacts block or its expire_in.
+            # Refuse rather than certify only the keys visible at truncation.
+            errors.append(
+                f"{name} has an extends chain deeper than the budget; its "
+                "artifact retention cannot be verified (WI#791)"
+            )
+            continue
+        artifacts = effective.get("artifacts")
+        if not isinstance(artifacts, dict):
+            continue
+        expire_in = artifacts.get("expire_in")
+        seconds = artifact_expiry_seconds(expire_in)
+        if seconds is None:
+            errors.append(
+                f"{name} declares artifacts but its expire_in {expire_in!r} is "
+                "missing or not a bounded duration (WI#791)"
+            )
+            continue
+        if seconds > ARTIFACT_MAX_EXPIRY_SECONDS:
+            errors.append(
+                f"{name} keeps artifacts for {expire_in!r}; one year is the "
+                "longest reviewed retention (WI#791)"
+            )
+        paths = artifacts.get("paths", [])
+        if isinstance(paths, str):
+            paths = [paths]
+        paths = [str(path) for path in paths] if isinstance(paths, list) else []
+        if any("rootfs" in path for path in paths) and seconds > ROOTFS_ARTIFACT_MAX_SECONDS:
+            errors.append(
+                f"{name} uploads a rootfs tar with expire_in {expire_in!r}; "
+                "rootfs tars are pipeline-scoped and must expire within 2 days (WI#791)"
+            )
+        if any(
+            path.endswith(evidence) for path in paths for evidence in EVIDENCE_ARTIFACT_NAMES
+        ) and seconds < EVIDENCE_ARTIFACT_MIN_SECONDS:
+            errors.append(
+                f"{name} keeps scan/release evidence for {expire_in!r}; evidence "
+                "must be held at least 90 days (WI#791)"
+            )
+
+
 def main() -> int:
     errors: list[str] = []
     validate_log_scrubber_test_support(errors)
@@ -3423,6 +3566,7 @@ def main() -> int:
     validate_worker_ts_lanes(merged_config, errors)
     validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
+    validate_artifact_retention(merged_config, errors)
     validate_worker_versions(errors)
     validate_lunardepth_versions(errors)
     validate_proxy_tool_set_sync(errors)
