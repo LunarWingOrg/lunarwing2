@@ -135,7 +135,9 @@ Code that violates these won't be merged no matter how elegant it is.
 
 - IRC: `#lunarwing` on `irc.libera.chat:6697` (TLS)
 - Architecture specs: `docs/architecture/`
-- Subsystem specs: `ic/src/*/CLAUDE.md`
+- Subsystem specs: `ic/src/db/CLAUDE.md`, `ic/src/setup/README.md`,
+  `ic/src/tools/README.md`, `ic/src/workspace/README.md`,
+  `ic/src/NETWORK_SECURITY.md`
 - Testing guide: `docs/guides/TESTING_GUIDE.md`
 
 Ask before you build. We would rather tell you "bad idea" in a 30-second IRC reply than
@@ -143,4 +145,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-19 (v2.2.1.0 crate sweep). Update §2 whenever freeze status changes.*
+*Last updated: 2026-11-20 (subsystem spec paths). Update §2 whenever freeze status changes.*

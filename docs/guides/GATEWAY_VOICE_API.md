@@ -46,8 +46,8 @@ VOICE_REQUEST_TIMEOUT_SECS=120
 ```
 
 The gateway's proxy timeout is the sidecar's `VOICE_REQUEST_TIMEOUT_SECS` plus
-fixed headroom (30 s), so the sidecar's own structured timeout response always
-reaches the client instead of the gateway racing it.
+30 s of headroom. Match the gateway setting to the sidecar's so the latter
+can return its structured timeout before the proxy's HTTP request times out.
 
 `VOICE_SERVICE_URL` must be plain HTTP, point at `localhost` or a loopback IP,
 and carry no credentials, path, query, or fragment — the same invariants the
@@ -202,8 +202,9 @@ for the supported `restart-tenant` procedure (whole-tenant interruption).
 
 ## Bounds and Security
 
-- **Server-held credential**: only the gateway knows `VOICE_AUTH_TOKEN`; the
-  sidecar sees it on the proxied request, the desktop client never does.
+- **Server-held credential**: the daemon uses `VOICE_AUTH_TOKEN` to authenticate
+  to the sidecar; the desktop client authenticates to the gateway and never
+  receives the sidecar token.
 - **Loopback-only upstream**: proxy endpoints are derived from `VOICE_SERVICE_URL`
   through the shared `voice_endpoint` builder (HTTP, loopback host, no
   credentials/query/fragment/path). `no_proxy` + no-redirect client.

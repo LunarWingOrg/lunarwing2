@@ -36,17 +36,21 @@ the live (shared) knowledge store stays queryable too.
 
 ## Quickstart
 
-Create the tenant with the `--with-study-mcp` flag:
+Create the tenant with `--with-study-mcp` and a valid LLM endpoint. Replace the
+example URL with your TensorZero upstream. For a tenant without a local
+TensorZero proxy, `--llm-base-url` can supply a direct endpoint instead.
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-study-mcp
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant mytenant --with-study-mcp \
+  --tensorzero-url https://tensorzero.example.com
 ```
 
 Optional: point at a different study-notes checkout (it is still synced to the
 latest upstream before wiring):
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-study-mcp \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant mytenant --with-study-mcp \
+  --tensorzero-url https://tensorzero.example.com \
   --study-mcp-home /srv/my-lw2studymcp
 ```
 
@@ -175,10 +179,9 @@ without importing directly, run `sync-knowledge-sources`.
 
 - **New tenants only.** The env flag is written exclusively on the
   `add-tenant --with-study-mcp` path. `configure-study-mcp` (existing tenants)
-  wires the shared MCP read-only but never arms the seed; `upgrade-tenant`
-  never touches env, so an existing tenant upgraded onto a seed-capable
-  binary is never populated; env regeneration only carries an existing value
-  forward (including an explicit operator `=0` opt-out).
+  wires the shared MCP read-only but never arms the seed. `upgrade-tenant`
+  patches the tenant env but does not set the seed flag. Env regeneration
+  only carries an existing value forward (including an explicit `=0` opt-out).
 - **The bootstrap runs exactly once per tenant.** A state file
   (`knowledge_seed_state.json`, see below) is written once the pass has walked
   every discovered note; later startups skip that bootstrap entirely. The
@@ -263,11 +266,10 @@ After provisioning and the first `start-tenant`:
 
 ## Existing tenants, upgrades, and opt-outs
 
-- **Upgraded tenants are never seeded.** `upgrade-tenant` never touches the
-  tenant env, so a tenant created on a pre-seed commit and upgraded onto a
-  seed-capable branch keeps an untouched knowledge store with zero
-  `study-notes/` documents. Verified live on both systemd and Gentoo/OpenRC
-  hosts (see the verification records below).
+- **An upgrade does not opt a tenant into seeding.** `upgrade-tenant` can patch
+  the tenant env, but it does not add `KNOWLEDGE_SEED_FROM_STUDY_MCP`. Upgrading
+  an unarmed tenant therefore does not bootstrap `study-notes/` documents.
+  The historical verification records below cover systemd and Gentoo/OpenRC.
 - **`configure-study-mcp` never arms the seed.** It wires (or re-syncs) the
   shared read-only MCP only unless `--enable-knowledge-sync` is supplied. That
   flag opts an existing tenant into additive refresh without pretending it is a
@@ -301,9 +303,9 @@ After provisioning and the first `start-tenant`:
   production multi-tenant deployment runbook
 - [`../ops/TENANT-CONFIGURATION.md`](../ops/TENANT-CONFIGURATION.md) — tenant
   env file layout and configuration reference
-- [`../ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](../ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md) —
+- [`../ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](../ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md) —
   mechanism design record + Gentoo/OpenRC live verification
-- [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
+- [`../ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
   systemd live verification (including the upgraded-tenant negative case)
 - [`../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
   refresh architecture, safety invariants, and hosted-delta follow-up

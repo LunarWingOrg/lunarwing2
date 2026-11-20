@@ -4,11 +4,9 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Ubuntu 22.0
 24.04 LTS (or newer) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the
 infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
-probes were re-checked. External-worker egress enforcement (WI#424) requires
-the host `nft` command, so `nftables` is now explicit below. Disk health reuses
-`df`, `stat`, and `timeout` from the already-expected core utilities; no other
-new host package is required.
+**Revalidated 2026-11-10 (v2.2.0.0).** External-worker egress enforcement
+(WI#424) requires the host `nft` command from `nftables`. Disk health reuses
+`df`, `stat`, and `timeout` from the already-expected core utilities.
 
 This is the Ubuntu equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
@@ -35,7 +33,7 @@ The admin script, the per-tenant daemons, and the health/self-heal pipeline need
 |---------|-----|
 | `jq` | Port registry (`/etc/lunarwing/ports.json`), health-check JSON, self-heal, send-notification |
 | `git` | Per-tenant repo clones |
-| `python3` | TensorZero proxy, WeeChat WS adapter, all `health-*.sh` scripts |
+| `python3` | MT admin, TensorZero proxy, WeeChat WS adapter, and the `health-worker-egress.sh` probe |
 | `curl` | Self-heal Gotify pages, `health-models` probe, gateway deep-checks |
 | `util-linux` | Provides `flock` — build lock + self-heal single-instance lock (Essential, always present) |
 
@@ -130,7 +128,7 @@ the health pipeline do **not** need these:
 | Package | Why |
 |---------|-----|
 | `weechat` | The IRC client the agent talks to |
-| `tmux` | The `weechat-<tenant>` systemd unit runs weechat inside a tmux session |
+| `tmux` | The `lunarwing-weechat-<tenant>.service` user unit runs WeeChat inside tmux |
 | `python3-aiohttp` | Required by the WeeChat WS adapter (`lunarwing-weechat-adapter-<tenant>`); without it the adapter crashes on import |
 
 ```bash
@@ -148,9 +146,10 @@ importer) needs these third-party modules. **The existing quickstart hints only 
 against each tool's `requirements.txt` and source imports).
 
 Ubuntu's system Python is PEP-668 managed, so either apt-install the `python3-*` packages
-(from **universe**) **or** install the pinned requirements into a venv
-(`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`) — each tool ships
-one. The venv route needs `python3-venv`.
+(from **universe**) **or** install the tool's declared requirements into a venv
+(`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`, from the tool's
+directory). The onboard CLI and web requirements specify minimum versions. The venv
+route needs `python3-venv`.
 
 > **24.04 (noble) caveat:** noble ships `python3-pydantic` **1.10.x**, but
 > `lunarwing_mt_onboard_web` requires `pydantic>=2.0` / `fastapi>=0.110`. Check with
@@ -189,23 +188,24 @@ Notes:
 ### Test/CI-only Python packages
 
 Only needed to run the repo's Python test harnesses, not for a live deployment — a venv
-with the shipped requirements files is the recommended route:
+with the shipped dependencies is the recommended route. `tests/requirements.txt` also
+pins pytest and tenacity, but `tests/runner.py` uses neither; E2E dependencies are
+declared in `ic/tests/e2e/pyproject.toml`.
 
 | Package | Consumers |
 |---------|-----------|
-| `python3-pytest` (+ `python3-pytest-asyncio`, `python3-pytest-timeout` plugins) | `tests/runner.py`, `ic/tests/e2e` |
+| `python3-pytest` (+ `python3-pytest-asyncio`, `python3-pytest-timeout` plugins) | `ic/tests/e2e` |
 | `python3-requests` | `tests/runner.py` |
 | `python3-websocket` | `tests/runner.py` (imports `websocket`; this is the `websocket-client` PyPI project) |
-| `python3-tenacity` | `tests/runner.py` (universe) |
 | `pytest-playwright` + `playwright` (pip only) | `ic/tests/e2e` browser scenarios |
-| `anthropic` (pip only, optional) | `ic/tests/e2e` vision scenarios |
+| `anthropic` (pip only, optional) | Declared by the `vision` extra in `ic/tests/e2e/pyproject.toml`, not a base E2E dependency |
 
 ---
 
 ## One-shot install (Podman + cron + WeeChat)
 
 ```bash
-sudo add-apt-repository universe   # for python3-questionary / python3-tenacity, etc.
+sudo add-apt-repository universe   # for python3-questionary, etc.
 sudo apt install \
   jq git python3 curl \
   podman uidmap fuse-overlayfs slirp4netns nftables \

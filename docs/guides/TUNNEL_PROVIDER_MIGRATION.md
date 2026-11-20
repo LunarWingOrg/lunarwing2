@@ -1,13 +1,14 @@
 # Managed Tunnel Provider Migration
 
-Since LunarWing v2.0.3, the managed providers are NetBird Reverse Proxy and
+Since LunarWing v2.0.3.0, the managed providers are NetBird Reverse Proxy and
 custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale providers were removed. An
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** `TUNNEL_URL` precedence,
-`TUNNEL_CUSTOM_COMMAND`, and the V24 settings scrub match
-`ic/src/config/tunnel.rs` and `ic/migrations/V24__remove_legacy_tunnel_settings.sql`.
+**Source revalidated 2026-11-20 for v2.2.1.0 (`4192ee72b`).** The resolver,
+custom command, settings write guard, doctor checks and V24 migrations were
+checked against the tree. This is not a live migration test.
+
 This guide concerns daemon/webhook exposure, not the separate opt-in sandbox
 egress overlay in [`SANDBOX_TUNNEL_NETWORKING.md`](SANDBOX_TUNNEL_NETWORKING.md).
 
@@ -36,7 +37,13 @@ Custom managed command:
 ```env
 TUNNEL_PROVIDER=custom
 TUNNEL_CUSTOM_COMMAND=example-tunnel --port {port} --host {host}
+TUNNEL_CUSTOM_URL_PATTERN=tunnel.example.com
 ```
+
+Use a command that prints its public URL on stdout. The optional pattern is a
+substring, not a regular expression. If unset or not matched, the custom
+provider reports its local HTTP target instead. The command is split on
+whitespace after placeholder substitution; it is not evaluated by a shell.
 
 Externally managed HTTPS endpoint:
 
@@ -51,8 +58,8 @@ exposure.
 
 ## Settings Cleanup
 
-Database migration V24 removes these persisted provider-specific rows for all
-users:
+Database migration V24 removes these provider-specific keys for all users,
+both as individual rows and as fields in the `tunnel` settings object:
 
 - `tunnel.cf_token`
 - `tunnel.ngrok_token`
@@ -61,9 +68,10 @@ users:
 - `tunnel.ts_hostname`
 
 V24 intentionally keeps `tunnel.provider` as a migration marker. Replace or
-delete its legacy value through setup or CLI. Web settings can perform recovery
-only when LunarWing starts through a temporary valid tunnel environment or
-static `TUNNEL_URL` override. PostgreSQL and libSQL receive equivalent cleanup.
+clear the legacy value through setup or configuration. If a persisted value
+blocks startup, use a temporary valid provider (including `none`) or a static
+`TUNNEL_URL` override to reach the web settings. Both PostgreSQL and libSQL
+receive the cleanup.
 
 Remove matching environment variables and values from local JSON/TOML config:
 
@@ -86,10 +94,10 @@ settings APIs reject their reintroduction.
 
 ## Verify
 
-1. Run `lunarwing doctor` with the same tunnel environment or disk settings and
-   confirm NetBird, custom, or static URL status. Startup remains authoritative
-   for DB-backed settings.
-2. Start LunarWing and confirm boot output reports expected HTTPS URL.
+1. Run `lunarwing doctor` with the same tunnel environment or disk settings.
+   Static and custom checks validate configuration, not public reachability.
+   Startup remains authoritative for DB-backed settings.
+2. Start LunarWing and confirm boot output reports the expected HTTPS URL.
 3. Test authenticated webhook and gateway routes through that URL.
 4. Confirm retired vendor exposure is disabled when no longer required.
 

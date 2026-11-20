@@ -1,9 +1,8 @@
 # SSH Agent Harness
 
 **Status:** As-built; source revalidated 2026-11-12 for v2.2.0.0.
-The bridge/config implementation is unchanged since the socket-directory mount
-fix. Source symbols below define the contract; historical dependency versions
-and static test counts are not deployment health evidence.
+Source symbols below define the contract; historical dependency versions and
+static test counts are not deployment health evidence.
 
 WI#454 split each worker lane into a non-root bridge/task pair. The SSH-agent
 socket directory now mounts into the lane's **task** container
@@ -180,9 +179,10 @@ persisted anywhere. See §7.
 **Failure posture is deliberately soft.** `validate()` failure,
 `start_agent_server()` failure, and even `SSHBridge::new` failure all only
 `warn!` — a misconfigured `[ssh]` block never blocks daemon startup.
-`validate()` returns `Ok` on an empty host
-map, and checks only hostname validity, `port != 0`, and non-empty user — it
-does **not** check that a key secret exists (keys may be uploaded later).
+`validate()` returns `Ok` on an empty host map. Otherwise it checks that each
+map key matches the entry's `host`, the hostname is valid, the port is nonzero,
+and the user is nonempty. It does **not** check that a key secret exists (keys
+may be uploaded later).
 
 ### 4.2 Agent startup — the load-bearing path (`bridge/ssh.rs` → `bridge/ssh_agent.rs`)
 
@@ -236,9 +236,8 @@ paths (`orchestrator/external_worker.rs`, `tools/builtin/job.rs`,
 Injection is done entirely by `ic/scripts/lunarwing-mt-admin.sh` (since the
 v2.0.8.0 refactor a thin composition root over `mt-admin-lib/NN-*.sh` — the
 socket pre-creation and daemon-first ordering live in
-`mt-admin-lib/04-tenant-lifecycle.sh`, the worker bind-mounts in
-`mt-admin-lib/09-worker-config.sh`, and the unit-level mounts in
-`mt-admin-lib/07-units-systemd.sh` / `08-units-openrc.sh`):
+`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh`, and the worker bind-mounts in
+`ic/scripts/mt-admin-lib/09-worker-config.sh`):
 
 1. **Pre-create** the socket directory (`run/ssh-agent`, mode 0755) before the
    daemon starts, so podman can bind-mount it even before the first socket
@@ -252,12 +251,16 @@ socket pre-creation and daemon-first ordering live in
    atomically backfills the tenant's dedicated `SSH_API_TOKEN`; an upload
    failure retains the staged key and stops startup before workers launch.
 4. **Start the worker's task container** with the socket **directory**
-   bind-mounted and `SSH_AUTH_SOCK` set (including generated container service
-   definitions):
+   bind-mounted and `SSH_AUTH_SOCK` set:
 
    ```
    -v <run_dir>/ssh-agent:/tmp/ssh-agent:ro,z -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
    ```
+
+   `ic/scripts/mt-admin-lib/07-units-systemd.sh` renders the shared task mount
+   arguments into the Quadlet. On OpenRC, mt-admin passes them when creating
+   the container; the OpenRC worker unit starts and probes that existing
+   container and does not declare the mount itself.
 
    Mounting the directory — not the socket file — is the fix for the stale
    inode defect: a daemon restart binds a **fresh socket inode** at the same
@@ -299,7 +302,7 @@ constant-time-validated `Authorization: Bearer <SSH_API_TOKEN>` header.
 | `GET /hosts` | `list_hosts` | live-map hosts; per-host `has_key` comes from the secrets store |
 | `POST /hosts` | `add_host` | adds to the live map only; hardcodes timeouts (10/30/60/3) |
 | `GET /hosts/{host}` | `get_host` | live map only |
-| `DELETE /hosts/{host}` | `remove_host` | removes from the live map only; leaves the encrypted key and startup config |
+| `DELETE /hosts/{host}` | `remove_host` | removes the live entry and revokes its stored host-key pin; leaves the encrypted private key and startup config |
 | `POST /hosts/{host}/key` | `upload_key` | stores the encrypted key; updates only the agent's status map |
 | `DELETE /hosts/{host}/key` | `delete_key` | deletes the encrypted secret; updates only the agent's status map |
 | `GET /hosts/{host}/key/status` | `key_status` | encrypted-secret existence |
@@ -309,11 +312,12 @@ constant-time-validated `Authorization: Bearer <SSH_API_TOKEN>` header.
 `SSHKeyType` serializes lowercase (`"ed25519"`); `HostKeyMode` serializes
 PascalCase (`"Strict"`) — clients must match the casing.
 
-> **Host CRUD is not durable.** `add_host` and `remove_host` mutate only
-> `SSHBridge.hosts`; they do not rewrite `config.toml`. A daemon restart rebuilds
-> the map from startup configuration, discarding API-added hosts and restoring
-> API-removed hosts still present in the file. Durable changes require editing
-> `[[ssh.hosts]]` through the operator-controlled config path.
+> **Host-map changes are not durable.** `add_host` and `remove_host` do not
+> rewrite `config.toml`. A daemon restart rebuilds the map from startup
+> configuration, discarding API-added hosts and restoring API-removed hosts
+> still present in the file. A revoked host-key pin does not come back with
+> the host. Persistent host-map changes require editing `[[ssh.hosts]]`
+> through the operator-controlled config path.
 >
 > **Runtime key-mutation caveat.** Upload/delete persists the encrypted secret
 > immediately, but `SshAgentServer::add_key` and `remove_key` modify only its
@@ -378,9 +382,11 @@ PascalCase (`"Strict"`) — clients must match the casing.
   explicit wipe.
 - **The HTTP API uses one tenant-wide bearer token.** `SSH_API_TOKEN` protects
   every SSH management route and missing configuration leaves the router
-  unmounted. The webhook server defaults to `127.0.0.1`; operators can still
-  configure a non-loopback bind, so token secrecy and network policy remain
-  required.
+  unmounted. Without an HTTP channel the unified webhook server falls back to
+  `127.0.0.1:8080`. When the HTTP channel is enabled, its resolved host and
+  port control the bind, including for the SSH routes. The HTTP channel's
+  host default is `0.0.0.0` when no host is configured. Set `HTTP_HOST=127.0.0.1`
+  to keep an enabled HTTP channel loopback-only.
 - **Audit logging is a no-op in production** (`NullAuditLogger`). The `SshEvent`
   variants are defined but not persisted, and only host add/remove and agent
   start currently call the logger.
@@ -460,8 +466,9 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-44 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
-`ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
+47 unit tests across the harness modules as of 2026-11-20, all in-module
+(`#[cfg(test)]`), none in `ic/tests/` (tool-specific `ssh` / `ssh_git` tests are
+additional):
 
 | File | Tests |
 |------|-------|
@@ -470,7 +477,7 @@ Known limitations / follow-ups:
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
 | `ssh_hostkeys.rs` | 15 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, legacy RSA pin warning, concurrent-first-key race |
 | `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
-| `ssh_client.rs` | 7 — output caps; mislabeled RSA client-key rejection; non-RSA host-key offers; RSA-only and mixed negotiation-error mapping |
+| `ssh_client.rs` | 10 — output caps; mislabeled RSA client-key rejection; non-RSA host-key offers; RSA-only and mixed negotiation-error mapping; host-key certificate refusal and no certificate algorithm offered |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
 Notable gaps: no test performs successful signing with a real key or the full

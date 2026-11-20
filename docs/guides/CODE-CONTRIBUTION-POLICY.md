@@ -36,7 +36,7 @@ See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the
 - **Error handling:** use `thiserror` for structured errors and `anyhow` for propagation. Avoid `unwrap()` and `expect()` in production code. They are allowed only in tests or for literally infallible invariants (e.g. literal regexes) with a safety comment.
 - **Types:** prefer strong types and enums over stringly-typed control flow when the shape is known.
 - **Naming:** standard Rust conventions (`snake_case` functions/variables, `PascalCase` types/traits, `SCREAMING_SNAKE_CASE` constants).
-- **Complexity:** keep functions under 100 lines, cognitive complexity under 15, and arguments under 7 (enforced via `clippy.toml`).
+- **Complexity:** aim for fewer than 100 lines per function, cognitive complexity below 15, and fewer than 7 arguments. `ic/clippy.toml` sets thresholds of 100, 15, and 7 for the corresponding Clippy lints; those thresholds only apply when the lints are enabled.
 - **Secrets:** use the `secrecy` crate; never log or expose secrets.
 - **Logging:** use `tracing` macros (`info!`, `warn!`, `error!`), not `println!`.
 

@@ -4,10 +4,9 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** Every referenced
-mt-admin subcommand and flag was checked against the current composition root
-and modules. New tenant envs default to `SANDBOX_NETWORK=proxy-enforced` on
-Linux; mt-admin fills the value only when unset and preserves `none`,
+**Revalidated against source 2026-11-10 (v2.2.0.0).** New tenant envs default
+to `SANDBOX_NETWORK=proxy-enforced` on Linux; mt-admin fills the value only
+when unset and preserves `none`,
 `proxy-enforced`, `tunnel`, and legacy advisory `proxy` on re-render. The managed
 sandbox image includes the pinned Python development suite. Required LLM
 endpoints, worker source validation, `worker-listeners` and `worker-egress`
@@ -26,14 +25,16 @@ Required for the core MT flow:
 
 - root or sudo access;
 - Bash, coreutils, jq, git, curl, and Python 3;
-- Docker or Podman with rootless support for tenant PostgreSQL and workers;
-- PostgreSQL client utilities used by backup/restore checks;
+- rootless Podman (preferred) or rootful Docker for tenant PostgreSQL and workers;
 - the distribution's supported init system: systemd or OpenRC.
+
+MT admin runs `pg_dump` and `pg_restore` inside the tenant's PostgreSQL
+container; no host PostgreSQL client package is needed for backup or restore.
 
 Optional components add requirements:
 
 - WeeChat, tmux, and Python `aiohttp` for the WeeChat relay/adapter;
-- Tesseract/container support for LunarVision;
+- the LunarVision sidecar image, which includes Tesseract (no host install needed);
 - the approved DarkFi build prerequisites for DarkIRC;
 - worker-specific container images and credentials;
 - `nftables` (the host `nft` command) for external-worker egress enforcement.
@@ -90,21 +91,25 @@ Useful opt-ins and opt-outs include:
 
 ```bash
 # Add the tenant user to the docker/podman group (explicit opt-in — see note)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group \
+  --tensorzero-url https://tensorzero.example.com
 
 # Enable the per-tenant TensorZero proxy (upstream is REQUIRED — see below)
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy \
   --tensorzero-url https://tensorzero.internal.example:7070
 
 # Enable the per-tenant DarkIRC daemon and adapter
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc \
+  --tensorzero-url https://tensorzero.example.com
 
 # Seed the tenant's knowledge store with the full shared lw2studymcp
 # study-notes base (one-shot, first boot only; read-only shared MCP included)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp \
+  --tensorzero-url https://tensorzero.example.com
 
 # Skip automatic WeeChat relay bootstrap
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap \
+  --tensorzero-url https://tensorzero.example.com
 ```
 
 `--docker-group` exists for one case only: a tenant that must reach a shared
@@ -125,8 +130,9 @@ containers), a rendered env never carries the baked `.invalid` placeholder
 (mt-admin dies at render time when an enabled worker has no container-reachable
 URL), and a hand-started container without `<WORKER>_BASE_URL` refuses to start
 on the placeholder naming the environment variable to fix. `upgrade-tenant` backfills
-an inheritable endpoint for every enabled worker before rebuilding, so managed
-tenants do not need per-worker `configure-*` calls.
+inheritable endpoints for workers that support them before rebuilding.
+LunarDepth requires an explicit route (base URL, model, and a key file or the
+explicit unauthenticated-gateway opt-in); it does not inherit the daemon's route.
 
 For knowledge-store seeding details (what is imported, the one-shot safety
 invariants, opt-outs, and verification), see
@@ -273,7 +279,7 @@ credentials. Run the preflight afterward. Since WI#577, the non-empty managed
 `RELAY_PASSWORD` also wins over a stale per-owner store secret in channel setup
 and per-callback authentication; the store is only the fallback.
 
-For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.md`](../ops/WEECHAT-SERVICES.md) and [`lunarwing_weechat_wss/README.md`](lunarwing_weechat_wss/README.md).
+For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.md`](../ops/WEECHAT-SERVICES.md) and the [WeeChat relay guide](lunarwing_weechat_wss/README.md).
 
 ## 8. Day-to-Day Operations
 
@@ -294,7 +300,7 @@ On OpenRC hosts still carrying legacy per-tenant TensorZero proxy units (`/etc/i
 sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
 ```
 
-Until that sweep succeeds, every other mt-admin command on OpenRC except `help` and `upgrade-tenant` refuses up front (exit 1, `error: OpenRC proxy migration required; refusing <command>`; `writers-active` exits 2 = unknown) and names this command; only a positively detected systemd host skips the file-only legacy-unit guard (internally the OpenRC service/update wrappers return 125 for a refusal, never a service state). The sweep is file-only (legacy units are archived under `$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default `/var/lib/lunarwing/openrc-proxy-backups`; services are not restarted) and stops on an unregistered or symlinked proxy unit, or on an unsafe archive dir (a symlinked path component, a location inside `init.d`, or an existing directory that is not a non-symlink dir owned by root with mode 0700) — move that file outside `init.d` by hand (or fix the archive dir) and retry. In the same maintenance window update `tensorzero-proxy-configurations/lunarwing-proxy.py` in every proxy tenant's checkout before anything restarts the tenant, then restart through mt-admin (see [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)).
+Until that sweep succeeds, the OpenRC dispatch guard exempts only `help` (including `--help` and `-h`), `upgrade-tenant`, `reinstall-health-library`, and `render-units --all-proxies` itself. Other commands refuse up front (exit 1, `error: OpenRC proxy migration required; refusing <command>`; `writers-active` exits 2 = unknown) and name the sweep command. Only a positively detected systemd host skips the file-only legacy-unit guard (internally the OpenRC service/update wrappers return 125 for a refusal, never a service state). The sweep is file-only (legacy units are archived under `$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default `/var/lib/lunarwing/openrc-proxy-backups`; services are not restarted) and stops on an unregistered or symlinked proxy unit, or on an unsafe archive dir (a symlinked path component, a location inside `init.d`, or an existing directory that is not a non-symlink dir owned by root with mode 0700) — move that file outside `init.d` by hand (or fix the archive dir) and retry. In the same maintenance window update `tensorzero-proxy-configurations/lunarwing-proxy.py` in every proxy tenant's checkout before anything restarts the tenant, then restart through mt-admin (see [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)).
 
 Use the worker lifecycle commands for one worker rather than restarting the entire tenant when possible:
 
@@ -314,7 +320,7 @@ sudo ic/scripts/lunarwing-port-drift-preflight.sh          # every tenant
 sudo ic/scripts/lunarwing-port-drift-preflight.sh ruffles  # one tenant
 ```
 
-It cross-checks `lunarwing.env` (gateway/http/orchestrator/coord_admin/adapter/worker WSS ports, the XMPP/relay/adapter/darkirc/vision/voice URLs, and the `DATABASE_URL` port), `xmpp-bridge.env`'s `XMPP_BRIDGE_BIND`, `proxy.env` plus the rendered proxy unit's `--port` on either init, `darkirc-adapter.env` and `darkirc_config.toml` for darkirc tenants, and every systemd Quadlet's `PublishPort` host ports. A wrong *existing* value is a FAIL (patch-env will not overwrite it); a missing value is a WARN (the next render back-fills it); a missing Quadlet is INFO (OpenRC and docker-rootful hosts legitimately have none). Non-loopback Quadlet `PublishPort`s (including a host-less `PORT:CONTAINER` mapping) and proxy `--bind` values are FAILs too. Run it after manual env edits, restores, or partial upgrades, and resolve FAILs before restarting. The WeeChat relay credential checks stay in `lunarwing-weechat-preflight.sh`. `upgrade-preflight.sh` invokes this verifier per tenant as a non-fatal note, so drift is surfaced during an upgrade assessment without changing its STOP/GO verdict.
+It cross-checks `lunarwing.env` (gateway/http/orchestrator/coord_admin/adapter/worker WSS ports, the XMPP/relay/adapter/darkirc/vision/voice URLs, and the `DATABASE_URL` port), `xmpp-bridge.env`'s `XMPP_BRIDGE_BIND`, `proxy.env` plus the rendered proxy unit's `--port` on either init, `darkirc-adapter.env` and `darkirc_config.toml` for darkirc tenants, and every systemd Quadlet's `PublishPort` host ports. A wrong *existing* port is a FAIL, except for `COORD_ADMIN_PORT`: its mismatch is a WARN because even a full re-render preserves an explicit value. A missing value is a WARN (the next render back-fills it); a missing Quadlet is INFO (OpenRC and rootful Docker hosts legitimately have none). Non-loopback Quadlet `PublishPort`s (including a host-less `PORT:CONTAINER` mapping) and proxy `--bind` values are FAILs too. Run it after manual env edits, restores, or partial upgrades, and resolve FAILs before restarting. The WeeChat relay credential checks stay in `lunarwing-weechat-preflight.sh`. `upgrade-preflight.sh` invokes this verifier per tenant as a non-fatal note, so drift is surfaced during an upgrade assessment without changing its STOP/GO verdict.
 
 For init-agnostic diagnostics, prefer the read-only inspection verbs over raw `psql`/`ps`/`pgrep` against tenant state (WI#268):
 

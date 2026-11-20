@@ -90,10 +90,10 @@ chunk replacement in one transaction, so search does not observe a new document
 body with stale chunks. Appends use an atomic database append and then reindex.
 
 The append path commits content first and re-chunks in a separate transaction
-(`Workspace::append` -> `append_document` -> `reindex_document`). A crash
-between the two strands the document zero-chunked forever, so chunk-driven
-search under-reports content that `ws.read` still serves in full (the Sep-2026
-Kageho "0 vs 6671" symptom). Migration V27 adds the `indexed_at` outbox marker:
+(`Workspace::append` -> `append_document` -> `reindex_document`). Before V27,
+a crash between the two could strand the document without chunks, even though
+`ws.read` still served its full content (the Sep-2026 Kageho "0 vs 6671"
+symptom). V27 adds the `indexed_at` outbox marker so these writes can be repaired:
 `NULL` = content changed but chunks not yet rebuilt; non-`NULL` = projection
 current. It is set to `NULL` in the same statement that commits content
 (append/content-only update) and stamped `NOW()` inside the transaction that
