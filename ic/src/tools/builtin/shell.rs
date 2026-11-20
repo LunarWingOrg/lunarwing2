@@ -1006,7 +1006,7 @@ impl Tool for ShellTool {
         let workdir = params.get("workdir").and_then(|v| v.as_str());
         let capability_evidence = params
             .get("capability_manifest")
-            .and_then(|value| self.sandbox.as_ref().map(|sandbox| (value, sandbox)))
+            .zip(self.sandbox.as_ref())
             .map(|(value, sandbox)| {
                 let manifest = crate::sandbox::CapabilityManifest::from_value(value.clone())
                     .map_err(crate::tools::tool::ToolError::InvalidParameters)?;
@@ -1627,6 +1627,67 @@ mod tests {
             32768,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn manifest_never_falls_back_to_direct_host_execution() {
+        let tool = ShellTool::new();
+        let current_dir = std::env::current_dir().unwrap();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "command": "echo must-not-run",
+                    "capability_manifest": {"manifest_version":1}
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .expect_err("direct execution is not a manifest backend");
+        assert!(
+            matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied"))
+        );
+        assert!(current_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn manifest_auth_denition_precedes_runtime_and_audit_is_not_a_secret_container() {
+        let sandbox = SandboxManager::new(crate::sandbox::SandboxConfig {
+            network: crate::sandbox::SandboxNetworkMode::None,
+            protected_paths: Vec::new(),
+            ..Default::default()
+        });
+        let tool = ShellTool::new().with_sandbox(Arc::new(sandbox));
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "command": "echo must-not-run",
+                    "capability_manifest": {
+                        "manifest_version": 1,
+                        "network": {"mode":"tunnel"},
+                        "secrets": {"names":["git_credentials"]}
+                    }
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .expect_err("unauthorized tunnel is rejected");
+        assert!(
+            matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied"))
+        );
+        let schema = tool.parameters_schema();
+        assert_eq!(
+            schema["properties"]["capability_manifest"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["capability_manifest"]["properties"]["manifest_version"]["const"],
+            1
+        );
+        assert_eq!(
+            schema["properties"]["capability_manifest"]["properties"]["secrets"]["properties"]["names"]
+                ["maxItems"],
+            0
+        );
     }
 
     #[tokio::test]

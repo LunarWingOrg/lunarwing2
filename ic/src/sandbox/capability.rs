@@ -254,14 +254,14 @@ impl CapabilityManifest {
     }
 
     fn validate_secrets_and_extensions(&self) -> Result<()> {
-        for name in &self.secrets.names {
+        if let Some(name) = self.secrets.names.first() {
             validate_capability_name(name, "secrets.names")?;
             return Err(manifest_error(
                 "secrets.names",
                 "generic shell secret injection is unsupported; worker jobs retain their host-issued credential grants",
             ));
         }
-        for extension in &self.extensions {
+        if let Some(extension) = self.extensions.first() {
             validate_capability_name(extension, "extensions")?;
             return Err(manifest_error(
                 "extensions",
@@ -854,14 +854,11 @@ mod tests {
             },
             ..minimal()
         };
-        assert!(
-            authorize_manifest(
-                &write,
-                &crate::sandbox::SandboxConfig::default(),
-                temp.path()
-            )
-            .is_ok()
-        );
+        let writable = crate::sandbox::SandboxConfig {
+            policy: SandboxPolicy::WorkspaceWrite,
+            ..crate::sandbox::SandboxConfig::default()
+        };
+        assert!(authorize_manifest(&write, &writable, temp.path()).is_ok());
         let readonly = crate::sandbox::SandboxConfig {
             policy: SandboxPolicy::ReadOnly,
             ..Default::default()
@@ -905,7 +902,7 @@ mod tests {
         assert!(
             crate::sandbox::mount_guard::validate_mount_dir(
                 &destination,
-                &vec![outside.path().to_path_buf()]
+                &[outside.path().to_path_buf()]
             )
             .is_err()
         );

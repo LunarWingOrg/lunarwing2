@@ -157,5 +157,8 @@ worker-image expansion, or shell-tool package installation is involved.
 
 The focused `sandbox::capability` unit suite includes wall-clock samples of the
 pure decision/audit serialization work; canonical mount validation also walks
-the existing host filesystem. Samples are for local documentation only, not a
-portable performance guarantee or an unattended benchmark.
+the existing host filesystem. WI#797 local measurement on the development host: about 20 µs per decision
+including canonical mount checks, and about 15 µs per JSON audit serialization
+(mean of 20 decisions and 1000 serializations, warmed test build). These are
+samples for local documentation, not a portable performance guarantee or an
+unattended benchmark.
