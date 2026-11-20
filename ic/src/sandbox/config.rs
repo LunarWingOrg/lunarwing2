@@ -37,7 +37,8 @@ impl std::str::FromStr for SandboxRuntime {
 ///
 /// The default is `ProxyEnforced` on Linux and `None` elsewhere, where the
 /// local Unix-socket relay is unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SandboxNetworkMode {
     /// Route egress through the validating HTTP proxy (allowlist + credential
     /// injection). Advisory: enforced via `http_proxy`/`https_proxy` env vars
