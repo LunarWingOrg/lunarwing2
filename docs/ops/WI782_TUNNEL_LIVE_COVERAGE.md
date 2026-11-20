@@ -137,9 +137,11 @@ v2.2.0.0 limitation was measured on. The merged-head run below was taken at
 > Podman only: 9 of 9 tests on Podman 5.8.2 (2026-11-11), including NetBird
 > 0.82.0 and a real WireGuard peer; **10 reported passes on Podman 6.1.4
 > (2026-11-19, before the WI#782 review follow-up)** with the NetBird gate
-> closed; and **14 of 14 at the merged head of WI#782 on Podman 6.1.4
-> (2026-11-20)**, after the teardown rewrite, with the same gate closed and the
-> detached-unit checks skipped for want of systemd service mode. A Docker CLI
+> closed; and **the seven live WireGuard lanes passed at the merged head of
+> WI#782 on Podman 6.1.4 (2026-11-20)**, after the teardown rewrite, together
+> with the suite's six runtime-free tests, while **NetBird was not run** (gate
+> closed) and the detached-unit checks were skipped for want of systemd service
+> mode. A Docker CLI
 > lane (`LUNARWING_E2E_DOCKER_TESTS=1`) exists and is off by
 > default, but **no Docker run is claimed**. The detached systemd helper-unit
 > checks run for Podman in systemd service mode: they first prove the transient unit
