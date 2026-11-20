@@ -14,8 +14,11 @@ import { test } from "node:test"
  * real-CLI contract gate also runs
  * in the worker image build. Print mode forces the auto
  * permission policy, the upstream dangerous-command guard is skipped in auto
- * mode, and [[permission.rules]] never load from config — this hook is the
- * only in-CLI enforcement point.
+ * mode. Since 2.6.0 config [[permission.rules]] do load, in print mode too
+ * (the baked config's rules and, for a trusted workspace, those of
+ * `<project>/.kimi-code/local.toml`); the lane bakes no rule, keeps the
+ * workspace untrusted, and this hook runs in the earlier phase, so it is
+ * still the only in-CLI enforcement point.
  *
  * Each case feeds a PreToolUse payload through the real script and asserts
  * the exit code: 0 = allow, 2 = block (reason on stderr). Everything else
