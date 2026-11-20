@@ -8,7 +8,7 @@ lifecycle events, the capabilities document, image validation, Engine V2
 generated images and the `/quit` refusal. Client tokens (M2b) are not part of
 this version; every authenticated request uses the master credential.
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** Capabilities, event names and
+**Source revalidated 2026-11-20 for v2.2.1.0.** Capabilities, event names and
 wire limits match the current server and golden fixture. Live provider
 reasoning remains opt-in through `ENGINE_V2_STREAM_REASONING`; idle/interrupted
 V1 steer notes now arrive before the next request with explicit pre-turn
