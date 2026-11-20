@@ -691,6 +691,13 @@ host's concurrent builds before retrying manually.
   if a listed path disappears. This textual check is supplemented by a
   per-release review of effective flags and newly added build paths; it
   cannot resolve variable indirection.
+- WI#788 pins the two-level chain behind the WI#781 heapless acceptances:
+  `[bans]` restricts heapless below 0.9.4 to postcard and restricts postcard
+  below 2.0.0 to its current parents (monty, wasmtime, wasmtime-environ,
+  wasmtime-internal-cache). cargo-deny `wrappers` is a direct-parent check,
+  so a new postcard parent fails the bans gate instead of silently
+  inheriting all nine acceptances; `test_deny_toml_guards.py` asserts the
+  wrapper list still matches the postcard parents in every lockfile.
 - WI#363 pins the accepted-advisory ownership trail in `ic/deny.toml` (filed
   from MR !1505 review CP-2/CP-8 and MR !1518 review DC-7: the 2.1.5.0 reasons
   named WI#304/#305/#306, which were closed without the migrations landing,
