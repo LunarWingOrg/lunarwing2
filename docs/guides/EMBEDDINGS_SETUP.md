@@ -2,11 +2,9 @@
 
 Embeddings are optional and disabled by default. When enabled, LunarWing uses them for vector-backed workspace memory search.
 
-**Revalidated against source 2026-11-19 (v2.2.1.0).** Environment knobs
-(`EMBEDDING_ENABLED/PROVIDER/MODEL/BASE_URL/DIMENSION/CACHE_SIZE`,
-`OLLAMA_BASE_URL`), the 10 000-entry default cache, the `>= 1` cache-size
-floor, provider list, and shared outbound URL validation match
-`ic/src/config/embeddings.rs`; no configuration change is required.
+**Source revalidated 2026-11-20 for v2.2.1.0 (`4192ee72b`).** Configuration
+resolution is in `ic/src/config/embeddings.rs`; provider requests are in
+`ic/src/workspace/embeddings.rs`.
 
 ## Configure in the Web UI
 
@@ -18,8 +16,9 @@ The authenticated Configuration view exposes:
 - `embeddings.base_url` for `openai_compatible`
 
 The web UI saves these settings to the database. At startup, LunarWing can also
-read legacy `settings.json` and the TOML configuration before loading database
-settings. Use the web UI rather than editing legacy JSON for normal operation.
+read legacy `settings.json` and TOML bootstrap config. If a TOML or environment
+override is already in place, changing the database value does not replace it.
+Use the web UI rather than editing legacy JSON for normal operation.
 
 The web UI offers `openai`, `lunarwing_cloud`, and `openai_compatible`. The backend also supports `ollama` when configured through the environment.
 
@@ -27,15 +26,19 @@ The web UI offers `openai`, `lunarwing_cloud`, and `openai_compatible`. The back
 
 Environment values override database-backed settings:
 
-```bash
+```dotenv
 EMBEDDING_ENABLED=true
 EMBEDDING_PROVIDER=openai_compatible
 EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_BASE_URL=https://embeddings.example.com/openai
-OPENAI_API_KEY=<secret>
 ```
 
-`EMBEDDING_BASE_URL` is the service root **before** `/v1/embeddings`; LunarWing appends that path. Do not include a trailing `/v1` unless the provider's API intentionally requires a doubled path.
+Set `OPENAI_API_KEY` through the protected instance environment, not in a
+committed config file or shell history.
+
+`EMBEDDING_BASE_URL` is the service root **before** `/v1/embeddings`; LunarWing
+appends that path. For an endpoint ending in `/v1/embeddings`, leave off both
+`/v1` and `/embeddings`.
 
 Additional controls:
 
@@ -56,6 +59,11 @@ If an OpenAI-backed provider is enabled without `OPENAI_API_KEY`, LunarWing logs
 
 ## Network Safety
 
-Embedding and Ollama base URLs pass the shared outbound URL validation. Remote plain HTTP, private ranges, link-local addresses, and cloud metadata targets are rejected by default; localhost HTTP is allowed. `ALLOW_PRIVATE_IPS=1` disables those private-address restrictions and should be used only in an intentionally isolated deployment, such as the committed private-network harness configuration.
+Embedding and Ollama base URLs are checked when configuration loads. Remote
+plain HTTP and HTTPS resolving to private, loopback, link-local or metadata
+addresses are rejected by default; localhost HTTP is allowed. This check
+does not pin addresses at request time. Use only trusted endpoints and keep
+egress controls in place. The private-network harness needs the explicit
+`ALLOW_PRIVATE_IPS=1` opt-in; do not copy it to normal deployments.
 
 After changing startup environment values, restart the service through the appropriate service-management path. For multi-tenant installations, use `ic/scripts/lunarwing-mt-admin.sh` rather than direct tenant `systemctl` or `rc-service` commands.
