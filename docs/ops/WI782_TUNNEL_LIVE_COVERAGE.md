@@ -60,6 +60,36 @@ This development host is an **OpenRC** machine (PID 1 is `init`, no
 `systemctl`) with **rootless Podman 6.1.4 (crun)** and **no Docker binary**.
 That is the same class of host the v2.2.0.0 limitation was measured on.
 
+- **Merged-head Podman suite run: 14 passes (AHI-1, 2026-11-20).** The suite
+  was run live at the head the branch carries, after the teardown rewrite that
+  the earlier 10-pass run predates. On the same host, with
+  `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1
+  LUNARWING_E2E_TUNNEL_BASE_IMAGE=quay.io/libpod/alpine:latest` and
+  `--test podman_sandbox_tunnel_integration -- --nocapture --test-threads=1`,
+  the run reported `test result: ok. 14 passed; 0 failed; 0 ignored` in
+  624.16 s. Every live WireGuard lane ran — lifecycle and join, custom DNS,
+  hostname endpoint, dead peer, healthy peer death, cold-start budget,
+  concurrent first commands — and the teardown wrapper's two regression tests
+  ran with them. The NetBird test skipped because its gate was closed. The
+  detached-unit checks printed their service-mode skip, as designed on this
+  host. Afterwards `podman ps -a` reported no container carrying
+  `lunarwing.sandbox-tunnel` or `lunarwing.sandbox` and `podman volume ls` no
+  `lunarwing` volume, so the scoped leftover assertions ran and passed rather
+  than being vacuous. This is the run AHI-1 asked for: a failure in the
+  maintainer's Docker or service-mode runs can no longer be mistaken for a
+  fault of the rewrite.
+- **Gate-closed regression at the same head.** The same target with no gates
+  opened reported `14 passed; … finished in 0.00s`, so no lane runs by default
+  and CI's shape stays green.
+- **Service-mode requirement at the same head.** Re-running
+  `tunnel_concurrent_first_commands_keep_firewall_stable` with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1` fails before any fixture starts, at
+  `tests/podman_sandbox_tunnel_integration.rs:922`, with
+  `LUNARWING_E2E_TUNNEL_REQUIRE_SYSTEMD=1 but the detached-unit checks cannot
+  run: the workload spawner is not in systemd service mode`
+  (`test result: FAILED. 0 passed; 1 failed; … 13 filtered out`, 0.00 s). A host
+  without service mode therefore cannot record a pass by accident, and the
+  rejection costs no container start.
 - **Original Podman suite run, before the review follow-up: 10 reported passes.**
   On this host,
   `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_PODMAN_TESTS=1
