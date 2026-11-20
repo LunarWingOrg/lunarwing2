@@ -20,9 +20,9 @@ import { test } from "node:test"
  * workspace untrusted, and this hook runs in the earlier phase, so it is
  * still the only in-CLI enforcement point.
  *
- * Each case feeds a PreToolUse payload through the real script and asserts
- * the exit code: 0 = allow, 2 = block (reason on stderr). Everything else
- * upstream treats as allow, so the script itself must only ever exit 0/2.
+ * Each case feeds a PreToolUse payload through the real hook without running
+ * the submitted command. It asserts 0 = allow or 2 = block (reason on stderr).
+ * Everything else upstream treats as allow, so the hook must only exit 0/2.
  */
 
 const guardPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
@@ -111,6 +111,7 @@ test("dangerous segment inside a compound command is denied", () => {
   assertBlocked("echo hi && sudo id", "privilege")
   assertBlocked("cargo build; shutdown now", "power")
   assertBlocked("cat f | sudo tee /etc/hosts", "privilege")
+  assertBlocked("echo hi\nchmod -R 755 /etc; true", "recursive mode")
 })
 
 test("recursive rm on separate command lines is denied outside temp roots", () => {
@@ -126,6 +127,39 @@ test("uppercase recursive and force rm flags are denied outside temp roots", () 
   assertBlocked("rm -vR /home/kumo", "rm")
   assertBlocked("rm -fR /home/kumo", "rm")
   assertAllowed("rm -R /tmp/wi795-scratch")
+})
+
+test("rm checks continued lines together and still allows literal temp cleanup", () => {
+  const continuation = "\\\n"
+  const outsideTemp = "./wi795-check-only-tree"
+  assertBlocked(`rm ${continuation}-rf ${outsideTemp}`, "recursive/forced rm outside")
+  assertBlocked(`rm ${continuation}-rf ${continuation}${outsideTemp}`, "recursive/forced rm outside")
+  assertAllowed(`rm -rf ${continuation}/tmp/wi795-scratch`)
+  assertAllowed(`rm -rf /tmp/wi795-scratch ${continuation}&& echo done`)
+  assertAllowed(`rm -rf /var/t${continuation}mp/wi795-scratch`)
+})
+
+test("an escaped backslash does not continue an rm command onto the next line", () => {
+  const escapedBackslash = "\\\\"
+  assertAllowed(`rm -rf /tmp/wi795-scratch${escapedBackslash}\necho done`)
+})
+
+for (const [name, terminator] of [["CR", "\r"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]]) {
+  test(`rm treats ${name} as text, not a newline or a word separator`, () => {
+    assertBlocked(`rm -rf ./wi795-check-only-tree ${terminator}x`, "recursive/forced rm outside")
+    assertBlocked(`rm -rf /tmp/wi795-scratch ${terminator}; true`, "recursive/forced rm outside")
+    assertAllowed(`rm -rf /tmp/wi795${terminator}scratch`)
+  })
+}
+
+test("GNU rm long-option abbreviations are checked without mistaking operands for options", () => {
+  for (const flags of ["--r", "--rec", "--f", "--fo", "--rec --fo"]) {
+    assertBlocked(`rm ${flags} ./wi795-check-only-tree`, "recursive/forced rm outside")
+  }
+  assertAllowed("rm --rec --fo /temp/wi795-scratch")
+  assertAllowed("rm --dir ./wi795-check-only-tree")
+  assertAllowed("rm -- --rec")
+  assertBlocked("rm --rec -- /tmp/wi795-scratch -wi795-check-only-tree", "recursive/forced rm outside")
 })
 
 test("unparseable or malformed payloads fail closed", () => {
