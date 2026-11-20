@@ -5,9 +5,10 @@ custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale provider
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
-**Source revalidated 2026-11-20 for v2.2.1.0 (`4192ee72b`).** The resolver,
+**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The resolver,
 custom command, settings write guard, doctor checks and V24 migrations were
-checked against the tree. This is not a live migration test.
+checked against the tree, along with the rest of this page. This is not a live
+migration test.
 
 This guide concerns daemon/webhook exposure, not the separate opt-in sandbox
 egress overlay in [`SANDBOX_TUNNEL_NETWORKING.md`](SANDBOX_TUNNEL_NETWORKING.md).
@@ -40,10 +41,12 @@ TUNNEL_CUSTOM_COMMAND=example-tunnel --port {port} --host {host}
 TUNNEL_CUSTOM_URL_PATTERN=tunnel.example.com
 ```
 
-Use a command that prints its public URL on stdout. The optional pattern is a
-substring, not a regular expression. If unset or not matched, the custom
-provider reports its local HTTP target instead. The command is split on
-whitespace after placeholder substitution; it is not evaluated by a shell.
+To have LunarWing discover the public URL, set a pattern and use a command that
+prints the URL on stdout. The pattern is a substring, not a regular expression.
+Without a pattern, or if no printed URL matches it within the discovery window,
+the custom provider reports its local HTTP target instead. The command is split
+on whitespace
+after placeholder substitution; it is not evaluated by a shell.
 
 Externally managed HTTPS endpoint:
 
@@ -94,10 +97,15 @@ settings APIs reject their reintroduction.
 
 ## Verify
 
-1. Run `lunarwing doctor` with the same tunnel environment or disk settings.
-   Static and custom checks validate configuration, not public reachability.
-   Startup remains authoritative for DB-backed settings.
-2. Start LunarWing and confirm boot output reports the expected HTTPS URL.
+1. Run `lunarwing doctor` with the same tunnel environment. Its file-based
+   fallback is legacy `settings.json`, not `config.toml`; it does not resolve
+   the daemon's TOML overlay or database settings. Static and custom checks
+   validate configuration, not public reachability. Startup remains
+   authoritative for TOML and DB-backed settings.
+2. With CLI enabled and no `--message`, confirm the interactive boot screen
+   reports the expected HTTPS URL. Shipped services and managed tenants set
+   `CLI_ENABLED=false`, so they do not print that screen: inspect startup logs
+   for failures and verify the configured provider's public endpoint instead.
 3. Test authenticated webhook and gateway routes through that URL.
 4. Confirm retired vendor exposure is disabled when no longer required.
 
