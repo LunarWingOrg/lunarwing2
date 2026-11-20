@@ -3364,10 +3364,12 @@ EVIDENCE_ARTIFACT_NAMES = (
     "worker-vulnerabilities.json",
 )
 # Top-level keys GitLab reserves; everything else mapping to a dict is a job or
-# a hidden job template.
+# a hidden job template. The deprecated global forms (a bare `artifacts:`,
+# `retry:`, ... at the top level) are listed so they cannot be mistaken for jobs.
 RESERVED_TOP_LEVEL_KEYS = {
     "default", "include", "stages", "variables", "workflow",
     "image", "services", "cache", "before_script", "after_script",
+    "artifacts", "retry", "timeout", "interruptible", "tags",
 }
 
 
@@ -3404,6 +3406,16 @@ def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
                 "defaults.yml default:artifacts expire_in "
                 f"{default_artifacts['expire_in']!r} is not a bounded duration (WI#791)"
             )
+    # A bare top-level `artifacts:` is GitLab's deprecated global form. It is
+    # applied to every job, so it is a backstop too and needs the same bound.
+    global_artifacts = merged.get("artifacts")
+    if isinstance(global_artifacts, dict) and artifact_expiry_seconds(
+        global_artifacts.get("expire_in")
+    ) is None:
+        errors.append(
+            "top-level artifacts expire_in "
+            f"{global_artifacts.get('expire_in')!r} is not a bounded duration (WI#791)"
+        )
 
     for name, job in merged.items():
         if name in RESERVED_TOP_LEVEL_KEYS or not isinstance(job, dict):

@@ -94,6 +94,14 @@ class ArtifactRetentionGateTests(unittest.TestCase):
         errors = retention_errors({"job": {"artifacts": {"expire_in": "2 days"}}})
         self.assertTrue(any("default:artifacts" in error for error in errors))
 
+    def test_deprecated_global_artifacts_is_a_bounded_backstop(self):
+        merged = {**BACKSTOP, "artifacts": {"paths": ["out"]}}
+        self.assertTrue(
+            any("top-level artifacts" in error for error in retention_errors(merged))
+        )
+        bounded = {**BACKSTOP, "artifacts": {"expire_in": "1 day"}}
+        self.assertEqual(retention_errors(bounded), [])
+
     def test_retention_longer_than_one_year_is_rejected(self):
         merged = {**BACKSTOP, "job": {"artifacts": {"expire_in": "2 years"}}}
         self.assertTrue(any("one year" in error for error in retention_errors(merged)))
