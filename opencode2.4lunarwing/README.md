@@ -87,10 +87,12 @@ artifact publisher (WI#785) off whatever the caller's environment or a
 workspace config says,
 and the builder stage fails the image if the reviewed text behind that pin
 stops holding (a text tripwire, not a proof; re-read the flag code on every
-bump). The pin covers the event watches only: a worker that is given
-an OpenCode Console credential, for example `OPENCODE_API_KEY`, still takes
-Console-authored instructions and skills, plus the Console's config merge
-of providers, remote MCP servers, policies and the web-search selection
+bump). The pin covers the event watches, the MCP push-event channel and the
+artifact publisher only (WI#785): a worker that is given an OpenCode Console
+credential, for example `OPENCODE_API_KEY`, still takes Console-authored
+instructions and skills (once Console advertises them with the
+`x-opencode-instructions-skills` header), plus the Console's config merge of
+providers, remote MCP servers, policies and the web-search selection
 (WI#665). The lane config's `update: "disable"` pin is not honored by
 the updater itself (it reads only the global config dir), so the image
 also carries `OPENCODE_DISABLE_AUTOUPDATE=1` to silence the background
