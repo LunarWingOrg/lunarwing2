@@ -330,7 +330,7 @@ do not replace those gates.
   with the NetBird provider is refused during configuration validation, before
   any container-runtime call. Use NetBird nameserver groups reachable through
   the overlay; an upstream outside the overlay fails closed because its
-  resolver sockets are unmarked.
+  resolver sockets are unmarked
 - **Harness redaction remains bounded and best-effort.** Offset or grouped
   dumps, other encodings, arbitrary fragments and unmarked truncation are not
   comprehensively covered. The external-worker isolation boundary remains
