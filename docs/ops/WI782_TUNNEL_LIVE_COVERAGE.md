@@ -120,7 +120,7 @@ v2.2.0.0 limitation was measured on. The merged-head run below was taken at
   live gates closed, including regressions for teardown after an error and a
   panic. With stub container CLIs, both unsupported service-mode cases were
   rejected before the runtime was called. The live coverage that answers AHI-1
-  at the merged head is the 14-pass run below, not this gate-closed check.
+  at the merged head is the 14-pass run above, not this gate-closed check.
 - **Docker fallback: not run live here.** No approved Docker test host was
   available. The Docker lane exists and is gated. The run is
   `LUNARWING_E2E_TUNNEL_TESTS=1 LUNARWING_E2E_DOCKER_TESTS=1` against
