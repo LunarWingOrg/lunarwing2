@@ -144,6 +144,60 @@ test("an escaped backslash does not continue an rm command onto the next line", 
   assertAllowed(`rm -rf /tmp/wi795-scratch${escapedBackslash}\necho done`)
 })
 
+test("a continued rm is denied after an apostrophe the shell does not quote", () => {
+  // WI#810: in a heredoc body, in a quoted heredoc delimiter's body, and
+  // inside $'...', an apostrophe is plain text for the shell. The join must
+  // not switch off there, or the rm and its flags sit in separate segments.
+  const nl = "\n"
+  const continuation = "\\\n"
+  const outsideTemp = "./wi810-check-only-tree"
+  assertBlocked(`cat <<EOF${nl}it's fine${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`cat <<'EOF'${nl}it's fine${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`echo $'it\\'s'${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+})
+
+test("apostrophes the shell does quote do not stop the join or hide the rm", () => {
+  const nl = "\n"
+  const continuation = "\\\n"
+  const outsideTemp = "./wi810-check-only-tree"
+  assertBlocked(`cat <<EOF${nl}it's not it's${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`echo "it's fine"${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`echo hi # it's fine${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`echo it\\'s${nl}rm ${continuation}-rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+})
+
+test("a backslash-newline inside single quotes is still a continuation", () => {
+  // Same root cause as WI#810: the shell keeps the backslash literal but rm
+  // still runs, and the guard cannot tell this quote from an apostrophe.
+  const continuation = "\\\n"
+  assertBlocked(`rm 'x${continuation}y' -rf ./wi810-check-only-tree`,
+    "recursive/forced rm outside")
+})
+
+test("a recursive rm under temp roots over a continuation line is still allowed", () => {
+  const continuation = "\\\n"
+  assertAllowed(`rm -rf ${continuation}/tmp/wi810-scratch`)
+  assertAllowed(`rm ${continuation}-rf /tmp/wi810-scratch`)
+  assertAllowed(`rm -rf /tmp/wi810-scratch ${continuation}&& echo done`)
+})
+
+test("literal rm text inside a quoted argument is not an rm command", () => {
+  // Joining every backslash-newline merges this printf argument into one
+  // word, so no rm word remains. bash never runs it either: WI#810 note 20355
+  // records both of these as repaired false positives, pinned so a later
+  // change cannot start denying literal text again.
+  const continuation = "\\\n"
+  assertAllowed(`printf 'a${continuation}rm -rf /etc${continuation}b'`)
+  assertAllowed(`grep -F 'a${continuation}rm -rf /etc${continuation}b' file`)
+})
+
 for (const [name, terminator] of [["CR", "\r"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]]) {
   test(`rm treats ${name} as text, not a newline or a word separator`, () => {
     assertBlocked(`rm -rf ./wi795-check-only-tree ${terminator}x`, "recursive/forced rm outside")
