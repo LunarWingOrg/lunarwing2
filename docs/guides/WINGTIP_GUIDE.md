@@ -8,7 +8,7 @@ The full reference is [`tui/README.md`](../../tui/README.md): every flag, key, c
 the voice and image rules, and a longer troubleshooting table. The design is
 [`docs/proposals/WINGTIP_DESIGN.md`](../proposals/WINGTIP_DESIGN.md).
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** Wingtip's package floor remains
+**Source revalidated 2026-11-20 for v2.2.1.0.** Wingtip's package floor remains
 Bun `>=1.3.14` (CI uses 1.4.4). Current gateways still authenticate only the
 master credential; client tokens (M2b) and Wingtip's own socket transport (M4)
 remain future work. The daemon's protocol-1 socket ownership, permission, and
