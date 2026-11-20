@@ -8,7 +8,8 @@ operator-managed.
 This integration targets self-hosted NetBird. It does not require NetBird Cloud
 or a LunarWing-side management API token.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** `netbird expose`
+**Revalidated against source 2026-11-20 (v2.2.2.0 `9c96220bb2`).** The full
+page was checked. `netbird expose`
 process management, `TUNNEL_NETBIRD_NAME_PREFIX`/`TUNNEL_NETBIRD_CUSTOM_DOMAIN`,
 and the V24 legacy-provider scrub match `ic/src/tunnel/`, `ic/src/config/tunnel.rs`,
 and `ic/migrations/`. This is inbound daemon/gateway exposure. The opt-in,
@@ -70,9 +71,11 @@ rm -f /root/netbird-setup-key
 ```
 
 Protect the setup key as a secret. Do not place it in LunarWing settings or service
-environment. Avoid passing it on the command line, where other users may be able
-to see process arguments. Check `netbird up --help` for `--setup-key-file` support
-in your installed version. Confirm peer readiness:
+environment. **Do not pass it as a command-line argument:** unless `/proc` is
+mounted with a suitable `hidepid` setting, process arguments are visible in the
+process list to every local account. Use the file-based flow above instead.
+Check `netbird up --help` for `--setup-key-file` support in your installed
+version. Confirm peer readiness:
 
 ```bash
 netbird status --check startup
@@ -159,9 +162,12 @@ Run diagnostics:
 lunarwing doctor
 ```
 
-Start LunarWing and confirm boot screen reports provider `netbird` plus HTTPS
-URL. Test authenticated health or webhook route through that URL. Stop
-LunarWing, then verify NetBird removes ephemeral service.
+With CLI enabled and no `--message`, the interactive boot screen reports
+provider `netbird` plus the HTTPS URL. Shipped services and managed tenants set
+`CLI_ENABLED=false` and do not print that screen; use debug startup logs to see
+the reported URL without exposing gateway tokens. Test an authenticated health
+or webhook route through that URL. Stop LunarWing, then verify NetBird removes
+the ephemeral service.
 
 Common failures:
 
