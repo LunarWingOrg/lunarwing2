@@ -1178,7 +1178,7 @@ Enforced controls (opencode2 lane unless noted):
    missed them. **Well-known remote config (adjacent to WI#665, no control
    here):** upstream also merges remote config from every registered
    "well-known" origin (`packages/core/src/wellknown.ts`,
-   `packages/core/src/config.ts:182-229,345-366` at the v2.3.2 pin); its
+   `packages/core/src/config.ts:182-229,352-366` at the v2.3.2 pin); its
    `integration.use` resource is the origin's URL, which the managed policy's
    `opencode*` pattern does not match. It takes an origin registered in the
    worker's state with a key credential saved for it, and egress to that

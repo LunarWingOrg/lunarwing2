@@ -1,7 +1,7 @@
 # v2.3.2 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
-# from the proven v1 worker (opencode4lunarwing, pinned v1.19.5) so tenants
+# from the proven v1 worker (opencode4lunarwing, pinned v1.19.6) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.3.2
@@ -350,9 +350,9 @@ RUN set -eu; \
 
 # WI#665: managed Console-policy. opencode loads /etc/opencode as MANAGED
 # settings, above every project, global and explicit config document
-# (packages/core/src/config/discovery.ts:28-33, :63-68 at the v2.3.2 pin), and
+# (packages/core/src/config/discovery.ts:27-32, :63-67 at the v2.3.2 pin), and
 # splits a managed document's `policies` off to load first so they keep final
-# authority (packages/core/src/config.ts:305-350). The single
+# authority (packages/core/src/config.ts:305-325). The single
 # `integration.use` deny below therefore holds when the real binary is started
 # without the wrapper, from a workspace config, or with a saved Console login.
 # A managed config document also OUTRANKS every other layer for ordinary

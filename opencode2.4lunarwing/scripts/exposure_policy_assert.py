@@ -295,9 +295,9 @@ def check_installed_managed_policy(
     # Upstream reads two names from the managed directory, `opencode.json` and
     # `opencode.jsonc` (packages/core/src/config/discovery.ts:12 and
     # config.ts:270-277 at the v2.3.2 pin), and the second one's policies
-    # outrank the first's (config.ts:315-328), so a sibling document can lift
+    # outrank the first's (config.ts:313-325), so a sibling document can lift
     # the reviewed deny while the reviewed file is untouched. The directory
-    # is also a config directory entry (config.ts:277), the kind upstream
+    # is also a config directory entry (config.ts:275), the kind upstream
     # scans for skills and plugins. It must therefore hold the one reviewed
     # file and nothing else.
     try:
