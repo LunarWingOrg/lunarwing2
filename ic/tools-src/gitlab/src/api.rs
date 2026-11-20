@@ -252,30 +252,131 @@ pub fn create_issue_note(
     client.request_json("POST", &endpoint, Some(&json!({ "body": body })))
 }
 
+pub struct ListMergeRequests<'a> {
+    pub state: &'a str,
+    pub source_branch: Option<&'a str>,
+    pub target_branch: Option<&'a str>,
+    pub per_page: u32,
+    pub page_number: u32,
+    pub all_pages: bool,
+}
+
 pub fn list_merge_requests(
     client: &GitlabClient,
     project: &str,
+    request: ListMergeRequests<'_>,
+) -> Result<Value, String> {
+    let endpoint = merge_requests_endpoint(
+        project,
+        request.state,
+        request.source_branch,
+        request.target_branch,
+        request.per_page,
+        request.page_number,
+        request.all_pages,
+    )?;
+    if request.all_pages {
+        client.request_all_pages(&endpoint)
+    } else {
+        client.request_json("GET", &endpoint, None)
+    }
+}
+
+fn merge_requests_endpoint(
+    project: &str,
     state: &str,
+    source_branch: Option<&str>,
+    target_branch: Option<&str>,
     per_page: u32,
     page_number: u32,
-) -> Result<Value, String> {
+    all_pages: bool,
+) -> Result<String, String> {
     validate_choice(
         "state",
         state,
         &["opened", "closed", "locked", "merged", "all"],
     )?;
     let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
-        "/projects/{}/merge_requests?state={}&per_page={per_page}&page={page_number}",
+    let per_page = if all_pages { 100 } else { per_page };
+    let mut endpoint = format!(
+        "/projects/{}/merge_requests?state={}&per_page={per_page}",
         project_path(project)?,
         url_encode(state)
     );
-    client.request_json("GET", &endpoint, None)
+    if !all_pages {
+        endpoint.push_str(&format!("&page={page_number}"));
+    }
+    for (field, branch) in [
+        ("source_branch", source_branch),
+        ("target_branch", target_branch),
+    ] {
+        if let Some(branch) = branch {
+            require_nonempty(field, branch)?;
+            endpoint.push_str(&format!("&{field}={}", url_encode(branch)));
+        }
+    }
+    Ok(endpoint)
 }
 
 pub fn get_merge_request(client: &GitlabClient, project: &str, iid: u64) -> Result<Value, String> {
     let endpoint = format!("/projects/{}/merge_requests/{iid}", project_path(project)?);
     client.request_json("GET", &endpoint, None)
+}
+
+pub fn get_mr_changes(
+    client: &GitlabClient,
+    project: &str,
+    iid: u64,
+    access_raw_diffs: bool,
+) -> Result<Value, String> {
+    let query = if access_raw_diffs {
+        "?access_raw_diffs=true"
+    } else {
+        ""
+    };
+    let endpoint = format!(
+        "/projects/{}/merge_requests/{iid}/changes{query}",
+        project_path(project)?
+    );
+    annotate_mr_changes(client.request_json("GET", &endpoint, None)?)
+}
+
+fn annotate_mr_changes(mut response: Value) -> Result<Value, String> {
+    let mr = response
+        .as_object_mut()
+        .ok_or("expected a GitLab merge request changes object")?;
+    // GitLab can cap the file list (e.g. changes_count="404+") without setting
+    // overflow, even with raw diffs. Only an exact, matching count is evidence.
+    let count = mr
+        .get("changes_count")
+        .and_then(Value::as_str)
+        .and_then(|value| {
+            if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                value.parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+    let complete = mr.get("overflow").and_then(Value::as_bool) == Some(false)
+        && mr
+            .get("changes")
+            .and_then(Value::as_array)
+            .is_some_and(|files| {
+                count == Some(files.len())
+                    && files.iter().all(|file| {
+                        // Empty text can also be a rename or a binary file; the
+                        // response alone cannot establish that its contents were seen.
+                        file.get("diff")
+                            .and_then(Value::as_str)
+                            .is_some_and(|diff| !diff.is_empty())
+                            && ["too_large", "collapsed"].into_iter().all(|flag| {
+                                file.get(flag)
+                                    .is_none_or(|value| value.as_bool() == Some(false))
+                            })
+                    })
+            });
+    mr.insert("diff_complete".into(), json!(complete));
+    Ok(response)
 }
 
 pub struct CreateMergeRequest<'a> {
@@ -370,6 +471,18 @@ pub fn approve_merge_request(
         project_path(project)?
     );
     client.request_json("POST", &endpoint, Some(&json!({ "sha": sha })))
+}
+
+pub fn unapprove_merge_request(
+    client: &GitlabClient,
+    project: &str,
+    iid: u64,
+) -> Result<Value, String> {
+    let endpoint = format!(
+        "/projects/{}/merge_requests/{iid}/unapprove",
+        project_path(project)?
+    );
+    client.request_json("POST", &endpoint, Some(&json!({})))
 }
 
 pub fn merge_merge_request(
@@ -827,8 +940,8 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        project_search_endpoint, require_changes, search_blobs_endpoint, validate_choice,
-        validate_file_path, work_items_endpoint,
+        annotate_mr_changes, merge_requests_endpoint, project_search_endpoint, require_changes,
+        search_blobs_endpoint, validate_choice, validate_file_path, work_items_endpoint,
     };
 
     #[test]
@@ -864,6 +977,78 @@ mod tests {
 
         assert!(work_items_endpoint("35", "opened", 20, Some("\n"), false).is_err());
         assert!(work_items_endpoint("35", "opened", 20, Some(&"x".repeat(2_049)), false).is_err());
+    }
+
+    #[test]
+    fn capped_mr_file_count_is_incomplete_even_with_all_returned_patches() {
+        let patch = json!({"new_path": "file", "diff": "@@ -1 +1 @@\n-old\n+new", "collapsed": false, "too_large": false});
+        let mut response =
+            json!({"overflow": false, "changes_count": "404+", "changes": vec![patch; 404]});
+        let annotated = annotate_mr_changes(response.clone()).unwrap();
+        response["diff_complete"] = json!(false);
+        assert_eq!(annotated, response);
+    }
+
+    #[test]
+    fn mr_diff_completeness_requires_matching_count_and_available_patches() {
+        let patch = json!({"diff": "patch"});
+        let complete = json!({"overflow": false, "changes_count": "1", "changes": [patch]});
+        assert_eq!(
+            annotate_mr_changes(complete.clone()).unwrap()["diff_complete"],
+            true
+        );
+        for count in [json!(""), json!(null), json!("2"), json!("+1")] {
+            let mut incomplete = complete.clone();
+            incomplete["changes_count"] = count;
+            assert_eq!(
+                annotate_mr_changes(incomplete).unwrap()["diff_complete"],
+                false
+            );
+        }
+        for (key, value) in [
+            ("collapsed", json!(true)),
+            ("too_large", json!(true)),
+            ("diff", json!("")),
+        ] {
+            let mut incomplete = complete.clone();
+            incomplete["changes"][0][key] = value;
+            assert_eq!(
+                annotate_mr_changes(incomplete).unwrap()["diff_complete"],
+                false
+            );
+        }
+        let mut overflow = complete;
+        overflow["overflow"] = json!(true);
+        assert_eq!(
+            annotate_mr_changes(overflow).unwrap()["diff_complete"],
+            false
+        );
+    }
+
+    #[test]
+    fn merge_request_filters_reach_request_urls() {
+        let single = merge_requests_endpoint(
+            "group/project",
+            "opened",
+            Some("feature/wi-279"),
+            Some("integration branch"),
+            20,
+            2,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            single,
+            "/projects/group%2Fproject/merge_requests?state=opened&per_page=20&page=2&source_branch=feature%2Fwi-279&target_branch=integration%20branch"
+        );
+
+        let all =
+            merge_requests_endpoint("35", "merged", None, Some("main"), 500, 1, true).unwrap();
+        assert_eq!(
+            all,
+            "/projects/35/merge_requests?state=merged&per_page=100&target_branch=main"
+        );
+        assert!(merge_requests_endpoint("35", "opened", Some(" "), None, 20, 1, false).is_err());
     }
 
     #[test]
