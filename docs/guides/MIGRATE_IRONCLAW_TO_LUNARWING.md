@@ -43,12 +43,13 @@ Use a published release artifact when available. If a local deployment build is 
 taskset -c 0-11 cargo build --release -j12 --bin lunarwing
 ```
 
-Build the XMPP bridge or WASM extensions only when the instance uses them:
+Also from `ic/`, build the XMPP bridge or WASM extensions only when the
+instance uses them:
 
 ```bash
 # The bridge is excluded from the ic workspace, so `-p xmpp-bridge` matches nothing.
 taskset -c 0-11 cargo build --release -j12 --manifest-path bridges/xmpp-bridge/Cargo.toml
-scripts/build-wasm-extensions.sh
+taskset -c 0-11 scripts/build-wasm-extensions.sh
 ```
 
 Release builds are appropriate here because the result is being deployed. Use `cargo check`, not a debug build, for compile-only verification.
