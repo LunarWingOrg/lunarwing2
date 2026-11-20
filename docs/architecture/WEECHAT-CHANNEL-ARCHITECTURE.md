@@ -4,7 +4,8 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** The host minimum remains
+**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
+was checked. The host minimum remains
 30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
 delivery is immediate only while a wait is active. `default_dm_policy` is
 `pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
