@@ -8,7 +8,7 @@ operator-managed.
 This integration targets self-hosted NetBird. It does not require NetBird Cloud
 or a LunarWing-side management API token.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** `netbird expose`
+**Revalidated against source 2026-11-20 (v2.2.1.0).** `netbird expose`
 process management, `TUNNEL_NETBIRD_NAME_PREFIX`/`TUNNEL_NETBIRD_CUSTOM_DOMAIN`,
 and the V24 legacy-provider scrub match `ic/src/tunnel/`, `ic/src/config/tunnel.rs`,
 and `ic/migrations/`. This is inbound daemon/gateway exposure. The opt-in,
