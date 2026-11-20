@@ -131,7 +131,13 @@ const consoleServer = Bun.serve({
   fetch(request) {
     const path = new URL(request.url).pathname;
     requests.push(`${request.method} ${path}`);
-    if (path === "/api/v2/config") return Response.json(CONSOLE_CONFIG);
+    if (path === "/api/v2/config")
+      // v2.3.0+ gates the skill and instruction lists behind this response
+      // header (`listsHeader` in packages/core/src/plugin/provider/opencode.ts);
+      // without it the Console's lists are never fetched at all.
+      return Response.json(CONSOLE_CONFIG, {
+        headers: { "x-opencode-instructions-skills": "1" },
+      });
     if (path === "/api/v2/instructions") return Response.json({ instructions: [INSTRUCTION] });
     if (path === "/api/v2/skills") return Response.json({ skills: [{ slug: SKILL_SLUG, version: "1" }] });
     if (path === `/api/v2/skills/${SKILL_SLUG}`) return Response.json(SKILL_BUNDLE);
