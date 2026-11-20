@@ -4,6 +4,12 @@ plan description: Provider ABI migration
 plan status: done
 ---
 
+> **Historical plan with disputed completion status.** This file was already in
+> the plan archive before the 2026-11-20 reorganization; its `done` marker above
+> is original. The [completion audit](../../ops/history/NEAR_REMOVAL_COMPLETION_AUDIT.md)
+> found missing live-verification and final stale-name evidence, so do not treat
+> the marker alone as proof that every gate was met.
+
 ## Idea
 Remove NEAR AI branding and identifiers from Rust provider/config surfaces and rename the WASM WIT ABI namespace away from `near::agent` to LunarWing-owned names. This is broader than crate/dependency cleanup and may be compatibility-breaking for existing WASM tools/channels and tenant configs, so the plan treats compatibility decisions, migration behavior, and verification as first-class deliverables. The intended end state is that active LunarWing Rust code, WIT bindings, config structs, env/docs where feasible, and package/dependency names no longer expose `Near*`, `nearai`, `NEARAI_*`, or `near::agent` naming except where deliberately retained as a temporary legacy alias with a documented removal window.
 
