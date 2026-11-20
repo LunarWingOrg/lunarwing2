@@ -41,16 +41,22 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
     fn description() -> String {
         "Manage a self-hosted GitLab instance through REST API v4. Supports projects, \
          classic issues and comments, unified Work Items (Issues, Tasks, and hierarchy), \
-         merge requests and approvals, branches, repository files, search, pipelines, \
-         jobs, and current-user lookup. Use project numeric ID or group/project path; \
-         use project-local iid values. Token is injected by LunarWing and never exposed \
-         to WASM. List responses carry explicit pagination metadata. Use list_issues \
-         with all_pages=true for classic issues, or list_work_items with all_pages=true \
-         for a bounded, single-approval inventory across Issue and Task types. \
-         search_blobs takes optional ref (branch, tag, or commit SHA) and searches \
-         only the project's default branch when it is omitted, so branch-only files \
-         need ref. Bad parameter names are rejected with the action's valid set. \
-         Calls require approval unless you choose to always allow this tool."
+         merge requests including file diffs and approvals, branches, repository files, \
+         search, pipelines, jobs, and current-user lookup. Use project numeric ID or \
+         group/project path; use project-local iid values. Token is injected by \
+         LunarWing and never exposed to WASM. List responses carry explicit pagination \
+         metadata. Use get_mr_changes to review an MR's file list and per-file diff \
+         content without a local checkout; check overflow and each file's too_large \
+         or collapsed marker before treating a diff as complete. list_merge_requests \
+         filters by source_branch and target_branch and accepts all_pages=true; \
+         use list_issues with all_pages=true for classic issues, or list_work_items \
+         with all_pages=true for a bounded, single-approval inventory across Issue and \
+         Task types. search_blobs takes optional ref (branch, tag, or commit SHA) and \
+         searches only the project's default branch when it is omitted, so branch-only \
+         files need ref. approve_merge_request requires the current head sha; \
+         unapprove_merge_request removes only the token user's approval. Bad parameter \
+         names are rejected with the action's valid set. Calls require approval unless \
+         you choose to always allow this tool."
             .to_string()
     }
 }
@@ -185,11 +191,26 @@ fn execute_with(
         GitlabAction::ListMergeRequests {
             project,
             state,
+            source_branch,
+            target_branch,
             per_page,
             page,
-        } => api::list_merge_requests(&client, &project, &state, per_page, page)?,
+            all_pages,
+        } => api::list_merge_requests(
+            &client,
+            &project,
+            &state,
+            source_branch.as_deref(),
+            target_branch.as_deref(),
+            per_page,
+            page,
+            all_pages,
+        )?,
         GitlabAction::GetMergeRequest { project, iid } => {
             api::get_merge_request(&client, &project, iid)?
+        }
+        GitlabAction::GetMrChanges { project, iid } => {
+            api::get_mr_changes(&client, &project, iid)?
         }
         GitlabAction::CreateMergeRequest {
             project,
@@ -238,6 +259,9 @@ fn execute_with(
         }
         GitlabAction::ApproveMergeRequest { project, iid, sha } => {
             api::approve_merge_request(&client, &project, iid, &sha)?
+        }
+        GitlabAction::UnapproveMergeRequest { project, iid } => {
+            api::unapprove_merge_request(&client, &project, iid)?
         }
         GitlabAction::MergeMergeRequest {
             project,
@@ -468,11 +492,13 @@ fn action_name(action: &GitlabAction) -> &'static str {
         GitlabAction::CreateIssueNote { .. } => "create_issue_note",
         GitlabAction::ListMergeRequests { .. } => "list_merge_requests",
         GitlabAction::GetMergeRequest { .. } => "get_merge_request",
+        GitlabAction::GetMrChanges { .. } => "get_mr_changes",
         GitlabAction::CreateMergeRequest { .. } => "create_merge_request",
         GitlabAction::UpdateMergeRequest { .. } => "update_merge_request",
         GitlabAction::ListMrNotes { .. } => "list_mr_notes",
         GitlabAction::CreateMrNote { .. } => "create_mr_note",
         GitlabAction::ApproveMergeRequest { .. } => "approve_merge_request",
+        GitlabAction::UnapproveMergeRequest { .. } => "unapprove_merge_request",
         GitlabAction::MergeMergeRequest { .. } => "merge_merge_request",
         GitlabAction::ListBranches { .. } => "list_branches",
         GitlabAction::GetBranch { .. } => "get_branch",
@@ -614,6 +640,60 @@ mod tests {
         );
     }
 
+    /// WI#279: the pure-API review surface must reach GitLab's MR changes
+    /// endpoint, request only the token user's own unapproval, and carry both
+    /// branch filters into the list request. Recording clients pin each exact
+    /// request so a later dispatch edit cannot silently drop them.
+    #[test]
+    fn merge_request_review_actions_dispatch_their_requests() {
+        for (params, method, endpoint) in [
+            (
+                r#"{"action":"get_mr_changes","project":"group/repo","iid":7}"#,
+                "GET",
+                "/projects/group%2Frepo/merge_requests/7/changes",
+            ),
+            (
+                r#"{"action":"unapprove_merge_request","project":35,"iid":7}"#,
+                "POST",
+                "/projects/35/merge_requests/7/unapprove",
+            ),
+            (
+                r#"{"action":"list_merge_requests","project":"group/repo","state":"opened","source_branch":"feature/wi-279","target_branch":"integration","per_page":50}"#,
+                "GET",
+                "/projects/group%2Frepo/merge_requests?state=opened&per_page=50&page=1&source_branch=feature%2Fwi-279&target_branch=integration",
+            ),
+        ] {
+            let recorded = super::gitlab::recorder();
+            let client = super::gitlab::GitlabClient::recording(recorded.clone());
+            execute_with(params, move || Ok(client))
+                .expect_err("the recording client errors instead of sending");
+            let requests = recorded.lock().expect("recorder lock");
+            assert_eq!(requests.len(), 1, "{params}");
+            assert_eq!(requests[0].0, method, "{params}");
+            assert_eq!(requests[0].1, endpoint, "{params}");
+        }
+    }
+
+    /// `all_pages` is a bounded single-approval walk: the caller's page is
+    /// irrelevant, the walk starts at page 1, and pages are requested at the
+    /// widest size so the merge loop owns pagination.
+    #[test]
+    fn merge_request_inventory_walk_starts_at_page_one_with_full_pages() {
+        let recorded = super::gitlab::recorder();
+        let client = super::gitlab::GitlabClient::recording(recorded.clone());
+        execute_with(
+            r#"{"action":"list_merge_requests","project":"35","state":"opened","target_branch":"master","per_page":5,"page":3,"all_pages":true}"#,
+            move || Ok(client),
+        )
+        .expect_err("the recording client errors instead of sending");
+        let requests = recorded.lock().expect("recorder lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].1,
+            "/projects/35/merge_requests?state=opened&per_page=100&target_branch=master&page=1"
+        );
+    }
+
     /// NX-6: a parameter rejection must run before the client loads — the
     /// promise in `validated_action`'s doc comment is pinned by a loader
     /// that would abort the test if it ever ran for rejected parameters.
@@ -652,12 +732,15 @@ mod tests {
             r#"{"action":"list_issue_notes","project":"g/p","iid":1}"#,
             r#"{"action":"create_issue_note","project":"g/p","iid":1,"body":"b"}"#,
             r#"{"action":"list_merge_requests","project":"g/p","state":"merged"}"#,
+            r#"{"action":"list_merge_requests","project":"g/p","source_branch":"a","target_branch":"b","all_pages":true}"#,
             r#"{"action":"get_merge_request","project":"g/p","iid":1}"#,
+            r#"{"action":"get_mr_changes","project":"g/p","iid":1}"#,
             r#"{"action":"create_merge_request","project":"g/p","source_branch":"a","target_branch":"b","title":"t"}"#,
             r#"{"action":"update_merge_request","project":"g/p","iid":1,"title":"t"}"#,
             r#"{"action":"list_mr_notes","project":"g/p","iid":1}"#,
             r#"{"action":"create_mr_note","project":"g/p","iid":1,"body":"b"}"#,
             r#"{"action":"approve_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
+            r#"{"action":"unapprove_merge_request","project":"g/p","iid":1}"#,
             r#"{"action":"merge_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
             r#"{"action":"list_branches","project":"g/p","search":"feat"}"#,
             r#"{"action":"get_branch","project":"g/p","branch":"main"}"#,
