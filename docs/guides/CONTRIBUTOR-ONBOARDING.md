@@ -145,4 +145,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-20 (v2.2.1.0 documentation revalidation). Update §2 whenever freeze status changes.*
+*Last updated: 2026-11-20 (subsystem spec paths). Update §2 whenever freeze status changes.*

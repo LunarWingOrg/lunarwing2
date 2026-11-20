@@ -5,7 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-20 for v2.2.1.0.** Read the behavior sections below
+**Source revalidated 2026-11-10 for v2.2.0.0.** Read the behavior sections below
 as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
@@ -52,7 +52,8 @@ as the current contract. Relevant release changes include:
 Source ownership: `runtime/mission.rs` and `runtime/manager.rs` in the engine;
 `ic/src/bridge/{router,effect_adapter,store_adapter}.rs` and the `router/`
 submodules in the host; `ic/src/gate/` for pending-gate storage; and
-`ic/src/channels/web/handlers/chat.rs` for HTTP approval routing.
+`ic/src/channels/web/server.rs` for the registered HTTP approval route and its
+`chat_approval_handler`.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -666,7 +667,7 @@ bearer header (query-token fallback is reserved for streaming routes).
 **Approval state in `GET /api/chat/history` (WI#520).** The `pending_approval`
 envelope is populated for Engine V2 threads too. Engine V2 dual-writes history
 and leaves the legacy in-memory session turn untouched, so before WI#520 the
-field was `null` for the whole life of a Live Engine V2 approval gate and a
+field was absent for the whole life of a live Engine V2 approval gate and a
 client polling only history could never learn the `request_id` required by
 `POST /api/chat/approval` — a live highwinds gate expired at its 30-minute
 window that way. Both history handlers now run
@@ -688,11 +689,13 @@ envelope). The lookup is:
   external gates are not resolvable through the approval endpoint and appear
   only in `pending-gates`/SSE.
 
-A gate-store read failure degrades to `null` with a warn-level log: history must
-still render. `null` therefore means "no live approval gate for this thread in
-this envelope", not "nothing is pending anywhere" — automation that needs every
-gate (auth included) must poll `GET /api/chat/pending-gates` or follow the
-`approval_needed` SSE event, exactly as the browser UI does.
+A gate-store read failure leaves `pending_approval` absent and logs a warning:
+history still renders. An absent field means "no live approval gate for this
+thread in this envelope", not "nothing is pending anywhere". Use
+`GET /api/chat/pending-gates` to reconcile live gates. On SSE,
+`approval_needed` covers approval prompts; Engine V2 also emits
+`gate_required` for gate requirements and `auth_required` for authentication
+prompts. Listening to `approval_needed` alone misses non-approval gates.
 
 Pending gates are filtered by live thread state (WI#332): a gate parked on a
 thread is only listed while that thread exists, is still `Waiting`, and belongs
@@ -1484,9 +1487,9 @@ categorical refusal of `mission_create`/`mission_delete`/`mission_resume`
 to Mission threads
 alongside the Research-thread refusal — partial v1 parity (create/delete
 only; v1 also denies update/fire, which v2 keeps as steering) — so creating,
-deleting or resuming a mission stays with the foreground conversation (supervised
-only when the tenant sets `AGENT_SUPERVISED_MODE`), plus the fan-out
-disclosure on the run-spawning approval prompts. The owner-scoped steering
+deleting or resuming a mission stays with the foreground conversation (which
+can be supervised via `AGENT_SUPERVISED_MODE` or `lunarwing --supervised`).
+Run-spawning approval prompts disclose fan-out. The owner-scoped steering
 reach that remains is deliberate and stays open. One related seam remains
 by design: the structured-tier policy preflight
 (`executor/structured.rs`) evaluates policy from `available_actions`, which
@@ -1936,12 +1939,13 @@ fallback, and durable gate handling as an on-time result. Authentication-marker
 text is subject to response hooks; only a valid credential request in the
 transformed output becomes an auth gate. It is not recorded as assistant prose.
 
-The watcher has a second 600-second budget, then requests stop with a bounded
-60-second grace and reports a terminal timeout if its stop succeeds. It never
-joins a still-running handle, which would hide it from
-`/interrupt`. Cancellation failure reports an error and leaves the live handle
-addressable. These are in-process delivery guarantees; the watcher is not a
-durable cross-restart outbox.
+The watcher has a second 600-second budget. If it expires, the stop request
+has a 60-second grace and, after a successful request, settlement gets its own
+60-second grace. A settled stop reports a terminal timeout; if the run already
+ended or paused before the stop, the watcher delivers its actual result. If
+stop or settlement fails, it reports an error without joining a still-running
+handle, which stays addressable to `/interrupt`. These are in-process delivery
+guarantees; the watcher is not a durable cross-restart outbox.
 
 **Join and restart recovery (WI#532/WI#534).** A thread id names a reusable
 conversation surface, not a unique execution. `Thread.created_at` is therefore
@@ -1964,10 +1968,10 @@ could see a new `Created` record without its task and fail that live task.
 Task-level errors enter the same claimable completed slot, and task errors or
 panics unregister their generation even when no joiner remains.
 
-Completed entries expire after 22 minutes and are pruned on insertion and read,
-covering the longest foreground/late-waiter budget without retaining every turn
-for the daemon's lifetime. Every joiner can read an outcome, but an atomic
-per-generation completion claim permits only one channel/history/gate
+Completed entries expire 22 minutes after completion and are pruned on
+insertion and read. This retention is not an end-to-end waiter deadline.
+Every joiner can read an outcome, but an atomic per-generation completion
+claim permits only one channel/history/gate
 completion pass. Foreground, late, and expired-gate waiters all use that claim;
 later waiters return the empty sentinel instead of duplicating a reply, history
 entry, or pending gate. After retention expires, store recovery creates a fresh

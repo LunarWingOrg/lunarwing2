@@ -2,7 +2,7 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-11-20 (v2.2.1.0).** The referenced ops
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The referenced ops
 runbook, `ic/scripts/release-test.sh`, and channel/worker/multi-tenant tiers
 were checked against the current tree. The checklist now covers the v2.1.9
 response/cache and worker-source baselines plus v2.2 sandbox networking and

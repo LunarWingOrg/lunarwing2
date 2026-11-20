@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Created:** 2026-06-13. **Source revalidated:** 2026-11-20, v2.2.1.0.
+**Created:** 2026-06-13. **Source revalidated:** 2026-11-10, v2.2.0.0.
 **Status:** Reference — documents current behavior, not a proposal.
 **Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
 [multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),
@@ -27,7 +27,7 @@ env file, and schedules the pipeline (systemd timer or OpenRC cron) in one step.
 It can be opted out with `--no-health`.
 
 > **v2.0.8.0 note (mt-admin refactor):** `ic/scripts/lunarwing-mt-admin.sh` is
-> now a thin composition root that sources `ic/scripts/mt-admin-lib/NN-*.sh`
+> now a thin composition root that sources numbered modules in `ic/scripts/mt-admin-lib/`
 > modules. `ensure_health_pipeline()` lives in
 > `mt-admin-lib/12-health-pipeline.sh` and is invoked from `add_tenant()` in
 > `mt-admin-lib/04-tenant-lifecycle.sh`; the CLI surface described here is
@@ -148,13 +148,18 @@ of tenant provisioning (unless `--no-health` is passed). This function:
    `LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=N` in the same file, as a plain
    `NAME=value` line, to change it. The same-named environment variable takes
    precedence for one run. Values must be integers from 10 to 3600; invalid
-   values stop mt-admin before any unit is written. The health pipeline only
-   escalates `unhealthy`, so a longer cadence delays detection by roughly
-   three intervals (three retries) and nothing else. Containers whose Quadlet
+   values stop mt-admin before any unit is written. It takes five consecutive
+   failed checks outside the start period for PostgreSQL's Quadlet to report
+   `unhealthy`, and three for the other listed Quadlets. Increasing the
+   interval delays that transition; the host pipeline still samples on its
+   own schedule. Containers whose Quadlet
    is hashed (LunarVision, LunarVoice, workers) are recreated with the new
    cadence on the next `start-tenant` or `upgrade-tenant`; Postgres picks it up
-   on its next restart. OpenRC hosts disable Podman's timer healthchecks
-   entirely, so the setting does not apply there.
+   on its next restart. With OpenRC and Podman, mt-admin disables the
+   Podman timer healthchecks and the generated OpenRC units run their own
+   probes. With OpenRC and Docker it does not disable container healthchecks;
+   for example, it passes the configured interval to Docker worker task
+   containers. The OpenRC unit probes do not use that interval.
 
 Because the pipeline is host-global and auto-discovers tenants, scheduling is
 idempotent. Subsequent `add-tenant` calls re-run `ensure_health_pipeline()`.

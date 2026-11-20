@@ -6,7 +6,7 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-11-20 (v2.2.1.0).** `ALLOW_LOCAL_TOOLS`,
+**Revalidated against source 2026-11-10 (v2.2.0.0).** `ALLOW_LOCAL_TOOLS`,
 `AGENT_AUTO_APPROVE_TOOLS` (including the legacy `AUTO_APPROVE_TOOLS` alias),
 the `full_access` double opt-in, the generic podman-first runtime, the four
 network tiers, and the scrubbed child environment match the config resolver and
@@ -17,13 +17,18 @@ Use the narrowest access that satisfies the task. `full_access` combined with au
 
 ## 1. Register Local Tools
 
-Local developer tools are not registered in a normal production configuration unless this startup environment value is enabled:
+With the default sandbox enabled, the daemon registers the sandboxed `shell`
+tool even when `ALLOW_LOCAL_TOOLS` is unset or false. To also register the
+built-in file tools (`read_file`, `write_file`, `list_dir`, and `apply_patch`),
+set this startup environment value:
 
 ```bash
 ALLOW_LOCAL_TOOLS=true
 ```
 
-This registers the built-in `read_file`, `write_file`, `list_dir`, `apply_patch`, and `shell` tools. Restart LunarWing after changing it.
+This also selects the direct host `shell` by default. Keep `SANDBOX_ENABLED=true`
+and set `SANDBOX_ENFORCE=true` if you want the shell to stay sandboxed; the file
+tools still run on the host. Restart LunarWing after changing these settings.
 
 For an MT-admin tenant, edit the managed tenant environment file under `/home/<tenant>/lunarwing/env/`, then restart through MT admin. Do not call a tenant's unit directly:
 

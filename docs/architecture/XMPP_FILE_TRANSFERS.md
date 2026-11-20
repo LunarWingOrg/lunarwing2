@@ -1,6 +1,6 @@
 # XMPP File Transfer Support
 
-**Source revalidated 2026-11-20 for v2.2.1.0.** Transfer contracts live in
+**Source revalidated 2026-11-10 for v2.2.0.0.** Transfer contracts live in
 `ic/src/channels/xmpp/mod.rs`, the standalone bridge, the WASM channel/host,
 and `ic/src/vision_enrichment.rs`. Size limits described as MiB below use
 1024 × 1024 bytes; the 100,000-byte extracted-text cap is decimal.
@@ -63,9 +63,9 @@ Outbound (agent sends file):
 Inbound (user sends file):
   XMPP stanza arrives (OOB element and/or aesgcm:// URL in the body)
     -> XmppChannel.handle_message_stanza()   (OMEMO-decrypts the body first)
-    -> extract_inbound_attachments(payloads, body)
-         collect_oob_urls()    : <x jabber:x:oob> URLs (capped)
-         collect_aesgcm_urls() : aesgcm:// URLs found only in the decrypted body
+    -> collect_inbound_attachment_urls(payloads, body)
+         collect_oob_urls() : <x jabber:x:oob> URLs (capped)
+         body scan          : aesgcm:// tokens not already seen in OOB URLs
     -> bounded-concurrency download (<=4 at once), each via download_oob_file():
          http(s)   : GET + streaming size cap (read_capped_body)
          aesgcm:// : GET https form + AES-256-GCM decrypt (download_aesgcm_file)
@@ -84,10 +84,13 @@ Inbound (user sends file):
 
 All inbound logic lives in `ic/src/channels/xmpp/mod.rs`.
 
-### URL extraction (`extract_inbound_attachments`)
+### URL extraction (`collect_inbound_attachment_urls`)
 
 1. `collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS + 1)` — parses `<x xmlns='jabber:x:oob'>` elements (via `Oob::try_from`). The effective cap is all-or-nothing: a stanza with more than 10 URLs has its body cleared and **no** downloads attempted.
-2. `collect_aesgcm_urls(body, …)` — scans the **decrypted body** for `aesgcm://` URLs and adds any not already present (deduped, same cap). This covers encrypted files whose client omits the cleartext OOB element. Plain `https://` links in a body are intentionally **not** auto-downloaded.
+2. `collect_inbound_attachment_urls` also scans whitespace-delimited tokens
+   in the **decrypted body** for the `aesgcm://` prefix and adds URLs not already
+   present (deduped, same cap). This covers clients that omit the cleartext OOB
+   element. Plain `https://` links in a body are not auto-downloaded.
 3. Downloads run with **bounded concurrency** (`buffered`, ≤4 at once) so one slow URL can't serialize the batch and stall the single client event loop. Results stay in stanza order; per-URL failures are logged and skipped.
 
 ### Download (`download_oob_file`)
@@ -192,7 +195,7 @@ All other MIME types are rejected outright.
 Encrypted file shares are handled end-to-end:
 
 - **Unencrypted messages**: the OOB `<x>` element is present in `msg.payloads` and extracted directly; `https://` files are downloaded as-is.
-- **Encrypted DMs/rooms**: the body is OMEMO-decrypted first, then scanned for `aesgcm://` URLs (`collect_aesgcm_urls`) — covering clients that omit the cleartext OOB element to avoid leaking the URL to the server. `aesgcm://` media is fetched and AES-256-GCM-decrypted locally (`download_aesgcm_file`). An `aesgcm://` URL carried in an OOB element is handled the same way.
+- **Encrypted DMs/rooms**: the body is OMEMO-decrypted first, then scanned for `aesgcm://` URLs (`collect_inbound_attachment_urls`) — covering clients that omit the cleartext OOB element to avoid leaking the URL to the server. `aesgcm://` media is fetched and AES-256-GCM-decrypted locally (`download_aesgcm_file`). An `aesgcm://` URL carried in an OOB element is handled the same way.
 - Plain `https://` URLs that appear only in a (decrypted) body are **not** auto-downloaded — only the explicit `aesgcm://` encrypted-media scheme is.
 
 ## Security Notes

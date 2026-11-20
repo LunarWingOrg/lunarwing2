@@ -2,7 +2,7 @@
 
 **Status:** As-built. LunarWing provisions a dedicated DarkIRC daemon and HTTP adapter for every DarkIRC-enabled tenant.
 
-**Revalidated against source 2026-11-20 (v2.2.1.0).** Per-tenant topology,
+**Revalidated against source 2026-11-10 (v2.2.0.0).** Per-tenant topology,
 mt-admin ownership commands, adapter env contract, and the 3000 ms polling
 floor match the current tree. The WI#376 legacy OpenRC proxy-unit migration
 still refuses DarkIRC OpenRC lifecycle calls until `render-units --all-proxies`
@@ -44,7 +44,7 @@ A shared DarkIRC daemon is not supported. It would collapse tenant P2P identity 
 - `build-darkirc` builds the approved pinned DarkFi revision and installs the trusted contact-key helper;
 - `build-tenant --with-wasm` builds and installs the current channel artifact;
 - `render-units` writes the correct systemd-user or OpenRC service definitions;
-- `start-tenant`, `stop-tenant`, `restart-tenant`, `status`, and `doctor` manage and inspect the complete tenant service graph;
+- `start-tenant`, `stop-tenant`, and `restart-tenant` manage the tenant services; `status` reports their init state and `doctor` checks the MT host prerequisites and registry;
 - `remove-tenant` removes managed services and configuration according to its selected retention/purge mode.
 
 Do not call internal shell helpers such as `write_tenant_darkirc_adapter_env` or `ports_get` from an operator runbook. They are implementation details, not stable commands.
@@ -57,10 +57,13 @@ MT admin writes a protected `darkirc-adapter.env` containing tenant-specific val
 - adapter loopback host and `darkirc_adapter` port;
 - tenant bridge nick/user/real name;
 - `ADAPTER_SECRET` bearer token;
-- queue and message-size limits;
-- paced outbound interval;
-- durable outbox journal under tenant state;
 - adapter log level.
+
+The standard `ic/scripts/templates/darkirc-adapter.env.template` enables the
+durable outbox journal under tenant state. It shows outbound pacing, chunk-size,
+and outbox capacity settings as commented examples; the adapter supplies the
+defaults. The fallback renderer (when the template is absent) sets neither those
+tuning values nor the journal path.
 
 It also writes `DARKIRC_ADAPTER_URL` and `DARKIRC_ADAPTER_SECRET` into the protected LunarWing environment. The channel setup schema sources the URL from the former and injects the latter as a host-side bearer credential.
 
@@ -113,7 +116,9 @@ Completion of a staged exchange does not remove the need to verify the full peer
 A healthy deployment should satisfy all of the following:
 
 1. MT admin `status` reports the tenant daemon, DarkIRC daemon, and adapter in the expected init state.
-2. MT admin `doctor` finds no port, ownership, service, or contact-state fault.
+2. MT admin `doctor` passes its host prerequisite and port-registry checks.
+   Use `darkirc-contact doctor <tenant>` for managed contact-key state; the
+   host-wide `doctor` does not check it or probe the DarkIRC services.
 3. The adapter's loopback `/health` response reports an IRC connection and expected nick without exposing the bearer token.
 4. The authenticated gateway status reports healthy DarkIRC channel state.
 5. Paired/allowlisted sender behavior matches `dm_policy`.

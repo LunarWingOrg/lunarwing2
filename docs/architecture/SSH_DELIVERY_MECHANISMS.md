@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built; source revalidated 2026-11-20 for v2.2.1.0. Worker socket
+**Status:** As-built; source revalidated 2026-11-12 for v2.2.0.0. Worker socket
 mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
 units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
 `ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
@@ -242,12 +242,13 @@ host-key verification stay host-side — the guest never sees key material.
 - **WIT:** adds an `ssh-exec` import to `wit/tool.wit` at package `@0.3.0` — a
   pure import addition, so **existing WASM guests do not need rebuilding**.
 
-**How to enable / build.** The guest wasm must be built (needs `rustup` +
-`wasm32-wasip2` + `cargo-component`):
+**How to enable / build.** Build the guest with Cargo and the
+`wasm32-wasip2` Rust target. `cargo-component` is not required:
 
 ```bash
 cd ic
-taskset -c 0-11 cargo component build --locked --release -j12 \
+rustup target add wasm32-wasip2
+taskset -c 0-11 cargo build --locked --release -j12 \
   --target wasm32-wasip2 --manifest-path tools-src/ssh/Cargo.toml
 # -> tools-src/ssh/target/wasm32-wasip2/release/ssh_tool.wasm
 # or, registry-driven for all tools: scripts/build-wasm-extensions.sh --tools

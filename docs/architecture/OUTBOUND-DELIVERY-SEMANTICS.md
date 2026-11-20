@@ -1,6 +1,6 @@
 # Outbound Message Delivery Semantics
 
-**Source revalidated 2026-11-20 for v2.2.1.0.** Defines what a successful
+**Source revalidated 2026-11-10 for v2.2.0.0.** Defines what a successful
 `message`-tool send means and what the native XMPP channel guarantees about
 outbound stanzas. WI#270 established acceptance wording; WI#277 added durable
 spooling. The initiating incident was a mission recording "Delivered via XMPP"
@@ -72,9 +72,10 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
    that caller was never acknowledged. The client task claims a record by
    atomic rename before sending, preventing simultaneous spool and queue
    copies from sending it. It deletes the record on send success and replays
-   pending records that are due on each `Event::Online` bind and subsequent
-   retry ticks. Backoff still applies after reconnect; parked failures need
-   operator attention, so persistence is not an unconditional delivery promise.
+   pending records that are due when it handles `Event::Online`. There is no
+   periodic retry tick: a record that is still in backoff at bind waits for a
+   later `Event::Online` when it is due. Parked failures need operator attention,
+   so persistence is not an unconditional delivery promise.
    The hourly rate limiter is checked before persistence and is not re-applied
    to replays. Spooled content is plaintext JSON, the same on-disk exposure
    class as the adjacent OMEMO identity store. Internal protocol sends
@@ -86,9 +87,9 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
    when the client task finishes with a message) drives the wait; if the
    queue does not drain, shutdown WARNs with the pending depth — a
    delivery-*delay* notice now, not data loss, because every acked message
-   still pending has a spool record the next bind replays. An empty queue
-   returns immediately.
-4. **Post-enqueue failures retry from the spool** (WI#277). A send_stanza
+   still pending has a spool record eligible for replay on bind once due.
+   An empty queue returns immediately.
+4. **Post-enqueue failures become eligible for replay on bind** (WI#277). A send_stanza
    error, OMEMO/encrypted-room prep error, or XEP-0363 upload failure marks
    the record for retry with exponential backoff (30s base, capped at 1h);
    after 24 attempts the record is parked as `<key>.failed.json` with the
@@ -173,7 +174,7 @@ Wrappers forward it (`SharedWasmChannel`; the test `TestChannelHandle`).
 | Channel | Mapping |
 | --- | --- |
 | `gateway` | SSE `turn_started` / `turn_finished`, only for messages that carry a chat-handler `message_id` and a thread; internal messages (job monitor, routines) and WebSocket sends emit nothing |
-| `unix_socket_repl` | nothing yet (the socket milestones add `TurnStarted` / `TurnFinished` frames) |
+| `unix_socket_repl` | `TurnStarted` / `TurnFinished` frames for a live, stamped message owned by that connection |
 | every other channel | the default no-op |
 
 ### Outcomes

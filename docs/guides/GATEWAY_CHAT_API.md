@@ -8,8 +8,7 @@ lifecycle events, the capabilities document, image validation, Engine V2
 generated images and the `/quit` refusal. Client tokens (M2b) are not part of
 this version; every authenticated request uses the master credential.
 
-**Source revalidated 2026-11-20 for v2.2.1.0.** Capabilities, event names and
-wire limits match the current server and golden fixture. Live provider
+**Source revalidated 2026-11-10 for v2.2.0.0.** Live provider
 reasoning remains opt-in through `ENGINE_V2_STREAM_REASONING`; idle/interrupted
 V1 steer notes now arrive before the next request with explicit pre-turn
 framing (WI#584), as detailed below.
@@ -310,7 +309,7 @@ stamped message caused it.
 | `auth_required` / `auth_completed` | `extension_name`, `instructions?`, `auth_url?`, `setup_url?` / `extension_name`, `success`, `message` | agent status: correlated; the `auth-token` handler: not correlated | partly |
 | `turn_cost`, `suggestions` | as named | V1 only | yes |
 | `thread_state_changed`, `turn_recovery`, `child_thread_spawned` | as named | V2 | yes |
-| `job_started` | `job_id`, `title`, `browse_url` | a job created during a turn | yes |
+| `job_started` | `job_id`, `title`, `browse_url` | defined by the wire schema and exercised by the fixture; no current production emitter | — |
 | `job_message`, `job_tool_use`, `job_tool_result`, `job_status`, `job_result` | as named | the job event bus | no |
 | `extension_status`, `skill_activated`, `error`, `heartbeat`, `stream_gap` | as named | extensions, unused, unused, global, lag | no |
 
@@ -471,8 +470,14 @@ would arrive twice.
 
 ## History
 
-`GET /api/chat/history?thread_id=<uuid>&limit=50&before=<rfc3339>` answers
-`{"thread_id","turns":[{"turn_number","user_input","response","state","started_at","completed_at","tool_calls","reasoning"}],"has_more","oldest_timestamp","pending_approval?"}`.
+`GET /api/chat/history?thread_id=<uuid>&limit=50&before=<rfc3339>` returns
+`thread_id`, `turns`, and `has_more`. `oldest_timestamp` (the pagination cursor)
+and `pending_approval` are omitted when absent. Each turn includes `turn_number`,
+`user_input`, `response`, `state`, `started_at`, `completed_at`, and `tool_calls`.
+`response` and `completed_at` can be `null`; `reasoning` and the flattened
+recovery fields (`failure_kind`, `recovery_state`, `recovery_attempt`, `error`)
+are omitted when absent. Each tool call includes `name`, `has_result`, and
+`has_error`; it only includes `result_preview` or `error` when present.
 Durable V2 history shows an in-flight turn as `Failed`; `user_input` is the
 effective content (with an `<attachment>` block for images); history carries
 no `message_id` or `client_turn_id`.
@@ -525,10 +530,9 @@ sent over it are validated like `send`; a rejection answers a WebSocket
   `SseEvent` variant, and fails `sse_current_fixture_matches_server_output`
   when the server output changes. Regenerate and review the diff with
   `LW_REGEN_FIXTURES=1 taskset -c 0-11 cargo test -j12 --lib -- channels::web::tests::correlation`.
-  Clients check their decoder against it; for M2a every line was fed through
-  `tui/src/transport/gateway-wire.ts` (`parseGatewayEvent` and
-  `mapGatewayEvent`, as `gateway.ts` calls them) without a rejected or
-  misread event. A `bun test` that replays the file in `tui/` is a follow-up.
+  `tui/test/transport/sse-fixture.test.ts` replays the fixture through the
+  client's SSE parser and `parseGatewayEvent` / `mapGatewayEvent` decoders.
+  It runs as part of `bun test` in the `tui-ts` CI job (`.gitlab/ci/validate.yml`).
 - Server tests: `cargo test --lib -- channels::web` (correlation, lifecycle,
   images, capabilities, voice), `--test e2e_turn_lifecycle` and
   `--test e2e_quit_refusal` (`--features libsql`).
