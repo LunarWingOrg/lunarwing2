@@ -2538,12 +2538,14 @@ in full on this host with `mt-admin build-kimi-worker`,
 The first opencode2 attempt failed at `exposure_policy_assert.py
 --image-filesystem` because the build's `LUNARWING_WRAPPER_SHA256` anchor was
 taken from the pre-edit wrapper while the build context carried the edited one;
-re-running from one tree built clean and the anchor matched. **The
-opencode2 in-image version marker is not asserted by that build** — the image
-has no `opencode --version` RUN — so the v2.3.2 binary is evidenced by the
-pinned `OPENCODE_REF` checkout (the Dockerfile tests
-`rev-parse FETCH_HEAD = OPENCODE_REF` after fetching `refs/tags/v2.3.2`) and by
-the candidate `/app`-side checks, not by a version print.
+re-running from one tree built clean and the anchor matched. That build also
+asserts the in-image version — `opencode --version` must equal
+`opencode v2.3.2`, and the step fails otherwise — and runs the whole in-image
+gate set: `sdk_surface_assert.ts`, the nine Bun suites, and
+`prepare_reproducible_build`, `study_notes_config`,
+`exposure_policy_assert_test` (88), `console_policy_eval_test` (10),
+`image_config_policy`, `entrypoint_config`, `compile_out_remote_tunnel_test`
+(27) and `runtime_smoke_test`, plus the no-leaked-state check.
 
 **`console_policy_eval.py` against the built image (checklist item 7).** Run on
 the candidate image with `--network=none`. Its first run returned
