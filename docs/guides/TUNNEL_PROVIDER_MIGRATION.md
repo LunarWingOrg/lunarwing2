@@ -45,8 +45,7 @@ To have LunarWing discover the public URL, set a pattern and use a command that
 prints the URL on stdout. The pattern is a substring, not a regular expression.
 Without a pattern, or if no printed URL matches it within the discovery window,
 the custom provider reports its local HTTP target instead. The command is split
-on whitespace
-after placeholder substitution; it is not evaluated by a shell.
+on whitespace after placeholder substitution; it is not evaluated by a shell.
 
 Externally managed HTTPS endpoint:
 
