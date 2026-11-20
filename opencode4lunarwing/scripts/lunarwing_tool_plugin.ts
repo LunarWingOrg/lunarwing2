@@ -312,14 +312,16 @@ export function createProxyTools(client: SessionTitleClient): Record<string, Pro
         "and pipelines on the tenant's self-hosted GitLab. Required argument: action (string) — " +
         "one of list_projects, get_project, create_project, list_issues, get_issue, " +
         "create_issue, update_issue, list_issue_notes, create_issue_note, list_work_items, " +
-        "get_work_item, list_merge_requests, get_merge_request, create_merge_request, " +
+        "get_work_item, list_merge_requests, get_merge_request, get_mr_changes, create_merge_request, " +
         "update_merge_request, list_mr_notes, create_mr_note, approve_merge_request, " +
-        "merge_merge_request, list_branches, get_branch, create_branch, delete_branch, " +
+        "unapprove_merge_request, merge_merge_request, list_branches, get_branch, create_branch, delete_branch, " +
         "get_file_content, create_or_update_file, delete_file, search_projects, search_issues, " +
         "search_blobs, list_pipelines, get_pipeline, list_jobs, current_user. All remaining " +
         "arguments are action-specific and passed through: 'project' (numeric id or " +
         "'group/project') scopes most actions; 'iid' is the project-local issue/MR id; " +
-        "merge approval/merge actions require the MR head 'sha'; file update/delete require the " +
+        "approve_merge_request and merge_merge_request require the MR head 'sha'; " +
+        "unapprove_merge_request removes only the token user's approval and needs no 'sha'. " +
+        "Do not claim a complete review when get_mr_changes reports diff_complete=false. File update/delete require the " +
         "current 'last_commit_id' from get_file_content; pagination uses 'page'/'cursor', and " +
         "'all_pages: true' walks bounded chains. An invalid call returns a tool error naming the " +
         "missing or malformed field." +

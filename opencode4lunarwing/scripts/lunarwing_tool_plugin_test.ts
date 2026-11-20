@@ -99,6 +99,8 @@ const relay = new ToolProxyRelay()
   assert.deepEqual(Object.keys(tools.lunarwing_memory_write!.args).sort(), ["content", "target"])
   assert.deepEqual(Object.keys(tools.lunarwing_memory_read!.args), ["path"])
   assert.deepEqual(Object.keys(tools.lunarwing_gitlab_tool!.args), ["action"])
+  assert.match(tools.lunarwing_gitlab_tool!.description, /\bget_mr_changes\b/)
+  assert.match(tools.lunarwing_gitlab_tool!.description, /\bunapprove_merge_request\b/)
   assert.equal(tools.lunarwing_memory_write!.args.layer, undefined)
 }
 

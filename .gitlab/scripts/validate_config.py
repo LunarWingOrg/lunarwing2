@@ -3339,10 +3339,13 @@ def validate_log_scrubber_test_support(errors: list[str]) -> None:
 #   * rootfs tars (hundreds of MiB, consumed only by later jobs in the same
 #     pipeline) expire within two days;
 #   * scan/release evidence (SBOM, vulnerability report, promotion evidence) is
-#     kept at least 90 days.
-# A top-level `default: artifacts: expire_in` is required as a backstop so an
-# artifacts block that somehow slips past still expires, but the backstop is not
-# accepted in place of a job-level value.
+#     kept at least 30 days, the longest a pipeline lives: the project deletes
+#     pipelines after 30 days, and their jobs, logs and artifacts go with them
+#     whatever expire_in says.
+# A top-level `default: artifacts: expire_in` is required as a backstop, but
+# GitLab applies `default:` only to a job that does not define the keyword, so
+# it does not reach a job with its own `artifacts:` block and no expire_in; the
+# backstop is not accepted in place of a job-level value.
 ARTIFACT_EXPIRY_UNITS = {
     "second": 1,
     "minute": 60,
@@ -3357,15 +3360,18 @@ ARTIFACT_EXPIRY_TOKEN = re.compile(
 )
 ARTIFACT_MAX_EXPIRY_SECONDS = 365 * 86400
 ROOTFS_ARTIFACT_MAX_SECONDS = 2 * 86400
-EVIDENCE_ARTIFACT_MIN_SECONDS = 90 * 86400
+EVIDENCE_ARTIFACT_MIN_SECONDS = 30 * 86400
 EVIDENCE_ARTIFACT_NAMES = (
     "worker-image-evidence.json",
     "worker-sbom.cdx.json",
     "worker-vulnerabilities.json",
 )
 # Top-level keys GitLab reserves; everything else mapping to a dict is a job or
-# a hidden job template. The deprecated global forms (a bare `artifacts:`,
-# `retry:`, ... at the top level) are listed so they cannot be mistaken for jobs.
+# a hidden job template. `image`, `services`, `cache`, `before_script` and
+# `after_script` are GitLab's deprecated global keywords and may still appear at
+# the top level; `artifacts`, `retry`, `timeout`, `interruptible` and `tags` are
+# not valid top-level keywords at all. All are listed so they cannot be mistaken
+# for jobs.
 RESERVED_TOP_LEVEL_KEYS = {
     "default", "include", "stages", "variables", "workflow",
     "image", "services", "cache", "before_script", "after_script",
@@ -3416,8 +3422,10 @@ def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
                 "defaults.yml default:artifacts expire_in "
                 f"{default_artifacts['expire_in']!r} is not a bounded duration (WI#791)"
             )
-    # A bare top-level `artifacts:` is GitLab's deprecated global form. It is
-    # applied to every job, so it is a backstop too and needs the same bound.
+    # A top-level `artifacts:` is not a GitLab keyword (the deprecated global
+    # keywords are image, services, cache, before_script and after_script), so
+    # this cannot arise in a valid config. Bound it defensively anyway: config
+    # that writes one gets a bounded value rather than an implicit default.
     global_artifacts = merged.get("artifacts")
     if isinstance(global_artifacts, dict) and artifact_expiry_seconds(
         global_artifacts.get("expire_in")
@@ -3470,7 +3478,8 @@ def validate_artifact_retention(merged: dict, errors: list[str]) -> None:
         ) and seconds < EVIDENCE_ARTIFACT_MIN_SECONDS:
             errors.append(
                 f"{name} keeps scan/release evidence for {expire_in!r}; evidence "
-                "must be held at least 90 days (WI#791)"
+                "must be held at least 30 days, the most a pipeline outlives "
+                "(WI#791)"
             )
 
 

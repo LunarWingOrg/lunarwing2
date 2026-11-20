@@ -47,10 +47,10 @@ function readStdin() {
 }
 
 /** Extract the operand tokens of an `rm` invocation (flags and redirects stripped). */
-function rmOperands(commandSegment) {
-  return commandSegment
-    .split(/\s+/)
-    .filter((token) => token.length > 0 && !token.startsWith("-"))
+function rmOperands(words, endOfOptions) {
+  return words
+    .filter((token, i) => token.length > 0 &&
+      (!token.startsWith("-") || (endOfOptions !== -1 && i > endOfOptions)))
     .map((token) => token.replace(/^["']|["']$/g, ""))
     // A redirection target is not an rm operand (e.g. `2>/dev/null`).
     .filter((token) => !/^\d*>/.test(token));
@@ -62,18 +62,65 @@ function isSafeRmOperand(operand) {
   return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
 }
 
-/** Split a command line into `;`/`&&`/`||`/pipe-separated segments. */
+// Join backslash-LF pairs before splitting for rm. Escaped backslashes and
+// backslashes in single quotes or comments do not continue a shell line.
+function joinLineContinuations(command) {
+  if (!command.includes("\\\n")) return command;
+  let joined = "";
+  let quote = "";
+  let atWordStart = true;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < command.length) {
+      const next = command[++i];
+      if (next === "\n") continue;
+      joined += ch + next;
+      atWordStart = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      atWordStart = false;
+    } else if (ch === "#" && atWordStart) {
+      const lf = command.indexOf("\n", i);
+      if (lf === -1) return joined + command.slice(i);
+      joined += command.slice(i, lf);
+      i = lf - 1; // Leave the comment's newline intact.
+      continue;
+    } else {
+      atWordStart = " \t\n;|&()<>".includes(ch);
+    }
+    joined += ch;
+  }
+  return joined;
+}
+
+/** Split on control operators and LF, leaving other line terminators in the text. */
 function commandSegments(command) {
-  return command.split(/(?:\s*[;|&]{1,2}\s*)/);
+  return command.split(/[;|&]{1,2}|\n+/);
+}
+
+function isRmLongDeleteOption(word) {
+  // GNU rm accepts any unique prefix of these options. An adjacent redirect
+  // ends the option word; the bare -- marker is not an option prefix.
+  const option = /^--[a-z]+(?=$|[<>])/.exec(word)?.[0];
+  return option !== undefined && ("--recursive".startsWith(option) || "--force".startsWith(option));
 }
 
 function checkRm(segment) {
-  const match = /\brm\s+(.*)$/.exec(segment);
+  const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
   const rest = match[1];
-  // Recursive or force delete flags (rm -r, -f, -rf, -fr, --recursive…).
-  if (!/(^|\s)-[a-zA-Z]*[rf]|--recursive|--force/.test(rest)) return null;
-  const operands = rmOperands(rest);
+  // Bash splits words on space and tab here, not JS's broader whitespace set.
+  const words = rest.split(/[ \t]+/);
+  const endOfOptions = words.indexOf("--");
+  const optionWords = endOfOptions === -1 ? words : words.slice(0, endOfOptions);
+  // Keep the existing conservative flag checks as well as GNU abbreviations.
+  if (!/(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) &&
+      !optionWords.some(isRmLongDeleteOption)) return null;
+  const operands = rmOperands(words, endOfOptions);
   if (operands.length === 0) return "rm -r/-f without an explicit operand";
   if (!operands.every(isSafeRmOperand)) {
     return `recursive/forced rm outside ${RM_SAFE_TEMP_ROOTS.join(", ")}: ${operands.join(" ").slice(0, 80)}`;
@@ -131,11 +178,15 @@ function evaluate(command) {
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match.
-  for (const rule of DENY_RULES) {
-    if (rule.pattern.test(command)) return rule.name;
-  }
+  const wholeCommandDenial = checkDenyRules(command);
+  if (wholeCommandDenial) return wholeCommandDenial;
+  // Keep those rules on the original text. Only rm needs the joined view.
   for (const segment of commandSegments(command)) {
-    const denied = checkDenyRules(segment) ?? checkRm(segment);
+    const denied = checkDenyRules(segment);
+    if (denied) return denied;
+  }
+  for (const segment of commandSegments(joinLineContinuations(command))) {
+    const denied = checkRm(segment);
     if (denied) return denied;
   }
   return null;

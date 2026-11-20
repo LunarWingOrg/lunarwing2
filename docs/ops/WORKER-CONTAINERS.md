@@ -3742,9 +3742,15 @@ auto-approval:
   (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
   `wipefs`, block-device writes), fork bombs, remote-content-piped-to-shell,
   recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
-  recursive/forced `rm` outside temp roots. Unparseable payloads deny.
-  `/app/config` and `/app/hooks` are read-only to the runtime user, so a
-  task cannot edit its own guard.
+  recursive/forced `rm` outside temp roots. For `rm`, the hook joins shell
+  line continuations before splitting commands on LF and control operators.
+  It checks lowercase and uppercase short flags and GNU long-option
+  abbreviations (WI#795). This is a text check, not a shell parser: quoted
+  arguments and heredoc bodies can be denied if they mention a blocked
+  command. Use file editing tools to write that text literally. The container
+  remains the security boundary. Unparseable payloads deny. `/app/config` and
+  `/app/hooks` are read-only to the runtime user, so a task cannot edit its
+  own guard.
 - `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
   that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD` or
   `KIMI_CODE_TRUST_WORKSPACE` (unsets both in CLI and bridge mode), and
@@ -3767,6 +3773,10 @@ auto-approval:
 Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
+
+The hook is baked into the Kimi worker image. Tenants pick up WI#795 only
+after rebuilding the image with the fix and recreating their workers; see
+[Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
 

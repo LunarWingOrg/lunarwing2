@@ -119,15 +119,33 @@ pub enum GitlabAction {
         project: String,
         #[serde(default = "default_mr_state")]
         state: String,
+        #[serde(default)]
+        source_branch: Option<String>,
+        #[serde(default)]
+        target_branch: Option<String>,
         #[serde(default = "default_per_page")]
         per_page: u32,
         #[serde(default = "default_page")]
         page: u32,
+        /// Fetch every matching page in one bounded call for review
+        /// inventories; inspect `pagination.complete` before reviewing all.
+        #[serde(default)]
+        all_pages: bool,
     },
     GetMergeRequest {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
         iid: u64,
+    },
+    /// Get the current MR's file list and per-file diffs directly from
+    /// GitLab, without requiring a local checkout.
+    GetMrChanges {
+        #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
+        project: String,
+        iid: u64,
+        /// Request raw diffs from Gitaly; file and response limits still apply.
+        #[serde(default)]
+        access_raw_diffs: bool,
     },
     CreateMergeRequest {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
@@ -175,6 +193,12 @@ pub enum GitlabAction {
         project: String,
         iid: u64,
         sha: String,
+    },
+    /// Remove only the configured GitLab user's approval from the MR.
+    UnapproveMergeRequest {
+        #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
+        project: String,
+        iid: u64,
     },
     MergeMergeRequest {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]

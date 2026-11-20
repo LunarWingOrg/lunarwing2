@@ -26,8 +26,9 @@
     # WI#791: short by design. These files are inputs to the scan, the
     # out-of-band exposure verification, and promotion in this same pipeline;
     # nothing outside the pipeline reads them. The big opencode2 rootfs export
-    # lives here too. Provenance that must outlive the pipeline is the scan
-    # SBOM (90 days) and worker-image-evidence.json on promotion (1 year).
+    # lives here too. Provenance is re-uploaded by the scan (SBOM) and promotion
+    # (evidence) jobs, and is kept 30 days at most: the project deletes
+    # pipelines after 30 days and everything they hold goes with them.
     expire_in: 2 days
     reports:
       dotenv: worker-image.env
@@ -166,8 +167,10 @@
   artifacts:
     when: always
     # WI#791: evidence, not build output. The SBOM and vulnerability report are
-    # what a later audit reads; keep them well past the pipeline that made them.
-    expire_in: 90 days
+    # what a later audit reads. 30 days is the most this project keeps: it
+    # deletes pipelines after 30 days, and a pipeline's jobs and artifacts go
+    # with it whatever expire_in says (docs/ops/CI_ARTIFACT_RETENTION.md).
+    expire_in: 30 days
     reports:
       container_scanning: gl-container-scanning-report.json
     paths:
@@ -201,8 +204,10 @@
     - python3 .gitlab/scripts/promote-worker-image.py promote
   artifacts:
     # WI#791: release evidence. One small JSON file per promoted image, and the
-    # only durable record of what was published; keep it for a year.
-    expire_in: 1 year
+    # only durable record of what was published. 30 days at most, for the same
+    # reason as the scan artifacts: the pipeline and its artifacts are deleted
+    # after 30 days.
+    expire_in: 30 days
     paths:
       - worker-image-evidence.json
   rules:

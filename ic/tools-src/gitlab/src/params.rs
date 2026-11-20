@@ -59,9 +59,18 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
     ("create_issue_note", &["project", "iid", "body"]),
     (
         "list_merge_requests",
-        &["project", "state", "per_page", "page"],
+        &[
+            "project",
+            "state",
+            "source_branch",
+            "target_branch",
+            "per_page",
+            "page",
+            "all_pages",
+        ],
     ),
     ("get_merge_request", &["project", "iid"]),
+    ("get_mr_changes", &["project", "iid", "access_raw_diffs"]),
     (
         "create_merge_request",
         &[
@@ -88,6 +97,7 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
     ("list_mr_notes", &["project", "iid", "per_page", "page"]),
     ("create_mr_note", &["project", "iid", "body"]),
     ("approve_merge_request", &["project", "iid", "sha"]),
+    ("unapprove_merge_request", &["project", "iid"]),
     (
         "merge_merge_request",
         &[
@@ -500,16 +510,15 @@ mod tests {
 
     #[test]
     fn all_pages_rejection_explains_paging() {
-        let error =
-            validate(r#"{"action":"list_merge_requests","project":"g/p","all_pages":true}"#)
-                .expect_err("all_pages must be rejected here");
+        let error = validate(r#"{"action":"list_mr_notes","project":"g/p","all_pages":true}"#)
+            .expect_err("all_pages must be rejected here");
         assert!(
             error.contains("this action returns a single page; use page/per_page"),
             "{error}"
         );
 
-        // The two actions that do support it keep accepting it.
-        for action in ["list_issues", "list_work_items"] {
+        // The actions that do support it keep accepting it.
+        for action in ["list_issues", "list_work_items", "list_merge_requests"] {
             let params = json!({ "action": action, "project": "g/p", "all_pages": true });
             assert!(
                 validate(&params.to_string()).is_ok(),

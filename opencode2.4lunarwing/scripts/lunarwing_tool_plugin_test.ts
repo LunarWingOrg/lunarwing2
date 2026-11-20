@@ -110,6 +110,8 @@ const relay = new ToolProxyRelay()
   )
   assert.deepEqual((tools.lunarwing_memory_read!.input as { required: string[] }).required, ["path"])
   assert.deepEqual((tools.lunarwing_gitlab_tool!.input as { required: string[] }).required, ["action"])
+  assert.match(tools.lunarwing_gitlab_tool!.description, /\bget_mr_changes\b/)
+  assert.match(tools.lunarwing_gitlab_tool!.description, /\bunapprove_merge_request\b/)
 }
 
 // ── the default export matches the v2 plugin module shape ({id, setup}) ──────

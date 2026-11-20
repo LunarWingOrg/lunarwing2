@@ -36,6 +36,10 @@ For a true positive, revocation or rotation must be complete before acceptance.
 | 2026-11-19 | `7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/syn/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `syn` 3.0.10 (WI#767 vendor refresh). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `syn` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-19 | `7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime-wasi` 36.0.21 (WI#767 vendor refresh). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `wasmtime-wasi` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-19 | `7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime` 36.0.21 (WI#767 vendor refresh). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `wasmtime` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/cranelift-assembler-x64/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `cranelift-assembler-x64` 0.123.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `cranelift-assembler-x64` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `cranelift-entity` 0.123.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `cranelift-entity` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime-wasi` 36.0.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `wasmtime-wasi` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime` 36.0.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. It carries two findings on line 1 but one fingerprint, so it adds one pin. The package digest in it equals the `wasmtime` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 
 No new fingerprints were accepted by the change that introduced this log.
 
@@ -44,6 +48,12 @@ v2.2.1.0 vendor refresh (WI#767) moved vendor fixtures without refreshing the
 baseline. Each is a cargo checksum manifest whose package digest equals the
 crate's checksum in `ic/Cargo.lock`; none records a secret value or matched
 content.
+
+The four rows for commit `da90adaad` were added by WI#798 after the Wasmtime
+36.0.23 refresh (!2617) moved the same class of vendor fixture without
+refreshing the baseline. Each is a cargo checksum manifest whose package digest
+equals the crate's checksum in `ic/Cargo.lock`; none records a secret value or
+matched content.
 
 ## Historical baseline triage closure (WI#575)
 

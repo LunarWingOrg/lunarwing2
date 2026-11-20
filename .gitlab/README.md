@@ -1011,8 +1011,13 @@ Open **Settings > CI/CD** and apply:
 Artifact retention is per job, and `ci-config` fails a job that declares
 `artifacts:` without a bounded `expire_in` (longer than one year is refused;
 rootfs tars must expire within two days; SBOM and promotion evidence must be
-kept at least 90 days). A top-level `default:artifacts:expire_in` in
-`defaults.yml` is only a backstop. Change the YAML and the expected values in
+kept at least 30 days). Evidence is kept 30 days at most in practice: the
+project deletes pipelines after 30 days, and a pipeline's jobs, logs and
+artifacts go with it whatever `expire_in` says. A top-level
+`default:artifacts:expire_in` in `defaults.yml` is only a backstop, and a
+narrow one: GitLab applies `default:` only to jobs that do not define the
+keyword, so it does not reach a job with its own `artifacts:` block and no
+`expire_in`. Change the YAML and the expected values in
 `.gitlab/tests/test_artifact_retention.py` together.
 
 Runner cache credentials, if a shared cache backend is used, stay in runner
