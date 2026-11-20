@@ -164,9 +164,9 @@ run was taken at `4192ee72b`, where the test file is unchanged.
   a no-op.
 - **Docker post-run state.** `docker ps -a` listed no container and
   `docker volume ls` no volume afterwards; the scoped leftover assertions also
-  ran and passed inside the lanes. The built images remain in the Docker store
-  (`localhost/lw-tunnel-e2e:latest` and the base image) because the lane builds
-  them, as on the Podman host.
+  ran and passed inside the lanes. As on the Podman host, the lane builds
+  `localhost/lw-tunnel-e2e:latest` and its base image in the Docker store; the
+  temporary engine used for this run was removed afterwards.
 - **Gate-closed regression at the same build.** Without the gates the same
   target reported `14 passed; … finished in 0.00s`, so no lane runs by default
   and CI's shape is unchanged.
