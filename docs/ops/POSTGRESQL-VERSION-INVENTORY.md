@@ -179,9 +179,9 @@ sequentially with the three above:
 
 The container runs from the reviewed digest, mounts the named volume
 `lunarwing-pg-camel` at `/var/lib/postgresql/data`, and holds the `vector`
-extension at 0.8.7 — that is, the tenant was created directly on the pin and
-never carried a floating `pg16` reference. Nothing needed a refresh and
-nothing was changed.
+extension at 0.8.7. The tenant was registered at `03:15:43Z`, after the pin
+became the mt-admin default, and its Quadlet names the digest; its image never
+needed a refresh, and nothing was changed.
 
 `/etc/lunarwing/ports.json` now lists four tenants (`hermes`, `antelope`,
 `barracuda`, `camel`), and all four `pgvector` `Image=` lines under
