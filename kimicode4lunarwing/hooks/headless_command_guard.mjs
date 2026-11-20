@@ -62,8 +62,12 @@ function isSafeRmOperand(operand) {
   return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
 }
 
-// Join backslash-LF pairs before splitting for rm. Escaped backslashes and
-// backslashes in single quotes or comments do not continue a shell line.
+// Join backslash-LF pairs before splitting for rm. A backslash-LF pair is
+// dropped in every quote state, because the hook cannot tell a real quote from
+// an apostrophe the shell reads as plain text (a heredoc body, `$'...'`).
+// Joining too much only merges lines, and an rm is still found in the merged
+// line; not joining can hide a continued rm. Escaped backslashes and
+// backslashes in comments do not continue a shell line.
 function joinLineContinuations(command) {
   if (!command.includes("\\\n")) return command;
   let joined = "";
@@ -71,12 +75,16 @@ function joinLineContinuations(command) {
   let atWordStart = true;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < command.length) {
-      const next = command[++i];
-      if (next === "\n") continue;
-      joined += ch + next;
-      atWordStart = false;
-      continue;
+    if (ch === "\\" && i + 1 < command.length) {
+      if (command[i + 1] === "\n") {
+        i++;
+        continue;
+      }
+      if (quote !== "'") {
+        joined += ch + command[++i];
+        atWordStart = false;
+        continue;
+      }
     }
     if (quote) {
       if (ch === quote) quote = "";
