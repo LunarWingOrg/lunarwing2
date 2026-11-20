@@ -149,6 +149,12 @@ WORKER_SCAN_EFFECTIVE_KEYS = frozenset({
 WORKER_SCAN_JOB_KEYS = frozenset({"extends", "needs"})
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
 DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
+# WI#809: the tool registry is the compile list a tenant build uses, and
+# wasm-tools-check.py derives its own plan from deliverables.json `ci` — the
+# two are cross-checked by validate_tool_compile_coverage.
+WASM_TOOL_REGISTRY = ROOT / "ic" / "registry" / "tools"
+WASM_TOOL_PLAN_JOB = "wasm-tools-check"
+WASM_TOOL_PLAN_RUNNER = ".gitlab/scripts/wasm-tools-check.py"
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
@@ -2750,6 +2756,99 @@ def validate_build_inputs(data: dict, merged: dict, errors: list[str]) -> dict[s
     return lockfiles
 
 
+def validate_tool_compile_coverage(merged: dict, errors: list[str]) -> None:
+    """Every registry tool must name a blocking job that compiles it (WI#809).
+
+    The registry is what a tenant build compiles (``ic/scripts/build-wasm-extensions.sh``
+    walks ``ic/registry/tools/*.json``), so a tool that no CI job compiles is
+    first seen broken at a tenant build. Each registry source directory must
+    resolve to a production deliverable, and that deliverable's ``ci`` list
+    must name a non-optional job whose effective script either builds that
+    directory or runs the plan-driven ``wasm-tools-check.py`` runner — which
+    selects its crates from the same ``ci`` field, so the two cannot drift.
+    """
+    if not WASM_TOOL_REGISTRY.is_dir():
+        errors.append(f"tool registry missing: {WASM_TOOL_REGISTRY.relative_to(ROOT)}")
+        return
+    if not DELIVERABLES.is_file():
+        errors.append(".gitlab/deliverables.json missing")
+        return
+    try:
+        data = json.loads(DELIVERABLES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        errors.append(f".gitlab/deliverables.json is not valid JSON: {error}")
+        return
+    entries = [entry for entry in data.get("deliverables", []) if isinstance(entry, dict)]
+    by_directory: dict[pathlib.Path, dict] = {}
+    for entry in entries:
+        manifest = safe_relative_path(entry.get("manifest"))
+        if manifest is None:
+            continue
+        by_directory[(ROOT / manifest).parent.resolve()] = entry
+
+    for registry_path in sorted(WASM_TOOL_REGISTRY.glob("*.json")):
+        try:
+            registry_entry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"tool registry {registry_path.name} unreadable: {error}")
+            continue
+        source = registry_entry.get("source")
+        if not isinstance(source, dict) or not isinstance(source.get("dir"), str):
+            errors.append(f"tool registry {registry_path.name} has no source.dir")
+            continue
+        tool_name = registry_entry.get("name") or registry_path.stem
+        directory = (ROOT / "ic" / source["dir"]).resolve()
+        deliverable = by_directory.get(directory)
+        if deliverable is None:
+            errors.append(
+                f"registry tool {tool_name!r} source dir {source['dir']!r} has no "
+                ".gitlab/deliverables.json entry"
+            )
+            continue
+        name = deliverable.get("name", "<unnamed>")
+        if deliverable.get("status") != "production":
+            # Fixtures and staging ports are deliberately unbuilt; only what
+            # ships must be compiled by a gate.
+            continue
+        ci = deliverable.get("ci")
+        if not isinstance(ci, list) or not ci:
+            errors.append(f"production tool deliverable {name!r} must declare a CI job")
+            continue
+        if not any(compiling_job_covers(job, source["dir"], merged) for job in ci if isinstance(job, str)):
+            errors.append(
+                f"production tool deliverable {name!r} (registry {tool_name!r}) names no "
+                "blocking CI job that compiles it; add "
+                f"{WASM_TOOL_PLAN_JOB!r} to its ci list"
+            )
+
+
+def compiling_job_covers(job_name: str, source_dir: str, merged: dict) -> bool:
+    """True when ``job_name`` is a blocking job that compiles ``source_dir``.
+
+    A job covers a tool when its extends-resolved script builds that source
+    directory or runs the plan-driven runner. Templates and missing jobs never
+    count.
+    """
+    if job_name.startswith(".") or job_name not in merged:
+        return False
+    effective = resolve_extends(merged.get(job_name), merged)
+    if effective.get("allow_failure") is True or effective.get(EXTENDS_TRUNCATED_KEY):
+        return False
+    text = "\n".join(
+        _script_text(effective.get(key))
+        for key in ("before_script", "script")
+    )
+    return source_dir in text or WASM_TOOL_PLAN_RUNNER in text
+
+
+def _script_text(script: object) -> str:
+    if isinstance(script, str):
+        return script
+    if isinstance(script, list):
+        return "\n".join(line for line in script if isinstance(line, str))
+    return ""
+
+
 def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
     if not DELIVERABLES.is_file():
         errors.append(".gitlab/deliverables.json missing")
@@ -3583,6 +3682,7 @@ def main() -> int:
     validate_trivy_ignore(errors)
     validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
+    validate_tool_compile_coverage(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     validate_worker_snapshots(merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
