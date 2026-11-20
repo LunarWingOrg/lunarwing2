@@ -22,7 +22,8 @@ such as `STATUSTODAYWED`.
   self-improving skills B-2/B-3.
 - **Completed validation and status snapshots:** Engine V2 local compatibility,
   skill-feedback live E2E, and the original B-1/B-2/B-3 status record.
-- **Pre-existing archive:** Near/IronClaw naming-removal plan.
+- **Pre-existing archive:** Near/IronClaw naming-removal plan, whose original
+  done marker was not accepted as completion evidence by its later audit.
 
 ## Maintenance rules
 

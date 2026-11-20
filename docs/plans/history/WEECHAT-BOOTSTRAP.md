@@ -1,6 +1,6 @@
 ---
 plan name: WeeChat-Bootstrap
-plan file: docs/plans/history/WEECHAT_RELAY_BOOTSTRAP_2026-07-15.md
+plan file: docs/plans/history/WEECHAT-BOOTSTRAP.md
 plan description: Secure tenant relay provisioning
 plan status: done
 ---
