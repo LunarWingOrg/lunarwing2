@@ -1721,7 +1721,7 @@ For every LunarDepth version or security-input bump:
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
-`docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
+`docs/plans/history/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
 keeps its v1.19.6 pin (v1.18.25 was the last dispatch-verified release; see
 the known issue above); v2 is opt-in per tenant until upstream's patch
 stack settles. Do not configure both lanes on the same
