@@ -807,7 +807,10 @@ mod tests {
         // Closing a Unix listener does not remove its filesystem entry.
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
         let nodes = RecordingLabelNodes::new(&socket, Some("1"));
-        let [first, second] = RELAY_SOCKET_CONTEXTS;
+        // Pinned as literals, so a changed candidate cannot silently change
+        // both the code under test and the expectation.
+        let first = "system_u:system_r:container_t:s0";
+        let second = "system_u:system_r:container_t:s0:c0.c1023";
         let [client_with_categories, client_base] = SIMULATED_CLIENT_CONTEXTS;
 
         let (listener, label) = bind_relay_listener_with(nodes.clone(), &socket).unwrap();
