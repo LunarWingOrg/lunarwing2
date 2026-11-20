@@ -110,12 +110,22 @@ and returns the merge request with its `changes` array of per-file diffs
 cannot be checked out or where the file list is not known in advance; without
 it, reviewing means guessing paths for `get_file_content`.
 
-A `changes` array is not automatically the whole diff. `overflow: true` means
-GitLab truncated the database-backed diff set and you should fall back to
-`get_file_content` at the diff refs or a local `git diff`. A `too_large` entry
-cannot be retrieved through the API at all, and a `collapsed` entry was omitted
-from this response. Check those markers per file before reporting that every
-change was reviewed. `unapprove_merge_request` removes only the configured
+A `changes` array is not automatically the whole diff. The tool adds
+`diff_complete`: it is true only when `overflow` is false, an exact
+`changes_count` matches the array length, and each entry has nonempty patch
+text with no `collapsed` or `too_large` marker set. A count ending in `+`
+(for example, `"404+"`) is capped even if `overflow` is false. When
+`diff_complete` is false, do not report the review as complete. Use
+`get_file_content` at the diff refs for known files whose patches are missing;
+use a local checkout to enumerate changes if the file list is capped.
+
+Set `access_raw_diffs: true` to request patches from Gitaly instead of the
+database. This can recover collapsed patches but is slower and cannot guarantee
+an uncapped file list. GitLab's backend limits and the tool's 8 MiB HTTP response
+limit still apply. The `/changes` endpoint is deprecated in GitLab API v4 and
+scheduled for removal in v5.
+
+`unapprove_merge_request` removes only the configured
 token user's approval (`POST …/unapprove`) and needs no `sha`; it does not
 reset other reviewers' approvals.
 

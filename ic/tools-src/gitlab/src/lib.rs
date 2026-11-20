@@ -46,8 +46,10 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
          group/project path; use project-local iid values. Token is injected by \
          LunarWing and never exposed to WASM. List responses carry explicit pagination \
          metadata. Use get_mr_changes to review an MR's file list and per-file diff \
-         content without a local checkout; check overflow and each file's too_large \
-         or collapsed marker before treating a diff as complete. list_merge_requests \
+         content without a local checkout. If diff_complete is false, don't claim a \
+         complete review. A changes_count ending in + indicates a capped count even \
+         if overflow is false. Optional access_raw_diffs=true can recover some omitted \
+         patches, but not necessarily missing files. list_merge_requests \
          filters by source_branch and target_branch and accepts all_pages=true; \
          use list_issues with all_pages=true for classic issues, or list_work_items \
          with all_pages=true for a bounded, single-approval inventory across Issue and \
@@ -211,7 +213,11 @@ fn execute_with(
         GitlabAction::GetMergeRequest { project, iid } => {
             api::get_merge_request(&client, &project, iid)?
         }
-        GitlabAction::GetMrChanges { project, iid } => api::get_mr_changes(&client, &project, iid)?,
+        GitlabAction::GetMrChanges {
+            project,
+            iid,
+            access_raw_diffs,
+        } => api::get_mr_changes(&client, &project, iid, access_raw_diffs)?,
         GitlabAction::CreateMergeRequest {
             project,
             source_branch,
@@ -651,6 +657,11 @@ mod tests {
                 r#"{"action":"get_mr_changes","project":"group/repo","iid":7}"#,
                 "GET",
                 "/projects/group%2Frepo/merge_requests/7/changes",
+            ),
+            (
+                r#"{"action":"get_mr_changes","project":"group/repo","iid":7,"access_raw_diffs":true}"#,
+                "GET",
+                "/projects/group%2Frepo/merge_requests/7/changes?access_raw_diffs=true",
             ),
             (
                 r#"{"action":"unapprove_merge_request","project":35,"iid":7}"#,

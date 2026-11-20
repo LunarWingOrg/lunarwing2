@@ -143,6 +143,9 @@ pub enum GitlabAction {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
         iid: u64,
+        /// Request raw diffs from Gitaly; file and response limits still apply.
+        #[serde(default)]
+        access_raw_diffs: bool,
     },
     CreateMergeRequest {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]

@@ -70,7 +70,7 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
         ],
     ),
     ("get_merge_request", &["project", "iid"]),
-    ("get_mr_changes", &["project", "iid"]),
+    ("get_mr_changes", &["project", "iid", "access_raw_diffs"]),
     (
         "create_merge_request",
         &[
