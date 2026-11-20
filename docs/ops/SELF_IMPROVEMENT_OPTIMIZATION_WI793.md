@@ -1,7 +1,7 @@
 # WI#793 — Self-Improvement Optimization Opportunities
 
-**Date:** 2026-11-20  
-**Source revision:** `9c96220bb2c3711774612a71a23e094d49b788ab`  
+**Date:** 2026-11-20
+**Source revision:** `9c96220bb2c3711774612a71a23e094d49b788ab`
 **Scope:** Engine V2 self-improvement, skill extraction/feedback/patching, prompt overlays, and runtime orchestrator patching.
 
 ## Scope and confidence
@@ -18,7 +18,7 @@ Existing B-1/B-2/B-3 design documents and the 2026-07-15 audit describe older st
 |---|---|---|---|
 | P0 | Prompt-overlay writes and reads do not share one identity/update contract | Verified | Stop teaching rules that can be lost, overwritten by UUID order, or left dormant |
 | P0 | Orchestrator fallback records the wrong version and lacks per-version counters | Verified | Prevent a bad patch from poisoning a healthy fallback and produce real rollback evidence |
-| P0 | Skill selection grants credential-bearing authority by prompt prose, not by an explicit contract | Verified design gap | Make skills composable, measurable instructions instead of implicit capability grants |
+| P0 | Skill injection claims credential-bearing authority in prompt prose instead of stating an explicit, verified contract | Verified design gap | Make skills composable, measurable instructions instead of capability claims |
 | P1 | Every activated skill receives the whole thread's outcome | Existing approximation | Reduce false patching/demotion; establish a no-skill and per-skill baseline |
 | P1 | Skill changes cannot be restored as content, and patches omit snippets/activation | Verified | Make an approved experiment reversible and cover the behavior that can actually change |
 | P1 | The core loop has no experiment ledger, budget metrics, or negative/rejected controls | Verified product gap | Demonstrate improvement rather than equating activity with learning |
@@ -44,9 +44,9 @@ These are useful foundations, not reasons to rewrite the subsystem:
 
 `process_self_improvement_output` appends to the first matching overlay document (`runtime/mission.rs:5136-5211`). Both mission prompts instead tell the model to read and save an updated overlay through `__save_memory_doc__` (`prompts/mission_self_improvement.md:20-28`; `prompts/mission_expected_behavior.md:26-36`).
 
-That host function creates a new document with a new ID (`scripting.rs:2294-2414`). The bridge maps every such title to the same workspace path, but records the path under each distinct ID (`store_adapter.rs:1390-1443,1466-1489`). After restart, the reader retains both in-memory docs, not just the last file writer. Finally, shared listing sorts by UUID and prompt extraction takes the first matching document (`traits/store.rs:161-171`; `executor/prompt.rs:182-201`).
+That host function creates a new document with a new ID (`scripting.rs:2294-2414`). The bridge maps every such title to the same workspace path, but records the path under each distinct ID (`store_adapter.rs:1390-1443,1466-1489`). Until reload, the reader retains both in-memory docs; after reload, both IDs share one file, so only the last writer's content survives and earlier appended rules are lost. Before that, shared listing sorts by UUID and prompt extraction takes the first matching document (`traits/store.rs:161-171`; `executor/prompt.rs:182-201`), which may be the stale copy.
 
-**Impact:** the JSON append path is safe when enabled, but repeated interface-driven overlay saves can select an old/stale document arbitrarily, accumulate invisible memory records, and overwrite the same durable path. This undermines every subsequent prompt experiment.
+**Impact:** the JSON append path is safe when enabled, but repeated interface-driven overlay saves can select an old/stale document arbitrarily, accumulate invisible memory records, and overwrite the same durable path. After a restart, a rule that appeared active can silently disappear. This undermines every subsequent prompt experiment.
 
 **Recommendation**
 
@@ -86,17 +86,17 @@ The scorer sorts only by descending score, with ties inherited from the unsorted
 
 Injection then asserts for every active skill that it has “API access with automatic credential injection,” tells the model not to search for tools, and directs it to HTTP (`default.py:699-736`). The advertised snippet section lists only name/description, not snippet source (`default.py:718-724`). The engine passes only `skill_snippet_names` into `execute_code_with_skills` (`scripting.rs:467-580`); those names become `known_actions` and can then fall through to ordinary tool dispatch (`scripting.rs:607-610,787-807,1088-1105`). There is no snippet-body injection in that path.
 
-**Impact:** a learned markdown procedure can produce an implicit capability grant, a supposedly callable function can really be an unavailable tool, and a stable-ID collision can alter the record used for feedback. These effects contaminate both user outcomes and the metrics that should explain them. Labeling installed-skill content as suggestions does not remove the unconditional credential claim that follows it.
+**Impact:** a learned markdown procedure can make a false capability claim, a supposedly callable function can really be an unavailable tool, and a stable-ID collision can alter the record used for feedback. These effects contaminate both user outcomes and the metrics that should explain them. Labeling installed-skill content as suggestions does not remove the unconditional credential claim that follows it. Host-side credential injection, tool leases, and approval gates remain the actual authority boundary; the defect is that the prompt misrepresents that boundary and steers the model down the wrong path.
 
 **Recommendation**
 
-- Model distinct contracts: instructional guidance; a catalog-provided callable tool; an approved credential/domain mapping. Ordinary prose must grant none of the latter two. Never present a callable unless it resolves to a real sandboxed function or an existing leased tool.
+- Model distinct contracts: instructional guidance; a catalog-provided callable tool; an approved credential/domain mapping. Ordinary prose must not imply either of the latter two. Never present a callable unless it resolves to a real sandboxed function or an existing leased tool.
 - Represent untrusted skill text as reference instructions. Do not convert it into network, credential, or approval authority; preserve host-side allowlists and approval policies.
 - Validate snippet syntax and execution against Monty's actual binding contract before advertising it, or remove unsupported snippets from the advertised callable surface. Never route an unresolved SKILL.md helper silently through `http`/credentials.
 - Rank by minimum relevance, then deterministic score/doc-ID tie-break. Measure injected chars/tokens, not just a self-declared estimate; retain the top-three and 4,000-token ceilings as conservative starting limits.
 - Handle same-name/different-content collisions as explicit conflicts. A UUID is not a skill semantic identity, and two unrelated tools must not inherit each other's guidance.
 
-**Acceptance:** a plain-text extracted skill cannot claim credentials; an unbound helper is never advertised as callable; an explicitly registered helper executes in the intended sandbox; 100 unrelated and three relevant candidate skills deterministic-select only the latter without blowing the injected budget. Add a name-collision test and an untrusted-skill/prompt-injection test.
+**Acceptance:** injected text for a plain-text extracted skill makes no credential claim; an unbound helper is never advertised as callable; an explicitly registered helper executes in the intended sandbox; 100 unrelated and three relevant candidate skills deterministic-select only the latter without blowing the injected budget. Add a name-collision test and an untrusted-skill/prompt-injection test.
 
 ## P1 — Turn metrics into evidence, not just counters
 
@@ -157,7 +157,7 @@ Current counters answer “what happened when a skill was present?” They do no
 1. Use sanitized persisted traces in an offline replay harness with mock effects; do not put tenant secrets into corpus fixtures. Freeze a task cohort before changing behavior.
 2. Compare baseline against the exact candidate on the same cohort, including **no-skill** and **suppressed-rule/overlay-off** controls. Run repeated noisy cases rather than one happy path.
 3. Start with conservative gates: primary task success must not regress; target signature must improve; token/step/cost ceilings must hold; security/approvals must be identical or stricter.
-4. For live evaluation, canary demotion is opt-in, bounded, and separately approved. Do not silently use low-confidence skill activation as a training data generator.
+4. For live evaluation, canary activation is opt-in, bounded, and separately approved. Do not silently use low-confidence skill activation as a training data generator.
 5. Persist superseded/rejected candidates and negative outcomes. A rejected patch is a useful pattern record, not a reason to propose the same patch on every new failure.
 
 **Acceptance:** a fixture that fails at the target signature and a control fixture that previously passed both execute baseline/candidate; no improvement blocks promotion; a safety change cannot be traded for additional successes; a report states token, step, and evidence-coverage changes. Prove replay behavior first; live canary numbers are a later decision.
@@ -186,7 +186,9 @@ A successful thread can still contain earlier failures. Counts alone do not show
 
 **Verified current behavior**
 
-Trigger deduplication uses only `source_thread_id` and optional `content_hash` (`types/mission.rs:431-452`). The terminal error event already uses its source thread, so an identical delivery is suppressed. Maintenance additionally embeds a current-time candidate list under the same identity (`runtime/mission.rs:2113-2144`); depending on whether an earlier error event was processed, a newly eligible candidate can either share the old identity or have no stable deduplication footprint.
+Trigger deduplication uses only `source_thread_id` and optional `content_hash` (`types/mission.rs:431-452`), and the payload carries no event-type or candidate-set discriminator. The dedup list is per mission (`runtime/mission.rs:1397-1407,1479-1484`), so different missions do not suppress each other. Within one mission, however, two semantically different occurrences that name the same source thread are treated as the same occurrence. The skill-maintenance event embeds a current-time candidate list but is keyed only by the completing thread ID, not by which candidates were due (`runtime/mission.rs:2113-2144`); a re-delivery after the candidate list changes is indistinguishable from the original. Expected-behavior events likewise have `thread_id` but no request discriminator (`prompts/mission_expected_behavior.md:5-13`).
+
+**Impact:** evidence can be discarded or conflated precisely when the aggregate has changed, and the daily dispatch count / token spend may show activity without a corresponding new observation. This is a correctness gap in the trigger identity, not just cosmetic logging.
 
 Non-insight payloads are rendered into the mission prompt using `serde_json::to_string_pretty(...).chars().take(4000)` (`runtime/mission.rs:4523-4532`). That is unbounded by item count and can cut off later evidence in mid-string.
 
