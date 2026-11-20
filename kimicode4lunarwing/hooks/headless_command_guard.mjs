@@ -62,17 +62,17 @@ function isSafeRmOperand(operand) {
   return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
 }
 
-/** Split a command line into `;`/`&&`/`||`/pipe-separated segments. */
+/** Split a command into `;`/`&&`/`||`/pipe/newline-separated segments. */
 function commandSegments(command) {
-  return command.split(/(?:\s*[;|&]{1,2}\s*)/);
+  return command.split(/(?:\s*[;|&]{1,2}\s*|\r?\n+)/);
 }
 
 function checkRm(segment) {
   const match = /\brm\s+(.*)$/.exec(segment);
   if (!match) return null;
   const rest = match[1];
-  // Recursive or force delete flags (rm -r, -f, -rf, -fr, --recursive…).
-  if (!/(^|\s)-[a-zA-Z]*[rf]|--recursive|--force/.test(rest)) return null;
+  // Recursive or force delete flags (rm -r, -f, -R, -RF, --recursive…).
+  if (!/(^|\s)-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest)) return null;
   const operands = rmOperands(rest);
   if (operands.length === 0) return "rm -r/-f without an explicit operand";
   if (!operands.every(isSafeRmOperand)) {
