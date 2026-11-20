@@ -195,7 +195,9 @@ count recorded here is a count at the time of the pass.
 
 The box for every host other than `ajhermes-z` is not met and stays open. No
 host beyond `ajhermes-z` was available to this author, so no other host was
-inspected here. There is no fleet host registry to work from either:
+inspected here, and none was attempted: the maintainer's 2026-11-19 decision
+is that an agent uses only hosts it was given an account on. There is no fleet
+host registry to work from either:
 `/etc/lunarwing/ports.json` describes only the host it sits on,
 `lunarwing-mt-admin.sh` has no cross-host enumeration, and no remote mt-admin
 target (`LUNARWING_MT_ADMIN` or an SSH entry) is configured. Any host not
