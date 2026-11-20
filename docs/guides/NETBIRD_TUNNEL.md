@@ -21,9 +21,10 @@ guide's peer or setup key for that boundary.
 LunarWing performs these actions:
 
 - Waits for `netbird status --check startup` to report a ready peer.
-- Starts `netbird expose <port> --protocol http`.
-- Reads the generated public HTTPS URL.
-- Keeps the expose process alive for session renewal.
+- Starts `netbird expose <port> --protocol http` with the configured name
+  prefix and optional custom domain.
+- Reads the public HTTPS URL from the child process and retains the child
+  for this daemon run. It does not automatically relaunch a failed child.
 - Sends `SIGTERM` during normal shutdown so NetBird removes the service.
 - On Linux, asks the kernel to send `SIGTERM` to the expose process if
   LunarWing exits unexpectedly.
@@ -44,17 +45,8 @@ netbird status --check startup
 netbird expose --help
 ```
 
-NetBird Reverse Proxy is currently beta. Self-hosted deployments require:
-
-- Traefik with TLS passthrough in front of NetBird.
-- NetBird Reverse Proxy instance connected to management service.
-- Proxy base domain and wildcard DNS pointing to proxy host.
-- Public TCP port 443 for TLS and ACME TLS-ALPN-01.
-- Public TCP port 80 when using ACME HTTP-01 instead.
-- Peer Expose enabled for a dedicated group containing LunarWing peer.
-- Inbound blocking disabled on exposing peer.
-
-Follow current upstream documentation:
+Set up Reverse Proxy, DNS, certificates and Peer Expose for a dedicated peer
+group using the upstream instructions for your deployed NetBird version:
 
 - [NetBird Reverse Proxy](https://docs.netbird.io/manage/reverse-proxy)
 - [Expose from CLI](https://docs.netbird.io/manage/reverse-proxy/expose-from-cli)
@@ -77,19 +69,17 @@ netbird up \
 rm -f /root/netbird-setup-key
 ```
 
-Protect setup key as a secret. Do not place it in LunarWing settings or service
-environment. Do not pass it as `--setup-key '<setup-key>'` on a shared host:
-command-line arguments are visible in the process list to every local account,
-tenant accounts included, unless `/proc` is mounted with `hidepid`.
-`--setup-key-file` exists in current NetBird clients (0.75.0 has it); check
-`netbird up --help` on older ones. Confirm peer readiness:
+Protect the setup key as a secret. Do not place it in LunarWing settings or service
+environment. Avoid passing it on the command line, where other users may be able
+to see process arguments. Check `netbird up --help` for `--setup-key-file` support
+in your installed version. Confirm peer readiness:
 
 ```bash
 netbird status --check startup
 ```
 
-Enable Peer Expose in NetBird dashboard under **Settings > Clients**. Restrict
-permission to a dedicated peer group instead of granting it network-wide.
+Restrict Peer Expose permission to the dedicated peer group instead of
+granting it network-wide.
 
 ## Migrating from Removed Managed Providers
 
@@ -121,7 +111,9 @@ change after LunarWing restarts.
 Name prefix must contain 1-32 lowercase letters, digits, or hyphens. It must
 start and end with a letter or digit.
 
-Static `TUNNEL_URL` still takes precedence over managed provider settings.
+Static `TUNNEL_URL` takes precedence over managed provider settings. The managed
+tunnel selects the configured HTTP channel first, then the gateway; when neither
+is configured it targets port 8080.
 
 ## Listener Requirements
 
