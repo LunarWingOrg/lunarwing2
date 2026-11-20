@@ -27,8 +27,8 @@ env file, and schedules the pipeline (systemd timer or OpenRC cron) in one step.
 It can be opted out with `--no-health`.
 
 > **v2.0.8.0 note (mt-admin refactor):** `ic/scripts/lunarwing-mt-admin.sh` is
-> now a thin composition root that sources numbered modules in `ic/scripts/mt-admin-lib/`
-> modules. `ensure_health_pipeline()` lives in
+> now a thin composition root that sources numbered modules in
+> `ic/scripts/mt-admin-lib/`. `ensure_health_pipeline()` lives in
 > `mt-admin-lib/12-health-pipeline.sh` and is invoked from `add_tenant()` in
 > `mt-admin-lib/04-tenant-lifecycle.sh`; the CLI surface described here is
 > unchanged.
@@ -310,6 +310,13 @@ changing the pipeline structure documented above:
   `active` keeps a healthy instance; the bare component identity pages for that
   shape only when the report holds no unit at all, so on a host where another
   tenant's units are listed nothing pages for it (AGL-5).
+- **OpenRC component and scheduler diagnostics (WI#789):** An unhealthy
+  component without a failing service row can escalate as monitor-only
+  `openrc`; a stopped cron scheduler observed during a run gets its own
+  `openrc@scheduler` target. Self-heal does not start the scheduler. A
+  cron-driven pipeline cannot report its own scheduler outage on schedule;
+  use the stale-report alert and see the [health pipeline README](../../ic-infrastructure-health-check/README.md)
+  for the manual observation and recovery path.
 - **Gateway hardening:** absent legacy sessions dir is healthy-with-note (not a
   degradation), stale lock and oversized session issues are now detected, and
   the `gateway` suite validates the stale-lock/oversized-session checks.
@@ -320,9 +327,10 @@ changing the pipeline structure documented above:
   `KNOWLEDGE_SYNC_ENABLED` / `KNOWLEDGE_SWEEP_ENABLED` and cadences from the
   tenant env file; disabled features ignore stale/failed/malformed state.
 
-The canonical aggregate suite list grew from 14 to 19 registered suites (the
-WI#180 note initially overcounted at 20; the corrected count is recorded in
-`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md`); see that audit for the `ORDER` list.
+WI#180 grew the aggregate suite list from 14 to 19. The current
+`ic-infrastructure-health-check/tests/run-all.sh --list` registers 21 suites.
+See the [historical coverage audit](SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md) for
+the earlier counts; registration does not imply a live test run.
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
 reference the health pipeline — it predates the MT integration.

@@ -6,8 +6,7 @@ This guide is the production setup for the configuration that was live-disproved
 
 **Revalidated against source 2026-11-10 (v2.2.0.0).** The `KNOW:` wire format,
 `needs-verification` ingestion semantics, publisher allowlist shapes, and the
-`coordination_knowledge` hook match `ic/src/hooks/coordination_knowledge.rs`;
-the full-occupant-JID and room-bare-JID rules below are unchanged.
+`coordination_knowledge` hook are implemented in `ic/src/hooks/coordination_knowledge.rs`.
 
 ## Wire format
 
@@ -89,7 +88,10 @@ COORD_KNOWLEDGE_SHARE=true
 COORD_KNOWLEDGE_PUBLISH=true
 ```
 
-- `COORD_CHANNELS` names the room(s) whose traffic the coordination hooks process. Without it, no coordination hooks register at all.
+- `COORD_CHANNELS` names the room(s) whose traffic the coordination hooks
+  process. Registration requires `COORD_ENABLED=true`, a nonempty room list,
+  and a valid `COORD_AGENT_ID` for each daemon. MT admin normally fills in
+  `COORD_AGENT_ID` from the tenant name; verify the value on older tenants.
 - `COORD_KNOWLEDGE_PUBLISH=true` enables emitting `KNOW:` shares; enable it only when every daemon in the room understands the format (mixed-version fleets should hold off).
 - Optional tuning: `COORD_KNOWLEDGE_MAX_PER_HOUR` (default 30, max 1000), `COORD_KNOWLEDGE_MIN_CHARS` (default 12), `COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR` (default 300, max 10000).
 
@@ -118,7 +120,9 @@ Exit code 0 means no definitive misconfiguration; warnings still deserve operato
 
 ## Watch the live drop counters
 
-With `COORD_ADMIN_TOKEN` and `COORD_ADMIN_PORT` set, the daemon exposes body-free ingest diagnostics:
+When the coordination admin listener is enabled with `COORD_ADMIN_TOKEN`
+and knowledge-share diagnostics are registered, `/coord/knowledge` exposes
+body-free counters on the admin port. Use the configured `COORD_ADMIN_PORT`:
 
 ```bash
 curl -sf -H "Authorization: Bearer $COORD_ADMIN_TOKEN" \

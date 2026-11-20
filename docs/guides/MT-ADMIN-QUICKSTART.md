@@ -91,21 +91,25 @@ Useful opt-ins and opt-outs include:
 
 ```bash
 # Add the tenant user to the docker/podman group (explicit opt-in — see note)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group \
+  --tensorzero-url https://tensorzero.example.com
 
 # Enable the per-tenant TensorZero proxy (upstream is REQUIRED — see below)
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy \
   --tensorzero-url https://tensorzero.internal.example:7070
 
 # Enable the per-tenant DarkIRC daemon and adapter
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc \
+  --tensorzero-url https://tensorzero.example.com
 
 # Seed the tenant's knowledge store with the full shared lw2studymcp
 # study-notes base (one-shot, first boot only; read-only shared MCP included)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp \
+  --tensorzero-url https://tensorzero.example.com
 
 # Skip automatic WeeChat relay bootstrap
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap \
+  --tensorzero-url https://tensorzero.example.com
 ```
 
 `--docker-group` exists for one case only: a tenant that must reach a shared
@@ -126,8 +130,9 @@ containers), a rendered env never carries the baked `.invalid` placeholder
 (mt-admin dies at render time when an enabled worker has no container-reachable
 URL), and a hand-started container without `<WORKER>_BASE_URL` refuses to start
 on the placeholder naming the environment variable to fix. `upgrade-tenant` backfills
-an inheritable endpoint for every enabled worker before rebuilding, so managed
-tenants do not need per-worker `configure-*` calls.
+inheritable endpoints for workers that support them before rebuilding.
+LunarDepth requires an explicit route (base URL, model, and a key file or the
+explicit unauthenticated-gateway opt-in); it does not inherit the daemon's route.
 
 For knowledge-store seeding details (what is imported, the one-shot safety
 invariants, opt-outs, and verification), see

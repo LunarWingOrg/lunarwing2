@@ -5,8 +5,8 @@ A WASM tool for LunarWing that sends push notifications to a self-hosted Gotify 
 **Revalidated against source 2026-11-19 (v2.2.1.0).** Registry manifest,
 capability sidecar, and crate all use `0.1.8`. The compiled-in defaults
 (`https://gotify.darkc.sobe.world`, title `LunarWing`) and the
-`configure-gotify`/`--gotify-url`/`--gotify-title` mt-admin paths match the
-current tree; the configuration contract is unchanged.
+`configure-gotify`/`--gotify-url`/`--gotify-title` mt-admin paths are the
+starting point for the configuration below.
 
 ## Build and Install
 
@@ -15,10 +15,9 @@ The registry source is `ic/tools-src/gotify`, a symlink to the canonical `lunarw
 ```bash
 cd ic
 lunarwing registry install gotify --build
-lunarwing tool setup gotify
 ```
 
-`registry install --build` uses the manifest in `ic/registry/tools/gotify.json`, builds the WASM component from source, and installs its capability sidecar. `tool setup` prompts for the required `gotify_app_token` and stores it through LunarWing's encrypted secrets path.
+`registry install --build` uses the manifest in `ic/registry/tools/gotify.json`, builds the WASM component from source, and installs its capability sidecar. Configure the token separately as described under [Secrets](#secrets).
 
 For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install both `gotify.wasm` and `gotify.capabilities.json` below `${LUNARWING_BASE_DIR:-$HOME/.lunarwing}/tools/`, then restart LunarWing.
 
@@ -73,9 +72,12 @@ If `config/gotify.json` is absent or unparseable, the tool falls back to the com
 
 For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `ic/scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
 
-For a multi-tenant deployment, MT admin can configure Gotify during provisioning:
+For a multi-tenant deployment, MT admin can configure Gotify during provisioning.
+Replace the example LLM and Gotify URLs with your own endpoints:
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent --gotify-url https://gotify.example.com --gotify-title "My Agent"
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent \
+  --llm-base-url https://llm.example.com/v1 \
+  --gotify-url https://gotify.example.com --gotify-title "My Agent"
 ```
 Creates the workspace config at provisioning time. The capabilities file is automatically rewritten when WASM tools are installed (`install-wasm`).
 
@@ -105,7 +107,23 @@ The tool requires one secret:
 |---|---|
 | `gotify_app_token` | Gotify application token (injected as `X-Gotify-Key` header by the host — never exposed to WASM) |
 
-Use `lunarwing tool setup gotify` or the authenticated extension setup UI to store the secret. Do not place the token in the workspace JSON or capability file.
+The shipped capability file declares the HTTP credential mapping, but its
+`setup.required_secrets` list is empty. To enable the interactive setup prompt,
+set this top-level section in the installed capability file (leave the rest
+of the file intact):
+
+```json
+{
+  "setup": {
+    "required_secrets": [{"name": "gotify_app_token", "prompt": "Gotify application token"}]
+  }
+}
+```
+
+Then run `lunarwing tool setup gotify` with the target instance's configuration
+and user scope (use the installed tool name if different). It reads the token
+without echoing it and writes it to the encrypted store. Do not put the token
+value in the workspace JSON or capability file.
 
 ## Usage
 
@@ -117,9 +135,9 @@ The agent calls the `gotify` tool with a JSON payload:
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `message` | string | yes | — | Notification body (supports markdown) |
+| `message` | string | yes (schema) | `Notification from LunarWing` (guest fallback) | Notification body (supports markdown) |
 | `title` | string | no | From `config/gotify.json`, or `LunarWing` | Notification title |
-| `priority` | integer | no | `3` | 1-3 low, 5-7 medium, 8-10 high |
+| `priority` | integer | no | `9` in the guest | Specify it explicitly: the published tool schema still advertises `3`. |
 
 For routine prompts that use Gotify, see `ic/docs/GOTIFY_ROUTINE_PROMPT.md`.
 
