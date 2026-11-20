@@ -140,28 +140,33 @@ realm `https://git.lunarwing.org/jwt/auth`.)
 
 Worker images and their artifacts can be multi-GB (the opencode2 candidate
 uploads a 279 MiB rootfs tar). Traefik streams request bodies by default,
-which is fine; a layer push or artifact upload that is cut after about 60
-seconds with `499`, `504` or `connection reset by peer` means a timeout fired.
-The edge setting is
+which is fine. A layer push or artifact upload that is cut after about 60
+seconds with `499`, `504` or `connection reset by peer` is consistent with a
+proxy timeout. The suspected edge setting is
 `entryPoints.websecure.transport.respondingTimeouts.readTimeout`, which
 defaults to **60 s** since Traefik 2.11.2 / 3.0 and bounds the whole request
-including its body. The recommended value for both `git.lunarwing.org` and
-`registry.git.lunarwing.org` is **`30m`**, bounded rather than `0` (the
-timeout also protects against clients that send a body slowly). This is
-static configuration, so Traefik must be restarted; if the public entry point
-must keep 60 s, give the runners a separate entry point with the 30m value and
-an address allowlist. Also raise the omnibus `registry_nginx` body/proxy
-timeouts per `REGISTRY_PUSH_499.md`. Leave request buffering off.
+including its body. Check the deployed version before choosing a setting:
+prefer a bounded body-read timeout on the affected routes where supported,
+or a separate address-allowlisted CI entry point. A public entry-point
+increase affects every site on that entry point. See `REGISTRY_PUSH_499.md`
+for the options and upstream nginx checks. Leave request buffering off.
 
-The default is still in force as of 2026-11-19: a rate-limited upload through
-the edge is cut at 61.18 s every time, and the cut answer is `HTTP/2 502` with
+In the 2026-11-19 measurement, rate-limited project uploads through
+the edge stopped at 61.18 s with `HTTP/2 502`,
 an 11-byte `Bad Gateway` body and no `server` header, consistent with an
 edge-generated error rather than an omnibus nginx response. This is separate
 from an upstream nginx `499` log entry when Traefik disconnects. Uploads of
 12 MiB at 100 KiB/s and 25 MiB at 400 KiB/s both stopped at 61.18 s, pointing
-to a time limit rather than a size limit. After the change, the same probe
-must end `201` in about 125 s; see [Verification](REGISTRY_PUSH_499.md#verification)
-for the commands.
+to a time limit rather than a size limit. The go/no-go check is a successful
+rate-limited body transfer lasting over 60 s through the affected route and
+entry point; see [Verification](REGISTRY_PUSH_499.md#verification).
+
+The token-free probe measures how long the edge reads an unfinished HTTP
+request head. It reported `CUT` at 60.07 s on both hosts on 2026-11-19.
+Raising the entry-point deadline beyond the hold can produce `OPEN`, but lets
+unauthenticated connections occupy edge resources longer. A router-only
+body-timeout fix leaves the head deadline unchanged. Neither result verifies
+an upload.
 
 Until the edge change is live, runner 17 (the slow `laptop`/`rainova43`
 runner) no longer carries the `container-build` tag, so it cannot take the

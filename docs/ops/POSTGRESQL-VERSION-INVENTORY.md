@@ -148,16 +148,38 @@ packages 0.8.7, which [the audit](POSTGRESQL-2026-11-12-CVE-AUDIT.md#re-verifica
 showed loads the new `vector.so` and needs the SQL step only for catalog
 comments. That step stays operator-run, after backup, per tenant.
 
+### Re-check 2026-11-20 (WI#780)
+
+Read-only re-check on `ajhermes-z`; nothing was changed. `pg-image-status`,
+`psql` and the rendered Quadlets were read per tenant, sequentially:
+
+| Tenant | `server_version` | `server_version_num` | pgvector `extversion` | Image ID | Quadlet `Image=` |
+|---|---|---|---|---|---|
+| `hermes` | 16.16 (Debian 16.16-1.pgdg12+1) | 160016 | 0.8.6 | `b0108689bf51…` | pinned `…@sha256:484e8380…` |
+| `antelope` | 16.16 (Debian 16.16-1.pgdg12+1) | 160016 | 0.8.7 | `b0108689bf51…` | pinned `…@sha256:484e8380…` |
+| `barracuda` | 16.16 (Debian 16.16-1.pgdg12+1) | 160016 | 0.8.7 | `b0108689bf51…` | pinned `…@sha256:484e8380…` |
+
+A search of every `pgvector` `Image=` line under
+`/home/*/.config/containers/systemd/` returned exactly these three units, each
+naming the reviewed digest: no tenant on this host keeps a floating `pg16`
+reference. `ALTER EXTENSION vector UPDATE` was not run, so `hermes` still
+reports 0.8.6 installed against 0.8.7 available, as described above.
+
 ### Other hosts
 
-No other host was verified in this run. From `ajhermes-z` there is no fleet
-host registry: `/etc/lunarwing/ports.json` describes only this host,
+The box for every host other than `ajhermes-z` is not met and stays open. No
+host beyond `ajhermes-z` was available to this author, so no other host was
+inspected here. There is no fleet host registry to work from either:
+`/etc/lunarwing/ports.json` describes only the host it sits on,
 `lunarwing-mt-admin.sh` has no cross-host enumeration, and no remote mt-admin
-access (SSH key or `LUNARWING_MT_ADMIN` target) is configured. `colgatev`
-resolves over the NetBird mesh but refuses the available SSH identity, and its
-tenants were already recorded in the WI#777 section above. Any host not named
-in this document therefore stays **uninspected** — not patched, and not
-covered by this host's result.
+target (`LUNARWING_MT_ADMIN` or an SSH entry) is configured. Any host not
+named in this document therefore stays **uninspected** — not patched, and not
+covered by this host's result. Running the same three commands per tenant on
+each remaining host, on systemd and OpenRC alike, needs an operator with an
+account there.
+
+The `colgatev` rows in the WI#777 section above are that host's own record and
+are not re-verified from `ajhermes-z`.
 
 The open question on this item about the `colgatev` row — whether that host
 really holds a tenant `antelope`, since the 2026-11-13 audit listed only

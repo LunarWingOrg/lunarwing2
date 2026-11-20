@@ -248,6 +248,33 @@ assert_eq "$(jq -r '.service'  "$b25/captured.json" 2>/dev/null)" "systemd@acme"
 assert_eq "$(jq -r '.recovery' "$b25/captured.json" 2>/dev/null)" "systemctl start user@1011.service" \
     "B25: escalation object carries the recovery command"
 
+# B25b — WI#766 review AGW-2: render the page itself. B25 replaces the notifier
+# with a stub that only copies the escalation object, so send-notification.sh
+# never runs there and a deleted Recovery line would pass. Run the real
+# renderer over that object with a stub sender and assert the line reaches the
+# outgoing message.
+b25bin="$b25/stub-bin"; mkdir -p "$b25bin"
+cat > "$b25bin/curl" <<'STUBCURL'
+#!/usr/bin/env bash
+# Stub sender: capture the -d payload and report success.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d) printf '%s' "$2" > "${CURL_STUB_OUT:?CURL_STUB_OUT unset}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '200'
+STUBCURL
+chmod +x "$b25bin/curl"
+oB25b="$(env PATH="$b25bin:$PATH" CURL_STUB_OUT="$b25/page.json" \
+    GOTIFY_URL='http://stub.invalid' GOTIFY_TOKEN='stub-token' \
+    "$LIB_DIR/../send-notification.sh" degraded "$b25/captured.json" 2>&1)"
+assert_contains "$oB25b" "Notification sent" "B25b: real notifier runs against the stub sender"
+b25page="$(jq -r '.message // ""' "$b25/page.json" 2>/dev/null || true)"
+assert_contains "$b25page" "Service: systemd@acme" "B25b: rendered page names the tenant identity"
+assert_contains "$b25page" "Recovery: systemctl start user@1011.service" \
+    "B25b: rendered page carries the recovery command"
+
 # B26 — a monitor-only identity with no recovery hint (worker egress) keeps the
 # escalation object free of an empty recovery field.
 b26="$(sb)"; report "$b26" '{components:[{component:"worker_egress",status:"critical",metrics:{instances:[
@@ -263,6 +290,95 @@ assert_eq "$(jq -r '.service' "$b26/captured.json" 2>/dev/null)" "worker_egress@
     "B26: unrelated monitor-only identity still escalates"
 assert_eq "$(jq -r 'has("recovery")' "$b26/captured.json" 2>/dev/null)" "false" \
     "B26: no recovery field when no hint exists"
+
+# B27-B31 — WI#789: OpenRC parity of the WI#766 shape. An openrc component that
+# degrades with no failing service (empty or all-healthy services[]) must still
+# reach a target, both under MT defaults and with logical remediation on.
+b27="$(sb)"; report "$b27" '{components:[{component:"openrc",status:"degraded",metrics:{services:[]}}]}'
+mkdir -p "$b27/initd"
+oB27="$(run_dry "$b27" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b27/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB27" "ESCALATING: openrc (monitor_only" "B27: zero-service openrc degrade escalates (MT defaults)"
+assert_absent   "$oB27" "nothing to do"                      "B27: zero-service openrc degrade is no longer silent"
+
+b27b="$(sb)"; report "$b27b" '{components:[{component:"openrc",status:"critical",metrics:{services:[]}}]}'
+mkdir -p "$b27b/initd"
+oB27b="$(run_dry "$b27b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b27b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=true)"
+assert_contains "$oB27b" "ESCALATING: openrc (monitor_only" "B27b: critical openrc with no service escalates too"
+assert_absent   "$oB27b" "no service mapping for component 'openrc'" "B27b: logical remediation skips the service lookup for openrc"
+
+# B28 — the cron blind spot: hook installed with no scheduler running degrades
+# the component while every service probe is healthy. It gets its own
+# openrc@scheduler identity carrying the concrete recovery command.
+b28="$(sb)"; report "$b28" '{components:[{component:"openrc",status:"degraded",metrics:{
+  services:[{name:"lunarwing-acme",state:"started",status:"healthy"}],
+  scheduler:{hook_installed:true,running:null,installed:"cronie",status:"degraded"}}}]}'
+mkdir -p "$b28/initd"
+oB28="$(run_dry "$b28" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b28/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB28" "ESCALATING: openrc@scheduler (monitor_only" "B28: dead scheduler escalates as its own identity"
+assert_contains "$oB28" "recovery=rc-service cronie start"           "B28: scheduler page names the recovery command"
+assert_absent   "$oB28" "ESCALATING: openrc (monitor_only"           "B28: scheduler degrade does not also page the bare component"
+assert_absent   "$oB28" "would run: rc-service"                      "B28: scheduler is never restarted as a service"
+
+# B28b — degraded scheduler with an empty services[] list: one target, and the
+# component-level fallback does not page a second time alongside it.
+b28b="$(sb)"; report "$b28b" '{components:[{component:"openrc",status:"degraded",metrics:{
+  services:[],scheduler:{hook_installed:true,running:null,installed:"cronie",status:"degraded"}}}]}'
+mkdir -p "$b28b/initd"
+oB28b="$(run_dry "$b28b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b28b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB28b" "identified 1 target(s)"              "B28b: scheduler blind spot is the only target"
+assert_absent   "$oB28b" "ESCALATING: openrc (monitor_only"    "B28b: no bare-component double page beside the scheduler"
+
+# B29 — a real failing service keeps its step-2 restart path and the degraded
+# component is not paged again as the bare openrc identity (service-count guard).
+b29="$(sb)"; report "$b29" '{components:[{component:"openrc",status:"degraded",metrics:{
+  services:[{name:"lunarwing-acme",state:"stopped",status:"critical"}]}}]}'
+mkdir -p "$b29/initd"
+oB29="$(run_dry "$b29" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b29/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB29" "would run: rc-service lunarwing-acme restart" "B29: failing openrc service keeps its restart path"
+assert_absent   "$oB29" "ESCALATING: openrc (monitor_only"             "B29: a failing service is not paged again as the bare component"
+
+# B29b — intentionally `skipped` services do not keep the component fallback
+# silent: the component-level monitoring gap still escalates.
+b29b="$(sb)"; report "$b29b" '{components:[{component:"openrc",status:"degraded",metrics:{
+  services:[{name:"lunarwing-acme",state:"stopped",status:"skipped"}]}}]}'
+mkdir -p "$b29b/initd"
+oB29b="$(run_dry "$b29b" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b29b/initd" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB29b" "ESCALATING: openrc (monitor_only" "B29b: skipped services still allow the component fallback"
+
+# B30 — a healthy scheduler clears the synthetic state (report-as-truth).
+b30="$(sb)"; report "$b30" '{components:[{component:"openrc",status:"healthy",metrics:{
+  scheduler:{hook_installed:true,running:"cronie",installed:"cronie",status:"healthy"}}}]}'
+mkdir -p "$b30/initd"
+seed_state "$b30" '{"openrc@scheduler":{retries:1,consecutive_unhealthy:2}}'
+oB30="$(run_raw "$b30" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$b30/initd" SELF_HEAL_VERIFY_HEALTH=false -- --report "$b30/report.json" --backoff 0)"
+assert_contains "$oB30" "RECOVERED: cleared state for openrc@scheduler" "B30: healthy scheduler clears synthetic state"
+assert_eq "$(state_of "$b30")" '{}' "B30: recovered scheduler state cleared"
+
+# B31 — simulate two manual observations of a stopped scheduler. From clean
+# state, the default grace defers the first; the second hands the notifier
+# the scheduler identity and the operator's recovery command.
+b31="$(sb)"; report "$b31" '{components:[{component:"openrc",status:"degraded",metrics:{
+  scheduler:{hook_installed:true,running:null,installed:"fcron",status:"degraded"}}}]}'
+mkdir -p "$b31/initd"
+mk_mockbin "$b31"
+{ echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$b31/captured.json\""; } > "$b31/capture-notifier"
+chmod +x "$b31/capture-notifier"
+b31_env=(
+    SELF_HEAL_NOTIFY_SCRIPT="$b31/capture-notifier" LUNARWING_MT_OPENRC_INITD_DIR="$b31/initd"
+    SELF_HEAL_GRACE_CHECKS= SELF_HEAL_VERIFY_HEALTH=false
+)
+oB31="$(run_chaos "$b31" openrc "${b31_env[@]}")"
+assert_contains "$oB31" "GRACE: openrc@scheduler unhealthy 1/2" "B31: first observation is deferred at default grace"
+if [[ -e "$b31/captured.json" ]]; then
+    bad "B31: first observation does not notify" "the notifier ran before the grace threshold"
+else
+    ok "B31: first observation does not notify"
+fi
+run_chaos "$b31" openrc "${b31_env[@]}" >/dev/null
+assert_eq "$(jq -r '.service'  "$b31/captured.json" 2>/dev/null)" "openrc@scheduler" \
+    "B31: escalation object names the scheduler identity"
+assert_eq "$(jq -r '.recovery' "$b31/captured.json" 2>/dev/null)" "rc-service fcron start" \
+    "B31: escalation object carries the recovery command"
 
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[

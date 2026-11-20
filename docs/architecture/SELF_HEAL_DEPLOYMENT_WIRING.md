@@ -302,7 +302,9 @@ changing the pipeline structure documented above:
   leaves no unit to target, so self-heal escalates it as monitor-only
   `systemd@<tenant>`; the page carries `systemctl start user@<uid>.service`,
   and nothing is restarted. A tenant whose bus refuses while its manager is
-  `active` keeps a healthy instance and only the bare component identity pages.
+  `active` keeps a healthy instance; the bare component identity pages for that
+  shape only when the report holds no unit at all, so on a host where another
+  tenant's units are listed nothing pages for it (AGL-5).
 - **Gateway hardening:** absent legacy sessions dir is healthy-with-note (not a
   degradation), stale lock and oversized session issues are now detected, and
   the `gateway` suite validates the stale-lock/oversized-session checks.
