@@ -1,6 +1,7 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Created:** 2026-06-13. **Source revalidated:** 2026-11-10, v2.2.0.0.
+**Created:** 2026-06-13. **Source revalidated:** 2026-11-20, v2.2.2.0
+(`9c96220bb2`); the full page was checked.
 **Status:** Reference — documents current behavior, not a proposal.
 **Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
 [multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),
@@ -327,7 +328,7 @@ changing the pipeline structure documented above:
   `KNOWLEDGE_SYNC_ENABLED` / `KNOWLEDGE_SWEEP_ENABLED` and cadences from the
   tenant env file; disabled features ignore stale/failed/malformed state.
 
-WI#180 grew the aggregate suite list from 14 to 19. The current
+WI#180 grew the aggregate suite list from 15 to 19. The current
 `ic-infrastructure-health-check/tests/run-all.sh --list` registers 21 suites.
 See the [historical coverage audit](SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md) for
 the earlier counts; registration does not imply a live test run.
