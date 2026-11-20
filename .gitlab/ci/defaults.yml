@@ -1,14 +1,17 @@
 default:
   interruptible: true
   timeout: 2h
-  # WI#791: backstop only. Artifacts were 99.3% of project storage and had no
-  # retention beyond GitLab's "keep latest successful job" setting. Every job
-  # that declares artifacts must still set its own expire_in; ci-config fails
-  # on a job that does not (validate_artifact_retention in
-  # .gitlab/scripts/validate_config.py). Seven days is deliberately short for
-  # the accidental case; the deliberate long-lived evidence files are SBOMs and
-  # scan reports (90 days) and release promotion evidence (1 year). See
-  # docs/ops/CI_ARTIFACT_RETENTION.md.
+  # WI#791: backstop only, and a narrow one. GitLab applies `default:` only to
+  # jobs that do not define the keyword themselves, so this does not reach a
+  # job with its own `artifacts:` block and no `expire_in` (the instance
+  # default applies there); jobs with no `artifacts:` block at all upload
+  # nothing. Every job that declares artifacts must still set its own
+  # expire_in; ci-config fails on a job that does not
+  # (validate_artifact_retention in .gitlab/scripts/validate_config.py). Seven
+  # days is deliberately short for the accidental case. Scan/release evidence
+  # (SBOM, vulnerability report, promotion evidence) is kept 30 days at most:
+  # the project deletes pipelines after 30 days and their artifacts go with
+  # them. See docs/ops/CI_ARTIFACT_RETENTION.md.
   artifacts:
     expire_in: 7 days
   retry:

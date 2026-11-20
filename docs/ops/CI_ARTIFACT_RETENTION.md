@@ -6,8 +6,11 @@ because the project setting **Keep artifacts from most recent successful jobs**
 was on, which keeps the latest artifact set of every ref regardless of
 `expire_in`, and agents open one branch per work item. The largest entries were
 the ~250-280 MiB worker rootfs tars from the `worker-*-candidate` jobs. A manual
-cleanup removed artifacts older than two days on 2026-11-20 and took the project
-to 9.66 GiB. This document records the retention rules that now keep it there.
+cleanup on 2026-11-20 deleted non-log artifacts older than two days and took the
+project to 9.66 GiB; it also deleted the scan and promotion artifacts of every
+release pipeline older than two days, and promotion never rebuilds, so that
+evidence cannot be made again. This document records the retention rules that
+now keep storage down, and the cleanup rule below supersedes that one-off.
 
 ## Rules
 
@@ -17,20 +20,27 @@ Audit of every `artifacts:` block before this change, and the value it has now
 
 | Declaration | Jobs covered | Artifacts | Before | Now | Why |
 | --- | --- | --- | --- | --- | --- |
-| `.worker-candidate` | pebble, opencode, opencode2, kimi candidates | dotenv, image metadata, inputs hash, `opencode2-rootfs-export` | 30 days | **2 days** | Read only by the scan, the out-of-band exposure verification, and promotion in the same pipeline. |
+| `.worker-candidate` | pebble, opencode, kimi candidates | dotenv, image metadata, inputs hash, `opencode2-rootfs-export` | 30 days | **2 days** | Read only by the scan, the out-of-band exposure verification, and promotion in the same pipeline. opencode2 and lunardepth declare their own blocks. |
 | `worker-opencode2-candidate` | opencode2 candidate | metadata plus `opencode2-rootfs.tar` | 30 days | **2 days** | Rootfs tar, ~250-280 MiB; pipeline-scoped. |
 | `worker-lunardepth-candidate` | lunardepth candidate | metadata plus `lunardepth-rootfs.tar` | 30 days | **2 days** | Rootfs tar; pipeline-scoped. |
-| `.worker-scan` | all four `worker-*-scan` jobs | `worker-sbom.cdx.json`, `worker-vulnerabilities.json`, container-scanning report | 30 days | **90 days** | Audit evidence for an image a tenant may still be running. |
-| `.worker-promotion` | all four `worker-*-promote` jobs | `worker-image-evidence.json` | 1 year | **1 year** | The only durable record of what was published. Comment added; value unchanged. |
+| `.worker-scan` | all five `worker-*-scan` jobs (pebble, opencode, opencode2, lunardepth, kimi) | `worker-sbom.cdx.json`, `worker-vulnerabilities.json`, container-scanning report | 30 days | **30 days** | Audit evidence for an image a tenant may still be running. 30 days is the platform ceiling, not a shortening: see below. |
+| `.worker-promotion` | all five `worker-*-promote` jobs | `worker-image-evidence.json` | 1 year | **30 days** | The only durable record of what was published, and it lives exactly as long as its pipeline. |
 | `python-unit`, `shell-harnesses` | test reports | JUnit XML | 7 days | **7 days** | Small test reports. |
 | `wasm-channel-test-artifacts` | wasm channel binaries | 2 `.wasm` files | 1 day | **1 day** | Build output only. |
-| `default` | backstop for any job without its own value | — | none | **7 days** | New. Not a substitute for a per-job value. |
+| `default` | no job in practice | — | none | **7 days** | Backstop only; it does not reach a job with its own `artifacts:` block (see below). |
 
 GitLab applies `expire_in` per **job**, not per path: everything a job uploads
 shares one expiry. That is why the candidate jobs keep their small metadata
 with the tar for 2 days instead of splitting it out; anything that must outlive
-the pipeline is re-uploaded by the scan (SBOM) or promotion (evidence) job,
-which are cheap and small.
+the candidate job is re-uploaded by the scan (SBOM) or promotion (evidence)
+job, which are cheap and small.
+
+Evidence is kept **30 days at most**, whatever `expire_in` says. The project
+setting **Delete pipelines after** is 30 days, and when GitLab deletes a
+pipeline it deletes its jobs, logs and artifacts with it. The scan and
+promotion jobs declare 30 days because that is the ceiling the platform
+delivers; a longer value would promise time that does not exist. Measured on
+2026-11-20, the oldest pipeline of the project was exactly 30 days old.
 
 Operational consequence: a manual `worker-*-promote` job downloads its
 candidate's dotenv and metadata. Play it from the pipeline that produced the
@@ -38,8 +48,11 @@ candidate, within two days. If it has already expired, re-run the candidate and
 then the scan; the promotion never rebuilds, so that is the only recovery.
 
 `default:artifacts:expire_in: 7 days` in `.gitlab/ci/defaults.yml` is a
-backstop for a job that somehow ships without a value. It is not a substitute
-for one.
+backstop, but a narrow one. GitLab does not merge `default` into a job that
+defines the same keyword: a job with its own `artifacts:` block and no
+`expire_in` gets the instance expiry, not this value. The default reaches only
+jobs that have no `artifacts:` block at all, and those upload nothing. The
+control that matters is the gate below.
 
 ## Enforcement
 
@@ -51,7 +64,8 @@ for one.
 - any job keeps artifacts longer than **1 year**;
 - a job uploads a path containing `rootfs` and keeps it longer than **2 days**;
 - a job uploads `worker-image-evidence.json`, `worker-sbom.cdx.json`, or
-  `worker-vulnerabilities.json` for less than **90 days**;
+  `worker-vulnerabilities.json` for less than **30 days**, the longest a
+  pipeline lives;
 - `.gitlab/ci/defaults.yml` loses the `default:artifacts:expire_in` backstop.
 
 Values are resolved through `extends`, so an inherited expiry counts only when
@@ -70,7 +84,8 @@ Changed on the GitLab host on 2026-11-20 for WI#791:
 Checked, left unchanged:
 
 - **Delete pipelines after**: 30 days (`ci_delete_pipelines_in_seconds =
-  2592000`). This is the only thing that bounds job logs.
+  2592000`). This bounds everything: job logs, job artifacts and the jobs
+  themselves. Nothing outlives its pipeline, whatever `expire_in` says.
 
 New expiries apply only to jobs created after the change lands. Artifacts that
 already exist keep the expiry they were created with, so storage falls
@@ -112,16 +127,19 @@ what is produced from here on.
 
 So the 7-day check has two legitimate outcomes:
 
-1. **Re-run the one-off cleanup once this is live.** Delete non-log artifacts
-   older than two days again, as was done on 2026-11-20. Everything left is then
-   post-change-shaped, the 2-day expiries hold the line, and the check passes.
-   This is the intended path.
-2. **Record the number and the reason.** If nobody re-runs it, storage stays
-   above 10 GiB until the pre-change 30-day artifacts age out, and the check
-   cannot pass however good the gate is. Record that in WI#791 rather than
-   loosening any `expire_in`.
+1. **Record the number and the reason.** Storage stays above 10 GiB until the
+   pre-change 30-day artifacts age out, and the check cannot pass however good
+   the gate is. Record that on WI#805 rather than loosening any `expire_in`.
+2. **Delete only artifacts whose own expiry has passed.** A cleanup must not
+   delete "non-log artifacts older than two days": that removes the scan and
+   promotion evidence of every release pipeline older than two days, and
+   promotion never rebuilds, so the evidence cannot be made again. A cleanup
+   must spare the files of every `worker-*-scan` and `worker-*-promote` job
+   (`worker-sbom.cdx.json`, `worker-vulnerabilities.json`,
+   `worker-image-evidence.json`) — in practice, delete nothing whose expiry has
+   not passed.
 
-On or shortly after **2026-11-27**, record the number in WI#791 with:
+On or shortly after **2026-11-27**, record the number on WI#805 with:
 
 - UI: **Settings > Usage Quotas > Storage** (Maintainer), which splits
   `Job artifacts` from `Job logs`.
@@ -134,5 +152,5 @@ to `keep_latest_artifact: true` is a regression, not a preference.
 If the check lands above 10 GiB with the artifact gate green and the pre-change
 artifacts already cleaned, the remaining gap is **job logs**: lower the pipeline
 deletion window or archive traces at the instance level and record that decision
-in WI#791 rather than loosening artifact expiries. The post-cleanup split was
+on WI#805 rather than loosening artifact expiries. The post-cleanup split was
 about 5.26 GiB of artifacts and 4.39 GiB of logs.
