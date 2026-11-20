@@ -4,7 +4,7 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** The host minimum remains
+**Source revalidated 2026-11-20 for v2.2.1.0.** The host minimum remains
 30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
 delivery is immediate only while a wait is active. `default_dm_policy` is
 `pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
@@ -193,10 +193,14 @@ buffer not yet in the adapter's cached buffer list, the adapter refreshes the li
 rather than dropped when the retry resolves the buffer; a still-unknown buffer is logged and
 dropped (see §5 — that drop was the real first-DM bug, below both the cursor and the WASM).
 Its blocking endpoint **`GET /api/wait?cursor=<n>&timeout=<s>`** returns immediately with
-all retained events `seq > cursor`, or blocks until a line arrives (or a ~20s heartbeat). If
-`cursor > event_seq` (the adapter restarted and its in-memory seq reset below the client) it
-**replays the post-restart backlog** (treats the cursor as 0) instead of reporting "caught up", so
-a line recorded right after a restart isn't skipped. `on_start` seeds the WASM's
+all retained events `seq > cursor`, or blocks until a line arrives (or a ~20s heartbeat).
+The adapter persists the event log to a journal and restores it at startup, so seqs normally
+continue across a restart and the saved cursor stays valid. If `cursor > event_seq` anyway
+(journal compaction, or persistence disabled mid-flight), the adapter logs it and
+**aligns `event_seq` forward to the cursor** so new lines get fresh, strictly increasing ids.
+Only with persistence off (no journal file) does it treat the cursor as 0 and **replay the
+post-restart backlog** instead of reporting "caught up". Either way a line recorded right
+after a restart is not skipped. `on_start` seeds the WASM's
 `state/event_cursor` to the adapter's current cursor so buffered history isn't replayed at daemon
 start.
 
@@ -377,7 +381,7 @@ Then restart the daemon so `on_start` re-resolves.
 | **Channel debug logs invisible** | `debug_logging=true` produced nothing in the journal | The host forwarded all guest `Info/Debug/Trace` logs via `tracing::debug!`, dropped by the default `RUST_LOG=lunarwing=info`. | **Fixed** — faithful level mapping (`Info→info!`, `Trace→trace!`); `debug_logging` is now visible at `info`. |
 | **Guest 3s interval is clamped to 30s** | A message can wait after an early `/api/wait` return even though the adapter already buffered it | The guest and capabilities file request 3000ms, but host `MIN_POLL_INTERVAL_MS=30000` wins during schema conversion and startup validation. | **Open / documented** — long-poll is immediate only while a wait is active. `MissedTickBehavior::Skip` prevents catch-up bursts but does not remove the host floor. |
 | **`poll_interval_ms` ignored** | Configuring the interval did nothing | Caps `config` key was `poll_interval_ms` but the struct field is `poll_interval_seconds` — different name ⇒ value dropped, struct default (3) used. | **Fixed** — caps key renamed to `poll_interval_seconds`. |
-| **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed for the normal new-buffer race** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a resolved new buffer's first line is captured (`record_event`); if the buffer is still unknown after the retry, it is warned and dropped. The long-poll global cursor delivers captured lines immediately (§3). `/api/wait` also replays the post-restart backlog so a DM right after an adapter restart isn't skipped. The poll fallback emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
+| **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed for the normal new-buffer race** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a resolved new buffer's first line is captured (`record_event`); if the buffer is still unknown after the retry, it is warned and dropped. The long-poll global cursor delivers captured lines immediately (§3). With journal persistence the adapter restores the event log and continues seqs across a restart, so a DM right after an adapter restart is still delivered; without persistence it replays from 0. The poll fallback emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
 | **Mirror loop (long-poll mode)** | Agent answers its own messages endlessly; `event_cursor` climbs steadily with no human input | The `irc_privmsg`/`self_msg`/`no_log` tag filter lived **only** in `poll_buffer`. `do_longpoll` feeds events straight to `handle_inbound_line`, which had no tag check — so in long-poll mode the agent's own `self_msg` replies were ingested and re-answered, each reply becoming the next event. Shipped in the original long-poll commit; not the adapter work. | **Fixed** — tag filter moved into `handle_inbound_line` (`tags_allow_ingest`), the single choke point **both** ingest paths share; `poll_buffer` keeps its pre-filter. Regression test `test_tags_allow_ingest`. |
 | **Password is the *second* blocker** | After ports are fixed, or after rotation, the adapter returns 401 | The adapter authenticates incoming WASM requests against the per-tenant `RELAY_PASSWORD` (`check_auth`); a stale per-owner secret formerly overrode the rotated managed value. | **Fixed** — host injection exists, and WI#577 makes the managed value win in setup and per-callback authentication. See [WeeChat operations](../ops/WEECHAT-SERVICES.md) for the coordinated rotation/restart contract. |
 | **Stale `setup_fields` shadowing** | Caps/env edits "don't take" | Highest-precedence DB layer (§4). | Documented (§4); see §6 for the proposed precedence redesign. |
@@ -412,8 +416,8 @@ Then restart the daemon so `on_start` re-resolves.
 - **First-DM delivery (real fix is at the adapter):** the adapter refreshes its buffer list
   **synchronously and retries** before recording, so a resolved new buffer's first line is captured
   into the event log instead of dropped (`ws_adapter.py`; a still-unknown buffer is warned and
-  dropped); the long-poll cursor then delivers it, and
-  `/api/wait` replays the post-restart backlog. The poll fallback still emits the first batch for
+  dropped); the long-poll cursor then delivers it, and the persisted journal plus seq alignment
+  keep it deliverable across an adapter restart. The poll fallback still emits the first batch for
   new **DM/query** buffers (`is_dm_buffer`, `lib.rs`, with a regression test).
 - **Mirror-loop guard:** the `irc_privmsg`/`self_msg`/`no_log` tag filter now lives in
   `handle_inbound_line` (`tags_allow_ingest`) — the choke point **both** ingest paths share — so the
@@ -444,8 +448,9 @@ The channel has three separately deployed artifacts:
 - **Daemon binary:** host callback scheduling, log-level mapping, and WASM runtime.
 - **WASM channel plus capabilities:** long-poll consumer, mirror-loop filtering,
   HTTP timeouts, network selection, and setup defaults.
-- **Tenant-clone adapter:** `ws_adapter.py` owns `/api/wait`, the event log,
-  new-buffer first-line capture, and post-restart replay.
+- **Tenant-clone adapter:** `ws_adapter.py` owns `/api/wait`, the event log and
+  its journal, new-buffer first-line capture, and post-restart journal restore
+  with cursor alignment.
 
 Use mt-admin's documented `upgrade-tenant <tenant> --target <reviewed-ref>` flow
 for an existing tenant rather than pulling or restarting individual services by
