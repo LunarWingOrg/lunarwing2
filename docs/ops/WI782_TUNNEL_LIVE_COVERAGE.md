@@ -1,6 +1,7 @@
 # WI#782 — Sandbox tunnel live coverage: Docker fallback and systemd service mode
 
-**Date:** 2026-11-19, with the merged-head live run added 2026-11-20
+**Date:** 2026-11-19, with the merged-head live run and the AHN-1 wording
+correction added 2026-11-20
 (SweetieBot; the tree landed from branch `sweetiebot/kimi-wi782-20261119-1905`
 as squash `afa2998a9`, and the run was recorded from branch
 `sweetiebot/kimi-wi782-20261120-0005`).
@@ -130,6 +131,14 @@ v2.2.0.0 limitation was measured on. The merged-head run below was taken at
 - **systemd service mode and tenant-unit run: not run live here.** No approved
   test host with a systemd user manager was available. Acceptance boxes 1–3
   stay open for the maintainer.
+- **Review follow-up, AHN-1 (2026-11-20).** The approval of !2600 noted that the
+  release paragraph below counted "14 of 14", which is the number of test
+  functions in the file, not live coverage: seven live WireGuard lanes, six
+  tests that need no runtime, and the NetBird lane, which skips while its gate
+  is closed. The paragraph and the guide's matrix row now say what ran — the
+  seven live WireGuard lanes and the six runtime-free tests passed at the
+  merged head, and NetBird was not run. No test code changed for this wording
+  correction, so the merged-head run still applies to the file as it stands.
 
 ## Replacement paragraph for the v2.2.1.0 release notes
 
