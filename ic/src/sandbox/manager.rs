@@ -334,13 +334,12 @@ impl SandboxManager {
             evidence,
         } = decision;
         let audit_json = crate::sandbox::audit_json(&evidence)?;
-        if network != self.config.network {
-            // A reduced request cannot leave a previously initialized wider
-            // transport or shared sidecar attached to this execution.
-            self.shutdown().await;
-        }
-        tracing::info!(capability_audit = %audit_json, "Sandbox capability decision authorized");
         let declared = evidence.origin == crate::sandbox::capability::CapabilityOrigin::Declared;
+        if declared {
+            tracing::info!(capability_audit = %audit_json, "Sandbox capability decision authorized");
+        } else {
+            tracing::debug!(capability_audit = %audit_json, "Sandbox compatibility capability decision");
+        }
         let network_override = declared.then_some(network);
         let limits_override = declared.then_some(limits);
 
@@ -368,10 +367,12 @@ impl SandboxManager {
             return self.execute_direct(command, cwd, env).await;
         }
 
-        // Ensure we're initialized
-        if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            self.initialize_for_network(network).await?;
+        if network != self.config.network {
+            // A reduced request cannot leave a previously initialized wider
+            // transport or shared sidecar attached to this execution.
+            self.shutdown().await;
         }
+        self.initialize_for_network(network).await?;
 
         // Retry transient container failures (Docker daemon glitches, container
         // creation races) up to MAX_SANDBOX_RETRIES times with exponential backoff.
@@ -379,6 +380,10 @@ impl SandboxManager {
         let mut last_err: Option<SandboxError> = None;
 
         for attempt in 0..=MAX_SANDBOX_RETRIES {
+            if network != self.config.network {
+                // Tenant policy or transport may have changed during backoff.
+                self.shutdown().await;
+            }
             if attempt > 0 {
                 let delay = std::time::Duration::from_secs(1 << attempt); // 2s, 4s
                 tracing::warn!(

@@ -139,7 +139,7 @@ pub enum EnforcementStatus {
 #[serde(deny_unknown_fields)]
 pub struct EffectiveNetworkCapability {
     pub mode: SandboxNetworkMode,
-    pub provider: Option<&'static str>,
+    pub provider: Option<NetworkProvider>,
     pub dns: DnsRequestMode,
     pub enforcement: EnforcementStatus,
 }
@@ -372,6 +372,15 @@ fn validate_tunnel_request(
     Ok(())
 }
 
+impl From<crate::sandbox::TunnelProvider> for NetworkProvider {
+    fn from(provider: crate::sandbox::TunnelProvider) -> Self {
+        match provider {
+            crate::sandbox::TunnelProvider::Netbird => Self::Netbird,
+            crate::sandbox::TunnelProvider::Wireguard => Self::Wireguard,
+        }
+    }
+}
+
 impl NetworkProvider {
     fn as_str(self) -> &'static str {
         match self {
@@ -470,14 +479,11 @@ fn authorize_validated(
     };
     let network = EffectiveNetworkCapability {
         mode,
-        provider: (mode == SandboxNetworkMode::Tunnel)
-            .then(|| {
-                config
-                    .tunnel
-                    .as_ref()
-                    .map(|tunnel| tunnel.provider.as_str())
-            })
-            .flatten(),
+        provider: config
+            .tunnel
+            .as_ref()
+            .filter(|_| mode == SandboxNetworkMode::Tunnel)
+            .map(|tunnel| tunnel.provider.into()),
         dns: manifest.network.dns,
         enforcement: if mode == SandboxNetworkMode::None {
             tracing::debug!("Sandbox network disabled by manifest policy");
@@ -580,10 +586,7 @@ pub fn compatibility_decision(
     };
     let effective_network = EffectiveNetworkCapability {
         mode: network.unwrap_or(SandboxNetworkMode::None),
-        provider: config
-            .tunnel
-            .as_ref()
-            .map(|tunnel| tunnel.provider.as_str()),
+        provider: config.tunnel.as_ref().map(|tunnel| tunnel.provider.into()),
         dns: DnsRequestMode::Default,
         enforcement: if config.policy == SandboxPolicy::FullAccess {
             EnforcementStatus::Advisory
