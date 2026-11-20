@@ -33,10 +33,9 @@ that every configured channel accepted the message.
 ## The contract: acceptance, not delivery
 
 The `message` tool (`ic/src/tools/builtin/message.rs`) calls
-`ChannelManager::broadcast`, whose channel implementations queue the
-outbound message and return. A successful return means **the channel
-accepted the message for delivery** — it is now the channel's outbound
-queue's problem. It does **not** mean the recipient received it, and
+`ChannelManager::broadcast` or `broadcast_all`. A successful return means
+**the channel accepted the message for delivery**; how it handles that
+message is channel-specific. It does **not** mean the recipient received it, and
 agents/missions must not record "delivered" in memory based on this tool
 alone (the tool description says exactly this).
 
@@ -99,11 +98,11 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
 
 ## What is still NOT guaranteed (and where it is tracked)
 
-- **Exactly-once delivery.** The spool makes the XMPP path at-least-once:
-  a crash after the stanza reached the wire but before the record was
-  cleared replays the message on the next bind, so duplicates are possible
-  (whole-message granularity — a retried multi-part message re-sends parts
-  that already went out). End-to-end receipts would be needed to close
+- **Exactly-once delivery.** The spool preserves accepted sends for replay,
+  not guaranteed delivery. A crash after the stanza reached the wire but
+  before clearing the record can cause replay on a later bind. A replayed
+  multi-part message can re-send parts that already went out. End-to-end
+  receipts would be needed to close
   this; no channel returns a delivery receipt and remote confirmation
   (e.g. XEP-0198 acks) is not part of this contract.
 - **Mission-run ledger.** The engine-side half of WI#270's long-term fix is
@@ -145,9 +144,9 @@ documents.
 **Added 2026-11-03 (TUI design 8.2, milestone M2a).** A reply alone does not
 tell a client that the agent is done with a message: a turn can end without a
 reply, stop at a gate, or keep running in the background. The agent therefore
-reports, for every inbound message, when it started handling it and how that
-ended. The vocabulary is `lunarwing_common::TurnOutcome`; the gateway's wire
-form is specified in [GATEWAY_CHAT_API.md](../guides/GATEWAY_CHAT_API.md#turn-lifecycle).
+reports when it starts handling a message and how handling ends. Some messages
+finish without starting (see below). The vocabulary is `lunarwing_common::TurnOutcome`;
+the gateway's wire form is specified in [GATEWAY_CHAT_API.md](../guides/GATEWAY_CHAT_API.md#turn-lifecycle).
 
 Source anchors: `Channel::message_lifecycle` (`ic/src/channels/channel.rs`);
 `MessageLifecycle` and `OutcomeHints` (`ic/src/channels/lifecycle.rs`);
@@ -174,7 +173,7 @@ Wrappers forward it (`SharedWasmChannel`; the test `TestChannelHandle`).
 | Channel | Mapping |
 | --- | --- |
 | `gateway` | SSE `turn_started` / `turn_finished`, only for messages that carry a chat-handler `message_id` and a thread; internal messages (job monitor, routines) and WebSocket sends emit nothing |
-| `unix_socket_repl` | `TurnStarted` / `TurnFinished` frames for a live, stamped message owned by that connection |
+| `unix_socket_repl` | Ignores `Started`. On `Finished(NoReply)`, if no reply was recorded and the session is still connected, attempts a `Response` containing `(no reply)` (or `Nothing is waiting for approval.` for an approval keyword). It does not emit `TurnStarted` or `TurnFinished` frames. |
 | every other channel | the default no-op |
 
 ### Outcomes
@@ -278,8 +277,9 @@ Rules (`OutcomeHints`):
 reached it through V1 `NO_REPLY` and Engine V2
 `Completed { response: None }`; WI#550 maps both to the empty-response sentinel
 on every channel, so they finish `no_reply` without stopping the agent or
-sending anything. V2 writes no assistant compatibility-history row; V1 keeps the
-literal `NO_REPLY` response in its in-memory thread history and database as before,
+delivering the model's sentinel as text. The socket's lifecycle hook can still
+send the placeholder described above. V2 writes no assistant compatibility-history
+row; V1 keeps the literal `NO_REPLY` response in its thread history and database as before,
 since persistence happens before outbound suppression. Legacy command routing
 also uses the empty suppression sentinel for non-replies, including message-less
 success, suppressed, interrupted and approval-pending results; only an explicitly

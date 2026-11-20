@@ -4,7 +4,7 @@
 **Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-10 for v2.2.0.0.
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (v2.2.1.0)
+## Current State (v2.2.0.0)
 
 `ic/src/agent/agent_loop.rs::supervise_message()` creates one
 `Arc<AtomicBool>` per scheduled inbound message and passes it to

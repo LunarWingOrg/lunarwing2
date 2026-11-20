@@ -63,10 +63,10 @@ Outbound (agent sends file):
 Inbound (user sends file):
   XMPP stanza arrives (OOB element and/or aesgcm:// URL in the body)
     -> XmppChannel.handle_message_stanza()   (OMEMO-decrypts the body first)
-    -> collect_inbound_attachment_urls(payloads, body)
-         collect_oob_urls() : <x jabber:x:oob> URLs (capped)
-         body scan          : aesgcm:// tokens not already seen in OOB URLs
-    -> bounded-concurrency download (<=4 at once), each via download_oob_file():
+    -> inbound job queued on a bounded FIFO worker
+    -> extract_inbound_attachments(payloads, body)
+         collect_inbound_attachment_urls() : OOB URLs and aesgcm:// body tokens
+    -> bounded-concurrency download (<=4 per job), each via download_oob_file():
          http(s)   : GET + streaming size cap (read_capped_body)
          aesgcm:// : GET https form + AES-256-GCM decrypt (download_aesgcm_file)
     -> IncomingMessage.attachments populated with data + metadata
@@ -91,7 +91,12 @@ All inbound logic lives in `ic/src/channels/xmpp/mod.rs`.
    in the **decrypted body** for the `aesgcm://` prefix and adds URLs not already
    present (deduped, same cap). This covers clients that omit the cleartext OOB
    element. Plain `https://` links in a body are not auto-downloaded.
-3. Downloads run with **bounded concurrency** (`buffered`, ≤4 at once) so one slow URL can't serialize the batch and stall the single client event loop. Results stay in stanza order; per-URL failures are logged and skipped.
+3. One FIFO worker handles inbound attachment jobs off the client event loop.
+   It runs up to four downloads concurrently within a job and retains stanza
+   order. Per-URL failures are logged and skipped; an extraction timeout
+   discards the job's attachments. If the queue is full or the worker has
+   stopped, the channel delivers without downloads and still strips recognized
+   URLs from the body.
 
 ### Download (`download_oob_file`)
 
@@ -134,6 +139,7 @@ staging is allowed up to 50 MiB.
 | Limit | Value | Enforced at |
 |-------|-------|-------------|
 | OOB/aesgcm URLs processed per stanza | 10 (`MAX_OOB_ATTACHMENTS`) | XmppChannel |
+| Pending inbound attachment jobs | 16 (`INBOUND_ATTACHMENT_QUEUE_CAPACITY`) | XmppChannel |
 | Concurrent inbound downloads | 4 (`MAX_CONCURRENT_OOB_DOWNLOADS`) | XmppChannel |
 | Per-file download size (enforced while streaming) | 20 MiB (`OOB_MAX_FILE_SIZE`) | XmppChannel |
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
