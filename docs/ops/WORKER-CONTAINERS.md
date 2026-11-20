@@ -2297,9 +2297,16 @@ v2.3.0/2.6.2 in their windows; all three have since closed.
 Dockerfile `ARG OPENCODE_VERSION`/`ARG OPENCODE_REF`, the `opencode` case of
 `.gitlab/scripts/build-worker-image.sh`, `scripts/opencode_result.ts` (the ref
 comment), `README.md` and `AGENTS.md`. A search for `2.5.3`, `v2.2.7`,
-`fedc6f208`, `v1.19.5` and `810c0eba` now returns only historical mentions:
-this entry, the v2.2.7/v2.2.6/v2.2.5 entries, `docs/ops/history/`, and the
-trail sentences that name the older pins by date. Base image digests and
+`fedc6f208`, `v1.19.5` and `810c0eba` (re-run 2026-11-20 for WI#785) returns
+only historical mentions: this entry, the v2.2.7/v2.2.6/v2.2.5 entries,
+`docs/ops/history/`, and the trail sentences that name the older pins by date —
+`kimicode4lunarwing/AGENTS.md:20` and `scripts/headless_command_guard_test.ts`
+(the 2.5.3 contract-gate date), `opencode4lunarwing/Dockerfile:4`,
+`AGENTS.md:34` and `README.md:98-99` (the v1.18.29/WI#531 trail),
+`scripts/opencode_result.ts:41` (the v1.19.5 commit named for a byte-identical
+middleware), `scripts/exposure_policy_assert.py:456` (a v1.19.5-era server
+note), and `docs/ops/WORKER-CONTAINERS.md:33`, `:1568`, `:2582` — the last
+naming `810c0eba` for the models.dev snapshot, which is unchanged at v1.19.6. Base image digests and
 `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged; nothing in the new upstream
 required a change.
 
