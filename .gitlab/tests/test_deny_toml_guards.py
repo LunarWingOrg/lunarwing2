@@ -73,6 +73,56 @@ class WasmtimeSecurityFloorTests(unittest.TestCase):
                 self.assertNotIn("source", caches[0], "registry cache bypasses our patch")
 
 
+class PostcardGrandparentPinTests(unittest.TestCase):
+    """WI#788: the heapless acceptance is only as narrow as postcard's own
+    [bans] pin. If a new crate takes postcard with its default features, it
+    becomes a second heapless parent and inherits all nine acceptances with
+    no lockfile change beyond the new parent itself — so the policy guard
+    must fail offline until the new parent is reviewed and listed."""
+
+    def policy(self) -> dict:
+        return tomllib.loads((ROOT / "ic/deny.toml").read_text(encoding="utf-8"))
+
+    def lockfile_parents(self) -> dict[str, set[str]]:
+        parents: dict[str, set[str]] = {}
+        for lock in sorted(ROOT.glob("ic/**/Cargo.lock")):
+            relative = lock.relative_to(ROOT)
+            if {"vendor", "target"} & set(relative.parts):
+                continue
+            packages = tomllib.loads(lock.read_text(encoding="utf-8")).get(
+                "package", []
+            )
+            if not any(package.get("name") == "postcard" for package in packages):
+                continue
+            for package in packages:
+                for dependency in package.get("dependencies", []):
+                    if dependency.split()[0] == "postcard":
+                        parents.setdefault(package["name"], set()).add(str(relative))
+        return parents
+
+    def test_postcard_ban_lists_exactly_the_parents_in_the_lockfiles(self):
+        parents = self.lockfile_parents()
+        self.assertTrue(parents, "no lockfile depends on postcard; drop the ban")
+        entries = [
+            entry
+            for entry in self.policy()["bans"]["deny"]
+            if entry.get("name") == "postcard"
+        ]
+        self.assertEqual(len(entries), 1, entries)
+        self.assertEqual(entries[0]["version"], "<2.0.0")
+        self.assertEqual(set(entries[0]["wrappers"]), set(parents), parents)
+
+    def test_heapless_acceptance_stays_behind_both_pins(self):
+        deny = self.policy()["bans"]["deny"]
+        self.assertIn(
+            {"name": "heapless", "version": "<0.9.4", "wrappers": ["postcard"]},
+            deny,
+        )
+        postcard = [entry for entry in deny if entry.get("name") == "postcard"]
+        self.assertEqual(len(postcard), 1, "heapless is one hop from postcard")
+        self.assertIn("monty", postcard[0]["wrappers"], "the only default-feature parent")
+
+
 class DenyTomlAdvisoryGuardTests(unittest.TestCase):
     """Offline half (WI#363 fix item 1): reason shape + cited-path existence."""
 

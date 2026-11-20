@@ -63,10 +63,10 @@ Outbound (agent sends file):
 Inbound (user sends file):
   XMPP stanza arrives (OOB element and/or aesgcm:// URL in the body)
     -> XmppChannel.handle_message_stanza()   (OMEMO-decrypts the body first)
+    -> inbound job queued on a bounded FIFO worker
     -> extract_inbound_attachments(payloads, body)
-         collect_oob_urls()    : <x jabber:x:oob> URLs (capped)
-         collect_aesgcm_urls() : aesgcm:// URLs found only in the decrypted body
-    -> bounded-concurrency download (<=4 at once), each via download_oob_file():
+         collect_inbound_attachment_urls() : OOB URLs and aesgcm:// body tokens
+    -> bounded-concurrency download (<=4 per job), each via download_oob_file():
          http(s)   : GET + streaming size cap (read_capped_body)
          aesgcm:// : GET https form + AES-256-GCM decrypt (download_aesgcm_file)
     -> IncomingMessage.attachments populated with data + metadata
@@ -84,11 +84,19 @@ Inbound (user sends file):
 
 All inbound logic lives in `ic/src/channels/xmpp/mod.rs`.
 
-### URL extraction (`extract_inbound_attachments`)
+### URL extraction (`collect_inbound_attachment_urls`)
 
 1. `collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS + 1)` — parses `<x xmlns='jabber:x:oob'>` elements (via `Oob::try_from`). The effective cap is all-or-nothing: a stanza with more than 10 URLs has its body cleared and **no** downloads attempted.
-2. `collect_aesgcm_urls(body, …)` — scans the **decrypted body** for `aesgcm://` URLs and adds any not already present (deduped, same cap). This covers encrypted files whose client omits the cleartext OOB element. Plain `https://` links in a body are intentionally **not** auto-downloaded.
-3. Downloads run with **bounded concurrency** (`buffered`, ≤4 at once) so one slow URL can't serialize the batch and stall the single client event loop. Results stay in stanza order; per-URL failures are logged and skipped.
+2. `collect_inbound_attachment_urls` also scans whitespace-delimited tokens
+   in the **decrypted body** for the `aesgcm://` prefix and adds URLs not already
+   present (deduped, same cap). This covers clients that omit the cleartext OOB
+   element. Plain `https://` links in a body are not auto-downloaded.
+3. One FIFO worker handles inbound attachment jobs off the client event loop.
+   It runs up to four downloads concurrently within a job and retains stanza
+   order. Per-URL failures are logged and skipped; an extraction timeout
+   discards the job's attachments. If the queue is full or the worker has
+   stopped, the channel delivers without downloads and still strips recognized
+   URLs from the body.
 
 ### Download (`download_oob_file`)
 
@@ -131,6 +139,7 @@ staging is allowed up to 50 MiB.
 | Limit | Value | Enforced at |
 |-------|-------|-------------|
 | OOB/aesgcm URLs processed per stanza | 10 (`MAX_OOB_ATTACHMENTS`) | XmppChannel |
+| Pending inbound attachment jobs | 16 (`INBOUND_ATTACHMENT_QUEUE_CAPACITY`) | XmppChannel |
 | Concurrent inbound downloads | 4 (`MAX_CONCURRENT_OOB_DOWNLOADS`) | XmppChannel |
 | Per-file download size (enforced while streaming) | 20 MiB (`OOB_MAX_FILE_SIZE`) | XmppChannel |
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
@@ -192,7 +201,7 @@ All other MIME types are rejected outright.
 Encrypted file shares are handled end-to-end:
 
 - **Unencrypted messages**: the OOB `<x>` element is present in `msg.payloads` and extracted directly; `https://` files are downloaded as-is.
-- **Encrypted DMs/rooms**: the body is OMEMO-decrypted first, then scanned for `aesgcm://` URLs (`collect_aesgcm_urls`) — covering clients that omit the cleartext OOB element to avoid leaking the URL to the server. `aesgcm://` media is fetched and AES-256-GCM-decrypted locally (`download_aesgcm_file`). An `aesgcm://` URL carried in an OOB element is handled the same way.
+- **Encrypted DMs/rooms**: the body is OMEMO-decrypted first, then scanned for `aesgcm://` URLs (`collect_inbound_attachment_urls`) — covering clients that omit the cleartext OOB element to avoid leaking the URL to the server. `aesgcm://` media is fetched and AES-256-GCM-decrypted locally (`download_aesgcm_file`). An `aesgcm://` URL carried in an OOB element is handled the same way.
 - Plain `https://` URLs that appear only in a (decrypted) body are **not** auto-downloaded — only the explicit `aesgcm://` encrypted-media scheme is.
 
 ## Security Notes

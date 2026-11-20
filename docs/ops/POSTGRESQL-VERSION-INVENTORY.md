@@ -160,16 +160,44 @@ Read-only re-check on `ajhermes-z`; nothing was changed. `pg-image-status`,
 | `barracuda` | 16.16 (Debian 16.16-1.pgdg12+1) | 160016 | 0.8.7 | `b0108689bf51…` | pinned `…@sha256:484e8380…` |
 
 A search of every `pgvector` `Image=` line under
-`/home/*/.config/containers/systemd/` returned exactly these three units, each
-naming the reviewed digest: no tenant on this host keeps a floating `pg16`
-reference. `ALTER EXTENSION vector UPDATE` was not run, so `hermes` still
-reports 0.8.6 installed against 0.8.7 available, as described above.
+`/home/*/.config/containers/systemd/` returned exactly three units at that
+pass, each naming the reviewed digest: no tenant on this host kept a floating
+`pg16` reference. `ALTER EXTENSION vector UPDATE` was not run, so `hermes`
+still reports 0.8.6 installed against 0.8.7 available, as described above.
+
+### Fourth tenant, 2026-11-20 05:00Z (WI#780)
+
+The 03:00Z pass above described the `ajhermes-z` registry as it stood then.
+A tenant `camel` was registered afterwards — registry `created_at`
+`2026-11-20T03:15:43Z` — so the three-tenant statement is a statement about
+that pass, not about the host. The same read-only commands were run for it,
+sequentially with the three above:
+
+| Tenant | `server_version` | `server_version_num` | pgvector `extversion` | Image ID | Quadlet `Image=` |
+|---|---|---|---|---|---|
+| `camel` | 16.16 (Debian 16.16-1.pgdg12+1) | 160016 | 0.8.7 | `b0108689bf51…` | pinned `…@sha256:484e8380…` |
+
+The container runs from the reviewed digest, mounts the named volume
+`lunarwing-pg-camel` at `/var/lib/postgresql/data`, and holds the `vector`
+extension at 0.8.7. The tenant was registered at `03:15:43Z`, after the pin
+became the mt-admin default, and its Quadlet names the digest; its image never
+needed a refresh, and nothing was changed.
+
+`/etc/lunarwing/ports.json` now lists four tenants (`hermes`, `antelope`,
+`barracuda`, `camel`), and all four `pgvector` `Image=` lines under
+`/home/*/.config/containers/systemd/` name the reviewed digest, so no tenant
+on this host keeps a floating `pg16` reference. `ALTER EXTENSION vector UPDATE`
+was still not run; `hermes` remains the only tenant whose catalog is 0.8.6.
+The tenant list on this host is host-local and grows with provisioning, so a
+count recorded here is a count at the time of the pass.
 
 ### Other hosts
 
 The box for every host other than `ajhermes-z` is not met and stays open. No
 host beyond `ajhermes-z` was available to this author, so no other host was
-inspected here. There is no fleet host registry to work from either:
+inspected here, and none was attempted: the maintainer's 2026-11-19 decision
+is that an agent uses only hosts it was given an account on. There is no fleet
+host registry to work from either:
 `/etc/lunarwing/ports.json` describes only the host it sits on,
 `lunarwing-mt-admin.sh` has no cross-host enumeration, and no remote mt-admin
 target (`LUNARWING_MT_ADMIN` or an SSH entry) is configured. Any host not

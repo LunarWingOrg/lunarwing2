@@ -210,6 +210,7 @@ spawned work:
 - **2026-10-29 (v2.1.7.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1331`; `process_user_input` and `process_approval` still live in `thread_ops.rs`) — no scope change; defer decision stands
 - **2026-11-01 (v2.1.8.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1331`; `process_user_input` and `process_approval` symbols unchanged) — no scope change; defer decision stands
 - **2026-11-10 (v2.2.0.0):** re-verified the same symbol-based boundaries (`HARD_KILL_GRACE_SECS` remains 30; the suppression flag remains per supervised message; legacy input, approval, and Engine V2 behavior retain their existing ownership) — no scope change; defer decision stands
+- **2026-11-20 (v2.2.1.0), targeted source check:** `HARD_KILL_GRACE_SECS` is 30 (`agent_loop.rs:54`); `supervise_message` creates the per-message flag (`agent_loop.rs:1331`); `handle_priority_interrupt` still uses its own unsuppressed flag (`agent_loop.rs:1453`); `process_user_input` and `process_approval` remain in `thread_ops.rs`. Defer decision stands.
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---

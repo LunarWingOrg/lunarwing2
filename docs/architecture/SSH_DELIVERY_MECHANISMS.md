@@ -242,12 +242,13 @@ host-key verification stay host-side — the guest never sees key material.
 - **WIT:** adds an `ssh-exec` import to `wit/tool.wit` at package `@0.3.0` — a
   pure import addition, so **existing WASM guests do not need rebuilding**.
 
-**How to enable / build.** The guest wasm must be built (needs `rustup` +
-`wasm32-wasip2` + `cargo-component`):
+**How to enable / build.** Build the guest with Cargo and the
+`wasm32-wasip2` Rust target. `cargo-component` is not required:
 
 ```bash
 cd ic
-taskset -c 0-11 cargo component build --locked --release -j12 \
+rustup target add wasm32-wasip2
+taskset -c 0-11 cargo build --locked --release -j12 \
   --target wasm32-wasip2 --manifest-path tools-src/ssh/Cargo.toml
 # -> tools-src/ssh/target/wasm32-wasip2/release/ssh_tool.wasm
 # or, registry-driven for all tools: scripts/build-wasm-extensions.sh --tools

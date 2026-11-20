@@ -31,7 +31,7 @@ The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and 
 Keep `ARG SOURCE_DATE_EPOCH=0` before runtime account creation and preserve the same-layer `/etc/shadow` epoch-day assertion (WI#510): timestamp rewriting cannot fix a wall-clock day embedded in file contents. All four worker snapshots and `CI_DEBIAN_SNAPSHOT` move together; `20261105T082236Z` includes the Bookworm/Trixie Brotli OS-package fixes. Snapshot sources stay HTTPS and every APT call sets `Acquire::https::Timeout=60` (WI#561). The old client's update and apt-only bootstrap install use `Acquire::Retries=0`; after the `dpkg --compare-versions` `3.0.4` floor passes, the fixed client installs the remaining packages with `Acquire::Retries=3`, including the toolchain layer. Every update uses `--error-on=any`. Keep both direct CA-bundle copies from the digest-pinned Python image before APT and run `update-ca-certificates` after package installation; slim bases may have no system trust store.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
-v1.18.25 pin is retired: v1.19.5 carries the `61845b0` whitespace repair as a
+v1.18.25 pin is retired: v1.19.5 and v1.19.6 carry the `61845b0` whitespace repair as a
 content-equivalent backport (the tag does not contain that commit), so
 `fix_photon_patch_context.py` would fail as redundant. The two fixer files,
 their Dockerfile `COPY`/`RUN` and self-test invocation, and this lane's two
@@ -45,7 +45,7 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 - Expose the internal opencode serve port (4096) externally
 - Store secrets in config files (use env vars with `{env:VAR}` syntax)
 - Remove the health server — orchestration depends on it
-- Let the worker self-expose (WI#357): v1.19.5 has no service mode, pairing,
+- Let the worker self-expose (WI#357): v1.19.6 has no service mode, pairing,
   or tunnel (those are v2 surfaces), but session sharing exists and stays
   pinned `"share": "disabled"` in `config/opencode.json`. Workers must never
   open their own inbound path or publish sessions; see

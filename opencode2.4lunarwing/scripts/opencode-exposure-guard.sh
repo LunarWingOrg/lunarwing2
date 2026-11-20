@@ -60,18 +60,21 @@
 # private servers. The agent can rewrite that live config, so this is still a
 # naive-use guard.
 #
-# One environment variable is forced on every start (WI#609, !2398 AAV-1):
-# OPENCODE_FLAGS=-console_watches. v2.2.7 ships Console event watches, a way
-# to steer a session from OpenCode Console (a hosted third party), behind the
-# feature flag `console_watches`. Upstream resolves a flag from OPENCODE_FLAGS
-# first, then from `experimental.<key>` in the highest-priority config
-# document that sets `experimental`, which can be a project's own
-# opencode.json in the task-writable workspace, then from the channel
-# default. A leading `-` turns a flag off, so this value keeps the flag off
-# whatever the caller's environment or a workspace file says. It replaces the
-# inherited value instead of extending it: the lane runs with no flag
-# opt-ins, so OPENCODE_FLAGS=all must not survive. An operator's own
-# `-<key>` entries are dropped with it; the wrapper owns this variable.
+# One environment variable is forced on every start (WI#609, !2398 AAV-1;
+# WI#785 AGN-2). OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts.
+# v2.2.7 shipped Console event watches, and v2.3.2 adds two more surfaces of
+# the same kind: `mcp_events` (declare event support to MCP servers and wake a
+# session on their push events) and `artifacts` (a publisher that uploads files
+# to OpenCode Console). Each hangs on a feature flag. Upstream resolves a flag
+# from OPENCODE_FLAGS first (a comma-separated list), then from
+# `experimental.<key>` in the highest-priority config document that sets
+# `experimental`, which can be a project's own opencode.json in the
+# task-writable workspace, then from the channel default. A leading `-` turns
+# a flag off, so this value keeps all three off whatever the caller's
+# environment or a workspace file says. It replaces the inherited value
+# instead of extending it: the lane runs with no flag opt-ins, so
+# OPENCODE_FLAGS=all must not survive. An operator's own `-<key>` entries are
+# dropped with it; the wrapper owns this variable.
 #
 # What this does not cover: the pin gates the event watches only, not what a
 # worker with a Console credential also takes from the Console with the flag
@@ -172,5 +175,5 @@ for arg in "$@"; do
 done
 [ "$want_host" = 0 ] || refuse "--hostname" "missing value — the worker's opencode server must bind loopback only"
 
-export OPENCODE_FLAGS="-console_watches"
+export OPENCODE_FLAGS="-console_watches,-mcp_events,-artifacts"
 exec "$REAL_OPENCODE" "$@"

@@ -109,14 +109,16 @@ Without the symlink, run `tui/bin/wingtip --tenant <tenant>` from the repository
 one tenant file, a plain `wingtip` uses it. With several, it shows a picker.
 
 You don't have to wait for a restarting tenant. If the gateway is not answering yet, the header shows
-`reconnecting in N s` and Wingtip keeps retrying (the delay grows to at most 15 s).
+`reconnecting in N s` and Wingtip keeps retrying. The base delay caps at 15 s
+before ±20% jitter; a longer server retry hint takes precedence.
 `/transport reconnect` retries at once.
 
 ## 4. Your first session
 
 The header names the tenant, the connection state (`ready` once connected), the engine, and `exact` or
-`legacy daemon`. With a copied master token it also carries the warning "this TUI uses the tenant
-master token". F1 opens the help overlay, and the footer always lists the keys that work right now.
+`legacy daemon`. With a copied master token, the warning "this TUI uses the tenant master token"
+appears in the transport panel (`/transport`), not in the header. F1 opens the help overlay, and the
+footer lists the keys that work right now.
 
 | To | Do |
 |---|---|
@@ -128,13 +130,14 @@ master token". F1 opens the help overlay, and the footer always lists the keys t
 | answer an approval | Alt+Y approve, Alt+A approve and always allow the tool, Alt+N deny; Alt+V shows the full parameters first |
 | copy a reply | drag over it with the mouse, or `/copy` |
 | see threads | `/thread list`; `/thread new` starts one |
-| send a slash command to the daemon | `//<command>`; a single `/` is Wingtip's own command |
+| send a slash command to the daemon | `//<command>` explicitly forwards it (subject to the usual guards); `/<command>` also forwards it if there is no local handler |
 | quit | `/quit`, or Ctrl+C twice |
 
 Things worth knowing on day one:
 
-- **Approvals need a moment.** An approve key works only after the prompt has been on screen for 1 s,
-  and only after Alt+V when the parameters don't fit the panel. Deny always works.
+- **Approvals need a moment.** The prompt must have been focused for at least 1 s before you can
+  approve or deny. Approve and Always require Alt+V first if parameters are hidden, and neither can
+  accept truncated parameters. Deny does not require opening the parameters.
 - **Images you send are stored.** The daemon keeps every image in the tenant's workspace with no
   expiry, readable from every channel. Wingtip says so the first time. It accepts PNG, JPEG, GIF and
   WebP only.

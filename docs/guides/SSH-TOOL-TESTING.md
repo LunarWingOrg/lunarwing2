@@ -8,7 +8,10 @@ Use these checks to validate the SSH paths described in [`../architecture/SSH_DE
 the current tree. Worker SSH is available only in task containers that receive
 the socket; Kimi deliberately receives no mount (WI#206).
 
-All SSH tools accept a host from the configured `[[ssh.hosts]]` allowlist. Replace `<ssh-host>` below with that exact configured host value; an arbitrary IP or hostname is rejected even when it is reachable.
+The built-in `ssh`, `ssh_git`, and WASM `ssh` tools accept a host from the
+configured `[[ssh.hosts]]` allowlist. Replace `<ssh-host>` in those tests with
+the exact configured value. Worker OpenSSH does not consult this allowlist;
+it has separate egress and host-key checks (see §4).
 
 ## Prerequisites
 

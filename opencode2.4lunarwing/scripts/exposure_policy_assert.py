@@ -89,20 +89,25 @@ OPENTUNNEL_MARKERS = (b"opentunnel.xyz", b"@opentunnel/client", b"@opentunnel/pr
 # sync with sessionPermissions() in scripts/opencode_task_executor.ts.
 REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair", "serve"))
 
-# WI#609, !2398 AAV-1: opencode v2.2.7 ships Console event watches, a remote
-# steering channel through OpenCode Console, behind the feature flag
-# `console_watches`. The lane keeps it off in two places. The lane config must
-# not turn it on (`experimental.all_flags` turns every flag on). And the
-# wrapper forces the flag off in OPENCODE_FLAGS, which upstream resolves before
-# every config document, a project's own opencode.json included.
-FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", "console_watches")
-WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="-console_watches"'
+# WI#609, !2398 AAV-1 / WI#785 AGN-2: opencode v2.2.7 shipped Console event
+# watches, a remote steering channel through OpenCode Console, behind the
+# feature flag `console_watches`; v2.3.2 adds two surfaces of the same kind,
+# `mcp_events` (MCP push-event wake-ups) and `artifacts` (a publisher that
+# uploads to OpenCode Console). The lane keeps all three off in two places. The
+# lane config must not turn one on (`experimental.all_flags` turns every flag
+# on). And the wrapper forces each off in OPENCODE_FLAGS, which upstream
+# resolves before every config document, a project's own opencode.json
+# included. Pinning the two new flags off applies the v2.2.7 decision ("record
+# the surface, pin it off") rather than the weaker "off by default".
+PINNED_OFF_FLAGS = ("console_watches", "mcp_events", "artifacts")
+FORBIDDEN_EXPERIMENTAL_FLAGS = ("all_flags", *PINNED_OFF_FLAGS)
+WRAPPER_FLAG_PIN = 'export OPENCODE_FLAGS="' + ",".join("-" + flag for flag in PINNED_OFF_FLAGS) + '"'
 WRAPPER_EXEC = 'exec "$REAL_OPENCODE" "$@"'
 REAL_BINARY_PATH = "/usr/local/lib/opencode2/opencode"
 # SHA-256 over the wrapper's code lines (comments and blank lines stripped),
 # so ANY code edit — including one the shape checks below do not name — needs
 # a review of this checker in the same commit (WI#609 ABH-2).
-WRAPPER_CODE_DIGEST = "ade0df974608bf2ca1f43a6d0c8ccaf7efe68398038e4f2061048bb47013952e"
+WRAPPER_CODE_DIGEST = "ada4eb7505ca9867e5e86bfd1fcd0fad8a293c72dcdc5752ad1d262c005b68ca"
 # Shell features that can make the wrapper's tail unreachable or change what
 # its last two lines mean. The wrapper needs none of them. Dot-sourcing is
 # refused wherever it appears, not only at a line start.
@@ -294,7 +299,7 @@ def check_installed_managed_policy(
     )
     # Upstream reads two names from the managed directory, `opencode.json` and
     # `opencode.jsonc` (packages/core/src/config/discovery.ts:12 and
-    # config.ts:270-277 at the v2.2.7 pin), and the second one's policies
+    # config.ts:270-277 at the v2.3.2 pin), and the second one's policies
     # outrank the first's (config.ts:313-325), so a sibling document can lift
     # the reviewed deny while the reviewed file is untouched. The directory
     # is also a config directory entry (config.ts:275), the kind upstream
@@ -586,7 +591,7 @@ def check_wrapper(lane: pathlib.Path) -> None:
              "wrapper code edit must be reviewed and WRAPPER_CODE_DIGEST updated in the same "
              "commit (WI#609 ABH-2)")
         return
-    check("wrapper forces OPENCODE_FLAGS=-console_watches before the real binary starts")
+    check("wrapper forces OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts before the real binary starts")
 
 
 def check_binary(binary: pathlib.Path) -> None:

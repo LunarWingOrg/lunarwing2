@@ -68,14 +68,15 @@ The build is resource-bounded by MT admin. Run long build/provision operations i
 
 ## Provision an MT Tenant
 
-Enable DarkIRC when adding the tenant:
+Enable DarkIRC when adding the tenant. Replace the example URL with your LLM
+endpoint:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant> \
-  --enable-darkirc
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
-sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant mytenant \
+  --enable-darkirc --llm-base-url https://llm.example.com/v1
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant mytenant --with-wasm
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant mytenant
+sudo ic/scripts/lunarwing-mt-admin.sh status mytenant
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
@@ -119,7 +120,11 @@ Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) fo
 
 ## Message Limits
 
-The host's channel budget asks the model to stay within six 390-byte DarkIRC messages. The adapter performs UTF-8-safe IRC chunking, ordering markers, framing limits, and paced outbound delivery. Its durable outbox location and limits are set by the tenant adapter environment.
+The host's channel budget asks the model to stay within six 390-byte DarkIRC
+messages. The adapter performs UTF-8-safe IRC chunking, ordering markers,
+framing limits, and paced delivery. The standard adapter env enables the
+outbox journal; the adapter supplies the tuning defaults unless overridden
+(see [adapter configuration](DARKIRC_MT_ADAPTER.md#adapter-configuration)).
 
 Changing only the WASM response split does not change IRC framing or delivery pacing. Review the adapter source and the host outbound hook together when modifying limits.
 
@@ -127,7 +132,9 @@ Changing only the WASM response split does not change IRC framing or delivery pa
 
 For a tenant managed by MT admin:
 
-1. `status <tenant>` reports the daemon, adapter, and LunarWing healthy; host `doctor` reports required dependencies available.
+1. `status <tenant>` reports the expected init state for the daemon, adapter,
+   and LunarWing. Host `doctor` checks general MT prerequisites, not live
+   DarkIRC health or contact-key state.
 2. The adapter `/health` endpoint reports an IRC connection on the tenant's registry port.
 3. Authenticated gateway status reports healthy DarkIRC channel state.
 4. A paired test nick can send and receive a direct message.

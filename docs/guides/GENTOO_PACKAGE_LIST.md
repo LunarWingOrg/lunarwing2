@@ -3,11 +3,11 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** The current mt-admin `require_cmd` set
-was re-checked: cargo, chcon, curl, flock, git, jq, nft, od, passwd, python3,
-setpriv, sha256sum, tar, taskset, and useradd, plus podman/docker. WI#424
-worker egress enforcement needs `nft` from `net-firewall/nftables`, now listed
-explicitly below. Disk health reuses existing core utilities.
+**Revalidated 2026-11-10 (v2.2.0.0).** Across mt-admin's subcommands,
+`require_cmd` checks cargo, chcon, curl, flock, git, jq, nft, od, passwd,
+python3, setpriv, sha256sum, tar, taskset, and useradd. Runtime detection
+checks for Podman or Docker separately. WI#424 worker egress enforcement
+needs `nft` from `net-firewall/nftables`. Disk health reuses existing core utilities.
 
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).
@@ -25,7 +25,7 @@ The admin script, the per-tenant daemons, and the health/self-heal pipeline need
 |---------|-----|
 | `app-misc/jq` | Port registry (`/etc/lunarwing/ports.json`), health-check JSON, self-heal, send-notification |
 | `dev-vcs/git` | Per-tenant repo clones |
-| `dev-lang/python` (python3) | TensorZero proxy, WeeChat WS adapter, all `health-*.sh` scripts |
+| `dev-lang/python` (python3) | MT admin, TensorZero proxy, WeeChat WS adapter, and the `health-worker-egress.sh` probe |
 | `net-misc/curl` | Self-heal Gotify pages, `health-models` probe, gateway deep-checks |
 | `sys-apps/util-linux` | Provides `flock` — build lock + self-heal single-instance lock (usually already installed). Also provides `setpriv` — **required for cgroup v2 build bounding, and gated behind the `caps` USE flag** (see §1b). |
 
@@ -137,7 +137,7 @@ health pipeline do **not** need these:
 | Package | Why |
 |---------|-----|
 | `net-irc/weechat` | The IRC client the agent talks to |
-| `app-misc/tmux` | The `weechat-<tenant>` OpenRC unit runs weechat inside a tmux session |
+| `app-misc/tmux` | The `lunarwing-weechat-<tenant>` OpenRC unit runs WeeChat inside tmux |
 | `dev-python/aiohttp` | Required by the WeeChat WS adapter (`lunarwing-weechat-adapter-<tenant>`); without it the adapter crashes on import |
 
 ```bash
@@ -151,8 +151,9 @@ sudo emerge net-irc/weechat app-misc/tmux dev-python/aiohttp
 
 The supported host-side Python tooling (multi-tenant onboard CLIs/web UI and Hermes importer)
 needs these third-party modules. Gentoo's system Python is PEP-668 managed, so either
-emerge the `dev-python/*` atoms **or** install the pinned requirements into a venv
-(`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`) — each tool ships one.
+emerge the `dev-python/*` atoms **or** install the tool's declared requirements
+into a venv (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`, from
+the tool's directory). The onboard CLI and web requirements specify minimum versions.
 
 | Package | Consumers |
 |---------|-----------|
@@ -186,16 +187,17 @@ Notes:
 ### Test/CI-only Python packages
 
 Only needed to run the repo's Python test harnesses, not for a live deployment — a venv with the
-shipped requirements files is the recommended route:
+shipped dependencies is the recommended route. `tests/requirements.txt` also pins
+pytest and tenacity, but `tests/runner.py` uses neither; E2E dependencies are declared
+in `ic/tests/e2e/pyproject.toml`.
 
 | Package | Consumers |
 |---------|-----------|
-| `dev-python/pytest` (+ `pytest-asyncio`, `pytest-timeout` plugins) | `tests/runner.py`, `ic/tests/e2e` |
+| `dev-python/pytest` (+ `pytest-asyncio`, `pytest-timeout` plugins) | `ic/tests/e2e` |
 | `dev-python/requests` | `tests/runner.py` |
 | `dev-python/websocket-client` | `tests/runner.py` (imports `websocket`) |
-| `dev-python/tenacity` | `tests/runner.py` |
 | `pytest-playwright` + `playwright` (pip only) | `ic/tests/e2e` browser scenarios |
-| `anthropic` (pip only, optional) | `ic/tests/e2e` vision scenarios |
+| `anthropic` (pip only, optional) | Declared by the `vision` extra in `ic/tests/e2e/pyproject.toml`, not a base E2E dependency |
 
 ---
 

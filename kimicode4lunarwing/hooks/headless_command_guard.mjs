@@ -5,9 +5,12 @@
 // The worker runs `kimi -p --output-format stream-json` headless. Verified
 // against 2.0.2 (live-verified; 2.5.2 real-CLI contract gate passes): print mode
 // forces the auto permission policy, and the upstream dangerous-command guard
-// is skipped in auto mode. [[permission.rules]] never load from config, so a PreToolUse
-// hook (which fires BEFORE permission checks in every mode and blocks with
-// exit code 2) is the only in-CLI fail-closed mechanism available.
+// is skipped in auto mode. Since 2.6.0 config [[permission.rules]] do load,
+// in print mode too (the baked config's rules and, for a trusted workspace,
+// those of <project>/.kimi-code/local.toml); the lane bakes no rule, keeps
+// the workspace untrusted, and this hook fires in the earlier phase, before
+// permission checks in every mode, blocking with exit code 2 — the only
+// in-CLI fail-closed mechanism available.
 //
 // The hook receives the PreToolUse event as JSON on stdin. Exit codes:
 //   0 — allow, 2 — block (stderr reason is surfaced to the model),

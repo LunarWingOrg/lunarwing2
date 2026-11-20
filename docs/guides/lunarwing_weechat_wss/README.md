@@ -37,13 +37,13 @@ MT admin configures WeeChat by default when adding a tenant. It:
 - renders WeeChat, adapter, and LunarWing dependencies for systemd user managers or OpenRC;
 - injects `RELAY_URL`, `WS_ADAPTER_URL`, and `RELAY_PASSWORD` into the host/channel setup path.
 
-Typical flow:
+Typical flow (replace the example LLM URL with your direct endpoint):
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
-sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant mytenant --llm-base-url https://llm.example.com/v1
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant mytenant --with-wasm
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant mytenant
+sudo ic/scripts/lunarwing-mt-admin.sh status mytenant
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
@@ -142,19 +142,19 @@ IRC identity is not cryptographic. WeeChat sender principals are network-qualifi
 
 ## Verification
 
-1. MT admin `status <tenant>` reports WeeChat, adapter, and LunarWing healthy; host `doctor` reports required dependencies available.
+1. MT admin `status <tenant>` reports the expected init state for WeeChat, its adapter, and LunarWing; host `doctor` checks general MT prerequisites.
 2. The preflight script confirms the relay type, bind address, port, and protected password wiring.
 3. The adapter health endpoint responds on the tenant's `weechat_adapter` port.
 4. A configured IRC connection receives a direct message and channel message according to policy.
 5. Pairing rejects an unknown sender until approved.
 6. Outbound replies reach the correct network-qualified buffer.
-7. Restart restores WeeChat upgrade state and does not replay or mirror-loop prior messages.
+7. Check buffer restoration and absence of mirror loops after restart. Adapter backlog replay and journal alignment depend on the saved cursor (see the architecture guide).
 
 Use test networks/rooms and redact relay credentials and message contents from evidence.
 
 ## Troubleshooting
 
-- **Wrong tenant ports:** run `patch-env`, `render-units`, then `doctor`; do not edit the settings table or capability JSON to fight generated MT values.
+- **Wrong tenant ports:** use `lunarwing-weechat-preflight.sh` to locate drift and reconcile against the registry. `patch-env` fills missing values but does not fix conflicting ones.
 - **Relay authentication loop:** run the secret-safe preflight and relay recovery command. Do not use `ic_sm` scripts or print the master key.
 - **Adapter disconnected:** verify WeeChat is running first, the relay type is `api`, and the loopback relay port matches the registry.
 - **No inbound messages:** inspect adapter health, network/sender policy, pairing, and the architecture guide's long-poll/fallback state.
