@@ -199,19 +199,19 @@ fn execute_with(
         } => api::list_merge_requests(
             &client,
             &project,
-            &state,
-            source_branch.as_deref(),
-            target_branch.as_deref(),
-            per_page,
-            page,
-            all_pages,
+            api::ListMergeRequests {
+                state: &state,
+                source_branch: source_branch.as_deref(),
+                target_branch: target_branch.as_deref(),
+                per_page,
+                page_number: page,
+                all_pages,
+            },
         )?,
         GitlabAction::GetMergeRequest { project, iid } => {
             api::get_merge_request(&client, &project, iid)?
         }
-        GitlabAction::GetMrChanges { project, iid } => {
-            api::get_mr_changes(&client, &project, iid)?
-        }
+        GitlabAction::GetMrChanges { project, iid } => api::get_mr_changes(&client, &project, iid)?,
         GitlabAction::CreateMergeRequest {
             project,
             source_branch,

@@ -252,26 +252,30 @@ pub fn create_issue_note(
     client.request_json("POST", &endpoint, Some(&json!({ "body": body })))
 }
 
+pub struct ListMergeRequests<'a> {
+    pub state: &'a str,
+    pub source_branch: Option<&'a str>,
+    pub target_branch: Option<&'a str>,
+    pub per_page: u32,
+    pub page_number: u32,
+    pub all_pages: bool,
+}
+
 pub fn list_merge_requests(
     client: &GitlabClient,
     project: &str,
-    state: &str,
-    source_branch: Option<&str>,
-    target_branch: Option<&str>,
-    per_page: u32,
-    page_number: u32,
-    all_pages: bool,
+    request: ListMergeRequests<'_>,
 ) -> Result<Value, String> {
     let endpoint = merge_requests_endpoint(
         project,
-        state,
-        source_branch,
-        target_branch,
-        per_page,
-        page_number,
-        all_pages,
+        request.state,
+        request.source_branch,
+        request.target_branch,
+        request.per_page,
+        request.page_number,
+        request.all_pages,
     )?;
-    if all_pages {
+    if request.all_pages {
         client.request_all_pages(&endpoint)
     } else {
         client.request_json("GET", &endpoint, None)
@@ -945,8 +949,8 @@ mod tests {
             "/projects/group%2Fproject/merge_requests?state=opened&per_page=20&page=2&source_branch=feature%2Fwi-279&target_branch=integration%20branch"
         );
 
-        let all = merge_requests_endpoint("35", "merged", None, Some("main"), 500, 1, true)
-            .unwrap();
+        let all =
+            merge_requests_endpoint("35", "merged", None, Some("main"), 500, 1, true).unwrap();
         assert_eq!(
             all,
             "/projects/35/merge_requests?state=merged&per_page=100&target_branch=main"
