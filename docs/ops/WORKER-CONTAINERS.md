@@ -977,8 +977,10 @@ Enforced controls (opencode2 lane unless noted):
    scanning **every argv token**: `service`/`pair` subcommands, the
    `--service` flag, and every `--hostname` occurrence (loopback only).
    Since the v2.2.7 bump it also starts the real binary with
-   `OPENCODE_FLAGS=-console_watches`, replacing whatever the caller's
-   environment holds: that keeps the Console event watches off, because
+   `OPENCODE_FLAGS=-console_watches` — `-console_watches,-mcp_events,-artifacts`
+   since WI#785 — replacing whatever the caller's environment holds: that keeps
+   the Console event watches, the MCP push-event channel and the Console
+   artifact publisher off, because
    upstream resolves the variable before every config document (see the
    v2.2.7 and v2.3.2 bump entries). Children the real binary spawns inherit the value,
    with one exception: a managed service started from a `service.json` that
@@ -2310,6 +2312,16 @@ still starts no server: it runs `kimi -p` per task, and the 2.6.x creation-time
 environment flags are not passed. `2.6.1`/`2.6.2` were patch releases inside
 their windows at the previous attempt; `2.6.3` supersedes them and was taken
 directly, so no intermediate pin was ever deployed.
+
+**AGN-3: the guard blocks end to end at 2.6.3.** A mock OpenAI-compatible
+provider (SSE, as the CLI asks) answered a headless `kimi -p` run with one Bash
+tool call, `sudo id`. The guard denied it with exit 2 and the CLI fed the
+denial back to the model as a tool error: the second provider request carried
+`{"role": "tool", "tool_call_id": "call_1", "content": "<system>ERROR: Tool
+execution failed.</system>\nheadless-guard: denied — privilege escalation"}`,
+and `sudo` never ran. That is the end-to-end check AGN-3 asked for at the
+pinned 2.6.3 tarball (installed under a throwaway prefix, removed afterwards);
+the contract gate's comment (which had only the 2.0.2 result) now cites it.
 
 The 2.6.0–2.6.3 release notes were read for anything that adds a channel or a
 host. There is no pairing, sharing, tunnel or service-mode change. The 2.6.0
