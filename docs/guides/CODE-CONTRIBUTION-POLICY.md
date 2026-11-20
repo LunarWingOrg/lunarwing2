@@ -2,7 +2,7 @@
 
 This document is the single canonical reference for how code is contributed to LunarWing. It consolidates conventions that were previously scattered across `AGENTS.md`, the GitLab CI, subsystem specs, and guide documents. When this policy disagrees with an older document, this one wins.
 
-**Documentation reviewed:** 2026-11-10 for v2.2.0.0 against the repository-root and `ic/` agent contracts.
+**Documentation reviewed:** 2026-11-20 against the repository-root and `ic/` agent contracts at `9c96220bb2`.
 
 ## 1. Project values
 
