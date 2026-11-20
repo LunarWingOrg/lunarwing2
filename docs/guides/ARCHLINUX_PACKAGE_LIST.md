@@ -3,7 +3,7 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Arch Linux + systemd** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** External-worker egress enforcement
+**Revalidated 2026-11-20 at `9c96220bb2`.** External-worker egress enforcement
 (WI#424) requires the host `nft` command from `nftables`. Disk health reuses
 `df`, `stat`, and `timeout` from the already-expected core utilities.
 

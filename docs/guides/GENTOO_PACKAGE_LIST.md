@@ -3,7 +3,7 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-10 (v2.2.0.0).** Across mt-admin's subcommands,
+**Revalidated 2026-11-20 at `9c96220bb2`.** Across mt-admin's subcommands,
 `require_cmd` checks cargo, chcon, curl, flock, git, jq, nft, od, passwd,
 python3, setpriv, sha256sum, tar, taskset, and useradd. Runtime detection
 checks for Podman or Docker separately. WI#424 worker egress enforcement
