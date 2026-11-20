@@ -1,6 +1,6 @@
 # ic_sm
 
-> **ARCHIVED EXPERIMENT / UNSUPPORTED (reviewed 2026-11-10).** The scripts
+> **ARCHIVED EXPERIMENT / UNSUPPORTED (reviewed 2026-11-20).** The scripts
 > referenced here write directly to a database and predate current secret-store
 > invariants. Do not use them on a tenant, share its master key, or assume a
 > daemon restart is unnecessary. Use authenticated extension setup and the
