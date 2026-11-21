@@ -133,7 +133,9 @@ ignored rather than treated as wildcards.
 records; a number selects 16–8,192) of `(canonical tool name, unadjusted
 baseline, frozen EMA prediction, actual duration)`. It is written from the
 same completion path with no I/O, no parameters and no user identity; the
-oldest record is evicted when full. A disabled trace costs nothing. Reading it
+oldest record is evicted when full. Only completed (`Ok`) calls are traced;
+failures, timeouts and cancellations have no completed-call runtime and stay
+out, matching the learner contract. A disabled trace costs nothing. Reading it
 via the owner route is what feeds the per-category rollout gate; enabling
 hints for a tenant is still a separate operator decision.
 

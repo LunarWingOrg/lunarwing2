@@ -35,8 +35,10 @@ wait or a deadline. Failed/timed-out/canceled calls do not train the cache.
 `Tool::estimated_duration` must describe a typical unadjusted runtime, **not** a
 timeout; return `None` when unknown. Costs remain unknown unless reported by
 the tool. Restart resets learned statistics; `LUNARWING_TOOL_ESTIMATES=0`
-disables new recording/display. Details and staged scope:
-[runtime estimation](../estimation/README.md).
+disables new recording/display. `LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates
+display per tool category while recording continues, and the user-scoped
+`GET /api/estimates` route exposes the learned models and counters. Details and
+staged scope: [runtime estimation](../estimation/README.md).
 
 ### Workload process isolation (WI#671, WI#679)
 
