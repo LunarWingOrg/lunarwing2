@@ -37,6 +37,15 @@ const LATE_STEP_ALLOWANCE: Duration = Duration::from_secs(90);
 const LATE_MAX_TIMEOUT: Duration = Duration::from_secs(1_800);
 const STOP_GRACE: Duration = Duration::from_secs(60);
 
+/// Longest a detached turn can keep running before the late watcher reports its
+/// second `Finished`: the wait budget plus the capped late budget plus both stop
+/// graces. The channel manager's finished-message memory derives its TTL from
+/// this window (WI#820), so a change to any part of the late budget carries
+/// through instead of silently undercutting the memory.
+pub(crate) const LONGEST_LATE_WINDOW: Duration = OUTCOME_TIMEOUT
+    .saturating_add(LATE_MAX_TIMEOUT)
+    .saturating_add(STOP_GRACE.saturating_mul(2));
+
 /// Late-turn budget for a turn that completed `tool_calls` discrete tool actions:
 /// the base budget plus one step allowance per action, capped at
 /// [`LATE_MAX_TIMEOUT`]. A turn with no tool calls keeps the base budget exactly.

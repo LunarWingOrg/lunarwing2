@@ -309,9 +309,13 @@ Keep the WI#550 producer fixes and their independent silent-reply tests. The
   `message_lifecycle`), reports no `Finished`; the main loop only logs it.
 - Messages still queued at process exit get no `Finished`; clients
   resynchronize when they reconnect.
-- The memory of finished messages is bounded (the 1024 most recent, 30
-  minutes each). If more than 1024 other messages finish between the loop's
-  `timed_out` and the end of an Engine V2 turn that outlived it, or the turn
-  ends more than 30 minutes after that report, the late watcher reports a
-  second `Finished` (its real outcome). Clients ignore a second finish of a
-  sealed turn.
+- The memory of finished messages is bounded (the 1024 most recent). Each
+  entry lives for the longest Engine V2 late-turn window — 610 s wait budget
+  + 1800 s capped late budget + 2 × 60 s stop graces = 42 minutes 10 seconds
+  — which the entry's TTL derives from, so a change to the late budget moves
+  both together. The late watcher's own budget and graces therefore cannot
+  outlast it; only two paths can still produce a second `Finished` (its real
+  outcome): more than 1024 other messages finishing between the loop's
+  `timed_out` and the end of the turn that outlived it, or a channel whose
+  delivery of the late reply takes longer than the rest of the window.
+  Clients ignore a second finish of a sealed turn.
