@@ -49,7 +49,7 @@ _ensure_tenant_image() {  # <name> <image>
 }
 _systemctl_user() { CALLS+=("systemctl:$2:${3:-}"); return 0; }
 _ctr() {
-  local name="$1" verb="$2"
+  local verb="$2"
   shift 2
   case "$verb $*" in
     "image inspect -f {{.Id}} "*)
@@ -136,7 +136,6 @@ RUNNING_IMAGES[lunarwing-pebble-alice]=sha256:oldpebble
 upgrade_refresh_worker_containers alice
 assert_no_call "rm:-f lunarwing-pebble-alice" 'intentionally stopped OpenRC pebble container is left alone'
 assert_no_call "distribute:lunarwing-worker-pebble:latest" 'intentionally stopped lane is not redistributed'
-INIT_SYSTEM=systemd
 
 # ── a deselected lane is not touched ────────────────────────────────────────
 reset_fixture
