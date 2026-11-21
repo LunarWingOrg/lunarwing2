@@ -80,6 +80,7 @@ impl LateAllowance {
     }
 
     /// A flat allowance from now, never extended by progress.
+    #[cfg(test)]
     fn flat(budget: Duration) -> Self {
         Self {
             started: tokio::time::Instant::now(),
