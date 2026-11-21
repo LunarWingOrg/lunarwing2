@@ -61,16 +61,17 @@ process.exit(0)
 `
       break
     case "reserved-env":
-      // WI#833: reports every KIMI_CODE_* name and the auto-update/telemetry
-      // switches the CLI process actually received.
+      // WI#833: report the relevant env settings the CLI actually received.
       script = `#!/usr/bin/env node
 const relay = process.env.KIMI_CODE_REMOTE_CONTROL_RELAY_URL || "<unset>"
 const update = process.env.KIMI_CODE_NO_AUTO_UPDATE || "<unset>"
 const telemetry = process.env.KIMI_DISABLE_TELEMETRY || "<unset>"
 const version = process.env.KIMI_CODE_VERSION || "<unset>"
 const imageVersion = process.env.KIMI_CODE_IMAGE_VERSION || "<unset>"
+const home = process.env.KIMI_CODE_HOME || "<unset>"
+const futureFlag = process.env.KIMI_CODE_SOME_FUTURE_FLAG || "<unset>"
 const messages = [
-  { role: "assistant", content: "relay=" + relay + " update=" + update + " telemetry=" + telemetry + " version=" + version + " image=" + imageVersion },
+  { role: "assistant", content: "relay=" + relay + " update=" + update + " telemetry=" + telemetry + " version=" + version + " image=" + imageVersion + " home=" + home + " future=" + futureFlag },
 ]
 for (const m of messages) {
   process.stdout.write(JSON.stringify(m) + "\\n")
@@ -156,20 +157,33 @@ process.exit(0)
 async function runExecutor(
   request: TaskRequest,
   binPath: string | null,
+  kimiHome: string | null = "/tmp",
 ): Promise<{ result?: TaskResult; progress: string[] }> {
+  const previousEnv = {
+    KIMI_BIN: process.env.KIMI_BIN,
+    WORKSPACE_ROOT: process.env.WORKSPACE_ROOT,
+    KIMI_CODE_HOME: process.env.KIMI_CODE_HOME,
+  }
   if (binPath === null) delete process.env.KIMI_BIN
   else process.env.KIMI_BIN = binPath
   process.env.WORKSPACE_ROOT = "/tmp"
-  process.env.KIMI_CODE_HOME = "/tmp"
+  if (kimiHome === null) delete process.env.KIMI_CODE_HOME
+  else process.env.KIMI_CODE_HOME = kimiHome
   const progress: string[] = []
   let result: TaskResult | undefined
-  await executeTask(
-    request,
-    (p) => { progress.push(p.delta) },
-    (r) => { result = r },
-    undefined,
-  )
-  delete process.env.KIMI_BIN
+  try {
+    await executeTask(
+      request,
+      (p) => { progress.push(p.delta) },
+      (r) => { result = r },
+      undefined,
+    )
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
   return { result, progress }
 }
 
@@ -272,6 +286,7 @@ test("executeTask: task environment cannot disable the dangerous-command guard (
   assert.ok(result, "result was not emitted")
   assert.equal(result!.status, "success")
   assert.equal(result!.output, "guard=<unset> reminder=<unset> trust=<unset>")
+})
 
 test("executeTask: a task-supplied KIMI_CODE_* name not on the allowlist never reaches the CLI (WI#833)", async () => {
   // WI#833 point 2: the executor stripped three names one at a time, so the
@@ -309,6 +324,7 @@ test("executeTask: a task-supplied KIMI_CODE_* name not on the allowlist never r
   }
   assert.ok(!output.includes("relay.evil.example"), `relay URL reached the CLI: ${output}`)
   assert.match(output, /relay=<unset>/, `relay URL must be stripped: ${output}`)
+  assert.match(output, /future=<unset>/, `unknown KIMI_CODE_* must be stripped: ${output}`)
   assert.match(output, /version=2\.7\.2/, `allowlisted KIMI_CODE_VERSION must survive: ${output}`)
   assert.match(output, /image=2\.7\.2/, `allowlisted KIMI_CODE_IMAGE_VERSION must survive: ${output}`)
   const dropWarnings = warnings.filter((w) =>
@@ -352,6 +368,20 @@ test("executeTask: a task cannot turn auto-update or telemetry back on (WI#833)"
   }
 })
 
+test("executeTask: the task cannot select KIMI_CODE_HOME, even when the worker leaves it unset", async () => {
+  const bin = makeMockKimi("reserved-env")
+  const request: TaskRequest = {
+    task_id: "kimi-home-env",
+    prompt: "check the CLI home",
+    timeout_ms: 10_000,
+    context: { environment: { KIMI_CODE_HOME: "/tmp/task-choice" } },
+  }
+  for (const [workerHome, expected] of [[null, "<unset>"], ["/tmp/worker-home", "/tmp/worker-home"]] as const) {
+    const { result } = await runExecutor(request, bin, workerHome)
+    assert.ok(result, "result was not emitted")
+    assert.equal(result.status, "success")
+    assert.ok(result.output?.includes(`home=${expected} `), "only the worker may select the CLI home")
+  }
 })
 
 test("executeTask: hub-handshake token never reaches the task env (WI#373)", async () => {

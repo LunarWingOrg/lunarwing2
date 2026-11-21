@@ -516,13 +516,6 @@ test("the probe commands of runs 500-505 stay ordinary work", () => {
   assertAllowed("rm -rf /tmp/x")
 })
 
-test("a long command of repeated words is decided without rescanning", () => {
-  // The regex form of the recursive-change rule rescanned the rest of the
-  // command from every `chmod`; 12 KB of repetitions took ten seconds and
-  // tripped runGuard's kill timeout. The linear scan decides it immediately.
-  assertAllowed("chmod -R ".repeat(1500))
-})
-
 test("a task cannot start kimi service mode (WI#833)", () => {
   // WI#833 point 1: `kimi` is on PATH in the worker image, and these three
   // spellings started service mode — an HTTP API (sessions, :wait, /api/v1/kap.md,
@@ -532,6 +525,7 @@ test("a task cannot start kimi service mode (WI#833)", () => {
   assertBlocked("kimi web --json", "kimi service mode")
   assertBlocked("kimi server --port 9000 &", "kimi service mode")
   assertBlocked("/usr/local/bin/kimi server", "kimi service mode")
+  assertBlocked("kimi --debug server", "kimi service mode")
   // Through a wrapper, a prefix assignment, a shell one-liner and a loop body.
   assertBlocked("bash -c 'kimi server'", "kimi service mode")
   assertBlocked("bash -lc 'kimi web'", "kimi service mode")
@@ -577,4 +571,19 @@ test("a task cannot start any listed listener (WI#833)", () => {
   assertAllowed("socat -V")
   assertAllowed("python3 -m pytest tests/ -q")
   assertAllowed("python3 -m json.tool")
+})
+
+test("kimi print-mode prompt values are not service subcommands", () => {
+  assertAllowed("kimi -p server")
+  assertAllowed("kimi --prompt web")
+  assertAllowed("kimi --prompt='check web' --output-format stream-json")
+  assertAllowed('kimi -p "check web; list server notes" --output-format stream-json')
+  assertAllowed(`bash -c 'kimi -p "review web"'`)
+})
+
+test("a long command of repeated words is decided without rescanning", () => {
+  // The regex form of the recursive-change rule rescanned the rest of the
+  // command from every `chmod`; 12 KB of repetitions took ten seconds and
+  // tripped runGuard's kill timeout. The linear scan decides it immediately.
+  assertAllowed("chmod -R ".repeat(1500))
 })

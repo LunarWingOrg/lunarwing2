@@ -23,8 +23,7 @@ import { runInNewContext } from "node:vm";
 // (power/privilege/disk destruction, fork bombs, pipe-to-shell, decoded
 // payloads into a shell) plus worker-lane specifics (deletion outside the
 // temp roots whatever tool performs it, block-device writes, git commands
-// that discard uncommitted work, SSH-agent socket use, and a listener started
-// from a task — kimi's own service mode included, WI#833). It is deliberately
+// that discard uncommitted work, SSH-agent socket use). It is deliberately
 // NOT a general command parser: everything it cannot positively classify as
 // safe within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer) and
@@ -315,13 +314,12 @@ function checkDeviceWrites(text) {
   return null;
 }
 
-/** Deletion, decode, listener and device checks that need the command text with its quoting intact. */
+/** Deletion, decode and device checks that need the command text with its quoting intact. */
 function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
-    checkListeners(text) ??
     checkDecodedPipe(text);
 }
 
@@ -431,103 +429,6 @@ function isInterpreterStage(stage) {
   return false;
 }
 
-// WI#833 point 1: a task must not open an inbound path (WI#357). kimi's own
-// service modes (`kimi server`, `kimi web`) are the reported case, but the
-// class is "a listener started from a task", so a closed verb list covers the
-// common spellings too. Like every other rule here this is a naive-use
-// control: it matches the shapes it can positively read and lets an unknown
-// spelling pass.
-const LISTENER_PREFIXES = new Set([
-  "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
-  "xargs", "time",
-  // xargs's replacement placeholder, which stands where the command goes.
-  "{}",
-  // Shell keywords and grouping words that sit before a command.
-  "if", "then", "elif", "else", "while", "until", "do", "done", "!", "{", "}", "(", ")",
-]);
-
-/** True for a wrapper, an assignment, an option or a wrapper's numeric operand. */
-function isPrefixWord(word) {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) ||
-    word.startsWith("-") ||
-    /^\d+$/.test(word) ||
-    word === "{}" ||
-    LISTENER_PREFIXES.has(commandBasename(word));
-}
-
-/** True when a shell would read the word after `previous` as a command (`-c`, `-lc`). */
-function isCommandOption(previous) {
-  return previous !== undefined && /^-[a-zA-Z]*c$/.test(previous);
-}
-
-/** The kimi subcommand word, ignoring leading options. */
-function kimiSubcommand(args) {
-  const subcommand = args.find((word) => !word.startsWith("-"));
-  return subcommand === "server" || subcommand === "web" ? subcommand : null;
-}
-
-const LISTENER_COMMANDS = [
-  // `python3 -m http.server 8080`
-  {
-    name: /^python[0-9.]*$/,
-    test: (args) => {
-      const moduleIndex = args.indexOf("-m");
-      return moduleIndex !== -1 && args[moduleIndex + 1] === "http.server";
-    },
-  },
-  // `nc -l 9000`, `ncat -l`, `netcat -lp 9000`
-  {
-    name: /^(?:nc|ncat|netcat)$/,
-    test: (args) => args.some((word) => /^-[a-zA-Z]*l[a-zA-Z]*$/.test(word) || word === "--listen"),
-  },
-  // `socat TCP-LISTEN:9000,fork -`
-  {
-    name: /^socat$/,
-    test: (args) => args.some((word) => /TCP[46]?-LISTEN:/.test(word)),
-  },
-  // `php -S 0.0.0.0:8080`
-  {
-    name: /^php[0-9.]*$/,
-    test: (args) => args.includes("-S"),
-  },
-  // `ruby -run -e httpd . -p 8080`
-  {
-    name: /^ruby$/,
-    test: (args) => args.includes("-run") && args.includes("httpd"),
-  },
-];
-
-/** Deny starting kimi service mode or any listed listener from a task (WI#833). */
-function checkListeners(text) {
-  for (const segment of commandSegments(text)) {
-    // A quoted argument that names a command (`sh -c 'kimi server'`) is read as
-    // the words the shell would build.
-    const words = argumentWords(segment)
-      .flatMap((word) => stripShellQuotes(word).split(/[ \t]+/))
-      .filter((word) => word.length > 0);
-    // prefixOnly[i] is true when every word before i is a wrapper, an option
-    // or an assignment, so words[i] sits where a command starts. One pass:
-    // a repeated-word command must not be rescanned from every position.
-    const prefixOnly = [true];
-    for (const word of words) prefixOnly.push(prefixOnly[prefixOnly.length - 1] && isPrefixWord(word));
-    for (let i = 0; i < words.length; i++) {
-      const commandHere = prefixOnly[i] || isCommandOption(words[i - 1]);
-      if (!commandHere) continue;
-      const name = commandBasename(words[i]);
-      const args = words.slice(i + 1);
-      if (name === "kimi") {
-        const subcommand = kimiSubcommand(args);
-        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
-        continue;
-      }
-      if (name === "busybox" && args[0] === "httpd") return "listener started from a task: busybox httpd";
-      const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
-      if (rule && rule.test(args)) return `listener started from a task: ${name}`;
-    }
-  }
-  return null;
-}
-
 /** Deny a decode command piped into a shell or interpreter (WI#826). */
 function checkDecodedPipe(text) {
   for (const list of text.split(/[;\n]|&&|\|\|/)) {
@@ -623,7 +524,7 @@ function evaluate(command) {
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
-  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command);
+  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ?? checkListeners(command);
   if (rawDenial) return rawDenial;
   // bash joins every backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -636,11 +537,124 @@ function evaluate(command) {
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
-      checkRawShapes(joined);
+      checkRawShapes(joined) ??
+      (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
       const denied = checkRm(segment);
       if (denied) return denied;
+    }
+  }
+  return null;
+}
+
+// WI#833: keep listener checks separate from the other raw command rules.
+// This recognizes literal command shapes, not general Bash execution.
+const LISTENER_PREFIXES = new Set([
+  "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
+  "xargs", "time", "{}", "if", "then", "elif", "else", "while", "until", "do", "done", "!", "{", "}", "(", ")",
+]);
+
+/** Read simple command words, keeping quoted values (including empty ones) together. */
+function* listenerSegments(text) {
+  let words = [];
+  let word = "";
+  let started = false;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      const next = text[i + 1];
+      word += quote === '"' && !'\\"$`\n'.includes(next) ? ch : text[++i];
+      started = true;
+    } else if (quote) {
+      if (ch === quote) quote = "";
+      else word += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+    } else if (" \t;|&\n".includes(ch)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+      if (";|&\n".includes(ch) && words.length > 0) {
+        yield words;
+        words = [];
+      }
+    } else {
+      word += ch;
+      started = true;
+    }
+  }
+  if (started) words.push(word);
+  if (words.length > 0) yield words;
+}
+
+function kimiServiceSubcommand(words, start) {
+  let i = start;
+  for (; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "--") {
+      i++;
+      break;
+    }
+    // Kimi's -p and --prompt consume one whole argument. --prompt=value
+    // needs no special case; its value is already part of the option word.
+    if (words[i] === "-p" || words[i] === "--prompt") i++;
+  }
+  const subcommand = words[i];
+  return subcommand === "server" || subcommand === "web" ? subcommand : null;
+}
+
+const LISTENER_COMMANDS = [
+  {
+    name: /^python[0-9.]*$/,
+    test: (args) => {
+      const moduleIndex = args.indexOf("-m");
+      return moduleIndex !== -1 && args[moduleIndex + 1] === "http.server";
+    },
+  },
+  {
+    name: /^(?:nc|ncat|netcat)$/,
+    test: (args) => args.some((word) => /^-[a-zA-Z]*l[a-zA-Z]*$/.test(word) || word === "--listen"),
+  },
+  { name: /^socat$/, test: (args) => args.some((word) => /TCP[46]?-LISTEN:/.test(word)) },
+  { name: /^php[0-9.]*$/, test: (args) => args.includes("-S") },
+  { name: /^ruby$/, test: (args) => args.includes("-run") && args.includes("httpd") },
+];
+
+function listenerShellBody(words, start) {
+  for (let i = start; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "--") break;
+    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(words[i])) return words[i + 1];
+  }
+  return undefined;
+}
+
+/** Deny recognized service commands without treating prompt text as a subcommand. */
+function checkListeners(text, depth = 0) {
+  for (const words of listenerSegments(text)) {
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      const name = commandBasename(word);
+      if (name === "busybox" && words[i + 1] === "httpd") return "listener started from a task: busybox httpd";
+      if (LISTENER_PREFIXES.has(word) || LISTENER_PREFIXES.has(name) ||
+          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(word)) continue;
+
+      if (name === "kimi") {
+        const subcommand = kimiServiceSubcommand(words, i + 1);
+        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
+      } else if (SHELL_NAME.test(name)) {
+        const body = listenerShellBody(words, i + 1);
+        if (body !== undefined) {
+          if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+          const denied = checkListeners(body, depth + 1);
+          if (denied) return denied;
+        }
+      } else {
+        const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+        if (rule?.test(words.slice(i + 1))) return `listener started from a task: ${name}`;
+      }
+      break;
     }
   }
   return null;

@@ -55,8 +55,8 @@ function taskKimiBin(enforceRootOwnership?: boolean): string {
  * Both entries are informational image metadata; the CLI reads neither, so a
  * task cannot change lane behavior through them. The names the lane owns
  * itself (`KIMI_CODE_HOME`, `KIMI_CODE_LLM_HEADERS_TIMEOUT_MS`,
- * `KIMI_CODE_NO_AUTO_UPDATE`) are not on the list: they are assigned after
- * the drop, from operator values.
+ * `KIMI_CODE_NO_AUTO_UPDATE`) are not on the list: lane policy sets or clears
+ * them after merging the environments.
  */
 export const TASK_SETTABLE_KIMI_CODE_ENV: readonly string[] = [
   "KIMI_CODE_VERSION",
@@ -508,6 +508,8 @@ export async function executeTask(
     const kimiHome = kimiCodeHome()
     if (kimiHome) {
       env.KIMI_CODE_HOME = kimiHome
+    } else {
+      delete env.KIMI_CODE_HOME
     }
     // Auto-update and telemetry: forced, not defaulted (WI#833 point 3). The
     // `||` form let a task-supplied "0"/"false" survive, so a task could turn
