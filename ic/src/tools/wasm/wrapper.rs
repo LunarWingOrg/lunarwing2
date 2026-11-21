@@ -5530,6 +5530,70 @@ mod tests {
         assert!(!super::uses_direct_gitlab_config_preload("gitlab", &[]));
     }
 
+    /// WI#817 manual live check: which server does the tool actually ask?
+    ///
+    /// Run against a base dir provisioned by mt-admin (or a stub that copies
+    /// its output):
+    ///
+    /// ```bash
+    /// WI817_LIVE_BASE_DIR=/path/to/state \
+    /// WI817_LIVE_TOKEN=<gotify application token> \
+    ///   cargo test --lib -- tools::wasm::wrapper::tests::wi817_live_gotify_target \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints the resolved server and the HTTP outcome and fails when the
+    /// server is unreachable or rejects the message.
+    #[tokio::test]
+    #[ignore = "manual live check; needs a provisioned base dir and a Gotify token"]
+    async fn wi817_live_gotify_target() {
+        let base_dir = std::env::var("WI817_LIVE_BASE_DIR")
+            .expect("set WI817_LIVE_BASE_DIR to a base dir provisioned by mt-admin"); // safety: manual test only
+        let token =
+            std::env::var("WI817_LIVE_TOKEN").expect("set WI817_LIVE_TOKEN to a Gotify app token"); // safety: manual test only
+        let base_dir = std::path::PathBuf::from(base_dir);
+
+        let content =
+            super::read_host_provisioned_workspace_config(&base_dir, super::GOTIFY_CONFIG_PATH)
+                .expect("config/gotify.json missing under the supplied base dir"); // safety: manual test only
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("config/gotify.json did not parse"); // safety: manual test only
+        let base_url = config
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("config/gotify.json has no url"); // safety: manual test only
+        let title = config
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or("LunarWing");
+        let url = format!("{}/message", base_url.trim_end_matches('/'));
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .unwrap_or_default();
+        println!("WI817 live check: asking {host} at {url} (title {title})");
+
+        let payload = serde_json::json!({
+            "title": title,
+            "message": "reading path check",
+            "priority": 1,
+        });
+
+        let response = reqwest::Client::new()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("X-Gotify-Key", token)
+            .body(payload.to_string())
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .expect("request to the configured Gotify server failed"); // safety: manual test only
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        println!("WI817 live check: {host} answered HTTP {status}: {body}");
+        assert!(status.is_success(), "Gotify rejected the message: {status}");
+    }
+
     #[test]
     fn test_host_provisioned_workspace_config_is_gotify_only() {
         let config_prefix = ["config/".to_string()];
