@@ -987,7 +987,7 @@ fn canonicalize_command_url(raw: &str) -> Result<String> {
              relative and scp-style remotes are refused"
         ))
     })?;
-    validate_virtual_relative_path(relative).map_err(|reason| denied(reason))?;
+    validate_virtual_relative_path(relative).map_err(denied)?;
     Ok(format!("file:///workspace/{relative}"))
 }
 
@@ -1344,6 +1344,25 @@ mod tests {
             .unwrap();
         let grant =
             authorize_grant(&host, &[], &workspace, SandboxNetworkMode::ProxyEnforced).unwrap();
+        // The container sees the virtual /workspace spelling; the host path
+        // is a different spelling and stays refused (checked below).
+        authorize_shell_command(
+            "git clone /workspace/remotes/origin.git clone-two",
+            Some(&grant),
+        )
+        .unwrap();
+        assert!(
+            authorize_shell_command(
+                &format!("git clone {} clone-two", remote.display()),
+                Some(&grant)
+            )
+            .is_err()
+        );
+        run(
+            &workspace,
+            &["clone", "-q", remote.to_str().unwrap(), "clone-two"],
+        );
+        assert!(workspace.join("clone-two/.git").is_dir());
         authorize_shell_command("git push origin main", Some(&grant)).unwrap();
         let heads = Command::new("git")
             .args(["rev-parse", "refs/heads/main"])
