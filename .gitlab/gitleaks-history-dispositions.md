@@ -40,6 +40,11 @@ For a true positive, revocation or rotation must be complete before acceptance.
 | 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `cranelift-entity` 0.123.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `cranelift-entity` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime-wasi/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime-wasi` 36.0.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `wasmtime-wasi` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-20 | `da90adaad4d542c2372f3f3a9486e97c7c2569cb:ic/vendor/wasmtime/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `wasmtime` 36.0.23 (Wasmtime 36.0.23 refresh, WI#798). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. It carries two findings on line 1 but one fingerprint, so it adds one pin. The package digest in it equals the `wasmtime` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `cc` 1.11.3 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `cc` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/serde_with/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `serde_with` 3.25.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `serde_with` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml` 1.2.2+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_edit/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_edit` 0.25.20+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml_edit` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_parser/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_parser` 1.1.6+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml_parser` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 
 No new fingerprints were accepted by the change that introduced this log.
 
@@ -54,6 +59,11 @@ The four rows for commit `da90adaad` were added by WI#798 after the Wasmtime
 refreshing the baseline. Each is a cargo checksum manifest whose package digest
 equals the crate's checksum in `ic/Cargo.lock`; none records a secret value or
 matched content.
+
+The five rows for commit `aacffdd47` were added by WI#799 after the v2.2.2.0
+vendor refresh moved those crates' fixtures without refreshing the baseline.
+Each is a cargo checksum manifest whose package digest equals the crate's
+checksum in `ic/Cargo.lock`; none records a secret value or matched content.
 
 ## Historical baseline triage closure (WI#575)
 

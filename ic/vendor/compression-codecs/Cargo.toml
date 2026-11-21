@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.83"
 name = "compression-codecs"
-version = "0.4.47"
+version = "0.4.48"
 authors = [
     "Wim Looman <wim@nemo157.com>",
     "Allen Bui <fairingrey@gmail.com>",
@@ -89,6 +89,7 @@ zstd = [
     "zstd-safe",
 ]
 zstd-mzstd = ["dep:mzstd"]
+zstd-zrip = ["dep:zrip"]
 zstdmt = [
     "zstd",
     "zstd-safe/zstdmt",
@@ -151,6 +152,16 @@ features = [
     "std",
     "compression",
     "decompression",
+]
+optional = true
+default-features = false
+
+[dependencies.zrip]
+version = "0.8.22"
+features = [
+    "std",
+    "ldm",
+    "simd",
 ]
 optional = true
 default-features = false

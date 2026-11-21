@@ -74,10 +74,10 @@ $ cargo add jiff
 Third, edit `src/main.rs`. Delete what's there and replace it with this:
 
 ```rust
-use jiff::{Unit, Zoned};
+use jiff::{Unit, ZonedDateTime};
 
 fn main() -> Result<(), jiff::Error> {
-    let now = Zoned::now().round(Unit::Second)?;
+    let now = ZonedDateTime::now().round(Unit::Second)?;
     println!("{now}");
     Ok(())
 }
@@ -106,22 +106,6 @@ into your binary.
 The "[crate features](https://docs.rs/jiff/#crate-features)" section of the
 documentation lists the full set of supported features.
 
-### Future plans
-
-My original plan was to release Jiff 1.0 in Summer 2025. It is now November
-2026, so that deadline has clearly slipped. I've continued to make progress
-toward Jiff 1.0, but it has been more work than anticipated. I don't currently
-have a timeline for a Jiff 1.0 release.
-
-It's important to get Jiff 1.0 as "right" as possible. Namely, once it's
-released, I plan to commit to its API indefinitely. At which point, users of
-Jiff should feel comfortable using it as a stable base in public APIs.
-
-Once Jiff 1.0 is released, Jiff 0.2 will continue to get critical bug fix
-updates. There won't be any active feature development, but since so many folks
-are already using Jiff 0.2, it makes sense to offer a transition grace period.
-My plan here is to do it for 1 year after Jiff 1.0 is released.
-
 ### Performance
 
 The most important design goal of Jiff is to be a high level datetime library
@@ -134,14 +118,14 @@ had optimization attention paid to them, but many still have not. It is a goal
 to improve where we can, but performance will generally come second to API
 comprehension and correctness.
 
-The submodules in Jiff, especially `jiff::fmt`, often work as an
-escape hatch for more complicated APIs that provide more control. For
-example, using the `std::fmt::Display` implementation of `Zoned` makes
-it difficult to write the data into a reusable buffer. Conversely,
-[`jiff::fmt::temporal::DateTimePrinter::print_zoned`] provides a way to write a
-`Zoned` into an existing `String` or even a `Vec<u8>`.
+The submodules in Jiff, especially `jiff::fmt`, often work as an escape hatch
+for more complicated APIs that provide more control. For example, using the
+`std::fmt::Display` implementation of `ZonedDateTime` makes it difficult to
+write the data into a reusable buffer. Conversely,
+[`jiff::fmt::temporal::DateTimePrinter::print_zoned_datetime`] provides a way to
+write a `ZonedDateTime` into an existing `String` or even a `Vec<u8>`.
 
-[`jiff::fmt::temporal::DateTimePrinter::print_zoned`]: https://docs.rs/jiff/latest/jiff/fmt/temporal/struct.DateTimePrinter.html#method.print_zoned
+[`jiff::fmt::temporal::DateTimePrinter::print_zoned_datetime`]: https://docs.rs/jiff/latest/jiff/fmt/temporal/struct.DateTimePrinter.html#method.print_zoned_datetime
 
 ### Platform support
 
@@ -196,7 +180,7 @@ of `jiff`.
 
 ### Minimum Rust version policy
 
-This crate's minimum supported `rustc` version (MSRV) is `1.70.0`. Jiff
+This crate's minimum supported `rustc` version (MSRV) is `1.85.0`. Jiff
 itself, and any dependencies of Jiff within this repository, will never use a
 Rust version that requires a Rust compiler released in the previous 1 year.
 (Dependents of Jiff in this repository, e.g., `jiff-icu`, may use a newer MSRV,
@@ -216,6 +200,5 @@ As is standard in the Rust ecosystem, Jiff does not consider an increase in
 its MSRV to be a semver incompatible change. However, Jiff will limit MSRV
 increases to minor version updates. For example, if Jiff `1.0` requires Rust
 `1.20.0`, then Jiff `1.0.z` for all values of `z` will also require Rust
-`1.20.0` or older. However, Jiff `1.y` for `y > 0` may require a newer minimum
-version of Rust. (During Jiff's pre-1.0 releases, MSRV bumps will only occur
-in semver incompatible releases.)
+`1.20.0` or newer. However, Jiff `1.y` for `y > 0` may require a newer minimum
+version of Rust.
