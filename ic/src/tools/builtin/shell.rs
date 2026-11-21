@@ -575,6 +575,7 @@ fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
         "execution_failed" => "command failed inside the sandbox container",
         "credential_injection_failed" => "sandbox proxy credential injection failed",
         "mount_path_denied" => "sandbox refused the requested working directory",
+        "capability_denied" => "sandbox capability policy denied the request",
         _ => "sandboxed execution failed",
     };
     let mut message = format!(
@@ -976,7 +977,9 @@ impl Tool for ShellTool {
          if /tenant-logs exists there, it holds the daemon's own log (secret-scrubbed, \
          read-only): daemon.log, previous rotation daemon.log.1. \
          Output is bounded; truncated=true and a warning mean the captured data is incomplete, \
-         even if success=true. Use files or smaller chunks for large payloads."
+         even if success=true. Use files or smaller chunks for large payloads. \
+         Git network access (clone/fetch/pull/push) in a capability_manifest call needs the \
+         git-remotes grant from host policy; force pushes and remote ref deletion are refused."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
