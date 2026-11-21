@@ -14,8 +14,9 @@ Assertions (opencode2 lane):
   2. config/opencode2.json pins "update": "disable".
   3. config/opencode2.json carries the shell deny rules for the
      self-exposure subcommands (control 2, config layer), and sets neither
-     experimental.console_watches nor experimental.all_flags (WI#609, !2398
-     AAV-1: the Console event watches stay off).
+     experimental.all_flags nor any of the three pinned-off flags —
+     console_watches, mcp_events, artifacts (WI#609, !2398 AAV-1; WI#785
+     AGN-2: every pinned surface stays off).
   4. entrypoint.sh starts the server with a password and a loopback default
      hostname, never invokes service mode, never passes --service, defaults
      OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
@@ -25,10 +26,10 @@ Assertions (opencode2 lane):
      service/pair subcommands, the --service flag, every --hostname
      occurrence, and `auth login` with an http(s) target (the well-known
      remote-config registration, WI#750) (control 2, wrapper layer). It also forces
-     OPENCODE_FLAGS=-console_watches right before it execs the real binary
-     (WI#609, !2398 AAV-1): those two statements must be the last two code
-     lines, and no other code line may launch the binary or touch the
-     variable.
+     OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts right before it
+     execs the real binary (WI#609, !2398 AAV-1; WI#785 AGN-2): those two
+     statements must be the last two code lines, and no other code line may
+     launch the binary or touch the variable.
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
@@ -386,10 +387,11 @@ def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
         key for key in FORBIDDEN_EXPERIMENTAL_FLAGS if experimental.get(key, False) is not False
     ]
     if opted_in:
-        fail(f"{config_path} must not set experimental flags {opted_in} — the Console "
-             "event watches are a remote instruction channel and stay off (WI#609 AAV-1)")
+        fail(f"{config_path} must not set experimental flags {opted_in} — every pinned-off "
+             "flag stays off, whether it opens a remote instruction channel or publishes "
+             "outbound (WI#609 AAV-1, WI#785 AGN-2)")
     else:
-        check("opencode2.json leaves the Console event watches flag off")
+        check("opencode2.json leaves every pinned-off flag off")
 
 
 def serve_invocation_lines(code: str) -> list[str]:
@@ -582,8 +584,8 @@ def check_wrapper(lane: pathlib.Path) -> None:
         problems.append("the line before the pin ends in a shell operator that continues into it")
     if problems:
         fail(f"{wrapper} must end with exactly {WRAPPER_FLAG_PIN!r} then {WRAPPER_EXEC!r} and "
-             f"launch the real binary nowhere else: {problems} — the Console event watches "
-             "stay off (WI#609 AAV-1)")
+             f"launch the real binary nowhere else: {problems} — all three pinned flags "
+             "stay off (WI#609 AAV-1, WI#785 AGN-2)")
         return
     digest = hashlib.sha256("\n".join(code).encode()).hexdigest()
     if digest != WRAPPER_CODE_DIGEST:
