@@ -357,7 +357,9 @@ test("root path spellings are resolved before the recursive-change rule", () => 
   assertBlocked("chmod -R 777 //etc", "recursive")
   assertBlocked("chmod -R 777 /etc/../etc", "recursive")
   assertBlocked('chmod -R 777 "/./etc"', "recursive")
+  assertBlocked("chmod -vR 755 /etc", "recursive")
   assertAllowed("chmod -R 755 ./build")
+  assertAllowed("chmod -R 777 /app/build")
   assertAllowed("chown -R user:user ./workspace")
 })
 
@@ -388,6 +390,7 @@ test("decoded payloads piped into a shell or interpreter are denied", () => {
   assertBlocked(`echo ${payload} | rev | sh`, "decoded")
   assertBlocked(`printf 'x' | xxd -r -p | bash`, "decoded")
   assertBlocked(`echo ${payload} | base64 --decode | /bin/sh`, "decoded")
+  assertBlocked(`echo ${payload} | base64 -d | /usr/bin/env bash`, "decoded")
   assertBlocked(`echo ${payload} | base64 -d | python3 -`, "decoded")
   // A decode to a file, or into a module that reads its input as data, stays
   // ordinary work.
@@ -406,7 +409,10 @@ test("git commands that discard workspace changes are denied", () => {
   assertBlocked("git checkout -- .", "git command")
   assertBlocked("git stash -u", "git command")
   assertBlocked("git stash --include-untracked", "git command")
+  assertBlocked("git -C /tmp/repo clean -fd", "git command")
   assertAllowed("git status && git diff --stat")
+  assertAllowed("git commit -m 'clean -fd'")
+  assertAllowed("git reset --soft HEAD~1")
   assertAllowed("git clean -n")
   assertAllowed("git clean --dry-run")
   assertAllowed("git stash")

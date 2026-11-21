@@ -312,12 +312,132 @@ function checkDeviceWrites(text) {
   return null;
 }
 
-/** Deletion and device checks that need the command text with its quoting intact. */
+/** Deletion, decode and device checks that need the command text with its quoting intact. */
 function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
     checkInterpreterDeletion(text) ??
-    checkDeviceWrites(text);
+    checkDeviceWrites(text) ??
+    checkDecodedPipe(text);
+}
+
+const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
+const GIT_CALL = /\bgit\b/g;
+const ROOT_CHANGE_CALL = /\bch(?:mod|own|grp)\b/g;
+const STAGE_PREFIXES = ["sudo", "env", "exec", "busybox"];
+const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
+
+/** True for the filesystem root or a path at or under a listed system root. */
+function isSystemRootPath(candidate) {
+  if (!candidate.startsWith("/")) return false;
+  const path = normalizePath(candidate);
+  if (path === "/") return true;
+  return SYSTEM_ROOTS.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+/**
+ * Deny a recursive mode/ownership change on a system root, however the root is
+ * spelled. A linear scan, not a regex: the regex form rescanned the rest of
+ * the command from every `chmod` and took ten seconds on 12 KB of them.
+ */
+function checkRecursiveRootChange(segment) {
+  for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
+    const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
+    if (!/(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?=[ \t]|$)/.test(rest)) continue;
+    for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
+      if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
+    }
+  }
+  return false;
+}
+
+/** The git verb after any leading options, and the argument text after it. */
+function gitVerb(rest) {
+  let i = 0;
+  while (i < rest.length) {
+    while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+    const start = i;
+    while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+    const word = rest.slice(start, i);
+    if (word.length === 0) break;
+    if (!word.startsWith("-")) return { verb: word, after: rest.slice(i) };
+    if (word === "-C" || word === "-c") {
+      // These options take a value, which is not the verb.
+      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+    }
+  }
+  return { verb: "", after: "" };
+}
+
+/**
+ * Deny git commands that irrecoverably discard uncommitted work (WI#826):
+ * forced `clean`, `reset --hard`, a whole-tree checkout and `stash -u`.
+ * Linear scan over the git invocations; dry runs and `git status` pass.
+ */
+function checkGitDiscard(segment) {
+  for (const match of segment.matchAll(GIT_CALL)) {
+    const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
+    if (verb === "clean" && /(?:^|[ \t])-[a-zA-Z]*[fdxX]|(?:^|[ \t])--force(?=[ \t]|$)/.test(after)) {
+      return true;
+    }
+    if (verb === "reset" && /(?:^|[ \t])--hard(?=[ \t]|$)/.test(after)) return true;
+    if (verb === "checkout" && /(?:^|[ \t])\.(?=[ \t]*$)/.test(after)) return true;
+    if (verb === "stash" &&
+        /(?:^|[ \t])-[a-zA-Z]*u[a-zA-Z]*(?=[ \t]|$)|(?:^|[ \t])--include-untracked(?=[ \t]|$)/.test(after)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The command word of a pipeline stage, after env/exec/busybox prefixes. */
+function commandBasename(word) {
+  return stripShellQuotes(word).replace(/^[({]+/, "").replace(/[)}]+$/, "").split("/").pop() ?? "";
+}
+
+function stageCommand(stage) {
+  const words = argumentWords(stage).map(stripShellQuotes);
+  let i = 0;
+  while (i < words.length) {
+    const isPrefix = STAGE_PREFIXES.includes(commandBasename(words[i])) || /^[A-Za-z_]\w*=/.test(words[i]);
+    if (!isPrefix) break;
+    i++;
+  }
+  return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1) };
+}
+
+function isDecodeStage(stage) {
+  const { name, args } = stageCommand(stage);
+  if (name === "base64") return args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "--decode");
+  if (name === "xxd") return args.some((word) => /^-[a-zA-Z]*r[a-zA-Z]*$/.test(word) || word === "--revert");
+  return name === "rev" || name === "tr";
+}
+
+/** True when the stage executes its stdin: a shell, or an interpreter one-liner. */
+function isInterpreterStage(stage) {
+  const { name, args } = stageCommand(stage);
+  if (SHELL_NAME.test(name)) return true;
+  if (name === "python" || name === "python3") return args.length === 0 || args.includes("-c") || args.includes("-");
+  if (name === "perl") return args.some((word) => /^-[a-zA-Z]*[eE]/.test(word));
+  if (name === "ruby") return args.some((word) => /^-[a-zA-Z]*e/.test(word));
+  if (name === "node") {
+    return args.some((word) => ["-e", "--eval", "-p", "--print", "-"].includes(word));
+  }
+  return false;
+}
+
+/** Deny a decode command piped into a shell or interpreter (WI#826). */
+function checkDecodedPipe(text) {
+  for (const list of text.split(/[;\n]|&&|\|\|/)) {
+    const stages = list.split("|");
+    for (let i = 1; i < stages.length; i++) {
+      if (isInterpreterStage(stages[i]) && isDecodeStage(stages[i - 1])) {
+        return "decoded content piped into a shell or interpreter";
+      }
+    }
+  }
+  return null;
 }
 
 const DENY_RULES = [
@@ -345,29 +465,18 @@ const DENY_RULES = [
       /\b(curl|wget|fetch|nc|ncat|netcat)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*(?:ba|z|da|a|k)?sh\b|\b(curl|wget)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*python3?\b/,
   },
   {
-    name: "decoded content piped into a shell or interpreter",
-    // A decode command on the left of a pipe runs attacker-chosen text just as
-    // a fetched script does (WI#826); the interpreter alternation mirrors the
-    // pipe rule above. `python3 -m <module>` reads its input as data and stays
-    // ordinary, and `rev`/`tr` must be a whole word so `rev-list` does not match.
-    pattern:
-      /(?:^|[\s;&|()])(?:base64\b[^|]*?\s(?:-[a-zA-Z]*d[a-zA-Z]*|--decode)\b|xxd\b[^|]*?\s(?:-[a-zA-Z]*r[a-zA-Z]*|--revert)\b|(?:rev|tr)(?=[\s|]))[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*(?:(?:ba|z|da|a|k)?sh\b|python3?\s+(?:-c\b|-(?=\s|$))|perl\s+(?:-e|-E)\b|ruby\s+-e\b|node\s+(?:-e|--eval)\b)/,
-  },
-  {
     name: "git command that discards workspace changes",
     // Irrecoverable discards of uncommitted work in the task workspace
     // (WI#826): forced `git clean`, `git reset --hard`, a whole-tree checkout,
     // and `git stash -u`. Dry runs (`clean -n`), `git stash` without `-u` and
     // `git status` stay ordinary work.
-    pattern:
-      /\bgit\b[^;&|]*\bclean\b[^;&|]*\s(?:-[a-zA-Z]*[fdxX]|--force)\b|\bgit\b[^;&|]*\breset\b[^;&|]*--hard\b|\bgit\b[^;&|]*\bcheckout\b[^;&|]*\s--?\s*\.(?:\s|$)|\bgit\b[^;&|]*\bcheckout\b[^;&|]*\s\.(?:\s|$)|\bgit\b[^;&|]*\bstash\b[^;&|]*\s(?:-[a-zA-Z]*u[a-zA-Z]*|--include-untracked)\b/,
+    check: checkGitDiscard,
   },
   {
     name: "recursive mode/ownership change on system roots",
-    // The system-root alternation is optional so the bare filesystem root (/)
-    // is covered too; a named directory still matches with or without a trailing slash.
-    pattern:
-      /\bch(mod|own|grp)\b[^;&|]*(-R|--recursive)[^;&|]*\s+\/(?:(?:etc|usr|var|home|root|boot|bin|sbin|lib|lib64|opt|srv)?(?:\/|\s|$))/,
+    // The bare filesystem root and every listed root count, with the root
+    // spelled however bash passes it (WI#826).
+    check: checkRecursiveRootChange,
   },
   {
     name: "direct block-device write",
@@ -384,7 +493,8 @@ const DENY_RULES = [
 
 function checkDenyRules(segment) {
   for (const rule of DENY_RULES) {
-    if (rule.pattern.test(segment)) return rule.name;
+    const hit = rule.check ? rule.check(segment) : rule.pattern.test(segment);
+    if (hit) return rule.name;
   }
   return null;
 }
