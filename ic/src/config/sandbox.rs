@@ -54,6 +54,9 @@ pub struct SandboxModeConfig {
     pub tenant_logs: crate::sandbox::TenantLogsMode,
     /// Env-only tunnel sidecar settings, validated when `network = tunnel`.
     pub tunnel: SandboxTunnelModeConfig,
+    /// Per-tenant git remote grant (WI#816): `SANDBOX_GIT_REMOTES` as
+    /// `name=url[,name=url...]`. `None` keeps git network access denied.
+    pub git: Option<crate::sandbox::GitGrantConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -189,6 +192,7 @@ impl Default for SandboxModeConfig {
             orphan_threshold_secs: 600,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         }
     }
 }
@@ -227,6 +231,15 @@ impl SandboxModeConfig {
         }
 
         let network = parse_string_env("SANDBOX_NETWORK", ss.network.clone())?;
+        let git = match optional_env("SANDBOX_GIT_REMOTES")? {
+            Some(spec) => crate::sandbox::GitGrantConfig::from_spec(&spec).map_err(|message| {
+                ConfigError::InvalidValue {
+                    key: "SANDBOX_GIT_REMOTES".to_string(),
+                    message,
+                }
+            })?,
+            None => None,
+        };
         let tunnel = SandboxTunnelModeConfig::resolve_env()?;
         if network.parse::<crate::sandbox::SandboxNetworkMode>()
             == Ok(crate::sandbox::SandboxNetworkMode::Tunnel)
@@ -263,6 +276,7 @@ impl SandboxModeConfig {
                 crate::sandbox::TenantLogsMode::Info,
             )?,
             tunnel,
+            git,
         })
     }
 
@@ -335,6 +349,7 @@ impl SandboxModeConfig {
             tunnel,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: self.tenant_logs,
+            git: self.git.clone(),
         }
     }
 }
@@ -1032,6 +1047,7 @@ mod tests {
             allow_full_access: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
@@ -1065,6 +1081,7 @@ mod tests {
             enforce: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Off,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);

@@ -718,20 +718,16 @@ impl ShellTool {
         workdir: &Path,
         timeout: Duration,
         manifest: Option<&crate::sandbox::CapabilityManifest>,
+        git_env: &HashMap<String, String>,
     ) -> Result<ShellCommandOutput, ToolError> {
         let execute = async {
             if let Some(manifest) = manifest {
                 sandbox
-                    .execute_with_manifest(cmd, workdir, manifest, std::collections::HashMap::new())
+                    .execute_with_manifest(cmd, workdir, manifest, git_env.clone())
                     .await
             } else {
                 sandbox
-                    .execute_with_policy(
-                        cmd,
-                        workdir,
-                        self.sandbox_policy,
-                        std::collections::HashMap::new(),
-                    )
+                    .execute_with_policy(cmd, workdir, self.sandbox_policy, git_env.clone())
                     .await
             }
         };
@@ -914,13 +910,23 @@ impl ShellTool {
             .or_else(|| self.working_dir.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        // Determine timeout
+        // Determine timeout. A declared manifest also authorizes the git
+        // grant here, before any runtime, proxy or credential work: a remote
+        // outside host policy, a force push, a remote ref deletion, or any
+        // git network operation without a grant is refused with
+        // `capability_denied` (WI#816).
         let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
+        let mut git_env = HashMap::new();
         let timeout_duration = match (&self.sandbox, &capability_manifest) {
             (Some(sandbox), Some(manifest)) => {
                 let decision = sandbox
                     .authorize_manifest(manifest, &cwd)
                     .map_err(|error| sandbox_error_envelope(&error))?;
+                crate::sandbox::git_grant::authorize_shell_command(cmd, decision.git.as_ref())
+                    .map_err(|error| sandbox_error_envelope(&error))?;
+                if let Some(git) = decision.git.as_ref() {
+                    git_env.extend(git.container_env());
+                }
                 timeout_duration.min(Duration::from_secs(
                     decision.evidence.resources.timeout_seconds,
                 ))
@@ -940,6 +946,7 @@ impl ShellTool {
                     &cwd,
                     timeout_duration,
                     capability_manifest.as_ref(),
+                    &git_env,
                 )
                 .await;
         }

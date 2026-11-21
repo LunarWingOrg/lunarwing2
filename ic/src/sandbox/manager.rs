@@ -354,6 +354,7 @@ impl SandboxManager {
             network,
             limits,
             evidence,
+            git: _,
         } = decision;
         let audit_json = crate::sandbox::audit_json(&evidence)?;
         let declared = evidence.origin == crate::sandbox::capability::CapabilityOrigin::Declared;
