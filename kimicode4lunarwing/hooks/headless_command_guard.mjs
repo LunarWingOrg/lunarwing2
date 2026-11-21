@@ -458,12 +458,58 @@ function deletionCallOffsets(code, aliases) {
   return offsets;
 }
 
-/** The Perl one-liner call offsets and the bareword forms (no parentheses). */
-function perlDeletionVerdict(code) {
+/**
+ * Strip one layer of shell quoting that wraps the whole one-liner body, so the
+ * interpreter's own string literals are the only quotes the readers see:
+ * `'print "unlink"'` becomes `print "unlink"` (WI#832).
+ */
+function stripOuterShellQuotes(code) {
+  const text = code.trim();
+  if (text.length < 2) return text;
+  const quote = text[0];
+  if (quote !== "'" && quote !== '"') return text;
+  let end = -1;
+  for (let i = 1; i < text.length; i++) {
+    if (quote === '"' && text[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (text[i] === quote) end = i;
+  }
+  return end === text.length - 1 ? text.slice(1, -1) : text;
+}
+
+/** True when `index` in the code sits inside a single- or double-quoted string. */
+function insideQuotedString(code, index) {
+  let quote = "";
+  for (let i = 0; i < index; i++) {
+    const ch = code[i];
+    if (ch === "\\" && quote !== "'") {
+      i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+    }
+  }
+  return quote !== "";
+}
+
+/**
+ * The Perl parenthesis-free deletion verdict: `rmtree "dir"`, `unlink glob
+ * "dir/*"`, and a variable operand the guard cannot resolve (WI#832). A call
+ * name inside a string literal (`print "unlink"`) is text, not a call.
+ */
+function perlDeletionVerdict(rawCode) {
+  const code = stripOuterShellQuotes(rawCode);
   for (const match of code.matchAll(PERL_BAREWORD_DELETE)) {
+    if (insideQuotedString(code, match.index)) continue;
     if (!isSafeTempPath(match[2])) return outsideTempReason("interpreter deletion", [match[2]]);
   }
-  if (PERL_BAREWORD_VARIABLE.test(code)) {
+  for (const match of code.matchAll(PERL_BAREWORD_VARIABLE)) {
+    if (insideQuotedString(code, match.index)) continue;
     return "interpreter deletion whose target the guard cannot verify";
   }
   return null;
@@ -669,10 +715,46 @@ function isInterpreterStage(stage) {
   return false;
 }
 
-/** Deny a decode command piped into a shell or interpreter (WI#826). */
+/**
+ * Split text on a one-character separator, ignoring separators inside quotes
+ * and after a backslash, so a quoted interpreter body (`-c 'a;b'`) stays one
+ * word for the pipeline rules (WI#832).
+ */
+function splitOutsideQuotes(text, separator) {
+  const pieces = [];
+  let piece = "";
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      piece += ch + text[++i];
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === separator) {
+      pieces.push(piece);
+      piece = "";
+      continue;
+    }
+    piece += ch;
+  }
+  pieces.push(piece);
+  return pieces;
+}
+
+/** The `;`, LF, `&&` and `||` lists of the text, read outside quotes. */
+function commandLists(text) {
+  return splitOutsideQuotes(text, ";").flatMap((piece) => splitOutsideQuotes(piece, "\n"))
+    .flatMap((piece) => piece.split(/&&|\|\|/));
+}
+
+/** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
 function checkDecodedPipe(text) {
-  for (const list of text.split(/[;\n]|&&|\|\|/)) {
-    const stages = list.split("|");
+  for (const list of commandLists(text)) {
+    const stages = splitOutsideQuotes(list, "|");
     for (let i = 1; i < stages.length; i++) {
       if (isInterpreterStage(stages[i]) && isDecodeStage(stages[i - 1])) {
         return "decoded content piped into a shell or interpreter";

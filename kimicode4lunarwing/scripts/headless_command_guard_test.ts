@@ -733,6 +733,9 @@ test("interpreter one-liners delete without parentheses or through a binding", (
   assertAllowed(`python3 -c "from shutil import rmtree as r; r('/tmp/wi832-x')"`)
   assertAllowed(`python3 -c "import shutil; getattr(shutil, 'rmtree')('/tmp/wi832-x')"`)
   assertAllowed(`python3 -c "import shutil as s; s.rmtree('/tmp/wi832-x')"`)
+  // A deletion name inside a string literal is text, not a call.
+  assertAllowed(`perl -e 'print "unlink", "/home/kimi/x"'`)
+  assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
 })
 
 test("find and rsync delete through the same temp-root test", () => {
