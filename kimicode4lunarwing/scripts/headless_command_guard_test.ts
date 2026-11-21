@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -105,6 +106,56 @@ test("recursive rm inside temp roots is allowed, outside is denied", () => {
   assertBlocked("rm -rf /tmp/*.log", "rm")
   // non-recursive rm is allowed anywhere (no -r/-f)
   assertAllowed("rm stale-lockfile")
+})
+
+const RM_SAFE_TEMP_ROOTS = ["/tmp", "/temp", "/var/tmp"]
+
+function isUnderSafeTempRoot(path: string) {
+  return RM_SAFE_TEMP_ROOTS.some((root) => path === root || path.startsWith(`${root}/`))
+}
+
+test("a symlink under a temp root cannot carry rm outside the safe roots", (t) => {
+  // WI#812: containment was a prefix test on the operand as typed, so
+  // `ln -s /app/hooks /tmp/gt/hooks` followed by `rm -rf /tmp/gt/hooks/sub`
+  // was allowed and bash deleted inside /app/hooks.
+  const target = mkdtempSync(join(process.cwd(), "wi812-target-"))
+  const linkRoot = mkdtempSync("/tmp/wi812-link-")
+  try {
+    const resolvedTarget = realpathSync(target)
+    if (isUnderSafeTempRoot(resolvedTarget)) {
+      t.skip(`scratch target ${resolvedTarget} is inside a temp root`)
+      return
+    }
+    mkdirSync(join(target, "sub"))
+    const link = join(linkRoot, "hooks")
+    symlinkSync(resolvedTarget, link, "dir")
+    assertBlocked(`rm -rf ${link}/sub`, "recursive/forced rm outside")
+    assertBlocked(`rm -rf ${link}/sub/`, "recursive/forced rm outside")
+    assertBlocked(`rm -rf ${link}`, "recursive/forced rm outside")
+    // A symlink that resolves back inside the safe root is still containment.
+    mkdirSync(join(linkRoot, "real"))
+    const innerLink = join(linkRoot, "inner")
+    symlinkSync(join(linkRoot, "real"), innerLink, "dir")
+    assertAllowed(`rm -rf ${innerLink}/x`)
+    // A name rm creates rather than traverses has no symlink to follow.
+    assertAllowed(`rm -rf ${linkRoot}/not-yet-there/sub`)
+    assert.ok(existsSync(join(target, "sub")), "guard must not run the rm")
+  } finally {
+    rmSync(linkRoot, { recursive: true, force: true })
+    rmSync(target, { recursive: true, force: true })
+  }
+})
+
+test("words the shell would rewrite are denied rather than resolved literally", () => {
+  // The hook runs before the shell expands the command, so it must refuse the
+  // expansion rather than resolve the token it sees (WI#812 review).
+  assertBlocked("rm -rf {/tmp/x,/home/kumo}", "recursive/forced rm outside")
+  assertBlocked("rm -rf /tmp/x{,/../../home/kumo}", "recursive/forced rm outside")
+  assertBlocked("rm -rf /tmp/$DIR", "recursive/forced rm outside")
+  assertBlocked("rm -rf /tmp/'gt'/sub", "recursive/forced rm outside")
+  assertBlocked("rm -rf ~/project", "recursive/forced rm outside")
+  assertBlocked("rm -rf $HOME/project", "recursive/forced rm outside")
+  assertAllowed("rm -rf /tmp/wi812-scratch")
 })
 
 test("dangerous segment inside a compound command is denied", () => {
