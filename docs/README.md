@@ -15,7 +15,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
 * Updated on October 1st, 2026 for the v2.1.4.0 pre-release pass: indexed the new tenant system-prompts guide (WI#220); release index now points at v2.1.3.0 as latest.*
 * Updated on October 5th, 2026 for the v2.1.5.0 pre-release pass: release index now points at v2.1.4.0 as latest; new v2.1.5.0 ops docs (cargo-deny audit, open work-item status) indexed under [`ops/README.md`](ops/README.md).*
-* Updated on November 20th, 2026 for WI#794: [`plans/REORG.md`](plans/REORG.md) is now the active plan index; delivered and dated plans moved to [`plans/history/`](plans/history/README.md) with status banners, and inbound plan links updated.*
+* Updated on November 20th, 2026 for WI#794: [`plans/README.md`](plans/README.md) is now the active plan index; delivered and dated plans moved to [`plans/history/`](plans/history/README.md) with status banners, and inbound plan links updated.*
 
 ## Companion applications
 
@@ -149,12 +149,12 @@ Architecture and code reviews.
 ### [`plans/`](plans/)
 
 Implementation plans with remaining work; completed and superseded records are
-archived separately. See **[the plan index](plans/REORG.md)** for purposes,
+archived separately. See **[the plan index](plans/README.md)** for purposes,
 verified status and current authorities.
 
 | File | Description |
 |------|-------------|
-| [`plans/REORG.md`](plans/REORG.md) | Active plan index and classification/archival rules (WI#794) |
+| [`plans/README.md`](plans/README.md) | Active plan index and classification/archival rules (WI#794) |
 | [`ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md`](plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md) | Engine V2 XMPP/DarkIRC/WeeChat parity backlog; CHPAR-012 live DarkIRC/XMPP validation and teardown remain unrecorded since 2026-07-19 |
 | [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](plans/WI191_PERFORMANCE_EMA_INTEGRATION.md) | Shipped tool-runtime EMA slice plus later estimation design; #318 owns remaining rollout and measurement phases |
 | [`plans/history/README.md`](plans/history/README.md) | Implemented plans and dated status snapshots, with completion caveats and current references |
