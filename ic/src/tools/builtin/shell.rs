@@ -719,16 +719,15 @@ impl ShellTool {
         workdir: &Path,
         timeout: Duration,
         manifest: Option<&crate::sandbox::CapabilityManifest>,
-        git_env: &HashMap<String, String>,
     ) -> Result<ShellCommandOutput, ToolError> {
         let execute = async {
             if let Some(manifest) = manifest {
                 sandbox
-                    .execute_with_manifest(cmd, workdir, manifest, git_env.clone())
+                    .execute_with_manifest(cmd, workdir, manifest, HashMap::new())
                     .await
             } else {
                 sandbox
-                    .execute_with_policy(cmd, workdir, self.sandbox_policy, git_env.clone())
+                    .execute_with_policy(cmd, workdir, self.sandbox_policy, HashMap::new())
                     .await
             }
         };
@@ -911,23 +910,14 @@ impl ShellTool {
             .or_else(|| self.working_dir.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        // Determine timeout. A declared manifest also authorizes the git
-        // grant here, before any runtime, proxy or credential work: a remote
-        // outside host policy, a force push, a remote ref deletion, or any
-        // git network operation without a grant is refused with
-        // `capability_denied` (WI#816).
+        // Cap the outer timeout to the manifest's effective limit. The
+        // manager performs Git preflight before preparing the runtime.
         let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
-        let mut git_env = HashMap::new();
         let timeout_duration = match (&self.sandbox, &capability_manifest) {
             (Some(sandbox), Some(manifest)) => {
                 let decision = sandbox
                     .authorize_manifest(manifest, &cwd)
                     .map_err(|error| sandbox_error_envelope(&error))?;
-                crate::sandbox::git_grant::authorize_shell_command(cmd, decision.git.as_ref())
-                    .map_err(|error| sandbox_error_envelope(&error))?;
-                if let Some(git) = decision.git.as_ref() {
-                    git_env.extend(git.container_env());
-                }
                 timeout_duration.min(Duration::from_secs(
                     decision.evidence.resources.timeout_seconds,
                 ))
@@ -947,7 +937,6 @@ impl ShellTool {
                     &cwd,
                     timeout_duration,
                     capability_manifest.as_ref(),
-                    &git_env,
                 )
                 .await;
         }
@@ -978,8 +967,9 @@ impl Tool for ShellTool {
          read-only): daemon.log, previous rotation daemon.log.1. \
          Output is bounded; truncated=true and a warning mean the captured data is incomplete, \
          even if success=true. Use files or smaller chunks for large payloads. \
-         Git network access (clone/fetch/pull/push) in a capability_manifest call needs the \
-         git-remotes grant from host policy; force pushes and remote ref deletion are refused."
+          For manifest-backed Git reads over HTTP(S), request the host's git-remotes grant. \
+          It narrows proxy hosts and supplies no credentials; Git push is not supported by \
+          manifest preflight. Use network disabled for ordinary local Git reads without a grant."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

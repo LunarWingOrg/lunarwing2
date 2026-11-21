@@ -22,8 +22,8 @@ remain separate:
   token-scoped credential grants, MCP grants, mounts, and job iteration limits.
   This WI does not wire those containers to the shell manifest. External worker
   lanes remain governed by mt-admin's per-tenant container configuration and
-  egress allowlists, not by this envelope. Do not infer that a shell manifest
-  grants access to tools such as git or to a worker's credential grants.
+  egress allowlists, not by this envelope. The generic shell's Git extension
+  does not grant access to a worker's credentials.
 - **FullAccess/local execution** remains a separately opted-in legacy path.
   A supplied manifest refuses disabled or absent sandbox configuration rather
   than executing on the host. A request cannot select FullAccess.
@@ -114,38 +114,48 @@ size is bounded at 16 KiB.
 }
 ```
 
-`extensions: ["git-remotes"]` asks for the host's per-tenant git grant. The host
-grants it with `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`:
+`extensions: ["git-remotes"]` requests a credential-free Git read grant. The
+tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
+`git.remotes` can select a subset by name but cannot add a remote.
 
-- `https://host/path` and `http://host/path` remotes need `proxy-enforced` or
-  the legacy advisory `proxy`; they fail closed under `none` and `tunnel`
-  because the grant cannot prove the remote is reachable only through the
-  allowlist. The host must also allow the remote's host in the sandbox egress
-  allowlist (`SANDBOX_EXTRA_DOMAINS`); the grant never adds a domain.
-- `file:///workspace/...` remotes are virtual paths into the call's own
-  workspace. They must canonicalize inside that workspace and work in every
-  egress mode.
-- URLs must not embed credentials or a userinfo component; such configuration
-  is a load error.
+- HTTP(S) remotes require `proxy-enforced`; `none`, `tunnel`, and advisory
+  `proxy` do not carry them. All proxy traffic for that call is restricted to
+  the exact selected hosts. Each must already match the tenant sandbox egress
+  allowlist (`SANDBOX_EXTRA_DOMAINS` plus defaults); the grant adds no domain.
+- `file:///workspace/...` paths must initially resolve inside the call's
+  workspace. They work in `none`, `proxy-enforced`, and `tunnel`. A file-only
+  grant in `proxy-enforced` has no upstream hosts. A file-only grant in
+  `tunnel` does not change the existing tunnel's policy.
+- Configured URLs must not contain userinfo, a query, or a fragment. Invalid
+  configuration is reported without printing the supplied value.
 
-Without the extension, git network operations inside a manifest-backed call are
-refused with `capability_denied` before a runtime, proxy or credential is
-started. `git.remotes` narrows the host list and can never add a remote; an
-unknown name is a denial. Inside the call, a granted remote is used by alias
-(`git push origin main`) or by its exact URL. Relative and scp-style remotes are
-refused. `git push --force`, `--force-with-lease`, `-f`, `--mirror`, `--delete`,
-`--prune`, a leading `+` refspec, and a leading `:` (ref deletion) refspec are
-denied, so a force push and a remote ref deletion are both refused.
+The manifest preflight checks recognizable Git commands before starting a
+runtime. Use a literal granted URL for cloning and name an explicit granted
+remote for fetch or pull with networking enabled. Unsupported read options
+are denied instead of guessing which argument is the remote. With network
+disabled, ordinary local reads such as `git clone . copy`, `git fetch` and
+`git pull` can run without a grant. Operations that write to the local
+workspace still need a writable mount. Calls that omit the manifest retain
+legacy behavior and do not use this preflight or the scoped proxy.
 
-The container holds no credential. It receives the granted remote URLs as
-`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
-`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Private repositories
-that need a credential are out of scope: use the host-side `ssh_git` tool,
-which keeps keys in the harness agent and never enters the shell container.
+The shell scan is not a security boundary: Git configuration and scripts can
+change what actually runs, and HTTPS CONNECT does not expose repository paths
+or Git operations to the proxy. Manifest preflight rejects recognized `git
+push` invocations, not just force or delete flags, because even a plain push
+can use repository-local settings. This is not a repository write filter for
+arbitrary shell processes. Use server-side permissions and branch protection
+to enforce repository write policy.
+
+The grant supplies no credential. The container receives the granted remote
+URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Host-held
+authentication and push support inside the shell remain open under WI#816.
+The separate host-side `ssh_git` tool is unchanged.
 
 `capability_evidence.git` records the grant identifier, supported egress modes,
-and per-remote name, transport, host and read/write operation classes. It never
-records a credential, token, key, URL userinfo, or helper command.
+and per-remote name, transport, host and the `read` operation class. It reports
+the grant, not the operation a process actually performed. It never records a
+credential, token, key, URL userinfo, or helper command.
 
 ## Compatibility and retries
 
@@ -161,7 +171,7 @@ image lookup, proxy/tunnel startup, mounts, secret work, or a runtime launch.
 It is validated again on each internal retry or shell resume/retry call,
 including host working-directory canonicalization; no previous grant is
 reused. Policy denials map to `[sandbox:capability_denied]` and are never
-a transient runtime failure. A reduced network decision neither starts nor
+a transient runtime failure. A network-disabled decision neither starts nor
 stops the host's proxy or tunnel: its container gets `--network none` and
 attaches neither, so the shared transports stay up for the other calls.
 
@@ -179,8 +189,9 @@ Successful manifest-backed shell results include `capability_evidence`. This
 typed data is safe to persist in job metadata or an audit snapshot: canonical
 host source, virtual destination, writable flag, network/provider/DNS mode,
 `enforced` / `advisory` / `not-requested` status, effective resource limits,
-absence of a disk cap, empty shell secret/extension grants, and origin/policy
-ID. It contains no secret values, credentials, runtime env, or raw job token.
+absence of a disk cap, empty shell secret grants, granted extensions, and
+origin/policy ID. It contains no secret values, credentials, runtime env, or
+raw job token.
 JSON serialization handles any diagnostic strings as data.
 
 The evidence describes what this shell granted; it does not claim additional

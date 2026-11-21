@@ -1061,6 +1061,26 @@ impl CliRunner {
         args: &[String],
         limits: &ResourceLimits,
     ) -> Result<ContainerOutput> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            // A fake runner must not fall through to the installed CLI;
+            // even a test image name can trigger an actual registry pull.
+            let args: Vec<_> = args.iter().map(String::as_str).collect();
+            let output = tokio::time::timeout(limits.timeout, runtime.output(&args, None))
+                .await
+                .map_err(|_| SandboxError::Timeout(limits.timeout))?
+                .map_err(|error| SandboxError::ExecutionFailed {
+                    reason: format!("simulated runtime failed: {error}"),
+                })?;
+            return Ok(ContainerOutput {
+                exit_code: i64::from(output.status.code().unwrap_or(-1)),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                duration: Duration::ZERO,
+                truncated: false,
+            });
+        }
+
         // Spawn through the workload spawner: fresh process group +
         // kill_on_drop + systemd transient-service isolation when available
         // (BUG-005, WI#178/WI#181). The service context is required for the

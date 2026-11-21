@@ -1216,10 +1216,7 @@ mod tests {
         assert_eq!(git.remotes[0].name, "origin");
         assert_eq!(
             git.remotes[0].operations,
-            vec![
-                crate::sandbox::git_grant::GitOperationClass::Read,
-                crate::sandbox::git_grant::GitOperationClass::Write
-            ]
+            vec![crate::sandbox::git_grant::GitOperationClass::Read]
         );
         assert_eq!(
             decision.evidence.extensions,
@@ -1228,7 +1225,7 @@ mod tests {
         let json = audit_json(&decision.evidence).expect("audit");
         assert!(json.contains("host:sandbox-git-remotes"));
         assert!(json.contains("\"transport\":\"file\""));
-        assert!(json.contains("\"operations\":[\"read\",\"write\"]"));
+        assert!(json.contains("\"operations\":[\"read\"]"));
         assert!(
             !json.contains("git.example.test"),
             "an unselected remote leaked into the evidence: {json}"

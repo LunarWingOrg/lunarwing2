@@ -887,21 +887,17 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
-**Git remote grant (WI#816).** The generic shell sandbox can use git against
-repositories an operator explicitly allows for that tenant, without a
-credential entering the container. The capability-manifest extension
-`git-remotes` requests it; `SANDBOX_GIT_REMOTES=name=url[,name=url...]` is the
-host grant, unset by default (all git network access denied). Network remotes
-(`https`/`http`) are supported only in `proxy-enforced` (enforced) and legacy
-advisory `proxy`, and fail closed under `none` and `tunnel`; `file` remotes are
-virtual `/workspace/...` paths and work in every mode. Force pushes
-(`--force`, `-f`, `--force-with-lease`, `--mirror`) and remote ref deletion
-(`--delete`, `--prune`, leading `:` refspec) are refused before execution; the
-host-side `ssh_git` tool remains the path for credential-bearing SSH access.
-The container environment carries only granted remote URLs plus git hardening
-switches. This does not touch worker lanes: mt-admin worker egress allowlists
-and worker credential grants are unchanged, and the shell sandbox still never
-exports inbound listeners.
+**Git remote grant (WI#816).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
+is unset by default. A manifest can opt into the `git-remotes` read grant.
+For HTTP(S) it requires `proxy-enforced` and narrows that call's proxy to the
+selected, already-allowlisted hosts. It does not enforce repository paths or
+Git operations. File remotes are paths inside `/workspace` and work in any
+supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
+injects no credential, and manifest preflight rejects recognized Git pushes.
+Calls without a manifest keep their existing Git and egress behavior. See the
+[manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
+for the boundaries and the authentication and push work still open. Worker
+egress allowlists, credential grants, and inbound policy are unchanged.
 
 ## Worker exposure policy (WI#357)
 
