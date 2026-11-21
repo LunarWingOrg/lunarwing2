@@ -1456,6 +1456,44 @@ async fn late_reply_suppressed_by_outbound_hook_finishes_no_reply() {
     assert_eq!(finishes, expected); // safety: test-only assertion
 }
 
+/// WI#807: the turn record names every thread outcome with a stable string, so
+/// an operator comparing runs never reads a `Debug` spelling. Every variant is
+/// covered so a new one cannot slip in unnamed.
+#[test]
+fn thread_outcome_kind_names_every_outcome() {
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::Completed { response: None }),
+        "completed"
+    );
+    assert_eq!(thread_outcome_kind(&ThreadOutcome::Stopped), "stopped");
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::MaxIterations),
+        "max_iterations"
+    );
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+            error: "boom".into(),
+        }),
+        "failed"
+    );
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            parameters: serde_json::json!({}),
+            resume_kind: lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "github".into(),
+                instructions: "Provide a token.".into(),
+                auth_url: None,
+            },
+            resume_output: None,
+        }),
+        "gate_paused"
+    );
+}
+
 /// WI#807: the late-turn budget scales with the discrete tool calls a turn
 /// actually completed. The 8-step case is the known-step-count data point the
 /// WI asks for: 8 calls earn 8 × 90s on top of the flat 600s budget.

@@ -1961,13 +1961,22 @@ stop or settlement fails, it reports an error without joining a still-running
 handle, which stays addressable to `/interrupt`. These are in-process delivery
 guarantees; the watcher is not a durable cross-restart outbox.
 
-Each late turn then leaves one `Late turn finished` record on the boundary
-between "fits its budget" and "ran out": `tool_calls`, the final
-`late_budget_secs` (including steps earned during the late wait),
-`budget_exhausted`, `elapsed_ms` and the outcome. That makes a bounded task
-with a known step count a real data point: eight calls earn a 1320-second
-allowance, and `budget_exhausted=false` says the model finished inside it
-rather than merely avoiding a crash.
+Each turn then leaves one `Turn finished` record on the boundary between
+"fits its budget" and "ran out", tagged with its `phase`: `foreground` for a
+turn that finished inside the 610-second wait, `late` for one the watcher
+followed after delivery detached. Both records carry `tool_calls`,
+`budget_secs` (the budget of that phase; on the late phase the final
+step-aware allowance, including steps earned during the late wait),
+`budget_exhausted` (always false on the foreground phase), `elapsed_ms`
+measured against that phase's budget, and the outcome (the thread outcome
+kind on the foreground phase, the delivery outcome on the late phase). That
+makes a bounded task with a known step count a real data point whatever its
+size: eight calls earn a 1320-second late allowance, and
+`budget_exhausted=false` says the model finished inside it rather than merely
+avoiding a crash. The foreground record is the baseline the late one cannot
+supply: without it, a bounded task that fit the wait budget left no
+steps-or-time record at all, so "slow", "thrashing" and "doing a lot of real
+work" could not be told apart on turns that never detached.
 
 **Join and restart recovery (WI#532/WI#534).** A thread id names a reusable
 conversation surface, not a unique execution. `Thread.created_at` is therefore
