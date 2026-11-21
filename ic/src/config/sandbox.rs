@@ -1360,6 +1360,49 @@ mod tests {
         unsafe { std::env::remove_var("SANDBOX_TENANT_LOGS") };
     }
 
+    /// WI#816: the host grant is env-only, defaulting to no grant, and a
+    /// credential-bearing or malformed spec is a load error rather than a
+    /// silently smaller grant.
+    #[test]
+    fn sandbox_git_remotes_env_grants_and_rejects_credentials() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+
+        // SAFETY: Under ENV_MUTEX (restored on drop), no concurrent env access.
+        unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve default");
+        assert!(cfg.git.is_none());
+        assert!(cfg.to_sandbox_config().git.is_none());
+
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_REMOTES",
+                "origin=file:///workspace/remotes/origin.git",
+            )
+        };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve grant");
+        let grant = cfg.git.as_ref().expect("grant");
+        assert_eq!(grant.remotes.len(), 1);
+        assert_eq!(grant.remotes[0].name, "origin");
+        let propagated = cfg.to_sandbox_config().git.expect("propagated grant");
+        assert_eq!(propagated, *grant);
+
+        for bad in [
+            "origin=https://user:token@git.example.test/repo.git",
+            "origin=/srv/git/repo.git",
+            "origin",
+        ] {
+            unsafe { std::env::set_var("SANDBOX_GIT_REMOTES", bad) };
+            match SandboxModeConfig::resolve(&settings) {
+                Err(ConfigError::InvalidValue { key, .. }) => {
+                    assert_eq!(key, "SANDBOX_GIT_REMOTES")
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+        unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
+    }
+
     #[test]
     fn sandbox_enforce_env_overrides_default() {
         let _guard = crate::config::helpers::lock_env();
