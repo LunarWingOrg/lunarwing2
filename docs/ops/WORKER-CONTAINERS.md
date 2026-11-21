@@ -3744,6 +3744,13 @@ auto-approval:
   recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
   recursive/forced `rm` outside temp roots. For `rm`, the hook joins shell
   line continuations before splitting commands on LF and control operators.
+  The hook cannot tell a real quote from an apostrophe in a heredoc body or
+  `$'…'`, so it reads the command three ways, whatever the quote state: every
+  backslash-newline pair dropped (a continuation), every pair as a space (the
+  line break that ends a comment or stays in quoted text), and pairs dropped
+  outside single quotes but spaces inside them. An `rm` that any reading shows
+  is checked (WI#810). Mixed shapes beyond these three readings can still
+  pass; the container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
