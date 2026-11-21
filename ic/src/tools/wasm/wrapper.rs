@@ -5692,9 +5692,9 @@ mod tests {
         std::fs::write(config_dir.join("gotify.json"), disk_content)
             .expect("failed to write on-disk config"); // safety: test code only
 
-        let backend = LibSqlBackend::new_memory()
+        let backend = LibSqlBackend::new_local(&base.join("wi831.db"))
             .await
-            .expect("should create in-memory libsql backend"); // safety: test code only
+            .expect("should create libsql backend"); // safety: test code only
         backend.run_migrations().await.expect("migrations"); // safety: test code only
         let db: Arc<dyn Database> = Arc::new(backend);
         let workspace = crate::workspace::Workspace::new_with_db("wi831-preload", db);
