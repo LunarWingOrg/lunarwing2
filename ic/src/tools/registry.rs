@@ -189,6 +189,10 @@ impl ToolRegistry {
             return description.to_owned();
         }
         if let Some((_, tool)) = self.get_resolved_for_user(tool_name, user_id).await {
+            // Per-category gating keeps recording for suppressed categories.
+            if !self.estimates.display_enabled_for(tool.name()) {
+                return description.to_owned();
+            }
             let params = crate::tools::prepare_tool_params(tool.as_ref(), params);
             if let Some(estimate) = self.estimates.estimate(user_id, tool.as_ref(), &params) {
                 return format!("{description}\n\n{}", estimate.approval_hint());

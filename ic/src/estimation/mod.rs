@@ -6,14 +6,21 @@
 //! - Statistical models that improve over time
 
 mod cost;
+mod diagnostics;
 mod learner;
 mod runtime;
 mod time;
 mod value;
 
 pub use cost::CostEstimator;
-pub use learner::{EstimationLearner, LearningModel};
-pub use runtime::{ToolEstimates, ToolEstimationMode};
+pub use diagnostics::{
+    CategoryPolicy, CategoryPolicySummary, EvaluationCategory, EvaluationSummary,
+};
+pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
+pub use runtime::{
+    CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateDiagnostics, ToolEstimationMode,
+    ToolEstimates,
+};
 pub use time::TimeEstimator;
 pub use value::ValueEstimator;
 
@@ -199,6 +206,11 @@ impl Estimator {
     /// Get the value estimator.
     pub fn value(&self) -> &ValueEstimator {
         &self.value
+    }
+
+    /// Read-only learner access for the diagnostics surface.
+    pub fn learner(&self) -> &EstimationLearner {
+        &self.learner
     }
 }
 
