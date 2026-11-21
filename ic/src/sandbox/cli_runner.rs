@@ -2176,20 +2176,20 @@ mod tests {
             "Error: pull access denied for lunarwing-worker, repository does not exist",
         ];
         for stderr in cases {
-            let classified = classify_run_failure(stderr, "lunarwing-worker:latest", 125);
+            let classified = classify_run_failure(stderr, "lunarwing-worker:latest", 125, false);
             assert_eq!(
                 classified.as_ref().map(SandboxError::kind),
                 Some("image_unavailable"),
                 "should classify runtime error: {stderr}"
             );
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest", 1).is_none(),
+                classify_run_failure(stderr, "lunarwing-worker:latest", 1, false).is_none(),
                 "ordinary command output must not be classified: {stderr}"
             );
         }
-        assert!(classify_run_failure("sh: foo: command not found", "img", 127).is_none());
+        assert!(classify_run_failure("sh: foo: command not found", "img", 127, false).is_none());
         assert!(
-            classify_run_failure("Error: command rejected input", "img", 1).is_none(),
+            classify_run_failure("Error: command rejected input", "img", 1, false).is_none(),
             "runtime prefix without exit 125 must not mask ordinary errors"
         );
     }
@@ -2216,7 +2216,7 @@ mod tests {
         ];
         for (stderr, exit_code) in cases {
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest", exit_code).is_none(),
+                classify_run_failure(stderr, "lunarwing-worker:latest", exit_code, false).is_none(),
                 "command stderr must remain ordinary ContainerOutput: exit={exit_code}, {stderr}"
             );
         }
@@ -2228,7 +2228,7 @@ mod tests {
                       unlinkat /home/dwarfstar/.local/share/containers/storage/overlay/compat2795814874/merged/subdir:\n\
                       no space left on device when we tried to delete an item in the merged directory:\n\
                       driver not supported";
-        let err = classify_run_failure(stderr, "lunarwing-worker:latest", 125).unwrap();
+        let err = classify_run_failure(stderr, "lunarwing-worker:latest", 125, false).unwrap();
         match &err {
             SandboxError::StorageUnavailable { path, reason } => {
                 assert_eq!(path, "/home/dwarfstar/.local/share/containers/storage");
@@ -2249,6 +2249,7 @@ mod tests {
             "Error: configure storage: kernel does not support overlay fs: invalid argument",
             "lunarwing-worker:latest",
             125,
+            false,
         )
         .unwrap();
         assert_eq!(capability_failure.kind(), "execution_failed");
@@ -2276,19 +2277,29 @@ mod tests {
 
     #[test]
     fn proxy_relay_and_runtime_setup_failures_are_structured() {
-        for (stderr, kind) in [
-            ("lunarwing-proxy-relay: Python 3 required", "proxy_error"),
+        // The relay marker alone is not enough: it needs the host-side fact
+        // that no container connection reached the relay (WI#836).
+        for (stderr, relay_unreached, kind) in [
+            (
+                "lunarwing-proxy-relay: Python 3 required",
+                true,
+                "proxy_error",
+            ),
             (
                 "Error: statfs /private/channel: permission denied",
+                true,
                 "execution_failed",
             ),
             (
                 "docker: Error response from daemon: invalid mount config",
+                true,
                 "execution_failed",
             ),
         ] {
             assert_eq!(
-                classify_run_failure(stderr, "image", 125).unwrap().kind(),
+                classify_run_failure(stderr, "image", 125, relay_unreached)
+                    .unwrap()
+                    .kind(),
                 kind
             );
         }
@@ -2299,16 +2310,39 @@ mod tests {
     #[test]
     fn relay_transport_lines_do_not_become_proxy_failures() {
         let transport = "lunarwing-proxy-relay transport: [Errno 13] Permission denied";
-        assert!(classify_run_failure(transport, "image", 0).is_none());
-        assert!(classify_run_failure(transport, "image", 125).is_none());
+        assert!(classify_run_failure(transport, "image", 0, true).is_none());
+        assert!(classify_run_failure(transport, "image", 125, true).is_none());
         assert!(matches!(
             classify_run_failure(
                 "lunarwing-proxy-relay: [Errno 13] Permission denied",
                 "image",
-                125
+                125,
+                true
             ),
             Some(SandboxError::ProxyError { .. })
         ));
+    }
+
+    /// WI#836: the sandboxed command shares stderr with the relay wrapper, so
+    /// the marker alone cannot attribute a failure to the proxy. A run whose
+    /// command did reach the relay keeps its own exit status and stderr.
+    #[test]
+    fn command_printed_relay_marker_is_not_a_proxy_failure() {
+        let forged = "lunarwing-proxy-relay: x";
+        assert!(classify_run_failure(forged, "image", 3, false).is_none());
+        // Even with the startup exit code, a command that reached the relay
+        // keeps its own status.
+        assert!(classify_run_failure(forged, "image", 125, false).is_none());
+        // A marker mid-line is a command's own text, not the relay's line.
+        assert!(
+            classify_run_failure("cp: cannot stat 'lunarwing-proxy-relay: x'", "image", 125, true)
+                .is_none()
+        );
+        // A startup marker needs the startup exit code too.
+        assert!(
+            classify_run_failure("lunarwing-proxy-relay: [Errno 2] missing", "image", 1, true)
+                .is_none()
+        );
     }
 
     #[test]

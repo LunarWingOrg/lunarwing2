@@ -616,6 +616,27 @@ mod tests {
         .expect("the returned relay listener must accept a new client");
     }
 
+    /// WI#836: the host relay is the only party that can say whether a
+    /// container reached the proxy. A fresh relay has accepted nothing, and a
+    /// single container connect moves the counter.
+    #[tokio::test]
+    async fn relay_reports_container_contact() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = ProxyRelay::start(listener.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        let path = relay.path().join("proxy.sock");
+        assert!(!relay.connected(), "a fresh relay has no container contact");
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !relay.connected() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an accepted container connect must be observable on the host");
+    }
+
     #[tokio::test]
     async fn relay_drop_removes_socket_and_closes_live_connections() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
