@@ -584,8 +584,12 @@ Commands:
                                   non-zero when unresolvable; treat that as
                                   uninspected, never as evidence.
 
-  configure-gotify <name> <url>    Set custom Gotify URL for a tenant
-                                   (updates workspace config + capabilities)
+  configure-gotify <name> <url>    Set custom Gotify URL for a tenant.
+                                   Writes <tenant state>/workspace/config/gotify.json
+                                   (= <LUNARWING_BASE_DIR>/workspace/config/gotify.json,
+                                   which the daemon merges into the tool's workspace
+                                   view) and rewrites the capability allowlist and
+                                   credential host pattern from the same host.
 
   configure-pebble <name>          Configure pebble worker for a tenant
     --nanogpt-api-key <key>        NanoGPT API key
