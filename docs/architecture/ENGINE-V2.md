@@ -1939,7 +1939,12 @@ fallback, and durable gate handling as an on-time result. Authentication-marker
 text is subject to response hooks; only a valid credential request in the
 transformed output becomes an auth gate. It is not recorded as assistant prose.
 
-The watcher has a second 600-second budget. If it expires, the stop request
+The watcher's second budget is step-aware (WI#807): a flat 600-second base,
+plus 90 seconds for every tool action the turn completed before detaching,
+capped at 1800 seconds. Only `ActionExecuted`/`ActionFailed` events earn time,
+so a turn that is thinking or looping without reaching a tool keeps the flat
+base and cannot extend its own budget. A turn with no tool calls keeps exactly
+the old 600-second budget. If the late budget expires, the stop request
 has a 60-second grace and, after a successful request, settlement gets its own
 60-second grace. A settled stop reports a terminal timeout; if the run already
 ended or paused before the stop, the watcher delivers its actual result. If
