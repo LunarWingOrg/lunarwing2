@@ -1943,8 +1943,11 @@ text is subject to response hooks; only a valid credential request in the
 transformed output becomes an auth gate. It is not recorded as assistant prose.
 
 The watcher's second budget is step-aware (WI#807): a flat 600-second base,
-plus 90 seconds for every tool action the turn completed before detaching,
-capped at 1800 seconds. Only `ActionExecuted` events earn time. That
+plus 90 seconds for every tool action the turn completed, measured from the
+detach instant and capped there at 1800 seconds. The watcher re-reads the
+budget whenever a wait slice expires, so a tool action completed during the
+late wait also extends the deadline, not only the actions the turn had
+completed when it detached. Only `ActionExecuted` events earn time. That
 includes a tool that ran and returned an error; a loop on such a tool earns
 time up to the cap. `ActionFailed` earns nothing: it reports refusals (the
 per-step tool-call limit, a missing lease, a policy denial, an adapter
@@ -1957,6 +1960,14 @@ ended or paused before the stop, the watcher delivers its actual result. If
 stop or settlement fails, it reports an error without joining a still-running
 handle, which stays addressable to `/interrupt`. These are in-process delivery
 guarantees; the watcher is not a durable cross-restart outbox.
+
+Each late turn then leaves one `Late turn finished` record on the boundary
+between "fits its budget" and "ran out": `tool_calls`, the final
+`late_budget_secs` (including steps earned during the late wait),
+`budget_exhausted`, `elapsed_ms` and the outcome. That makes a bounded task
+with a known step count a real data point: eight calls earn a 1320-second
+allowance, and `budget_exhausted=false` says the model finished inside it
+rather than merely avoiding a crash.
 
 **Join and restart recovery (WI#532/WI#534).** A thread id names a reusable
 conversation surface, not a unique execution. `Thread.created_at` is therefore

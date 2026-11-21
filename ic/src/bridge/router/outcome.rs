@@ -64,6 +64,62 @@ fn is_tool_step(kind: &EventKind) -> bool {
     matches!(kind, EventKind::ActionExecuted { .. })
 }
 
+/// The late turn's time allowance (WI#807).
+///
+/// The allowance is measured from `started`. A step-aware turn re-reads it as
+/// the turn completes more tool actions, so a chain that keeps doing real work
+/// also during the late wait extends its own deadline, not only the steps it
+/// had completed when it detached. The hard ceiling stays
+/// [`LATE_MAX_TIMEOUT`] from the same start, so a runaway loop still stops.
+#[derive(Debug, Clone, Copy)]
+struct LateAllowance {
+    started: tokio::time::Instant,
+    /// A flat allowance, never extended by progress. `None` selects the
+    /// step-aware budget.
+    flat: Option<Duration>,
+}
+
+impl LateAllowance {
+    /// The step-aware allowance from `started` (WI#807).
+    fn step_aware(started: tokio::time::Instant) -> Self {
+        Self {
+            started,
+            flat: None,
+        }
+    }
+
+    /// A flat allowance from now, never extended by progress.
+    #[cfg(test)]
+    fn flat(budget: Duration) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            flat: Some(budget),
+        }
+    }
+
+    /// The allowance for a turn that has completed `tool_calls` tool actions.
+    fn budget(&self, tool_calls: u32) -> Duration {
+        self.flat
+            .unwrap_or_else(|| late_budget_for_steps(tool_calls))
+    }
+
+    /// Time left before the allowance runs out, `None` once it has.
+    fn remaining(&self, tool_calls: u32) -> Option<Duration> {
+        let budget = self.budget(tool_calls);
+        let elapsed = self.started.elapsed();
+        (elapsed < budget).then(|| budget - elapsed)
+    }
+}
+
+/// What the late wait produced, for the one `Late turn finished` record: the
+/// reply text, the allowance the turn ended with (including steps earned during
+/// the late wait), and whether it ran out and the watcher stopped the run.
+struct LateOutcome {
+    text: Option<String>,
+    budget: Duration,
+    exhausted: bool,
+}
+
 struct TurnCompletion {
     state: EngineState,
     delivery: ResponseDelivery,
@@ -158,19 +214,18 @@ impl TurnCompletion {
         let mut cancellation = self.cancellation_guard();
         if !self.wait(&mut events, budget).await {
             let tool_calls = self.tool_calls();
-            let late_budget = late_budget_for_steps(tool_calls);
+            let allowance = LateAllowance::step_aware(tokio::time::Instant::now());
             tracing::warn!(
                 thread_id = %self.thread_id,
                 tool_calls,
-                late_budget_secs = late_budget.as_secs(),
+                late_budget_secs = allowance.budget(tool_calls).as_secs(),
                 "Turn wait budget exhausted; transferring delivery to late watcher"
             );
             self.delivery
                 .channels
                 .note_turn_outcome(self.message.id, TurnOutcome::Detached);
             tokio::spawn(async move {
-                self.deliver_late(&mut events, late_budget, STOP_GRACE)
-                    .await;
+                self.deliver_late(&mut events, allowance, STOP_GRACE).await;
             });
             cancellation.disarm();
             return Ok(Some(String::new()));
@@ -271,7 +326,7 @@ impl TurnCompletion {
     async fn deliver_late(
         self,
         events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
-        budget: Duration,
+        allowance: LateAllowance,
         stop_grace: Duration,
     ) {
         let mut cancellation = self.cancellation_guard();
@@ -287,7 +342,7 @@ impl TurnCompletion {
         ).await;
         let wait_started = tokio::time::Instant::now();
         let result = self
-            .late_result(events, budget, stop_grace, stop_grace)
+            .late_result(events, allowance, stop_grace, stop_grace)
             .await;
         if !self
             .state
@@ -297,11 +352,18 @@ impl TurnCompletion {
         {
             cancellation.disarm();
         }
-        let outcome = self.deliver_late_result(result).await;
+        let (budget, exhausted) = match &result {
+            Ok(completed) => (completed.budget, completed.exhausted),
+            Err(_) => (allowance.budget(self.tool_calls()), false),
+        };
+        let outcome = self
+            .deliver_late_result(result.map(|completed| completed.text))
+            .await;
         tracing::info!(
             thread_id = %self.thread_id,
             tool_calls = self.tool_calls(),
             late_budget_secs = budget.as_secs(),
+            budget_exhausted = exhausted,
             elapsed_ms = wait_started.elapsed().as_millis() as u64,
             %outcome,
             "Late turn finished"
@@ -346,21 +408,55 @@ impl TurnCompletion {
             .await;
     }
 
-    /// Once `budget` expires, the independent stop and post-stop graces bound a
-    /// stuck turn's failure report to their sum: 120 seconds in production
-    /// (plus channel delivery), rather than one shared 60-second grace (WI#673).
+    /// Once `allowance` runs out, the independent stop and post-stop graces
+    /// bound a stuck turn's failure report to their sum: 120 seconds in
+    /// production (plus channel delivery), rather than one shared 60-second
+    /// grace (WI#673).
     async fn late_result(
         &self,
         events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
-        budget: Duration,
+        allowance: LateAllowance,
         stop_grace: Duration,
         post_stop_grace: Duration,
-    ) -> Result<Option<String>, Error> {
-        if self.wait(events, budget).await {
-            return self.join_late(false).await;
+    ) -> Result<LateOutcome, Error> {
+        if self.wait_within(events, allowance).await {
+            let text = self.join_late(false).await?;
+            return Ok(LateOutcome {
+                text,
+                budget: allowance.budget(self.tool_calls()),
+                exhausted: false,
+            });
         }
-        self.late_result_after_budget(events, stop_grace, post_stop_grace)
-            .await
+        let text = self
+            .late_result_after_budget(events, stop_grace, post_stop_grace)
+            .await?;
+        Ok(LateOutcome {
+            text,
+            budget: allowance.budget(self.tool_calls()),
+            exhausted: true,
+        })
+    }
+
+    /// Waits for the run to end within `allowance`.
+    ///
+    /// A step-aware allowance is re-read after every expired wait slice, so a
+    /// tool action completed during the late wait extends the deadline
+    /// (WI#807). A flat allowance has nothing left once its one slice expires.
+    /// The loop is bounded because the step-aware budget never exceeds
+    /// [`LATE_MAX_TIMEOUT`] from the allowance's start.
+    async fn wait_within(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+        allowance: LateAllowance,
+    ) -> bool {
+        loop {
+            let Some(slice) = allowance.remaining(self.tool_calls()) else {
+                return false;
+            };
+            if self.wait(events, slice).await {
+                return true;
+            }
+        }
     }
 
     /// The path of [`Self::late_result`] once the late budget ran out: stop the
