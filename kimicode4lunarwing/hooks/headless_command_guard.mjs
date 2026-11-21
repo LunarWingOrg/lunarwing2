@@ -116,6 +116,40 @@ function shellWordView(command) {
   return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
+/**
+ * Expand `pre{a,b}suf` brace lists the way bash does: one word per element,
+ * each carrying the word's prefix and suffix. A list without a comma is not a
+ * brace-expansion list and is left alone.
+ */
+function expandBraceLists(text) {
+  let expanded = text;
+  let previous;
+  do {
+    previous = expanded;
+    expanded = expanded.replace(
+      /([^\s;|&()<>{}]*)\{([^{}]*,[^{}]*)\}([^\s;|&()<>{}]*)/g,
+      (_, prefix, list, suffix) =>
+        list.split(",").map((item) => `${prefix}${item}${suffix}`).join(" "),
+    );
+  } while (expanded !== previous);
+  return expanded;
+}
+
+/**
+ * The word view after runtime word assembly (WI#824). bash builds the command
+ * word from forms that never contain the literal text, so the raw segment is
+ * not enough: `${IFS}` and `$IFS` split words, `{rm,-rf,/etc}` brace-expands,
+ * and `$(...)` / backticks substitute the command's text into the word. The
+ * substitution's inner text is kept as words, which can only over-deny within
+ * this deny-list hook.
+ */
+function shellAssemblyView(command) {
+  return expandBraceLists(shellWordView(command))
+    .replace(/\$\(/g, " ")
+    .replace(/[`()]/g, " ")
+    .replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, " ");
+}
+
 /** Split on control operators and LF, leaving other line terminators in the text. */
 function commandSegments(command) {
   return command.split(/[;|&]{1,2}|\n+/);
@@ -126,6 +160,17 @@ function isRmLongDeleteOption(word) {
   // ends the option word; the bare -- marker is not an option prefix.
   const option = /^--[a-z]+(?=$|[<>])/.exec(word)?.[0];
   return option !== undefined && ("--recursive".startsWith(option) || "--force".startsWith(option));
+}
+
+/**
+ * Run checkRm on every textual view of the segment: the raw text, the word
+ * view bash builds (quote splices and escapes, WI#821), and the word-assembly
+ * view (WI#824).
+ */
+function checkRmViews(segment) {
+  return checkRm(segment) ??
+    checkRm(shellWordView(segment)) ??
+    checkRm(shellAssemblyView(segment));
 }
 
 function checkRm(segment) {
@@ -233,7 +278,7 @@ function evaluate(command) {
       checkDenyRulesEverywhere(shellWordView(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
-      const denied = checkRm(segment);
+      const denied = checkRmViews(segment);
       if (denied) return denied;
     }
   }
