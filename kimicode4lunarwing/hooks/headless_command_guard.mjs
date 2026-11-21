@@ -62,8 +62,8 @@ function isSafeRmOperand(operand) {
   return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
 }
 
-// Join backslash-LF pairs before splitting for rm. A pair is handled in every
-// quote state, because the hook cannot tell a real quote from an apostrophe
+// Join backslash-LF pairs before matching, for every rule. A pair is handled
+// in every quote state, because the hook cannot tell a real quote from an apostrophe
 // the shell reads as plain text (a heredoc body, `$'...'`). Each pair becomes
 // `lineBreak`, or `quotedLineBreak` while the joiner believes it is inside
 // single quotes. The caller reads the whole command three ways: every pair
@@ -111,6 +111,11 @@ function joinLineContinuations(command, lineBreak = "", quotedLineBreak = lineBr
   return joined;
 }
 
+/** The word view bash builds: one escaping level dropped, quote characters removed. */
+function shellWordView(command) {
+  return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
+}
+
 /** Split on control operators and LF, leaving other line terminators in the text. */
 function commandSegments(command) {
   return command.split(/[;|&]{1,2}|\n+/);
@@ -145,33 +150,40 @@ function checkRm(segment) {
 const DENY_RULES = [
   {
     name: "privilege escalation",
-    pattern: /(^|[\s;&|(])(sudo|doas)\b/,
+    pattern: /(^|[\s;&|(])(?:[\w.+-]*\/)*(sudo|doas)\b/,
   },
   {
     name: "power/disk destruction command",
     pattern:
-      /\b(shutdown|halt|poweroff|reboot|mkfs(\.[a-z0-9]+)?|wipefs|bcdedit|diskpart|fdisk|sfdisk|parted)\b/,
+      /\b(shutdown|halt|poweroff|reboot|mkfs(\.[a-z0-9]+)?|wipefs|mkswap|blkdiscard|sgdisk|bcdedit|diskpart|fdisk|sfdisk|parted)\b/,
   },
   {
     name: "fork bomb",
-    // Classic bash fork bomb shapes: `:(){ :|:& };:`, `f(){ f|f& }; f`, and
-    // equivalents — a function definition whose body pipes itself into
-    // itself in the background.
-    pattern: /\([^)]*\)\s*\{[^}]*\|[^}]*&\s*\}/,
+    // Classic bash fork bomb shapes: `:(){ :|:& };:`, `f(){ f|f& }; f`,
+    // `x(){ x|x&; }; x`, and equivalents — a function definition whose body
+    // pipes itself into itself in the background.
+    pattern: /\([^)]*\)\s*\{[^}]*\|[^}]*&[^}]*\}/,
   },
   {
     name: "remote content piped into a shell or interpreter",
+    // The interpreter is matched by any path (| /bin/bash), an env/exec/busybox
+    // prefix (| /usr/bin/env bash) and the usual shell names.
     pattern:
-      /\b(curl|wget|fetch|nc|ncat|netcat)\b[^|]*\|\s*(sudo\s+)?(ba|z|da|a|k)?sh\b|\b(curl|wget)\b[^|]*\|\s*python3?\b/,
+      /\b(curl|wget|fetch|nc|ncat|netcat)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*(?:ba|z|da|a|k)?sh\b|\b(curl|wget)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*python3?\b/,
   },
   {
     name: "recursive mode/ownership change on system roots",
+    // The system-root alternation is optional so the bare filesystem root (/)
+    // is covered too; a named directory still matches with or without a trailing slash.
     pattern:
-      /\bch(mod|own|grp)\b[^;&|]*(-R|--recursive)[^;&|]*\s+\/(etc|usr|var|home|root|boot|bin|sbin|lib|lib64|opt|srv)(\/|\s|$)/,
+      /\bch(mod|own|grp)\b[^;&|]*(-R|--recursive)[^;&|]*\s+\/(?:(?:etc|usr|var|home|root|boot|bin|sbin|lib|lib64|opt|srv)?(?:\/|\s|$))/,
   },
   {
     name: "direct block-device write",
-    pattern: />\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop)/,
+    // Device namespaces beyond the legacy names: LVM (/dev/mapper/…) and the
+    // udev links (/dev/disk/by-id/…). truncate is only denied at a block device.
+    pattern:
+      />\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
   },
   {
     name: "SSH agent socket use (worker lane is not a credential broker)",
@@ -186,21 +198,40 @@ function checkDenyRules(segment) {
   return null;
 }
 
+/** Run every deny rule over the whole text and over each command segment. */
+function checkDenyRulesEverywhere(text) {
+  const wholeTextDenial = checkDenyRules(text);
+  if (wholeTextDenial) return wholeTextDenial;
+  for (const segment of commandSegments(text)) {
+    const denied = checkDenyRules(segment);
+    if (denied) return denied;
+  }
+  return null;
+}
+
+// How a backslash-LF pair may read: a continuation dropped, a line break kept
+// as a space (it ends a comment or stays in quoted text), and a continuation
+// dropped only outside single quotes. bash reads one of these, and the hook
+// cannot tell which apostrophe is a real quote (WI#810).
+const JOIN_READINGS = [["", ""], [" ", " "], ["", " "]];
+
 function evaluate(command) {
   if (command.length > MAX_COMMAND_CHARS) {
     return `command exceeds ${MAX_COMMAND_CHARS} chars`;
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
-  // on ;|& would shred the very shape they match.
-  const wholeCommandDenial = checkDenyRules(command);
-  if (wholeCommandDenial) return wholeCommandDenial;
-  // Keep those rules on the original text. Only rm needs the joined view.
-  for (const segment of commandSegments(command)) {
-    const denied = checkDenyRules(segment);
-    if (denied) return denied;
-  }
-  for (const [lineBreak, quotedLineBreak] of [["", ""], [" ", " "], ["", " "]]) {
+  // on ;|& would shred the very shape they match. Keep them on the raw text.
+  const rawDenial = checkDenyRulesEverywhere(command);
+  if (rawDenial) return rawDenial;
+  // bash joins every backslash-LF pair into the word around it, so a rule
+  // anchored on a word never matches the raw text (`su\<LF>do`). Run every
+  // rule on the joined text and on the word view bash builds, the same three
+  // readings rm uses (WI#813).
+  for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const joinedDenial = checkDenyRulesEverywhere(joined) ??
+      checkDenyRulesEverywhere(shellWordView(joined));
+    if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
       const denied = checkRm(segment);
       if (denied) return denied;

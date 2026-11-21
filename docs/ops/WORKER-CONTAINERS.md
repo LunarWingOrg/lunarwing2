@@ -3747,17 +3747,24 @@ auto-approval:
   `PreToolUse` / `Bash` entry invoking the baked guard.
 - `hooks/headless_command_guard.mjs`: denies privilege escalation
   (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
-  `wipefs`, block-device writes), fork bombs, remote-content-piped-to-shell,
-  recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
-  recursive/forced `rm` outside temp roots. For `rm`, the hook joins shell
-  line continuations before splitting commands on LF and control operators.
-  The hook cannot tell a real quote from an apostrophe in a heredoc body or
-  `$'…'`, so it reads the command three ways, whatever the quote state: every
-  backslash-newline pair dropped (a continuation), every pair as a space (the
-  line break that ends a comment or stays in quoted text), and pairs dropped
-  outside single quotes but spaces inside them. An `rm` that any reading shows
-  is checked (WI#810). Mixed shapes beyond these three readings can still
-  pass; the container stays the boundary.
+  `wipefs`, `mkswap`, `blkdiscard`, `sgdisk`, block-device writes including
+  `/dev/mapper` and `/dev/disk/by-*`), fork bombs, remote-content-piped-to-shell,
+  recursive `chmod`/`chown` on system roots (including the bare `/`), SSH-agent
+  socket use, and recursive/forced `rm` outside temp roots. Every rule is
+  checked on the original text and again on a shell-word view that drops quote
+  characters and one level of backslash escaping, so `"sudo"`, `\sudo` and
+  `/usr/bin/sudo` still match the privilege rule, a piped interpreter matches
+  through a path or an `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`),
+  and the recursive `chmod`/`chown` rule covers `/` (WI#813). The hook also
+  joins shell line continuations for every rule, not only `rm`: bash builds one
+  word from a backslash-newline pair, so a continuation inside a denied word is
+  checked on the joined text (WI#813). It cannot tell a real quote from an
+  apostrophe in a heredoc body or `$'…'`, so it reads the command three ways,
+  whatever the quote state: every backslash-newline pair dropped (a
+  continuation), every pair as a space (the line break that ends a comment or
+  stays in quoted text), and pairs dropped outside single quotes but spaces
+  inside them. Every rule is checked on each reading (WI#810). Mixed shapes
+  beyond these readings can still pass; the container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
