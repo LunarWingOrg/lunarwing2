@@ -876,6 +876,14 @@ mod tests {
             schema["properties"]["secrets"]["properties"]["names"]["maxItems"],
             0
         );
+        assert_eq!(
+            schema["properties"]["extensions"]["items"]["const"],
+            "git-remotes"
+        );
+        assert_eq!(
+            schema["properties"]["git"]["properties"]["remotes"]["maxItems"],
+            git_grant::MAX_GIT_REMOTES
+        );
         let encoded = serde_json::to_string(&schema).unwrap();
         assert!(!encoded.contains("TODO"));
         assert!(
