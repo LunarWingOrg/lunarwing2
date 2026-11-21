@@ -1171,6 +1171,16 @@ the BuildKit-parser Dockerfile policy gate; cross-stage copies are not local
 checkout inputs. See `docs/ops/WORKER-CONTAINERS.md` checklist item 7 when retiring the
 photon fixer after an upstream bump.
 
+The pebble lane (WI#806) is checked against its whole Dockerfile instead,
+because its manifest is a hand-maintained per-file list that had already
+drifted from the image: `entrypoint-split.sh` and `src/task_runner.rs` were
+COPY'd but unhashed. `DOCKERFILE_BUILD_CONTEXTS` binds that lane to its
+build context, and every literal local COPY source in any stage must appear
+in the manifest — including every file beneath a directory source such as
+the builder's `src` tree, so a new bridge module cannot ship unrecorded.
+Cross-stage `--from=` sources, globs, and sources outside the context stay
+outside this check, and a malformed COPY fails closed.
+
 The former `rust-compile-16gb` lock serialized heavy Rust work across pipelines:
 for example, pipeline #3812 waited while #3811 ran its backend tests. That lock
 is now removed; ready jobs can run concurrently on eligible runners within their
