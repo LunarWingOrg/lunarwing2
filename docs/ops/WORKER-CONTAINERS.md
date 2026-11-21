@@ -3758,6 +3758,18 @@ auto-approval:
   outside single quotes but spaces inside them. An `rm` that any reading shows
   is checked (WI#810). Mixed shapes beyond these three readings can still
   pass; the container stays the boundary.
+  Containment is decided on the resolved path (WI#812): each operand's
+  longest existing prefix and each safe root are passed through `realpath`
+  (symlinks followed, not-yet-existing trailing components re-attached), and
+  an operand that cannot be resolved denies. A symlink under `/tmp` therefore
+  no longer carries `rm` to its target, and deleting a link whose target is
+  outside the temp roots denies even though only the link would go. A link
+  that resolves back inside them stays allowed. Words bash rewrites after the
+  hook — `$`, backticks, quotes, globs, brace lists — and relative or `~`
+  operands are refused before resolving, because the hook would otherwise
+  check one shape and `rm` delete another; this is where brace expansion is
+  contained (`rm -rf {/tmp/x,/home/kumo}` denies). Names `rm` creates rather
+  than traverses are still allowed inside a temp root.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
@@ -3788,8 +3800,9 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
-The hook is baked into the Kimi worker image. Tenants pick up WI#795 only
-after rebuilding the image with the fix and recreating their workers; see
+The hook is baked into the Kimi worker image. Tenants pick up WI#795 and
+WI#812 only after rebuilding the image with the fix and recreating their
+workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
