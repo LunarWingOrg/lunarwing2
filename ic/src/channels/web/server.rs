@@ -41,6 +41,9 @@ use crate::channels::web::auth::{AuthenticatedUser, UserIdentity, auth_middlewar
 use crate::channels::web::handlers::cron_workers::{
     cron_worker_control_handler, cron_worker_status_handler,
 };
+use crate::channels::web::handlers::estimates::{
+    estimates_evaluation_handler, estimates_handler,
+};
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -515,6 +518,12 @@ pub(super) async fn start_server_with_mascot(
         .route("/api/missions", get(missions_list_handler))
         .route("/api/missions/summary", get(missions_summary_handler))
         .route("/api/missions/{id}", get(missions_detail_handler))
+        // Runtime estimation diagnostics (work item #318; read-only)
+        .route("/api/estimates", get(estimates_handler))
+        .route(
+            "/api/estimates/evaluation",
+            get(estimates_evaluation_handler),
+        )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -3714,6 +3723,13 @@ mod tests {
 
     /// Build a minimal `GatewayState` for testing the OAuth callback handler.
     fn test_gateway_state(ext_mgr: Option<Arc<ExtensionManager>>) -> Arc<GatewayState> {
+        test_gateway_state_with_tools(ext_mgr, None)
+    }
+
+    fn test_gateway_state_with_tools(
+        ext_mgr: Option<Arc<ExtensionManager>>,
+        tool_registry: Option<Arc<ToolRegistry>>,
+    ) -> Arc<GatewayState> {
         Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -3723,7 +3739,7 @@ mod tests {
             log_broadcaster: None,
             log_level_handle: None,
             extension_manager: ext_mgr,
-            tool_registry: None,
+            tool_registry,
             store: None,
             job_manager: None,
             external_worker_manager: None,
@@ -3753,6 +3769,114 @@ mod tests {
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
         })
+    }
+
+    /// WI#318 A2/A4: diagnostics routes sit behind gateway auth; the
+    /// evaluation aggregate is owner-only and every payload is parameter-free.
+    #[tokio::test]
+    async fn estimates_routes_require_auth_and_owner_for_evaluation() {
+        use crate::channels::web::auth::MultiAuthState;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let registry = Arc::new(
+            ToolRegistry::new()
+                .with_estimation_mode(crate::estimation::ToolEstimationMode::Display),
+        );
+        let params = serde_json::json!({ "secret": "sk-never-rendered" });
+        for _ in 0..5 {
+            let observation = registry
+                .estimates()
+                .begin("alice", &crate::tools::builtin::EchoTool, &params)
+                .expect("observation");
+            registry
+                .estimates()
+                .complete(observation, std::time::Duration::from_millis(5), None);
+        }
+        let state = test_gateway_state_with_tools(None, Some(registry));
+        let auth = MultiAuthState::multi(std::collections::HashMap::from([
+            (
+                "owner-token".to_string(),
+                UserIdentity {
+                    user_id: "test".to_string(),
+                    workspace_read_scopes: Vec::new(),
+                },
+            ),
+            (
+                "alice-token".to_string(),
+                UserIdentity {
+                    user_id: "alice".to_string(),
+                    workspace_read_scopes: Vec::new(),
+                },
+            ),
+        ]));
+        let app = Router::new()
+            .route("/api/estimates", get(estimates_handler))
+            .route(
+                "/api/estimates/evaluation",
+                get(estimates_evaluation_handler),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                crate::channels::web::auth::CombinedAuthState::from(auth),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let request = |uri: &str, token: Option<&str>| {
+            let mut builder = axum::http::Request::builder().uri(uri);
+            if let Some(token) = token {
+                builder = builder.header("Authorization", format!("Bearer {token}"));
+            }
+            builder.body(Body::empty()).expect("request")
+        };
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/api/estimates", None))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/estimates", Some("alice-token")))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body.contains("echo"));
+        assert!(!body.contains("sk-never-rendered"));
+        assert!(!body.contains("test"));
+        assert!(!body.contains("tool:"));
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "/api/estimates/evaluation",
+                    Some("alice-token")
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // Owner sees that the opt-in trace is off, not another user's data.
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "/api/estimates/evaluation",
+                    Some("owner-token")
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     async fn settings_request(
