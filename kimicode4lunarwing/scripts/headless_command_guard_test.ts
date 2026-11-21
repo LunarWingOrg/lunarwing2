@@ -532,16 +532,25 @@ test("a task cannot start kimi service mode (WI#833)", () => {
   assertBlocked("kimi web --json", "kimi service mode")
   assertBlocked("kimi server --port 9000 &", "kimi service mode")
   assertBlocked("/usr/local/bin/kimi server", "kimi service mode")
-  // Through a wrapper, a prefix assignment and a shell one-liner.
+  // Through a wrapper, a prefix assignment, a shell one-liner and a loop body.
   assertBlocked("bash -c 'kimi server'", "kimi service mode")
+  assertBlocked("bash -lc 'kimi web'", "kimi service mode")
   assertBlocked("env KIMI_X=1 kimi web", "kimi service mode")
   assertBlocked("cd /app && kimi server", "kimi service mode")
+  assertBlocked("for f in x; do kimi server; done", "kimi service mode")
+  assertBlocked("if true; then kimi server; fi", "kimi service mode")
+  assertBlocked("xargs -I {} kimi server", "kimi service mode")
   // The subcommands the lane uses keep passing.
   assertAllowed("kimi -p hello")
   assertAllowed("kimi -p 'kimi server' --output-format stream-json")
   assertAllowed("kimi --version")
   assertAllowed("kimi chat")
   assertAllowed("kimi mcp serve")
+  // Shell keywords, loops and wrapper flags do not deny ordinary work.
+  assertAllowed("for f in *.rs; do echo $f; done")
+  assertAllowed("if true; then cargo check; fi")
+  assertAllowed("bash -lc 'cargo check -j18'")
+  assertAllowed("find /tmp -print0 | xargs -0 -I {} rm -rf {}")
   // Reading the words is not running them.
   assertAllowed("grep -rn 'kimi server' .")
   assertAllowed("echo 'kimi web --json'")

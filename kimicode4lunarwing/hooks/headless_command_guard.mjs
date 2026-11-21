@@ -439,6 +439,11 @@ function isInterpreterStage(stage) {
 // spelling pass.
 const LISTENER_PREFIXES = new Set([
   "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
+  "xargs", "time",
+  // xargs's replacement placeholder, which stands where the command goes.
+  "{}",
+  // Shell keywords and grouping words that sit before a command.
+  "if", "then", "elif", "else", "while", "until", "do", "done", "!", "{", "}", "(", ")",
 ]);
 
 /** True for a wrapper, an assignment, an option or a wrapper's numeric operand. */
@@ -446,7 +451,13 @@ function isPrefixWord(word) {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) ||
     word.startsWith("-") ||
     /^\d+$/.test(word) ||
+    word === "{}" ||
     LISTENER_PREFIXES.has(commandBasename(word));
+}
+
+/** True when a shell would read the word after `previous` as a command (`-c`, `-lc`). */
+function isCommandOption(previous) {
+  return previous !== undefined && /^-[a-zA-Z]*c$/.test(previous);
 }
 
 /** The kimi subcommand word, ignoring leading options. */
@@ -500,8 +511,7 @@ function checkListeners(text) {
     const prefixOnly = [true];
     for (const word of words) prefixOnly.push(prefixOnly[prefixOnly.length - 1] && isPrefixWord(word));
     for (let i = 0; i < words.length; i++) {
-      const previous = words[i - 1];
-      const commandHere = prefixOnly[i] || previous === "-c" || previous === "--command";
+      const commandHere = prefixOnly[i] || isCommandOption(words[i - 1]);
       if (!commandHere) continue;
       const name = commandBasename(words[i]);
       const args = words.slice(i + 1);
