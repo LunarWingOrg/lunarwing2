@@ -27,12 +27,12 @@ import { test } from "node:test"
 
 const guardPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
 
-function runGuard(payload: unknown) {
+function runGuard(payload: unknown, timeout = 10_000) {
   const input = typeof payload === "string" ? payload : JSON.stringify(payload)
   const result = spawnSync(process.execPath, [guardPath], {
     input,
     encoding: "utf8",
-    timeout: 10_000,
+    timeout,
   })
   return result
 }
@@ -79,6 +79,67 @@ test("dangerous-class commands are denied", () => {
   assertBlocked("echo pwn > /dev/sda", "block-device")
   assertBlocked("SSH_AUTH_SOCK=/tmp/ssh-agent.sock ssh host", "SSH")
   assertBlocked("ls /tmp/ssh-agent.sock", "SSH")
+})
+
+test("rm word assembly through ${IFS}, quote splices, brace lists and substitution is denied", () => {
+  // WI#824: bash builds the command word from these forms, so the raw text
+  // never contains a literal `rm` and checkRm walked past the deny class.
+  assertBlocked("rm${IFS}-rf${IFS}/etc", "recursive/forced rm outside")
+  assertBlocked("rm$IFS-rf$IFS/etc", "recursive/forced rm outside")
+  assertBlocked("r''m -rf /etc", "recursive/forced rm outside")
+  assertBlocked('r"m" -rf /etc', "recursive/forced rm outside")
+  assertBlocked("{rm,-rf,/etc}", "dynamically assembled command word")
+  assertBlocked("$(echo rm) -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("echo $(echo rm) -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("`echo rm` -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("echo `echo rm` -rf /home/kumo", "recursive/forced rm outside")
+  // The flag word assembled around a backslash-newline (WI#824 table).
+  const continuation = "\\\n"
+  assertBlocked(`rm "-r${continuation}f" /etc`, "rm")
+  // Explicit temp operands still work after the simple IFS reading. The
+  // fallback does not attempt to resolve an unknown command or brace operand.
+  assertBlocked("$(echo rm) -rf /tmp/wi824-scratch", "dynamically assembled command word")
+  assertAllowed("rm${IFS}-rf${IFS}/tmp/wi824-scratch")
+  assertBlocked("rm -rf /tmp/wi824-{debug,release}", "rm")
+  assertAllowed("ls {a,b}")
+})
+
+test("ambiguous command words with deletion-style flags are refused without evaluating the shell", () => {
+  const fixture = "./guard-check-only-tree"
+  // These are inert fixtures for the guard, not shell commands the test runs.
+  for (const word of [
+    "$(printf %s fi)xture",
+    "$(printf %s fix)$(printf %s ture)",
+    "`printf %s fi`xture",
+    "$(printf %s fixture; true)",
+    "$(printf %s fixture | cat)",
+    "$(printf %s fixture && true)",
+    "./fi[x]ture",
+    "$fixture",
+    "${prefix}ture",
+    "$'\\x66ixture'",
+  ]) {
+    assertBlocked(`${word} -r ${fixture}`, "dynamically assembled command word")
+  }
+  assertBlocked(`fixture\${IFS:0:1}-r\${IFS:0:1}${fixture}`, "dynamically assembled command word")
+  assertBlocked(`rm "-r" ${fixture}`, "recursive/forced rm outside")
+  assertAllowed("mkdir -p build/{debug,release}")
+  assertAllowed("cd $(git rev-parse --show-toplevel)")
+})
+
+test("brace-shaped text at the command limit classifies within one second", () => {
+  const capacity = 16_384
+  const prefix = "printf %s "
+  const list = "build-{debug,release} "
+  const suffix = "{debug,release'"
+  const literal = "'" + "x".repeat(capacity - prefix.length - suffix.length - 1) + suffix
+  for (const text of [literal, list.repeat(Math.ceil(capacity / list.length)).slice(0, capacity - prefix.length)]) {
+    const command = prefix + text
+    assert.equal(command.length, capacity)
+    const result = runGuard({ tool_input: { command } }, 1_000)
+    assert.ifError(result.error)
+    assert.equal(result.status, 0, result.stderr)
+  }
 })
 
 test("ordinary work commands are allowed", () => {

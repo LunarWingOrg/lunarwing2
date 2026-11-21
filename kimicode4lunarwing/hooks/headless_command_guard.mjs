@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { runInNewContext } from "node:vm";
+
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
 // (WI#206).
 //
@@ -545,6 +547,111 @@ function evaluate(command) {
   return null;
 }
 
+// Leave substitutions opaque in this reading. In particular, an operator
+// inside a substitution must not separate the outer command from its args.
+// Scan once without trying to run the substitution or predict its output.
+function maskSubstitutions(text) {
+  let masked = "";
+  let depth = 0;
+  let backticks = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "`") {
+      if (depth === 0 && !backticks) masked += "$";
+      backticks = !backticks;
+    } else if (backticks) {
+      continue;
+    } else if (depth > 0) {
+      if (ch === "(") depth++;
+      if (ch === ")") depth--;
+    } else if (ch === "$" && text[i + 1] === "(") {
+      masked += "$";
+      depth = 1;
+      i++;
+    } else {
+      masked += ch;
+    }
+  }
+  return masked;
+}
+
+const RM_DYNAMIC_WORD = /[$`*?[\]{}]/;
+const RM_WRAPPERS = new Set(["command", "env", "exec", "busybox"]);
+
+function hasRmDeleteOption(words) {
+  for (const word of words) {
+    if (word === "--") return false;
+    const shortFlags = /^-([A-Za-z]+)(?=$|[<>])/.exec(word)?.[1];
+    if ((shortFlags && /[rRfF]/.test(shortFlags)) || isRmLongDeleteOption(word)) return true;
+  }
+  return false;
+}
+
+function hasAssembledDeleteOption(words) {
+  // Inspect brace alternatives without expanding them. A slice of IFS may
+  // also separate words; keep it opaque except when looking for flag tokens.
+  return hasRmDeleteOption(words.flatMap((word) => word.split(/\$\{IFS:[^{}\n]*\}|[{},]/)));
+}
+
+function checkAmbiguousRm(segment) {
+  const words = segment.split(/[ \t]+/).filter(Boolean);
+  let first = 0;
+  while (first < words.length) {
+    const word = words[first];
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) &&
+        !RM_WRAPPERS.has(word.slice(word.lastIndexOf("/") + 1))) break;
+    first++;
+  }
+  const command = words[first];
+  if (!command) return null;
+
+  if (RM_DYNAMIC_WORD.test(command) && hasAssembledDeleteOption(words.slice(first))) {
+    return "recursive/forced rm with a dynamically assembled command word; use a literal command and temp path";
+  }
+  // As in checkRm, also recognize a literal rm after a wrapper. The opaque
+  // reading is for adding denials only, never for accepting a rewritten path.
+  const rm = words.findIndex((word) => word === "rm" || word.endsWith("/rm"));
+  if (rm !== -1) {
+    const args = words.slice(rm + 1);
+    // Empty braces are not Bash expansion. Leave any placeholder handling
+    // to the existing rm and pipeline rules.
+    if (hasAssembledDeleteOption(args) &&
+        rmOperands(args, args.indexOf("--")).some((word) => word !== "{}" && RM_DYNAMIC_WORD.test(word))) {
+      return "recursive/forced rm with an expanded operand; use a literal temp path";
+    }
+  }
+  return null;
+}
+
+function checkRmAssembly(command) {
+  const readings = new Set(JOIN_READINGS.map(([outside, inside]) => joinLineContinuations(command, outside, inside)));
+  for (const reading of readings) {
+    const words = shellWordView(reading);
+    // Check plain IFS separators as spaces without evaluating parameters.
+    const separated = words.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, " ");
+    const inSubstitution = separated.replace(/\$\(|[`()]/g, " ");
+    for (const segment of commandSegments(inSubstitution)) {
+      const denied = checkRm(segment);
+      if (denied) return denied;
+    }
+
+    const opaque = maskSubstitutions(separated).replace(/[()]/g, ";");
+    for (const segment of commandSegments(opaque)) {
+      const denied = checkAmbiguousRm(segment);
+      if (denied) return denied;
+    }
+  }
+  return null;
+}
+
+// The CLI can allow a hook that misses its 10 s deadline. Interrupt our own
+// synchronous classifier much earlier, including any legacy regex checks.
+const ANALYSIS_TIMEOUT_MS = 2_000;
+
+function classify(command) {
+  return evaluate(command) ?? checkRmAssembly(command);
+}
+
 async function main() {
   let payload;
   try {
@@ -558,7 +665,18 @@ async function main() {
     deny("Bash tool call without a command string");
     return;
   }
-  const reason = evaluate(command);
+  let reason;
+  try {
+    // The script source is constant: the shell command is only passed as
+    // data to the classifier and is never executed by the hook.
+    reason = runInNewContext("classify(command)", { classify, command }, {
+      timeout: ANALYSIS_TIMEOUT_MS,
+      contextCodeGeneration: { strings: false, wasm: false },
+    });
+  } catch (error) {
+    if (error?.code !== "ERR_SCRIPT_EXECUTION_TIMEOUT") throw error;
+    deny("command analysis exceeded its time budget; use simpler commands");
+  }
   if (reason) deny(reason);
   else allow();
 }

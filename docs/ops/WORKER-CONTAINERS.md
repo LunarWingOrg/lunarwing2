@@ -4031,6 +4031,17 @@ auto-approval:
   `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
   containers force-recreate. Other worker lanes keep the socket.
 
+WI#824 adds an `rm` word-assembly check alongside the raw and shell-word
+checks. It reads simple IFS separators as whitespace and looks for destructive
+options without expanding brace lists or running substitutions. It denies
+ambiguous command words with recursive or forced flags and refuses expanded
+`rm` operands rather than guessing which paths they name. Ordinary brace
+lists in non-destructive commands still work. This is not a Bash evaluator:
+it cannot resolve values from scripts, functions, or state set at runtime.
+The hook denies if its synchronous analysis exceeds two seconds, before the CLI's
+10-second hook timeout (which can allow a call). Rebuild the Kimi worker
+image and recreate the worker to pick up the updated hook.
+
 Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
