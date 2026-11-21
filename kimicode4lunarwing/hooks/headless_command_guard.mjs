@@ -24,7 +24,7 @@
 // within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer).
 
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname } from "node:path";
 
 const MAX_COMMAND_CHARS = 16384;
@@ -67,8 +67,10 @@ function rmOperands(words, endOfOptions) {
 // Resolve the longest existing prefix of a path, following symlinks, and
 // re-attach the components that do not exist yet: rm deletes those names
 // rather than traversing them, so there is no symlink to follow there. Returns
-// null when the prefix cannot be resolved (symlink loop, permission error),
-// which denies.
+// null when the prefix cannot be resolved (symlink loop, permission error), or
+// when a component exists but is a symlink that does not resolve: its target
+// can be created before rm runs, and the name below it would then be deleted
+// through the link.
 function resolveExistingPrefix(target) {
   let prefix = target;
   const missing = [];
@@ -80,11 +82,20 @@ function resolveExistingPrefix(target) {
       return `${base}${missing.reverse().join("/")}`;
     } catch (error) {
       if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return null;
+      if (isDanglingSymlink(prefix)) return null;
       const parent = dirname(prefix);
       if (parent === prefix) return null;
       missing.push(basename(prefix));
       prefix = parent;
     }
+  }
+}
+
+function isDanglingSymlink(target) {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 

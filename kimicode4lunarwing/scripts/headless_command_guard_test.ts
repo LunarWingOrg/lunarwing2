@@ -139,6 +139,12 @@ test("a symlink under a temp root cannot carry rm outside the safe roots", (t) =
     assertAllowed(`rm -rf ${innerLink}/x`)
     // A name rm creates rather than traverses has no symlink to follow.
     assertAllowed(`rm -rf ${linkRoot}/not-yet-there/sub`)
+    // A link that does not resolve yet is refused: its target can be created
+    // before rm runs, and rm would then delete through it.
+    const dangling = join(linkRoot, "dangling")
+    symlinkSync(join(resolvedTarget, "later"), dangling, "dir")
+    assertBlocked(`rm -rf ${dangling}/sub`, "recursive/forced rm outside")
+    assertBlocked(`rm -rf ${dangling}`, "recursive/forced rm outside")
     assert.ok(existsSync(join(target, "sub")), "guard must not run the rm")
   } finally {
     rmSync(linkRoot, { recursive: true, force: true })

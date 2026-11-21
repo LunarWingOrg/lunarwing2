@@ -3764,6 +3764,8 @@ auto-approval:
   an operand that cannot be resolved denies. A symlink under `/tmp` therefore
   no longer carries `rm` to its target, and deleting a link whose target is
   outside the temp roots denies even though only the link would go. A link
+  that does not resolve yet also denies: its target can be created before
+  `rm` runs, which would then delete through it. A link
   that resolves back inside them stays allowed. Words bash rewrites after the
   hook — `$`, backticks, quotes, globs, brace lists — and relative or `~`
   operands are refused before resolving, because the hook would otherwise
