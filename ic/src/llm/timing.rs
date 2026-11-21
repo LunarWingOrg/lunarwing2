@@ -149,7 +149,8 @@ impl StreamTimingState<'_> {
             call,
             &self.served_label,
             self.started_at.elapsed(),
-            self.first_chunk_at.map(|at| at.duration_since(self.started_at)),
+            self.first_chunk_at
+                .map(|at| at.duration_since(self.started_at)),
         );
     }
 
@@ -381,10 +382,10 @@ mod tests {
                     reason: "stub failure".to_string(),
                 });
             }
-            Ok(futures::stream::iter(
-                self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>(),
+            Ok(
+                futures::stream::iter(self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>())
+                    .boxed(),
             )
-            .boxed())
         }
 
         async fn complete_with_tools(
@@ -422,10 +423,10 @@ mod tests {
                     reason: "stub failure".to_string(),
                 });
             }
-            Ok(futures::stream::iter(
-                self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>(),
+            Ok(
+                futures::stream::iter(self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>())
+                    .boxed(),
             )
-            .boxed())
         }
     }
 

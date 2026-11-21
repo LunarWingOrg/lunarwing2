@@ -220,10 +220,7 @@ impl LlmTimings {
             .estimate_operation(&key, None, None)
             .map(|estimate| estimate.duration);
         LlmTimingCounters::bump(&self.counters.calls_started);
-        Some(LlmCall {
-            key,
-            predicted,
-        })
+        Some(LlmCall { key, predicted })
     }
 
     /// Record a completed call. `completed_label` is the model that actually
@@ -291,8 +288,7 @@ impl LlmTimings {
             let learner = state.estimator.learner();
             min_samples = learner.min_samples();
             for (key, model) in learner.all_models() {
-                let Some(label) = key.strip_prefix("Llm(").and_then(|k| k.strip_suffix(')'))
-                else {
+                let Some(label) = key.strip_prefix("Llm(").and_then(|k| k.strip_suffix(')')) else {
                     continue;
                 };
                 let estimate = state.estimator.estimate_operation(key, None, None);
@@ -343,10 +339,7 @@ mod tests {
 
     #[test]
     fn setting_and_disabled_cache() {
-        assert_eq!(
-            LlmTimingMode::from_setting(None),
-            LlmTimingMode::Observe
-        );
+        assert_eq!(LlmTimingMode::from_setting(None), LlmTimingMode::Observe);
         assert_eq!(
             LlmTimingMode::from_setting(Some("1")),
             LlmTimingMode::Observe
