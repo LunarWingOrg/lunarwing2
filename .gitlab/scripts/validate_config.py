@@ -1078,16 +1078,30 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
 
 # WI#363 (offline half only, per the 2026-10-20 scope decision): the
 # accepted-advisory list in ic/deny.toml relies on two facts no gate used to
-# check — every ignore reason must name a clearing owner work item (the
-# 2.1.5.0 reasons named WI#304/#305/#306, closed without the migrations
-# landing, and nobody noticed until a review), and every repo-relative path
-# the policy and its audit trail cite must still exist (release moves broke
-# this link class once — MR !1505 review CP-8). Owner liveness (whether a
-# named owner is still open) is deliberately out of scope: every owner the
-# accepted advisories cite was closed with the chains still locked, so an
-# online owner gate could only run failed-allowed; owner liveness stays a
-# review and release-notes concern, not a CI gate.
-DENY_OWNER_PATTERN = re.compile(r"clearing owner:?\s*WI#(\d+)", re.IGNORECASE)
+# check — every ignore reason must name a clearing owner (the 2.1.5.0 reasons
+# named WI#304/#305/#306, closed without the migrations landing, and nobody
+# noticed until a review), and every repo-relative path the policy and its
+# audit trail cite must still exist (release moves broke this link class once
+# — MR !1505 review CP-8). Owner liveness (whether a named owner is still
+# open) is deliberately out of scope: every owner the accepted advisories cite
+# was closed with the chains still locked, so an online owner gate could only
+# run failed-allowed; owner liveness stays a review and release-notes concern,
+# not a CI gate.
+#
+# WI#779 (2026-11-21): the owner token must name a tracked document, not a
+# work item. Four owners the acceptances cited (WI#367, WI#418, WI#749,
+# WI#781) were closed while their pins stayed locked, and WI#418's own
+# decision record set the rule they broke — a closed work item cannot own a
+# standing acceptance. A document has no closure event, so the doc-only form
+# removes the liveness question instead of polling it: the guard requires the
+# owner path to resolve inside the checkout and the document to name the
+# advisory ID it owns. A deleted, renamed or silently split decision record
+# then fails offline. The model is described in
+# docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md.
+DENY_DOC_OWNER_PATTERN = re.compile(
+    r"clearing owner:?\s*([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.md)\b",
+    re.IGNORECASE,
+)
 DENY_WI_PATTERN = re.compile(r"WI#\d+")
 DENY_URL_PATTERN = re.compile(r"https?://\S+")
 DENY_PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
@@ -1171,23 +1185,60 @@ def check_cited_paths(
         )
 
 
+def check_deny_owner_document(
+    label: str, owner_path: str, advisory_id: str | None, errors: list[str]
+) -> None:
+    """WI#779: a doc-only clearing owner must exist and name its advisory.
+
+    The owner token is a repo-relative `.md` path (tracked-ness is checked
+    separately by `check_cited_paths`). The document must resolve inside the
+    checkout and its text must name the accepted advisory, so a decision
+    record that is deleted, renamed, moved or stops covering an entry fails
+    this guard instead of silently owning it.
+    """
+    parts = pathlib.PurePosixPath(owner_path).parts
+    candidate = ROOT / owner_path
+    if ".." in parts or not candidate.resolve().is_relative_to(ROOT.resolve()):
+        errors.append(
+            f"ic/deny.toml {label} clearing owner {owner_path} must resolve "
+            "inside the checkout"
+        )
+        return
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(
+            f"ic/deny.toml {label} clearing owner {owner_path} cannot be read "
+            f"({error}); a doc-only owner must be a tracked decision record"
+        )
+        return
+    if advisory_id is not None and advisory_id not in text:
+        errors.append(
+            f"ic/deny.toml {label} clearing owner {owner_path} does not name "
+            f"{advisory_id}; the owner record must list every advisory it owns"
+        )
+
+
 def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = None) -> None:
     """WI#363 offline guard: deny.toml reasons name an owner; cited paths exist.
 
     Every [advisories].ignore entry must be a table whose non-empty reason
-    names a work item AND a "clearing owner WI#N" — a reason naming only
-    closed historical records would leave the acceptance without a named
-    owner to re-verify against at the next release. Every repo-relative path
-    cited anywhere in ic/deny.toml (comments and reason strings) and in the
-    marker-delimited cargo-deny section of .gitlab/README.md must be a
-    tracked path. The tracked-file truth comes from `git ls-files`; in an
-    image without a git binary (the ci-config lint image ships none) it
-    falls back to checkout existence, restricted to citations git mode
-    could list: no `..` segments, no path components beneath a directory
-    symlink (git lists the link itself, never the paths beneath it — a
-    symlink at the final component is fine because git lists leaf
-    symlinks), and no symlink escapes out of the checkout — the same truth
-    in CI because the runner checks out a clean tree.
+    names a work item AND a doc-only clearing owner — `clearing owner
+    <repo-relative>.md`, per WI#779. A reason naming only a `clearing owner
+    WI#N` is refused because a closed work item cannot own a standing
+    acceptance, and the four owners the acceptances cited (WI#367, WI#418,
+    WI#749, WI#781) were closed with the pins still locked. The named
+    document must resolve inside the checkout and name the entry's advisory
+    ID. Every repo-relative path cited anywhere in ic/deny.toml (comments and
+    reason strings) and in the marker-delimited cargo-deny section of
+    .gitlab/README.md must be a tracked path. The tracked-file truth comes
+    from `git ls-files`; in an image without a git binary (the ci-config lint
+    image ships none) it falls back to checkout existence, restricted to
+    citations git mode could list: no `..` segments, no path components
+    beneath a directory symlink (git lists the link itself, never the paths
+    beneath it — a symlink at the final component is fine because git lists
+    leaf symlinks), and no symlink escapes out of the checkout — the same
+    truth in CI because the runner checks out a clean tree.
     """
     deny_path = ROOT / "ic" / "deny.toml"
     try:
@@ -1222,11 +1273,16 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
             continue
         if not DENY_WI_PATTERN.search(reason):
             errors.append(f"ic/deny.toml {label} reason names no WI#N work item")
-        if not DENY_OWNER_PATTERN.search(reason):
+        owner = DENY_DOC_OWNER_PATTERN.search(reason)
+        if owner is None:
             errors.append(
-                f"ic/deny.toml {label} reason names no 'clearing owner WI#N' "
-                "(WI#363 offline guard)"
+                f"ic/deny.toml {label} reason names no 'clearing owner "
+                "<repo-relative>.md' document (WI#779 doc-only owner model); "
+                "a work item cannot own a standing acceptance"
             )
+        else:
+            advisory_id = entry_id if isinstance(entry_id, str) and entry_id else None
+            check_deny_owner_document(label, owner.group(1), advisory_id, errors)
 
     readme_path = ROOT / ".gitlab" / "README.md"
     try:
