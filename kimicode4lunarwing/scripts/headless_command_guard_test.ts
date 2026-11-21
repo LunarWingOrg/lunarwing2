@@ -713,3 +713,94 @@ test("a long command of repeated words is decided without rescanning", () => {
   // tripped runGuard's kill timeout. The linear scan decides it immediately.
   assertAllowed("chmod -R ".repeat(1500))
 })
+
+test("interpreter one-liners delete without parentheses or through a binding", () => {
+  // WI#832: WI#826 read only a `name(` call with the target in the first
+  // argument, so a parenthesis-free Perl call, an import alias and a getattr
+  // lookup all deleted freely.
+  assertBlocked(`perl -MFile::Path -e 'rmtree "/home/kimi/x"'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink glob "/home/kimi/x/*"'`, "deletion outside")
+  assertBlocked(`python3 -c "from shutil import rmtree as r; r('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil; getattr(shutil, 'rmtree')('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil as s; s.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil; f = shutil.rmtree; f('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree $target'`, "cannot verify")
+  // The same readings keep a literal temp target allowed; a glob is not a
+  // literal (as for `rm -rf /tmp/*.log`), so it stays denied.
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/wi832-x"'`)
+  assertAllowed(`perl -e 'unlink "/tmp/wi832-x/file"'`)
+  assertBlocked(`perl -e 'unlink glob "/tmp/wi832-x/*"'`, "deletion outside")
+  assertAllowed(`python3 -c "from shutil import rmtree as r; r('/tmp/wi832-x')"`)
+  assertAllowed(`python3 -c "import shutil; getattr(shutil, 'rmtree')('/tmp/wi832-x')"`)
+  assertAllowed(`python3 -c "import shutil as s; s.rmtree('/tmp/wi832-x')"`)
+})
+
+test("find and rsync delete through the same temp-root test", () => {
+  // WI#832: `find -exec unlink` deleted without a deletion action match, and
+  // rsync --delete removed whatever the destination had.
+  assertBlocked("find /home/kimi -type f -exec unlink {} \\;", "deletion outside")
+  assertBlocked("find /home/kimi -type f -exec rmdir {} \\;", "deletion outside")
+  assertBlocked("find /home/kimi -type f -exec shred {} \\;", "deletion outside")
+  assertBlocked("rsync -a --delete /tmp/empty/ /home/kimi/x/", "deletion outside")
+  assertBlocked("rsync -a --del /tmp/empty/ /home/kimi/x/", "deletion outside")
+  assertBlocked("rsync -a --remove-source-files /home/kimi/x/ /tmp/wi832/", "deletion outside")
+  assertAllowed("find /tmp/wi832 -type f -exec unlink {} \\;")
+  assertAllowed("rsync -a --delete /tmp/empty/ /tmp/wi832-x/")
+  assertAllowed("rsync -a /tmp/wi832-a/ /tmp/wi832-b/")
+  assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
+})
+
+test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
+  assertBlocked(`printf '\\x73\\x75\\x64\\x6f id' | sh`, "decoded")
+  assertBlocked(`printf '\\163\\165\\144\\157 id' | sh`, "decoded")
+  assertBlocked("echo aGVsbG8K | openssl base64 -d | sh", "decoded")
+  assertBlocked("zcat payload.gz | bash", "decoded")
+  assertBlocked("gunzip -c payload.gz | bash", "decoded")
+  assertBlocked("xzcat payload.xz | bash", "decoded")
+  assertBlocked("zstd -d -c payload.zst | bash", "decoded")
+  assertBlocked("echo aGVsbG8K | perl -MMIME::Base64 -ne 'print decode_base64($_)' | sh", "decoded")
+  assertBlocked("echo aGVsbG8K | python3 -c 'import base64;print(base64.b64decode(\"aGVsbG8K\"))' | sh", "decoded")
+  // A plain printf with no escapes decodes nothing.
+  assertAllowed(`printf '%s\\n' hello | sh`)
+  assertAllowed("printf 'hello world' | rev")
+})
+
+test("git commands that discard work are denied in the spellings WI#832 named", () => {
+  // `git restore` discards the same uncommitted changes as `git checkout -- .`,
+  // so it takes the same verdict; the rest are the flag spellings of classes
+  // WI#826 already denied.
+  assertBlocked("git restore .", "git command")
+  assertBlocked("git restore --worktree --staged .", "git command")
+  assertBlocked("git stash --all", "git command")
+  assertBlocked("git stash -a", "git command")
+  assertBlocked("git checkout -f", "git command")
+  assertBlocked("git checkout --force", "git command")
+  assertBlocked("git switch --discard-changes", "git command")
+  assertBlocked("git switch -f main", "git command")
+  assertAllowed("git restore src/main.rs")
+  assertAllowed("git restore --staged src/main.rs")
+  assertAllowed("git stash list")
+  assertAllowed("git stash pop")
+  assertAllowed("git switch -c feature")
+  assertAllowed("git checkout -b feature")
+})
+
+test("the noclobber override writes a block device like a plain redirect", () => {
+  assertBlocked("cat x >| /dev/sda1", "block-device")
+  assertBlocked("echo pwn >| /dev/mapper/vg-root", "block-device")
+  assertAllowed("cat x >| /tmp/wi832.out")
+})
+
+test("a dry-run clean and a deleting tr no longer deny (WI#832 false denials)", () => {
+  // `git clean -fdn` is a dry run, like the allowed `git clean -n`; the flag
+  // test had matched the `f` alone.
+  assertBlocked("git clean -fd", "git command")
+  assertBlocked("git clean -fdx", "git command")
+  assertAllowed("git clean -fdn")
+  assertAllowed("git clean -fn")
+  assertAllowed("git clean --dry-run -fd")
+  // `tr -d '\r'` strips carriage returns; it decodes nothing.
+  assertBlocked("echo aGVsbG8K | tr -d '\\n' | rev | sh", "decoded")
+  assertAllowed("cat script.sh | tr -d '\\r' | bash")
+  assertAllowed("cat script.sh | tr -d '\\r' > script.sh.tmp")
+})
