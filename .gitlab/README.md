@@ -744,8 +744,8 @@ host's concurrent builds before retrying manually.
   decision record states the rule they broke: a closed work item cannot own
   a standing acceptance. The guard therefore refuses `clearing owner WI#N`,
   requires the named document to resolve inside the checkout, and requires
-  it to name the advisory ID it owns, so a deleted, renamed or split
-  decision record fails offline. The standing owner for every current entry
+  it to list the advisory ID it owns as the first cell of a table row, so a
+  deleted, renamed or split decision record fails offline. The standing owner for every current entry
   is `docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md`. Checking whether a
   work item is still open (owner liveness) remains out of scope per the
   WI#363 scope decision of 2026-10-20 — an online owner gate could only run

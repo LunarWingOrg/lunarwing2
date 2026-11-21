@@ -1194,13 +1194,16 @@ def check_cited_paths(
 def check_deny_owner_document(
     label: str, owner_path: str, advisory_id: str | None, errors: list[str]
 ) -> None:
-    """WI#779: a doc-only clearing owner must exist and name its advisory.
+    """WI#779: a doc-only clearing owner must exist and list its advisory.
 
     The owner token is a repo-relative `.md` path (tracked-ness is checked
     separately by `check_cited_paths`). The document must resolve inside the
-    checkout and its text must name the accepted advisory, so a decision
-    record that is deleted, renamed, moved or stops covering an entry fails
-    this guard instead of silently owning it.
+    checkout and list the accepted advisory as the first cell of a table row,
+    so a decision record that is deleted, renamed, moved or stops covering an
+    entry fails this guard instead of silently owning it. A mention anywhere
+    else (prose, a history table's later cell) does not count: the record's
+    own superseded-owner table names several IDs in full (WI#779 review
+    AIO-1).
     """
     parts = pathlib.PurePosixPath(owner_path).parts
     candidate = ROOT / owner_path
@@ -1218,10 +1221,12 @@ def check_deny_owner_document(
             f"({error}); a doc-only owner must be a tracked decision record"
         )
         return
-    if advisory_id is not None and advisory_id not in text:
+    row = re.compile(rf"^\|\s*{re.escape(advisory_id or '')}\s*\|", re.MULTILINE)
+    if advisory_id is not None and not row.search(text):
         errors.append(
-            f"ic/deny.toml {label} clearing owner {owner_path} does not name "
-            f"{advisory_id}; the owner record must list every advisory it owns"
+            f"ic/deny.toml {label} clearing owner {owner_path} does not list "
+            f"{advisory_id} as the first cell of a table row; the owner record "
+            "must list every advisory it owns"
         )
 
 
@@ -1234,8 +1239,8 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
     WI#N` is refused because a closed work item cannot own a standing
     acceptance, and the four owners the acceptances cited (WI#367, WI#418,
     WI#749, WI#781) were closed with the pins still locked. The named
-    document must resolve inside the checkout and name the entry's advisory
-    ID. Every repo-relative path cited anywhere in ic/deny.toml (comments and
+    document must resolve inside the checkout and list the entry's advisory
+    ID as the first cell of a table row. Every repo-relative path cited anywhere in ic/deny.toml (comments and
     reason strings) and in the marker-delimited cargo-deny section of
     .gitlab/README.md must be a tracked path. The tracked-file truth comes
     from `git ls-files`; in an image without a git binary (the ci-config lint

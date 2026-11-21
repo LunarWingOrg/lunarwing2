@@ -34,9 +34,9 @@ ignore = [
     # own decision record states the rule: a closed work item cannot own a
     # standing acceptance). Each reason below ends with that owner token plus
     # the historical WI that accepted it; validate_config.py requires the
-    # owner document to exist as a tracked path AND to name the entry's
-    # advisory ID, so a deleted or split decision record fails the ci-config
-    # lane. Do not re-point an entry at a work item: it can close.
+    # owner document to exist as a tracked path AND to list the entry's
+    # advisory ID as the first cell of a table row, so a deleted or split
+    # decision record fails the ci-config lane. Do not re-point an entry at a work item: it can close.
     # WI#368's rsa acceptance was cleared 2026-11-11 by disabling russh's
     # optional rsa feature. Re-verify each exposure note at every release per
     # the protocol in the standing ownership record. Historical decision

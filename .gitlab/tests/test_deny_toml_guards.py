@@ -4,7 +4,8 @@ ic/deny.toml accepted-advisory guard.
 
 validate_config.validate_deny_toml_advisories (ci-config lane) requires
 every [advisories].ignore reason to name a "clearing owner" that is a
-repo-relative document, and that document to name the advisory it owns
+repo-relative document, and that document to list the advisory it owns
+as the first cell of a table row
 (WI#779 doc-only owner model: the four work-item owners the acceptances
 cited — WI#367, WI#418, WI#749, WI#781 — were all closed with their pins
 still locked). It also requires every cited repo-relative path to be
@@ -159,8 +160,12 @@ class DenyTomlAdvisoryGuardTests(unittest.TestCase):
     OWNER_DOC_TEXT = (
         "# Standing advisory ownership record\n"
         "\n"
-        "This document is the clearing owner for RUSTSEC-0000-0001 and\n"
-        "RUSTSEC-0000-0002.\n"
+        "| Advisory | Note |\n"
+        "|---|---|\n"
+        "| RUSTSEC-0000-0001 | demo |\n"
+        "| RUSTSEC-0000-0002 | demo two |\n"
+        "\n"
+        "Superseded owners: | WI#331 | RUSTSEC-0000-0003 | closed |\n"
     )
     DENY_OK = """[advisories]
 unmaintained = "workspace"
@@ -290,10 +295,25 @@ ignore = [
         errors = self.errors(deny, self.README_OK)
         self.assertTrue(
             any(
-                "clearing owner docs/ops/EXISTS.md does not name RUSTSEC-0000-0003"
+                "clearing owner docs/ops/EXISTS.md does not list RUSTSEC-0000-0003"
                 in error
                 for error in errors
             ),
+            errors,
+        )
+
+    def test_advisory_in_a_later_table_cell_does_not_count(self):
+        # WI#779 review AIO-1: the standing record's superseded-owner table
+        # names IDs in full; such a row must not keep an acceptance owned
+        # once its accepted-table row is gone.
+        self.OWNER_DOC_TEXT = self.OWNER_DOC_TEXT + "| WI#781 | 2026-11-20 | RUSTSEC-0000-0004 | closed |\n"
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0004", '
+            'reason = "demo; clearing owner docs/ops/EXISTS.md" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any("does not list RUSTSEC-0000-0004 as the first cell" in error for error in errors),
             errors,
         )
 
