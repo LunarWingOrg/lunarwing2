@@ -46,14 +46,13 @@ fn late_budget_for_steps(tool_calls: u32) -> Duration {
         .min(LATE_MAX_TIMEOUT)
 }
 
-/// Only completed tool actions earn extra late-turn time; LLM steps, state
-/// changes and gate events do not, so a loop that never reaches a tool cannot
-/// extend its own budget.
+/// Only completed tool actions earn extra late-turn time. LLM steps, state
+/// changes, gate events and `ActionFailed` do not: the engine reports a
+/// refused call (the per-step tool-call limit, a missing lease, a policy
+/// denial) as `ActionFailed` too, so a loop that keeps hitting a wall cannot
+/// extend its own budget (WI#807 review AIP-1).
 fn is_tool_step(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
-    )
+    matches!(kind, EventKind::ActionExecuted { .. })
 }
 
 struct TurnCompletion {

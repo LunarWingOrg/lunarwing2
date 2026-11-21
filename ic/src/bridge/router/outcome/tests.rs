@@ -1486,7 +1486,8 @@ fn late_budget_is_capped_and_cannot_overflow() {
 }
 
 /// Only completed tool actions extend the late budget. LLM steps, state
-/// changes and gates are thinking/waiting, not demonstrated task progress.
+/// changes and gates are thinking/waiting, and a failed action includes
+/// refusals, so none of them is demonstrated task progress.
 #[test]
 fn only_tool_action_events_count_as_steps() {
     use lunarwing_engine::StepId;
@@ -1500,11 +1501,14 @@ fn only_tool_action_events_count_as_steps() {
         params_summary: None,
         result_preview: None,
     }));
-    assert!(is_tool_step(&EventKind::ActionFailed {
+    // WI#807 review AIP-1: a refusal such as the per-step tool-call limit is
+    // reported as ActionFailed and must not earn time.
+    assert!(!is_tool_step(&EventKind::ActionFailed {
         step_id: step,
         action_name: "shell".into(),
         call_id: "call-2".into(),
-        error: "failed".into(),
+        error: "Tool call limit reached (50 per code step). Break your task into multiple steps."
+            .into(),
         params_summary: None,
     }));
     assert!(!is_tool_step(&EventKind::StepStarted { step_id: step }));

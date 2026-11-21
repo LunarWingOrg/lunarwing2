@@ -1941,9 +1941,12 @@ transformed output becomes an auth gate. It is not recorded as assistant prose.
 
 The watcher's second budget is step-aware (WI#807): a flat 600-second base,
 plus 90 seconds for every tool action the turn completed before detaching,
-capped at 1800 seconds. Only `ActionExecuted`/`ActionFailed` events earn time,
-so a turn that is thinking or looping without reaching a tool keeps the flat
-base and cannot extend its own budget. A turn with no tool calls keeps exactly
+capped at 1800 seconds. Only `ActionExecuted` events earn time. That
+includes a tool that ran and returned an error; a loop on such a tool earns
+time up to the cap. `ActionFailed` earns nothing: it reports refusals (the
+per-step tool-call limit, a missing lease, a policy denial, an adapter
+refusal) and a tool that timed out or panicked, so a turn that is thinking or
+keeps hitting a refusal keeps the flat base. A turn with no tool calls keeps exactly
 the old 600-second budget. If the late budget expires, the stop request
 has a 60-second grace and, after a successful request, settlement gets its own
 60-second grace. A settled stop reports a terminal timeout; if the run already
