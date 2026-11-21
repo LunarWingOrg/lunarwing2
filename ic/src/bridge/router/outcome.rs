@@ -6,9 +6,10 @@
 //! detached turn itself.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use lunarwing_engine::ThreadOutcome;
+use lunarwing_engine::{EventKind, ThreadOutcome};
 
 use crate::agent::Agent;
 use crate::agent::response_delivery::ResponseDelivery;
@@ -25,9 +26,35 @@ use super::{
 
 const OUTCOME_TIMEOUT: Duration =
     Duration::from_secs(lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10);
+/// Base late-turn budget: the fixed 600s every turn got before WI#807.
 const LATE_TIMEOUT: Duration =
     Duration::from_secs(lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS);
+/// Extra late-turn time earned per completed tool call (WI#807). Small models can
+/// spend most of a flat budget on a long but healthy agentic chain, so the budget
+/// scales with demonstrated work instead of being one ceiling for every turn.
+const LATE_STEP_ALLOWANCE: Duration = Duration::from_secs(90);
+/// Hard ceiling for the scaled late budget, so a runaway loop still stops.
+const LATE_MAX_TIMEOUT: Duration = Duration::from_secs(1_800);
 const STOP_GRACE: Duration = Duration::from_secs(60);
+
+/// Late-turn budget for a turn that completed `tool_calls` discrete tool actions:
+/// the base budget plus one step allowance per action, capped at
+/// [`LATE_MAX_TIMEOUT`]. A turn with no tool calls keeps the base budget exactly.
+fn late_budget_for_steps(tool_calls: u32) -> Duration {
+    LATE_TIMEOUT
+        .saturating_add(LATE_STEP_ALLOWANCE.saturating_mul(tool_calls))
+        .min(LATE_MAX_TIMEOUT)
+}
+
+/// Only completed tool actions earn extra late-turn time; LLM steps, state
+/// changes and gate events do not, so a loop that never reaches a tool cannot
+/// extend its own budget.
+fn is_tool_step(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
+    )
+}
 
 struct TurnCompletion {
     state: EngineState,
@@ -37,6 +64,9 @@ struct TurnCompletion {
     thread_id: lunarwing_engine::ThreadId,
     run_started_at: chrono::DateTime<chrono::Utc>,
     history: Option<HistoryReference>,
+    /// Discrete tool actions forwarded for this turn so far. Shared through
+    /// `&self` because the late watcher reads it after the turn detaches.
+    tool_call_count: AtomicU32,
 }
 
 #[derive(serde::Deserialize)]
@@ -101,6 +131,7 @@ pub(super) async fn await_thread_outcome(
         thread_id,
         run_started_at,
         history: history_reference(state, message, thread_id).await,
+        tool_call_count: AtomicU32::new(0),
     };
     turn.await_outcome(events, OUTCOME_TIMEOUT).await
 }
@@ -118,12 +149,19 @@ impl TurnCompletion {
     ) -> Result<Option<String>, Error> {
         let mut cancellation = self.cancellation_guard();
         if !self.wait(&mut events, budget).await {
-            tracing::warn!(thread_id = %self.thread_id, "Turn wait budget exhausted; transferring delivery to late watcher");
+            let tool_calls = self.tool_calls();
+            let late_budget = late_budget_for_steps(tool_calls);
+            tracing::warn!(
+                thread_id = %self.thread_id,
+                tool_calls,
+                late_budget_secs = late_budget.as_secs(),
+                "Turn wait budget exhausted; transferring delivery to late watcher"
+            );
             self.delivery
                 .channels
                 .note_turn_outcome(self.message.id, TurnOutcome::Detached);
             tokio::spawn(async move {
-                self.deliver_late(&mut events, LATE_TIMEOUT, STOP_GRACE)
+                self.deliver_late(&mut events, late_budget, STOP_GRACE)
                     .await;
             });
             cancellation.disarm();
@@ -180,7 +218,14 @@ impl TurnCompletion {
         }).await.is_ok()
     }
 
+    fn tool_calls(&self) -> u32 {
+        self.tool_call_count.load(Ordering::Relaxed)
+    }
+
     async fn forward(&self, event: &lunarwing_engine::ThreadEvent) {
+        if is_tool_step(&event.kind) {
+            self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(recovery) = super::model_recovery_info(event) {
             let state = match recovery.recovery_state.as_str() {
                 "retrying" => "Retrying",
@@ -232,6 +277,7 @@ impl TurnCompletion {
                 &engine_status_metadata(&self.message, &self.thread_id.to_string()),
             ),
         ).await;
+        let wait_started = tokio::time::Instant::now();
         let result = self
             .late_result(events, budget, stop_grace, stop_grace)
             .await;
@@ -244,6 +290,14 @@ impl TurnCompletion {
             cancellation.disarm();
         }
         let outcome = self.deliver_late_result(result).await;
+        tracing::info!(
+            thread_id = %self.thread_id,
+            tool_calls = self.tool_calls(),
+            late_budget_secs = budget.as_secs(),
+            elapsed_ms = wait_started.elapsed().as_millis() as u64,
+            %outcome,
+            "Late turn finished"
+        );
         self.report_late_finish(outcome).await;
     }
 
@@ -353,7 +407,7 @@ impl TurnCompletion {
         stop_grace: Duration,
         post_stop_grace: Duration,
     ) -> Result<bool, Error> {
-        tracing::debug!(thread_id = %self.thread_id, "Late turn budget exhausted; requesting thread stop");
+        tracing::debug!(thread_id = %self.thread_id, tool_calls = self.tool_calls(), "Late turn budget exhausted; requesting thread stop");
         // Leave the handle addressable by /interrupt on either timeout; joining
         // could otherwise remove a still-running thread.
         let stop = Self::await_late_stop_request(
@@ -367,7 +421,7 @@ impl TurnCompletion {
         .await?;
         match stop {
             Ok(()) => {
-                tracing::warn!(thread_id = %self.thread_id, "Late turn budget exhausted; stopping thread");
+                tracing::warn!(thread_id = %self.thread_id, tool_calls = self.tool_calls(), "Late turn budget exhausted; stopping thread");
             }
             Err(lunarwing_engine::EngineError::ThreadNotFound(_)) => {
                 tracing::debug!(
