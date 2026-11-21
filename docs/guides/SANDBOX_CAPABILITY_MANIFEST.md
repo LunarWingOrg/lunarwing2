@@ -71,10 +71,10 @@ size is bounded at 16 KiB.
   overlay combinations fail rather than silently reconfiguring a sidecar.
 - Omitted `filesystem` requests the existing virtual `/workspace` read-only.
   `read_write: ["/workspace"]` is allowed only when host `SandboxPolicy` is
-  `WorkspaceWrite`. The virtual path must be exactly `/workspace`, not `/`,
-  `/etc`, `../`, relative paths, or other paths; both RO and RW are a
-  conflict. Multiple mounts and toolchain mounts are not implemented in
-  version 1.
+  `WorkspaceWrite`; `read_only` may then be omitted. The virtual path must be
+  exactly `/workspace`, not `/`, `/etc`, `../`, relative paths, or other
+  paths; both RO and RW are a conflict. Multiple mounts and toolchain mounts
+  are not implemented in version 1.
 - The manifest names only the virtual destination. The host source of
   `/workspace` is the call's working directory (`workdir`), as for a call
   without a manifest. It is canonicalized and checked by the existing

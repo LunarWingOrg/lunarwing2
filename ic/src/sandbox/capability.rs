@@ -81,23 +81,27 @@ pub struct NetworkCapabilityRequest {
     pub dns: DnsRequestMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemCapabilityRequest {
     /// Virtual destinations only. The host source of `/workspace` is the
     /// call's working directory, checked by `mount_guard`; the manifest does
-    /// not name or narrow it.
-    #[serde(default = "workspace_read_only")]
-    pub read_only: Vec<PathBuf>,
+    /// not name or narrow it. An omitted `read_only` means `["/workspace"]`
+    /// unless `read_write` asks for the workspace (WI#797 review AIL-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<Vec<PathBuf>>,
     #[serde(default)]
     pub read_write: Vec<PathBuf>,
 }
 
-impl Default for FilesystemCapabilityRequest {
-    fn default() -> Self {
-        Self {
-            read_only: workspace_read_only(),
-            read_write: Vec::new(),
+impl FilesystemCapabilityRequest {
+    /// The read-only paths in effect: an omitted list is the read-only
+    /// workspace, or nothing when the workspace is requested writable.
+    pub fn read_only_paths(&self) -> Vec<PathBuf> {
+        match &self.read_only {
+            Some(paths) => paths.clone(),
+            None if self.read_write.is_empty() => workspace_read_only(),
+            None => Vec::new(),
         }
     }
 }
@@ -389,17 +393,14 @@ impl NetworkProvider {
 
 impl FilesystemCapabilityRequest {
     fn validate(&self, host_policy: &SandboxPolicy) -> Result<()> {
-        if !self.read_only.is_empty() && !self.read_write.is_empty() {
+        let read_only = self.read_only_paths();
+        if !read_only.is_empty() && !self.read_write.is_empty() {
             return Err(manifest_error(
                 "filesystem",
                 "read_only and read_write cannot both request workspace paths",
             ));
         }
-        let requested = self
-            .read_only
-            .iter()
-            .chain(&self.read_write)
-            .collect::<Vec<_>>();
+        let requested = read_only.iter().chain(&self.read_write).collect::<Vec<_>>();
         if requested.len() != 1 {
             return Err(manifest_error(
                 "filesystem",
@@ -660,7 +661,7 @@ pub fn capability_manifest_schema() -> serde_json::Value {
             "filesystem": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "read_only": {"type": "array", "items": {"const": "/workspace"}, "maxItems": 1, "default": ["/workspace"]},
+                    "read_only": {"type": "array", "items": {"const": "/workspace"}, "maxItems": 1, "description": "Omitted: [\"/workspace\"], unless read_write requests the workspace"},
                     "read_write": {"type": "array", "items": {"const": "/workspace"}, "maxItems": 1, "default": []}
                 }
             },
@@ -731,7 +732,8 @@ mod tests {
         let manifest: CapabilityManifest =
             serde_json::from_str("{\"manifest_version\":1}").unwrap();
         assert_eq!(manifest.network.mode, NetworkRequestMode::Disabled);
-        assert_eq!(manifest.filesystem.read_only, workspace_read_only());
+        assert_eq!(manifest.filesystem.read_only, None);
+        assert_eq!(manifest.filesystem.read_only_paths(), workspace_read_only());
         assert!(manifest.secrets.names.is_empty());
         assert!(manifest.extensions.is_empty());
         assert!(manifest.resources.timeout_seconds.is_none());
@@ -834,7 +836,7 @@ mod tests {
         ] {
             let manifest = CapabilityManifest {
                 filesystem: FilesystemCapabilityRequest {
-                    read_only: vec![path.into()],
+                    read_only: Some(vec![path.into()]),
                     read_write: vec![],
                 },
                 ..minimal()
@@ -851,7 +853,7 @@ mod tests {
         }
         let write = CapabilityManifest {
             filesystem: FilesystemCapabilityRequest {
-                read_only: vec![],
+                read_only: Some(vec![]),
                 read_write: workspace_read_only(),
             },
             ..minimal()
@@ -922,6 +924,38 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn writable_workspace_needs_no_explicit_empty_read_only_list() {
+        // WI#797 review AIL-4: `{"read_write": ["/workspace"]}` alone asks for
+        // a writable workspace; naming both lists stays a conflict.
+        let temp = tempfile::tempdir().unwrap();
+        let writable = crate::sandbox::SandboxConfig {
+            policy: SandboxPolicy::WorkspaceWrite,
+            ..crate::sandbox::SandboxConfig::default()
+        };
+        let manifest = CapabilityManifest::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "filesystem": {"read_write": ["/workspace"]}
+        }))
+        .unwrap();
+        let decision = authorize_manifest(&manifest, &writable, temp.path()).unwrap();
+        assert_eq!(decision.policy, SandboxPolicy::WorkspaceWrite);
+        assert!(decision.evidence.filesystem.writable);
+        let both = CapabilityManifest::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "filesystem": {"read_only": ["/workspace"], "read_write": ["/workspace"]}
+        }))
+        .unwrap();
+        assert!(authorize_manifest(&both, &writable, temp.path()).is_err());
+        let default = authorize_manifest(&minimal(), &writable, temp.path()).unwrap();
+        assert_eq!(default.policy, SandboxPolicy::ReadOnly);
+        let readonly_host = crate::sandbox::SandboxConfig {
+            policy: SandboxPolicy::ReadOnly,
+            ..crate::sandbox::SandboxConfig::default()
+        };
+        assert!(authorize_manifest(&manifest, &readonly_host, temp.path()).is_err());
     }
 
     #[test]
