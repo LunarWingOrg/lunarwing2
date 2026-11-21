@@ -3,7 +3,7 @@
 A WASM tool for LunarWing that sends push notifications to a self-hosted Gotify server.
 
 **Revalidated against source 2026-11-20 at `9c96220bb2`.** Registry manifest,
-capability sidecar, and crate all use `0.1.8`. The compiled-in defaults
+capability sidecar, and crate all use `0.1.9`. The compiled-in defaults
 (`https://gotify.darkc.sobe.world`, title `LunarWing`) and the
 `configure-gotify`/`--gotify-url`/`--gotify-title` mt-admin paths are the
 starting point for the configuration below.
