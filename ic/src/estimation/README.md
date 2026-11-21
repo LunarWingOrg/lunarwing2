@@ -161,6 +161,48 @@ the rollout gate. A comparison baseline for other tools (or a revised gate)
 still needs a maintainer decision. Running the representative tenant
 evaluation and enabling hints for passing categories are separate steps.
 
+## LLM logical-call timing (WI#318 Phase B)
+
+Tool hints answer "how long does this tool take". LLM calls need the same
+treatment at a different boundary, so a separate daemon-wide cache records
+**completed logical-call latency**.
+
+- **One boundary.** `LlmTimingProvider` (`ic/src/llm/timing.rs`) decorates the
+  chain built once by `build_provider_chain`, so v1 chat, local jobs, routines,
+  container execution and the v2 `LlmBridgeAdapter` are measured by the same
+  timer. There is no per-delegate timer and no second writer: the
+  `observability` tool/LLM events remain unused, which settles the plan's
+  "choose one carrier" decision in favour of the estimator hook.
+- **What trains.** Exactly one sample per completed call the caller awaited.
+  The timer sits outside retry, smart routing, failover, circuit breaking and
+  the response cache, and inside stream integrity. A cache hit never reaches
+  the inner provider, so it cannot train. Streaming calls train only on the
+  terminal `Done` chunk; a failed, partial or dropped stream is counted
+  (`failures` / `cancellations`) and trains nothing.
+- **What is counted separately.** Retry and failover layers already report
+  recovered attempts as `LlmStreamObservation::Retried`; the timer records
+  `retried_calls` and `retry_attempts` from those and never converts them into
+  duration samples. First-chunk latency is summed separately
+  (`first_chunk_samples`, `first_chunk_sum_ms`) and never feeds the EMA.
+- **Attribution.** Keys are canonical `Llm(model)` labels with bounded length
+  (256 bytes). The entry label is the chain's active model; the completion
+  label is the model that actually served the call, so a failover trains the
+  fallback rather than the primary. Keys never contain prompts, results,
+  parameters, user identity or URLs.
+- **No cost.** Duration only. A real per-call charge stays with
+  `CostGuard::record_llm_call`; the v2 adapter's `cost_usd: 0.0` means
+  "unavailable", so it never becomes a free-cost sample.
+- **Diagnostics.** `GET /api/estimates/llm` is owner-only (403 for other
+  authenticated users, 401 without a token) and reports `mode`,
+  `min_samples`, the counters above, and per-model `duration_ema_ms`,
+  `time_error_ema`, `confidence`, `confidence_label` and the warm
+  `estimate_ms` (absent until five valid samples). No user identity or private
+  key is included.
+- **Setting.** `LUNARWING_LLM_TIMINGS=0` disables recording; unset or any
+  other value observes. It is read once when the chain is built, is not
+  DB-backed, and resets on restart. Nothing here changes behaviour: an
+  estimator failure can never change a call's result.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
