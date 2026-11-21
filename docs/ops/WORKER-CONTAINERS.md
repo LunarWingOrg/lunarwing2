@@ -3957,7 +3957,8 @@ auto-approval:
   `wipefs`, `mkswap`, `blkdiscard`, `sgdisk`, block-device writes including
   `/dev/mapper` and `/dev/disk/by-*` by redirection, `of=`, `truncate`, `tee`
   or `cp`), fork bombs, remote-content-piped-to-shell, a decode command
-  (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or interpreter,
+  (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or an interpreter
+  one-liner,
   recursive `chmod`/`chown` on system roots (including the bare `/`), forced
   `git clean`, `git reset --hard`, a whole-tree `git checkout` and
   `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
@@ -3986,11 +3987,11 @@ auto-approval:
   one-liner (a non-literal argument is denied as unverifiable). The git
   commands are recorded as denied because the loss is irrecoverable; `git
   clean -n`, `git stash` without `-u`, `git restore` and `git status` stay
-  ordinary work. What remains to the container: arbitrary interpreter code
-  (`python3 -c` with any other body, or a runtime started on a script file),
-  deletion by tools this hook does not classify (`mv`, other languages'
-  one-liners, writes through unlisted utilities), and mixed shapes beyond the
-  readings above, which can still pass. The container stays the boundary.
+  ordinary work. What remains to the container: interpreter bodies that are
+  not one of the classified deletion or decode shapes, deletion by tools this
+  hook does not classify (`mv`, other languages' one-liners, writes through
+  unlisted utilities), and mixed shapes beyond the readings above, which can
+  still pass. The container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked

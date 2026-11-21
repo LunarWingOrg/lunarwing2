@@ -453,3 +453,10 @@ test("the probe commands of runs 500-505 stay ordinary work", () => {
   assertAllowed("chmod -R 755 ./build")
   assertAllowed("rm -rf /tmp/x")
 })
+
+test("a long command of repeated words is decided without rescanning", () => {
+  // The regex form of the recursive-change rule rescanned the rest of the
+  // command from every `chmod`; 12 KB of repetitions took ten seconds and
+  // tripped runGuard's kill timeout. The linear scan decides it immediately.
+  assertAllowed("chmod -R ".repeat(1500))
+})
