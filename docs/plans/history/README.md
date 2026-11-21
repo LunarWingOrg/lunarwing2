@@ -14,6 +14,6 @@ outdated. Read each status banner before using any part of a record.
 | [Self-improving skills status, 2026-07-15](SELF_IMPROVING_SKILLS_STATUS_2026-07-15.md) | Point-in-time implementation and audit summary; not current findings | [v2.0.1.0 release notes](../../releases/RELEASE-v2.0.1.0.md) |
 | [WeeChat relay bootstrap](WEECHAT-BOOTSTRAP.md) | Shipped in v2.0.1.0 | [WeeChat relay specification](../../specs/WeeChat-Relay.md) |
 
-The active index is [`docs/plans/REORG.md`](../REORG.md). When archiving a plan,
+The active index is [`docs/plans/README.md`](../README.md). When archiving a plan,
 add its completed or superseded state here and provide a link to current behavior
 or a successor work item; do not delete the original evidence.
