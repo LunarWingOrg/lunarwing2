@@ -1127,6 +1127,67 @@ class WorkerInputManifestTests(unittest.TestCase):
                 dockerfile.write_text(original, encoding="utf-8")
                 self.write_build_script(kimi_files=self.kimi_files)
 
+    def write_pebble_dockerfile(self, *instructions):
+        (self.root / "pebble4lunarwing/Dockerfile").write_text(
+            "FROM scratch AS builder\n"
+            + "\n".join(instructions)
+            + "\nFROM scratch AS runtime\n",
+            encoding="utf-8",
+        )
+
+    def test_pebble_runtime_copy_omission_is_caught(self):
+        # WI#806: entrypoint-split.sh is COPY'd in the runtime stage and was
+        # absent from the manifest, which the builder-only OpenCode check
+        # could not see.
+        (self.root / "pebble4lunarwing/entrypoint-split.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        self.write_pebble_dockerfile(
+            "COPY pebble4lunarwing/entrypoint-split.sh /usr/local/bin/entrypoint-split.sh"
+        )
+        self.assertTrue(any(
+            "pebble" in error and "entrypoint-split.sh" in error for error in self.errors()
+        ))
+        self.write_build_script(
+            kimi_files=self.kimi_files,
+            pebble_files=("pebble4lunarwing/Dockerfile", "pebble4lunarwing/entrypoint-split.sh"),
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_pebble_directory_copy_requires_every_file_beneath_it(self):
+        # The bridge tree arrives as one `COPY .../src ./bridge/src`; a new
+        # module must join the hand-maintained list, which is how
+        # src/task_runner.rs went unhashed.
+        (self.root / "pebble4lunarwing/src").mkdir(parents=True)
+        for name in ("bridge.rs", "task_runner.rs"):
+            (self.root / "pebble4lunarwing/src" / name).write_text("// fixture\n", encoding="utf-8")
+        self.write_pebble_dockerfile("COPY pebble4lunarwing/src ./bridge/src")
+        self.assertTrue(any(
+            "pebble" in error and "src/task_runner.rs" in error for error in self.errors()
+        ))
+        self.write_build_script(
+            kimi_files=self.kimi_files,
+            pebble_files=(
+                "pebble4lunarwing/Dockerfile",
+                "pebble4lunarwing/src/bridge.rs",
+                "pebble4lunarwing/src/task_runner.rs",
+            ),
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_pebble_cross_stage_copy_is_not_a_checkout_input(self):
+        self.write_pebble_dockerfile(
+            "COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin/pebble"
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_pebble_malformed_copy_fails_closed(self):
+        self.write_pebble_dockerfile('COPY ["pebble4lunarwing/entrypoint.sh"')
+        self.assertTrue(any("cannot inspect Dockerfile COPY inputs" in error for error in self.errors()))
+
+    def test_pebble_copy_source_outside_context_is_ignored(self):
+        (self.root / "elsewhere.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        self.write_pebble_dockerfile("COPY elsewhere.sh /usr/local/bin/elsewhere.sh")
+        self.assertEqual(self.errors(), [])
+
     def test_builder_copy_shell_json_options_and_continuations(self):
         for instruction in (
             "COPY scripts/helper.py /build/helper.py",
