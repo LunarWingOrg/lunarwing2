@@ -23,7 +23,8 @@ import { runInNewContext } from "node:vm";
 // (power/privilege/disk destruction, fork bombs, pipe-to-shell, decoded
 // payloads into a shell) plus worker-lane specifics (deletion outside the
 // temp roots whatever tool performs it, block-device writes, git commands
-// that discard uncommitted work, SSH-agent socket use). It is deliberately
+// that discard uncommitted work, SSH-agent socket use, and a listener started
+// from a task — kimi's own service mode included, WI#833). It is deliberately
 // NOT a general command parser: everything it cannot positively classify as
 // safe within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer) and

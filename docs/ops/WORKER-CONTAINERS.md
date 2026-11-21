@@ -1232,6 +1232,18 @@ Enforced controls (opencode2 lane unless noted):
    adjacent remote-config path; its remaining boundary is the tenant egress
    allowlist, and an origin the worker cannot reach supplies nothing (it
    also needs a saved key credential). Re-check on each bump.
+   **kimi task-settable `KIMI_CODE_*` and new listeners (WI#833):** the
+   executor drops every task-supplied `KIMI_CODE_*` name that is not on
+   `TASK_SETTABLE_KIMI_CODE_ENV` (`scripts/kimi_task_executor.ts`), and the
+   guard hook denies `kimi server`/`kimi web` plus a closed listener verb
+   list (`python -m http.server`, `nc`/`ncat`/`netcat -l`, `socat
+   TCP-LISTEN`, `busybox httpd`, `php -S`, `ruby -run -e httpd`). On every
+   kimi bump, re-read the new dist's `KIMI_CODE_*` names and every new
+   subcommand: record, for each, whether a task may set it or whether it
+   opens a listener, and either add it to the deny/allowlist with a test or
+   say why the lane cannot take it. A name or subcommand the guard does not
+   know is unguarded, not safe — the guard is a naive-use control, so a new
+   name is only covered once it is listed.
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
@@ -2392,7 +2404,11 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   `GET /api/v1/kap.md`, and the move of MCP server/OAuth management to
   `/api/v1/mcp/*` are service-mode surfaces on a server the lane never starts
   (verified: no listener during a headless run). No new instruction channel
-  is reachable from `kimi -p`.
+  is reachable from `kimi -p`. **Corrected by WI#833:** that holds for the
+  lane, not for a task. `kimi` is on `PATH` (`Dockerfile:255`), so a task's
+  Bash tool could start service mode itself; the guard hook now denies
+  `kimi server` and `kimi web` (and the other listener spellings below) with
+  exit 2, pinned by `scripts/headless_command_guard_test.ts`.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
 - **ACP session preview restore, `/tasks`, the follow-up behavior setting,
@@ -3988,7 +4004,10 @@ auto-approval:
   `/`), forced `git clean`, `git reset --hard`, a whole-tree `git checkout`
   and `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
   `rm`, `find -delete`, `find -exec rm`, `xargs rm` or a Python, Perl, Ruby or
-  Node one-liner. Every rule is checked on the original text and again on a
+  Node one-liner, and a listener started from a task — `kimi server`,
+  `kimi web`, `python -m http.server`, `nc`/`ncat`/`netcat -l`,
+  `socat TCP-LISTEN`, `busybox httpd`, `php -S` and `ruby -run -e httpd`
+  (WI#833). Every rule is checked on the original text and again on a
   shell-word view that drops quote characters and one level of backslash
   escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the privilege
   rule, a piped interpreter matches through a path or an
