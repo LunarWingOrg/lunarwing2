@@ -12,6 +12,7 @@ use super::Actuals;
 
 const MAX_MODELS: usize = 1024;
 const MAX_CATEGORY_BYTES: usize = 1024;
+pub(super) const DEFAULT_MIN_SAMPLES: u64 = 5;
 const MAX_DURATION_SECS: f64 = 86_400.0;
 const MIN_FACTOR: f64 = 0.01;
 const MAX_FACTOR: f64 = 100.0;
@@ -116,7 +117,7 @@ impl EstimationLearner {
         Self {
             models: HashMap::new(),
             alpha: 0.1, // EMA smoothing factor
-            min_samples: 5,
+            min_samples: DEFAULT_MIN_SAMPLES,
             observation_sequence: 0,
             counters: LearnerCounters::default(),
         }
@@ -335,7 +336,7 @@ impl EstimationLearner {
     }
 }
 
-fn valid_duration(duration: Duration) -> Option<f64> {
+pub(super) fn valid_duration(duration: Duration) -> Option<f64> {
     let seconds = duration.as_secs_f64();
     (seconds > 0.0 && seconds <= MAX_DURATION_SECS).then_some(seconds)
 }

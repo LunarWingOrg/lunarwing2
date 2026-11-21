@@ -171,8 +171,12 @@ impl ToolRegistry {
     }
 
     /// Override the process setting when composing a registry (including tests).
-    pub fn with_estimation_mode(mut self, mode: crate::estimation::ToolEstimationMode) -> Self {
-        self.estimates = crate::estimation::ToolEstimates::new(mode);
+    pub fn with_estimation_mode(self, mode: crate::estimation::ToolEstimationMode) -> Self {
+        self.with_estimates(crate::estimation::ToolEstimates::new(mode))
+    }
+
+    pub(crate) fn with_estimates(mut self, estimates: crate::estimation::ToolEstimates) -> Self {
+        self.estimates = estimates;
         self
     }
 

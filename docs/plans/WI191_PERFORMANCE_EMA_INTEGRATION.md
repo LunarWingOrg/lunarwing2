@@ -362,14 +362,19 @@ aggregate-only. Never expose raw arguments, prompts, tokens, credentials or
 cross-tenant data. No synchronous DB writes belong on the hot path.
 
 **Implemented under #318 (A2/A3/A4 recording).** `GET /api/estimates` returns
-the caller's own categories, counters and active category policy;
-`GET /api/estimates/evaluation` is owner-only and returns the opt-in trace
-aggregate (no user identity). `LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates
-display per canonical tool name while recording continues;
-`LUNARWING_TOOL_ESTIMATES_TRACE` enables the bounded, parameter-free records
-that feed the held-out gate. Running the evaluation on a real tenant and
-enabling hints for passing categories remain A4/A5 operator steps; this code
-does not change any approval, scheduling or cost behaviour.
+the caller's own categories and active category policy.
+`GET /api/estimates/counters` is owner-only and reports unlabeled registry-wide
+totals, with eligibility counted at execution start even in observe mode.
+`GET /api/estimates/evaluation` is owner-only and compares errors on the same
+retained calls, with separate warmup and early cold-start coverage.
+`LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates display per canonical tool name
+while recording continues. `LUNARWING_TOOL_ESTIMATES_TRACE` enables the
+bounded, parameter-free records behind the evaluation route. Only `http`
+currently declares a production duration baseline. A missing comparison is
+not a pass; evaluation for other tools needs an agreed baseline or gate.
+Running the evaluation on a real tenant and enabling hints for passing
+categories remain A4/A5 operator steps; this code does not change any approval,
+scheduling or cost behaviour.
 
 ## Persistence decision
 

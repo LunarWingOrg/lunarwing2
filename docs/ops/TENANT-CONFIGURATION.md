@@ -685,11 +685,16 @@ warmup), or `LUNARWING_TOOL_ESTIMATES=0` to disable both recording and hints.
 The value is read once at startup, learned statistics reset on restart, and
 scheduling, approval policy, timeouts, and budgets are never changed.
 `LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates **display** only (comma-separated
-canonical tool names; `-name`/`!name` suppresses a category) and
+canonical tool names; `-name`/`!name` suppresses a category). Malformed rules,
+names over 256 bytes, or more than 256 distinct rules disable hints and log
+a startup warning without stopping recording.
+`GET /api/estimates` shows only the caller's own models.
+`GET /api/estimates/counters` is owner-only and reports registry-wide totals,
+including estimate eligibility in observe mode.
 `LUNARWING_TOOL_ESTIMATES_TRACE=1` enables the bounded held-out evaluation
-trace used for the rollout gate. With hints enabled, `GET /api/estimates`
-shows the caller's own categories and counters;
-`GET /api/estimates/evaluation` is owner-only and aggregate. Details:
+trace. `GET /api/estimates/evaluation` is owner-only and reports paired errors,
+warmup and cold-start metrics; categories without paired data cannot pass the
+accuracy gate. Details:
 [`../../ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 
 The mt-admin env writer sets `AGENT_AUTO_APPROVE_TOOLS=false` on new tenants.

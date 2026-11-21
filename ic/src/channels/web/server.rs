@@ -41,7 +41,6 @@ use crate::channels::web::auth::{AuthenticatedUser, UserIdentity, auth_middlewar
 use crate::channels::web::handlers::cron_workers::{
     cron_worker_control_handler, cron_worker_status_handler,
 };
-use crate::channels::web::handlers::estimates::{estimates_evaluation_handler, estimates_handler};
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -517,11 +516,7 @@ pub(super) async fn start_server_with_mascot(
         .route("/api/missions/summary", get(missions_summary_handler))
         .route("/api/missions/{id}", get(missions_detail_handler))
         // Runtime estimation diagnostics (work item #318; read-only)
-        .route("/api/estimates", get(estimates_handler))
-        .route(
-            "/api/estimates/evaluation",
-            get(estimates_evaluation_handler),
-        )
+        .merge(crate::channels::web::handlers::estimates::routes())
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -3769,27 +3764,36 @@ mod tests {
         })
     }
 
-    /// WI#318 A2/A4: diagnostics routes sit behind gateway auth; the
-    /// evaluation aggregate is owner-only and every payload is parameter-free.
-    #[tokio::test]
-    async fn estimates_routes_require_auth_and_owner_for_evaluation() {
+    fn estimates_test_router(trace: Option<crate::estimation::EvaluationTrace>) -> Router {
         use crate::channels::web::auth::MultiAuthState;
-        use axum::body::Body;
-        use tower::ServiceExt;
+        use crate::estimation::{CategoryPolicy, ToolEstimates, ToolEstimationMode};
+        use crate::tools::{
+            Tool,
+            builtin::{EchoTool, TimeTool},
+        };
 
         let registry = Arc::new(
-            ToolRegistry::new()
-                .with_estimation_mode(crate::estimation::ToolEstimationMode::Display),
+            ToolRegistry::new().with_estimates(ToolEstimates::configured(
+                ToolEstimationMode::Observe,
+                CategoryPolicy::default(),
+                trace,
+            )),
         );
         let params = serde_json::json!({ "secret": "sk-never-rendered" });
-        for _ in 0..5 {
-            let observation = registry
-                .estimates()
-                .begin("alice", &crate::tools::builtin::EchoTool, &params)
-                .expect("observation");
-            registry
-                .estimates()
-                .complete(observation, std::time::Duration::from_millis(5), None);
+        let workloads: [(&str, &dyn Tool, usize); 2] =
+            [("alice", &EchoTool, 6), ("test", &TimeTool, 1)];
+        for (user, tool, calls) in workloads {
+            for _ in 0..calls {
+                let observation = registry
+                    .estimates()
+                    .begin(user, tool, &params)
+                    .expect("observation");
+                registry.estimates().complete(
+                    observation,
+                    std::time::Duration::from_millis(5),
+                    None,
+                );
+            }
         }
         let state = test_gateway_state_with_tools(None, Some(registry));
         let auth = MultiAuthState::multi(std::collections::HashMap::from([
@@ -3808,67 +3812,115 @@ mod tests {
                 },
             ),
         ]));
-        let app = Router::new()
-            .route("/api/estimates", get(estimates_handler))
-            .route(
-                "/api/estimates/evaluation",
-                get(estimates_evaluation_handler),
-            )
+        crate::channels::web::handlers::estimates::routes()
             .route_layer(middleware::from_fn_with_state(
                 crate::channels::web::auth::CombinedAuthState::from(auth),
                 auth_middleware,
             ))
-            .with_state(state);
+            .with_state(state)
+    }
 
-        let request = |uri: &str, token: Option<&str>| {
-            let mut builder = axum::http::Request::builder().uri(uri);
-            if let Some(token) = token {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
-            builder.body(Body::empty()).expect("request")
-        };
+    async fn request_estimates(
+        app: &Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
 
-        assert_eq!(
-            app.clone()
-                .oneshot(request("/api/estimates", None))
-                .await
-                .expect("response")
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
-
-        let response = app
-            .clone()
-            .oneshot(request("/api/estimates", Some("alice-token")))
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(builder.body(Body::empty()).expect("request"))
             .await
-            .expect("response");
+            .expect("response")
+    }
+
+    async fn estimates_json(response: axum::response::Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("body");
-        let body = String::from_utf8(body.to_vec()).expect("utf8");
-        assert!(body.contains("echo"));
-        assert!(!body.contains("sk-never-rendered"));
-        assert!(!body.contains("test"));
-        assert!(!body.contains("tool:"));
+        let body = std::str::from_utf8(&body).expect("utf8");
+        for private in ["sk-never-rendered", "\"alice\"", "\"test\"", "tool:"] {
+            assert!(!body.contains(private));
+        }
+        serde_json::from_str(body).expect("json")
+    }
 
+    #[tokio::test]
+    async fn estimates_routes_require_auth_and_isolate_models_from_registry_counters() {
+        let app = estimates_test_router(None);
+        for uri in [
+            "/api/estimates",
+            "/api/estimates/counters",
+            "/api/estimates/evaluation",
+        ] {
+            assert_eq!(
+                request_estimates(&app, uri, None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for (token, tool, calls) in [("alice-token", "echo", 6), ("owner-token", "time", 1)] {
+            let body =
+                estimates_json(request_estimates(&app, "/api/estimates", Some(token)).await).await;
+            let categories = body["categories"].as_array().expect("categories");
+            assert_eq!(categories.len(), 1);
+            assert_eq!(categories[0]["tool"], tool);
+            assert_eq!(categories[0]["samples"], calls);
+            assert!(body.get("estimates").is_none());
+            assert!(body.get("observations").is_none());
+        }
+        for uri in ["/api/estimates/counters", "/api/estimates/evaluation"] {
+            assert_eq!(
+                request_estimates(&app, uri, Some("alice-token"))
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let counts = estimates_json(
+            request_estimates(&app, "/api/estimates/counters", Some("owner-token")).await,
+        )
+        .await;
         assert_eq!(
-            app.clone()
-                .oneshot(request("/api/estimates/evaluation", Some("alice-token")))
-                .await
-                .expect("response")
-                .status(),
-            StatusCode::FORBIDDEN
+            counts,
+            serde_json::json!({
+                "estimates": { "estimate_requests": 7, "estimates_returned": 1, "estimates_withheld": 6 },
+                "observations": { "observations_recorded": 7, "observations_dropped": 0,
+                                  "observations_clipped": 0, "duration_values_rejected": 0, "models_evicted": 0 },
+            })
         );
-        // Owner sees that the opt-in trace is off, not another user's data.
         assert_eq!(
-            app.clone()
-                .oneshot(request("/api/estimates/evaluation", Some("owner-token")))
+            request_estimates(&app, "/api/estimates/evaluation", Some("owner-token"))
                 .await
-                .expect("response")
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn estimates_evaluation_exposes_only_owner_aggregates_when_enabled() {
+        let app = estimates_test_router(Some(crate::estimation::EvaluationTrace::new(16)));
+        let uri = "/api/estimates/evaluation";
+        assert_eq!(
+            request_estimates(&app, uri, Some("alice-token"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let body = estimates_json(request_estimates(&app, uri, Some("owner-token")).await).await;
+        assert_eq!(body["recorded"], 7);
+        assert!(body.get("records").is_none());
+        let echo = &body["categories"][0];
+        assert_eq!(echo["tool"], "echo");
+        assert_eq!(echo["samples"], 6);
+        assert_eq!(echo["warmup"]["samples"], 5);
+        assert_eq!(echo["prediction_samples"], 1);
+        assert_eq!(echo["paired_samples"], 0);
+        assert!(echo["improvement_percent"].is_null());
     }
 
     async fn settings_request(
