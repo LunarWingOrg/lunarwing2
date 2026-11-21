@@ -9,7 +9,9 @@ the second, and fail closed on every drift shape.
 The second half covers the flag pin anchor (WI#609 ABE-2): a tree with the
 v2.3.2 shape of the flag registry, the resolver and the Console plugin
 passes, and every way upstream could take the meaning out of the wrapper's
-OPENCODE_FLAGS=-console_watches pin fails the build.
+OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts pin fails the build.
+The anchor pins the watch gate by hand and the registry of all three keys by
+whole-file digest (WI#804).
 """
 
 from __future__ import annotations
