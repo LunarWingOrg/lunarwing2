@@ -3986,7 +3986,8 @@ auto-approval:
   (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or an interpreter
   one-liner, recursive `chmod`/`chown` on system roots (including the bare
   `/`), forced `git clean`, `git reset --hard`, a whole-tree `git checkout`
-  and `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
+  and `git stash -u`, SSH agent use (the `/tmp/ssh-agent` mount path, the
+  `SSH_AUTH_SOCK` variable and `ssh-add`), and deletion outside temp roots by
   `rm`, `find -delete`, `find -exec rm`, `xargs rm` or a Python, Perl, Ruby or
   Node one-liner. Every rule is checked on the original text and again on a
   shell-word view that drops quote characters and one level of backslash
@@ -4043,6 +4044,27 @@ auto-approval:
   `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
   containers force-recreate. Other worker lanes keep the socket.
 
+WI#829 moves the SSH rule from the bare `/tmp/ssh-agent.sock` literal — a
+spelling no lane ever has — to the mount the lanes actually use. A lane that
+gets an agent mounts the directory `/tmp/ssh-agent` and exports
+`SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock`; Kimi and LunarDepth get no
+agent at all. The rule now denies the directory, the socket inside it,
+`ssh -o IdentityAgent=<socket>`, the `SSH_AUTH_SOCK` variable, and
+`ssh-add`, the step that loads a key into an agent. Direct key-file
+authentication stays allowed, and that is a deliberate residual of this rule,
+not an oversight: the Kimi lane has no agent, so `ssh -i <key>` and the
+lane's own `~/.ssh` keys behind `ssh -T` are the same non-brokered path, and
+key-based push is a supported worker action (`openssh-client` and `git` are
+image packages). The rule's boundary is that the lane must not become a
+credential broker — an agent socket, or an agent holding keys — not which
+files the worker may read; reads of its own home stay ordinary work. Because
+`ssh-add` is denied, an agent the worker starts itself holds nothing to
+serve, so `ssh-agent` startup is not separately matched. The guard test pins
+both halves: the real mount spellings and `ssh-add` deny, and `ssh -T
+git@github.com` and `ssh -i <key>` stay allowed. The in-image smoke check
+probes the same directory alongside the bare literal, so a reintroduced
+mount fails smoke rather than passing the old path check.
+
 WI#824 adds an `rm` word-assembly check alongside the raw and shell-word
 checks. It reads simple IFS separators as whitespace and looks for destructive
 options without expanding brace lists or running substitutions. It denies
@@ -4058,8 +4080,8 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
-The hook is baked into the Kimi worker image. Tenants pick up WI#795 and
-WI#826 only after rebuilding the image with the fix and recreating their
+The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826
+and WI#829 only after rebuilding the image with the fix and recreating their
 workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
