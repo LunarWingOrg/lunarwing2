@@ -360,7 +360,9 @@ impl ChannelManager {
     }
 
     /// True once a `Finished` other than `Detached` was reported for message `message_id`
-    /// (remembered for the 1024 most recent finishes, at most 30 minutes each).
+    /// (remembered for the 1024 most recent finishes, each for the longest V2 late-turn
+    /// window — 42 minutes 10 seconds — so the late watcher still sees the message
+    /// finished when it reports its own `Finished`).
     ///
     /// The Engine V2 late watcher reports a second `Finished` only after `Detached`: when
     /// the agent loop's soft timeout fired first, `timed_out` was the message's last one.

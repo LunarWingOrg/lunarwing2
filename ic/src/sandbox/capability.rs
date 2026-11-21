@@ -668,7 +668,7 @@ pub fn capability_manifest_schema() -> serde_json::Value {
             "resources": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "cpu_shares": {"type": ["integer", "null"], "minimum": 1, "multipleOf": 64},
+                    "cpu_shares": {"type": ["integer", "null"], "minimum": 1},
                     "memory_bytes": {"type": ["integer", "null"], "minimum": 1048576, "multipleOf": 1048576},
                     "timeout_seconds": {"type": ["integer", "null"], "minimum": 1}
                 }
@@ -805,6 +805,41 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// WI#820: the published schema must describe what `resource_decision`
+    /// enforces. `cpu_shares` accepts any value from 1 up to the host ceiling
+    /// and only that range is checked, so the schema carries no divisibility
+    /// rule; the test pins both sides together.
+    #[test]
+    fn cpu_shares_schema_matches_decoder() {
+        let schema = capability_manifest_schema();
+        let cpu = &schema["properties"]["resources"]["properties"]["cpu_shares"];
+        assert_eq!(cpu["minimum"], 1);
+        assert!(
+            cpu.get("multipleOf").is_none(),
+            "cpu_shares schema must not require a multiple the decoder does not enforce"
+        );
+        let config = crate::sandbox::SandboxConfig::default();
+        let accepted = ResourceCapabilityRequest {
+            cpu_shares: Some(32),
+            memory_bytes: None,
+            timeout_seconds: None,
+        };
+        let limits = resource_decision(accepted, &config).unwrap();
+        assert_eq!(limits.cpu_shares, 32);
+        for rejected in [0, config.cpu_shares + 1] {
+            let request = ResourceCapabilityRequest {
+                cpu_shares: Some(rejected),
+                memory_bytes: None,
+                timeout_seconds: None,
+            };
+            let error = resource_decision(request, &config).unwrap_err();
+            assert!(
+                error.to_string().contains("resources.cpu_shares"),
+                "cpu_shares {rejected} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod outcome;
 #[cfg(all(test, feature = "libsql"))]
 mod project_recovery_tests;
 mod v1_history_import;
+pub(crate) use outcome::LONGEST_LATE_WINDOW;
 use outcome::{await_thread_outcome, turn_history_metadata_key};
 
 use std::sync::{Arc, OnceLock};

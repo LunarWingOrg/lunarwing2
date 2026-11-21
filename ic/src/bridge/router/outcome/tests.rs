@@ -1485,6 +1485,20 @@ fn late_budget_is_capped_and_cannot_overflow() {
     assert_eq!(late_budget_for_steps(u32::MAX), LATE_MAX_TIMEOUT);
 }
 
+/// WI#820: the window the channel manager's finished-message memory must cover,
+/// spelled out so a change to any part of the late budget is reviewed against it.
+/// The memory derives its TTL from [`LONGEST_LATE_WINDOW`], so growing a part
+/// grows the TTL too; this test makes the new number visible in the diff.
+#[test]
+fn longest_late_window_spells_out_the_worst_case() {
+    assert_eq!(OUTCOME_TIMEOUT, Duration::from_secs(610));
+    assert_eq!(
+        LONGEST_LATE_WINDOW,
+        OUTCOME_TIMEOUT + LATE_MAX_TIMEOUT + STOP_GRACE * 2
+    );
+    assert_eq!(LONGEST_LATE_WINDOW, Duration::from_secs(2_530));
+}
+
 /// Only completed tool actions extend the late budget. LLM steps, state
 /// changes and gates are thinking/waiting, and a failed action includes
 /// refusals, so none of them is demonstrated task progress.
