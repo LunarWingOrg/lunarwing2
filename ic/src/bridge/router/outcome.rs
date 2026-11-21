@@ -64,6 +64,19 @@ fn is_tool_step(kind: &EventKind) -> bool {
     matches!(kind, EventKind::ActionExecuted { .. })
 }
 
+/// Stable name for a thread outcome in the turn record: operators compare
+/// runs by this field, so it must not be the `Debug` spelling and must not
+/// change silently (WI#807).
+fn thread_outcome_kind(outcome: &ThreadOutcome) -> &'static str {
+    match outcome {
+        ThreadOutcome::Completed { .. } => "completed",
+        ThreadOutcome::Stopped => "stopped",
+        ThreadOutcome::MaxIterations => "max_iterations",
+        ThreadOutcome::Failed { .. } => "failed",
+        ThreadOutcome::GatePaused { .. } => "gate_paused",
+    }
+}
+
 /// The late turn's time allowance (WI#807).
 ///
 /// The allowance is measured from `started`. A step-aware turn re-reads it as
@@ -111,9 +124,10 @@ impl LateAllowance {
     }
 }
 
-/// What the late wait produced, for the one `Late turn finished` record: the
-/// reply text, the allowance the turn ended with (including steps earned during
-/// the late wait), and whether it ran out and the watcher stopped the run.
+/// What the late wait produced, for the one `Turn finished` record of the
+/// late phase: the reply text, the allowance the turn ended with (including
+/// steps earned during the late wait), and whether it ran out and the
+/// watcher stopped the run.
 struct LateOutcome {
     text: Option<String>,
     budget: Duration,
@@ -212,7 +226,10 @@ impl TurnCompletion {
         budget: Duration,
     ) -> Result<Option<String>, Error> {
         let mut cancellation = self.cancellation_guard();
-        if !self.wait(&mut events, budget).await {
+        let wait_started = tokio::time::Instant::now();
+        let finished_in_time = self.wait(&mut events, budget).await;
+        let waited = wait_started.elapsed();
+        if !finished_in_time {
             let tool_calls = self.tool_calls();
             let allowance = LateAllowance::step_aware(tokio::time::Instant::now());
             tracing::warn!(
@@ -234,8 +251,11 @@ impl TurnCompletion {
             cancellation.disarm();
             return Ok(Some(String::new()));
         };
+        let kind = thread_outcome_kind(&outcome);
+        let completed = self.complete_once(outcome).await;
+        self.log_turn_finished("foreground", budget, false, waited, kind);
         cancellation.disarm();
-        self.complete_once(outcome).await
+        completed
     }
 
     fn cancellation_guard(&self) -> AwaitThreadCancellationGuard {
@@ -283,6 +303,33 @@ impl TurnCompletion {
 
     fn tool_calls(&self) -> u32 {
         self.tool_call_count.load(Ordering::Relaxed)
+    }
+
+    /// One record per turn on the boundary between "fits its budget" and "ran
+    /// out" (WI#807). Recording only the late phase describes just the turns
+    /// that detach, so a bounded task that fits the foreground wait left no
+    /// steps-or-time data point at all; the `foreground` phase supplies that
+    /// baseline. `elapsed_ms` is measured against `budget_secs` of the same
+    /// phase, so steps-per-minute and `budget_exhausted` are comparable
+    /// across runs and phases.
+    fn log_turn_finished(
+        &self,
+        phase: &'static str,
+        budget: Duration,
+        exhausted: bool,
+        elapsed: Duration,
+        outcome: &'static str,
+    ) {
+        tracing::info!(
+            thread_id = %self.thread_id,
+            phase,
+            tool_calls = self.tool_calls(),
+            budget_secs = budget.as_secs(),
+            budget_exhausted = exhausted,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome,
+            "Turn finished"
+        );
     }
 
     async fn forward(&self, event: &lunarwing_engine::ThreadEvent) {
@@ -359,14 +406,12 @@ impl TurnCompletion {
         let outcome = self
             .deliver_late_result(result.map(|completed| completed.text))
             .await;
-        tracing::info!(
-            thread_id = %self.thread_id,
-            tool_calls = self.tool_calls(),
-            late_budget_secs = budget.as_secs(),
-            budget_exhausted = exhausted,
-            elapsed_ms = wait_started.elapsed().as_millis() as u64,
-            %outcome,
-            "Late turn finished"
+        self.log_turn_finished(
+            "late",
+            budget,
+            exhausted,
+            wait_started.elapsed(),
+            outcome.as_str(),
         );
         self.report_late_finish(outcome).await;
     }
