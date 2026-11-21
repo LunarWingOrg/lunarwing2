@@ -5630,21 +5630,20 @@ mod tests {
     async fn wi831_live_gotify_notification() {
         use crate::db::Database;
         use crate::db::libsql::LibSqlBackend;
-        use crate::secrets::{CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore};
+        use crate::secrets::{
+            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+        };
         use crate::tools::wasm::capabilities::{
             Capabilities, EndpointPattern, HttpCapability, SecretsCapability, WorkspaceCapability,
         };
 
         let base_dir = crate::bootstrap::lunarwing_base_dir();
-        let token = std::env::var("WI831_LIVE_TOKEN")
-            .expect("set WI831_LIVE_TOKEN to a Gotify app token"); // safety: manual test only
+        let token =
+            std::env::var("WI831_LIVE_TOKEN").expect("set WI831_LIVE_TOKEN to a Gotify app token"); // safety: manual test only
         let wasm_path = std::path::PathBuf::from(
             std::env::var("WI831_LIVE_WASM").expect("set WI831_LIVE_WASM to gotify-tool.wasm"), // safety: manual test only
         );
-        println!(
-            "WI831 live check: base dir {}",
-            base_dir.display()
-        );
+        println!("WI831 live check: base dir {}", base_dir.display());
 
         let content =
             super::read_host_provisioned_workspace_config(&base_dir, super::GOTIFY_CONFIG_PATH)
@@ -5739,7 +5738,9 @@ mod tests {
             )
             .await;
         match outcome {
-            Ok(output) => println!("WI831 live check: {host} accepted the notification: {output:?}"),
+            Ok(output) => {
+                println!("WI831 live check: {host} accepted the notification: {output:?}")
+            }
             Err(error) => panic!("WI831 live check: {host} rejected the notification: {error}"),
         }
     }
@@ -5865,7 +5866,8 @@ mod tests {
 
         // A gotify grant that excludes `config/` gets no merge either.
         let notes_prefixes = vec!["notes/".to_string()];
-        let reader = super::preload_workspace_reader(&workspace, "gotify", &notes_prefixes, base).await;
+        let reader =
+            super::preload_workspace_reader(&workspace, "gotify", &notes_prefixes, base).await;
         assert_eq!(
             reader.read(super::GOTIFY_CONFIG_PATH),
             None,
