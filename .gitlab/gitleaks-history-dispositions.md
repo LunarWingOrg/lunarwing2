@@ -60,10 +60,12 @@ refreshing the baseline. Each is a cargo checksum manifest whose package digest
 equals the crate's checksum in `ic/Cargo.lock`; none records a secret value or
 matched content.
 
-The five rows for commit `aacffdd47` were added by WI#799 after the v2.2.2.0
-vendor refresh moved those crates' fixtures without refreshing the baseline.
-Each is a cargo checksum manifest whose package digest equals the crate's
-checksum in `ic/Cargo.lock`; none records a secret value or matched content.
+The five rows for commit `aacffdd47` were added by WI#799 in the same merge
+request as the v2.2.2.0 vendor refresh: the refresh moved those crates'
+fixtures, and the baseline was updated through the draft/review/accept flow of
+`.gitlab/scripts/refresh-secret-history-baseline.py` before merge. Each is a
+cargo checksum manifest whose package digest equals the crate's checksum in
+`ic/Cargo.lock`; none records a secret value or matched content.
 
 ## Historical baseline triage closure (WI#575)
 
