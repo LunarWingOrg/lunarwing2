@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 name = "zip"
-version = "9.7.1"
+version = "9.8.1"
 authors = [
     "Mathijs van de Nes <git@mathijs.vd-nes.nl>",
     "Marli Frost <marli@frost.red>",
@@ -59,6 +59,23 @@ rustdoc-args = [
 
 [features]
 _arbitrary = ["dep:arbitrary"]
+_bsd_compatible_features = [
+    "aes-crypto",
+    "bzip2",
+    "chrono",
+    "deflate-flate2",
+    "flate2/rust_backend",
+    "deflate-zopfli",
+    "jiff-02",
+    "legacy-zip",
+    "lzma",
+    "nt-time",
+    "ppmd",
+    "unreserved",
+    "xz",
+    "time",
+    "zstd",
+]
 _bzip2_any = []
 _deflate-any = []
 _miri_compatible_features = [
@@ -75,6 +92,7 @@ _miri_compatible_features = [
     "unreserved",
     "xz",
     "time",
+    "zstd-rs",
 ]
 aes-crypto = [
     "dep:aes",
@@ -146,6 +164,10 @@ unreserved = []
 xz = ["dep:lzma-rust2"]
 zeroize = []
 zstd = ["dep:zstd"]
+zstd-rs = [
+    "zstd",
+    "zstd/rust-backend",
+]
 
 [lib]
 name = "zip"
@@ -251,7 +273,7 @@ version = "^0.8.3"
 optional = true
 
 [dependencies.zstd]
-version = "^0.14.2"
+version = "^0.14.4"
 optional = true
 default-features = false
 
