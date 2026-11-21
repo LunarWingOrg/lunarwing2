@@ -774,6 +774,8 @@ test("git commands that discard work are denied in the spellings WI#832 named", 
   // WI#826 already denied.
   assertBlocked("git restore .", "git command")
   assertBlocked("git restore --worktree --staged .", "git command")
+  assertBlocked("git restore ./", "git command")
+  assertBlocked("git checkout ./", "git command")
   assertBlocked("git stash --all", "git command")
   assertBlocked("git stash -a", "git command")
   assertBlocked("git checkout -f", "git command")

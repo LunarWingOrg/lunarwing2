@@ -644,7 +644,7 @@ function checkGitDiscard(segment) {
       return true;
     }
     if (verb === "reset" && /(?:^|[ \t])--hard(?=[ \t]|$)/.test(after)) return true;
-    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.(?=[ \t]*$)/.test(after)) {
+    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(after)) {
       return true;
     }
     if ((verb === "checkout" || verb === "switch") &&
