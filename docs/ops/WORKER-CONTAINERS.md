@@ -3997,18 +3997,18 @@ auto-approval:
 - `hooks/headless_command_guard.mjs`: denies privilege escalation
   (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
   `wipefs`, `mkswap`, `blkdiscard`, `sgdisk`, block-device writes including
-  `/dev/mapper` and `/dev/disk/by-*` by redirection, `of=`, `truncate`, `tee`
-  or `cp`), fork bombs, remote-content-piped-to-shell, a decode command
-  (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or an interpreter
-  one-liner, recursive `chmod`/`chown` on system roots (including the bare
-  `/`), forced `git clean`, `git reset --hard`, a whole-tree `git checkout`
-  and `git stash -u`, SSH agent use (the `/tmp/ssh-agent` mount path, the
+  `/dev/mapper` and `/dev/disk/by-*` by redirection, `>|`, `of=`, `truncate`,
+  `tee` or `cp`), fork bombs, remote-content-piped-to-shell, a decode command
+  piped into a shell or an interpreter one-liner, recursive `chmod`/`chown` on
+  system roots (including the bare `/`), a git command that discards
+  uncommitted work, SSH agent use (the `/tmp/ssh-agent` mount path, the
   `SSH_AUTH_SOCK` variable and `ssh-add`), and deletion outside temp roots by
-  `rm`, `find -delete`, `find -exec rm`, `xargs rm` or a Python, Perl, Ruby or
-  Node one-liner. Every rule is checked on the original text and again on a
-  shell-word view that drops quote characters and one level of backslash
-  escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the privilege
-  rule, a piped interpreter matches through a path or an
+  `rm`, `find -delete`, `find -exec`/`-ok` with `rm`, `unlink`, `rmdir` or
+  `shred`, `xargs rm`, `rsync --delete`/`--remove-source-files`, or a Python,
+  Perl, Ruby or Node one-liner. Every rule is checked on the original text and
+  again on a shell-word view that drops quote characters and one level of
+  backslash escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the
+  privilege rule, a piped interpreter matches through a path or an
   `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`), and the recursive
   `chmod`/`chown` rule covers `/` (WI#813). The hook also
   joins shell line continuations for every rule, not only `rm`: bash builds one
@@ -4024,7 +4024,8 @@ auto-approval:
   a reading, so the raw spelling stays checked too. The non-`rm` deletion
   shapes use the same temp-root test as `rm`: the `find` start paths, the
   `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
-  deleted set is unknown and the call is denied), and the first quoted
+  deleted set is unknown and the call is denied), the `rsync` destination for
+  `--delete` and its sources for `--remove-source-files`, and the first
   argument of a `rmtree`/`rmSync`/`unlink`-style call in an interpreter
   one-liner (a non-literal argument is denied as unverifiable). That shared
   test judges the **resolved** path (WI#830, from WI#812): each target's
@@ -4048,14 +4049,32 @@ auto-approval:
   recursive or forced `rm` in a line that also creates a symbolic link
   (`ln -s`, `ln --symbolic`, `cp -s`, `cp --symbolic-link`) is therefore
   denied outright; other ways of creating a link in the same line, and a
-  `find`/`xargs`/one-liner deletion in such a line, are the residual. The git
-  commands are recorded as denied because the loss is irrecoverable; `git
-  clean -n`, `git stash` without `-u`, `git restore` and `git status` stay
-  ordinary work. What remains to the container: interpreter bodies that are
-  not one of the classified deletion or decode shapes, deletion by tools this
-  hook does not classify (`mv`, other languages' one-liners, writes through
-  unlisted utilities), and mixed shapes beyond the readings above, which can
-  still pass. The container stays the boundary.
+  `find`/`xargs`/one-liner deletion in such a line, are the residual. The
+  one-liner reader finds the eval flag after any number of options
+  (`perl -MFile::Path -e …`), follows a deletion name bound by
+  `from … import … as …`, `import … as …` or `x = shutil.rmtree`, resolves
+  `getattr(module, 'rmtree')`, and reads Perl's parenthesis-free
+  `rmtree "dir"` / `unlink glob "dir/*"`. The decode side counts
+  `base64 -d`, `xxd -r`, `rev`, `openssl base64 -d`, the decompressors
+  (`gzip`, `zcat`, `bzip2`, `xz`, `zstd`, with their `*cat`/`un*` forms),
+  `printf` with `\x`/octal escapes, a `perl`/`python3` base64 one-liner, and
+  `tr` — but only a `tr` that deletes nothing, because `tr -d '\r'` normalises
+  text. The git commands are recorded as denied because the loss is
+  irrecoverable: forced `git clean` (a dry run — `-n`, `--dry-run`, `-fdn` —
+  passes), `git reset --hard`, a whole-tree `git checkout`/`git restore`,
+  `git checkout -f`, `git switch --discard-changes`, `git stash -u`/`--all`,
+  and `git stash -a`; `git status`, `git stash` without those flags and
+  `git restore <path>` stay ordinary work. `git restore .` takes the same
+  verdict as `git checkout -- .`, which discards the same changes (WI#832).
+  What remains to the container, named as accepted residuals: deletion by a
+  utility this hook does not classify (`mv` into a removed directory, `truncate`
+  on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
+  not one of the classified deletion or decode shapes (`os.system("rm …")`, a
+  script file rather than a `-e`/`-c` one-liner, a language other than Python,
+  Perl, Ruby or Node), a decoder this list does not name (`uudecode`, `bsdcat`,
+  a `dd`-piped payload), a quoted separator inside a `-c` body that the
+  quote-aware split still mis-reads, and mixed shapes beyond the readings
+  above, which can still pass. The container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
