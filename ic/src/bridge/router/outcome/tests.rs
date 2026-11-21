@@ -1476,9 +1476,11 @@ fn late_budget_scales_with_completed_tool_calls() {
 /// The scaled budget is bounded, so a runaway loop still stops at the ceiling.
 #[test]
 fn late_budget_is_capped_and_cannot_overflow() {
-    let steps_to_cap =
-        ((LATE_MAX_TIMEOUT - LATE_TIMEOUT).as_secs() / LATE_STEP_ALLOWANCE.as_secs()) as u32;
-    assert_eq!(late_budget_for_steps(steps_to_cap), LATE_MAX_TIMEOUT);
+    let headroom = (LATE_MAX_TIMEOUT - LATE_TIMEOUT).as_secs();
+    let steps_to_cap = (headroom / LATE_STEP_ALLOWANCE.as_secs()) as u32;
+    // The ceiling is not an exact multiple of the allowance, so the step that
+    // reaches it clamps the remainder: prove both sides of that step.
+    assert!(late_budget_for_steps(steps_to_cap) < LATE_MAX_TIMEOUT);
     assert_eq!(late_budget_for_steps(steps_to_cap + 1), LATE_MAX_TIMEOUT);
     assert_eq!(late_budget_for_steps(u32::MAX), LATE_MAX_TIMEOUT);
 }
