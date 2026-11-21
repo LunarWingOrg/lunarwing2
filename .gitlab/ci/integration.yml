@@ -56,7 +56,9 @@ cavepony-wasm:
 # crate's unit tests natively and lints with -D warnings. ci-config fails when
 # a production tool names no compiling job, so a new tool cannot fall out of
 # the run unnoticed. The changes globs are a superset of every production
-# tool's triggers, so a new tool under ic/tools-src needs no edit here.
+# tool's triggers, so a new tool under ic/tools-src needs no edit here. They
+# end in **/*: GitLab matches with FNM_PATHNAME, where a trailing ** does
+# not reach files in subdirectories.
 wasm-tools-check:
   extends:
     - .rust-job
@@ -76,11 +78,11 @@ wasm-tools-check:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
-        - "ic/tools-src/**"
-        - "lunarwing-gotify-tool/**"
-        - "ic/lunarwing-gotify-tool/**"
-        - "ic/registry/tools/**"
-        - "ic/wit/**"
+        - "ic/tools-src/**/*"
+        - "lunarwing-gotify-tool/**/*"
+        - "ic/lunarwing-gotify-tool/**/*"
+        - "ic/registry/tools/**/*"
+        - "ic/wit/**/*"
         - ".gitlab/deliverables.json"
         - ".gitlab/scripts/wasm-tools-check.py"
         - ".gitlab/ci/integration.yml"

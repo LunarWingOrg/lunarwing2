@@ -143,7 +143,7 @@ class WasmToolsCheckShapeTests(unittest.TestCase):
                        "python3 .gitlab/scripts/wasm-tools-check.py"],
             "rules": [
                 {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"',
-                 "changes": ["ic/tools-src/**"]},
+                 "changes": ["ic/tools-src/**/*"]},
                 {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
             ],
         }
@@ -192,9 +192,70 @@ class WasmToolsCheckShapeTests(unittest.TestCase):
         errors = self.errors()
         self.assertTrue(any("do not cover trigger" in error for error in errors), errors)
 
+    def test_trailing_double_star_does_not_cover_nested_files(self):
+        # WI#809 review AIJ-1: GitLab matches `changes:` with FNM_PATHNAME, so
+        # `dir/**` stops at direct children and a tool's source files would
+        # not start the job.
+        self.job["rules"][0]["changes"] = ["ic/tools-src/**"]
+        errors = self.errors()
+        self.assertTrue(any("do not cover trigger" in error for error in errors), errors)
+
     def test_nested_trigger_glob_is_covered(self):
         self.write_inventory([deliverable(triggers=["ic/tools-src/x/src/**"])])
         self.assertEqual(self.errors(), [])
+
+
+class GitLabChangesMatchTests(unittest.TestCase):
+    """The validator's matcher follows GitLab's (Ruby File.fnmatch with
+    FNM_PATHNAME | FNM_DOTMATCH | FNM_EXTGLOB); the cases were checked against
+    Ruby 3.3 for WI#809 review AIJ-1."""
+
+    def test_trailing_double_star_stops_at_direct_children(self):
+        self.assertTrue(config.gitlab_changes_match("ic/tools-src/**", "ic/tools-src/README.md"))
+        self.assertFalse(config.gitlab_changes_match("ic/tools-src/**", "ic/tools-src/gitlab/Cargo.toml"))
+        self.assertFalse(config.gitlab_changes_match("ic/tools-src/**", "ic/tools-src/gitlab/src/api.rs"))
+
+    def test_double_star_slash_spans_directories(self):
+        for path in ("ic/tools-src/README.md", "ic/tools-src/gitlab/Cargo.toml", "ic/tools-src/gitlab/src/api.rs"):
+            with self.subTest(path=path):
+                self.assertTrue(config.gitlab_changes_match("ic/tools-src/**/*", path))
+        self.assertFalse(config.gitlab_changes_match("ic/tools-src/**/*", "ic/tools-srcx/a"))
+
+    def test_star_does_not_cross_a_slash_but_matches_dot_files(self):
+        self.assertFalse(config.gitlab_changes_match("ic/*", "ic/src/main.rs"))
+        self.assertTrue(config.gitlab_changes_match("**/*.md", "docs/a/.hidden.md"))
+        self.assertTrue(config.gitlab_changes_match("ic/{wit,registry}/**/*", "ic/wit/deps/x/y.wit"))
+
+
+    def test_fail_open_shapes_are_refused(self):
+        # Second-reader cases: `**/` spans directories only at a segment
+        # start, a class never matches `/`, and an unterminated `[` or `{`
+        # matches nothing, as in Ruby.
+        self.assertFalse(config.gitlab_changes_match("ic/tools-src**/*", "ic/tools-src/gitlab/x/x"))
+        self.assertFalse(config.gitlab_changes_match("ic[/]tools-src/**/*", "ic/tools-src/a"))
+        self.assertFalse(config.gitlab_changes_match("ic[!x]tools-src/**/*", "ic/tools-src/a"))
+        self.assertFalse(config.gitlab_changes_match("a[b", "a[b"))
+        self.assertFalse(config.gitlab_changes_match("a{b", "a{b"))
+        self.assertTrue(config.gitlab_changes_match("a\\*b", "a*b"))
+        self.assertFalse(config.gitlab_changes_match("a\\*b", "axb"))
+
+    def test_braces_expand_before_the_other_rules(self):
+        # Ruby expands braces over the raw pattern first: `gitlab{**/,}*` is
+        # `gitlab**/*` or `gitlab*`, neither reaching nested files, and an
+        # unmatched `{`, even inside a class, matches nothing.
+        self.assertFalse(config.gitlab_changes_match("a{**/,}x", "a/b/c/x"))
+        self.assertFalse(config.pattern_covers("ic/tools-src/gitlab{**/,}*", "ic/tools-src/gitlab/**"))
+        self.assertFalse(config.gitlab_changes_match("[{a,]}", "a}"))
+        self.assertFalse(config.pattern_covers("ic/tools-src/**/*[!{]", "ic/tools-src/gitlab/**"))
+        self.assertTrue(config.gitlab_changes_match("{a,b}{c,d}", "bd"))
+        self.assertFalse(config.gitlab_changes_match("[a--b]", "a"))
+
+    def test_stand_in_names_cannot_satisfy_coverage(self):
+        # A glob that only matches the stand-in names must not count as
+        # covering a tool's trigger.
+        self.assertFalse(config.pattern_covers("ic/tools-src/**/x", "ic/tools-src/gitlab/**"))
+        self.assertFalse(config.pattern_covers("**/?", "ic/tools-src/gitlab/**"))
+        self.assertTrue(config.pattern_covers("ic/tools-src/**/*", "ic/tools-src/gitlab/**"))
 
 
 if __name__ == "__main__":

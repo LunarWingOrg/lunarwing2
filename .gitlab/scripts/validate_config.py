@@ -2849,14 +2849,189 @@ def _script_text(script: object) -> str:
     return ""
 
 
+def _gitlab_glob_regex(pattern: str) -> str:
+    """Translate one GitLab `rules:changes` glob into a regular expression.
+
+    GitLab matches these globs with Ruby's ``File.fnmatch`` and the flags
+    ``FNM_PATHNAME | FNM_DOTMATCH | FNM_EXTGLOB``: ``*``, ``?`` and bracket
+    classes never match ``/``, only a ``**/`` that starts a segment spans
+    directories (zero or more), any other ``**`` is a plain ``*``, and ``\\``
+    escapes the next character. Braces are expanded before this translation
+    (see ``_glob_expand_braces``). A pattern with an unterminated ``[``
+    matches nothing, as in Ruby.
+    Python's ``fnmatch`` lets ``*`` cross ``/``, so ``dir/**`` looked as if
+    it covered nested files when GitLab does not run the job for them
+    (WI#809 review AIJ-1).
+    """
+    never = "(?!)"
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        at_segment_start = index == 0 or pattern[index - 1] == "/"
+        if at_segment_start and pattern.startswith("**/", index):
+            out.append("(?:[^/]*/)*")
+            index += 3
+        elif char == "*":
+            out.append("[^/]*")
+            index += 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        elif char == "\\":
+            if index + 1 >= len(pattern):
+                return never
+            out.append(re.escape(pattern[index + 1]))
+            index += 2
+        elif char == "[":
+            end = _glob_bracket_end(pattern, index)
+            if end is None:
+                return never
+            body = pattern[index + 1:end]
+            negate = body.startswith("!") or body.startswith("^")
+            if negate:
+                body = body[1:]
+            if not body:
+                return never
+            items = []
+            position = 0
+            while position < len(body):
+                if body[position] == "\\" and position + 1 < len(body):
+                    items.append(re.escape(body[position + 1]))
+                    position += 2
+                elif body[position] == "-" and 0 < position < len(body) - 1:
+                    items.append("-")
+                    position += 1
+                else:
+                    items.append(re.escape(body[position]))
+                    position += 1
+            members = "".join(items)
+            if any(operator in members for operator in ("--", "&&", "~~", "||")):
+                # Python reserves these for set operations; refuse rather
+                # than guess (fails closed).
+                return never
+            out.append("(?!/)[" + ("^" if negate else "") + members + "]")
+            index = end + 1
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return "".join(out)
+
+
+def _glob_bracket_end(pattern: str, start: int) -> int | None:
+    """Index of the `]` closing the class opened at `start`, or None."""
+    position = start + 1
+    if position < len(pattern) and pattern[position] in "!^":
+        position += 1
+    while position < len(pattern):
+        if pattern[position] == "\\":
+            position += 2
+            continue
+        if pattern[position] == "]":
+            return position
+        position += 1
+    return None
+
+
+def _glob_brace_end(pattern: str, start: int) -> int | None:
+    """Index of the `}` closing the brace opened at `start`, or None."""
+    depth = 0
+    position = start
+    while position < len(pattern):
+        if pattern[position] == "\\":
+            position += 2
+            continue
+        if pattern[position] == "{":
+            depth += 1
+        elif pattern[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return None
+
+
+def _glob_split_alternatives(body: str) -> list[str]:
+    """Split a brace body at its top-level commas."""
+    parts, depth, current, position = [], 0, "", 0
+    while position < len(body):
+        char = body[position]
+        if char == "\\" and position + 1 < len(body):
+            current += body[position:position + 2]
+            position += 2
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+        position += 1
+    parts.append(current)
+    return parts
+
+
+def _glob_expand_braces(pattern: str) -> list[str] | None:
+    """Expand ``{a,b}`` the way Ruby's ``ruby_brace_expand`` does.
+
+    Expansion runs over the raw pattern before any other rule, honours only
+    ``\\`` escapes and nesting (bracket classes are not special here), and a
+    ``{`` without its ``}`` makes the whole pattern match nothing (None).
+    """
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "{":
+            end = _glob_brace_end(pattern, index)
+            if end is None:
+                return None
+            prefix, suffix = pattern[:index], pattern[end + 1:]
+            expanded: list[str] = []
+            for alternative in _glob_split_alternatives(pattern[index + 1:end]):
+                more = _glob_expand_braces(prefix + alternative + suffix)
+                if more is None:
+                    return None
+                expanded.extend(more)
+            return expanded
+        index += 1
+    return [pattern]
+
+
+def gitlab_changes_match(pattern: str, path: str) -> bool:
+    """Whether GitLab's `rules:changes` glob `pattern` matches `path`.
+
+    A glob this translation cannot express (for example a reversed range)
+    matches nothing, so the coverage check fails closed on it.
+    """
+    expansions = _glob_expand_braces(pattern)
+    if expansions is None:
+        return False
+    for expansion in expansions:
+        try:
+            if re.fullmatch(_gitlab_glob_regex(expansion), path) is not None:
+                return True
+        except re.error:
+            continue
+    return False
+
+
 def pattern_covers(pattern: str, sample: str) -> bool:
-    """Whether a `changes:` glob admits a representative path from `pattern`.
+    """Whether a `changes:` glob admits the paths a tool trigger stands for.
 
     A tool's `triggers` name its paths (``ic/tools-src/gitlab/**``); the job
-    must run when one of them changes. ``**`` is stood in for by a nested
-    path so both sides compare as plain globs.
+    must run when any of them changes. The trigger's ``**`` is stood in for
+    by a direct file, a nested source file and a dot directory, and GitLab's
+    own matching rule must admit all three.
     """
-    return fnmatch.fnmatchcase(sample.replace("**", "x/x"), pattern)
+    stand_ins = ("Cargo.toml", "src/lib.rs", ".cargo/config.toml")
+    samples = {sample.replace("**", stand_in) for stand_in in stand_ins}
+    return all(gitlab_changes_match(pattern, path) for path in samples)
 
 
 def validate_wasm_tools_check_shape(merged: dict, errors: list[str]) -> None:
