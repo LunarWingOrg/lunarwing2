@@ -1,7 +1,8 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
-Status: **tool/approval slice shipped in v2.1.4.0; Phase A rollout remains in
-progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
+gating and the evaluation trace are implemented; the held-out tenant evaluation
+and hint rollout remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
@@ -359,6 +360,21 @@ models are per-user, so gateway access must use existing authentication and
 expose only the caller's own models. Any cross-user operator view must be
 aggregate-only. Never expose raw arguments, prompts, tokens, credentials or
 cross-tenant data. No synchronous DB writes belong on the hot path.
+
+**Implemented under #318 (A2/A3/A4 recording).** `GET /api/estimates` returns
+the caller's own categories and active category policy.
+`GET /api/estimates/counters` is owner-only and reports unlabeled registry-wide
+totals, with eligibility counted at execution start even in observe mode.
+`GET /api/estimates/evaluation` is owner-only and compares errors on the same
+retained calls, with separate warmup and early cold-start coverage.
+`LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates display per canonical tool name
+while recording continues. `LUNARWING_TOOL_ESTIMATES_TRACE` enables the
+bounded, parameter-free records behind the evaluation route. Only `http`
+currently declares a production duration baseline. A missing comparison is
+not a pass; evaluation for other tools needs an agreed baseline or gate.
+Running the evaluation on a real tenant and enabling hints for passing
+categories remain A4/A5 operator steps; this code does not change any approval,
+scheduling or cost behaviour.
 
 ## Persistence decision
 

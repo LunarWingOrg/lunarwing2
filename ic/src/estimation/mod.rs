@@ -6,19 +6,29 @@
 //! - Statistical models that improve over time
 
 mod cost;
+mod diagnostics;
 mod learner;
 mod runtime;
 mod time;
 mod value;
 
 pub use cost::CostEstimator;
-pub use learner::{EstimationLearner, LearningModel};
-pub use runtime::{ToolEstimates, ToolEstimationMode};
+pub use diagnostics::{
+    CategoryPolicy, CategoryPolicySummary, EvaluationCategory, EvaluationMetrics,
+    EvaluationSummary, EvaluationTrace, WarmupSummary,
+};
+pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
+pub use runtime::{
+    CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateCounters, ToolEstimateDiagnostics,
+    ToolEstimates, ToolEstimationMode,
+};
 pub use time::TimeEstimator;
 pub use value::ValueEstimator;
 
 use rust_decimal::Decimal;
 use std::time::Duration;
+
+const MAX_TOOL_NAME_BYTES: usize = 256;
 
 /// A completed execution paired with its *unadjusted* baselines and the
 /// duration prediction captured before execution. Unknown cost stays unknown.
@@ -199,6 +209,11 @@ impl Estimator {
     /// Get the value estimator.
     pub fn value(&self) -> &ValueEstimator {
         &self.value
+    }
+
+    /// Read-only learner access for the diagnostics surface.
+    pub fn learner(&self) -> &EstimationLearner {
+        &self.learner
     }
 }
 

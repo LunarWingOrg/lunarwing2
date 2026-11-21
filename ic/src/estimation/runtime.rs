@@ -1,16 +1,23 @@
-//! Registry-owned, user-isolated tool calibration. No I/O or process globals.
+//! Registry-owned, user-isolated tool calibration. No persistence or process globals.
 //!
 //! The learner bounds its model count; canceled/failed/timed-out calls do not
 //! train successful runtime. Only short statistical updates hold the mutex.
+//! Diagnostics reads and the optional evaluation trace never touch a tool's
+//! hot path with I/O.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use crate::tools::Tool;
 
-use super::{Actuals, Estimator, RuntimeEstimate};
+use super::diagnostics::{
+    CategoryPolicy, CategoryPolicySummary, EvaluationSummary, EvaluationTrace, TraceRecord,
+};
+use super::learner::{LearnerCounterSnapshot, LearningModel};
+use super::{Actuals, Estimator, MAX_TOOL_NAME_BYTES, RuntimeEstimate};
 
 /// Recording is enabled by default; public hints require explicit opt-in
 /// until representative workloads have passed the rollout accuracy gate.
@@ -29,33 +36,162 @@ impl ToolEstimationMode {
             _ => Self::Observe,
         }
     }
+
+    /// Stable, non-sensitive label for diagnostics responses and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Observe => "observe",
+            Self::Display => "display",
+        }
+    }
 }
+
+/// Comma-separated display allowlist/suppression list (WI#318 A3).
+const ENV_CATEGORIES: &str = "LUNARWING_TOOL_ESTIMATES_CATEGORIES";
+/// Opt-in bounded held-out evaluation trace (WI#318 A4).
+const ENV_TRACE: &str = "LUNARWING_TOOL_ESTIMATES_TRACE";
 
 /// Process-lifetime cache owned by one tool registry. Restart starts cold.
 pub struct ToolEstimates {
-    estimator: Mutex<Estimator>,
+    state: Mutex<EstimationState>,
     mode: ToolEstimationMode,
+    categories: CategoryPolicy,
+    trace: Option<Mutex<EvaluationTrace>>,
+}
+
+#[derive(Default)]
+struct EstimationState {
+    estimator: Estimator,
+    requests: EstimateRequestSnapshot,
+}
+
+/// One lookup per tracked execution attempt, independent of hint display.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct EstimateRequestSnapshot {
+    pub estimate_requests: u64,
+    pub estimates_returned: u64,
+    pub estimates_withheld: u64,
+}
+
+impl EstimateRequestSnapshot {
+    fn record(&mut self, eligible: bool) {
+        self.estimate_requests = self.estimate_requests.saturating_add(1);
+        let outcome = if eligible {
+            &mut self.estimates_returned
+        } else {
+            &mut self.estimates_withheld
+        };
+        *outcome = outcome.saturating_add(1);
+    }
+}
+
+/// Registry-wide counts. Expose only as owner-only, unlabeled aggregates.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ToolEstimateCounters {
+    pub estimates: EstimateRequestSnapshot,
+    pub observations: LearnerCounterSnapshot,
+}
+
+/// User-scoped diagnostics. Never contains the private learner key, tool
+/// parameters, results or another user's activity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolEstimateDiagnostics {
+    pub mode: &'static str,
+    pub category_policy: CategoryPolicySummary,
+    pub categories: Vec<CategoryDiagnostics>,
+}
+
+/// One canonical tool category as seen by the requesting user.
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryDiagnostics {
+    pub tool: String,
+    pub samples: u64,
+    pub duration_samples: u64,
+    pub duration_ratio_samples: u64,
+    pub cost_samples: u64,
+    pub duration_ema_ms: f64,
+    pub time_error_ema: f64,
+    pub confidence: f64,
+    pub confidence_label: &'static str,
+    /// Whether the active category policy would display this category's hint.
+    pub hint_displayed: bool,
+}
+
+impl CategoryDiagnostics {
+    fn from_model(
+        tool: &str,
+        model: &LearningModel,
+        confidence: f64,
+        min_samples: u64,
+        hint_displayed: bool,
+    ) -> Self {
+        let confidence_label = if model.time_sample_count < min_samples {
+            "none"
+        } else if confidence < 0.5 {
+            "low"
+        } else {
+            "moderate"
+        };
+        Self {
+            tool: tool.to_owned(),
+            samples: model.sample_count,
+            duration_samples: model.time_sample_count,
+            duration_ratio_samples: model.time_ratio_sample_count,
+            cost_samples: model.cost_sample_count,
+            duration_ema_ms: model.duration_secs * 1_000.0,
+            time_error_ema: model.time_error_rate,
+            confidence,
+            confidence_label,
+            hint_displayed,
+        }
+    }
 }
 
 /// Per-invocation data frozen before execution; contains no arguments/results.
 pub(crate) struct ToolObservation {
     key: String,
     actuals: Actuals,
+    /// Pending trace row; actual duration is only filled for an `Ok` call.
+    trace: Option<TraceRecord>,
 }
 
 impl ToolEstimates {
     pub fn new(mode: ToolEstimationMode) -> Self {
+        Self::configured(mode, CategoryPolicy::default(), None)
+    }
+
+    /// Compose a registry-owned cache. Category gating and the evaluation
+    /// trace are independent of the mode and of approval/cost policy.
+    pub(crate) fn configured(
+        mode: ToolEstimationMode,
+        categories: CategoryPolicy,
+        trace: Option<EvaluationTrace>,
+    ) -> Self {
         Self {
-            estimator: Mutex::new(Estimator::new()),
+            state: Mutex::new(EstimationState::default()),
             mode,
+            categories,
+            trace: trace.map(Mutex::new),
         }
     }
 
+    /// Whether hints are enabled at all (ignores per-category gating).
     pub fn display_enabled(&self) -> bool {
         self.mode == ToolEstimationMode::Display
     }
 
-    /// Only return an estimate after five completed, usable runtime samples.
+    /// Whether this canonical tool category may display a hint.
+    pub fn display_enabled_for(&self, tool_name: &str) -> bool {
+        self.display_enabled() && self.categories.allows(tool_name)
+    }
+
+    pub fn category_policy(&self) -> CategoryPolicySummary {
+        self.categories.summary()
+    }
+
+    /// Read-only lookup, used for approval hints. It does not count as an
+    /// execution attempt and only returns a warmed estimate.
     pub fn estimate(
         &self,
         user_id: &str,
@@ -65,9 +201,10 @@ impl ToolEstimates {
         let key = self.key(user_id, tool.name())?;
         let baseline_time = tool.estimated_duration(params);
         let baseline_cost = tool.estimated_cost(params);
-        self.estimator
+        self.state
             .lock()
             .ok()?
+            .estimator
             .estimate_operation(&key, baseline_time, baseline_cost)
     }
 
@@ -77,27 +214,46 @@ impl ToolEstimates {
         tool: &dyn Tool,
         params: &serde_json::Value,
     ) -> Option<ToolObservation> {
-        let key = self.key(user_id, tool.name())?;
+        let tool_name = tool.name();
+        let key = self.key(user_id, tool_name)?;
         // Tool hooks run outside the lock and may use the normalized arguments;
         // arguments themselves are never stored in the learner.
         let baseline_time = tool.estimated_duration(params);
         let baseline_cost = tool.estimated_cost(params);
-        let predicted_time = self
-            .estimator
-            .lock()
-            .ok()?
-            .estimate_operation(&key, baseline_time, baseline_cost)
-            .map(|estimate| estimate.duration)
-            .or(baseline_time);
+        let (estimate, prior_duration_samples) = {
+            let mut state = self.state.lock().ok()?;
+            let estimate = state
+                .estimator
+                .estimate_operation(&key, baseline_time, baseline_cost);
+            state.requests.record(estimate.is_some());
+            // Capture the model's age with the prediction, never after the
+            // call or a concurrent completion has trained the learner.
+            let prior_duration_samples = self.trace.as_ref().map(|_| {
+                state
+                    .estimator
+                    .learner()
+                    .get_model(&key)
+                    .map_or(0, |model| model.time_sample_count)
+            });
+            (estimate, prior_duration_samples)
+        };
+        let prediction = estimate.map(|estimate| estimate.duration);
         Some(ToolObservation {
             key,
             actuals: Actuals {
                 baseline_time,
                 baseline_cost,
-                predicted_time,
+                predicted_time: prediction.or(baseline_time),
                 actual_time: Duration::ZERO,
                 actual_cost: None,
             },
+            trace: prior_duration_samples.map(|prior_duration_samples| TraceRecord {
+                tool: Arc::from(tool_name),
+                baseline: baseline_time,
+                prediction,
+                actual: Duration::ZERO,
+                prior_duration_samples,
+            }),
         })
     }
 
@@ -107,8 +263,8 @@ impl ToolEstimates {
         elapsed: Duration,
         cost: Option<Decimal>,
     ) {
-        if let Ok(mut estimator) = self.estimator.lock() {
-            estimator.record_operation_actuals(
+        if let Ok(mut state) = self.state.lock() {
+            state.estimator.record_operation_actuals(
                 &observation.key,
                 Actuals {
                     actual_time: elapsed,
@@ -117,10 +273,73 @@ impl ToolEstimates {
                 },
             );
         }
+        // No grouping, sorting or logging while holding the trace lock.
+        if let (Some(trace), Some(record)) = (&self.trace, observation.trace)
+            && let Ok(mut trace) = trace.lock()
+        {
+            trace.push(TraceRecord {
+                actual: elapsed,
+                ..record
+            });
+        }
+    }
+
+    /// User-scoped snapshot of this registry's models. A caller can only see
+    /// categories recorded under its own length-framed key prefix.
+    pub fn diagnostics(&self, user_id: &str) -> ToolEstimateDiagnostics {
+        let prefix = format!("tool:{}:{user_id}", user_id.len());
+        let mut categories = Vec::new();
+        if let Ok(state) = self.state.lock() {
+            let learner = state.estimator.learner();
+            let min_samples = learner.min_samples();
+            for (key, model) in learner.all_models() {
+                let Some(tool) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if tool.is_empty() {
+                    continue;
+                }
+                categories.push(CategoryDiagnostics::from_model(
+                    tool,
+                    model,
+                    learner.confidence(key),
+                    min_samples,
+                    self.display_enabled_for(tool),
+                ));
+            }
+        }
+        categories.sort_by(|a, b| a.tool.cmp(&b.tool));
+        ToolEstimateDiagnostics {
+            mode: self.mode.as_str(),
+            category_policy: self.categories.summary(),
+            categories,
+        }
+    }
+
+    /// Counts for the entire registry. Call only from owner-only diagnostics.
+    pub(crate) fn aggregate_counters(&self) -> ToolEstimateCounters {
+        self.state.lock().map_or_else(
+            |_| ToolEstimateCounters::default(),
+            |state| ToolEstimateCounters {
+                estimates: state.requests,
+                observations: state.estimator.learner().counters().snapshot(),
+            },
+        )
+    }
+
+    /// Operator-only aggregate of the held-out evaluation trace. Returns
+    /// `None` when the trace is disabled; records carry no user identity.
+    pub fn evaluation(&self) -> Option<EvaluationSummary> {
+        // Clone the bounded records (tool names are shared), then release the
+        // lock before grouping and sorting the snapshot.
+        let snapshot = self.trace.as_ref()?.lock().ok()?.clone();
+        Some(snapshot.summary())
     }
 
     fn key(&self, user_id: &str, tool_name: &str) -> Option<String> {
-        if self.mode == ToolEstimationMode::Disabled || user_id.len() > 512 || tool_name.len() > 256
+        if self.mode == ToolEstimationMode::Disabled
+            || user_id.len() > 512
+            || tool_name.len() > MAX_TOOL_NAME_BYTES
         {
             return None;
         }
@@ -133,9 +352,18 @@ impl ToolEstimates {
 impl Default for ToolEstimates {
     fn default() -> Self {
         // Read once at registry construction, independent of approval/cost policy.
-        Self::new(ToolEstimationMode::from_setting(
-            std::env::var("LUNARWING_TOOL_ESTIMATES").ok().as_deref(),
-        ))
+        let mode = std::env::var("LUNARWING_TOOL_ESTIMATES").ok();
+        let categories = match std::env::var(ENV_CATEGORIES) {
+            Ok(value) => CategoryPolicy::from_setting(Some(&value)),
+            Err(std::env::VarError::NotPresent) => CategoryPolicy::default(),
+            Err(std::env::VarError::NotUnicode(_)) => CategoryPolicy::invalid("invalid UTF-8"),
+        };
+        let trace = std::env::var(ENV_TRACE).ok();
+        Self::configured(
+            ToolEstimationMode::from_setting(mode.as_deref()),
+            categories,
+            EvaluationTrace::from_setting(trace.as_deref()),
+        )
     }
 }
 
@@ -166,6 +394,7 @@ mod tests {
             ToolEstimationMode::from_setting(Some("0")),
             ToolEstimationMode::Disabled
         );
+        assert_eq!(ToolEstimationMode::Observe.as_str(), "observe");
     }
 
     #[test]
@@ -189,6 +418,88 @@ mod tests {
                 .begin(&"x".repeat(513), &EchoTool, &params)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn category_policy_gates_display_but_keeps_recording() {
+        let params = serde_json::json!({});
+        let estimates = ToolEstimates::configured(
+            ToolEstimationMode::Display,
+            CategoryPolicy::from_setting(Some("other-tool")),
+            None,
+        );
+        for _ in 0..5 {
+            let observation = estimates.begin("alice", &EchoTool, &params).unwrap();
+            estimates.complete(observation, Duration::from_millis(5), None);
+        }
+        assert!(!estimates.display_enabled_for(EchoTool.name()));
+        assert!(estimates.display_enabled());
+        let diagnostics = estimates.diagnostics("alice");
+        assert_eq!(diagnostics.categories.len(), 1);
+        assert_eq!(diagnostics.categories[0].tool, EchoTool.name());
+        assert_eq!(diagnostics.categories[0].duration_samples, 5);
+        assert!(!diagnostics.categories[0].hint_displayed);
+        assert_eq!(diagnostics.category_policy.mode, "allowlist");
+
+        let suppressed = ToolEstimates::configured(
+            ToolEstimationMode::Display,
+            CategoryPolicy::from_setting(Some(&format!("-{}", EchoTool.name()))),
+            None,
+        );
+        assert!(!suppressed.display_enabled_for(EchoTool.name()));
+    }
+
+    #[test]
+    fn diagnostics_are_user_scoped_and_never_echo_keys_or_parameters() {
+        let secret = "sk-live-very-secret-parameter";
+        let params = serde_json::json!({ "api_key": secret });
+        let estimates = ToolEstimates::new(ToolEstimationMode::Observe);
+        for _ in 0..5 {
+            let observation = estimates.begin("alice", &EchoTool, &params).unwrap();
+            estimates.complete(observation, Duration::from_millis(7), None);
+        }
+        let alice = estimates.diagnostics("alice");
+        assert_eq!(alice.categories.len(), 1);
+        assert_eq!(alice.categories[0].tool, EchoTool.name());
+        assert_eq!(alice.categories[0].samples, 5);
+        let rendered = serde_json::to_string(&alice).unwrap();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("alice"));
+        assert!(!rendered.contains("tool:"));
+
+        assert!(estimates.diagnostics("bob").categories.is_empty());
+        assert!(estimates.diagnostics("x").categories.is_empty());
+    }
+
+    #[test]
+    fn evaluation_freezes_model_age_and_prediction_before_execution() {
+        let params = serde_json::json!({});
+        let traced = ToolEstimates::configured(
+            ToolEstimationMode::Observe,
+            CategoryPolicy::default(),
+            Some(EvaluationTrace::new(64)),
+        );
+        let early = traced.begin("alice", &EchoTool, &params).unwrap();
+        let window = traced.evaluation().unwrap().cold_start_sample_limit;
+        for _ in 0..window {
+            let observation = traced.begin("alice", &EchoTool, &params).unwrap();
+            traced.complete(observation, Duration::from_millis(4), None);
+        }
+        // This call finished after other calls warmed the model, but must
+        // still be part of warmup. Bob starts his own warmup independently.
+        traced.complete(early, Duration::from_millis(4), None);
+        for user in ["alice", "bob"] {
+            let observation = traced.begin(user, &EchoTool, &params).unwrap();
+            traced.complete(observation, Duration::from_millis(4), None);
+        }
+
+        let summary = traced.evaluation().unwrap();
+        let echo = &summary.categories[0];
+        assert_eq!(echo.overall.samples, window + 3);
+        assert_eq!(echo.overall.prediction_samples, window - 4);
+        assert_eq!(echo.warmup.samples, 7);
+        assert_eq!(echo.cold_start.samples, window + 2);
+        assert_eq!(echo.cold_start.prediction_samples, window - 5);
     }
 
     #[test]
