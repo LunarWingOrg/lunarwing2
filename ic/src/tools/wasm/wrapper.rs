@@ -5603,6 +5603,147 @@ mod tests {
         assert!(status.is_success(), "Gotify rejected the message: {status}");
     }
 
+    /// WI#831 (AJB-2) live notification check through the tool component.
+    ///
+    /// Unlike [`wi817_live_gotify_target`], which only POSTs with curl
+    /// semantics, this runs the real gotify WASM component through the
+    /// wrapper: the on-disk `config/gotify.json` merge, the capability
+    /// allowlist, and the `gotify_app_token` credential injection all have to
+    /// agree for the notification to be accepted. The merge reads
+    /// `LUNARWING_BASE_DIR` exactly as the daemon does, so point the process
+    /// at a provisioned base dir.
+    ///
+    /// ```bash
+    /// LUNARWING_BASE_DIR=/path/to/state \
+    /// WI831_LIVE_TOKEN=<gotify application token> \
+    /// WI831_LIVE_WASM=/path/to/gotify-tool.wasm \
+    ///   cargo test --lib -- tools::wasm::wrapper::tests::wi831_live_gotify_notification \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Set `WASM_HTTP_ALLOW_PRIVATE_IPS=1` when the configured URL is a
+    /// private or loopback host. Prints the server asked and the HTTP
+    /// outcome; fails when the tool reports an error.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[ignore = "manual live check; needs a provisioned base dir, a Gotify token, and the built tool"]
+    async fn wi831_live_gotify_notification() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::secrets::{CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore};
+        use crate::tools::wasm::capabilities::{
+            Capabilities, EndpointPattern, HttpCapability, SecretsCapability, WorkspaceCapability,
+        };
+
+        let base_dir = crate::bootstrap::lunarwing_base_dir();
+        let token = std::env::var("WI831_LIVE_TOKEN")
+            .expect("set WI831_LIVE_TOKEN to a Gotify app token"); // safety: manual test only
+        let wasm_path = std::path::PathBuf::from(
+            std::env::var("WI831_LIVE_WASM").expect("set WI831_LIVE_WASM to gotify-tool.wasm"), // safety: manual test only
+        );
+        println!(
+            "WI831 live check: base dir {}",
+            base_dir.display()
+        );
+
+        let content =
+            super::read_host_provisioned_workspace_config(&base_dir, super::GOTIFY_CONFIG_PATH)
+                .expect("config/gotify.json missing under the supplied base dir"); // safety: manual test only
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("config/gotify.json did not parse"); // safety: manual test only
+        let base_url = config
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("config/gotify.json has no url") // safety: manual test only
+            .trim_end_matches('/')
+            .to_string();
+        let host = url::Url::parse(&base_url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .expect("config/gotify.json url has no host"); // safety: manual test only
+        println!("WI831 live check: tool will ask {host} ({base_url}/message)");
+
+        let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read the tool component"); // safety: manual test only
+        // The real component needs more than for_testing()'s 1 MB floor.
+        let mut runtime_config = WasmRuntimeConfig::for_testing();
+        runtime_config.default_limits = runtime_config
+            .default_limits
+            .with_memory(64 * 1024 * 1024)
+            .with_fuel(500_000_000);
+        let runtime = Arc::new(
+            WasmToolRuntime::new(runtime_config).expect("WASM runtime should initialize"), // safety: manual test only
+        );
+        let prepared = runtime
+            .prepare("gotify-tool", &wasm_bytes, None)
+            .await
+            .expect("gotify component should prepare"); // safety: manual test only
+
+        let store = test_secrets_store();
+        store
+            .create(
+                "wi831-live",
+                CreateSecretParams::new("gotify_app_token", token),
+            )
+            .await
+            .expect("failed to store the token"); // safety: manual test only
+
+        let backend = LibSqlBackend::new_local(&base_dir.join("wi831-live.db"))
+            .await
+            .expect("should create libsql backend"); // safety: manual test only
+        backend.run_migrations().await.expect("migrations"); // safety: manual test only
+        let db: Arc<dyn Database> = Arc::new(backend);
+        let workspace = Arc::new(crate::workspace::Workspace::new_with_db("wi831-live", db));
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "gotify_app_token".to_string(),
+            CredentialMapping {
+                secret_name: "gotify_app_token".to_string(),
+                location: CredentialLocation::Header {
+                    name: "X-Gotify-Key".to_string(),
+                    prefix: None,
+                },
+                host_patterns: vec![host.clone()],
+                path_patterns: Vec::new(),
+                optional: false,
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                allowlist: vec![EndpointPattern {
+                    host: host.clone(),
+                    path_prefix: Some("/".to_string()),
+                    methods: vec!["POST".to_string()],
+                }],
+                credentials,
+                ..Default::default()
+            }),
+            secrets: Some(SecretsCapability {
+                allowed_names: vec!["gotify_app_token".to_string()],
+            }),
+            workspace_read: Some(WorkspaceCapability {
+                allowed_prefixes: vec!["config/".to_string()],
+                reader: None,
+            }),
+            ..Default::default()
+        };
+
+        let tool = super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, caps)
+            .with_workspace(workspace)
+            .with_secrets_store(Arc::new(store));
+        let ctx = JobContext::with_user("wi831-live", "WI831 live check", "WI831 live check");
+        let outcome = tool
+            .execute(
+                serde_json::json!({"message": "WI#831 live notification check", "priority": 1}),
+                &ctx,
+            )
+            .await;
+        match outcome {
+            Ok(output) => println!("WI831 live check: {host} accepted the notification: {output:?}"),
+            Err(error) => panic!("WI831 live check: {host} rejected the notification: {error}"),
+        }
+    }
+
     #[test]
     fn test_host_provisioned_workspace_config_is_gotify_only() {
         let config_prefix = ["config/".to_string()];
