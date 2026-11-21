@@ -3222,19 +3222,22 @@ write_tenant_gotify_config() {
 
   sudo -u "$name" mkdir -p "$config_dir"
   gotify_url="$(printf '%s' "$gotify_url" | sed 's|/$||')"
+  # Build the object with jq (WI#831 AJB-4): a title or URL containing `"`
+  # or `\` used to break the hand-printed JSON, and the tool then fell back
+  # to its compiled-in defaults. `require_cmd` keeps the dependency explicit
+  # — configure_gotify_capabilities already requires jq.
+  require_cmd jq
+  local payload
+  payload="$(jq -cn --arg url "$gotify_url" --arg title "$gotify_title" \
+    '{url: $url} + (if $title == "" then {} else {title: $title} end)')" \
+    || die "could not build the gotify config JSON"
   # WI#390: commit through the tenant-side atomic writer — root never opens
   # gotify.json inside the tenant-writable state tree. The writer's mode 600
   # also hardens the previous umask-dependent 0644. The explicit returns keep
   # the refusal fatal even when errexit is suppressed by the caller's context.
-  if [[ -n "$gotify_title" ]]; then
-    printf '{"url": "%s", "title": "%s"}\n' "$gotify_url" "$gotify_title" \
-      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
-      || return 1
-  else
-    printf '{"url": "%s"}\n' "$gotify_url" \
-      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
-      || return 1
-  fi
+  printf '%s\n' "$payload" \
+    | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
+    || return 1
   say "wrote: $config_path"
 }
 
