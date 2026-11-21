@@ -423,7 +423,7 @@ is the default and keeps today's behaviour: any git network operation in a
 manifest-backed call is refused with `capability_denied` before a runtime,
 proxy or credential is touched. Other extension names stay denied.
 
-- **Host policy decides.** `extra_remotes` from a request can only narrow the
+- **Host policy decides.** `git.remotes` from a request can only narrow the
   host list; a name, URL, host or credential the tenant was not granted is a
   denial. URLs with embedded userinfo, query strings, relative paths, or
   schemes other than `https`/`http`/`file` are refused at configuration load.
