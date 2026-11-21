@@ -2,13 +2,13 @@
 
 Embeddings are optional and disabled by default. When enabled, LunarWing uses them for vector-backed workspace memory search.
 
-**Source revalidated 2026-11-20 for v2.2.1.0 (`4192ee72b`).** Configuration
+**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** Configuration
 resolution is in `ic/src/config/embeddings.rs`; provider requests are in
-`ic/src/workspace/embeddings.rs`.
+`ic/src/workspace/embeddings.rs`. The full page was checked against the source.
 
 ## Configure in the Web UI
 
-The authenticated Configuration view exposes:
+In the authenticated web UI, open **Settings → Inference** to expose:
 
 - `embeddings.enabled`
 - `embeddings.provider`
@@ -16,9 +16,11 @@ The authenticated Configuration view exposes:
 - `embeddings.base_url` for `openai_compatible`
 
 The web UI saves these settings to the database. At startup, LunarWing can also
-read legacy `settings.json` and TOML bootstrap config. If a TOML or environment
-override is already in place, changing the database value does not replace it.
-Use the web UI rather than editing legacy JSON for normal operation.
+read legacy `settings.json` and TOML bootstrap config. An environment override
+wins over the database value. A TOML value wins only when it differs from the
+corresponding `Settings::default()` value; explicitly setting a value equal to
+that built-in default does not count as an override. Use the web UI rather than
+editing legacy JSON for normal operation.
 
 The web UI offers `openai`, `lunarwing_cloud`, and `openai_compatible`. The backend also supports `ollama` when configured through the environment.
 
@@ -59,11 +61,15 @@ If an OpenAI-backed provider is enabled without `OPENAI_API_KEY`, LunarWing logs
 
 ## Network Safety
 
-Embedding and Ollama base URLs are checked when configuration loads. Remote
-plain HTTP and HTTPS resolving to private, loopback, link-local or metadata
-addresses are rejected by default; localhost HTTP is allowed. This check
-does not pin addresses at request time. Use only trusted endpoints and keep
-egress controls in place. The private-network harness needs the explicit
-`ALLOW_PRIVATE_IPS=1` opt-in; do not copy it to normal deployments.
+Embedding and Ollama base URLs are checked when configuration loads. Without
+`ALLOW_PRIVATE_IPS=1`, remote plain HTTP is refused and HTTPS resolving to
+private, loopback, link-local or metadata addresses is rejected; localhost HTTP
+is allowed. The opt-out applies to **mt-admin tenant environments and the
+shipped service units as well as the private-network harness**, where
+`ALLOW_PRIVATE_IPS=1` is set for access to private-network dependencies. It
+permits any parseable HTTP or HTTPS URL in this configuration check; use trusted
+endpoints and egress controls. For operators overriding that managed default,
+removing the opt-in restores the stricter checks. The check does not pin
+addresses at request time.
 
 After changing startup environment values, restart the service through the appropriate service-management path. For multi-tenant installations, use `ic/scripts/lunarwing-mt-admin.sh` rather than direct tenant `systemctl` or `rc-service` commands.

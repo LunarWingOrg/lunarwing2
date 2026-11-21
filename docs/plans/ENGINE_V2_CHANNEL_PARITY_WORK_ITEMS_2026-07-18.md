@@ -17,6 +17,12 @@ affected areas, acceptance criteria, tests, and dependencies.
 
 No item in this document is implemented merely by creating this plan.
 
+> **Status note (2026-11-20):** CHPAR-012 is still the only open item **in this
+> record**. Its DarkIRC, XMPP and authorized teardown validation had no recorded
+> completion as of 2026-07-19. The reorganization found no superseding evidence;
+> revalidate current behavior and replace stale execution details before resuming.
+> The original verification commands below remain historical.
+
 ---
 
 ## Status Legend

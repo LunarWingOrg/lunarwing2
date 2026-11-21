@@ -15,6 +15,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
 * Updated on October 1st, 2026 for the v2.1.4.0 pre-release pass: indexed the new tenant system-prompts guide (WI#220); release index now points at v2.1.3.0 as latest.*
 * Updated on October 5th, 2026 for the v2.1.5.0 pre-release pass: release index now points at v2.1.4.0 as latest; new v2.1.5.0 ops docs (cargo-deny audit, open work-item status) indexed under [`ops/README.md`](ops/README.md).*
+* Updated on November 20th, 2026 for WI#794: [`plans/REORG.md`](plans/REORG.md) is now the active plan index; delivered and dated plans moved to [`plans/history/`](plans/history/README.md) with status banners, and inbound plan links updated.*
 
 ## Companion applications
 
@@ -69,6 +70,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Versioned Vision/OCR sidecar endpoints and MT port behavior |
 | [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica WASM channel and tool deployment |
 | [`NETBIRD_TUNNEL.md`](guides/NETBIRD_TUNNEL.md) | Self-hosted NetBird Reverse Proxy tunnel setup |
+| [`SANDBOX_CAPABILITY_MANIFEST.md`](guides/SANDBOX_CAPABILITY_MANIFEST.md) | Version-1 shell capability requests, deny defaults, host policy, effective limits, audit evidence, compatibility, external-worker boundary |
 | [`SANDBOX_TUNNEL_NETWORKING.md`](guides/SANDBOX_TUNNEL_NETWORKING.md) | Egress-only NetBird/WireGuard networking for the generic sandbox (WI#248/592): settings and defaults, per-instance sidecars and image identity, custom DNS, WireGuard handshake health, NetBird live validation |
 | [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migration from removed managed Cloudflare/ngrok/Tailscale providers |
 | [`DEBIAN_PACKAGE_LIST.md`](guides/DEBIAN_PACKAGE_LIST.md) | Debian MT host packages and Python tooling dependencies |
@@ -146,17 +148,16 @@ Architecture and code reviews.
 
 ### [`plans/`](plans/)
 
-Active implementation plans, execution backlogs, and delivery-status records.
+Implementation plans with remaining work; completed and superseded records are
+archived separately. See **[the plan index](plans/REORG.md)** for purposes,
+verified status and current authorities.
 
 | File | Description |
 |------|-------------|
-| [`ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md`](plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md) | Prioritized implementation backlog derived from the Engine V2 XMPP/DarkIRC/WeeChat parity audit, with acceptance criteria, tests, dependencies, and rollout gates |
-| [`e2e-skill-feedback.md`](plans/e2e-skill-feedback.md) | Live-tenant Engine V2 skill-feedback validation plan |
-| [`SELF_IMPROVING_SKILLS_B2_B3.md`](plans/SELF_IMPROVING_SKILLS_B2_B3.md) | B-2/B-3 self-improving skills implementation plan and delivered status |
-| [`WeeChat-Bootstrap.md`](plans/WeeChat-Bootstrap.md) | Secure tenant WeeChat relay provisioning plan |
-| [`Near-Removal.md`](plans/history/Near-Removal.md) | Provider and WIT ABI naming migration plan |
-| [`PHASE5PLANSTATUSTODAYWED.md`](plans/PHASE5PLANSTATUSTODAYWED.md) | Engine V2 local compatibility phase status record |
-| [`SKILLb1b2b3STATUSTODAYWED.md`](plans/SKILLb1b2b3STATUSTODAYWED.md) | Self-improving skills implementation and verification status record |
+| [`plans/REORG.md`](plans/REORG.md) | Active plan index and classification/archival rules (WI#794) |
+| [`ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md`](plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md) | Engine V2 XMPP/DarkIRC/WeeChat parity backlog; CHPAR-012 live DarkIRC/XMPP validation and teardown remain unrecorded since 2026-07-19 |
+| [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](plans/WI191_PERFORMANCE_EMA_INTEGRATION.md) | Shipped tool-runtime EMA slice plus later estimation design; #318 owns remaining rollout and measurement phases |
+| [`plans/history/README.md`](plans/history/README.md) | Implemented plans and dated status snapshots, with completion caveats and current references |
 
 ---
 
@@ -424,7 +425,7 @@ When adding new documentation, place it in the appropriate subdirectory:
 3. **`ops/`** — if it covers *deployment or operations*
 4. **`reference/`** — if it's a *protocol spec, contract, or API doc*
 5. **`specs/`** — if it's a *standalone feature specification*
-6. **`plans/`** — if it's an *implementation plan, execution backlog, or delivery-status record*
+6. **`plans/`** — if it's an *implementation plan with actionable remaining work*; put completed or superseded records in **`plans/history/`**
 7. **`proposals/`** — if it's a *proposal or design for not-yet-shipped work*
 8. **`bugs/`** — if it's a *bug report* (and add it to [`bugs/README.md`](bugs/README.md))
 9. **`reviews/`** — if it's a *codebase or architecture review*

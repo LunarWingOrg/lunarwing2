@@ -2,7 +2,7 @@
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.19.6) so tenants
-# opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
+# opt into v2 explicitly — see docs/plans/history/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.3.2
 ARG OPENCODE_REF=c0ad18b402eb2827fc1ee71c171b1177b3fc02d1

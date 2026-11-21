@@ -1,8 +1,14 @@
 ---
 plan name: WeeChat-Bootstrap
+plan file: docs/plans/history/WEECHAT-BOOTSTRAP.md
 plan description: Secure tenant relay provisioning
 plan status: done
 ---
+
+> **Historical; shipped in v2.0.1.0.** Use the [WeeChat relay specification](../../specs/WeeChat-Relay.md)
+> and [current WeeChat guide](../../guides/lunarwing_weechat_wss/README.md) for
+> provisioning and recovery. The `.omo` source path named below was local to the
+> original planning environment and is not a current repository file.
 
 ## Idea
 Implement the approved Approach A for LunarWing multi-tenant setup: automatically generate a fresh tenant's loopback-only WeeChat API relay configuration through WeeChat's supported one-shot command interface; preserve and fail on any existing configuration; keep the resolved relay password out of argv, logs, unit files, and relay.conf by storing an environment expression; expose only a dedicated minimal credential environment to the persistent WeeChat service on both systemd user managers and OpenRC; provide a fatal explicit retry command while keeping automatic add-tenant failure recoverable; verify with fixture-first shell tests, read-only preflight checks, an opt-in real-WeeChat smoke test, and updated active documentation. The decision-complete source plan is `.omo/plans/weechat-relay-auto-bootstrap.md`.

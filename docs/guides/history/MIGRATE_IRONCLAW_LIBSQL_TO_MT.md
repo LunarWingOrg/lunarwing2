@@ -1,6 +1,6 @@
 # Migrating an IronClaw libSQL Instance to a Multi-Tenant LunarWing Setup
 
-> **ARCHIVED / DO NOT EXECUTE (reviewed 2026-11-10).** This is the historical
+> **ARCHIVED / DO NOT EXECUTE (reviewed 2026-11-20).** This is the historical
 > V18-era procedure, not a supported migration path. Its fixed table list, SQL
 > snippets, constraint handling, ports, and connection examples predate current
 > owner-scope, extension, reflex, document-version, approval-policy, and runtime

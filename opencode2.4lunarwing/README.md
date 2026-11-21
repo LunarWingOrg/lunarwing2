@@ -3,7 +3,7 @@
 WebSocket bridge that integrates [OpenCode 2](https://opencode.ai)
 (anomalyco/opencode, `v2` line) as a LunarWing external worker — the v2 lane
 alongside the proven v1 worker (`opencode4lunarwing/`, pinned v1.19.6).
-See `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md` for the lane's rationale:
+See `docs/plans/history/OPENCODE2_EXTERNAL_WORKER_PLAN.md` for the lane's original rationale:
 v1 stays the default; v2 is opt-in per tenant until upstream's 2.0.x patch
 stack settles.
 

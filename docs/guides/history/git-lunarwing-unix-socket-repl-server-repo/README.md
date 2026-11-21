@@ -1,6 +1,6 @@
 # git-lunarwing-unix-socket-repl-server-repo
 
-> **ARCHIVED GITLAB TEMPLATE (reviewed 2026-11-10).** The old remote URLs and
+> **ARCHIVED GITLAB TEMPLATE (reviewed 2026-11-20).** The old remote URLs and
 > generic checklist below are not maintained setup instructions. Use the
 > [current REPL server source](../../../../git-lunarwing-unix-socket-repl-server-repo/)
 > and [client source](../../../../git-lunarwing-unix-socket-client-repo/), and

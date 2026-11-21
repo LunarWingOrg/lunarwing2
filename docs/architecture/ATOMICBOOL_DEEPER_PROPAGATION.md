@@ -1,15 +1,16 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-10 for v2.2.0.0.
+**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (v2.2.0.0)
+## Current State (v2.2.2.0)
 
 `ic/src/agent/agent_loop.rs::supervise_message()` creates one
-`Arc<AtomicBool>` per scheduled inbound message and passes it to
-`handle_message()`. The scheduler can supervise multiple conversation scopes;
-there is no single process-wide active-message flag. On the legacy
+`Arc<AtomicBool>` per dequeued inbound message and passes it to
+`handle_message()`. The scheduler hands messages to concurrent supervisor
+tasks and can supervise multiple conversation scopes; there is no single
+process-wide active-message flag. On the legacy
 ordinary-user-input path, `handle_message()` passes a reference into
 `process_user_input()` and subsequent turns drained from that message queue.
 `handle_priority_interrupt()` creates its own unsuppressed flag and calls
@@ -27,7 +28,9 @@ The flag currently guards only selected legacy-path behavior:
 - the normal-result `Interrupted`, `Done`, `Suggestions`, `TurnCost`, and
   `ApprovalNeeded` statuses in `process_user_input()`;
 - the drain loop, which discards already-drained and remaining queued text after
-  suppression instead of starting another turn.
+  suppression instead of starting another turn;
+- the V1 turn-outcome hint in `handle_message()`, which is not reported once a
+  soft timeout has already reported `TimedOut`.
 
 The outer message loop also stops waiting at the soft timeout, sends the timeout
 reply itself, and never delivers the eventual top-level return value. That is why
@@ -211,6 +214,7 @@ spawned work:
 - **2026-11-01 (v2.1.8.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` still 30 at `agent_loop.rs:52`; suppression flag still created per inbound message at `agent_loop.rs:1331`; `process_user_input` and `process_approval` symbols unchanged) — no scope change; defer decision stands
 - **2026-11-10 (v2.2.0.0):** re-verified the same symbol-based boundaries (`HARD_KILL_GRACE_SECS` remains 30; the suppression flag remains per supervised message; legacy input, approval, and Engine V2 behavior retain their existing ownership) — no scope change; defer decision stands
 - **2026-11-20 (v2.2.1.0), targeted source check:** `HARD_KILL_GRACE_SECS` is 30 (`agent_loop.rs:54`); `supervise_message` creates the per-message flag (`agent_loop.rs:1331`); `handle_priority_interrupt` still uses its own unsuppressed flag (`agent_loop.rs:1453`); `process_user_input` and `process_approval` remain in `thread_ops.rs`. Defer decision stands.
+- **2026-11-20 (v2.2.2.0), full-page check at `9c96220bb2`:** the symbol-based boundaries are unchanged. The current-state text now describes dequeued messages and concurrent supervisor tasks rather than the older scheduled-message model. Defer decision stands.
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---

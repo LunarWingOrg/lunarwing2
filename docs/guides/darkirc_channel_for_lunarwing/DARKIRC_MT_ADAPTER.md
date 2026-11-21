@@ -2,7 +2,7 @@
 
 **Status:** As-built. LunarWing provisions a dedicated DarkIRC daemon and HTTP adapter for every DarkIRC-enabled tenant.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** Per-tenant topology,
+**Revalidated against source 2026-11-20 at `9c96220bb2`.** Per-tenant topology,
 mt-admin ownership commands, adapter env contract, and the 3000 ms polling
 floor match the current tree. The WI#376 legacy OpenRC proxy-unit migration
 still refuses DarkIRC OpenRC lifecycle calls until `render-units --all-proxies`

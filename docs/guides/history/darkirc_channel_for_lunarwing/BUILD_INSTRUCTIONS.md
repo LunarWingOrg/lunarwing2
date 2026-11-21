@@ -1,7 +1,7 @@
 # DarkIRC Channel for LunarWing — Build & Maintenance Guide
 
 > **ARCHIVED / DO NOT APPLY THE HOST PATCH OR LEGACY MT STEPS (reviewed
-> 2026-11-10).** This predates the registry symlink, current capabilities,
+> 2026-11-20).** This predates the registry symlink, current capabilities,
 > per-tenant adapter, protected credentials, contact-key exchange, and mt-admin
 > lifecycle. Use the [current build and deployment guide](../../darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md),
 > [adapter architecture](../../darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md),

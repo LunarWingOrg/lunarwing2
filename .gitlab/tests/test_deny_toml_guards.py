@@ -3,12 +3,16 @@
 ic/deny.toml accepted-advisory guard.
 
 validate_config.validate_deny_toml_advisories (ci-config lane) requires
-every [advisories].ignore reason to name a "clearing owner WI#N" and every
-cited repo-relative path to be tracked, with a no-git checkout-existence
-fallback for the git-less ci-config image. The online owner-liveness half of
-MR !1795 was dropped by the scope decision: no owner-liveness job or network
-call exists. Registered in .gitlab/scripts/python_tests.py as well, so the
-suite also runs in python-unit.
+every [advisories].ignore reason to name a "clearing owner" that is a
+repo-relative document, and that document to list the advisory it owns
+as the first cell of a table row
+(WI#779 doc-only owner model: the four work-item owners the acceptances
+cited — WI#367, WI#418, WI#749, WI#781 — were all closed with their pins
+still locked). It also requires every cited repo-relative path to be
+tracked, with a no-git checkout-existence fallback for the git-less
+ci-config image. The online owner-liveness half of MR !1795 was dropped by
+the scope decision: no owner-liveness job or network call exists, and the
+doc-only owner form removes the liveness question instead of polling it.
 
 WI#524 also pins the Wasmtime 36.x security floor and the advisory-fixed
 cache/zstd selection in both affected lockfiles.
@@ -143,16 +147,33 @@ class DenyTomlAdvisoryGuardTests(unittest.TestCase):
         "ic/deny.toml",
         ".gitlab/README.md",
         "docs/ops/EXISTS.md",
+        # Tracked but deliberately never written to disk: the unreadable
+        # doc-only owner case. A citation check passes it (tracked), so the
+        # owner-read check is what must fail.
+        "docs/ops/UNWRITTEN.md",
         "ic/src/main.rs",
         ".gitlab/scripts/check-default-graph-advisories.sh",
     }
+    # The doc-only clearing owner must name every advisory it owns
+    # (WI#779). docs/ops/EXISTS.md stands in for the real standing record
+    # docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md in these fixtures.
+    OWNER_DOC_TEXT = (
+        "# Standing advisory ownership record\n"
+        "\n"
+        "| Advisory | Note |\n"
+        "|---|---|\n"
+        "| RUSTSEC-0000-0001 | demo |\n"
+        "| RUSTSEC-0000-0002 | demo two |\n"
+        "\n"
+        "Superseded owners: | WI#331 | RUSTSEC-0000-0003 | closed |\n"
+    )
     DENY_OK = """[advisories]
 unmaintained = "workspace"
 # Audit trail: docs/ops/EXISTS.md and the module tree under ic/src/.
 # Prose fragments like opencode/opencode2/pebble or 2026-0098/0099 are not paths.
 ignore = [
-    { id = "RUSTSEC-0000-0001", reason = "demo; clearing owner WI#363" },
-    { id = "RUSTSEC-0000-0002", reason = "demo two; decision record WI#331 (closed), clearing owner WI#367" },
+    { id = "RUSTSEC-0000-0001", reason = "demo; historical record WI#331; clearing owner docs/ops/EXISTS.md" },
+    { id = "RUSTSEC-0000-0002", reason = "demo two; decision record WI#331 (closed), clearing owner docs/ops/EXISTS.md" },
 ]
 """
     README_OK = (
@@ -179,10 +200,16 @@ ignore = [
             readme_dir = self.root / ".gitlab"
             readme_dir.mkdir(parents=True, exist_ok=True)
             (readme_dir / "README.md").write_text(readme_text, encoding="utf-8")
+        self.write_owner_doc(self.OWNER_DOC_TEXT)
         errors: list[str] = []
         with mock.patch.object(config, "ROOT", self.root):
             config.validate_deny_toml_advisories(errors, tracked=set(self.TRACKED))
         return errors
+
+    def write_owner_doc(self, text: str) -> None:
+        owner_dir = self.root / "docs" / "ops"
+        owner_dir.mkdir(parents=True, exist_ok=True)
+        (owner_dir / "EXISTS.md").write_text(text, encoding="utf-8")
 
     def ok(self) -> list[str]:
         return self.errors(self.DENY_OK, self.README_OK)
@@ -215,14 +242,95 @@ ignore = [
     def test_reason_with_wi_but_no_clearing_owner_fails(self):
         # A reason naming only a (closed) historical decision record names
         # no owner to re-verify the acceptance against — refused offline
-        # (WI#363; owner liveness itself is out of scope by the 2026-10-20
-        # scope decision, so the requirement is the phrase, not openness).
+        # (WI#363). Since WI#779 the owner must be a document, never a work
+        # item: every work-item owner the acceptances cited was closed with
+        # the pins still locked.
         deny = (
             '[advisories]\nignore = [ { id = "RUSTSEC-0000-0001", '
             'reason = "decision record WI#331" } ]\n'
         )
         errors = self.errors(deny, self.README_OK)
-        self.assertTrue(any("names no 'clearing owner WI#N'" in error for error in errors))
+        self.assertTrue(
+            any("names no 'clearing owner <repo-relative>.md'" in error for error in errors)
+        )
+
+    def test_work_item_clearing_owner_fails(self):
+        # The pre-WI#779 form is refused: a work item can close while its
+        # acceptances stay standing, which is the defect WI#779 exists to
+        # remove.
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0001", '
+            'reason = "demo; clearing owner WI#363" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any("names no 'clearing owner <repo-relative>.md'" in error for error in errors)
+        )
+
+    def test_unreadable_owner_document_fails(self):
+        # Tracked but absent from disk: the citation check passes, the owner
+        # read must still fail so a deleted decision record is not a valid
+        # owner.
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0001", '
+            'reason = "demo; clearing owner docs/ops/UNWRITTEN.md" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any(
+                "clearing owner docs/ops/UNWRITTEN.md cannot be read" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_owner_document_must_name_the_advisory(self):
+        # A document that is a valid tracked path but does not record the
+        # advisory it owns is refused; otherwise a split or renamed record
+        # could silently keep owning an acceptance.
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0003", '
+            'reason = "demo; clearing owner docs/ops/EXISTS.md" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any(
+                "clearing owner docs/ops/EXISTS.md does not list RUSTSEC-0000-0003"
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_advisory_in_a_later_table_cell_does_not_count(self):
+        # WI#779 review AIO-1: the standing record's superseded-owner table
+        # names IDs in full; such a row must not keep an acceptance owned
+        # once its accepted-table row is gone.
+        self.OWNER_DOC_TEXT = self.OWNER_DOC_TEXT + "| WI#781 | 2026-11-20 | RUSTSEC-0000-0004 | closed |\n"
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0004", '
+            'reason = "demo; clearing owner docs/ops/EXISTS.md" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any("does not list RUSTSEC-0000-0004 as the first cell" in error for error in errors),
+            errors,
+        )
+
+    def test_owner_document_must_stay_inside_the_checkout(self):
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0001", '
+            'reason = "demo; clearing owner docs/../outside.md" } ]\n'
+        )
+        errors = self.errors(deny, self.README_OK)
+        self.assertTrue(
+            any(
+                "clearing owner docs/../outside.md must resolve inside the checkout"
+                in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_non_table_entry_fails(self):
         deny = '[advisories]\nignore = [ "RUSTSEC-0000-0001" ]\n'
@@ -297,7 +405,9 @@ class DenyTomlNoGitFallbackTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = pathlib.Path(temporary.name)
         (root / "docs" / "ops").mkdir(parents=True)
-        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "docs" / "ops" / "EXISTS.md").write_text(
+            DenyTomlAdvisoryGuardTests.OWNER_DOC_TEXT, encoding="utf-8"
+        )
         (root / "ic" / "src").mkdir(parents=True)
         (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
         (root / ".gitlab").mkdir()
@@ -328,7 +438,9 @@ class DenyTomlNoGitFallbackTests(unittest.TestCase):
         (root / "ic" / "src").mkdir(parents=True)
         (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
         (root / "docs" / "ops").mkdir(parents=True)
-        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "docs" / "ops" / "EXISTS.md").write_text(
+            DenyTomlAdvisoryGuardTests.OWNER_DOC_TEXT, encoding="utf-8"
+        )
         (root / "docs" / "escape").symlink_to(outer, target_is_directory=True)
         (root / ".gitlab").mkdir()
         (root / ".gitlab" / "README.md").write_text(
@@ -378,7 +490,9 @@ class DenyTomlNoGitFallbackTests(unittest.TestCase):
         (root / "ic" / "src").mkdir(parents=True)
         (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
         (root / "docs" / "ops").mkdir(parents=True)
-        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "docs" / "ops" / "EXISTS.md").write_text(
+            DenyTomlAdvisoryGuardTests.OWNER_DOC_TEXT, encoding="utf-8"
+        )
         (root / "ic" / "realdir").mkdir()
         (root / "ic" / "realdir" / "file.md").write_text("x", encoding="utf-8")
         (root / "ic" / "linkdir").symlink_to("realdir", target_is_directory=True)

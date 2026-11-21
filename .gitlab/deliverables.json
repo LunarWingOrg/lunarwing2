@@ -72,7 +72,7 @@
       "manifest": "ic/tools-src/gitlab/Cargo.toml",
       "lockfile": "ic/tools-src/gitlab/Cargo.lock",
       "targets": ["gitlab-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/gitlab/**"]
     },
     {
@@ -82,7 +82,7 @@
       "manifest": "ic/tools-src/llm-context/Cargo.toml",
       "lockfile": "ic/tools-src/llm-context/Cargo.lock",
       "targets": ["llm-context-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/llm-context/**"]
     },
     {
@@ -92,7 +92,7 @@
       "manifest": "ic/tools-src/multica-bridge/Cargo.toml",
       "lockfile": "ic/tools-src/multica-bridge/Cargo.lock",
       "targets": ["multica-bridge-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/multica-bridge/**"]
     },
     {
@@ -102,7 +102,7 @@
       "manifest": "ic/tools-src/ssh/Cargo.toml",
       "lockfile": "ic/tools-src/ssh/Cargo.lock",
       "targets": ["ssh-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/ssh/**"]
     },
     {
@@ -112,7 +112,7 @@
       "manifest": "ic/tools-src/vision-analyze/Cargo.toml",
       "lockfile": "ic/tools-src/vision-analyze/Cargo.lock",
       "targets": ["vision-analyze-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/vision-analyze/**"]
     },
     {
@@ -122,7 +122,7 @@
       "manifest": "ic/tools-src/voice-transcribe/Cargo.toml",
       "lockfile": "ic/tools-src/voice-transcribe/Cargo.lock",
       "targets": ["voice-transcribe-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/voice-transcribe/**"]
     },
     {
@@ -132,7 +132,7 @@
       "manifest": "ic/tools-src/web-search/Cargo.toml",
       "lockfile": "ic/tools-src/web-search/Cargo.lock",
       "targets": ["web-search-tool"],
-      "ci": ["standalone-deliverables"],
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
       "triggers": ["ic/tools-src/web-search/**"]
     },
     {
@@ -146,14 +146,15 @@
       "triggers": ["ic/unix-socket-client/**"]
     },
     {
-      "name": "gotify-tool",
-      "status": "production",
+      "name": "gotify-tool-ic-copy",
+      "status": "retired",
       "owner": "tools",
       "manifest": "ic/lunarwing-gotify-tool/Cargo.toml",
       "lockfile": "ic/lunarwing-gotify-tool/Cargo.lock",
-      "targets": ["gotify-tool"],
-      "ci": ["standalone-deliverables"],
-      "triggers": ["ic/lunarwing-gotify-tool/**"]
+      "targets": [],
+      "comment": "Stale duplicate under ic/ (binds a private wit/tool.wit and still says IronClaw); the registry's tools-src/gotify symlink points at the root-level copy that tenants build",
+      "ci": [],
+      "triggers": []
     },
     {
       "name": "test-echo-tool",
@@ -238,15 +239,15 @@
       "triggers": ["projects/ocr-sidecar/**"]
     },
     {
-      "name": "gotify-tool-repo-root-copy",
-      "status": "retired",
+      "name": "gotify-tool",
+      "status": "production",
       "owner": "tools",
       "manifest": "lunarwing-gotify-tool/Cargo.toml",
       "lockfile": "lunarwing-gotify-tool/Cargo.lock",
-      "targets": [],
-      "comment": "Historical root-level copy; the canonical build lives at ic/lunarwing-gotify-tool",
-      "ci": [],
-      "triggers": []
+      "targets": ["gotify-tool"],
+      "comment": "The copy tenants build: ic/registry/tools/gotify.json names tools-src/gotify, a tracked symlink to this directory, and it binds the live ic/wit/tool.wit",
+      "ci": ["standalone-deliverables", "wasm-tools-check"],
+      "triggers": ["lunarwing-gotify-tool/**"]
     },
     {
       "name": "gotify-tool-wasm-reference-copy",
@@ -255,7 +256,7 @@
       "manifest": "gotify-wasm/lunarwing-gotify-tool/Cargo.toml",
       "lockfile": "gotify-wasm/lunarwing-gotify-tool/Cargo.lock",
       "targets": [],
-      "comment": "Historical reference copy; the canonical build lives at ic/lunarwing-gotify-tool",
+      "comment": "Historical reference copy; the canonical build is the root-level lunarwing-gotify-tool directory that the registry symlink points at",
       "ci": [],
       "triggers": []
     },

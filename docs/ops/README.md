@@ -77,6 +77,10 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 
 ## Planning and active ledgers
 
+- [`SELF_IMPROVEMENT_OPTIMIZATION_WI793.md`](SELF_IMPROVEMENT_OPTIMIZATION_WI793.md)
+  — static audit of the Engine V2 learning loop: verified overlay/orchestrator
+  versioning defects, skill/capability boundary proposals, evidence and
+  evaluation gates, and a prioritized acceptance-test backlog (WI#793).
 - The current `AGENT_GOALS_*.md` file is the active pre-release checklist.
 - Current v2.1.6.0 release evidence:
   [`v2.1.6.0_CARGO_DENY_AUDIT.md`](v2.1.6.0_CARGO_DENY_AUDIT.md) (dependency

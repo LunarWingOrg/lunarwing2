@@ -142,6 +142,13 @@ can still carry its input token, but it belongs to the separate bridge
 container and is inaccessible from the task container. See the split
 contract below for IPC and shared-workspace limits.
 
+The separate generic shell's optional version-1 JSON capability manifest does
+not grant any of these worker tokens, worker credentials, container filesystem
+access, or public listener access. Host policy remains authoritative; its
+unsupported secret references, paths, providers, and extensions fail closed.
+See `docs/guides/SANDBOX_CAPABILITY_MANIFEST.md` and the scope boundary in
+`ic/src/NETWORK_SECURITY.md` before granting new capabilities.
+
 Each lane enforces the strip at its task-process boundary:
 
 - **Kimi** — the executor deletes `AGENT_AUTH_TOKEN` from the assembled
@@ -1721,7 +1728,7 @@ For every LunarDepth version or security-input bump:
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
-`docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
+`docs/plans/history/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
 keeps its v1.19.6 pin (v1.18.25 was the last dispatch-verified release; see
 the known issue above); v2 is opt-in per tenant until upstream's patch
 stack settles. Do not configure both lanes on the same
@@ -3744,6 +3751,13 @@ auto-approval:
   recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
   recursive/forced `rm` outside temp roots. For `rm`, the hook joins shell
   line continuations before splitting commands on LF and control operators.
+  The hook cannot tell a real quote from an apostrophe in a heredoc body or
+  `$'…'`, so it reads the command three ways, whatever the quote state: every
+  backslash-newline pair dropped (a continuation), every pair as a space (the
+  line break that ends a comment or stays in quoted text), and pairs dropped
+  outside single quotes but spaces inside them. An `rm` that any reading shows
+  is checked (WI#810). Mixed shapes beyond these three readings can still
+  pass; the container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked

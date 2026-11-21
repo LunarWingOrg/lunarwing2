@@ -1,6 +1,6 @@
 # WeeChat Channel Troubleshooting
 
-> **ARCHIVED / DO NOT APPLY ITS DATABASE OR STATE EDITS (reviewed 2026-11-10).**
+> **ARCHIVED / DO NOT APPLY ITS DATABASE OR STATE EDITS (reviewed 2026-11-20).**
 > Port mismatches, credential failures, and stale setup fields now have managed
 > preflight, patch-env, render-units, and coordinated-rotation paths. Direct DB
 > updates and deleting channel workspace state are not first-line recovery.

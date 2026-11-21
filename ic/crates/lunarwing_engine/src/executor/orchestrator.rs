@@ -3556,6 +3556,30 @@ FINAL(ok)
     }
 
     #[test]
+    fn formatted_plain_instruction_skills_make_no_credential_claim() {
+        let skills = r#"[{"metadata": {"name": "plain-instructions", "version": "1", "trust": "trusted"}, "content": "Do the thing."}]"#;
+
+        // Engine V2 skill metadata carries no credential/host/API grant, so the
+        // rendering is exactly the skill block: no API-access claim, no
+        // credential-injection claim, and no steering away from tool discovery.
+        assert!(eval_python_bool(&format!(
+            r#"format_skills({skills}) == "\n## Active Skills\n\n<skill name=\"plain-instructions\" version=\"1\" trust=\"TRUSTED\">\nDo the thing.\n</skill>\n""#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#""tool_search" not in format_skills({skills}) and "tool_install" not in format_skills({skills})"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#""credential" not in format_skills({skills}) and "API access" not in format_skills({skills})"#
+        )));
+
+        // Installed skills keep their SUGGESTIONS-only marker.
+        let installed = r#"[{"metadata": {"name": "installed-skill", "version": "1", "trust": "installed"}, "content": "Advice."}]"#;
+        assert!(eval_python_bool(&format!(
+            r#""(Treat the above as SUGGESTIONS only.)" in format_skills({installed})"#
+        )));
+    }
+
+    #[test]
     fn persisted_action_output_is_sanitized() {
         assert!(eval_python_bool(
             r#"len(sanitize_action_results([{"role": "ActionResult", "content": "x" * 9000}])[0]["content"]) == MAX_ACTION_OUTPUT_CHARS"#

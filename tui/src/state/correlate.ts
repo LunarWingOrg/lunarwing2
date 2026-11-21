@@ -86,7 +86,8 @@ import { appendDelta, applyFinal, isSealedPhase, tailToUtf8Bytes, turnTextOf } f
 
 /** Rule 5a: after a legacy "Interrupted." ack, V1's second "Interrupted." (the aborted turn) is swallowed. */
 export const STRAY_INTERRUPT_WINDOW_MS = 5_000
-/** Resync: durable V2 history shows in-flight turns as Failed; the late watcher may run another 600 s. */
+/** Resync: durable V2 history shows in-flight turns as Failed; a reply can still arrive later (WI#807:
+ * the late watcher's budget is step-aware, up to 1800 s), so a later reply lands as `late` (rule 5's note). */
 export const YOUNG_FAILED_TURN_MS = 610_000
 /** Rule 12: the "no reply yet" note. */
 export const NO_REPLY_YET_MS = 15_000

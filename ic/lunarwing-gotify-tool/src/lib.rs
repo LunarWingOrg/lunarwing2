@@ -187,7 +187,7 @@ fn dispatch(params_json: &str) -> Result<String, String> {
     let status = response.status;
     let resp_body = String::from_utf8_lossy(&response.body).to_string();
 
-    if status >= 200 && status < 300 {
+    if (200..300).contains(&status) {
         lunarwing::agent::host::log(
             lunarwing::agent::host::LogLevel::Info,
             &format!("Gotify notification sent (HTTP {status})"),
