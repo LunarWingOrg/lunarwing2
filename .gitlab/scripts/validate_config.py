@@ -3114,6 +3114,14 @@ def validate_wasm_tools_check_shape(merged: dict, errors: list[str]) -> None:
         errors.append(f"{WASM_TOOL_PLAN_JOB} must run {WASM_TOOL_PLAN_RUNNER}")
     if "wasm32-wasip2" not in script:
         errors.append(f"{WASM_TOOL_PLAN_JOB} must install the wasm32-wasip2 target")
+    conditions = [
+        str(rule.get("if", "")) for rule in effective.get("rules") or [] if isinstance(rule, dict)
+    ]
+    for required in FULL_VALIDATION_RULES[:2]:
+        if required not in conditions:
+            errors.append(
+                f"{WASM_TOOL_PLAN_JOB} must also run for {required!r}, as every required check does"
+            )
     changes: list[str] = []
     for rule in effective.get("rules") or []:
         if isinstance(rule, dict) and "merge_request_event" in str(rule.get("if", "")):

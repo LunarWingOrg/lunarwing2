@@ -142,6 +142,8 @@ class WasmToolsCheckShapeTests(unittest.TestCase):
             "script": ["rustup target add --toolchain 1.96.1 wasm32-wasip2",
                        "python3 .gitlab/scripts/wasm-tools-check.py"],
             "rules": [
+                {"if": '$LUNARWING_CI_FULL_VALIDATION == "1"'},
+                {"if": '$CI_PIPELINE_SOURCE == "schedule"'},
                 {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"',
                  "changes": ["ic/tools-src/**/*"]},
                 {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
@@ -183,6 +185,14 @@ class WasmToolsCheckShapeTests(unittest.TestCase):
         self.job.pop("extends")
         self.assertTrue(any(".rust-job" in error for error in self.errors()))
 
+    def test_full_validation_and_schedule_rules_required(self):
+        # WI#809 review AIJ-2: schedules and LUNARWING_CI_FULL_VALIDATION=1
+        # must compile the tools, as they run every other required check.
+        self.job["rules"] = self.job["rules"][2:]
+        errors = self.errors()
+        self.assertTrue(any("LUNARWING_CI_FULL_VALIDATION" in error for error in errors), errors)
+        self.assertTrue(any("schedule" in error for error in errors), errors)
+
     def test_mr_rule_needs_changes_globs(self):
         self.job["rules"] = [{"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'}]
         self.assertTrue(any("changes: globs" in error for error in self.errors()))
@@ -196,7 +206,7 @@ class WasmToolsCheckShapeTests(unittest.TestCase):
         # WI#809 review AIJ-1: GitLab matches `changes:` with FNM_PATHNAME, so
         # `dir/**` stops at direct children and a tool's source files would
         # not start the job.
-        self.job["rules"][0]["changes"] = ["ic/tools-src/**"]
+        self.job["rules"][2]["changes"] = ["ic/tools-src/**"]
         errors = self.errors()
         self.assertTrue(any("do not cover trigger" in error for error in errors), errors)
 

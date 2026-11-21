@@ -618,7 +618,9 @@ host's concurrent builds before retrying manually.
   runs the plan-driven `.gitlab/scripts/wasm-tools-check.py`), so a new tool is
   covered without editing the job. Adding a tool means adding its
   `deliverables.json` entry with `wasm-tools-check` in `ci`; the MR-path
-  `changes:` globs already cover every production tool directory.
+  `changes:` globs already cover every production tool directory. The job
+  also runs on schedules and when `LUNARWING_CI_FULL_VALIDATION=1`, like
+  every other required check.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
   killing the whole pipeline after push. It also installs the pinned Go

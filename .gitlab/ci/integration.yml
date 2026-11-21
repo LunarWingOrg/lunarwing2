@@ -76,6 +76,10 @@ wasm-tools-check:
     CARGO_TARGET_DIR: "$CI_PROJECT_DIR/.ci-cache/wasm-tools-target"
   timeout: 2h
   rules:
+    # Requested full-validation runs and schedules compile the tools too, as
+    # they do every other required check (WI#809 review AIJ-2).
+    - if: '$LUNARWING_CI_FULL_VALIDATION == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - "ic/tools-src/**/*"
