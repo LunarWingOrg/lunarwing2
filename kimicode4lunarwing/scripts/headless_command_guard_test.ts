@@ -81,6 +81,38 @@ test("dangerous-class commands are denied", () => {
   assertBlocked("ls /tmp/ssh-agent.sock", "SSH")
 })
 
+test("the SSH agent mount path and ssh-add are denied (WI#829)", () => {
+  // ic/scripts/mt-admin-lib/09-worker-config.sh mounts a directory at
+  // /tmp/ssh-agent and exports SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock.
+  // The bare /tmp/ssh-agent.sock literal the rule used to match alone never
+  // exists on any lane, and the kimi lane gets no agent mount at all.
+  for (const command of [
+    "ls /tmp/ssh-agent",
+    "ls /tmp/ssh-agent/",
+    "ls /tmp/ssh-agent/ssh-agent.sock",
+    "cat /tmp/ssh-agent/ssh-agent.sock",
+    "ssh -o IdentityAgent=/tmp/ssh-agent/ssh-agent.sock host",
+    "xargs -a /tmp/ssh-agent/ssh-agent.sock true",
+    "ls /tmp//ssh-agent/ssh-agent.sock",
+    "ls /tmp/wi829/../ssh-agent/ssh-agent.sock",
+  ]) {
+    assertBlocked(command, "SSH")
+  }
+  // ssh-add is the step that loads a key into an agent — the credential
+  // broker action itself, whether spelled bare or through a path.
+  assertBlocked("ssh-add /home/kimi/.ssh/id_ed25519", "SSH")
+  assertBlocked("ssh-add", "SSH")
+  assertBlocked("/usr/bin/ssh-add -D", "SSH")
+  // Direct key-file use stays ordinary work: with no agent on this lane it is
+  // how a key-based push authenticates. Denying `-i` but allowing the ambient
+  // ~/.ssh key behind `ssh -T` would be the same credential path twice.
+  assertAllowed("ssh -T git@github.com")
+  assertAllowed("ssh -i /home/kimi/.ssh/id_ed25519 git@github.com")
+  assertAllowed("GIT_SSH_COMMAND='ssh -i /home/kimi/.ssh/id_ed25519' git push origin main")
+  // A different path that merely shares the prefix stays ordinary work.
+  assertAllowed("ls /tmp/ssh-agent-notes")
+})
+
 test("rm word assembly through ${IFS}, quote splices, brace lists and substitution is denied", () => {
   // WI#824: bash builds the command word from these forms, so the raw text
   // never contains a literal `rm` and checkRm walked past the deny class.
