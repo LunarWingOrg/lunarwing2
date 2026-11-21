@@ -186,6 +186,7 @@ class CompilingJobCoversShapeTests(unittest.TestCase):
             ".gitlab/scripts/cargo-ci.sh build --manifest-path tools-src/x/Cargo.toml",
             "taskset -c 0-5 bash .gitlab/scripts/cargo-ci.sh clippy --manifest-path tools-src/x/Cargo.toml",
             "cd ic/tools-src/x && cargo build --release",
+            "cd ic/tools-src/x;cargo build",
             ["cd ic/tools-src/x", "cargo build --release"],
             "cd ic && cd tools-src/x && cargo check",
         )
