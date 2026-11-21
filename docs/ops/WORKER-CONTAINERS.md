@@ -3580,18 +3580,22 @@ tenant.
 `pebble opencode kimi opencode2` order, after starting the daemon. A stale
 image's user-contract refusal returns **3**; a refusal that depends only on one
 lane's configuration returns **4** (currently an undeclared, malformed or
-unresolvable pebble model backend). The worker pass warns for either status,
+unresolvable pebble model backend). Since WI#796 an enabled lane whose image is
+absent is also **3** (it used to soft-skip), and a worker whose unit exists but
+never reaches its listener is **5**. The worker pass warns for 3, 4 and 5,
 continues to later selected lanes, then names all refused lanes and returns
-**1** if any were refused. `start-worker` exposes the starter's status 3 or 4
-directly. Both refusals remain fail-closed for their own lane: no refused
+**1** if any were refused. `start-worker` exposes the starter's status 3, 4 or 5
+directly. All three refusals remain fail-closed for their own lane: no refused
 worker is launched, rendered or recorded as ready.
 
 Other outcomes stay distinct:
 
-- Deselected workers, OpenRC intentionally stopped workers, unallocated ports
-  and unavailable images retain their existing soft-skip behavior.
+- Deselected workers, OpenRC intentionally stopped workers and unallocated
+  ports retain their existing soft-skip behavior. An unavailable image does not
+  (WI#796): a dead lane reported as a green upgrade is how pebble stayed down
+  on every derpy build.
 - Shared runtime, credential, workspace or egress-apply failures are **not**
-  lane-local refusals: any nonzero status other than 3 or 4 aborts the pass.
+  lane-local refusals: any nonzero status other than 3, 4 or 5 aborts the pass.
   Each starter runs in its own `set -e` subshell so an inner failure cannot fall
   through to hash storage, unit registration or a false `worker ready` line.
   The degraded summary names the failed lanes and every selected,
@@ -4004,6 +4008,33 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>  # logs "config ch
 ```
 
 Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all five lanes on both paths.
+
+**Upgrade rebuilds the containers (WI#796).** The image-ID contract only fires
+when a lane's starter reaches its recreate path, so a lane that soft-skipped or
+failed before it kept serving the pre-upgrade container while `upgrade-tenant`
+finished green; on the derpy tenant that surfaced only as
+`Connection refused (os error 111)` at dispatch. Both upgrade paths now call
+`upgrade_refresh_worker_containers` after promotion: it distributes each
+enabled lane's `:latest` image into the tenant's rootless store and removes the
+bridge and task containers that still run a different image, so the following
+start rebuilds them from the promoted image. It is idempotent (a lane already on
+the current image is untouched), skips a deselected lane and an intentionally
+stopped OpenRC lane, and only warns when an image cannot be distributed. The
+standalone verb is:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh refresh-worker-containers <tenant>
+```
+
+Two related start-time refusals became loud in the same change. An enabled lane
+whose image is absent now returns **3** (`image refused`) instead of a silent
+`return 0`, and a Quadlet unit that exists but never starts returns **5**, named
+by `worker_quadlet_start_failed` with the container log hint. Status 5 continues
+the worker pass like 3 and 4 — one dead lane must not stop the others — but it is
+listed under `failed worker lanes:`, so `start-tenant` returns 1 and
+`upgrade-tenant` reports **upgrade incomplete** instead of a green summary.
+`ic/scripts/tests/test-mt-admin-worker-container-refresh.sh` pins the refresh
+step and `test-mt-admin-worker-startup.sh` pins both refusals on each init path.
 
 mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). Standalone per-lane builds retain the live operator-checkout behavior: `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
 
