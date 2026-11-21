@@ -2,9 +2,9 @@
 //!
 //! `GET /api/estimates` is user-scoped: the bearer token resolves the user and
 //! only that user's models are returned. `GET /api/estimates/counters` and
-//! `GET /api/estimates/evaluation` expose owner-only aggregates, without user
-//! identities. All routes sit behind the existing gateway auth middleware;
-//! no tool parameters are returned.
+//! `GET /api/estimates/evaluation`, and `GET /api/estimates/llm` expose
+//! owner-only aggregates without user identities. All routes use the existing
+//! gateway auth middleware and return no request content.
 
 use std::sync::Arc;
 
@@ -76,8 +76,8 @@ async fn estimates_evaluation_handler(
     ))
 }
 
-/// Owner-only daemon-wide LLM logical-call duration models. Provider model
-/// names are configuration, not user data; no prompt or result is included.
+/// Owner-only daemon-wide LLM logical-call duration models with configured
+/// provider and model labels, never request content.
 async fn estimates_llm_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,

@@ -535,9 +535,9 @@ failure modes have been demonstrated separately. Changing any gate's authority,
 expiry, channel/request-ID binding, decision token or redaction contract is
 never a rollout mechanism.
 
-## Decisions confirmed for Phase B (B3 carrier)
+## Phase B implementation choice (B3 carrier)
 
-Resolved by SweetieBot (autonomous) under #318 on 2026-11-21.
+Implemented under #318 on 2026-11-21; maintainer acceptance remains separate.
 
 **Keep the estimator hook as the single carrier; the observability
 tool/LLM start/end events stay unwired.** `LlmTimingProvider` decorates the
@@ -551,11 +551,11 @@ adapter's `cost_usd: 0.0` is "unavailable", never "free" (B2).
 
 The LLM clock is **completed logical-call latency**, measured outside retry,
 smart routing, failover and the circuit breaker, and inside the response cache.
-A cache hit is served before the timer's inner provider, so it never trains.
-Recovered attempts arrive as `LlmStreamObservation::Retried` and are counted
-separately, first-chunk latency is summed separately, and a failed, partial or
-cancelled stream trains nothing. Keys are `Llm(model)` with a 256-byte bound; the completion label
-attributes a failover to the model that served the call. Diagnostics are the
-owner-only `GET /api/estimates/llm`; `LUNARWING_LLM_TIMINGS=0` disables
-recording and unset observes. Gate-wait analytics (B4) remain open and must
-stay separate from these runtime EMAs.
+A cache hit bypasses the timer. Both streaming clocks start before setup.
+Blocking and streaming dispatches, retries, provider switches and first-chunk
+latency are counted separately. A failed, partial, cancelled or switched call
+does not train. A successful single-provider call (including same-provider
+backoff) trains its selected configured provider/model pair, with a 256-byte
+bound on each label. Diagnostics are the owner-only `GET /api/estimates/llm`;
+`LUNARWING_LLM_TIMINGS=0` disables recording and unset observes. Gate-wait
+analytics (B4) remain open and must stay separate from these runtime EMAs.

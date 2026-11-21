@@ -219,6 +219,7 @@ impl GatewayWorkflowHarness {
             log_level_handle: None,
             extension_manager: components.extension_manager.clone(),
             tool_registry: Some(Arc::clone(&components.tools)),
+            llm_timings: Some(Arc::clone(&components.llm_timings)),
             store: components.db.clone(),
             job_manager: None,
             external_worker_manager: None,

@@ -1,8 +1,8 @@
 //! Daemon-wide LLM logical-call duration calibration (WI#318 Phase B1/B2).
 //!
 //! `LlmTimings` is owned by the provider chain built once per daemon. Keys are
-//! canonical provider model names (`Llm(model)`), carry no user identity,
-//! prompt, result or parameter, and are bounded by the learner's model cap.
+//! bounded provider/model pairs, carry no user identity, prompt, result or
+//! parameter, and are bounded by the learner's model cap.
 //! Only durations are learned: a real per-call charge is still recorded by the
 //! existing cost guard, so a v2 `cost_usd: 0.0` never becomes a free sample.
 //!
@@ -15,14 +15,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::llm::{
+    LlmTimingObservation, LlmTimingObserver, LlmTimingOutcome, LlmTimingTarget, valid_timing_label,
+};
+
 use super::learner::LearningModel;
 use super::{Actuals, Estimator, RuntimeEstimate};
 
 /// Read once when the provider chain is built; `0` disables recording.
 const ENV_MODE: &str = "LUNARWING_LLM_TIMINGS";
-/// Upper bound for a canonical model label, mirroring the tool cache.
-const MAX_LABEL_BYTES: usize = 256;
-
 /// Recording is on by default; it only feeds diagnostics in this slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmTimingMode {
@@ -47,13 +48,6 @@ impl LlmTimingMode {
     }
 }
 
-/// One logical call frozen at entry. The key never leaves the process.
-#[derive(Debug, Clone)]
-pub struct LlmCall {
-    key: String,
-    predicted: Option<Duration>,
-}
-
 /// Duration models plus attempt/retry/first-chunk counts for one daemon.
 pub struct LlmTimings {
     state: Mutex<LlmTimingState>,
@@ -70,18 +64,20 @@ struct LlmTimingState {
 #[derive(Debug, Default)]
 struct LlmTimingCounters {
     calls_started: AtomicU64,
+    provider_attempts: AtomicU64,
     completions: AtomicU64,
     failures: AtomicU64,
     cancellations: AtomicU64,
     retried_calls: AtomicU64,
     retry_attempts: AtomicU64,
+    provider_switches: AtomicU64,
     first_chunk_samples: AtomicU64,
     first_chunk_sum_ms: AtomicU64,
 }
 
 impl LlmTimingCounters {
-    fn bump(counter: &AtomicU64) -> u64 {
-        counter.fetch_add(1, Ordering::Relaxed) + 1
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add(counter: &AtomicU64, value: u64) {
@@ -91,11 +87,13 @@ impl LlmTimingCounters {
     fn snapshot(&self) -> LlmTimingCounterSnapshot {
         LlmTimingCounterSnapshot {
             calls_started: self.calls_started.load(Ordering::Relaxed),
+            provider_attempts: self.provider_attempts.load(Ordering::Relaxed),
             completions: self.completions.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
             cancellations: self.cancellations.load(Ordering::Relaxed),
             retried_calls: self.retried_calls.load(Ordering::Relaxed),
             retry_attempts: self.retry_attempts.load(Ordering::Relaxed),
+            provider_switches: self.provider_switches.load(Ordering::Relaxed),
             first_chunk_samples: self.first_chunk_samples.load(Ordering::Relaxed),
             first_chunk_sum_ms: self.first_chunk_sum_ms.load(Ordering::Relaxed),
         }
@@ -107,17 +105,21 @@ impl LlmTimingCounters {
 pub struct LlmTimingCounterSnapshot {
     /// Logical calls entering the timing boundary (one per caller attempt).
     pub calls_started: u64,
-    /// Calls that produced a terminal success and trained the duration EMA.
+    /// Dispatches to a concrete provider, including retry and fallback legs.
+    pub provider_attempts: u64,
+    /// Terminal successes, including those excluded from model training.
     pub completions: u64,
     /// Calls that returned an error; they train nothing.
     pub failures: u64,
-    /// Streams dropped before a terminal chunk; they train nothing.
+    /// Dropped call futures and dropped or truncated streams.
     pub cancellations: u64,
-    /// Calls whose stream reported at least one recovered attempt.
+    /// Calls that began at least one same-provider retry.
     pub retried_calls: u64,
-    /// Extra attempts reported beyond the first, summed over all streams.
+    /// Same-provider retries started, blocking and streaming.
     pub retry_attempts: u64,
-    /// Streams that produced at least one chunk.
+    /// Calls that changed provider or model after dispatch; each counted once.
+    pub provider_switches: u64,
+    /// Streams that delivered at least one content chunk.
     pub first_chunk_samples: u64,
     /// Sum of first-chunk latencies, in milliseconds.
     pub first_chunk_sum_ms: u64,
@@ -126,6 +128,7 @@ pub struct LlmTimingCounterSnapshot {
 /// One canonical model as observed by this daemon.
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmModelDiagnostics {
+    pub provider: String,
     pub model: String,
     pub samples: u64,
     pub duration_samples: u64,
@@ -140,7 +143,7 @@ pub struct LlmModelDiagnostics {
 
 impl LlmModelDiagnostics {
     fn from_model(
-        label: &str,
+        labels: (&str, &str),
         model: &LearningModel,
         confidence: f64,
         estimate: Option<&RuntimeEstimate>,
@@ -154,7 +157,8 @@ impl LlmModelDiagnostics {
             "moderate"
         };
         Self {
-            model: label.to_owned(),
+            provider: labels.0.to_owned(),
+            model: labels.1.to_owned(),
             samples: model.sample_count,
             duration_samples: model.time_sample_count,
             duration_ratio_samples: model.time_ratio_sample_count,
@@ -208,70 +212,24 @@ impl LlmTimings {
         self.mode.as_str()
     }
 
-    /// Start one logical call. The prediction is frozen here so later
-    /// completions cannot retroactively change the forecast error.
-    pub fn begin(&self, label: &str) -> Option<LlmCall> {
-        let key = self.key_for(label)?;
-        let predicted = self
-            .state
-            .lock()
-            .ok()?
-            .estimator
-            .estimate_operation(&key, None, None)
-            .map(|estimate| estimate.duration);
-        LlmTimingCounters::bump(&self.counters.calls_started);
-        Some(LlmCall { key, predicted })
-    }
-
-    /// Record a completed call. `completed_label` is the model that actually
-    /// served it, so a failover never trains the primary's model.
-    pub fn complete(
-        &self,
-        call: LlmCall,
-        completed_label: &str,
-        elapsed: Duration,
-        first_chunk: Option<Duration>,
-    ) {
-        let key = self.key_for(completed_label).unwrap_or(call.key);
-        if let Ok(mut state) = self.state.lock() {
+    fn train(&self, target: LlmTimingTarget, elapsed: Duration) {
+        if let Some(key) = model_key(&target.provider, &target.model)
+            && let Ok(mut state) = self.state.lock()
+        {
             state.estimator.record_operation_actuals(
                 &key,
                 Actuals {
                     baseline_time: None,
                     baseline_cost: None,
-                    predicted_time: call.predicted,
+                    predicted_time: target.predicted,
                     actual_time: elapsed,
                     actual_cost: None,
                 },
             );
         }
-        LlmTimingCounters::bump(&self.counters.completions);
-        self.record_first_chunk(first_chunk);
     }
 
-    /// Record a call that returned an error. Nothing is trained.
-    pub fn fail(&self) {
-        LlmTimingCounters::bump(&self.counters.failures);
-    }
-
-    /// Record a stream dropped before its terminal chunk. Nothing is trained.
-    pub fn cancel(&self) {
-        LlmTimingCounters::bump(&self.counters.cancellations);
-    }
-
-    /// Record the recovered-attempt count a retry/failover layer reported.
-    pub fn record_retry(&self, attempts: u32) {
-        LlmTimingCounters::bump(&self.counters.retried_calls);
-        LlmTimingCounters::add(
-            &self.counters.retry_attempts,
-            u64::from(attempts.saturating_sub(1)),
-        );
-    }
-
-    fn record_first_chunk(&self, first_chunk: Option<Duration>) {
-        let Some(first_chunk) = first_chunk else {
-            return;
-        };
+    fn record_first_chunk(&self, first_chunk: Duration) {
         LlmTimingCounters::bump(&self.counters.first_chunk_samples);
         LlmTimingCounters::add(
             &self.counters.first_chunk_sum_ms,
@@ -288,12 +246,12 @@ impl LlmTimings {
             let learner = state.estimator.learner();
             min_samples = learner.min_samples();
             for (key, model) in learner.all_models() {
-                let Some(label) = key.strip_prefix("Llm(").and_then(|k| k.strip_suffix(')')) else {
+                let Some(labels) = labels_from_key(key) else {
                     continue;
                 };
                 let estimate = state.estimator.estimate_operation(key, None, None);
                 models.push(LlmModelDiagnostics::from_model(
-                    label,
+                    labels,
                     model,
                     learner.confidence(key),
                     estimate.as_ref(),
@@ -301,7 +259,7 @@ impl LlmTimings {
                 ));
             }
         }
-        models.sort_by(|a, b| a.model.cmp(&b.model));
+        models.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
         LlmTimingDiagnostics {
             mode: self.mode.as_str(),
             min_samples,
@@ -309,13 +267,72 @@ impl LlmTimings {
             models,
         }
     }
+}
 
-    fn key_for(&self, label: &str) -> Option<String> {
-        if !self.enabled() || label.is_empty() || label.len() > MAX_LABEL_BYTES {
+impl LlmTimingObserver for LlmTimings {
+    fn call_started(&self) {
+        if self.enabled() {
+            LlmTimingCounters::bump(&self.counters.calls_started);
+        }
+    }
+
+    fn predict(&self, provider: &str, model: &str) -> Option<Duration> {
+        if !self.enabled() {
             return None;
         }
-        Some(format!("Llm({label})"))
+        let key = model_key(provider, model)?;
+        self.state
+            .lock()
+            .ok()?
+            .estimator
+            .estimate_operation(&key, None, None)
+            .map(|estimate| estimate.duration)
     }
+
+    fn call_finished(&self, observation: LlmTimingObservation) {
+        if !self.enabled() {
+            return;
+        }
+        let counters = &self.counters;
+        LlmTimingCounters::add(&counters.provider_attempts, observation.attempts);
+        if observation.retries > 0 {
+            LlmTimingCounters::bump(&counters.retried_calls);
+            LlmTimingCounters::add(&counters.retry_attempts, observation.retries);
+        }
+        if observation.switched {
+            LlmTimingCounters::bump(&counters.provider_switches);
+        }
+        if let Some(first_chunk) = observation.first_chunk {
+            self.record_first_chunk(first_chunk);
+        }
+        match observation.outcome {
+            LlmTimingOutcome::Completed { elapsed, target } => {
+                LlmTimingCounters::bump(&counters.completions);
+                if !observation.switched
+                    && let Some(target) = target
+                {
+                    self.train(target, elapsed);
+                }
+            }
+            LlmTimingOutcome::Failed => LlmTimingCounters::bump(&counters.failures),
+            LlmTimingOutcome::Cancelled => LlmTimingCounters::bump(&counters.cancellations),
+        }
+    }
+}
+
+fn model_key(provider: &str, model: &str) -> Option<String> {
+    // Length framing keeps provider/model pairs distinct even when names
+    // contain separators. Neither component comes from request text.
+    (valid_timing_label(provider) && valid_timing_label(model))
+        .then(|| format!("Llm({}:{provider}{model})", provider.len()))
+}
+
+fn labels_from_key(key: &str) -> Option<(&str, &str)> {
+    let (provider_len, labels) = key
+        .strip_prefix("Llm(")?
+        .strip_suffix(')')?
+        .split_once(':')?;
+    labels.split_at_checked(provider_len.parse().ok()?)
 }
 
 impl Default for LlmTimings {
@@ -331,10 +348,27 @@ mod tests {
     fn warmed(mode: LlmTimingMode, model: &str, calls: u64) -> LlmTimings {
         let timings = LlmTimings::new(mode);
         for _ in 0..calls {
-            let call = timings.begin(model).unwrap();
-            timings.complete(call, model, Duration::from_millis(40), None);
+            record(&timings, "provider-a", model, 40);
         }
         timings
+    }
+
+    fn record(timings: &LlmTimings, provider: &str, model: &str, elapsed_ms: u64) {
+        timings.call_started();
+        timings.call_finished(LlmTimingObservation {
+            outcome: LlmTimingOutcome::Completed {
+                elapsed: Duration::from_millis(elapsed_ms),
+                target: Some(LlmTimingTarget {
+                    provider: provider.into(),
+                    model: model.into(),
+                    predicted: timings.predict(provider, model),
+                }),
+            },
+            attempts: 1,
+            retries: 0,
+            switched: false,
+            first_chunk: None,
+        });
     }
 
     #[test]
@@ -350,7 +384,8 @@ mod tests {
         );
         let disabled = LlmTimings::new(LlmTimingMode::Disabled);
         assert!(!disabled.enabled());
-        assert!(disabled.begin("model").is_none());
+        record(&disabled, "provider", "model", 10);
+        assert_eq!(disabled.diagnostics().counters.calls_started, 0);
         assert!(disabled.diagnostics().models.is_empty());
     }
 
@@ -358,8 +393,7 @@ mod tests {
     fn hides_estimate_until_warm_and_reports_counters() {
         let timings = LlmTimings::new(LlmTimingMode::Observe);
         for _ in 0..4 {
-            let call = timings.begin("model-a").unwrap();
-            timings.complete(call, "model-a", Duration::from_millis(50), None);
+            record(&timings, "provider-a", "model-a", 50);
         }
         let cold = timings.diagnostics();
         assert_eq!(cold.models.len(), 1);
@@ -367,8 +401,7 @@ mod tests {
         assert_eq!(cold.models[0].confidence_label, "none");
         assert!(cold.models[0].estimate_ms.is_none());
 
-        let call = timings.begin("model-a").unwrap();
-        timings.complete(call, "model-a", Duration::from_millis(50), None);
+        record(&timings, "provider-a", "model-a", 50);
         let warm = timings.diagnostics();
         assert_eq!(warm.models[0].confidence_label, "low");
         assert!(warm.models[0].estimate_ms.is_some());
@@ -377,67 +410,58 @@ mod tests {
     }
 
     #[test]
-    fn failures_cancellations_and_retries_never_train() {
+    fn switches_count_even_when_no_model_is_trained() {
         let timings = LlmTimings::new(LlmTimingMode::Observe);
-        let failed = timings.begin("model-a").unwrap();
-        timings.fail();
-        drop(failed);
-        timings.cancel();
-        timings.record_retry(3);
-        timings.record_retry(1);
-
+        timings.call_started();
+        timings.call_finished(LlmTimingObservation {
+            outcome: LlmTimingOutcome::Completed {
+                elapsed: Duration::from_millis(100),
+                target: None,
+            },
+            attempts: 3,
+            retries: 1,
+            switched: true,
+            first_chunk: Some(Duration::from_millis(50)),
+        });
         let diagnostics = timings.diagnostics();
         assert!(diagnostics.models.is_empty());
-        assert_eq!(diagnostics.counters.calls_started, 1);
-        assert_eq!(diagnostics.counters.completions, 0);
-        assert_eq!(diagnostics.counters.failures, 1);
-        assert_eq!(diagnostics.counters.cancellations, 1);
-        assert_eq!(diagnostics.counters.retried_calls, 2);
-        assert_eq!(diagnostics.counters.retry_attempts, 2);
+        assert_eq!(diagnostics.counters.completions, 1);
+        assert_eq!(diagnostics.counters.provider_switches, 1);
+        assert_eq!(diagnostics.counters.provider_attempts, 3);
+        assert_eq!(diagnostics.counters.retried_calls, 1);
+        assert_eq!(diagnostics.counters.retry_attempts, 1);
+        assert_eq!(diagnostics.counters.first_chunk_sum_ms, 50);
     }
 
     #[test]
-    fn completion_label_attributes_failover_to_the_serving_model() {
-        let timings = LlmTimings::new(LlmTimingMode::Observe);
-        let call = timings.begin("primary").unwrap();
-        timings.complete(call, "fallback", Duration::from_millis(30), None);
-        let diagnostics = timings.diagnostics();
-        assert_eq!(diagnostics.models.len(), 1);
-        assert_eq!(diagnostics.models[0].model, "fallback");
-    }
-
-    #[test]
-    fn models_are_isolated_and_first_chunk_is_separate() {
-        let timings = warmed(LlmTimingMode::Observe, "model-a", 5);
+    fn providers_serving_the_same_model_are_isolated() {
+        let timings = warmed(LlmTimingMode::Observe, "shared-model", 5);
         for _ in 0..5 {
-            let call = timings.begin("model-b").unwrap();
-            timings.complete(
-                call,
-                "model-b",
-                Duration::from_millis(400),
-                Some(Duration::from_millis(20)),
-            );
+            record(&timings, "provider-b", "shared-model", 400);
         }
         let diagnostics = timings.diagnostics();
         assert_eq!(diagnostics.models.len(), 2);
         let a = &diagnostics.models[0];
         let b = &diagnostics.models[1];
-        assert_eq!(a.model, "model-a");
-        assert_eq!(b.model, "model-b");
+        assert_eq!((&*a.provider, &*a.model), ("provider-a", "shared-model"));
+        assert_eq!((&*b.provider, &*b.model), ("provider-b", "shared-model"));
         assert!((a.duration_ema_ms - 40.0).abs() < 1.0);
         assert!((b.duration_ema_ms - 400.0).abs() < 1.0);
-        assert_eq!(diagnostics.counters.first_chunk_samples, 5);
-        assert_eq!(diagnostics.counters.first_chunk_sum_ms, 100);
     }
 
     #[test]
     fn labels_are_bounded_and_never_echoed_as_keys() {
         let timings = LlmTimings::new(LlmTimingMode::Observe);
-        assert!(timings.begin(&"x".repeat(MAX_LABEL_BYTES + 1)).is_none());
-        assert!(timings.begin("").is_none());
-        let call = timings.begin("model-a").unwrap();
-        timings.complete(call, "model-a", Duration::from_millis(10), None);
-        let rendered = serde_json::to_string(&timings.diagnostics()).unwrap();
+        record(&timings, "provider", &"x".repeat(257), 10);
+        record(&timings, "", "model-a", 10);
+        record(&timings, "provider", "https://not-a-model.invalid", 10);
+        assert!(timings.diagnostics().models.is_empty());
+        record(&timings, "provider", ":model-a)", 10);
+        record(&timings, "provider:", "model-a)", 30);
+        let diagnostics = timings.diagnostics();
+        assert_eq!(diagnostics.models.len(), 2);
+        assert_eq!(diagnostics.models[0].model, ":model-a)");
+        let rendered = serde_json::to_string(&diagnostics).unwrap();
         assert!(!rendered.contains("Llm("));
     }
 }

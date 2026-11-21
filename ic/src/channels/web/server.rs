@@ -3771,6 +3771,9 @@ mod tests {
     fn estimates_test_router(trace: Option<crate::estimation::EvaluationTrace>) -> Router {
         use crate::channels::web::auth::MultiAuthState;
         use crate::estimation::{CategoryPolicy, ToolEstimates, ToolEstimationMode};
+        use crate::llm::{
+            LlmTimingObservation, LlmTimingObserver, LlmTimingOutcome, LlmTimingTarget,
+        };
         use crate::tools::{
             Tool,
             builtin::{EchoTool, TimeTool},
@@ -3800,14 +3803,27 @@ mod tests {
             }
         }
         let mut state = test_gateway_state_with_tools(None, Some(registry));
-        // Warmed LLM timing cache: two models, one call each, so the
+        // Seed the LLM timing cache: two models, one call each, so the
         // owner-only route has a stable, non-user-scoped payload.
         let timings = Arc::new(crate::estimation::LlmTimings::new(
             crate::estimation::LlmTimingMode::Observe,
         ));
         for model in ["model-a", "model-b"] {
-            let call = timings.begin(model).expect("llm call");
-            timings.complete(call, model, std::time::Duration::from_millis(25), None);
+            timings.call_started();
+            timings.call_finished(LlmTimingObservation {
+                outcome: LlmTimingOutcome::Completed {
+                    elapsed: std::time::Duration::from_millis(25),
+                    target: Some(LlmTimingTarget {
+                        provider: "provider-test".into(),
+                        model: model.into(),
+                        predicted: None,
+                    }),
+                },
+                attempts: 1,
+                retries: 0,
+                switched: false,
+                first_chunk: None,
+            });
         }
         Arc::get_mut(&mut state)
             .expect("sole state owner")
@@ -3930,6 +3946,7 @@ mod tests {
         assert_eq!(llm["counters"]["calls_started"], 2);
         assert_eq!(llm["counters"]["completions"], 2);
         assert_eq!(llm["models"][0]["model"], "model-a");
+        assert_eq!(llm["models"][0]["provider"], "provider-test");
         assert_eq!(llm["models"][1]["model"], "model-b");
         assert!(llm["models"][0]["estimate_ms"].is_null());
     }

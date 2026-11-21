@@ -20,8 +20,7 @@ pub use diagnostics::{
 };
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
 pub use llm::{
-    LlmCall, LlmModelDiagnostics, LlmTimingCounterSnapshot, LlmTimingDiagnostics, LlmTimingMode,
-    LlmTimings,
+    LlmModelDiagnostics, LlmTimingCounterSnapshot, LlmTimingDiagnostics, LlmTimingMode, LlmTimings,
 };
 pub use runtime::{
     CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateCounters, ToolEstimateDiagnostics,

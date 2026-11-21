@@ -62,7 +62,10 @@ pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
 pub use timeout::TimeoutProvider;
-pub use timing::LlmTimingProvider;
+pub(crate) use timing::valid_timing_label;
+pub use timing::{
+    LlmTimingObservation, LlmTimingObserver, LlmTimingOutcome, LlmTimingProvider, LlmTimingTarget,
+};
 
 use std::sync::Arc;
 
@@ -215,6 +218,7 @@ fn create_openai_compat_from_registry(
     );
 
     let adapter = RigAdapter::new(model, &config.model)
+        .with_timing_provider_id(&config.provider_id)
         .with_unsupported_params(config.unsupported_params.clone());
     Ok(Arc::new(adapter))
 }
@@ -255,6 +259,7 @@ fn create_ollama_from_registry(
     );
 
     let adapter = RigAdapter::new(model, &config.model)
+        .with_timing_provider_id(&config.provider_id)
         .with_unsupported_params(config.unsupported_params.clone());
     Ok(Arc::new(adapter))
 }
@@ -326,17 +331,18 @@ fn create_cheap_provider_for_backend(
 /// with the same output-integrity observer.
 ///
 /// This is the single source of truth for provider chain construction,
-/// called by both `main.rs` and `app.rs`.
+/// called by `AppBuilder`. The timing observer is optional and owned by the
+/// caller, so the provider chain doesn't depend on the daemon's estimator.
 #[allow(clippy::type_complexity)]
 pub async fn build_provider_chain(
     config: &LlmConfig,
     session: Arc<SessionManager>,
+    timing_observer: Option<Arc<dyn LlmTimingObserver>>,
 ) -> Result<
     (
         Arc<dyn LlmProvider>,
         Option<Arc<dyn LlmProvider>>,
         Option<Arc<RecordingLlm>>,
-        Arc<crate::estimation::LlmTimings>,
     ),
     LlmError,
 > {
@@ -460,14 +466,9 @@ pub async fn build_provider_chain(
 
     // WI#318 B1/B3: one timing boundary for the chain, outside retry, smart
     // routing, failover and the circuit breaker but inside the response cache.
-    // A cache hit therefore never reaches the timer, and one sample equals one
-    // completed logical call that actually hit a provider.
-    let timings = Arc::new(crate::estimation::LlmTimings::from_env());
-    let llm: Arc<dyn LlmProvider> = Arc::new(LlmTimingProvider::new(llm, Arc::clone(&timings)));
-    tracing::debug!(
-        mode = timings.mode_str(),
-        "LLM logical-call timing initialized"
-    );
+    // Cache hits bypass the timer; calls that switch provider/model are
+    // counted but never train a model on a mixed duration.
+    let llm = LlmTimingProvider::wrap(llm, timing_observer.clone());
 
     // 5. Response cache
     let llm: Arc<dyn LlmProvider> = if config.response_cache_enabled {
@@ -522,17 +523,16 @@ pub async fn build_provider_chain(
 
     // Standalone cheap LLM for heartbeat/evaluation gets the same observation.
     let cheap_llm = create_cheap_llm_provider(config, session)?.map(|cheap| {
-        let cheap: Arc<dyn LlmProvider> = Arc::new(stream_integrity::StreamIntegrityProvider::new(
-            cheap,
+        Arc::new(stream_integrity::StreamIntegrityProvider::new(
+            LlmTimingProvider::wrap(cheap, timing_observer),
             Arc::clone(&telemetry),
-        ));
-        Arc::new(LlmTimingProvider::new(cheap, Arc::clone(&timings))) as Arc<dyn LlmProvider>
+        )) as Arc<dyn LlmProvider>
     });
     if let Some(ref cheap) = cheap_llm {
         tracing::debug!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
 
-    Ok((llm, cheap_llm, recording_handle, timings))
+    Ok((llm, cheap_llm, recording_handle))
 }
 
 #[cfg(test)]
@@ -786,7 +786,7 @@ mod tests {
         config.lunarwing_cloud.fallback_model = Some("fallback-test-model".to_string());
         let session = Arc::new(SessionManager::new(SessionConfig::default()));
 
-        let (provider, _, _, _) = build_provider_chain(&config, session)
+        let (provider, _, _) = build_provider_chain(&config, session, None)
             .await
             .expect("provider chain should build");
 

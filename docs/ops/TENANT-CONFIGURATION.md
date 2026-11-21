@@ -707,15 +707,14 @@ accuracy gate. Details:
 LLM logical-call timing (WI#318 Phase B) is a separate, daemon-wide cache.
 `LUNARWING_LLM_TIMINGS=0` disables it; unset or any other value observes. One
 timer decorates the provider chain built at startup, so v1 chat, local jobs,
-routines, the container path and the v2 bridge all contribute one sample per
-completed logical call that reached a provider. Retries and failover are counted
-as separate attempts and never train the duration EMA; the timer sits inside the
-response cache, so a cache hit never reaches it, and failed or cancelled
-streams train nothing. Cost is not learned here — the v2 adapter's
-`cost_usd: 0.0` means "unavailable", never "free". Models are keyed by
-canonical provider model name, contain no user identity, and reset on restart.
-`GET /api/estimates/llm` is owner-only and reports the per-model duration EMA,
-confidence, sample counts and attempt/retry/first-chunk counters.
+routines, the container path and the v2 bridge share one clock. It includes
+stream setup and same-provider retry backoff. Cache hits, failures, incomplete
+streams and calls that switch provider/model do not train. Cost is not learned
+here — the v2 adapter's `cost_usd: 0.0` means "unavailable", never "free".
+Models are keyed by configured provider ID and model, contain no user identity,
+and reset on restart. `GET /api/estimates/llm` is owner-only and reports the
+duration EMA, confidence, sample counts, dispatches, retries, switches and
+first-chunk timing.
 
 The mt-admin env writer sets `AGENT_AUTO_APPROVE_TOOLS=false` on new tenants.
 Re-rendering preserves an existing canonical override; an older tenant with

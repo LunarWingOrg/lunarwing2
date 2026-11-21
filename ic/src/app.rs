@@ -322,16 +322,21 @@ impl AppBuilder {
     #[allow(clippy::type_complexity)]
     pub async fn init_llm(
         &self,
+        timing_observer: Option<Arc<dyn crate::llm::LlmTimingObserver>>,
     ) -> Result<
         (
             Arc<dyn LlmProvider>,
             Option<Arc<dyn LlmProvider>>,
             Option<Arc<RecordingLlm>>,
-            Arc<crate::estimation::LlmTimings>,
         ),
         anyhow::Error,
     > {
-        Ok(crate::llm::build_provider_chain(&self.config.llm, self.session.clone()).await?)
+        Ok(crate::llm::build_provider_chain(
+            &self.config.llm,
+            self.session.clone(),
+            timing_observer,
+        )
+        .await?)
     }
 
     /// Phase 4: Initialize safety, tools, embeddings, and workspace.
@@ -1142,18 +1147,14 @@ impl AppBuilder {
             }
         }
 
-        let (llm, cheap_llm, recording_handle, llm_timings) =
-            if let Some(llm) = self.llm_override.take() {
-                // Injected providers bypass the chain, so timing starts cold.
-                (
-                    llm,
-                    None,
-                    None,
-                    Arc::new(crate::estimation::LlmTimings::from_env()),
-                )
-            } else {
-                self.init_llm().await?
-            };
+        let llm_timings = Arc::new(crate::estimation::LlmTimings::from_env());
+        let (llm, cheap_llm, recording_handle) = if let Some(llm) = self.llm_override.take() {
+            // Injected providers bypass the chain and do not record timings.
+            (llm, None, None)
+        } else {
+            self.init_llm(llm_timings.enabled().then(|| llm_timings.clone() as Arc<_>))
+                .await?
+        };
         let (safety, tools, embeddings, workspace, workspace_resolver, builder) =
             self.init_tools(&llm).await?;
 
