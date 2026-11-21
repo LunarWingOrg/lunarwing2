@@ -429,6 +429,9 @@ pub struct GatewayState {
     /// Job context manager for live runtime state (`stuck`, `repair_attempts`)
     /// that is not persisted on the sandbox-job record (WI#475).
     pub context_manager: Option<Arc<crate::context::ContextManager>>,
+    /// Daemon-wide LLM logical-call timing models (WI#318 Phase B). Owner-only
+    /// diagnostics; the same cache the provider chain writes to.
+    pub llm_timings: Option<Arc<crate::estimation::LlmTimings>>,
 }
 
 /// Start the gateway HTTP server.
@@ -3761,6 +3764,7 @@ mod tests {
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
+            llm_timings: None,
         })
     }
 

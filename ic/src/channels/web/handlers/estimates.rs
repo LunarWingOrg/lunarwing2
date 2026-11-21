@@ -12,7 +12,9 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
-use crate::estimation::{EvaluationSummary, ToolEstimateCounters, ToolEstimateDiagnostics};
+use crate::estimation::{
+    EvaluationSummary, LlmTimingDiagnostics, ToolEstimateCounters, ToolEstimateDiagnostics,
+};
 use crate::tools::ToolRegistry;
 
 pub(crate) fn routes() -> Router<Arc<GatewayState>> {
@@ -23,6 +25,7 @@ pub(crate) fn routes() -> Router<Arc<GatewayState>> {
             "/api/estimates/evaluation",
             get(estimates_evaluation_handler),
         )
+        .route("/api/estimates/llm", get(estimates_llm_handler))
 }
 
 fn registry(state: &GatewayState) -> Result<&ToolRegistry, (StatusCode, String)> {
@@ -71,4 +74,23 @@ async fn estimates_evaluation_handler(
         StatusCode::NOT_FOUND,
         "Evaluation trace is not enabled".to_string(),
     ))
+}
+
+/// Owner-only daemon-wide LLM logical-call duration models. Provider model
+/// names are configuration, not user data; no prompt or result is included.
+async fn estimates_llm_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<LlmTimingDiagnostics>, (StatusCode, String)> {
+    if user.user_id != state.owner_id {
+        return Err((StatusCode::FORBIDDEN, "Owner access required".to_string()));
+    }
+    state
+        .llm_timings
+        .as_deref()
+        .map(|timings| Json(timings.diagnostics()))
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM timing diagnostics unavailable".to_string(),
+        ))
 }

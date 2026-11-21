@@ -28,6 +28,7 @@ mod streaming;
 #[cfg(test)]
 pub(crate) mod streaming_test_support;
 mod timeout;
+mod timing;
 pub mod transcription;
 
 pub mod image_models;
@@ -61,6 +62,7 @@ pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
 pub use timeout::TimeoutProvider;
+pub use timing::LlmTimingProvider;
 
 use std::sync::Arc;
 
@@ -334,6 +336,7 @@ pub async fn build_provider_chain(
         Arc<dyn LlmProvider>,
         Option<Arc<dyn LlmProvider>>,
         Option<Arc<RecordingLlm>>,
+        Arc<crate::estimation::LlmTimings>,
     ),
     LlmError,
 > {
@@ -506,18 +509,29 @@ pub async fn build_provider_chain(
         Arc::clone(&telemetry),
     ));
 
+    // WI#318 B1/B3: one timing boundary for the whole chain. Placed after
+    // stream integrity so recovered attempts arrive as `Retried` observations,
+    // and outside retry/failover/cache so one sample equals one logical call.
+    let timings = Arc::new(crate::estimation::LlmTimings::from_env());
+    let llm: Arc<dyn LlmProvider> = Arc::new(LlmTimingProvider::new(llm, Arc::clone(&timings)));
+    tracing::debug!(
+        mode = timings.mode_str(),
+        "LLM logical-call timing initialized"
+    );
+
     // Standalone cheap LLM for heartbeat/evaluation gets the same observation.
     let cheap_llm = create_cheap_llm_provider(config, session)?.map(|cheap| {
-        Arc::new(stream_integrity::StreamIntegrityProvider::new(
+        let cheap: Arc<dyn LlmProvider> = Arc::new(stream_integrity::StreamIntegrityProvider::new(
             cheap,
             Arc::clone(&telemetry),
-        )) as Arc<dyn LlmProvider>
+        ));
+        Arc::new(LlmTimingProvider::new(cheap, Arc::clone(&timings))) as Arc<dyn LlmProvider>
     });
     if let Some(ref cheap) = cheap_llm {
         tracing::debug!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
 
-    Ok((llm, cheap_llm, recording_handle))
+    Ok((llm, cheap_llm, recording_handle, timings))
 }
 
 #[cfg(test)]
@@ -771,7 +785,7 @@ mod tests {
         config.lunarwing_cloud.fallback_model = Some("fallback-test-model".to_string());
         let session = Arc::new(SessionManager::new(SessionConfig::default()));
 
-        let (provider, _, _) = build_provider_chain(&config, session)
+        let (provider, _, _, _) = build_provider_chain(&config, session)
             .await
             .expect("provider chain should build");
 
