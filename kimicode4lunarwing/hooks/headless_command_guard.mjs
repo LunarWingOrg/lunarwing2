@@ -185,7 +185,10 @@ function checkRm(segment) {
   // Keep the existing conservative flag checks as well as GNU abbreviations.
   if (!/(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) &&
       !optionWords.some(isRmLongDeleteOption)) return null;
-  const operands = rmOperands(words, endOfOptions);
+  const operands = rmOperands(words, endOfOptions)
+    // `xargs -I {}` fills the placeholder from its input; the feeding find
+    // paths are what checkXargsDeletion classifies (WI#826).
+    .filter((operand) => !fromXargs || operand !== "{}");
   if (operands.length === 0) {
     return fromXargs ? null : "rm -r/-f without an explicit operand";
   }
@@ -421,6 +424,7 @@ function evaluate(command) {
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
+      checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
       checkRawShapes(joined);
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
