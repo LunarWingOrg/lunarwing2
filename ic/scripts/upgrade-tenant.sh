@@ -468,6 +468,10 @@ else
   fi
   run mt promote-worker-images "$TENANT" \
     || converge_after_failed_upgrade "worker image promotion failed"
+  # WI#796: rebuild the worker containers onto the promoted images before the
+  # start; the start re-creates whatever this removes.
+  run mt refresh-worker-containers "$TENANT" \
+    || say "WARNING: could not refresh every worker container; check 'podman ps -a' for '$TENANT'" >&2
 fi
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----

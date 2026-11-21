@@ -616,7 +616,11 @@ host's concurrent builds before retrying manually.
   `CARGO_TARGET_DIR` across the crates. `ci-config` fails when a production
   tool's `ci` names no blocking job that builds its registry directory (or
   runs the plan-driven `.gitlab/scripts/wasm-tools-check.py`), so a new tool is
-  covered without editing the job. Adding a tool means adding its
+  covered without editing the job. Coverage means an actual cargo compile
+  subcommand run from that directory or with `--manifest-path` naming its
+  manifest, directly or through `cargo-ci.sh`; a script that only mentions the
+  path in an `echo`, a comment or a lone `cd` does not cover the tool
+  (WI#825). Adding a tool means adding its
   `deliverables.json` entry with `wasm-tools-check` in `ci`; the MR-path
   `changes:` globs already cover every production tool directory. The job
   also runs on schedules and when `LUNARWING_CI_FULL_VALIDATION=1`, like
@@ -742,10 +746,15 @@ host's concurrent builds before retrying manually.
   because every work-item owner the acceptances cited (WI#367, WI#418,
   WI#749, WI#781) was closed with the pins still locked, and WI#418's own
   decision record states the rule they broke: a closed work item cannot own
-  a standing acceptance. The guard therefore refuses `clearing owner WI#N`,
-  requires the named document to resolve inside the checkout, and requires
-  it to list the advisory ID it owns as the first cell of a table row, so a
-  deleted, renamed or split decision record fails offline. The standing owner for every current entry
+  a standing acceptance. The guard therefore requires every reason to name
+  a document owner — `clearing owner <repo-relative>.md`; a reason whose
+  only owner is a work item (the old `clearing owner WI#N` form) is refused
+  because it names no document. It also requires the named document to
+  resolve inside the checkout and to list the advisory ID it owns as the
+  first cell of a table row, so a deleted, renamed or split decision record
+  fails offline. A historical work-item phrase kept next to the document
+  owner (the RUSTSEC-2021-0145 reason records `historical clearing owner
+  WI#367`) is allowed. The standing owner for every current entry
   is `docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md`. Checking whether a
   work item is still open (owner liveness) remains out of scope per the
   WI#363 scope decision of 2026-10-20 — an online owner gate could only run
@@ -1170,6 +1179,16 @@ narrow check does not claim completeness for directory/glob COPYs or replace
 the BuildKit-parser Dockerfile policy gate; cross-stage copies are not local
 checkout inputs. See `docs/ops/WORKER-CONTAINERS.md` checklist item 7 when retiring the
 photon fixer after an upstream bump.
+
+The pebble lane (WI#806) is checked against its whole Dockerfile instead,
+because its manifest is a hand-maintained per-file list that had already
+drifted from the image: `entrypoint-split.sh` and `src/task_runner.rs` were
+COPY'd but unhashed. `DOCKERFILE_BUILD_CONTEXTS` binds that lane to its
+build context, and every literal local COPY source in any stage must appear
+in the manifest — including every file beneath a directory source such as
+the builder's `src` tree, so a new bridge module cannot ship unrecorded.
+Cross-stage `--from=` sources, globs, and sources outside the context stay
+outside this check, and a malformed COPY fails closed.
 
 The former `rust-compile-16gb` lock serialized heavy Rust work across pipelines:
 for example, pipeline #3812 waited while #3811 ran its backend tests. That lock

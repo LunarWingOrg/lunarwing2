@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "939549520e6004b051b02c8b5f74973b833f3670"
+    "sha1": "3b1bdf9d787e23ae840cf32e765caac32b7ad8ee"
   },
   "path_in_vcs": "crates/jiff-tzdb-platform"
 }

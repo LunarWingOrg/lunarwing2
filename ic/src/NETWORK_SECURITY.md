@@ -414,6 +414,36 @@ contracts. Existing worker tokens and approved job credential grants are
 unchanged; generic-shell named secret injection and arbitrary mounts or devices
 are not implemented.
 
+### Git remote grant (WI#816)
+
+`git-remotes` is an opt-in, credential-free read grant for manifest-backed
+shell calls. The tenant operator sets `SANDBOX_GIT_REMOTES`
+(`name=url[,name=url...]`); unset or empty grants nothing. `git.remotes`
+selects names from that list. Calls without a manifest retain the configured
+legacy behavior, including any existing egress.
+
+- **The proxy enforces hosts, not repository URLs.** A granted HTTP(S) remote
+  requires `proxy-enforced`. A per-call proxy only permits the selected
+  exact hosts, which must already be on the tenant egress allowlist. It keeps
+  public-IP checks and DNS pinning and uses no credential resolver with access
+  to secrets. It neither changes nor falls back to the shared proxy. HTTPS
+  CONNECT does not expose repository paths or operation types.
+- **The shell scan is best-effort preflight.** It checks recognizable Git
+  commands for a granted alias or literal URL, and refuses recognized pushes
+  before execution regardless of flags or configured defaults. It cannot
+  enforce arbitrary shell behavior or Git history policy. A network-disabled
+  manifest needs no grant for ordinary local clone, fetch, or pull.
+- **File remotes** must initially canonicalize inside the call's workspace.
+  They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
+  grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
+  is unsupported by manifest v1.
+- **Credentials and evidence.** The grant injects no credential. Configured
+  URLs cannot include userinfo, queries, or fragments; errors do not echo
+  supplied values. `capability_evidence.git` records the grant ID, supported
+  egress modes and remote names, transports, hosts and `read` operation class,
+  not a record of actual Git operations. Host-held authentication and push
+  support remain open under WI#816; the separate `ssh_git` tool is unchanged.
+
 ### Network egress tiers
 
 Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via

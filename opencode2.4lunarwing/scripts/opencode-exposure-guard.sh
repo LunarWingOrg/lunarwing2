@@ -76,8 +76,11 @@
 # OPENCODE_FLAGS=all must not survive. An operator's own `-<key>` entries are
 # dropped with it; the wrapper owns this variable.
 #
-# What this does not cover: the pin gates the event watches only, not what a
-# worker with a Console credential also takes from the Console with the flag
+# What this does not cover: each pin gates only its own surface — the Console
+# event watches, the MCP push-event capability with its `watch_mcp_event`
+# tool, and the artifact service that the Console artifact publisher
+# registers with (WI#785 AGN-2, re-read at v2.3.2 in WI#804) — not what a
+# worker with a Console credential also takes from the Console with all three
 # off — Console-authored instructions, skills, providers, remote MCP servers,
 # policies and the web-search selection (WI#665). Children the real binary
 # spawns inherit the value, except a managed service started from a

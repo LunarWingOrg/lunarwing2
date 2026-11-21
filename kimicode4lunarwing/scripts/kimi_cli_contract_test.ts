@@ -236,9 +236,10 @@ test(
 //      malformed hooks table would be rejected at runtime).
 // End-to-end denial behavior (hook blocks a dangerous tool call in print
 // mode) was verified against kimi-code 2.0.2 with a live mock provider during
-// WI#206 investigation, and again at 2.6.3 with a mock provider on 2026-11-20
-// (WI#785 AGN-3: `sudo id` came back to the model as a tool error and never
-// ran); the image build has no provider, so it is pinned here at the
+// WI#206 investigation, again at 2.6.3 with a mock provider on 2026-11-20
+// (WI#785 AGN-3), and again at 2.7.2 on 2026-11-21 (WI#804); each time
+// `sudo id` came back to the model as a tool error and never ran; the image
+// build has no provider, so it is pinned here at the
 // config-contract level instead.
 test(
   "real CLI accepts the baked PreToolUse guard hook config (WI#206)",

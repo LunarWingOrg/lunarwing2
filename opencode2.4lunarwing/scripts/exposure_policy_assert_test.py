@@ -541,8 +541,9 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("opencode-exposure-guard.sh", result.stderr)
 
-    def test_console_watches_opt_in_in_config_fails(self) -> None:
-        # WI#609 AAV-1: either key turns the Console event watches flag on.
+    def test_pinned_off_flag_or_all_flags_opt_in_in_config_fails(self) -> None:
+        # WI#609 AAV-1 / WI#785 AGN-2: all_flags or any pinned-off flag set to
+        # anything but false turns that surface on.
         config_path = self.lane / "config" / "opencode2.json"
         base = json.loads(config_path.read_text())
         for experimental in (
@@ -551,6 +552,9 @@ class ExposurePolicyAssertTests(unittest.TestCase):
             {"console_watches": "true"},
             {"all_flags": None},
             {"todo": False, "console_watches": True},
+            {"mcp_events": True},
+            {"artifacts": True},
+            {"artifacts": "true"},
         ):
             with self.subTest(experimental=experimental):
                 config_path.write_text(json.dumps({**base, "experimental": experimental}))
@@ -574,13 +578,14 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         for experimental in (
             {},
             {"console_watches": False, "all_flags": False},
+            {"console_watches": False, "mcp_events": False, "artifacts": False},
             {"todo": True},
         ):
             with self.subTest(experimental=experimental):
                 config_path.write_text(json.dumps({**base, "experimental": experimental}))
                 result = run_assert("--lane", str(self.lane))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("leaves the Console event watches flag off", result.stdout)
+                self.assertIn("leaves every pinned-off flag off", result.stdout)
 
     def test_wrapper_without_a_live_flag_pin_fails(self) -> None:
         # WI#609 AAV-1 / ABE-3: the pin and the exec must be the last two code

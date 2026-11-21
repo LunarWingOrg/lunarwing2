@@ -3,7 +3,7 @@
 Use these checks to validate the SSH paths described in [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md). Setup and recovery procedures live in [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md).
 
 **Revalidated against source 2026-11-20 at `9c96220bb2`.** The four delivery paths
-(built-in `ssh`, `ssh_git`, WASM `ssh` registry `0.1.9`, and worker SSH), the
+(built-in `ssh`, `ssh_git`, WASM `ssh` registry `0.1.10`, and worker SSH), the
 `[[ssh.hosts]]` allowlist, and the WASM `ssh.allowed_hosts` capability match
 the current tree. Worker SSH is available only in task containers that receive
 the socket; Kimi deliberately receives no mount (WI#206).
@@ -70,12 +70,13 @@ Expected behavior:
 - the action requires approval;
 - `path` is resolved below `<base_dir>/ssh-git/`;
 - absolute paths, `..`, symlink escapes, and option-injection inputs are rejected;
+- a push `ref` that deletes a remote ref is rejected before git runs: an empty source (`:main`, `:refs/tags/<tag>`) or the bare matching-branches `:`; force-push refs (leading `+`) are rejected too;
 - authentication uses the harness agent socket and the clone completes without an interactive prompt;
 - on the first unpinned AcceptFirst call, logs show a russh host-key preflight
   before Git; subsequent calls and calls after a daemon restart reuse the
   encrypted pin, while OpenSSH always runs with strict host-key checking.
 
-Only test `push` against an explicitly disposable remote. Force-push refs are rejected, and `pull` is fast-forward only.
+Only test `push` against an explicitly disposable remote. Force-push refs are rejected, `pull` is fast-forward only, and a `ref` with an empty source (`:main`, `:refs/tags/<tag>`, bare `:`) is rejected because it would delete a remote ref or push matching branches.
 
 ## 3. WASM `ssh`
 

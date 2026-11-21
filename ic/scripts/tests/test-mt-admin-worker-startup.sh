@@ -61,7 +61,7 @@ stop_tenant_init_services() { record stop-init; }
 clean_stale_pause_pid() { :; }
 ensure_init_system() { :; }
 ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=true; }
-podman_supports_quadlet() { [[ "$failure_mode" == none ]]; }
+podman_supports_quadlet() { [[ "$failure_mode" == none || -n "$quadlet_start_refused" ]]; }
 _wait_user_manager() { :; }
 tenant_worker_enabled() { [[ " $selected " == *" $2 "* ]]; }
 tenant_worker_desired_running() { [[ "$2" != "$intentionally_stopped" ]]; }
@@ -83,7 +83,17 @@ _container_config_changed() { return 1; }
 _store_container_hash() { record "hash:$2"; }
 _register_worker_unit() { record "unit:$2"; }
 render_worker_quadlet() { record "render:$2"; }
-_systemctl_user() { record "systemctl:$2:${3:-}"; }
+_systemctl_user() {
+  record "systemctl:$2:${3:-}"
+  # WI#796: model a Quadlet unit that refuses to start (StartLimitBurst lockout,
+  # a launcher that dies before it listens). The unit exists but never reaches
+  # its listener, which used to be reported as a successful lane start.
+  if [[ -n "$quadlet_start_refused" && "${2:-}" == start \
+      && "${3:-}" == "lunarwing-${quadlet_start_refused}-alice.service" ]]; then
+    return 1
+  fi
+  return 0
+}
 prepare_worker_workspace() { printf '%s/workspace' "$fixture"; }
 _snapshot_tenant_env() { local -n target="$3"; target="$(mktemp "$fixture/snapshot.XXXXXX")"; cp "$2" "$target"; }
 prepare_worker_task_launch() {
@@ -156,6 +166,7 @@ selected='pebble opencode kimi opencode2'
 intentionally_stopped=''
 unallocated=''
 missing_image=''
+quadlet_start_refused=''
 failure_mode=none
 for INIT_SYSTEM in systemd openrc; do
   for verb in start_tenant restart_tenant; do
@@ -195,10 +206,31 @@ for INIT_SYSTEM in systemd openrc; do
     unallocated=''
     missing_image="$lane"
     run_start start_tenant
-    expect test "$rc" = 0
+    # WI#796: an enabled lane whose image is absent is a refused lane, not a
+    # silent skip — a green exit here is how a dead worker port shipped.
+    expect test "$rc" = 1
     expect grep -q "$lane worker image not available" "$output"
+    expect grep -q "failed worker lanes: $lane" "$output"
     missing_image=''
   done
+
+  # WI#796: a Quadlet unit that refuses to start (unit exists, no listener) must
+  # name the lane and keep the remaining selected lanes starting. The imperative
+  # OpenRC path has no unit to fail, so this pins the systemd path only.
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    quadlet_start_refused=pebble
+    for verb in start_tenant restart_tenant; do
+      run_start "$verb"
+      expect test "$rc" = 1
+      expect grep -q 'lunarwing-pebble-alice.service failed to start' "$output"
+      expect grep -q 'pebble worker never reached its listener' "$output"
+      expect grep -q 'failed worker lanes: pebble' "$output"
+      expect grep -q probe:opencode "$events"
+      expect grep -q probe:kimi "$events"
+      expect grep -q probe:opencode2 "$events"
+    done
+    quadlet_start_refused=''
+  fi
 
   failure_mode=pebble-config
   for verb in start_tenant restart_tenant; do

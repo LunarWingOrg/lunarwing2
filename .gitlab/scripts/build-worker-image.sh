@@ -22,12 +22,14 @@ case "$1" in
         dockerfile_dir=pebble4lunarwing
         # CY-4 precedent (see the opencode2 block): build-read inputs hash
         # into worker-inputs. The builder stage COPYs and `cargo test`s the
-        # whole bridge src tree; the runtime stage COPYs entrypoint.sh and
-        # the WI#324 MCP registration config.
+        # whole bridge src tree; the runtime stage COPYs both entrypoints
+        # (the legacy launcher and the WI#454 split launcher) and the WI#324
+        # MCP registration config.
         input_files='pebble4lunarwing/Dockerfile
 pebble4lunarwing/Cargo.toml
 pebble4lunarwing/Cargo.lock
 pebble4lunarwing/entrypoint.sh
+pebble4lunarwing/entrypoint-split.sh
 pebble4lunarwing/config/settings.json
 pebble4lunarwing/src/bridge.rs
 pebble4lunarwing/src/executor.rs
@@ -35,6 +37,7 @@ pebble4lunarwing/src/health.rs
 pebble4lunarwing/src/main.rs
 pebble4lunarwing/src/mcp_shim.rs
 pebble4lunarwing/src/protocol.rs
+pebble4lunarwing/src/task_runner.rs
 pebble4lunarwing/src/tool_proxy.rs
 pebble4lunarwing/src/workspace_path.rs
 pebble4lunarwing/upstream/Cargo.lock
@@ -193,8 +196,8 @@ kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
-        source_ref=2.6.3
-        build_args="KIMI_CODE_VERSION=2.6.3
+        source_ref=2.7.2
+        build_args="KIMI_CODE_VERSION=2.7.2
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

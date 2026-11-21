@@ -40,10 +40,18 @@ if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
 fi
 [[ -n "${AGENT_AUTH_TOKEN_FILE:-}" ]] || die "split-bridge requires the hub credential"
 
+# WI#796: the task container can legitimately need longer than the old 30s
+# window to create the runner socket (its own unit allows 120s to start), and a
+# bridge that dies first shows the tenant only "Connection refused (os error
+# 111)". Match the 120s the opencode lanes already use and name the wait in the
+# bridge log so the failure is diagnosable from `podman logs`.
 attempt=0
 while [[ ! -S "$RUNNER_SOCKET" ]]; do
   attempt=$((attempt + 1))
-  [[ "$attempt" -lt 30 ]] || die "task runner did not create $RUNNER_SOCKET"
+  [[ "$attempt" -le 120 ]] || die "task runner did not create $RUNNER_SOCKET after 120s"
+  if (( attempt == 1 || attempt % 10 == 0 )); then
+    log "waiting for task runner (attempt $attempt/120)"
+  fi
   sleep 1
 done
 

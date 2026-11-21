@@ -1,15 +1,18 @@
 //! Statistical learning for estimation improvement.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::Serialize;
 
 use super::Actuals;
 
 const MAX_MODELS: usize = 1024;
 const MAX_CATEGORY_BYTES: usize = 1024;
+pub(super) const DEFAULT_MIN_SAMPLES: u64 = 5;
 const MAX_DURATION_SECS: f64 = 86_400.0;
 const MIN_FACTOR: f64 = 0.01;
 const MAX_FACTOR: f64 = 100.0;
@@ -56,6 +59,46 @@ impl Default for LearningModel {
     }
 }
 
+/// Non-identifying observation counters for the diagnostics surface.
+///
+/// Updated with relaxed atomics while the estimator mutex is held, so the
+/// counts can be read without changing any estimate or locking order.
+#[derive(Debug, Default)]
+pub struct LearnerCounters {
+    recorded: AtomicU64,
+    dropped: AtomicU64,
+    clipped: AtomicU64,
+    duration_values_rejected: AtomicU64,
+    evicted: AtomicU64,
+}
+
+impl LearnerCounters {
+    /// Point-in-time copy. Never includes category names or user identity.
+    pub fn snapshot(&self) -> LearnerCounterSnapshot {
+        LearnerCounterSnapshot {
+            observations_recorded: self.recorded.load(Ordering::Relaxed),
+            observations_dropped: self.dropped.load(Ordering::Relaxed),
+            observations_clipped: self.clipped.load(Ordering::Relaxed),
+            duration_values_rejected: self.duration_values_rejected.load(Ordering::Relaxed),
+            models_evicted: self.evicted.load(Ordering::Relaxed),
+        }
+    }
+
+    fn bump(counter: &AtomicU64) -> u64 {
+        counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Serialisable copy of [`LearnerCounters`].
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct LearnerCounterSnapshot {
+    pub observations_recorded: u64,
+    pub observations_dropped: u64,
+    pub observations_clipped: u64,
+    pub duration_values_rejected: u64,
+    pub models_evicted: u64,
+}
+
 /// Learner that improves estimates over time.
 pub struct EstimationLearner {
     /// Models per category.
@@ -65,6 +108,7 @@ pub struct EstimationLearner {
     /// Minimum samples before adjusting.
     min_samples: u64,
     observation_sequence: u64,
+    counters: LearnerCounters,
 }
 
 impl EstimationLearner {
@@ -73,9 +117,15 @@ impl EstimationLearner {
         Self {
             models: HashMap::new(),
             alpha: 0.1, // EMA smoothing factor
-            min_samples: 5,
+            min_samples: DEFAULT_MIN_SAMPLES,
             observation_sequence: 0,
+            counters: LearnerCounters::default(),
         }
+    }
+
+    /// Aggregate counters for diagnostics; contains no category names.
+    pub fn counters(&self) -> &LearnerCounters {
+        &self.counters
     }
 
     /// Record actual results and update the model.
@@ -104,9 +154,23 @@ impl EstimationLearner {
     /// while forecast error uses the prediction frozen before execution.
     pub fn record_actuals(&mut self, category: &str, actuals: Actuals) {
         if category.len() > MAX_CATEGORY_BYTES {
+            LearnerCounters::bump(&self.counters.dropped);
+            tracing::debug!(
+                category_bytes = category.len(),
+                reason = "category_too_long",
+                "estimation observation dropped"
+            );
             return;
         }
         let duration = valid_duration(actuals.actual_time);
+        if duration.is_none() {
+            LearnerCounters::bump(&self.counters.duration_values_rejected);
+            tracing::debug!(
+                actual_ms = actuals.actual_time.as_millis() as u64,
+                reason = "duration_out_of_range",
+                "estimation duration sample rejected"
+            );
+        }
         let cost_ratio =
             actuals
                 .baseline_cost
@@ -120,14 +184,40 @@ impl EstimationLearner {
                         .to_f64()
                         .filter(|ratio| ratio.is_finite())
                 });
+        if let Some(ratio) = cost_ratio.filter(|ratio| *ratio > MAX_FACTOR) {
+            LearnerCounters::bump(&self.counters.clipped);
+            tracing::debug!(ratio, "estimation cost ratio clipped");
+        }
+        if let (Some(seconds), Some(base)) =
+            (duration, actuals.baseline_time.and_then(valid_duration))
+        {
+            let ratio = seconds / base;
+            if !(MIN_FACTOR..=MAX_FACTOR).contains(&ratio) {
+                LearnerCounters::bump(&self.counters.clipped);
+                tracing::debug!(ratio, "estimation duration ratio clipped");
+            }
+        }
         if duration.is_none() && cost_ratio.is_none() {
+            LearnerCounters::bump(&self.counters.dropped);
+            tracing::debug!(
+                reason = "no_usable_measurement",
+                "estimation observation dropped"
+            );
             return;
+        }
+        if let (Some(model), Some(seconds)) = (self.models.get(category), duration)
+            && model.time_sample_count > 0
+            && !(model.duration_secs * 0.1..=model.duration_secs * 10.0).contains(&seconds)
+        {
+            LearnerCounters::bump(&self.counters.clipped);
+            tracing::debug!(seconds, "estimation duration outlier bounded");
         }
         self.make_room(category);
         self.observation_sequence = self.observation_sequence.saturating_add(1);
         let model = self.models.entry(category.to_owned()).or_default();
         model.last_observation = self.observation_sequence;
         model.sample_count = model.sample_count.saturating_add(1);
+        LearnerCounters::bump(&self.counters.recorded);
         if let Some(ratio) = cost_ratio {
             let ratio = ratio.clamp(0.0, MAX_FACTOR);
             model.cost_factor = smooth(
@@ -160,6 +250,11 @@ impl EstimationLearner {
             .map(|(key, _)| key.clone())
         {
             self.models.remove(&oldest);
+            LearnerCounters::bump(&self.counters.evicted);
+            tracing::debug!(
+                models = self.models.len(),
+                "estimation model evicted (least recently observed)"
+            );
         }
     }
 
@@ -217,6 +312,11 @@ impl EstimationLearner {
         &self.models
     }
 
+    /// Minimum valid samples before an estimate is published.
+    pub fn min_samples(&self) -> u64 {
+        self.min_samples
+    }
+
     /// Set the EMA alpha.
     pub fn set_alpha(&mut self, alpha: f64) {
         if alpha.is_finite() {
@@ -236,7 +336,7 @@ impl EstimationLearner {
     }
 }
 
-fn valid_duration(duration: Duration) -> Option<f64> {
+pub(super) fn valid_duration(duration: Duration) -> Option<f64> {
     let seconds = duration.as_secs_f64();
     (seconds > 0.0 && seconds <= MAX_DURATION_SECS).then_some(seconds)
 }

@@ -1533,6 +1533,56 @@ restore_promoted_workers() {  # <name> — re-tag only tags this run still owns
   return "$rc"
 }
 
+# WI#796: promotion retags an image in the ADMIN store only. The tenant picks
+# an image up when start-tenant runs the lane starter, whose image-ID contract
+# recreates the container — and any lane whose starter skipped or failed that
+# path kept serving its pre-upgrade container while the upgrade finished green
+# (derpy pebble: "Connection refused (os error 111)" on every build). This
+# distributes each enabled lane's promoted image into the tenant's store and
+# removes the bridge/task containers that still run a different image, so the
+# start below rebuilds them from the new one. Idempotent: a lane already on the
+# current image is left alone, and advisory failures never abort an upgrade.
+upgrade_refresh_worker_containers() {  # <name>
+  local name="$1" lane image current container running_image
+  ensure_container_runtime
+  ensure_init_system
+  for lane in pebble opencode kimi opencode2 lunardepth; do
+    tenant_worker_enabled "$name" "$lane" || continue
+    if [[ "$INIT_SYSTEM" == openrc ]] && ! tenant_worker_desired_running "$name" "$lane"; then
+      say "$lane worker is intentionally stopped for $name; leaving its containers alone"
+      continue
+    fi
+    image="$(worker_image_ref "$lane" latest)"
+    if ! _ensure_tenant_image "$name" "$image"; then
+      say "WARNING: $lane image $image is not available; its worker container stays on the previous image" >&2
+      continue
+    fi
+    current="$(_ctr "$name" image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
+    [[ -n "$current" ]] || continue
+    for container in "lunarwing-${lane}-${name}" "$(worker_task_container_name "$lane" "$name")"; do
+      running_image="$(_ctr_inspect "$name" -f '{{.Image}}' "$container" 2>/dev/null || true)"
+      [[ -n "$running_image" ]] || continue
+      [[ "$running_image" != "$current" ]] || continue
+      if [[ "$INIT_SYSTEM" == systemd && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+        # The Quadlet unit owns the container and Restart=on-failure would race
+        # a bare rm; stop it first, as the config-change recreate path does.
+        _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
+      elif [[ "$INIT_SYSTEM" == openrc ]]; then
+        # The babysitter can restart the old container while it still exists.
+        # Stop supervision without changing the lane's desired state or runlevels.
+        if ! _openrc_stop_service_if_installed "${container}-sup" >&2; then
+          say "WARNING: could not stop OpenRC supervisor ${container}-sup; skipping removal of $container" >&2
+          continue
+        fi
+      fi
+      say "replacing $container: it does not run the upgraded $lane image"
+      _ctr "$name" rm -f "$container" >/dev/null 2>&1 \
+        || say "WARNING: could not remove $container for tenant '$name'; it stays on the previous image" >&2
+    done
+  done
+  return 0
+}
+
 promote_candidate_workers() {  # <tenant>
   local name="$1" lane candidate_ref latest_ref old_id candidate_id
   local lanes_file rollback_file

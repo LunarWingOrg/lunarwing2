@@ -684,6 +684,10 @@ mod estimation_tests {
                 .estimate("alice", tool.as_ref(), &json!({}))
                 .is_none()
         );
+        let counts = tools.estimates().aggregate_counters();
+        assert_eq!(counts.estimates.estimate_requests, 15);
+        assert_eq!(counts.estimates.estimates_withheld, 15);
+        assert_eq!(counts.observations.observations_recorded, 0);
         for _ in 0..5 {
             execute_tool_with_safety(&tools, &safety, tool.name(), json!({}), &ctx)
                 .await
@@ -730,14 +734,22 @@ mod estimation_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observation_only_and_disabled_modes_preserve_output_and_approval_text() {
-        use crate::estimation::ToolEstimationMode;
-        for mode in [ToolEstimationMode::Observe, ToolEstimationMode::Disabled] {
-            let tools = ToolRegistry::new().with_estimation_mode(mode);
+    async fn execution_counts_eligibility_without_displaying_observed_or_suppressed_hints() {
+        use crate::estimation::{CategoryPolicy, ToolEstimates, ToolEstimationMode};
+        for (mode, categories) in [
+            (ToolEstimationMode::Observe, None),
+            (ToolEstimationMode::Display, Some("-timed-tool")),
+            (ToolEstimationMode::Disabled, None),
+        ] {
+            let tools = ToolRegistry::new().with_estimates(ToolEstimates::configured(
+                mode,
+                CategoryPolicy::from_setting(categories),
+                None,
+            ));
             tools.register(Arc::new(TimedTool)).await;
             let safety = safety();
             let ctx = JobContext::with_user("alice", "test", "mode");
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let output =
                     execute_tool_with_safety(&tools, &safety, "timed-tool", json!({}), &ctx)
                         .await
@@ -758,7 +770,22 @@ mod estimation_tests {
                     .estimates()
                     .estimate("alice", &TimedTool, &json!({}))
                     .is_some(),
-                mode == ToolEstimationMode::Observe
+                mode != ToolEstimationMode::Disabled
+            );
+            let counts = tools.estimates().aggregate_counters();
+            let enabled = mode != ToolEstimationMode::Disabled;
+            assert_eq!(
+                counts.estimates.estimate_requests,
+                if enabled { 6 } else { 0 }
+            );
+            assert_eq!(counts.estimates.estimates_returned, u64::from(enabled));
+            assert_eq!(
+                counts.estimates.estimates_withheld,
+                if enabled { 5 } else { 0 }
+            );
+            assert_eq!(
+                counts.observations.observations_recorded,
+                if enabled { 6 } else { 0 }
             );
         }
     }

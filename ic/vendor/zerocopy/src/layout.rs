@@ -490,6 +490,61 @@ impl TrailingSliceLayout {
         Some(size)
     }
 
+    /// Computes the size described by this layout for `elems` trailing slice
+    /// elements without overflow checks.
+    ///
+    /// # Safety
+    ///
+    /// The trailing slice's byte range (`offset..offset + elems * elem_size`)
+    /// must be representable in `usize` and contained within the complete object
+    /// size, which must also fit in `usize`.
+    #[inline(always)]
+    #[allow(unstable_name_collisions)]
+    #[cfg_attr(
+        kani,
+        kani::requires(
+            elems
+                .checked_mul(self.elem_size)
+                .and_then(|trailing_size| self.offset.checked_add(trailing_size))
+                .is_some_and(|trailing_end| {
+                    self.size_for_elems(elems).is_some_and(|size| trailing_end <= size)
+                })
+        )
+    )]
+    #[cfg_attr(kani, kani::ensures(|&size| Some(size) == self.size_for_elems(elems)))]
+    pub(crate) unsafe fn size_for_elems_unchecked(self, elems: usize) -> usize {
+        #[cfg(all(kani, kani_slow))]
+        #[kani::proof_for_contract(TrailingSliceLayout::size_for_elems_unchecked)]
+        #[kani::solver(kissat)]
+        fn proof() {
+            let layout: TrailingSliceLayout = kani::any();
+            let elems: usize = kani::any();
+            if let Some(trailing_size) = elems.checked_mul(layout.elem_size) {
+                if let Some(trailing_end) = layout.offset.checked_add(trailing_size) {
+                    if layout.size_for_elems(elems).is_some_and(|size| trailing_end <= size) {
+                        // SAFETY: Preconditions are satisfied.
+                        unsafe { layout.size_for_elems_unchecked(elems) };
+                    }
+                }
+            }
+        }
+
+        #[allow(unused_imports)]
+        use crate::util::polyfills::*;
+
+        // SAFETY: The caller guarantees that `elems * self.elem_size` is
+        // representable in `usize`.
+        let trailing_size = unsafe { elems.unchecked_mul(self.elem_size) };
+        // SAFETY: The caller guarantees that `self.offset + trailing_size` does
+        // not overflow `usize`.
+        let trailing_end = unsafe { self.offset.unchecked_add(trailing_size) };
+        // SAFETY: The caller guarantees that `trailing_end` is contained in the
+        // complete object size, which fits in `usize`. Since `self.padding_for_elems(elems)`
+        // is the non-negative difference between the complete object size and
+        // `trailing_end`, adding it cannot overflow `usize`.
+        unsafe { trailing_end.unchecked_add(self.padding_for_elems(elems)) }
+    }
+
     /// Returns `true` only when `self` and `other` describe the same size for
     /// every trailing slice length.
     ///
@@ -3227,6 +3282,10 @@ mod tests {
         for elems in 0..8 {
             assert_eq!(align4.size_for_elems(elems), Some(2 + 4 * elems));
             assert_eq!(align4.size_for_elems(elems), align2.size_for_elems(elems));
+            // SAFETY: `size_for_elems` returned `Some`.
+            assert_eq!(unsafe { align4.size_for_elems_unchecked(elems) }, 2 + 4 * elems);
+            // SAFETY: `size_for_elems` returned `Some`.
+            assert_eq!(unsafe { align2.size_for_elems_unchecked(elems) }, 2 + 4 * elems);
         }
 
         let dynamically_padded = TrailingSliceLayout { elem_size: 1, ..align4 };
@@ -4201,6 +4260,33 @@ mod proofs {
         DstLayout { align: align, size_info: size_info, statically_shallow_unpadded: kani::any() }
     }
 
+    /// Generates sized layouts satisfying the same `Layout::from_size_align`
+    /// validity constraints as the `SizeInfo::Sized` branch of
+    /// `any_valid_dst_layout`.
+    ///
+    /// Because CBMC is a path-merging bounded model checker rather than a
+    /// path-pruning symbolic executor, calling `any_valid_dst_layout` and
+    /// discarding `SizeInfo::SliceDst` via `kani::assume(false)` still
+    /// bit-blasts the `TrailingSliceLayout` minimum-size arithmetic into the
+    /// SAT formula. Harnesses scoped strictly to sized layouts call this
+    /// generator directly to avoid that dead circuit.
+    fn any_valid_sized_dst_layout() -> (DstLayout, usize) {
+        let align = any_layout_align();
+        let size: usize = kani::any();
+
+        kani::assume(size <= DstLayout::MAX_SIZE);
+        kani::assume(Layout::from_size_align(size, align.get()).is_ok());
+
+        (
+            DstLayout {
+                align,
+                size_info: SizeInfo::Sized { size },
+                statically_shallow_unpadded: kani::any(),
+            },
+            size,
+        )
+    }
+
     /// Generates either a fixed size at most `DstLayout::MAX_SIZE`, or a DST
     /// description from `any_bounded_trailing_layout`.
     ///
@@ -4958,11 +5044,7 @@ mod proofs {
     fn prove_dst_layout_pad_to_align_sized() {
         use crate::util::padding_needed_for;
 
-        let layout: DstLayout = any_valid_dst_layout();
-        let SizeInfo::Sized { size: unpadded_size } = layout.size_info else {
-            kani::assume(false);
-            loop {}
-        };
+        let (layout, unpadded_size) = any_valid_sized_dst_layout();
 
         let padded = layout.pad_to_align();
         assert_eq!(padded.align, layout.align);

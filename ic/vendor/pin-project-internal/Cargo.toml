@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "pin-project-internal"
-version = "1.1.13"
+version = "1.2.0"
 build = false
 autolib = false
 autobins = false
@@ -46,13 +46,13 @@ path = "src/lib.rs"
 proc-macro = true
 
 [dependencies.proc-macro2]
-version = "1.0.60"
+version = "1.0.91"
 
 [dependencies.quote]
-version = "1.0.25"
+version = "1.0.35"
 
 [dependencies.syn]
-version = "2.0.1"
+version = "3"
 features = [
     "parsing",
     "printing",
@@ -76,6 +76,10 @@ trailing_empty_array = "warn"
 transmute_undefined_repr = "warn"
 undocumented_unsafe_blocks = "warn"
 unused_trait_names = "warn"
+
+[lints.clippy.assert_is_empty]
+level = "allow"
+priority = 1
 
 [lints.clippy.bool_assert_comparison]
 level = "allow"

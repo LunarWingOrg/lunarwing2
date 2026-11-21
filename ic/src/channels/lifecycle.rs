@@ -54,7 +54,13 @@ impl OutcomeHints {
     /// evicted first.
     pub(crate) const MAX_ENTRIES: usize = 1024;
     /// A hint or finished entry older than this is ignored and dropped.
-    pub(crate) const TTL: Duration = Duration::from_secs(1800);
+    ///
+    /// Derived from the V2 late watcher's longest window (WI#820): after the agent
+    /// loop's soft timeout reports `Finished`, the late watcher can deliver its own
+    /// `Finished` up to that long afterwards, and the memory must still cover it so
+    /// the watcher sees the message already finished instead of reporting a second
+    /// finish. Deriving it means a change to the late budget carries through.
+    pub(crate) const TTL: Duration = crate::bridge::router::LONGEST_LATE_WINDOW;
 
     /// Records `hint` for `message_id`, replacing an older hint for the same id.
     ///
@@ -348,5 +354,25 @@ mod tests {
         let almost = start + OutcomeHints::TTL - Duration::from_secs(1);
         assert!(hints.has_finished_at(newest, almost));
         assert!(!hints.has_finished_at(newest, start + OutcomeHints::TTL));
+    }
+
+    /// WI#820: the finished-message memory must cover the longest late-turn
+    /// window. The late watcher reports its second `Finished` up to that long
+    /// after the turn started, so a TTL shorter than the window would let it
+    /// report a duplicate finish. Deriving [`OutcomeHints::TTL`] from the
+    /// window keeps this green; this test makes an accidental decoupling fail.
+    #[test]
+    fn ttl_covers_the_longest_late_window() {
+        assert_eq!(
+            OutcomeHints::TTL,
+            crate::bridge::router::LONGEST_LATE_WINDOW
+        );
+        let hints = OutcomeHints::default();
+        let start = Instant::now();
+        let id = Uuid::new_v4();
+        hints.resolve_at(id, TurnOutcome::TimedOut, start);
+        // One second inside the window: still remembered.
+        let inside = start + crate::bridge::router::LONGEST_LATE_WINDOW - Duration::from_secs(1);
+        assert!(hints.has_finished_at(id, inside));
     }
 }

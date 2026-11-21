@@ -4,6 +4,7 @@
 
 pub mod coord;
 pub mod cron_workers;
+pub mod estimates;
 pub mod jobs;
 pub mod memory;
 pub mod missions;

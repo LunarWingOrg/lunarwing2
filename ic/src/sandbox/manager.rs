@@ -32,9 +32,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
-use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
+use crate::sandbox::config::{SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
-use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder};
+use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder, NoCredentialResolver};
 use crate::sandbox::tunnel_sidecar::{TunnelSidecar, TunnelSidecarConfig};
 
 /// Output from sandbox execution.
@@ -336,9 +336,17 @@ impl SandboxManager {
         command: &str,
         cwd: &Path,
         manifest: &crate::sandbox::CapabilityManifest,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
         let decision = crate::sandbox::authorize_manifest(manifest, &self.config, cwd)?;
+        crate::sandbox::git_grant::authorize_shell_command(
+            command,
+            decision.git.as_ref(),
+            decision.network,
+        )?;
+        if let Some(git) = decision.git.as_ref() {
+            env.extend(git.container_env());
+        }
         self.execute_decision(command, cwd, decision, env).await
     }
 
@@ -349,26 +357,24 @@ impl SandboxManager {
         decision: crate::sandbox::CapabilityDecision,
         env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
-        let crate::sandbox::CapabilityDecision {
-            policy,
-            network,
-            limits,
-            evidence,
-        } = decision;
-        let audit_json = crate::sandbox::audit_json(&evidence)?;
-        let declared = evidence.origin == crate::sandbox::capability::CapabilityOrigin::Declared;
+        let scoped_hosts = decision
+            .git
+            .as_ref()
+            .filter(|_| decision.network == SandboxNetworkMode::ProxyEnforced)
+            .map(|git| git.proxy_hosts(&self.config.network_allowlist))
+            .transpose()?;
+        let audit_json = crate::sandbox::audit_json(&decision.evidence)?;
+        let declared =
+            decision.evidence.origin == crate::sandbox::capability::CapabilityOrigin::Declared;
         if declared {
             tracing::info!(capability_audit = %audit_json, "Sandbox capability decision authorized");
         } else {
             tracing::debug!(capability_audit = %audit_json, "Sandbox compatibility capability decision");
         }
-        let network_override = declared.then_some(network);
-        let limits_override = declared.then_some(limits);
-
         // FullAccess policy bypasses the sandbox entirely.
         // Double-check the allow_full_access guard at execution time as well,
         // in case the policy was overridden per-call via execute_with_policy().
-        if policy == SandboxPolicy::FullAccess {
+        if decision.policy == SandboxPolicy::FullAccess {
             if !self.config.allow_full_access {
                 tracing::error!(
                     "FullAccess execution requested but SANDBOX_ALLOW_FULL_ACCESS is not \
@@ -389,15 +395,20 @@ impl SandboxManager {
             return self.execute_direct(command, cwd, env).await;
         }
 
-        if network == self.config.network {
+        if scoped_hosts.is_none() && decision.network == self.config.network {
             self.initialize().await?;
         } else {
-            // Validation lets only `none` differ from the host mode. That run
-            // gets `--network none` and joins no proxy or sidecar, so the
-            // shared transports stay up for concurrent calls (WI#797 review
-            // AIL-2).
+            // Neither network-disabled runs nor scoped proxies need shared
+            // transports. Do not start or stop them on these calls' behalf.
             self.ensure_runner().await?;
         }
+        // Keep the scoped listener alive across retries. Dropping it closes
+        // its shutdown channel; each run owns and cleans up its Unix relay.
+        let scoped_proxy = match scoped_hosts {
+            Some(hosts) => Some(self.start_scoped_git_proxy(hosts).await?),
+            None => None,
+        };
+        let scoped_port = scoped_proxy.as_ref().map(|(_, port)| *port);
 
         // Retry transient container failures (Docker daemon glitches, container
         // creation races) up to MAX_SANDBOX_RETRIES times with exponential backoff.
@@ -417,14 +428,7 @@ impl SandboxManager {
             }
 
             match self
-                .try_execute_in_container(
-                    command,
-                    cwd,
-                    policy,
-                    env.clone(),
-                    network_override,
-                    limits_override.as_ref(),
-                )
+                .try_execute_in_container(command, cwd, &decision, env.clone(), scoped_port)
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -445,17 +449,29 @@ impl SandboxManager {
         }))
     }
 
+    async fn start_scoped_git_proxy(&self, hosts: Vec<String>) -> Result<(HttpProxy, u16)> {
+        let proxy = NetworkProxyBuilder::from_config(&self.config)
+            .with_allowlist(hosts)
+            .with_credentials(Vec::new())
+            .with_credential_resolver(Arc::new(NoCredentialResolver))
+            .build_and_start(0)
+            .await?;
+        let addr = proxy.addr().await.ok_or_else(|| SandboxError::ProxyError {
+            reason: "scoped Git proxy has no listening address".into(),
+        })?;
+        Ok((proxy, addr.port()))
+    }
+
     /// Single attempt at container execution (no retry logic).
     async fn try_execute_in_container(
         &self,
         command: &str,
         cwd: &Path,
-        policy: SandboxPolicy,
+        decision: &crate::sandbox::CapabilityDecision,
         env: HashMap<String, String>,
-        network_override: Option<SandboxNetworkMode>,
-        limits_override: Option<&ResourceLimits>,
+        scoped_port: Option<u16>,
     ) -> Result<ExecOutput> {
-        let network = network_override.unwrap_or(self.config.network);
+        let network = decision.network;
         // Containment: the mounted directory is agent-chosen, so refuse any
         // path resolving into the tenant secret directory (or a bare secret
         // file) before the runtime is ever asked to mount it. Fail closed —
@@ -486,7 +502,9 @@ impl SandboxManager {
             None
         };
 
-        let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {
+        let proxy_port = if let Some(port) = scoped_port {
+            port
+        } else if let Some(proxy) = self.proxy.read().await.as_ref() {
             proxy.addr().await.map(|a| a.port()).unwrap_or(0)
         } else {
             0
@@ -501,19 +519,12 @@ impl SandboxManager {
                     reason: "container runtime not initialized".to_string(),
                 })?;
 
-        let limits = limits_override.cloned().unwrap_or_else(|| ResourceLimits {
-            memory_bytes: self.config.memory_limit_mb * 1024 * 1024,
-            cpu_shares: self.config.cpu_shares,
-            timeout: self.config.timeout,
-            max_output_bytes: 64 * 1024,
-        });
-
         let container_output = runner
             .execute(ExecParams {
                 command,
                 working_dir: &cwd,
-                policy,
-                limits: &limits,
+                policy: decision.policy,
+                limits: &decision.limits,
                 env: &env,
                 network,
                 proxy_port,
@@ -1485,6 +1496,126 @@ mod tests {
         assert!(run.windows(2).any(|pair| pair == ["--memory", "1m"]));
         assert!(run.windows(2).any(|pair| pair == ["--cpu-shares", "64"]));
         assert!(!run.iter().any(|arg| arg.contains("container:")));
+        manager.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_grant_clone_reaches_the_runtime_with_credential_free_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("remotes/origin.git")).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = manifest_test_manager(&state, SandboxNetworkMode::None);
+        manager.config.policy = SandboxPolicy::WorkspaceWrite;
+        manager.config.git = crate::sandbox::GitGrantConfig::from_spec(
+            "origin=file:///workspace/remotes/origin.git",
+        )
+        .unwrap();
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "filesystem": {"read_write": ["/workspace"]},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        let command = "git clone file:///workspace/remotes/origin.git work";
+        manager
+            .execute_with_manifest(command, temp.path(), &manifest, HashMap::new())
+            .await
+            .expect("clone reached the simulated container runtime");
+        manager.shutdown().await;
+
+        let calls = state.lock().unwrap();
+        let args = calls
+            .iter()
+            .find(|args| args.first().is_some_and(|arg| arg == "run"))
+            .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "-e",
+                "GIT_CONFIG_VALUE_0=file:///workspace/remotes/origin.git"
+            ]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-e", "GIT_TERMINAL_PROMPT=0"])
+        );
+        assert_eq!(args.last().map(String::as_str), Some(command));
+        for arg in args {
+            for needle in ["token", "password", "PRIVATE KEY", "helper="] {
+                assert!(
+                    !arg.to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase()),
+                    "{arg}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_grant_relay_enforces_selected_hosts_without_changing_shared_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manifest_test_manager(&Arc::default(), SandboxNetworkMode::ProxyEnforced);
+        manager.config.network_allowlist = vec!["git.example.test".into(), "127.0.0.1".into()];
+        manager.config.git =
+            crate::sandbox::GitGrantConfig::from_spec("upstream=https://git.example.test/repo.git")
+                .unwrap();
+        manager.test_runner = Some(Arc::new(CliRunner::for_test(
+            ContainerRuntime::Podman,
+            "localhost/sandbox-test:latest".into(),
+            TestRuntime::new(|args, _| async move {
+                if args.first().is_some_and(|arg| arg == "run") {
+                    assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+                    let channel = args
+                        .iter()
+                        .find_map(|arg| arg.strip_suffix(":/run/lunarwing-proxy:ro,z"))
+                        .expect("scoped relay mount");
+                    let mut socket =
+                        tokio::net::UnixStream::connect(Path::new(channel).join("proxy.sock"))
+                            .await
+                            .unwrap();
+                    // The shared proxy lists this address, but the scoped proxy
+                    // should reject it at the allowlist before public IP checks.
+                    socket.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let mut response = String::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        socket.read_to_string(&mut response),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+                    assert!(response.contains("not in allowlist"), "{response}");
+                }
+                Ok(fake_output(true, String::new(), String::new()))
+            }),
+        )));
+        manager.initialize().await.unwrap();
+        let original_proxy_addr = manager.proxy.read().await.as_ref().unwrap().addr().await;
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        manager
+            .execute_with_manifest(
+                "git ls-remote upstream",
+                temp.path(),
+                &manifest,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let shared = manager.proxy.read().await;
+        assert_eq!(shared.as_ref().unwrap().addr().await, original_proxy_addr);
+        assert_eq!(shared.as_ref().unwrap().request_count(), 0);
+        drop(shared);
         manager.shutdown().await;
     }
 

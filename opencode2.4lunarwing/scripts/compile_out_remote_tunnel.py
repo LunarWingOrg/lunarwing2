@@ -26,17 +26,22 @@ packages/*/package.json. The runtime-stage binary marker scan remains the
 backstop if upstream drifts past even this.
 
 Second job, same stage and same fail-closed style (WI#609, !2398 ABE-2): the
-anchor for the wrapper's feature-flag pin. opencode v2.3.2 ships Console event
-watches, a remote steering channel, behind the flag `console_watches`, and the
-lane's wrapper starts every opencode with OPENCODE_FLAGS=-console_watches.
-That pin is only as good as the pinned upstream source: an unknown entry in
-OPENCODE_FLAGS is ignored without a word, and upstream ships a feature by
-deleting its flag. The anchor is a TEXT TRIPWIRE, necessary and not
-sufficient: it fails the build when the reviewed text no longer holds — the
-whole-file digests of the two flag files, the two-statement watch gate in the
-Console plugin, and the counts of files naming the watch wiring — but it does
-not prove that the pin still holds. The per-bump human re-read of the flag
-code (bump checklist item 7) remains the decision.
+anchor for the wrapper's feature-flag pin. The wrapper starts every opencode
+with OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts, pinning off three
+surfaces: the Console event watches (`console_watches`, a remote steering
+channel in v2.2.7), MCP push events (`mcp_events`) and the artifact service
+the Console publisher registers with (`artifacts`), the last two added at
+v2.3.2 (WI#785 AGN-2). That pin is only as good as the pinned upstream source:
+an unknown entry in OPENCODE_FLAGS is ignored without a word, and upstream
+ships a feature by deleting its flag. The anchor is a TEXT TRIPWIRE, necessary
+and not sufficient: it fails the build when the reviewed text no longer holds —
+the whole-file digests of the two flag files (which cover all three registry
+keys), the two-statement watch gate in the Console plugin, and the counts of
+files naming the watch wiring — but it does not prove that the pin still
+holds. The `mcp_events` and `artifacts` gates have no dedicated anchor of their
+own (adding one is a guard change and waits for the maintainer, WI#804); the
+per-bump human re-read of the flag code (bump checklist item 7) remains the
+decision.
 
 A pin that predates the flags has none of these files and no reference to
 them: log and pass, as for the tunnel.

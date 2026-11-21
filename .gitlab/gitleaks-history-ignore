@@ -1062,6 +1062,11 @@
 a930c5904555adcf9dc551e12dda807d5b35255b:ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:22
 a930c5904555adcf9dc551e12dda807d5b35255b:ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:23
 aa96ba405425255df91227faeb881e67b959e85b:lunarwing_mt_onboard/secrets_tests.py:generic-api-key:92
+aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1
+aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/serde_with/.cargo-checksum.json:generic-api-key:1
+aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml/.cargo-checksum.json:generic-api-key:1
+aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_edit/.cargo-checksum.json:generic-api-key:1
+aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_parser/.cargo-checksum.json:generic-api-key:1
 aaf1730862850bee93ffe54095d0531c75ec8d85:ic/crates/lunarwing_safety/src/log_scrubber.rs:generic-api-key:128
 aaf1730862850bee93ffe54095d0531c75ec8d85:ic/crates/lunarwing_safety/src/log_scrubber.rs:generic-api-key:136
 bdde230946f031357c2631fff0e7ce7fa92e6aa0:ic/src/orchestrator/harness.rs:private-key:2719

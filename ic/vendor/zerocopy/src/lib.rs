@@ -397,6 +397,8 @@ pub use crate::{
 extern crate alloc;
 #[cfg(any(feature = "alloc", test))]
 use alloc::{boxed::Box, vec::Vec};
+#[cfg(all(not(no_zerocopy_allocator_api_1_100_0), feature = "alloc"))]
+use core::alloc::Allocator;
 #[cfg(any(feature = "alloc", test))]
 use core::alloc::Layout;
 
@@ -869,6 +871,27 @@ pub unsafe trait KnownLayout {
         meta.size_for_metadata(Self::LAYOUT)
     }
 
+    /// Computes the size of an object of type `Self` with the given pointer
+    /// metadata without overflow checks.
+    ///
+    /// # Safety
+    ///
+    /// The resulting size must fit in a [`usize`].
+    #[doc(hidden)]
+    #[must_use]
+    #[inline(always)]
+    #[cfg_attr(
+        all(coverage_nightly, __ZEROCOPY_INTERNAL_USE_ONLY_NIGHTLY_FEATURES_IN_TESTS),
+        coverage(off)
+    )]
+    unsafe fn size_for_metadata_unchecked(meta: Self::PointerMetadata) -> usize {
+        // SAFETY: The caller promises that the resulting size fits in a `usize`.
+        // By invariant on `Self::LAYOUT`, if `Self` is a slice DST,
+        // `offset + elems * elem_size` does not overflow and is no greater than
+        // the complete object size.
+        unsafe { meta.size_for_metadata_unchecked(Self::LAYOUT) }
+    }
+
     /// Computes whether `meta` can describe a valid allocation of `Self`.
     ///
     /// # Safety
@@ -965,6 +988,22 @@ pub trait PointerMetadata: Copy + Eq + Debug + Ord {
     /// `size_for_metadata` promises to only return `None` if the resulting size
     /// would not fit in a `usize`.
     fn size_for_metadata(self, layout: DstLayout) -> Option<usize>;
+
+    /// Computes the size of the object with the given layout and pointer
+    /// metadata without overflow checks.
+    ///
+    /// # Panics
+    ///
+    /// If `Self = ()`, `layout` must describe a sized type. If `Self = usize`,
+    /// `layout` must describe a slice DST. Otherwise, `size_for_metadata_unchecked`
+    /// may panic.
+    ///
+    /// # Safety
+    ///
+    /// The resulting size must fit in a `usize`. If `Self = usize`, the trailing
+    /// slice's byte range (`offset..offset + elems * elem_size`) must be
+    /// representable in `usize` and contained within the complete object size.
+    unsafe fn size_for_metadata_unchecked(self, layout: DstLayout) -> usize;
 }
 
 impl PointerMetadata for () {
@@ -984,6 +1023,19 @@ impl PointerMetadata for () {
             // NOTE: This branch is unreachable, but we return `None` rather
             // than `unreachable!()` to avoid generating panic paths.
             SizeInfo::SliceDst(_) => None,
+        }
+    }
+
+    #[inline(always)]
+    #[cfg_attr(
+        all(coverage_nightly, __ZEROCOPY_INTERNAL_USE_ONLY_NIGHTLY_FEATURES_IN_TESTS),
+        coverage(off)
+    )]
+    unsafe fn size_for_metadata_unchecked(self, layout: DstLayout) -> usize {
+        match layout.size_info {
+            SizeInfo::Sized { size } => size,
+            // SAFETY: The caller promises that `layout` describes a sized type for `Self = ()`.
+            SizeInfo::SliceDst(_) => unsafe { core::hint::unreachable_unchecked() },
         }
     }
 }
@@ -1006,6 +1058,22 @@ impl PointerMetadata for usize {
             // NOTE: This branch is unreachable, but we return `None` rather
             // than `unreachable!()` to avoid generating panic paths.
             SizeInfo::Sized { .. } => None,
+        }
+    }
+
+    #[inline(always)]
+    #[cfg_attr(
+        all(coverage_nightly, __ZEROCOPY_INTERNAL_USE_ONLY_NIGHTLY_FEATURES_IN_TESTS),
+        coverage(off)
+    )]
+    unsafe fn size_for_metadata_unchecked(self, layout: DstLayout) -> usize {
+        match layout.size_info {
+            // SAFETY: The caller promises that the resulting size fits in a
+            // `usize` and that the trailing slice's byte range is representable
+            // and contained in the complete object size.
+            SizeInfo::SliceDst(trailing) => unsafe { trailing.size_for_elems_unchecked(self) },
+            // SAFETY: The caller promises that `layout` describes a slice DST for `Self = usize`.
+            SizeInfo::Sized { .. } => unsafe { core::hint::unreachable_unchecked() },
         }
     }
 }
@@ -1510,12 +1578,12 @@ where
 /// Neither this derive, nor the [safety conditions] of `FromZeros`, requires
 /// that structs are marked with `#[repr(C)]`.
 ///
-/// Per the [Rust reference](reference),
+/// Per the [Rust reference][the Rust reference],
 ///
 /// > The representation of a type can change the padding between fields, but
 /// > does not change the layout of the fields themselves.
 ///
-/// [reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
+/// [the Rust reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
 ///
 /// Since the layout of structs only consists of padding bytes and field bytes,
 /// a struct is soundly `FromZeros` if:
@@ -3852,58 +3920,78 @@ pub unsafe trait FromZeros: TryFromBytes {
     where
         Self: Sized,
     {
-        // If `T` is a ZST, then return a proper boxed instance of it. There is
-        // no allocation, but `Box` does require a correct dangling pointer.
-        let layout = Layout::new::<Self>();
-        if layout.size() == 0 {
-            // Construct the `Box` from a dangling pointer to avoid calling
-            // `Self::new_zeroed`. This ensures that stack space is never
-            // allocated for `Self` even on lower opt-levels where this branch
-            // might not get optimized out.
-
-            // SAFETY: Per [1], when `T` is a ZST, `Box<T>`'s only validity
-            // requirements are that the pointer is non-null and sufficiently
-            // aligned. Per [2], `NonNull::dangling` produces a pointer which
-            // is sufficiently aligned. Since the produced pointer is a
-            // `NonNull`, it is non-null.
-            //
-            // [1] Per https://doc.rust-lang.org/1.81.0/std/boxed/index.html#memory-layout:
-            //
-            //   For zero-sized values, the `Box` pointer has to be non-null and sufficiently aligned.
-            //
-            // [2] Per https://doc.rust-lang.org/std/ptr/struct.NonNull.html#method.dangling:
-            //
-            //   Creates a new `NonNull` that is dangling, but well-aligned.
-            return Ok(unsafe { Box::from_raw(NonNull::dangling().as_ptr()) });
+        // SAFETY: `BoxAllocator::allocate_zeroed` is a valid argument of
+        // `new_box`. The referent of the pointer returned by `allocate_zeroed`
+        // (and, consequently, the `Box` derived from it) is a valid instance of
+        // `Wrapping<Self>`, because `Self` (and thus `Wrapping<Self>`) is
+        // `FromZeros`.
+        unsafe {
+            crate::util::new_box::<Wrapping<Self>, _>(
+                (),
+                crate::util::UnwrapWrapping(crate::util::GlobalAlloc),
+                crate::util::BoxAllocator::<Wrapping<Self>>::allocate_zeroed,
+            )
         }
-
-        // FIXME(#429): Add a "SAFETY" comment and remove this `allow`.
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout).cast::<Self>() };
-        if ptr.is_null() {
-            return Err(AllocError);
-        }
-        // FIXME(#429): Add a "SAFETY" comment and remove this `allow`.
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        Ok(unsafe { Box::from_raw(ptr) })
     }
 
-    /// Creates a `Box<[Self]>` (a boxed slice) from zeroed bytes.
+    /// Creates a `Box<Self, A>` in `alloc` from zeroed bytes.
     ///
-    /// This function is useful for allocating large values of `[Self]` on the
-    /// heap and zero-initializing them, without ever creating a temporary
-    /// instance of `[Self; _]` on the stack. For example,
-    /// `u8::new_box_slice_zeroed(1048576)` will allocate the slice directly on
-    /// the heap; it does not require storing the slice on the stack.
+    /// This function is useful for allocating large values on the heap using a
+    /// custom allocator and zero-initializing them, without ever creating a
+    /// temporary instance of `Self` on the stack. For example,
+    /// `<[u8; 1048576]>::new_box_zeroed_in(alloc)` will allocate
+    /// `[u8; 1048576]` directly in `alloc`; it does not require storing
+    /// `[u8; 1048576]` in a temporary variable on the stack.
     ///
     /// On systems that use a heap implementation that supports allocating from
-    /// pre-zeroed memory, using `new_box_slice_zeroed` may have performance
-    /// benefits.
+    /// pre-zeroed memory, using `new_box_zeroed_in` (or related functions) may
+    /// have performance benefits.
     ///
-    /// If `Self` is a zero-sized type, then this function will return a
-    /// `Box<[Self]>` that has the correct `len`. Such a box cannot contain any
-    /// actual information, but its `len()` property will report the correct
-    /// value.
+    /// # Errors
+    ///
+    /// Returns an error on allocation failure.
+    #[must_use = "has no side effects (other than allocation)"]
+    #[cfg(all(not(no_zerocopy_allocator_api_1_100_0), feature = "alloc"))]
+    #[cfg_attr(doc_cfg, doc(cfg(all(rust = "1.100.0", feature = "alloc"))))]
+    #[inline]
+    fn new_box_zeroed_in<A: Allocator>(alloc: A) -> Result<Box<Self, A>, AllocError>
+    where
+        Self: Sized,
+    {
+        // SAFETY: `BoxAllocator::allocate_zeroed` is a valid argument of
+        // `new_box`. The referent of the pointer returned by `allocate_zeroed`
+        // (and, consequently, the `Box` derived from it) is a valid instance of
+        // `Wrapping<Self>`, because `Self` (and thus `Wrapping<Self>`) is
+        // `FromZeros`.
+        unsafe {
+            crate::util::new_box::<Wrapping<Self>, _>(
+                (),
+                crate::util::UnwrapWrapping(alloc),
+                crate::util::BoxAllocator::<Wrapping<Self>>::allocate_zeroed,
+            )
+        }
+    }
+
+    /// Creates a `Box<Self>` from zeroed bytes with `count` trailing elements.
+    ///
+    /// `Self` may be a slice or a [slice DST]. `count` specifies the number of
+    /// elements in the trailing slice.
+    ///
+    /// This function is useful for allocating large values of `Self` on the
+    /// heap and zero-initializing them, without ever creating a temporary
+    /// instance on the stack. For example,
+    /// `<[u8]>::new_box_zeroed_with_elems(1048576)` will allocate the slice
+    /// directly on the heap; it does not require storing the slice on the
+    /// stack.
+    ///
+    /// On systems that use a heap implementation that supports allocating from
+    /// pre-zeroed memory, using `new_box_zeroed_with_elems` may have
+    /// performance benefits.
+    ///
+    /// If the trailing slice element type is zero-sized, the returned box still
+    /// has `count` trailing elements.
+    ///
+    /// [slice DST]: KnownLayout#dynamically-sized-types
     ///
     /// # Errors
     ///
@@ -3935,11 +4023,17 @@ pub unsafe trait FromZeros: TryFromBytes {
     where
         Self: KnownLayout<PointerMetadata = usize>,
     {
-        // SAFETY: `alloc::alloc::alloc_zeroed` is a valid argument of
-        // `new_box`. The referent of the pointer returned by `alloc_zeroed`
+        // SAFETY: `BoxAllocator::allocate_zeroed` is a valid argument of
+        // `new_box`. The referent of the pointer returned by `allocate_zeroed`
         // (and, consequently, the `Box` derived from it) is a valid instance of
         // `Self`, because `Self` is `FromZeros`.
-        unsafe { crate::util::new_box(count, alloc::alloc::alloc_zeroed) }
+        unsafe {
+            crate::util::new_box(
+                count,
+                crate::util::GlobalAlloc,
+                crate::util::BoxAllocator::<Self>::allocate_zeroed,
+            )
+        }
     }
 
     #[deprecated(since = "0.8.0", note = "renamed to `FromZeros::new_box_zeroed_with_elems`")]
@@ -4145,12 +4239,12 @@ pub unsafe trait FromZeros: TryFromBytes {
 /// Neither this derive, nor the [safety conditions] of `FromBytes`, requires
 /// that structs are marked with `#[repr(C)]`.
 ///
-/// Per the [Rust reference](reference),
+/// Per the [Rust reference][the Rust reference],
 ///
 /// > The representation of a type can change the padding between fields, but
 /// > does not change the layout of the fields themselves.
 ///
-/// [reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
+/// [the Rust reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
 ///
 /// Since the layout of structs only consists of padding bytes and field bytes,
 /// a struct is soundly `FromBytes` if:
@@ -6821,6 +6915,24 @@ mod tests {
         test!([()], layout(0, 1, Some(0), true));
         test!([u8], layout(0, 1, Some(1), true));
         test!(str, layout(0, 1, Some(1), true));
+
+        // Test `size_for_metadata_unchecked`
+        // SAFETY: Sized types have empty metadata and fit in `usize`.
+        assert_eq!(unsafe { <() as KnownLayout>::size_for_metadata_unchecked(()) }, 0);
+        // SAFETY: Sized types have empty metadata and fit in `usize`.
+        assert_eq!(unsafe { <u8 as KnownLayout>::size_for_metadata_unchecked(()) }, 1);
+        // SAFETY: Sized types have empty metadata and fit in `usize`.
+        assert_eq!(unsafe { <u64 as KnownLayout>::size_for_metadata_unchecked(()) }, 8);
+        // SAFETY: 10 elements of `u8` (10 bytes) fit in `usize`.
+        assert_eq!(unsafe { <[u8] as KnownLayout>::size_for_metadata_unchecked(10) }, 10);
+        // SAFETY: 10 elements of `u16` (20 bytes) fit in `usize`.
+        assert_eq!(unsafe { <[u16] as KnownLayout>::size_for_metadata_unchecked(10) }, 20);
+        // SAFETY: 10 elements of `()` (0 bytes) fit in `usize`.
+        assert_eq!(unsafe { <[()] as KnownLayout>::size_for_metadata_unchecked(10) }, 0);
+        // SAFETY: `u8::LAYOUT` describes a sized type.
+        assert_eq!(unsafe { ().size_for_metadata_unchecked(u8::LAYOUT) }, 1);
+        // SAFETY: `<[u8]>::LAYOUT` describes a slice DST with 10 bytes fitting in `usize`.
+        assert_eq!(unsafe { 10usize.size_for_metadata_unchecked(<[u8]>::LAYOUT) }, 10);
     }
 
     #[test]
@@ -8028,6 +8140,7 @@ mod tests {
         #[test]
         fn test_new_box_zeroed() {
             assert_eq!(u64::new_box_zeroed(), Ok(Box::new(0)));
+            assert_eq!(Wrapping::<u64>::new_box_zeroed(), Ok(Box::new(Wrapping(0))));
         }
 
         #[test]
@@ -8043,6 +8156,114 @@ mod tests {
             {
                 assert_eq!(<()>::new_box_zeroed(), Ok(Box::new(())));
             }
+        }
+
+        #[cfg(not(no_zerocopy_allocator_api_1_100_0))]
+        #[test]
+        fn test_new_box_zeroed_in() {
+            assert_eq!(
+                u64::new_box_zeroed_in(::alloc::alloc::Global),
+                Ok(Box::new_in(0, ::alloc::alloc::Global)),
+            );
+            assert_eq!(
+                Wrapping::<u64>::new_box_zeroed_in(::alloc::alloc::Global),
+                Ok(Box::new_in(Wrapping(0), ::alloc::alloc::Global)),
+            );
+        }
+
+        #[cfg(not(no_zerocopy_allocator_api_1_100_0))]
+        #[test]
+        fn test_new_box_zeroed_in_array() {
+            drop(<[u32; 0x1000]>::new_box_zeroed_in(::alloc::alloc::Global));
+        }
+
+        #[cfg(not(no_zerocopy_allocator_api_1_100_0))]
+        #[test]
+        fn test_new_box_zeroed_in_zst() {
+            #[derive(FromZeros, PartialEq, Debug)]
+            #[repr(C, align(64))]
+            struct AlignedZst;
+
+            // This test exists in order to exercise unsafe code, especially
+            // when running under Miri.
+            #[allow(clippy::unit_cmp)]
+            {
+                assert_eq!(
+                    <()>::new_box_zeroed_in(::alloc::alloc::Global),
+                    Ok(Box::new_in((), ::alloc::alloc::Global)),
+                );
+            }
+            let b = AlignedZst::new_box_zeroed_in(::alloc::alloc::Global).unwrap();
+            assert_eq!(*b, AlignedZst);
+            assert_eq!(Box::as_ptr(&b).addr() % 64, 0);
+        }
+
+        #[cfg(not(no_zerocopy_allocator_api_1_100_0))]
+        #[test]
+        fn test_new_box_zeroed_in_custom_allocator() {
+            #[derive(Default, Debug)]
+            struct TrackingAllocator {
+                allocated: Cell<usize>,
+                deallocated: Cell<usize>,
+                fail: Cell<bool>,
+            }
+
+            // SAFETY: `TrackingAllocator` delegates all allocation and
+            // deallocation directly to `::alloc::alloc::Global`, which
+            // satisfies the `Allocator` safety contract.
+            unsafe impl Allocator for TrackingAllocator {
+                fn allocate(
+                    &self,
+                    layout: Layout,
+                ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+                    if self.fail.get() {
+                        return Err(core::alloc::AllocError);
+                    }
+                    let ptr = ::alloc::alloc::Global.allocate(layout)?;
+                    // Dirty the allocation so we verify `new_box_zeroed_in`
+                    // calls `allocate_zeroed` (which zeroes the bytes).
+                    // SAFETY: `ptr` is a newly allocated, valid `[u8]` block of
+                    // length `ptr.len()`.
+                    unsafe {
+                        ptr.cast::<u8>().as_ptr().write_bytes(0xFF, layout.size());
+                    }
+                    self.allocated.set(self.allocated.get() + 1);
+                    Ok(ptr)
+                }
+
+                unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                    self.deallocated.set(self.deallocated.get() + 1);
+                    // SAFETY: The caller upholds the `deallocate` preconditions
+                    // for blocks allocated via `::alloc::alloc::Global`.
+                    unsafe { ::alloc::alloc::Global.deallocate(ptr, layout) };
+                }
+            }
+
+            let alloc = TrackingAllocator::default();
+            let b = <[u64; 4]>::new_box_zeroed_in(&alloc).unwrap();
+            assert_eq!(*b, [0, 0, 0, 0]);
+            assert_eq!(alloc.allocated.get(), 1);
+            assert_eq!(alloc.deallocated.get(), 0);
+            drop(b);
+            assert_eq!(alloc.deallocated.get(), 1);
+
+            // ZST should not call `allocate` or `deallocate`.
+            alloc.fail.set(true);
+            let b = <()>::new_box_zeroed_in(&alloc).unwrap();
+            assert_eq!(alloc.allocated.get(), 1);
+            drop(b);
+            assert_eq!(alloc.deallocated.get(), 1);
+
+            // Allocation failure should return `Err(AllocError)` without
+            // panicking or leaking.
+            let res = u64::new_box_zeroed_in(&alloc);
+            assert_eq!(res.unwrap_err(), AllocError);
+            assert_eq!(alloc.allocated.get(), 1);
+            assert_eq!(alloc.deallocated.get(), 1);
+
+            // Also exercise passing an owned allocator by value.
+            let b = u64::new_box_zeroed_in(TrackingAllocator::default()).unwrap();
+            assert_eq!(*b, 0);
         }
 
         #[test]

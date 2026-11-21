@@ -1,5 +1,68 @@
 # CHANGELOG
 
+1.0.1 (2026-11-17)
+==================
+Bug fixes:
+
+* [#713](https://github.com/BurntSushi/jiff/issues/713):
+`%Z` in `Timestamp::strftime` should format as `UTC`.
+* [#714](https://github.com/BurntSushi/jiff/issues/714):
+Parsing a timestamp could produce an out of bounds value.
+
+
+1.0.0 (2026-11-15)
+==================
+This marks the Jiff 1.0 release. Barring some unforeseen major problem with the
+API, this release marks an indefinite commitment to 1.x.y. Consumers of this
+library should feel confident about putting Jiff types into their public API.
+New major versions of Jiff will not be made lightly.
+
+The most significant breaking change in this release large but simple: the
+`Zoned` type has been renamed to `ZonedDateTime`. This also impacts APIs like
+`Timestamp::to_zoned`, which are now called `Timestamp::to_zoned_datetime`. The
+remaining breaking changes are pretty minor and shouldn't impact most users.
+
+Enhancements:
+
+* [3211f23](https://github.com/BurntSushi/jiff/commit/3211f23a7f87eceffda70031c2954a2359cb370c):
+Bump MSRV to Rust 1.85.
+* [#262](https://github.com/BurntSushi/jiff/issues/262):
+Use `core::error::Error` in lieu of `std::error::Error`.
+* [#314](https://github.com/BurntSushi/jiff/issues/314):
+**BREAKING**: Make `Zoned::iso_week_date` take `&self` instead of `self`.
+* [#624](https://github.com/BurntSushi/jiff/issues/624):
+Make more methods take `&self`.
+* [#471](https://github.com/BurntSushi/jiff/issues/471):
+Turn `Custom` into a trait object.
+* [#499](https://github.com/BurntSushi/jiff/issues/499):
+**BREAKING**: Make `Offset::saturating_add` fallible.
+* [#629](https://github.com/BurntSushi/jiff/issues/629), [#626](https://github.com/BurntSushi/jiff/issues/626):
+**BREAKING**: Make `impl Sub for Timestamp` return a `SignedDuration`.
+* [#436](https://github.com/BurntSushi/jiff/issues/436):
+**BREAKING**: Seal the `ToSpan` trait.
+* [#463](https://github.com/BurntSushi/jiff/issues/463):
+Provide an accessor for an underlying `std::io::Error`.
+* [#467](https://github.com/BurntSushi/jiff/issues/467):
+**BREAKING**: Make conversions from `Timestamp` to `SystemTime` fallible.
+* [#374](https://github.com/BurntSushi/jiff/issues/374):
+**BREAKING**: Rename `Zoned` to `ZonedDateTime`.
+* [#618](https://github.com/BurntSushi/jiff/issues/618):
+**BREAKING**: Make `jiff_tzdb::VERSION` required.
+* [c03581f](https://github.com/BurntSushi/jiff/commit/c03581f405955ed4bbebfda0ae28e03120c289fa):
+Add `Span::to_friendly` routine as a convenience for `format("{:#}", span)`.
+
+Documentation:
+
+* [#545](https://github.com/BurntSushi/jiff/issues/545):
+Clarify specification labeling in formatting table.
+* [#630](https://github.com/BurntSushi/jiff/issues/630):
+Clarify the use of the propleptic Gregorian calendar.
+
+Performance:
+
+* [4d66e92](https://github.com/BurntSushi/jiff/commit/4d66e92ecdd6a012c952f7a5c0f628d0ecde662d):
+Add `inline(never)` to `strtime` routine.
+
 0.2.46 (2026-11-15)
 ===================
 Bug fixes:
@@ -844,7 +907,7 @@ This release of Jiff includes a new opt-in proc macro for embedding a
 `TimeZone` into your binary. Just enable Jiff's `static` feature, and this will
 print the current time in the `America/New_York` time zone:
 
-```rust
+```rust,ignore
 use jiff::{
     tz::{self, TimeZone},
     Timestamp,
@@ -1500,7 +1563,7 @@ This release introduces some new minor APIs that support formatting
 Previously, using the standard formatting routines that Jiff provides, it was
 only possible to format a `Timestamp` using Zulu time. For example:
 
-```rust
+```rust,ignore
 use jiff::Timestamp;
 
 assert_eq!(
@@ -1516,7 +1579,7 @@ zone identifier), it may be useful in contexts where you just want to
 "hint" at what a user's local time is. To that end, there is a new
 `Timestamp::display_with_offset` method that makes this possible:
 
-```rust
+```rust,ignore
 use jiff::{tz, Timestamp};
 
 assert_eq!(
@@ -1532,7 +1595,7 @@ Moreover, this release also includes new convenience APIs on the Temporal and
 RFC 2822 printer types for returning strings. For example, previously, if you
 were using the RFC 2822 printer to format a `Timestamp`, you had to do this:
 
-```rust
+```rust,ignore
 use jiff::{fmt::rfc2822::DateTimePrinter, Timestamp};
 
 let mut buf = String::new();
@@ -1542,7 +1605,7 @@ assert_eq!(buf, "Thu, 1 Jan 1970 00:00:00 -0000");
 
 But now you can just do this:
 
-```rust
+```rust,ignore
 use jiff::{fmt::rfc2822::DateTimePrinter, Timestamp};
 
 assert_eq!(
@@ -1566,7 +1629,7 @@ sub-module. It provides convenience routines similar to Chrono's
 `jiff::Timestamp` and an integer number of seconds, milliseconds, microseconds
 or nanoseconds. For example:
 
-```rust
+```rust,ignore
 use jiff::Timestamp;
 
 #[derive(serde::Serialize, serde::Deserialize)]

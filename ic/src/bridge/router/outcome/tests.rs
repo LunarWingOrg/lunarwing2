@@ -214,7 +214,7 @@ impl Rig {
         self.turn
             .deliver_late(
                 &mut self.events,
-                Duration::from_secs(5),
+                LateAllowance::flat(Duration::from_secs(5)),
                 Duration::from_secs(1),
             )
             .await;
@@ -349,13 +349,14 @@ async fn gate_waiting_join_is_silent_and_preserves_the_thread() {
         .turn
         .late_result(
             &mut rig.events,
-            Duration::from_millis(1),
+            LateAllowance::flat(Duration::from_millis(1)),
             Duration::from_secs(2),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
-    assert!(result.is_none());
+    assert!(result.text.is_none());
+    assert!(!result.exhausted);
     assert!(rig.replies.lock().unwrap().is_empty());
     let saved = rig
         .turn
@@ -629,7 +630,7 @@ async fn late_response_obeys_before_outbound_hook() {
     rig.turn
         .deliver_late(
             &mut rig.events,
-            Duration::from_secs(5),
+            LateAllowance::flat(Duration::from_secs(5)),
             Duration::from_secs(1),
         )
         .await;
@@ -650,7 +651,7 @@ async fn late_authentication_fallback_persists_a_resolvable_gate() {
     rig.turn
         .deliver_late(
             &mut rig.events,
-            Duration::from_secs(5),
+            LateAllowance::flat(Duration::from_secs(5)),
             Duration::from_secs(1),
         )
         .await;
@@ -902,7 +903,7 @@ async fn late_second_deadline_stops_a_real_blocked_model_call() {
         Duration::from_secs(5),
         rig.turn.deliver_late(
             &mut rig.events,
-            Duration::from_millis(1),
+            LateAllowance::flat(Duration::from_millis(1)),
             Duration::from_secs(2),
         ),
     )
@@ -947,7 +948,7 @@ async fn late_gateway_response_uses_real_channel_once_with_original_thread() {
     rig.turn
         .deliver_late(
             &mut rig.events,
-            Duration::from_secs(5),
+            LateAllowance::flat(Duration::from_secs(5)),
             Duration::from_secs(1),
         )
         .await;
@@ -1439,7 +1440,7 @@ async fn late_reply_suppressed_by_outbound_hook_finishes_no_reply() {
     rig.turn
         .deliver_late(
             &mut rig.events,
-            Duration::from_secs(5),
+            LateAllowance::flat(Duration::from_secs(5)),
             Duration::from_secs(1),
         )
         .await;
@@ -1453,6 +1454,44 @@ async fn late_reply_suppressed_by_outbound_hook_finishes_no_reply() {
         .collect();
     let expected = [MessageLifecycle::Finished(TurnOutcome::NoReply)];
     assert_eq!(finishes, expected); // safety: test-only assertion
+}
+
+/// WI#807: the turn record names every thread outcome with a stable string, so
+/// an operator comparing runs never reads a `Debug` spelling. Every variant is
+/// covered so a new one cannot slip in unnamed.
+#[test]
+fn thread_outcome_kind_names_every_outcome() {
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::Completed { response: None }),
+        "completed"
+    );
+    assert_eq!(thread_outcome_kind(&ThreadOutcome::Stopped), "stopped");
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::MaxIterations),
+        "max_iterations"
+    );
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+            error: "boom".into(),
+        }),
+        "failed"
+    );
+    assert_eq!(
+        thread_outcome_kind(&ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            parameters: serde_json::json!({}),
+            resume_kind: lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "github".into(),
+                instructions: "Provide a token.".into(),
+                auth_url: None,
+            },
+            resume_output: None,
+        }),
+        "gate_paused"
+    );
 }
 
 /// WI#807: the late-turn budget scales with the discrete tool calls a turn
@@ -1483,6 +1522,20 @@ fn late_budget_is_capped_and_cannot_overflow() {
     assert!(late_budget_for_steps(steps_to_cap) < LATE_MAX_TIMEOUT);
     assert_eq!(late_budget_for_steps(steps_to_cap + 1), LATE_MAX_TIMEOUT);
     assert_eq!(late_budget_for_steps(u32::MAX), LATE_MAX_TIMEOUT);
+}
+
+/// WI#820: the window the channel manager's finished-message memory must cover,
+/// spelled out so a change to any part of the late budget is reviewed against it.
+/// The memory derives its TTL from [`LONGEST_LATE_WINDOW`], so growing a part
+/// grows the TTL too; this test makes the new number visible in the diff.
+#[test]
+fn longest_late_window_spells_out_the_worst_case() {
+    assert_eq!(OUTCOME_TIMEOUT, Duration::from_secs(610));
+    assert_eq!(
+        LONGEST_LATE_WINDOW,
+        OUTCOME_TIMEOUT + LATE_MAX_TIMEOUT + STOP_GRACE * 2
+    );
+    assert_eq!(LONGEST_LATE_WINDOW, Duration::from_secs(2_530));
 }
 
 /// Only completed tool actions extend the late budget. LLM steps, state
@@ -1541,4 +1594,80 @@ async fn forwarded_tool_events_increment_the_turn_step_count() {
         rig.turn.forward(&event).await;
     }
     assert_eq!(rig.turn.tool_calls(), 8);
+}
+
+/// WI#807: the allowance is re-read as the turn completes tool actions, so a
+/// chain that earns its steps during the late wait is not held to the count it
+/// had at detach. At 700 s a zero-step turn has spent its 600 s base budget;
+/// two calls completed in the meantime earn 180 s back and leave 80 s.
+#[test]
+fn late_allowance_extends_with_steps_completed_during_the_late_wait() {
+    let started = tokio::time::Instant::now() - Duration::from_secs(700);
+    let allowance = LateAllowance::step_aware(started);
+    assert!(allowance.remaining(0).is_none());
+    let remaining = allowance
+        .remaining(2)
+        .expect("two completed calls restore headroom");
+    assert!(
+        remaining > Duration::from_secs(79) && remaining <= Duration::from_secs(80),
+        "{remaining:?}"
+    );
+}
+
+/// The ceiling is measured from the allowance's start, so re-reading the budget
+/// cannot extend a runaway loop past [`LATE_MAX_TIMEOUT`].
+#[test]
+fn late_allowance_cap_is_measured_from_its_start() {
+    let started = tokio::time::Instant::now() - LATE_MAX_TIMEOUT + Duration::from_secs(5);
+    let allowance = LateAllowance::step_aware(started);
+    let remaining = allowance
+        .remaining(1_000)
+        .expect("still inside the ceiling");
+    assert!(
+        remaining <= Duration::from_secs(5) && remaining > Duration::from_secs(4),
+        "{remaining:?}"
+    );
+}
+
+/// A flat allowance stays what the caller asked for, however many steps the
+/// turn completes: it is the exact wait the late-result tests rely on.
+#[test]
+fn flat_late_allowance_never_grows() {
+    let allowance = LateAllowance::flat(Duration::from_millis(1));
+    assert_eq!(allowance.budget(1_000), Duration::from_millis(1));
+    assert!(allowance.remaining(1_000) <= Some(Duration::from_millis(1)));
+}
+
+/// The bounded, known-step data point the WI asks for: a late turn that
+/// completes a tool call after its base budget expired keeps running, and ends
+/// with the earned allowance recorded.
+#[tokio::test(start_paused = true)]
+async fn a_step_during_the_late_wait_extends_the_deadline() {
+    let mut rig = Rig::new(Some("late answer"), None).await;
+    let started = tokio::time::Instant::now();
+    let llm = Arc::clone(&rig.llm);
+    let turn = &rig.turn;
+    // The step arrives at 500 s and the model is released at 650 s: past the
+    // flat 600 s budget, inside the 690 s one-call budget.
+    let driver = async move {
+        tokio::time::sleep(Duration::from_secs(500)).await;
+        turn.tool_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        llm.release.notify_one();
+    };
+    let waiter = turn.late_result(
+        &mut rig.events,
+        LateAllowance::step_aware(started),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+    let (result, ()) = tokio::join!(waiter, driver);
+    let completed = result.expect("the late result must not fail");
+    assert!(
+        !completed.exhausted,
+        "a healthy step must extend the deadline"
+    );
+    assert_eq!(completed.text.as_deref(), Some("late answer"));
+    assert_eq!(completed.budget, LATE_TIMEOUT + LATE_STEP_ALLOWANCE);
 }

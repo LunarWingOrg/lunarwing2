@@ -60,7 +60,7 @@ impl CredentialResolver for EnvCredentialResolver {
     }
 }
 
-/// A credential resolver that returns nothing (for testing).
+/// A credential resolver for proxy sessions that must not use daemon secrets.
 pub struct NoCredentialResolver;
 
 #[async_trait::async_trait]

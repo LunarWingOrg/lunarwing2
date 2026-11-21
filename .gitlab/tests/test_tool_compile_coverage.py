@@ -77,6 +77,14 @@ class ToolCompileCoverageTests(unittest.TestCase):
         self.write_inventory([deliverable(ci=["standalone-deliverables", "builds-x"])])
         self.assertEqual(self.errors(), [])
 
+    def test_mentioning_the_directory_is_not_coverage(self):
+        # WI#825: the old substring test let any mention of the path through.
+        self.jobs["wasm-tools-check"]["script"] = ["echo hollow"]
+        self.jobs["builds-x"]["script"] = ['echo "building ic/tools-src/x someday"']
+        self.write_inventory([deliverable(ci=["standalone-deliverables", "builds-x"])])
+        errors = self.errors()
+        self.assertTrue(any("names no blocking CI job" in error for error in errors), errors)
+
     def test_resolution_only_job_does_not_cover(self):
         self.write_inventory([deliverable(ci=["standalone-deliverables"])])
         errors = self.errors()
@@ -125,6 +133,75 @@ class ToolCompileCoverageTests(unittest.TestCase):
         errors = []
         config.validate_tool_compile_coverage(merged, errors)
         self.assertEqual(errors, [])
+
+
+class CompilingJobCoversShapeTests(unittest.TestCase):
+    """WI#825: only a cargo compile that names the crate counts as coverage."""
+
+    source_dir = "tools-src/x"
+
+    def covers(self, script, job_name="builds-x"):
+        jobs = {job_name: {"script": script}}
+        return config.compiling_job_covers(job_name, self.source_dir, jobs)
+
+    def test_mentions_are_not_coverage(self):
+        scripts = (
+            'echo "building ic/tools-src/x someday"',
+            "# cargo build --manifest-path ic/tools-src/x/Cargo.toml",
+            "echo cargo build --manifest-path ic/tools-src/x/Cargo.toml",
+            'echo "x && cargo build --manifest-path ic/tools-src/x/Cargo.toml"',
+            "cd ic/tools-src/x",
+            'echo "cd ic/tools-src/x && cargo build"',
+        )
+        for script in scripts:
+            with self.subTest(script=script):
+                self.assertFalse(self.covers(script))
+
+    def test_non_build_or_foreign_cargo_commands_are_not_coverage(self):
+        scripts = (
+            "cargo metadata --manifest-path ic/tools-src/x/Cargo.toml",
+            "cargo build --manifest-path ic/tools-src/other/Cargo.toml",
+            "cargo build --manifest-path ic/tools-src/x/README.md",
+            "cargo build",
+            "cargo build --manifest-path",
+            "bash .gitlab/scripts/cargo-ci.sh metadata --manifest-path tools-src/x/Cargo.toml",
+            "bash .gitlab/scripts/cargo-ci.sh build --manifest-path ../other/Cargo.toml",
+        )
+        for script in scripts:
+            with self.subTest(script=script):
+                self.assertFalse(self.covers(script))
+
+    def test_allow_failure_job_still_does_not_cover(self):
+        jobs = {"builds-x": {"script": [
+            "cargo build --manifest-path ic/tools-src/x/Cargo.toml"], "allow_failure": True}}
+        self.assertFalse(config.compiling_job_covers("builds-x", self.source_dir, jobs))
+
+    def test_manifest_and_directory_builds_are_coverage(self):
+        scripts = (
+            "cargo build --manifest-path ic/tools-src/x/Cargo.toml",
+            "cargo test --manifest-path=ic/tools-src/x/Cargo.toml",
+            "env RUST_LOG=1 cargo clippy --manifest-path $CI_PROJECT_DIR/ic/tools-src/x/Cargo.toml",
+            "bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --manifest-path tools-src/x/Cargo.toml",
+            "bash .gitlab/scripts/cargo-ci.sh test -j2 --manifest-path=tools-src/x/Cargo.toml",
+            ".gitlab/scripts/cargo-ci.sh build --manifest-path tools-src/x/Cargo.toml",
+            "taskset -c 0-5 bash .gitlab/scripts/cargo-ci.sh clippy --manifest-path tools-src/x/Cargo.toml",
+            "cd ic/tools-src/x && cargo build --release",
+            "cd ic/tools-src/x;cargo build",
+            ["cd ic/tools-src/x", "cargo build --release"],
+            "cd ic && cd tools-src/x && cargo check",
+        )
+        for script in scripts:
+            with self.subTest(script=script):
+                self.assertTrue(self.covers(script))
+
+    def test_cargo_ci_sh_manifest_resolves_against_ic(self):
+        # The runner chdirs into ic/, so a bare `x/Cargo.toml` names
+        # ic/x/Cargo.toml, not the crate.
+        self.assertFalse(self.covers(
+            "bash .gitlab/scripts/cargo-ci.sh build --manifest-path x/Cargo.toml"))
+
+    def test_plan_runner_alternative_is_unchanged(self):
+        self.assertTrue(self.covers("python3 .gitlab/scripts/wasm-tools-check.py"))
 
 
 class WasmToolsCheckShapeTests(unittest.TestCase):

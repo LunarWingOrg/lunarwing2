@@ -22,8 +22,8 @@ remain separate:
   token-scoped credential grants, MCP grants, mounts, and job iteration limits.
   This WI does not wire those containers to the shell manifest. External worker
   lanes remain governed by mt-admin's per-tenant container configuration and
-  egress allowlists, not by this envelope. Do not infer that a shell manifest
-  grants access to tools such as git or to a worker's credential grants.
+  egress allowlists, not by this envelope. The generic shell's Git extension
+  does not grant access to a worker's credentials.
 - **FullAccess/local execution** remains a separately opted-in legacy path.
   A supplied manifest refuses disabled or absent sandbox configuration rather
   than executing on the host. A request cannot select FullAccess.
@@ -96,11 +96,66 @@ size is bounded at 16 KiB.
   credential grants are unchanged. Requesting `git_credentials` here is a
   denial, not a secret lookup.
 - Omitted `extensions` is empty; every named extension is reserved and denied
-  by default. A future grant requires reviewed host policy and an enforcement
-  backend. Browser, GUI, devices and other hardware receive no access.
+  by default. The single exception is `git-remotes` (WI#816), and only when
+  the tenant operator sets `SANDBOX_GIT_REMOTES`. Browser, GUI, devices and
+  other hardware receive no access.
 - Unsupported or advisory-only behavior fails closed. The string `"proxy"` is
   accepted by the serde-shaped enum for an actionable policy denial, not exposed
   in the published request schema as a supported grant.
+
+## Git remotes (WI#816)
+
+```json
+{
+  "manifest_version": 1,
+  "network": {"mode": "proxy-enforced"},
+  "extensions": ["git-remotes"],
+  "git": {"remotes": ["origin"]}
+}
+```
+
+`extensions: ["git-remotes"]` requests a credential-free Git read grant. The
+tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
+`git.remotes` can select a subset by name but cannot add a remote.
+
+- HTTP(S) remotes require `proxy-enforced`; `none`, `tunnel`, and advisory
+  `proxy` do not carry them. All proxy traffic for that call is restricted to
+  the exact selected hosts. Each must already match the tenant sandbox egress
+  allowlist (`SANDBOX_EXTRA_DOMAINS` plus defaults); the grant adds no domain.
+- `file:///workspace/...` paths must initially resolve inside the call's
+  workspace. They work in `none`, `proxy-enforced`, and `tunnel`. A file-only
+  grant in `proxy-enforced` has no upstream hosts. A file-only grant in
+  `tunnel` does not change the existing tunnel's policy.
+- Configured URLs must not contain userinfo, a query, or a fragment. Invalid
+  configuration is reported without printing the supplied value.
+
+The manifest preflight checks recognizable Git commands before starting a
+runtime. Use a literal granted URL for cloning and name an explicit granted
+remote for fetch or pull with networking enabled. Unsupported read options
+are denied instead of guessing which argument is the remote. With network
+disabled, ordinary local reads such as `git clone . copy`, `git fetch` and
+`git pull` can run without a grant. Operations that write to the local
+workspace still need a writable mount. Calls that omit the manifest retain
+legacy behavior and do not use this preflight or the scoped proxy.
+
+The shell scan is not a security boundary: Git configuration and scripts can
+change what actually runs, and HTTPS CONNECT does not expose repository paths
+or Git operations to the proxy. Manifest preflight rejects recognized `git
+push` invocations, not just force or delete flags, because even a plain push
+can use repository-local settings. This is not a repository write filter for
+arbitrary shell processes. Use server-side permissions and branch protection
+to enforce repository write policy.
+
+The grant supplies no credential. The container receives the granted remote
+URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Host-held
+authentication and push support inside the shell remain open under WI#816.
+The separate host-side `ssh_git` tool is unchanged.
+
+`capability_evidence.git` records the grant identifier, supported egress modes,
+and per-remote name, transport, host and the `read` operation class. It reports
+the grant, not the operation a process actually performed. It never records a
+credential, token, key, URL userinfo, or helper command.
 
 ## Compatibility and retries
 
@@ -116,7 +171,7 @@ image lookup, proxy/tunnel startup, mounts, secret work, or a runtime launch.
 It is validated again on each internal retry or shell resume/retry call,
 including host working-directory canonicalization; no previous grant is
 reused. Policy denials map to `[sandbox:capability_denied]` and are never
-a transient runtime failure. A reduced network decision neither starts nor
+a transient runtime failure. A network-disabled decision neither starts nor
 stops the host's proxy or tunnel: its container gets `--network none` and
 attaches neither, so the shared transports stay up for the other calls.
 
@@ -134,8 +189,9 @@ Successful manifest-backed shell results include `capability_evidence`. This
 typed data is safe to persist in job metadata or an audit snapshot: canonical
 host source, virtual destination, writable flag, network/provider/DNS mode,
 `enforced` / `advisory` / `not-requested` status, effective resource limits,
-absence of a disk cap, empty shell secret/extension grants, and origin/policy
-ID. It contains no secret values, credentials, runtime env, or raw job token.
+absence of a disk cap, empty shell secret grants, granted extensions, and
+origin/policy ID. It contains no secret values, credentials, runtime env, or
+raw job token.
 JSON serialization handles any diagnostic strings as data.
 
 The evidence describes what this shell granted; it does not claim additional

@@ -1222,9 +1222,9 @@ _tenant_worker_start_failure_summary() {
   fi
 }
 
-# Called with errexit off, outside an ignored-errexit context. Image-contract
-# refusals (3) and lane-local configuration refusals (4) continue; shared
-# runtime/auth/config failures abort and name the selected lanes not attempted.
+# Called with errexit off, outside an ignored-errexit context. Image/task setup
+# (3), lane-local config (4), and bridge Quadlet start (5) failures continue;
+# shared failures abort and name the selected lanes not attempted.
 _start_tenant_workers() {
   local name="$1" _w worker_rc
   # Shared with upgrade_tenant_locked's degraded summary; reset on every pass.
@@ -1243,7 +1243,7 @@ _start_tenant_workers() {
       worker_rc=$?
       if [[ "$worker_rc" -ne 0 ]]; then
         TENANT_START_FAILED_WORKERS+=("$_w")
-        if [[ "$worker_rc" -ne 3 && "$worker_rc" -ne 4 ]]; then
+        if [[ "$worker_rc" -ne 3 && "$worker_rc" -ne 4 && "$worker_rc" -ne 5 ]]; then
           _record_not_attempted_workers "$name" "$_w"
           warn_err "$_w worker startup failed for $name (status $worker_rc); aborting worker pass"
           say "WARNING: tenant '$name' startup degraded; $(_tenant_worker_start_failure_summary)" >&2
@@ -1251,6 +1251,11 @@ _start_tenant_workers() {
         fi
         if [[ "$worker_rc" -eq 3 ]]; then
           say "WARNING: $_w worker image refused for $name; continuing with later selected lanes" >&2
+        elif [[ "$worker_rc" -eq 5 ]]; then
+          # WI#796: the unit/container exists but never reached its listener.
+          # Report the dead port; a green exit here is what hid a refused
+          # pebble lane behind "Connection refused (os error 111)" on dispatch.
+          warn_err "$_w worker did not start for $name (status 5); its WSS port is dead; continuing with later selected lanes"
         else
           say "WARNING: $_w worker configuration refused for $name; continuing with later selected lanes" >&2
         fi
@@ -2063,6 +2068,10 @@ upgrade_tenant_locked() {
     upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
       "worker/sandbox image promotion failed (exit $promote_rc)"
   fi
+
+  # WI#796: rebuild the enabled worker containers onto the promoted images. The
+  # start below re-creates whatever this step removes; advisory only.
+  upgrade_refresh_worker_containers "$name"
 
   local post_rc=0
   set +e

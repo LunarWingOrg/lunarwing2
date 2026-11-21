@@ -124,6 +124,7 @@ pub mod config;
 pub mod container;
 pub mod detect;
 pub mod error;
+pub mod git_grant;
 pub mod manager;
 pub mod mount_guard;
 pub mod proxy;
@@ -147,6 +148,9 @@ pub use detect::{
     DockerDetection, DockerStatus, Platform, check_docker, check_podman, podman_install_hint,
 };
 pub use error::{Result, SandboxError};
+pub use git_grant::{
+    EffectiveGitCapability, GIT_REMOTE_EXTENSION, GitGrantAuthorization, GitGrantConfig, GitRemote,
+};
 pub use manager::{ExecOutput, SandboxManager, SandboxManagerBuilder};
 pub use proxy::{
     CredentialResolver, DefaultPolicyDecider, DomainAllowlist, EnvCredentialResolver, HttpProxy,

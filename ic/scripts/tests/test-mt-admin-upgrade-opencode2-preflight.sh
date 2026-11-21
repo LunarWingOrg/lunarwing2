@@ -64,6 +64,8 @@ tenant_state_dir() { printf '%s\n' "$fixture/state"; }
 mkdir -p "$fixture/state"
 build_candidate_workers() { printf 'candidates\n' >>"$events"; }
 promote_candidate_workers() { :; }
+# The container refresh harness covers distribution; this fixture has no tenant store.
+upgrade_refresh_worker_containers() { :; }
 cleanup_candidate_workers() { :; }
 upgrade_candidate_lanes() { :; }
 

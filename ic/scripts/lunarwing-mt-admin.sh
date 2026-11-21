@@ -452,6 +452,12 @@ Commands:
   restore-worker-images <name>     Re-tag the :latest worker and sandbox images
                                    recorded before promotion (rollback without rebuild)
 
+  refresh-worker-containers <name>
+                                   Distribute each enabled lane's current image into
+                                   the tenant store and remove the worker containers
+                                   that still run a different image, so the next
+                                   start rebuilds them (WI#796)
+
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
@@ -546,6 +552,8 @@ Commands:
                                   existing named volume, health-gate, and restore daemon state
   pg-image-status <name>          Print container image reference/ID and SELECT version()
   start-worker <name> <worker>    Start one enabled external worker
+                                   3: image unavailable/incompatible or task Quadlet setup failed
+                                   4: lane configuration refused; 5: bridge Quadlet start failed
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
@@ -584,8 +592,12 @@ Commands:
                                   non-zero when unresolvable; treat that as
                                   uninspected, never as evidence.
 
-  configure-gotify <name> <url>    Set custom Gotify URL for a tenant
-                                   (updates workspace config + capabilities)
+  configure-gotify <name> <url>    Set custom Gotify URL for a tenant.
+                                   Writes <tenant state>/workspace/config/gotify.json
+                                   (= <LUNARWING_BASE_DIR>/workspace/config/gotify.json,
+                                   which the daemon merges into the tool's workspace
+                                   view) and rewrites the capability allowlist and
+                                   credential host pattern from the same host.
 
   configure-pebble <name>          Configure pebble worker for a tenant
     --nanogpt-api-key <key>        NanoGPT API key
@@ -1261,6 +1273,21 @@ main() {
       ensure_container_runtime
       _ensure_marker_dir
       restore_promoted_workers "$restore_name"
+      ;;
+
+    refresh-worker-containers)
+      # WI#796: drop the bridge/task containers of every enabled lane that still
+      # runs a different image than the one now in the tenant's store, so the
+      # next start rebuilds them from the promoted image. Idempotent and
+      # advisory: a lane already current is untouched and a failed distribution
+      # only warns (the upgrade reports the lane separately).
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: refresh-worker-containers <name>"
+      local refresh_name
+      refresh_name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$refresh_name" || die "tenant '$refresh_name' not found in registry"
+      upgrade_refresh_worker_containers "$refresh_name"
       ;;
 
     clear-promote-rollback)

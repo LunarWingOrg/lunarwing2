@@ -191,6 +191,9 @@ pub struct SandboxConfig {
     /// The sandbox-visible daemon log copy and its `/tenant-logs` mount
     /// (WI#287; `SANDBOX_TENANT_LOGS`, default `info`).
     pub tenant_logs: TenantLogsMode,
+    /// Per-tenant git remote grant (WI#816; `SANDBOX_GIT_REMOTES`). `None`
+    /// keeps the shell's git network access denied by default.
+    pub git: Option<crate::sandbox::git_grant::GitGrantConfig>,
 }
 
 impl Default for SandboxConfig {
@@ -211,6 +214,7 @@ impl Default for SandboxConfig {
             tunnel: None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: TenantLogsMode::Info,
+            git: None,
         }
     }
 }

@@ -7,6 +7,7 @@ import fnmatch
 import hashlib
 import json
 import pathlib
+import posixpath
 import re
 import shlex
 import subprocess
@@ -155,6 +156,27 @@ DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", 
 WASM_TOOL_REGISTRY = ROOT / "ic" / "registry" / "tools"
 WASM_TOOL_PLAN_JOB = "wasm-tools-check"
 WASM_TOOL_PLAN_RUNNER = ".gitlab/scripts/wasm-tools-check.py"
+# WI#825: coverage must be a cargo invocation that compiles the crate, not the
+# crate's path appearing anywhere in the script text (an echo, a comment, a
+# lone `cd`). Only these cargo subcommands produce (or type-check) a build.
+CARGO_COMPILE_SUBCOMMANDS = frozenset(
+    {"bench", "build", "check", "clippy", "install", "run", "rustc", "test"}
+)
+CARGO_CI_SCRIPT = "cargo-ci.sh"
+# .gitlab/scripts/cargo-ci.sh chdirs into ic/ before it runs cargo.
+CARGO_CI_DIRECTORY = "ic"
+SHELL_OPERATOR_CHARACTERS = frozenset("();<>|&")
+SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SHELL_PASSTHROUGH_WRAPPERS = frozenset({"builtin", "command", "exec", "nohup", "time"})
+SHELL_WRAPPERS = {
+    # wrapper: options that consume the next argument, leading positionals
+    "env": (frozenset({"--chdir", "--unset", "-C", "-u"}), 0),
+    "ionice": (frozenset({"-c", "-n", "-p"}), 0),
+    "nice": (frozenset({"-n"}), 0),
+    "taskset": (frozenset({"-c", "-p"}), 0),
+    "timeout": (frozenset({"-k", "-s", "--kill-after", "--signal"}), 1),
+}
+SHELLS = frozenset({"bash", "dash", "sh"})
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
@@ -184,6 +206,14 @@ WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi", "lunardepth")
 OPENCODE_BUILD_CONTEXTS = {
     "opencode": "opencode4lunarwing",
     "opencode2": "opencode2.4lunarwing",
+}
+# WI#806: pebble is the only lane whose manifest is a hand-maintained per-file
+# list with no Dockerfile cross-check, and it drifted: entrypoint-split.sh and
+# src/task_runner.rs were COPY'd into the image but absent from
+# worker-inputs.sha256. Every literal local COPY source under these contexts
+# (any stage, files and directory trees) must appear in that lane's manifest.
+DOCKERFILE_BUILD_CONTEXTS = {
+    "pebble": "pebble4lunarwing",
 }
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
 # cross-checks kimi-cli/package.json, npm-ci's both package dirs, tsc reads
@@ -2622,6 +2652,118 @@ def opencode_builder_script_inputs(text: str) -> set[str]:
     return inputs
 
 
+def dockerfile_local_copy_sources(text: str, context: str) -> set[str]:
+    """Literal local COPY sources under `context/`, from every stage.
+
+    Unlike opencode_builder_script_inputs this is not limited to the builder
+    stage's scripts/: the pebble lane ships its launchers and config in the
+    runtime stage, and its builder stage COPYs the whole src tree, so every
+    file beneath it is an input. Cross-stage/cross-image (`--from=`) sources
+    are not checkout files; globs and paths outside the context carry no
+    per-file identity here. Shell and JSON COPY forms, options and
+    continuations come from the shared logical-instruction reader.
+    """
+    sources: set[str] = set()
+    prefix = f"{context}/"
+    for instruction in dockerfile_instructions(text):
+        if not instruction.startswith("COPY "):
+            continue
+        arguments = instruction.removeprefix("COPY ")
+        from_stage = False
+        while arguments.startswith("--"):
+            option, _, arguments = arguments.partition(" ")
+            from_stage |= option.startswith("--from=")
+        if from_stage:
+            continue
+        if arguments.startswith("["):
+            try:
+                paths = json.loads(arguments)
+            except ValueError as exc:
+                raise ValueError(f"COPY JSON form does not parse: {exc}") from None
+        else:
+            paths = shlex.split(arguments)
+        if (
+            not isinstance(paths, list)
+            or len(paths) < 2
+            or not all(isinstance(path, str) for path in paths)
+        ):
+            raise ValueError("COPY must have source paths and a destination")
+        for source in paths[:-1]:
+            normalized = source.removeprefix("./")
+            if not normalized.startswith(prefix):
+                continue
+            if ".." in pathlib.PurePosixPath(normalized).parts:
+                continue
+            if any(char in source for char in "*?["):
+                continue
+            sources.add(normalized)
+    return sources
+
+
+def dockerfile_copy_input_files(source: str) -> list[str]:
+    """Repo-relative files a literal COPY source ships from the checkout.
+
+    A directory source ships every file beneath it, which is how the pebble
+    bridge tree arrives; checking only the directory would let a new module
+    fall outside the manifest. `target` subtrees are local build output, not
+    checkout inputs (CI checkouts are clean). A missing source cannot be
+    recorded and fails the build itself, so it contributes nothing here.
+    """
+    path = ROOT / source
+    if path.is_file():
+        return [source]
+    if not path.is_dir():
+        return []
+    source_depth = len(pathlib.PurePosixPath(source).parts)
+    inputs: list[str] = []
+    for child in sorted(path.rglob("*")):
+        if not child.is_file():
+            continue
+        relative = child.relative_to(ROOT)
+        if "target" in relative.parts[source_depth:]:
+            continue
+        inputs.append(relative.as_posix())
+    return inputs
+
+
+def opencode_builder_copy_errors(worker: str, context: str, entries: list[str]) -> list[str]:
+    """Every literal builder COPY scripts/<file> input must be in the manifest."""
+    dockerfile = ROOT / context / "Dockerfile"
+    if not dockerfile.is_file():
+        return []  # missing listed files are reported by the caller
+    try:
+        builder_scripts = opencode_builder_script_inputs(dockerfile.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return [f"{worker} cannot inspect builder COPY inputs: {exc}"]
+    errors: list[str] = []
+    for source in sorted(builder_scripts):
+        required = f"{context}/{source}"
+        if required not in entries:
+            errors.append(
+                f"{worker} worker-inputs manifest omits builder COPY input {required!r}"
+            )
+    return errors
+
+
+def dockerfile_copy_errors(worker: str, context: str, entries: list[str]) -> list[str]:
+    """Every literal local Dockerfile COPY source must be in the manifest."""
+    dockerfile = ROOT / context / "Dockerfile"
+    if not dockerfile.is_file():
+        return []  # missing listed files are reported by the caller
+    try:
+        sources = dockerfile_local_copy_sources(dockerfile.read_text(encoding="utf-8"), context)
+    except ValueError as exc:
+        return [f"{worker} cannot inspect Dockerfile COPY inputs: {exc}"]
+    errors: list[str] = []
+    for source in sorted(sources):
+        for required in dockerfile_copy_input_files(source):
+            if required not in entries:
+                errors.append(
+                    f"{worker} worker-inputs manifest omits Dockerfile COPY input {required!r}"
+                )
+    return errors
+
+
 def validate_worker_input_manifest(errors: list[str]) -> None:
     """The worker-inputs manifest is the promotion evidence of what went
     into a candidate image (CY-4: build-executed scripts must hash into it).
@@ -2637,6 +2779,10 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
     `COPY scripts/*.ts` glob cannot silently outgrow the recorded inputs.
     For both OpenCode lanes, literal builder COPY scripts/<file> inputs must
     also be listed, so a new build-time patcher cannot lose its provenance.
+    For pebble, whose hand-maintained per-file list had already drifted from
+    its Dockerfile, every literal local COPY source under the context in any
+    stage must be listed — including every file beneath a directory source
+    such as the builder's src tree (WI#806).
     The on-disk glob reads the working tree; CI checkouts are clean, so an
     untracked scratch .ts only ever fails a local run."""
     build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
@@ -2673,23 +2819,12 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
                 errors.append(
                     f"build-worker-image.sh {worker} input {entry!r} does not exist"
                 )
-        context = OPENCODE_BUILD_CONTEXTS.get(worker)
-        if context is None:
-            continue
-        dockerfile = ROOT / context / "Dockerfile"
-        if not dockerfile.is_file():
-            continue  # missing listed files are reported above
-        try:
-            builder_scripts = opencode_builder_script_inputs(dockerfile.read_text(encoding="utf-8"))
-        except ValueError as exc:
-            errors.append(f"{worker} cannot inspect builder COPY inputs: {exc}")
-            continue
-        for source in sorted(builder_scripts):
-            required = f"{context}/{source}"
-            if required not in entries:
-                errors.append(
-                    f"{worker} worker-inputs manifest omits builder COPY input {required!r}"
-                )
+        builder_context = OPENCODE_BUILD_CONTEXTS.get(worker)
+        if builder_context is not None:
+            errors.extend(opencode_builder_copy_errors(worker, builder_context, entries))
+        copy_context = DOCKERFILE_BUILD_CONTEXTS.get(worker)
+        if copy_context is not None:
+            errors.extend(dockerfile_copy_errors(worker, copy_context, entries))
     kimi_block = blocks.get("kimi")
     if kimi_block is None:
         return
@@ -2886,9 +3021,12 @@ def validate_tool_compile_coverage(merged: dict, errors: list[str]) -> None:
 def compiling_job_covers(job_name: str, source_dir: str, merged: dict) -> bool:
     """True when ``job_name`` is a blocking job that compiles ``source_dir``.
 
-    A job covers a tool when its extends-resolved script builds that source
-    directory or runs the plan-driven runner. Templates and missing jobs never
-    count.
+    A job covers a tool when its extends-resolved ``before_script`` or
+    ``script`` runs a cargo compile of that crate — from inside the crate's
+    directory or with ``--manifest-path`` naming its manifest, directly or
+    through ``cargo-ci.sh`` — or runs the plan-driven runner. A path that only
+    appears in the text (an ``echo``, a comment, a lone ``cd``) is not
+    coverage (WI#825). Templates and missing jobs never count.
     """
     if job_name.startswith(".") or job_name not in merged:
         return False
@@ -2899,7 +3037,151 @@ def compiling_job_covers(job_name: str, source_dir: str, merged: dict) -> bool:
         _script_text(effective.get(key))
         for key in ("before_script", "script")
     )
-    return source_dir in text or WASM_TOOL_PLAN_RUNNER in text
+    if WASM_TOOL_PLAN_RUNNER in text:
+        return True
+    crate_dir = posixpath.normpath(posixpath.join("ic", source_dir))
+    cwd = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for segment in _shell_segments(_shell_tokens(stripped)):
+            cwd = _shell_cwd_after(segment, cwd)
+            if _segment_compiles_crate(segment, cwd, crate_dir):
+                return True
+    return False
+
+
+def _shell_tokens(command: str) -> list[str]:
+    """Split one shell command line into words and control operators."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        # An unbalanced quote makes the command unreadable; it must never
+        # count as coverage, so the line contributes no commands.
+        return []
+
+
+def _shell_segments(tokens: list[str]) -> list[list[str]]:
+    """Split tokens at shell control operators (``&&``, ``;``, ``|``, ...)."""
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= SHELL_OPERATOR_CHARACTERS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [segment for segment in segments if segment]
+
+
+def _command_word(tokens: list[str]) -> list[str]:
+    """Tokens from the command word on, dropping assignments and wrappers."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if SHELL_ASSIGNMENT.match(token):
+            index += 1
+            continue
+        name = posixpath.basename(token)
+        if name in SHELL_PASSTHROUGH_WRAPPERS:
+            index += 1
+            continue
+        wrapper = SHELL_WRAPPERS.get(name)
+        if wrapper is None:
+            break
+        argument_options, positionals = wrapper
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 2 if tokens[index] in argument_options else 1
+        index += positionals
+    return tokens[index:]
+
+
+def _cargo_arguments(tokens: list[str], cwd: str) -> tuple[list[str], str] | None:
+    """Cargo arguments for one command and the directory they resolve against.
+
+    ``bash .gitlab/scripts/cargo-ci.sh`` yields its own arguments with ``ic/``
+    as the base because the runner chdirs there; a direct ``cargo`` uses the
+    shell's current directory. An inline ``bash -c`` script is opaque, so it
+    never counts as coverage (WI#825).
+    """
+    command = _command_word(tokens)
+    if not command:
+        return None
+    name = posixpath.basename(command[0])
+    if name == "cargo":
+        return command[1:], cwd
+    if name == CARGO_CI_SCRIPT:
+        return command[1:], CARGO_CI_DIRECTORY
+    if name not in SHELLS:
+        return None
+    index = 1
+    while index < len(command) and command[index].startswith("-"):
+        if command[index] == "-c":
+            return None
+        index += 1
+    if index >= len(command) or posixpath.basename(command[index]) != CARGO_CI_SCRIPT:
+        return None
+    return command[index + 1:], CARGO_CI_DIRECTORY
+
+
+def _cargo_manifest(arguments: list[str]) -> tuple[bool, str]:
+    """``(present, value)`` of ``--manifest-path``; value is "" when malformed."""
+    for index, argument in enumerate(arguments):
+        if argument == "--manifest-path":
+            value = arguments[index + 1] if index + 1 < len(arguments) else ""
+            return True, "" if value.startswith("-") else value
+        if argument.startswith("--manifest-path="):
+            return True, argument.split("=", 1)[1]
+    return False, ""
+
+
+def _resolve_script_path(path: str, base: str) -> str:
+    """Resolve a script path against ``base`` ("" is the repository root)."""
+    if not base or path.startswith(("/", "$")):
+        return path
+    return f"{base}/{path}"
+
+
+def _names_ci_path(path: str, expected: str) -> bool:
+    """True when ``path`` names ``expected``, allowing a variable/absolute prefix.
+
+    A path without such a prefix is compared exactly against the repository
+    relative ``expected``; ``$CI_PROJECT_DIR/ic/...`` or ``/builds/.../ic/...``
+    matches when the whole remaining path is the expected one.
+    """
+    normalized = posixpath.normpath(path)
+    if not normalized or normalized == ".":
+        return False
+    return normalized == expected or normalized.endswith(f"/{expected}")
+
+
+def _segment_compiles_crate(tokens: list[str], cwd: str, crate_dir: str) -> bool:
+    """True when one shell segment runs a cargo compile of ``crate_dir``."""
+    invocation = _cargo_arguments(tokens, cwd)
+    if invocation is None:
+        return False
+    arguments, base = invocation
+    if not arguments or arguments[0] not in CARGO_COMPILE_SUBCOMMANDS:
+        return False
+    present, manifest = _cargo_manifest(arguments)
+    if present:
+        return bool(manifest) and _names_ci_path(
+            _resolve_script_path(manifest, base), f"{crate_dir}/Cargo.toml"
+        )
+    return _names_ci_path(base, crate_dir)
+
+
+def _shell_cwd_after(tokens: list[str], cwd: str) -> str:
+    """The shell's working directory after one segment, following ``cd``."""
+    command = _command_word(tokens)
+    if len(command) < 2 or posixpath.basename(command[0]) != "cd":
+        return cwd
+    target = command[1]
+    if target in ("-", "~") or target.startswith("~/"):
+        return ""
+    return _resolve_script_path(target, cwd)
 
 
 def _script_text(script: object) -> str:

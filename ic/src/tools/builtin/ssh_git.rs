@@ -16,6 +16,8 @@
 //!   - all local paths are confined under `<base_dir>/ssh-git/` via
 //!     [`validate_path`] (rejects absolute paths, `..` traversal, symlink escape);
 //!   - the child process env is scrubbed to an allowlist (no gateway secrets);
+//!   - push refspecs that would delete a remote ref (`:main`, bare `:`) or
+//!     force it (leading `+`) are refused before git runs;
 //!   - `requires_approval = Always`, `domain = Orchestrator`, output sanitized.
 
 use std::path::{Path, PathBuf};
@@ -85,7 +87,8 @@ impl Tool for SshGitTool {
          `host` must be an alias in [[ssh.hosts]]. `path` is a location RELATIVE to the ssh-git \
          sandbox (absolute paths and '..' are rejected): the clone destination, or an existing \
          repo dir for fetch/pull/push. Authentication uses the harness ssh-agent; the private key \
-         never leaves the daemon. pull is fast-forward-only and force-push is not allowed."
+         never leaves the daemon. pull is fast-forward-only; force-push and ref \
+         deletion (a push refspec with an empty source, e.g. ':main' or ':') are not allowed."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -111,7 +114,7 @@ impl Tool for SshGitTool {
                 },
                 "ref": {
                     "type": "string",
-                    "description": "Optional branch/tag/refspec (clone --branch; fetch/pull/push refspec). Omit or pass null/empty to use Git's default ref behavior (remote HEAD for clone)."
+                    "description": "Optional branch/tag/refspec (clone --branch; fetch/pull/push refspec). Omit or pass null/empty to use Git's default ref behavior (remote HEAD for clone). Push refspecs must name a source ref; deletion spellings such as ':main', ':refs/tags/v1' or bare ':' are rejected."
                 },
                 "depth": {
                     "type": "integer",
@@ -153,9 +156,12 @@ impl Tool for SshGitTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("cannot create ssh-git root: {e}")))?;
         let repo_dir = validate_path(path_str, Some(&self.sandbox_root))?;
 
-        // --- option-injection defense on caller-influenced git args ---
+        // --- option-injection and destructive-refspec defense on caller-influenced git args ---
         if let Some(r) = git_ref {
             validate_git_arg("ref", r)?;
+            if operation == "push" {
+                validate_push_ref(r)?;
+            }
         }
 
         // --- resolve host config + agent socket + verifier (brief read lock) ---
@@ -196,11 +202,6 @@ impl Tool for SshGitTool {
                     return Err(ToolError::InvalidParameters(format!(
                         "no git repository at '{path_str}'"
                     )));
-                }
-                if operation == "push"
-                    && let Some(r) = git_ref
-                {
-                    validate_push_ref(r)?;
                 }
             }
         }
@@ -434,6 +435,9 @@ fn build_argv(
             args.push("push".into());
             args.push("origin".into());
             if let Some(r) = git_ref {
+                // Defense in depth: `execute` checks early, but no argv for a
+                // destructive refspec may be built here either.
+                validate_push_ref(r)?;
                 args.push(r.to_string());
             }
         }
@@ -462,9 +466,35 @@ fn validate_git_arg(name: &str, value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Reject force-push refspecs (a leading `+`).
+/// Reject push refspecs that would delete a remote ref or force it.
+///
+/// Git deletes a remote ref when the refspec names no source (`:main`,
+/// `:refs/tags/v1`). The bare matching-branches refspec (`:`) also has an empty
+/// source and is refused. A leading `+` marks a force update and is refused
+/// even when it accompanies a deletion (`+:main`).
 fn validate_push_ref(git_ref: &str) -> Result<(), ToolError> {
-    if git_ref.starts_with('+') {
+    let refspec = git_ref.trim();
+    let (force, spec) = match refspec.strip_prefix('+') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, refspec),
+    };
+    if spec.starts_with('-') {
+        return Err(ToolError::InvalidParameters(
+            "push refspec must not start with '-' (option injection)".into(),
+        ));
+    }
+    if spec.is_empty() {
+        return Err(ToolError::InvalidParameters(
+            "push refspec must name a source ref".into(),
+        ));
+    }
+    if spec.starts_with(':') {
+        return Err(ToolError::NotAuthorized(format!(
+            "push refspec '{refspec}' has an empty source and would delete a remote ref \
+             (or, for bare ':', push matching branches); ref deletion is not allowed"
+        )));
+    }
+    if force {
         return Err(ToolError::NotAuthorized(
             "force-push refspecs (leading '+') are not allowed".into(),
         ));
@@ -747,6 +777,13 @@ mod tests {
             build_argv("push", "", "", Some("main"), None).unwrap(),
             vec!["push", "origin", "main"]
         );
+        assert_eq!(
+            build_argv("push", "", "", Some("src:dst"), None).unwrap(),
+            vec!["push", "origin", "src:dst"]
+        );
+        assert!(build_argv("push", "", "", Some(":main"), None).is_err());
+        assert!(build_argv("push", "", "", Some(":"), None).is_err());
+        assert!(build_argv("push", "", "", Some("+:main"), None).is_err());
     }
 
     #[test]
@@ -756,6 +793,51 @@ mod tests {
         assert!(validate_git_arg("ref", "main").is_ok());
         assert!(validate_push_ref("+main").is_err());
         assert!(validate_push_ref("main").is_ok());
+    }
+
+    #[test]
+    fn test_validate_push_ref_refuses_ref_deletion() {
+        for refused in [
+            ":main",
+            ":refs/heads/main",
+            ":refs/tags/v1",
+            ":",
+            "+:main",
+            "+ :main",
+            "  :main  ",
+        ] {
+            let err = validate_push_ref(refused).unwrap_err();
+            assert!(
+                matches!(err, ToolError::NotAuthorized(_)),
+                "{refused}: {err:?}"
+            );
+            assert!(err.to_string().contains("empty source"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_push_ref_refuses_option_spellings() {
+        for refused in ["--delete", "-d", "+-d", "+", "--mirror"] {
+            let err = validate_push_ref(refused).unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidParameters(_)),
+                "{refused}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_push_ref_allows_adding_and_fast_forwarding() {
+        for allowed in [
+            "main",
+            "refs/heads/main",
+            "src:dst",
+            "refs/heads/main:refs/heads/other",
+            "v1.0.0",
+            "release/2.2",
+        ] {
+            assert!(validate_push_ref(allowed).is_ok(), "{allowed}");
+        }
     }
 
     #[tokio::test]
@@ -831,5 +913,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_push_deletion_ref_rejected_before_host_resolution() {
+        // No hosts are configured and no agent socket exists: the deletion
+        // refusal must fire first, before any SSH/agent work.
+        let tmp = TempDir::new().unwrap();
+        let tool = SshGitTool::new(bridge(vec![]).await, tmp.path().to_path_buf());
+        for refused in [":main", ":refs/tags/v1", ":"] {
+            let err = tool
+                .execute(
+                    serde_json::json!({"operation":"push","host":"unconfigured","path":"repo","ref":refused}),
+                    &JobContext::new("t", "t"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::NotAuthorized(_)), "{err:?}");
+            assert!(err.to_string().contains("delete"), "{err}");
+        }
     }
 }

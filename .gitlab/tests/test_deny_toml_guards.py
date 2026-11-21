@@ -267,6 +267,18 @@ ignore = [
             any("names no 'clearing owner <repo-relative>.md'" in error for error in errors)
         )
 
+    def test_historical_work_item_phrase_beside_document_owner_passes(self):
+        # WI#820: the guard requires a document owner, not the absence of
+        # work-item words. A historical `clearing owner WI#N` phrase kept
+        # next to the document owner is allowed; the real RUSTSEC-2021-0145
+        # reason records both forms.
+        deny = (
+            '[advisories]\nignore = [ { id = "RUSTSEC-0000-0001", '
+            'reason = "demo; historical clearing owner WI#331 (closed); '
+            'clearing owner docs/ops/EXISTS.md" } ]\n'
+        )
+        self.assertEqual(self.errors(deny, self.README_OK), [])
+
     def test_unreadable_owner_document_fails(self):
         # Tracked but absent from disk: the citation check passes, the owner
         # read must still fail so a deleted decision record is not a valid

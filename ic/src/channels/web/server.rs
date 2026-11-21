@@ -515,6 +515,8 @@ pub(super) async fn start_server_with_mascot(
         .route("/api/missions", get(missions_list_handler))
         .route("/api/missions/summary", get(missions_summary_handler))
         .route("/api/missions/{id}", get(missions_detail_handler))
+        // Runtime estimation diagnostics (work item #318; read-only)
+        .merge(crate::channels::web::handlers::estimates::routes())
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -3714,6 +3716,13 @@ mod tests {
 
     /// Build a minimal `GatewayState` for testing the OAuth callback handler.
     fn test_gateway_state(ext_mgr: Option<Arc<ExtensionManager>>) -> Arc<GatewayState> {
+        test_gateway_state_with_tools(ext_mgr, None)
+    }
+
+    fn test_gateway_state_with_tools(
+        ext_mgr: Option<Arc<ExtensionManager>>,
+        tool_registry: Option<Arc<ToolRegistry>>,
+    ) -> Arc<GatewayState> {
         Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -3723,7 +3732,7 @@ mod tests {
             log_broadcaster: None,
             log_level_handle: None,
             extension_manager: ext_mgr,
-            tool_registry: None,
+            tool_registry,
             store: None,
             job_manager: None,
             external_worker_manager: None,
@@ -3753,6 +3762,165 @@ mod tests {
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
         })
+    }
+
+    fn estimates_test_router(trace: Option<crate::estimation::EvaluationTrace>) -> Router {
+        use crate::channels::web::auth::MultiAuthState;
+        use crate::estimation::{CategoryPolicy, ToolEstimates, ToolEstimationMode};
+        use crate::tools::{
+            Tool,
+            builtin::{EchoTool, TimeTool},
+        };
+
+        let registry = Arc::new(
+            ToolRegistry::new().with_estimates(ToolEstimates::configured(
+                ToolEstimationMode::Observe,
+                CategoryPolicy::default(),
+                trace,
+            )),
+        );
+        let params = serde_json::json!({ "secret": "sk-never-rendered" });
+        let workloads: [(&str, &dyn Tool, usize); 2] =
+            [("alice", &EchoTool, 6), ("test", &TimeTool, 1)];
+        for (user, tool, calls) in workloads {
+            for _ in 0..calls {
+                let observation = registry
+                    .estimates()
+                    .begin(user, tool, &params)
+                    .expect("observation");
+                registry.estimates().complete(
+                    observation,
+                    std::time::Duration::from_millis(5),
+                    None,
+                );
+            }
+        }
+        let state = test_gateway_state_with_tools(None, Some(registry));
+        let auth = MultiAuthState::multi(std::collections::HashMap::from([
+            (
+                "owner-token".to_string(),
+                UserIdentity {
+                    user_id: "test".to_string(),
+                    workspace_read_scopes: Vec::new(),
+                },
+            ),
+            (
+                "alice-token".to_string(),
+                UserIdentity {
+                    user_id: "alice".to_string(),
+                    workspace_read_scopes: Vec::new(),
+                },
+            ),
+        ]));
+        crate::channels::web::handlers::estimates::routes()
+            .route_layer(middleware::from_fn_with_state(
+                crate::channels::web::auth::CombinedAuthState::from(auth),
+                auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn request_estimates(
+        app: &Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(builder.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn estimates_json(response: axum::response::Response) -> serde_json::Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = std::str::from_utf8(&body).expect("utf8");
+        for private in ["sk-never-rendered", "\"alice\"", "\"test\"", "tool:"] {
+            assert!(!body.contains(private));
+        }
+        serde_json::from_str(body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn estimates_routes_require_auth_and_isolate_models_from_registry_counters() {
+        let app = estimates_test_router(None);
+        for uri in [
+            "/api/estimates",
+            "/api/estimates/counters",
+            "/api/estimates/evaluation",
+        ] {
+            assert_eq!(
+                request_estimates(&app, uri, None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for (token, tool, calls) in [("alice-token", "echo", 6), ("owner-token", "time", 1)] {
+            let body =
+                estimates_json(request_estimates(&app, "/api/estimates", Some(token)).await).await;
+            let categories = body["categories"].as_array().expect("categories");
+            assert_eq!(categories.len(), 1);
+            assert_eq!(categories[0]["tool"], tool);
+            assert_eq!(categories[0]["samples"], calls);
+            assert!(body.get("estimates").is_none());
+            assert!(body.get("observations").is_none());
+        }
+        for uri in ["/api/estimates/counters", "/api/estimates/evaluation"] {
+            assert_eq!(
+                request_estimates(&app, uri, Some("alice-token"))
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let counts = estimates_json(
+            request_estimates(&app, "/api/estimates/counters", Some("owner-token")).await,
+        )
+        .await;
+        assert_eq!(
+            counts,
+            serde_json::json!({
+                "estimates": { "estimate_requests": 7, "estimates_returned": 1, "estimates_withheld": 6 },
+                "observations": { "observations_recorded": 7, "observations_dropped": 0,
+                                  "observations_clipped": 0, "duration_values_rejected": 0, "models_evicted": 0 },
+            })
+        );
+        assert_eq!(
+            request_estimates(&app, "/api/estimates/evaluation", Some("owner-token"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn estimates_evaluation_exposes_only_owner_aggregates_when_enabled() {
+        let app = estimates_test_router(Some(crate::estimation::EvaluationTrace::new(16)));
+        let uri = "/api/estimates/evaluation";
+        assert_eq!(
+            request_estimates(&app, uri, Some("alice-token"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let body = estimates_json(request_estimates(&app, uri, Some("owner-token")).await).await;
+        assert_eq!(body["recorded"], 7);
+        assert!(body.get("records").is_none());
+        let echo = &body["categories"][0];
+        assert_eq!(echo["tool"], "echo");
+        assert_eq!(echo["samples"], 6);
+        assert_eq!(echo["warmup"]["samples"], 5);
+        assert_eq!(echo["prediction_samples"], 1);
+        assert_eq!(echo["paired_samples"], 0);
+        assert!(echo["improvement_percent"].is_null());
     }
 
     async fn settings_request(
