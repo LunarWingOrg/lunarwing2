@@ -15,7 +15,7 @@
 // The hook receives the PreToolUse event as JSON on stdin. Exit codes:
 //   0 — allow, 2 — block (stderr reason is surfaced to the model),
 //   anything else — upstream treats as allow (fail-open), so this script
-//   keeps its logic dependency-free and always exits 0 or 2.
+//   keeps its logic free of third-party dependencies and always exits 0 or 2.
 //
 // This guards the dangerous classes from the upstream analyzer
 // (power/privilege/disk destruction, fork bombs, pipe-to-shell) plus
@@ -24,8 +24,16 @@
 // within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer).
 
+import { realpathSync } from "node:fs";
+import { basename, dirname } from "node:path";
+
 const MAX_COMMAND_CHARS = 16384;
 const RM_SAFE_TEMP_ROOTS = ["/tmp", "/temp", "/var/tmp"];
+// Characters that make bash rewrite the word before rm sees it: parameter and
+// command expansion, quote removal, globs and brace lists. The operand below is
+// read as rm's literal argument, so a word carrying any of them would be
+// checked in one shape and deleted in another.
+const RM_SHELL_EXPANDED_CHARS = "$`'\"*?[]{}";
 
 function deny(reason) {
   process.stderr.write(`headless-guard: denied — ${reason}\n`);
@@ -56,10 +64,49 @@ function rmOperands(words, endOfOptions) {
     .filter((token) => !/^\d*>/.test(token));
 }
 
+// Resolve the longest existing prefix of a path, following symlinks, and
+// re-attach the components that do not exist yet: rm deletes those names
+// rather than traversing them, so there is no symlink to follow there. Returns
+// null when the prefix cannot be resolved (symlink loop, permission error),
+// which denies.
+function resolveExistingPrefix(target) {
+  let prefix = target;
+  const missing = [];
+  for (;;) {
+    try {
+      const resolved = realpathSync.native(prefix);
+      if (missing.length === 0) return resolved;
+      const base = resolved.endsWith("/") ? resolved : `${resolved}/`;
+      return `${base}${missing.reverse().join("/")}`;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return null;
+      const parent = dirname(prefix);
+      if (parent === prefix) return null;
+      missing.push(basename(prefix));
+      prefix = parent;
+    }
+  }
+}
+
+// Both sides are resolved: a temp root can itself be a symlink (macOS /tmp),
+// and an operand can reach a root through one. A root that cannot be resolved
+// is dropped, so a broken root can only deny.
+const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
+  .map((root) => resolveExistingPrefix(root))
+  .filter((root) => root !== null);
+
+// Containment is decided on the resolved path (WI#812): the operand as typed
+// says nothing about where a symlink under a temp root leads. Words the shell
+// would expand into other words are refused before resolving, as is anything
+// not absolute — its root would depend on the working directory.
 function isSafeRmOperand(operand) {
-  if (operand.length === 0 || operand.startsWith("$") || operand.includes("..")) return false;
-  if (operand.includes("*") || operand.includes("?") || operand.includes("[")) return false;
-  return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
+  if (!operand.startsWith("/") || operand.includes("..")) return false;
+  for (const ch of operand) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch)) return false;
+  }
+  const resolved = resolveExistingPrefix(operand);
+  if (resolved === null) return false;
+  return RM_RESOLVED_SAFE_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`));
 }
 
 // Join backslash-LF pairs before splitting for rm. A pair is handled in every
