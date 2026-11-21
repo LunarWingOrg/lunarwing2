@@ -71,10 +71,15 @@ run_bridge() {
   export KIMI_MODE=websocket
   export WS_ROLE="${WS_ROLE:-server}"
 
+  # WI#796: same 120s window as the opencode lanes, with the wait named in the
+  # bridge log instead of leaving a bare die.
   local attempt=0
   while [[ ! -S "$RUNNER_SOCKET" ]]; do
     attempt=$((attempt + 1))
-    [[ "$attempt" -lt 30 ]] || die "task runner did not create $RUNNER_SOCKET"
+    [[ "$attempt" -le 120 ]] || die "task runner did not create $RUNNER_SOCKET after 120s"
+    if (( attempt == 1 || attempt % 10 == 0 )); then
+      log "waiting for task runner (attempt $attempt/120)"
+    fi
     sleep 1
   done
   start_health
