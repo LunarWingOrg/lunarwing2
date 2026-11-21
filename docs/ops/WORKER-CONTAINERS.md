@@ -3958,17 +3958,16 @@ auto-approval:
   `/dev/mapper` and `/dev/disk/by-*` by redirection, `of=`, `truncate`, `tee`
   or `cp`), fork bombs, remote-content-piped-to-shell, a decode command
   (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or an interpreter
-  one-liner,
-  recursive `chmod`/`chown` on system roots (including the bare `/`), forced
-  `git clean`, `git reset --hard`, a whole-tree `git checkout` and
-  `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
+  one-liner, recursive `chmod`/`chown` on system roots (including the bare
+  `/`), forced `git clean`, `git reset --hard`, a whole-tree `git checkout`
+  and `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
   `rm`, `find -delete`, `find -exec rm`, `xargs rm` or a Python, Perl, Ruby or
   Node one-liner. Every rule is checked on the original text and again on a
   shell-word view that drops quote characters and one level of backslash
-  escaping, so `"sudo"`, `\sudo` and
-  `/usr/bin/sudo` still match the privilege rule, a piped interpreter matches
-  through a path or an `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`),
-  and the recursive `chmod`/`chown` rule covers `/` (WI#813). The hook also
+  escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the privilege
+  rule, a piped interpreter matches through a path or an
+  `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`), and the recursive
+  `chmod`/`chown` rule covers `/` (WI#813). The hook also
   joins shell line continuations for every rule, not only `rm`: bash builds one
   word from a backslash-newline pair, so a continuation inside a denied word is
   checked on the joined text (WI#813). It cannot tell a real quote from an
