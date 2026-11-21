@@ -17,10 +17,11 @@ Each tenant's configuration lives under their home directory:
 │   ├── proxy.env           # Present only when --enable-proxy is selected
 │   ├── darkirc-adapter.env # Present only when --enable-darkirc is selected
 │   ├── pebble.env          # Present after configure-pebble
-│   └── gotify.json         # Gotify notification settings (optional)
+│   └── (no gotify file: see state/workspace/config/gotify.json below)
 ├── state/
 │   ├── config.toml         # Daemon settings (auto-seeded on first start)
 │   ├── workspace-template/ # Identity files (SOUL.md, IDENTITY.md, etc.)
+│   ├── workspace/config/gotify.json # Gotify settings (write via configure-gotify)
 │   ├── tools/              # Installed WASM tools
 │   ├── channels/           # Installed WASM channels
 │   ├── darkirc/            # DarkIRC state when enabled
@@ -485,17 +486,23 @@ This command refuses to overwrite any existing non-empty WeeChat configuration (
 
 ## Gotify Notifications
 
-If a Gotify server is available, configure it in `env/gotify.json`:
+Configure Gotify with `configure-gotify` (or `add-tenant --gotify-url/--gotify-title` at
+provisioning time); it writes `state/workspace/config/gotify.json`, which is
+`<LUNARWING_BASE_DIR>/workspace/config/gotify.json`:
 
-```json
-{
-  "gotify_url": "https://gotify.example.com",
-  "gotify_token": "your-app-token",
-  "gotify_title": "TenantName"
-}
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-gotify <tenant> https://gotify.example.com "TenantName"
 ```
 
-The Gotify WASM tool reads this file at runtime. You can set the URL and title during tenant creation with `--gotify-url` and `--gotify-title`.
+```json
+{"url": "https://gotify.example.com", "title": "TenantName"}
+```
+
+The daemon merges that file into the Gotify WASM tool's workspace view on every
+execution, so the tool asks the configured server. The same command rewrites the
+installed capability allowlist and credential host pattern from the same host;
+do not hand-edit either file. The app token is the `gotify_app_token` secret, not
+part of this file. See [`../guides/gotify-wasm/README.md`](../guides/gotify-wasm/README.md).
 
 ## Study Notes / Knowledge Seeding and Refresh
 
