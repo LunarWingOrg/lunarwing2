@@ -1648,7 +1648,13 @@ The URL excludes `/chat/completions`; the example hosts and function name are pl
 
 For an existing tenant, `configure-lunardepth` runs the v18 registry migration without renumbering existing ports, allocates the lane's two ports, enables `workers.lunardepth`, and writes the generic daemon endpoint with `supports_credentials = false`. The task env file contains literal unquoted route and key values; placeholder mode and a real key are distinct choices, and `--api-key-file` is refused while the unauthenticated-gateway exception is on, because no key would be stored. Podman env-file parsing therefore cannot turn the URL or credential into a value containing quote characters.
 
-`configure-lunardepth` validates and stores the route. It does not render the effective overlay; that happens at start (below). When the worker pair is running, the command applies the new configuration at once and restarts the pair if it changed, so a unit never keeps an overlay digest that no longer matches its environment. When the pair is not running, the command says that the configuration applies at the next `start-worker <tenant> lunardepth`.
+`configure-lunardepth` validates and stores the route. The effective overlay
+is rendered at start (below). If the worker pair is running, the command
+applies the configuration immediately and restarts the pair if it changed.
+An apply failure is reported as a failed start (including status **5** if the
+bridge Quadlet fails to start), but the saved configuration is not rolled back.
+Correct the startup failure and retry `start-worker <tenant> lunardepth`.
+If the pair was not running, the saved configuration applies at the next start.
 
 `LUNARDEPTH_API_KEY` is **task-visible, including to the model**. Issue a different independently revocable key per tenant, restricted to that tenant's inference. `configure-lunardepth --api-key-file` stages it only in `lunardepth-task.env`, never in the bridge, overlay, argv, logs, health, examples, or export text. The fleet command enforces the same rule: `add-tenants --lunardepth-api-key-file` is accepted for a single tenant only, and several tenants take `--lunardepth-api-key-dir <dir>` with one `<tenant>.key` file each. Two tenants with the same key are refused before the first tenant is created. `lunarwing-mt-provision-openrc.sh` has `LUNARDEPTH_API_KEY_DIR` for this. The key is not a hidden trust boundary against a model or code running with the task's authority.
 
@@ -3577,16 +3583,20 @@ tenant.
 ### Shared startup isolation (WI#469 / goal 113; WI#552)
 
 `start-tenant` and `restart-tenant` attempt selected workers in the existing
-`pebble opencode kimi opencode2` order, after starting the daemon. A stale
-image's user-contract refusal returns **3**; a refusal that depends only on one
-lane's configuration returns **4** (currently an undeclared, malformed or
-unresolvable pebble model backend). Since WI#796 an enabled lane whose image is
-absent is also **3** (it used to soft-skip), and a worker whose unit exists but
-never reaches its listener is **5**. The worker pass warns for 3, 4 and 5,
-continues to later selected lanes, then names all refused lanes and returns
-**1** if any were refused. `start-worker` exposes the starter's status 3, 4 or 5
-directly. All three refusals remain fail-closed for their own lane: no refused
-worker is launched, rendered or recorded as ready.
+`pebble opencode kimi opencode2 lunardepth` order, after starting the daemon.
+`start-worker <tenant> <worker>` returns the selected lane's startup status
+directly:
+
+- **3**: the image is unavailable (no longer a soft skip as of WI#796), its
+  user contract is incompatible, or the task Quadlet could not be set up.
+- **4**: the lane refused its configuration (for example, an undeclared,
+  malformed or unresolvable model backend).
+- **5**: the bridge Quadlet failed to start (WI#796). The command logs the
+  unit status and where to find the container logs.
+
+The tenant-wide pass records each of these as a failed lane, not as ready.
+It attempts later selected lanes. If the pass completes with those failures,
+it names the failed lanes and returns **1**.
 
 Other outcomes stay distinct:
 
@@ -4019,8 +4029,12 @@ enabled lane's `:latest` image into the tenant's rootless store and removes the
 bridge and task containers that still run a different image, so the following
 start rebuilds them from the promoted image. It is idempotent (a lane already on
 the current image is untouched), skips a deselected lane and an intentionally
-stopped OpenRC lane, and only warns when an image cannot be distributed. The
-standalone verb is:
+stopped OpenRC lane, and only warns when an image cannot be distributed. On
+OpenRC it stops each stale container's installed `-sup` supervisor before
+removing that container. A failed supervisor stop warns and skips that removal
+without changing boot registration or the lane's desired state. The standalone
+verb removes stale containers but does not start their replacements; follow
+it with `start-tenant <tenant>`:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh refresh-worker-containers <tenant>
@@ -4034,7 +4048,7 @@ the worker pass like 3 and 4 — one dead lane must not stop the others — but 
 listed under `failed worker lanes:`, so `start-tenant` returns 1 and
 `upgrade-tenant` reports **upgrade incomplete** instead of a green summary.
 `ic/scripts/tests/test-mt-admin-worker-container-refresh.sh` pins the refresh
-step and `test-mt-admin-worker-startup.sh` pins both refusals on each init path.
+step and `test-mt-admin-worker-startup.sh` pins the lane failure statuses.
 
 mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). Standalone per-lane builds retain the live operator-checkout behavior: `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
 

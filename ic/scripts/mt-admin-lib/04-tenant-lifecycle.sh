@@ -1222,9 +1222,9 @@ _tenant_worker_start_failure_summary() {
   fi
 }
 
-# Called with errexit off, outside an ignored-errexit context. Image-contract
-# refusals (3) and lane-local configuration refusals (4) continue; shared
-# runtime/auth/config failures abort and name the selected lanes not attempted.
+# Called with errexit off, outside an ignored-errexit context. Image/task setup
+# (3), lane-local config (4), and bridge Quadlet start (5) failures continue;
+# shared failures abort and name the selected lanes not attempted.
 _start_tenant_workers() {
   local name="$1" _w worker_rc
   # Shared with upgrade_tenant_locked's degraded summary; reset on every pass.

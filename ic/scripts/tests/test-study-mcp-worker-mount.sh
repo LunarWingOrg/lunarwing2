@@ -373,7 +373,14 @@ _systemctl_user() {
   systemctl_calls+=("$*")
   [[ "${2:-}" != "start" ]]
 }
+set +e
 start_tenant_opencode test >/dev/null 2>&1
+start_rc=$?
+set -e
+if [[ "$start_rc" -ne 5 ]]; then
+  printf 'OpenCode Quadlet start failure returned %s, expected 5\n' "$start_rc" >&2
+  exit 1
+fi
 reset_seen=false
 status_full_seen=false
 for call in "${systemctl_calls[@]}"; do

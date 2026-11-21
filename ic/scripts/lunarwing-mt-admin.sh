@@ -552,6 +552,8 @@ Commands:
                                   existing named volume, health-gate, and restore daemon state
   pg-image-status <name>          Print container image reference/ID and SELECT version()
   start-worker <name> <worker>    Start one enabled external worker
+                                   3: image unavailable/incompatible or task Quadlet setup failed
+                                   4: lane configuration refused; 5: bridge Quadlet start failed
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped

@@ -1563,12 +1563,19 @@ upgrade_refresh_worker_containers() {  # <name>
       running_image="$(_ctr_inspect "$name" -f '{{.Image}}' "$container" 2>/dev/null || true)"
       [[ -n "$running_image" ]] || continue
       [[ "$running_image" != "$current" ]] || continue
-      say "replacing $container: it does not run the upgraded $lane image"
       if [[ "$INIT_SYSTEM" == systemd && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
         # The Quadlet unit owns the container and Restart=on-failure would race
         # a bare rm; stop it first, as the config-change recreate path does.
         _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
+      elif [[ "$INIT_SYSTEM" == openrc ]]; then
+        # The babysitter can restart the old container while it still exists.
+        # Stop supervision without changing the lane's desired state or runlevels.
+        if ! _openrc_stop_service_if_installed "${container}-sup" >&2; then
+          say "WARNING: could not stop OpenRC supervisor ${container}-sup; skipping removal of $container" >&2
+          continue
+        fi
       fi
+      say "replacing $container: it does not run the upgraded $lane image"
       _ctr "$name" rm -f "$container" >/dev/null 2>&1 \
         || say "WARNING: could not remove $container for tenant '$name'; it stays on the previous image" >&2
     done
