@@ -89,6 +89,54 @@ parameters in its history view; it never falls back to credentials. The same
 rule now applies to v2 live delivery and recovery when a gate lacks a redacted
 snapshot (including a legacy persisted gate or a tool removed while pausing).
 
+## Diagnostics and category gating (WI#318)
+
+Two read-only gateway routes expose what observe mode learns. Both sit behind
+the existing bearer-token middleware, add no listener, and return only
+aggregate numbers plus canonical tool names — never parameters, results,
+credentials, the private learner key or another user's models.
+
+- `GET /api/estimates` is **user-scoped**: the token resolves the user and the
+  response lists only that user's categories with `samples`,
+  `duration_ema_ms`, `time_error_ema`, `confidence`, `confidence_label`
+  (`none`/`low`/`moderate`), cost/duration sample counts and
+  `hint_displayed`. It also reports the active `mode`, the category-policy
+  shape and counters: `estimate_requests`, `estimates_returned` (eligible),
+  `estimates_withheld` (cold start or warmup), `observations_recorded`,
+  `observations_dropped`, `observations_clipped`, `duration_values_rejected`
+  and `models_evicted`.
+- `GET /api/estimates/evaluation` is **owner-only** (`owner_id`) and returns
+  the opt-in held-out trace aggregate: per category, sample count, prediction
+  coverage, median absolute error of the unadjusted baseline and of the frozen
+  EMA prediction, plus `improvement_percent`. The trace records carry no user
+  identity. With the trace disabled the route answers `404` (owner) and
+  `403` for any other identity, checked before revealing whether it is on.
+
+`debug!` tracing covers evictions and clipped or rejected observations; no
+category key (which embeds the user) is ever logged.
+
+### Per-category display gating
+
+`LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates **display only** and is read once
+when each registry is built. Entries are comma-separated canonical tool names;
+positive names form an allowlist, and `-name` or `!name` suppress a category.
+Suppression wins, an empty allowlist means "every category" (the shipped
+`LUNARWING_TOOL_ESTIMATES=1` behaviour), and categories that are not displayed
+keep recording. The global `LUNARWING_TOOL_ESTIMATES=0` kill switch still
+disables recording entirely and is independent of approval and cost guards.
+Malformed or oversized entries (over 128 bytes, more than 256 entries) are
+ignored rather than treated as wildcards.
+
+### Held-out evaluation trace (A4 input)
+
+`LUNARWING_TOOL_ESTIMATES_TRACE=1` enables a bounded in-memory ring (2,048
+records; a number selects 16–8,192) of `(canonical tool name, unadjusted
+baseline, frozen EMA prediction, actual duration)`. It is written from the
+same completion path with no I/O, no parameters and no user identity; the
+oldest record is evicted when full. A disabled trace costs nothing. Reading it
+via the owner route is what feeds the per-category rollout gate; enabling
+hints for a tenant is still a separate operator decision.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
@@ -120,7 +168,10 @@ does not establish the latter workload-level result.
 The later slices in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../../../docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md)
 remain follow-ups: LLM logical-call timing, bounded whole-job/mission-run
-views, gate-wait analytics, durable aggregate caches, held-out workload
-calibration and concurrency overhead evaluation. Tool calls *within* a job
-are covered now; the whole job does not yet have an ETA. This cache never
-changes scheduling, approval policy, timeouts, provider selection, or budgets.
+views, gate-wait analytics, durable aggregate caches and the real-tenant
+held-out evaluation. The diagnostics surface, per-category display gating and
+the opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
+A4 on a tenant and enabling hints (A5) are still operator steps. Tool calls
+*within* a job are covered now; the whole job does not yet have an ETA. This
+cache never changes scheduling, approval policy, timeouts, provider selection,
+or budgets.

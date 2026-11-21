@@ -201,11 +201,11 @@ impl ToolEstimates {
         let baseline_time = tool.estimated_duration(params);
         let baseline_cost = tool.estimated_cost(params);
         self.requests.requested.fetch_add(1, Ordering::Relaxed);
-        let estimate = self.estimator.lock().ok()?.estimate_operation(
-            &key,
-            baseline_time,
-            baseline_cost,
-        );
+        let estimate =
+            self.estimator
+                .lock()
+                .ok()?
+                .estimate_operation(&key, baseline_time, baseline_cost);
         if estimate.is_some() {
             self.requests.returned.fetch_add(1, Ordering::Relaxed);
         } else {

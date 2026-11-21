@@ -63,7 +63,8 @@ impl CategoryPolicy {
 
     /// Whether `category` (a canonical tool name) may display a hint.
     pub fn allows(&self, category: &str) -> bool {
-        !self.suppress.contains(category) && (self.allow.is_empty() || self.allow.contains(category))
+        !self.suppress.contains(category)
+            && (self.allow.is_empty() || self.allow.contains(category))
     }
 
     /// Bounded, non-sensitive description for diagnostics responses.
@@ -103,7 +104,7 @@ pub(crate) struct TraceRecord {
 
 /// Opt-in bounded ring of parameter-free evaluation records.
 #[derive(Debug)]
-pub(crate) struct EvaluationTrace {
+pub struct EvaluationTrace {
     capacity: usize,
     records: VecDeque<TraceRecord>,
     evicted: u64,
@@ -131,7 +132,7 @@ impl EvaluationTrace {
         (capacity > 0).then(|| Self::new(capacity))
     }
 
-    pub fn push(&mut self, record: TraceRecord) {
+    pub(crate) fn push(&mut self, record: TraceRecord) {
         if self.records.len() >= self.capacity {
             self.records.pop_front();
             self.evicted = self.evicted.saturating_add(1);
@@ -232,7 +233,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]

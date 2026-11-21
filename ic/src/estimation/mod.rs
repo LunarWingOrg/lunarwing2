@@ -14,12 +14,12 @@ mod value;
 
 pub use cost::CostEstimator;
 pub use diagnostics::{
-    CategoryPolicy, CategoryPolicySummary, EvaluationCategory, EvaluationSummary,
+    CategoryPolicy, CategoryPolicySummary, EvaluationCategory, EvaluationSummary, EvaluationTrace,
 };
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
 pub use runtime::{
-    CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateDiagnostics, ToolEstimationMode,
-    ToolEstimates,
+    CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateDiagnostics, ToolEstimates,
+    ToolEstimationMode,
 };
 pub use time::TimeEstimator;
 pub use value::ValueEstimator;

@@ -187,10 +187,9 @@ impl EstimationLearner {
             LearnerCounters::bump(&self.counters.clipped);
             tracing::debug!(ratio, "estimation cost ratio clipped");
         }
-        if let (Some(seconds), Some(base)) = (
-            duration,
-            actuals.baseline_time.and_then(valid_duration),
-        ) {
+        if let (Some(seconds), Some(base)) =
+            (duration, actuals.baseline_time.and_then(valid_duration))
+        {
             let ratio = seconds / base;
             if !(MIN_FACTOR..=MAX_FACTOR).contains(&ratio) {
                 LearnerCounters::bump(&self.counters.clipped);
@@ -199,7 +198,10 @@ impl EstimationLearner {
         }
         if duration.is_none() && cost_ratio.is_none() {
             LearnerCounters::bump(&self.counters.dropped);
-            tracing::debug!(reason = "no_usable_measurement", "estimation observation dropped");
+            tracing::debug!(
+                reason = "no_usable_measurement",
+                "estimation observation dropped"
+            );
             return;
         }
         if let (Some(model), Some(seconds)) = (self.models.get(category), duration)

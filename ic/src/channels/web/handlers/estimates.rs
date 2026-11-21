@@ -42,19 +42,15 @@ pub async fn estimates_evaluation_handler(
         return Err((StatusCode::FORBIDDEN, "Owner access required".to_string()));
     }
     let registry = registry(&state)?;
-    registry
-        .estimates()
-        .evaluation()
-        .map(Json)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "Evaluation trace is not enabled".to_string(),
-        ))
+    registry.estimates().evaluation().map(Json).ok_or((
+        StatusCode::NOT_FOUND,
+        "Evaluation trace is not enabled".to_string(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::estimation::{CategoryPolicy, EvaluationTrace, ToolEstimationMode, ToolEstimates};
+    use crate::estimation::{CategoryPolicy, EvaluationTrace, ToolEstimates, ToolEstimationMode};
 
     /// The user-facing payload must not carry another user's models, the
     /// private learner key, or any tool parameter value.

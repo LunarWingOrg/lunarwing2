@@ -41,9 +41,7 @@ use crate::channels::web::auth::{AuthenticatedUser, UserIdentity, auth_middlewar
 use crate::channels::web::handlers::cron_workers::{
     cron_worker_control_handler, cron_worker_status_handler,
 };
-use crate::channels::web::handlers::estimates::{
-    estimates_evaluation_handler, estimates_handler,
-};
+use crate::channels::web::handlers::estimates::{estimates_evaluation_handler, estimates_handler};
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -3856,10 +3854,7 @@ mod tests {
 
         assert_eq!(
             app.clone()
-                .oneshot(request(
-                    "/api/estimates/evaluation",
-                    Some("alice-token")
-                ))
+                .oneshot(request("/api/estimates/evaluation", Some("alice-token")))
                 .await
                 .expect("response")
                 .status(),
@@ -3868,10 +3863,7 @@ mod tests {
         // Owner sees that the opt-in trace is off, not another user's data.
         assert_eq!(
             app.clone()
-                .oneshot(request(
-                    "/api/estimates/evaluation",
-                    Some("owner-token")
-                ))
+                .oneshot(request("/api/estimates/evaluation", Some("owner-token")))
                 .await
                 .expect("response")
                 .status(),
