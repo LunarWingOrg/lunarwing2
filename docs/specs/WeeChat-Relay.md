@@ -100,4 +100,8 @@ Automatically provision a working WeeChat HTTP API relay for newly created Lunar
 
 ## Source plan
 
-Decision-complete implementation details are maintained in `.omo/plans/weechat-relay-auto-bootstrap.md` and registered as plan `WeeChat-Bootstrap`.
+The [archived bootstrap plan](../plans/history/WEECHAT-BOOTSTRAP.md) retains the
+original design (registered as plan `WeeChat-Bootstrap`). Its referenced
+`.omo/plans/weechat-relay-auto-bootstrap.md` source was local to the planning
+environment and is not a repository file. This specification and the current
+WeeChat operations guide are authoritative for current behavior.

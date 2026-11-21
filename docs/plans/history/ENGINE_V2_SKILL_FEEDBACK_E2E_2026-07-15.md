@@ -1,8 +1,15 @@
 ---
 plan name: e2e-skill-feedback
 plan description: Live-tenant E2E of Engine V2 skill feedback
-plan status: active
+plan status: completed (2026-07-15)
 ---
+
+> **Historical validation plan.** The disposable OpenRC tenant run was performed,
+> its counters and exactly-once behavior were confirmed, and the tenant was
+> purged. See the [same-day status record](SELF_IMPROVING_SKILLS_STATUS_2026-07-15.md)
+> and [v2.0.1.0 release notes](../../releases/RELEASE-v2.0.1.0.md). The original
+> build settings and proposed tenant state below are retained only as evidence
+> of the plan; do not use them as a current operational runbook.
 
 ## Idea
 Execute a live end-to-end test of the uncommitted Engine V2 skill usage feedback mechanism on a disposable OpenRC tenant. Provision a new tenant, inject the current worktree's binary (with the uncommitted changes), enable SKILL_SELF_IMPROVEMENT, seed an extracted V2 skill, submit a real Engine V2 thread, verify the skill's usage metric increments exactly once, then destroy the tenant.

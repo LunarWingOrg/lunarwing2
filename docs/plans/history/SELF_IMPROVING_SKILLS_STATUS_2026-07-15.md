@@ -1,4 +1,15 @@
-What was completed today
+# Self-improving skills status — 2026-07-15
+
+> **Historical implementation record.** This is a point-in-time branch summary,
+> not a current implementation plan. The audit findings below were subsequently
+> addressed; see the [v2.0.1.0 release notes](../../releases/RELEASE-v2.0.1.0.md)
+> for the completed lifecycle and its default-disabled safeguards. The
+> [2026-07-15 audit](../../reviews/SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md)
+> remains the original findings record.
+
+Original filename: `SKILLb1b2b3STATUSTODAYWED.md`.
+
+## What was completed on 2026-07-15
 1. Engine V2 skill-feedback implementation
 Added the missing production feedback loop:
 •
