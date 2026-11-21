@@ -281,10 +281,14 @@ fn uses_direct_gitlab_config_preload(tool_name: &str, prefixes: &[String]) -> bo
 }
 
 /// Pre-load workspace documents matching the given prefixes into a sync reader.
+///
+/// `base_dir` is the daemon's [`crate::bootstrap::lunarwing_base_dir`], passed
+/// in so tests can point the host-provisioned merge at a fixture tree.
 async fn preload_workspace_reader(
     workspace: &crate::workspace::Workspace,
     tool_name: &str,
     prefixes: &[String],
+    base_dir: &std::path::Path,
 ) -> PreloadedWorkspaceReader {
     let mut data = HashMap::new();
 
@@ -325,8 +329,7 @@ async fn preload_workspace_reader(
     // derives the capability allowlist from this exact file, so the effective
     // URL and the allowlist can never name different hosts.
     if let Some(path) = host_provisioned_workspace_config(tool_name, prefixes)
-        && let Some(content) =
-            read_host_provisioned_workspace_config(&crate::bootstrap::lunarwing_base_dir(), path)
+        && let Some(content) = read_host_provisioned_workspace_config(base_dir, path)
     {
         data.insert(path.to_string(), content);
     }
@@ -1927,7 +1930,13 @@ impl Tool for WasmToolWrapper {
         let mut capabilities = self.capabilities.clone();
         if let (Some(ws), Some(ws_cap)) = (&self.workspace, &capabilities.workspace_read) {
             let prefixes = ws_cap.allowed_prefixes.clone();
-            let reader = preload_workspace_reader(ws, self.name(), &prefixes).await;
+            let reader = preload_workspace_reader(
+                ws,
+                self.name(),
+                &prefixes,
+                &crate::bootstrap::lunarwing_base_dir(),
+            )
+            .await;
             if let Some(ref mut cap) = capabilities.workspace_read {
                 cap.reader = Some(Arc::new(reader));
             }
@@ -5662,6 +5671,64 @@ mod tests {
             super::read_host_provisioned_workspace_config(base, "config/oversized.json"),
             None,
             "oversized config is not read"
+        );
+    }
+
+    /// WI#831 (AJB-1): the on-disk operator config must win in the preload,
+    /// and only for the tool and prefixes that own it.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_preload_merges_host_provisioned_gotify_config_over_store() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::tools::wasm::WorkspaceReader;
+
+        let tmp = tempfile::tempdir().expect("failed to create temp dir"); // safety: test code only
+        let base = tmp.path();
+        let disk_content = r#"{"url":"https://on-disk.example.org","title":"Operator"}"#;
+        let store_content = r#"{"url":"https://workspace-store.example.org"}"#;
+        let config_dir = base.join("workspace").join("config");
+        std::fs::create_dir_all(&config_dir).expect("failed to create config dir"); // safety: test code only
+        std::fs::write(config_dir.join("gotify.json"), disk_content)
+            .expect("failed to write on-disk config"); // safety: test code only
+
+        let backend = LibSqlBackend::new_memory()
+            .await
+            .expect("should create in-memory libsql backend"); // safety: test code only
+        backend.run_migrations().await.expect("migrations"); // safety: test code only
+        let db: Arc<dyn Database> = Arc::new(backend);
+        let workspace = crate::workspace::Workspace::new_with_db("wi831-preload", db);
+        workspace
+            .write(super::GOTIFY_CONFIG_PATH, store_content)
+            .await
+            .expect("failed to seed the workspace store copy"); // safety: test code only
+
+        // The owning tool with the config prefix: the on-disk file wins.
+        let gotify_prefixes = vec!["config/".to_string()];
+        let reader =
+            super::preload_workspace_reader(&workspace, "gotify", &gotify_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            Some(disk_content.to_string()),
+            "on-disk operator config must override the workspace store copy"
+        );
+
+        // An unrelated tool gets the store copy, never the host merge.
+        let reader =
+            super::preload_workspace_reader(&workspace, "other-tool", &gotify_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            Some(store_content.to_string()),
+            "unrelated tools get no host-provisioned merge"
+        );
+
+        // A gotify grant that excludes `config/` gets no merge either.
+        let notes_prefixes = vec!["notes/".to_string()];
+        let reader = super::preload_workspace_reader(&workspace, "gotify", &notes_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            None,
+            "a prefix grant outside config/ must not merge the config"
         );
     }
 
