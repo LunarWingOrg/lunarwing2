@@ -1219,8 +1219,13 @@ mod tests {
         );
         let json = audit_json(&decision.evidence).expect("audit");
         assert!(json.contains("host:sandbox-git-remotes"));
-        assert!(json.contains("file"));
-        for needle in ["token", "secret", "password", "PRIVATE KEY"] {
+        assert!(json.contains("\"transport\":\"file\""));
+        assert!(json.contains("\"operations\":[\"read\",\"write\"]"));
+        assert!(
+            !json.contains("git.example.test"),
+            "an unselected remote leaked into the evidence: {json}"
+        );
+        for needle in ["token", "credential-value", "password", "PRIVATE KEY", "user:"] {
             assert!(
                 !json
                     .to_ascii_lowercase()
