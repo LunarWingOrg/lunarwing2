@@ -2069,6 +2069,10 @@ upgrade_tenant_locked() {
       "worker/sandbox image promotion failed (exit $promote_rc)"
   fi
 
+  # WI#796: rebuild the enabled worker containers onto the promoted images. The
+  # start below re-creates whatever this step removes; advisory only.
+  upgrade_refresh_worker_containers "$name"
+
   local post_rc=0
   set +e
   if [[ "$do_render" == "true" ]]; then

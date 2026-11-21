@@ -452,6 +452,12 @@ Commands:
   restore-worker-images <name>     Re-tag the :latest worker and sandbox images
                                    recorded before promotion (rollback without rebuild)
 
+  refresh-worker-containers <name>
+                                   Distribute each enabled lane's current image into
+                                   the tenant store and remove the worker containers
+                                   that still run a different image, so the next
+                                   start rebuilds them (WI#796)
+
   clear-promote-rollback <name>    Drop the pre-promotion record once the whole
                                    upgrade succeeded (WI#527)
 
@@ -1261,6 +1267,21 @@ main() {
       ensure_container_runtime
       _ensure_marker_dir
       restore_promoted_workers "$restore_name"
+      ;;
+
+    refresh-worker-containers)
+      # WI#796: drop the bridge/task containers of every enabled lane that still
+      # runs a different image than the one now in the tenant's store, so the
+      # next start rebuilds them from the promoted image. Idempotent and
+      # advisory: a lane already current is untouched and a failed distribution
+      # only warns (the upgrade reports the lane separately).
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: refresh-worker-containers <name>"
+      local refresh_name
+      refresh_name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$refresh_name" || die "tenant '$refresh_name' not found in registry"
+      upgrade_refresh_worker_containers "$refresh_name"
       ;;
 
     clear-promote-rollback)
