@@ -1220,10 +1220,11 @@ Enforced controls (opencode2 lane unless noted):
    adjacent remote-config path; its remaining boundary is the tenant egress
    allowlist, and an origin the worker cannot reach supplies nothing (it
    also needs a saved key credential). Re-check on each bump.
-   **Feature flags:** the wrapper's `-console_watches` pin is
-   only as good as the pinned source. An unknown entry in `OPENCODE_FLAGS`
-   is ignored without a word, and upstream ships a feature by deleting its
-   flag. The builder stage therefore anchors the pin
+   **Feature flags:** the wrapper's
+   `-console_watches,-mcp_events,-artifacts` pin is only as good as the
+   pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
+   word, and upstream ships a feature by deleting its flag. The builder stage
+   therefore anchors the pin
    (`scripts/compile_out_remote_tunnel.py`, `check_flag_pin_anchor`) and
    fails the image when the whole-file digests of the registry
    (`packages/schema/src/config/flag.ts`) and the resolver
@@ -1231,16 +1232,28 @@ Enforced controls (opencode2 lane unless noted):
    `packages/core/src/plugin/provider/opencode.ts` no longer computes
    `watching` from `flags.enabled("console_watches")` and starts the watches
    from it as its only call site, or when the count of scanned files naming
-   `OpencodeWatches` (2) or `Flag.Overrides` (0) changes. That anchor is a
+   `OpencodeWatches` (2) or `Flag.Overrides` (0) changes. The digests cover
+   the registry keys, so a removed or renamed flag still trips them, but the
+   watch gate is the only call site anchored by hand: the `mcp_events` and
+   `artifacts` gates are covered by the digests alone, not by their own
+   anchors (WI#804: adding one is a guard change and waits for the
+   maintainer). That anchor is a
    text tripwire, necessary and not sufficient: on EVERY bump, whether or
    not it fires, re-read the flag code by hand and grep the pinned source
    for new `syncWatches` call sites, new files naming `OpencodeWatches` or
    `Flag.Overrides`, and new `OPENCODE_FLAGS` readers, then answer in the
    bump entry: for every new or removed flag, what it turns on and whether
-   the lane takes it; whether `console_watches` still gates the watches (a
-   removed flag may mean the feature shipped and the watches are now always
-   on, or that the pin predates the flag — decide which); and whether
-   anything now resolves above the variable. Then update `REVIEWED_FLAGS`,
+   the lane takes it; and, for **each of the three pinned flags**, whether
+   it still gates its own surface — `console_watches` the Console event
+   watches (`packages/core/src/plugin/provider/opencode.ts`, a removed flag
+   may mean the feature shipped and the watches are now always on, or that
+   the pin predates the flag — decide which), `mcp_events` the MCP
+   push-event capability and the `watch_mcp_event` tool
+   (`packages/core/src/mcp/index.ts`, `packages/core/src/tool/plugin/mcp-events.ts`),
+   and `artifacts` the artifact service every publisher registers with
+   (`packages/core/src/artifact.ts`, `Artifact.enabled` plus the
+   `requireEnabled` guard on each operation) — and whether anything now
+   resolves above the variable. Then update `REVIEWED_FLAGS`,
    the digests and the anchors in the same commit. Do not edit the anchor to
    make it pass without that review. For opencode2 bumps past v2.0.24 the
    compile-out guard (8) plus these guards cover the *shipped binary*;
@@ -2263,6 +2276,199 @@ CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
 
+### 2.7.2 bump — WI#804 (2026-11-21)
+
+**Re-check on 2026-11-21 09:05Z.** `npm dist-tag ls @moonshot-ai/kimi-code`
+reports `latest` **2.7.2** (the only other tag is the canary line,
+`2.7.0-canary.20261120021741-0947717`). `git ls-remote --tags` on
+`anomalyco/opencode` still resolves the newest `v2.*` tag to **v2.3.2** at
+`c0ad18b402eb2827fc1ee71c171b1177b3fc02d1` and the newest `v1.*` tag to
+**v1.19.6** at `f4e363c8295fa90a03dddc451882fffe8fbce357` — both the commits
+already pinned, so the opencode2 and opencode v1 lanes were re-checked and
+moved nowhere. Pebble and LunarDepth are out of scope by the item, but recorded
+as asked: Pebble's upstream HEAD is still the pin
+(`2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`), and LunarDepth's HEAD has moved
+to `9eb615d8362bde1b7e4cd8148c60d0cd87f00df6` from the pin
+`0472d115e5297093f249c222639431ba8ff0bb78`; a bump of either is its own item.
+
+**Pins, publication times and the 24-hour rule.** Publication times come from
+the npm `time` map (kimi) and the GitHub release `published_at` (opencode), as
+in the earlier entries.
+
+| Lane | Pin | Found by | Published | Window ended |
+|---|---|---|---|---|
+| kimi-code | **2.7.2** | npm `dist-tags.latest` | 2026-11-20 09:15Z | 2026-11-21 09:15Z |
+| opencode2 | **v2.3.2** @ `c0ad18b402eb2827fc1ee71c171b1177b3fc02d1` (re-checked, unchanged) | `git ls-remote` (newest `v2.*` tag) | 2026-11-18 01:35Z | 2026-11-19 01:35Z |
+| opencode v1 | **v1.19.6** @ `f4e363c8295fa90a03dddc451882fffe8fbce357` (re-checked, unchanged) | `git ls-remote` (newest `v1.*` tag) | 2026-11-17 07:21Z | 2026-11-18 07:21Z |
+
+The kimi chain was superseded twice inside windows: **2.7.0** (2026-11-19
+11:24Z) was superseded by **2.7.1** (2026-11-20 06:43Z) inside 2.7.0's own
+window, and 2.7.1 by **2.7.2** (npm `time`: 2026-11-20 09:15:06Z) inside
+2.7.1's. Per the item's rule the replacement is taken only after its own 24
+hours, so 2.7.2 was taken on this branch after **2026-11-21 09:15:06Z** and
+neither 2.7.0 nor 2.7.1 was ever pinned. The branch commits that move the pin
+are dated after that instant; anything prepared earlier was restaged, not
+taken.
+`latest` is 2.7.2 and the taken pin is 2.7.2; the two are stated separately
+because they need not agree (AHU-3). Both opencode tags are lightweight:
+`git ls-remote` returns the commit directly for each and no `^{}` line exists.
+
+**Files that moved together (kimi).** the Dockerfile `ARG
+KIMI_CODE_VERSION`, `kimi-cli/package.json`, `kimi-cli/package-lock.json`,
+`.env.example`, the `config/config.toml` hook comment,
+`scripts/headless_command_guard_test.ts`, `scripts/kimi_cli_contract_test.ts`,
+`AGENTS.md`, the `kimi` case of `.gitlab/scripts/build-worker-image.sh`
+(`source_ref` and `KIMI_CODE_VERSION`), and the `KIMI_CODE_VERSION` paragraph
+of this file. A search for `2.6.3` returns only historical mentions: the
+v2.3.2 entry in this file (pin table, verification, AGN-3 and local-build
+paragraphs), the trail sentences that list older pins by date
+(`kimicode4lunarwing/AGENTS.md:20`,
+`scripts/headless_command_guard_test.ts:12-13`,
+`scripts/kimi_cli_contract_test.ts:239`, the `KIMI_CODE_VERSION` paragraph
+here), `docs/releases/RELEASE-v2.2.1.0.md`, and
+`.gitlab/tests/test_ci_apt_with_retry.py:204` (an unrelated
+`APT_DPKG_VERSION` fixture). Base image digests and
+`DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged; nothing in 2.7.x required a
+change.
+
+**Kimi 2.7.2 verification.** The lock regenerated with
+`npm install --package-lock-only --ignore-scripts` drifts only in the three
+version fields and the dependency record: the tarball is
+`https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.7.2.tgz` with
+integrity
+`sha512-Eq7512ssQH632Tg7C1LIK10CykToqF2lpBdkFjJ1IjSV86fMjEHpwxuKoo6fjh5XpCbwtKwijB0hTTbyDRLM9w==`,
+matching the registry's own `dist.integrity`. `engines.node` (`>=22.19.0`) and
+the runtime dependencies (`ws`, `qrcode`, `chokidar`) are identical to 2.6.3,
+so the pinned Node 22 base still satisfies the CLI. The real-CLI contract gate
+(`scripts/kimi_cli_contract_test.ts`) ran on this host against the 2.7.2
+tarball installed under a throwaway prefix (removed afterwards): **4/4 pass** —
+headless `-p --output-format stream-json` accepted with the
+`system.version`/`turn.step.retrying` meta stream unchanged, `--yolo` rejected
+alongside `-p`, the baked `[[hooks]]` PreToolUse guard config accepted, and the
+MCP NDJSON initialize/tools-list handshake with parent-env pass-through.
+
+**AGN-3: the guard blocks end to end at 2.7.2.** A mock OpenAI-compatible
+provider (SSE) answered a headless `kimi -p` run with one Bash tool call,
+`sudo id`; the seeded config carried the baked `[[hooks]]` entry and pointed
+`base_url` at the mock. The guard denied it with exit 2 and the CLI fed the
+denial back to the model: the second provider request carried
+`{"role": "tool", "tool_call_id": "call_1", "content": "<system>ERROR: Tool
+execution failed.</system>\nheadless-guard: denied — privilege escalation"}`,
+and `sudo` never ran. During the same run `ss -ltnp` saw no listener from the
+kimi process or its children at any tick — print mode still opens no inbound
+path.
+
+**Release notes 2.7.0–2.7.2.** The three releases were read for sharing,
+tunnels, pairing, service mode, remote configuration, self-update, listeners
+and new feature flags. 2.7.1 and 2.7.2 are web/TUI fixes (draft thinking
+effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
+2.7.0's notable changes and what was verified for this lane:
+
+- **Amazon Bedrock providers** (`type = "bedrock"`, `AWS_REGION`) are a new
+  outbound destination type, config-only. The baked config declares one
+  `openai`-type provider, the workspace stays untrusted so no task-supplied
+  config is loaded, and the entrypoint renders only the operator's
+  `KIMI_BASE_URL`/`KIMI_MODEL`/`KIMI_API_KEY`. The lane takes nothing.
+- **`kimi server` without a browser**, `kimi web --json`,
+  `GET /api/v1/sessions/{id}/interactions`, `POST /api/v1/sessions/{id}:wait`,
+  `GET /api/v1/kap.md`, and the move of MCP server/OAuth management to
+  `/api/v1/mcp/*` are service-mode surfaces on a server the lane never starts
+  (verified: no listener during a headless run). No new instruction channel
+  is reachable from `kimi -p`.
+- **SSH host configuration** is an interactive TUI/settings feature that
+  needs a per-host Kimi login; the lane has no login and never runs the TUI.
+- **ACP session preview restore, `/tasks`, the follow-up behavior setting,
+  multi-line feedback and the web sidebar fixes** are TUI/web surfaces print
+  mode does not use.
+- **`KIMI_CODE_SESSION_ID` and `KIMI_CODE_WORKSPACE_ID`** are now exported to
+  Bash tool child processes: identifiers of the task's own session and
+  workspace, not credentials; the executor's reserved-variable handling is
+  unchanged and neither is read as input.
+- **One new feature flag:** `KIMI_CODE_EXPERIMENTAL_PROMPT_PREDICTION`
+  (next-prompt predictions, opt-in with `=1`). It is TUI-only, off by default,
+  set by neither the entrypoint nor the executor, and print mode does not run
+  the TUI. No branch decision is needed because the lane cannot take it;
+  recorded here per the item.
+- No sharing, tunnel, pairing, remote-configuration or auto-update change
+  appears in the notes. A `KIMI_CODE_*` name diff of the 2.6.3 and 2.7.2 dist
+  bundles shows exactly three additions — the prompt-prediction flag and the
+  two session/workspace identifiers above — and the built 2.7.2 dist still
+  carries the same `KIMI_CODE_REMOTE_CONTROL_RELAY_URL` reference 2.6.3 had,
+  no `opentunnel` occurrence, and no `tunnel` match outside HTTP-proxy
+  internals.
+
+**opencode2 re-check and the two newer flag gates (AHU-2).** The pin did not
+move, so no opencode2 image was built; the gates were re-read at `c0ad18b40`
+and the anchor was re-run on a fresh sparse clone of v2.3.2
+(`compile_out_remote_tunnel.py` exits 0, "flag pin anchor text unchanged"):
+
+- **`console_watches`** still gates the watches:
+  `packages/core/src/plugin/provider/opencode.ts:341-342` keeps the
+  two-statement gate and `syncWatches` has exactly one call site. Counts hold:
+  `OpencodeWatches` in 2 files; no scanned file uses the `Flag.Overrides`
+  access form (the resolver's own `@opencode/Flag/Overrides` string is pinned
+  by digest).
+- **`mcp_events`** is read at `packages/core/src/mcp/index.ts:268` (the pool
+  client capability, so nothing is advertised while it is off), at
+  `packages/core/src/tool/plugin/mcp-events.ts:27` (the tool returns before
+  doing anything), and at `packages/core/src/automation.ts:301,1013` (an event
+  automation fails with "Event automations require experimental.mcp_events").
+  Every reader found is behind the flag.
+- **`artifacts`** is read at `packages/core/src/artifact.ts:266`
+  (`Artifact.enabled`) and `requireEnabled()` fails every service operation
+  while it is off; the Console publisher
+  (`packages/core/src/plugin/provider/opencode-artifacts.ts`) is one provider
+  of that service, and `artifacts.sync(...)` at `opencode.ts:343` also
+  requires `next.remote?.artifacts === true`. The pin therefore holds at the
+  service layer, not at the publisher's registration — as the v2.2.1.0 review
+  note 20150 said.
+- **No anchor was added for `mcp_events` or `artifacts`.** The whole-file
+  digests cover the registry keys, and the watch gate remains the only
+  hand-anchored call site; adding per-flag anchors is a guard change and waits
+  for the maintainer (recorded on WI#804 with the two options: accept the
+  residual, or pin them off with dedicated anchors). The wrapper's
+  `-console_watches,-mcp_events,-artifacts` pin and the registry resolve order
+  are unchanged, so the env override still wins over every config document.
+- `console_policy_eval_test.py` passes **10/10** at the pin. There is no
+  candidate image to run `console_policy_eval.py` against this time because
+  the pin did not move; the item's "on every opencode2 bump" trigger is not
+  met.
+
+**AHU-2 texts.** The checklist's feature-flag paragraph now asks, for each of
+the three pinned flags, whether it still gates its own surface and names the
+file to re-read; the wrapper's comment
+(`scripts/opencode-exposure-guard.sh`), the checker's docstring and item 5
+(`scripts/exposure_policy_assert.py`), and the compile-out's docstring
+(`scripts/compile_out_remote_tunnel.py`) describe the three-flag pin, and the
+two checker failure messages that blamed "the Console event watches" for any
+forbidden flag now name the pinned-off flags generally. The wrapper's code
+lines are unchanged, so `WRAPPER_CODE_DIGEST` still matches; the checker
+(88/88), compile-out (27/27) and console-policy (10/10) unit suites pass and
+both exposure profiles (`opencode2`, `opencode-v1`) pass.
+
+**Local image build (WI#804, 2026-11-21).** `mt-admin build-kimi-worker`
+(rootful podman, slim profile) built the lane in full from revision
+`958b351cd`: all 35 steps, `Successfully tagged
+localhost/lunarwing-worker-kimi:latest`, candidate ID
+`97a9f0a4bbac7115f71f8fc8cd2c038d3e5ff340d44ece2bdc851749839b9fa6`. The
+builder's own `npm test` gate ran inside the build (the scripts context and
+the CLI lock both changed). Out-of-band checks on the built image, all with
+`--network=none`: `/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/package.json`
+is **2.7.2**, `KIMI_CODE_IMAGE_VERSION=2.7.2`, and the shipped
+`/app/scripts/kimi_cli_contract_test.js` run with
+`KIMI_BIN=/opt/kimi-cli/node_modules/.bin/kimi` reports **4/4 pass**; the
+in-image `headless_command_guard_test.js` reports **21 pass / 0 fail**.
+
+**Line cites.** The two `docs/ops/WORKER-CONTAINERS.md` self-cites in the
+v2.3.2 entry (`:1568`, `:2582` when written) had already drifted; they now
+point at `:1582` (the opencode v1 default-image paragraph) and `:1588` (the
+models.dev snapshot paragraph naming `810c0eba`). The other cites checked
+still match: `kimicode4lunarwing/AGENTS.md:20`,
+`opencode4lunarwing/Dockerfile:4`, `AGENTS.md:34`, `README.md:98-99`,
+`scripts/opencode_result.ts:41`, and
+`opencode2.4lunarwing/scripts/exposure_policy_assert.py:456` (the start of the
+v1.19.5-era server note).
+
 ### v2.3.2 bump — WI#775 (2026-11-19)
 
 **Re-check on 2026-11-20 03:35Z (WI#785).** All three pins are unchanged and
@@ -2314,7 +2520,7 @@ only historical mentions: this entry, the v2.2.7/v2.2.6/v2.2.5 entries,
 `AGENTS.md:34` and `README.md:98-99` (the v1.18.29/WI#531 trail),
 `scripts/opencode_result.ts:41` (the v1.19.5 commit named for a byte-identical
 middleware), `scripts/exposure_policy_assert.py:456` (a v1.19.5-era server
-note), and `docs/ops/WORKER-CONTAINERS.md:33`, `:1568`, `:2582` — the last
+note), and `docs/ops/WORKER-CONTAINERS.md:33`, `:1582`, `:1588` — the last
 naming `810c0eba` for the models.dev snapshot, which is unchanged at v1.19.6. Base image digests and
 `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged; nothing in the new upstream
 required a change.
@@ -3552,9 +3758,10 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.6.3` and must match `kimi-cli/package-lock.json`. WI#609 moved the pin to
-2.5.3 on 2026-11-12 and WI#775 to 2.6.3 on 2026-11-19; the engine requirement
-remains `node >=22.19.0`, satisfied by the pinned Node 22 base (2.6.3's
+`2.7.2` and must match `kimi-cli/package-lock.json`. WI#609 moved the pin to
+2.5.3 on 2026-11-12, WI#775 to 2.6.3 on 2026-11-19 and WI#804 to 2.7.2 on
+2026-11-21; the engine requirement
+remains `node >=22.19.0`, satisfied by the pinned Node 22 base (2.7.2's
 `ws`/`qrcode`/`chokidar` runtime dependencies are the same as 2.5.3's). The worker uses only headless
 `kimi -p --output-format stream-json`, not the server APIs removed in 2.5.0.
 The real-CLI contract gate (`kimi_cli_contract_test.ts`) runs during the image
