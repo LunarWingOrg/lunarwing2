@@ -414,6 +414,40 @@ contracts. Existing worker tokens and approved job credential grants are
 unchanged; generic-shell named secret injection and arbitrary mounts or devices
 are not implemented.
 
+### Git remote grant (WI#816)
+
+The reserved `extensions` entry point carries exactly one grantable capability:
+`git-remotes`. A shell call requests it, and the host decides whether the tenant
+has one through `SANDBOX_GIT_REMOTES` (`name=url[,name=url...]`). Unset or empty
+is the default and keeps today's behaviour: any git network operation in a
+manifest-backed call is refused with `capability_denied` before a runtime,
+proxy or credential is touched. Other extension names stay denied.
+
+- **Host policy decides.** `extra_remotes` from a request can only narrow the
+  host list; a name, URL, host or credential the tenant was not granted is a
+  denial. URLs with embedded userinfo, query strings, relative paths, or
+  schemes other than `https`/`http`/`file` are refused at configuration load.
+- **Remotes are limited and matched exactly.** A push or fetch names a granted
+  remote alias, or the exact canonical URL of a granted remote; relative and
+  scp-style remotes are refused. `file:///workspace/...` remotes must
+  canonicalize inside the call's own workspace.
+- **No credential enters the container.** The container receives only
+  `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries for the granted remote URLs, a
+  reset `credential.helper`, `GIT_TERMINAL_PROMPT=0` and a null global config.
+  The grant has no credential value, and a test scans the generated environment
+  for one. Private hosted repositories need a credential and therefore remain
+  outside this slice; the host-side `ssh_git` tool is unchanged.
+- **History safety.** `git push --force*`, `--mirror`, `--delete`, `--prune`,
+  the deleted spelling of `--prune-tags`, a `+refspec`, and a `:refspec` ref
+  deletion are all refused, matching and going slightly beyond `ssh_git`.
+- **Egress modes are explicit.** Network remotes work in `proxy-enforced`
+  (enforced) and the legacy advisory `proxy` (logged as advisory). They fail
+  closed in `none` and `tunnel`. `file` remotes work in every mode because they
+  never leave the container.
+- **Audited.** `capability_evidence.git` records the grant ID, the supported
+  egress modes, and per remote the name, transport, host and operation classes
+  (read/write). No URL userinfo, credential, key or token is recorded.
+
 ### Network egress tiers
 
 Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via

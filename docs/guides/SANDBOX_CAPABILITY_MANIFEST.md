@@ -96,11 +96,56 @@ size is bounded at 16 KiB.
   credential grants are unchanged. Requesting `git_credentials` here is a
   denial, not a secret lookup.
 - Omitted `extensions` is empty; every named extension is reserved and denied
-  by default. A future grant requires reviewed host policy and an enforcement
-  backend. Browser, GUI, devices and other hardware receive no access.
+  by default. The single exception is `git-remotes` (WI#816), and only when
+  the tenant operator sets `SANDBOX_GIT_REMOTES`. Browser, GUI, devices and
+  other hardware receive no access.
 - Unsupported or advisory-only behavior fails closed. The string `"proxy"` is
   accepted by the serde-shaped enum for an actionable policy denial, not exposed
   in the published request schema as a supported grant.
+
+## Git remotes (WI#816)
+
+```json
+{
+  "manifest_version": 1,
+  "network": {"mode": "proxy-enforced"},
+  "extensions": ["git-remotes"],
+  "git": {"remotes": ["origin"]}
+}
+```
+
+`extensions: ["git-remotes"]` asks for the host's per-tenant git grant. The host
+grants it with `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`:
+
+- `https://host/path` and `http://host/path` remotes need `proxy-enforced` or
+  the legacy advisory `proxy`; they fail closed under `none` and `tunnel`
+  because the grant cannot prove the remote is reachable only through the
+  allowlist. The host must also allow the remote's host in the sandbox egress
+  allowlist (`SANDBOX_EXTRA_DOMAINS`); the grant never adds a domain.
+- `file:///workspace/...` remotes are virtual paths into the call's own
+  workspace. They must canonicalize inside that workspace and work in every
+  egress mode.
+- URLs must not embed credentials or a userinfo component; such configuration
+  is a load error.
+
+Without the extension, git network operations inside a manifest-backed call are
+refused with `capability_denied` before a runtime, proxy or credential is
+started. `git.remotes` narrows the host list and can never add a remote; an
+unknown name is a denial. Inside the call, a granted remote is used by alias
+(`git push origin main`) or by its exact URL. Relative and scp-style remotes are
+refused. `git push --force`, `--force-with-lease`, `-f`, `--mirror`, `--delete`,
+`--prune`, a leading `+` refspec, and a leading `:` (ref deletion) refspec are
+denied, so a force push and a remote ref deletion are both refused.
+
+The container holds no credential. It receives the granted remote URLs as
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Private repositories
+that need a credential are out of scope: use the host-side `ssh_git` tool,
+which keeps keys in the harness agent and never enters the shell container.
+
+`capability_evidence.git` records the grant identifier, supported egress modes,
+and per-remote name, transport, host and read/write operation classes. It never
+records a credential, token, key, URL userinfo, or helper command.
 
 ## Compatibility and retries
 

@@ -887,6 +887,22 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
+**Git remote grant (WI#816).** The generic shell sandbox can use git against
+repositories an operator explicitly allows for that tenant, without a
+credential entering the container. The capability-manifest extension
+`git-remotes` requests it; `SANDBOX_GIT_REMOTES=name=url[,name=url...]` is the
+host grant, unset by default (all git network access denied). Network remotes
+(`https`/`http`) are supported only in `proxy-enforced` (enforced) and legacy
+advisory `proxy`, and fail closed under `none` and `tunnel`; `file` remotes are
+virtual `/workspace/...` paths and work in every mode. Force pushes
+(`--force`, `-f`, `--force-with-lease`, `--mirror`) and remote ref deletion
+(`--delete`, `--prune`, leading `:` refspec) are refused before execution; the
+host-side `ssh_git` tool remains the path for credential-bearing SSH access.
+The container environment carries only granted remote URLs plus git hardening
+switches. This does not touch worker lanes: mt-admin worker egress allowlists
+and worker credential grants are unchanged, and the shell sandbox still never
+exports inbound listeners.
+
 ## Worker exposure policy (WI#357)
 
 **LunarWing owns every public exposure path** through `ic/src/tunnel/`
