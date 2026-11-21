@@ -616,7 +616,11 @@ host's concurrent builds before retrying manually.
   `CARGO_TARGET_DIR` across the crates. `ci-config` fails when a production
   tool's `ci` names no blocking job that builds its registry directory (or
   runs the plan-driven `.gitlab/scripts/wasm-tools-check.py`), so a new tool is
-  covered without editing the job. Adding a tool means adding its
+  covered without editing the job. Coverage means an actual cargo compile
+  subcommand run from that directory or with `--manifest-path` naming its
+  manifest, directly or through `cargo-ci.sh`; a script that only mentions the
+  path in an `echo`, a comment or a lone `cd` does not cover the tool
+  (WI#825). Adding a tool means adding its
   `deliverables.json` entry with `wasm-tools-check` in `ci`; the MR-path
   `changes:` globs already cover every production tool directory. The job
   also runs on schedules and when `LUNARWING_CI_FULL_VALIDATION=1`, like
