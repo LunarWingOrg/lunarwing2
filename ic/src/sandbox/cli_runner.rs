@@ -1023,7 +1023,9 @@ impl CliRunner {
         // can never leave a live container registered as in-flight (which
         // would make the reaper skip it forever).
         let _inflight_guard = InflightGuard::new(name.to_string());
-        let result = self.run_container(name, &args, limits).await;
+        let result = self
+            .run_container(name, &args, limits, relay.as_ref())
+            .await;
         // The relay lives at least as long as the container process; closing
         // it earlier (e.g. on an outer-task drop racing the detached cleanup)
         // only cuts in-flight proxy streams for a container the cleanup guard
@@ -1060,6 +1062,7 @@ impl CliRunner {
         name: &str,
         args: &[String],
         limits: &ResourceLimits,
+        relay: Option<&crate::sandbox::proxy::relay::ProxyRelay>,
     ) -> Result<ContainerOutput> {
         #[cfg(test)]
         if let Some(runtime) = &self.test_runtime {
@@ -1162,10 +1165,14 @@ impl CliRunner {
                 let (stdout, stdout_trunc) = out_buf.into_string();
                 let (stderr, stderr_trunc) = err_buf.into_string();
 
-                if exit_code != 0
-                    && let Some(err) = classify_run_failure(&stderr, &self.image, exit_code)
-                {
-                    return Err(err);
+                if exit_code != 0 {
+                    let relay_unreached = relay.is_some()
+                        && !relay_reached(relay, &stderr, exit_code).await;
+                    if let Some(err) =
+                        classify_run_failure(&stderr, &self.image, exit_code, relay_unreached)
+                    {
+                        return Err(err);
+                    }
                 }
 
                 Ok(ContainerOutput {
@@ -1342,10 +1349,61 @@ fn has_runtime_error_prefix(stderr: &str) -> bool {
     })
 }
 
+/// The relay's *startup-failure* line: the marker must begin the line, and
+/// the line is only trusted together with a host-side fact (WI#836).
+///
+/// The sandboxed command shares stderr with the relay wrapper, so the command
+/// can print the marker itself. `lunarwing-proxy-relay transport:` does not
+/// match, because the marker is followed by ` transport`, not `:`.
+fn has_relay_startup_error(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.starts_with("lunarwing-proxy-relay:"))
+}
+
+/// Whether the container ever reached the host relay, waiting briefly for the
+/// accept loop to observe a connect that was queued just before the exit.
+///
+/// A connection queued in the listen backlog is visible to the container's
+/// `connect()` before the host task accepts it, so a command that connects
+/// and exits immediately can outrun the counter. The wait only runs when the
+/// cheap gate (exit 125 plus a startup-marker line) already holds.
+async fn relay_reached(
+    relay: Option<&crate::sandbox::proxy::relay::ProxyRelay>,
+    stderr: &str,
+    exit_code: i64,
+) -> bool {
+    let Some(relay) = relay else {
+        return false;
+    };
+    if relay.connected() {
+        return true;
+    }
+    if exit_code == 125 && has_relay_startup_error(stderr) {
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if relay.connected() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Map runtime-originated failures to typed errors without attributing a
 /// sandboxed command's own stderr to the host container runtime.
-fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<SandboxError> {
-    if stderr.contains("lunarwing-proxy-relay:") {
+///
+/// `relay_unreached` is the host-side evidence for a proxy failure (WI#836):
+/// a relay ran for this execution but the container never connected to it,
+/// which is the only state a failed in-container startup can produce. The
+/// command cannot forge it from stderr, so the marker alone is not enough.
+fn classify_run_failure(
+    stderr: &str,
+    image: &str,
+    exit_code: i64,
+    relay_unreached: bool,
+) -> Option<SandboxError> {
+    if relay_unreached && exit_code == 125 && has_relay_startup_error(stderr) {
         return Some(SandboxError::ProxyError {
             reason: stderr.trim().into(),
         });

@@ -52,6 +52,11 @@ pub(crate) struct ProxyRelay {
     _directory: tempfile::TempDir,
     channel: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    /// Connections accepted from the container so far (WI#836). The host
+    /// relay's own bind-time self-test runs on the std listener before this
+    /// counter exists, so a fresh relay starts at zero and only a container
+    /// that reached the socket moves it.
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProxyRelay {
@@ -61,12 +66,15 @@ impl ProxyRelay {
             relay_setup().map_err(|e| SandboxError::ProxyError {
                 reason: format!("cannot create isolated proxy transport: {e}"),
             })?;
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepted);
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
-                    accepted = listener.accept(), if connections.len() < 32 => {
-                        let Ok((mut stream, _)) = accepted else { break };
+                    connection = listener.accept(), if connections.len() < 32 => {
+                        let Ok((mut stream, _)) = connection else { break };
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         connections.spawn(async move {
                             let _ = tokio::time::timeout(std::time::Duration::from_secs(120), async {
                                 let mut proxy = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
@@ -82,6 +90,7 @@ impl ProxyRelay {
             _directory: directory,
             channel,
             task,
+            accepted,
         })
     }
 
@@ -95,6 +104,17 @@ impl ProxyRelay {
     pub fn path(&self) -> &Path {
         // The parent directory is retained until the execution supervisor ends.
         &self.channel
+    }
+
+    /// Whether any container connection reached this relay (WI#836).
+    ///
+    /// A startup failure inside the container — a missing mount, a wrong
+    /// image, a denied socket — is the only state where the relay is up but
+    /// no container ever connected. The container's own command cannot move
+    /// this counter except by actually connecting through the mounted socket,
+    /// so it is a fact the command cannot forge from stderr alone.
+    pub fn connected(&self) -> bool {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 }
 
