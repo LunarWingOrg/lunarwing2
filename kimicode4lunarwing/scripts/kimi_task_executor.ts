@@ -49,6 +49,39 @@ function taskKimiBin(enforceRootOwnership?: boolean): string {
 }
 
 /**
+ * WI#833 point 2: `KIMI_CODE_*` names a task may set in its per-task
+ * environment. Everything else with that prefix is dropped, so a new upstream
+ * name is scrubbed by default rather than reaching the CLI from task input.
+ * Both entries are informational image metadata; the CLI reads neither, so a
+ * task cannot change lane behavior through them. The names the lane owns
+ * itself (`KIMI_CODE_HOME`, `KIMI_CODE_LLM_HEADERS_TIMEOUT_MS`,
+ * `KIMI_CODE_NO_AUTO_UPDATE`) are not on the list: they are assigned after
+ * the drop, from operator values.
+ */
+export const TASK_SETTABLE_KIMI_CODE_ENV: readonly string[] = [
+  "KIMI_CODE_VERSION",
+  "KIMI_CODE_IMAGE_VERSION",
+]
+
+/**
+ * `KIMI_CODE_*` names the executor handles by its own rule, so the allowlist
+ * pass leaves them alone: the three scrubbed one at a time by their own
+ * comments, the relay URL, and the operator-owned names reassigned below
+ * (`KIMI_CODE_HOME`, `KIMI_CODE_LLM_HEADERS_TIMEOUT_MS`,
+ * `KIMI_CODE_NO_AUTO_UPDATE`). Listing them keeps one warning per drop
+ * instead of two, and stops an operator value being reported as a task drop.
+ */
+const HANDLED_KIMI_CODE_ENV = new Set([
+  "KIMI_CODE_DANGEROUS_COMMAND_GUARD",
+  "KIMI_CODE_PERMISSION_MODE_REMINDER",
+  "KIMI_CODE_TRUST_WORKSPACE",
+  "KIMI_CODE_REMOTE_CONTROL_RELAY_URL",
+  "KIMI_CODE_HOME",
+  "KIMI_CODE_LLM_HEADERS_TIMEOUT_MS",
+  "KIMI_CODE_NO_AUTO_UPDATE",
+])
+
+/**
  * WI#462 (NB-10, run-195 review): the task child's PATH carries the
  * ROOT-OWNED directories first and the task uid's toolchain directories
  * after, so whatever one task leaves in its writable directories (a planted
@@ -426,6 +459,32 @@ export async function executeTask(
     // .kimi-code/mcp.json at startup — before any model turn and outside the
     // WI#206 PreToolUse hook. Task input must never be able to grant that.
     delete env.KIMI_CODE_TRUST_WORKSPACE
+    // WI#833 point 2: the 2.7.2 dist still references a remote-control relay
+    // URL, and no relay decision is on record for this lane. It is stripped
+    // from every source (process.env spread, task env, extra proxy env) the
+    // same way the trust switch is, so no spelling of it reaches the CLI. A
+    // task-supplied value is reported — the name is new enough that seeing it
+    // in a run is worth knowing about.
+    if (Object.hasOwn(request.context?.environment ?? {}, "KIMI_CODE_REMOTE_CONTROL_RELAY_URL")) {
+      console.warn(
+        `[kimi executor] dropped task-supplied env entry KIMI_CODE_REMOTE_CONTROL_RELAY_URL for task ${request.task_id}: no remote-control relay is configured for this lane (WI#833)`,
+      )
+    }
+    delete env.KIMI_CODE_REMOTE_CONTROL_RELAY_URL
+    // WI#833 point 2: the names above were scrubbed one at a time, so every
+    // new KIMI_CODE_* name upstream adds reached the CLI from task input
+    // unless someone remembered to strip it. Now the direction is inverted:
+    // a task-supplied KIMI_CODE_* name is dropped unless it is on this
+    // allowlist, and an unknown name is dropped by default. The entries are
+    // informational image metadata; the CLI reads neither.
+    for (const key of Object.keys(request.context?.environment ?? {})) {
+      if (!key.startsWith("KIMI_CODE_") || TASK_SETTABLE_KIMI_CODE_ENV.includes(key)) continue
+      if (HANDLED_KIMI_CODE_ENV.has(key)) continue
+      delete env[key]
+      console.warn(
+        `[kimi executor] dropped task-supplied env entry ${key} for task ${request.task_id}: not on the task-settable KIMI_CODE_* allowlist (WI#833)`,
+      )
+    }
     // WI#373: AGENT_AUTH_TOKEN is the bridge's hub-handshake credential. The
     // task process runs untrusted job code, so it must never inherit the
     // token. Deleted after every merge (process.env spread, task env, extra
@@ -450,9 +509,11 @@ export async function executeTask(
     if (kimiHome) {
       env.KIMI_CODE_HOME = kimiHome
     }
-    // Auto-update and telemetry: disable to keep CI/headless runs deterministic.
-    env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE || "1"
-    env.KIMI_DISABLE_TELEMETRY = env.KIMI_DISABLE_TELEMETRY || "1"
+    // Auto-update and telemetry: forced, not defaulted (WI#833 point 3). The
+    // `||` form let a task-supplied "0"/"false" survive, so a task could turn
+    // both back on; the assignment is operator policy, so it wins.
+    env.KIMI_CODE_NO_AUTO_UPDATE = "1"
+    env.KIMI_DISABLE_TELEMETRY = "1"
     // Operator-owned request deadline: task-supplied env cannot extend it.
     env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS = String(headersTimeoutMs)
 

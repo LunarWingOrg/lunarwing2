@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "auth-token-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "reserved-env" | "auth-token-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -53,6 +53,24 @@ const reminder = process.env.KIMI_CODE_PERMISSION_MODE_REMINDER || "<unset>"
 const trust = process.env.KIMI_CODE_TRUST_WORKSPACE || "<unset>"
 const messages = [
   { role: "assistant", content: "guard=" + guard + " reminder=" + reminder + " trust=" + trust },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
+process.exit(0)
+`
+      break
+    case "reserved-env":
+      // WI#833: reports every KIMI_CODE_* name and the auto-update/telemetry
+      // switches the CLI process actually received.
+      script = `#!/usr/bin/env node
+const relay = process.env.KIMI_CODE_REMOTE_CONTROL_RELAY_URL || "<unset>"
+const update = process.env.KIMI_CODE_NO_AUTO_UPDATE || "<unset>"
+const telemetry = process.env.KIMI_DISABLE_TELEMETRY || "<unset>"
+const version = process.env.KIMI_CODE_VERSION || "<unset>"
+const imageVersion = process.env.KIMI_CODE_IMAGE_VERSION || "<unset>"
+const messages = [
+  { role: "assistant", content: "relay=" + relay + " update=" + update + " telemetry=" + telemetry + " version=" + version + " image=" + imageVersion },
 ]
 for (const m of messages) {
   process.stdout.write(JSON.stringify(m) + "\\n")
@@ -254,6 +272,86 @@ test("executeTask: task environment cannot disable the dangerous-command guard (
   assert.ok(result, "result was not emitted")
   assert.equal(result!.status, "success")
   assert.equal(result!.output, "guard=<unset> reminder=<unset> trust=<unset>")
+
+test("executeTask: a task-supplied KIMI_CODE_* name not on the allowlist never reaches the CLI (WI#833)", async () => {
+  // WI#833 point 2: the executor stripped three names one at a time, so the
+  // remote-control relay reference in the 2.7.2 dist (and every future
+  // upstream name) reached the CLI from task input. Now the direction is
+  // inverted: only the allowlisted names survive.
+  const bin = makeMockKimi("reserved-env")
+  const request: TaskRequest = {
+    task_id: "reserved-env-test",
+    prompt: "try to set reserved names",
+    timeout_ms: 10_000,
+    context: {
+      environment: {
+        KIMI_CODE_REMOTE_CONTROL_RELAY_URL: "http://relay.evil.example/control",
+        KIMI_CODE_SOME_FUTURE_FLAG: "1",
+        // The two allowlisted names still reach the CLI.
+        KIMI_CODE_VERSION: "2.7.2",
+        KIMI_CODE_IMAGE_VERSION: "2.7.2",
+      },
+    },
+  }
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "))
+  }
+  let output: string
+  try {
+    const { result } = await runExecutor(request, bin)
+    assert.ok(result, "result was not emitted")
+    assert.equal(result!.status, "success")
+    output = result!.output ?? ""
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.ok(!output.includes("relay.evil.example"), `relay URL reached the CLI: ${output}`)
+  assert.match(output, /relay=<unset>/, `relay URL must be stripped: ${output}`)
+  assert.match(output, /version=2\.7\.2/, `allowlisted KIMI_CODE_VERSION must survive: ${output}`)
+  assert.match(output, /image=2\.7\.2/, `allowlisted KIMI_CODE_IMAGE_VERSION must survive: ${output}`)
+  const dropWarnings = warnings.filter((w) =>
+    w.includes("not on the task-settable KIMI_CODE_* allowlist") || w.includes("no remote-control relay"))
+  assert.ok(
+    dropWarnings.some((w) => w.includes("KIMI_CODE_REMOTE_CONTROL_RELAY_URL")),
+    `the relay drop must be reported: ${JSON.stringify(warnings)}`,
+  )
+  assert.ok(
+    dropWarnings.some((w) => w.includes("KIMI_CODE_SOME_FUTURE_FLAG")),
+    `an unknown KIMI_CODE_* name is dropped by default: ${JSON.stringify(warnings)}`,
+  )
+  assert.ok(
+    !dropWarnings.some((w) => w.includes("KIMI_CODE_VERSION")),
+    `allowlisted names must not be reported as dropped: ${JSON.stringify(warnings)}`,
+  )
+  assert.ok(!warnings.join("\n").includes("relay.evil.example"), "the dropped value must never be logged")
+})
+
+test("executeTask: a task cannot turn auto-update or telemetry back on (WI#833)", async () => {
+  // WI#833 point 3: `env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE
+  // || "1"` let a task-supplied "0"/"false" survive, so the executor now
+  // forces both switches instead of defaulting them.
+  const bin = makeMockKimi("reserved-env")
+  for (const value of ["0", "false", "no"]) {
+    const request: TaskRequest = {
+      task_id: `switch-env-${value}`,
+      prompt: "try to re-enable the switches",
+      timeout_ms: 10_000,
+      context: {
+        environment: {
+          KIMI_CODE_NO_AUTO_UPDATE: value,
+          KIMI_DISABLE_TELEMETRY: value,
+        },
+      },
+    }
+    const { result } = await runExecutor(request, bin)
+    assert.ok(result, `result was not emitted for ${value}`)
+    assert.equal(result!.status, "success")
+    assert.match(result!.output ?? "", /update=1 telemetry=1/, `task value ${value} must be overridden: ${result!.output}`)
+  }
+})
+
 })
 
 test("executeTask: hub-handshake token never reaches the task env (WI#373)", async () => {
