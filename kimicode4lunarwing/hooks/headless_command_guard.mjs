@@ -62,13 +62,18 @@ function isSafeRmOperand(operand) {
   return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
 }
 
-// Join backslash-LF pairs before splitting for rm. A backslash-LF pair is
-// dropped in every quote state, because the hook cannot tell a real quote from
-// an apostrophe the shell reads as plain text (a heredoc body, `$'...'`).
-// Joining too much only merges lines, and an rm is still found in the merged
-// line; not joining can hide a continued rm. Escaped backslashes and
-// backslashes in comments do not continue a shell line.
-function joinLineContinuations(command) {
+// Join backslash-LF pairs before splitting for rm. A pair is handled in every
+// quote state, because the hook cannot tell a real quote from an apostrophe
+// the shell reads as plain text (a heredoc body, `$'...'`). Each pair becomes
+// `lineBreak`, or `quotedLineBreak` while the joiner believes it is inside
+// single quotes. The caller reads the whole command three ways: every pair
+// dropped (a continuation), every pair as a space (the line break that ends a
+// comment or stays in quoted text), and dropped outside single quotes but a
+// space inside them, as bash reads real single quotes. Dropping alone can glue
+// a comment's last word to a following `rm`; not dropping can hide a continued
+// rm (WI#810). Outside single quotes, escaped backslashes and backslashes in
+// comments do not continue a shell line.
+function joinLineContinuations(command, lineBreak = "", quotedLineBreak = lineBreak) {
   if (!command.includes("\\\n")) return command;
   let joined = "";
   let quote = "";
@@ -78,6 +83,7 @@ function joinLineContinuations(command) {
     if (ch === "\\" && i + 1 < command.length) {
       if (command[i + 1] === "\n") {
         i++;
+        joined += quote === "'" ? quotedLineBreak : lineBreak;
         continue;
       }
       if (quote !== "'") {
@@ -193,9 +199,12 @@ function evaluate(command) {
     const denied = checkDenyRules(segment);
     if (denied) return denied;
   }
-  for (const segment of commandSegments(joinLineContinuations(command))) {
-    const denied = checkRm(segment);
-    if (denied) return denied;
+  for (const [lineBreak, quotedLineBreak] of [["", ""], [" ", " "], ["", " "]]) {
+    const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    for (const segment of commandSegments(joined)) {
+      const denied = checkRm(segment);
+      if (denied) return denied;
+    }
   }
   return null;
 }

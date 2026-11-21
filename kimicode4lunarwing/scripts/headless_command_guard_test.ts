@@ -136,7 +136,9 @@ test("rm checks continued lines together and still allows literal temp cleanup",
   assertBlocked(`rm ${continuation}-rf ${continuation}${outsideTemp}`, "recursive/forced rm outside")
   assertAllowed(`rm -rf ${continuation}/tmp/wi795-scratch`)
   assertAllowed(`rm -rf /tmp/wi795-scratch ${continuation}&& echo done`)
-  assertAllowed(`rm -rf /var/t${continuation}mp/wi795-scratch`)
+  // A path split in the middle of a word is also read with the line break as
+  // a space, which names /var/t: denied, failing closed (WI#810 review AII-1).
+  assertBlocked(`rm -rf /var/t${continuation}mp/wi795-scratch`, "recursive/forced rm outside")
 })
 
 test("an escaped backslash does not continue an rm command onto the next line", () => {
@@ -188,14 +190,42 @@ test("a recursive rm under temp roots over a continuation line is still allowed"
   assertAllowed(`rm -rf /tmp/wi810-scratch ${continuation}&& echo done`)
 })
 
-test("literal rm text inside a quoted argument is not an rm command", () => {
-  // Joining every backslash-newline merges this printf argument into one
-  // word, so no rm word remains. bash never runs it either: WI#810 note 20355
-  // records both of these as repaired false positives, pinned so a later
-  // change cannot start denying literal text again.
+test("rm text in a quoted argument over a backslash-newline is denied, failing closed", () => {
+  // The hook cannot tell these quotes from an apostrophe in a heredoc, so the
+  // line-break reading sees an rm word. bash never runs it; the text check
+  // denied it before WI#810 as well.
   const continuation = "\\\n"
-  assertAllowed(`printf 'a${continuation}rm -rf /etc${continuation}b'`)
-  assertAllowed(`grep -F 'a${continuation}rm -rf /etc${continuation}b' file`)
+  assertBlocked(`printf 'a${continuation}rm -rf /etc${continuation}b'`, "recursive/forced rm outside")
+  assertBlocked(`grep -F 'a${continuation}rm -rf /etc${continuation}b' file`, "recursive/forced rm outside")
+})
+
+test("a comment ending in a word and a backslash does not hide the next line's rm", () => {
+  // WI#810 review AII-1: inside the joiner's single-quote state a comment is
+  // not recognised, so dropping the pair alone would glue the comment's last
+  // word to rm. bash ends the comment at the newline and runs the rm.
+  const nl = "\n"
+  const continuation = "\\\n"
+  const outsideTemp = "./wi810-check-only-tree"
+  assertBlocked(`bash -c 'true # note a${continuation}rm -rf ${outsideTemp}'`, "recursive/forced rm outside")
+  assertBlocked(`sh -c '# note a${continuation}rm -rf ${outsideTemp}'`, "recursive/forced rm outside")
+  assertBlocked(`cat <<EOF${nl}it's${nl}EOF${nl}# cleanup a${continuation}rm -rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`echo $'it\\'s' # note a${continuation}rm -rf ${outsideTemp}`, "recursive/forced rm outside")
+})
+
+test("a comment pair in quotes and a flag continuation outside them are read together", () => {
+  // Second-reader finding on WI#810 review AII-1: the comment's pair sits in
+  // the joiner's single-quote state and must read as a line break, while the
+  // flag's pair outside it must be dropped. bash deletes the directory.
+  const nl = "\n"
+  const continuation = "\\\n"
+  const outsideTemp = "./wi810-check-only-tree"
+  assertBlocked(`bash -c 'true # a${continuation}rm -v '" -${continuation}rf ${outsideTemp}"`,
+    "recursive/forced rm outside")
+  assertBlocked(`cat <<EOF${nl}it's${nl}EOF${nl}# x${continuation}rm -v "'" -${continuation}rf ${outsideTemp}`,
+    "recursive/forced rm outside")
+  assertBlocked(`bash -c 'true # a${continuation}rm -v '\\ -${continuation}rf\\ ${outsideTemp}`,
+    "recursive/forced rm outside")
 })
 
 for (const [name, terminator] of [["CR", "\r"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]]) {
