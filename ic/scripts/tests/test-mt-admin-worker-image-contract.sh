@@ -786,6 +786,19 @@ for launcher in kimicode4lunarwing/entrypoint-split.sh opencode4lunarwing/entryp
   done
 done
 
+# WI#796: pebble and kimi used to die after 30s of waiting for the task runner
+# socket, presenting to the daemon only as "Connection refused (os error 111)".
+# Every split lane now shares the 120s window the opencode lanes already used,
+# and names the wait in the bridge log.
+for launcher in pebble4lunarwing/entrypoint-split.sh kimicode4lunarwing/entrypoint-split.sh; do
+  if grep -q -- '-le 120' "$HARNESS_REPO_ROOT/$launcher" \
+      && grep -q 'waiting for task runner (attempt' "$HARNESS_REPO_ROOT/$launcher"; then
+    pass "$launcher waits 120s for the task runner and logs the wait (WI#796)"
+  else
+    fail "$launcher must wait 120s for the task runner and log the wait (WI#796)"
+  fi
+done
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1

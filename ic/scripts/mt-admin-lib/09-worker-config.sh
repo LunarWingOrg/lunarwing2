@@ -28,6 +28,19 @@ worker_ipc_volume_name() {
   printf 'lunarwing-%s-%s-ipc-v2\n' "$1" "$2"
 }
 
+# WI#796: name a worker whose Quadlet unit refused to start, then return the
+# lane status the caller must propagate (5). Before this, every lane warned and
+# returned success, so upgrade-tenant finished green while the lane's WSS port
+# was dead and the daemon reported "Connection refused (os error 111)" on the
+# next dispatch. Status 5 continues the worker pass (one lane must not block the
+# others) but it is recorded as a failed lane, so start/upgrade report degraded.
+worker_quadlet_start_failed() {  # <tenant> <service> <lane>
+  local name="$1" service="$2" lane="$3"
+  say "WARNING: $service failed to start" >&2
+  _systemctl_user "$name" status "$service" --no-pager --full >&2 || true
+  say "WARNING: $lane worker never reached its listener; dispatch will fail with Connection refused until '$service' starts. Inspect: podman logs lunarwing-${lane}-${name}" >&2
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \
@@ -1961,8 +1974,8 @@ start_tenant_opencode() {
   fi
 
   if ! _ensure_tenant_image "$name" lunarwing-worker-opencode:latest; then
-    say "opencode worker image not available; run 'build-opencode-worker' first (skipping)"
-    return 0
+    say "opencode worker image not available; run 'build-opencode-worker' first"
+    return 3
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
@@ -2001,8 +2014,8 @@ start_tenant_opencode() {
       _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$opencode_launch_contract"
       say "opencode worker ready via quadlet ($opencode_service, WSS port $wss_port)"
     else
-      say "WARNING: $opencode_service failed to start" >&2
-      _systemctl_user "$name" status "$opencode_service" --no-pager --full >&2 || true
+      worker_quadlet_start_failed "$name" "$opencode_service" opencode
+      return 5
     fi
     return 0
   fi
@@ -2220,8 +2233,8 @@ start_tenant_opencode2() {
   fi
 
   if ! _ensure_tenant_image "$name" lunarwing-worker-opencode2:latest; then
-    say "opencode2 worker image not available; run 'build-opencode2-worker' first (skipping)"
-    return 0
+    say "opencode2 worker image not available; run 'build-opencode2-worker' first"
+    return 3
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
@@ -2258,8 +2271,8 @@ start_tenant_opencode2() {
       _store_container_hash "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$launch_contract"
       say "opencode2 worker ready via quadlet ($service, WSS port $wss_port)"
     else
-      say "WARNING: $service failed to start" >&2
-      _systemctl_user "$name" status "$service" --no-pager --full >&2 || true
+      worker_quadlet_start_failed "$name" "$service" opencode2
+      return 5
     fi
     return 0
   fi
@@ -2693,8 +2706,8 @@ start_tenant_kimi() {
   fi
 
   if ! _ensure_tenant_image "$name" lunarwing-worker-kimi:latest; then
-    say "kimi worker image not available; run 'build-kimi-worker' first (skipping)"
-    return 0
+    say "kimi worker image not available; run 'build-kimi-worker' first"
+    return 3
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
@@ -2731,8 +2744,8 @@ start_tenant_kimi() {
       _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$kimi_launch_contract"
       say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
     else
-      say "WARNING: $kimi_service failed to start" >&2
-      _systemctl_user "$name" status "$kimi_service" --no-pager --full >&2 || true
+      worker_quadlet_start_failed "$name" "$kimi_service" kimi
+      return 5
     fi
     return 0
   fi
@@ -2881,8 +2894,8 @@ start_tenant_pebble() {
   fi
 
   if ! _ensure_tenant_image "$name" lunarwing-worker-pebble:latest; then
-    say "pebble worker image not available; run 'build-pebble-worker' first (skipping)"
-    return 0
+    say "pebble worker image not available; run 'build-pebble-worker' first"
+    return 3
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract). WI#422: the
@@ -2929,8 +2942,8 @@ start_tenant_pebble() {
       _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$pebble_launch_contract"
       say "pebble worker ready via quadlet ($pebble_service, WSS port $wss_port)"
     else
-      say "WARNING: $pebble_service failed to start" >&2
-      _systemctl_user "$name" status "$pebble_service" --no-pager >&2 || true
+      worker_quadlet_start_failed "$name" "$pebble_service" pebble
+      return 5
     fi
     return 0
   fi
