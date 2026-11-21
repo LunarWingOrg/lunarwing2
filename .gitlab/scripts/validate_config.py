@@ -3112,6 +3112,8 @@ def _cargo_arguments(tokens: list[str], cwd: str) -> tuple[list[str], str] | Non
     name = posixpath.basename(command[0])
     if name == "cargo":
         return command[1:], cwd
+    if name == CARGO_CI_SCRIPT:
+        return command[1:], CARGO_CI_DIRECTORY
     if name not in SHELLS:
         return None
     index = 1

@@ -183,6 +183,7 @@ class CompilingJobCoversShapeTests(unittest.TestCase):
             "env RUST_LOG=1 cargo clippy --manifest-path $CI_PROJECT_DIR/ic/tools-src/x/Cargo.toml",
             "bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --manifest-path tools-src/x/Cargo.toml",
             "bash .gitlab/scripts/cargo-ci.sh test -j2 --manifest-path=tools-src/x/Cargo.toml",
+            ".gitlab/scripts/cargo-ci.sh build --manifest-path tools-src/x/Cargo.toml",
             "taskset -c 0-5 bash .gitlab/scripts/cargo-ci.sh clippy --manifest-path tools-src/x/Cargo.toml",
             "cd ic/tools-src/x && cargo build --release",
             ["cd ic/tools-src/x", "cargo build --release"],
