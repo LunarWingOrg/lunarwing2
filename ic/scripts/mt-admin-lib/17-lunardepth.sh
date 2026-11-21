@@ -402,8 +402,8 @@ start_tenant_lunardepth() {
   container_name="lunarwing-lunardepth-$name"
   [[ -n "$wss_port" ]] || { say "no lunardepth_wss port allocated for $name (skipping)"; return 0; }
   if ! _ensure_tenant_image "$name" lunarwing-worker-lunardepth:latest; then
-    say "LunarDepth worker image not available; run 'build-lunardepth-worker' first (skipping)"
-    return 0
+    say "LunarDepth worker image not available; run 'build-lunardepth-worker' first"
+    return 3
   fi
   render_lunardepth_overlay "$name"
   launch_contract="$launch_contract;overlay=$(sha256sum "$LUNARDEPTH_OVERLAY_FILE" | cut -d' ' -f1)"
@@ -442,8 +442,8 @@ _start_lunardepth_quadlet() {
     _store_container_hash "$name" "lunarwing-lunardepth-${name}" "$quadlet_file" "$launch_contract"
     say "LunarDepth worker ready via quadlet ($service, WSS port $wss_port)"
   else
-    say "WARNING: $service failed to start" >&2
-    _systemctl_user "$name" status "$service" --no-pager --full >&2 || true
+    worker_quadlet_start_failed "$name" "$service" lunardepth
+    return 5
   fi
 }
 

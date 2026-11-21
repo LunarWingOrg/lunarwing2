@@ -1243,7 +1243,7 @@ _start_tenant_workers() {
       worker_rc=$?
       if [[ "$worker_rc" -ne 0 ]]; then
         TENANT_START_FAILED_WORKERS+=("$_w")
-        if [[ "$worker_rc" -ne 3 && "$worker_rc" -ne 4 ]]; then
+        if [[ "$worker_rc" -ne 3 && "$worker_rc" -ne 4 && "$worker_rc" -ne 5 ]]; then
           _record_not_attempted_workers "$name" "$_w"
           warn_err "$_w worker startup failed for $name (status $worker_rc); aborting worker pass"
           say "WARNING: tenant '$name' startup degraded; $(_tenant_worker_start_failure_summary)" >&2
@@ -1251,6 +1251,11 @@ _start_tenant_workers() {
         fi
         if [[ "$worker_rc" -eq 3 ]]; then
           say "WARNING: $_w worker image refused for $name; continuing with later selected lanes" >&2
+        elif [[ "$worker_rc" -eq 5 ]]; then
+          # WI#796: the unit/container exists but never reached its listener.
+          # Report the dead port; a green exit here is what hid a refused
+          # pebble lane behind "Connection refused (os error 111)" on dispatch.
+          warn_err "$_w worker did not start for $name (status 5); its WSS port is dead; continuing with later selected lanes"
         else
           say "WARNING: $_w worker configuration refused for $name; continuing with later selected lanes" >&2
         fi
