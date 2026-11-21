@@ -421,6 +421,7 @@ test("git commands that discard workspace changes are denied", () => {
 
 test("block-device writes by tee and cp are denied", () => {
   // WI#826 group E: the device rule covered redirection, of= and truncate.
+  assertBlocked("tee /dev/sda1", "block-device")
   assertBlocked("echo pwn | tee /dev/sda1", "block-device")
   assertBlocked("tee -a /dev/nvme0n1", "block-device")
   assertBlocked("cp /etc/hostname /dev/sda1", "block-device")
