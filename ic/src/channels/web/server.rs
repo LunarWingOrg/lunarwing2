@@ -3799,7 +3799,19 @@ mod tests {
                 );
             }
         }
-        let state = test_gateway_state_with_tools(None, Some(registry));
+        let mut state = test_gateway_state_with_tools(None, Some(registry));
+        // Warmed LLM timing cache: two models, one call each, so the
+        // owner-only route has a stable, non-user-scoped payload.
+        let timings = Arc::new(crate::estimation::LlmTimings::new(
+            crate::estimation::LlmTimingMode::Observe,
+        ));
+        for model in ["model-a", "model-b"] {
+            let call = timings.begin(model).expect("llm call");
+            timings.complete(call, model, std::time::Duration::from_millis(25), None);
+        }
+        Arc::get_mut(&mut state)
+            .expect("sole state owner")
+            .llm_timings = Some(timings);
         let auth = MultiAuthState::multi(std::collections::HashMap::from([
             (
                 "owner-token".to_string(),
@@ -3861,6 +3873,7 @@ mod tests {
             "/api/estimates",
             "/api/estimates/counters",
             "/api/estimates/evaluation",
+            "/api/estimates/llm",
         ] {
             assert_eq!(
                 request_estimates(&app, uri, None).await.status(),
@@ -3903,6 +3916,22 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+        assert_eq!(
+            request_estimates(&app, "/api/estimates/llm", Some("alice-token"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let llm = estimates_json(
+            request_estimates(&app, "/api/estimates/llm", Some("owner-token")).await,
+        )
+        .await;
+        assert_eq!(llm["mode"], "observe");
+        assert_eq!(llm["counters"]["calls_started"], 2);
+        assert_eq!(llm["counters"]["completions"], 2);
+        assert_eq!(llm["models"][0]["model"], "model-a");
+        assert_eq!(llm["models"][1]["model"], "model-b");
+        assert!(llm["models"][0]["estimate_ms"].is_null());
     }
 
     #[tokio::test]
