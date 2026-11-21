@@ -84,7 +84,9 @@ pub struct NetworkCapabilityRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemCapabilityRequest {
-    /// Virtual sandbox paths only; host paths never come from a request.
+    /// Virtual destinations only. The host source of `/workspace` is the
+    /// call's working directory, checked by `mount_guard`; the manifest does
+    /// not name or narrow it.
     #[serde(default = "workspace_read_only")]
     pub read_only: Vec<PathBuf>,
     #[serde(default)]
@@ -672,9 +674,9 @@ pub fn capability_manifest_schema() -> serde_json::Value {
             },
             "secrets": {
                 "type": "object", "additionalProperties": false,
-                "properties": {"names": {"type": "array", "maxItems": 0, "default": []}}
+                "properties": {"names": {"type": "array", "items": {"type": "string"}, "maxItems": 0, "default": []}}
             },
-            "extensions": {"type": "array", "maxItems": 0, "default": []}
+            "extensions": {"type": "array", "items": {"type": "string"}, "maxItems": 0, "default": []}
         }
     })
 }
@@ -894,17 +896,31 @@ mod tests {
                 .expect_err("host symlink must be canonicalized and refused");
             assert!(matches!(error, SandboxError::MountPathDenied { .. }));
         }
-        let destination = decision
-            .evidence
-            .filesystem
-            .source
-            .join("../../../../../../etc");
+        // WI#797 review AIL-3: the guard refuses what is protected (and `/`,
+        // `/run`, `/var/run`), not every system path; a `..` walk into a
+        // protected directory is refused once it is canonicalized.
+        #[cfg(unix)]
+        {
+            let walk = temp.path().join("repo/../private");
+            let refused = crate::sandbox::mount_guard::validate_mount_dir(
+                &walk,
+                &[temp.path().join("private")],
+            );
+            assert!(
+                matches!(
+                    &refused,
+                    Err(SandboxError::MountPathDenied { reason, .. })
+                        if reason.contains("protected directory")
+                ),
+                "{refused:?}"
+            );
+        }
         assert!(
             crate::sandbox::mount_guard::validate_mount_dir(
-                &destination,
+                &decision.evidence.filesystem.source,
                 &[outside.path().to_path_buf()]
             )
-            .is_err()
+            .is_ok()
         );
     }
 

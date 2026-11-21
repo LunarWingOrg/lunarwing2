@@ -71,12 +71,16 @@ size is bounded at 16 KiB.
   overlay combinations fail rather than silently reconfiguring a sidecar.
 - Omitted `filesystem` requests the existing virtual `/workspace` read-only.
   `read_write: ["/workspace"]` is allowed only when host `SandboxPolicy` is
-  `WorkspaceWrite`. Mount paths must be exactly `/workspace`, not `/`, `/etc`,
-  `../`, relative paths, or other host paths; both RO and RW are a conflict.
-  Multiple mounts and toolchain mounts are not implemented in version 1. The
-  host working directory is canonicalized and checked by the existing
-  symlink/protected-path guard, and the runner continues to mask discovered
-  protected paths and Unix sockets. Repository mount masking is *existing*
+  `WorkspaceWrite`. The virtual path must be exactly `/workspace`, not `/`,
+  `/etc`, `../`, relative paths, or other paths; both RO and RW are a
+  conflict. Multiple mounts and toolchain mounts are not implemented in
+  version 1.
+- The manifest names only the virtual destination. The host source of
+  `/workspace` is the call's working directory (`workdir`), as for a call
+  without a manifest. It is canonicalized and checked by the existing
+  `mount_guard`, which refuses the protected paths and `/`, `/run` and
+  `/var/run`, not every system directory; the runner continues to mask
+  discovered protected paths and Unix sockets. Repository mount masking is *existing*
   enforcement, not a new grant of cross-tenant host access.
 - Omitted `resources` preserves host limits. Present values must reduce or
   equal the host ceiling. `cpu_shares` is a scheduler weight, not a dedicated
@@ -112,8 +116,9 @@ image lookup, proxy/tunnel startup, mounts, secret work, or a runtime launch.
 It is validated again on each internal retry or shell resume/retry call,
 including host working-directory canonicalization; no previous grant is
 reused. Policy denials map to `[sandbox:capability_denied]` and are never
-a transient runtime failure. A reduced network decision stops a previously
-initialized wider transport before creating the reduced run.
+a transient runtime failure. A reduced network decision neither starts nor
+stops the host's proxy or tunnel: its container gets `--network none` and
+attaches neither, so the shared transports stay up for the other calls.
 
 The generated container argument is still constrained by `CliRunner`; it adds
 `--network none` for an explicit network-disabled manifest and reduced cgroup

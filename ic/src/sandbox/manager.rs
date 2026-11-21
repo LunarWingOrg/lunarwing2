@@ -148,15 +148,9 @@ impl SandboxManager {
         self.initialize_for_network(self.config.network).await
     }
 
-    async fn initialize_for_network(&self, network: SandboxNetworkMode) -> Result<()> {
-        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
-        }
-        let _initialization = self.initialization.lock().await;
-        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
-        }
-
+    /// Detect the runtime CLI and check the image. The caller holds
+    /// `initialization`.
+    async fn load_runner_locked(&self) -> Result<()> {
         if !self.config.enabled {
             return Err(SandboxError::Config {
                 reason: "sandbox is disabled".to_string(),
@@ -180,6 +174,33 @@ impl SandboxManager {
         }
 
         *self.runner.write().await = Some(runner);
+        Ok(())
+    }
+
+    /// A lowered network decision needs only the runtime: its container
+    /// attaches no proxy relay and no sidecar, so it neither starts nor stops
+    /// the host's transports that every other call shares.
+    async fn ensure_runner(&self) -> Result<()> {
+        if self.runner.read().await.is_some() {
+            return Ok(());
+        }
+        let _initialization = self.initialization.lock().await;
+        if self.runner.read().await.is_some() {
+            return Ok(());
+        }
+        self.load_runner_locked().await
+    }
+
+    async fn initialize_for_network(&self, network: SandboxNetworkMode) -> Result<()> {
+        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _initialization = self.initialization.lock().await;
+        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.load_runner_locked().await?;
 
         let tunnel_start = if network == SandboxNetworkMode::Tunnel {
             self.initialize_tunnel().await
@@ -368,12 +389,15 @@ impl SandboxManager {
             return self.execute_direct(command, cwd, env).await;
         }
 
-        if network != self.config.network {
-            // A reduced request cannot leave a previously initialized wider
-            // transport or shared sidecar attached to this execution.
-            self.shutdown().await;
+        if network == self.config.network {
+            self.initialize().await?;
+        } else {
+            // Validation lets only `none` differ from the host mode. That run
+            // gets `--network none` and joins no proxy or sidecar, so the
+            // shared transports stay up for concurrent calls (WI#797 review
+            // AIL-2).
+            self.ensure_runner().await?;
         }
-        self.initialize_for_network(network).await?;
 
         // Retry transient container failures (Docker daemon glitches, container
         // creation races) up to MAX_SANDBOX_RETRIES times with exponential backoff.
@@ -381,10 +405,6 @@ impl SandboxManager {
         let mut last_err: Option<SandboxError> = None;
 
         for attempt in 0..=MAX_SANDBOX_RETRIES {
-            if network != self.config.network {
-                // Tenant policy or transport may have changed during backoff.
-                self.shutdown().await;
-            }
             if attempt > 0 {
                 let delay = std::time::Duration::from_secs(1 << attempt); // 2s, 4s
                 tracing::warn!(
@@ -1488,6 +1508,75 @@ mod tests {
         assert!(!manager.is_initialized());
         assert!(manager.proxy.read().await.is_none());
         assert!(manager.tunnel.read().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lowered_manifest_leaves_the_shared_proxy_running() {
+        // WI#797 review AIL-2: a `none` manifest on a proxy-enforced host must
+        // not stop the proxy that calls without a manifest are using.
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
+        let temp = tempfile::tempdir().unwrap();
+        manager.initialize().await.unwrap();
+        assert!(manager.proxy.read().await.is_some());
+        let lowered = crate::sandbox::CapabilityManifest {
+            manifest_version: 1,
+            ..Default::default()
+        };
+        let decision = manager.authorize_manifest(&lowered, temp.path()).unwrap();
+        assert_eq!(decision.network, SandboxNetworkMode::None);
+        for _ in 0..2 {
+            let _ = manager
+                .execute_with_manifest("true", temp.path(), &lowered, HashMap::new())
+                .await;
+            assert!(
+                manager.is_initialized(),
+                "a lowered run reset the shared manager"
+            );
+            assert!(
+                manager.proxy.read().await.is_some(),
+                "a lowered run stopped the shared proxy"
+            );
+        }
+        // The lowered decision's container arguments attach no shared
+        // transport. A proxy-enforced run would also carry `--network none`,
+        // so check for the relay mount, the proxy env and a sidecar namespace.
+        let args = manifest_arguments(&decision);
+        assert!(
+            args.windows(2).any(|pair| pair == ["--network", "none"]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("lunarwing-proxy")
+                || arg.to_ascii_lowercase().starts_with("http_proxy=")
+                || arg.to_ascii_lowercase().starts_with("https_proxy=")
+                || arg.starts_with("container:")),
+            "a lowered run joined a shared transport: {args:?}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lowered_manifest_on_a_cold_manager_starts_no_transport() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
+        let temp = tempfile::tempdir().unwrap();
+        let lowered = crate::sandbox::CapabilityManifest {
+            manifest_version: 1,
+            ..Default::default()
+        };
+        let _ = manager
+            .execute_with_manifest("true", temp.path(), &lowered, HashMap::new())
+            .await;
+        // The lowered run needed only the runtime; the host transports start
+        // with the first call that uses them.
+        assert!(manager.proxy.read().await.is_none());
+        assert!(!manager.is_initialized());
+        manager.initialize().await.unwrap();
+        assert!(manager.proxy.read().await.is_some());
+        manager.shutdown().await;
     }
 
     #[tokio::test]
