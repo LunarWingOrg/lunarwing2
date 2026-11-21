@@ -81,6 +81,28 @@ test("dangerous-class commands are denied", () => {
   assertBlocked("ls /tmp/ssh-agent.sock", "SSH")
 })
 
+test("rm word assembly through ${IFS}, quote splices, brace lists and substitution is denied", () => {
+  // WI#824: bash builds the command word from these forms, so the raw text
+  // never contains a literal `rm` and checkRm walked past the deny class.
+  assertBlocked("rm${IFS}-rf${IFS}/etc", "recursive/forced rm outside")
+  assertBlocked("rm$IFS-rf$IFS/etc", "recursive/forced rm outside")
+  assertBlocked("r''m -rf /etc", "recursive/forced rm outside")
+  assertBlocked('r"m" -rf /etc', "recursive/forced rm outside")
+  assertBlocked("{rm,-rf,/etc}", "recursive/forced rm outside")
+  assertBlocked("$(echo rm) -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("echo $(echo rm) -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("`echo rm` -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("echo `echo rm` -rf /home/kumo", "recursive/forced rm outside")
+  // The flag word assembled around a backslash-newline (WI#824 table).
+  const continuation = "\\\n"
+  assertBlocked(`rm "-r${continuation}f" /etc`, "rm")
+  // Operands still resolve: the assembled word is checked, not blanket-denied.
+  assertAllowed("$(echo rm) -rf /tmp/wi824-scratch")
+  assertAllowed("rm${IFS}-rf${IFS}/tmp/wi824-scratch")
+  assertAllowed("rm -rf /tmp/wi824-{debug,release}")
+  assertAllowed("ls {a,b}")
+})
+
 test("ordinary work commands are allowed", () => {
   assertAllowed("echo hello")
   assertAllowed("grep -rn needle .")

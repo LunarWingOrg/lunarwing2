@@ -271,7 +271,9 @@ function evaluate(command) {
   // bash joins every backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
   // rule on the joined text and on the word view bash builds, the same three
-  // readings rm uses (WI#813).
+  // readings rm uses (WI#813). rm also runs on its word-assembly view, where
+  // the command word exists only after `${IFS}` splitting, brace expansion or
+  // substitution (WI#824).
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
