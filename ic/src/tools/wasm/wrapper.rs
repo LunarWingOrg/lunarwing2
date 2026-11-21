@@ -211,6 +211,56 @@ fn enforce_scoped_http_target(
 
 const GITLAB_CONFIG_PATH: &str = "config/gitlab.json";
 
+/// Workspace config the host may also provision on disk under
+/// `<base_dir>/workspace/`.
+///
+/// mt-admin's `write_tenant_gotify_config` writes `config/gotify.json` there
+/// and `configure_gotify_capabilities` rewrites the tool's HTTP allowlist and
+/// credential host pattern from the same file. The workspace store only
+/// receives `.md` templates at startup, so without this fallback the guest's
+/// `workspace_read("config/gotify.json")` never sees the operator's URL: the
+/// tool falls back to its compiled-in host while the capability allowlist
+/// names the custom host, and notifications fail (WI#817).
+const GOTIFY_CONFIG_PATH: &str = "config/gotify.json";
+
+/// Upper bound for host-provisioned config files merged into a preload.
+/// The real files are a few hundred bytes; the cap keeps a tenant-writable
+/// tree from feeding the guest unbounded input.
+const MAX_HOST_PROVISIONED_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Relative path, if any, that `tool_name` should have merged from
+/// `<base_dir>/workspace/` into its preloaded workspace reader.
+fn host_provisioned_workspace_config(tool_name: &str, prefixes: &[String]) -> Option<&'static str> {
+    let path = match tool_name {
+        "gotify" | "gotify-tool" => GOTIFY_CONFIG_PATH,
+        _ => return None,
+    };
+    // An empty prefix list grants the whole workspace, mirroring
+    // `HostState::workspace_read`.
+    let allowed = prefixes.is_empty()
+        || prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()));
+    allowed.then_some(path)
+}
+
+/// Read a host-provisioned workspace config from `<base_dir>/workspace/<path>`.
+///
+/// Refuses symlinks (the tree is tenant-writable) and files over
+/// [`MAX_HOST_PROVISIONED_CONFIG_BYTES`]. A failed read yields `None` so the
+/// caller keeps whatever it already loaded.
+fn read_host_provisioned_workspace_config(
+    base_dir: &std::path::Path,
+    path: &str,
+) -> Option<String> {
+    let file_path = base_dir.join("workspace").join(path);
+    let metadata = std::fs::symlink_metadata(&file_path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_HOST_PROVISIONED_CONFIG_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(&file_path).ok()
+}
+
 /// Workspace reader backed by pre-loaded data.
 ///
 /// Loaded asynchronously before WASM execution so the sync host function
@@ -269,6 +319,16 @@ async fn preload_workspace_reader(
                 tracing::debug!(path = %path, "Failed to pre-load workspace doc for WASM: {e}");
             }
         }
+    }
+
+    // Operator-provisioned config wins over the store copy (WI#817): mt-admin
+    // derives the capability allowlist from this exact file, so the effective
+    // URL and the allowlist can never name different hosts.
+    if let Some(path) = host_provisioned_workspace_config(tool_name, prefixes)
+        && let Some(content) =
+            read_host_provisioned_workspace_config(&crate::bootstrap::lunarwing_base_dir(), path)
+    {
+        data.insert(path.to_string(), content);
     }
 
     if !data.is_empty() {
@@ -5468,6 +5528,77 @@ mod tests {
             &[super::GITLAB_CONFIG_PATH.to_string(), "notes/".to_string()]
         ));
         assert!(!super::uses_direct_gitlab_config_preload("gitlab", &[]));
+    }
+
+    #[test]
+    fn test_host_provisioned_workspace_config_is_gotify_only() {
+        let config_prefix = ["config/".to_string()];
+        assert_eq!(
+            super::host_provisioned_workspace_config("gotify", &config_prefix),
+            Some(super::GOTIFY_CONFIG_PATH)
+        );
+        assert_eq!(
+            super::host_provisioned_workspace_config("gotify-tool", &config_prefix),
+            Some(super::GOTIFY_CONFIG_PATH)
+        );
+        // Empty prefixes grant the whole workspace.
+        assert_eq!(
+            super::host_provisioned_workspace_config("gotify", &[]),
+            Some(super::GOTIFY_CONFIG_PATH)
+        );
+        // An unrelated prefix means the guest cannot read the config at all.
+        assert_eq!(
+            super::host_provisioned_workspace_config("gotify", &["notes/".to_string()]),
+            None
+        );
+        assert_eq!(
+            super::host_provisioned_workspace_config("other-tool", &config_prefix),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_host_provisioned_workspace_config() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir"); // safety: test code only
+        let base = tmp.path();
+        assert_eq!(
+            super::read_host_provisioned_workspace_config(base, super::GOTIFY_CONFIG_PATH),
+            None,
+            "absent file yields no override"
+        );
+
+        let config_dir = base.join("workspace").join("config");
+        std::fs::create_dir_all(&config_dir).expect("failed to create config dir"); // safety: test code only
+        let config_path = config_dir.join("gotify.json");
+        let content = r#"{"url":"https://gotify.example.org","title":"Example"}"#;
+        std::fs::write(&config_path, content).expect("failed to write config"); // safety: test code only
+        assert_eq!(
+            super::read_host_provisioned_workspace_config(base, super::GOTIFY_CONFIG_PATH),
+            Some(content.to_string()),
+            "mt-admin's on-disk config reaches the preload"
+        );
+
+        // A symlinked config is refused: the tree is tenant-writable.
+        #[cfg(unix)]
+        {
+            let link_path = config_dir.join("link.json");
+            std::os::unix::fs::symlink(&config_path, &link_path).expect("failed to create symlink"); // safety: test code only
+            assert_eq!(
+                super::read_host_provisioned_workspace_config(base, "config/link.json"),
+                None,
+                "symlinked config is not read"
+            );
+        }
+
+        let oversized = config_dir.join("oversized.json");
+        std::fs::File::create(&oversized)
+            .and_then(|file| file.set_len(super::MAX_HOST_PROVISIONED_CONFIG_BYTES + 1))
+            .expect("failed to create oversized config"); // safety: test code only
+        assert_eq!(
+            super::read_host_provisioned_workspace_config(base, "config/oversized.json"),
+            None,
+            "oversized config is not read"
+        );
     }
 
     #[test]
