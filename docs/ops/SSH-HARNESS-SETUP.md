@@ -257,7 +257,8 @@ SSH still require approval on every call. Full details + when-to-use each:
   `{output, stderr, exit_code, success}`. Ed25519/ECDSA keys only.
 - **`ssh_git`** — git `clone`/`fetch`/`pull`/`push` over SSH:
   `{operation, host, repo, path, ref?, depth?}`. Local paths are confined under
-  `<base_dir>/ssh-git/`; `pull` is fast-forward-only; force-push is blocked.
+  `<base_dir>/ssh-git/`; `pull` is fast-forward-only; force-push and ref
+  deletion (`:branch`) are blocked.
 - **`ssh` (WASM)** — the same one-command exec, but a sandboxed WASM tool with a
   per-tool host allowlist. Needs its guest wasm built (below).
 
