@@ -8,6 +8,7 @@
 mod cost;
 mod diagnostics;
 mod learner;
+mod llm;
 mod runtime;
 mod time;
 mod value;
@@ -18,6 +19,10 @@ pub use diagnostics::{
     EvaluationSummary, EvaluationTrace, WarmupSummary,
 };
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
+pub use llm::{
+    LlmCall, LlmModelDiagnostics, LlmTimingCounterSnapshot, LlmTimingDiagnostics, LlmTimingMode,
+    LlmTimings,
+};
 pub use runtime::{
     CategoryDiagnostics, EstimateRequestSnapshot, ToolEstimateCounters, ToolEstimateDiagnostics,
     ToolEstimates, ToolEstimationMode,
