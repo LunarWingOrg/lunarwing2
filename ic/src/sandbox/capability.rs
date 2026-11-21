@@ -11,6 +11,7 @@ use crate::sandbox::config::{
     DEFAULT_PIDS_LIMIT, ResourceLimits, SandboxNetworkMode, SandboxPolicy,
 };
 use crate::sandbox::error::{Result, SandboxError};
+use crate::sandbox::git_grant::{self, GIT_REMOTE_EXTENSION, GitGrantAuthorization};
 
 pub const CAPABILITY_MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
@@ -30,6 +31,17 @@ pub struct CapabilityManifest {
     /// New well-known capabilities must be reviewed before a backend may grant them.
     #[serde(default)]
     pub extensions: BTreeSet<String>,
+    /// Optional narrowing of a granted git remote set (WI#816). Naming a
+    /// remote never grants one the host policy does not already allow.
+    #[serde(default)]
+    pub git: GitCapabilityRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitCapabilityRequest {
+    #[serde(default)]
+    pub remotes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +206,10 @@ pub struct CapabilityEvidence {
     pub resources: EffectiveResourceCapability,
     pub secrets: EffectiveSecretCapability,
     pub extensions: Vec<String>,
+    /// The applied git remote grant, or `None` when the request did not ask
+    /// for one (WI#816). Names, transports, hosts and operation classes only.
+    #[serde(default)]
+    pub git: Option<git_grant::EffectiveGitCapability>,
 }
 
 /// Reconstruction fields are host-derived, never request-controlled runtime flags.
@@ -203,6 +219,9 @@ pub struct CapabilityDecision {
     pub network: SandboxNetworkMode,
     pub limits: ResourceLimits,
     pub evidence: CapabilityEvidence,
+    /// Authorized git remotes for command validation and container env. This
+    /// is host-derived and intentionally not part of the serialized evidence.
+    pub git: Option<GitGrantAuthorization>,
 }
 
 impl SandboxNetworkMode {
@@ -256,10 +275,13 @@ impl CapabilityManifest {
             ));
         }
         self.filesystem.validate(&config.policy)?;
-        self.validate_secrets_and_extensions()
+        self.validate_secrets_and_extensions(config)
     }
 
-    fn validate_secrets_and_extensions(&self) -> Result<()> {
+    fn validate_secrets_and_extensions(
+        &self,
+        config: &crate::sandbox::SandboxConfig,
+    ) -> Result<()> {
         if let Some(name) = self.secrets.names.first() {
             validate_capability_name(name, "secrets.names")?;
             return Err(manifest_error(
@@ -267,12 +289,39 @@ impl CapabilityManifest {
                 "generic shell secret injection is unsupported; worker jobs retain their host-issued credential grants",
             ));
         }
-        if let Some(extension) = self.extensions.first() {
+        for extension in &self.extensions {
             validate_capability_name(extension, "extensions")?;
+            if extension != GIT_REMOTE_EXTENSION {
+                return Err(manifest_error(
+                    "extensions",
+                    format!("no host policy grants extension '{extension}'"),
+                ));
+            }
+        }
+        if !self.extensions.is_empty() && config.git.is_none() {
             return Err(manifest_error(
                 "extensions",
-                format!("no host policy grants extension '{extension}'"),
+                "no host policy grants extension 'git-remotes' for this tenant; \
+                 SANDBOX_GIT_REMOTES is unset or empty",
             ));
+        }
+        if !self.git.remotes.is_empty() && !self.extensions.contains(GIT_REMOTE_EXTENSION) {
+            return Err(manifest_error(
+                "git.remotes",
+                "naming git remotes requires extensions=[\"git-remotes\"]",
+            ));
+        }
+        if self.git.remotes.len() > git_grant::MAX_GIT_REMOTES {
+            return Err(manifest_error(
+                "git.remotes",
+                format!(
+                    "at most {} remotes may be named",
+                    git_grant::MAX_GIT_REMOTES
+                ),
+            ));
+        }
+        for name in &self.git.remotes {
+            validate_capability_name(name, "git.remotes")?;
         }
         Ok(())
     }
@@ -499,6 +548,22 @@ fn authorize_validated(
             EnforcementStatus::Enforced
         },
     };
+    let git = if manifest.extensions.contains(GIT_REMOTE_EXTENSION) {
+        let host = config.git.as_ref().ok_or_else(|| {
+            manifest_error(
+                "extensions",
+                "no host policy grants extension 'git-remotes' for this tenant",
+            )
+        })?;
+        Some(git_grant::authorize_grant(
+            host,
+            &manifest.git.remotes,
+            &canonical,
+            mode,
+        )?)
+    } else {
+        None
+    };
     let limits = resource_decision(manifest.resources.clone(), config)?;
     let evidence = CapabilityEvidence {
         manifest_version: CAPABILITY_MANIFEST_VERSION,
@@ -521,13 +586,15 @@ fn authorize_validated(
             names: Vec::new(),
             injection: SecretInjectionStatus::None,
         },
-        extensions: Vec::new(),
+        extensions: manifest.extensions.iter().cloned().collect(),
+        git: git.as_ref().map(GitGrantAuthorization::evidence),
     };
     Ok(CapabilityDecision {
         policy,
         network: mode,
         limits,
         evidence,
+        git,
     })
 }
 
@@ -637,7 +704,9 @@ pub fn compatibility_decision(
                 injection: SecretInjectionStatus::LegacyConfiguredMappings,
             },
             extensions: Vec::new(),
+            git: None,
         },
+        git: None,
     }
 }
 
@@ -677,7 +746,25 @@ pub fn capability_manifest_schema() -> serde_json::Value {
                 "type": "object", "additionalProperties": false,
                 "properties": {"names": {"type": "array", "items": {"type": "string"}, "maxItems": 0, "default": []}}
             },
-            "extensions": {"type": "array", "items": {"type": "string"}, "maxItems": 0, "default": []}
+            "extensions": {
+                "type": "array",
+                "items": {"const": "git-remotes"},
+                "maxItems": 1,
+                "default": [],
+                "description": "The only grantable extension is 'git-remotes', and only when host policy (SANDBOX_GIT_REMOTES) grants it"
+            },
+            "git": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "remotes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 32,
+                        "default": [],
+                        "description": "Narrows the host-granted remote set; it can never add a remote"
+                    }
+                }
+            }
         }
     })
 }
@@ -788,6 +875,14 @@ mod tests {
         assert_eq!(
             schema["properties"]["secrets"]["properties"]["names"]["maxItems"],
             0
+        );
+        assert_eq!(
+            schema["properties"]["extensions"]["items"]["const"],
+            "git-remotes"
+        );
+        assert_eq!(
+            schema["properties"]["git"]["properties"]["remotes"]["maxItems"],
+            git_grant::MAX_GIT_REMOTES
         );
         let encoded = serde_json::to_string(&schema).unwrap();
         assert!(!encoded.contains("TODO"));
@@ -1085,6 +1180,180 @@ mod tests {
             SecretInjectionStatus::LegacyConfiguredMappings
         );
         assert_eq!(minimal().network.mode, NetworkRequestMode::Disabled);
+    }
+
+    fn git_config(remotes: &str) -> crate::sandbox::SandboxConfig {
+        crate::sandbox::SandboxConfig {
+            network: SandboxNetworkMode::ProxyEnforced,
+            git: Some(
+                crate::sandbox::GitGrantConfig::from_spec(remotes)
+                    .expect("grant spec")
+                    .expect("grant"),
+            ),
+            ..crate::sandbox::SandboxConfig::default()
+        }
+    }
+
+    fn git_workspace() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("remotes/origin.git")).expect("remote");
+        temp
+    }
+
+    fn git_manifest(value: serde_json::Value) -> CapabilityManifest {
+        CapabilityManifest::from_value(value).expect("manifest")
+    }
+
+    #[test]
+    fn git_grant_is_denied_without_host_policy_and_other_extensions_stay_closed() {
+        let temp = git_workspace();
+        let manifest = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "extensions": ["git-remotes"]
+        }));
+        let error = authorize_manifest(
+            &manifest,
+            &crate::sandbox::SandboxConfig::default(),
+            temp.path(),
+        )
+        .expect_err("no host grant");
+        assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
+        assert!(error.to_string().contains("git-remotes"), "{error}");
+        for extension in ["browser", "devices", "gui"] {
+            let manifest = git_manifest(serde_json::json!({
+                "manifest_version": 1,
+                "extensions": [extension]
+            }));
+            let config = git_config("origin=file:///workspace/remotes/origin.git");
+            let error = authorize_manifest(&manifest, &config, temp.path())
+                .expect_err("unreviewed extension");
+            assert!(error.to_string().contains(extension), "{error}");
+        }
+    }
+
+    #[test]
+    fn git_grant_records_host_operations_and_no_secret_values() {
+        let temp = git_workspace();
+        let config = git_config(
+            "origin=file:///workspace/remotes/origin.git,\
+             upstream=https://git.example.test/org/repo.git",
+        );
+        let manifest = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "network": {"mode": "proxy-enforced"},
+            "extensions": ["git-remotes"],
+            "git": {"remotes": ["origin"]}
+        }));
+        let decision = authorize_manifest(&manifest, &config, temp.path()).expect("grant");
+        let git = decision.evidence.git.as_ref().expect("git evidence");
+        assert_eq!(git.grant, "host:sandbox-git-remotes");
+        assert_eq!(git.remotes.len(), 1);
+        assert_eq!(git.remotes[0].name, "origin");
+        assert_eq!(
+            git.remotes[0].operations,
+            vec![crate::sandbox::git_grant::GitOperationClass::Read]
+        );
+        assert_eq!(
+            decision.evidence.extensions,
+            vec!["git-remotes".to_string()]
+        );
+        let json = audit_json(&decision.evidence).expect("audit");
+        assert!(json.contains("host:sandbox-git-remotes"));
+        assert!(json.contains("\"transport\":\"file\""));
+        assert!(json.contains("\"operations\":[\"read\"]"));
+        assert!(
+            !json.contains("git.example.test"),
+            "an unselected remote leaked into the evidence: {json}"
+        );
+        for needle in [
+            "token",
+            "credential-value",
+            "password",
+            "PRIVATE KEY",
+            "user:",
+        ] {
+            assert!(
+                !json
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase()),
+                "{json}"
+            );
+        }
+        let host_side = decision.git.as_ref().expect("host authorization");
+        assert_eq!(host_side.remotes.len(), 1);
+        assert_eq!(
+            host_side.cwd,
+            temp.path().canonicalize().expect("canonical")
+        );
+    }
+
+    #[test]
+    fn git_remotes_cannot_exceed_host_policy_or_bypass_the_extension() {
+        let temp = git_workspace();
+        let config = git_config("origin=file:///workspace/remotes/origin.git");
+        let outside = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "extensions": ["git-remotes"],
+            "git": {"remotes": ["other"]}
+        }));
+        let error = authorize_manifest(&outside, &config, temp.path()).expect_err("unknown remote");
+        assert!(error.to_string().contains("other"), "{error}");
+        let unnamed = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "git": {"remotes": ["origin"]}
+        }));
+        let error = authorize_manifest(&unnamed, &config, temp.path()).expect_err("no extension");
+        assert!(error.to_string().contains("extensions"), "{error}");
+        let bare = git_manifest(serde_json::json!({"manifest_version": 1}));
+        let decision = authorize_manifest(&bare, &config, temp.path()).expect("compat decision");
+        assert!(decision.git.is_none());
+        assert!(decision.evidence.git.is_none());
+    }
+
+    #[test]
+    fn git_network_remotes_fail_closed_under_none_and_tunnel() {
+        let temp = git_workspace();
+        let mut config = git_config("upstream=https://git.example.test/org/repo.git");
+        for (mode, request) in [
+            (SandboxNetworkMode::None, "none"),
+            (SandboxNetworkMode::Tunnel, "tunnel"),
+        ] {
+            config.network = mode;
+            config.tunnel = (mode == SandboxNetworkMode::Tunnel)
+                .then(crate::sandbox::TunnelSidecarConfig::default);
+            let manifest = git_manifest(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": request},
+                "extensions": ["git-remotes"]
+            }));
+            let error = authorize_manifest(&manifest, &config, temp.path())
+                .expect_err("unsupported egress mode");
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{error}"
+            );
+        }
+        // A file-only grant still works without egress.
+        config.network = SandboxNetworkMode::None;
+        config.tunnel = None;
+        let config = crate::sandbox::SandboxConfig {
+            git: Some(
+                crate::sandbox::GitGrantConfig::from_spec(
+                    "origin=file:///workspace/remotes/origin.git",
+                )
+                .expect("spec")
+                .expect("grant"),
+            ),
+            ..config
+        };
+        let manifest = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "network": {"mode": "none"},
+            "extensions": ["git-remotes"]
+        }));
+        let decision = authorize_manifest(&manifest, &config, temp.path()).expect("file grant");
+        assert_eq!(decision.network, SandboxNetworkMode::None);
+        assert!(decision.evidence.git.is_some());
     }
 
     #[test]

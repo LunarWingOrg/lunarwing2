@@ -54,6 +54,9 @@ pub struct SandboxModeConfig {
     pub tenant_logs: crate::sandbox::TenantLogsMode,
     /// Env-only tunnel sidecar settings, validated when `network = tunnel`.
     pub tunnel: SandboxTunnelModeConfig,
+    /// Per-tenant git remote grant (WI#816): `SANDBOX_GIT_REMOTES` as
+    /// `name=url[,name=url...]`. `None` keeps git network access denied.
+    pub git: Option<crate::sandbox::GitGrantConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -189,6 +192,7 @@ impl Default for SandboxModeConfig {
             orphan_threshold_secs: 600,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         }
     }
 }
@@ -227,6 +231,15 @@ impl SandboxModeConfig {
         }
 
         let network = parse_string_env("SANDBOX_NETWORK", ss.network.clone())?;
+        let git = match optional_env("SANDBOX_GIT_REMOTES")? {
+            Some(spec) => crate::sandbox::GitGrantConfig::from_spec(&spec).map_err(|message| {
+                ConfigError::InvalidValue {
+                    key: "SANDBOX_GIT_REMOTES".to_string(),
+                    message,
+                }
+            })?,
+            None => None,
+        };
         let tunnel = SandboxTunnelModeConfig::resolve_env()?;
         if network.parse::<crate::sandbox::SandboxNetworkMode>()
             == Ok(crate::sandbox::SandboxNetworkMode::Tunnel)
@@ -263,6 +276,7 @@ impl SandboxModeConfig {
                 crate::sandbox::TenantLogsMode::Info,
             )?,
             tunnel,
+            git,
         })
     }
 
@@ -335,6 +349,7 @@ impl SandboxModeConfig {
             tunnel,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: self.tenant_logs,
+            git: self.git.clone(),
         }
     }
 }
@@ -1032,6 +1047,7 @@ mod tests {
             allow_full_access: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
@@ -1065,6 +1081,7 @@ mod tests {
             enforce: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Off,
             tunnel: SandboxTunnelModeConfig::default(),
+            git: None,
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);
@@ -1341,6 +1358,49 @@ mod tests {
             other => panic!("expected InvalidValue, got {other:?}"),
         }
         unsafe { std::env::remove_var("SANDBOX_TENANT_LOGS") };
+    }
+
+    /// WI#816: the host grant is env-only, defaulting to no grant, and a
+    /// credential-bearing or malformed spec is a load error rather than a
+    /// silently smaller grant.
+    #[test]
+    fn sandbox_git_remotes_env_grants_and_rejects_credentials() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+
+        // SAFETY: Under ENV_MUTEX (restored on drop), no concurrent env access.
+        unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve default");
+        assert!(cfg.git.is_none());
+        assert!(cfg.to_sandbox_config().git.is_none());
+
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_REMOTES",
+                "origin=file:///workspace/remotes/origin.git",
+            )
+        };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve grant");
+        let grant = cfg.git.as_ref().expect("grant");
+        assert_eq!(grant.remotes.len(), 1);
+        assert_eq!(grant.remotes[0].name, "origin");
+        let propagated = cfg.to_sandbox_config().git.expect("propagated grant");
+        assert_eq!(propagated, *grant);
+
+        for bad in [
+            "origin=https://user:token@git.example.test/repo.git",
+            "origin=/srv/git/repo.git",
+            "origin",
+        ] {
+            unsafe { std::env::set_var("SANDBOX_GIT_REMOTES", bad) };
+            match SandboxModeConfig::resolve(&settings) {
+                Err(ConfigError::InvalidValue { key, .. }) => {
+                    assert_eq!(key, "SANDBOX_GIT_REMOTES")
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+        unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
     }
 
     #[test]

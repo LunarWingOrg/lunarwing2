@@ -575,6 +575,7 @@ fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
         "execution_failed" => "command failed inside the sandbox container",
         "credential_injection_failed" => "sandbox proxy credential injection failed",
         "mount_path_denied" => "sandbox refused the requested working directory",
+        "capability_denied" => "sandbox capability policy denied the request",
         _ => "sandboxed execution failed",
     };
     let mut message = format!(
@@ -722,16 +723,11 @@ impl ShellTool {
         let execute = async {
             if let Some(manifest) = manifest {
                 sandbox
-                    .execute_with_manifest(cmd, workdir, manifest, std::collections::HashMap::new())
+                    .execute_with_manifest(cmd, workdir, manifest, HashMap::new())
                     .await
             } else {
                 sandbox
-                    .execute_with_policy(
-                        cmd,
-                        workdir,
-                        self.sandbox_policy,
-                        std::collections::HashMap::new(),
-                    )
+                    .execute_with_policy(cmd, workdir, self.sandbox_policy, HashMap::new())
                     .await
             }
         };
@@ -914,7 +910,8 @@ impl ShellTool {
             .or_else(|| self.working_dir.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        // Determine timeout
+        // Cap the outer timeout to the manifest's effective limit. The
+        // manager performs Git preflight before preparing the runtime.
         let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
         let timeout_duration = match (&self.sandbox, &capability_manifest) {
             (Some(sandbox), Some(manifest)) => {
@@ -969,7 +966,10 @@ impl Tool for ShellTool {
          if /tenant-logs exists there, it holds the daemon's own log (secret-scrubbed, \
          read-only): daemon.log, previous rotation daemon.log.1. \
          Output is bounded; truncated=true and a warning mean the captured data is incomplete, \
-         even if success=true. Use files or smaller chunks for large payloads."
+         even if success=true. Use files or smaller chunks for large payloads. \
+          For manifest-backed Git reads over HTTP(S), request the host's git-remotes grant. \
+          It narrows proxy hosts and supplies no credentials; Git push is not supported by \
+          manifest preflight. Use network disabled for ordinary local Git reads without a grant."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1627,6 +1627,84 @@ mod tests {
             32768,
         )
         .await;
+    }
+
+    /// WI#816: a git network operation is refused before any runtime or
+    /// credential work when the call has no host grant, and when it names a
+    /// remote outside the grant. Both are `capability_denied`.
+    #[tokio::test]
+    async fn git_network_access_is_denied_before_runtime_without_a_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new().with_sandbox(Arc::new(SandboxManager::new(
+            crate::sandbox::SandboxConfig {
+                network: crate::sandbox::SandboxNetworkMode::None,
+                protected_paths: Vec::new(),
+                ..Default::default()
+            },
+        )));
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "command": "git clone https://git.example.test/org/repo.git",
+                    "workdir": temp.path(),
+                    "capability_manifest": {
+                        "manifest_version": 1,
+                        "network": {"mode": "none"}
+                    }
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .expect_err("no host git grant");
+        assert!(
+            matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_grant_refuses_an_ungranted_remote_and_force_push_before_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("remotes/origin.git")).unwrap();
+        let tool = ShellTool::new().with_sandbox(Arc::new(SandboxManager::new(
+            crate::sandbox::SandboxConfig {
+                network: crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+                protected_paths: Vec::new(),
+                git: Some(
+                    crate::sandbox::GitGrantConfig::from_spec(
+                        "origin=file:///workspace/remotes/origin.git",
+                    )
+                    .unwrap()
+                    .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )));
+        for command in [
+            "git clone https://evil.example.test/repo.git",
+            "git push --force origin main",
+            "git push origin :gone-branch",
+        ] {
+            let error = tool
+                .execute(
+                    serde_json::json!({
+                        "command": command,
+                        "workdir": temp.path(),
+                        "capability_manifest": {
+                            "manifest_version": 1,
+                            "network": {"mode": "proxy-enforced"},
+                            "extensions": ["git-remotes"]
+                        }
+                    }),
+                    &JobContext::default(),
+                )
+                .await
+                .expect_err(command);
+            assert!(
+                matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied")),
+                "{command}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
