@@ -282,19 +282,11 @@ impl LlmProvider for LlmTimingProvider {
     }
 }
 
-/// Wall-clock duration between two instants, exposed for tests that need the
-/// same monotonic source as the decorator.
-#[cfg(test)]
-fn elapsed_since(started_at: Instant) -> Duration {
-    started_at.elapsed()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     use crate::estimation::{LlmTimingMode, LlmTimings};
     use crate::llm::provider::{FinishReason, LlmStreamObservation, StreamFailureReason};
@@ -423,7 +415,17 @@ mod tests {
             &self,
             _request: ToolCompletionRequest,
         ) -> Result<LlmStream<'_>, LlmError> {
-            self.complete_stream(_request).await
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                return Err(LlmError::RequestFailed {
+                    provider: self.name.clone(),
+                    reason: "stub failure".to_string(),
+                });
+            }
+            Ok(futures::stream::iter(
+                self.chunks.iter().cloned().map(Ok).collect::<Vec<_>>(),
+            )
+            .boxed())
         }
     }
 
@@ -551,11 +553,5 @@ mod tests {
         let stream = provider.complete_stream(request()).await.unwrap();
         let _: Vec<_> = stream.collect().await;
         assert_eq!(stub.calls.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn elapsed_helper_uses_the_same_clock() {
-        let started = Instant::now();
-        assert!(elapsed_since(started) < Duration::from_secs(5));
     }
 }
