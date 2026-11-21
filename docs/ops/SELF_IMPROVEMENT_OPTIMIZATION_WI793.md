@@ -248,7 +248,7 @@ Move maintenance due calculation to the existing mission cron ticker and persist
 
 **Verified current behavior**
 
-Feedback writes and several collection/store failures use `debug!`, so ordinary operator log levels can miss them (`skill_feedback.rs:109-110`; `mission.rs:4332-4337,4403-4408`; `scripting.rs:2409-2411`). The default mission `notify_channels` list is empty (`types/mission.rs:481`; managed mission creation uses the same default). Proposal logging is present, but knowing that a proposal exists still does not prove its content was correct or effective.
+Several collection/store failures use `debug!`, so ordinary operator log levels can miss them (`mission.rs:4332-4337,4403-4408`; `scripting.rs:2409-2411`), and so does a failed skill-usage write from the orchestrator's `__record_skill_usage__` host function (`executor/orchestrator.rs:2374-2376`). The terminal feedback path logs its failed writes at `warn!` (`skill_feedback.rs:109-110`). The default mission `notify_channels` list is empty (`types/mission.rs:481`; managed mission creation uses the same default). Proposal logging is present, but knowing that a proposal exists still does not prove its content was correct or effective.
 
 **Recommendation**
 
