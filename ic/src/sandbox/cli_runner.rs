@@ -1166,8 +1166,8 @@ impl CliRunner {
                 let (stderr, stderr_trunc) = err_buf.into_string();
 
                 if exit_code != 0 {
-                    let relay_unreached = relay.is_some()
-                        && !relay_reached(relay, &stderr, exit_code).await;
+                    let relay_unreached =
+                        relay.is_some() && !relay_reached(relay, &stderr, exit_code).await;
                     if let Some(err) =
                         classify_run_failure(&stderr, &self.image, exit_code, relay_unreached)
                     {
@@ -2335,8 +2335,13 @@ mod tests {
         assert!(classify_run_failure(forged, "image", 125, false).is_none());
         // A marker mid-line is a command's own text, not the relay's line.
         assert!(
-            classify_run_failure("cp: cannot stat 'lunarwing-proxy-relay: x'", "image", 125, true)
-                .is_none()
+            classify_run_failure(
+                "cp: cannot stat 'lunarwing-proxy-relay: x'",
+                "image",
+                125,
+                true
+            )
+            .is_none()
         );
         // A startup marker needs the startup exit code too.
         assert!(
