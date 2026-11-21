@@ -1,6 +1,6 @@
 # Claude Code → Codex Parallel Feature Orchestration
 
-> **ARCHIVED CONCEPTUAL WORKFLOW (reviewed 2026-11-10).** The `.claude/`
+> **ARCHIVED CONCEPTUAL WORKFLOW (reviewed 2026-11-20).** The `.claude/`
 > skills, helper scripts, and demo artifacts referenced below are no longer in
 > the repository. This is not a supported agent setup or an instruction to
 > install that tooling; its branch, PR, and validation examples are historical.

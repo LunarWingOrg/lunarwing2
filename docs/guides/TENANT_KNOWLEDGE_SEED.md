@@ -12,7 +12,7 @@ a separate additive refresh cadence that imports newly published paths without
 changing existing notes. Existing tenants upgraded to a seed-capable binary are
 neither seeded nor opted in automatically.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The seeding and additive
+**Revalidated against source 2026-11-20 at `9c96220bb2`.** The seeding and additive
 refresh flows are unchanged. The stale-marking sweep has no 1,000-note scan cap:
 `knowledge_list_notes` pages the whole store with a keyset cursor (500-row
 pages, 100k safety ceiling), and the independent `KNOWLEDGE_SWEEP_ENABLED`

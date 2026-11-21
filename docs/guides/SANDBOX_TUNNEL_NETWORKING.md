@@ -1,5 +1,10 @@
 # Sandbox Tunnel Networking (NetBird / WireGuard)
 
+**Source revalidated 2026-11-20 at `9c96220bb2`.** The complete page was
+checked against the configuration resolver, tunnel sidecar, and integration
+harness. Dated live measurements below remain host-specific evidence, not new
+test results for this documentation review.
+
 `SANDBOX_NETWORK=tunnel` lets generic shell-sandbox commands make **outbound**
 connections through a NetBird or WireGuard sidecar. It does not expose the web
 gateway, open a host port, or let overlay peers connect into the sandbox. It

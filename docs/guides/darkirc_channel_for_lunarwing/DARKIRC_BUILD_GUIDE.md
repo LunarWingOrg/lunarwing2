@@ -8,7 +8,7 @@ LunarWing's DarkIRC integration has three components:
 
 Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
-**Revalidated against source 2026-11-19 (v2.2.1.0).** The registry manifest is
+**Revalidated against source 2026-11-20 at `9c96220bb2`.** The registry manifest is
 `0.1.17` and the WASM channel crate is `2.2.1`. The capability file (3000 ms
 poll floor, loopback allowlist, `pairing` DM default), source/registry symlink,
 and `darkirc-contact prepare/respond/complete` exchange commands match the
@@ -120,8 +120,9 @@ Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) fo
 
 ## Message Limits
 
-The host's channel budget asks the model to stay within six 390-byte DarkIRC
-messages. The adapter performs UTF-8-safe IRC chunking, ordering markers,
+The host's channel budget asks the model to keep a reply to at most three
+390-byte DarkIRC messages; replies beyond six messages are truncated before
+delivery. The adapter performs UTF-8-safe IRC chunking, ordering markers,
 framing limits, and paced delivery. The standard adapter env enables the
 outbox journal; the adapter supplies the tuning defaults unless overridden
 (see [adapter configuration](DARKIRC_MT_ADAPTER.md#adapter-configuration)).

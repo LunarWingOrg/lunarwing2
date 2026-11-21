@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-11-19, target release 2.2.1.0):**
+**Current state (updated 2026-11-20, target release 2.2.2.0):**
 
 - v2.1.9.0 (Kaitei) shipped 2026-11-08 with safer response caching and malformed
   final-answer recovery, operator-controlled worker source archives, protocol-1

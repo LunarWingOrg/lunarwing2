@@ -1,6 +1,7 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-11-10 for v2.2.0.0.
+Status: implemented; source revalidated 2026-11-20 for v2.2.2.0
+(`9c96220bb2`), including the full page.
 Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
 `job_manager.rs` and HTTP completion handling in `api.rs`.
 
@@ -74,7 +75,13 @@ effect adapter), and is presence-based on raw params, so string-typed values
 (`"allow_identity_injection": "true"`) cannot slip past it (DH-1).
 
 All harness host state lives under `~/.lunarwing/harness/<job_id>/`. The
-`harness/` base is mode 0700; job subdirectories are ordinarily 0755. This is
+`harness/` base is mode 0700. Job subdirectories are created without an
+explicit mode, so they follow the daemon's umask: 0700 under the units that
+`ic/systemd/` and mt-admin ship (systemd and OpenRC, umask 0077), and 0755
+under umask 022, which is what a daemon started by hand usually gets, and
+so does the systemd user unit that `lunarwing service install` writes (it
+sets no `UMask`; its OpenRC install uses the 0077 template).
+This is
 deliberately **outside** the projects base, which any job can mount
 via an explicit `project_dir` (CW-3). Explicit `project_dir` values are
 restricted to `projects/<uuid>` dirs owned by the calling user, and are

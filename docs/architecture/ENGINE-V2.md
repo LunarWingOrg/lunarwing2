@@ -5,7 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-10 for v2.2.0.0.** Read the behavior sections below
+**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** Read the behavior sections below
 as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
@@ -361,7 +361,7 @@ Key characteristics:
 - **Context as variables**: thread messages injected as `context` Python variable, thread goal as `goal`, step index as `step_number`, prior action results as `previous_results` dict
 - **Tool dispatch**: unknown function calls suspend the VM, go through lease check + policy check + `EffectExecutor`, then result returns to Python
 - **Recursive LLM calls**: `llm_query(prompt, context)` suspends the VM, spawns a single-shot LLM call, returns text as a Python string. Results stay as variables (symbolic composition), not injected into the parent's attention window
-- **Compact output metadata**: between code steps, only a summary is added to chat context (`[FULL OUTPUT: N chars]`, `[TRUNCATED: last 8000 of N chars shown]`, a short return-value preview, or `[code executed, no output]`) to prevent context bloat
+- **Bounded step output**: between code steps, `format_output` (`orchestrator/default.py`) adds the step's output to the chat context: the stdout under `[stdout]`, each successful action result as `[name]` with a 500-character preview, a failed one as `[name ERROR]` with its whole text, and `[return]` with the return value. Role-token openers are neutralized, and text over 8000 characters is cut from the front (`... (truncated) ...`) so the most recent output stays; an empty step adds `[code executed, no output]`. The `[FULL OUTPUT: N chars]` summary helper in `executor/scripting.rs` is not on this path
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
 - **Missing-import repair (WI#364)**: before each model-generated block reaches
   Monty, `inject_missing_imports` adds missing bare imports for dotted references
@@ -471,8 +471,9 @@ through explicit tools but never ride automatic recall.
 
 ### Authenticity hardening (WI#132)
 
-Memory-retrieval and compaction content is LLM-adjacent data, so it is labeled
-and neutralized before it can masquerade as engine-authored state:
+Memory-retrieval and compaction content is LLM-adjacent data. Retrieved
+content is labeled and neutralized before it can masquerade as engine-authored
+state; for compaction summaries, see the compaction entry below:
 
 - `__retrieve_docs__` is the live retrieval path (the dead `executor/context.rs`
   doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
@@ -487,11 +488,13 @@ and neutralized before it can masquerade as engine-authored state:
   assumed to come from a completed thread; persisted metadata cannot upgrade
   the trust label. The complete rendered section is role-token-neutralized.
   Mission meta-prompts also label and quote their retrieved records.
-- Compaction summaries are LLM output that replaces real history. The summary
-  is prefixed with an explicit `[Compaction summary — LLM-generated, replaces
-  earlier conversation history]` label and its role-token openers are
-  neutralized before it is inserted as an assistant message (compaction
-  laundering seam).
+- Compaction summaries are LLM output that replaces real history (compaction
+  laundering seam). Compaction is off by default (`enable_compaction: false`
+  in `types/thread.rs`). When it is on, `compact_if_needed` in
+  `orchestrator/default.py` inserts the summary as a plain assistant message,
+  without a label. The labelling and neutralizing helper `compact_messages`
+  (`executor/compaction.rs`, which prefixes `[Compaction summary —
+  LLM-generated, replaces earlier conversation history]`) is not on that path.
 - Both LLM adapters (`ic/src/llm/rig_adapter.rs`,
   `ic/src/llm/lunarwing_cloud_chat.rs`) neutralize role-token openers in
   system-role content as a final backstop (idempotent on already-neutralized
@@ -1246,7 +1249,7 @@ cadence, `routine_list` → `mission_list()`,
 `lunarwing routines edit --name <routine> --max-tool-rounds <n>` for a
 lightweight routine's tool-round budget, `routine_history` →
 `mission_history(name)`), instead of the slash-command advice the remaining
-v1-only tools (`cancel_job`, `build_software`) keep — bundled skills written
+v1-only tools (`cancel_job`, `cron_mission`, `build_software`) keep — bundled skills written
 for v1 (`routine-advisor`, `delegation`, `lunarwing-workflow-orchestrator`)
 still name the routine tools, so the redirect is what keeps a v2 agent on
 the working path. Autonomous threads (Research/Mission) hold leases for the
@@ -2278,7 +2281,7 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 ## Build & Test
 
 Run from `ic/`, using the vendored lockfile. These examples use the 12-thread
-cap that `AGENTS.md` sets for cargo on the development host.
+cap that the repository-root `AGENTS.md` sets for cargo on the development host.
 Use tmux for long runs and `cargo check` for compile verification.
 
 ```bash

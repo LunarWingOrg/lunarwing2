@@ -1,6 +1,6 @@
 # Installation Guide
 
-> **ARCHIVED / DO NOT USE FOR MT PROVISIONING (reviewed 2026-11-10).** This
+> **ARCHIVED / DO NOT USE FOR MT PROVISIONING (reviewed 2026-11-20).** This
 > guide includes manual password/configuration steps that predate managed relay
 > setup, protected env files, coordinated rotation, and the current capability
 > schema. Use the [current channel guide](../../../lunarwing_weechat_wss/README.md)
