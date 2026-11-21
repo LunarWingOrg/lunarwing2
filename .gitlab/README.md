@@ -705,24 +705,31 @@ host's concurrent builds before retrying manually.
   WI#418/WI#368 the same way). The offline guard `validate_config.py`
   (`validate_deny_toml_advisories`, ci-config lane) requires every
   `[advisories].ignore` entry to be a table whose non-empty reason names a
-  `clearing owner WI#N`, and requires every repo-relative path cited by
-  `ic/deny.toml` and by this marker-delimited section
-  (`deny-toml-guard-section:begin`/`end`) to be tracked (`git ls-files`; in
-  the git-less ci-config image, present inside the checkout — citations with
-  `..` segments, symlink escapes, or a directory-symlink component are
-  refused there too, matching what git mode can list (git lists the link
-  itself, never the paths beneath it; a leaf-symlink citation stays
-  accepted)) — bare
+  doc-only clearing owner — `clearing owner <repo-relative>.md` — and
+  requires every repo-relative path cited by `ic/deny.toml` and by this
+  marker-delimited section (`deny-toml-guard-section:begin`/`end`) to be
+  tracked (`git ls-files`; in the git-less ci-config image, present inside
+  the checkout — citations with `..` segments, symlink escapes, or a
+  directory-symlink component are refused there too, matching what git mode
+  can list (git lists the link itself, never the paths beneath it; a
+  leaf-symlink citation stays accepted)) — bare
   filenames without a repo-relative path and `file:line` anchors are the
-  documented out-of-scope limits. Checking whether a named owner is still
-  open (owner liveness) is deliberately out of scope per the WI#363 scope
-  decision of 2026-10-20: every owner the accepted advisories cite
-  (WI#367, WI#368, WI#418) was closed with the chains still locked, so an
-  online owner gate could only run failed-allowed; owner liveness stays a
-  review and release-notes concern, not a CI gate — no owner-liveness job
-  or network call exists. The guard carries unit tests under
-  `.gitlab/tests` (`test_deny_toml_guards.py`), also registered in the
-  `python-unit` suite.
+  documented out-of-scope limits.
+- WI#779 (2026-11-21) replaced the work-item owner with the doc-only model
+  because every work-item owner the acceptances cited (WI#367, WI#418,
+  WI#749, WI#781) was closed with the pins still locked, and WI#418's own
+  decision record states the rule they broke: a closed work item cannot own
+  a standing acceptance. The guard therefore refuses `clearing owner WI#N`,
+  requires the named document to resolve inside the checkout, and requires
+  it to name the advisory ID it owns, so a deleted, renamed or split
+  decision record fails offline. The standing owner for every current entry
+  is `docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md`. Checking whether a
+  work item is still open (owner liveness) remains out of scope per the
+  WI#363 scope decision of 2026-10-20 — an online owner gate could only run
+  failed-allowed — and the doc-only form removes the question rather than
+  polling it; no owner-liveness job or network call exists. The guard
+  carries unit tests under `.gitlab/tests` (`test_deny_toml_guards.py`),
+  also registered in the `python-unit` suite.
 <!-- deny-toml-guard-section:end -->
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
