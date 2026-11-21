@@ -1,7 +1,8 @@
 # Emoting mascot widget (web gateway)
 
-The web gateway shows a small animated pony/unicorn in a draggable corner
-widget that mirrors the agent's expressed emotions. When the agent replies
+With `MASCOT_ENABLED=true` (off by default), the web gateway shows a small
+animated pony/unicorn in a draggable corner widget that mirrors the agent's
+expressed emotions. When the agent replies
 with a roleplay action phrase — `*stamps hooves*`, `*ears perk up*` — the
 mascot plays the matching sprite animation instead of staying static.
 

@@ -120,8 +120,9 @@ Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) fo
 
 ## Message Limits
 
-The host's channel budget asks the model to stay within six 390-byte DarkIRC
-messages. The adapter performs UTF-8-safe IRC chunking, ordering markers,
+The host's channel budget asks the model to keep a reply to at most three
+390-byte DarkIRC messages; replies beyond six messages are truncated before
+delivery. The adapter performs UTF-8-safe IRC chunking, ordering markers,
 framing limits, and paced delivery. The standard adapter env enables the
 outbox journal; the adapter supplies the tuning defaults unless overridden
 (see [adapter configuration](DARKIRC_MT_ADAPTER.md#adapter-configuration)).

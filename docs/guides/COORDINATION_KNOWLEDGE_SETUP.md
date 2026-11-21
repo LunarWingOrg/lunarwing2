@@ -26,7 +26,7 @@ Wire claims are untrusted: they are stored as `needs-verification`, without conf
 
 Inbound path, in order:
 
-1. **XMPP bridge** joins the coordination MUC room and only accepts groupchat from allowlisted rooms (`XMPP_ALLOW_ROOMS_JSON`). A room not on that list is silently dropped — the daemon neither joins it nor receives from it.
+1. **XMPP bridge** joins the coordination MUC room and only accepts groupchat from allowlisted rooms. The daemon sets that list through the bridge's `/v1/configure` call, from `XMPP_ALLOW_ROOMS` in `lunarwing.env` (or the `xmpp_allow_rooms` setting when the variable is unset or empty). A room not on that list is silently dropped — the daemon neither joins it nor receives from it.
 2. **Coordination hooks** classify inbound room traffic by scope (`COORD_CHANNELS`); the knowledge-share hook (`coordination.knowledge_share`, priority 13) parses `KNOW:` lines.
 3. **Publisher allowlist** (`COORD_KNOWLEDGE_PUBLISHERS`) gates which senders may actually publish. Room occupancy is not authentication — any occupant can claim any nick the room forwards, so only operator-listed senders are ingested.
 4. Ingest writes the note into the daemon-local shared knowledge scope, subject to per-sender and daemon-wide hourly budgets.
@@ -37,20 +37,20 @@ The failure that motivated this guide: every one of steps 1–3 was misconfigure
 
 For two tenants `sunburst` and `ruffles` sharing room `mepuhiy@conference.xmpp.sobe.world`:
 
-### 1. Bridge room allowlist — both tenants
+### 1. Room allowlist — both tenants
 
-In each tenant's `xmpp-bridge.env`:
-
-```json
-XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
-```
-
-This makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
-
-The daemon's native XMPP channel drives the bridge's join/receive allowlist through the bridge's `/v1/configure` call, so also set the CSV form in `lunarwing.env`:
+In each tenant's `lunarwing.env`:
 
 ```
 XMPP_ALLOW_ROOMS=mepuhiy@conference.xmpp.sobe.world
+```
+
+The daemon's XMPP channel sends this list to the bridge in its `/v1/configure` call, which makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
+
+The bridge itself does not read `XMPP_ALLOW_ROOMS_JSON`. Keep the same room in each tenant's `xmpp-bridge.env` anyway, because `ic/scripts/xmpp-configure.sh` uses it for direct configure calls and `coord-doctor` checks it:
+
+```json
+XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
 ```
 
 ### 2. Publisher allowlist — each tenant lists the OTHER agent's occupant JID

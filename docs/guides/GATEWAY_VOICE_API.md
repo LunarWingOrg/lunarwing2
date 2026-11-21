@@ -57,8 +57,9 @@ the proxy for anything else.
 ## Gateway Endpoints
 
 All routes sit behind the standard gateway auth middleware (bearer token from
-`GATEWAY_AUTH_TOKEN`, `GATEWAY_USER_TOKENS`, or DB-backed tokens) and share the
-gateway's CORS and security-header layers.
+`GATEWAY_AUTH_TOKEN` or `GATEWAY_USER_TOKENS`; DB-backed tokens are not
+available in this build) and share the gateway's CORS and security-header
+layers.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |

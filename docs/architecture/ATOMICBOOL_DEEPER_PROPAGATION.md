@@ -28,7 +28,9 @@ The flag currently guards only selected legacy-path behavior:
 - the normal-result `Interrupted`, `Done`, `Suggestions`, `TurnCost`, and
   `ApprovalNeeded` statuses in `process_user_input()`;
 - the drain loop, which discards already-drained and remaining queued text after
-  suppression instead of starting another turn.
+  suppression instead of starting another turn;
+- the V1 turn-outcome hint in `handle_message()`, which is not reported once a
+  soft timeout has already reported `TimedOut`.
 
 The outer message loop also stops waiting at the soft timeout, sends the timeout
 reply itself, and never delivers the eventual top-level return value. That is why
