@@ -708,9 +708,10 @@ LLM logical-call timing (WI#318 Phase B) is a separate, daemon-wide cache.
 `LUNARWING_LLM_TIMINGS=0` disables it; unset or any other value observes. One
 timer decorates the provider chain built at startup, so v1 chat, local jobs,
 routines, the container path and the v2 bridge all contribute one sample per
-completed logical call. Retries and failover are counted as separate attempts
-and never train the duration EMA; cache hits never reach the timer, and failed
-or cancelled streams train nothing. Cost is not learned here — the v2 adapter's
+completed logical call that reached a provider. Retries and failover are counted
+as separate attempts and never train the duration EMA; the timer sits inside the
+response cache, so a cache hit never reaches it, and failed or cancelled
+streams train nothing. Cost is not learned here — the v2 adapter's
 `cost_usd: 0.0` means "unavailable", never "free". Models are keyed by
 canonical provider model name, contain no user identity, and reset on restart.
 `GET /api/estimates/llm` is owner-only and reports the per-model duration EMA,

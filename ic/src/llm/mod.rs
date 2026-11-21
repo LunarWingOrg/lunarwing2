@@ -458,6 +458,17 @@ pub async fn build_provider_chain(
         llm
     };
 
+    // WI#318 B1/B3: one timing boundary for the chain, outside retry, smart
+    // routing, failover and the circuit breaker but inside the response cache.
+    // A cache hit therefore never reaches the timer, and one sample equals one
+    // completed logical call that actually hit a provider.
+    let timings = Arc::new(crate::estimation::LlmTimings::from_env());
+    let llm: Arc<dyn LlmProvider> = Arc::new(LlmTimingProvider::new(llm, Arc::clone(&timings)));
+    tracing::debug!(
+        mode = timings.mode_str(),
+        "LLM logical-call timing initialized"
+    );
+
     // 5. Response cache
     let llm: Arc<dyn LlmProvider> = if config.response_cache_enabled {
         let rc_config = ResponseCacheConfig {
@@ -508,16 +519,6 @@ pub async fn build_provider_chain(
         llm,
         Arc::clone(&telemetry),
     ));
-
-    // WI#318 B1/B3: one timing boundary for the whole chain. Placed after
-    // stream integrity so recovered attempts arrive as `Retried` observations,
-    // and outside retry/failover/cache so one sample equals one logical call.
-    let timings = Arc::new(crate::estimation::LlmTimings::from_env());
-    let llm: Arc<dyn LlmProvider> = Arc::new(LlmTimingProvider::new(llm, Arc::clone(&timings)));
-    tracing::debug!(
-        mode = timings.mode_str(),
-        "LLM logical-call timing initialized"
-    );
 
     // Standalone cheap LLM for heartbeat/evaluation gets the same observation.
     let cheap_llm = create_cheap_llm_provider(config, session)?.map(|cheap| {

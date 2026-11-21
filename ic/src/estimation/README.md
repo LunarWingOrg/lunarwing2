@@ -173,12 +173,13 @@ treatment at a different boundary, so a separate daemon-wide cache records
   timer. There is no per-delegate timer and no second writer: the
   `observability` tool/LLM events remain unused, which settles the plan's
   "choose one carrier" decision in favour of the estimator hook.
-- **What trains.** Exactly one sample per completed call the caller awaited.
-  The timer sits outside retry, smart routing, failover, circuit breaking and
-  the response cache, and inside stream integrity. A cache hit never reaches
-  the inner provider, so it cannot train. Streaming calls train only on the
-  terminal `Done` chunk; a failed, partial or dropped stream is counted
-  (`failures` / `cancellations`) and trains nothing.
+- **What trains.** Exactly one sample per completed call that actually reached
+  a provider. The timer sits outside retry, smart routing, failover and the
+  circuit breaker, and inside the response cache and stream integrity. A cache
+  hit is therefore served before the timer's inner provider runs and cannot
+  train. Streaming calls train only on the terminal `Done` chunk; a failed,
+  partial or dropped stream is counted (`failures` / `cancellations`) and
+  trains nothing.
 - **What is counted separately.** Retry and failover layers already report
   recovered attempts as `LlmStreamObservation::Retried`; the timer records
   `retried_calls` and `retry_attempts` from those and never converts them into

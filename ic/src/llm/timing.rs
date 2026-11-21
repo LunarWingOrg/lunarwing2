@@ -545,6 +545,31 @@ mod tests {
         assert_eq!(diagnostics.models[0].duration_samples, 1);
     }
 
+    /// Mirrors the production nesting: the response cache wraps the timer, so
+    /// a cache hit is served before the timer's inner provider runs.
+    #[tokio::test]
+    async fn cache_hit_inside_the_chain_never_trains() {
+        let timings = timing();
+        let stub = Stub::new("model-a");
+        let timer = LlmTimingProvider::new(stub, Arc::clone(&timings));
+        let cache = crate::llm::CachedProvider::new(
+            Arc::new(timer),
+            crate::llm::ResponseCacheConfig::default(),
+        );
+
+        for _ in 0..2 {
+            let stream = cache
+                .complete_stream(request())
+                .await
+                .expect("stream should open");
+            let _: Vec<_> = stream.collect().await;
+        }
+        assert_eq!(cache.total_hits(), 1);
+        let diagnostics = timings.diagnostics();
+        assert_eq!(diagnostics.counters.calls_started, 1);
+        assert_eq!(diagnostics.counters.completions, 1);
+    }
+
     #[tokio::test]
     async fn disabled_timing_passes_through_without_work() {
         let timings = Arc::new(LlmTimings::new(LlmTimingMode::Disabled));

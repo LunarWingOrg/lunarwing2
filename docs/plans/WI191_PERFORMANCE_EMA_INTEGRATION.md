@@ -550,10 +550,11 @@ real per-call charge stays with `CostGuard::record_llm_call`, and the v2
 adapter's `cost_usd: 0.0` is "unavailable", never "free" (B2).
 
 The LLM clock is **completed logical-call latency**, measured outside retry,
-failover and the response cache. Recovered attempts arrive as
-`LlmStreamObservation::Retried` and are counted separately, first-chunk latency
-is summed separately, and a failed, partial or cancelled stream trains
-nothing. Keys are `Llm(model)` with a 256-byte bound; the completion label
+smart routing, failover and the circuit breaker, and inside the response cache.
+A cache hit is served before the timer's inner provider, so it never trains.
+Recovered attempts arrive as `LlmStreamObservation::Retried` and are counted
+separately, first-chunk latency is summed separately, and a failed, partial or
+cancelled stream trains nothing. Keys are `Llm(model)` with a 256-byte bound; the completion label
 attributes a failover to the model that served the call. Diagnostics are the
 owner-only `GET /api/estimates/llm`; `LUNARWING_LLM_TIMINGS=0` disables
 recording and unset observes. Gate-wait analytics (B4) remain open and must
