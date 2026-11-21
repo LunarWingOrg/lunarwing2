@@ -180,6 +180,7 @@ impl Rig {
                 thread_id: thread.id,
                 run_started_at: thread.created_at,
                 history: None,
+                tool_call_count: AtomicU32::new(0),
             },
             llm,
             events,
@@ -1452,4 +1453,92 @@ async fn late_reply_suppressed_by_outbound_hook_finishes_no_reply() {
         .collect();
     let expected = [MessageLifecycle::Finished(TurnOutcome::NoReply)];
     assert_eq!(finishes, expected); // safety: test-only assertion
+}
+
+/// WI#807: the late-turn budget scales with the discrete tool calls a turn
+/// actually completed. The 8-step case is the known-step-count data point the
+/// WI asks for: 8 calls earn 8 × 90s on top of the flat 600s budget.
+#[test]
+fn late_budget_scales_with_completed_tool_calls() {
+    assert_eq!(late_budget_for_steps(0), LATE_TIMEOUT);
+    assert_eq!(late_budget_for_steps(1), LATE_TIMEOUT + LATE_STEP_ALLOWANCE);
+    assert_eq!(
+        late_budget_for_steps(8),
+        LATE_TIMEOUT + LATE_STEP_ALLOWANCE * 8
+    );
+    assert_eq!(
+        late_budget_for_steps(8),
+        Duration::from_secs(1_320),
+        "an eight-call chain must fit a 22-minute late budget"
+    );
+}
+
+/// The scaled budget is bounded, so a runaway loop still stops at the ceiling.
+#[test]
+fn late_budget_is_capped_and_cannot_overflow() {
+    let headroom = (LATE_MAX_TIMEOUT - LATE_TIMEOUT).as_secs();
+    let steps_to_cap = (headroom / LATE_STEP_ALLOWANCE.as_secs()) as u32;
+    // The ceiling is not an exact multiple of the allowance, so the step that
+    // reaches it clamps the remainder: prove both sides of that step.
+    assert!(late_budget_for_steps(steps_to_cap) < LATE_MAX_TIMEOUT);
+    assert_eq!(late_budget_for_steps(steps_to_cap + 1), LATE_MAX_TIMEOUT);
+    assert_eq!(late_budget_for_steps(u32::MAX), LATE_MAX_TIMEOUT);
+}
+
+/// Only completed tool actions extend the late budget. LLM steps, state
+/// changes and gates are thinking/waiting, and a failed action includes
+/// refusals, so none of them is demonstrated task progress.
+#[test]
+fn only_tool_action_events_count_as_steps() {
+    use lunarwing_engine::StepId;
+
+    let step = StepId::new();
+    assert!(is_tool_step(&EventKind::ActionExecuted {
+        step_id: step,
+        action_name: "shell".into(),
+        call_id: "call-1".into(),
+        duration_ms: 1,
+        params_summary: None,
+        result_preview: None,
+    }));
+    // WI#807 review AIP-1: a refusal such as the per-step tool-call limit is
+    // reported as ActionFailed and must not earn time.
+    assert!(!is_tool_step(&EventKind::ActionFailed {
+        step_id: step,
+        action_name: "shell".into(),
+        call_id: "call-2".into(),
+        error: "Tool call limit reached (50 per code step). Break your task into multiple steps."
+            .into(),
+        params_summary: None,
+    }));
+    assert!(!is_tool_step(&EventKind::StepStarted { step_id: step }));
+    assert!(!is_tool_step(&EventKind::StepCompleted {
+        step_id: step,
+        tokens: TokenUsage::default(),
+    }));
+}
+
+/// The counter the late budget reads is fed by forwarded engine events, so a
+/// turn that completes eight tool calls is measured as eight steps.
+#[tokio::test]
+async fn forwarded_tool_events_increment_the_turn_step_count() {
+    use lunarwing_engine::StepId;
+
+    let rig = Rig::new(None, None).await;
+    assert_eq!(rig.turn.tool_calls(), 0);
+    for call in 0..8 {
+        let event = lunarwing_engine::ThreadEvent::new(
+            rig.turn.thread_id,
+            EventKind::ActionExecuted {
+                step_id: StepId::new(),
+                action_name: "shell".into(),
+                call_id: format!("call-{call}"),
+                duration_ms: 1,
+                params_summary: None,
+                result_preview: None,
+            },
+        );
+        rig.turn.forward(&event).await;
+    }
+    assert_eq!(rig.turn.tool_calls(), 8);
 }
