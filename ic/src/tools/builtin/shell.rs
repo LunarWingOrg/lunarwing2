@@ -1636,6 +1636,84 @@ mod tests {
         .await;
     }
 
+    /// WI#816: a git network operation is refused before any runtime or
+    /// credential work when the call has no host grant, and when it names a
+    /// remote outside the grant. Both are `capability_denied`.
+    #[tokio::test]
+    async fn git_network_access_is_denied_before_runtime_without_a_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new().with_sandbox(Arc::new(SandboxManager::new(
+            crate::sandbox::SandboxConfig {
+                network: crate::sandbox::SandboxNetworkMode::None,
+                protected_paths: Vec::new(),
+                ..Default::default()
+            },
+        )));
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "command": "git clone https://git.example.test/org/repo.git",
+                    "workdir": temp.path(),
+                    "capability_manifest": {
+                        "manifest_version": 1,
+                        "network": {"mode": "none"}
+                    }
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .expect_err("no host git grant");
+        assert!(
+            matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_grant_refuses_an_ungranted_remote_and_force_push_before_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("remotes/origin.git")).unwrap();
+        let tool = ShellTool::new().with_sandbox(Arc::new(SandboxManager::new(
+            crate::sandbox::SandboxConfig {
+                network: crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+                protected_paths: Vec::new(),
+                git: Some(
+                    crate::sandbox::GitGrantConfig::from_spec(
+                        "origin=file:///workspace/remotes/origin.git",
+                    )
+                    .unwrap()
+                    .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )));
+        for command in [
+            "git clone https://evil.example.test/repo.git",
+            "git push --force origin main",
+            "git push origin :gone-branch",
+        ] {
+            let error = tool
+                .execute(
+                    serde_json::json!({
+                        "command": command,
+                        "workdir": temp.path(),
+                        "capability_manifest": {
+                            "manifest_version": 1,
+                            "network": {"mode": "proxy-enforced"},
+                            "extensions": ["git-remotes"]
+                        }
+                    }),
+                    &JobContext::default(),
+                )
+                .await
+                .expect_err(command);
+            assert!(
+                matches!(error, ToolError::Sandbox(ref message) if message.contains("capability_denied")),
+                "{command}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn manifest_never_falls_back_to_direct_host_execution() {
         let tool = ShellTool::new();

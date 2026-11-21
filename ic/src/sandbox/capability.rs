@@ -1225,7 +1225,13 @@ mod tests {
             !json.contains("git.example.test"),
             "an unselected remote leaked into the evidence: {json}"
         );
-        for needle in ["token", "credential-value", "password", "PRIVATE KEY", "user:"] {
+        for needle in [
+            "token",
+            "credential-value",
+            "password",
+            "PRIVATE KEY",
+            "user:",
+        ] {
             assert!(
                 !json
                     .to_ascii_lowercase()

@@ -1491,6 +1491,86 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn git_grant_env_reaches_the_container_as_remote_urls_not_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("remotes/origin.git")).unwrap();
+        let manager = SandboxManager::new(SandboxConfig {
+            network: SandboxNetworkMode::ProxyEnforced,
+            protected_paths: Vec::new(),
+            git: Some(
+                crate::sandbox::GitGrantConfig::from_spec(
+                    "origin=file:///workspace/remotes/origin.git",
+                )
+                .unwrap()
+                .unwrap(),
+            ),
+            ..SandboxConfig::default()
+        });
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        let decision = manager.authorize_manifest(&manifest, temp.path()).unwrap();
+        let env: HashMap<String, String> = decision
+            .git
+            .as_ref()
+            .expect("git grant")
+            .container_env()
+            .into_iter()
+            .collect();
+        let spec = crate::sandbox::cli_runner::RunSpec {
+            runtime: ContainerRuntime::Podman,
+            keep_id: crate::sandbox::cli_runner::KeepIdMode::UidPinned,
+            user: "1000:1000",
+            image: "localhost/sandbox-test:latest",
+            name: "lunarwing-sandbox-git-test",
+            created_at_label: "2026-11-21T00:00:00Z",
+            command: "git push origin main",
+            working_dir: temp.path(),
+            policy: decision.policy,
+            limits: &decision.limits,
+            env: &env,
+            network: decision.network,
+            proxy_port: 0,
+            tunnel: None,
+            proxy_dir: None,
+            pids_limit: crate::sandbox::config::DEFAULT_PIDS_LIMIT,
+            masked: &[],
+            mask_dir: None,
+            masked_files: &[],
+            mask_file: None,
+            tenant_logs: None,
+        };
+        let args = crate::sandbox::cli_runner::build_run_args(&spec);
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "-e",
+                "GIT_CONFIG_VALUE_0=file:///workspace/remotes/origin.git"
+            ]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-e", "GIT_TERMINAL_PROMPT=0"])
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("git push origin main")
+        );
+        for arg in &args {
+            for needle in ["token", "password", "PRIVATE KEY", "helper="] {
+                assert!(
+                    !arg.to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase()),
+                    "{arg}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn manifest_shutdown_releases_transport_without_side_effects() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let manager = manifest_test_manager(&state, SandboxNetworkMode::None);
