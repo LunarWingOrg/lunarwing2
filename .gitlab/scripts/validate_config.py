@@ -149,6 +149,12 @@ WORKER_SCAN_EFFECTIVE_KEYS = frozenset({
 WORKER_SCAN_JOB_KEYS = frozenset({"extends", "needs"})
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
 DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
+# WI#809: the tool registry is the compile list a tenant build uses, and
+# wasm-tools-check.py derives its own plan from deliverables.json `ci` — the
+# two are cross-checked by validate_tool_compile_coverage.
+WASM_TOOL_REGISTRY = ROOT / "ic" / "registry" / "tools"
+WASM_TOOL_PLAN_JOB = "wasm-tools-check"
+WASM_TOOL_PLAN_RUNNER = ".gitlab/scripts/wasm-tools-check.py"
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
@@ -2806,6 +2812,335 @@ def validate_build_inputs(data: dict, merged: dict, errors: list[str]) -> dict[s
     return lockfiles
 
 
+def validate_tool_compile_coverage(merged: dict, errors: list[str]) -> None:
+    """Every registry tool must name a blocking job that compiles it (WI#809).
+
+    The registry is what a tenant build compiles (``ic/scripts/build-wasm-extensions.sh``
+    walks ``ic/registry/tools/*.json``), so a tool that no CI job compiles is
+    first seen broken at a tenant build. Each registry source directory must
+    resolve to a production deliverable, and that deliverable's ``ci`` list
+    must name a non-optional job whose effective script either builds that
+    directory or runs the plan-driven ``wasm-tools-check.py`` runner — which
+    selects its crates from the same ``ci`` field, so the two cannot drift.
+    """
+    if not WASM_TOOL_REGISTRY.is_dir():
+        errors.append(f"tool registry missing: {WASM_TOOL_REGISTRY.relative_to(ROOT)}")
+        return
+    if not DELIVERABLES.is_file():
+        errors.append(".gitlab/deliverables.json missing")
+        return
+    try:
+        data = json.loads(DELIVERABLES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        errors.append(f".gitlab/deliverables.json is not valid JSON: {error}")
+        return
+    entries = [entry for entry in data.get("deliverables", []) if isinstance(entry, dict)]
+    by_directory: dict[pathlib.Path, dict] = {}
+    for entry in entries:
+        manifest = safe_relative_path(entry.get("manifest"))
+        if manifest is None:
+            continue
+        by_directory[(ROOT / manifest).parent.resolve()] = entry
+
+    for registry_path in sorted(WASM_TOOL_REGISTRY.glob("*.json")):
+        try:
+            registry_entry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"tool registry {registry_path.name} unreadable: {error}")
+            continue
+        source = registry_entry.get("source")
+        if not isinstance(source, dict) or not isinstance(source.get("dir"), str):
+            errors.append(f"tool registry {registry_path.name} has no source.dir")
+            continue
+        tool_name = registry_entry.get("name") or registry_path.stem
+        directory = (ROOT / "ic" / source["dir"]).resolve()
+        deliverable = by_directory.get(directory)
+        if deliverable is None:
+            errors.append(
+                f"registry tool {tool_name!r} source dir {source['dir']!r} has no "
+                ".gitlab/deliverables.json entry"
+            )
+            continue
+        name = deliverable.get("name", "<unnamed>")
+        if deliverable.get("status") != "production":
+            # Fixtures and staging ports are deliberately unbuilt; only what
+            # ships must be compiled by a gate.
+            continue
+        ci = deliverable.get("ci")
+        if not isinstance(ci, list) or not ci:
+            errors.append(f"production tool deliverable {name!r} must declare a CI job")
+            continue
+        if not any(compiling_job_covers(job, source["dir"], merged) for job in ci if isinstance(job, str)):
+            errors.append(
+                f"production tool deliverable {name!r} (registry {tool_name!r}) names no "
+                "blocking CI job that compiles it; add "
+                f"{WASM_TOOL_PLAN_JOB!r} to its ci list"
+            )
+
+
+def compiling_job_covers(job_name: str, source_dir: str, merged: dict) -> bool:
+    """True when ``job_name`` is a blocking job that compiles ``source_dir``.
+
+    A job covers a tool when its extends-resolved script builds that source
+    directory or runs the plan-driven runner. Templates and missing jobs never
+    count.
+    """
+    if job_name.startswith(".") or job_name not in merged:
+        return False
+    effective = resolve_extends(merged.get(job_name), merged)
+    if effective.get("allow_failure") is True or effective.get(EXTENDS_TRUNCATED_KEY):
+        return False
+    text = "\n".join(
+        _script_text(effective.get(key))
+        for key in ("before_script", "script")
+    )
+    return source_dir in text or WASM_TOOL_PLAN_RUNNER in text
+
+
+def _script_text(script: object) -> str:
+    if isinstance(script, str):
+        return script
+    if isinstance(script, list):
+        return "\n".join(line for line in script if isinstance(line, str))
+    return ""
+
+
+def _gitlab_glob_regex(pattern: str) -> str:
+    """Translate one GitLab `rules:changes` glob into a regular expression.
+
+    GitLab matches these globs with Ruby's ``File.fnmatch`` and the flags
+    ``FNM_PATHNAME | FNM_DOTMATCH | FNM_EXTGLOB``: ``*``, ``?`` and bracket
+    classes never match ``/``, only a ``**/`` that starts a segment spans
+    directories (zero or more), any other ``**`` is a plain ``*``, and ``\\``
+    escapes the next character. Braces are expanded before this translation
+    (see ``_glob_expand_braces``). A pattern with an unterminated ``[``
+    matches nothing, as in Ruby.
+    Python's ``fnmatch`` lets ``*`` cross ``/``, so ``dir/**`` looked as if
+    it covered nested files when GitLab does not run the job for them
+    (WI#809 review AIJ-1).
+    """
+    never = "(?!)"
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        at_segment_start = index == 0 or pattern[index - 1] == "/"
+        if at_segment_start and pattern.startswith("**/", index):
+            out.append("(?:[^/]*/)*")
+            index += 3
+        elif char == "*":
+            out.append("[^/]*")
+            index += 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        elif char == "\\":
+            if index + 1 >= len(pattern):
+                return never
+            out.append(re.escape(pattern[index + 1]))
+            index += 2
+        elif char == "[":
+            end = _glob_bracket_end(pattern, index)
+            if end is None:
+                return never
+            body = pattern[index + 1:end]
+            negate = body.startswith("!") or body.startswith("^")
+            if negate:
+                body = body[1:]
+            if not body:
+                return never
+            items = []
+            position = 0
+            while position < len(body):
+                if body[position] == "\\" and position + 1 < len(body):
+                    items.append(re.escape(body[position + 1]))
+                    position += 2
+                elif body[position] == "-" and 0 < position < len(body) - 1:
+                    items.append("-")
+                    position += 1
+                else:
+                    items.append(re.escape(body[position]))
+                    position += 1
+            members = "".join(items)
+            if any(operator in members for operator in ("--", "&&", "~~", "||")):
+                # Python reserves these for set operations; refuse rather
+                # than guess (fails closed).
+                return never
+            out.append("(?!/)[" + ("^" if negate else "") + members + "]")
+            index = end + 1
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return "".join(out)
+
+
+def _glob_bracket_end(pattern: str, start: int) -> int | None:
+    """Index of the `]` closing the class opened at `start`, or None."""
+    position = start + 1
+    if position < len(pattern) and pattern[position] in "!^":
+        position += 1
+    while position < len(pattern):
+        if pattern[position] == "\\":
+            position += 2
+            continue
+        if pattern[position] == "]":
+            return position
+        position += 1
+    return None
+
+
+def _glob_brace_end(pattern: str, start: int) -> int | None:
+    """Index of the `}` closing the brace opened at `start`, or None."""
+    depth = 0
+    position = start
+    while position < len(pattern):
+        if pattern[position] == "\\":
+            position += 2
+            continue
+        if pattern[position] == "{":
+            depth += 1
+        elif pattern[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return None
+
+
+def _glob_split_alternatives(body: str) -> list[str]:
+    """Split a brace body at its top-level commas."""
+    parts, depth, current, position = [], 0, "", 0
+    while position < len(body):
+        char = body[position]
+        if char == "\\" and position + 1 < len(body):
+            current += body[position:position + 2]
+            position += 2
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+        position += 1
+    parts.append(current)
+    return parts
+
+
+def _glob_expand_braces(pattern: str) -> list[str] | None:
+    """Expand ``{a,b}`` the way Ruby's ``ruby_brace_expand`` does.
+
+    Expansion runs over the raw pattern before any other rule, honours only
+    ``\\`` escapes and nesting (bracket classes are not special here), and a
+    ``{`` without its ``}`` makes the whole pattern match nothing (None).
+    """
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "{":
+            end = _glob_brace_end(pattern, index)
+            if end is None:
+                return None
+            prefix, suffix = pattern[:index], pattern[end + 1:]
+            expanded: list[str] = []
+            for alternative in _glob_split_alternatives(pattern[index + 1:end]):
+                more = _glob_expand_braces(prefix + alternative + suffix)
+                if more is None:
+                    return None
+                expanded.extend(more)
+            return expanded
+        index += 1
+    return [pattern]
+
+
+def gitlab_changes_match(pattern: str, path: str) -> bool:
+    """Whether GitLab's `rules:changes` glob `pattern` matches `path`.
+
+    A glob this translation cannot express (for example a reversed range)
+    matches nothing, so the coverage check fails closed on it.
+    """
+    expansions = _glob_expand_braces(pattern)
+    if expansions is None:
+        return False
+    for expansion in expansions:
+        try:
+            if re.fullmatch(_gitlab_glob_regex(expansion), path) is not None:
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def pattern_covers(pattern: str, sample: str) -> bool:
+    """Whether a `changes:` glob admits the paths a tool trigger stands for.
+
+    A tool's `triggers` name its paths (``ic/tools-src/gitlab/**``); the job
+    must run when any of them changes. The trigger's ``**`` is stood in for
+    by a direct file, a nested source file and a dot directory, and GitLab's
+    own matching rule must admit all three.
+    """
+    stand_ins = ("Cargo.toml", "src/lib.rs", ".cargo/config.toml")
+    samples = {sample.replace("**", stand_in) for stand_in in stand_ins}
+    return all(gitlab_changes_match(pattern, path) for path in samples)
+
+
+def validate_wasm_tools_check_shape(merged: dict, errors: list[str]) -> None:
+    """Pin wasm-tools-check so the gate cannot degrade silently (WI#809).
+
+    The job must be blocking, inherit the Rust bootstrap, run the plan-driven
+    runner in the test stage, and its MR `changes:` globs must cover every
+    production tool's declared triggers — otherwise a tool edit would skip
+    the very job meant to compile it.
+    """
+    job = merged.get(WASM_TOOL_PLAN_JOB)
+    if not isinstance(job, dict):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} job missing")
+        return
+    effective = resolve_extends(job, merged)
+    if effective.get("allow_failure") is True or effective.get(EXTENDS_TRUNCATED_KEY):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must be blocking")
+    if not extends_template(job, ".rust-job"):
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must extend .rust-job for the pinned Rust bootstrap")
+    if effective.get("stage") != "test":
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must run in the test stage")
+    script = _script_text(effective.get("script"))
+    if WASM_TOOL_PLAN_RUNNER not in script:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must run {WASM_TOOL_PLAN_RUNNER}")
+    if "wasm32-wasip2" not in script:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} must install the wasm32-wasip2 target")
+    changes: list[str] = []
+    for rule in effective.get("rules") or []:
+        if isinstance(rule, dict) and "merge_request_event" in str(rule.get("if", "")):
+            changes.extend(glob for glob in rule.get("changes") or [] if isinstance(glob, str))
+    if not changes:
+        errors.append(f"{WASM_TOOL_PLAN_JOB} needs an MR rule with changes: globs")
+    if not DELIVERABLES.is_file():
+        return
+    try:
+        data = json.loads(DELIVERABLES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    for entry in data.get("deliverables", []):
+        if not isinstance(entry, dict) or entry.get("status") != "production":
+            continue
+        if WASM_TOOL_PLAN_JOB not in (entry.get("ci") or []):
+            continue
+        for trigger in entry.get("triggers") or []:
+            if not isinstance(trigger, str):
+                continue
+            if not any(pattern_covers(glob, trigger) for glob in changes):
+                errors.append(
+                    f"{WASM_TOOL_PLAN_JOB} changes: globs do not cover trigger "
+                    f"{trigger!r} of production tool {entry.get('name')!r}"
+                )
+
+
 def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
     if not DELIVERABLES.is_file():
         errors.append(".gitlab/deliverables.json missing")
@@ -3639,6 +3974,8 @@ def main() -> int:
     validate_trivy_ignore(errors)
     validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
+    validate_tool_compile_coverage(merged_config, errors)
+    validate_wasm_tools_check_shape(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     validate_worker_snapshots(merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)

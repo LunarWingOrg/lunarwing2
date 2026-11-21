@@ -570,6 +570,9 @@ host's concurrent builds before retrying manually.
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
 - `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
   + `wit_compat` test) are all required jobs; failures block merge.
+- `wasm-tools-check` is likewise blocking (no `allow_failure`): a production
+  tool that fails to build for `wasm32-wasip2`, fails its unit tests, or trips
+  clippy fails the merge request.
 - `ci-config` cheaply checks Cavepony's registry, capabilities, Cargo package,
   local lockfile entry, and CI version expectation together. The WASM build
   uses `--locked`; its runtime compatibility job still requires a fresh
@@ -598,6 +601,24 @@ host's concurrent builds before retrying manually.
   unclassified locks still fail validation. Pebble's patched upstream lock is
   one such input. `ci-config` checks its reviewed SHA256 default and runs
   `.gitlab/tests` regressions for the inventory and full package-record guard.
+- `wasm-tools-check` (WI#809) compiles, tests and lints every production WASM
+  tool crate. `standalone-deliverables` only proves a tool's lockfile matches
+  its manifest; before this job nothing compiled an `ic/tools-src` crate until
+  a tenant build did, so a broken tool reached a tenant before any pipeline
+  showed it. The job takes its crate list from `.gitlab/deliverables.json`
+  (the entries whose `ci` names `wasm-tools-check`) and resolves each manifest
+  through `ic/registry/tools/*.json` to the same `source.dir` a tenant build
+  compiles — the `gotify` entry therefore builds
+  `ic/tools-src/gotify -> ../../lunarwing-gotify-tool`, the copy that ships —
+  then runs `cargo build --locked --release --target wasm32-wasip2`,
+  `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`
+  for that directory through `.gitlab/scripts/cargo-ci.sh`, sharing one
+  `CARGO_TARGET_DIR` across the crates. `ci-config` fails when a production
+  tool's `ci` names no blocking job that builds its registry directory (or
+  runs the plan-driven `.gitlab/scripts/wasm-tools-check.py`), so a new tool is
+  covered without editing the job. Adding a tool means adding its
+  `deliverables.json` entry with `wasm-tools-check` in `ci`; the MR-path
+  `changes:` globs already cover every production tool directory.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
   killing the whole pipeline after push. It also installs the pinned Go

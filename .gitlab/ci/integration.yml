@@ -48,6 +48,55 @@ cavepony-wasm:
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml
     - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --test wit_compat cavepony_component_actions_fit_ten_million_fuel -- --exact
 
+# WI#809: the production WASM tool crates were only lock-resolved by
+# standalone-deliverables; no job compiled, tested or linted them. This job
+# reads its crate list from .gitlab/deliverables.json (entries whose ci names
+# it), resolves each through ic/registry/tools/*.json to the same source
+# directory a tenant build compiles, then builds for wasm32-wasip2, runs the
+# crate's unit tests natively and lints with -D warnings. ci-config fails when
+# a production tool names no compiling job, so a new tool cannot fall out of
+# the run unnoticed. The changes globs are a superset of every production
+# tool's triggers, so a new tool under ic/tools-src needs no edit here. They
+# end in **/*: GitLab matches with FNM_PATHNAME, where a trailing ** does
+# not reach files in subdirectories.
+wasm-tools-check:
+  extends:
+    - .rust-job
+  stage: test
+  needs:
+    - job: rust-check-default
+      artifacts: false
+      optional: true
+    - job: rust-cache-refresh
+      artifacts: false
+      optional: true
+  variables:
+    # The eight crates share most dependencies; one target directory compiles
+    # each of them once per job.
+    CARGO_TARGET_DIR: "$CI_PROJECT_DIR/.ci-cache/wasm-tools-target"
+  timeout: 2h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "ic/tools-src/**/*"
+        - "lunarwing-gotify-tool/**/*"
+        - "ic/lunarwing-gotify-tool/**/*"
+        - "ic/registry/tools/**/*"
+        - "ic/wit/**/*"
+        - ".gitlab/deliverables.json"
+        - ".gitlab/scripts/wasm-tools-check.py"
+        - ".gitlab/ci/integration.yml"
+        - ".gitlab/ci/defaults.yml"
+        - ".gitlab/scripts/bootstrap-rust.sh"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - rustup target add --toolchain 1.96.1 wasm32-wasip2
+    - python3 .gitlab/scripts/wasm-tools-check.py --list
+    - python3 .gitlab/scripts/wasm-tools-check.py
+
 # Architecture boundaries: blocking changed-line/hard-violation ratchet since
 # 2026-09-11 (goals 2.1.1.0 item 23). The script exits non-zero only for NEW
 # hard violations vs the pipeline base; the full-tree debt counts it prints
