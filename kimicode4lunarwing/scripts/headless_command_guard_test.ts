@@ -347,3 +347,117 @@ test("the bare filesystem root and an ampersand-separated fork bomb are denied",
   assertAllowed("chmod -R 755 ./build")
   assertAllowed("chown -R user:user ./workspace")
 })
+
+test("root path spellings are resolved before the recursive-change rule", () => {
+  // WI#826 group A: the rule matched the spelling of a root, not the path
+  // bash passes.
+  assertBlocked("chmod -R 777 /./etc", "recursive")
+  assertBlocked("chmod -R 777 /tmp/../etc", "recursive")
+  assertBlocked("chown -R root /./usr", "recursive")
+  assertBlocked("chmod -R 777 //etc", "recursive")
+  assertBlocked("chmod -R 777 /etc/../etc", "recursive")
+  assertBlocked('chmod -R 777 "/./etc"', "recursive")
+  assertBlocked("chmod -vR 755 /etc", "recursive")
+  assertAllowed("chmod -R 755 ./build")
+  assertAllowed("chmod -R 777 /app/build")
+  assertAllowed("chown -R user:user ./workspace")
+})
+
+test("deletion without rm is contained by the same temp-root test", () => {
+  // WI#826 group B: checkRm was the only rule that looked at what a command
+  // deletes, so find, xargs and interpreter one-liners deleted freely.
+  assertBlocked("find /home/kimi -delete", "deletion outside")
+  assertBlocked("find . -delete", "deletion outside")
+  assertBlocked("find /app -type f -delete", "deletion outside")
+  assertBlocked("find /home/kimi -exec rm {} +", "deletion outside")
+  assertBlocked("find /home/kimi | xargs rm", "deletion outside")
+  assertBlocked("find /app -name '*.o' -print0 | xargs -0 rm -f", "deletion outside")
+  // No find in the pipeline: the deleted set is unknown, so it fails closed.
+  assertBlocked("ls | xargs rm -f", "cannot verify")
+  assertAllowed("find /tmp/wi826 -delete")
+  assertAllowed("find /tmp/wi826 -type f -print0 | xargs -0 rm -f")
+  assertAllowed("find /tmp/wi826 -name '*.o' -exec rm {} +")
+  assertAllowed("find /tmp/wi826 -print0 | xargs -0 -I {} rm -rf {}")
+  assertAllowed("find . -name '*.rs'")
+  assertAllowed("find . -name '*.rs' -exec wc -l {} +")
+})
+
+test("decoded payloads piped into a shell or interpreter are denied", () => {
+  // WI#826 group C: the pipe rule needed a fetch command on the left, so a
+  // locally decoded payload reached the shell.
+  const payload = "aGVsbG8K"
+  assertBlocked(`echo ${payload} | base64 -d | bash`, "decoded")
+  assertBlocked(`echo ${payload} | rev | sh`, "decoded")
+  assertBlocked(`printf 'x' | xxd -r -p | bash`, "decoded")
+  assertBlocked(`echo ${payload} | base64 --decode | /bin/sh`, "decoded")
+  assertBlocked(`echo ${payload} | base64 -d | /usr/bin/env bash`, "decoded")
+  assertBlocked(`echo ${payload} | base64 -d | python3 -`, "decoded")
+  // A decode to a file, or into a module that reads its input as data, stays
+  // ordinary work.
+  assertAllowed(`echo ${payload} | base64 -d > /tmp/wi826.out`)
+  assertAllowed("echo hello | rev")
+  assertAllowed(`echo ${payload} | base64 -d | python3 -m json.tool`)
+})
+
+test("git commands that discard workspace changes are denied", () => {
+  // WI#826 group D: recorded as denied because the loss is irrecoverable.
+  // `git clean -n` (a dry run) and `git stash` without -u stay ordinary work.
+  assertBlocked("git clean -fdx", "git command")
+  assertBlocked("git clean -fd", "git command")
+  assertBlocked("git reset --hard", "git command")
+  assertBlocked("git reset --hard HEAD~1", "git command")
+  assertBlocked("git checkout -- .", "git command")
+  assertBlocked("git stash -u", "git command")
+  assertBlocked("git stash --include-untracked", "git command")
+  assertBlocked("git -C /tmp/repo clean -fd", "git command")
+  assertAllowed("git status && git diff --stat")
+  assertAllowed("git commit -m 'clean -fd'")
+  assertAllowed("git reset --soft HEAD~1")
+  assertAllowed("git clean -n")
+  assertAllowed("git clean --dry-run")
+  assertAllowed("git stash")
+  assertAllowed("git stash list")
+})
+
+test("block-device writes by tee and cp are denied", () => {
+  // WI#826 group E: the device rule covered redirection, of= and truncate.
+  assertBlocked("tee /dev/sda1", "block-device")
+  assertBlocked("echo pwn | tee /dev/sda1", "block-device")
+  assertBlocked("tee -a /dev/nvme0n1", "block-device")
+  assertBlocked("cp /etc/hostname /dev/sda1", "block-device")
+  assertBlocked("cp -a /etc /dev/mapper/vg-root", "block-device")
+  assertAllowed("tee /tmp/wi826.out")
+  assertAllowed("cp /etc/hostname /tmp/wi826.out")
+  // Reading a device into a file is not a write.
+  assertAllowed("cp /dev/sda1 /tmp/wi826.img")
+})
+
+test("interpreter one-liner deletion is contained by the temp-root test", () => {
+  // WI#826 group F: a Python, Perl or Node one-liner deleted anything.
+  assertBlocked(`python3 -c "import shutil;shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  // A non-literal target cannot be verified, so it fails closed.
+  assertBlocked(`python3 -c "import shutil;shutil.rmtree(target)"`, "cannot verify")
+  assertBlocked(`perl -e "use File::Path qw(rmtree); rmtree('/app/x')"`, "deletion outside")
+  assertBlocked(`node -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`node -e "require('fs').rmSync('./build',{recursive:true})"`, "deletion outside")
+  assertAllowed(`python3 -c "import shutil;shutil.rmtree('/tmp/wi826-x')"`)
+  assertAllowed(`perl -e "use File::Path qw(rmtree); rmtree('/tmp/wi826-x')"`)
+  assertAllowed(`node -e "require('fs').rmSync('/tmp/wi826-x',{recursive:true})"`)
+})
+
+test("the probe commands of runs 500-505 stay ordinary work", () => {
+  // WI#826 acceptance: no new false denials for the commands those runs saw.
+  assertAllowed("taskset -c 0-18 cargo check -j18")
+  assertAllowed("cargo check --all-features")
+  assertAllowed("git status")
+  assertAllowed("find . -name '*.rs'")
+  assertAllowed("chmod -R 755 ./build")
+  assertAllowed("rm -rf /tmp/x")
+})
+
+test("a long command of repeated words is decided without rescanning", () => {
+  // The regex form of the recursive-change rule rescanned the rest of the
+  // command from every `chmod`; 12 KB of repetitions took ten seconds and
+  // tripped runGuard's kill timeout. The linear scan decides it immediately.
+  assertAllowed("chmod -R ".repeat(1500))
+})

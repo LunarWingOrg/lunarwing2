@@ -3969,14 +3969,19 @@ auto-approval:
 - `hooks/headless_command_guard.mjs`: denies privilege escalation
   (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
   `wipefs`, `mkswap`, `blkdiscard`, `sgdisk`, block-device writes including
-  `/dev/mapper` and `/dev/disk/by-*`), fork bombs, remote-content-piped-to-shell,
-  recursive `chmod`/`chown` on system roots (including the bare `/`), SSH-agent
-  socket use, and recursive/forced `rm` outside temp roots. Every rule is
-  checked on the original text and again on a shell-word view that drops quote
-  characters and one level of backslash escaping, so `"sudo"`, `\sudo` and
-  `/usr/bin/sudo` still match the privilege rule, a piped interpreter matches
-  through a path or an `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`),
-  and the recursive `chmod`/`chown` rule covers `/` (WI#813). The hook also
+  `/dev/mapper` and `/dev/disk/by-*` by redirection, `of=`, `truncate`, `tee`
+  or `cp`), fork bombs, remote-content-piped-to-shell, a decode command
+  (`base64 -d`, `xxd -r`, `rev`, `tr`) piped into a shell or an interpreter
+  one-liner, recursive `chmod`/`chown` on system roots (including the bare
+  `/`), forced `git clean`, `git reset --hard`, a whole-tree `git checkout`
+  and `git stash -u`, SSH-agent socket use, and deletion outside temp roots by
+  `rm`, `find -delete`, `find -exec rm`, `xargs rm` or a Python, Perl, Ruby or
+  Node one-liner. Every rule is checked on the original text and again on a
+  shell-word view that drops quote characters and one level of backslash
+  escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the privilege
+  rule, a piped interpreter matches through a path or an
+  `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`), and the recursive
+  `chmod`/`chown` rule covers `/` (WI#813). The hook also
   joins shell line continuations for every rule, not only `rm`: bash builds one
   word from a backslash-newline pair, so a continuation inside a denied word is
   checked on the joined text (WI#813). It cannot tell a real quote from an
@@ -3984,8 +3989,22 @@ auto-approval:
   whatever the quote state: every backslash-newline pair dropped (a
   continuation), every pair as a space (the line break that ends a comment or
   stays in quoted text), and pairs dropped outside single quotes but spaces
-  inside them. Every rule is checked on each reading (WI#810). Mixed shapes
-  beyond these readings can still pass; the container stays the boundary.
+  inside them. Every rule is checked on each reading (WI#810). Absolute path
+  tokens are also read lexically resolved, so `//etc`, `/./etc` and
+  `/tmp/../etc` are the roots they resolve to (WI#826); normalising only adds
+  a reading, so the raw spelling stays checked too. The non-`rm` deletion
+  shapes use the same temp-root test as `rm`: the `find` start paths, the
+  `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
+  deleted set is unknown and the call is denied), and the first quoted
+  argument of a `rmtree`/`rmSync`/`unlink`-style call in an interpreter
+  one-liner (a non-literal argument is denied as unverifiable). The git
+  commands are recorded as denied because the loss is irrecoverable; `git
+  clean -n`, `git stash` without `-u`, `git restore` and `git status` stay
+  ordinary work. What remains to the container: interpreter bodies that are
+  not one of the classified deletion or decode shapes, deletion by tools this
+  hook does not classify (`mv`, other languages' one-liners, writes through
+  unlisted utilities), and mixed shapes beyond the readings above, which can
+  still pass. The container stays the boundary.
   It checks lowercase and uppercase short flags and GNU long-option
   abbreviations (WI#795). This is a text check, not a shell parser: quoted
   arguments and heredoc bodies can be denied if they mention a blocked
@@ -4016,8 +4035,9 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
-The hook is baked into the Kimi worker image. Tenants pick up WI#795 only
-after rebuilding the image with the fix and recreating their workers; see
+The hook is baked into the Kimi worker image. Tenants pick up WI#795 and
+WI#826 only after rebuilding the image with the fix and recreating their
+workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
