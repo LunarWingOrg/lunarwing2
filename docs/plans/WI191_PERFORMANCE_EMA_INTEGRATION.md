@@ -1,10 +1,11 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A rollout remains in
-progress**. Remaining implementation is tracked by
-[work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318);
-the completed wiring is tracked historically by
-[work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191).
+progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+closed that initial scope and is kept as the historical record of the
+completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
+owns the successor phases and is the authoritative backlog and acceptance gate.
+
 Implementation contract: [`ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 The initial integration covers slices 0/1 and the approval-description portion
 of slice 3: per-user registry-owned learning, all three tool execution paths,
@@ -20,12 +21,17 @@ and are not displayed. See the
 
 Original plan reviewed against `wire-in-ema` at `05ddcc5cd` (2026-09-26).
 The original #191 prerequisite was satisfied by v2.1.4.0; it is no longer a
-reason to defer implementation. Phase A documentation and decisions are updated
-by SweetieBot (autonomous) under #318 on 2026-11-20 without changing runtime
-behavior. Read-only diagnostics and category gating must precede the real-tenant
-held-out evaluation, and only categories that pass that evaluation may receive
-hints. The still-open #318 umbrella remains open for those later phases; this
-plan is not an assertion that its closing acceptance criteria are met.
+reason to defer implementation. Remaining work follows #318: Phase A covers
+diagnostics, per-category gating, held-out evaluation and tenant rollout of the
+shipped tool hints. Phase B adds LLM logical-call timing and gate-wait
+analytics, Phase C bounded job and mission-run estimates, and Phase D a durable
+aggregate cache only if the evidence justifies it. Phase A documentation and
+decisions are updated by SweetieBot (autonomous) under #318 on 2026-11-20
+without changing runtime behavior. Read-only diagnostics and category gating
+must precede the real-tenant held-out evaluation, and only categories that pass
+that evaluation may receive hints. Treat this document as design context, not
+as proof that any follow-up phase has shipped or that #318's closing acceptance
+criteria are met.
 
 ## Goal and non-goals
 
@@ -335,20 +341,24 @@ necessary identity/timing. Never add a synchronous DB write on the mission fire
 path or treat repeated cron/event fires, retries, gate pauses and the
 mission's whole lifetime as one run. If durability is justified, use a
 separately designed workspace-compatible aggregate or append-only metric,
-not a fake `agent_jobs` foreign key. The authenticated read-only mission viewer
-at `GET /api/missions`, `/api/missions/summary` and `/api/missions/{id}`
-(`ic/src/channels/web/server.rs`) is the available current-run detail surface.
-It does not provide general mission-definition CRUD. Extend its run view
-additively for historical estimates rather than proposing an unrelated viewer;
-the webhook ingress remains separate.
+not a fake `agent_jobs` foreign key. The web gateway provides authenticated
+read-only mission list, summary and detail endpoints at `GET /api/missions`,
+`GET /api/missions/summary` and `GET /api/missions/{id}`
+(`ic/src/channels/web/server.rs`); the detail view is the available
+current-run surface. Extend its run view additively for any advisory
+historical estimate rather than proposing an unrelated viewer; do not claim
+general mission-definition CRUD or alter mission semantics as part of this
+plan. The webhook ingress remains separate.
 
 ### C. Diagnostics — optional read-only surface
 
-Aggregate top slow tool/model categories and calibration error with bounded
-cardinality. Expose only non-sensitive category keys and aggregate counts to
-authorized operators; no raw arguments, prompts, tokens, credentials or
-per-user cross-tenant data. This is useful for diagnosing bottlenecks, but
-not a reason to add synchronous DB writes to the hot path.
+Read-only diagnostics are a **required Phase A gate**, not an optional extra.
+Show only non-sensitive category keys, sample counts, current and error EMAs,
+confidence labels, and eligible/withheld/clipped/evicted counters. The shipped
+models are per-user, so gateway access must use existing authentication and
+expose only the caller's own models. Any cross-user operator view must be
+aggregate-only. Never expose raw arguments, prompts, tokens, credentials or
+cross-tenant data. No synchronous DB writes belong on the hot path.
 
 ## Persistence decision
 

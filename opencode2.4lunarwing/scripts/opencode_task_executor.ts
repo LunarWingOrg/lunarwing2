@@ -5,7 +5,7 @@
  * SDK (@opencode/client/promise) to create sessions, send prompts, and stream
  * events back to the caller.
  *
- * v2 differences from the v1 worker (see docs/plans/
+ * v2 differences from the v1 worker (see docs/plans/history/
  * OPENCODE2_EXTERNAL_WORKER_PLAN.md §4):
  *  - Client construction is OpenCode.make({ baseUrl, headers }) — no
  *    per-request `directory` option, so the work dir is selected by running

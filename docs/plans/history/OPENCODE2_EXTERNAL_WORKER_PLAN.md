@@ -1,9 +1,11 @@
 # OpenCode 2 External Worker — Exploration Plan (v2.1.2.0, goals item #17)
 
-Status: **plan only** — no implementation is authorized by this document. It is the
-exploration output for `docs/ops/history/opencode2extworkerideaandissuesandpotentialplan.md`
-(the "opencode2 idea/issues/potential plan" note). Audience: whoever picks up the
-implementation (Rarity/AJ per the source note).
+Status: **implemented; historical design record**. The separate, opt-in
+`opencode2` worker lane now exists in `opencode2.4lunarwing/`. This was originally
+a plan-only exploration of `docs/ops/history/opencode2extworkerideaandissuesandpotentialplan.md`;
+the implementation phases and source references below describe that starting point,
+not current work. See the [worker README](../../../opencode2.4lunarwing/README.md)
+and [worker operations guide](../../ops/WORKER-CONTAINERS.md) for current behavior.
 
 ## 1. Decision being made
 

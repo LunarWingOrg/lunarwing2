@@ -1,4 +1,14 @@
-Full Branch Plan Status
+# Engine V2 local compatibility status — 2026-07-15
+
+> **Historical; subsequent work shipped in v2.0.1.0.** This is a 2026-07-15
+> branch snapshot, not a current backlog. Its uncommitted/partial states must not
+> be followed. The [v2.0.1.0 release notes](../../releases/RELEASE-v2.0.1.0.md)
+> record the completed compatibility coverage; current design lives in
+> [Engine V2 architecture](../../architecture/ENGINE-V2.md).
+
+Original filename: `PHASE5PLANSTATUSTODAYWED.md`.
+
+## Original branch status
 This branch was meant to execute the nine-task Engine V2 Local Compatibility Completion plan. It is roughly Tasks 1–3 complete, Task 4 partial, Tasks 5–9 unstarted.
 Completed and committed
 Task 1 — Engine V2 environment support

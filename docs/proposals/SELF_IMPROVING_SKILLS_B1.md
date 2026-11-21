@@ -271,5 +271,6 @@ patches `Installed` skills.
 **Note:** gateway static assets are `include_bytes!`-compiled — the GUI (like
 prior font work) requires a release rebuild / next tenant build to appear.
 
-**Deferred to a separate plan** (`docs/plans/SELF_IMPROVING_SKILLS_B2_B3.md`):
-B-2 confidence-based demotion/pruning, B-3 cross-agent skill sharing.
+**Originally deferred to a separate plan** (`docs/plans/history/SELF_IMPROVING_SKILLS_B2_B3.md`):
+B-2 confidence-based demotion/pruning and B-3 cross-agent skill sharing, now
+implemented. See the archive's status banner for the later lifecycle fixes.
