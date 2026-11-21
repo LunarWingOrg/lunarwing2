@@ -314,12 +314,13 @@ function checkDeviceWrites(text) {
   return null;
 }
 
-/** Deletion, decode and device checks that need the command text with its quoting intact. */
+/** Deletion, decode, listener and device checks that need the command text with its quoting intact. */
 function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
+    checkListeners(text) ??
     checkDecodedPipe(text);
 }
 
@@ -427,6 +428,93 @@ function isInterpreterStage(stage) {
     return args.some((word) => ["-e", "--eval", "-p", "--print", "-"].includes(word));
   }
   return false;
+}
+
+// WI#833 point 1: a task must not open an inbound path (WI#357). kimi's own
+// service modes (`kimi server`, `kimi web`) are the reported case, but the
+// class is "a listener started from a task", so a closed verb list covers the
+// common spellings too. Like every other rule here this is a naive-use
+// control: it matches the shapes it can positively read and lets an unknown
+// spelling pass.
+const LISTENER_PREFIXES = new Set([
+  "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
+]);
+
+/** True for a wrapper, an assignment, an option or a wrapper's numeric operand. */
+function isPrefixWord(word) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) ||
+    word.startsWith("-") ||
+    /^\d+$/.test(word) ||
+    LISTENER_PREFIXES.has(commandBasename(word));
+}
+
+/** The kimi subcommand word, ignoring leading options. */
+function kimiSubcommand(args) {
+  const subcommand = args.find((word) => !word.startsWith("-"));
+  return subcommand === "server" || subcommand === "web" ? subcommand : null;
+}
+
+const LISTENER_COMMANDS = [
+  // `python3 -m http.server 8080`
+  {
+    name: /^python[0-9.]*$/,
+    test: (args) => {
+      const moduleIndex = args.indexOf("-m");
+      return moduleIndex !== -1 && args[moduleIndex + 1] === "http.server";
+    },
+  },
+  // `nc -l 9000`, `ncat -l`, `netcat -lp 9000`
+  {
+    name: /^(?:nc|ncat|netcat)$/,
+    test: (args) => args.some((word) => /^-[a-zA-Z]*l[a-zA-Z]*$/.test(word) || word === "--listen"),
+  },
+  // `socat TCP-LISTEN:9000,fork -`
+  {
+    name: /^socat$/,
+    test: (args) => args.some((word) => /TCP[46]?-LISTEN:/.test(word)),
+  },
+  // `php -S 0.0.0.0:8080`
+  {
+    name: /^php[0-9.]*$/,
+    test: (args) => args.includes("-S"),
+  },
+  // `ruby -run -e httpd . -p 8080`
+  {
+    name: /^ruby$/,
+    test: (args) => args.includes("-run") && args.includes("httpd"),
+  },
+];
+
+/** Deny starting kimi service mode or any listed listener from a task (WI#833). */
+function checkListeners(text) {
+  for (const segment of commandSegments(text)) {
+    // A quoted argument that names a command (`sh -c 'kimi server'`) is read as
+    // the words the shell would build.
+    const words = argumentWords(segment)
+      .flatMap((word) => stripShellQuotes(word).split(/[ \t]+/))
+      .filter((word) => word.length > 0);
+    // prefixOnly[i] is true when every word before i is a wrapper, an option
+    // or an assignment, so words[i] sits where a command starts. One pass:
+    // a repeated-word command must not be rescanned from every position.
+    const prefixOnly = [true];
+    for (const word of words) prefixOnly.push(prefixOnly[prefixOnly.length - 1] && isPrefixWord(word));
+    for (let i = 0; i < words.length; i++) {
+      const previous = words[i - 1];
+      const commandHere = prefixOnly[i] || previous === "-c" || previous === "--command";
+      if (!commandHere) continue;
+      const name = commandBasename(words[i]);
+      const args = words.slice(i + 1);
+      if (name === "kimi") {
+        const subcommand = kimiSubcommand(args);
+        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
+        continue;
+      }
+      if (name === "busybox" && args[0] === "httpd") return "listener started from a task: busybox httpd";
+      const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+      if (rule && rule.test(args)) return `listener started from a task: ${name}`;
+    }
+  }
+  return null;
 }
 
 /** Deny a decode command piped into a shell or interpreter (WI#826). */
