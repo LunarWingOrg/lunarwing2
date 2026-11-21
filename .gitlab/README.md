@@ -742,10 +742,15 @@ host's concurrent builds before retrying manually.
   because every work-item owner the acceptances cited (WI#367, WI#418,
   WI#749, WI#781) was closed with the pins still locked, and WI#418's own
   decision record states the rule they broke: a closed work item cannot own
-  a standing acceptance. The guard therefore refuses `clearing owner WI#N`,
-  requires the named document to resolve inside the checkout, and requires
-  it to list the advisory ID it owns as the first cell of a table row, so a
-  deleted, renamed or split decision record fails offline. The standing owner for every current entry
+  a standing acceptance. The guard therefore requires every reason to name
+  a document owner — `clearing owner <repo-relative>.md`; a reason whose
+  only owner is a work item (the old `clearing owner WI#N` form) is refused
+  because it names no document. It also requires the named document to
+  resolve inside the checkout and to list the advisory ID it owns as the
+  first cell of a table row, so a deleted, renamed or split decision record
+  fails offline. A historical work-item phrase kept next to the document
+  owner (the RUSTSEC-2021-0145 reason records `historical clearing owner
+  WI#367`) is allowed. The standing owner for every current entry
   is `docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md`. Checking whether a
   work item is still open (owner liveness) remains out of scope per the
   WI#363 scope decision of 2026-10-20 — an online owner gate could only run
