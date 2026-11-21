@@ -118,6 +118,7 @@
 //!   backstop + API-independent CLI reaper (bounded probes)
 //! - **Timeout enforcement**: Commands are killed after the timeout
 
+pub mod capability;
 pub mod cli_runner;
 pub mod config;
 pub mod container;
@@ -129,6 +130,10 @@ pub mod proxy;
 pub(crate) mod runtime_path;
 pub mod tunnel_sidecar;
 
+pub use capability::{
+    CAPABILITY_MANIFEST_VERSION, CapabilityDecision, CapabilityEvidence, CapabilityManifest,
+    audit_json, authorize_manifest, capability_manifest_schema, compatibility_decision,
+};
 pub use cli_runner::{
     CliRunner, ContainerRuntime, KeepIdMode, SANDBOX_CONTAINER_LABEL, TunnelRunConfig,
     inflight_sandbox_containers,

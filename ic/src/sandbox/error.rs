@@ -84,6 +84,10 @@ pub enum SandboxError {
     /// Configuration error.
     #[error("Configuration error: {reason}")]
     Config { reason: String },
+
+    /// A declarative capability was malformed, unauthorized, or unenforceable.
+    #[error("{reason}")]
+    CapabilityDenied { field: String, reason: String },
 }
 
 impl SandboxError {
@@ -114,6 +118,7 @@ impl SandboxError {
             Self::TunnelUnavailable { .. } => "sandbox_unavailable",
             Self::Config { .. } => "config",
             Self::MountPathDenied { .. } => "mount_path_denied",
+            Self::CapabilityDenied { .. } => "capability_denied",
         }
     }
 
@@ -223,6 +228,13 @@ mod tests {
                 "sandbox_unavailable",
             ),
             (SandboxError::Config { reason: "x".into() }, "config"),
+            (
+                SandboxError::CapabilityDenied {
+                    field: "network.mode".into(),
+                    reason: "x".into(),
+                },
+                "capability_denied",
+            ),
             (
                 SandboxError::MountPathDenied {
                     path: "/home/u/lunarwing/env".into(),
