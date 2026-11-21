@@ -96,7 +96,10 @@ function isSafeTempPath(operand) {
  * would then be removed through the link.
  */
 function resolveExistingPrefix(target) {
-  let prefix = target;
+  // A trailing slash makes every filesystem call follow the final component,
+  // which hides a dangling link from the check below; realpath treats the two
+  // spellings the same otherwise.
+  let prefix = target.replace(/(.)\/+$/, "$1");
   const missing = [];
   for (;;) {
     try {
