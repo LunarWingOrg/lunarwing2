@@ -1,10 +1,11 @@
 # Release Notes for LunarWing v2.2.2.0
 
-## Codename: Kuran (クラン) — Clan
+## Codename: Kuran (クラン) — Clan (to confirm at the release; WI#828)
 
 <!-- DRAFT: the codename is the maintainer's. This line is filled from the
-     codename decision in WI#828 (2026-11-21), which closed the naming round
-     for this release. The maintainer replaces or confirms it at the release. -->
+     codename recorded in WI#828 (2026-11-21); that item is still open. The
+     maintainer confirms or replaces it at the release, and the visible
+     marker in the heading is removed then. -->
 
 **Release Date:** PLACEHOLDER — the maintainer sets the release date at the tag.
 
@@ -44,10 +45,11 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   the generic shell has no secret injection at all — and a manifest refuses a
   host with no sandbox configuration instead of executing on the host.
 - **A shell call can use git without the container holding a credential
-  (WI#816).** `extensions: ["git-remotes"]` grants a read-only, credential-free
-  git access to remotes the tenant operator names in `SANDBOX_GIT_REMOTES`; a
-  remote outside that list is refused. Host-held authentication and push from
-  inside the shell are **not** part of this release.
+  (WI#816).** `extensions: ["git-remotes"]` grants credential-free git access
+  to remotes the tenant operator names in `SANDBOX_GIT_REMOTES`; a remote
+  outside that list is refused. No credential is injected, which is what keeps
+  the grant from writing to an authenticated remote. Host-held authentication
+  and push from inside the shell are **not** part of this release.
 - **`upgrade-tenant` rebuilds the worker containers it used to leave behind
   (WI#796).** Both upgrade paths refresh each enabled lane's container after
   promotion, so a lane that had soft-skipped no longer keeps serving a
@@ -57,19 +59,22 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 - **A detached turn's late budget scales with the work it did (WI#807,
   WI#837).** The late watcher keeps a 600-second base, earns 90 seconds for
   every completed tool action, is re-read as it waits, and is capped at 1,800
-  seconds. Each late turn leaves one `Late turn finished` record with
-  `tool_calls`, `late_budget_secs`, `budget_exhausted` and `elapsed_ms`, so a
-  bounded task with a known step count becomes a measurable data point. The
-  TUI's own sealing windows move with it (WI#837).
+  seconds. Every turn, foreground and late, leaves one `Turn finished` record
+  with `phase`, `tool_calls`, `budget_secs`, `budget_exhausted`, `elapsed_ms`
+  and `outcome`, so a bounded task with a known step count becomes a
+  measurable data point. The TUI's own sealing windows move with it (WI#837).
 - **Tool runtime calibration reports what it has learned (WI#318).** One
   `ToolEstimates` per tool registry observes completed calls and exposes
-  read-only `GET /api/estimates` (user-scoped) plus owner-only counters and a
-  held-out evaluation trace. Hints in approval text stay opt-in
-  (`LUNARWING_TOOL_ESTIMATES=1`); the default is observe-only, and no learned
-  factor survives a restart.
-- **The WASM tool fleet is compiled, tested and linted by CI (WI#809,
-  WI#825).** `wasm-tools-check` builds every production tool crate for
-  `wasm32-wasip2`, runs its tests and clippy, and blocks a merge. `ci-config`
+  read-only `GET /api/estimates` (user-scoped) plus owner-only counters, a
+  held-out evaluation trace, LLM call timing and gate-wait diagnostics. Hints
+  in approval text stay opt-in (`LUNARWING_TOOL_ESTIMATES=1`); the default is
+  observe-only, and no learned factor survives a restart. LLM logical-call
+  timing (`LUNARWING_LLM_TIMINGS`) observes by default, daemon-wide; `0`
+  disables it.
+- **The WASM tool fleet is compiled by CI (WI#809, WI#825).**
+  `wasm-tools-check` builds the eight tool crates `.gitlab/deliverables.json`
+  assigns to it for `wasm32-wasip2`, runs their tests and clippy, and blocks a
+  merge; `cavepony-tool` is built by its own `cavepony-wasm` job. `ci-config`
   fails when a production tool names no blocking job that actually compiles
   its registry directory.
 
@@ -91,19 +96,22 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   effective policy and the refusals, and never records a secret value. The
   guide is
   [`docs/guides/SANDBOX_CAPABILITY_MANIFEST.md`](docs/guides/SANDBOX_CAPABILITY_MANIFEST.md).
-- **Git remotes are the one grantable extension, and the grant is read-only
-  (WI#816).** `SANDBOX_GIT_REMOTES` holds `name=url[,name=url...]`;
+- **Git remotes are the one grantable extension, and the grant carries no
+  credential (WI#816).** `SANDBOX_GIT_REMOTES` holds `name=url[,name=url...]`;
   `"extensions": ["git-remotes"]` with `"git": {"remotes": ["origin"]}` selects
   a subset by name and cannot add one. HTTP(S) remotes require
-  `proxy-enforced` and every host must already be on the tenant's egress
-  allowlist; `file:///workspace/...` remotes work in `none`, `proxy-enforced`
+  `proxy-enforced` and every host must already be on the tenant sandbox
+  egress allowlist (`SANDBOX_EXTRA_DOMAINS` plus defaults, not the worker
+  egress allowlists `mt-admin` keeps); `file:///workspace/...` remotes work in
+  `none`, `proxy-enforced`
   and `tunnel` when they resolve inside the call's workspace. The container
   receives the granted URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, a reset
   `credential.helper`, `GIT_TERMINAL_PROMPT=0` and `GIT_CONFIG_GLOBAL=/dev/null`
   — no credential. The manifest preflight rejects recognized `git push`
   invocations, including a plain push, because repository-local settings can
   change what runs; it also denies unrecognized read options rather than
-  guessing which argument is the remote. Calls that omit the manifest keep the
+  guessing which argument is the remote. Unlisted plumbing verbs such as
+  `git send-pack` are not refused by it (WI#844). Calls that omit the manifest keep the
   old behavior and skip both the preflight and the scoped proxy. The guide's
   wording is explicit that the shell scan is not a security boundary.
 - **The relay's accept loop no longer dies at 32 connections (WI#834).** The
@@ -133,8 +141,12 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   move together. The three 2.7.x releases add one feature flag
   (`KIMI_CODE_EXPERIMENTAL_PROMPT_PREDICTION`, TUI-only and off by default) and
   export the task's own session and workspace identifiers; the lane takes
-  neither as input. The real-CLI contract gate passed 4/4 on this host, and the
-  guard was shown blocking a mock-provider `sudo id` end to end.
+  neither as input. The pinned 2.7.2 CLI also carries two subcommands that
+  start a listener: `kimi rc` (alias `kimi remote`, the local server and web UI
+  through Remote Control) and `kimi vis` (the session visualizer, with
+  `--port`/`--host`). The guard in the tree this draft was checked against
+  does not deny them (WI#852). The real-CLI contract gate passed 4/4 on this
+  host, and the guard was shown blocking a mock-provider `sudo id` end to end.
 - **OpenCode 2 and OpenCode v1 were re-checked and did not move (WI#804).**
   `git ls-remote --tags` on `anomalyco/opencode` still resolves the newest
   `v2.*` tag to `v2.3.2` at `c0ad18b40…` and the newest `v1.*` tag to
@@ -144,7 +156,8 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   with "flag pin anchor text unchanged". Pebble's upstream HEAD is still
   `2d0f3786…`; LunarDepth's HEAD has moved to `9eb615d8…` from the pinned
   `0472d115…`, and a bump of either is its own item.
-- **A kimi task can no longer start service mode or re-enable remote control
+<!-- TODO(run-519 merges): add WI#839 #841 #842 #843 #845 #846 #847 #848 #849 #851 #852 #853 #816 #844 #850 #318-Phase-C #855 once merged -->
+- **The baked guard denies kimi service mode from a task's Bash tool
   (WI#833).** `kimi` is on `PATH`, so a task's Bash tool could start
   `kimi server`/`kimi web` itself. The baked `PreToolUse` hook now denies those
   subcommands, plus a closed list of listener tools (`python -m http.server`,
@@ -169,9 +182,11 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   rule (WI#830). It covers deletion performed by `find -exec unlink`,
   `rsync --delete` and interpreter one-liners, decoded payloads fed to an
   interpreter, device writes through `tee`/`cp`, and the git commands that
-  discard work — `git restore`, `git checkout`/`switch`, `git clean` and a
-  `stash` that takes untracked or everything — plus the alias and one-liner
-  spellings of them (WI#826, WI#832). The SSH rule now matches the agent
+  discard work: a forced `git clean` (a dry run passes), `git reset --hard`, a
+  whole-tree `git checkout`/`git restore`, a forced `checkout`/`switch`, and a
+  `stash` that takes untracked or ignored files (WI#826, WI#832). These rules
+  read the spellings their tests pin; abbreviated options, git aliases and
+  wrapped forms are tracked separately (WI#841, WI#842, WI#853). The SSH rule now matches the agent
   directory and socket path the lanes actually mount, and `ssh-add`, instead
   of a literal path no lane uses (WI#829); direct key-file auth stays allowed
   on purpose. Two false denials were removed in the same pass (WI#832). Every
@@ -180,10 +195,11 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   removes the shell escapes of a quoted one-liner before it reads the Perl
   deletion calls, so an escaped quote no longer hides an
   `rmtree`/`unlink`/`rmdir`/`remove_tree` operand, and every operand of a comma
-  list is read instead of only the first. `perlDeletionCall` also reports a
-  target it cannot resolve as unverifiable rather than as safe (WI#832). The
-  change is pinned by the guard's test and the guard's notes were corrected in
-  the same commit.
+  list is read instead of only the first. The change is pinned by the guard's
+  test, and the guard's notes were corrected in the same merge request. A
+  concatenated operand (`rmtree "/tmp/x/" . "../../workspace"`) and the
+  `glob()`, `<…>`, `qw()` and implicit-`$_` forms still passed this reader in
+  the tree this draft was checked against; they are tracked by WI#851.
 - **The pebble worker-inputs manifest covers the files that ship (WI#806).**
   `entrypoint-split.sh` and `src/task_runner.rs` are build-read inputs, so a
   change to either now moves the lane's `worker-inputs` hash instead of
@@ -210,11 +226,15 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   time — a tool that returned an error still counts, a refusal (`ActionFailed`)
   does not — and a turn with no tool calls keeps exactly the old 600 seconds.
   The stop request keeps its 60-second grace and settlement its own.
-- **Every late turn now leaves one measurement record (WI#807).** `Late turn
-  finished` carries `tool_calls`, the final `late_budget_secs`,
-  `budget_exhausted`, `elapsed_ms` and the outcome, on the boundary between
-  "fits its budget" and "ran out". The field names are pinned against the
-  record writer by a test.
+- **Every turn now leaves one measurement record (WI#807).** `Turn finished`
+  is written for the foreground phase and for the late phase, and carries
+  `phase`, `tool_calls`, `budget_secs` (the budget of that phase),
+  `budget_exhausted`, `elapsed_ms` and `outcome`, on the boundary between
+  "fits its budget" and "ran out" (`ic/src/bridge/router/outcome.rs`). The
+  detach warning ("Turn wait budget exhausted; transferring delivery to late
+  watcher") carries the starting `late_budget_secs`. The probe's field names
+  are pinned against the record writer by a test. A daemon older than this
+  release logs `Late turn finished` instead, for detached turns only.
 - **The bounded-turn probe measures a known-step task (WI#807).**
   `ic/scripts/bounded-turn-probe.py` runs a task with a known step count
   against a live daemon and reads that record's `budget_exhausted`,
@@ -224,12 +244,14 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   [`docs/ops/PRE-RELEASE-TESTING.md`](docs/ops/PRE-RELEASE-TESTING.md).
 - **The TUI's sealing windows follow the longer late budget (WI#837).**
   `YOUNG_FAILED_TURN_MS` moves from 610,000 to 2,530,000 ms, the daemon's
-  longest late window (600 s wait budget + the capped 1,800 s late budget +
-  both 60 s graces). The legacy `unanswered` seal stays at 610,000 ms
-  (`UNANSWERED_AFTER_MS`) on purpose, so a swallowed message does not hold its
-  queue slot for the whole late budget. `tui/src/state/correlate.ts` derives
-  the history window from `LONGEST_LATE_WINDOW`, and the reducer test states
-  the distinction.
+  longest late window (610 s wait budget `OUTCOME_TIMEOUT` + the capped
+  1,800 s late budget + both 60 s graces). The legacy `unanswered` seal stays
+  at 610,000 ms (`UNANSWERED_AFTER_MS`) on purpose, so a swallowed message does
+  not hold its queue slot for the whole late budget.
+  `tui/src/state/correlate.ts` holds the window as a literal
+  (`LATE_REPLY_WINDOW_MS`) that mirrors the daemon's `LONGEST_LATE_WINDOW`,
+  which `outcome/tests.rs` pins at 2,530 s; the reducer test states the
+  distinction.
 - **A finished message is remembered for the whole late window (WI#820).**
   The channel manager's finished-message memory
   (`ic/src/channels/lifecycle.rs`) derives its TTL from `LONGEST_LATE_WINDOW`
@@ -249,10 +271,18 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   duration and are not converted to zero-duration successes. No estimate is
   returned until five valid completed calls exist. Keys are per user and per
   canonical tool name, never logged, and at most 1,024 models are retained.
-  Three read-only gateway routes expose the model — `GET /api/estimates`
-  (user-scoped), `/api/estimates/counters` (owner-only) and
-  `/api/estimates/evaluation` (owner-only, opt-in trace); they use the
-  existing bearer-token middleware and add no listener.
+  Five read-only gateway routes expose the models — `GET /api/estimates`
+  (user-scoped), `/api/estimates/counters`, `/api/estimates/evaluation`
+  (opt-in trace), `/api/estimates/llm` and `/api/estimates/gate-waits` (all
+  four owner-only); they use the existing bearer-token middleware and add no
+  listener.
+- **LLM call timing observes by default (WI#318).** One daemon-wide timer
+  decorates the provider chain built at startup and records each completed
+  logical LLM call; cache hits, failures, incomplete streams and calls that
+  switch provider or model do not train, and cost is not learned. Unlike the
+  tool estimates it is on unless `LUNARWING_LLM_TIMINGS=0`; it is in memory,
+  keyed by configured provider and model with no user identity, and resets on
+  restart ([`docs/ops/TENANT-CONFIGURATION.md`](docs/ops/TENANT-CONFIGURATION.md)).
 - **Approval hints are opt-in and say what they are (WI#318).** With
   `LUNARWING_TOOL_ESTIMATES=1`, an approval description gains one line such as
   "Typical tool runtime: ~2.00s (EMA, 5 completed calls, low confidence).
@@ -312,16 +342,17 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   described as removed is still absent, and the comment says a re-broken record
   is a new maintainer decision.
 - **The secret-history baseline carries the 2.2.2 vendor commit (WI#799,
-  WI#798).** The sweep's vendor refresh adds five fingerprints, recorded in
+  WI#798).** Nine fingerprints were added since v2.2.1.0, recorded in
   `.gitlab/gitleaks-history-ignore` with disposition rows in
-  `.gitlab/gitleaks-history-dispositions.md`. Four of them are the Wasmtime
-  36.0.23 refresh (WI#798) — `wasmtime`, `wasmtime-wasi`,
-  `cranelift-assembler-x64` and `cranelift-entity` at commit `da90adaad` — each
-  a cargo checksum manifest whose package digest equals the crate's checksum in
-  `ic/Cargo.lock`, not a credential. Without them the blocking `secret-history`
+  `.gitlab/gitleaks-history-dispositions.md`, in two sets: five from the
+  sweep's vendor commit `aacffdd47` (WI#799: `cc`, `serde_with`, `toml`,
+  `toml_edit` and `toml_parser`) and four from the Wasmtime 36.0.23 refresh at
+  `da90adaad` (WI#798: `wasmtime`, `wasmtime-wasi`, `cranelift-assembler-x64`
+  and `cranelift-entity`). Each is a cargo checksum manifest whose package
+  digest equals the crate's checksum in `ic/Cargo.lock`, not a credential. Without them the blocking `secret-history`
   job would have failed at the release tag, because the scan runs only on
   schedules and protected tags.
-- **Every production WASM tool is compiled, tested and linted in CI (WI#809,
+- **The WASM tool crates are compiled, tested and linted in CI (WI#809,
   WI#825).** Before this, a tool crate was only resolved: nothing built an
   `ic/tools-src` crate until a tenant build did, so a broken tool reached a
   tenant before any pipeline showed it. `wasm-tools-check` takes its crate list
@@ -329,7 +360,9 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   `ic/registry/tools/*.json` to the same source directory a tenant build
   compiles, and runs `cargo build --locked --release --target wasm32-wasip2`,
   `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`
-  through `.gitlab/scripts/cargo-ci.sh`. The job blocks a merge. The coverage
+  through `.gitlab/scripts/cargo-ci.sh` for the eight crates assigned to it;
+  `cavepony-tool` is built by `cavepony-wasm`, which runs one host
+  compatibility test and no clippy. The job blocks a merge. The coverage
   check is no longer a substring test (WI#825): an `echo`, a comment or a lone
   `cd` that mentions the path does not count, only an actual cargo compile
   subcommand run from that directory or naming its manifest.
@@ -368,11 +401,14 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   `worker_quadlet_start_failed` with the container-log hint. The tenant-wide
   start pass records 3, 4 and 5 as failed lanes, attempts later lanes, and
   returns **1** after naming them. Deselected workers, intentionally stopped
-  OpenRC workers and unallocated ports keep their soft skip. On the derpy
-  tenant this class of silent skip had surfaced only as
-  `Connection refused (os error 111)` at dispatch.
-- **`start-tenant` now attempts LunarDepth in its lane order.** The shared
-  startup pass is `pebble opencode kimi opencode2 lunardepth`.
+  OpenRC workers and unallocated ports keep their soft skip. On a tenant this
+  class of silent skip had surfaced only as
+  `Connection refused (os error 111)` at dispatch. The pebble bridge now waits
+  up to 120 seconds, not 30, for the task runner's socket and logs the wait
+  (`pebble4lunarwing/entrypoint-split.sh`).
+- **The startup guide names LunarDepth in the lane order.** The shared
+  startup pass was already `pebble opencode kimi opencode2 lunardepth` at
+  v2.2.1.0; only the guide sentence changed.
 - **The relay's limits and its failure attribution are documented (WI#834,
   WI#836).** `ic/src/NETWORK_SECURITY.md` now states the 32-live-connection
   cap, that finished connections are reaped while the lifetime accept count
@@ -387,8 +423,9 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   `docs/architecture/`, 31 top-level guides and 11 nested ones — were read and
   source-checked, each with a row in the merge request's record. Nine
   statements on seven stamped pages were corrected, along with the five rows
-  left open from the v2.2.1.0 refresh. Seven archives were moved under
-  `history/` paths and name their current replacements. Two relative-link and
+  left open from the v2.2.1.0 refresh. Seven archives already under
+  `docs/guides/history/` were edited to mark their historical boundaries and
+  name their current replacements. Two relative-link and
   anchor walkers passed on all 54 documents, and no live provisioning or
   migration is claimed.
 - **New and extended operator material.**
@@ -427,11 +464,11 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 | Tool registry | cavepony-tool `0.4.13`, gitlab `0.1.18`, gotify `0.1.9`, llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`, vision-analyze `0.2.4`, voice-transcribe `0.1.10`, web-search `0.2.12` |
 | External workers | Kimi Code `2.7.2`, OpenCode `v1.19.6` (`f4e363c82…`), OpenCode 2 `v2.3.2` (`c0ad18b40…`), Pebble `2d0f3786…`, LunarDepth `0472d115…` |
 | Worker toolchain | Debian snapshot `20261105T082236Z`; Node `22.23.4` (Kimi, LunarDepth); pnpm `11.7.0` (LunarDepth); Bun `1.4.4` (OpenCode lanes) |
-| Sandbox | Linux default `proxy-enforced`; `tunnel` opt-in; optional version-1 `capability_manifest` that can only narrow host policy; one credential-free read-only git grant (`git-remotes`) when `SANDBOX_GIT_REMOTES` is set; relay serves 32 live connections and reaps them |
-| Runtime estimation | Observe by default; approval hints need `LUNARWING_TOOL_ESTIMATES=1`; per-user, per-tool, in memory; lost on restart |
+| Sandbox | Linux default `proxy-enforced`; `tunnel` opt-in; optional version-1 `capability_manifest` that can only narrow host policy; one credential-free git grant (`git-remotes`) when `SANDBOX_GIT_REMOTES` is set; relay serves 32 live connections and reaps them |
+| Runtime estimation | Observe by default; approval hints need `LUNARWING_TOOL_ESTIMATES=1`; tool models per-user, per-tool; LLM call timing daemon-wide (`LUNARWING_LLM_TIMINGS=0` disables); all in memory, lost on restart |
 | Terminal client / local REPL | Wingtip `0.1.0` over HTTP/SSE; TUI history recovery covers the daemon's 2,530 s longest late window while the legacy `unanswered` seal stays at 610 s; daemon Unix socket supports protocol 1 and legacy compatibility responses |
 | Advisory baseline | 23 accepted IDs, all owned by the standing record; no Wasmtime ignore; RUSTSEC-2026-0587 cleared by `wasmtime-wasi 36.0.23`; audit true at advisory-db `55e1c3df` |
-| CI | `cargo-deny 0.20.2`, `cargo-audit 0.23.0`, 27 tracked non-vendor lock roots; `wasm-tools-check` blocks on every production WASM tool |
+| CI | `cargo-deny 0.20.2`, `cargo-audit 0.23.0`, 27 tracked non-vendor lock roots; `wasm-tools-check` blocks on eight WASM tool crates, `cavepony-wasm` builds the ninth |
 
 No database migration is added by this release, and no existing wire or
 database contract changes. The estimation routes are additive and read-only,
@@ -450,8 +487,12 @@ do not replace those gates.
    rebuild enabled worker images. `./ic/scripts/build-wasm-extensions.sh`
    builds the WASM channels and tools from this tree; the registry entries
    expect the versions in the table above.
-2. **Rebuild the kimi worker image at `2.7.2`.** The other four lanes did not
-   move. Build through the protected candidate, scan and promotion jobs. The
+2. **Rebuild the kimi worker image at `2.7.2`.** The other lanes keep their
+   upstream pins, but their image inputs changed too: the pebble locks and
+   `entrypoint-split.sh` (the 120-second runner wait, WI#796), the OpenCode v1
+   tool plugin, and the OpenCode 2 plugin and exposure-guard scripts; only
+   LunarDepth's inputs are unchanged. Build through the protected candidate,
+   scan and promotion jobs. The
    candidate artifacts expire after two days, so play the manual
    `worker-kimi-promote` job from the pipeline that produced its candidate; if
    that pipeline's artifacts are gone, re-run the candidate and then the scan.
@@ -471,14 +512,16 @@ do not replace those gates.
 5. **Grant git to the shell only where you want it.** With no
    `SANDBOX_GIT_REMOTES`, a manifest that asks for `git-remotes` is refused and
    every other call behaves as before. When you set it, list the remotes as
-   `name=url`, keep the hosts on the tenant's egress allowlist, and remember
-   that the grant is read-only and carries no credential. Do not hand-edit the
+   `name=url`, keep the hosts on the tenant sandbox egress allowlist
+   (`SANDBOX_EXTRA_DOMAINS` plus defaults), and remember that the grant carries
+   no credential. Do not hand-edit the
    Gotify capability file: `configure-gotify` writes the workspace config and
    the allowlist together.
 6. **Leave estimation on observe unless you want the hints.** Setting
    `LUNARWING_TOOL_ESTIMATES=1` adds one line to approval descriptions; the
-   `GET /api/estimates*` routes work in either mode and add no listener. There
-   is nothing to migrate — the model is in memory and starts cold.
+   `GET /api/estimates*` routes work in either mode and add no listener. LLM
+   call timing observes unless `LUNARWING_LLM_TIMINGS=0`. There is nothing to
+   migrate — the models are in memory and start cold.
 7. **Leave the advisory acceptances as they are.** `ic/deny.toml` still carries
    23 IDs, and the audit found none stale. `cargo-deny` on this tree should
    pass with no warnings. If a gate reports an ID as `advisory-not-detected`,
@@ -519,7 +562,7 @@ do not replace those gates.
   the systemd user unit `lunarwing service install` writes, which sets no
   `UMask`. Run the daemon through a shipped unit if job directories must not be
   group- or world-readable.
-- **The shell git grant is read-only and carries no credential (WI#816).**
+- **The shell git grant carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
   but it is not a repository write filter for arbitrary shell processes; use
