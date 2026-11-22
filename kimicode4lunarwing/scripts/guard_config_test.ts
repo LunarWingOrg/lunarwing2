@@ -82,6 +82,23 @@ test("hasGuardHook: a rival Bash hook is not vouched for, a non-Bash hook is ign
   assert.equal(hasGuardHook(bakedConfig + otherEvent), true)
 })
 
+test("guardHookBlock matches the block entrypoint-task-setup.sh injects", () => {
+  // WI#847: two writers must register the same hook, or a repair would install
+  // an entry the setup script (and the contract gate) do not recognise.
+  const setup = readFileSync(
+    fileURLToPath(new URL("../entrypoint-task-setup.sh", import.meta.url)),
+    "utf8",
+  )
+  const lines = guardHookBlock().trim().split("\n")
+  assert.equal(lines[0], "[[hooks]]")
+  // The setup script writes the header with its leading blank-line newline.
+  assert.ok(setup.includes('"\\n[[hooks]]\\n"'), "setup script is missing the [[hooks]] header")
+  for (const line of lines.slice(1)) {
+    const asSource = line.replaceAll("\\", "\\\\").replaceAll('"', '\\"')
+    assert.ok(setup.includes(`"${asSource}\\n"`), `setup script is missing ${JSON.stringify(line)}`)
+  }
+})
+
 test("ensureGuardHook: repairs a task-stripped config in place and keeps mode", () => {
   const { home, path } = tempHome(strippedConfig())
   chmodSync(path, 0o600)

@@ -29,8 +29,6 @@ import {
 } from "node:fs"
 import { join } from "node:path"
 
-type StatsLike = Pick<Stats, "dev" | "ino" | "size" | "isFile">
-
 /** The command the baked config and entrypoint-task-setup.sh register. */
 export const GUARD_HOOK_COMMAND = "node /app/hooks/headless_command_guard.mjs"
 
@@ -278,7 +276,7 @@ export function ensureGuardHook(home: string | undefined, taskId: string, enforc
     )
   }
   let config: string
-  let checked: StatsLike
+  let checked: Stats
   try {
     checked = fstatSync(handle)
     if (!checked.isFile()) {
