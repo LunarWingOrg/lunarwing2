@@ -281,10 +281,14 @@ fn uses_direct_gitlab_config_preload(tool_name: &str, prefixes: &[String]) -> bo
 }
 
 /// Pre-load workspace documents matching the given prefixes into a sync reader.
+///
+/// `base_dir` is the daemon's [`crate::bootstrap::lunarwing_base_dir`], passed
+/// in so tests can point the host-provisioned merge at a fixture tree.
 async fn preload_workspace_reader(
     workspace: &crate::workspace::Workspace,
     tool_name: &str,
     prefixes: &[String],
+    base_dir: &std::path::Path,
 ) -> PreloadedWorkspaceReader {
     let mut data = HashMap::new();
 
@@ -325,8 +329,7 @@ async fn preload_workspace_reader(
     // derives the capability allowlist from this exact file, so the effective
     // URL and the allowlist can never name different hosts.
     if let Some(path) = host_provisioned_workspace_config(tool_name, prefixes)
-        && let Some(content) =
-            read_host_provisioned_workspace_config(&crate::bootstrap::lunarwing_base_dir(), path)
+        && let Some(content) = read_host_provisioned_workspace_config(base_dir, path)
     {
         data.insert(path.to_string(), content);
     }
@@ -1927,7 +1930,13 @@ impl Tool for WasmToolWrapper {
         let mut capabilities = self.capabilities.clone();
         if let (Some(ws), Some(ws_cap)) = (&self.workspace, &capabilities.workspace_read) {
             let prefixes = ws_cap.allowed_prefixes.clone();
-            let reader = preload_workspace_reader(ws, self.name(), &prefixes).await;
+            let reader = preload_workspace_reader(
+                ws,
+                self.name(),
+                &prefixes,
+                &crate::bootstrap::lunarwing_base_dir(),
+            )
+            .await;
             if let Some(ref mut cap) = capabilities.workspace_read {
                 cap.reader = Some(Arc::new(reader));
             }
@@ -5594,6 +5603,143 @@ mod tests {
         assert!(status.is_success(), "Gotify rejected the message: {status}");
     }
 
+    /// WI#831 (AJB-2) live notification check through the tool component.
+    ///
+    /// Unlike [`wi817_live_gotify_target`], which only POSTs with curl
+    /// semantics, this runs the real gotify WASM component through the
+    /// wrapper: the on-disk `config/gotify.json` merge, the capability
+    /// allowlist, and the `gotify_app_token` credential injection all have to
+    /// agree for the notification to be accepted. The merge reads
+    /// `LUNARWING_BASE_DIR` exactly as the daemon does, so point the process
+    /// at a provisioned test tenant's base dir. The test only reads the
+    /// provisioned config there; its workspace database is temporary.
+    ///
+    /// ```bash
+    /// LUNARWING_BASE_DIR=/path/to/state \
+    /// WI831_LIVE_TOKEN=<gotify application token> \
+    /// WI831_LIVE_WASM=/path/to/gotify-tool.wasm \
+    ///   cargo test --lib -- tools::wasm::wrapper::tests::wi831_live_gotify_notification \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Set `WASM_HTTP_ALLOW_PRIVATE_IPS=1` when the configured URL is a
+    /// private or loopback host. Prints the server asked and the HTTP
+    /// outcome; fails when the tool reports an error.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[ignore = "manual live check; needs a provisioned base dir, a Gotify token, and the built tool"]
+    async fn wi831_live_gotify_notification() {
+        use crate::secrets::{
+            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+        };
+        use crate::tools::wasm::capabilities::{
+            Capabilities, EndpointPattern, HttpCapability, SecretsCapability, WorkspaceCapability,
+        };
+
+        let base_dir = crate::bootstrap::lunarwing_base_dir();
+        let token =
+            std::env::var("WI831_LIVE_TOKEN").expect("set WI831_LIVE_TOKEN to a Gotify app token"); // safety: manual test only
+        let wasm_path = std::path::PathBuf::from(
+            std::env::var("WI831_LIVE_WASM").expect("set WI831_LIVE_WASM to gotify-tool.wasm"), // safety: manual test only
+        );
+        println!("WI831 live check: base dir {}", base_dir.display());
+
+        let content =
+            super::read_host_provisioned_workspace_config(&base_dir, super::GOTIFY_CONFIG_PATH)
+                .expect("config/gotify.json missing under the supplied base dir"); // safety: manual test only
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("config/gotify.json did not parse"); // safety: manual test only
+        let base_url = config
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("config/gotify.json has no url") // safety: manual test only
+            .trim_end_matches('/')
+            .to_string();
+        let host = url::Url::parse(&base_url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .expect("config/gotify.json url has no host"); // safety: manual test only
+        println!("WI831 live check: tool will ask {host} ({base_url}/message)");
+
+        let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read the tool component"); // safety: manual test only
+        // The real component needs more than for_testing()'s 1 MB floor.
+        let mut runtime_config = WasmRuntimeConfig::for_testing();
+        runtime_config.default_limits = runtime_config
+            .default_limits
+            .with_memory(64 * 1024 * 1024)
+            .with_fuel(500_000_000);
+        let runtime = Arc::new(
+            WasmToolRuntime::new(runtime_config).expect("WASM runtime should initialize"), // safety: manual test only
+        );
+        let prepared = runtime
+            .prepare("gotify-tool", &wasm_bytes, None)
+            .await
+            .expect("gotify component should prepare"); // safety: manual test only
+
+        let store = test_secrets_store();
+        store
+            .create(
+                "wi831-live",
+                CreateSecretParams::new("gotify_app_token", token),
+            )
+            .await
+            .expect("failed to store the token"); // safety: manual test only
+
+        let (db, _db_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(crate::workspace::Workspace::new_with_db("wi831-live", db));
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "gotify_app_token".to_string(),
+            CredentialMapping {
+                secret_name: "gotify_app_token".to_string(),
+                location: CredentialLocation::Header {
+                    name: "X-Gotify-Key".to_string(),
+                    prefix: None,
+                },
+                host_patterns: vec![host.clone()],
+                path_patterns: Vec::new(),
+                optional: false,
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                allowlist: vec![EndpointPattern {
+                    host: host.clone(),
+                    path_prefix: Some("/".to_string()),
+                    methods: vec!["POST".to_string()],
+                }],
+                credentials,
+                ..Default::default()
+            }),
+            secrets: Some(SecretsCapability {
+                allowed_names: vec!["gotify_app_token".to_string()],
+            }),
+            workspace_read: Some(WorkspaceCapability {
+                allowed_prefixes: vec!["config/".to_string()],
+                reader: None,
+            }),
+            ..Default::default()
+        };
+
+        let tool = super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, caps)
+            .with_workspace(workspace)
+            .with_secrets_store(Arc::new(store));
+        let ctx = JobContext::with_user("wi831-live", "WI831 live check", "WI831 live check");
+        let outcome = tool
+            .execute(
+                serde_json::json!({"message": "WI#831 live notification check", "priority": 1}),
+                &ctx,
+            )
+            .await;
+        match outcome {
+            Ok(output) => {
+                println!("WI831 live check: {host} accepted the notification: {output:?}")
+            }
+            Err(error) => panic!("WI831 live check: {host} rejected the notification: {error}"),
+        }
+    }
+
     #[test]
     fn test_host_provisioned_workspace_config_is_gotify_only() {
         let config_prefix = ["config/".to_string()];
@@ -5662,6 +5808,58 @@ mod tests {
             super::read_host_provisioned_workspace_config(base, "config/oversized.json"),
             None,
             "oversized config is not read"
+        );
+    }
+
+    /// WI#831 (AJB-1): the on-disk operator config must win in the preload,
+    /// and only for the tool and prefixes that own it.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_preload_merges_host_provisioned_gotify_config_over_store() {
+        use crate::tools::wasm::WorkspaceReader;
+
+        let (db, tmp) = crate::testing::test_db().await;
+        let base = tmp.path();
+        let disk_content = r#"{"url":"https://on-disk.example.org","title":"Operator"}"#;
+        let store_content = r#"{"url":"https://workspace-store.example.org"}"#;
+        let config_dir = base.join("workspace").join("config");
+        std::fs::create_dir_all(&config_dir).expect("failed to create config dir"); // safety: test code only
+        std::fs::write(config_dir.join("gotify.json"), disk_content)
+            .expect("failed to write on-disk config"); // safety: test code only
+
+        let workspace = crate::workspace::Workspace::new_with_db("wi831-preload", db);
+        workspace
+            .write(super::GOTIFY_CONFIG_PATH, store_content)
+            .await
+            .expect("failed to seed the workspace store copy"); // safety: test code only
+
+        // The owning tool with the config prefix: the on-disk file wins.
+        let gotify_prefixes = vec!["config/".to_string()];
+        let reader =
+            super::preload_workspace_reader(&workspace, "gotify", &gotify_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            Some(disk_content.to_string()),
+            "on-disk operator config must override the workspace store copy"
+        );
+
+        // An unrelated tool gets the store copy, never the host merge.
+        let reader =
+            super::preload_workspace_reader(&workspace, "other-tool", &gotify_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            Some(store_content.to_string()),
+            "unrelated tools get no host-provisioned merge"
+        );
+
+        // A gotify grant that excludes `config/` gets no merge either.
+        let notes_prefixes = vec!["notes/".to_string()];
+        let reader =
+            super::preload_workspace_reader(&workspace, "gotify", &notes_prefixes, base).await;
+        assert_eq!(
+            reader.read(super::GOTIFY_CONFIG_PATH),
+            None,
+            "a prefix grant outside config/ must not merge the config"
         );
     }
 
