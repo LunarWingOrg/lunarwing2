@@ -755,6 +755,10 @@ test("a long command of repeated words is decided without rescanning", () => {
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
   // tripped runGuard's kill timeout. The linear scan decides it immediately.
   assertAllowed("chmod -R ".repeat(1500))
+  // The WI#853 punctuation reading is linear too: 14 KB of substitutions and
+  // 12 KB of subshells stay inside the analysis deadline.
+  assertAllowed("$(git log -1) ".repeat(1000))
+  assertAllowed("(git status) ".repeat(1000))
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
