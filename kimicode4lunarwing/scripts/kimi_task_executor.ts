@@ -8,7 +8,17 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
-import { isAbsolute } from "node:path"
+import {
+  chownSync,
+  lstatSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from "node:fs"
+
+import { isAbsolute, join } from "node:path"
 
 import { dropLoaderEnv, resolveFromBridgePath, taskIdentity, taskSetprivArgv } from "./task_identity.js"
 import {
@@ -119,6 +129,124 @@ export interface ExecuteTaskOptions {
 function kimiCodeHome(): string {
   return process.env.KIMI_CODE_HOME || ""
 }
+
+/** The user-level MCP registration the CLI loads at session start (WI#848). */
+const MCP_CONFIG_FILE = "mcp.json"
+
+interface TrustedMcpSnapshot {
+  home: string
+  content: string
+  mode: number
+  uid: number
+  gid: number
+}
+
+let trustedMcpSnapshot: TrustedMcpSnapshot | null = null
+
+/**
+ * WI#848: the CLI reads `$KIMI_CODE_HOME/mcp.json` as trusted user-level
+ * config and spawns every server listed there before the first model turn.
+ * Those processes never pass through the Bash tool, so the PreToolUse hook
+ * cannot see them, and the file lives in the task's own home — a task can
+ * rewrite it for a later session. The task-side entrypoint materializes the
+ * root-owned baked registration at container start; this snapshot freezes
+ * those bytes (and mode) in the runner's memory before any task runs, and
+ * `restoreTrustedMcpConfig` puts them back before every CLI spawn. An
+ * operator override via KIMI_MCP_SOURCE is preserved because the snapshot is
+ * taken after the entrypoint wrote it.
+ *
+ * Capture at startup, never lazily: a lazy capture on the first task could
+ * bless a file a previous runner instance left poisoned. This is a
+ * same-uid restore, not a boundary — a task already running in this
+ * container can still race the window between restore and the CLI's read,
+ * and a nested `kimi -p` a task starts itself reads whatever the file holds
+ * at that moment. The container and the hook's deny rule remain the
+ * boundary; the restore removes the cross-task persistence this item is
+ * about.
+ */
+export function captureTrustedMcpConfig(home = kimiCodeHome()): void {
+  trustedMcpSnapshot = null
+  if (!home) return
+  const file = join(home, MCP_CONFIG_FILE)
+  let stat: Stats
+  try {
+    stat = lstatSync(file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(
+        `[kimi executor] cannot inspect the trusted user-level ${MCP_CONFIG_FILE} (${describeFsError(error)}); no per-task restore (WI#848)`,
+      )
+    }
+    return
+  }
+  if (!stat.isFile()) {
+    console.warn(
+      `[kimi executor] the trusted user-level ${MCP_CONFIG_FILE} is not a regular file; no per-task restore (WI#848)`,
+    )
+    return
+  }
+  try {
+    trustedMcpSnapshot = {
+      home,
+      content: readFileSync(file, "utf8"),
+      mode: stat.mode & 0o777,
+      uid: stat.uid,
+      gid: stat.gid,
+    }
+  } catch (error) {
+    console.warn(
+      `[kimi executor] cannot read the trusted user-level ${MCP_CONFIG_FILE} (${describeFsError(error)}); no per-task restore (WI#848)`,
+    )
+  }
+}
+
+function describeFsError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Put the captured registration back if anything changed it. A task that
+ * edited the file has already finished its own session, so the next task is
+ * innocent: log and repair rather than fail it. Only a failed write aborts
+ * the spawn — the CLI would otherwise start from content nobody vetted.
+ */
+function restoreTrustedMcpConfig(taskId: string): void {
+  const snapshot = trustedMcpSnapshot
+  if (!snapshot) return
+  const file = join(snapshot.home, MCP_CONFIG_FILE)
+  try {
+    const stat = lstatSync(file)
+    if (stat.isFile() && readFileSync(file, "utf8") === snapshot.content) return
+  } catch {
+    // Missing or unreadable: fall through to the write, which reports the
+    // real failure (or repairs a deleted/symlinked file).
+  }
+  const temporary = join(snapshot.home, `.${MCP_CONFIG_FILE}.${process.pid}.restore`)
+  try {
+    writeFileSync(temporary, snapshot.content, { mode: snapshot.mode })
+    // The legacy single-container shape runs this executor as root while the
+    // CLI runs as the task uid (WI#400). Its rename would hand the task a
+    // root-owned 0600 file it cannot read, so restore the original owner
+    // whenever this process is privileged enough to do it.
+    if (process.getuid?.() === 0 && (snapshot.uid !== 0 || snapshot.gid !== 0)) {
+      chownSync(temporary, snapshot.uid, snapshot.gid)
+    }
+    renameSync(temporary, file)
+  } catch (error) {
+    try {
+      unlinkSync(temporary)
+    } catch {
+      // The temporary file may never have been created.
+    }
+    throw new Error(
+      `refusing to spawn task ${taskId}: the trusted user-level ${MCP_CONFIG_FILE} could not be restored (${describeFsError(error)}, WI#848)`,
+    )
+  }
+  console.warn(
+    `[kimi executor] restored the trusted user-level ${MCP_CONFIG_FILE} before task ${taskId}; the on-disk file differed from the entrypoint's registration (WI#848)`,
+  )
+}
+
 function workspaceRoot(): string {
   return process.env.WORKSPACE_ROOT || "/workspace"
 }
@@ -573,6 +701,12 @@ export async function executeTask(
       delete env.LUNARWING_TASK_RUNNER_LISTEN_FD
       spawnBin = taskKimiBin(true)
     }
+
+    // WI#848: the CLI reads the trusted user-level mcp.json at session start.
+    // Put the entrypoint's registration back first, so a task that rewrote it
+    // (for this or a later session) cannot plant an MCP server the Bash hook
+    // never sees. Throws on a failed restore — fail closed rather than spawn.
+    restoreTrustedMcpConfig(request.task_id)
 
     proc = spawn(spawnBin, spawnArgs, {
       cwd: workDir,

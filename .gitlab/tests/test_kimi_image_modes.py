@@ -29,6 +29,7 @@ class KimiImageModesTests(unittest.TestCase):
             path.chmod(0o777 & ~umask)
         for source, target in (
             ("config/config.toml", "config/config.toml"),
+            ("config/mcp.json", "config/mcp.json"),
             ("hooks/headless_command_guard.mjs", "hooks/headless_command_guard.mjs"),
             ("entrypoint.sh", "entrypoint.sh"),
             ("entrypoint-task-setup.sh", "entrypoint-task-setup.sh"),

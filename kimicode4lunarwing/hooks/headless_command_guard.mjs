@@ -1543,7 +1543,8 @@ function evaluate(command) {
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
-  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ?? checkListeners(command);
+  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ??
+    checkTrustedUserConfig(command) ?? checkListeners(command);
   if (rawDenial) return rawDenial;
   // bash joins every backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -1560,6 +1561,8 @@ function evaluate(command) {
       (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
+      checkTrustedUserConfig(joined) ??
+      checkTrustedUserConfig(shellWordView(joined)) ??
       checkRawShapes(joined) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
@@ -1842,6 +1845,30 @@ function checkListeners(text, depth = 0) {
   for (const words of listenerSegments(text)) {
     const denied = checkListenerWords(words, depth);
     if (denied) return denied;
+  }
+  return null;
+}
+
+// WI#848: the user-level MCP registration is trusted input, not task state.
+// The CLI spawns every server listed in `$KIMI_CODE_HOME/mcp.json` before the
+// first model turn, outside this Bash hook — the same self-opened inbound
+// path the WI#833 listener rule denies, reached through a file instead of a
+// command. The file is in the task's own home, so a task can rewrite it (a
+// redirect, an interpreter json edit, `sed -i`). These two shapes name the
+// protected file through the config directory; a bare `mcp.json` after
+// `cd`-ing into that directory is caught by the directory rule. A task that
+// builds the path from fragments, or writes it from a script file, is the
+// residual the executor's per-spawn restore covers (WI#848). Ordinary repo
+// work — `grep -rn mcp.json docs/`, `grep -rn KIMI_CODE_HOME .`, reading the
+// read-only /app/config copy — stays allowed.
+const TRUSTED_USER_MCP_FILE =
+  /KIMI_CODE_HOME\b[^\s;&|]{0,24}mcp\.json|\.kimi-code\/mcp\.json/;
+const TRUSTED_USER_CONFIG_DIR =
+  /(?:^|[\s;&|()])(?:cd|pushd)\s+["']?(?:\$?\{?KIMI_CODE_HOME\}?|~\/\.kimi-code|\$\{?HOME\}?\/\.kimi-code|\/home\/kimi\/\.kimi-code)\/?["']?(?=$|[\s;&|)])/;
+
+function checkTrustedUserConfig(text) {
+  if (TRUSTED_USER_MCP_FILE.test(text) || TRUSTED_USER_CONFIG_DIR.test(text)) {
+    return "the user-level Kimi MCP config is trusted state, not task input (WI#848)";
   }
   return null;
 }
