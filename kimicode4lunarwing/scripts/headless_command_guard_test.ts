@@ -778,6 +778,36 @@ test("a value-taking option cannot hide kimi service mode (WI#845)", () => {
   assertAllowed("(kimi -p server)")
 })
 
+test("kimi remote control and the visualizer are listeners (WI#852)", () => {
+  // WI#852: the 2.7.2 CLI starts a listener from more subcommands than
+  // server/web. `rc` (alias `remote`) runs the local server through Remote
+  // Control, and `vis` binds the visualizer's HTTP port.
+  assertBlocked("kimi rc", "kimi service mode")
+  assertBlocked("kimi remote", "kimi service mode")
+  assertBlocked("kimi --model X rc", "kimi service mode")
+  assertBlocked("kimi rc --port 9000", "kimi service mode")
+  assertBlocked("kimi vis", "kimi service mode")
+  assertBlocked("kimi vis --host 0.0.0.0 --port 9000", "kimi service mode")
+  assertBlocked("/usr/local/bin/kimi vis", "kimi service mode")
+  assertBlocked("bash -c 'kimi rc'", "kimi service mode")
+  assertBlocked("cd /app && kimi remote", "kimi service mode")
+  assertBlocked("xargs -I {} kimi vis", "kimi service mode")
+  // The earlier service spellings keep their verdicts.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  // The lane's stdio and print-mode forms keep passing.
+  assertAllowed("kimi acp")
+  assertAllowed("kimi mcp serve")
+  assertAllowed("kimi --version")
+  assertAllowed("kimi -p hello")
+  assertAllowed("kimi -p 'open the vis page' --output-format stream-json")
+  assertAllowed("kimi -p 'kimi rc'")
+  assertAllowed("kimi --model X -p 'check remote'")
+  // Reading the words is not running them.
+  assertAllowed("grep -rn 'kimi vis' .")
+  assertAllowed("echo 'kimi rc --port 9000'")
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and

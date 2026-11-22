@@ -1235,7 +1235,8 @@ Enforced controls (opencode2 lane unless noted):
    **kimi task-settable `KIMI_CODE_*` and new listeners (WI#833):** the
    executor drops every task-supplied `KIMI_CODE_*` value that is not on
    `TASK_SETTABLE_KIMI_CODE_ENV` (`scripts/kimi_task_executor.ts`), and the
-   guard hook denies `kimi server`/`kimi web` plus a closed listener verb
+   guard hook denies `kimi server`/`kimi web`/`kimi rc`/`kimi remote`/`kimi
+   vis` plus a closed listener verb
    list (`python -m http.server`, `nc`/`ncat`/`netcat -l`, `socat
    TCP-LISTEN`, `busybox httpd`, `php -S`, `ruby -run -e httpd`). On every
    kimi bump, re-read the new dist's `KIMI_CODE_*` names and every new
@@ -2407,7 +2408,8 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   is reachable from `kimi -p`. **Corrected by WI#833:** that holds for the
   lane, not for a task. `kimi` is on `PATH` (`Dockerfile:255`), so a task's
   Bash tool could start service mode itself; the guard hook now denies
-  `kimi server` and `kimi web` (and the other listener spellings below) with
+  `kimi server`, `kimi web`, `kimi rc`/`kimi remote` and `kimi vis` (WI#852;
+  and the other listener spellings below) with
   exit 2, pinned by `scripts/headless_command_guard_test.ts`.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
@@ -4146,8 +4148,11 @@ The hook denies if its synchronous analysis exceeds two seconds, before the CLI'
 image and recreate the worker to pick up the updated hook.
 
 WI#833 adds a separate command-position check for Kimi's `server` and `web`
-subcommands and common listener tools. A print-mode prompt is data, even if
-its text is `server` or `web`. Since WI#845 the check reads the pinned CLI's
+subcommands and common listener tools. Since WI#852 the Kimi list comes from
+the 2.7.2 command definitions and also denies `kimi rc` (alias `kimi
+remote`) and `kimi vis`, which start the Remote Control server or the
+session visualizer. A print-mode prompt is data, even if its text is one of
+those names. Since WI#845 the check reads the pinned CLI's
 option table: a value-taking option (`-m`/`--model`, `-p`/`--prompt`,
 `--output-format`, `--skills-dir`, `--agent`, `--agent-file`, `--add-dir`,
 and `-S`/`--session` with its optional id) consumes the next word, and an
@@ -4171,8 +4176,8 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
-WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841, WI#845 and WI#853 only
-after rebuilding the image with the fix and recreating their workers; see
+WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841, WI#845, WI#852 and WI#853
+only after rebuilding the image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
