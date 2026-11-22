@@ -709,7 +709,8 @@ Local job and mission-run timing (WI#318 Phase C) use the same
 historical duration is recorded and frozen at dispatch but not shown; `1` adds
 it to `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}` (elapsed and
 remaining are always reported separately, remaining is `unknown` for an
-open-ended job) and to `GET /api/missions/{id}` as `run_timing`. Sandbox and
+open-ended job) and to `GET /api/missions/{id}` as `run_timing`, whose median
+and last-run duration appear only after five valid runs. Sandbox and
 external-worker jobs are not estimated. `LUNARWING_TOOL_ESTIMATES_CATEGORIES`
 does not gate jobs or missions — its entries are tool names.
 

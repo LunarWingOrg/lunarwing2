@@ -4942,10 +4942,14 @@ pub struct EngineMissionDetail {
 /// because a mission run is open-ended; no remaining time is invented.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MissionRunTiming {
-    /// Completed runs with a positive, usable duration.
+    /// Valid completed runs: finished successfully, with a positive active
+    /// duration read from the run's own state-change events.
     pub completed_runs: u64,
+    /// Median active duration; withheld until `completed_runs` reaches the
+    /// warm-up of [`crate::estimation::MIN_WARM_SAMPLES`] (A6.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub median_elapsed_secs: Option<u64>,
+    /// Active duration of the newest valid run; withheld like the median.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_elapsed_secs: Option<u64>,
     /// Elapsed time of the newest still-running run, when one exists.
@@ -5596,46 +5600,77 @@ fn mission_thread_run(thread: &lunarwing_engine::Thread) -> EngineMissionRun {
 const SUMMARY_CHAR_LIMIT: usize = 200;
 
 /// Summarise this mission's own completed runs for the detail view
-/// (WI#318 C3). Completed runs contribute duration; the newest Running
-/// thread contributes elapsed only. Median resists one slow or retried run.
+/// (WI#318 C3). Each valid run contributes its active duration; the newest
+/// Running thread contributes elapsed only. The median and the last run stay
+/// withheld until five valid runs exist (A6.2: no unvalidated provisional
+/// baseline). Median resists one slow or retried run.
 fn mission_run_timing(
     threads: &[lunarwing_engine::Thread],
     now: chrono::DateTime<chrono::Utc>,
 ) -> MissionRunTiming {
-    let mut completed: Vec<u64> = threads
-        .iter()
-        .filter_map(|thread| {
-            thread
-                .completed_at
-                .map(|completed| (completed - thread.created_at).num_seconds().max(0) as u64)
-        })
-        .filter(|secs| *secs > 0)
-        .collect();
     // `threads` follows `mission.thread_history`, which is oldest first.
-    let last_run_elapsed_secs = threads.iter().rev().find_map(|thread| {
-        thread
-            .completed_at
-            .map(|completed| (completed - thread.created_at).num_seconds().max(0) as u64)
-    });
+    let runs: Vec<u64> = threads.iter().filter_map(mission_run_active_secs).collect();
+    let warm = runs.len() as u64 >= crate::estimation::MIN_WARM_SAMPLES;
+    let last_run_elapsed_secs = runs.last().copied().filter(|_| warm);
+    let median_elapsed_secs = if warm {
+        let mut sorted = runs.clone();
+        sorted.sort_unstable();
+        sorted.get(sorted.len() / 2).copied()
+    } else {
+        None
+    };
     let running_elapsed_secs = threads
         .iter()
         .rev()
         .find(|thread| thread.state == lunarwing_engine::ThreadState::Running)
         .map(|thread| (now - thread.created_at).num_seconds().max(0) as u64);
-    completed.sort_unstable();
-    let median_elapsed_secs = if completed.is_empty() {
-        None
-    } else {
-        Some(completed[completed.len() / 2])
-    };
     MissionRunTiming {
-        completed_runs: completed.len() as u64,
+        completed_runs: runs.len() as u64,
         median_elapsed_secs,
         last_run_elapsed_secs,
         running_elapsed_secs,
         remaining_status: "unknown",
         scope: "completed_runs_for_this_mission",
     }
+}
+
+/// Active duration of one finished mission run, read from the thread's own
+/// state-change events: from its first entry into `Running` to its first
+/// entry into `Completed` (or `Done`), minus every stretch spent `Waiting`
+/// (an approval, a child) or `Suspended`. `completed_at` is not used: a later
+/// `Done` overwrites it. `None` for a run that did not end successfully,
+/// including one that went `Completed` then `Failed`, and for a run whose
+/// events do not show when it started and finished.
+fn mission_run_active_secs(thread: &lunarwing_engine::Thread) -> Option<u64> {
+    use lunarwing_engine::{EventKind, ThreadState};
+    if !matches!(thread.state, ThreadState::Completed | ThreadState::Done) {
+        return None;
+    }
+    let mut started = None;
+    let mut paused_since = None;
+    let mut paused = chrono::Duration::zero();
+    for event in &thread.events {
+        let EventKind::StateChanged { from, to, .. } = &event.kind else {
+            continue;
+        };
+        if matches!(from, ThreadState::Waiting | ThreadState::Suspended)
+            && let Some(since) = paused_since.take()
+        {
+            paused += event.timestamp - since;
+        }
+        match to {
+            ThreadState::Running if started.is_none() => started = Some(event.timestamp),
+            ThreadState::Waiting | ThreadState::Suspended => paused_since = Some(event.timestamp),
+            ThreadState::Completed | ThreadState::Done => {
+                let active = event.timestamp - started? - paused;
+                return u64::try_from(active.num_seconds())
+                    .ok()
+                    .filter(|secs| *secs > 0);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Truncate to at most `limit` characters without ever splitting a UTF-8
@@ -5648,39 +5683,130 @@ fn truncate_summary_chars(summary: &str, limit: usize) -> String {
 #[cfg(test)]
 mod mission_run_timing_tests {
     use super::*;
+    use lunarwing_engine::{EventKind, ThreadEvent, ThreadState};
 
-    fn thread(started_secs_ago: i64, duration_secs: Option<i64>) -> lunarwing_engine::Thread {
-        let now = chrono::Utc::now();
-        let mut thread = lunarwing_engine::Thread::new(
+    fn mission_thread() -> lunarwing_engine::Thread {
+        lunarwing_engine::Thread::new(
             "run",
             lunarwing_engine::ThreadType::Mission,
             lunarwing_engine::ProjectId::new(),
             "alice",
             lunarwing_engine::ThreadConfig::default(),
+        )
+    }
+
+    fn push_transition(
+        thread: &mut lunarwing_engine::Thread,
+        at: chrono::DateTime<chrono::Utc>,
+        from: ThreadState,
+        to: ThreadState,
+    ) {
+        let mut event = ThreadEvent::new(
+            thread.id,
+            EventKind::StateChanged {
+                from,
+                to,
+                reason: None,
+            },
         );
-        thread.created_at = now - chrono::Duration::seconds(started_secs_ago);
-        thread.completed_at =
-            duration_secs.map(|duration| thread.created_at + chrono::Duration::seconds(duration));
+        event.timestamp = at;
+        thread.events.push(event);
+        thread.state = to;
+        if matches!(to, ThreadState::Completed | ThreadState::Done) {
+            thread.completed_at = Some(at);
+        }
+    }
+
+    /// A run that started `ago` seconds back, worked `active` seconds and,
+    /// halfway through, waited `waited` seconds for an approval.
+    fn finished_run(ago: i64, active: i64, waited: i64) -> lunarwing_engine::Thread {
+        let mut thread = mission_thread();
+        let start = chrono::Utc::now() - chrono::Duration::seconds(ago);
+        thread.created_at = start - chrono::Duration::seconds(1);
+        push_transition(
+            &mut thread,
+            start,
+            ThreadState::Created,
+            ThreadState::Running,
+        );
+        let mut at = start + chrono::Duration::seconds(active / 2);
+        if waited > 0 {
+            push_transition(&mut thread, at, ThreadState::Running, ThreadState::Waiting);
+            at += chrono::Duration::seconds(waited);
+            push_transition(&mut thread, at, ThreadState::Waiting, ThreadState::Running);
+        }
+        at += chrono::Duration::seconds(active - active / 2);
+        push_transition(
+            &mut thread,
+            at,
+            ThreadState::Running,
+            ThreadState::Completed,
+        );
         thread
     }
 
     #[test]
-    fn completed_runs_use_median_and_running_run_only_reports_elapsed() {
-        let mut running = thread(30, None);
-        running.state = lunarwing_engine::ThreadState::Running;
+    fn warm_mission_uses_median_of_active_time_and_running_run_only_reports_elapsed() {
+        let mut running = mission_thread();
+        running.created_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+        running.state = ThreadState::Running;
         let threads = vec![
-            thread(300, Some(100)),
-            thread(200, Some(120)),
-            thread(100, Some(140)),
+            finished_run(9000, 100, 0),
+            finished_run(8000, 110, 0),
+            // Two hours waiting for an approval are not run time.
+            finished_run(7000, 120, 7200),
+            finished_run(6000, 130, 0),
+            finished_run(5000, 140, 0),
             running,
         ];
         let timing = mission_run_timing(&threads, chrono::Utc::now());
-        assert_eq!(timing.completed_runs, 3);
+        assert_eq!(timing.completed_runs, 5);
         assert_eq!(timing.median_elapsed_secs, Some(120));
         assert_eq!(timing.last_run_elapsed_secs, Some(140));
         assert!(timing.running_elapsed_secs.unwrap() >= 30); // safety: test
         assert_eq!(timing.remaining_status, "unknown");
         assert_eq!(timing.scope, "completed_runs_for_this_mission");
+    }
+
+    #[test]
+    fn timing_stays_withheld_below_five_valid_runs() {
+        let threads: Vec<_> = (0..4)
+            .map(|i| finished_run(5000 - i * 100, 60, 0))
+            .collect();
+        let timing = mission_run_timing(&threads, chrono::Utc::now());
+        assert_eq!(timing.completed_runs, 4);
+        assert_eq!(timing.median_elapsed_secs, None);
+        assert_eq!(timing.last_run_elapsed_secs, None);
+    }
+
+    #[test]
+    fn failed_and_unprovable_runs_are_not_valid_samples() {
+        let mut threads: Vec<_> = (0..4)
+            .map(|i| finished_run(5000 - i * 100, 60, 0))
+            .collect();
+        // Completed, then Failed: `completed_at` stays set, the run is not valid.
+        let mut failed = finished_run(4000, 600, 0);
+        let at = failed.completed_at.unwrap() + chrono::Duration::seconds(1); // safety: test
+        push_transition(&mut failed, at, ThreadState::Completed, ThreadState::Failed);
+        threads.push(failed);
+        // A completed thread with no state-change history cannot show when it ran.
+        let mut legacy = mission_thread();
+        legacy.created_at = chrono::Utc::now() - chrono::Duration::seconds(900);
+        legacy.state = ThreadState::Done;
+        legacy.completed_at = Some(legacy.created_at + chrono::Duration::seconds(300));
+        threads.push(legacy);
+
+        let timing = mission_run_timing(&threads, chrono::Utc::now());
+        assert_eq!(timing.completed_runs, 4);
+        assert_eq!(timing.median_elapsed_secs, None);
+    }
+
+    #[test]
+    fn done_after_completed_keeps_the_completion_time() {
+        let mut run = finished_run(5000, 100, 0);
+        let done_at = run.completed_at.unwrap() + chrono::Duration::seconds(3600); // safety: test
+        push_transition(&mut run, done_at, ThreadState::Completed, ThreadState::Done);
+        assert_eq!(mission_run_active_secs(&run), Some(100));
     }
 
     #[test]

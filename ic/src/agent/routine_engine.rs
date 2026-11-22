@@ -1469,6 +1469,10 @@ async fn execute_full_job(
         "max_iterations": execution.max_iterations,
         "owner_id": routine.user_id
     });
+    // WI#318 C1: routine runs train their own job-duration model, apart from
+    // jobs the user starts by hand.
+    metadata[crate::estimation::JOB_ESTIMATE_KIND_KEY] =
+        serde_json::json!(crate::estimation::LocalJobKind::Routine.as_str());
     // Carry the routine's notify config in job metadata so the message tool
     // can resolve channel/target per-job without global state mutation.
     if let Some(channel) = &routine.notify.channel {

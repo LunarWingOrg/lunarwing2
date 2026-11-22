@@ -204,8 +204,11 @@ impl Scheduler {
         // without a live learner lookup. Duration only — no job declares a
         // cost baseline, so `estimated_cost` stays unset. Sandbox and
         // external-worker jobs do not pass through here and are never given
-        // a local-job estimate (C2).
-        let job_estimate = self.tools.estimates().estimate_job(user_id);
+        // a local-job estimate (C2). Routine-fired runs and user-started jobs
+        // use separate models; the worker reads the same kind from the same
+        // metadata when it records the terminal observation.
+        let job_kind = crate::estimation::LocalJobKind::from_metadata(metadata.as_ref());
+        let job_estimate = self.tools.estimates().estimate_job(user_id, job_kind);
 
         // Apply both metadata and token budget in one closure (Issue #813: atomic update).
         // Use update_context_and_get to ensure atomicity: no gap where concurrent workers

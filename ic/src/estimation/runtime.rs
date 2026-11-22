@@ -16,7 +16,7 @@ use crate::tools::Tool;
 use super::diagnostics::{
     CategoryPolicy, CategoryPolicySummary, EvaluationSummary, EvaluationTrace, TraceRecord,
 };
-use super::jobs::{JobEstimateCounters, job_key};
+use super::jobs::{JobEstimateCounters, LocalJobKind, job_key};
 use super::learner::{LearnerCounterSnapshot, LearningModel};
 use super::{Actuals, Estimator, MAX_TOOL_NAME_BYTES, RuntimeEstimate};
 
@@ -342,13 +342,14 @@ impl ToolEstimates {
         self.display_enabled()
     }
 
-    /// Frozen historical duration for a local job about to be dispatched.
-    /// Read-only: it neither trains the model nor claims to be a deadline.
-    pub fn estimate_job(&self, user_id: &str) -> Option<RuntimeEstimate> {
+    /// Frozen historical duration for a local job about to be dispatched,
+    /// from the model of the same user and job kind. Read-only: it neither
+    /// trains the model nor claims to be a deadline.
+    pub fn estimate_job(&self, user_id: &str, kind: LocalJobKind) -> Option<RuntimeEstimate> {
         if self.mode == ToolEstimationMode::Disabled {
             return None;
         }
-        let key = job_key(user_id)?;
+        let key = job_key(user_id, kind)?;
         let mut state = self.state.lock().ok()?;
         let estimate = state.estimator.estimate_operation(&key, None, None);
         state.jobs.record_estimate(estimate.is_some());
@@ -363,6 +364,7 @@ impl ToolEstimates {
     pub fn record_job_terminal(
         &self,
         user_id: &str,
+        kind: LocalJobKind,
         elapsed: Duration,
         completed: bool,
         predicted: Option<Duration>,
@@ -370,7 +372,7 @@ impl ToolEstimates {
         if self.mode == ToolEstimationMode::Disabled {
             return;
         }
-        let Some(key) = job_key(user_id) else {
+        let Some(key) = job_key(user_id, kind) else {
             return;
         };
         let Ok(mut state) = self.state.lock() else {
@@ -489,27 +491,59 @@ mod tests {
     fn job_estimates_stay_withheld_until_warm_and_never_train_failed_runs() {
         let estimates = ToolEstimates::new(ToolEstimationMode::Observe);
         for _ in 0..4 {
-            estimates.record_job_terminal("alice", Duration::from_secs(90), true, None);
+            estimates.record_job_terminal(
+                "alice",
+                LocalJobKind::User,
+                Duration::from_secs(90),
+                true,
+                None,
+            );
         }
-        assert!(estimates.estimate_job("alice").is_none());
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
         // A failed run may be counted, but its elapsed time is not a
         // comparable completed run and must not train the model.
-        estimates.record_job_terminal("alice", Duration::from_secs(5), false, None);
-        assert!(estimates.estimate_job("alice").is_none());
-        estimates.record_job_terminal("alice", Duration::from_secs(90), true, None);
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(5),
+            false,
+            None,
+        );
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(90),
+            true,
+            None,
+        );
 
-        let estimate = estimates.estimate_job("alice").unwrap(); // safety: test
+        let estimate = estimates.estimate_job("alice", LocalJobKind::User).unwrap(); // safety: test
         assert_eq!(estimate.duration, Duration::from_secs(90));
         assert_eq!(estimate.cost, None);
         assert_eq!(estimate.samples, 5);
-        // A different user stays cold.
-        assert!(estimates.estimate_job("bob").is_none());
+        // A different user stays cold, and so does Alice's routine model:
+        // routine runs and user-started jobs are not comparable completions.
+        assert!(estimates.estimate_job("bob", LocalJobKind::User).is_none());
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::Routine)
+                .is_none()
+        );
 
         let counters = estimates.aggregate_counters().jobs;
         assert_eq!(counters.completed_runs, 5);
         assert_eq!(counters.non_completed_runs, 1);
-        // Two cold lookups plus Bob's.
-        assert_eq!(counters.estimates_withheld, 3);
+        // Two cold lookups plus Bob's and Alice's routine model.
+        assert_eq!(counters.estimates_withheld, 4);
         assert_eq!(counters.estimates_offered, 1);
     }
 
@@ -517,9 +551,19 @@ mod tests {
     fn disabled_mode_records_no_job_observations_and_shows_no_timing() {
         let estimates = ToolEstimates::new(ToolEstimationMode::Disabled);
         for _ in 0..6 {
-            estimates.record_job_terminal("alice", Duration::from_secs(10), true, None);
+            estimates.record_job_terminal(
+                "alice",
+                LocalJobKind::User,
+                Duration::from_secs(10),
+                true,
+                None,
+            );
         }
-        assert!(estimates.estimate_job("alice").is_none());
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
         assert!(!estimates.job_display_enabled());
         assert_eq!(
             estimates.aggregate_counters().jobs,
@@ -536,7 +580,13 @@ mod tests {
             .map(|_| {
                 let estimates = std::sync::Arc::clone(&estimates);
                 std::thread::spawn(move || {
-                    estimates.record_job_terminal("alice", Duration::from_secs(60), true, None);
+                    estimates.record_job_terminal(
+                        "alice",
+                        LocalJobKind::User,
+                        Duration::from_secs(60),
+                        true,
+                        None,
+                    );
                 })
             })
             .collect();
@@ -544,9 +594,15 @@ mod tests {
             handle.join().unwrap(); // safety: test
         }
         // Cancellations and failures are counted, never trained.
-        estimates.record_job_terminal("alice", Duration::from_secs(1), false, None);
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(1),
+            false,
+            None,
+        );
 
-        let estimate = estimates.estimate_job("alice").unwrap(); // safety: test
+        let estimate = estimates.estimate_job("alice", LocalJobKind::User).unwrap(); // safety: test
         assert_eq!(estimate.samples, 10);
         assert_eq!(estimate.duration, Duration::from_secs(60));
         // Job models use their own key prefix, so the per-tool diagnostics

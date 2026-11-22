@@ -379,8 +379,11 @@ plan. The webhook ingress remains separate.
 
 **Implemented under #318 (C1–C4).** `Scheduler::dispatch_job_inner` freezes a
 historical duration into `JobContext.estimated_duration` before the first
-persist, keyed by the constant, non-sensitive `local` job kind under a private
-per-user learner key. `Worker::run` records exactly one terminal observation
+persist, keyed by one of two non-sensitive job kinds under a private per-user
+learner key: `routine` for full-job routine runs (marked
+`estimate_kind = "routine"` in the job metadata by the routine engine) and
+`user` for every other local dispatch, because the two are not comparable
+completions. `Worker::run` records exactly one terminal observation
 after one execution loop: only `Completed` trains the duration model;
 `Failed`/`Cancelled` are counted separately; `Stuck` records nothing.
 `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}` report measured elapsed
@@ -388,9 +391,12 @@ separately from the frozen historical duration and report remaining time as
 `unknown`, since a max-iteration limit or worker timeout is not a finite plan.
 Sandbox/container and external-worker jobs are explicitly excluded: they keep
 `estimated_duration` unset and never receive a local-job estimate.
-`GET /api/missions/{id}` derives advisory run timing (completed run count,
-median and last completed-run duration, newest running run's elapsed) from the
-mission's own loaded threads on read; `lunarwing_engine` is untouched, there is
+`GET /api/missions/{id}` derives advisory run timing from the mission's own
+loaded threads on read: the valid run count (finished successfully; a run that
+went on to `Failed` does not count), the newest running run's elapsed, and,
+only once five valid runs exist (A6.2), the median and last run's active
+duration, read from each thread's state-change events with `Waiting` and
+`Suspended` stretches subtracted; `lunarwing_engine` is untouched, there is
 no second EMA writer, no extra store read and no fire-path write. Job and
 mission timing follow the same opt-in display mode as tool hints; recording
 continues in observe mode. `ic/src/estimation/jobs.rs` holds the bounded

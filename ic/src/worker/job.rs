@@ -346,8 +346,10 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         };
         let end = ctx.completed_at.unwrap_or_else(chrono::Utc::now);
         let elapsed = (end - started_at).to_std().unwrap_or_default();
+        let kind = crate::estimation::LocalJobKind::from_metadata(Some(&ctx.metadata));
         self.tools().estimates().record_job_terminal(
             &ctx.user_id,
+            kind,
             elapsed,
             completed,
             ctx.estimated_duration,

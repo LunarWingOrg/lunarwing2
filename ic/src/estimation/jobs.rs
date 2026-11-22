@@ -6,9 +6,11 @@
 //! estimate is never applied to another mode just because it also uses
 //! `create_job` (C2).
 //!
-//! The learner key is a constant, non-sensitive kind per user. Job titles,
-//! descriptions and metadata never become keys, so the model cardinality is
-//! bounded by the number of users with completed local runs.
+//! The learner key is a bounded, non-sensitive kind per user: routine-fired
+//! runs and user-started jobs train separate models, because they are not
+//! comparable completions. Job titles, descriptions and free-form metadata
+//! never become keys, so the model cardinality is at most two per user with
+//! completed local runs.
 //!
 //! Duration only: no production job declares a cost baseline, so a job
 //! estimate never invents one. Nothing here feeds scheduling, timeouts,
@@ -19,16 +21,56 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-/// Canonical learner category for local scheduler jobs.
-pub const LOCAL_JOB_KIND: &str = "local";
+/// Job metadata key the routine engine sets on the full-job runs it
+/// dispatches, so the frozen estimate and the terminal observation read the
+/// same [`LocalJobKind`].
+pub const JOB_ESTIMATE_KIND_KEY: &str = "estimate_kind";
 
-/// Private learner key for one user's local job model. Length framing keeps
-/// identifiers containing `:` unambiguous. Never emit it to an API or log.
-pub fn job_key(user_id: &str) -> Option<String> {
+/// Bounded learner kind for a local scheduler job (WI#318 C1). A routine's
+/// recurring run and a job a user starts by hand are not comparable
+/// completions, so each has its own model per user. A closed enum keeps the
+/// model count bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalJobKind {
+    /// A full-job routine run dispatched by the routine engine.
+    Routine,
+    /// Every other local dispatch: `create_job`, `/job`, a gateway restart.
+    User,
+}
+
+impl LocalJobKind {
+    /// The non-sensitive key suffix and metadata value for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Routine => "routine",
+            Self::User => "user",
+        }
+    }
+
+    /// The kind recorded in a job's metadata. Only the routine engine writes
+    /// `estimate_kind = "routine"`; any other value, or none, is a user-started
+    /// job. A restarted job is dispatched without its old metadata and so
+    /// counts as user-started.
+    pub fn from_metadata(metadata: Option<&serde_json::Value>) -> Self {
+        let kind = metadata
+            .and_then(|metadata| metadata.get(JOB_ESTIMATE_KIND_KEY))
+            .and_then(|value| value.as_str());
+        if kind == Some(Self::Routine.as_str()) {
+            Self::Routine
+        } else {
+            Self::User
+        }
+    }
+}
+
+/// Private learner key for one user's local job model of one kind. Length
+/// framing keeps identifiers containing `:` unambiguous. Never emit it to an
+/// API or log.
+pub fn job_key(user_id: &str, kind: LocalJobKind) -> Option<String> {
     if user_id.is_empty() || user_id.len() > 512 {
         return None;
     }
-    Some(format!("job:{}:{user_id}{LOCAL_JOB_KIND}", user_id.len()))
+    Some(format!("job:{}:{user_id}:{}", user_id.len(), kind.as_str()))
 }
 
 /// Counts for the owner-only diagnostics surface. No category names, user
@@ -109,11 +151,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_keys_are_user_scoped_and_framed() {
-        assert_eq!(job_key("alice").as_deref(), Some("job:5:alicelocal"));
-        assert_eq!(job_key("").as_deref(), None);
-        assert_eq!(job_key(&"x".repeat(513)), None);
-        assert_ne!(job_key("alice"), job_key("alice:local"));
+    fn job_keys_are_user_scoped_framed_and_split_by_kind() {
+        let user = LocalJobKind::User;
+        let routine = LocalJobKind::Routine;
+        assert_eq!(job_key("alice", user).as_deref(), Some("job:5:alice:user"));
+        assert_eq!(
+            job_key("alice", routine).as_deref(),
+            Some("job:5:alice:routine")
+        );
+        assert_eq!(job_key("", user).as_deref(), None);
+        assert_eq!(job_key(&"x".repeat(513), user), None);
+        assert_ne!(job_key("alice", user), job_key("alice:user", user));
+        assert_ne!(job_key("alice", user), job_key("alice", routine));
+    }
+
+    #[test]
+    fn job_kind_comes_only_from_the_routine_marker() {
+        use serde_json::json;
+        assert_eq!(LocalJobKind::from_metadata(None), LocalJobKind::User);
+        assert_eq!(
+            LocalJobKind::from_metadata(Some(&json!({ "max_iterations": 5 }))),
+            LocalJobKind::User
+        );
+        assert_eq!(
+            LocalJobKind::from_metadata(Some(&json!({ JOB_ESTIMATE_KIND_KEY: "routine" }))),
+            LocalJobKind::Routine
+        );
+        for other in [json!("Routine"), json!("user"), json!(1), json!(null)] {
+            assert_eq!(
+                LocalJobKind::from_metadata(Some(&json!({ JOB_ESTIMATE_KIND_KEY: other }))),
+                LocalJobKind::User
+            );
+        }
     }
 
     #[test]

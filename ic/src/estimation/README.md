@@ -254,10 +254,16 @@ mission's lifetime, or a whole coding job's unknown future steps.
 
 - **Local scheduler jobs only (C1).** `Scheduler::dispatch_job_inner` freezes
   one historical duration into `JobContext.estimated_duration` before the
-  first persist. The learner category is the constant, non-sensitive `local`
-  kind under a private per-user key; job titles, descriptions and metadata
-  never become keys. Cost is never estimated because no job declares a cost
-  baseline.
+  first persist. The learner key is a private per-user key with one of two
+  non-sensitive kinds: `routine` for full-job runs the routine engine
+  dispatches (it marks them with `estimate_kind = "routine"` in the job
+  metadata), and `user` for every other local dispatch (`create_job`, `/job`,
+  a gateway restart, which carries no old metadata). A routine's recurring
+  run and a job a user starts by hand are not comparable completions, so
+  they never train one model. Job titles, descriptions and free-form metadata
+  never become keys, so a user has at most two job models. The worker reads
+  the same kind from the same metadata for the terminal observation. Cost is
+  never estimated because no job declares a cost baseline.
 - **One terminal observation.** `Worker::run` records after exactly one
   execution loop, so the several completion paths cannot train one run twice.
   Only `Completed` trains the duration model. `Failed` and `Cancelled` are
@@ -274,19 +280,29 @@ mission's lifetime, or a whole coding job's unknown future steps.
   is a finite plan. `GET /api/jobs/summary` stays counts-only: an aggregate
   ETA over unrelated jobs has no defined scope, so none is produced.
 - **Mission runs (C3).** `GET /api/missions/{id}` derives a single run's
-  advisory timing from that mission's own completed threads on read: completed
-  run count, median and last completed-run duration, and the newest running
-  run's elapsed. `lunarwing_engine` is untouched, there is no second EMA
-  writer, no extra store read beyond the threads already loaded for the
-  detail view, and no write on the fire path. A recurring mission's lifetime
-  is never estimated.
+  advisory timing from that mission's own threads on read. A valid run is a
+  thread that finished successfully (`Completed` or `Done`; one that went on
+  to `Failed` does not count), and its duration is its **active** time read
+  from its own state-change events: from its first entry into `Running` to
+  its first entry into `Completed`, minus every stretch spent `Waiting` (an
+  approval, a child) or `Suspended`. A run whose events do not show when it
+  started and finished is not counted. The view reports the valid run count
+  and the newest running run's elapsed; the median and the last run's
+  duration stay withheld until five valid runs exist, the same warm-up as
+  every learned hint (A6.2). `lunarwing_engine` is untouched, there is no
+  second EMA writer, no extra store read beyond the threads already loaded
+  for the detail view, and no write on the fire path. A recurring mission's
+  lifetime is never estimated.
 - **Display gating.** Job and mission timing follow the same opt-in display
   mode as tool hints (`LUNARWING_TOOL_ESTIMATES=1`). Recording continues in
   observe mode; `0` disables both recording and display. The per-tool category
   allowlist is not consulted for jobs or missions, whose categories are not
   tool names.
 - **Never an input to behaviour.** Nothing here feeds scheduling, timeouts,
-  approvals, cost accounting, provider selection or LLM prompts.
+  approvals, cost accounting or provider selection. In display mode the
+  frozen job estimate does reach the agent, but only as a field of a
+  `job_status` tool result the agent asked for (C4); it is never added to a
+  prompt on its own, and observe mode keeps it out of `job_status` too.
 
 ## Disable and performance
 
