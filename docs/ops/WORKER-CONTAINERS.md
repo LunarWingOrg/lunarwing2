@@ -4153,8 +4153,10 @@ auto-approval:
   arguments and heredoc bodies can be denied if they mention a blocked
   command. Use file editing tools to write that text literally. The container
   remains the security boundary. Unparseable payloads deny. `/app/config` and
-  `/app/hooks` are read-only to the runtime user, so a task cannot edit its
-  own guard. Since WI#848 the hook also denies a command that names the
+  `/app/hooks` themselves are root-owned and read-only to the runtime user,
+  but the effective config the CLI reads is not: it is the task-owned
+  `$KIMI_CODE_HOME/config.toml` copy written by `entrypoint-task-setup.sh`
+  (see "Per-task guard re-assertion (WI#847)" below). Since WI#848 the hook also denies a command that names the
   user-level MCP registration through its config directory
   (`$KIMI_CODE_HOME/mcp.json`, `~/.kimi-code/mcp.json`, the absolute home
   spelling, and a bare `mcp.json` after `cd`-ing there). That covers the
@@ -4258,6 +4260,54 @@ The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
 WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841, WI#845, WI#852 and WI#853
 only after rebuilding the image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
+
+### Per-task guard re-assertion (WI#847)
+
+The guard registry the CLI actually loads is the task-owned copy, not the
+baked one. `entrypoint-task-setup.sh` writes `$KIMI_CODE_HOME/config.toml` as
+the task uid at mode `0600` inside `/home/kimi/.kimi-code`, so a task can
+rewrite that file (`echo '' >`, `sed -i`, a heredoc, a Python one-liner,
+`truncate -s 0`) and drop the `[[hooks]]` entry. The rewrite parses as valid
+TOML, the CLI starts clean, and because setup runs once per container boot and
+nothing re-asserted the hook afterwards, every later task in that container
+ran unguarded.
+
+`kimi_task_executor.ts` now calls `ensureGuardHook()`
+(`scripts/guard_config.ts`) immediately before every spawn, as whichever
+identity owns the file (container root in the single-container bridge, the
+task uid in the delegated task runner; the in-place write keeps ownership and
+mode so the CLI can still read it). The presence check is a small TOML
+structure scan that blanks comments and multi-line strings, so a hook entry
+that only *looks* registered (in a comment or a `"""` block) does not count;
+an element carrying any key outside `event`/`matcher`/`command`/`timeout`
+(an `enabled = false`, say) or a `timeout` other than `10` is not accepted
+either. A repair appends the canonical WI#206 block and logs it. Fail-closed:
+
+- Managed shapes (identity drop or delegated runner) fail the task when
+  `KIMI_CODE_HOME` is unset, when the file is missing/unreadable, or when it
+  is not a regular file (a symlinked config is refused rather than written
+  through).
+- If the file ends inside an unterminated string or table, the appended block
+  would not register; the task fails instead of spawning unguarded. The same
+  applies when a task truncated or garbled the config: the repair cannot
+  restore the operator's model/provider settings, so the CLI fails to start —
+  a loud, fail-closed stop, not a silent unguarded run. Restarting the worker
+  re-runs the setup script and restores the config from the baked source.
+- Host-side dev runs with no managed config (neither identity nor delegated
+  runner) skip the check.
+
+Accepted residuals, named so they are not mistaken for coverage: a task
+running concurrently with a newly spawned one can still overwrite the file
+between the re-assert and the new CLI's config read (the re-assert runs
+immediately before the spawn to keep that window minimal); `mcp.json` in the
+same task-owned home is not re-asserted (a task can register its own MCP
+server, which the CLI spawns at startup outside the hook — the task already
+runs as that uid, so this is guard-evasion, not privilege escalation, and it
+is tracked separately); and `telemetry = false` /
+`dangerous_command_guard = true` in the effective config are not re-checked —
+telemetry is forced off by the executor's `KIMI_DISABLE_TELEMETRY=1` and the
+upstream dangerous-command guard is inert under `-p`, where the hook is the
+enforcement point.
 
 ## LLM endpoints for LLM-backed workers (WI#330)
 
