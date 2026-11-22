@@ -689,11 +689,12 @@ function isSystemRootPath(candidate) {
 
 // The recursive flag as chmod/chown/chgrp parse it: the short cluster, or the
 // GNU long option, which getopt accepts down to its shortest unique prefix
-// (`--recu`; `--rec` is ambiguous with `--reference` and is an error). A
-// shorter ambiguous prefix or an attached value is rejected by getopt, but
-// matching it costs nothing and keeps the rule fail-closed.
+// (`--rec`: `rec` and `ref` differ in the third letter, so only `--re` is
+// ambiguous with `--reference`; coreutils 9.12 recurses on `--rec`). An
+// attached value is rejected by getopt, but matching it costs nothing and
+// keeps the rule fail-closed.
 const RECURSIVE_CHANGE_FLAG =
-  /(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recu[a-z]*)(?=[ \t=]|$)/;
+  /(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--rec[a-z]*)(?=[ \t=]|$)/;
 
 /**
  * Deny a recursive mode/ownership change on a system root, however the root is

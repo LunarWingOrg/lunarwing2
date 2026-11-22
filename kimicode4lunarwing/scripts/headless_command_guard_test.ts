@@ -552,11 +552,15 @@ test("root path spellings are resolved before the recursive-change rule", () => 
 
 test("the recursive flag is matched in its abbreviated long-option spellings", () => {
   // WI#843: chmod/chown/chgrp accept any unique prefix of `--recursive`
-  // (`--recu` and longer), so testing the literal spelling let
+  // (`--rec` and longer), so testing the literal spelling let
   // `chmod --recursiv 777 /etc` through.
   assertBlocked("chmod --recursiv 777 /etc", "recursive")
   assertBlocked("chmod --recursi 777 /usr", "recursive")
   assertBlocked("chmod --recu 777 /var", "recursive")
+  // `--rec` is the shortest unique prefix: only `--re` is ambiguous.
+  assertBlocked("chmod --rec 777 /etc", "recursive")
+  assertBlocked("chown --rec root:root /home", "recursive")
+  assertBlocked("chgrp --rec staff /srv", "recursive")
   assertBlocked("chmod --recursive 777 /etc", "recursive")
   assertBlocked("chown --recursiv root:root /home", "recursive")
   assertBlocked("chgrp --recursiv staff /srv", "recursive")
