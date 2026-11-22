@@ -105,14 +105,25 @@ def main() -> int:
         load_file_suite(ROOT / ".gitlab" / "tests" / "test_edge_read_timeout_probe.py"),
         records,
     )
+    bounded_ok, bounded_total, bounded_skipped = run_loaded_suite(
+        "bounded-turn probe",
+        load_file_suite(ROOT / ".gitlab" / "tests" / "test_bounded_turn_probe.py"),
+        records,
+    )
 
     junit.write(REPORT_PATH, records)
-    total += adapter_total + guard_total + scan_total + edge_total
-    skipped += adapter_skipped + guard_skipped + scan_skipped + edge_skipped
+    total += adapter_total + guard_total + scan_total + edge_total + bounded_total
+    skipped += (
+        adapter_skipped
+        + guard_skipped
+        + scan_skipped
+        + edge_skipped
+        + bounded_skipped
+    )
     if skipped:
         print(f"ERROR: {skipped} Python test(s) skipped; CI prerequisites are incomplete", file=sys.stderr)
         return 1
-    if not ok or not adapter_ok or not guard_ok or not scan_ok or not edge_ok:
+    if not ok or not adapter_ok or not guard_ok or not scan_ok or not edge_ok or not bounded_ok:
         return 1
 
     print(f"Python test suites passed: {total} tests, no skips.")
