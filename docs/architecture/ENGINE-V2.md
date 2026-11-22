@@ -1978,6 +1978,16 @@ supply: without it, a bounded task that fit the wait budget left no
 steps-or-time record at all, so "slow", "thrashing" and "doing a lot of real
 work" could not be told apart on turns that never detached.
 
+`ic/scripts/bounded-turn-probe.py` is that known-step task: it asks the agent
+for exactly N `echo` calls, waits for the turn, and reads this record from the
+daemon's log stream (`/api/logs/events`, which replays history before the live
+tail), so it works on systemd, OpenRC and launchd hosts without journal access.
+It reports `FITS`, `EXHAUSTED` or a step mismatch and exits nonzero for the
+last two, which makes the 9B/27B budget question a measurement instead of an
+impression. Its field names are pinned to `log_turn_finished` by
+`.gitlab/tests/test_bounded_turn_probe.py`; see
+[`PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
+
 **Join and restart recovery (WI#532/WI#534).** A thread id names a reusable
 conversation surface, not a unique execution. `Thread.created_at` is therefore
 the generation key for each incarnation: it changes when a new turn adopts the
