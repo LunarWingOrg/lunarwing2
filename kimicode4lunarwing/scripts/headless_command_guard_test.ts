@@ -550,6 +550,28 @@ test("root path spellings are resolved before the recursive-change rule", () => 
   assertAllowed("chown -R user:user ./workspace")
 })
 
+test("the recursive flag is matched in its abbreviated long-option spellings", () => {
+  // WI#843: chmod/chown/chgrp accept any unique prefix of `--recursive`
+  // (`--rec` and longer), so testing the literal spelling let
+  // `chmod --recursiv 777 /etc` through.
+  assertBlocked("chmod --recursiv 777 /etc", "recursive")
+  assertBlocked("chmod --recursi 777 /usr", "recursive")
+  assertBlocked("chmod --recu 777 /var", "recursive")
+  // `--rec` is the shortest unique prefix: only `--re` is ambiguous.
+  assertBlocked("chmod --rec 777 /etc", "recursive")
+  assertBlocked("chown --rec root:root /home", "recursive")
+  assertBlocked("chgrp --rec staff /srv", "recursive")
+  assertBlocked("chmod --recursive 777 /etc", "recursive")
+  assertBlocked("chown --recursiv root:root /home", "recursive")
+  assertBlocked("chgrp --recursiv staff /srv", "recursive")
+  // getopt rejects an attached value, but denying it is still fail-closed.
+  assertBlocked("chmod --recursiv=1 777 /etc", "recursive")
+  // Non-recursive long options and abbreviated recursive changes on project
+  // paths stay ordinary work.
+  assertAllowed("chmod --reference=/tmp/mode.txt ./build/file")
+  assertAllowed("chmod --recursiv 755 ./build")
+})
+
 test("deletion without rm is contained by the same temp-root test", () => {
   // WI#826 group B: checkRm was the only rule that looked at what a command
   // deletes, so find, xargs and interpreter one-liners deleted freely.
