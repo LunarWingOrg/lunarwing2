@@ -1158,11 +1158,11 @@ const KIMI_FLAG_OPTIONS = new Set([
 
 /**
  * Deny a service subcommand unless every reading of the option words agrees
- * there is none (WI#845). `-S`/`--session [id]` and options the table does not
- * know may or may not consume the next word, and the hook cannot ask the CLI,
- * so both readings are walked; `server` or `web` reached by either one is a
- * denial. `--option=value` needs no special case: its value is part of the
- * option word.
+ * there is none (WI#845). Only options the table knows are read as the CLI
+ * reads them; an unknown option may or may not consume the next word and the
+ * hook cannot ask the CLI, so both readings are walked and `server` or `web`
+ * reached by either one is a denial. `--option=value` needs no special case:
+ * its value is part of the option word.
  */
 function kimiServiceSubcommand(words, start) {
   const pending = [start];

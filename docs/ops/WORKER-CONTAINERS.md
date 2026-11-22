@@ -4147,7 +4147,15 @@ image and recreate the worker to pick up the updated hook.
 
 WI#833 adds a separate command-position check for Kimi's `server` and `web`
 subcommands and common listener tools. A print-mode prompt is data, even if
-its text is `server` or `web`. WI#839 reads through the shell punctuation
+its text is `server` or `web`. Since WI#845 the check reads the pinned CLI's
+option table: a value-taking option (`-m`/`--model`, `-p`/`--prompt`,
+`--output-format`, `--skills-dir`, `--agent`, `--agent-file`, `--add-dir`,
+and `-S`/`--session` with its optional id) consumes the next word, and an
+option the table does not name is read both ways, so no option value can
+become the "subcommand" and hide the real one. `kimi --model X server` and
+`kimi --port 9000 server` deny, while
+`kimi -p 'summarize the server logs' --output-format stream-json` still
+passes. WI#839 reads through the shell punctuation
 bash glues to a word: a subshell `(…)`, a `$(…)` or backtick substitution
 (also inside double quotes) and a glued `)` or `}` are scanned as the command
 they run, while quoted text that merely mentions `kimi server` stays data.
@@ -4163,8 +4171,8 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
-WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841 and WI#853 only after
-rebuilding the image with the fix and recreating their workers; see
+WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841, WI#845 and WI#853 only
+after rebuilding the image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
