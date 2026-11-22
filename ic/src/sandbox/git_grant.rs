@@ -819,44 +819,6 @@ fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
 /// `git config` writes persist an alias, an include, or a remote URL that a
 /// later command would use unseen by the preflight. Reads are unaffected.
 fn authorize_config(args: &[Word]) -> Result<()> {
-    // Value-less options, including every read selector. Anything else is
-    // denied rather than guessed, because an abbreviation could be a write.
-    const FLAGS: &[&str] = &[
-        "--global",
-        "--system",
-        "--local",
-        "--worktree",
-        "--get",
-        "--get-all",
-        "--get-regexp",
-        "--list",
-        "-l",
-        "--name-only",
-        "--show-origin",
-        "--show-scope",
-        "--show-names",
-        "--includes",
-        "--no-includes",
-        "--fixed-value",
-        "--null",
-        "-z",
-        "--all",
-        "-a",
-    ];
-    const WRITE_FLAGS: &[&str] = &[
-        "--add",
-        "--replace-all",
-        "--unset",
-        "--unset-all",
-        "--rename-section",
-        "--remove-section",
-        "--edit",
-        "-e",
-    ];
-    const VALUE_OPTIONS: &[&str] = &["-f", "--file", "--type", "--default", "--blob", "--comment"];
-    // `--get-urlmatch <name> <url>` takes two values.
-    const GET_URLMATCH: &str = "--get-urlmatch";
-
     let mut positionals: Vec<&Word> = Vec::new();
     let mut writes = false;
     let mut index = 0;
@@ -872,46 +834,25 @@ fn authorize_config(args: &[Word]) -> Result<()> {
             index += 1;
             continue;
         }
-        if text == GET_URLMATCH {
-            if args[index + 1..].len() < 2 {
-                return Err(denied("--get-urlmatch requires a key and a URL"));
-            }
-            positionals.extend(&args[index + 1..index + 3]);
-            index += 3;
-            continue;
-        }
-        if VALUE_OPTIONS.contains(&text) {
-            if args.get(index + 1).is_none_or(|value| value.dynamic) {
-                return Err(denied("git config option requires a literal value"));
-            }
-            index += 2;
-            if text == "--comment" {
-                writes = true;
-            }
-            continue;
-        }
-        let Some(flag) = text.split_once('=').map(|(flag, _)| flag) else {
-            // No `=`: a known value-less flag, a write flag, or unknown.
-            if WRITE_FLAGS.contains(&text) {
-                writes = true;
-            } else if !FLAGS.contains(&text) {
-                return Err(denied(
-                    "unsupported option in manifest git config; use full supported options",
-                ));
-            }
-            index += 1;
-            continue;
+        let classified = if text.starts_with("--") {
+            config_long_option(text)
+        } else {
+            config_short_option(&text[1..])
         };
-        if FLAGS.contains(&flag) || WRITE_FLAGS.contains(&flag) || flag == GET_URLMATCH {
-            index += 1;
-            if WRITE_FLAGS.contains(&flag) {
-                writes = true;
+        let Some((consumed, is_write)) = classified else {
+            return Err(denied(
+                "unsupported option in manifest git config; use full supported options",
+            ));
+        };
+        if consumed > 1 {
+            let values = args.get(index + 1..index + consumed);
+            match values {
+                Some(values) if values.iter().all(|value| !value.dynamic) => {}
+                _ => return Err(denied("git config option requires a literal value")),
             }
-            continue;
         }
-        return Err(denied(
-            "unsupported option in manifest git config; use full supported options",
-        ));
+        writes |= is_write;
+        index += consumed;
     }
     // `git config <name>` reads one key. `git config <name> <value>` and any
     // explicit write flag can persist a redirect.
@@ -932,6 +873,85 @@ fn authorize_config(args: &[Word]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Classify one long `git config` option as `(words consumed, is_write)`.
+/// Anything not listed is refused rather than guessed: an abbreviation could
+/// be a write or could change what the following word means.
+fn config_long_option(text: &str) -> Option<(usize, bool)> {
+    const FLAGS: &[&str] = &[
+        "--global",
+        "--system",
+        "--local",
+        "--worktree",
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--list",
+        "--name-only",
+        "--show-origin",
+        "--show-scope",
+        "--show-names",
+        "--includes",
+        "--no-includes",
+        "--fixed-value",
+        "--null",
+        "--all",
+    ];
+    const WRITE_FLAGS: &[&str] = &[
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "--edit",
+    ];
+    const VALUE_OPTIONS: &[&str] = &["--file", "--type", "--default", "--blob", "--comment"];
+    const GET_URLMATCH: &str = "--get-urlmatch";
+
+    if let Some((flag, value)) = text.split_once('=') {
+        if flag == GET_URLMATCH && !value.is_empty() {
+            return Some((2, false));
+        }
+        if VALUE_OPTIONS.contains(&flag) && !value.is_empty() {
+            return Some((1, flag == "--comment"));
+        }
+        if FLAGS.contains(&flag) {
+            return Some((1, false));
+        }
+        return WRITE_FLAGS.contains(&flag).then_some((1, true));
+    }
+    if text == GET_URLMATCH {
+        // `--get-urlmatch <name> <url>` consumes two values.
+        return Some((3, false));
+    }
+    if VALUE_OPTIONS.contains(&text) {
+        return Some((2, text == "--comment"));
+    }
+    if FLAGS.contains(&text) {
+        return Some((1, false));
+    }
+    WRITE_FLAGS.contains(&text).then_some((1, true))
+}
+
+/// Classify a `git config` short-option cluster. `-lz` is `-l -z`; `-f` takes
+/// the rest of the cluster or the next word as its file.
+fn config_short_option(cluster: &str) -> Option<(usize, bool)> {
+    let mut writes = false;
+    let mut chars = cluster.chars();
+    while let Some(flag) = chars.next() {
+        match flag {
+            'l' | 'z' | 'a' => {}
+            'e' => writes = true,
+            'f' => {
+                let attached: String = chars.collect();
+                return Some((if attached.is_empty() { 2 } else { 1 }, writes));
+            }
+            _ => return None,
+        }
+    }
+    Some((1, writes))
 }
 
 /// The host pins the granted aliases through `GIT_CONFIG_*` entries. A shell
@@ -1639,6 +1659,10 @@ mod tests {
             "git config --get remote.origin.url",
             "git config --get alias.p",
             "git config --list --local",
+            "git config -lz",
+            "git config --type=int --get core.repositoryformatversion",
+            "git config --type=int --get core.repositoryformatversion --local",
+            "git config -f /workspace/repo/.git/config --get user.name",
             "git config user.name fixture",
             "git config --type bool --get core.bare",
             "FOO=1 git status",
