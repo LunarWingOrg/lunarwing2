@@ -4042,9 +4042,12 @@ auto-approval:
   or sits inside the guard's own trees (`/home/kimi/.kimi-code`, `/app`, and
   `$KIMI_CODE_HOME`), or is a system root itself, is denied, because it moves
   a protected tree out of place and a later `rm -rf` of the new temp name
-  would be trivially legal; `~`/`$HOME` are expanded, a `.kimi-code`
-  component counts wherever it appears, and an operand with other shell
-  expansion stands for any name in its directory. Ordinary renames, a
+  would be trivially legal; `~`/`$HOME` are expanded, an operand holding a
+  variable, a command substitution, `~user` or a find/xargs `{}` placeholder
+  is refused because it can stand for any path, a `.kimi-code` component or
+  a dot-glob that can match it counts wherever it appears, and any other glob
+  stands for any name in its literal directory. GNU long-option prefixes
+  (`--t=` for `--target-directory`) are read. Ordinary renames, a
   workspace `mv a b` or `git mv`, pass, and the command word is read like
   `rm`'s (`\mv`, `"mv"`). That shared
   test judges the **resolved** path (WI#830, from WI#812): each target's
@@ -4120,8 +4123,8 @@ auto-approval:
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`truncate` on a file, `install`, `dd` to
   a file, `sed -i`, an `mv` or `tar` behind a variable command word, a
-  rename by `rename` or an interpreter, an `mv` of a relative operand after a
-  `cd` into a protected tree), an
+  rename by `rename` or an interpreter, an `mv` of a relative operand without
+  a `.kimi-code` name after a `cd` into a protected tree or its parent), an
   interpreter body that is
   not one of the classified deletion or decode shapes (`os.system("rm …")`, a
   script file rather than a `-e`/`-c` one-liner, a language other than Python,

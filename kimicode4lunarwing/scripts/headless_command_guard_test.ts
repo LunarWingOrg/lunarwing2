@@ -964,6 +964,25 @@ test("a rename of a protected tree and tar --remove-files are denied (WI#849)", 
   assertAllowed("mv -f notes.md docs/notes.md")
   assertAllowed('mv "$HOME/project/a" "$HOME/project/b"')
   assertAllowed("git commit -m 'rename x via mv a b'")
+  // From the independent read of the fix: a glob in the directory part, a
+  // variable, a substitution, `~user`, a find/xargs `{}` placeholder and the
+  // abbreviated target option all stand for the protected tree too.
+  for (const command of [
+    "mv /h*/kimi/.k* /tmp/wi849-x",
+    "mv /*/kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ~kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ${HOME%/}/.kimi-cod? /tmp/wi849-x",
+    "mv $(echo ~)/.k* /tmp/wi849-x",
+    "cd ~ && mv .kimi-cod? /tmp/wi849-x",
+    "echo /home/kimi/.kimi-code | xargs -I{} mv {} /tmp/wi849-x",
+    "find /home/kimi -maxdepth 1 -name '.k*' -exec mv {} /tmp/wi849-x \\;",
+    "mv --t=/home/kimi/.kimi-code /tmp/wi849-evil/config.toml",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv *.log logs/")
+  assertAllowed("mv file.{txt,md}")
+  assertAllowed("mv .gitignore .gitignore.bak")
 })
 
 test("every decode shape WI#832 named is denied into a shell or interpreter", () => {

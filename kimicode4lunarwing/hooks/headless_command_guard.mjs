@@ -413,9 +413,12 @@ function mvOperands(rest) {
       const equals = word.indexOf("=");
       const name = word.slice(2, equals === -1 ? undefined : equals);
       const attached = equals === -1 ? null : word.slice(equals + 1);
-      if (name !== "target-directory" && name !== "suffix") continue;
+      // GNU mv accepts unique prefixes: `--t` is `--target-directory`.
+      const target = name.length >= 1 && "target-directory".startsWith(name);
+      const suffix = name.length >= 2 && "suffix".startsWith(name);
+      if (!target && !suffix) continue;
       const { value, last } = optionValue(attached ?? "", words, i);
-      if (name === "target-directory") operands.push(value);
+      if (target) operands.push(value);
       i = last;
       continue;
     }
@@ -524,22 +527,55 @@ function mvProtectedRoots() {
   return [...MV_PROTECTED_ROOTS, home.replace(/(.)\/+$/, "$1")];
 }
 
+/** A glob path component as a regular expression over the names it can match. */
+function globComponentRegex(component) {
+  let pattern = "^";
+  for (let i = 0; i < component.length; i++) {
+    const ch = component[i];
+    const close = ch === "[" ? component.indexOf("]", i + 1) : ch === "{" ? component.indexOf("}", i + 1) : -1;
+    if (ch === "*") pattern += ".*";
+    else if (ch === "?") pattern += ".";
+    else if (close !== -1) {
+      // A bracket class or a brace list: either way, any name can follow.
+      pattern += ".*";
+      i = close;
+    } else pattern += ch.replace(/[.+^$()|\\[\]{}]/g, "\\$&");
+  }
+  return new RegExp(`${pattern}$`);
+}
+
+const mvOperandVerdicts = new Map();
+
 /**
  * True when an `mv` operand names, contains or sits inside a protected tree,
- * or is a system root itself. `~`/`$HOME` are expanded; a relative operand is
- * read from the hook's working directory, and any operand naming a
- * `.kimi-code` component counts wherever it is. An operand with other shell
- * expansion stands for any name in its literal directory.
+ * or is a system root itself. `~`/`$HOME` are expanded and a relative operand
+ * is read from the hook's working directory. An operand holding a variable, a
+ * command substitution, `~user` or a find/xargs `{}` placeholder can stand
+ * for any path, so it is refused. A `.kimi-code` component, or a dot-glob
+ * that can match it, counts wherever it is; any other glob stands for any
+ * name in its literal directory. Verdicts are cached for the readings of one
+ * command.
  */
 function mvTouchesProtected(operand) {
+  if (!mvOperandVerdicts.has(operand)) mvOperandVerdicts.set(operand, mvOperandProtected(operand));
+  return mvOperandVerdicts.get(operand);
+}
+
+function mvOperandProtected(operand) {
   const home = (process.env.HOME || "/home/kimi").replace(/(.)\/+$/, "$1");
   const text = operand.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, home);
-  if (/(?:^|\/)\.kimi-code(?:\/|$)/.test(text) || text.includes("KIMI_CODE_HOME")) return true;
+  if (/[$`]/.test(text) || text.startsWith("~") || text.includes("{}")) return true;
+  if (/(?:^|\/)\.kimi-code(?:\/|$)/.test(text)) return true;
   const roots = mvProtectedRoots();
-  const expansion = [...text].findIndex((ch) => RM_SHELL_EXPANDED_CHARS.includes(ch));
-  if (expansion !== -1) {
-    const directory = dirname(resolvePath(text.slice(0, expansion) + "x"));
-    return roots.some((root) => root === directory || root.startsWith(`${directory}/`));
+  const glob = [...text].findIndex((ch) => "*?[]{}".includes(ch));
+  if (glob !== -1) {
+    const dotGlob = text.split("/").some((part) => part.startsWith(".") &&
+      /[*?[\]{}]/.test(part) && globComponentRegex(part).test(".kimi-code"));
+    if (dotGlob) return true;
+    const prefix = text.slice(0, glob);
+    const directory = prefix.endsWith("/") ? resolvePath(prefix) : dirname(resolvePath(`${prefix}x`));
+    return roots.some((root) => directory === "/" || root === directory ||
+      root.startsWith(`${directory}/`) || directory.startsWith(`${root}/`));
   }
   const resolved = resolveExistingPrefix(resolvePath(text));
   if (resolved === null) return true;
