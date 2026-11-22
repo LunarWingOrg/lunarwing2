@@ -1044,4 +1044,29 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   assertAllowed("git config --get user.email")
   assertAllowed("git config --local core.hooksPath .githooks")
   assertAllowed("git status")
+  // git reads section names without regard to case, and an include or a
+  // config file named in the environment defines an alias the same way
+  // (review AKK-1/AKK-2 on !2686).
+  for (const command of [
+    "git -c Alias.z='reset --hard' z",
+    "git -c ALIAS.z='reset --hard' z",
+    "git -c include.path=/tmp/evil.cfg z",
+    "git -c includeIf.gitdir:/workspace/.path=/tmp/evil.cfg z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0=/tmp/evil.cfg git z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=Alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "GIT_CONFIG_GLOBAL=/tmp/evil.cfg git z",
+    "GIT_CONFIG_SYSTEM=/tmp/evil.cfg git z",
+    "git config Alias.z 'reset --hard'",
+    "git config set Alias.z 'reset --hard'",
+    "git config --file .git/config Alias.z 'reset --hard'",
+    "git config include.path /tmp/evil.cfg",
+    "git config --add include.path /tmp/evil.cfg",
+    "git config --rename-section foo alias",
+    "git config --edit",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config --rename-section foo bar")
+  assertAllowed("git config --list")
+  assertAllowed("git -c core.quotepath=off status")
 })

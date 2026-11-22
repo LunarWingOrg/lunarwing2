@@ -743,10 +743,23 @@ function clauseEnd(text, from) {
 // `alias.` later in the same command line is not attributed to this variable.
 const GIT_ALIAS_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=("[^"]*"|'[^']*'|\S+)/g;
 
-/** True when an environment `-c` spelling in the segment names an alias key. */
+// Config keys that move a git command around the verb rules: an alias is an
+// arbitrary verb, and an `include`/`includeIf` path pulls in a file that can
+// define one. git compares section names without regard to case, so
+// `Alias.z` is `alias.z` (WI#842).
+const GIT_REDIRECTING_KEY = /^(?:alias|include|includeif)\./i;
+// A section rename names the bare section (`--rename-section foo alias`).
+const GIT_REDIRECTING_SECTION = /^(?:alias|include|includeif)(?:\.|$)/i;
+
+// A config file named in the environment can define an alias the same way
+// an include does.
+const GIT_CONFIG_FILE_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:GLOBAL|SYSTEM)=/;
+
+/** True when the segment's environment names a redirecting key or config file. */
 function hasGitAliasEnv(segment) {
+  if (GIT_CONFIG_FILE_ENV.test(segment)) return true;
   for (const match of segment.matchAll(GIT_ALIAS_ENV)) {
-    if (/(?:^|[\s'"])alias\./.test(match[1])) return true;
+    if (/(?:^|[\s'"])(?:alias|include|includeif)\./i.test(match[1])) return true;
   }
   return false;
 }
@@ -768,19 +781,25 @@ function gitConfigOperands(after) {
 }
 
 /**
- * True when a `git config` call names an alias key (WI#842): the classic
+ * True when a `git config` call names a redirecting key (WI#842): the classic
  * `git config alias.z …` form, the modern `set`/`get` subcommands
- * (`git config set alias.z …`), or a section rename into `alias`
- * (`git config rename-section foo alias`). Reads are refused with the writes;
- * only other keys stay ordinary config work.
+ * (`git config set alias.z …`), a section rename into or out of one, in the
+ * subcommand or the `--rename-section` option form, or `--edit`, whose editor
+ * can write any key. Reads of those keys are refused with the writes; other
+ * keys stay ordinary config work.
  */
 function gitConfigAliasVerdict(after) {
+  const words = argumentWords(after);
+  if (words.some((word) => word === "-e" || word === "--edit")) return true;
   const operands = gitConfigOperands(after);
-  if (operands[0] === "set" || operands[0] === "get") return /^alias\./.test(operands[1] ?? "");
   if (operands[0] === "rename-section") {
-    return operands.slice(1, 3).some((name) => /^alias(?:\.|$)/.test(name));
+    return operands.slice(1, 3).some((name) => GIT_REDIRECTING_SECTION.test(name));
   }
-  return /^alias\./.test(operands[0] ?? "");
+  if (words.includes("--rename-section")) {
+    return operands.slice(0, 2).some((name) => GIT_REDIRECTING_SECTION.test(name));
+  }
+  if (operands[0] === "set" || operands[0] === "get") return GIT_REDIRECTING_KEY.test(operands[1] ?? "");
+  return GIT_REDIRECTING_KEY.test(operands[0] ?? "");
 }
 
 /**
@@ -789,22 +808,30 @@ function gitConfigAliasVerdict(after) {
  * `alias.*` key (the classic form, the `set`/`get` subcommands, or a section
  * rename into `alias`). An alias name is an arbitrary verb, so the discard
  * rules cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
- * the unknown verb `z`. Refusing the definition is the cheap, complete fix
- * for the shell-visible spellings; an alias already present in repo config,
- * which the guard cannot read cheaply, stays an accepted residual.
+ * the unknown verb `z`; an include does the same through a file. These
+ * refusals cover the spellings a command line shows; an alias already in a
+ * config file the task wrote directly, or one `HOME`/`XDG_CONFIG_HOME` points
+ * at, stays an accepted residual the guard cannot read cheaply.
+ *
+ * Only the leading option words and, for `config`, its own clause are read,
+ * so the verb-first scan of WI#853 keeps a long command linear (WI#824).
  */
-function gitAliasDefinition(rest) {
-  const words = argumentWords(rest);
+function gitAliasDefinition(segment, from) {
+  const { verb, after } = gitVerb(segment, from);
+  const words = argumentWords(segment.slice(from, after));
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (!word.startsWith("-")) break;
     let value = "";
     if (word === "-c" || word === "--config-env") value = stripShellQuotes(words[++i] ?? "");
     else if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
-    if (/^alias\./.test(value)) return true;
+    if (GIT_REDIRECTING_KEY.test(value)) return true;
   }
-  const { verb, after } = gitVerb(rest, 0);
-  return verb === "config" && gitConfigAliasVerdict(rest.slice(after));
+  if (verb !== "config") return false;
+  // A config clause is read whole; one past 4 KB is refused unread, which
+  // keeps repeated `git config` words linear and fails closed.
+  const end = clauseEnd(segment, after);
+  return end - after > 4096 || gitConfigAliasVerdict(segment.slice(after, end));
 }
 
 /** True when any short flag cluster in the text carries one of the letters. */
@@ -842,8 +869,7 @@ function hasGitLongOption(text, options) {
 function checkGitDiscard(segment) {
   if (hasGitAliasEnv(segment)) return true;
   for (const match of segment.matchAll(GIT_CALL)) {
-    const rest = segment.slice(match.index + 3, clauseEnd(segment, match.index + 3));
-    if (gitAliasDefinition(rest)) return true;
+    if (gitAliasDefinition(segment, match.index + 3)) return true;
     const { verb, after } = gitVerb(segment, match.index + 3);
     // Parse the verb before reading any options: a long clause full of
     // ordinary `git log` words then costs one word apiece (WI#824 deadline).

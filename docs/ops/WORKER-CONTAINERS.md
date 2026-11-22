@@ -4082,15 +4082,21 @@ auto-approval:
   or backtick body (also inside double quotes) and a glued `)` end the word
   around them, so `(git reset --hard)`, `$(git clean -fdx)` and
   `(chmod -R 777 /etc)` take the plain spellings' verdicts.
-  An alias is refused before the verb is read (WI#842): an inline
-  `-c alias.<name>=…` or `--config-env=alias.<name>=…`, the
+  An alias is refused before the verb is read (WI#842), because the alias
+  name is an arbitrary verb the rules have never seen
+  (`git -c alias.z='reset --hard' z`). An `include`/`includeIf` path does the
+  same through a file, so it is refused with it, and section names match
+  without regard to case, as git reads them (`Alias.z` is `alias.z`). Denied:
+  an inline `-c` or `--config-env` naming such a key, the
   `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS` environment spellings of the same
-  `-c`, and a `git config` call that names an `alias.*` key (the classic form
-  or the `set` subcommand) or renames a section into `alias` all deny, because
-  the alias name is an arbitrary verb the rules have never seen
-  (`git -c alias.z='reset --hard' z`). An alias already present in repo
-  config the guard cannot read cheaply remains an accepted residual; the
-  write that plants it is refused.
+  `-c`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` naming a config file, and a
+  `git config` call that names such a key (the classic form, `--add`, the
+  `set`/`get` subcommands), renames a section into or out of one (the
+  `rename-section` subcommand or `--rename-section` option), or opens
+  `--edit`. A `git config` clause longer than 4 KB is refused unread.
+  Accepted residuals: an alias already in a config file, one the task wrote
+  directly (`>> .git/config`), and one in a file `HOME` or `XDG_CONFIG_HOME`
+  points at; the guard cannot read those cheaply.
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`mv` into a removed directory, `truncate`
   on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
