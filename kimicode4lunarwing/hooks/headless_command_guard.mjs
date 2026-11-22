@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, resolve as resolvePath } from "node:path";
 import { runInNewContext } from "node:vm";
 
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
@@ -512,12 +512,46 @@ function tarInvocation(rest) {
  * then trivially inside them — and `tar --remove-files`, whose members are
  * deleted after archiving. Both take the shared temp-root test `rm` uses.
  */
+// The guard's own trees: the CLI's config home and the image's code and
+// config (WI#849). A rename that moves one of them, a directory above one, or
+// a system root out of place is the launder; any other rename is ordinary
+// work, so a workspace `mv a b` or `git mv` passes.
+const MV_PROTECTED_ROOTS = ["/home/kimi/.kimi-code", "/app"];
+
+function mvProtectedRoots() {
+  const home = process.env.KIMI_CODE_HOME;
+  if (!home || !home.startsWith("/")) return MV_PROTECTED_ROOTS;
+  return [...MV_PROTECTED_ROOTS, home.replace(/(.)\/+$/, "$1")];
+}
+
+/**
+ * True when an `mv` operand names, contains or sits inside a protected tree,
+ * or is a system root itself. `~`/`$HOME` are expanded; a relative operand is
+ * read from the hook's working directory, and any operand naming a
+ * `.kimi-code` component counts wherever it is. An operand with other shell
+ * expansion stands for any name in its literal directory.
+ */
+function mvTouchesProtected(operand) {
+  const home = (process.env.HOME || "/home/kimi").replace(/(.)\/+$/, "$1");
+  const text = operand.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, home);
+  if (/(?:^|\/)\.kimi-code(?:\/|$)/.test(text) || text.includes("KIMI_CODE_HOME")) return true;
+  const roots = mvProtectedRoots();
+  const expansion = [...text].findIndex((ch) => RM_SHELL_EXPANDED_CHARS.includes(ch));
+  if (expansion !== -1) {
+    const directory = dirname(resolvePath(text.slice(0, expansion) + "x"));
+    return roots.some((root) => root === directory || root.startsWith(`${directory}/`));
+  }
+  const resolved = resolveExistingPrefix(resolvePath(text));
+  if (resolved === null) return true;
+  if (resolved === "/" || SYSTEM_ROOTS.includes(resolved)) return true;
+  return roots.some((root) => resolved === root || resolved.startsWith(`${root}/`) ||
+    root.startsWith(`${resolved}/`));
+}
+
 function checkMoveAndTarDeletion(text) {
   for (const match of text.matchAll(MV_CALL)) {
-    const operands = mvOperands(match[1]);
-    if (operands.length > 0 && !operands.every(isSafeTempPath)) {
-      return outsideTempReason("mv", operands);
-    }
+    const hit = mvOperands(match[1]).find(mvTouchesProtected);
+    if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
   }
   for (const match of text.matchAll(TAR_CALL)) {
     const tar = tarInvocation(match[1]);
@@ -1329,6 +1363,7 @@ function evaluate(command) {
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
       checkRawShapes(joined) ??
+      checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {

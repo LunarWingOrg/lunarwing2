@@ -917,17 +917,17 @@ test("find and rsync delete through the same temp-root test", () => {
   assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
 })
 
-test("a rename and tar --remove-files take the same temp-root test (WI#849)", () => {
+test("a rename of a protected tree and tar --remove-files are denied (WI#849)", () => {
   // Two ALLOWed steps laundered a protected tree past the rm operand test: a
   // rename moved it out of the protected namespace, and `rm -rf /tmp/x` then
   // deleted the staged copy. The rename is the deletion, so both sides of the
   // mv and tar's removed members take the shared containment test.
-  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x", "deletion outside")
-  assertBlocked("mv /app/config /tmp/wi849-x", "deletion outside")
-  assertBlocked("mv /tmp/wi849-a /home/kimi/.kimi-code", "deletion outside")
-  assertBlocked("mv -t /tmp/wi849-x /home/kimi/.kimi-code", "deletion outside")
-  assertBlocked("mv --target-directory=/tmp/wi849-x /home/kimi/.kimi-code", "deletion outside")
-  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x && rm -rf /tmp/wi849-x", "deletion outside")
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /app/config /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /tmp/wi849-a /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv -t /tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv --target-directory=/tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x && rm -rf /tmp/wi849-x", "protected tree")
   assertBlocked("tar -cf /dev/null --remove-files /home/kimi/.kimi-code", "deletion outside")
   assertBlocked("tar -cf /dev/null --remove-files /app/hooks", "deletion outside")
   // A member list is contents the guard cannot see, like `xargs rm` with no find.
@@ -943,6 +943,27 @@ test("a rename and tar --remove-files take the same temp-root test (WI#849)", ()
   assertAllowed("tar -cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
   assertAllowed("tar cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
   assertAllowed("tar -cf /tmp/wi849.tar /tmp/wi849-d")
+  // Review AKL-1/AKL-2 on !2694: only the guard's own trees, a directory
+  // above one and the system roots are held back; ordinary renames pass, and
+  // the command word is read like rm's (`\mv`, `"mv"`).
+  for (const command of [
+    "mv /home/kimi /tmp/wi849-k",
+    "mv /usr /tmp/wi849-u",
+    "mv /tmp/wi849-evil /home/kimi/.kimi-code/config.toml",
+    "mv /home/kimi/.kimi* /tmp/wi849-x",
+    "cd /home/kimi && mv .kimi-code /tmp/wi849-x",
+    "\\mv /home/kimi/.kimi-code /tmp/wi849-x",
+    "\"mv\" /home/kimi/.kimi-code /tmp/wi849-x",
+    "'mv' /app/hooks /tmp/wi849-x",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv a.txt b.txt")
+  assertAllowed("git mv a.txt b.txt")
+  assertAllowed("mv src/old.rs src/new.rs")
+  assertAllowed("mv -f notes.md docs/notes.md")
+  assertAllowed('mv "$HOME/project/a" "$HOME/project/b"')
+  assertAllowed("git commit -m 'rename x via mv a b'")
 })
 
 test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
