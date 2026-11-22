@@ -150,6 +150,7 @@ impl GatewayChannel {
             voice: None,
             voice_rate_limiter: per_user_rate_limiter(VOICE_RATE_LIMIT),
             context_manager: None,
+            llm_timings: None,
         });
 
         Self {
@@ -200,6 +201,7 @@ impl GatewayChannel {
             voice: self.state.voice.clone(),
             voice_rate_limiter: per_user_rate_limiter(VOICE_RATE_LIMIT),
             context_manager: self.state.context_manager.clone(),
+            llm_timings: self.state.llm_timings.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -318,6 +320,12 @@ impl GatewayChannel {
     /// Inject the LLM provider for OpenAI-compatible API proxy.
     pub fn with_llm_provider(mut self, llm: Arc<dyn crate::llm::LlmProvider>) -> Self {
         self.rebuild_state(|s| s.llm_provider = Some(llm));
+        self
+    }
+
+    /// Inject the daemon-wide LLM timing cache (WI#318 Phase B diagnostics).
+    pub fn with_llm_timings(mut self, timings: Arc<crate::estimation::LlmTimings>) -> Self {
+        self.rebuild_state(|s| s.llm_timings = Some(timings));
         self
     }
 

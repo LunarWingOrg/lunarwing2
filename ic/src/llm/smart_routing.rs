@@ -852,6 +852,7 @@ impl SmartRoutingProvider {
                     empty_attempt_output_tokens = usage.map_or(0, |u| u.output_tokens),
                     "Smart routing: Escalating stream to primary (cheap model returned an empty stream)"
                 );
+                super::timing::record_provider_switch();
                 Ok(CheapStreamOutcome::Escalated(
                     self.primary.complete_stream(request).await?,
                 ))
@@ -1027,6 +1028,7 @@ impl LlmProvider for SmartRoutingProvider {
                             .cascade_escalations
                             .fetch_add(1, Ordering::Relaxed);
                         self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                        super::timing::record_provider_switch();
                         self.primary.complete(request).await
                     } else {
                         Ok(response)
@@ -1113,6 +1115,7 @@ impl LlmProvider for SmartRoutingProvider {
                         .cascade_escalations
                         .fetch_add(1, Ordering::Relaxed);
                     self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                    super::timing::record_provider_switch();
                     self.primary.complete_stream(request).await
                 } else {
                     Ok(futures::stream::iter(buffered.chunks.into_iter().map(Ok)).boxed())

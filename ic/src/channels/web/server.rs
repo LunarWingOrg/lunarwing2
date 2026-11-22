@@ -429,6 +429,9 @@ pub struct GatewayState {
     /// Job context manager for live runtime state (`stuck`, `repair_attempts`)
     /// that is not persisted on the sandbox-job record (WI#475).
     pub context_manager: Option<Arc<crate::context::ContextManager>>,
+    /// Daemon-wide LLM logical-call timing models (WI#318 Phase B). Owner-only
+    /// diagnostics; the same cache the provider chain writes to.
+    pub llm_timings: Option<Arc<crate::estimation::LlmTimings>>,
 }
 
 /// Start the gateway HTTP server.
@@ -3761,12 +3764,16 @@ mod tests {
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
+            llm_timings: None,
         })
     }
 
     fn estimates_test_router(trace: Option<crate::estimation::EvaluationTrace>) -> Router {
         use crate::channels::web::auth::MultiAuthState;
         use crate::estimation::{CategoryPolicy, ToolEstimates, ToolEstimationMode};
+        use crate::llm::{
+            LlmTimingObservation, LlmTimingObserver, LlmTimingOutcome, LlmTimingTarget,
+        };
         use crate::tools::{
             Tool,
             builtin::{EchoTool, TimeTool},
@@ -3795,7 +3802,32 @@ mod tests {
                 );
             }
         }
-        let state = test_gateway_state_with_tools(None, Some(registry));
+        let mut state = test_gateway_state_with_tools(None, Some(registry));
+        // Seed the LLM timing cache: two models, one call each, so the
+        // owner-only route has a stable, non-user-scoped payload.
+        let timings = Arc::new(crate::estimation::LlmTimings::new(
+            crate::estimation::LlmTimingMode::Observe,
+        ));
+        for model in ["model-a", "model-b"] {
+            timings.call_started();
+            timings.call_finished(LlmTimingObservation {
+                outcome: LlmTimingOutcome::Completed {
+                    elapsed: std::time::Duration::from_millis(25),
+                    target: Some(LlmTimingTarget {
+                        provider: "provider-test".into(),
+                        model: model.into(),
+                        predicted: None,
+                    }),
+                },
+                attempts: 1,
+                retries: 0,
+                switched: false,
+                first_chunk: None,
+            });
+        }
+        Arc::get_mut(&mut state)
+            .expect("sole state owner")
+            .llm_timings = Some(timings);
         let auth = MultiAuthState::multi(std::collections::HashMap::from([
             (
                 "owner-token".to_string(),
@@ -3857,6 +3889,7 @@ mod tests {
             "/api/estimates",
             "/api/estimates/counters",
             "/api/estimates/evaluation",
+            "/api/estimates/llm",
         ] {
             assert_eq!(
                 request_estimates(&app, uri, None).await.status(),
@@ -3899,6 +3932,23 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+        assert_eq!(
+            request_estimates(&app, "/api/estimates/llm", Some("alice-token"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let llm = estimates_json(
+            request_estimates(&app, "/api/estimates/llm", Some("owner-token")).await,
+        )
+        .await;
+        assert_eq!(llm["mode"], "observe");
+        assert_eq!(llm["counters"]["calls_started"], 2);
+        assert_eq!(llm["counters"]["completions"], 2);
+        assert_eq!(llm["models"][0]["model"], "model-a");
+        assert_eq!(llm["models"][0]["provider"], "provider-test");
+        assert_eq!(llm["models"][1]["model"], "model-b");
+        assert!(llm["models"][0]["estimate_ms"].is_null());
     }
 
     #[tokio::test]

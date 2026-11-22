@@ -296,6 +296,9 @@ impl FailoverProvider {
 
         for (position, provider_index) in available.iter().copied().enumerate() {
             let provider = &self.providers[provider_index];
+            if position > 0 {
+                super::timing::record_provider_switch();
+            }
             let result = call(Arc::clone(provider)).await;
             match result {
                 Ok(response) => {
@@ -343,6 +346,9 @@ impl FailoverProvider {
 
         for (position, provider_index) in available.iter().copied().enumerate() {
             let provider = self.providers[provider_index].as_ref();
+            if position > 0 {
+                super::timing::record_provider_switch();
+            }
             // WI#297: an empty-but-successful stream surfaces as a typed
             // `EmptyStream` error here, never as `Ok(empty)`. Deterministic
             // empties (`length`/`content_filter`) are non-retryable, so they

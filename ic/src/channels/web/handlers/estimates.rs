@@ -2,9 +2,9 @@
 //!
 //! `GET /api/estimates` is user-scoped: the bearer token resolves the user and
 //! only that user's models are returned. `GET /api/estimates/counters` and
-//! `GET /api/estimates/evaluation` expose owner-only aggregates, without user
-//! identities. All routes sit behind the existing gateway auth middleware;
-//! no tool parameters are returned.
+//! `GET /api/estimates/evaluation`, and `GET /api/estimates/llm` expose
+//! owner-only aggregates without user identities. All routes use the existing
+//! gateway auth middleware and return no request content.
 
 use std::sync::Arc;
 
@@ -12,7 +12,9 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
-use crate::estimation::{EvaluationSummary, ToolEstimateCounters, ToolEstimateDiagnostics};
+use crate::estimation::{
+    EvaluationSummary, LlmTimingDiagnostics, ToolEstimateCounters, ToolEstimateDiagnostics,
+};
 use crate::tools::ToolRegistry;
 
 pub(crate) fn routes() -> Router<Arc<GatewayState>> {
@@ -23,6 +25,7 @@ pub(crate) fn routes() -> Router<Arc<GatewayState>> {
             "/api/estimates/evaluation",
             get(estimates_evaluation_handler),
         )
+        .route("/api/estimates/llm", get(estimates_llm_handler))
 }
 
 fn registry(state: &GatewayState) -> Result<&ToolRegistry, (StatusCode, String)> {
@@ -71,4 +74,23 @@ async fn estimates_evaluation_handler(
         StatusCode::NOT_FOUND,
         "Evaluation trace is not enabled".to_string(),
     ))
+}
+
+/// Owner-only daemon-wide LLM logical-call duration models with configured
+/// provider and model labels, never request content.
+async fn estimates_llm_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<LlmTimingDiagnostics>, (StatusCode, String)> {
+    if user.user_id != state.owner_id {
+        return Err((StatusCode::FORBIDDEN, "Owner access required".to_string()));
+    }
+    state
+        .llm_timings
+        .as_deref()
+        .map(|timings| Json(timings.diagnostics()))
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM timing diagnostics unavailable".to_string(),
+        ))
 }

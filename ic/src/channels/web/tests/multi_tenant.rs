@@ -130,6 +130,7 @@ fn build_state_full(
         voice: None,
         voice_rate_limiter: PerUserRateLimiter::new(10, 60),
         context_manager,
+        llm_timings: None,
     })
 }
 
@@ -2476,6 +2477,7 @@ mod approval_resolution {
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
+            llm_timings: None,
         });
         (state, rx, thread_id)
     }

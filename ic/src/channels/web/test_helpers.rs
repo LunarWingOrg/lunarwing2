@@ -112,6 +112,7 @@ impl TestGatewayBuilder {
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
             context_manager: None,
+            llm_timings: None,
         })
     }
 

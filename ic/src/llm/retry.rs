@@ -237,6 +237,9 @@ impl RetryProvider {
         let mut last_error: Option<LlmError> = None;
 
         for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                super::timing::record_retry_attempt();
+            }
             match op().await {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
@@ -280,6 +283,9 @@ impl RetryProvider {
         // exhaustion — never silently dropped.
         let mut discarded_usage: Option<TokenUsage> = None;
         for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                super::timing::record_retry_attempt();
+            }
             // WI#297: an empty-but-successful stream surfaces as a typed
             // `EmptyStream` error here, never as `Ok(empty)`.
             let opening = match request.open(self.inner.as_ref()).await {

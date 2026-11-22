@@ -155,6 +155,17 @@ impl LunarWingCloudChatProvider {
         Ok(provider)
     }
 
+    fn record_dispatch(&self, model: &str) {
+        // Both runtime selection and request overrides can contain arbitrary
+        // user input. Learn only for the configured model, which can differ
+        // for primary, cheap and fallback providers.
+        let configured_model = self.config.model.as_str();
+        super::timing::record_dispatch(
+            "lunarwing_cloud",
+            (model == configured_model).then_some(configured_model),
+        );
+    }
+
     fn api_url(&self, path: &str) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
@@ -486,6 +497,7 @@ impl LlmProvider for LunarWingCloudChatProvider {
             tool_choice: None,
         };
 
+        self.record_dispatch(&request.model);
         let response: ChatCompletionResponse = self.send_request(&request).await?;
 
         let choice =
@@ -568,6 +580,7 @@ impl LlmProvider for LunarWingCloudChatProvider {
             tool_choice: req.tool_choice,
         };
 
+        self.record_dispatch(&request.model);
         let response: ChatCompletionResponse = self.send_request(&request).await?;
 
         let choice =
