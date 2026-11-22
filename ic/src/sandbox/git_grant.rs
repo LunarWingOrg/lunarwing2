@@ -1506,7 +1506,9 @@ mod tests {
                 "{command}: {error}"
             );
             assert!(
-                error.to_string().contains("not supported by manifest Git preflight"),
+                error
+                    .to_string()
+                    .contains("not supported by manifest Git preflight"),
                 "{command}: {error}"
             );
         }
