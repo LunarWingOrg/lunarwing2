@@ -4,10 +4,11 @@ import { spawn } from "node:child_process"
 import { chownSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { captureTrustedMcpConfig, executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "reserved-env" | "auth-token-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role" | "mcp-file"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "reserved-env" | "auth-token-env" | "guard-config" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role" | "mcp-file"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -93,6 +94,23 @@ for (const m of messages) {
 process.exit(0)
 `
       break
+    case "guard-config":
+      // WI#847: report what the CLI would actually load — the guard hook must
+      // be registered in $KIMI_CODE_HOME/config.toml at spawn time.
+      script = `#!/usr/bin/env node
+const fs = require("node:fs")
+const path = require("node:path")
+let state = "missing"
+try {
+  const text = fs.readFileSync(path.join(process.env.KIMI_CODE_HOME || "", "config.toml"), "utf8")
+  state = text.includes("/app/hooks/headless_command_guard.mjs") ? "present" : "absent"
+} catch {
+  state = "unreadable"
+}
+process.stdout.write(JSON.stringify({ role: "assistant", content: "guard=" + state }) + "\\n")
+process.exit(0)
+`
+      break
     case "hang":
       script = `#!/usr/bin/env node
 process.on("SIGTERM", () => {})
@@ -170,10 +188,24 @@ process.exit(0)
   return binPath
 }
 
+/**
+ * WI#847: the executor re-asserts the PreToolUse guard hook in
+ * $KIMI_CODE_HOME/config.toml before every spawn, and the managed shapes
+ * (identity drop, delegated runner) treat a missing config as fatal. Tests
+ * run with a real baked config so they exercise the managed shape; the
+ * WI#847 tests below seed their own homes to cover the stripped and missing
+ * cases.
+ */
+const EXECUTOR_HOME = mkdtempSync(join(tmpdir(), "kimi-executor-home-"))
+writeFileSync(
+  join(EXECUTOR_HOME, "config.toml"),
+  readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+)
+
 async function runExecutor(
   request: TaskRequest,
   binPath: string | null,
-  kimiHome: string | null = "/tmp",
+  kimiHome: string | null = EXECUTOR_HOME,
 ): Promise<{ result?: TaskResult; progress: string[] }> {
   const previousEnv = {
     KIMI_BIN: process.env.KIMI_BIN,
@@ -1055,4 +1087,67 @@ test("executeTask: WI#848 — a root-side restore hands the task its own file ba
     chownSync(home, process.getuid?.() ?? 0, process.getgid?.() ?? 0)
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+test("executeTask: re-asserts the guard hook before spawn after a task stripped it (WI#847)", async () => {
+  const bin = makeMockKimi("guard-config")
+  const home = mkdtempSync(join(tmpdir(), "kimi-guard-home-"))
+  const configPath = join(home, "config.toml")
+  const baked = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
+  // The measured task-authored rewrite: the [[hooks]] entry is gone and the
+  // file still parses as valid TOML, so nothing fails loudly on its own.
+  writeFileSync(configPath, baked.replace(/\n\[\[hooks\]\][\s\S]*?\ntimeout = 10\n/, "\n"))
+  const originalWarn = console.warn
+  console.warn = () => {}
+  try {
+    const { result } = await runExecutor(
+      { task_id: "guard-config", prompt: "check the guard", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.ok(result, "result was not emitted")
+    assert.equal(result!.status, "success")
+    // The CLI itself saw the repaired config — the re-assert runs before the
+    // spawn, so a rewrite cannot outlive the task that made it.
+    assert.equal(result!.output, "guard=present")
+  } finally {
+    console.warn = originalWarn
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: a managed task fails closed when the guard config is missing (WI#847)", async () => {
+  const bin = makeMockKimi("success")
+  const home = mkdtempSync(join(tmpdir(), "kimi-guard-missing-"))
+  const previous = {
+    KIMI_BIN: process.env.KIMI_BIN,
+    WORKSPACE_ROOT: process.env.WORKSPACE_ROOT,
+    KIMI_CODE_HOME: process.env.KIMI_CODE_HOME,
+  }
+  process.env.KIMI_BIN = bin
+  process.env.WORKSPACE_ROOT = "/tmp"
+  process.env.KIMI_CODE_HOME = home
+  let result: TaskResult | undefined
+  try {
+    await executeTask(
+      { task_id: "guard-missing", prompt: "should not spawn", timeout_ms: 10_000 },
+      () => {},
+      (r) => { result = r },
+      undefined,
+      undefined,
+      undefined,
+      { delegatedRunner: true },
+    )
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
+  assert.ok(result, "result was not emitted")
+  assert.equal(result!.status, "error")
+  assert.match(result!.error ?? "", /WI#847/)
+  assert.match(result!.error ?? "", /unavailable/)
+  assert.equal(result!.output, "", "the CLI must not have spawned or produced output")
 })
