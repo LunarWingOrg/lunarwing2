@@ -15,8 +15,12 @@ use crate::tools::wasm::{HostState, LogLevel};
 /// Maximum emitted messages per callback execution.
 ///
 /// Exceeding it no longer discards the accepted batch: the host dispatches what
-/// it accepted and reports the overflow, so a channel's guest cursor can still
-/// advance and drain the rest of its backlog (WI#850).
+/// it accepted, commits the guest's pending writes and reports the overflow
+/// (WI#850). Emits past the limit are still dropped without telling the guest,
+/// so a guest must not persist a cursor past more messages than it can emit in
+/// one callback: the XMPP guest processes at most one page per poll, while a
+/// guest that writes its cursor past every event it fetched loses the
+/// dropped ones.
 pub(crate) const MAX_EMITS_PER_EXECUTION: usize = 100;
 
 /// Maximum message content size (64 KB).
