@@ -1244,7 +1244,9 @@ Enforced controls (opencode2 lane unless noted):
    opens a listener, and either add it to the deny/allowlist with a test or
    say why the lane cannot take it. Unknown `KIMI_CODE_*` names are blocked
    from task input by default; new listener commands are not covered until
-   the hook recognizes them.
+   the hook recognizes them. Since WI#846 the listener rule reads a `find
+   -exec`/`-execdir`/`-ok`/`-okdir` body as the command bash runs, the same
+   as an `xargs` body (WI#826 already read both for deletion).
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
