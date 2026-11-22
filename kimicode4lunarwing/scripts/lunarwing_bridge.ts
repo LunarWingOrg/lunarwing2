@@ -474,6 +474,9 @@ async function startClient(): Promise<void> {
   }
 
   async function connect(): Promise<void> {
+    // WI#848: the client role can also run a task locally (host-side dev
+    // shape), so it takes the same startup snapshot the server role does.
+    captureTrustedMcpConfig()
     console.log(`[bridge] connecting to ${uri}...`)
 
     const headers: Record<string, string> = {}
