@@ -63,12 +63,13 @@ new categories evict the least recently observed category.
   calibration is exercised by the integration fixture, and production costs
   remain unknown until a tool supplies both a baseline and an actual charge.
 
-`Estimator::estimate_operation` is the new live consumer API. The older
-`estimate_job` facade remains for compatibility but its placeholder prices,
-value/margin arithmetic and static per-tool breakdown are **not** used for
-live predictions. Its numeric `record_actuals` interface remains available
-for compatibility; the new `record_operation_actuals` accepts `Actuals` to
-represent absent measurements and a frozen forecast explicitly.
+`Estimator::estimate_operation` is the only estimate API. The legacy
+`estimate_job` facade, `JobEstimate`, `ToolEstimate` and its numeric
+`record_actuals` were deleted under WI#318 (C5): they had no production callers,
+and their placeholder prices, value/margin arithmetic and static per-tool
+breakdown must not become a second job-estimate path.
+`record_operation_actuals` accepts `Actuals` to represent absent measurements
+and a frozen forecast explicitly.
 
 An approval description receives one short line such as:
 

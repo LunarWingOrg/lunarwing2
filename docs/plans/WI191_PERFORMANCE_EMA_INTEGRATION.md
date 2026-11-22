@@ -72,12 +72,17 @@ assertion about how quickly a particular pending approval will be handled.
 
 ## Existing seams and gaps
 
-- `ic/src/estimation/mod.rs:45-117` exposes `Estimator::estimate_job` and
-  `record_actuals`, with **no production callers**. `learner.rs:45-108` keeps
+- ~~`ic/src/estimation/mod.rs:45-117` exposes `Estimator::estimate_job` and
+  `record_actuals`, with **no production callers**.~~ **Removed under #318
+  (C5):** the legacy job facade (`estimate_job`, `record_actuals`,
+  `JobEstimate`, `ToolEstimate`) is deleted, so `estimate_operation` /
+  `record_operation_actuals` are the only estimate API. `learner.rs` keeps
   an in-memory per-category EMA (`alpha=0.1`, `min_samples=5`).
 - `ic/src/estimation/cost.rs:16-45` and `time.rs:12-38` know only `http`,
   `echo`, `time`, `json`; unknown tools get a nominal $0.001 / 5 seconds.
-  `ToolEstimate.confidence` is a literal 0.7 (`mod.rs:71-78`). The LLM price
+  Nothing in production consumes these standalone estimators after C5 removed
+  the legacy job facade; keep them unreferenced or delete in a later cleanup
+  rather than reintroducing a second estimate path. The LLM price
   in `cost.rs` is a flat approximation; production LLM accounting has its
   own model/provider rates. `value.rs:23-29` ignores the description.
 - `ic/src/tools/tool.rs:210-255` gives `ToolOutput` optional cost and a
@@ -118,6 +123,9 @@ assertion about how quickly a particular pending approval will be handled.
   `ic/crates/lunarwing_engine/src/reliability.rs:1-112`. It is not a
   substitute for the `ic/src/estimation/` learner; do not introduce a second
   parallel writer or combine reliability and ETA statistics implicitly.
+  **Resolved under #318 (E1):** it had no consumers anywhere in `ic/`, so it
+  was deleted rather than wired as a second EMA writer. The engine crate no
+  longer exports `ReliabilityTracker`.
 - Existing `ic/src/observability/traits.rs` defines tool and LLM start/end
   events, but its factory and record path have no production callers. Assess
   wiring that observer as a lightweight, optional carrier rather than adding
@@ -137,13 +145,11 @@ assertion about how quickly a particular pending approval will be handled.
 
 Keep the existing `Estimator` facade and `EstimationLearner`, but add a
 performance-oriented single-operation API (a job aggregate can compose it).
-Do not serialize the current `JobEstimate` wholesale into a UI: its `value`
-is not a useful performance metric and its `tool_breakdown` is presently
-unadjusted even though the job total can be adjusted
-(`ic/src/estimation/mod.rs:71-97`). Introduce a separate optional public
-runtime-estimate DTO or evolve the facade with explicit compatibility tests;
-the sum of displayed components must have the same semantics as the displayed
-aggregate.
+A future job view must not reuse the deleted `JobEstimate`: its `value`
+was not a useful performance metric and its `tool_breakdown` was unadjusted
+(`ic/src/estimation/mod.rs` before C5). Introduce a separate optional public
+runtime-estimate DTO; the sum of displayed components must have the same
+semantics as the displayed aggregate.
 Suggested internal types, subject to existing style and trait constraints:
 
 ```text
@@ -558,6 +564,33 @@ decisions based on these estimates are **out of scope** until accuracy and
 failure modes have been demonstrated separately. Changing any gate's authority,
 expiry, channel/request-ID binding, decision token or redaction contract is
 never a rollout mechanism.
+
+## Decisions recorded for phases C–E
+
+Recorded under #318 on 2026-11-22 from dead-code evidence; none of these
+changes behaviour or claims an accuracy result.
+
+- **C5 — the legacy job-estimate API is deleted, not composed.** `Estimator::estimate_job`,
+  `Estimator::record_actuals`, `JobEstimate` and `ToolEstimate` had no callers
+  outside `ic/src/estimation/`. They are removed, so
+  `estimate_operation` / `record_operation_actuals` are the only estimate API.
+  A future whole-job estimate must compose operation estimates and keep elapsed,
+  known-remaining and unknown separate; it must not resurrect `value` or the
+  unadjusted `tool_breakdown`.
+- **D1 — no durable cache is built yet.** This stays exactly the A6.1 decision:
+  the cache is conditional on the A4 tenant measurement showing that cold-start
+  loss materially misses the accuracy or coverage goals. No snapshot code is
+  added before that evidence, and a negative result is recorded in the rollout
+  evidence doc rather than in code.
+- **E1 — `ReliabilityTracker` is deleted.** `lunarwing_engine::ReliabilityTracker`
+  had no consumers anywhere in `ic/`. It was a second, unrelated EMA writer;
+  wiring it would have duplicated the estimator's clock and could be mistaken
+  for ETA statistics. The module and its `lib.rs` re-export are removed; the
+  engine crate keeps no reliability EMA.
+- **E2 — tool-cost learning stays inactive.** No production tool supplies
+  `estimated_cost`, and hints remain duration-only. Adding baselines is deferred
+  until a real per-call charge exists to learn from; the absence is documented
+  rather than replaced with a nominal price.
 
 ## Phase B implementation choice (B3 carrier)
 
