@@ -867,14 +867,19 @@ test("a task cannot edit the trusted user-level MCP registration (WI#848)", () =
   assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' /home/kimi/.kimi-code/mcp.json`, "user-level Kimi MCP config")
   assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' $HOME/.kimi-code/mcp.json`, "user-level Kimi MCP config")
   assertBlocked(`echo '{}' > \${HOME}/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`echo '{}' > \${KIMI_CODE_HOME}/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cp /tmp/x "$KIMI_CODE_HOME"/mcp.json`, "user-level Kimi MCP config")
   // A bare file name after moving into the config directory is the same write.
   assertBlocked(`cd ~/.kimi-code && sed -i 's/x/y/' mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cd ~/.kimi-code/ && sed -i 's/x/y/' mcp.json`, "user-level Kimi MCP config")
   assertBlocked(`cd $KIMI_CODE_HOME && python3 -c "open('mcp.json','w').write('{}')"`, "user-level Kimi MCP config")
   // Ordinary work keeps passing: reading the words, the read-only baked copy,
-  // and the repo's own files.
+  // the lane's config file and the repo's own files.
   assertAllowed("grep -rn mcp.json docs/")
   assertAllowed("grep -rn KIMI_CODE_HOME .")
   assertAllowed("cat /app/config/mcp.json")
+  assertAllowed("cat /home/kimi/.kimi-code/config.toml")
+  assertAllowed("cd /tmp && echo hi")
   assertAllowed("sed -i 's/x/y/' kimicode4lunarwing/config/mcp.json")
   assertAllowed(`echo "$KIMI_CODE_HOME"`)
   assertAllowed("cargo check -j18")

@@ -1864,7 +1864,7 @@ function checkListeners(text, depth = 0) {
 const TRUSTED_USER_MCP_FILE =
   /KIMI_CODE_HOME\b[^\s;&|]{0,24}mcp\.json|\.kimi-code\/mcp\.json/;
 const TRUSTED_USER_CONFIG_DIR =
-  /(?:^|[\s;&|()])(?:cd|pushd)\s+["']?(?:\$?\{?KIMI_CODE_HOME\}?|~\/\.kimi-code|\$\{?HOME\}?\/\.kimi-code|\/home\/kimi\/\.kimi-code)["']?(?=$|[\s;&|)])/;
+  /(?:^|[\s;&|()])(?:cd|pushd)\s+["']?(?:\$?\{?KIMI_CODE_HOME\}?|~\/\.kimi-code|\$\{?HOME\}?\/\.kimi-code|\/home\/kimi\/\.kimi-code)\/?["']?(?=$|[\s;&|)])/;
 
 function checkTrustedUserConfig(text) {
   if (TRUSTED_USER_MCP_FILE.test(text) || TRUSTED_USER_CONFIG_DIR.test(text)) {
