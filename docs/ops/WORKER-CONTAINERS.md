@@ -4082,7 +4082,14 @@ auto-approval:
   `unlink glob "dir/*"` deletion calls with or without parentheses, including
   every operand of a comma list; the `\"` and `\\` escapes a wrapping
   double-quoted shell word removes are unescaped first, because Perl never
-  sees the backslashes (WI#840). The decode side counts
+  sees the backslashes (WI#840). `rmtree`/`remove_tree` option hashes and
+  `rmtree`'s legacy numeric verbose/safe flags (second and third place of a
+  call without an option hash) are not deletion targets (any other number,
+  and any number given to `remove_tree`, is a path), an operand must be one string
+  literal ending at `,`, `)`, `;`, `or`/`and` or a statement modifier (a
+  concatenation, `&&`/`||`/`//` or other expression denies as unverifiable), and `glob(…)`, `<…>`, `qw(…)` and the implicit-`$_` forms are
+  read as deletion calls, while `qw(unlink)` stays text and a `qw(…)` list of
+  temp paths may pass (WI#851). The decode side counts
   `base64 -d`, `xxd -r`, `rev`, `openssl base64 -d`, the decompressors
   (`gzip`, `zcat`, `bzip2`, `xz`, `zstd`, with their `*cat`/`un*` forms),
   `printf` with `\x`/octal escapes, a `perl`/`python3` base64 one-liner, and
