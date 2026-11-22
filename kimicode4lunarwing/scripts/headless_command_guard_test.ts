@@ -903,6 +903,8 @@ test("a wrapped git discard or recursive chmod/chown is denied (WI#853)", () => 
   assertBlocked("(chmod -R 777 /etc)", "recursive")
   assertBlocked("(chown -R kimi /etc)", "recursive")
   assertBlocked("`chmod -R 777 /etc`", "recursive")
+  // The rm rule already read the wrapped form; keep that verdict pinned.
+  assertBlocked("(rm -rf /etc)", "deletion outside")
   // The unwrapped spellings keep their verdicts.
   assertBlocked("git reset --hard", "git command")
   assertBlocked("chmod -R 777 /etc", "recursive")
