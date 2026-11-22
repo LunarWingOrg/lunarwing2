@@ -4927,6 +4927,35 @@ pub struct EngineMissionDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_fire_at: Option<String>,
     pub threads: Vec<EngineThreadInfo>,
+    /// WI#318 C3: advisory timing for a *single* mission run, derived from
+    /// this mission's own completed runs. A recurring mission's lifetime is
+    /// never estimated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_timing: Option<MissionRunTiming>,
+}
+
+/// Read-only, in-memory run timing for one mission (WI#318 C3).
+///
+/// Deliberately derived from the mission's own persisted threads on read:
+/// no engine changes, no second EMA writer, no DB write on the fire path,
+/// and no key that outlives the mission. `remaining_status` is `unknown`
+/// because a mission run is open-ended; no remaining time is invented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MissionRunTiming {
+    /// Completed runs with a positive, usable duration.
+    pub completed_runs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_elapsed_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_elapsed_secs: Option<u64>,
+    /// Elapsed time of the newest still-running run, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_elapsed_secs: Option<u64>,
+    /// Always `unknown`: a run has no finite known step list here.
+    pub remaining_status: &'static str,
+    /// Which records the numbers use, so a caller cannot mistake them for a
+    /// deadline or for another mission's history.
+    pub scope: &'static str,
 }
 
 /// One mission fire rendered for the legacy `routine_history` tool (WI#265).
@@ -5437,13 +5466,17 @@ pub async fn get_engine_mission(
 
     let cadence_json = public_cadence_json(&m.cadence);
 
-    // Load thread summaries for the spawned threads table
+    // Load thread summaries for the spawned threads table. The loaded
+    // threads also feed the per-run timing below; no extra store reads.
     let mut threads = Vec::new();
+    let mut loaded_threads = Vec::new();
     for tid in &m.thread_history {
         if let Ok(Some(thread)) = state.store.load_thread(*tid).await {
             threads.push(thread_to_info(&thread));
+            loaded_threads.push(thread);
         }
     }
+    let run_timing = mission_run_timing(&loaded_threads, chrono::Utc::now());
 
     Ok(Some(EngineMissionDetail {
         info: mission_to_info(&m),
@@ -5453,6 +5486,7 @@ pub async fn get_engine_mission(
         success_criteria: m.success_criteria.clone(),
         next_fire_at: m.next_fire_at.map(|dt| dt.to_rfc3339()),
         threads,
+        run_timing: Some(run_timing),
     }))
 }
 
@@ -5561,11 +5595,102 @@ fn mission_thread_run(thread: &lunarwing_engine::Thread) -> EngineMissionRun {
 /// Character budget for mission run summaries in `routine_history` output.
 const SUMMARY_CHAR_LIMIT: usize = 200;
 
+/// Summarise this mission's own completed runs for the detail view
+/// (WI#318 C3). Completed runs contribute duration; the newest Running
+/// thread contributes elapsed only. Median resists one slow or retried run.
+fn mission_run_timing(
+    threads: &[lunarwing_engine::Thread],
+    now: chrono::DateTime<chrono::Utc>,
+) -> MissionRunTiming {
+    let mut completed: Vec<u64> = threads
+        .iter()
+        .filter_map(|thread| {
+            thread.completed_at.map(|completed| {
+                (completed - thread.created_at).num_seconds().max(0) as u64
+            })
+        })
+        .filter(|secs| *secs > 0)
+        .collect();
+    // `threads` follows `mission.thread_history`, which is oldest first.
+    let last_run_elapsed_secs = threads.iter().rev().find_map(|thread| {
+        thread.completed_at.map(|completed| {
+            (completed - thread.created_at).num_seconds().max(0) as u64
+        })
+    });
+    let running_elapsed_secs = threads
+        .iter()
+        .rev()
+        .find(|thread| thread.state == lunarwing_engine::ThreadState::Running)
+        .map(|thread| (now - thread.created_at).num_seconds().max(0) as u64);
+    completed.sort_unstable();
+    let median_elapsed_secs = if completed.is_empty() {
+        None
+    } else {
+        Some(completed[completed.len() / 2])
+    };
+    MissionRunTiming {
+        completed_runs: completed.len() as u64,
+        median_elapsed_secs,
+        last_run_elapsed_secs,
+        running_elapsed_secs,
+        remaining_status: "unknown",
+        scope: "completed_runs_for_this_mission",
+    }
+}
+
 /// Truncate to at most `limit` characters without ever splitting a UTF-8
 /// code point. A byte-index `String::truncate` would panic on multilingual
 /// assistant text whose limit-th byte lands mid-code-point (WI#265 review).
 fn truncate_summary_chars(summary: &str, limit: usize) -> String {
     summary.chars().take(limit).collect()
+}
+
+#[cfg(test)]
+mod mission_run_timing_tests {
+    use super::*;
+
+    fn thread(started_secs_ago: i64, duration_secs: Option<i64>) -> lunarwing_engine::Thread {
+        let now = chrono::Utc::now();
+        let mut thread = lunarwing_engine::Thread::new(
+            "run",
+            lunarwing_engine::ThreadType::Mission,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.created_at = now - chrono::Duration::seconds(started_secs_ago);
+        thread.completed_at = duration_secs
+            .map(|duration| thread.created_at + chrono::Duration::seconds(duration));
+        thread
+    }
+
+    #[test]
+    fn completed_runs_use_median_and_running_run_only_reports_elapsed() {
+        let mut running = thread(30, None);
+        running.state = lunarwing_engine::ThreadState::Running;
+        let threads = vec![
+            thread(300, Some(100)),
+            thread(200, Some(120)),
+            thread(100, Some(140)),
+            running,
+        ];
+        let timing = mission_run_timing(&threads, chrono::Utc::now());
+        assert_eq!(timing.completed_runs, 3);
+        assert_eq!(timing.median_elapsed_secs, Some(120));
+        assert_eq!(timing.last_run_elapsed_secs, Some(140));
+        assert!(timing.running_elapsed_secs.unwrap() >= 30); // safety: test
+        assert_eq!(timing.remaining_status, "unknown");
+        assert_eq!(timing.scope, "completed_runs_for_this_mission");
+    }
+
+    #[test]
+    fn cold_mission_reports_no_estimate() {
+        let timing = mission_run_timing(&[], chrono::Utc::now());
+        assert_eq!(timing.completed_runs, 0);
+        assert_eq!(timing.median_elapsed_secs, None);
+        assert_eq!(timing.last_run_elapsed_secs, None);
+        assert_eq!(timing.running_elapsed_secs, None);
+    }
 }
 
 /// Manually fire a mission (spawn a new thread).
