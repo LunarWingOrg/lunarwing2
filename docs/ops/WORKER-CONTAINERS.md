@@ -4080,8 +4080,9 @@ auto-approval:
   every operand of a comma list; the `\"` and `\\` escapes a wrapping
   double-quoted shell word removes are unescaped first, because Perl never
   sees the backslashes (WI#840). `rmtree`/`remove_tree` option hashes and
-  `rmtree`'s legacy numeric verbose/safe flags are not deletion targets (a
-  number given to `remove_tree` is a path), an operand must be one string
+  `rmtree`'s legacy numeric verbose/safe flags (second and third place of a
+  call without an option hash) are not deletion targets (any other number,
+  and any number given to `remove_tree`, is a path), an operand must be one string
   literal ending at `,`, `)`, `;`, `or`/`and` or a statement modifier (a
   concatenation, `&&`/`||`/`//` or other expression denies as unverifiable), and `glob(…)`, `<…>`, `qw(…)` and the implicit-`$_` forms are
   read as deletion calls, while `qw(unlink)` stays text and a `qw(…)` list of

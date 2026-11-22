@@ -936,6 +936,11 @@ test("Perl deletion options, list forms and expression operands (WI#851)", () =>
   assertAllowed(`perl -e 'unlink "/tmp/x" if -e "/tmp/x"'`)
   assertAllowed(`perl -e 'unlink "/tmp/x" unless -d "/tmp/x"'`)
   assertBlocked(`perl -e 'unlink for glob "/workspace/*"'`, "interpreter deletion")
+  // A bare number is an rmtree flag only in the second and third place of an
+  // old-style call; elsewhere, or next to an option hash, it is a path.
+  assertBlocked(`perl -MFile::Path -e 'rmtree 2024, "/tmp/x"'`, "interpreter deletion")
+  assertBlocked(`perl -MFile::Path -e 'rmtree "/tmp/x", 2024, {}'`, "interpreter deletion")
+  assertAllowed(`perl -MFile::Path -e 'rmtree("/tmp/x", 1)'`)
 })
 
 test("find and rsync delete through the same temp-root test", () => {

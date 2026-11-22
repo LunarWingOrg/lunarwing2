@@ -868,12 +868,12 @@ function perlDeletionElement(code, i, options, numericFlags) {
   const ch = code[i] ?? "";
   if (options && ch === "{") {
     const end = perlHashEnd(code, i);
-    return end === -1 ? { unverifiable: true } : { next: end, skipped: true };
+    return end === -1 ? { unverifiable: true } : { next: end, skipped: true, hash: true };
   }
   if (numericFlags && /[0-9]/.test(ch)) {
     let end = i;
     while (end < code.length && /[0-9]/.test(code[end])) end++;
-    return { next: end, skipped: true };
+    return { next: end, skipped: true, number: true };
   }
   if (ch === "<") return perlAngleOperand(code, i);
   const glob = perlGlobOperand(code, i);
@@ -916,19 +916,29 @@ function perlDeletionCall(code, from, keyword) {
   const options = keyword === "rmtree" || keyword === "remove_tree";
   const callEnd = (at) => (parenthesized ? code[at] === ")" : perlStatementEnd(code, at));
   const operands = [];
+  // File::Path reads `rmtree`'s numbers as the legacy verbose/safe flags only
+  // in the second and third place of an old-style call (no option hash); in
+  // any other place, or next to a hash, a number is a path (`./2024`).
+  let index = 0;
+  let hash = false;
+  let number = false;
   for (;;) {
     i = skipBlanks(code, i);
     // No target at all is the implicit `$_` form, which cannot be verified.
     if (callEnd(i)) return { operands, unverifiable: true };
-    const element = perlDeletionElement(code, i, options, keyword === "rmtree");
+    const numericFlags = keyword === "rmtree" && (index === 1 || index === 2);
+    const element = perlDeletionElement(code, i, options, numericFlags);
     if (element.unverifiable) return { operands, unverifiable: true };
     if (!element.skipped) operands.push(...element.values);
+    hash ||= element.hash === true;
+    number ||= element.number === true;
+    index++;
     i = skipBlanks(code, element.next);
     if (code[i] === ",") {
       i++;
       continue;
     }
-    return { operands, unverifiable: !callEnd(i) || operands.length === 0 };
+    return { operands, unverifiable: !callEnd(i) || operands.length === 0 || (hash && number) };
   }
 }
 
