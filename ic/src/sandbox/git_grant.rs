@@ -621,6 +621,7 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
     }
     let mut index = 0;
     while index < words.len() && is_assignment(&words[index].text) {
+        refuse_config_env_assignment(&words[index])?;
         index += 1;
     }
     while index < words.len() {
@@ -631,8 +632,19 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
                 while index < words.len()
                     && (words[index].text.starts_with('-') || is_assignment(&words[index].text))
                 {
+                    refuse_config_env_assignment(&words[index])?;
                     index += 1;
                 }
+            }
+            "export" => {
+                index += 1;
+                while index < words.len() {
+                    if is_assignment(&words[index].text) {
+                        refuse_config_env_assignment(&words[index])?;
+                    }
+                    index += 1;
+                }
+                return Ok(());
             }
             "command" | "exec" | "nohup" | "time" => {
                 index += 1;
@@ -736,14 +748,14 @@ fn scan_shell_c(
 }
 
 /// Configuration keys that could redirect a granted remote alias, log in, or
-/// rewrite a granted URL. A command-line override of one of these would make
-/// the alias/URL check describe a different destination than git contacts.
+/// rewrite a granted URL, or that can turn a literal subcommand into another
+/// one. A command-line override of one of these would make the alias/URL check
+/// describe a different destination or operation than git actually runs.
 ///
-/// `alias.` and `include.`/`includeIf.` belong here for the same reason at the
-/// verb level: an alias renames the subcommand the scan sees, and an include
-/// pulls in whatever the included file defines. Verified with real git —
-/// `git -c alias.q=push q <url> HEAD:refs/heads/x` pushes, and so does the
-/// alias `z = push` loaded through `-c include.path=<file>`.
+/// `alias.` is here because `git -c alias.p=push p` makes the preflight see an
+/// unrecognized subcommand while git runs `push`. `include.`/`includeif.` are
+/// here because `git -c include.path=<file>` loads a file that can define the
+/// same alias or rewrite `remote.<name>.url`.
 const REDIRECTING_CONFIG_KEYS: &[&str] = &[
     "remote.",
     "url.",
@@ -778,22 +790,181 @@ fn config_overrides(words: &[Word], index: usize) -> Vec<String> {
     }
 }
 
+/// A key names a redirecting section, either bare (`alias`) or by prefix
+/// (`alias.p`, `remote.origin.url`); keys are matched case-insensitively
+/// because Git lowercases section and variable names.
+fn is_redirecting_config_key(raw: &str) -> bool {
+    let key = raw.trim().to_ascii_lowercase();
+    REDIRECTING_CONFIG_KEYS.iter().any(|prefix| {
+        key.trim_end_matches('.') == prefix.trim_end_matches('.') || key.starts_with(prefix)
+    })
+}
+
 fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
     for override_value in overrides {
         let key = override_value
             .split_once('=')
             .map(|(key, _)| key)
-            .unwrap_or(override_value)
-            .trim()
-            .to_ascii_lowercase();
-        if REDIRECTING_CONFIG_KEYS
-            .iter()
-            .any(|prefix| key == **prefix || key.starts_with(prefix))
-        {
+            .unwrap_or(override_value);
+        if is_redirecting_config_key(key) {
             return Err(denied(
-                "git configuration overrides that can redirect a granted remote are not permitted",
+                "git configuration overrides that can redirect a granted remote or subcommand \
+                 are not permitted",
             ));
         }
+    }
+    Ok(())
+}
+
+/// `git config` writes persist an alias, an include, or a remote URL that a
+/// later command would use unseen by the preflight. Reads are unaffected.
+fn authorize_config(args: &[Word]) -> Result<()> {
+    let mut positionals: Vec<&Word> = Vec::new();
+    let mut writes = false;
+    let mut index = 0;
+    while index < args.len() {
+        let word = &args[index];
+        let text = word.text.as_str();
+        if text == "--" {
+            positionals.extend(args[index + 1..].iter());
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            positionals.push(word);
+            index += 1;
+            continue;
+        }
+        let classified = if text.starts_with("--") {
+            config_long_option(text)
+        } else {
+            config_short_option(&text[1..])
+        };
+        let Some((consumed, is_write)) = classified else {
+            return Err(denied(
+                "unsupported option in manifest git config; use full supported options",
+            ));
+        };
+        if consumed > 1 {
+            let values = args.get(index + 1..index + consumed);
+            match values {
+                Some(values) if values.iter().all(|value| !value.dynamic) => {}
+                _ => return Err(denied("git config option requires a literal value")),
+            }
+        }
+        writes |= is_write;
+        index += consumed;
+    }
+    // `git config <name>` reads one key. `git config <name> <value>` and any
+    // explicit write flag can persist a redirect.
+    if !writes && positionals.len() < 2 {
+        return Ok(());
+    }
+    let Some(key) = positionals.first() else {
+        return Ok(());
+    };
+    if key.dynamic {
+        return Err(denied(
+            "dynamic git config key cannot be authorized; name the key literally",
+        ));
+    }
+    if is_redirecting_config_key(&key.text) {
+        return Err(denied(
+            "git config writes that can redirect a granted remote or subcommand are not permitted",
+        ));
+    }
+    Ok(())
+}
+
+/// Classify one long `git config` option as `(words consumed, is_write)`.
+/// Anything not listed is refused rather than guessed: an abbreviation could
+/// be a write or could change what the following word means.
+fn config_long_option(text: &str) -> Option<(usize, bool)> {
+    const FLAGS: &[&str] = &[
+        "--global",
+        "--system",
+        "--local",
+        "--worktree",
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--list",
+        "--name-only",
+        "--show-origin",
+        "--show-scope",
+        "--show-names",
+        "--includes",
+        "--no-includes",
+        "--fixed-value",
+        "--null",
+        "--all",
+    ];
+    const WRITE_FLAGS: &[&str] = &[
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "--edit",
+    ];
+    const VALUE_OPTIONS: &[&str] = &["--file", "--type", "--default", "--blob", "--comment"];
+    const GET_URLMATCH: &str = "--get-urlmatch";
+
+    if let Some((flag, value)) = text.split_once('=') {
+        if flag == GET_URLMATCH && !value.is_empty() {
+            return Some((2, false));
+        }
+        if VALUE_OPTIONS.contains(&flag) && !value.is_empty() {
+            return Some((1, flag == "--comment"));
+        }
+        if FLAGS.contains(&flag) {
+            return Some((1, false));
+        }
+        return WRITE_FLAGS.contains(&flag).then_some((1, true));
+    }
+    if text == GET_URLMATCH {
+        // `--get-urlmatch <name> <url>` consumes two values.
+        return Some((3, false));
+    }
+    if VALUE_OPTIONS.contains(&text) {
+        return Some((2, text == "--comment"));
+    }
+    if FLAGS.contains(&text) {
+        return Some((1, false));
+    }
+    WRITE_FLAGS.contains(&text).then_some((1, true))
+}
+
+/// Classify a `git config` short-option cluster. `-lz` is `-l -z`; `-f` takes
+/// the rest of the cluster or the next word as its file.
+fn config_short_option(cluster: &str) -> Option<(usize, bool)> {
+    let mut writes = false;
+    let mut chars = cluster.chars();
+    while let Some(flag) = chars.next() {
+        match flag {
+            'l' | 'z' | 'a' => {}
+            'e' => writes = true,
+            'f' => {
+                let attached: String = chars.collect();
+                return Some((if attached.is_empty() { 2 } else { 1 }, writes));
+            }
+            _ => return None,
+        }
+    }
+    Some((1, writes))
+}
+
+/// The host pins the granted aliases through `GIT_CONFIG_*` entries. A shell
+/// assignment to one of those names would let the command install an alias or
+/// a helper that the preflight never saw, so refuse the prefix outright.
+fn refuse_config_env_assignment(word: &Word) -> Result<()> {
+    let Some((name, _)) = word.text.split_once('=') else {
+        return Ok(());
+    };
+    if name.trim().starts_with("GIT_CONFIG") {
+        return Err(denied(
+            "shell assignments to GIT_CONFIG_* are not permitted; the host owns git configuration",
+        ));
     }
     Ok(())
 }
@@ -871,6 +1042,7 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
             preflight.read_remote(remote)
         }
         "remote" => authorize_remote_subcommand(args, preflight),
+        "config" => authorize_config(args),
         "archive" => authorize_archive(args, preflight),
         "submodule" => authorize_submodule(args, preflight),
         // Porcelain `push` is not the only path to a remote. The plumbing
@@ -981,10 +1153,22 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
     };
     match action.text.as_str() {
         "add" | "set-url" => {
-            let positional: Vec<&Word> = args[1..]
-                .iter()
-                .filter(|word| !word.text.starts_with('-'))
-                .collect();
+            // Parse the option arity, so `-t main` cannot shift the URL to
+            // position 0 and leave the real destination unchecked.
+            let positional = read_positionals(
+                &args[1..],
+                &[
+                    "-f",
+                    "--tags",
+                    "--no-tags",
+                    "--push",
+                    "--add",
+                    "--mirror",
+                    "--fetch",
+                    "--no-fetch",
+                ],
+                &["-t", "--track", "-m", "--master"],
+            )?;
             let Some(url) = positional.get(1) else {
                 return Ok(());
             };
@@ -1450,6 +1634,82 @@ mod tests {
             &grant,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn remote_options_cannot_shift_the_checked_url() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git remote add -t main origin https://evil.example.test/repo.git",
+            "git remote set-url --push origin https://evil.example.test/repo.git",
+            "git remote set-url origin https://evil.example.test/repo.git",
+            "git remote add -m main origin ext::sh -c evil",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git remote add -t main backup file:///workspace/remotes/origin.git",
+            "git remote set-url --push origin /workspace/remotes/origin.git",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| {
+                panic!("{command}: {error}");
+            });
+        }
+    }
+
+    #[test]
+    fn alias_include_and_config_env_routes_are_denied_before_git_reevaluates_them() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git -c alias.x=push x origin HEAD:refs/heads/main",
+            "git -c 'alias.x=push --force' x origin HEAD:refs/heads/main",
+            "git -c alias.f=fetch f ../other.git",
+            "git --config=alias.p=push p origin main",
+            "git --config-env=alias.p=PUSH_VAR p origin main",
+            "git -C repo -c alias.p=push p origin main",
+            "git -c include.path=/tmp/evil.gitconfig p",
+            "git -c includeIf.gitdir:repo/.path=/tmp/evil.gitconfig p",
+            "git config alias.p push",
+            "git config --add alias.p push",
+            "git config --global alias.p 'push --force'",
+            "git config --file /tmp/cfg alias.p push",
+            "git config --unset remote.origin.url",
+            "git config --remove-section alias",
+            "git config --rename-section alias.p alias.q",
+            "git config user.name fixture; git config alias.p push",
+            "GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p",
+            "env GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p",
+            "export GIT_CONFIG_COUNT=1",
+            "bash -lc 'git config alias.p push'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git config --get remote.origin.url",
+            "git config --get alias.p",
+            "git config --list --local",
+            "git config -lz",
+            "git config --type=int --get core.repositoryformatversion",
+            "git config --type=int --get core.repositoryformatversion --local",
+            "git config -f /workspace/repo/.git/config --get user.name",
+            "git config user.name fixture",
+            "git config --type bool --get core.bare",
+            "FOO=1 git status",
+            "git -c user.name=fixture commit -m message",
+            "git commit -m message",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| {
+                panic!("{command}: {error}");
+            });
+        }
     }
 
     #[test]

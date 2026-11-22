@@ -894,6 +894,9 @@ selected, already-allowlisted hosts. It does not enforce repository paths or
 Git operations. File remotes are paths inside `/workspace` and work in any
 supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
 injects no credential, and manifest preflight rejects recognized Git pushes.
+It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
+`url.*`, `credential.*` and `http.extraheader` configuration, `git config`
+writes to those keys, and shell assignments to `GIT_CONFIG_*`.
 Calls without a manifest keep their existing Git and egress behavior. See the
 [manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
 for the boundaries and the authentication and push work still open. Worker
