@@ -35,6 +35,18 @@ use crate::tools::{
     ApprovalContext, ToolRegistry, autonomous_unavailable_error, prepare_tool_params, redact_params,
 };
 
+/// Whether a worker exit should record a terminal observation, and whether it
+/// may train the duration model. `Stuck` and any still-active state record
+/// nothing: self-repair can reschedule that job, and the recovered run must be
+/// the one observation, not two.
+fn terminal_run_outcome(state: JobState) -> Option<bool> {
+    match state {
+        JobState::Completed => Some(true),
+        JobState::Failed | JobState::Cancelled => Some(false),
+        _ => None,
+    }
+}
+
 fn worker_iteration_limit(job_context: Option<&JobContext>) -> usize {
     job_context
         .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
@@ -326,10 +338,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let Ok(ctx) = self.context_manager().get_context(self.job_id).await else {
             return;
         };
-        let completed = match ctx.state {
-            JobState::Completed => true,
-            JobState::Failed | JobState::Cancelled => false,
-            _ => return,
+        let Some(completed) = terminal_run_outcome(ctx.state) else {
+            return;
         };
         let Some(started_at) = ctx.started_at else {
             return;
@@ -1632,6 +1642,23 @@ mod tests {
     use crate::testing::{BroadcastCapture, RecordingBroadcastChannel};
     use crate::tools::builtin::MessageTool;
     use crate::tools::{Tool, ToolError as ToolExecError, ToolOutput};
+
+    #[test]
+    fn terminal_run_outcome_records_once_and_never_from_stuck() {
+        assert_eq!(terminal_run_outcome(JobState::Completed), Some(true));
+        assert_eq!(terminal_run_outcome(JobState::Failed), Some(false));
+        assert_eq!(terminal_run_outcome(JobState::Cancelled), Some(false));
+        // Stuck and still-active states defer to a possible recovered run.
+        for state in [
+            JobState::Stuck,
+            JobState::Pending,
+            JobState::InProgress,
+            JobState::Submitted,
+            JobState::Accepted,
+        ] {
+            assert_eq!(terminal_run_outcome(state), None);
+        }
+    }
 
     #[test]
     fn worker_iteration_limit_defaults_and_clamps() {
