@@ -737,6 +737,49 @@ function clauseEnd(text, from) {
   return end;
 }
 
+// `GIT_CONFIG_KEY_*` (with `GIT_CONFIG_COUNT`) and `GIT_CONFIG_PARAMETERS` are
+// git's environment spellings of `-c`; an alias planted that way is the same
+// bypass as `-c alias.*` (WI#842).
+const GIT_ALIAS_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=[^;&|\n]*\balias\./;
+
+/** The `<name>` operand of a `git config` call, after option/value pairs. */
+function gitConfigKey(after) {
+  const words = argumentWords(after);
+  const valueOptions = ["--file", "-f", "--type", "--default", "--blob"];
+  for (let i = 0; i < words.length; i++) {
+    if (valueOptions.includes(words[i])) {
+      i++;
+      continue;
+    }
+    if (words[i].startsWith("-")) continue;
+    return stripShellQuotes(words[i]);
+  }
+  return "";
+}
+
+/**
+ * True when a git invocation would define an alias (WI#842): an inline
+ * `-c`/`--config-env` alias assignment, or a `git config` call naming an
+ * `alias.*` key. An alias name is an arbitrary verb, so the discard rules
+ * cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
+ * the unknown verb `z`. Refusing the definition is the cheap, complete fix
+ * for the shell-visible spellings; an alias already present in repo config,
+ * which the guard cannot read cheaply, stays an accepted residual.
+ */
+function gitAliasDefinition(rest) {
+  const words = argumentWords(rest);
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (!word.startsWith("-")) break;
+    let value = "";
+    if (word === "-c" || word === "--config-env") value = stripShellQuotes(words[++i] ?? "");
+    else if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    if (/^alias\./.test(value)) return true;
+  }
+  const { verb, after } = gitVerb(rest, 0);
+  return verb === "config" && /^alias\./.test(gitConfigKey(rest.slice(after)));
+}
+
 /** True when any short flag cluster in the text carries one of the letters. */
 function hasShortFlag(text, letters) {
   for (const match of text.matchAll(/(?:^|[ \t])-([a-zA-Z]+)(?=[ \t]|$)/g)) {
@@ -765,9 +808,15 @@ function hasGitLongOption(text, options) {
  * checkout or restore, forced checkout/switch, and a `stash` that takes
  * untracked or ignored files. Long options are read by any GNU-unambiguous
  * prefix, like the `rm` rules (WI#841). Linear scan over the git invocations.
+ *
+ * The verb rules read the literal verb, so an alias is refused before them
+ * (WI#842): the alias name would be an arbitrary verb they have never seen.
  */
 function checkGitDiscard(segment) {
+  if (GIT_ALIAS_ENV.test(segment)) return true;
   for (const match of segment.matchAll(GIT_CALL)) {
+    const rest = segment.slice(match.index + 3, clauseEnd(segment, match.index + 3));
+    if (gitAliasDefinition(rest)) return true;
     const { verb, after } = gitVerb(segment, match.index + 3);
     // Parse the verb before reading any options: a long clause full of
     // ordinary `git log` words then costs one word apiece (WI#824 deadline).
