@@ -148,6 +148,11 @@ class FakeGateway:
             return {"api_version": 1}
         raise AssertionError(f"unexpected GET {path}")
 
+    def raw_get(self, path):
+        if path == "/api/chat/capabilities":
+            return 200, json.dumps({"api_version": 1}).encode()
+        raise AssertionError(f"unexpected GET {path}")
+
     def get_text(self, path):
         if path == "/api/logs/download":
             return self.history_body
@@ -172,6 +177,31 @@ def log_body(*messages):
 
 def entry(message):
     return {"level": "INFO", "target": "lunarwing", "message": message, "timestamp": "t"}
+
+
+class ContractTests(unittest.TestCase):
+    """A refused token and a legacy daemon must not read as the same failure."""
+
+    class StatusGateway:
+        def __init__(self, status):
+            self.status = status
+
+        def raw_get(self, _path):
+            return self.status, b"body"
+
+    def test_a_healthy_contract_passes(self):
+        probe.require_contract(self.StatusGateway(200))
+
+    def test_a_refused_token_is_named_as_a_token_problem(self):
+        for status in (401, 403):
+            with self.assertRaises(probe.ProbeError) as caught:
+                probe.require_contract(self.StatusGateway(status))
+            self.assertIn("refused the token", str(caught.exception))
+
+    def test_a_missing_capabilities_route_is_a_legacy_daemon(self):
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.require_contract(self.StatusGateway(404))
+        self.assertIn("legacy daemon", str(caught.exception))
 
 
 class WaitTests(unittest.TestCase):

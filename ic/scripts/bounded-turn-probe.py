@@ -120,6 +120,10 @@ class Gateway:
             raise ProbeError(f"GET {path} answered {status}: {body[:200]!r}")
         return body.decode("utf-8", "replace")
 
+    def raw_get(self, path):
+        """The status and body of a GET, for callers that classify the status."""
+        return self._request("GET", path)
+
     def post_json(self, path, payload):
         status, body = self._request("POST", path, payload)
         if status not in (200, 202):
@@ -131,13 +135,21 @@ class Gateway:
 
 
 def require_contract(gateway):
-    """A daemon without the chat contract has no turn lifecycle events."""
-    try:
-        gateway.get_json("/api/chat/capabilities")
-    except ProbeError as error:
+    """A daemon without the chat contract has no turn lifecycle events.
+
+    The status separates the two failures an operator hits first: a refused
+    token is a bad `--token-file`, while a 404 is a daemon that predates the
+    contract and has no turn lifecycle events at all.
+    """
+    status, body = gateway.raw_get("/api/chat/capabilities")
+    if status in (401, 403):
+        raise ProbeError(f"the gateway refused the token ({status}); check --token-file")
+    if status == 404:
         raise ProbeError(
-            f"daemon does not serve /api/chat/capabilities (legacy daemon?): {error}"
-        ) from error
+            "the daemon does not serve /api/chat/capabilities (legacy daemon?)"
+        )
+    if status != 200:
+        raise ProbeError(f"GET /api/chat/capabilities answered {status}: {body[:200]!r}")
 
 
 def create_thread(gateway):
