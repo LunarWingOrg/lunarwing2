@@ -47,11 +47,20 @@ pub struct BridgeMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MessagesQuery {
+    /// Return only messages with a cursor greater than this value.
     pub cursor: Option<u64>,
+    /// Page size for this fetch. Omitted means the bridge's default page size;
+    /// the bridge clamps it to a ceiling that keeps every page inside a
+    /// channel's per-callback emit budget (WI#850).
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MessagesResponse {
+    /// Cursor of the last message in this page, or the request cursor when the
+    /// page is empty. Persist this verbatim: it advances only past the messages
+    /// actually returned, so a backlog that did not fit in one page is fetched
+    /// on the next poll instead of being skipped (WI#850).
     #[serde(default)]
     pub cursor: u64,
     #[serde(default)]
