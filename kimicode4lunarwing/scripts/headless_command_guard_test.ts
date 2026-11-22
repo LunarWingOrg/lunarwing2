@@ -1010,3 +1010,28 @@ test("a dry-run clean and a deleting tr no longer deny (WI#832 false denials)", 
   assertAllowed("cat script.sh | tr -d '\\r' | bash")
   assertAllowed("cat script.sh | tr -d '\\r' > script.sh.tmp")
 })
+
+test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => {
+  // The verb rules read the literal verb, so `git -c alias.z='reset --hard' z`
+  // was classified as the unknown verb `z` and allowed while git discarded the
+  // change. The alias definition is refused instead of resolved: the value may
+  // live in repo config the guard cannot read cheaply.
+  assertBlocked("git -c alias.z='reset --hard' z", "git command")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
+  assertBlocked("git -c alias.z=status z", "git command")
+  assertBlocked("git --config-env=alias.z=Z z", "git command")
+  assertBlocked("git --config-env alias.z=Z z", "git command")
+  // The repo-config write that plants the same alias is refused too.
+  assertBlocked("git config alias.t1 'reset --hard'", "git command")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
+  assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "git command")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+  // Ordinary config and option use stays allowed.
+  assertAllowed("git -c user.name=bot commit -m x")
+  assertAllowed("git config --get user.email")
+  assertAllowed("git config --local core.hooksPath .githooks")
+  assertAllowed("git status")
+})
