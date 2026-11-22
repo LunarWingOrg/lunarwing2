@@ -137,17 +137,23 @@ spec = importlib.util.spec_from_file_location("proxy_relay", sys.argv[1])
 relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
 stderr = io.StringIO()
+manager = mock.Mock()
 with (mock.patch.object(relay.socket, "socket") as socket,
       mock.patch.object(relay, "Relay") as server,
       mock.patch.object(relay.subprocess, "run") as command,
       contextlib.redirect_stderr(stderr)):
+    manager.attach_mock(socket, "socket")
+    manager.attach_mock(server, "server")
     probe = socket.return_value.__enter__.return_value
     probe.connect.side_effect = PermissionError(errno.EACCES, "Permission denied")
     assert relay.main() == 125
 socket.assert_called_once_with(relay.socket.AF_UNIX, relay.socket.SOCK_STREAM)
 probe.settimeout.assert_called_once_with(5)
 probe.connect.assert_called_once_with(relay.SOCKET)
-server.assert_not_called()
+# WI#836: the listener is bound before the probe, so a startup failure leaves
+# the host relay with zero accepted connections while a live run has one.
+order = [name for name, _, _ in manager.mock_calls]
+assert "server" in order and order.index("server") < order.index("socket"), order
 command.assert_not_called()
 assert stderr.getvalue().startswith("lunarwing-proxy-relay: [Errno 13] Permission denied;")
 assert "euid=" in stderr.getvalue() and "proxy.sock" in stderr.getvalue()
