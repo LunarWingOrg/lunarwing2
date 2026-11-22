@@ -75,7 +75,7 @@ RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=3068ae5e90b5959e6617e651bee33e0807b1a6f13b222588b05ce290734d688a
+ARG PEBBLE_LOCK_SHA256=064d47e44c84b29f5ceb4bc8085951c128a7908beab0047589d488dfab8e269d
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \

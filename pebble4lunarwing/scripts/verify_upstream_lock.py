@@ -49,10 +49,16 @@ import tomllib
 # zero-length buffer; affected >= 1.0.0, < 1.1.6). Re-pointing the `rustix`
 # edge also changes fd-lock's whole record, so both names join the allowlist;
 # no other package moves.
+# 2026-11-22 (RUSTSEC-2026-0592): url 2.5.8 -> 2.5.9 clears a stack overflow
+# in `Url::origin()` on nested `blob:` URLs (affected <= 2.5.8). url 2.5.9
+# requires form_urlencoded ^1.2.3, so form_urlencoded 1.2.2 -> 1.2.3 moves
+# with it; both keep their dependency edges, so only their version/checksum
+# lines change.
 ALLOWED_PACKAGES = {
     "chacha20",
     "clipboard-win",
     "fd-lock",
+    "form_urlencoded",
     "pulldown-cmark",
     "quinn",
     "quinn-proto",
@@ -61,6 +67,7 @@ ALLOWED_PACKAGES = {
     "rustls",
     "rustls-webpki",
     "tokio",
+    "url",
     "webpki-roots",
 }
 
