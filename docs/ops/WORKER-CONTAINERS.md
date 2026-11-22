@@ -4297,6 +4297,10 @@ Fail-closed:
   restore the operator's model/provider settings, so the CLI fails to start —
   a loud, fail-closed stop, not a silent unguarded run. Restarting the worker
   re-runs the setup script and restores the config from the baked source.
+  A task that makes the file read-only after stripping the hook, or that
+  leaves a rival `PreToolUse`/`Bash` entry behind, fails later tasks the same
+  way: the failure is loud and a restart heals it, which is the intended
+  trade against spawning anything unguarded.
 - Host-side dev runs with no managed config (neither identity nor delegated
   runner) skip the check.
 
