@@ -74,7 +74,10 @@ delivered messages. A request cursor below the acknowledged one is therefore
 read as such a reset: the page starts after the acknowledged cursor, so nothing
 already delivered comes back as a new inbound turn, and messages that arrived
 while the daemon was down are still served. A page that was handed out but not
-acknowledged is served again, so delivery stays at-least-once (WI#850).
+acknowledged is served again, so delivery stays at-least-once (WI#850) up to
+the daemon's in-memory queue: the poller acknowledges a page once it has handed
+it to the agent's queue, so messages still waiting in that queue when the
+daemon restarts are not served again.
 
 Upgrade order does not matter for delivery. An older bridge ignores `limit`
 and returns its whole backlog with its newest cursor; the XMPP guest then

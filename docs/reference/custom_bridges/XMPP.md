@@ -156,7 +156,10 @@ greater than the request `cursor`.
   re-activated channel polls from zero): the page then starts after the
   acknowledged cursor, so delivered messages are not replayed as new inbound
   turns, while messages queued meanwhile are still served. A page handed out
-  but not yet acknowledged is served again (at-least-once) (WI#850).
+  but not yet acknowledged is served again (at-least-once) (WI#850). The
+  poller acknowledges a page once the daemon has queued it for the agent, so
+  messages still in that in-memory queue at a daemon restart are not served
+  again.
 
 ### `POST /v1/messages/send`
 
