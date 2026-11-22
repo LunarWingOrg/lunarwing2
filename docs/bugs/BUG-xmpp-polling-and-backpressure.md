@@ -61,7 +61,7 @@ the guest's pending cursor write with it, so each tick re-fetched the same
 set: a self-sustaining livelock, first seen as a 60-emit burst followed by
 `on_poll exceeded the per-callback emit limit` after the 2026-11-22 upgrade.
 
-Both halves are now closed:
+The livelock and the replay behind it are now closed:
 
 - `GET /v1/messages` takes `limit` (default 64, clamped to 100) and reports the
   cursor of the last message actually returned, so a poller drains a backlog in
@@ -71,6 +71,13 @@ Both halves are now closed:
   loop, and `finish_poll_callback`) dispatches the accepted page and commits
   pending workspace writes — including the guest cursor — before it reports the
   overflow, so an over-limit tick advances rather than replaying.
+- The replay itself: the guest keeps its cursor only in the channel's
+  in-memory workspace store, so a daemon-side reset polled again from zero
+  while the bridge still held its ring of delivered messages. The bridge now
+  records the cursor the poller acknowledges (a request echoing the previous
+  response cursor) and serves a lower request cursor from the acknowledged one,
+  so a reset resumes after the last delivered message instead of replaying the
+  ring as new turns.
 
 Raising `MAX_EMITS_PER_EXECUTION` was explicitly rejected: the failure was an
 all-or-nothing batch reject, so a larger cap only moves the backlog size at

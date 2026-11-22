@@ -142,13 +142,21 @@ greater than the request `cursor`.
   the daemon's per-callback emit limit. A backlog larger than one page is
   drained across successive polls.
 - The response `cursor` is the cursor of the **last message in the page**, or
-  the request cursor when the page is empty. Pollers persist it verbatim;
+  the cursor the page started after when the page is empty. Pollers persist it
+  verbatim;
   returning the newest cursor instead made a large backlog replay every tick
   and left inbound XMPP wedged until a restart (WI#850).
 - The bridge's cursor sequence is per-process. A request cursor above the
   bridge's current cursor means the bridge restarted: the response carries the
   bridge's current cursor so the poller resynchronizes rather than waiting
   behind an unreachable position.
+- A request that echoes the previous response cursor acknowledges everything
+  up to it. A request cursor below the acknowledged one means the poller lost
+  its cursor (the daemon keeps it in memory, so a daemon-only restart or a
+  re-activated channel polls from zero): the page then starts after the
+  acknowledged cursor, so delivered messages are not replayed as new inbound
+  turns, while messages queued meanwhile are still served. A page handed out
+  but not yet acknowledged is served again (at-least-once) (WI#850).
 
 ### `POST /v1/messages/send`
 

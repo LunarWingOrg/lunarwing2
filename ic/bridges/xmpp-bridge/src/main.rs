@@ -86,6 +86,15 @@ struct BridgeInner {
     channel: Option<Arc<XmppChannel>>,
     current_cursor: u64,
     messages: VecDeque<QueuedMessage>,
+    /// Highest cursor the poller has acknowledged in this bridge process. A
+    /// poller sends back the cursor of the last page it dispatched and
+    /// persisted, so a request that echoes the last response cursor confirms
+    /// delivery of everything up to it (WI#850).
+    acknowledged_cursor: u64,
+    /// Cursor of the most recent `/v1/messages` response. Only a request that
+    /// echoes it advances `acknowledged_cursor`, so an arbitrary cursor cannot
+    /// mark undelivered messages as delivered.
+    last_response_cursor: u64,
 }
 
 #[derive(Clone)]
@@ -469,22 +478,56 @@ async fn messages_handler(
         .limit
         .unwrap_or(DEFAULT_MESSAGES_PAGE_LIMIT)
         .clamp(1, MAX_MESSAGES_PAGE_LIMIT);
-    let inner = state.inner.read().await;
+    let mut inner = state.inner.write().await;
+    let start = poll_start(&mut inner, cursor);
     let page: Vec<&QueuedMessage> = inner
         .messages
         .iter()
-        .filter(|message| message.cursor > cursor)
+        .filter(|message| message.cursor > start)
         .take(limit)
         .collect();
     // Advance only past the messages actually returned. Reporting the bridge's
     // newest cursor here would skip the rest of the backlog as soon as a page
     // is capped (WI#850).
-    let next_cursor = page.last().map_or(cursor, |message| message.cursor);
-
-    Ok(Json(MessagesResponse {
+    let next_cursor = page.last().map_or(start, |message| message.cursor);
+    let response = MessagesResponse {
         cursor: resync_cursor(cursor, inner.current_cursor, next_cursor),
         messages: page.iter().map(|message| message.payload.clone()).collect(),
-    }))
+    };
+    inner.last_response_cursor = response.cursor;
+
+    Ok(Json(response))
+}
+
+/// The cursor a poll reads after, given what the poller has acknowledged.
+///
+/// The daemon keeps its cursor in memory, so a daemon-only restart or a
+/// re-activated channel polls again from zero while this bridge keeps its
+/// ring of already-delivered messages. Serving from the request cursor would
+/// replay up to the whole ring as new inbound turns (WI#850). A request
+/// cursor below the acknowledged one can only come from such a reset, so the
+/// poll resumes after the last acknowledged message instead: nothing
+/// delivered is replayed, and messages queued while the daemon was down
+/// (cursors above the acknowledged one) are still served. A page that was
+/// handed out but not yet acknowledged is served again, so delivery stays
+/// at-least-once. A cursor ahead of this process is the bridge-restart case
+/// that `resync_cursor` handles; its page is empty either way.
+fn poll_start(inner: &mut BridgeInner, request_cursor: u64) -> u64 {
+    if request_cursor > inner.current_cursor {
+        return request_cursor;
+    }
+    if request_cursor == inner.last_response_cursor {
+        inner.acknowledged_cursor = inner.acknowledged_cursor.max(request_cursor);
+    }
+    if request_cursor < inner.acknowledged_cursor {
+        tracing::info!(
+            request_cursor,
+            acknowledged_cursor = inner.acknowledged_cursor,
+            "Poll cursor is behind the acknowledged cursor (daemon-side reset); resuming after the last delivered message instead of replaying"
+        );
+        return inner.acknowledged_cursor;
+    }
+    request_cursor
 }
 
 /// Keep a poller's cursor usable after the bridge process restarts.
@@ -1047,6 +1090,90 @@ mod tests {
 
         assert!(page.messages.is_empty());
         assert_eq!(page.cursor, 3, "an idle poll must not move the cursor");
+    }
+
+    /// Queue `count` more inbound messages after the existing ones.
+    async fn enqueue_backlog(state: &AppState, count: usize) {
+        let mut inner = state.inner.write().await;
+        for _ in 0..count {
+            inner.current_cursor += 1;
+            let cursor = inner.current_cursor;
+            inner.messages.push_back(QueuedMessage {
+                cursor,
+                payload: BridgeMessage {
+                    message_id: format!("m{}", cursor - 1),
+                    user_id: "user".to_string(),
+                    sender_id: None,
+                    user_name: None,
+                    content: format!("message {}", cursor - 1),
+                    thread_id: None,
+                    metadata_json: "{}".to_string(),
+                    attachments: Vec::new(),
+                },
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_reset_poller_resumes_after_the_acknowledged_cursor() {
+        // WI#850: the daemon keeps its cursor in memory, so a daemon-only
+        // restart polls again from zero while this bridge still holds the
+        // delivered messages. They must not come back as new inbound turns.
+        let state = state_with_backlog(150);
+        let router = build_router(state);
+
+        let first = get_messages(router.clone(), "/v1/messages?cursor=0&limit=10").await;
+        assert_eq!(first.cursor, 10);
+        // Echoing the cursor acknowledges the first page.
+        let second = get_messages(router.clone(), "/v1/messages?cursor=10&limit=10").await;
+        assert_eq!(second.cursor, 20);
+
+        let after_reset = get_messages(router.clone(), "/v1/messages?cursor=0&limit=10").await;
+        assert_eq!(
+            after_reset.messages[0].message_id, "m10",
+            "a reset poller resumes after the acknowledged page, not at the start of the ring"
+        );
+        assert_eq!(after_reset.cursor, 20);
+    }
+
+    #[tokio::test]
+    async fn messages_unacknowledged_page_is_served_again() {
+        // A poller that failed to dispatch a page asks with its old cursor
+        // again; that page must come back (at-least-once), not be skipped.
+        let state = state_with_backlog(30);
+        let router = build_router(state);
+
+        let first = get_messages(router.clone(), "/v1/messages?cursor=0&limit=10").await;
+        assert_eq!(first.cursor, 10);
+        let retry = get_messages(router.clone(), "/v1/messages?cursor=0&limit=10").await;
+        assert_eq!(retry.messages[0].message_id, "m0");
+        assert_eq!(retry.cursor, 10);
+    }
+
+    #[tokio::test]
+    async fn messages_reset_poller_still_gets_messages_queued_while_down() {
+        let state = state_with_backlog(5);
+        let router = build_router(state.clone());
+
+        let first = get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        assert_eq!(first.cursor, 5);
+        let idle = get_messages(router.clone(), "/v1/messages?cursor=5").await;
+        assert!(idle.messages.is_empty());
+
+        // Messages arrive while the daemon is down, then it polls from zero.
+        enqueue_backlog(&state, 3).await;
+        let after_reset = get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        let ids: Vec<_> = after_reset
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["m5", "m6", "m7"],
+            "only the undelivered messages come back"
+        );
+        assert_eq!(after_reset.cursor, 8);
     }
 
     #[tokio::test]

@@ -273,9 +273,11 @@ The bridge API should be intentionally small.
 
 Returns normalized inbound messages. The response cursor is the cursor of the
 last message in the returned page (or the request cursor when the page is
-empty), and `limit` is clamped to the daemon's per-callback emit budget so a
-poll can never overflow `on_poll`. A large backlog is drained over successive
-polls; see `bridges/xmpp-bridge/README.md` (WI#850).
+empty), and `limit` is clamped to the daemon's per-callback emit budget so one
+page never exceeds the host's emit limit (the limit counts emits, not bytes). A
+large backlog is drained over successive polls, and a poller that lost its
+cursor resumes after the last acknowledged message instead of replaying the
+ring; see `bridges/xmpp-bridge/README.md` (WI#850).
 
 ```json
 {
