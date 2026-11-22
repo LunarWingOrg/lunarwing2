@@ -486,8 +486,51 @@ mod tests {
     }
 
     #[test]
-    fn category_policy_gates_display_but_keeps_recording() {
-        let params = serde_json::json!({});
+    fn job_estimates_stay_withheld_until_warm_and_never_train_failed_runs() {
+        let estimates = ToolEstimates::new(ToolEstimationMode::Observe);
+        for _ in 0..4 {
+            estimates.record_job_terminal("alice", Duration::from_secs(90), true, None);
+        }
+        assert!(estimates.estimate_job("alice").is_none());
+        // A failed run may be counted, but its elapsed time is not a
+        // comparable completed run and must not train the model.
+        estimates.record_job_terminal("alice", Duration::from_secs(5), false, None);
+        assert!(estimates.estimate_job("alice").is_none());
+        estimates.record_job_terminal("alice", Duration::from_secs(90), true, None);
+
+        let estimate = estimates.estimate_job("alice").unwrap(); // safety: test
+        assert_eq!(estimate.duration, Duration::from_secs(90));
+        assert_eq!(estimate.cost, None);
+        assert_eq!(estimate.samples, 5);
+        // A different user stays cold.
+        assert!(estimates.estimate_job("bob").is_none());
+
+        let counters = estimates.aggregate_counters().jobs;
+        assert_eq!(counters.completed_runs, 5);
+        assert_eq!(counters.non_completed_runs, 1);
+        // Two cold lookups plus Bob's.
+        assert_eq!(counters.estimates_withheld, 3);
+        assert_eq!(counters.estimates_offered, 1);
+    }
+
+    #[test]
+    fn disabled_mode_records_no_job_observations_and_shows_no_timing() {
+        let estimates = ToolEstimates::new(ToolEstimationMode::Disabled);
+        for _ in 0..6 {
+            estimates.record_job_terminal("alice", Duration::from_secs(10), true, None);
+        }
+        assert!(estimates.estimate_job("alice").is_none());
+        assert!(!estimates.job_display_enabled());
+        assert_eq!(
+            estimates.aggregate_counters().jobs,
+            crate::estimation::JobEstimateCounters::default()
+        );
+        assert!(!ToolEstimates::new(ToolEstimationMode::Observe).job_display_enabled());
+        assert!(ToolEstimates::new(ToolEstimationMode::Display).job_display_enabled());
+    }
+
+    #[test]
+    fn category_policy_gates_display_but_keeps_recording() {        let params = serde_json::json!({});
         let estimates = ToolEstimates::configured(
             ToolEstimationMode::Display,
             CategoryPolicy::from_setting(Some("other-tool")),

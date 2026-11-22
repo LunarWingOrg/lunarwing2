@@ -36,7 +36,7 @@ pub fn job_key(user_id: &str) -> Option<String> {
 
 /// Counts for the owner-only diagnostics surface. No category names, user
 /// identity or parameters.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct JobEstimateCounters {
     pub estimates_offered: u64,
     pub estimates_withheld: u64,

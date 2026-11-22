@@ -3753,6 +3753,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn job_status_shows_timing_only_when_display_is_enabled() {
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = manager
+            .create_job("Timed Job", "Description")
+            .await
+            .unwrap(); // safety: test
+        manager
+            .update_context(job_id, |ctx| {
+                ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+                ctx.estimated_duration = Some(std::time::Duration::from_secs(120));
+            })
+            .await
+            .unwrap(); // safety: test
+        let params = serde_json::json!({ "job_id": job_id.to_string() });
+
+        let hidden = JobStatusTool::new(Arc::clone(&manager));
+        let result = hidden
+            .execute(params.clone(), &JobContext::default())
+            .await
+            .unwrap(); // safety: test
+        let timing = &result.result["timing"];
+        assert!(timing.get("estimated_total_secs").is_none());
+        assert_eq!(timing["remaining_status"], "unknown");
+        assert!(timing["elapsed_secs"].as_u64().unwrap() >= 30); // safety: test
+
+        let shown = JobStatusTool::new(manager).with_timing_display(true);
+        let result = shown
+            .execute(params, &JobContext::default())
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(result.result["timing"]["estimated_total_secs"], 120);
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn persisted_external_job_remains_queryable_after_restart() {
