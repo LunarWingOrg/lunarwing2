@@ -849,6 +849,37 @@ test("kimi remote control and the visualizer are listeners (WI#852)", () => {
   assertAllowed("echo 'kimi rc --port 9000'")
 })
 
+test("a task cannot edit the trusted user-level MCP registration (WI#848)", () => {
+  // The CLI loads $KIMI_CODE_HOME/mcp.json as trusted config and spawns every
+  // server in it before the first model turn, outside this Bash hook. The
+  // measured ALLOWs at master: a shell redirect, a python3 json edit, and a
+  // sed in-place edit. The executor's per-spawn restore is the backstop for
+  // computed paths; these spellings are denied here.
+  assertBlocked(
+    `echo '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}' > "$KIMI_CODE_HOME/mcp.json"`,
+    "user-level Kimi MCP config",
+  )
+  assertBlocked(
+    `python3 -c "import os,json; p=os.environ['KIMI_CODE_HOME']+'/mcp.json'; open(p,'w').write('{}')"`,
+    "user-level Kimi MCP config",
+  )
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' ~/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' /home/kimi/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' $HOME/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`echo '{}' > \${HOME}/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  // A bare file name after moving into the config directory is the same write.
+  assertBlocked(`cd ~/.kimi-code && sed -i 's/x/y/' mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cd $KIMI_CODE_HOME && python3 -c "open('mcp.json','w').write('{}')"`, "user-level Kimi MCP config")
+  // Ordinary work keeps passing: reading the words, the read-only baked copy,
+  // and the repo's own files.
+  assertAllowed("grep -rn mcp.json docs/")
+  assertAllowed("grep -rn KIMI_CODE_HOME .")
+  assertAllowed("cat /app/config/mcp.json")
+  assertAllowed("sed -i 's/x/y/' kimicode4lunarwing/config/mcp.json")
+  assertAllowed(`echo "$KIMI_CODE_HOME"`)
+  assertAllowed("cargo check -j18")
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
