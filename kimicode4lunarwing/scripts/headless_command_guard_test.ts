@@ -742,6 +742,25 @@ test("a task cannot start any listed listener (WI#833)", () => {
   assertAllowed("python3 -m json.tool")
 })
 
+test("find -exec is the same launcher as xargs (WI#846)", () => {
+  // WI#846: bash runs a find `-exec` body exactly as it runs an `xargs` body,
+  // but LISTENER_PREFIXES covered only xargs, so the listener rule read one
+  // launcher and not its twin (the deletion rule already read both).
+  assertBlocked("find . -name x -exec kimi server {} \\;", "kimi service mode")
+  assertBlocked("find . -name x -exec nc -l 9000 {} \\;", "listener started from a task")
+  assertBlocked("find . -type f -execdir python3 -m http.server 8080 {} \\;", "listener started from a task")
+  assertBlocked("find . -name x -exec sh -c 'kimi server' {} \\;", "kimi service mode")
+  assertBlocked("bash -c 'find . -exec kimi server {} \\;'", "kimi service mode")
+  assertBlocked("find . -name x -exec busybox httpd -p 8080 {} \\;", "busybox httpd")
+  // Both terminators, and the xargs control that already denied.
+  assertBlocked("find . -name x -exec kimi web {} +", "kimi service mode")
+  assertBlocked("find . -print0 | xargs -0 -I {} kimi server", "kimi service mode")
+  // Ordinary find work keeps passing, including reading a listener name.
+  assertAllowed("find . -name '*.ts' -exec grep -l 'kimi server' {} \\;")
+  assertAllowed("find . -type f -exec chmod 644 {} \\;")
+  assertAllowed("find /tmp -name '*.log' -delete")
+})
+
 test("kimi print-mode prompt values are not service subcommands", () => {
   assertAllowed("kimi -p server")
   assertAllowed("kimi --prompt web")
