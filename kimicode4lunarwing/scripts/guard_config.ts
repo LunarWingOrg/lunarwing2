@@ -18,8 +18,18 @@
  * comment or a multi-line string must not count, because the CLI would not
  * register it either.
  */
-import { lstatSync, readFileSync, writeFileSync } from "node:fs"
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readFileSync,
+  writeSync,
+  type Stats,
+} from "node:fs"
 import { join } from "node:path"
+
+type StatsLike = Pick<Stats, "dev" | "ino" | "size" | "isFile">
 
 /** The command the baked config and entrypoint-task-setup.sh register. */
 export const GUARD_HOOK_COMMAND = "node /app/hooks/headless_command_guard.mjs"
@@ -237,6 +247,12 @@ function errorMessage(error: unknown): string {
  * bridge, the task uid in the delegated task runner); the in-place write keeps
  * the file's ownership and mode so the CLI can still read it.
  *
+ * The path lives in a directory the task uid owns, so it is not trusted to be
+ * the file it was a moment ago: both opens use O_NOFOLLOW, and the write is
+ * only performed on the same device/inode the check read. A symlink, a
+ * swapped file, or a non-regular file fails the task rather than redirecting a
+ * root write.
+ *
  * `enforce` (managed container shapes) turns a missing config into a task
  * failure; host-side dev runs have no managed config and skip it.
  */
@@ -250,33 +266,40 @@ export function ensureGuardHook(home: string | undefined, taskId: string, enforc
     return
   }
   const path = join(home, "config.toml")
-  let stats: ReturnType<typeof lstatSync>
+  let handle: number
   try {
-    stats = lstatSync(path)
+    handle = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
   } catch (error) {
-    const missing = (error as NodeJS.ErrnoException).code === "ENOENT"
-    if (missing && !enforce) return
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" && !enforce) return
+    const shape = code === "ELOOP" ? "is a symlink, not a regular file" : `is unavailable (${errorMessage(error)})`
     throw new Error(
-      `cannot verify the PreToolUse guard hook: ${path} is unavailable (${errorMessage(error)}); refusing to spawn task ${taskId} unguarded (WI#847)`,
-    )
-  }
-  if (!stats.isFile()) {
-    throw new Error(
-      `cannot verify the PreToolUse guard hook: ${path} is not a regular file; refusing to spawn task ${taskId} unguarded (WI#847)`,
-    )
-  }
-  if (stats.size > MAX_CONFIG_BYTES) {
-    throw new Error(
-      `cannot verify the PreToolUse guard hook: ${path} is ${stats.size} bytes, over the ${MAX_CONFIG_BYTES}-byte limit; refusing to load an untrusted config into the bridge for task ${taskId} (WI#847)`,
+      `cannot verify the PreToolUse guard hook: ${path} ${shape}; refusing to spawn task ${taskId} unguarded (WI#847)`,
     )
   }
   let config: string
+  let checked: StatsLike
   try {
-    config = readFileSync(path, "utf8")
+    checked = fstatSync(handle)
+    if (!checked.isFile()) {
+      throw new Error(
+        `cannot verify the PreToolUse guard hook: ${path} is not a regular file; refusing to spawn task ${taskId} unguarded (WI#847)`,
+      )
+    }
+    if (checked.size > MAX_CONFIG_BYTES) {
+      throw new Error(
+        `cannot verify the PreToolUse guard hook: ${path} is ${checked.size} bytes, over the ${MAX_CONFIG_BYTES}-byte limit; refusing to load an untrusted config into the bridge for task ${taskId} (WI#847)`,
+      )
+    }
+    config = readFileSync(handle, "utf8")
   } catch (error) {
-    throw new Error(
-      `cannot verify the PreToolUse guard hook: ${path} is unreadable (${errorMessage(error)}); refusing to spawn task ${taskId} unguarded (WI#847)`,
-    )
+    throw error instanceof Error && error.message.includes("WI#847")
+      ? error
+      : new Error(
+          `cannot verify the PreToolUse guard hook: ${path} is unreadable (${errorMessage(error)}); refusing to spawn task ${taskId} unguarded (WI#847)`,
+        )
+  } finally {
+    closeSync(handle)
   }
   if (hasGuardHook(config)) return
   const repaired = config + guardHookBlock()
@@ -285,12 +308,30 @@ export function ensureGuardHook(home: string | undefined, taskId: string, enforc
       `cannot re-assert the PreToolUse guard hook in ${path}: the file ends inside a string or table, or carries a PreToolUse/Bash hooks entry other than the lane's own, so no appended [[hooks]] entry would be the one answering for Bash; refusing to spawn task ${taskId} unguarded (WI#847)`,
     )
   }
+  let writeHandle: number
   try {
-    writeFileSync(path, repaired, "utf8")
+    writeHandle = openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW)
   } catch (error) {
     throw new Error(
       `cannot re-assert the PreToolUse guard hook in ${path} (${errorMessage(error)}); refusing to spawn task ${taskId} unguarded (WI#847)`,
     )
+  }
+  try {
+    const current = fstatSync(writeHandle)
+    if (!current.isFile() || current.dev !== checked.dev || current.ino !== checked.ino) {
+      throw new Error(
+        `cannot re-assert the PreToolUse guard hook in ${path}: the file changed while it was being verified; refusing to spawn task ${taskId} unguarded (WI#847)`,
+      )
+    }
+    writeSync(writeHandle, guardHookBlock())
+  } catch (error) {
+    throw error instanceof Error && error.message.includes("WI#847")
+      ? error
+      : new Error(
+          `cannot re-assert the PreToolUse guard hook in ${path} (${errorMessage(error)}); refusing to spawn task ${taskId} unguarded (WI#847)`,
+        )
+  } finally {
+    closeSync(writeHandle)
   }
   console.warn(
     `[kimi executor] re-asserted the PreToolUse guard hook in ${path} for task ${taskId}: a previous task had rewritten the config without it (WI#847)`,
