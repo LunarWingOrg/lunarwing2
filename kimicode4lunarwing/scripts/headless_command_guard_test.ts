@@ -851,6 +851,39 @@ test("git commands that discard work are denied in the spellings WI#832 named", 
   assertAllowed("git checkout -b feature")
 })
 
+test("GNU long-option abbreviations cannot walk past the git discard rules", () => {
+  // WI#841: git resolves any unambiguous prefix of a long option, so `--har`,
+  // `--for` and `--includ` discard exactly like the spelled-out option. The
+  // guard reads them the way the `rm` rules read theirs (WI#795).
+  for (const command of [
+    "git reset --h",
+    "git reset --ha",
+    "git reset --har",
+    "git reset --har HEAD~1",
+    "git clean --f",
+    "git clean --fo",
+    "git clean --for",
+    "git clean -fd --for",
+    "git checkout --f",
+    "git checkout --forc .",
+    "git switch --dis",
+    "git switch --discard-ch",
+    "git stash --a",
+    "git stash --al",
+    "git stash --includ",
+    "git stash --include-untrack",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  // A dry run deletes nothing, so its abbreviation stays ordinary work.
+  assertAllowed("git clean --d")
+  assertAllowed("git clean --dry-r")
+  assertAllowed("git clean -fd --d")
+  // A longer word is not a prefix of the option and must not be read as one.
+  assertAllowed("git reset --harder")
+  assertAllowed("git clean --forces")
+})
+
 test("the noclobber override writes a block device like a plain redirect", () => {
   assertBlocked("cat x >| /dev/sda1", "block-device")
   assertBlocked("echo pwn >| /dev/mapper/vg-root", "block-device")
