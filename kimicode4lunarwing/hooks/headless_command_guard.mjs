@@ -1225,6 +1225,62 @@ function listenerShellBody(words, start) {
   return undefined;
 }
 
+const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/**
+ * Deny a listener started from a find `-exec`/`-ok` body (WI#846). Bash runs
+ * that body exactly as it runs an `xargs` body, which LISTENER_PREFIXES
+ * already reads; the body is the words up to the `;` or `+` terminator. A
+ * quoted or escaped terminator arrives as its own `;` word.
+ */
+function checkFindExecListeners(words, start, depth) {
+  for (let i = start; i < words.length; i++) {
+    if (!FIND_EXEC_ACTIONS.has(words[i])) continue;
+    const body = [];
+    for (i++; i < words.length && words[i] !== ";" && words[i] !== "+"; i++) body.push(words[i]);
+    if (body.length === 0) continue;
+    const denied = checkListenerWords(body, depth + 1);
+    if (denied) return denied;
+  }
+  return null;
+}
+
+/** Classify the command word of one listener segment and its arguments. */
+function checkListenerWords(words, depth) {
+  for (let i = 0; i < words.length; i++) {
+    const raw = words[i];
+    const word = listenerWord(raw);
+    const name = commandBasename(word);
+    if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
+      return "listener started from a task: busybox httpd";
+    }
+    if (LISTENER_PREFIXES.has(raw) || LISTENER_PREFIXES.has(word) ||
+        LISTENER_PREFIXES.has(name) ||
+        /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(raw)) continue;
+
+    if (name === "kimi") {
+      const subcommand = kimiServiceSubcommand(words, i + 1);
+      if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
+    } else if (SHELL_NAME.test(name)) {
+      const body = listenerShellBody(words, i + 1);
+      if (body !== undefined) {
+        if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+        const denied = checkListeners(body, depth + 1);
+        if (denied) return denied;
+      }
+    } else if (name === "find") {
+      const denied = checkFindExecListeners(words, i + 1, depth);
+      if (denied) return denied;
+    } else {
+      const args = words.slice(i + 1).map(listenerWord);
+      const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+      if (rule?.test(args)) return `listener started from a task: ${name}`;
+    }
+    break;
+  }
+  return null;
+}
+
 /** Deny recognized service commands without treating prompt text as a subcommand. */
 function checkListeners(text, depth = 0) {
   // A substitution or backtick body runs its words as a command, so scan it
@@ -1235,34 +1291,8 @@ function checkListeners(text, depth = 0) {
     if (denied) return denied;
   }
   for (const words of listenerSegments(text)) {
-    for (let i = 0; i < words.length; i++) {
-      const raw = words[i];
-      const word = listenerWord(raw);
-      const name = commandBasename(word);
-      if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
-        return "listener started from a task: busybox httpd";
-      }
-      if (LISTENER_PREFIXES.has(raw) || LISTENER_PREFIXES.has(word) ||
-          LISTENER_PREFIXES.has(name) ||
-          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(raw)) continue;
-
-      if (name === "kimi") {
-        const subcommand = kimiServiceSubcommand(words, i + 1);
-        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
-      } else if (SHELL_NAME.test(name)) {
-        const body = listenerShellBody(words, i + 1);
-        if (body !== undefined) {
-          if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
-          const denied = checkListeners(body, depth + 1);
-          if (denied) return denied;
-        }
-      } else {
-        const args = words.slice(i + 1).map(listenerWord);
-        const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
-        if (rule?.test(args)) return `listener started from a task: ${name}`;
-      }
-      break;
-    }
+    const denied = checkListenerWords(words, depth);
+    if (denied) return denied;
   }
   return null;
 }
