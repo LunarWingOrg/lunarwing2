@@ -76,6 +76,13 @@ already delivered comes back as a new inbound turn, and messages that arrived
 while the daemon was down are still served. A page that was handed out but not
 acknowledged is served again, so delivery stays at-least-once (WI#850).
 
+Upgrade order does not matter for delivery. An older bridge ignores `limit`
+and returns its whole backlog with its newest cursor; the XMPP guest then
+processes at most one page (64 messages) and persists the cursor of the last
+one it processed, computed from the consecutive cursor sequence, so the rest
+comes back on the next poll instead of being dropped by the host's emit limit.
+An older guest against this bridge gets the default page of 64.
+
 When `XMPP_BRIDGE_TOKEN` is set, requests must include `Authorization: Bearer <token>`.
 The server also rejects non-loopback clients.
 
