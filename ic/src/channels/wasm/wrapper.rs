@@ -1849,16 +1849,21 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         match result {
             Ok(Ok((response, mut host_state, pending_writes))) => {
-                // Process emitted messages
+                // Process emitted messages before checking the overflow so an
+                // over-limit webhook callback still delivers what it accepted
+                // and persists its pending writes instead of losing the whole
+                // batch (WI#850).
                 let emitted = host_state.take_emitted_messages();
-                if host_state.emits_dropped() > 0 {
+                let emits_dropped = host_state.emits_dropped();
+                Self::log_emit_overflow(&channel_name, "on_http_request", emits_dropped);
+                self.process_emitted_messages(emitted).await?;
+                self.workspace_store.commit_writes(&pending_writes);
+                if emits_dropped > 0 {
                     return Err(WasmChannelError::CallbackFailed {
                         name: channel_name,
                         reason: "on_http_request exceeded the per-callback emit limit".to_string(),
                     });
                 }
-                self.process_emitted_messages(emitted).await?;
-                self.workspace_store.commit_writes(&pending_writes);
 
                 tracing::debug!(
                     channel = %channel_name,
@@ -1875,34 +1880,82 @@ impl WasmChannel {
         }
     }
 
+    /// Warn that a callback overflowed the per-execution emit limit.
+    fn log_emit_overflow(channel_name: &str, callback: &str, emits_dropped: usize) {
+        if emits_dropped == 0 {
+            return;
+        }
+        tracing::warn!(
+            channel = %channel_name,
+            callback,
+            dropped = emits_dropped,
+            "Callback exceeded the per-callback emit limit; dispatching the accepted page so the guest cursor can advance"
+        );
+    }
+
+    /// Collect a finished `on_poll` callback's host state.
+    ///
+    /// Accepted messages and pending workspace writes are always returned, even
+    /// when the callback overflowed the per-execution emit limit. Dropping the
+    /// batch together with the error was the WI#850 livelock: the guest's cursor
+    /// write lives in `pending_writes`, so nothing advanced, every tick
+    /// re-fetched the same backlog, and inbound channel traffic stayed wedged
+    /// until a restart. The overflow count rides along so callers can dispatch
+    /// the accepted page, commit the cursor write, and still record an unhealthy
+    /// tick.
+    fn collect_poll_execution(
+        channel_name: &str,
+        mut host_state: ChannelHostState,
+    ) -> PollExecution {
+        let degraded = Self::log_callback_entries(channel_name, host_state.take_logs());
+        let emits_dropped = host_state.emits_dropped();
+        Self::log_emit_overflow(channel_name, "on_poll", emits_dropped);
+
+        let emitted_messages = host_state.take_emitted_messages();
+        if !emitted_messages.is_empty() {
+            tracing::debug!(
+                channel = %channel_name,
+                count = emitted_messages.len(),
+                "WASM on_poll emitted {} message(s)",
+                emitted_messages.len(),
+            );
+        }
+
+        PollExecution {
+            emitted_messages,
+            pending_writes: host_state.take_pending_writes(),
+            degraded,
+            emits_dropped,
+        }
+    }
+
     async fn finish_poll_callback(
         &self,
         channel_name: &str,
-        mut host_state: ChannelHostState,
+        host_state: ChannelHostState,
     ) -> Result<(), WasmChannelError> {
-        let degraded = self.log_callback_host_state(&mut host_state);
-        let emitted = host_state.take_emitted_messages();
-        if !emitted.is_empty() {
-            tracing::debug!(
-                channel = %channel_name,
-                count = emitted.len(),
-                "WASM on_poll emitted {} message(s)",
-                emitted.len(),
-            );
+        let PollExecution {
+            emitted_messages,
+            pending_writes,
+            degraded,
+            emits_dropped,
+        } = Self::collect_poll_execution(channel_name, host_state);
+
+        // Dispatch and persist before reporting an overflow: the accepted page
+        // and the guest cursor write must survive so the next poll resumes
+        // instead of replaying the same backlog (WI#850).
+        if let Err(error) = self.process_emitted_messages(emitted_messages).await {
+            self.record_poll_failure(WasmChannelHealthState::PollDispatchFailed);
+            return Err(error);
         }
-        let pending_writes = host_state.take_pending_writes();
-        if host_state.emits_dropped() > 0 {
+        self.workspace_store.commit_writes(&pending_writes);
+        if emits_dropped > 0 {
             self.record_poll_failure(WasmChannelHealthState::PollFailed);
             return Err(WasmChannelError::CallbackFailed {
                 name: channel_name.to_string(),
                 reason: "on_poll exceeded the per-callback emit limit".to_string(),
             });
         }
-        if let Err(error) = self.process_emitted_messages(emitted).await {
-            self.record_poll_failure(WasmChannelHealthState::PollDispatchFailed);
-            return Err(error);
-        }
-        self.workspace_store.commit_writes(&pending_writes);
         if degraded {
             self.record_poll_failure(WasmChannelHealthState::PollFailed);
         } else {
@@ -2762,6 +2815,7 @@ impl WasmChannel {
                                         emitted_messages,
                                         pending_writes,
                                         degraded,
+                                        emits_dropped,
                                     } = execution;
                                     let dispatch_result = if emitted_messages.is_empty() {
                                         Ok(())
@@ -2782,8 +2836,13 @@ impl WasmChannel {
                                     };
                                     match dispatch_result {
                                         Ok(()) => {
+                                            // Commit even when the callback
+                                            // overflowed: the guest cursor
+                                            // write must advance past the page
+                                            // that was just dispatched, or the
+                                            // next tick replays it (WI#850).
                                             ws.commit_writes(&pending_writes);
-                                            if degraded {
+                                            if degraded || emits_dropped > 0 {
                                                 Self::record_poll_failure_shared(
                                                     &poll_failures,
                                                     &health,
@@ -2884,9 +2943,13 @@ impl WasmChannel {
 
     /// Execute a single poll callback with a fresh WASM instance.
     ///
-    /// Returns any emitted messages from the callback. Pending workspace writes
-    /// are committed to the shared `ChannelWorkspaceStore` so state persists
-    /// across poll ticks (e.g., channel polling offset).
+    /// Returns the emitted messages and pending workspace writes from the
+    /// callback; the caller dispatches the messages and commits the writes to
+    /// the shared `ChannelWorkspaceStore` so state persists across poll ticks
+    /// (e.g., channel polling offset). A callback that overflowed the
+    /// per-execution emit limit still returns its accepted messages and writes
+    /// with `emits_dropped` set — the caller dispatches, commits, and then
+    /// records an unhealthy tick instead of discarding the batch (WI#850).
     #[allow(clippy::too_many_arguments)]
     async fn execute_poll(
         channel_name: &str,
@@ -2949,28 +3012,7 @@ impl WasmChannel {
         .await;
 
         match result {
-            Ok(Ok(mut host_state)) => {
-                let degraded = Self::log_callback_entries(channel_name, host_state.take_logs());
-
-                if host_state.emits_dropped() > 0 {
-                    return Err(WasmChannelError::CallbackFailed {
-                        name: channel_name.to_string(),
-                        reason: "on_poll exceeded the per-callback emit limit".to_string(),
-                    });
-                }
-                let emitted = host_state.take_emitted_messages();
-                let pending_writes = host_state.take_pending_writes();
-                tracing::debug!(
-                    channel = %channel_name,
-                    emitted_count = emitted.len(),
-                    "WASM channel on_poll completed"
-                );
-                Ok(PollExecution {
-                    emitted_messages: emitted,
-                    pending_writes,
-                    degraded,
-                })
-            }
+            Ok(Ok(host_state)) => Ok(Self::collect_poll_execution(channel_name, host_state)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(WasmChannelError::Timeout {
                 name: channel_name.to_string(),
@@ -3146,6 +3188,12 @@ struct PollExecution {
     emitted_messages: Vec<EmittedMessage>,
     pending_writes: Vec<PendingWorkspaceWrite>,
     degraded: bool,
+    /// Emits the callback attempted after the per-execution limit.
+    ///
+    /// The accepted messages in `emitted_messages` are still dispatched, so a
+    /// non-zero count marks the tick unhealthy instead of throwing the batch
+    /// away (WI#850).
+    emits_dropped: usize,
 }
 
 #[async_trait]
@@ -4094,7 +4142,7 @@ mod tests {
     use crate::channels::OutgoingResponse;
     use crate::channels::wasm::capabilities::ChannelCapabilities;
     use crate::channels::wasm::error::WasmChannelError;
-    use crate::channels::wasm::host::EmittedMessage;
+    use crate::channels::wasm::host::{ChannelHostState, EmittedMessage, MAX_EMITS_PER_EXECUTION};
     use crate::channels::wasm::runtime::{
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
@@ -4822,6 +4870,43 @@ mod tests {
         assert!(result.is_ok());
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[test]
+    fn poll_execution_keeps_accepted_batch_and_cursor_write_on_emit_overflow() {
+        // WI#850: the guest cursor write lives in pending workspace writes, so
+        // discarding the batch on overflow left the cursor parked and every
+        // tick re-fetched the same backlog. The accepted page and the cursor
+        // write must survive the overflow.
+        let caps = ChannelCapabilities::for_channel("test");
+        let mut host_state = ChannelHostState::new("test", caps);
+        for i in 0..MAX_EMITS_PER_EXECUTION {
+            host_state
+                .emit_message(EmittedMessage::new("user", format!("message {i}")))
+                .expect("emit within the per-execution limit");
+        }
+        host_state
+            .emit_message(EmittedMessage::new("user", "overflow"))
+            .expect("overflowing emits are silently rejected");
+        host_state
+            .workspace_write("cursor.txt", "42".to_string())
+            .expect("cursor write is queued");
+
+        let execution = WasmChannel::collect_poll_execution("test", host_state);
+
+        assert_eq!(
+            execution.emitted_messages.len(),
+            MAX_EMITS_PER_EXECUTION,
+            "accepted messages must still be dispatched after an overflow"
+        );
+        assert_eq!(execution.emits_dropped, 1);
+        assert_eq!(
+            execution.pending_writes.len(),
+            1,
+            "the cursor write must still be committed after an overflow"
+        );
+        assert_eq!(execution.pending_writes[0].content, "42");
+        assert!(!execution.degraded);
     }
 
     #[tokio::test]
