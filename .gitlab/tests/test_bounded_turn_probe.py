@@ -12,6 +12,7 @@ import pathlib
 import re
 import sys
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -135,6 +136,9 @@ class FakeGateway:
     """Serves the contract endpoints, a history body and a scripted stream."""
 
     def __init__(self, history_body="", stream_entries=()):
+        self.base_url = "http://127.0.0.1:1"
+        self.token = "token"
+        self.timeout = 60
         self.history_body = history_body
         self.stream_entries = list(stream_entries)
         self.sent = []
@@ -198,6 +202,43 @@ class WaitTests(unittest.TestCase):
         gateway = FakeGateway(history_body=log_body("unrelated"))
         with mock.patch.object(probe, "stream_logs", lambda _g, _t: iter(())):
             self.assertIsNone(probe.wait_for_record(gateway, THREAD, timeout=60))
+
+
+class StreamTests(unittest.TestCase):
+    """A closed window is a verdict, a broken transport is a harness error."""
+
+    def test_an_idle_stream_that_times_out_yields_no_entries(self):
+        gateway = FakeGateway()
+        with mock.patch.object(
+            probe.urllib.request, "urlopen", side_effect=TimeoutError("idle")
+        ):
+            self.assertEqual(list(probe.stream_logs(gateway, timeout=1)), [])
+
+    def test_a_refused_connection_is_a_harness_error(self):
+        gateway = FakeGateway()
+        with mock.patch.object(
+            probe.urllib.request, "urlopen", side_effect=urllib.error.URLError("refused")
+        ):
+            with self.assertRaises(probe.ProbeError):
+                list(probe.stream_logs(gateway, timeout=1))
+
+    def test_data_lines_parse_and_comments_are_skipped(self):
+        gateway = FakeGateway()
+        payload = (
+            b": keep-alive\n\n"
+            b'data: {"message": "Turn finished thread_id=x"}\n\n'
+        )
+
+        class FakeResponse:
+            def __enter__(self):
+                return iter(payload.splitlines(keepends=True))
+
+            def __exit__(self, *_exc):
+                return False
+
+        with mock.patch.object(probe.urllib.request, "urlopen", return_value=FakeResponse()):
+            entries = list(probe.stream_logs(gateway, timeout=5))
+        self.assertEqual([entry["message"] for entry in entries], ["Turn finished thread_id=x"])
 
 
 class SendTests(unittest.TestCase):

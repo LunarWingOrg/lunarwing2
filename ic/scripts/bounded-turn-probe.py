@@ -242,7 +242,9 @@ def stream_logs(gateway, timeout):
     )
     deadline = time.monotonic() + timeout
     try:
-        with urllib.request.urlopen(request, timeout=gateway.timeout) as response:
+        with urllib.request.urlopen(
+            request, timeout=min(gateway.timeout, max(timeout, 1.0))
+        ) as response:
             for raw in response:
                 if time.monotonic() >= deadline:
                     return
@@ -253,6 +255,11 @@ def stream_logs(gateway, timeout):
                     yield json.loads(line[len("data:") :].strip())
                 except json.JSONDecodeError:
                     continue
+    except TimeoutError:
+        # The window closed while the stream was idle; that is "no record",
+        # not a transport failure. The endpoint's 15-second keep-alive
+        # normally ends the read first.
+        return
     except (urllib.error.URLError, OSError) as error:
         raise ProbeError(f"GET /api/logs/events failed: {error}") from error
 
