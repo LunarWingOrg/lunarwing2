@@ -917,6 +917,34 @@ test("find and rsync delete through the same temp-root test", () => {
   assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
 })
 
+test("a rename and tar --remove-files take the same temp-root test (WI#849)", () => {
+  // Two ALLOWed steps laundered a protected tree past the rm operand test: a
+  // rename moved it out of the protected namespace, and `rm -rf /tmp/x` then
+  // deleted the staged copy. The rename is the deletion, so both sides of the
+  // mv and tar's removed members take the shared containment test.
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x", "deletion outside")
+  assertBlocked("mv /app/config /tmp/wi849-x", "deletion outside")
+  assertBlocked("mv /tmp/wi849-a /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("mv -t /tmp/wi849-x /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("mv --target-directory=/tmp/wi849-x /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x && rm -rf /tmp/wi849-x", "deletion outside")
+  assertBlocked("tar -cf /dev/null --remove-files /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("tar -cf /dev/null --remove-files /app/hooks", "deletion outside")
+  // A member list is contents the guard cannot see, like `xargs rm` with no find.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -T /tmp/wi849-list", "cannot verify")
+  // A relative member follows `-C`, so it is refused like every relative operand.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -C /home/kimi .kimi-code", "deletion outside")
+  // The same spellings stay ordinary work inside the temp roots: the archive
+  // name and a suffix value are option values, not members.
+  assertAllowed("rm -rf /tmp/wi849-x")
+  assertAllowed("mv /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -S .bak /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -t /tmp/wi849-x /tmp/wi849-a")
+  assertAllowed("tar -cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar -cf /tmp/wi849.tar /tmp/wi849-d")
+})
+
 test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
   assertBlocked(`printf '\\x73\\x75\\x64\\x6f id' | sh`, "decoded")
   assertBlocked(`printf '\\163\\165\\144\\157 id' | sh`, "decoded")
