@@ -174,11 +174,14 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   of a literal path no lane uses (WI#829); direct key-file auth stays allowed
   on purpose. Two false denials were removed in the same pass (WI#832). Every
   rule is pinned by `scripts/headless_command_guard_test.ts`.
-- **A Perl deletion reached through an escaped quote is denied (WI#840).** An
-  escaped quote before the operand no longer defeats the
-  `PERL_BAREWORD_DELETE` rule, so `rmtree`/`unlink`/`rmdir` spellings reached
-  through that quoting are refused. The change is pinned by the guard's test
-  and its notes were corrected in the same commit.
+- **A Perl deletion behind shell quoting is denied (WI#840).** The guard
+  removes the shell escapes of a quoted one-liner before it reads the Perl
+  deletion calls, so an escaped quote no longer hides an
+  `rmtree`/`unlink`/`rmdir`/`remove_tree` operand, and every operand of a comma
+  list is read instead of only the first. `perlDeletionCall` also reports a
+  target it cannot resolve as unverifiable rather than as safe (WI#832). The
+  change is pinned by the guard's test and the guard's notes were corrected in
+  the same commit.
 - **The pebble worker-inputs manifest covers the files that ship (WI#806).**
   `entrypoint-split.sh` and `src/task_runner.rs` are build-read inputs, so a
   change to either now moves the lane's `worker-inputs` hash instead of
@@ -376,12 +379,13 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 ## Documentation
 
 - **Architecture and guide refresh (WI#803).** Fifty-four documents — 12 under
-  `docs/architecture/`, 31 top-level guides and 11 nested ones — were revalidated
-  against the source, each with a row in the merge request's record. The
-  corrected texts include the gotify config path, `EMBEDDINGS_SETUP.md`, the
-  NetBird and tunnel-provider pages, and the SSH tool pages. Seven archived
-  pages were moved under `history/` paths and name their current replacements.
-  No live provisioning or migration is claimed.
+  `docs/architecture/`, 31 top-level guides and 11 nested ones — were read and
+  source-checked, each with a row in the merge request's record. Nine
+  statements on seven stamped pages were corrected, along with the five rows
+  left open from the v2.2.1.0 refresh. Seven archives were moved under
+  `history/` paths and name their current replacements. Two relative-link and
+  anchor walkers passed on all 54 documents, and no live provisioning or
+  migration is claimed.
 - **New and extended operator material.**
   [`docs/guides/SANDBOX_CAPABILITY_MANIFEST.md`](docs/guides/SANDBOX_CAPABILITY_MANIFEST.md)
   (WI#797, extended by WI#816),
@@ -503,6 +507,13 @@ do not replace those gates.
   `ssh_git`'s post-pin OpenSSH transport retain their own host-key algorithm
   policies. RSA private keys are rejected on every LunarWing SSH path; RSA host
   keys are unsupported only on the shared `russh` paths.
+- **Harness job directories follow the daemon's umask (WI#803).** The
+  `harness/` base is mode 0700. A job subdirectory is created without an
+  explicit mode, so it is 0700 under the units `ic/systemd/` and `mt-admin`
+  ship (umask 0077) and 0755 under umask 022 — a daemon started by hand, and
+  the systemd user unit `lunarwing service install` writes, which sets no
+  `UMask`. Run the daemon through a shipped unit if job directories must not be
+  group- or world-readable.
 - **The shell git grant is read-only and carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
