@@ -1,10 +1,10 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
-gating and the evaluation trace are implemented; Phase B1–B3 LLM
-logical-call timing is implemented (owner-only diagnostics, no prompt-facing
-use yet). The held-out tenant evaluation, hint rollout, gate-wait analytics
-(B4) and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+gating and the evaluation trace are implemented; Phase B1–B4 LLM
+logical-call timing and gate-wait analytics are implemented (owner-only
+diagnostics, no prompt-facing use yet). The held-out tenant evaluation, hint
+rollout and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
@@ -20,7 +20,8 @@ logical-call timing) is now implemented as a daemon-wide, in-memory,
 duration-only cache at the provider-chain boundary, surfaced by the owner-only
 `GET /api/estimates/llm`; retries, failover, cache hits and cancellations are
 counted separately and never train the EMA. It is not yet used in any estimate
-shown to a user. Gate-wait analytics (B4),
+shown to a user. Gate-wait analytics (B4) are implemented separately in
+`ic/src/gate/wait_analytics.rs` (owner-only `GET /api/estimates/gate-waits`),
 whole-job/mission-run estimates, held-out workload
 evaluation and durable caches remain follow-ups; tool calls within those
 jobs are covered by this slice. Costs are only learned when actually reported,
@@ -303,6 +304,15 @@ expiry have distinct paths (`ic/src/bridge/router.rs:2495-2798,5377-5404`).
 Keep this statistic separate from tool/LLM runtime; optional wait-history
 display is not a promise about when a human will approve a future request.
 
+**Implemented under #318 (B4).** `ic/src/gate/wait_analytics.rs` accumulates,
+in memory and bounded to 24 series, the wait per `(channel family, outcome)`.
+Approved and denied gates are observed at their single resolution entry point;
+expired gates use `expires_at - created_at`, the fail-closed deadline, so lazy
+cleanup latency is not reported as user wait. Cancellations and credential
+hand-offs are excluded. The owner-only `GET /api/estimates/gate-waits` returns
+the aggregate with a note that it is not a response-time promise. Nothing here
+is read by expiry, approval, scheduling or cost accounting.
+
 ### B. Bounded jobs and mission runs — second user-visible release
 
 Separate **current elapsed** from **predicted remaining**. When a job has
@@ -572,4 +582,6 @@ does not train. A successful single-provider call (including same-provider
 backoff) trains its selected configured provider/model pair, with a 256-byte
 bound on each label. Diagnostics are the owner-only `GET /api/estimates/llm`;
 `LUNARWING_LLM_TIMINGS=0` disables recording and unset observes. Gate-wait
-analytics (B4) remain open and must stay separate from these runtime EMAs.
+analytics (B4) are implemented separately in `ic/src/gate/wait_analytics.rs`
+with the owner-only `/api/estimates/gate-waits` view, and stay separate from
+these runtime EMAs.

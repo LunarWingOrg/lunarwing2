@@ -222,6 +222,30 @@ treatment at a different boundary, so a separate daemon-wide cache records
   DB-backed, and resets on restart. Nothing here changes behaviour: an
   estimator failure can never change a call's result.
 
+## Gate-wait analytics (WI#318 Phase B4)
+
+Gate wait is observed separately from tool and LLM runtime EMAs, and nothing
+here feeds an estimate or a decision.
+
+- **What is recorded.** For an approved or denied gate, `resolution_at -
+  created_at`; for an expired gate, `expires_at - created_at`, i.e. the
+  fail-closed deadline rather than the moment a later ingress noticed the
+  expiry. Cancellations and credential hand-offs are not approval waits and are
+  not recorded. Waits are clamped to one day, and clock skew yields zero.
+- **Labels.** Only the outcome (`approved`, `denied`, `expired`) and a bounded
+  channel family (`web`, `gateway`, `xmpp`, `signal`, `repl`, `http`,
+  `bootstrap`, `extension`). Extension channel names and everything derived from
+  them collapse to `extension`; no parameters, users, threads or request IDs
+  are stored.
+- **Storage.** In-memory, process-lifetime, bounded to 24 series, in the
+  pending-gate store. No persistence, no I/O on the resolution path. Recording
+  never changes `take_verified`'s request-ID, channel or expiry checks, and
+  expiry remains a fail-closed security timer that reads none of this data.
+- **Diagnostics.** `GET /api/estimates/gate-waits` is owner-only (403 for other
+  authenticated users, 401 without a token) and reports per series the sample
+  count, mean, maximum and EMA of the observed wait in milliseconds, plus a
+  `note` stating that this is not a promise about human response time.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
