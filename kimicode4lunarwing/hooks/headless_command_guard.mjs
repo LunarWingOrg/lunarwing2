@@ -1168,8 +1168,9 @@ const KIMI_FLAG_OPTIONS = new Set([
  * there is none (WI#845). Only options the table knows are read as the CLI
  * reads them; an unknown option may or may not consume the next word and the
  * hook cannot ask the CLI, so both readings are walked and a service
- * subcommand (`KIMI_SERVICE_SUBCOMMANDS`) reached by either one is a denial. `--option=value` needs no special case:
- * its value is part of the option word.
+ * subcommand (`KIMI_SERVICE_SUBCOMMANDS`) reached by either one is a denial.
+ * `--option=value` needs no special case: its value is part of the option
+ * word.
  */
 function kimiServiceSubcommand(words, start) {
   const pending = [start];
