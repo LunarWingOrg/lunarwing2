@@ -15,8 +15,8 @@ mod value;
 
 pub use cost::CostEstimator;
 pub use diagnostics::{
-    CategoryPolicy, CategoryPolicySummary, EvaluationCategory, EvaluationMetrics,
-    EvaluationSummary, EvaluationTrace, WarmupSummary,
+    BaselineComparison, CategoryPolicy, CategoryPolicySummary, EvaluationCategory,
+    EvaluationMetrics, EvaluationSummary, EvaluationTrace, WarmupBaseline, WarmupSummary,
 };
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
 pub use llm::{
