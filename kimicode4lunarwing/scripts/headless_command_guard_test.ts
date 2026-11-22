@@ -772,6 +772,10 @@ test("a value-taking option cannot hide kimi service mode (WI#845)", () => {
   assertAllowed("kimi --model server -p hello")
   assertAllowed("kimi -S server -p hello")
   assertAllowed("kimi --output-format stream-json -p hello")
+  // With WI#839 the subcommand word may carry glued punctuation.
+  assertBlocked("(kimi --model X server)", "kimi service mode")
+  assertBlocked("$(kimi -m X web)", "kimi service mode")
+  assertAllowed("(kimi -p server)")
 })
 
 test("a long command of repeated words is decided without rescanning", () => {

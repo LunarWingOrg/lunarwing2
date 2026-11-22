@@ -1172,13 +1172,16 @@ function kimiServiceSubcommand(words, start) {
     if (i >= words.length || seen.has(i)) continue;
     seen.add(i);
     const word = words[i];
+    // The subcommand word may carry the punctuation bash glues to it
+    // (`server)` in `(kimi -m X server)`), read as in WI#839.
     if (word === "--") {
-      const after = words[i + 1];
+      const after = listenerWord(words[i + 1] ?? "");
       if (after === "server" || after === "web") return after;
       continue;
     }
     if (!word.startsWith("-")) {
-      if (word === "server" || word === "web") return word;
+      const subcommand = listenerWord(word);
+      if (subcommand === "server" || subcommand === "web") return subcommand;
       continue;
     }
     if (word.includes("=")) pending.push(i + 1);
