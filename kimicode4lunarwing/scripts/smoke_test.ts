@@ -17,14 +17,17 @@ const WS_PATH = process.env.WS_PATH || "/ws/agent"
  * managed tenant launch path no longer mounts the SSH-agent socket; this
  * check proves the absence inside the running container (it runs in the
  * agent-smoke service of the same image) so a regression in the mount
- * wiring surfaces in smoke, not in an incident.
+ * wiring surfaces in smoke, not in an incident. Lanes that do mount the
+ * agent bind a directory at /tmp/ssh-agent, so the directory — not only the
+ * bare /tmp/ssh-agent.sock literal, which no lane creates — is the shape a
+ * reintroduced mount would leave behind (WI#829).
  */
 async function checkNoSshCredentials(): Promise<boolean> {
   const failures: string[] = []
   if (process.env.SSH_AUTH_SOCK) {
     failures.push(`SSH_AUTH_SOCK is set (${process.env.SSH_AUTH_SOCK})`)
   }
-  for (const socket of ["/tmp/ssh-agent.sock"]) {
+  for (const socket of ["/tmp/ssh-agent.sock", "/tmp/ssh-agent"]) {
     try {
       accessSync(socket, constants.F_OK)
       failures.push(`${socket} exists`)

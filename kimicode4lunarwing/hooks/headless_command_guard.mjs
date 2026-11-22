@@ -23,7 +23,8 @@ import { runInNewContext } from "node:vm";
 // (power/privilege/disk destruction, fork bombs, pipe-to-shell, decoded
 // payloads into a shell) plus worker-lane specifics (deletion outside the
 // temp roots whatever tool performs it, block-device writes, git commands
-// that discard uncommitted work, SSH-agent socket use). It is deliberately
+// that discard uncommitted work, SSH agent use — the mount path, the
+// SSH_AUTH_SOCK variable and `ssh-add`). It is deliberately
 // NOT a general command parser: everything it cannot positively classify as
 // safe within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer) and
@@ -488,8 +489,19 @@ const DENY_RULES = [
       />\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
   },
   {
-    name: "SSH agent socket use (worker lane is not a credential broker)",
-    pattern: /\bSSH_AUTH_SOCK\b|\/tmp\/ssh-agent\.sock/,
+    name: "SSH agent use (worker lane is not a credential broker)",
+    // Every lane that mounts an agent shares a directory at /tmp/ssh-agent
+    // with the socket inside, exported as
+    // SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
+    // (ic/scripts/mt-admin-lib/09-worker-config.sh). Matching the directory
+    // covers that real spelling, the socket inside it, and
+    // `ssh -o IdentityAgent=<socket>`; the bare /tmp/ssh-agent.sock literal
+    // is the one spelling no lane uses (WI#829). `ssh-add` is the step that
+    // loads a key into an agent, i.e. the credential-broker action itself.
+    // Direct key-file auth (`ssh -i <key>`, the lane's own ~/.ssh behind
+    // `ssh -T`) stays allowed on purpose — see WORKER-CONTAINERS.md.
+    pattern:
+      /\bSSH_AUTH_SOCK\b|\/tmp\/ssh-agent(?:\.sock)?(?=$|[\/\s"'`.,)\]};|&])|(?:^|[\s;&|()])(?:[\w.+-]*\/)*ssh-add(?![\w-])/,
   },
 ];
 
