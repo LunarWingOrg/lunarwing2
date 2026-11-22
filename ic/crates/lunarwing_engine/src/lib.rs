@@ -18,7 +18,6 @@ pub mod capability;
 pub mod executor;
 pub mod gate;
 pub mod memory;
-pub mod reliability;
 pub mod runtime;
 pub mod traits;
 pub mod types;
@@ -116,10 +115,6 @@ pub use executor::ExecutionLoop;
 
 pub use memory::MemoryStore;
 pub use memory::RetrievalEngine;
-
-// ── Re-exports: reliability ──────────────────────────────────
-
-pub use reliability::ReliabilityTracker;
 
 // ── Test utilities ──────────────────────────────────────────
 

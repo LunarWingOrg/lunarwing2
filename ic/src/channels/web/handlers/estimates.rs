@@ -15,6 +15,7 @@ use crate::channels::web::server::GatewayState;
 use crate::estimation::{
     EvaluationSummary, LlmTimingDiagnostics, ToolEstimateCounters, ToolEstimateDiagnostics,
 };
+use crate::gate::wait_analytics::GateWaitDiagnostics;
 use crate::tools::ToolRegistry;
 
 pub(crate) fn routes() -> Router<Arc<GatewayState>> {
@@ -26,6 +27,10 @@ pub(crate) fn routes() -> Router<Arc<GatewayState>> {
             get(estimates_evaluation_handler),
         )
         .route("/api/estimates/llm", get(estimates_llm_handler))
+        .route(
+            "/api/estimates/gate-waits",
+            get(estimates_gate_waits_handler),
+        )
 }
 
 fn registry(state: &GatewayState) -> Result<&ToolRegistry, (StatusCode, String)> {
@@ -74,6 +79,29 @@ async fn estimates_evaluation_handler(
         StatusCode::NOT_FOUND,
         "Evaluation trace is not enabled".to_string(),
     ))
+}
+
+/// Owner-only gate-wait aggregate, separate from runtime and LLM estimates.
+/// It reports observed waits by bounded channel family and outcome; it is not
+/// a prediction and never influences gate expiry or approval policy.
+async fn estimates_gate_waits_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<GateWaitDiagnostics>, (StatusCode, String)> {
+    if user.user_id != state.owner_id {
+        return Err((StatusCode::FORBIDDEN, "Owner access required".to_string()));
+    }
+    match crate::bridge::gate_wait_diagnostics().await {
+        Ok(Some(diagnostics)) => Ok(Json(diagnostics)),
+        Ok(None) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Engine pending-gate store is not initialized".to_string(),
+        )),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Gate-wait diagnostics unavailable: {error}"),
+        )),
+    }
 }
 
 /// Owner-only daemon-wide LLM logical-call duration models with configured

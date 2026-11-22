@@ -1,10 +1,10 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
-gating and the evaluation trace are implemented; Phase B1–B3 LLM
-logical-call timing is implemented (owner-only diagnostics, no prompt-facing
-use yet). The held-out tenant evaluation, hint rollout, gate-wait analytics
-(B4) and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+gating and the evaluation trace are implemented; Phase B1–B4 LLM
+logical-call timing and gate-wait analytics are implemented (owner-only
+diagnostics, no prompt-facing use yet). The held-out tenant evaluation, hint
+rollout and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
@@ -20,7 +20,8 @@ logical-call timing) is now implemented as a daemon-wide, in-memory,
 duration-only cache at the provider-chain boundary, surfaced by the owner-only
 `GET /api/estimates/llm`; retries, failover, cache hits and cancellations are
 counted separately and never train the EMA. It is not yet used in any estimate
-shown to a user. Gate-wait analytics (B4),
+shown to a user. Gate-wait analytics (B4) are implemented separately in
+`ic/src/gate/wait_analytics.rs` (owner-only `GET /api/estimates/gate-waits`),
 whole-job/mission-run estimates, held-out workload
 evaluation and durable caches remain follow-ups; tool calls within those
 jobs are covered by this slice. Costs are only learned when actually reported,
@@ -71,12 +72,17 @@ assertion about how quickly a particular pending approval will be handled.
 
 ## Existing seams and gaps
 
-- `ic/src/estimation/mod.rs:45-117` exposes `Estimator::estimate_job` and
-  `record_actuals`, with **no production callers**. `learner.rs:45-108` keeps
+- ~~`ic/src/estimation/mod.rs:45-117` exposes `Estimator::estimate_job` and
+  `record_actuals`, with **no production callers**.~~ **Removed under #318
+  (C5):** the legacy job facade (`estimate_job`, `record_actuals`,
+  `JobEstimate`, `ToolEstimate`) is deleted, so `estimate_operation` /
+  `record_operation_actuals` are the only estimate API. `learner.rs` keeps
   an in-memory per-category EMA (`alpha=0.1`, `min_samples=5`).
 - `ic/src/estimation/cost.rs:16-45` and `time.rs:12-38` know only `http`,
   `echo`, `time`, `json`; unknown tools get a nominal $0.001 / 5 seconds.
-  `ToolEstimate.confidence` is a literal 0.7 (`mod.rs:71-78`). The LLM price
+  Nothing in production consumes these standalone estimators after C5 removed
+  the legacy job facade; keep them unreferenced or delete in a later cleanup
+  rather than reintroducing a second estimate path. The LLM price
   in `cost.rs` is a flat approximation; production LLM accounting has its
   own model/provider rates. `value.rs:23-29` ignores the description.
 - `ic/src/tools/tool.rs:210-255` gives `ToolOutput` optional cost and a
@@ -117,6 +123,9 @@ assertion about how quickly a particular pending approval will be handled.
   `ic/crates/lunarwing_engine/src/reliability.rs:1-112`. It is not a
   substitute for the `ic/src/estimation/` learner; do not introduce a second
   parallel writer or combine reliability and ETA statistics implicitly.
+  **Resolved under #318 (E1):** it had no consumers anywhere in `ic/`, so it
+  was deleted rather than wired as a second EMA writer. The engine crate no
+  longer exports `ReliabilityTracker`.
 - Existing `ic/src/observability/traits.rs` defines tool and LLM start/end
   events, but its factory and record path have no production callers. Assess
   wiring that observer as a lightweight, optional carrier rather than adding
@@ -136,13 +145,11 @@ assertion about how quickly a particular pending approval will be handled.
 
 Keep the existing `Estimator` facade and `EstimationLearner`, but add a
 performance-oriented single-operation API (a job aggregate can compose it).
-Do not serialize the current `JobEstimate` wholesale into a UI: its `value`
-is not a useful performance metric and its `tool_breakdown` is presently
-unadjusted even though the job total can be adjusted
-(`ic/src/estimation/mod.rs:71-97`). Introduce a separate optional public
-runtime-estimate DTO or evolve the facade with explicit compatibility tests;
-the sum of displayed components must have the same semantics as the displayed
-aggregate.
+A future job view must not reuse the deleted `JobEstimate`: its `value`
+was not a useful performance metric and its `tool_breakdown` was unadjusted
+(`ic/src/estimation/mod.rs` before C5). Introduce a separate optional public
+runtime-estimate DTO; the sum of displayed components must have the same
+semantics as the displayed aggregate.
 Suggested internal types, subject to existing style and trait constraints:
 
 ```text
@@ -303,6 +310,15 @@ expiry have distinct paths (`ic/src/bridge/router.rs:2495-2798,5377-5404`).
 Keep this statistic separate from tool/LLM runtime; optional wait-history
 display is not a promise about when a human will approve a future request.
 
+**Implemented under #318 (B4).** `ic/src/gate/wait_analytics.rs` accumulates,
+in memory and bounded to 24 series, the wait per `(channel family, outcome)`.
+Approved and denied gates are observed at their single resolution entry point;
+expired gates use `expires_at - created_at`, the fail-closed deadline, so lazy
+cleanup latency is not reported as user wait. Cancellations and credential
+hand-offs are excluded. The owner-only `GET /api/estimates/gate-waits` returns
+the aggregate with a note that it is not a response-time promise. Nothing here
+is read by expiry, approval, scheduling or cost accounting.
+
 ### B. Bounded jobs and mission runs — second user-visible release
 
 Separate **current elapsed** from **predicted remaining**. When a job has
@@ -376,12 +392,16 @@ totals, with eligibility counted at execution start even in observe mode.
 retained calls, with separate warmup and early cold-start coverage.
 `LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates display per canonical tool name
 while recording continues. `LUNARWING_TOOL_ESTIMATES_TRACE` enables the
-bounded, parameter-free records behind the evaluation route. Only `http`
-currently declares a production duration baseline. A missing comparison is
-not a pass; evaluation for other tools needs an agreed baseline or gate.
-Running the evaluation on a real tenant and enabling hints for passing
-categories remain A4/A5 operator steps; this code does not change any approval,
-scheduling or cost behaviour.
+bounded, parameter-free records behind the evaluation route. Each category is
+compared against two named baselines: `declared_baseline` from
+`Tool::estimated_duration` where a tool supplies one (only `http` today), and
+`comparison_baseline`, the mean of the model's own first five valid completed
+runs, frozen before each call. The A4 gate is at least 10% lower median
+absolute error than `comparison_baseline`; the declared comparison is reported
+alongside rather than being required for a category to be judged. A missing or
+empty comparison is not a pass. Running the evaluation on a real tenant and
+enabling hints for passing categories remain A4/A5 operator steps; this code
+does not change any approval, scheduling or cost behaviour.
 
 ## Persistence decision
 
@@ -528,12 +548,49 @@ choices, not evidence that the real-tenant accuracy or overhead gates have run.
    and the other channels must retain their direct, owner-scoped status
    routing. Add tests for the duration-only line, truncation and redaction, and
    do not duplicate the hint where a channel already renders the description.
+4. **A4 compares against a model-derived baseline for every category
+   (maintainer decision, 2026-11-21).** The evaluation trace records the mean
+   of the model's own first five valid completed runs of the same user/tool
+   model, captured at `begin()` with the prediction and never including the
+   evaluated call or anything later. The gate is at least 10% lower median
+   absolute error than that baseline, per category. Where a tool declares
+   `estimated_duration` (`http` today), the trace keeps that comparison too;
+   the summary names which baseline each figure uses. This stays in-memory and
+   parameter-free, adds no storage or hot-path I/O, and leaves the warmup and
+   cold-start cohorts reported separately.
 
 All automatic timeout, scheduling, provider-selection, bid/value, and budget
 decisions based on these estimates are **out of scope** until accuracy and
 failure modes have been demonstrated separately. Changing any gate's authority,
 expiry, channel/request-ID binding, decision token or redaction contract is
 never a rollout mechanism.
+
+## Decisions recorded for phases C–E
+
+Recorded under #318 on 2026-11-22 from dead-code evidence; none of these
+changes behaviour or claims an accuracy result.
+
+- **C5 — the legacy job-estimate API is deleted, not composed.** `Estimator::estimate_job`,
+  `Estimator::record_actuals`, `JobEstimate` and `ToolEstimate` had no callers
+  outside `ic/src/estimation/`. They are removed, so
+  `estimate_operation` / `record_operation_actuals` are the only estimate API.
+  A future whole-job estimate must compose operation estimates and keep elapsed,
+  known-remaining and unknown separate; it must not resurrect `value` or the
+  unadjusted `tool_breakdown`.
+- **D1 — no durable cache is built yet.** This stays exactly the A6.1 decision:
+  the cache is conditional on the A4 tenant measurement showing that cold-start
+  loss materially misses the accuracy or coverage goals. No snapshot code is
+  added before that evidence, and a negative result is recorded in the rollout
+  evidence doc rather than in code.
+- **E1 — `ReliabilityTracker` is deleted.** `lunarwing_engine::ReliabilityTracker`
+  had no consumers anywhere in `ic/`. It was a second, unrelated EMA writer;
+  wiring it would have duplicated the estimator's clock and could be mistaken
+  for ETA statistics. The module and its `lib.rs` re-export are removed; the
+  engine crate keeps no reliability EMA.
+- **E2 — tool-cost learning stays inactive.** No production tool supplies
+  `estimated_cost`, and hints remain duration-only. Adding baselines is deferred
+  until a real per-call charge exists to learn from; the absence is documented
+  rather than replaced with a nominal price.
 
 ## Phase B implementation choice (B3 carrier)
 
@@ -558,4 +615,6 @@ does not train. A successful single-provider call (including same-provider
 backoff) trains its selected configured provider/model pair, with a 256-byte
 bound on each label. Diagnostics are the owner-only `GET /api/estimates/llm`;
 `LUNARWING_LLM_TIMINGS=0` disables recording and unset observes. Gate-wait
-analytics (B4) remain open and must stay separate from these runtime EMAs.
+analytics (B4) are implemented separately in `ic/src/gate/wait_analytics.rs`
+with the owner-only `/api/estimates/gate-waits` view, and stay separate from
+these runtime EMAs.

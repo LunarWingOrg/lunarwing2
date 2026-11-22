@@ -129,8 +129,12 @@ ic/crates/lunarwing_engine/src/
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
     insights.rs           Evidence validation and insight recall eligibility
     skill_tracker.rs      SkillTracker (confidence tracking, versioned updates, rollback)
-  reliability.rs          ReliabilityTracker (per-action success rate and latency via EMA)
 ```
+
+`ReliabilityTracker` (a separate per-action EMA) was removed under WI#318 (E1):
+it had no consumers, and runtime ETA statistics live in `ic/src/estimation/`
+with a single writer. Do not reintroduce a parallel reliability EMA without an
+explicit, distinct consumer.
 
 ## Thread State Machine
 

@@ -63,12 +63,13 @@ new categories evict the least recently observed category.
   calibration is exercised by the integration fixture, and production costs
   remain unknown until a tool supplies both a baseline and an actual charge.
 
-`Estimator::estimate_operation` is the new live consumer API. The older
-`estimate_job` facade remains for compatibility but its placeholder prices,
-value/margin arithmetic and static per-tool breakdown are **not** used for
-live predictions. Its numeric `record_actuals` interface remains available
-for compatibility; the new `record_operation_actuals` accepts `Actuals` to
-represent absent measurements and a frozen forecast explicitly.
+`Estimator::estimate_operation` is the only estimate API. The legacy
+`estimate_job` facade, `JobEstimate`, `ToolEstimate` and its numeric
+`record_actuals` were deleted under WI#318 (C5): they had no production callers,
+and their placeholder prices, value/margin arithmetic and static per-tool
+breakdown must not become a second job-estimate path.
+`record_operation_actuals` accepts `Actuals` to represent absent measurements
+and a frozen forecast explicitly.
 
 An approval description receives one short line such as:
 
@@ -135,31 +136,43 @@ recording and hints entirely.
 
 `LUNARWING_TOOL_ESTIMATES_TRACE=1` enables a bounded in-memory ring (2,048
 records; a number selects 16–8,192). Each record stores the canonical tool
-name, unadjusted baseline, frozen EMA prediction, actual duration, and the
-model's valid duration sample count **before the call started**. Only `Ok`
+name, the tool's declared duration baseline, a model-derived comparison
+baseline, the frozen EMA prediction, the actual duration, and the model's
+valid duration sample count **before the call started**. Only `Ok`
 completions are traced; there are no parameters, user identities or trace
 writes to logs, files or the database. The oldest record is evicted when full.
 The owner route copies the retained records and aggregates them after releasing
 the trace lock. Check `evicted` when assessing window coverage.
 
-For each category, `coverage` is the fraction of retained completions with a
-learned prediction. Both median absolute errors (in ms) and
-`improvement_percent` use only the same `paired_samples`: calls with both a
-usable declared baseline (positive and at most one day) and a frozen EMA
-prediction. `warmup` reports counts and baseline-only error for calls started
-before the model had five valid duration samples. `cold_start` reports the
-same coverage and paired metrics as the overall category, but only for calls
-started with fewer than `cold_start_sample_limit` (20) prior valid durations
-in that user/tool model. This includes warmup and the first post-warmup
-forecasts. It is based on model age, not completion order, and starts over
-when a model is evicted or the registry restarts.
+Every category is compared against two named baselines, so the rollout gate no
+longer depends on `http` being the only tool that declares one:
 
-Only `http` currently declares a production duration baseline. Without paired
-samples, both error medians and `improvement_percent` are `null`; a zero
-baseline median also makes improvement undefined. None of these cases passes
-the rollout gate. A comparison baseline for other tools (or a revised gate)
-still needs a maintainer decision. Running the representative tenant
-evaluation and enabling hints for passing categories are separate steps.
+- `declared_baseline` uses `Tool::estimated_duration`, where a tool supplies it.
+- `comparison_baseline` is the mean of the model's own **first five valid
+  completed runs** (the warmup window). It is derived only from earlier calls,
+  frozen at `begin()` with the prediction, and never includes the call being
+  evaluated or anything later. It is `null` until one valid run exists.
+
+For each category, `coverage` is the fraction of retained completions with a
+learned prediction. Each baseline block reports its own median absolute errors
+(in ms), `samples` and `improvement_percent`, computed only over the calls where
+both that baseline and a frozen EMA prediction existed. The two blocks are
+paired over the same retained records but not necessarily the same subset.
+`warmup` reports counts and baseline-only error for calls started before the
+model had five valid duration samples, for both baselines. `cold_start` reports
+the same coverage and paired metrics as the overall category, but only for
+calls started with fewer than `cold_start_sample_limit` (20) prior valid
+durations in that user/tool model. This includes warmup and the first
+post-warmup forecasts. It is based on model age, not completion order, and
+starts over when a model is evicted or the registry restarts.
+
+**Gate definition (per category):** at least 10% lower median absolute error
+than the `comparison_baseline`, with absolute error in seconds, `coverage` and
+sample counts reported. A declared baseline is reported alongside where one
+exists. Without paired samples, an error median or `improvement_percent` is
+`null`; a zero baseline median also makes improvement undefined. None of these
+cases passes the gate. Running the representative tenant evaluation and
+enabling hints for passing categories are separate steps.
 
 ## LLM logical-call timing (WI#318 Phase B)
 
@@ -209,6 +222,30 @@ treatment at a different boundary, so a separate daemon-wide cache records
   other value observes. It is read once when the chain is built, is not
   DB-backed, and resets on restart. Nothing here changes behaviour: an
   estimator failure can never change a call's result.
+
+## Gate-wait analytics (WI#318 Phase B4)
+
+Gate wait is observed separately from tool and LLM runtime EMAs, and nothing
+here feeds an estimate or a decision.
+
+- **What is recorded.** For an approved or denied gate, `resolution_at -
+  created_at`; for an expired gate, `expires_at - created_at`, i.e. the
+  fail-closed deadline rather than the moment a later ingress noticed the
+  expiry. Cancellations and credential hand-offs are not approval waits and are
+  not recorded. Waits are clamped to one day, and clock skew yields zero.
+- **Labels.** Only the outcome (`approved`, `denied`, `expired`) and a bounded
+  channel family (`web`, `gateway`, `xmpp`, `signal`, `repl`, `http`,
+  `bootstrap`, `extension`). Extension channel names and everything derived from
+  them collapse to `extension`; no parameters, users, threads or request IDs
+  are stored.
+- **Storage.** In-memory, process-lifetime, bounded to 24 series, in the
+  pending-gate store. No persistence, no I/O on the resolution path. Recording
+  never changes `take_verified`'s request-ID, channel or expiry checks, and
+  expiry remains a fail-closed security timer that reads none of this data.
+- **Diagnostics.** `GET /api/estimates/gate-waits` is owner-only (403 for other
+  authenticated users, 401 without a token) and reports per series the sample
+  count, mean, maximum and EMA of the observed wait in milliseconds, plus a
+  `note` stating that this is not a promise about human response time.
 
 ## Disable and performance
 
