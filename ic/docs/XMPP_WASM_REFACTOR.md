@@ -269,9 +269,13 @@ The bridge API should be intentionally small.
 
 ### Inbound pull API
 
-`GET /v1/messages?cursor=<cursor>`
+`GET /v1/messages?cursor=<cursor>&limit=<n>`
 
-Returns normalized inbound messages:
+Returns normalized inbound messages. The response cursor is the cursor of the
+last message in the returned page (or the request cursor when the page is
+empty), and `limit` is clamped to the daemon's per-callback emit budget so a
+poll can never overflow `on_poll`. A large backlog is drained over successive
+polls; see `bridges/xmpp-bridge/README.md` (WI#850).
 
 ```json
 {
