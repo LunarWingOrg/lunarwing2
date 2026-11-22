@@ -859,16 +859,18 @@ function perlAngleOperand(code, i) {
 /**
  * One element of a Perl deletion call's operand list: a path target, an
  * option that is not a target, or an expression the guard cannot verify. The
- * File::Path option hash and `rmtree`'s legacy numeric verbose/safe flags are
- * the only options, and only for `rmtree`/`remove_tree` (WI#851).
+ * File::Path option hash of `rmtree`/`remove_tree` and `rmtree`'s legacy
+ * numeric verbose/safe flags are the only options (WI#851); `remove_tree` has
+ * no legacy flags, so a bare number there is a path (`remove_tree "x", 0`
+ * removes `./0`).
  */
-function perlDeletionElement(code, i, options) {
+function perlDeletionElement(code, i, options, numericFlags) {
   const ch = code[i] ?? "";
   if (options && ch === "{") {
     const end = perlHashEnd(code, i);
     return end === -1 ? { unverifiable: true } : { next: end, skipped: true };
   }
-  if (options && /[0-9]/.test(ch)) {
+  if (numericFlags && /[0-9]/.test(ch)) {
     let end = i;
     while (end < code.length && /[0-9]/.test(code[end])) end++;
     return { next: end, skipped: true };
@@ -884,14 +886,17 @@ function perlDeletionElement(code, i, options) {
 }
 
 /**
- * True when `i` ends a Perl statement: `;`, a closing block, a comment, the
- * end of the code, or the low-precedence `or`/`and` a guarded deletion ends
- * with (`unlink "/tmp/x" or die`).
+ * True when `i` ends a list operator's arguments: `;`, a closing block, a
+ * comment, the end of the code, the low-precedence `or`/`and` a guarded
+ * deletion ends with (`unlink "/tmp/x" or die`), or a statement modifier
+ * (`unlink "/tmp/x" if -e "/tmp/x"`). `&&`, `||` and `//` bind tighter than a
+ * list operator, so they continue the operand: `unlink "/tmp/x" && "/w/f"`
+ * deletes `/w/f` and must read as unverifiable.
  */
 function perlStatementEnd(code, i) {
   if (i >= code.length) return true;
   if (";})\n#".includes(code[i])) return true;
-  return /^(?:or|and)(?![\w])|^\|\||^&&|^\/\//.test(code.slice(i));
+  return /^(?:or|and|if|unless|while|until|for|foreach)(?![\w])/.test(code.slice(i));
 }
 
 /**
@@ -915,7 +920,7 @@ function perlDeletionCall(code, from, keyword) {
     i = skipBlanks(code, i);
     // No target at all is the implicit `$_` form, which cannot be verified.
     if (callEnd(i)) return { operands, unverifiable: true };
-    const element = perlDeletionElement(code, i, options);
+    const element = perlDeletionElement(code, i, options, keyword === "rmtree");
     if (element.unverifiable) return { operands, unverifiable: true };
     if (!element.skipped) operands.push(...element.values);
     i = skipBlanks(code, element.next);

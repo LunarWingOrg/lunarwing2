@@ -926,6 +926,16 @@ test("Perl deletion options, list forms and expression operands (WI#851)", () =>
   assertAllowed(`perl -e 'unlink "/tmp/x" or die "no"'`)
   assertAllowed(`perl -e 'print "unlink"'`)
   assertAllowed(`perl -e 'my %h = (unlink => 1); print 1'`)
+  // Review AKM-1..AKM-3 on !2696: `&&`, `||` and `//` bind tighter than a list
+  // operator, so the operand continues past them; `remove_tree` has no legacy
+  // numeric flags; a statement modifier ends a complete operand list.
+  assertBlocked(`perl -e 'unlink "/tmp/x" && "/workspace/f"'`, "interpreter deletion")
+  assertBlocked(`perl -e 'unlink "/tmp/x", "/tmp/y" && "/workspace/f"'`, "interpreter deletion")
+  assertBlocked(`perl -MFile::Path=remove_tree -e 'remove_tree "/tmp/x", 0'`, "interpreter deletion")
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/x", 0, 1'`)
+  assertAllowed(`perl -e 'unlink "/tmp/x" if -e "/tmp/x"'`)
+  assertAllowed(`perl -e 'unlink "/tmp/x" unless -d "/tmp/x"'`)
+  assertBlocked(`perl -e 'unlink for glob "/workspace/*"'`, "interpreter deletion")
 })
 
 test("find and rsync delete through the same temp-root test", () => {
