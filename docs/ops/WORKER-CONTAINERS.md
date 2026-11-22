@@ -4139,9 +4139,13 @@ image and recreate the worker to pick up the updated hook.
 
 WI#833 adds a separate command-position check for Kimi's `server` and `web`
 subcommands and common listener tools. A print-mode prompt is data, even if
-its text is `server` or `web`. This check does not resolve dynamic command
-names or recognize every program that can listen; the container's network
-policy remains the boundary. The executor strips the relay URL and keeps
+its text is `server` or `web`. WI#839 reads through the shell punctuation
+bash glues to a word: a subshell `(…)`, a `$(…)` or backtick substitution
+(also inside double quotes) and a glued `)` or `}` are scanned as the command
+they run, while quoted text that merely mentions `kimi server` stays data.
+This check does not resolve dynamic command names or recognize every program
+that can listen; the container's network policy remains the boundary. The
+executor strips the relay URL and keeps
 `KIMI_CODE_HOME` worker-owned (or unset), regardless of task input. Auto-update
 and telemetry stay disabled. This change also requires a rebuilt Kimi worker
 image and a recreated worker.
@@ -4151,8 +4155,8 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
-WI#829 and WI#830 only after rebuilding the image with the fix and recreating
-their workers; see
+WI#829, WI#830, WI#832, WI#833, WI#839 and WI#840 only after rebuilding the
+image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)

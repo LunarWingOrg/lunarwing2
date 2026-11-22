@@ -676,6 +676,49 @@ test("a task cannot start kimi service mode (WI#833)", () => {
   assertAllowed("echo 'kimi web --json'")
 })
 
+test("a glued subshell or substitution does not hide a listener (WI#839)", () => {
+  // WI#839: the listener reader split words only on spaces, tabs, ; | & and
+  // newlines, so a glued `)` or backtick stayed part of the word and
+  // `(kimi server)` allowed. All seven allowed rows of the item's table deny.
+  assertBlocked("(kimi server)", "kimi service mode")
+  assertBlocked("(cd /tmp && kimi server)", "kimi service mode")
+  assertBlocked("(cd /tmp; kimi server)", "kimi service mode")
+  assertBlocked("$(kimi server)", "kimi service mode")
+  assertBlocked("echo $(kimi server)", "kimi service mode")
+  assertBlocked("`kimi server`", "kimi service mode")
+  assertBlocked("bash -c '(kimi server)'", "kimi service mode")
+  // Same glue, the spellings the study pass added to this item's corpus: a
+  // glued brace, an ANSI-C quoted subcommand, and a substitution bash runs
+  // even inside double quotes.
+  assertBlocked("{kimi server}", "kimi service mode")
+  assertBlocked("kimi server}", "kimi service mode")
+  assertBlocked("kimi $'server'", "kimi service mode")
+  assertBlocked('echo "$(kimi server)"', "kimi service mode")
+  assertBlocked('x="$(kimi server)"', "kimi service mode")
+  // The other listener verbs follow the command word through the same glue.
+  assertBlocked("(python3 -m http.server 8000)", "listener started from a task")
+  assertBlocked("(nc -l 9000)", "listener started from a task")
+  assertBlocked("(socat TCP-LISTEN:9000 -)", "listener started from a task")
+  assertBlocked("$(nc -l 9000)", "listener started from a task")
+  // The denied controls keep their verdicts.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  assertBlocked("( kimi server )", "kimi service mode")
+  assertBlocked("{ kimi server; }", "kimi service mode")
+  assertBlocked("(kimi web --json)", "kimi service mode")
+  // Prompt text and quoted mentions stay data; ordinary substitutions pass.
+  assertAllowed('kimi -p "server"')
+  assertAllowed("(kimi -p hello)")
+  assertAllowed("kimi mcp serve")
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("echo 'kimi web --json'")
+  assertAllowed('echo "$(git rev-parse HEAD)"')
+  assertAllowed("x=$(date +%s)")
+  assertAllowed("(cd ic && cargo check)")
+  assertAllowed("git commit -m 'fix (kimi) server docs'")
+  assertAllowed("nc -zv host 80")
+})
+
 test("a task cannot start any listed listener (WI#833)", () => {
   // The hook had no listener rule at all, so fixing only the kimi subcommands
   // would leave the class open (WI#833 study pass-394).
