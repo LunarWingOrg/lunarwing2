@@ -156,12 +156,29 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   policy remains the boundary. The change needs a rebuilt kimi image and a
   recreated worker, and the guide's bump checklist now asks for the new
   `KIMI_CODE_*` names and subcommands to be re-read on every bump.
-- **The kimi guard's deletion rules are hard to walk past (WI#840).** An
-  escaped quote before a Perl deletion operand no longer defeats the
+- **The kimi headless guard closes a series of bypasses (WI#795, WI#810,
+  WI#813, WI#824, WI#826, WI#829, WI#830, WI#832).** The `PreToolUse` hook
+  (`kimicode4lunarwing/hooks/headless_command_guard.mjs`) joins
+  backslash-newline continuations for every deny family rather than one
+  (WI#813), keeps the join on when an apostrophe appears in a heredoc body
+  (WI#810), matches a multi-line command in the recursive-`rm` rule (WI#795),
+  recognises `rm` after word-splicing and without a literal `rm` token
+  (WI#824, WI#826), and applies resolved-path containment to every deletion
+  rule (WI#830). It covers deletion performed by `find -exec unlink`,
+  `rsync --delete` and interpreter one-liners, decoded payloads fed to an
+  interpreter, device writes through `tee`/`cp`, and the git commands that
+  discard work — `git restore`, `git checkout`/`switch`, `git clean` and a
+  `stash` that takes untracked or everything — plus the alias and one-liner
+  spellings of them (WI#826, WI#832). The SSH rule now matches the agent
+  directory and socket path the lanes actually mount, and `ssh-add`, instead
+  of a literal path no lane uses (WI#829); direct key-file auth stays allowed
+  on purpose. Two false denials were removed in the same pass (WI#832). Every
+  rule is pinned by `scripts/headless_command_guard_test.ts`.
+- **A Perl deletion reached through an escaped quote is denied (WI#840).** An
+  escaped quote before the operand no longer defeats the
   `PERL_BAREWORD_DELETE` rule, so `rmtree`/`unlink`/`rmdir` spellings reached
-  through that quoting are denied. The change is pinned by
-  `kimicode4lunarwing/scripts/headless_command_guard_test.ts`, and the guard's
-  notes were corrected in the same commit.
+  through that quoting are refused. The change is pinned by the guard's test
+  and its notes were corrected in the same commit.
 - **The pebble worker-inputs manifest covers the files that ship (WI#806).**
   `entrypoint-split.sh` and `src/task_runner.rs` are build-read inputs, so a
   change to either now moves the lane's `worker-inputs` hash instead of
