@@ -608,7 +608,10 @@ mod tests {
         }
         let model = learner.get_model("tool").unwrap();
         assert_eq!(model.time_sample_count, COMPARISON_BASELINE_SAMPLES);
-        assert_eq!(model.early_duration_baseline(), Some(Duration::from_secs(6)));
+        assert_eq!(
+            model.early_duration_baseline(),
+            Some(Duration::from_secs(6))
+        );
 
         // Later calls train the EMA but never move the evaluation reference.
         learner.record_actuals("tool", timing(100));
