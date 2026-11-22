@@ -917,6 +917,74 @@ test("find and rsync delete through the same temp-root test", () => {
   assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
 })
 
+test("a rename of a protected tree and tar --remove-files are denied (WI#849)", () => {
+  // Two ALLOWed steps laundered a protected tree past the rm operand test: a
+  // rename moved it out of the protected namespace, and `rm -rf /tmp/x` then
+  // deleted the staged copy. The rename is the deletion, so both sides of the
+  // mv and tar's removed members take the shared containment test.
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /app/config /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /tmp/wi849-a /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv -t /tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv --target-directory=/tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x && rm -rf /tmp/wi849-x", "protected tree")
+  assertBlocked("tar -cf /dev/null --remove-files /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("tar -cf /dev/null --remove-files /app/hooks", "deletion outside")
+  // A member list is contents the guard cannot see, like `xargs rm` with no find.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -T /tmp/wi849-list", "cannot verify")
+  // A relative member follows `-C`, so it is refused like every relative operand.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -C /home/kimi .kimi-code", "deletion outside")
+  // The same spellings stay ordinary work inside the temp roots: the archive
+  // name and a suffix value are option values, not members.
+  assertAllowed("rm -rf /tmp/wi849-x")
+  assertAllowed("mv /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -S .bak /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -t /tmp/wi849-x /tmp/wi849-a")
+  assertAllowed("tar -cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar -cf /tmp/wi849.tar /tmp/wi849-d")
+  // Review AKL-1/AKL-2 on !2694: only the guard's own trees, a directory
+  // above one and the system roots are held back; ordinary renames pass, and
+  // the command word is read like rm's (`\mv`, `"mv"`).
+  for (const command of [
+    "mv /home/kimi /tmp/wi849-k",
+    "mv /usr /tmp/wi849-u",
+    "mv /tmp/wi849-evil /home/kimi/.kimi-code/config.toml",
+    "mv /home/kimi/.kimi* /tmp/wi849-x",
+    "cd /home/kimi && mv .kimi-code /tmp/wi849-x",
+    "\\mv /home/kimi/.kimi-code /tmp/wi849-x",
+    "\"mv\" /home/kimi/.kimi-code /tmp/wi849-x",
+    "'mv' /app/hooks /tmp/wi849-x",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv a.txt b.txt")
+  assertAllowed("git mv a.txt b.txt")
+  assertAllowed("mv src/old.rs src/new.rs")
+  assertAllowed("mv -f notes.md docs/notes.md")
+  assertAllowed('mv "$HOME/project/a" "$HOME/project/b"')
+  assertAllowed("git commit -m 'rename x via mv a b'")
+  // From the independent read of the fix: a glob in the directory part, a
+  // variable, a substitution, `~user`, a find/xargs `{}` placeholder and the
+  // abbreviated target option all stand for the protected tree too.
+  for (const command of [
+    "mv /h*/kimi/.k* /tmp/wi849-x",
+    "mv /*/kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ~kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ${HOME%/}/.kimi-cod? /tmp/wi849-x",
+    "mv $(echo ~)/.k* /tmp/wi849-x",
+    "cd ~ && mv .kimi-cod? /tmp/wi849-x",
+    "echo /home/kimi/.kimi-code | xargs -I{} mv {} /tmp/wi849-x",
+    "find /home/kimi -maxdepth 1 -name '.k*' -exec mv {} /tmp/wi849-x \\;",
+    "mv --t=/home/kimi/.kimi-code /tmp/wi849-evil/config.toml",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv *.log logs/")
+  assertAllowed("mv file.{txt,md}")
+  assertAllowed("mv .gitignore .gitignore.bak")
+})
+
 test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
   assertBlocked(`printf '\\x73\\x75\\x64\\x6f id' | sh`, "decoded")
   assertBlocked(`printf '\\163\\165\\144\\157 id' | sh`, "decoded")

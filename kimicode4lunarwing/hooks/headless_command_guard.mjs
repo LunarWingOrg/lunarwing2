@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, resolve as resolvePath } from "node:path";
 import { runInNewContext } from "node:vm";
 
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
@@ -369,6 +369,236 @@ function checkRsyncDeletion(text) {
   return null;
 }
 
+const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b([^;&|\n]*)/g;
+const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b([^;&|\n]*)/g;
+// tar's argument-taking short options. Every other letter is a flag, so an
+// old-style first word (`tar cf archive …`) is read letter by letter.
+const TAR_SHORT_ARG = new Set("bCfFgHIKLNTVX");
+// tar's long options whose value is the rest of the word or the next word.
+// `--atime-preserve` and the other optional-argument options are absent on
+// purpose: they never take a separate word, and eating one could hide a
+// member from the check below.
+const TAR_LONG_ARG = [
+  "file", "directory", "files-from", "exclude", "exclude-from", "transform",
+  "xform", "owner", "group", "mode", "mtime", "format", "blocking-factor",
+  "record-size", "tape-length", "label", "newer", "after-date",
+  "listed-incremental", "use-compress-program", "rmt-command", "rsh-command",
+  "index-file", "checkpoint-action", "info-script", "new-volume-script",
+  "volno-file", "suffix", "strip-components", "to-command", "quoting-style",
+  "sort", "pax-option", "sparse-version", "level", "hole-detection",
+];
+
+/** An option value: the attached rest of the word, otherwise the next word. */
+function optionValue(attached, words, index) {
+  if (attached.length > 0) return { value: attached, last: index };
+  return { value: words[index + 1] ?? "", last: index + 1 };
+}
+
+/**
+ * The path operands of an `mv` invocation: every source and the destination,
+ * including a `-t`/`--target-directory` value, which is a destination without
+ * being an operand word. `-S`/`--suffix` takes a value that is not a path
+ * (WI#849).
+ */
+function mvOperands(rest) {
+  const words = argumentWords(rest).map(stripShellQuotes);
+  const operands = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      operands.push(...words.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const attached = equals === -1 ? null : word.slice(equals + 1);
+      // GNU mv accepts unique prefixes: `--t` is `--target-directory`.
+      const target = name.length >= 1 && "target-directory".startsWith(name);
+      const suffix = name.length >= 2 && "suffix".startsWith(name);
+      if (!target && !suffix) continue;
+      const { value, last } = optionValue(attached ?? "", words, i);
+      if (target) operands.push(value);
+      i = last;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const cluster = word.slice(1);
+      for (let j = 0; j < cluster.length; j++) {
+        if (cluster[j] !== "t" && cluster[j] !== "S") continue;
+        const { value, last } = optionValue(cluster.slice(j + 1), words, i);
+        if (cluster[j] === "t") operands.push(value);
+        i = last;
+        break;
+      }
+      continue;
+    }
+    operands.push(word);
+  }
+  // A redirection target is not an operand (e.g. `2>/tmp/log`).
+  return operands.filter((operand) => !/^\d*>/.test(operand));
+}
+
+/** The argument-taking long option a name spells, exactly or by unique prefix. */
+function tarLongValueOption(name) {
+  if (TAR_LONG_ARG.includes(name)) return name;
+  if (name.length < 4) return null;
+  return TAR_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+}
+
+/** Read one tar short-option cluster; returns the index of its last consumed word. */
+function tarCluster(cluster, words, index, state) {
+  for (let j = 0; j < cluster.length; j++) {
+    if (!TAR_SHORT_ARG.has(cluster[j])) continue;
+    const { last } = optionValue(cluster.slice(j + 1), words, index);
+    if (cluster[j] === "T") state.unverifiable = true;
+    // An argument ends the cluster: the rest of the word is its value, or the
+    // next word when nothing is attached.
+    return last;
+  }
+  return index;
+}
+
+/** Read one tar long option; returns the index of its last consumed word. */
+function tarLongOption(word, words, index, state) {
+  const equals = word.indexOf("=");
+  const name = word.slice(2, equals === -1 ? undefined : equals);
+  const attached = equals === -1 ? null : word.slice(equals + 1);
+  if (attached === null && "remove-files".startsWith(name)) {
+    state.removeFiles = true;
+    return index;
+  }
+  const valueOption = tarLongValueOption(name);
+  if (valueOption === "files-from") state.unverifiable = true;
+  return valueOption === null ? index : optionValue(attached ?? "", words, index).last;
+}
+
+/**
+ * Read a tar invocation for `--remove-files` (WI#849): the member words tar
+ * removes after archiving, and whether a `-T`/`--files-from` list replaces
+ * them with contents the guard cannot see. Only literal member paths matter:
+ * a relative member is refused by the shared containment test anyway, so a
+ * `-C` base cannot point the removal at a protected tree.
+ */
+function tarInvocation(rest) {
+  const words = argumentWords(rest).map(stripShellQuotes);
+  const state = { removeFiles: false, members: [], unverifiable: false };
+  let i = 0;
+  // Old-style options (`tar cf archive …`) carry the cluster without a dash.
+  if (words.length > 0 && /^[A-Za-z]+$/.test(words[0]) && /[cxtruA]/.test(words[0])) {
+    i = tarCluster(words[0], words, 0, state) + 1;
+  }
+  for (; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      state.members.push(...words.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      i = tarLongOption(word, words, i, state);
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      i = tarCluster(word.slice(1), words, i, state);
+      continue;
+    }
+    state.members.push(word);
+  }
+  state.members = state.members.filter((member) => !/^\d*>/.test(member));
+  return state;
+}
+
+/**
+ * Deny the two shapes that remove a tree without a deleting verb (WI#849): an
+ * `mv` whose source or destination leaves the temp roots — a rename moves the
+ * tree out of the protected namespace, and a later `rm -rf` of the new name is
+ * then trivially inside them — and `tar --remove-files`, whose members are
+ * deleted after archiving. Both take the shared temp-root test `rm` uses.
+ */
+// The guard's own trees: the CLI's config home and the image's code and
+// config (WI#849). A rename that moves one of them, a directory above one, or
+// a system root out of place is the launder; any other rename is ordinary
+// work, so a workspace `mv a b` or `git mv` passes.
+const MV_PROTECTED_ROOTS = ["/home/kimi/.kimi-code", "/app"];
+
+function mvProtectedRoots() {
+  const home = process.env.KIMI_CODE_HOME;
+  if (!home || !home.startsWith("/")) return MV_PROTECTED_ROOTS;
+  return [...MV_PROTECTED_ROOTS, home.replace(/(.)\/+$/, "$1")];
+}
+
+/** A glob path component as a regular expression over the names it can match. */
+function globComponentRegex(component) {
+  let pattern = "^";
+  for (let i = 0; i < component.length; i++) {
+    const ch = component[i];
+    const close = ch === "[" ? component.indexOf("]", i + 1) : ch === "{" ? component.indexOf("}", i + 1) : -1;
+    if (ch === "*") pattern += ".*";
+    else if (ch === "?") pattern += ".";
+    else if (close !== -1) {
+      // A bracket class or a brace list: either way, any name can follow.
+      pattern += ".*";
+      i = close;
+    } else pattern += ch.replace(/[.+^$()|\\[\]{}]/g, "\\$&");
+  }
+  return new RegExp(`${pattern}$`);
+}
+
+const mvOperandVerdicts = new Map();
+
+/**
+ * True when an `mv` operand names, contains or sits inside a protected tree,
+ * or is a system root itself. `~`/`$HOME` are expanded and a relative operand
+ * is read from the hook's working directory. An operand holding a variable, a
+ * command substitution, `~user` or a find/xargs `{}` placeholder can stand
+ * for any path, so it is refused. A `.kimi-code` component, or a dot-glob
+ * that can match it, counts wherever it is; any other glob stands for any
+ * name in its literal directory. Verdicts are cached for the readings of one
+ * command.
+ */
+function mvTouchesProtected(operand) {
+  if (!mvOperandVerdicts.has(operand)) mvOperandVerdicts.set(operand, mvOperandProtected(operand));
+  return mvOperandVerdicts.get(operand);
+}
+
+function mvOperandProtected(operand) {
+  const home = (process.env.HOME || "/home/kimi").replace(/(.)\/+$/, "$1");
+  const text = operand.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, home);
+  if (/[$`]/.test(text) || text.startsWith("~") || text.includes("{}")) return true;
+  if (/(?:^|\/)\.kimi-code(?:\/|$)/.test(text)) return true;
+  const roots = mvProtectedRoots();
+  const glob = [...text].findIndex((ch) => "*?[]{}".includes(ch));
+  if (glob !== -1) {
+    const dotGlob = text.split("/").some((part) => part.startsWith(".") &&
+      /[*?[\]{}]/.test(part) && globComponentRegex(part).test(".kimi-code"));
+    if (dotGlob) return true;
+    const prefix = text.slice(0, glob);
+    const directory = prefix.endsWith("/") ? resolvePath(prefix) : dirname(resolvePath(`${prefix}x`));
+    return roots.some((root) => directory === "/" || root === directory ||
+      root.startsWith(`${directory}/`) || directory.startsWith(`${root}/`));
+  }
+  const resolved = resolveExistingPrefix(resolvePath(text));
+  if (resolved === null) return true;
+  if (resolved === "/" || SYSTEM_ROOTS.includes(resolved)) return true;
+  return roots.some((root) => resolved === root || resolved.startsWith(`${root}/`) ||
+    root.startsWith(`${resolved}/`));
+}
+
+function checkMoveAndTarDeletion(text) {
+  for (const match of text.matchAll(MV_CALL)) {
+    const hit = mvOperands(match[1]).find(mvTouchesProtected);
+    if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
+  }
+  for (const match of text.matchAll(TAR_CALL)) {
+    const tar = tarInvocation(match[1]);
+    if (!tar.removeFiles) continue;
+    if (tar.unverifiable) return "tar --remove-files over a member list the guard cannot verify";
+    if (tar.members.length === 0) return "tar --remove-files without an explicit member";
+    if (!tar.members.every(isSafeTempPath)) return outsideTempReason("tar --remove-files", tar.members);
+  }
+  return null;
+}
+
 /** Read a quoted first argument starting after a call's `(`; null if it is not a literal. */
 function quotedFirstArgument(code, from) {
   let i = from;
@@ -626,6 +856,7 @@ function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
     checkRsyncDeletion(text) ??
+    checkMoveAndTarDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
     checkDecodedPipe(text);
@@ -1168,6 +1399,7 @@ function evaluate(command) {
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
       checkRawShapes(joined) ??
+      checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {

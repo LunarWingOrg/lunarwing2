@@ -4011,7 +4011,8 @@ auto-approval:
   uncommitted work, SSH agent use (the `/tmp/ssh-agent` mount path, the
   `SSH_AUTH_SOCK` variable and `ssh-add`), and deletion outside temp roots by
   `rm`, `find -delete`, `find -exec`/`-ok` with `rm`, `unlink`, `rmdir` or
-  `shred`, `xargs rm`, `rsync --delete`/`--remove-source-files`, or a Python,
+  `shred`, `xargs rm`, `rsync --delete`/`--remove-source-files`, an `mv` of
+  the guard's own trees, every member of `tar --remove-files`, or a Python,
   Perl, Ruby or Node one-liner. Every rule is checked on the original text and
   again on a shell-word view that drops quote characters and one level of
   backslash escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the
@@ -4034,10 +4035,24 @@ auto-approval:
   shapes use the same temp-root test as `rm`: the `find` start paths, the
   `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
   deleted set is unknown and the call is denied), the `rsync` destination for
-  `--delete` and its sources for `--remove-source-files`, every operand of a
-  Perl deletion's comma list, and the first argument of a
+  `--delete` and its sources for `--remove-source-files`, `tar --remove-files`' members (WI#849; a
+  `-T`/`--files-from` list is unverifiable and denies, and a relative member
+  — such as one below `-C` — is refused like every relative operand), every
+  operand of a Perl deletion's comma list, and the first argument of a
   `rmtree`/`rmSync`/`unlink`-style call in another interpreter one-liner (a
-  non-literal argument is denied as unverifiable). That shared
+  non-literal argument is denied as unverifiable). A rename is held to a
+  narrower test (WI#849): an `mv` whose source or destination names, contains
+  or sits inside the guard's own trees (`/home/kimi/.kimi-code`, `/app`, and
+  `$KIMI_CODE_HOME`), or is a system root itself, is denied, because it moves
+  a protected tree out of place and a later `rm -rf` of the new temp name
+  would be trivially legal; `~`/`$HOME` are expanded, an operand holding a
+  variable, a command substitution, `~user` or a find/xargs `{}` placeholder
+  is refused because it can stand for any path, a `.kimi-code` component or
+  a dot-glob that can match it counts wherever it appears, and any other glob
+  stands for any name in its literal directory. GNU long-option prefixes
+  (`--t=` for `--target-directory`) are read. Ordinary renames, a
+  workspace `mv a b` or `git mv`, pass, and the command word is read like
+  `rm`'s (`\mv`, `"mv"`). That shared
   test judges the **resolved** path (WI#830, from WI#812): each target's
   longest existing prefix and each safe root are passed through `realpath`
   (symlinks followed, not-yet-existing trailing components re-attached), and a
@@ -4109,8 +4124,11 @@ auto-approval:
   other rules, this one reads quoted text too, so a command that only
   mentions `git config include.path` can be refused.
   What remains to the container, named as accepted residuals: deletion by a
-  utility this hook does not classify (`mv` into a removed directory, `truncate`
-  on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
+  utility this hook does not classify (`truncate` on a file, `install`, `dd` to
+  a file, `sed -i`, an `mv` or `tar` behind a variable command word, a
+  rename by `rename` or an interpreter, an `mv` of a relative operand without
+  a `.kimi-code` name after a `cd` into a protected tree or its parent), an
+  interpreter body that is
   not one of the classified deletion or decode shapes (`os.system("rm …")`, a
   script file rather than a `-e`/`-c` one-liner, a language other than Python,
   Perl, Ruby or Node), a decoder this list does not name (`uudecode`, `bsdcat`,
