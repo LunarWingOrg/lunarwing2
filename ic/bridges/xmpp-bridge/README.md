@@ -50,8 +50,21 @@ the bridge starts before `lunarwing run`. The bridge unit declares
 - `POST /v1/configure`
 - `GET /v1/status`
 - `POST /v1/outbound-rate-limit`
-- `GET /v1/messages?cursor=<n>`
+- `GET /v1/messages?cursor=<n>&limit=<n>`
 - `POST /v1/messages/send`
+
+`GET /v1/messages` returns a bounded page: `limit` defaults to 64 and is
+clamped to 100 so one page always fits inside the daemon's per-callback emit
+limit. The response `cursor` is the cursor of the last message in the page (or
+the request cursor when the page is empty), so pollers must persist it verbatim
+and poll again to drain the rest of a larger backlog. Returning the newest
+cursor instead parked the channel on a backlog larger than one page and left
+inbound XMPP wedged after an upgrade (WI#850).
+
+The cursor sequence is per bridge process. If a poller presents a cursor above
+the bridge's current cursor (a bridge restart reset the sequence), the response
+carries the bridge's current cursor so the poller resynchronizes instead of
+waiting forever behind a cursor that can never be reached.
 
 When `XMPP_BRIDGE_TOKEN` is set, requests must include `Authorization: Bearer <token>`.
 The server also rejects non-loopback clients.
