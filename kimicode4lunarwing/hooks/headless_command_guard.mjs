@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { runInNewContext } from "node:vm";
 
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
@@ -32,6 +34,11 @@ import { runInNewContext } from "node:vm";
 
 const MAX_COMMAND_CHARS = 16384;
 const RM_SAFE_TEMP_ROOTS = ["/tmp", "/temp", "/var/tmp"];
+// Characters that make bash rewrite a word before the deleting command sees
+// it: parameter and command expansion, quote removal, globs and brace lists.
+// An operand is read as the literal argument, so a word carrying any of them
+// would be checked in one shape and deleted in another (WI#830, from WI#812).
+const RM_SHELL_EXPANDED_CHARS = "$`'\"*?[]{}";
 
 function deny(reason) {
   process.stderr.write(`headless-guard: denied — ${reason}\n`);
@@ -63,15 +70,70 @@ function rmOperands(words, endOfOptions) {
 }
 
 /**
- * The containment test shared by every deletion rule (WI#826): a target is
- * provably inside the temp roots only as a literal path, with no expansion,
- * no `..` segment and no glob.
+ * The containment test shared by every deletion rule (WI#826, WI#830): a
+ * target is provably inside the temp roots only as a literal absolute path,
+ * with no expansion, no `..` segment and no glob, whose *resolved* form is
+ * under a resolved root. Resolving is what makes a symlink under a temp root
+ * useless as a bridge to somewhere else (WI#812, WI#830).
  */
 function isSafeTempPath(operand) {
-  if (operand.length === 0 || operand.startsWith("$") || operand.includes("..")) return false;
-  if (operand.includes("*") || operand.includes("?") || operand.includes("[")) return false;
-  return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
+  if (!operand.startsWith("/") || operand.includes("..")) return false;
+  for (const ch of operand) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch)) return false;
+  }
+  const resolved = resolveExistingPrefix(operand);
+  if (resolved === null) return false;
+  return RM_RESOLVED_SAFE_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`));
 }
+
+/**
+ * Resolve the longest existing prefix of a path, following symlinks, and
+ * re-attach the components that do not exist yet: a deletion removes those
+ * names rather than traversing them, so there is no symlink to follow there.
+ * Returns null when the prefix cannot be resolved (symlink loop, permission
+ * error), or when a component exists but is a symlink that does not resolve:
+ * its target can be created before the deletion runs, and the name below it
+ * would then be removed through the link.
+ */
+function resolveExistingPrefix(target) {
+  // A trailing slash makes every filesystem call follow the final component,
+  // which hides a dangling link from the check below; realpath treats the two
+  // spellings the same otherwise.
+  let prefix = target.replace(/(.)\/+$/, "$1");
+  const missing = [];
+  for (;;) {
+    try {
+      const resolved = realpathSync.native(prefix);
+      if (missing.length === 0) return resolved;
+      const base = resolved.endsWith("/") ? resolved : `${resolved}/`;
+      return `${base}${missing.reverse().join("/")}`;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return null;
+      if (isDanglingSymlink(prefix)) return null;
+      const parent = dirname(prefix);
+      if (parent === prefix) return null;
+      missing.push(basename(prefix));
+      prefix = parent;
+    }
+  }
+}
+
+function isDanglingSymlink(target) {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Both sides are resolved: a temp root can itself be a symlink (macOS /tmp),
+ * and a target can reach a root through one. A root that cannot be resolved
+ * is dropped, so a broken root can only deny.
+ */
+const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
+  .map((root) => resolveExistingPrefix(root))
+  .filter((root) => root !== null);
 
 /** Split a command tail into bash words (space and tab only). */
 function argumentWords(rest) {
@@ -174,6 +236,16 @@ function isRmLongDeleteOption(word) {
   return option !== undefined && ("--recursive".startsWith(option) || "--force".startsWith(option));
 }
 
+/** True when an `rm` argument text carries a recursive or forced flag. */
+function rmDeleteOption(rest) {
+  const words = rest.split(/[ \t]+/);
+  const endOfOptions = words.indexOf("--");
+  const optionWords = endOfOptions === -1 ? words : words.slice(0, endOfOptions);
+  // Keep the conservative flag test as well as GNU abbreviations.
+  return /(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) ||
+    optionWords.some(isRmLongDeleteOption);
+}
+
 function checkRm(segment) {
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
@@ -184,10 +256,7 @@ function checkRm(segment) {
   // Bash splits words on space and tab here, not JS's broader whitespace set.
   const words = rest.split(/[ \t]+/);
   const endOfOptions = words.indexOf("--");
-  const optionWords = endOfOptions === -1 ? words : words.slice(0, endOfOptions);
-  // Keep the existing conservative flag checks as well as GNU abbreviations.
-  if (!/(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) &&
-      !optionWords.some(isRmLongDeleteOption)) return null;
+  if (!rmDeleteOption(rest)) return null;
   const operands = rmOperands(words, endOfOptions)
     // `xargs -I {}` fills the placeholder from its input; the feeding find
     // paths are what checkXargsDeletion classifies (WI#826).
@@ -196,7 +265,7 @@ function checkRm(segment) {
     return fromXargs ? null : "rm -r/-f without an explicit operand";
   }
   if (!operands.every(isSafeTempPath)) {
-    return `recursive/forced rm outside ${RM_SAFE_TEMP_ROOTS.join(", ")}: ${operands.join(" ").slice(0, 80)}`;
+    return outsideTempReason("rm", operands);
   }
   return null;
 }
@@ -769,12 +838,49 @@ function checkRmAssembly(command) {
   return null;
 }
 
+// A symbolic link created anywhere in the same command line makes containment
+// unverifiable for that line: the link does not exist at check time, so a
+// recursive or forced deletion below it resolves as a name to be created and
+// bash then removes through the link (WI#830 AIT-1, from WI#812 review).
+const LINK_CREATORS = new Set(["ln", "cp"]);
+const SYMLINK_FLAG = /^-[a-zA-Z]*s[a-zA-Z]*$|^--symbolic(?:-link)?$/;
+
+/** True when a segment runs `ln`/`cp` with a symbolic-link flag. */
+function createsSymbolicLink(segment) {
+  const words = argumentWords(segment).map(stripShellQuotes);
+  for (let i = 0; i < words.length; i++) {
+    if (!LINK_CREATORS.has(commandBasename(words[i]))) continue;
+    for (let j = i + 1; j < words.length && !/^[;&|]/.test(words[j]); j++) {
+      if (SYMLINK_FLAG.test(words[j])) return true;
+      // A word that is not an option starts the operands; keep scanning, a
+      // later flag is still ln's (`ln a b -s` is accepted by GNU ln).
+    }
+  }
+  return false;
+}
+
+/** Deny a recursive or forced deletion in a line that also creates a symlink. */
+function checkSameLineLink(command) {
+  const readings = new Set(JOIN_READINGS.map(([outside, inside]) => joinLineContinuations(command, outside, inside)));
+  for (const reading of readings) {
+    const view = shellWordView(reading);
+    if (!createsSymbolicLink(view)) continue;
+    for (const segment of commandSegments(view)) {
+      const rest = /\brm[ \t]+(.*)$/s.exec(segment)?.[1];
+      if (rest !== undefined && rmDeleteOption(rest)) {
+        return "recursive/forced rm in a command line that also creates a symbolic link; use a separate call";
+      }
+    }
+  }
+  return null;
+}
+
 // The CLI can allow a hook that misses its 10 s deadline. Interrupt our own
 // synchronous classifier much earlier, including any legacy regex checks.
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command) {
-  return evaluate(command) ?? checkRmAssembly(command);
+  return evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
 }
 
 async function main() {

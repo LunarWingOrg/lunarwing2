@@ -4026,7 +4026,29 @@ auto-approval:
   `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
   deleted set is unknown and the call is denied), and the first quoted
   argument of a `rmtree`/`rmSync`/`unlink`-style call in an interpreter
-  one-liner (a non-literal argument is denied as unverifiable). The git
+  one-liner (a non-literal argument is denied as unverifiable). That shared
+  test judges the **resolved** path (WI#830, from WI#812): each target's
+  longest existing prefix and each safe root are passed through `realpath`
+  (symlinks followed, not-yet-existing trailing components re-attached), and a
+  target that cannot be resolved denies. A symlink under `/tmp` therefore no
+  longer carries any deletion rule to its target, so
+  `find /tmp/<link>/ -mindepth 1 -delete` denies as
+  `rm -rf /tmp/<dir>/<link>/sub` does. A link that does not resolve yet also
+  denies: its target can be created before the deletion runs, which would then
+  remove through it. Deleting a link whose target is outside the temp roots
+  denies even though only the link would go, and a link that resolves back
+  inside the roots stays allowed. Words bash rewrites after the hook — `$`,
+  backticks, quotes, globs, brace lists — and relative or `~` operands are
+  refused before resolving, because the hook would otherwise check one shape
+  and the deletion remove another; this is where a brace-list operand is
+  contained (`rm -rf {/tmp/x,/home/kumo}` denies). Names the deletion creates
+  rather than traverses are still allowed inside a temp root. One residual of
+  the same class remains (WI#830 AIT-1): a link created **earlier in the same
+  command line** does not exist at check time, so it cannot be resolved. A
+  recursive or forced `rm` in a line that also creates a symbolic link
+  (`ln -s`, `ln --symbolic`, `cp -s`, `cp --symbolic-link`) is therefore
+  denied outright; other ways of creating a link in the same line, and a
+  `find`/`xargs`/one-liner deletion in such a line, are the residual. The git
   commands are recorded as denied because the loss is irrecoverable; `git
   clean -n`, `git stash` without `-u`, `git restore` and `git status` stay
   ordinary work. What remains to the container: interpreter bodies that are
@@ -4105,9 +4127,9 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
-The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826
-and WI#829 only after rebuilding the image with the fix and recreating their
-workers; see
+The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
+WI#829 and WI#830 only after rebuilding the image with the fix and recreating
+their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
