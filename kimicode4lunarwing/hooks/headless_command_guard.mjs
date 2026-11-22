@@ -691,21 +691,15 @@ function isSystemRootPath(candidate) {
  * spelled. A linear scan, not a regex: the regex form rescanned the rest of
  * the command from every `chmod` and took ten seconds on 12 KB of them.
  */
-function recursiveRootChangeIn(text) {
-  for (const match of text.matchAll(ROOT_CHANGE_CALL)) {
-    const rest = text.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
+function checkRecursiveRootChange(segment) {
+  for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
+    const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
     if (!/(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?=[ \t]|$)/.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
     }
   }
   return false;
-}
-
-function checkRecursiveRootChange(segment) {
-  if (recursiveRootChangeIn(segment)) return true;
-  const view = shellPunctuationView(segment);
-  return view !== segment && recursiveRootChangeIn(view);
 }
 
 /** The git verb after any leading options, and the argument text after it. */
@@ -756,9 +750,9 @@ function hasGitLongOption(text, options) {
  * untracked or ignored files. Long options are read by any GNU-unambiguous
  * prefix, like the `rm` rules (WI#841). Linear scan over the git invocations.
  */
-function gitDiscardIn(text) {
-  for (const match of text.matchAll(GIT_CALL)) {
-    const { verb, after } = gitVerb(text.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
+function checkGitDiscard(segment) {
+  for (const match of segment.matchAll(GIT_CALL)) {
+    const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
     const dryRun = hasShortFlag(after, "n") || hasGitLongOption(after, ["--dry-run"]);
     if (verb === "clean" && !dryRun &&
         (hasShortFlag(after, "fdxX") || hasGitLongOption(after, ["--force"]))) {
@@ -778,12 +772,6 @@ function gitDiscardIn(text) {
     }
   }
   return false;
-}
-
-function checkGitDiscard(segment) {
-  if (gitDiscardIn(segment)) return true;
-  const view = shellPunctuationView(segment);
-  return view !== segment && gitDiscardIn(view);
 }
 
 /** The command word of a pipeline stage, after env/exec/busybox prefixes. */
@@ -991,11 +979,14 @@ function evaluate(command) {
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
   // rule on the joined text, on its lexically normalised absolute paths and
   // on the word view bash builds, the same three readings rm uses (WI#813,
-  // WI#826).
+  // WI#826). An extra quote-preserving reading separates the shell
+  // punctuation bash glues to a word, so `(git reset --hard)` and
+  // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
+      checkDenyRulesEverywhere(shellPunctuationView(joined)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
       checkRawShapes(joined) ??
