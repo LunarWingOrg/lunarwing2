@@ -769,14 +769,14 @@ function gitConfigOperands(after) {
 
 /**
  * True when a `git config` call names an alias key (WI#842): the classic
- * `git config alias.z …` form, the modern `set` subcommand
+ * `git config alias.z …` form, the modern `set`/`get` subcommands
  * (`git config set alias.z …`), or a section rename into `alias`
  * (`git config rename-section foo alias`). Reads are refused with the writes;
  * only other keys stay ordinary config work.
  */
 function gitConfigAliasVerdict(after) {
   const operands = gitConfigOperands(after);
-  if (operands[0] === "set") return /^alias\./.test(operands[1] ?? "");
+  if (operands[0] === "set" || operands[0] === "get") return /^alias\./.test(operands[1] ?? "");
   if (operands[0] === "rename-section") {
     return operands.slice(1, 3).some((name) => /^alias(?:\.|$)/.test(name));
   }
@@ -786,9 +786,9 @@ function gitConfigAliasVerdict(after) {
 /**
  * True when a git invocation would define an alias (WI#842): an inline
  * `-c`/`--config-env` alias assignment, or a `git config` call naming an
- * `alias.*` key (the classic form, the `set` subcommand, or a section rename
- * into `alias`). An alias name is an arbitrary verb, so the discard rules
- * cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
+ * `alias.*` key (the classic form, the `set`/`get` subcommands, or a section
+ * rename into `alias`). An alias name is an arbitrary verb, so the discard
+ * rules cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
  * the unknown verb `z`. Refusing the definition is the cheap, complete fix
  * for the shell-visible spellings; an alias already present in repo config,
  * which the guard cannot read cheaply, stays an accepted residual.

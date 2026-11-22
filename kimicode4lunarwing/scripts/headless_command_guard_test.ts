@@ -1028,6 +1028,7 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   // git's modern config subcommands write the same key: `set` names it after
   // the subcommand, and `rename-section foo alias` turns a section into aliases.
   assertBlocked("git config set alias.z 'reset --hard'", "git command")
+  assertBlocked("git config get alias.z", "git command")
   assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
   assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
   assertBlocked("git config rename-section foo alias", "git command")
