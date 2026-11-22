@@ -9,6 +9,7 @@ they never touch a tenant.
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import unittest
 from unittest import mock
@@ -240,6 +241,48 @@ class TargetTests(unittest.TestCase):
         with mock.patch.object(probe, "open", mock.mock_open(read_data="tok\n"), create=True):
             with self.assertRaises(probe.ProbeError):
                 probe.resolve_target(args)
+
+
+class SourceContractTests(unittest.TestCase):
+    """The record is rendered by Rust and parsed here; drift must fail a test.
+
+    `log_turn_finished` is the one writer of the line, and these tests are the
+    one reader outside it. If a field is renamed or dropped on either side the
+    probe would silently find nothing, so the names are pinned against the
+    source rather than against a fixture.
+    """
+
+    OUTCOME_RS = ROOT / "ic" / "src" / "bridge" / "router" / "outcome.rs"
+
+    def turn_finished_block(self):
+        source = self.OUTCOME_RS.read_text(encoding="utf-8")
+        body = source.split("fn log_turn_finished", 1)[1]
+        block = body.split("tracing::info!(", 1)[1]
+        return block.split("\n        );", 1)[0]
+
+    def test_every_field_the_probe_requires_is_emitted(self):
+        block = self.turn_finished_block()
+        for name in probe.REQUIRED_FIELDS:
+            assigned = re.search(rf"\b{name}\s*=", block)
+            shorthand = re.search(rf"(?:^|[\s(,])\b{name}\s*,", block, re.MULTILINE)
+            self.assertTrue(
+                assigned or shorthand,
+                f"log_turn_finished no longer emits the field '{name}'",
+            )
+
+    def test_no_field_the_probe_reads_is_renamed_away(self):
+        self.assertEqual(
+            set(probe.REQUIRED_FIELDS),
+            {
+                "thread_id",
+                "phase",
+                "tool_calls",
+                "budget_secs",
+                "budget_exhausted",
+                "elapsed_ms",
+                "outcome",
+            },
+        )
 
 
 if __name__ == "__main__":
