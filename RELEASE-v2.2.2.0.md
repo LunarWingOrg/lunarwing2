@@ -15,7 +15,8 @@ into `aragents/kimil00p/v2.2.2.0` since the tag `v2.2.1.0`
 [`docs/releases/RELEASE-v2.2.1.0.md`](docs/releases/RELEASE-v2.2.1.0.md).
 Every statement about a mechanism was checked against the tree at
 `c7aab1ae47a22bc98d9a5a8990329043e7c83242` (the branch tip when this draft was
-written), not against a commit message or a merge-request description. The
+written), or against the committed operations record where a run is cited —
+never against a commit message or a merge-request description. The
 section-by-section record of what each statement was checked against, and the
 disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 
@@ -143,11 +144,18 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   `0472d115…`, and a bump of either is its own item.
 - **A kimi task can no longer start service mode or re-enable remote control
   (WI#833).** `kimi` is on `PATH`, so a task's Bash tool could start
-  `kimi server`/`kimi web` itself. The baked `PreToolUse` guard now denies
-  those spellings (and the listener spellings around them) with exit 2 before
-  the process starts, and the task executor refuses the remote-control relay
-  variable, auto-update and telemetry. A mock-provider run saw no listener
-  from the kimi process or its children at any tick.
+  `kimi server`/`kimi web` itself. The baked `PreToolUse` hook now denies those
+  subcommands, plus a closed list of listener tools (`python -m http.server`,
+  `nc`/`ncat`/`netcat -l`, `socat TCP-LISTEN`, `busybox httpd`, `php -S`,
+  `ruby -run -e httpd`), with exit 2 before the process starts; a print-mode
+  prompt whose text is `server` or `web` is still data. The executor drops
+  every task-supplied `KIMI_CODE_*` value that is not on its allowlist, strips
+  the remote-control relay URL, keeps `KIMI_CODE_HOME` worker-owned, and leaves
+  auto-update and telemetry disabled. The hook does not resolve dynamic command
+  names or recognize every program that can listen; the container's network
+  policy remains the boundary. The change needs a rebuilt kimi image and a
+  recreated worker, and the guide's bump checklist now asks for the new
+  `KIMI_CODE_*` names and subcommands to be re-read on every bump.
 - **The kimi guard's deletion rules are hard to walk past (WI#840).** An
   escaped quote before a Perl deletion operand no longer defeats the
   `PERL_BAREWORD_DELETE` rule, so `rmtree`/`unlink`/`rmdir` spellings reached
@@ -376,11 +384,12 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   startup contract (WI#804, WI#796, WI#833, WI#840).** The bump checklist, the
   guard's listener rules and the `start-worker` status table are the versions
   this tree implements.
-- **Small corrections.** The four guide version stamps the 2.2.1 sweep left
-  behind, a false dispositions sentence and the Wasmtime "held" wording were
-  corrected (WI#827). The deny-guard README sentence, the finished-message
-  memory window and the `cpu_shares` schema description were corrected
-  (WI#820).
+- **Small corrections.** Three guide version stamps the 2.2.1 sweep left
+  behind (SSH tool testing, the vision OCR sidecar and the gotify guide) and a
+  false dispositions sentence now name the current versions and state that
+  WI#799 refreshed the baseline in the same merge request (WI#827). The
+  deny-guard README sentence, the finished-message memory window and the
+  `cpu_shares` schema description were corrected (WI#820).
 
 ## Compatibility
 
@@ -398,9 +407,11 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 | Advisory baseline | 23 accepted IDs, all owned by the standing record; no Wasmtime ignore; RUSTSEC-2026-0587 cleared by `wasmtime-wasi 36.0.23`; audit true at advisory-db `55e1c3df` |
 | CI | `cargo-deny 0.20.2`, `cargo-audit 0.23.0`, 27 tracked non-vendor lock roots; `wasm-tools-check` blocks on every production WASM tool |
 
-A `2.2.2` patch bump changes no wire or database contract. The capability
-manifest is opt-in per call, the git grant is off without `SANDBOX_GIT_REMOTES`,
-and estimation is observe-only until an operator sets a flag.
+No database migration is added by this release, and no existing wire or
+database contract changes. The estimation routes are additive and read-only,
+the capability manifest is opt-in per call, the git grant is off without
+`SANDBOX_GIT_REMOTES`, and estimation is observe-only until an operator sets a
+flag.
 
 Registry bumps require rebuilt WASM artifacts. Rebuild every enabled worker
 image through the protected candidate, scan and promotion path; local builds
