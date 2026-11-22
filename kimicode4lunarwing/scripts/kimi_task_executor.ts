@@ -8,7 +8,15 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
-import { chownSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs"
+import {
+  chownSync,
+  lstatSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from "node:fs"
 
 import { isAbsolute, join } from "node:path"
 
@@ -238,6 +246,7 @@ function restoreTrustedMcpConfig(taskId: string): void {
     `[kimi executor] restored the trusted user-level ${MCP_CONFIG_FILE} before task ${taskId}; the on-disk file differed from the entrypoint's registration (WI#848)`,
   )
 }
+
 function workspaceRoot(): string {
   return process.env.WORKSPACE_ROOT || "/workspace"
 }
