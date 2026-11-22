@@ -4025,9 +4025,10 @@ auto-approval:
   shapes use the same temp-root test as `rm`: the `find` start paths, the
   `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
   deleted set is unknown and the call is denied), the `rsync` destination for
-  `--delete` and its sources for `--remove-source-files`, and the first
-  argument of a `rmtree`/`rmSync`/`unlink`-style call in an interpreter
-  one-liner (a non-literal argument is denied as unverifiable). That shared
+  `--delete` and its sources for `--remove-source-files`, every operand of a
+  Perl deletion's comma list, and the first argument of a
+  `rmtree`/`rmSync`/`unlink`-style call in another interpreter one-liner (a
+  non-literal argument is denied as unverifiable). That shared
   test judges the **resolved** path (WI#830, from WI#812): each target's
   longest existing prefix and each safe root are passed through `realpath`
   (symlinks followed, not-yet-existing trailing components re-attached), and a
@@ -4053,8 +4054,11 @@ auto-approval:
   one-liner reader finds the eval flag after any number of options
   (`perl -MFile::Path -e …`), follows a deletion name bound by
   `from … import … as …`, `import … as …` or `x = shutil.rmtree`, resolves
-  `getattr(module, 'rmtree')`, and reads Perl's parenthesis-free
-  `rmtree "dir"` / `unlink glob "dir/*"`. The decode side counts
+  `getattr(module, 'rmtree')`, and reads Perl's `rmtree "dir"` /
+  `unlink glob "dir/*"` deletion calls with or without parentheses, including
+  every operand of a comma list; the `\"` and `\\` escapes a wrapping
+  double-quoted shell word removes are unescaped first, because Perl never
+  sees the backslashes (WI#840). The decode side counts
   `base64 -d`, `xxd -r`, `rev`, `openssl base64 -d`, the decompressors
   (`gzip`, `zcat`, `bzip2`, `xz`, `zstd`, with their `*cat`/`un*` forms),
   `printf` with `\x`/octal escapes, a `perl`/`python3` base64 one-liner, and
