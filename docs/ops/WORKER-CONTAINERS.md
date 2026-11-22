@@ -4085,8 +4085,9 @@ auto-approval:
   An alias is refused before the verb is read (WI#842): an inline
   `-c alias.<name>=…` or `--config-env=alias.<name>=…`, the
   `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS` environment spellings of the same
-  `-c`, and a `git config` call naming an `alias.*` key all deny, because the
-  alias name is an arbitrary verb the rules have never seen
+  `-c`, and a `git config` call that names an `alias.*` key (the classic form
+  or the `set` subcommand) or renames a section into `alias` all deny, because
+  the alias name is an arbitrary verb the rules have never seen
   (`git -c alias.z='reset --hard' z`). An alias already present in repo
   config the guard cannot read cheaply remains an accepted residual; the
   write that plants it is refused.

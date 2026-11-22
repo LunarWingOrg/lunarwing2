@@ -751,25 +751,43 @@ function hasGitAliasEnv(segment) {
   return false;
 }
 
-/** The `<name>` operand of a `git config` call, after option/value pairs. */
-function gitConfigKey(after) {
+/** The name operands of a `git config` call, after options and their values. */
+function gitConfigOperands(after) {
   const words = argumentWords(after);
   const valueOptions = ["--file", "-f", "--type", "--default", "--blob"];
+  const operands = [];
   for (let i = 0; i < words.length; i++) {
     if (valueOptions.includes(words[i])) {
       i++;
       continue;
     }
     if (words[i].startsWith("-")) continue;
-    return stripShellQuotes(words[i]);
+    operands.push(stripShellQuotes(words[i]));
   }
-  return "";
+  return operands;
+}
+
+/**
+ * True when a `git config` call names an alias key (WI#842): the classic
+ * `git config alias.z …` form, the modern `set` subcommand
+ * (`git config set alias.z …`), or a section rename into `alias`
+ * (`git config rename-section foo alias`). Reads are refused with the writes;
+ * only other keys stay ordinary config work.
+ */
+function gitConfigAliasVerdict(after) {
+  const operands = gitConfigOperands(after);
+  if (operands[0] === "set") return /^alias\./.test(operands[1] ?? "");
+  if (operands[0] === "rename-section") {
+    return operands.slice(1, 3).some((name) => /^alias(?:\.|$)/.test(name));
+  }
+  return /^alias\./.test(operands[0] ?? "");
 }
 
 /**
  * True when a git invocation would define an alias (WI#842): an inline
  * `-c`/`--config-env` alias assignment, or a `git config` call naming an
- * `alias.*` key. An alias name is an arbitrary verb, so the discard rules
+ * `alias.*` key (the classic form, the `set` subcommand, or a section rename
+ * into `alias`). An alias name is an arbitrary verb, so the discard rules
  * cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
  * the unknown verb `z`. Refusing the definition is the cheap, complete fix
  * for the shell-visible spellings; an alias already present in repo config,
@@ -786,7 +804,7 @@ function gitAliasDefinition(rest) {
     if (/^alias\./.test(value)) return true;
   }
   const { verb, after } = gitVerb(rest, 0);
-  return verb === "config" && /^alias\./.test(gitConfigKey(rest.slice(after)));
+  return verb === "config" && gitConfigAliasVerdict(rest.slice(after));
 }
 
 /** True when any short flag cluster in the text carries one of the letters. */
