@@ -79,8 +79,13 @@ impl SeriesStats {
 /// [`PendingGateStore`]: super::store::PendingGateStore
 #[derive(Debug, Default)]
 pub struct GateWaitAnalytics {
-    series: Mutex<BTreeMap<(&'static str, GateWaitOutcome), SeriesStats>>,
-    dropped: Mutex<u64>,
+    state: Mutex<WaitState>,
+}
+
+#[derive(Debug, Default)]
+struct WaitState {
+    series: BTreeMap<(&'static str, GateWaitOutcome), SeriesStats>,
+    dropped: u64,
 }
 
 impl GateWaitAnalytics {
@@ -94,29 +99,31 @@ impl GateWaitAnalytics {
     pub fn record(&self, channel: &str, outcome: GateWaitOutcome, waited: Duration) {
         let waited = waited.min(Duration::from_secs(86_400));
         let family = channel_family(channel);
-        let Ok(mut series) = self.series.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if !series.contains_key(&(family, outcome)) && series.len() >= MAX_SERIES {
-            if let Ok(mut dropped) = self.dropped.lock() {
-                *dropped = dropped.saturating_add(1);
-            }
+        if !state.series.contains_key(&(family, outcome)) && state.series.len() >= MAX_SERIES {
+            state.dropped = state.dropped.saturating_add(1);
             return;
         }
-        series.entry((family, outcome)).or_default().observe(waited);
+        state
+            .series
+            .entry((family, outcome))
+            .or_default()
+            .observe(waited);
     }
 
     pub fn diagnostics(&self) -> GateWaitDiagnostics {
-        let dropped = self.dropped.lock().map_or(0, |dropped| *dropped);
-        let Ok(series) = self.series.lock() else {
+        let Ok(state) = self.state.lock() else {
             return GateWaitDiagnostics {
                 samples: 0,
-                dropped,
+                dropped: 0,
                 outcomes: Vec::new(),
                 note: NOTE,
             };
         };
-        let outcomes = series
+        let outcomes = state
+            .series
             .iter()
             .map(|(&(channel_family, outcome), stats)| GateWaitSeries {
                 channel_family: channel_family.to_owned(),
@@ -128,8 +135,8 @@ impl GateWaitAnalytics {
             })
             .collect();
         GateWaitDiagnostics {
-            samples: series.values().map(|stats| stats.samples).sum(),
-            dropped,
+            samples: state.series.values().map(|stats| stats.samples).sum(),
+            dropped: state.dropped,
             outcomes,
             note: NOTE,
         }
