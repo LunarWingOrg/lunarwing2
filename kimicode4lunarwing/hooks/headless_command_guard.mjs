@@ -637,6 +637,47 @@ const ROOT_CHANGE_CALL = /\bch(?:mod|own|grp)\b/g;
 const STAGE_PREFIXES = ["sudo", "env", "exec", "busybox"];
 const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
 
+/**
+ * The word view bash builds around shell punctuation (WI#853): an unquoted
+ * `(`, `)` or backtick ends the word around it, because a subshell, a `$(…)`
+ * or a backtick body runs a command of its own. A substitution and a backtick
+ * still run inside double quotes; text in single quotes is literal. Each
+ * syntax character becomes a space, so an option or path rule sees the end of
+ * its word (`--hard)` reads as `--hard `). A backslash-escaped character is
+ * kept as text. This is a reading, not a parser: it only adds matches.
+ */
+function shellPunctuationView(text) {
+  let view = "";
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      view += ch + text[++i];
+      continue;
+    }
+    if (quote === "'") {
+      view += ch;
+      if (ch === "'") quote = "";
+    } else if (ch === "'") {
+      quote = "'";
+      view += ch;
+    } else if (ch === '"') {
+      quote = quote === '"' ? "" : '"';
+      view += ch;
+    } else if (ch === "`") {
+      view += " ";
+    } else if (ch === "$" && text[i + 1] === "(") {
+      view += "  ";
+      i++;
+    } else if (ch === "(" || ch === ")") {
+      view += " ";
+    } else {
+      view += ch;
+    }
+  }
+  return view;
+}
+
 /** True for the filesystem root or a path at or under a listed system root. */
 function isSystemRootPath(candidate) {
   if (!candidate.startsWith("/")) return false;
@@ -650,15 +691,21 @@ function isSystemRootPath(candidate) {
  * spelled. A linear scan, not a regex: the regex form rescanned the rest of
  * the command from every `chmod` and took ten seconds on 12 KB of them.
  */
-function checkRecursiveRootChange(segment) {
-  for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
-    const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
+function recursiveRootChangeIn(text) {
+  for (const match of text.matchAll(ROOT_CHANGE_CALL)) {
+    const rest = text.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
     if (!/(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?=[ \t]|$)/.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
     }
   }
   return false;
+}
+
+function checkRecursiveRootChange(segment) {
+  if (recursiveRootChangeIn(segment)) return true;
+  const view = shellPunctuationView(segment);
+  return view !== segment && recursiveRootChangeIn(view);
 }
 
 /** The git verb after any leading options, and the argument text after it. */
@@ -709,9 +756,9 @@ function hasGitLongOption(text, options) {
  * untracked or ignored files. Long options are read by any GNU-unambiguous
  * prefix, like the `rm` rules (WI#841). Linear scan over the git invocations.
  */
-function checkGitDiscard(segment) {
-  for (const match of segment.matchAll(GIT_CALL)) {
-    const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
+function gitDiscardIn(text) {
+  for (const match of text.matchAll(GIT_CALL)) {
+    const { verb, after } = gitVerb(text.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
     const dryRun = hasShortFlag(after, "n") || hasGitLongOption(after, ["--dry-run"]);
     if (verb === "clean" && !dryRun &&
         (hasShortFlag(after, "fdxX") || hasGitLongOption(after, ["--force"]))) {
@@ -731,6 +778,12 @@ function checkGitDiscard(segment) {
     }
   }
   return false;
+}
+
+function checkGitDiscard(segment) {
+  if (gitDiscardIn(segment)) return true;
+  const view = shellPunctuationView(segment);
+  return view !== segment && gitDiscardIn(view);
 }
 
 /** The command word of a pipeline stage, after env/exec/busybox prefixes. */
