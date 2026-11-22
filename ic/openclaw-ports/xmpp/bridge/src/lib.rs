@@ -61,6 +61,11 @@ pub struct MessagesResponse {
     /// page is empty. Persist this verbatim: it advances only past the messages
     /// actually returned, so a backlog that did not fit in one page is fetched
     /// on the next poll instead of being skipped (WI#850).
+    ///
+    /// The bridge's cursor sequence is per-process. A request cursor above the
+    /// bridge's current cursor means the bridge restarted; the response then
+    /// carries the bridge's current cursor so the poller resynchronizes instead
+    /// of waiting behind a position that can never be reached.
     #[serde(default)]
     pub cursor: u64,
     #[serde(default)]
