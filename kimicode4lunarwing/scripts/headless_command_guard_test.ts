@@ -516,6 +516,71 @@ test("the probe commands of runs 500-505 stay ordinary work", () => {
   assertAllowed("rm -rf /tmp/x")
 })
 
+test("a task cannot start kimi service mode (WI#833)", () => {
+  // WI#833 point 1: `kimi` is on PATH in the worker image, and these three
+  // spellings started service mode — an HTTP API (sessions, :wait, /api/v1/kap.md,
+  // MCP management) that is a listener opened by a task (WI#357).
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  assertBlocked("kimi web --json", "kimi service mode")
+  assertBlocked("kimi server --port 9000 &", "kimi service mode")
+  assertBlocked("/usr/local/bin/kimi server", "kimi service mode")
+  assertBlocked("kimi --debug server", "kimi service mode")
+  // Through a wrapper, a prefix assignment, a shell one-liner and a loop body.
+  assertBlocked("bash -c 'kimi server'", "kimi service mode")
+  assertBlocked("bash -lc 'kimi web'", "kimi service mode")
+  assertBlocked("env KIMI_X=1 kimi web", "kimi service mode")
+  assertBlocked("cd /app && kimi server", "kimi service mode")
+  assertBlocked("for f in x; do kimi server; done", "kimi service mode")
+  assertBlocked("if true; then kimi server; fi", "kimi service mode")
+  assertBlocked("xargs -I {} kimi server", "kimi service mode")
+  // The subcommands the lane uses keep passing.
+  assertAllowed("kimi -p hello")
+  assertAllowed("kimi -p 'kimi server' --output-format stream-json")
+  assertAllowed("kimi --version")
+  assertAllowed("kimi chat")
+  assertAllowed("kimi mcp serve")
+  // Shell keywords, loops and wrapper flags do not deny ordinary work.
+  assertAllowed("for f in *.rs; do echo $f; done")
+  assertAllowed("if true; then cargo check; fi")
+  assertAllowed("bash -lc 'cargo check -j18'")
+  assertAllowed("find /tmp -print0 | xargs -0 -I {} rm -rf {}")
+  // Reading the words is not running them.
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("echo 'kimi web --json'")
+})
+
+test("a task cannot start any listed listener (WI#833)", () => {
+  // The hook had no listener rule at all, so fixing only the kimi subcommands
+  // would leave the class open (WI#833 study pass-394).
+  assertBlocked("python3 -m http.server 8080", "listener started from a task")
+  assertBlocked("python3 -m http.server 8080 &", "listener started from a task")
+  assertBlocked("nc -l -p 9000", "listener started from a task")
+  assertBlocked("ncat -l 9000", "listener started from a task")
+  assertBlocked("netcat -lp 9000", "listener started from a task")
+  assertBlocked("socat TCP-LISTEN:9000,fork -", "listener started from a task")
+  assertBlocked("busybox httpd -p 8080", "listener started from a task")
+  assertBlocked("php -S 0.0.0.0:8080", "listener started from a task")
+  assertBlocked("ruby -run -e httpd . -p 8080", "listener started from a task")
+  assertBlocked("echo hi | nc -l 9000", "listener started from a task")
+  // The same programs used as clients, or for their version, stay ordinary work.
+  assertAllowed("nc -zv host 80")
+  assertAllowed("curl -sf http://127.0.0.1:8080/health")
+  assertAllowed("php --version")
+  assertAllowed("ruby -v")
+  assertAllowed("socat -V")
+  assertAllowed("python3 -m pytest tests/ -q")
+  assertAllowed("python3 -m json.tool")
+})
+
+test("kimi print-mode prompt values are not service subcommands", () => {
+  assertAllowed("kimi -p server")
+  assertAllowed("kimi --prompt web")
+  assertAllowed("kimi --prompt='check web' --output-format stream-json")
+  assertAllowed('kimi -p "check web; list server notes" --output-format stream-json')
+  assertAllowed(`bash -c 'kimi -p "review web"'`)
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and

@@ -1232,6 +1232,18 @@ Enforced controls (opencode2 lane unless noted):
    adjacent remote-config path; its remaining boundary is the tenant egress
    allowlist, and an origin the worker cannot reach supplies nothing (it
    also needs a saved key credential). Re-check on each bump.
+   **kimi task-settable `KIMI_CODE_*` and new listeners (WI#833):** the
+   executor drops every task-supplied `KIMI_CODE_*` value that is not on
+   `TASK_SETTABLE_KIMI_CODE_ENV` (`scripts/kimi_task_executor.ts`), and the
+   guard hook denies `kimi server`/`kimi web` plus a closed listener verb
+   list (`python -m http.server`, `nc`/`ncat`/`netcat -l`, `socat
+   TCP-LISTEN`, `busybox httpd`, `php -S`, `ruby -run -e httpd`). On every
+   kimi bump, re-read the new dist's `KIMI_CODE_*` names and every new
+   subcommand: record, for each, whether a task may set it or whether it
+   opens a listener, and either add it to the deny/allowlist with a test or
+   say why the lane cannot take it. Unknown `KIMI_CODE_*` names are blocked
+   from task input by default; new listener commands are not covered until
+   the hook recognizes them.
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
@@ -2392,7 +2404,11 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   `GET /api/v1/kap.md`, and the move of MCP server/OAuth management to
   `/api/v1/mcp/*` are service-mode surfaces on a server the lane never starts
   (verified: no listener during a headless run). No new instruction channel
-  is reachable from `kimi -p`.
+  is reachable from `kimi -p`. **Corrected by WI#833:** that holds for the
+  lane, not for a task. `kimi` is on `PATH` (`Dockerfile:255`), so a task's
+  Bash tool could start service mode itself; the guard hook now denies
+  `kimi server` and `kimi web` (and the other listener spellings below) with
+  exit 2, pinned by `scripts/headless_command_guard_test.ts`.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
 - **ACP session preview restore, `/tasks`, the follow-up behavior setting,
@@ -4053,6 +4069,15 @@ it cannot resolve values from scripts, functions, or state set at runtime.
 The hook denies if its synchronous analysis exceeds two seconds, before the CLI's
 10-second hook timeout (which can allow a call). Rebuild the Kimi worker
 image and recreate the worker to pick up the updated hook.
+
+WI#833 adds a separate command-position check for Kimi's `server` and `web`
+subcommands and common listener tools. A print-mode prompt is data, even if
+its text is `server` or `web`. This check does not resolve dynamic command
+names or recognize every program that can listen; the container's network
+policy remains the boundary. The executor strips the relay URL and keeps
+`KIMI_CODE_HOME` worker-owned (or unset), regardless of task input. Auto-update
+and telemetry stay disabled. This change also requires a rebuilt Kimi worker
+image and a recreated worker.
 
 Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
