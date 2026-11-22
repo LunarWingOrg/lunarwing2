@@ -7,6 +7,7 @@
 
 mod cost;
 mod diagnostics;
+mod jobs;
 mod learner;
 mod llm;
 mod runtime;
@@ -18,6 +19,7 @@ pub use diagnostics::{
     BaselineComparison, CategoryPolicy, CategoryPolicySummary, EvaluationCategory,
     EvaluationMetrics, EvaluationSummary, EvaluationTrace, WarmupBaseline, WarmupSummary,
 };
+pub use jobs::{JOB_ESTIMATE_KIND_KEY, JobEstimateCounters, JobTimingView, LocalJobKind, job_key};
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
 pub use llm::{
     LlmModelDiagnostics, LlmTimingCounterSnapshot, LlmTimingDiagnostics, LlmTimingMode, LlmTimings,
@@ -33,6 +35,10 @@ use rust_decimal::Decimal;
 use std::time::Duration;
 
 const MAX_TOOL_NAME_BYTES: usize = 256;
+
+/// Valid completed samples a learned or historical timing needs before it may
+/// be shown (WI#318 A6.2): below this, timing stays withheld.
+pub const MIN_WARM_SAMPLES: u64 = learner::DEFAULT_MIN_SAMPLES;
 
 /// A completed execution paired with its *unadjusted* baselines and the
 /// duration prediction captured before execution. Unknown cost stays unknown.

@@ -4713,6 +4713,23 @@ function formatDuration(secs) {
   return h + 'h ' + (m % 60) + 'm';
 }
 
+// WI#318 C4: measured elapsed, an advisory historical duration and the
+// remaining time are shown as separate fields. Remaining is `unknown` for an
+// open-ended job; it is never invented from a max-iteration or timeout limit.
+function renderJobTiming(timing) {
+  if (!timing) return '';
+  let html = '';
+  if (timing.estimated_total_secs != null) {
+    html += metaItem('Typical completed run', formatDuration(timing.estimated_total_secs));
+  }
+  if (timing.remaining_secs != null) {
+    html += metaItem('Estimated remaining', formatDuration(timing.remaining_secs));
+  } else if (timing.remaining_status === 'unknown') {
+    html += metaItem('Remaining', 'unknown');
+  }
+  return html;
+}
+
 function renderJobOverview(container, job) {
   // Metadata grid
   const grid = document.createElement('div');
@@ -4723,6 +4740,7 @@ function renderJobOverview(container, job) {
     + metaItem('Started', formatDate(job.started_at))
     + metaItem('Completed', formatDate(job.completed_at))
     + metaItem('Duration', formatDuration(job.elapsed_secs))
+    + renderJobTiming(job.timing)
     + (job.job_mode ? metaItem('Mode', job.job_mode) : '');
   container.appendChild(grid);
 

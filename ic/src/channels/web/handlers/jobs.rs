@@ -61,6 +61,13 @@ pub async fn jobs_list_handler(
         "Database not available".to_string(),
     ))?;
 
+    // WI#318 C1/C4: show the frozen historical duration only when the
+    // daemon's estimation display mode is on. Recording is independent.
+    let show_timing = state
+        .tool_registry
+        .as_ref()
+        .is_some_and(|registry| registry.estimates().job_display_enabled());
+
     let mut jobs: Vec<JobInfo> = Vec::new();
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
 
@@ -87,6 +94,9 @@ pub async fn jobs_list_handler(
                     user_id: j.user_id.clone(),
                     created_at: j.created_at.to_rfc3339(),
                     started_at: j.started_at.map(|dt| dt.to_rfc3339()),
+                    // Sandbox and external-worker jobs are deliberately not
+                    // estimated (WI#318 C2).
+                    estimated_duration_secs: None,
                     job_mode: mode.filter(|m| *m != "worker").map(str::to_string),
                     worker_name: worker_name_from_mode(mode),
                 });
@@ -116,6 +126,9 @@ pub async fn jobs_list_handler(
                     user_id: j.user_id.clone(),
                     created_at: j.created_at.to_rfc3339(),
                     started_at: j.started_at.map(|dt| dt.to_rfc3339()),
+                    estimated_duration_secs: show_timing
+                        .then_some(j.estimated_duration_secs)
+                        .flatten(),
                     job_mode: None,
                     worker_name: None,
                 });
@@ -291,6 +304,9 @@ pub async fn jobs_detail_handler(
                 job_kind: Some("sandbox".to_string()),
                 stuck,
                 repair_attempts,
+                // No local-job estimate is applied to sandbox or external
+                // worker jobs (WI#318 C2); the existing elapsed field stays.
+                timing: None,
             }));
         }
         Ok(None) => {}
@@ -332,6 +348,16 @@ pub async fn jobs_detail_handler(
                 },
                 None => (None, Some(ctx.repair_attempts)),
             };
+            let timing_display = state
+                .tool_registry
+                .as_ref()
+                .is_some_and(|registry| registry.estimates().job_display_enabled());
+            let timing = crate::estimation::JobTimingView::new(
+                ctx.started_at,
+                ctx.completed_at,
+                timing_display.then_some(ctx.estimated_duration).flatten(),
+                chrono::Utc::now(),
+            );
             Ok(Json(JobDetailResponse {
                 id: ctx.job_id,
                 title: ctx.title.clone(),
@@ -351,6 +377,7 @@ pub async fn jobs_detail_handler(
                 job_kind: Some("agent".to_string()),
                 stuck,
                 repair_attempts,
+                timing: Some(timing),
             }))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Job not found".to_string())),

@@ -247,6 +247,63 @@ here feeds an estimate or a decision.
   count, mean, maximum and EMA of the observed wait in milliseconds, plus a
   `note` stating that this is not a promise about human response time.
 
+## Job and mission-run estimates (WI#318 Phase C)
+
+Phase C estimates a **bounded run**, never an open-ended conversation, a
+mission's lifetime, or a whole coding job's unknown future steps.
+
+- **Local scheduler jobs only (C1).** `Scheduler::dispatch_job_inner` freezes
+  one historical duration into `JobContext.estimated_duration` before the
+  first persist. The learner key is a private per-user key with one of two
+  non-sensitive kinds: `routine` for full-job runs the routine engine
+  dispatches (it marks them with `estimate_kind = "routine"` in the job
+  metadata), and `user` for every other local dispatch (`create_job`, `/job`,
+  a gateway restart, which carries no old metadata). A routine's recurring
+  run and a job a user starts by hand are not comparable completions, so
+  they never train one model. Job titles, descriptions and free-form metadata
+  never become keys, so a user has at most two job models. The worker reads
+  the same kind from the same metadata for the terminal observation. Cost is
+  never estimated because no job declares a cost baseline.
+- **One terminal observation.** `Worker::run` records after exactly one
+  execution loop, so the several completion paths cannot train one run twice.
+  Only `Completed` trains the duration model. `Failed` and `Cancelled` are
+  counted separately because their elapsed time is not a comparable run;
+  `Stuck` records nothing so self-repair can still finish the job.
+- **Sandbox and external-worker jobs are excluded (C2).**
+  `ContainerJobManager` and `ExternalWorkerManager` jobs have a different
+  start/terminal mapping; they never receive a local-job estimate just
+  because both paths use `create_job`. Their `estimated_duration` stays unset.
+- **Surfaces (C4).** `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}`
+  report measured elapsed separately from the frozen historical duration and
+  report remaining time as `unknown`. A known remaining time is deliberately
+  not invented from a max-iteration limit or worker timeout, because neither
+  is a finite plan. `GET /api/jobs/summary` stays counts-only: an aggregate
+  ETA over unrelated jobs has no defined scope, so none is produced.
+- **Mission runs (C3).** `GET /api/missions/{id}` derives a single run's
+  advisory timing from that mission's own threads on read. A valid run is a
+  thread that finished successfully (`Completed` or `Done`; one that went on
+  to `Failed` does not count), and its duration is its **active** time read
+  from its own state-change events: from its first entry into `Running` to
+  its first entry into `Completed`, minus every stretch spent `Waiting` (an
+  approval, a child) or `Suspended`. A run whose events do not show when it
+  started and finished is not counted. The view reports the valid run count
+  and the newest running run's elapsed; the median and the last run's
+  duration stay withheld until five valid runs exist, the same warm-up as
+  every learned hint (A6.2). `lunarwing_engine` is untouched, there is no
+  second EMA writer, no extra store read beyond the threads already loaded
+  for the detail view, and no write on the fire path. A recurring mission's
+  lifetime is never estimated.
+- **Display gating.** Job and mission timing follow the same opt-in display
+  mode as tool hints (`LUNARWING_TOOL_ESTIMATES=1`). Recording continues in
+  observe mode; `0` disables both recording and display. The per-tool category
+  allowlist is not consulted for jobs or missions, whose categories are not
+  tool names.
+- **Never an input to behaviour.** Nothing here feeds scheduling, timeouts,
+  approvals, cost accounting or provider selection. In display mode the
+  frozen job estimate does reach the agent, but only as a field of a
+  `job_status` tool result the agent asked for (C4); it is never added to a
+  prompt on its own, and observe mode keeps it out of `job_status` too.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
@@ -277,11 +334,13 @@ does not establish the latter workload-level result.
 
 The later slices in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../../../docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md)
-remain follow-ups: bounded whole-job/mission-run views, gate-wait analytics,
-durable aggregate caches and the real-tenant
-held-out evaluation. The diagnostics surface, per-category display gating and
-the opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
-A4 on a tenant and enabling hints (A5) are still operator steps. Tool calls
-*within* a job are covered now; the whole job does not yet have an ETA. This
-cache never changes scheduling, approval policy, timeouts, provider selection,
-or budgets.
+still open: the real-tenant held-out evaluation (A4), enabling hints (A5) and
+the conditional durable aggregate cache (D1). Phase B (LLM timing, gate-wait
+analytics) and Phase C (bounded local-job and mission-run views) are
+implemented; sandbox and external-worker jobs are explicitly excluded from
+job estimates. The diagnostics surface, per-category display gating and the
+opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
+A4 on a tenant and enabling hints (A5) are still operator steps. Whole-job
+remaining time is reported as unknown unless a finite plan actually exists.
+This cache never changes scheduling, approval policy, timeouts, provider
+selection, or budgets.

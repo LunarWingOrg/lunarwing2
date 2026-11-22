@@ -531,6 +531,10 @@ pub struct AgentJobRecord {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Historical duration frozen when a local job was dispatched (WI#318
+    /// C1). `None` for jobs without a warmed estimate, and never set for
+    /// sandbox or external-worker jobs.
+    pub estimated_duration_secs: Option<u64>,
     pub failure_reason: Option<String>,
 }
 
@@ -845,7 +849,7 @@ impl Store {
             .query(
                 r#"
                 SELECT id, title, status, user_id, failure_reason,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at, estimated_time_secs
                 FROM agent_jobs WHERE source = 'direct'
                 ORDER BY created_at DESC
                 "#,
@@ -863,6 +867,9 @@ impl Store {
                 created_at: r.get("created_at"),
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
+                estimated_duration_secs: r
+                    .get::<_, Option<i32>>("estimated_time_secs")
+                    .and_then(|secs| u64::try_from(secs).ok()),
                 failure_reason: r.get("failure_reason"),
             })
             .collect())
@@ -877,7 +884,7 @@ impl Store {
             .query(
                 r#"
                 SELECT id, title, status, user_id, failure_reason,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at, estimated_time_secs
                 FROM agent_jobs WHERE source = 'direct' AND user_id = $1
                 ORDER BY created_at DESC
                 "#,
@@ -895,6 +902,9 @@ impl Store {
                 created_at: r.get("created_at"),
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
+                estimated_duration_secs: r
+                    .get::<_, Option<i32>>("estimated_time_secs")
+                    .and_then(|secs| u64::try_from(secs).ok()),
                 failure_reason: r.get("failure_reason"),
             })
             .collect())

@@ -3925,6 +3925,8 @@ mod tests {
                 "estimates": { "estimate_requests": 7, "estimates_returned": 1, "estimates_withheld": 6 },
                 "observations": { "observations_recorded": 7, "observations_dropped": 0,
                                   "observations_clipped": 0, "duration_values_rejected": 0, "models_evicted": 0 },
+                "jobs": { "estimates_offered": 0, "estimates_withheld": 0,
+                          "completed_runs": 0, "non_completed_runs": 0 },
             })
         );
         assert_eq!(

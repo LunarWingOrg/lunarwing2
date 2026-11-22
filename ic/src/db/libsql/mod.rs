@@ -675,6 +675,39 @@ mod tests {
         assert_eq!(loaded.user_id, "test-user-42");
     }
 
+    /// WI#318 C1: the historical local-job duration round-trips through both
+    /// the job row and the agent-job list projection.
+    #[tokio::test]
+    async fn test_estimated_duration_round_trips_through_agent_job_listing() {
+        use crate::context::JobContext;
+        use crate::db::JobStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_job_estimate.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut ctx = JobContext::with_user("test-user-est", "Timed Job", "A timed job");
+        ctx.estimated_duration = Some(std::time::Duration::from_secs(90));
+        backend.save_job(&ctx).await.unwrap();
+
+        let loaded = backend.get_job(ctx.job_id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.estimated_duration,
+            Some(std::time::Duration::from_secs(90))
+        );
+
+        let listed = backend
+            .list_agent_jobs_for_user("test-user-est")
+            .await
+            .unwrap();
+        let record = listed
+            .iter()
+            .find(|record| record.id == ctx.job_id)
+            .expect("saved job listed");
+        assert_eq!(record.estimated_duration_secs, Some(90));
+    }
+
     #[tokio::test]
     async fn test_concurrent_writes_succeed() {
         // Use a temp file so connections share state (in-memory DBs are connection-local)
