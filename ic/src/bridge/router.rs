@@ -36,6 +36,7 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
 use crate::gate::pending::{PendingGate, PendingGateKey};
+use crate::gate::wait_analytics::GateWaitOutcome;
 use crate::history::roles::{
     ASSISTANT_ROLE, EngineRole, INTERRUPTED_ROLE, USER_ROLE, classify_engine_role,
     is_bookkeeping_role,
@@ -2394,6 +2395,19 @@ pub async fn list_engine_pending_gates(
         .collect())
 }
 
+/// Owner-only gate-wait aggregate. Returns `None` when engine v2 has not been
+/// initialised, because the store that observes waits does not exist yet.
+pub async fn gate_wait_diagnostics()
+-> Result<Option<crate::gate::wait_analytics::GateWaitDiagnostics>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    Ok(guard
+        .as_ref()
+        .map(|state| state.pending_gates.wait_analytics().diagnostics()))
+}
+
 pub async fn resolve_engine_auth_callback(
     user_id: &str,
     credential_name: &str,
@@ -2961,6 +2975,18 @@ pub async fn resolve_gate(
             "Tool '{}' requires approval and cannot run in shared channels. Ask the user to message me directly (DM) to use this tool.",
             pending.action_name
         )));
+    }
+
+    // WI#318 B4: observe the wait only for decisions that take effect here.
+    // Cancellations and credential hand-offs are not approval waits, and no
+    // gate decision below reads this aggregate.
+    let wait_outcome = match &resolution {
+        lunarwing_engine::GateResolution::Approved { .. } => Some(GateWaitOutcome::Approved),
+        lunarwing_engine::GateResolution::Denied { .. } => Some(GateWaitOutcome::Denied),
+        _ => None,
+    };
+    if let Some(outcome) = wait_outcome {
+        state.pending_gates.record_wait(&pending, outcome);
     }
 
     let event_rx = match resolution {

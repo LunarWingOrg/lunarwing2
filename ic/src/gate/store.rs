@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use super::pending::{PendingGate, PendingGateKey, PendingGateView};
+use super::wait_analytics::{GateWaitAnalytics, GateWaitOutcome, expired_wait, observed_wait};
 
 // ── Trusted channels ────────────────────────────────────────
 
@@ -167,6 +168,7 @@ pub struct PendingGateStore {
     inner: Mutex<StoreInner>,
     key_locks: Arc<KeyLockRegistry>,
     persistence: Option<Arc<dyn GatePersistence>>,
+    wait_analytics: Arc<GateWaitAnalytics>,
 }
 
 impl PendingGateStore {
@@ -179,7 +181,26 @@ impl PendingGateStore {
             }),
             key_locks: Arc::new(KeyLockRegistry::default()),
             persistence,
+            wait_analytics: Arc::new(GateWaitAnalytics::new()),
         }
+    }
+
+    /// Append-only gate-wait diagnostics. Reads never touch gate state, and
+    /// nothing here feeds expiry, scheduling or cost decisions.
+    pub fn wait_analytics(&self) -> &Arc<GateWaitAnalytics> {
+        &self.wait_analytics
+    }
+
+    /// Record the outcome of a gate that `take_verified` already released.
+    pub fn record_wait(&self, gate: &PendingGate, outcome: GateWaitOutcome) {
+        let waited = match outcome {
+            GateWaitOutcome::Expired => expired_wait(gate),
+            GateWaitOutcome::Approved | GateWaitOutcome::Denied => {
+                observed_wait(gate.created_at, chrono::Utc::now())
+            }
+        };
+        self.wait_analytics
+            .record(&gate.source_channel, outcome, waited);
     }
 
     /// Create a store without persistence (in-memory only).
@@ -276,6 +297,13 @@ impl PendingGateStore {
                     inner.by_request_id.remove(&g.request_id);
                 }
                 drop(inner);
+                if let Some(ref expired) = gate {
+                    self.wait_analytics.record(
+                        &expired.source_channel,
+                        GateWaitOutcome::Expired,
+                        expired_wait(expired),
+                    );
+                }
                 if let Some(ref persistence) = self.persistence
                     && let Err(e) = persistence.remove(key).await
                 {
@@ -446,6 +474,11 @@ impl PendingGateStore {
             {
                 tracing::debug!(error = %e, "failed to remove expired gate from persistence");
             }
+            self.wait_analytics.record(
+                &gate.source_channel,
+                GateWaitOutcome::Expired,
+                expired_wait(&gate),
+            );
             expired.push(gate);
         }
         expired
@@ -780,6 +813,62 @@ mod tests {
             store.take_verified(&key, request_id, "web").await,
             Err(GateStoreError::Expired)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_expiry_is_observed_without_changing_the_expiry_decision() {
+        let store = PendingGateStore::in_memory();
+        let gate = sample_gate_with("user1", ThreadId::new(), "xmpp", -60);
+        let key = gate.key();
+        let request_id = gate.request_id;
+        let created_at = gate.created_at;
+        let expires_at = gate.expires_at;
+        store.insert(gate).await.unwrap();
+
+        assert!(matches!(
+            store.take_verified(&key, request_id, "xmpp").await,
+            Err(GateStoreError::Expired)
+        ));
+        let diagnostics = store.wait_analytics().diagnostics();
+        assert_eq!(diagnostics.samples, 1);
+        assert_eq!(diagnostics.outcomes.len(), 1);
+        assert_eq!(diagnostics.outcomes[0].channel_family, "xmpp");
+        assert_eq!(diagnostics.outcomes[0].outcome, "expired");
+        // The observed wait is the fail-closed deadline, not when cleanup
+        // happened to notice it.
+        let deadline_ms = expires_at
+            .signed_duration_since(created_at)
+            .num_milliseconds()
+            .max(0) as u64;
+        assert_eq!(diagnostics.outcomes[0].max_ms, deadline_ms);
+    }
+
+    #[tokio::test]
+    async fn test_resolution_is_observed_by_bounded_family_and_outcome() {
+        let store = PendingGateStore::in_memory();
+        for (channel, outcome) in [
+            ("web", GateWaitOutcome::Approved),
+            ("web", GateWaitOutcome::Denied),
+            ("some-extension", GateWaitOutcome::Approved),
+        ] {
+            let gate = sample_gate(channel);
+            store.insert(gate.clone()).await.unwrap();
+            store
+                .take_verified(&gate.key(), gate.request_id, channel)
+                .await
+                .unwrap();
+            store.record_wait(&gate, outcome);
+        }
+        let diagnostics = store.wait_analytics().diagnostics();
+        assert_eq!(diagnostics.samples, 3);
+        let families: Vec<_> = diagnostics
+            .outcomes
+            .iter()
+            .map(|series| (series.channel_family.as_str(), series.outcome))
+            .collect();
+        assert!(families.contains(&("web", "approved")));
+        assert!(families.contains(&("web", "denied")));
+        assert!(families.contains(&("extension", "approved")));
     }
 
     #[tokio::test]
