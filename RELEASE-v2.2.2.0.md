@@ -114,6 +114,15 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   `git send-pack` are not refused by it (WI#844). Calls that omit the manifest keep the
   old behavior and skip both the preflight and the scoped proxy. The guide's
   wording is explicit that the shell scan is not a security boundary.
+- **The git preflight refuses more routes around its own check (WI#816,
+  WI#844).** It denies git's remote transport plumbing (`send-pack`,
+  `fetch-pack`, `http-push`, `http-fetch`, `remote-*`, also invoked by path),
+  in-command configuration of `alias.*`, `include.*`/`includeIf.*` and the
+  redirecting `remote.*`, `url.*`, `credential.*` and `http.extraheader` keys,
+  `git config` writes to those keys and shell assignments to `GIT_CONFIG_*`,
+  and it reads the option arity of `remote add`/`set-url` so the checked word
+  is the URL. These are preflight refusals: the grant still carries no
+  credential, and the per-call proxy still bounds egress.
 - **The relay's accept loop no longer dies at 32 connections (WI#834).** The
   host relay (`ic/src/sandbox/proxy/relay.rs`) reaps finished connections, so
   its 32-connection cap bounds live connections only and the lifetime
@@ -144,8 +153,7 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   neither as input. The pinned 2.7.2 CLI also carries two subcommands that
   start a listener: `kimi rc` (alias `kimi remote`, the local server and web UI
   through Remote Control) and `kimi vis` (the session visualizer, with
-  `--port`/`--host`). The guard in the tree this draft was checked against
-  does not deny them (WI#852). The real-CLI contract gate passed 4/4 on this
+  `--port`/`--host`). Since WI#852 the guard denies both (below). The real-CLI contract gate passed 4/4 on this
   host, and the guard was shown blocking a mock-provider `sudo id` end to end.
 - **OpenCode 2 and OpenCode v1 were re-checked and did not move (WI#804).**
   `git ls-remote --tags` on `anomalyco/opencode` still resolves the newest
@@ -156,7 +164,47 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   with "flag pin anchor text unchanged". Pebble's upstream HEAD is still
   `2d0f3786…`; LunarDepth's HEAD has moved to `9eb615d8…` from the pinned
   `0472d115…`, and a bump of either is its own item.
-<!-- TODO(run-519 merges): add WI#839 #841 #842 #843 #845 #846 #847 #848 #849 #851 #852 #853 #816 #844 #850 #318-Phase-C #855 once merged -->
+- **The guard reads the punctuation bash glues to a word (WI#839, WI#853).**
+  A subshell `(…)`, a `$(…)` or backtick substitution (also inside double
+  quotes) and a glued `)` or `}` no longer hide a listener, a git discard or a
+  recursive `chmod`/`chown` of a system root: `(kimi server)`,
+  `$(git clean -fdx)` and `(chmod -R 777 /etc)` take the plain spellings'
+  verdicts.
+- **Kimi's options and subcommands are read as the pinned CLI reads them
+  (WI#845, WI#846, WI#852).** The listener check reads the 2.7.2 option
+  table, so an option value (`kimi --model X server`) cannot stand in for the
+  subcommand, and an option the table does not name is read both ways.
+  `kimi rc`, `kimi remote` and `kimi vis` are denied with `server` and `web`,
+  and a `find -exec`/`-execdir`/`-ok`/`-okdir` body is read like an `xargs`
+  body.
+- **The git and file rules read options as the tools do (WI#841, WI#842,
+  WI#843).** Git discard options match by any GNU-unambiguous prefix
+  (`git reset --har`), `chmod`/`chown`/`chgrp` match `--rec` and longer, and a
+  git alias or include definition is refused before the verb is read: inline
+  `-c`/`--config-env` (after git's own value options), the
+  `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS` spellings,
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, and `git config` writes, reads,
+  renames and edits of `alias.*`, `include.*` and `includeIf.*` keys, matched
+  without regard to case. An alias already in a config file stays an accepted
+  residual.
+- **A rename or `tar --remove-files` cannot launder a protected tree
+  (WI#849).** An `mv` whose source or destination names, contains or sits
+  inside `/home/kimi/.kimi-code`, `/app` or `$KIMI_CODE_HOME`, or is a system
+  root, is denied, as is one holding a variable, a substitution, `~user` or a
+  `{}` placeholder; ordinary workspace renames pass. Every member of
+  `tar --remove-files` takes the temp-root test.
+- **Perl deletion reads its operands exactly (WI#851).** File::Path option
+  hashes and `rmtree`'s legacy flags are not targets; `glob()`, `<…>`,
+  `qw()` and the implicit-`$_` forms are read as deletions; and an operand
+  that is not one string literal (a concatenation, `&&`, `||`, `//`) is
+  unverifiable.
+- **A task can no longer rewrite the guard or the MCP registration for later
+  tasks (WI#847, WI#848).** The executor re-asserts the `PreToolUse` guard in
+  `$KIMI_CODE_HOME/config.toml` before every spawn and refuses to spawn when
+  it cannot. The trusted `mcp.json` is a root-owned image input, materialized
+  at start and restored before every spawn, and the hook denies the plain
+  writes to it. These and the guard changes above need the rebuilt Kimi image;
+  the guide's rollout sentence names them.
 - **The baked guard denies kimi service mode from a task's Bash tool
   (WI#833).** `kimi` is on `PATH`, so a task's Bash tool could start
   `kimi server`/`kimi web` itself. The baked `PreToolUse` hook now denies those
@@ -184,9 +232,9 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   interpreter, device writes through `tee`/`cp`, and the git commands that
   discard work: a forced `git clean` (a dry run passes), `git reset --hard`, a
   whole-tree `git checkout`/`git restore`, a forced `checkout`/`switch`, and a
-  `stash` that takes untracked or ignored files (WI#826, WI#832). These rules
-  read the spellings their tests pin; abbreviated options, git aliases and
-  wrapped forms are tracked separately (WI#841, WI#842, WI#853). The SSH rule now matches the agent
+  `stash` that takes untracked or ignored files (WI#826, WI#832).
+  Abbreviated options, git aliases and wrapped forms are covered by WI#841,
+  WI#842 and WI#853 (above). The SSH rule now matches the agent
   directory and socket path the lanes actually mount, and `ssh-add`, instead
   of a literal path no lane uses (WI#829); direct key-file auth stays allowed
   on purpose. Two false denials were removed in the same pass (WI#832). Every
@@ -198,8 +246,8 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   list is read instead of only the first. The change is pinned by the guard's
   test, and the guard's notes were corrected in the same merge request. A
   concatenated operand (`rmtree "/tmp/x/" . "../../workspace"`) and the
-  `glob()`, `<…>`, `qw()` and implicit-`$_` forms still passed this reader in
-  the tree this draft was checked against; they are tracked by WI#851.
+  `glob()`, `<…>`, `qw()` and implicit-`$_` forms are covered by WI#851
+  (above).
 - **The pebble worker-inputs manifest covers the files that ship (WI#806).**
   `entrypoint-split.sh` and `src/task_runner.rs` are build-read inputs, so a
   change to either now moves the lane's `worker-inputs` hash instead of
@@ -293,6 +341,13 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   the bounded held-out trace. Authorization and external-wait gates receive no
   hint, and gate IDs, expiry, redaction and resolution semantics are unchanged.
 
+- **Job and mission timing (WI#318 Phase C).** A local job gets an estimate
+  frozen at dispatch from a per-user model kept apart by kind (routine runs and
+  user-started jobs). In display mode it appears in `job_status` and
+  `GET /api/jobs/{id}`, and mission detail shows run timing once five valid
+  runs exist, counting active time only (approval and child waits excluded).
+  Sandbox and external jobs are excluded, and nothing feeds behaviour.
+
 ## Tools and extensions
 
 - **The GitLab tool can read merge-request diffs (WI#279).** `get_mr_changes`
@@ -307,6 +362,13 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   leading `+`. Before this, only force-push was refused.
   [`docs/ops/SSH-HARNESS-SETUP.md`](docs/ops/SSH-HARNESS-SETUP.md) and
   `docs/guides/SSH-TOOL-TESTING.md` say so.
+- **The XMPP channel drains a backlog in pages without replaying it
+  (WI#850).** The bridge serves `GET /v1/messages` in pages (`limit`, default
+  64, at most 100), the host dispatches an accepted page and commits the
+  guest's cursor before it reports an emit overflow, and a poller that lost
+  its cursor (a daemon-only restart) resumes after the last acknowledged
+  message instead of replaying the bridge's ring. Upgrade the bridge with the
+  daemon and rebuild the WASM channel (registry 0.1.25).
 - **The channel and tool registries patch-bump with their crates (WI#799).**
   Channels are darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19` and xmpp
   `0.1.24`. Every tool whose source or dependencies moved in the sweep is
@@ -376,6 +438,12 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   promotion artifacts of every release pipeline older than two days, and
   promotion never rebuilds, so that evidence cannot be made again. Rootfs tars
   still expire in two days.
+
+- **The pebble locks move to `url` 2.5.9 (RUSTSEC-2026-0592, WI#855).** The
+  advisory (a stack overflow in `Url::origin()` on nested `blob:` URLs) failed
+  `satellite-advisory-sweep` on the two pebble locks, the only ones still at
+  2.5.8. Both now carry `url` 2.5.9 and `form_urlencoded` 1.2.3, the override
+  verifier allows both, and `PEBBLE_LOCK_SHA256` pins the new override.
 
 ## Operations and tenant lifecycle
 
@@ -562,6 +630,12 @@ do not replace those gates.
   the systemd user unit `lunarwing service install` writes, which sets no
   `UMask`. Run the daemon through a shipped unit if job directories must not be
   group- or world-readable.
+- **The Kimi guard reads text, not a shell.** Launchers outside its closed
+  list (`eval`, `taskset`, `flock`, `script -c`, `watch`), process
+  substitution `<(…)`, brace expansion, `rename` and interpreter renames still
+  pass, as do the git preflight's unread shell shapes (`env -u`, `!`,
+  `{ … }`, `timeout -s`, `nice -n`). The egress allowlist and the container
+  remain the boundary.
 - **The shell git grant carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
