@@ -87,7 +87,7 @@ All routes are versioned under `/v1` and served over loopback only.
 | `POST /v1/configure` | Supply JID/password/policy and start the XMPP session. |
 | `GET /v1/status` | Report configuration, connection, OMEMO, room, and rate-limit diagnostics. |
 | `POST /v1/outbound-rate-limit` | Change the live outbound hourly cap without restarting. |
-| `GET /v1/messages?cursor=<n>` | Return queued inbound messages with a cursor strictly greater than `<n>` (returns immediately — not a long-poll). |
+| `GET /v1/messages?cursor=<n>&limit=<n>` | Return a bounded page of queued inbound messages with a cursor strictly greater than `<n>` (returns immediately — not a long-poll). |
 | `POST /v1/messages/send` | Send an outbound message, optionally with base64 attachments. |
 
 ### Authentication
@@ -132,6 +132,27 @@ Returns connection and crypto diagnostics. Fields include:
 
 `device_id` and `fingerprint` let you verify/trust the LunarWing device from a
 client such as Gajim.
+
+### `GET /v1/messages`
+
+Returns a bounded page of queued inbound messages whose cursor is strictly
+greater than the request `cursor`.
+
+- `limit` defaults to 64 and is clamped to 100, so one page always fits inside
+  the daemon's per-callback emit limit. A backlog larger than one page is
+  drained across successive polls.
+- The response `cursor` is the cursor of the **last message in the page**, or
+  the request cursor when the page is empty. Pollers persist it verbatim;
+  returning the newest cursor instead made a large backlog replay every tick
+  and left inbound XMPP wedged until a restart (WI#850).
+- The bridge's cursor sequence is per-process. A request cursor above the
+  bridge's current cursor means the bridge restarted: the response carries the
+  bridge's current cursor so the poller resynchronizes rather than waiting
+  behind an unreachable position.
+
+### `POST /v1/messages/send`
+
+Sends an outbound message, optionally with base64 attachments.
 
 ### `POST /v1/outbound-rate-limit`
 
