@@ -1,13 +1,14 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { spawn } from "node:child_process"
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from "node:fs"
+import { chownSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { executeTask } from "./kimi_task_executor.js"
+import { fileURLToPath } from "node:url"
+import { captureTrustedMcpConfig, executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "reserved-env" | "auth-token-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "reserved-env" | "auth-token-env" | "guard-config" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role" | "mcp-file"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -93,6 +94,23 @@ for (const m of messages) {
 process.exit(0)
 `
       break
+    case "guard-config":
+      // WI#847: report what the CLI would actually load — the guard hook must
+      // be registered in $KIMI_CODE_HOME/config.toml at spawn time.
+      script = `#!/usr/bin/env node
+const fs = require("node:fs")
+const path = require("node:path")
+let state = "missing"
+try {
+  const text = fs.readFileSync(path.join(process.env.KIMI_CODE_HOME || "", "config.toml"), "utf8")
+  state = text.includes("/app/hooks/headless_command_guard.mjs") ? "present" : "absent"
+} catch {
+  state = "unreadable"
+}
+process.stdout.write(JSON.stringify({ role: "assistant", content: "guard=" + state }) + "\\n")
+process.exit(0)
+`
+      break
     case "hang":
       script = `#!/usr/bin/env node
 process.on("SIGTERM", () => {})
@@ -148,16 +166,46 @@ for (const m of messages) {
 process.exit(0)
 `
       break
+    case "mcp-file":
+      // Reads what the CLI would load at session start, so a test can prove
+      // the executor restored the trusted file BEFORE the spawn (WI#848).
+      script = `#!/usr/bin/env node
+const { readFileSync } = require("node:fs")
+const { join } = require("node:path")
+let text = "<unreadable>"
+try {
+  text = readFileSync(join(process.env.KIMI_CODE_HOME || "", "mcp.json"), "utf8").trim()
+} catch (error) {
+  text = "read failed: " + error.message
+}
+process.stdout.write(JSON.stringify({ role: "assistant", content: text }) + "\\n")
+process.exit(0)
+`
+      break
   }
   writeFileSync(binPath, script, { mode: 0o755 })
   chmodSync(binPath, 0o755)
   return binPath
 }
 
+/**
+ * WI#847: the executor re-asserts the PreToolUse guard hook in
+ * $KIMI_CODE_HOME/config.toml before every spawn, and the managed shapes
+ * (identity drop, delegated runner) treat a missing config as fatal. Tests
+ * run with a real baked config so they exercise the managed shape; the
+ * WI#847 tests below seed their own homes to cover the stripped and missing
+ * cases.
+ */
+const EXECUTOR_HOME = mkdtempSync(join(tmpdir(), "kimi-executor-home-"))
+writeFileSync(
+  join(EXECUTOR_HOME, "config.toml"),
+  readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+)
+
 async function runExecutor(
   request: TaskRequest,
   binPath: string | null,
-  kimiHome: string | null = "/tmp",
+  kimiHome: string | null = EXECUTOR_HOME,
 ): Promise<{ result?: TaskResult; progress: string[] }> {
   const previousEnv = {
     KIMI_BIN: process.env.KIMI_BIN,
@@ -937,4 +985,169 @@ process.stdout.write(JSON.stringify({
   } finally {
     delete process.env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS
   }
+})
+
+test("executeTask: WI#848 — a rewritten user-level mcp.json is restored before the CLI reads it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "kimi-wi848-restore-"))
+  const trusted = '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}\n'
+  const tampered = '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}\n'
+  writeFileSync(join(home, "mcp.json"), trusted, { mode: 0o600 })
+  const bin = makeMockKimi("mcp-file")
+  try {
+    captureTrustedMcpConfig(home)
+    // A finished task left a server registration behind for the next session.
+    writeFileSync(join(home, "mcp.json"), tampered, { mode: 0o600 })
+    const { result } = await runExecutor(
+      { task_id: "wi848-restore", prompt: "read the registration", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.equal(result?.status, "success")
+    // The mock reports what the CLI would have loaded: the trusted bytes, not
+    // the task's.
+    assert.equal(result?.output, trusted.trim())
+    assert.equal(readFileSync(join(home, "mcp.json"), "utf8"), trusted)
+    assert.equal(statSync(join(home, "mcp.json")).mode & 0o777, 0o600)
+  } finally {
+    captureTrustedMcpConfig("") // drop the snapshot so later tests see none
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: WI#848 — a deleted user-level mcp.json is restored before the spawn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "kimi-wi848-deleted-"))
+  const trusted = '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}\n'
+  writeFileSync(join(home, "mcp.json"), trusted, { mode: 0o600 })
+  const bin = makeMockKimi("mcp-file")
+  try {
+    captureTrustedMcpConfig(home)
+    rmSync(join(home, "mcp.json"))
+    const { result } = await runExecutor(
+      { task_id: "wi848-deleted", prompt: "read the registration", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.equal(result?.status, "success")
+    assert.equal(result?.output, trusted.trim())
+  } finally {
+    captureTrustedMcpConfig("")
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: WI#848 — a failed restore fails the task instead of spawning", async () => {
+  const home = mkdtempSync(join(tmpdir(), "kimi-wi848-failed-"))
+  const trusted = '{"mcpServers":{}}\n'
+  writeFileSync(join(home, "mcp.json"), trusted, { mode: 0o600 })
+  const bin = makeMockKimi("mcp-file")
+  try {
+    captureTrustedMcpConfig(home)
+    // The directory is gone, so neither the read nor the repair can succeed.
+    rmSync(home, { recursive: true, force: true })
+    const { result } = await runExecutor(
+      { task_id: "wi848-failed", prompt: "read the registration", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.equal(result?.status, "error")
+    assert.match(result?.error ?? "", /could not be restored/)
+  } finally {
+    captureTrustedMcpConfig("")
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: WI#848 — a root-side restore hands the task its own file back", { skip: process.getuid?.() !== 0 }, async () => {
+  // The legacy single-container shape runs the bridge/executor as root and the
+  // CLI as the task uid (WI#400). A rename as root would leave a root-owned
+  // 0600 mcp.json the CLI cannot read, failing every later session.
+  const home = mkdtempSync(join(tmpdir(), "kimi-wi848-owner-"))
+  const file = join(home, "mcp.json")
+  const trusted = '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}\n'
+  const tampered = '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}\n'
+  writeFileSync(file, trusted, { mode: 0o600 })
+  chownSync(file, 65534, 65534)
+  const bin = makeMockKimi("mcp-file")
+  try {
+    captureTrustedMcpConfig(home)
+    writeFileSync(file, tampered, { mode: 0o600 })
+    const { result } = await runExecutor(
+      { task_id: "wi848-owner", prompt: "read the registration", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.equal(result?.status, "success")
+    assert.equal(result?.output, trusted.trim())
+    const restored = statSync(file)
+    assert.equal(restored.uid, 65534, "the restored file keeps the task uid's ownership")
+    assert.equal(restored.gid, 65534)
+    assert.equal(restored.mode & 0o777, 0o600)
+  } finally {
+    captureTrustedMcpConfig("")
+    chownSync(home, process.getuid?.() ?? 0, process.getgid?.() ?? 0)
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: re-asserts the guard hook before spawn after a task stripped it (WI#847)", async () => {
+  const bin = makeMockKimi("guard-config")
+  const home = mkdtempSync(join(tmpdir(), "kimi-guard-home-"))
+  const configPath = join(home, "config.toml")
+  const baked = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
+  // The measured task-authored rewrite: the [[hooks]] entry is gone and the
+  // file still parses as valid TOML, so nothing fails loudly on its own.
+  writeFileSync(configPath, baked.replace(/\n\[\[hooks\]\][\s\S]*?\ntimeout = 10\n/, "\n"))
+  const originalWarn = console.warn
+  console.warn = () => {}
+  try {
+    const { result } = await runExecutor(
+      { task_id: "guard-config", prompt: "check the guard", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.ok(result, "result was not emitted")
+    assert.equal(result!.status, "success")
+    // The CLI itself saw the repaired config — the re-assert runs before the
+    // spawn, so a rewrite cannot outlive the task that made it.
+    assert.equal(result!.output, "guard=present")
+  } finally {
+    console.warn = originalWarn
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: a managed task fails closed when the guard config is missing (WI#847)", async () => {
+  const bin = makeMockKimi("success")
+  const home = mkdtempSync(join(tmpdir(), "kimi-guard-missing-"))
+  const previous = {
+    KIMI_BIN: process.env.KIMI_BIN,
+    WORKSPACE_ROOT: process.env.WORKSPACE_ROOT,
+    KIMI_CODE_HOME: process.env.KIMI_CODE_HOME,
+  }
+  process.env.KIMI_BIN = bin
+  process.env.WORKSPACE_ROOT = "/tmp"
+  process.env.KIMI_CODE_HOME = home
+  let result: TaskResult | undefined
+  try {
+    await executeTask(
+      { task_id: "guard-missing", prompt: "should not spawn", timeout_ms: 10_000 },
+      () => {},
+      (r) => { result = r },
+      undefined,
+      undefined,
+      undefined,
+      { delegatedRunner: true },
+    )
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
+  assert.ok(result, "result was not emitted")
+  assert.equal(result!.status, "error")
+  assert.match(result!.error ?? "", /WI#847/)
+  assert.match(result!.error ?? "", /unavailable/)
+  assert.equal(result!.output, "", "the CLI must not have spawned or produced output")
 })

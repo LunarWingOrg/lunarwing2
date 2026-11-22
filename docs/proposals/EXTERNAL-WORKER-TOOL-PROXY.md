@@ -435,9 +435,14 @@ as the WI's thin stdio MCP server, giving the worker agent a native
   `<gitroot>/.mcp.json` / `<cwd>/.kimi-code/mcp.json`, so workspace content
   can shadow or disable the `lunarwing` entry. Neither changes the security
   posture: the hub's allowlist and gates stay authoritative for every call.
-- `entrypoint.sh` registers the shim in `$KIMI_CODE_HOME/mcp.json`
-  (user-level, so no workspace trust prompt), write-if-absent so operators
-  can disable or replace the entry.
+- `entrypoint-task-setup.sh` materializes the shim registration in
+  `$KIMI_CODE_HOME/mcp.json` from the root-owned baked `config/mcp.json`
+  (`KIMI_MCP_SOURCE`) at every container start, and `kimi_task_executor.ts`
+  rewrites the same bytes before every spawn (WI#848). The user-level file
+  needs no workspace trust prompt and is trusted, so it must not be
+  task-writable state: an operator overrides it by pointing
+  `KIMI_MCP_SOURCE` at another root-owned file, not by editing the runtime
+  copy.
 
 The **opencode** lane implements the same wire contract with a different
 in-task mechanism, because the kimi shim shape does not translate: `opencode

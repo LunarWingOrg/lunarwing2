@@ -215,15 +215,58 @@ fi
 
 # WI#324 worker-side tool bridge: register the thin stdio MCP server that
 # relays MCP tools/list + tools/call into tool_list/tool_call frames on the
-# hub WebSocket. User-level mcp.json is trusted (no workspace trust prompt);
-# written only when absent so an operator can override or disable the entry
-# ("enabled": false) without the entrypoint clobbering it. The shim
-# advertises zero tools unless the bridge injects the per-task proxy env, and
-# the hub stays deny-by-default without a tool_allowlist grant.
-if [ ! -f "$KIMI_CODE_HOME/mcp.json" ]; then
-  umask 0177
-  printf '%s\n' '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}' \
-    > "$KIMI_CODE_HOME/mcp.json"
-  umask "$FILE_UMASK"
-  log "Registered lunarwing MCP tool-proxy server in $KIMI_CODE_HOME/mcp.json"
+# hub WebSocket.
+#
+# WI#848: the CLI loads $KIMI_CODE_HOME/mcp.json as TRUSTED user-level config
+# (no workspace trust prompt) and spawns every server in it before the first
+# model turn, outside the PreToolUse Bash hook — WI#411 only gates the
+# workspace .mcp.json behind KIMI_CODE_TRUST_WORKSPACE. The file lives in the
+# task's own home, so a task can rewrite it, and the old write-if-absent guard
+# also preserved such an edit across container restarts. The trusted content
+# is now a root-owned image input: materialize it from KIMI_MCP_SOURCE at
+# every container start (validated JSON, atomic, mode 0600) and let
+# kimi_task_executor re-materialize the same bytes before every task spawn.
+# Point KIMI_MCP_SOURCE at another root-owned file to override the entry;
+# {"mcpServers":{}} or "enabled": false there opts out. The shim advertises
+# zero tools unless the bridge injects the per-task proxy env, and the hub
+# stays deny-by-default without a tool_allowlist grant.
+KIMI_MCP_SOURCE="${KIMI_MCP_SOURCE:-/app/config/mcp.json}"
+if [ ! -f "$KIMI_MCP_SOURCE" ]; then
+  die "Kimi MCP config source not found: $KIMI_MCP_SOURCE"
 fi
+python3 - "$KIMI_MCP_SOURCE" "$KIMI_CODE_HOME/mcp.json" <<'PY'
+import json, os, sys, tempfile
+
+source, target = sys.argv[1:]
+with open(source, "r", encoding="utf-8") as mcp_file:
+    text = mcp_file.read()
+try:
+    document = json.loads(text)
+except json.JSONDecodeError as error:
+    raise SystemExit(f"invalid MCP config {source}: {error}")
+if not isinstance(document, dict):
+    raise SystemExit(f"invalid MCP config {source}: expected a JSON object")
+if not isinstance(document.get("mcpServers"), dict):
+    raise SystemExit(f'invalid MCP config {source}: "mcpServers" must be an object')
+
+fd, temporary = tempfile.mkstemp(prefix=".mcp.json.", dir=os.path.dirname(target))
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as mcp_file:
+        mcp_file.write(text)
+        mcp_file.flush()
+        os.fsync(mcp_file.fileno())
+    os.replace(temporary, target)
+    os.chmod(target, 0o600)
+except BaseException:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+log "Materialized user-level MCP registration from $KIMI_MCP_SOURCE in $KIMI_CODE_HOME/mcp.json"

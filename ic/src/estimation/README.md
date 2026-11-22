@@ -63,12 +63,13 @@ new categories evict the least recently observed category.
   calibration is exercised by the integration fixture, and production costs
   remain unknown until a tool supplies both a baseline and an actual charge.
 
-`Estimator::estimate_operation` is the new live consumer API. The older
-`estimate_job` facade remains for compatibility but its placeholder prices,
-value/margin arithmetic and static per-tool breakdown are **not** used for
-live predictions. Its numeric `record_actuals` interface remains available
-for compatibility; the new `record_operation_actuals` accepts `Actuals` to
-represent absent measurements and a frozen forecast explicitly.
+`Estimator::estimate_operation` is the only estimate API. The legacy
+`estimate_job` facade, `JobEstimate`, `ToolEstimate` and its numeric
+`record_actuals` were deleted under WI#318 (C5): they had no production callers,
+and their placeholder prices, value/margin arithmetic and static per-tool
+breakdown must not become a second job-estimate path.
+`record_operation_actuals` accepts `Actuals` to represent absent measurements
+and a frozen forecast explicitly.
 
 An approval description receives one short line such as:
 
@@ -135,31 +136,43 @@ recording and hints entirely.
 
 `LUNARWING_TOOL_ESTIMATES_TRACE=1` enables a bounded in-memory ring (2,048
 records; a number selects 16–8,192). Each record stores the canonical tool
-name, unadjusted baseline, frozen EMA prediction, actual duration, and the
-model's valid duration sample count **before the call started**. Only `Ok`
+name, the tool's declared duration baseline, a model-derived comparison
+baseline, the frozen EMA prediction, the actual duration, and the model's
+valid duration sample count **before the call started**. Only `Ok`
 completions are traced; there are no parameters, user identities or trace
 writes to logs, files or the database. The oldest record is evicted when full.
 The owner route copies the retained records and aggregates them after releasing
 the trace lock. Check `evicted` when assessing window coverage.
 
-For each category, `coverage` is the fraction of retained completions with a
-learned prediction. Both median absolute errors (in ms) and
-`improvement_percent` use only the same `paired_samples`: calls with both a
-usable declared baseline (positive and at most one day) and a frozen EMA
-prediction. `warmup` reports counts and baseline-only error for calls started
-before the model had five valid duration samples. `cold_start` reports the
-same coverage and paired metrics as the overall category, but only for calls
-started with fewer than `cold_start_sample_limit` (20) prior valid durations
-in that user/tool model. This includes warmup and the first post-warmup
-forecasts. It is based on model age, not completion order, and starts over
-when a model is evicted or the registry restarts.
+Every category is compared against two named baselines, so the rollout gate no
+longer depends on `http` being the only tool that declares one:
 
-Only `http` currently declares a production duration baseline. Without paired
-samples, both error medians and `improvement_percent` are `null`; a zero
-baseline median also makes improvement undefined. None of these cases passes
-the rollout gate. A comparison baseline for other tools (or a revised gate)
-still needs a maintainer decision. Running the representative tenant
-evaluation and enabling hints for passing categories are separate steps.
+- `declared_baseline` uses `Tool::estimated_duration`, where a tool supplies it.
+- `comparison_baseline` is the mean of the model's own **first five valid
+  completed runs** (the warmup window). It is derived only from earlier calls,
+  frozen at `begin()` with the prediction, and never includes the call being
+  evaluated or anything later. It is `null` until one valid run exists.
+
+For each category, `coverage` is the fraction of retained completions with a
+learned prediction. Each baseline block reports its own median absolute errors
+(in ms), `samples` and `improvement_percent`, computed only over the calls where
+both that baseline and a frozen EMA prediction existed. The two blocks are
+paired over the same retained records but not necessarily the same subset.
+`warmup` reports counts and baseline-only error for calls started before the
+model had five valid duration samples, for both baselines. `cold_start` reports
+the same coverage and paired metrics as the overall category, but only for
+calls started with fewer than `cold_start_sample_limit` (20) prior valid
+durations in that user/tool model. This includes warmup and the first
+post-warmup forecasts. It is based on model age, not completion order, and
+starts over when a model is evicted or the registry restarts.
+
+**Gate definition (per category):** at least 10% lower median absolute error
+than the `comparison_baseline`, with absolute error in seconds, `coverage` and
+sample counts reported. A declared baseline is reported alongside where one
+exists. Without paired samples, an error median or `improvement_percent` is
+`null`; a zero baseline median also makes improvement undefined. None of these
+cases passes the gate. Running the representative tenant evaluation and
+enabling hints for passing categories are separate steps.
 
 ## LLM logical-call timing (WI#318 Phase B)
 
@@ -210,6 +223,87 @@ treatment at a different boundary, so a separate daemon-wide cache records
   DB-backed, and resets on restart. Nothing here changes behaviour: an
   estimator failure can never change a call's result.
 
+## Gate-wait analytics (WI#318 Phase B4)
+
+Gate wait is observed separately from tool and LLM runtime EMAs, and nothing
+here feeds an estimate or a decision.
+
+- **What is recorded.** For an approved or denied gate, `resolution_at -
+  created_at`; for an expired gate, `expires_at - created_at`, i.e. the
+  fail-closed deadline rather than the moment a later ingress noticed the
+  expiry. Cancellations and credential hand-offs are not approval waits and are
+  not recorded. Waits are clamped to one day, and clock skew yields zero.
+- **Labels.** Only the outcome (`approved`, `denied`, `expired`) and a bounded
+  channel family (`web`, `gateway`, `xmpp`, `signal`, `repl`, `http`,
+  `bootstrap`, `extension`). Extension channel names and everything derived from
+  them collapse to `extension`; no parameters, users, threads or request IDs
+  are stored.
+- **Storage.** In-memory, process-lifetime, bounded to 24 series, in the
+  pending-gate store. No persistence, no I/O on the resolution path. Recording
+  never changes `take_verified`'s request-ID, channel or expiry checks, and
+  expiry remains a fail-closed security timer that reads none of this data.
+- **Diagnostics.** `GET /api/estimates/gate-waits` is owner-only (403 for other
+  authenticated users, 401 without a token) and reports per series the sample
+  count, mean, maximum and EMA of the observed wait in milliseconds, plus a
+  `note` stating that this is not a promise about human response time.
+
+## Job and mission-run estimates (WI#318 Phase C)
+
+Phase C estimates a **bounded run**, never an open-ended conversation, a
+mission's lifetime, or a whole coding job's unknown future steps.
+
+- **Local scheduler jobs only (C1).** `Scheduler::dispatch_job_inner` freezes
+  one historical duration into `JobContext.estimated_duration` before the
+  first persist. The learner key is a private per-user key with one of two
+  non-sensitive kinds: `routine` for full-job runs the routine engine
+  dispatches (it marks them with `estimate_kind = "routine"` in the job
+  metadata), and `user` for every other local dispatch (`create_job`, `/job`,
+  a gateway restart, which carries no old metadata). A routine's recurring
+  run and a job a user starts by hand are not comparable completions, so
+  they never train one model. Job titles, descriptions and free-form metadata
+  never become keys, so a user has at most two job models. The worker reads
+  the same kind from the same metadata for the terminal observation. Cost is
+  never estimated because no job declares a cost baseline.
+- **One terminal observation.** `Worker::run` records after exactly one
+  execution loop, so the several completion paths cannot train one run twice.
+  Only `Completed` trains the duration model. `Failed` and `Cancelled` are
+  counted separately because their elapsed time is not a comparable run;
+  `Stuck` records nothing so self-repair can still finish the job.
+- **Sandbox and external-worker jobs are excluded (C2).**
+  `ContainerJobManager` and `ExternalWorkerManager` jobs have a different
+  start/terminal mapping; they never receive a local-job estimate just
+  because both paths use `create_job`. Their `estimated_duration` stays unset.
+- **Surfaces (C4).** `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}`
+  report measured elapsed separately from the frozen historical duration and
+  report remaining time as `unknown`. A known remaining time is deliberately
+  not invented from a max-iteration limit or worker timeout, because neither
+  is a finite plan. `GET /api/jobs/summary` stays counts-only: an aggregate
+  ETA over unrelated jobs has no defined scope, so none is produced.
+- **Mission runs (C3).** `GET /api/missions/{id}` derives a single run's
+  advisory timing from that mission's own threads on read. A valid run is a
+  thread that finished successfully (`Completed` or `Done`; one that went on
+  to `Failed` does not count), and its duration is its **active** time read
+  from its own state-change events: from its first entry into `Running` to
+  its first entry into `Completed`, minus every stretch spent `Waiting` (an
+  approval, a child) or `Suspended`. A run whose events do not show when it
+  started and finished is not counted. The view reports the valid run count
+  and the newest running run's elapsed; the median and the last run's
+  duration stay withheld until five valid runs exist, the same warm-up as
+  every learned hint (A6.2). `lunarwing_engine` is untouched, there is no
+  second EMA writer, no extra store read beyond the threads already loaded
+  for the detail view, and no write on the fire path. A recurring mission's
+  lifetime is never estimated.
+- **Display gating.** Job and mission timing follow the same opt-in display
+  mode as tool hints (`LUNARWING_TOOL_ESTIMATES=1`). Recording continues in
+  observe mode; `0` disables both recording and display. The per-tool category
+  allowlist is not consulted for jobs or missions, whose categories are not
+  tool names.
+- **Never an input to behaviour.** Nothing here feeds scheduling, timeouts,
+  approvals, cost accounting or provider selection. In display mode the
+  frozen job estimate does reach the agent, but only as a field of a
+  `job_status` tool result the agent asked for (C4); it is never added to a
+  prompt on its own, and observe mode keeps it out of `job_status` too.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
@@ -240,11 +334,13 @@ does not establish the latter workload-level result.
 
 The later slices in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../../../docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md)
-remain follow-ups: bounded whole-job/mission-run views, gate-wait analytics,
-durable aggregate caches and the real-tenant
-held-out evaluation. The diagnostics surface, per-category display gating and
-the opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
-A4 on a tenant and enabling hints (A5) are still operator steps. Tool calls
-*within* a job are covered now; the whole job does not yet have an ETA. This
-cache never changes scheduling, approval policy, timeouts, provider selection,
-or budgets.
+still open: the real-tenant held-out evaluation (A4), enabling hints (A5) and
+the conditional durable aggregate cache (D1). Phase B (LLM timing, gate-wait
+analytics) and Phase C (bounded local-job and mission-run views) are
+implemented; sandbox and external-worker jobs are explicitly excluded from
+job estimates. The diagnostics surface, per-category display gating and the
+opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
+A4 on a tenant and enabling hints (A5) are still operator steps. Whole-job
+remaining time is reported as unknown unless a finite plan actually exists.
+This cache never changes scheduling, approval policy, timeouts, provider
+selection, or budgets.

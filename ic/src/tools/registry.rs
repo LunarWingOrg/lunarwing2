@@ -684,7 +684,8 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(create_tool));
         let mut list_tool = ListJobsTool::new(Arc::clone(&context_manager));
-        let mut status_tool = JobStatusTool::new(Arc::clone(&context_manager));
+        let mut status_tool = JobStatusTool::new(Arc::clone(&context_manager))
+            .with_timing_display(self.estimates.job_display_enabled());
         if let Some(store) = &store {
             list_tool = list_tool.with_store(Arc::clone(store));
             status_tool = status_tool.with_store(Arc::clone(store));

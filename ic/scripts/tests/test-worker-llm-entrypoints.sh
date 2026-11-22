@@ -196,6 +196,13 @@ def stage_setup(source, app, home):
     target = app / "entrypoint-task-setup.sh"
     target.write_text(text)
     target.chmod(0o755)
+    # WI#848: the setup script materializes $KIMI_CODE_HOME/mcp.json from the
+    # baked KIMI_MCP_SOURCE (/app/config/mcp.json before relocation); stage a
+    # copy so the harness exercises the real input instead of dying on a
+    # missing source.
+    baked_mcp = source / "config" / "mcp.json"
+    if baked_mcp.exists():
+        (app / "config" / "mcp.json").write_text(baked_mcp.read_text())
 
 
 def relocate_entrypoint(entrypoint, app, home, bin_dir=None):

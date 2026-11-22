@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
 import { connect, createServer, type Socket } from "node:net"
-import { existsSync, mkdtempSync, rmSync, statSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import {
   TaskRunner,
@@ -24,8 +25,19 @@ function scratch(): string {
   scratchDirs.push(dir)
   return dir
 }
+// WI#847: the delegated runner is a managed shape — the executor verifies the
+// PreToolUse guard hook in $KIMI_CODE_HOME/config.toml before every spawn, and
+// the launcher (entrypoint-split.sh) exports that home to the runner. Seed it
+// with the baked config so delegated runs exercise the same contract.
+const RUNNER_HOME = scratch()
+writeFileSync(
+  join(RUNNER_HOME, "config.toml"),
+  readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+)
+process.env.KIMI_CODE_HOME = RUNNER_HOME
 after(() => {
   for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true })
+  delete process.env.KIMI_CODE_HOME
 })
 
 function makeMockKimi(content: string): string {

@@ -739,8 +739,17 @@ retry/failure event rather than waiting silently for the outer task deadline.
 
 The kimi worker image ships the WI#324 worker-side bridge: a per-task unix
 socket relay in `lunarwing_bridge.ts` plus a thin stdio MCP server
-(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`
-by the entrypoint (write-if-absent; set `"enabled": false` there to opt out).
+(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`.
+Since WI#848 that registration is a root-owned image input
+(`config/mcp.json`, materialized by `entrypoint-task-setup.sh` at every
+container start and re-materialized by `kimi_task_executor.ts` before every
+CLI spawn): the CLI trusts the user-level file without any workspace-trust
+prompt and starts its servers before the first model turn, outside the
+`PreToolUse` Bash hook, so its content cannot come from task state. Point
+`KIMI_MCP_SOURCE` at another root-owned file to override the entry
+(`{"mcpServers":{}}` or `"enabled": false` opts out); a task's edit to the
+runtime file is reverted before the next session, and the guard denies the
+literal spellings that name it.
 The kimi CLI spawns the shim per task session; the bridge injects
 `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` per task, and the shim
 translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
@@ -894,6 +903,9 @@ selected, already-allowlisted hosts. It does not enforce repository paths or
 Git operations. File remotes are paths inside `/workspace` and work in any
 supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
 injects no credential, and manifest preflight rejects recognized Git pushes.
+It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
+`url.*`, `credential.*` and `http.extraheader` configuration, `git config`
+writes to those keys, and shell assignments to `GIT_CONFIG_*`.
 Calls without a manifest keep their existing Git and egress behavior. See the
 [manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
 for the boundaries and the authentication and push work still open. Worker
@@ -1235,7 +1247,8 @@ Enforced controls (opencode2 lane unless noted):
    **kimi task-settable `KIMI_CODE_*` and new listeners (WI#833):** the
    executor drops every task-supplied `KIMI_CODE_*` value that is not on
    `TASK_SETTABLE_KIMI_CODE_ENV` (`scripts/kimi_task_executor.ts`), and the
-   guard hook denies `kimi server`/`kimi web` plus a closed listener verb
+   guard hook denies `kimi server`/`kimi web`/`kimi rc`/`kimi remote`/`kimi
+   vis` plus a closed listener verb
    list (`python -m http.server`, `nc`/`ncat`/`netcat -l`, `socat
    TCP-LISTEN`, `busybox httpd`, `php -S`, `ruby -run -e httpd`). On every
    kimi bump, re-read the new dist's `KIMI_CODE_*` names and every new
@@ -1243,7 +1256,9 @@ Enforced controls (opencode2 lane unless noted):
    opens a listener, and either add it to the deny/allowlist with a test or
    say why the lane cannot take it. Unknown `KIMI_CODE_*` names are blocked
    from task input by default; new listener commands are not covered until
-   the hook recognizes them.
+   the hook recognizes them. Since WI#846 the listener rule reads a `find
+   -exec`/`-execdir`/`-ok`/`-okdir` body as the command bash runs, the same
+   as an `xargs` body (WI#826 already read both for deletion).
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
@@ -2407,7 +2422,8 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   is reachable from `kimi -p`. **Corrected by WI#833:** that holds for the
   lane, not for a task. `kimi` is on `PATH` (`Dockerfile:255`), so a task's
   Bash tool could start service mode itself; the guard hook now denies
-  `kimi server` and `kimi web` (and the other listener spellings below) with
+  `kimi server`, `kimi web`, `kimi rc`/`kimi remote` and `kimi vis` (WI#852;
+  and the other listener spellings below) with
   exit 2, pinned by `scripts/headless_command_guard_test.ts`.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
@@ -4004,13 +4020,16 @@ auto-approval:
   uncommitted work, SSH agent use (the `/tmp/ssh-agent` mount path, the
   `SSH_AUTH_SOCK` variable and `ssh-add`), and deletion outside temp roots by
   `rm`, `find -delete`, `find -exec`/`-ok` with `rm`, `unlink`, `rmdir` or
-  `shred`, `xargs rm`, `rsync --delete`/`--remove-source-files`, or a Python,
+  `shred`, `xargs rm`, `rsync --delete`/`--remove-source-files`, an `mv` of
+  the guard's own trees, every member of `tar --remove-files`, or a Python,
   Perl, Ruby or Node one-liner. Every rule is checked on the original text and
   again on a shell-word view that drops quote characters and one level of
   backslash escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the
   privilege rule, a piped interpreter matches through a path or an
   `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`), and the recursive
-  `chmod`/`chown` rule covers `/` (WI#813). The hook also
+  `chmod`/`chown` rule covers `/` (WI#813) and the GNU long-option
+  abbreviations of `--recursive` (`--rec` and longer, the shortest form
+  getopt accepts — `--recursiv` and `--rec` no longer pass; WI#843). The hook also
   joins shell line continuations for every rule, not only `rm`: bash builds one
   word from a backslash-newline pair, so a continuation inside a denied word is
   checked on the joined text (WI#813). It cannot tell a real quote from an
@@ -4025,9 +4044,24 @@ auto-approval:
   shapes use the same temp-root test as `rm`: the `find` start paths, the
   `find` that feeds an `xargs rm` in the same pipeline (with no `find`, the
   deleted set is unknown and the call is denied), the `rsync` destination for
-  `--delete` and its sources for `--remove-source-files`, and the first
-  argument of a `rmtree`/`rmSync`/`unlink`-style call in an interpreter
-  one-liner (a non-literal argument is denied as unverifiable). That shared
+  `--delete` and its sources for `--remove-source-files`, `tar --remove-files`' members (WI#849; a
+  `-T`/`--files-from` list is unverifiable and denies, and a relative member
+  — such as one below `-C` — is refused like every relative operand), every
+  operand of a Perl deletion's comma list, and the first argument of a
+  `rmtree`/`rmSync`/`unlink`-style call in another interpreter one-liner (a
+  non-literal argument is denied as unverifiable). A rename is held to a
+  narrower test (WI#849): an `mv` whose source or destination names, contains
+  or sits inside the guard's own trees (`/home/kimi/.kimi-code`, `/app`, and
+  `$KIMI_CODE_HOME`), or is a system root itself, is denied, because it moves
+  a protected tree out of place and a later `rm -rf` of the new temp name
+  would be trivially legal; `~`/`$HOME` are expanded, an operand holding a
+  variable, a command substitution, `~user` or a find/xargs `{}` placeholder
+  is refused because it can stand for any path, a `.kimi-code` component or
+  a dot-glob that can match it counts wherever it appears, and any other glob
+  stands for any name in its literal directory. GNU long-option prefixes
+  (`--t=` for `--target-directory`) are read. Ordinary renames, a
+  workspace `mv a b` or `git mv`, pass, and the command word is read like
+  `rm`'s (`\mv`, `"mv"`). That shared
   test judges the **resolved** path (WI#830, from WI#812): each target's
   longest existing prefix and each safe root are passed through `realpath`
   (symlinks followed, not-yet-existing trailing components re-attached), and a
@@ -4053,8 +4087,18 @@ auto-approval:
   one-liner reader finds the eval flag after any number of options
   (`perl -MFile::Path -e …`), follows a deletion name bound by
   `from … import … as …`, `import … as …` or `x = shutil.rmtree`, resolves
-  `getattr(module, 'rmtree')`, and reads Perl's parenthesis-free
-  `rmtree "dir"` / `unlink glob "dir/*"`. The decode side counts
+  `getattr(module, 'rmtree')`, and reads Perl's `rmtree "dir"` /
+  `unlink glob "dir/*"` deletion calls with or without parentheses, including
+  every operand of a comma list; the `\"` and `\\` escapes a wrapping
+  double-quoted shell word removes are unescaped first, because Perl never
+  sees the backslashes (WI#840). `rmtree`/`remove_tree` option hashes and
+  `rmtree`'s legacy numeric verbose/safe flags (second and third place of a
+  call without an option hash) are not deletion targets (any other number,
+  and any number given to `remove_tree`, is a path), an operand must be one string
+  literal ending at `,`, `)`, `;`, `or`/`and` or a statement modifier (a
+  concatenation, `&&`/`||`/`//` or other expression denies as unverifiable), and `glob(…)`, `<…>`, `qw(…)` and the implicit-`$_` forms are
+  read as deletion calls, while `qw(unlink)` stays text and a `qw(…)` list of
+  temp paths may pass (WI#851). The decode side counts
   `base64 -d`, `xxd -r`, `rev`, `openssl base64 -d`, the decompressors
   (`gzip`, `zcat`, `bzip2`, `xz`, `zstd`, with their `*cat`/`un*` forms),
   `printf` with `\x`/octal escapes, a `perl`/`python3` base64 one-liner, and
@@ -4066,9 +4110,41 @@ auto-approval:
   and `git stash -a`; `git status`, `git stash` without those flags and
   `git restore <path>` stay ordinary work. `git restore .` takes the same
   verdict as `git checkout -- .`, which discards the same changes (WI#832).
+  The long options are read by any GNU-unambiguous prefix (`git reset --har`,
+  `git clean --for`, `git stash --includ`, `git switch --dis`), the same way
+  the `rm` rules already read theirs (WI#841).
+  The git discard rules and the recursive `chmod`/`chown` rule also read the
+  shell punctuation bash glues to a word (WI#853): a subshell `(…)`, a `$(…)`
+  or backtick body (also inside double quotes) and a glued `)` end the word
+  around them, so `(git reset --hard)`, `$(git clean -fdx)` and
+  `(chmod -R 777 /etc)` take the plain spellings' verdicts.
+  An alias is refused before the verb is read (WI#842), because the alias
+  name is an arbitrary verb the rules have never seen
+  (`git -c alias.z='reset --hard' z`). An `include`/`includeIf` path does the
+  same through a file, so it is refused with it, and section names match
+  without regard to case, as git reads them (`Alias.z` is `alias.z`). Denied:
+  an inline `-c` or `--config-env` naming such a key, the
+  `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS` environment spellings of the same
+  `-c`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` naming a config file, and a
+  `git config` call that names such a key (the classic form, `--add`, the
+  `set`/`get` subcommands), renames a section into or out of one (the
+  `rename-section` subcommand or `--rename-section` option), or opens the
+  editor (`edit`, `--edit`, `-e` before the first operand). git's own value
+  options (`-C`, `--work-tree`, `--git-dir`, …) are stepped over, and
+  `git config`'s value options and long-option prefixes are read as git reads
+  them (`--fil` is `--file`). A `git config` clause longer than 4 KB is
+  refused unread. Accepted residuals: an alias already in a config file, one
+  the task wrote directly (`>> .git/config`), one in a file `HOME` or
+  `XDG_CONFIG_HOME` points at, and a key held in a shell variable
+  (`GIT_CONFIG_KEY_0=$k`); the guard cannot read those cheaply. Like the
+  other rules, this one reads quoted text too, so a command that only
+  mentions `git config include.path` can be refused.
   What remains to the container, named as accepted residuals: deletion by a
-  utility this hook does not classify (`mv` into a removed directory, `truncate`
-  on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
+  utility this hook does not classify (`truncate` on a file, `install`, `dd` to
+  a file, `sed -i`, an `mv` or `tar` behind a variable command word, a
+  rename by `rename` or an interpreter, an `mv` of a relative operand without
+  a `.kimi-code` name after a `cd` into a protected tree or its parent), an
+  interpreter body that is
   not one of the classified deletion or decode shapes (`os.system("rm …")`, a
   script file rather than a `-e`/`-c` one-liner, a language other than Python,
   Perl, Ruby or Node), a decoder this list does not name (`uudecode`, `bsdcat`,
@@ -4080,8 +4156,24 @@ auto-approval:
   arguments and heredoc bodies can be denied if they mention a blocked
   command. Use file editing tools to write that text literally. The container
   remains the security boundary. Unparseable payloads deny. `/app/config` and
-  `/app/hooks` are read-only to the runtime user, so a task cannot edit its
-  own guard.
+  `/app/hooks` themselves are root-owned and read-only to the runtime user,
+  but the effective config the CLI reads is not: it is the task-owned
+  `$KIMI_CODE_HOME/config.toml` copy written by `entrypoint-task-setup.sh`
+  (see "Per-task guard re-assertion (WI#847)" below). Since WI#848 the hook also denies a command that names the
+  user-level MCP registration through its config directory
+  (`$KIMI_CODE_HOME/mcp.json`, `~/.kimi-code/mcp.json`, the absolute home
+  spelling, and a bare `mcp.json` after `cd`-ing there). That covers the
+  measured shell-redirect, interpreter-json-edit and `sed -i` writes. A path
+  assembled from fragments, or written by a script file, gets past the text
+  rule; `kimi_task_executor.ts` re-materializes the entrypoint's registration
+  before every spawn, so such an edit cannot reach a later session. A nested
+  `kimi -p` a task starts itself reads whatever the file holds at that
+  moment, which stays an accepted residual — the container is the boundary.
+- `entrypoint-task-setup.sh`: materializes `$KIMI_CODE_HOME/mcp.json` from
+  the root-owned `KIMI_MCP_SOURCE` (`/app/config/mcp.json`; WI#848) at every
+  container start, validating it as a JSON object with an `mcpServers`
+  object. It replaces any existing file — the old write-if-absent guard
+  preserved a task's edit across restarts.
 - `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
   that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD` or
   `KIMI_CODE_TRUST_WORKSPACE` (unsets both in CLI and bridge mode), and
@@ -4095,7 +4187,13 @@ auto-approval:
   `KIMI_CODE_PERMISSION_MODE_REMINDER` and `KIMI_CODE_TRUST_WORKSPACE` from
   per-task environments after every merge, so task-controlled
   `context.environment` cannot change the approval policy or grant
-  workspace trust.
+  workspace trust. Since WI#848 the runner (and the legacy in-bridge
+  executor) snapshots `$KIMI_CODE_HOME/mcp.json` at startup and rewrites
+  the file from that snapshot immediately before every spawn. The restore
+  is same-uid best-effort between concurrent tasks, not a boundary: a task
+  can still race the window, and a nested `kimi -p` it starts reads the
+  file as it stands. What it removes is persistence — a finished task's
+  registration cannot reach the next session.
 - mt-admin no longer mounts the tenant SSH-agent socket into the kimi
   container (both the imperative `podman run` and the Quadlet), adds
   `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
@@ -4134,10 +4232,25 @@ The hook denies if its synchronous analysis exceeds two seconds, before the CLI'
 image and recreate the worker to pick up the updated hook.
 
 WI#833 adds a separate command-position check for Kimi's `server` and `web`
-subcommands and common listener tools. A print-mode prompt is data, even if
-its text is `server` or `web`. This check does not resolve dynamic command
-names or recognize every program that can listen; the container's network
-policy remains the boundary. The executor strips the relay URL and keeps
+subcommands and common listener tools. Since WI#852 the Kimi list comes from
+the 2.7.2 command definitions and also denies `kimi rc` (alias `kimi
+remote`) and `kimi vis`, which start the Remote Control server or the
+session visualizer. A print-mode prompt is data, even if its text is one of
+those names. Since WI#845 the check reads the pinned CLI's
+option table: a value-taking option (`-m`/`--model`, `-p`/`--prompt`,
+`--output-format`, `--skills-dir`, `--agent`, `--agent-file`, `--add-dir`,
+and `-S`/`--session` with its optional id) consumes the next word, and an
+option the table does not name is read both ways, so no option value can
+become the "subcommand" and hide the real one. `kimi --model X server` and
+`kimi --port 9000 server` deny, while
+`kimi -p 'summarize the server logs' --output-format stream-json` still
+passes. WI#839 reads through the shell punctuation
+bash glues to a word: a subshell `(…)`, a `$(…)` or backtick substitution
+(also inside double quotes) and a glued `)` or `}` are scanned as the command
+they run, while quoted text that merely mentions `kimi server` stays data.
+This check does not resolve dynamic command names or recognize every program
+that can listen; the container's network policy remains the boundary. The
+executor strips the relay URL and keeps
 `KIMI_CODE_HOME` worker-owned (or unset), regardless of task input. Auto-update
 and telemetry stay disabled. This change also requires a rebuilt Kimi worker
 image and a recreated worker.
@@ -4147,9 +4260,65 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
-WI#829 and WI#830 only after rebuilding the image with the fix and recreating
-their workers; see
+WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841, WI#845, WI#852 and WI#853
+only after rebuilding the image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
+
+### Per-task guard re-assertion (WI#847)
+
+The guard registry the CLI actually loads is the task-owned copy, not the
+baked one. `entrypoint-task-setup.sh` writes `$KIMI_CODE_HOME/config.toml` as
+the task uid at mode `0600` inside `/home/kimi/.kimi-code`, so a task can
+rewrite that file (`echo '' >`, `sed -i`, a heredoc, a Python one-liner,
+`truncate -s 0`) and drop the `[[hooks]]` entry. The rewrite parses as valid
+TOML, the CLI starts clean, and because setup runs once per container boot and
+nothing re-asserted the hook afterwards, every later task in that container
+ran unguarded.
+
+`kimi_task_executor.ts` now calls `ensureGuardHook()`
+(`scripts/guard_config.ts`) immediately before every spawn, as whichever
+identity owns the file (container root in the single-container bridge, the
+task uid in the delegated task runner; the in-place write keeps ownership and
+mode so the CLI can still read it). The presence check is a small TOML
+structure scan that blanks comments and multi-line strings, so a hook entry
+that only *looks* registered (in a comment or a `"""` block) does not count;
+an element carrying any key outside `event`/`matcher`/`command`/`timeout`
+(an `enabled = false`, say) or a `timeout` other than `10` is not accepted
+either, and neither is a `PreToolUse`/`Bash` element with a different command
+(whether the CLI runs every matching hook or only the first is not pinned by
+the contract gate, so the lane only vouches for configs where its own entry
+answers for Bash). A repair appends the canonical WI#206 block and logs it.
+Fail-closed:
+
+- Managed shapes (identity drop or delegated runner) fail the task when
+  `KIMI_CODE_HOME` is unset, when the file is missing/unreadable, or when it
+  is not a regular file (a symlinked config is refused rather than written
+  through).
+- If the file ends inside an unterminated string or table, the appended block
+  would not register; the task fails instead of spawning unguarded. The same
+  applies when a task truncated or garbled the config: the repair cannot
+  restore the operator's model/provider settings, so the CLI fails to start —
+  a loud, fail-closed stop, not a silent unguarded run. Restarting the worker
+  re-runs the setup script and restores the config from the baked source.
+  A task that makes the file read-only after stripping the hook, or that
+  leaves a rival `PreToolUse`/`Bash` entry behind, fails later tasks the same
+  way: the failure is loud and a restart heals it, which is the intended
+  trade against spawning anything unguarded.
+- Host-side dev runs with no managed config (neither identity nor delegated
+  runner) skip the check.
+
+Accepted residuals, named so they are not mistaken for coverage: a task
+running concurrently with a newly spawned one can still overwrite the file
+between the re-assert and the new CLI's config read (the re-assert runs
+immediately before the spawn to keep that window minimal); `mcp.json` in the
+same task-owned home is not re-asserted (a task can register its own MCP
+server, which the CLI spawns at startup outside the hook — the task already
+runs as that uid, so this is guard-evasion, not privilege escalation, and it
+is a separate change from this one); and `telemetry = false` /
+`dangerous_command_guard = true` in the effective config are not re-checked —
+telemetry is forced off by the executor's `KIMI_DISABLE_TELEMETRY=1` and the
+upstream dangerous-command guard is inert under `-p`, where the hook is the
+enforcement point.
 
 ## LLM endpoints for LLM-backed workers (WI#330)
 

@@ -12,3 +12,4 @@ pub mod pending;
 pub mod persistence;
 pub mod store;
 pub mod violation_store;
+pub mod wait_analytics;

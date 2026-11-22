@@ -84,7 +84,7 @@ pub async fn missions_summary_handler(
 }
 
 pub async fn missions_detail_handler(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
     Path(id): Path<String>,
 ) -> Result<Json<MissionDetailResponse>, (StatusCode, String)> {
@@ -93,10 +93,21 @@ pub async fn missions_detail_handler(
         return Err((StatusCode::BAD_REQUEST, "Invalid mission ID".to_string()));
     }
 
-    let mission = crate::bridge::get_engine_mission(&id, &user.user_id)
+    let mut mission = crate::bridge::get_engine_mission(&id, &user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
+
+    // WI#318 C3: run timing is advisory and follows the same opt-in display
+    // mode as tool and job hints. In observe mode it stays recorded nowhere
+    // else and is omitted here; nothing in expiry, firing or approval reads it.
+    let display = state
+        .tool_registry
+        .as_ref()
+        .is_some_and(|registry| registry.estimates().job_display_enabled());
+    if !display {
+        mission.run_timing = None;
+    }
 
     Ok(Json(MissionDetailResponse { mission }))
 }

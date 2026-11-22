@@ -23,6 +23,15 @@ const CURSOR_PATH: &str = "cursor.txt";
 const DEFAULT_BRIDGE_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_POLL_INTERVAL_MS: u32 = 30_000;
 
+/// Messages requested per bridge poll, and the most one poll processes.
+///
+/// A current bridge clamps pages to the daemon's per-callback emit budget, and
+/// `bounded_page` holds a bridge that predates paging to the same bound, so one
+/// poll never exceeds the host's emit limit (it counts emits, not bytes).
+/// Asking for less than the ceiling keeps a single tick cheap and lets the
+/// cursor advance every poll while a large backlog drains (WI#850).
+const MESSAGES_PAGE_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeConfig {
     display_name: String,
@@ -168,9 +177,10 @@ impl Guest for XmppChannel {
 
         let cursor = read_cursor();
         let url = format!(
-            "{}/v1/messages?cursor={}",
+            "{}/v1/messages?cursor={}&limit={}",
             trim_base_url(&config.bridge_url),
-            cursor
+            cursor,
+            MESSAGES_PAGE_LIMIT
         );
         let response: PollResponse = match request_json("GET", &url, None) {
             Ok(body) => match serde_json::from_slice(&body) {
@@ -192,8 +202,8 @@ impl Guest for XmppChannel {
             }
         };
 
-        let new_cursor = response.cursor;
-        for message in response.messages {
+        let (take, new_cursor) = bounded_page(response.cursor, response.messages.len());
+        for message in response.messages.into_iter().take(take) {
             let inbound_attachments = decode_inbound_attachments(message.attachments);
             let sender_id = message.sender_id.unwrap_or(message.user_id);
             channel_host::emit_message(&EmittedMessage {
@@ -426,6 +436,28 @@ fn request_json(method: &str, url: &str, body: Option<Vec<u8>>) -> Result<Vec<u8
     Ok(response.body)
 }
 
+/// How many messages of a poll response to process this tick, and the cursor
+/// to persist after them.
+///
+/// A bridge that predates paging ignores `limit` and returns its whole backlog
+/// with its newest cursor. Emitting all of it would overflow the host's
+/// per-callback emit limit, which drops the excess while the persisted cursor
+/// still moves past it (WI#850). Bridge cursors are consecutive per queued
+/// message, and a response ends at its own cursor (the last message returned,
+/// or for an old bridge its newest message), so message `i` of `n` carries
+/// `response_cursor - (n - 1 - i)`. Process at most one page and persist the
+/// cursor of the last processed message; the next poll returns the rest.
+fn bounded_page(response_cursor: u64, message_count: usize) -> (usize, u64) {
+    if message_count <= MESSAGES_PAGE_LIMIT {
+        return (message_count, response_cursor);
+    }
+    let deferred = (message_count - MESSAGES_PAGE_LIMIT) as u64;
+    (
+        MESSAGES_PAGE_LIMIT,
+        response_cursor.saturating_sub(deferred),
+    )
+}
+
 fn read_cursor() -> u64 {
     channel_host::workspace_read(CURSOR_PATH)
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -561,6 +593,29 @@ fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_page_passes_a_current_bridge_page_through() {
+        assert_eq!(
+            bounded_page(100, MESSAGES_PAGE_LIMIT),
+            (MESSAGES_PAGE_LIMIT, 100)
+        );
+        assert_eq!(bounded_page(10, 10), (10, 10));
+        assert_eq!(
+            bounded_page(7, 0),
+            (0, 7),
+            "an empty page keeps the response cursor"
+        );
+    }
+
+    #[test]
+    fn bounded_page_defers_the_rest_of_an_old_bridge_backlog() {
+        // An old bridge returns all 150 queued messages (cursors 1..=150) with
+        // its newest cursor; the guest processes 64 and persists cursor 64.
+        assert_eq!(bounded_page(150, 150), (MESSAGES_PAGE_LIMIT, 64));
+        // Cursors 1001..=1150 after an earlier ring: the 64th is 1064.
+        assert_eq!(bounded_page(1150, 150), (MESSAGES_PAGE_LIMIT, 1064));
+    }
 
     #[test]
     fn response_routing_prefers_target_and_falls_back_to_room() {

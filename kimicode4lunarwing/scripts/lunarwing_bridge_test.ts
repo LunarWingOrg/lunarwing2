@@ -14,6 +14,18 @@ import { TaskRunner } from "./task_runner.js"
 const bridgePath = fileURLToPath(new URL("./lunarwing_bridge.js", import.meta.url))
 const WAIT_TIMEOUT_MS = 10_000
 
+// WI#847: the executor verifies the PreToolUse guard hook in
+// $KIMI_CODE_HOME/config.toml before every spawn, and the delegated runner is
+// a managed shape. The runner shares THIS process and the bridge child
+// inherits this environment, so seed a real baked config for both — the same
+// home entrypoint-split.sh exports to the runner.
+const BRIDGE_HOME = mkdtempSync(join(tmpdir(), "kimi-bridge-home-"))
+writeFileSync(
+  join(BRIDGE_HOME, "config.toml"),
+  readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+)
+process.env.KIMI_CODE_HOME = BRIDGE_HOME
+
 async function withTimeout<T>(wait: Promise<T>, description: string, timeoutMs = WAIT_TIMEOUT_MS): Promise<T> {
   let timer: NodeJS.Timeout | undefined
   try {

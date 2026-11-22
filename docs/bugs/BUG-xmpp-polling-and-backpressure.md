@@ -41,7 +41,7 @@ messages were observed as consumed, and that restarting a tenant restored
 delivery. Those observations are not, by themselves, proof of an undelivered
 message: the XMPP bridge exposes a replay buffer. `messages_handler` reads by
 cursor and `enqueue_message` appends/trims the buffer; it does not remove
-entries on client consumption (`ic/bridges/xmpp-bridge/src/main.rs:446-463,515-546`).
+entries on client consumption (`ic/bridges/xmpp-bridge/src/main.rs:463-511,560-590`).
 The live outage is therefore **unverified** from the recorded fields alone.
 The old proposed-fix section is no longer a plan: most of its implementation is
 present below.
@@ -50,6 +50,38 @@ A valid current repro must correlate a bridge cursor that advances with no
 corresponding emitted-message/agent log, inspect channel health, and show the
 WASM delivery task blocked or exited. Nonzero replay-buffer depth alone is not
 a failure criterion.
+
+## WI#850: bounded pages replace the whole-backlog read
+
+`messages_handler` used to return every buffered message past the caller's
+cursor together with the bridge's newest cursor. Once a backlog exceeded the
+WASM host's per-callback emit limit (`MAX_EMITS_PER_EXECUTION`, 100 in
+`ic/src/channels/wasm/host.rs`), the host rejected the whole batch and dropped
+the guest's pending cursor write with it, so each tick re-fetched the same
+set: a self-sustaining livelock, first seen as a 60-emit burst followed by
+`on_poll exceeded the per-callback emit limit` after the 2026-11-22 upgrade.
+
+The livelock and the replay behind it are now closed:
+
+- `GET /v1/messages` takes `limit` (default 64, clamped to 100) and reports the
+  cursor of the last message actually returned, so a poller drains a backlog in
+  pages; a poller cursor above the bridge's current cursor (bridge restart) is
+  resynchronized instead of waiting forever.
+- The host's poll path (`execute_poll` → `collect_poll_execution`, the polling
+  loop, and `finish_poll_callback`) dispatches the accepted page and commits
+  pending workspace writes — including the guest cursor — before it reports the
+  overflow, so an over-limit tick advances rather than replaying.
+- The replay itself: the guest keeps its cursor only in the channel's
+  in-memory workspace store, so a daemon-side reset polled again from zero
+  while the bridge still held its ring of delivered messages. The bridge now
+  records the cursor the poller acknowledges (a request echoing the previous
+  response cursor) and serves a lower request cursor from the acknowledged one,
+  so a reset resumes after the last delivered message instead of replaying the
+  ring as new turns.
+
+Raising `MAX_EMITS_PER_EXECUTION` was explicitly rejected: the failure was an
+all-or-nothing batch reject, so a larger cap only moves the backlog size at
+which a channel wedges.
 
 ## Current implementation
 
@@ -136,3 +168,10 @@ the watchdog scripts gained checks, moving the deep channel-health regions to
 `lunarwing-watchdog.sh:83-102` and `lunarwing-watchdog-openrc.sh:75-94`; and
 the work-item #73 `agent_loop.rs` insertions moved the FIFO/deferral region to
 `:1106-1184`. The residual queue-backpressure path is unchanged.
+
+Re-verified on 2026-11-22 for WI#850: the bridge now pages `GET /v1/messages`
+and the host dispatches the accepted poll page instead of rejecting the batch,
+so the whole-backlog livelock documented above is closed. `messages_handler`
+moved to `main.rs:463-511` and `enqueue_message` to `:560-590`. The residual
+queue-backpressure path (bounded dispatch queue, `reserve_many` await) is
+unchanged and remains a separate, unreproduced risk.

@@ -550,6 +550,28 @@ test("root path spellings are resolved before the recursive-change rule", () => 
   assertAllowed("chown -R user:user ./workspace")
 })
 
+test("the recursive flag is matched in its abbreviated long-option spellings", () => {
+  // WI#843: chmod/chown/chgrp accept any unique prefix of `--recursive`
+  // (`--rec` and longer), so testing the literal spelling let
+  // `chmod --recursiv 777 /etc` through.
+  assertBlocked("chmod --recursiv 777 /etc", "recursive")
+  assertBlocked("chmod --recursi 777 /usr", "recursive")
+  assertBlocked("chmod --recu 777 /var", "recursive")
+  // `--rec` is the shortest unique prefix: only `--re` is ambiguous.
+  assertBlocked("chmod --rec 777 /etc", "recursive")
+  assertBlocked("chown --rec root:root /home", "recursive")
+  assertBlocked("chgrp --rec staff /srv", "recursive")
+  assertBlocked("chmod --recursive 777 /etc", "recursive")
+  assertBlocked("chown --recursiv root:root /home", "recursive")
+  assertBlocked("chgrp --recursiv staff /srv", "recursive")
+  // getopt rejects an attached value, but denying it is still fail-closed.
+  assertBlocked("chmod --recursiv=1 777 /etc", "recursive")
+  // Non-recursive long options and abbreviated recursive changes on project
+  // paths stay ordinary work.
+  assertAllowed("chmod --reference=/tmp/mode.txt ./build/file")
+  assertAllowed("chmod --recursiv 755 ./build")
+})
+
 test("deletion without rm is contained by the same temp-root test", () => {
   // WI#826 group B: checkRm was the only rule that looked at what a command
   // deletes, so find, xargs and interpreter one-liners deleted freely.
@@ -676,6 +698,49 @@ test("a task cannot start kimi service mode (WI#833)", () => {
   assertAllowed("echo 'kimi web --json'")
 })
 
+test("a glued subshell or substitution does not hide a listener (WI#839)", () => {
+  // WI#839: the listener reader split words only on spaces, tabs, ; | & and
+  // newlines, so a glued `)` or backtick stayed part of the word and
+  // `(kimi server)` allowed. All seven allowed rows of the item's table deny.
+  assertBlocked("(kimi server)", "kimi service mode")
+  assertBlocked("(cd /tmp && kimi server)", "kimi service mode")
+  assertBlocked("(cd /tmp; kimi server)", "kimi service mode")
+  assertBlocked("$(kimi server)", "kimi service mode")
+  assertBlocked("echo $(kimi server)", "kimi service mode")
+  assertBlocked("`kimi server`", "kimi service mode")
+  assertBlocked("bash -c '(kimi server)'", "kimi service mode")
+  // Same glue, the spellings the study pass added to this item's corpus: a
+  // glued brace, an ANSI-C quoted subcommand, and a substitution bash runs
+  // even inside double quotes.
+  assertBlocked("{kimi server}", "kimi service mode")
+  assertBlocked("kimi server}", "kimi service mode")
+  assertBlocked("kimi $'server'", "kimi service mode")
+  assertBlocked('echo "$(kimi server)"', "kimi service mode")
+  assertBlocked('x="$(kimi server)"', "kimi service mode")
+  // The other listener verbs follow the command word through the same glue.
+  assertBlocked("(python3 -m http.server 8000)", "listener started from a task")
+  assertBlocked("(nc -l 9000)", "listener started from a task")
+  assertBlocked("(socat TCP-LISTEN:9000 -)", "listener started from a task")
+  assertBlocked("$(nc -l 9000)", "listener started from a task")
+  // The denied controls keep their verdicts.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  assertBlocked("( kimi server )", "kimi service mode")
+  assertBlocked("{ kimi server; }", "kimi service mode")
+  assertBlocked("(kimi web --json)", "kimi service mode")
+  // Prompt text and quoted mentions stay data; ordinary substitutions pass.
+  assertAllowed('kimi -p "server"')
+  assertAllowed("(kimi -p hello)")
+  assertAllowed("kimi mcp serve")
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("echo 'kimi web --json'")
+  assertAllowed('echo "$(git rev-parse HEAD)"')
+  assertAllowed("x=$(date +%s)")
+  assertAllowed("(cd ic && cargo check)")
+  assertAllowed("git commit -m 'fix (kimi) server docs'")
+  assertAllowed("nc -zv host 80")
+})
+
 test("a task cannot start any listed listener (WI#833)", () => {
   // The hook had no listener rule at all, so fixing only the kimi subcommands
   // would leave the class open (WI#833 study pass-394).
@@ -699,6 +764,25 @@ test("a task cannot start any listed listener (WI#833)", () => {
   assertAllowed("python3 -m json.tool")
 })
 
+test("find -exec is the same launcher as xargs (WI#846)", () => {
+  // WI#846: bash runs a find `-exec` body exactly as it runs an `xargs` body,
+  // but LISTENER_PREFIXES covered only xargs, so the listener rule read one
+  // launcher and not its twin (the deletion rule already read both).
+  assertBlocked("find . -name x -exec kimi server {} \\;", "kimi service mode")
+  assertBlocked("find . -name x -exec nc -l 9000 {} \\;", "listener started from a task")
+  assertBlocked("find . -type f -execdir python3 -m http.server 8080 {} \\;", "listener started from a task")
+  assertBlocked("find . -name x -exec sh -c 'kimi server' {} \\;", "kimi service mode")
+  assertBlocked("bash -c 'find . -exec kimi server {} \\;'", "kimi service mode")
+  assertBlocked("find . -name x -exec busybox httpd -p 8080 {} \\;", "busybox httpd")
+  // Both terminators, and the xargs control that already denied.
+  assertBlocked("find . -name x -exec kimi web {} +", "kimi service mode")
+  assertBlocked("find . -print0 | xargs -0 -I {} kimi server", "kimi service mode")
+  // Ordinary find work keeps passing, including reading a listener name.
+  assertAllowed("find . -name '*.ts' -exec grep -l 'kimi server' {} \\;")
+  assertAllowed("find . -type f -exec chmod 644 {} \\;")
+  assertAllowed("find /tmp -name '*.log' -delete")
+})
+
 test("kimi print-mode prompt values are not service subcommands", () => {
   assertAllowed("kimi -p server")
   assertAllowed("kimi --prompt web")
@@ -707,11 +791,109 @@ test("kimi print-mode prompt values are not service subcommands", () => {
   assertAllowed(`bash -c 'kimi -p "review web"'`)
 })
 
+test("a value-taking option cannot hide kimi service mode (WI#845)", () => {
+  // Only -p/--prompt consumed a value, so every other option's value was read
+  // as the subcommand and the real one was allowed.
+  assertBlocked("kimi --model X server", "kimi service mode")
+  assertBlocked("kimi -m X server", "kimi service mode")
+  assertBlocked("kimi --output-format stream-json server", "kimi service mode")
+  assertBlocked("kimi --agent-file agent.md web", "kimi service mode")
+  assertBlocked("kimi -S 1 server", "kimi service mode")
+  // Options the 2.7.2 table does not know are read both ways, so a plausible
+  // value cannot hide the subcommand either.
+  assertBlocked("kimi --port 9000 server", "kimi service mode")
+  assertBlocked("kimi --host 0.0.0.0 web", "kimi service mode")
+  assertBlocked("kimi --debug server", "kimi service mode")
+  // The equals forms were already denied; keep them denied.
+  assertBlocked("kimi --model=X server", "kimi service mode")
+  assertBlocked("kimi --output-format=stream-json server", "kimi service mode")
+  assertBlocked("kimi -mX server", "kimi service mode")
+  // Prompt and option values are still not subcommands.
+  assertAllowed("kimi -p 'summarize the server logs'")
+  assertAllowed("kimi --model server -p hello")
+  assertAllowed("kimi -S server -p hello")
+  assertAllowed("kimi --output-format stream-json -p hello")
+  // With WI#839 the subcommand word may carry glued punctuation.
+  assertBlocked("(kimi --model X server)", "kimi service mode")
+  assertBlocked("$(kimi -m X web)", "kimi service mode")
+  assertAllowed("(kimi -p server)")
+})
+
+test("kimi remote control and the visualizer are listeners (WI#852)", () => {
+  // WI#852: the 2.7.2 CLI starts a listener from more subcommands than
+  // server/web. `rc` (alias `remote`) runs the local server through Remote
+  // Control, and `vis` binds the visualizer's HTTP port.
+  assertBlocked("kimi rc", "kimi service mode")
+  assertBlocked("kimi remote", "kimi service mode")
+  assertBlocked("kimi --model X rc", "kimi service mode")
+  assertBlocked("kimi rc --port 9000", "kimi service mode")
+  assertBlocked("kimi vis", "kimi service mode")
+  assertBlocked("kimi vis --host 0.0.0.0 --port 9000", "kimi service mode")
+  assertBlocked("/usr/local/bin/kimi vis", "kimi service mode")
+  assertBlocked("bash -c 'kimi rc'", "kimi service mode")
+  assertBlocked("cd /app && kimi remote", "kimi service mode")
+  assertBlocked("xargs -I {} kimi vis", "kimi service mode")
+  // The earlier service spellings keep their verdicts.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  // The lane's stdio and print-mode forms keep passing.
+  assertAllowed("kimi acp")
+  assertAllowed("kimi mcp serve")
+  assertAllowed("kimi --version")
+  assertAllowed("kimi -p hello")
+  assertAllowed("kimi -p 'open the vis page' --output-format stream-json")
+  assertAllowed("kimi -p 'kimi rc'")
+  assertAllowed("kimi --model X -p 'check remote'")
+  // Reading the words is not running them.
+  assertAllowed("grep -rn 'kimi vis' .")
+  assertAllowed("echo 'kimi rc --port 9000'")
+})
+
+test("a task cannot edit the trusted user-level MCP registration (WI#848)", () => {
+  // The CLI loads $KIMI_CODE_HOME/mcp.json as trusted config and spawns every
+  // server in it before the first model turn, outside this Bash hook. The
+  // measured ALLOWs at master: a shell redirect, a python3 json edit, and a
+  // sed in-place edit. The executor's per-spawn restore is the backstop for
+  // computed paths; these spellings are denied here.
+  assertBlocked(
+    `echo '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}' > "$KIMI_CODE_HOME/mcp.json"`,
+    "user-level Kimi MCP config",
+  )
+  assertBlocked(
+    `python3 -c "import os,json; p=os.environ['KIMI_CODE_HOME']+'/mcp.json'; open(p,'w').write('{}')"`,
+    "user-level Kimi MCP config",
+  )
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' ~/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' /home/kimi/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`sed -i 's/"enabled":true/"enabled":false/' $HOME/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`echo '{}' > \${HOME}/.kimi-code/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`echo '{}' > \${KIMI_CODE_HOME}/mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cp /tmp/x "$KIMI_CODE_HOME"/mcp.json`, "user-level Kimi MCP config")
+  // A bare file name after moving into the config directory is the same write.
+  assertBlocked(`cd ~/.kimi-code && sed -i 's/x/y/' mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cd ~/.kimi-code/ && sed -i 's/x/y/' mcp.json`, "user-level Kimi MCP config")
+  assertBlocked(`cd $KIMI_CODE_HOME && python3 -c "open('mcp.json','w').write('{}')"`, "user-level Kimi MCP config")
+  // Ordinary work keeps passing: reading the words, the read-only baked copy,
+  // the lane's config file and the repo's own files.
+  assertAllowed("grep -rn mcp.json docs/")
+  assertAllowed("grep -rn KIMI_CODE_HOME .")
+  assertAllowed("cat /app/config/mcp.json")
+  assertAllowed("cat /home/kimi/.kimi-code/config.toml")
+  assertAllowed("cd /tmp && echo hi")
+  assertAllowed("sed -i 's/x/y/' kimicode4lunarwing/config/mcp.json")
+  assertAllowed(`echo "$KIMI_CODE_HOME"`)
+  assertAllowed("cargo check -j18")
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
   // tripped runGuard's kill timeout. The linear scan decides it immediately.
   assertAllowed("chmod -R ".repeat(1500))
+  // The WI#853 punctuation reading is linear too: 14 KB of substitutions and
+  // 12 KB of subshells stay inside the analysis deadline.
+  assertAllowed("$(git log -1) ".repeat(1000))
+  assertAllowed("(git status) ".repeat(1000))
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
@@ -738,6 +920,65 @@ test("interpreter one-liners delete without parentheses or through a binding", (
   assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
 })
 
+test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
+  // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
+  // in double quotes reaches Perl with the inner quotes unescaped, so
+  // `rmtree \"<path>\"` deletes exactly as `rmtree '<path>'` does.
+  assertBlocked(`perl -e "use File::Path; rmtree \\"/workspace\\""`, "deletion outside")
+  assertBlocked(`perl -e "unlink \\"/etc/passwd\\""`, "deletion outside")
+  assertBlocked(`perl -e "rmdir \\"/workspace/src\\""`, "deletion outside")
+  assertAllowed(`perl -e "use File::Path; rmtree \\"/tmp/wi840-x\\""`)
+  // A Perl deletion takes a comma list; checking only the first operand left
+  // every later path unread.
+  assertBlocked(`perl -e 'unlink "/tmp/wi840-x", "/home/kimi/y"'`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/tmp/wi840-x", "/etc/passwd")'`, "deletion outside")
+  assertBlocked(`perl -e "unlink \\"/tmp/wi840-x\\", \\"/etc/passwd\\""`, "deletion outside")
+  assertAllowed(`perl -e 'unlink "/tmp/wi840-a", "/tmp/wi840-b"'`)
+  // Unescaping the shell spelling must not turn a string literal into a call.
+  assertAllowed(`perl -e "print \\"unlink\\", \\"/home/kimi/x\\""`)
+})
+
+test("Perl deletion options, list forms and expression operands (WI#851)", () => {
+  // !2681 marked every non-literal operand unverifiable, so File::Path's
+  // option hash and rmtree's legacy verbose/safe flags denied a temp-only
+  // cleanup. They are options, not targets; the path operands are still read.
+  assertAllowed(`perl -MFile::Path -e 'rmtree("/tmp/x", {verbose => 1})'`)
+  assertAllowed(`perl -MFile::Path=remove_tree -e 'remove_tree("/tmp/x", {error => \\my $e})'`)
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/x", 0, 1'`)
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/home/kimi/x", {verbose => 1})'`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/tmp/x", "/home/kimi/y", {verbose => 1})'`, "deletion outside")
+  // An operand is one string literal; a concatenation is an expression whose
+  // result the guard cannot verify, so `..` cannot be appended to a temp path.
+  assertBlocked(`perl -e 'use File::Path; rmtree "/tmp/x/" . "../../workspace"'`, "cannot verify")
+  // glob(…), <…>, qw(…) and the implicit-`$_` target are deletion calls.
+  assertBlocked(`perl -e 'unlink glob("/workspace/*")'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink </workspace/*>'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink qw(/workspace/a /workspace/b)'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink for glob "/workspace/*"'`, "cannot verify")
+  assertBlocked(`perl -e 'for (glob "/workspace/*") { unlink }'`, "cannot verify")
+  // A qw() list of temp paths may pass.
+  assertAllowed(`perl -e 'unlink qw(/tmp/a /tmp/b)'`)
+  // The rows already decided correctly keep their verdicts.
+  assertAllowed(`perl -e 'unlink "/tmp/x" or die "no"'`)
+  assertAllowed(`perl -e 'print "unlink"'`)
+  assertAllowed(`perl -e 'my %h = (unlink => 1); print 1'`)
+  // Review AKM-1..AKM-3 on !2696: `&&`, `||` and `//` bind tighter than a list
+  // operator, so the operand continues past them; `remove_tree` has no legacy
+  // numeric flags; a statement modifier ends a complete operand list.
+  assertBlocked(`perl -e 'unlink "/tmp/x" && "/workspace/f"'`, "interpreter deletion")
+  assertBlocked(`perl -e 'unlink "/tmp/x", "/tmp/y" && "/workspace/f"'`, "interpreter deletion")
+  assertBlocked(`perl -MFile::Path=remove_tree -e 'remove_tree "/tmp/x", 0'`, "interpreter deletion")
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/x", 0, 1'`)
+  assertAllowed(`perl -e 'unlink "/tmp/x" if -e "/tmp/x"'`)
+  assertAllowed(`perl -e 'unlink "/tmp/x" unless -d "/tmp/x"'`)
+  assertBlocked(`perl -e 'unlink for glob "/workspace/*"'`, "interpreter deletion")
+  // A bare number is an rmtree flag only in the second and third place of an
+  // old-style call; elsewhere, or next to an option hash, it is a path.
+  assertBlocked(`perl -MFile::Path -e 'rmtree 2024, "/tmp/x"'`, "interpreter deletion")
+  assertBlocked(`perl -MFile::Path -e 'rmtree "/tmp/x", 2024, {}'`, "interpreter deletion")
+  assertAllowed(`perl -MFile::Path -e 'rmtree("/tmp/x", 1)'`)
+})
+
 test("find and rsync delete through the same temp-root test", () => {
   // WI#832: `find -exec unlink` deleted without a deletion action match, and
   // rsync --delete removed whatever the destination had.
@@ -751,6 +992,74 @@ test("find and rsync delete through the same temp-root test", () => {
   assertAllowed("rsync -a --delete /tmp/empty/ /tmp/wi832-x/")
   assertAllowed("rsync -a /tmp/wi832-a/ /tmp/wi832-b/")
   assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
+})
+
+test("a rename of a protected tree and tar --remove-files are denied (WI#849)", () => {
+  // Two ALLOWed steps laundered a protected tree past the rm operand test: a
+  // rename moved it out of the protected namespace, and `rm -rf /tmp/x` then
+  // deleted the staged copy. The rename is the deletion, so both sides of the
+  // mv and tar's removed members take the shared containment test.
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /app/config /tmp/wi849-x", "protected tree")
+  assertBlocked("mv /tmp/wi849-a /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv -t /tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv --target-directory=/tmp/wi849-x /home/kimi/.kimi-code", "protected tree")
+  assertBlocked("mv /home/kimi/.kimi-code /tmp/wi849-x && rm -rf /tmp/wi849-x", "protected tree")
+  assertBlocked("tar -cf /dev/null --remove-files /home/kimi/.kimi-code", "deletion outside")
+  assertBlocked("tar -cf /dev/null --remove-files /app/hooks", "deletion outside")
+  // A member list is contents the guard cannot see, like `xargs rm` with no find.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -T /tmp/wi849-list", "cannot verify")
+  // A relative member follows `-C`, so it is refused like every relative operand.
+  assertBlocked("tar -cf /tmp/wi849.tar --remove-files -C /home/kimi .kimi-code", "deletion outside")
+  // The same spellings stay ordinary work inside the temp roots: the archive
+  // name and a suffix value are option values, not members.
+  assertAllowed("rm -rf /tmp/wi849-x")
+  assertAllowed("mv /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -S .bak /tmp/wi849-a /tmp/wi849-b")
+  assertAllowed("mv -t /tmp/wi849-x /tmp/wi849-a")
+  assertAllowed("tar -cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar cf /tmp/wi849.tar --remove-files /tmp/wi849-d")
+  assertAllowed("tar -cf /tmp/wi849.tar /tmp/wi849-d")
+  // Review AKL-1/AKL-2 on !2694: only the guard's own trees, a directory
+  // above one and the system roots are held back; ordinary renames pass, and
+  // the command word is read like rm's (`\mv`, `"mv"`).
+  for (const command of [
+    "mv /home/kimi /tmp/wi849-k",
+    "mv /usr /tmp/wi849-u",
+    "mv /tmp/wi849-evil /home/kimi/.kimi-code/config.toml",
+    "mv /home/kimi/.kimi* /tmp/wi849-x",
+    "cd /home/kimi && mv .kimi-code /tmp/wi849-x",
+    "\\mv /home/kimi/.kimi-code /tmp/wi849-x",
+    "\"mv\" /home/kimi/.kimi-code /tmp/wi849-x",
+    "'mv' /app/hooks /tmp/wi849-x",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv a.txt b.txt")
+  assertAllowed("git mv a.txt b.txt")
+  assertAllowed("mv src/old.rs src/new.rs")
+  assertAllowed("mv -f notes.md docs/notes.md")
+  assertAllowed('mv "$HOME/project/a" "$HOME/project/b"')
+  assertAllowed("git commit -m 'rename x via mv a b'")
+  // From the independent read of the fix: a glob in the directory part, a
+  // variable, a substitution, `~user`, a find/xargs `{}` placeholder and the
+  // abbreviated target option all stand for the protected tree too.
+  for (const command of [
+    "mv /h*/kimi/.k* /tmp/wi849-x",
+    "mv /*/kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ~kimi/.kimi-cod? /tmp/wi849-x",
+    "mv ${HOME%/}/.kimi-cod? /tmp/wi849-x",
+    "mv $(echo ~)/.k* /tmp/wi849-x",
+    "cd ~ && mv .kimi-cod? /tmp/wi849-x",
+    "echo /home/kimi/.kimi-code | xargs -I{} mv {} /tmp/wi849-x",
+    "find /home/kimi -maxdepth 1 -name '.k*' -exec mv {} /tmp/wi849-x \\;",
+    "mv --t=/home/kimi/.kimi-code /tmp/wi849-evil/config.toml",
+  ]) {
+    assertBlocked(command, "protected tree")
+  }
+  assertAllowed("mv *.log logs/")
+  assertAllowed("mv file.{txt,md}")
+  assertAllowed("mv .gitignore .gitignore.bak")
 })
 
 test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
@@ -790,6 +1099,65 @@ test("git commands that discard work are denied in the spellings WI#832 named", 
   assertAllowed("git checkout -b feature")
 })
 
+test("GNU long-option abbreviations cannot walk past the git discard rules", () => {
+  // WI#841: git resolves any unambiguous prefix of a long option, so `--har`,
+  // `--for` and `--includ` discard exactly like the spelled-out option. The
+  // guard reads them the way the `rm` rules read theirs (WI#795).
+  for (const command of [
+    "git reset --h",
+    "git reset --ha",
+    "git reset --har",
+    "git reset --har HEAD~1",
+    "git clean --f",
+    "git clean --fo",
+    "git clean --for",
+    "git clean -fd --for",
+    "git checkout --f",
+    "git checkout --forc .",
+    "git switch --dis",
+    "git switch --discard-ch",
+    "git stash --a",
+    "git stash --al",
+    "git stash --includ",
+    "git stash --include-untrack",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  // A dry run deletes nothing, so its abbreviation stays ordinary work.
+  assertAllowed("git clean --d")
+  assertAllowed("git clean --dry-r")
+  assertAllowed("git clean -fd --d")
+  // A longer word is not a prefix of the option and must not be read as one.
+  assertAllowed("git reset --harder")
+  assertAllowed("git clean --forces")
+})
+
+test("a wrapped git discard or recursive chmod/chown is denied (WI#853)", () => {
+  // bash runs the body of a subshell, a command substitution and a backtick
+  // body as commands of their own, and the glued punctuation ends the word
+  // around it: `--hard)`, `-fdx)` and `/etc)` must read as the plain words.
+  assertBlocked("(git reset --hard)", "git command")
+  assertBlocked("(git reset --har)", "git command")
+  assertBlocked("$(git clean -fdx)", "git command")
+  assertBlocked("echo $(git checkout -- .)", "git command")
+  assertBlocked("echo $(git checkout -- . )", "git command")
+  assertBlocked("`git reset --hard`", "git command")
+  assertBlocked('echo "$(git clean -fdx)"', "git command")
+  assertBlocked("cd repo && (git reset --hard)", "git command")
+  assertBlocked("(chmod -R 777 /etc)", "recursive")
+  assertBlocked("(chown -R kimi /etc)", "recursive")
+  assertBlocked("`chmod -R 777 /etc`", "recursive")
+  // The rm rule already read the wrapped form; keep that verdict pinned.
+  assertBlocked("(rm -rf /etc)", "deletion outside")
+  // The unwrapped spellings keep their verdicts.
+  assertBlocked("git reset --hard", "git command")
+  assertBlocked("chmod -R 777 /etc", "recursive")
+  // Read-only git and a wrapped dry-run clean stay ordinary work.
+  assertAllowed("(git status)")
+  assertAllowed("$(git log -1)")
+  assertAllowed("$(git clean -fdn)")
+})
+
 test("the noclobber override writes a block device like a plain redirect", () => {
   assertBlocked("cat x >| /dev/sda1", "block-device")
   assertBlocked("echo pwn >| /dev/mapper/vg-root", "block-device")
@@ -808,4 +1176,85 @@ test("a dry-run clean and a deleting tr no longer deny (WI#832 false denials)", 
   assertBlocked("echo aGVsbG8K | tr -d '\\n' | rev | sh", "decoded")
   assertAllowed("cat script.sh | tr -d '\\r' | bash")
   assertAllowed("cat script.sh | tr -d '\\r' > script.sh.tmp")
+})
+
+test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => {
+  // The verb rules read the literal verb, so `git -c alias.z='reset --hard' z`
+  // was classified as the unknown verb `z` and allowed while git discarded the
+  // change. The alias definition is refused instead of resolved: the value may
+  // live in repo config the guard cannot read cheaply.
+  assertBlocked("git -c alias.z='reset --hard' z", "git command")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
+  assertBlocked("git -c alias.z=status z", "git command")
+  assertBlocked("git --config-env=alias.z=Z z", "git command")
+  assertBlocked("git --config-env alias.z=Z z", "git command")
+  // The repo-config write that plants the same alias is refused too.
+  assertBlocked("git config alias.t1 'reset --hard'", "git command")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  // git's modern config subcommands write the same key: `set` names it after
+  // the subcommand, and `rename-section foo alias` turns a section into aliases.
+  assertBlocked("git config set alias.z 'reset --hard'", "git command")
+  assertBlocked("git config get alias.z", "git command")
+  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
+  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
+  assertBlocked("git config rename-section foo alias", "git command")
+  // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
+  assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "git command")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+  // The environment value is read as one shell word: an `alias.` in a later
+  // argument of the same line is not attributed to the variable.
+  assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
+  // Ordinary config and option use stays allowed.
+  assertAllowed("git -c user.name=bot commit -m x")
+  assertAllowed("git config --get user.email")
+  assertAllowed("git config --local core.hooksPath .githooks")
+  assertAllowed("git status")
+  // git reads section names without regard to case, and an include or a
+  // config file named in the environment defines an alias the same way
+  // (review AKK-1/AKK-2 on !2686).
+  for (const command of [
+    "git -c Alias.z='reset --hard' z",
+    "git -c ALIAS.z='reset --hard' z",
+    "git -c include.path=/tmp/evil.cfg z",
+    "git -c includeIf.gitdir:/workspace/.path=/tmp/evil.cfg z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0=/tmp/evil.cfg git z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=Alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "GIT_CONFIG_GLOBAL=/tmp/evil.cfg git z",
+    "GIT_CONFIG_SYSTEM=/tmp/evil.cfg git z",
+    "git config Alias.z 'reset --hard'",
+    "git config set Alias.z 'reset --hard'",
+    "git config --file .git/config Alias.z 'reset --hard'",
+    "git config include.path /tmp/evil.cfg",
+    "git config --add include.path /tmp/evil.cfg",
+    "git config --rename-section foo alias",
+    "git config --edit",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config --rename-section foo bar")
+  assertAllowed("git config --list")
+  assertAllowed("git -c core.quotepath=off status")
+  // From the independent read of the fix: git's own value options are
+  // stepped over, git config's value options and long-option prefixes are
+  // read, and an edit option counts only before the first operand.
+  for (const command of [
+    "git -C . -c alias.z='reset --hard' z",
+    "git --work-tree . -c alias.z='reset --hard' z",
+    "git -C . --config-env alias.z=V z",
+    "git config --comment x alias.z 'reset --hard'",
+    "git config -t bool-or-str alias.z 'reset --hard'",
+    "git config --fil .git/config alias.z 'reset --hard'",
+    "git config set --value x alias.z 'reset --hard'",
+    "git config --ren foo alias",
+    "git config edit",
+    "git config --ed",
+    "git --work-tree . reset --hard",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config core.editor 'vim -e'")
+  assertAllowed('git config user.name "Jane -e Doe"')
+  assertAllowed("git -C sub log --oneline")
 })

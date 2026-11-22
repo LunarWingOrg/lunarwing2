@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, resolve as resolvePath } from "node:path";
 import { runInNewContext } from "node:vm";
 
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
@@ -294,9 +294,11 @@ const FROM_IMPORT = /\bfrom\s+([\w.]+)\s+import\s+([^;\n]+)/g;
 const MODULE_IMPORT_ALIAS = /\bimport\s+([\w.]+)\s+as\s+([\w$]+)/g;
 const ASSIGNED_SINK =
   /\b([A-Za-z_$][\w$]*)\s*=\s*((?:[\w$]+\.)*)(rmtree|remove_tree|rimraf|rmdir|unlink|remove|removedirs|rmSync|rmdirSync|unlinkSync)\b(?!\s*\()/g;
-// Perl calls deletion without parentheses: `rmtree "/x"`, `unlink glob "/x/*"`.
-const PERL_BAREWORD_DELETE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s*(?:glob\s+)?(['"])([^'"]*)\1/g;
-const PERL_BAREWORD_VARIABLE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s+(?:glob\s+)?[$@%]/g;
+// Perl calls deletion with or without parentheses: `rmtree "/x"`,
+// `rmtree("/x")`, `unlink glob "/x/*"`. The call head is matched alone and
+// its operands are read by perlDeletionCall, so a comma list is checked in
+// full rather than only its first operand (WI#840).
+const PERL_DELETE_CALL = /\b(?:unlink|rmdir|rmtree|remove_tree)\b/g;
 const DEVICE_TARGET = /^\/dev\/(?:sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
 const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b([^;&|\n]*)/g;
 const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b([^;&|\n]*)/g;
@@ -363,6 +365,236 @@ function checkRsyncDeletion(text) {
     const deleted = option === "--remove-source-files" ? operands.slice(0, -1) : operands.slice(-1);
     if (deleted.length === 0) return `rsync ${option} without a verifiable target`;
     if (!deleted.every(isSafeTempPath)) return outsideTempReason(`rsync ${option}`, deleted);
+  }
+  return null;
+}
+
+const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b([^;&|\n]*)/g;
+const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b([^;&|\n]*)/g;
+// tar's argument-taking short options. Every other letter is a flag, so an
+// old-style first word (`tar cf archive …`) is read letter by letter.
+const TAR_SHORT_ARG = new Set("bCfFgHIKLNTVX");
+// tar's long options whose value is the rest of the word or the next word.
+// `--atime-preserve` and the other optional-argument options are absent on
+// purpose: they never take a separate word, and eating one could hide a
+// member from the check below.
+const TAR_LONG_ARG = [
+  "file", "directory", "files-from", "exclude", "exclude-from", "transform",
+  "xform", "owner", "group", "mode", "mtime", "format", "blocking-factor",
+  "record-size", "tape-length", "label", "newer", "after-date",
+  "listed-incremental", "use-compress-program", "rmt-command", "rsh-command",
+  "index-file", "checkpoint-action", "info-script", "new-volume-script",
+  "volno-file", "suffix", "strip-components", "to-command", "quoting-style",
+  "sort", "pax-option", "sparse-version", "level", "hole-detection",
+];
+
+/** An option value: the attached rest of the word, otherwise the next word. */
+function optionValue(attached, words, index) {
+  if (attached.length > 0) return { value: attached, last: index };
+  return { value: words[index + 1] ?? "", last: index + 1 };
+}
+
+/**
+ * The path operands of an `mv` invocation: every source and the destination,
+ * including a `-t`/`--target-directory` value, which is a destination without
+ * being an operand word. `-S`/`--suffix` takes a value that is not a path
+ * (WI#849).
+ */
+function mvOperands(rest) {
+  const words = argumentWords(rest).map(stripShellQuotes);
+  const operands = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      operands.push(...words.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const attached = equals === -1 ? null : word.slice(equals + 1);
+      // GNU mv accepts unique prefixes: `--t` is `--target-directory`.
+      const target = name.length >= 1 && "target-directory".startsWith(name);
+      const suffix = name.length >= 2 && "suffix".startsWith(name);
+      if (!target && !suffix) continue;
+      const { value, last } = optionValue(attached ?? "", words, i);
+      if (target) operands.push(value);
+      i = last;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const cluster = word.slice(1);
+      for (let j = 0; j < cluster.length; j++) {
+        if (cluster[j] !== "t" && cluster[j] !== "S") continue;
+        const { value, last } = optionValue(cluster.slice(j + 1), words, i);
+        if (cluster[j] === "t") operands.push(value);
+        i = last;
+        break;
+      }
+      continue;
+    }
+    operands.push(word);
+  }
+  // A redirection target is not an operand (e.g. `2>/tmp/log`).
+  return operands.filter((operand) => !/^\d*>/.test(operand));
+}
+
+/** The argument-taking long option a name spells, exactly or by unique prefix. */
+function tarLongValueOption(name) {
+  if (TAR_LONG_ARG.includes(name)) return name;
+  if (name.length < 4) return null;
+  return TAR_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+}
+
+/** Read one tar short-option cluster; returns the index of its last consumed word. */
+function tarCluster(cluster, words, index, state) {
+  for (let j = 0; j < cluster.length; j++) {
+    if (!TAR_SHORT_ARG.has(cluster[j])) continue;
+    const { last } = optionValue(cluster.slice(j + 1), words, index);
+    if (cluster[j] === "T") state.unverifiable = true;
+    // An argument ends the cluster: the rest of the word is its value, or the
+    // next word when nothing is attached.
+    return last;
+  }
+  return index;
+}
+
+/** Read one tar long option; returns the index of its last consumed word. */
+function tarLongOption(word, words, index, state) {
+  const equals = word.indexOf("=");
+  const name = word.slice(2, equals === -1 ? undefined : equals);
+  const attached = equals === -1 ? null : word.slice(equals + 1);
+  if (attached === null && "remove-files".startsWith(name)) {
+    state.removeFiles = true;
+    return index;
+  }
+  const valueOption = tarLongValueOption(name);
+  if (valueOption === "files-from") state.unverifiable = true;
+  return valueOption === null ? index : optionValue(attached ?? "", words, index).last;
+}
+
+/**
+ * Read a tar invocation for `--remove-files` (WI#849): the member words tar
+ * removes after archiving, and whether a `-T`/`--files-from` list replaces
+ * them with contents the guard cannot see. Only literal member paths matter:
+ * a relative member is refused by the shared containment test anyway, so a
+ * `-C` base cannot point the removal at a protected tree.
+ */
+function tarInvocation(rest) {
+  const words = argumentWords(rest).map(stripShellQuotes);
+  const state = { removeFiles: false, members: [], unverifiable: false };
+  let i = 0;
+  // Old-style options (`tar cf archive …`) carry the cluster without a dash.
+  if (words.length > 0 && /^[A-Za-z]+$/.test(words[0]) && /[cxtruA]/.test(words[0])) {
+    i = tarCluster(words[0], words, 0, state) + 1;
+  }
+  for (; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      state.members.push(...words.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      i = tarLongOption(word, words, i, state);
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      i = tarCluster(word.slice(1), words, i, state);
+      continue;
+    }
+    state.members.push(word);
+  }
+  state.members = state.members.filter((member) => !/^\d*>/.test(member));
+  return state;
+}
+
+/**
+ * Deny the two shapes that remove a tree without a deleting verb (WI#849): an
+ * `mv` whose source or destination leaves the temp roots — a rename moves the
+ * tree out of the protected namespace, and a later `rm -rf` of the new name is
+ * then trivially inside them — and `tar --remove-files`, whose members are
+ * deleted after archiving. Both take the shared temp-root test `rm` uses.
+ */
+// The guard's own trees: the CLI's config home and the image's code and
+// config (WI#849). A rename that moves one of them, a directory above one, or
+// a system root out of place is the launder; any other rename is ordinary
+// work, so a workspace `mv a b` or `git mv` passes.
+const MV_PROTECTED_ROOTS = ["/home/kimi/.kimi-code", "/app"];
+
+function mvProtectedRoots() {
+  const home = process.env.KIMI_CODE_HOME;
+  if (!home || !home.startsWith("/")) return MV_PROTECTED_ROOTS;
+  return [...MV_PROTECTED_ROOTS, home.replace(/(.)\/+$/, "$1")];
+}
+
+/** A glob path component as a regular expression over the names it can match. */
+function globComponentRegex(component) {
+  let pattern = "^";
+  for (let i = 0; i < component.length; i++) {
+    const ch = component[i];
+    const close = ch === "[" ? component.indexOf("]", i + 1) : ch === "{" ? component.indexOf("}", i + 1) : -1;
+    if (ch === "*") pattern += ".*";
+    else if (ch === "?") pattern += ".";
+    else if (close !== -1) {
+      // A bracket class or a brace list: either way, any name can follow.
+      pattern += ".*";
+      i = close;
+    } else pattern += ch.replace(/[.+^$()|\\[\]{}]/g, "\\$&");
+  }
+  return new RegExp(`${pattern}$`);
+}
+
+const mvOperandVerdicts = new Map();
+
+/**
+ * True when an `mv` operand names, contains or sits inside a protected tree,
+ * or is a system root itself. `~`/`$HOME` are expanded and a relative operand
+ * is read from the hook's working directory. An operand holding a variable, a
+ * command substitution, `~user` or a find/xargs `{}` placeholder can stand
+ * for any path, so it is refused. A `.kimi-code` component, or a dot-glob
+ * that can match it, counts wherever it is; any other glob stands for any
+ * name in its literal directory. Verdicts are cached for the readings of one
+ * command.
+ */
+function mvTouchesProtected(operand) {
+  if (!mvOperandVerdicts.has(operand)) mvOperandVerdicts.set(operand, mvOperandProtected(operand));
+  return mvOperandVerdicts.get(operand);
+}
+
+function mvOperandProtected(operand) {
+  const home = (process.env.HOME || "/home/kimi").replace(/(.)\/+$/, "$1");
+  const text = operand.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, home);
+  if (/[$`]/.test(text) || text.startsWith("~") || text.includes("{}")) return true;
+  if (/(?:^|\/)\.kimi-code(?:\/|$)/.test(text)) return true;
+  const roots = mvProtectedRoots();
+  const glob = [...text].findIndex((ch) => "*?[]{}".includes(ch));
+  if (glob !== -1) {
+    const dotGlob = text.split("/").some((part) => part.startsWith(".") &&
+      /[*?[\]{}]/.test(part) && globComponentRegex(part).test(".kimi-code"));
+    if (dotGlob) return true;
+    const prefix = text.slice(0, glob);
+    const directory = prefix.endsWith("/") ? resolvePath(prefix) : dirname(resolvePath(`${prefix}x`));
+    return roots.some((root) => directory === "/" || root === directory ||
+      root.startsWith(`${directory}/`) || directory.startsWith(`${root}/`));
+  }
+  const resolved = resolveExistingPrefix(resolvePath(text));
+  if (resolved === null) return true;
+  if (resolved === "/" || SYSTEM_ROOTS.includes(resolved)) return true;
+  return roots.some((root) => resolved === root || resolved.startsWith(`${root}/`) ||
+    root.startsWith(`${resolved}/`));
+}
+
+function checkMoveAndTarDeletion(text) {
+  for (const match of text.matchAll(MV_CALL)) {
+    const hit = mvOperands(match[1]).find(mvTouchesProtected);
+    if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
+  }
+  for (const match of text.matchAll(TAR_CALL)) {
+    const tar = tarInvocation(match[1]);
+    if (!tar.removeFiles) continue;
+    if (tar.unverifiable) return "tar --remove-files over a member list the guard cannot verify";
+    if (tar.members.length === 0) return "tar --remove-files without an explicit member";
+    if (!tar.members.every(isSafeTempPath)) return outsideTempReason("tar --remove-files", tar.members);
   }
   return null;
 }
@@ -461,7 +693,10 @@ function deletionCallOffsets(code, aliases) {
 /**
  * Strip one layer of shell quoting that wraps the whole one-liner body, so the
  * interpreter's own string literals are the only quotes the readers see:
- * `'print "unlink"'` becomes `print "unlink"` (WI#832).
+ * `'print "unlink"'` becomes `print "unlink"` (WI#832). A double-quoted shell
+ * word also passes `\"`, `\\`, `\$` and `` \` `` to the interpreter without
+ * the backslash, so those escapes are removed too; the readers then see the
+ * code the interpreter runs, not the shell's spelling of it (WI#840).
  */
 function stripOuterShellQuotes(code) {
   const text = code.trim();
@@ -476,7 +711,9 @@ function stripOuterShellQuotes(code) {
     }
     if (text[i] === quote) end = i;
   }
-  return end === text.length - 1 ? text.slice(1, -1) : text;
+  if (end !== text.length - 1) return text;
+  const inner = text.slice(1, -1);
+  return quote === '"' ? inner.replace(/\\(["\\$`])/g, "$1") : inner;
 }
 
 /** True when `index` in the code sits inside a single- or double-quoted string. */
@@ -497,20 +734,234 @@ function insideQuotedString(code, index) {
   return quote !== "";
 }
 
+function skipBlanks(code, i) {
+  while (i < code.length && (code[i] === " " || code[i] === "\t")) i++;
+  return i;
+}
+
+/** The value of the Perl string literal that opens at `from` and the index after it. */
+function perlStringLiteral(code, from) {
+  const quote = code[from];
+  if (quote !== "'" && quote !== '"') return null;
+  let value = "";
+  for (let i = from + 1; i < code.length; i++) {
+    if (code[i] === "\\" && i + 1 < code.length) {
+      value += code[++i];
+      continue;
+    }
+    if (code[i] === quote) return { value, next: i + 1 };
+    value += code[i];
+  }
+  return null;
+}
+
+// Perl's paired delimiters; a delimiter without a pair (`q/…/`) closes on
+// itself. Quote-like bodies and File::Path option hashes are skipped with it.
+const PERL_DELIMITERS = { "(": ")", "[": "]", "{": "}", "<": ">" };
+
 /**
- * The Perl parenthesis-free deletion verdict: `rmtree "dir"`, `unlink glob
- * "dir/*"`, and a variable operand the guard cannot resolve (WI#832). A call
- * name inside a string literal (`print "unlink"`) is text, not a call.
+ * The index after the Perl delimiter pair that opens at `open`, or -1 when it
+ * never closes. A backslash escapes the next character and bracket pairs nest.
+ */
+function perlDelimitedEnd(code, open) {
+  const openCh = code[open];
+  const closeCh = PERL_DELIMITERS[openCh] ?? openCh;
+  const paired = openCh !== closeCh;
+  let depth = 0;
+  for (let i = paired ? open : open + 1; i < code.length; i++) {
+    if (code[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (paired && code[i] === openCh) depth++;
+    else if (code[i] === closeCh && (!paired || --depth === 0)) return i + 1;
+  }
+  return -1;
+}
+
+/**
+ * The index after the `}` that closes the File::Path option hash at `i`, or
+ * -1. Quotes are skipped so a brace inside an option value does not close it.
+ */
+function perlHashEnd(code, i) {
+  let depth = 0;
+  let quote = "";
+  for (let j = i; j < code.length; j++) {
+    const ch = code[j];
+    if (quote) {
+      if (ch === "\\") j++;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return j + 1;
+  }
+  return -1;
+}
+
+// Quote-like string operators whose body is text, not code: a deletion keyword
+// spelled inside one (`qw(unlink)`) is not a call. `q` must not follow a sigil
+// (so `$q = …` is not read as a literal) and takes a bracketed delimiter
+// (WI#851).
+const PERL_QUOTE_LIKE = /(?<![\w$@%&\\])(?:qw|qq|qx|q)\s*[([{]/g;
+
+/** True when `index` sits inside a Perl quote-like literal (`qw(…)`, `q{…}`). */
+function insidePerlQuoteLike(code, index) {
+  for (const match of code.matchAll(PERL_QUOTE_LIKE)) {
+    const open = match.index + match[0].length - 1;
+    if (open >= index) return false;
+    const end = perlDelimitedEnd(code, open);
+    if (end !== -1 && index < end) return true;
+  }
+  return false;
+}
+
+/** A `qw(…)` list of literal words at `i`, or null when there is none. */
+function perlQuoteWordList(code, i) {
+  if (!code.startsWith("qw", i) || /\w/.test(code[i + 2] ?? "")) return null;
+  const open = skipBlanks(code, i + 2);
+  if (PERL_DELIMITERS[code[open]] === undefined && code[open] !== "/") return null;
+  const end = perlDelimitedEnd(code, open);
+  if (end === -1) return { unverifiable: true };
+  const values = code.slice(open + 1, end - 1).split(/[ \t\n]+/).filter((word) => word.length > 0);
+  return { next: end, values };
+}
+
+/** The pattern a `glob(…)` operand names: a quoted literal or its bare text. */
+function perlGlobTarget(text) {
+  const literal = perlStringLiteral(text, 0);
+  return literal !== null && literal.next === text.length ? literal.value : text;
+}
+
+/** A Perl `glob(…)` or `glob …` operand at `i`, or null when there is none. */
+function perlGlobOperand(code, i) {
+  if (!code.startsWith("glob", i) || /\w/.test(code[i + 4] ?? "")) return null;
+  const open = skipBlanks(code, i + 4);
+  if (code[open] === "(") {
+    const end = perlDelimitedEnd(code, open);
+    if (end === -1) return { unverifiable: true };
+    return { next: end, values: [perlGlobTarget(code.slice(open + 1, end - 1).trim())] };
+  }
+  const literal = perlStringLiteral(code, open);
+  if (literal === null) return { unverifiable: true };
+  return { next: literal.next, values: [literal.value] };
+}
+
+/** A `<…>` glob operand at `i`. */
+function perlAngleOperand(code, i) {
+  const end = code.indexOf(">", i + 1);
+  if (end === -1) return { unverifiable: true };
+  const value = code.slice(i + 1, end).trim();
+  return value.length === 0 ? { unverifiable: true } : { next: end + 1, values: [value] };
+}
+
+/**
+ * One element of a Perl deletion call's operand list: a path target, an
+ * option that is not a target, or an expression the guard cannot verify. The
+ * File::Path option hash of `rmtree`/`remove_tree` and `rmtree`'s legacy
+ * numeric verbose/safe flags are the only options (WI#851); `remove_tree` has
+ * no legacy flags, so a bare number there is a path (`remove_tree "x", 0`
+ * removes `./0`).
+ */
+function perlDeletionElement(code, i, options, numericFlags) {
+  const ch = code[i] ?? "";
+  if (options && ch === "{") {
+    const end = perlHashEnd(code, i);
+    return end === -1 ? { unverifiable: true } : { next: end, skipped: true, hash: true };
+  }
+  if (numericFlags && /[0-9]/.test(ch)) {
+    let end = i;
+    while (end < code.length && /[0-9]/.test(code[end])) end++;
+    return { next: end, skipped: true, number: true };
+  }
+  if (ch === "<") return perlAngleOperand(code, i);
+  const glob = perlGlobOperand(code, i);
+  if (glob !== null) return glob;
+  const wordList = perlQuoteWordList(code, i);
+  if (wordList !== null) return wordList;
+  const literal = perlStringLiteral(code, i);
+  if (literal !== null) return { next: literal.next, values: [literal.value] };
+  return { unverifiable: true };
+}
+
+/**
+ * True when `i` ends a list operator's arguments: `;`, a closing block, a
+ * comment, the end of the code, the low-precedence `or`/`and` a guarded
+ * deletion ends with (`unlink "/tmp/x" or die`), or a statement modifier
+ * (`unlink "/tmp/x" if -e "/tmp/x"`). `&&`, `||` and `//` bind tighter than a
+ * list operator, so they continue the operand: `unlink "/tmp/x" && "/w/f"`
+ * deletes `/w/f` and must read as unverifiable.
+ */
+function perlStatementEnd(code, i) {
+  if (i >= code.length) return true;
+  if (";})\n#".includes(code[i])) return true;
+  return /^(?:or|and|if|unless|while|until|for|foreach)(?![\w])/.test(code.slice(i));
+}
+
+/**
+ * The operands of a Perl deletion call whose keyword `keyword` ends at `from`,
+ * and whether any part of its operand list is not a single string literal. The
+ * call may be spelled with or without parentheses and may take a comma list;
+ * every operand is read, because checking only the first leaves the rest
+ * unverified (WI#840). `glob(…)`, `<…>`, `qw(…)` and the implicit-`$_` form
+ * are call shapes too (WI#851). Null means the keyword is not a call at all
+ * (a `=>` hash key).
+ */
+function perlDeletionCall(code, from, keyword) {
+  let i = skipBlanks(code, from);
+  if (code.startsWith("=>", i)) return null;
+  const parenthesized = code[i] === "(";
+  if (parenthesized) i++;
+  const options = keyword === "rmtree" || keyword === "remove_tree";
+  const callEnd = (at) => (parenthesized ? code[at] === ")" : perlStatementEnd(code, at));
+  const operands = [];
+  // File::Path reads `rmtree`'s numbers as the legacy verbose/safe flags only
+  // in the second and third place of an old-style call (no option hash); in
+  // any other place, or next to a hash, a number is a path (`./2024`).
+  let index = 0;
+  let hash = false;
+  let number = false;
+  for (;;) {
+    i = skipBlanks(code, i);
+    // No target at all is the implicit `$_` form, which cannot be verified.
+    if (callEnd(i)) return { operands, unverifiable: true };
+    const numericFlags = keyword === "rmtree" && (index === 1 || index === 2);
+    const element = perlDeletionElement(code, i, options, numericFlags);
+    if (element.unverifiable) return { operands, unverifiable: true };
+    if (!element.skipped) operands.push(...element.values);
+    hash ||= element.hash === true;
+    number ||= element.number === true;
+    index++;
+    i = skipBlanks(code, element.next);
+    if (code[i] === ",") {
+      i++;
+      continue;
+    }
+    return { operands, unverifiable: !callEnd(i) || operands.length === 0 || (hash && number) };
+  }
+}
+
+/**
+ * The Perl deletion verdict: `rmtree "dir"`, `unlink glob "dir/*"`,
+ * `rmtree("a", "b")`, and a target the guard cannot resolve (WI#832). Every
+ * operand of the comma list is read, and the shell escapes of a quoted
+ * one-liner are removed before the calls are read (WI#840). `glob(…)`,
+ * `<…>`, `qw(…)` and the implicit-`$_` forms are calls too, and the File::Path
+ * options of `rmtree`/`remove_tree` are not targets (WI#851). A call name
+ * inside a string literal (`print "unlink"`) or a quote-like literal
+ * (`qw(unlink)`) is text, not a call.
  */
 function perlDeletionVerdict(rawCode) {
   const code = stripOuterShellQuotes(rawCode);
-  for (const match of code.matchAll(PERL_BAREWORD_DELETE)) {
-    if (insideQuotedString(code, match.index)) continue;
-    if (!isSafeTempPath(match[2])) return outsideTempReason("interpreter deletion", [match[2]]);
-  }
-  for (const match of code.matchAll(PERL_BAREWORD_VARIABLE)) {
-    if (insideQuotedString(code, match.index)) continue;
-    return "interpreter deletion whose target the guard cannot verify";
+  for (const match of code.matchAll(PERL_DELETE_CALL)) {
+    if (insideQuotedString(code, match.index) || insidePerlQuoteLike(code, match.index)) continue;
+    const call = perlDeletionCall(code, match.index + match[0].length, match[0]);
+    if (call === null) continue;
+    if (call.unverifiable) return "interpreter deletion whose target the guard cannot verify";
+    for (const operand of call.operands) {
+      if (!isSafeTempPath(operand)) return outsideTempReason("interpreter deletion", [operand]);
+    }
   }
   return null;
 }
@@ -567,6 +1018,7 @@ function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
     checkRsyncDeletion(text) ??
+    checkMoveAndTarDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
     checkDecodedPipe(text);
@@ -578,6 +1030,48 @@ const ROOT_CHANGE_CALL = /\bch(?:mod|own|grp)\b/g;
 const STAGE_PREFIXES = ["sudo", "env", "exec", "busybox"];
 const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
 
+/**
+ * The word view bash builds around shell punctuation (WI#853): an unquoted
+ * `(`, `)` or backtick ends the word around it, because a subshell, a `$(…)`
+ * or a backtick body runs a command of its own. A substitution and a backtick
+ * still run inside double quotes; text in single quotes is literal. Each
+ * syntax character becomes a space, so an option or path rule sees the end of
+ * its word (`--hard)` reads as `--hard `). A backslash-escaped character is
+ * kept as text. This is a reading, not a parser: it only adds matches.
+ */
+function shellPunctuationView(text) {
+  if (!text.includes("(") && !text.includes(")") && !text.includes("`")) return text;
+  let view = "";
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      view += ch + text[++i];
+      continue;
+    }
+    if (quote === "'") {
+      view += ch;
+      if (ch === "'") quote = "";
+    } else if (ch === "'") {
+      quote = "'";
+      view += ch;
+    } else if (ch === '"') {
+      quote = quote === '"' ? "" : '"';
+      view += ch;
+    } else if (ch === "`") {
+      view += " ";
+    } else if (ch === "$" && text[i + 1] === "(") {
+      view += "  ";
+      i++;
+    } else if (ch === "(" || ch === ")") {
+      view += " ";
+    } else {
+      view += ch;
+    }
+  }
+  return view;
+}
+
 /** True for the filesystem root or a path at or under a listed system root. */
 function isSystemRootPath(candidate) {
   if (!candidate.startsWith("/")) return false;
@@ -585,6 +1079,15 @@ function isSystemRootPath(candidate) {
   if (path === "/") return true;
   return SYSTEM_ROOTS.some((root) => path === root || path.startsWith(`${root}/`));
 }
+
+// The recursive flag as chmod/chown/chgrp parse it: the short cluster, or the
+// GNU long option, which getopt accepts down to its shortest unique prefix
+// (`--rec`: `rec` and `ref` differ in the third letter, so only `--re` is
+// ambiguous with `--reference`; coreutils 9.12 recurses on `--rec`). An
+// attached value is rejected by getopt, but matching it costs nothing and
+// keeps the rule fail-closed.
+const RECURSIVE_CHANGE_FLAG =
+  /(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--rec[a-z]*)(?=[ \t=]|$)/;
 
 /**
  * Deny a recursive mode/ownership change on a system root, however the root is
@@ -594,7 +1097,7 @@ function isSystemRootPath(candidate) {
 function checkRecursiveRootChange(segment) {
   for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
     const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
-    if (!/(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?=[ \t]|$)/.test(rest)) continue;
+    if (!RECURSIVE_CHANGE_FLAG.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
     }
@@ -602,23 +1105,179 @@ function checkRecursiveRootChange(segment) {
   return false;
 }
 
-/** The git verb after any leading options, and the argument text after it. */
-function gitVerb(rest) {
-  let i = 0;
-  while (i < rest.length) {
-    while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+/** True for a character that ends the current command clause. */
+function isClauseTerminator(ch) {
+  return ch === ";" || ch === "&" || ch === "|" || ch === "\n";
+}
+
+// git's own options that take the next word as their value (`git -C dir`,
+// `git --work-tree dir`). The value is neither the verb nor an option, so a
+// scan of the leading words must step over it.
+const GIT_VALUE_OPTIONS = new Set([
+  "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
+  "--config-env", "--attr-source", "--list-cmds",
+]);
+
+/** The git verb after any leading options, and the index after it. */
+function gitVerb(text, from) {
+  let i = from;
+  while (i < text.length) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
     const start = i;
-    while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
-    const word = rest.slice(start, i);
+    while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
+    const word = text.slice(start, i);
     if (word.length === 0) break;
-    if (!word.startsWith("-")) return { verb: word, after: rest.slice(i) };
-    if (word === "-C" || word === "-c") {
+    if (!word.startsWith("-")) return { verb: word, after: i };
+    if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb.
-      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
-      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+      while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
     }
   }
-  return { verb: "", after: "" };
+  return { verb: "", after: text.length };
+}
+
+/** Index of the next clause terminator at or after `from`, or the text end. */
+function clauseEnd(text, from) {
+  let end = text.length;
+  for (const terminator of [";", "&", "|", "\n"]) {
+    const index = text.indexOf(terminator, from);
+    if (index !== -1 && index < end) end = index;
+  }
+  return end;
+}
+
+// `GIT_CONFIG_KEY_*` (with `GIT_CONFIG_COUNT`) and `GIT_CONFIG_PARAMETERS` are
+// git's environment spellings of `-c`; an alias planted that way is the same
+// bypass as `-c alias.*` (WI#842). The value is read as one shell word, so an
+// `alias.` later in the same command line is not attributed to this variable.
+const GIT_ALIAS_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=("[^"]*"|'[^']*'|\S+)/g;
+
+// Config keys that move a git command around the verb rules: an alias is an
+// arbitrary verb, and an `include`/`includeIf` path pulls in a file that can
+// define one. git compares section names without regard to case, so
+// `Alias.z` is `alias.z` (WI#842).
+const GIT_REDIRECTING_KEY = /^(?:alias|include|includeif)\./i;
+// A section rename names the bare section (`--rename-section foo alias`).
+const GIT_REDIRECTING_SECTION = /^(?:alias|include|includeif)(?:\.|$)/i;
+
+// A config file named in the environment can define an alias the same way
+// an include does.
+const GIT_CONFIG_FILE_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:GLOBAL|SYSTEM)=/;
+
+/** True when the segment's environment names a redirecting key or config file. */
+function hasGitAliasEnv(segment) {
+  if (GIT_CONFIG_FILE_ENV.test(segment)) return true;
+  for (const match of segment.matchAll(GIT_ALIAS_ENV)) {
+    if (/(?:^|[\s'"])(?:alias|include|includeif)\./i.test(match[1])) return true;
+  }
+  return false;
+}
+
+// `git config`'s long options, for resolving the unambiguous prefixes git
+// accepts (`--fil` is `--file`, `--ren` is `--rename-section`).
+const GIT_CONFIG_LONG_OPTIONS = [
+  "global", "system", "local", "worktree", "file", "blob", "get", "get-all",
+  "get-regexp", "get-urlmatch", "get-color", "get-colorbool", "replace-all",
+  "add", "unset", "unset-all", "rename-section", "remove-section", "list",
+  "fixed-value", "edit", "type", "no-type", "null", "name-only", "includes",
+  "no-includes", "show-origin", "show-scope", "default", "comment", "value",
+  "bool", "int", "bool-or-int", "path", "expiry-date", "all", "regexp", "url",
+  "append",
+];
+const GIT_CONFIG_VALUE_LONG = new Set(["file", "blob", "type", "default", "comment", "value"]);
+const GIT_CONFIG_VALUE_SHORT = new Set(["-f", "-t"]);
+
+/** The `git config` long option a `--name` spells, exactly or by unique prefix. */
+function gitConfigLongOption(name) {
+  if (GIT_CONFIG_LONG_OPTIONS.includes(name)) return name;
+  const matches = GIT_CONFIG_LONG_OPTIONS.filter((option) => option.startsWith(name));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * Read a `git config` call: its name operands after options and their
+ * values, whether it opens the editor, and whether it renames a section. An
+ * edit option counts only before the first operand, where git reads it; a
+ * later `-e` is a value (`core.editor 'vim -e'`).
+ */
+function gitConfigCall(after) {
+  const words = argumentWords(after);
+  const call = { operands: [], edit: false, rename: false };
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word.startsWith("--") && word.length > 2) {
+      const equals = word.indexOf("=");
+      const option = gitConfigLongOption(word.slice(2, equals === -1 ? undefined : equals));
+      if (option === "edit" && call.operands.length === 0) call.edit = true;
+      if (option === "rename-section") call.rename = true;
+      if (equals === -1 && GIT_CONFIG_VALUE_LONG.has(option)) i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      if (word === "-e" && call.operands.length === 0) call.edit = true;
+      if (GIT_CONFIG_VALUE_SHORT.has(word)) i++;
+      continue;
+    }
+    call.operands.push(stripShellQuotes(word));
+  }
+  return call;
+}
+
+/**
+ * True when a `git config` call names a redirecting key (WI#842): the classic
+ * `git config alias.z …` form, the modern `set`/`get` subcommands
+ * (`git config set alias.z …`), a section rename into or out of one, in the
+ * subcommand or the `--rename-section` option form (or its prefixes), or the
+ * `edit` subcommand and `--edit`/`-e`, whose editor can write any key. Reads of those keys are refused with the writes; other
+ * keys stay ordinary config work.
+ */
+function gitConfigAliasVerdict(after) {
+  const { operands, edit, rename } = gitConfigCall(after);
+  if (edit || operands[0] === "edit") return true;
+  if (operands[0] === "rename-section") {
+    return operands.slice(1, 3).some((name) => GIT_REDIRECTING_SECTION.test(name));
+  }
+  if (rename) return operands.slice(0, 2).some((name) => GIT_REDIRECTING_SECTION.test(name));
+  if (operands[0] === "set" || operands[0] === "get") return GIT_REDIRECTING_KEY.test(operands[1] ?? "");
+  return GIT_REDIRECTING_KEY.test(operands[0] ?? "");
+}
+
+/**
+ * True when a git invocation would define an alias (WI#842): an inline
+ * `-c`/`--config-env` alias assignment, or a `git config` call naming an
+ * `alias.*` key (the classic form, the `set`/`get` subcommands, or a section
+ * rename into `alias`). An alias name is an arbitrary verb, so the discard
+ * rules cannot classify what it runs — `git -c alias.z='reset --hard' z` reads as
+ * the unknown verb `z`; an include does the same through a file. These
+ * refusals cover the spellings a command line shows; an alias already in a
+ * config file the task wrote directly, or one `HOME`/`XDG_CONFIG_HOME` points
+ * at, stays an accepted residual the guard cannot read cheaply.
+ *
+ * Only the leading option words and, for `config`, its own clause are read,
+ * so the verb-first scan of WI#853 keeps a long command linear (WI#824).
+ */
+function gitAliasDefinition(segment, from) {
+  const { verb, after } = gitVerb(segment, from);
+  const words = argumentWords(segment.slice(from, after));
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (!word.startsWith("-")) break;
+    let value = "";
+    if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    else if (GIT_VALUE_OPTIONS.has(word)) {
+      // Step over every option value (`git -C . -c alias.z=…`); only a `-c`
+      // or `--config-env` value can name a key.
+      const next = stripShellQuotes(words[++i] ?? "");
+      if (word === "-c" || word === "--config-env") value = next;
+    }
+    if (GIT_REDIRECTING_KEY.test(value)) return true;
+  }
+  if (verb !== "config") return false;
+  // A config clause is read whole; one past 4 KB is refused unread, which
+  // keeps repeated `git config` words linear and fails closed.
+  const end = clauseEnd(segment, after);
+  return end - after > 4096 || gitConfigAliasVerdict(segment.slice(after, end));
 }
 
 /** True when any short flag cluster in the text carries one of the letters. */
@@ -630,29 +1289,55 @@ function hasShortFlag(text, letters) {
 }
 
 /**
+ * True when the argument text carries a long option that GNU getopt resolves
+ * to one of `options`: any prefix of the spelled option counts (`--har` for
+ * `--hard`), the way `isRmLongDeleteOption` reads `rm` (WI#841). A bare `--`
+ * marker, a `--name=value` word and a longer word sharing the letters do not
+ * match; an adjacent redirect ends the option word.
+ */
+function hasGitLongOption(text, options) {
+  for (const match of text.matchAll(/(?:^|[ \t])(--[a-z][a-z-]*)(?=$|[ \t<>])/g)) {
+    if (options.some((option) => option.startsWith(match[1]))) return true;
+  }
+  return false;
+}
+
+/**
  * Deny git commands that irrecoverably discard uncommitted work (WI#826,
  * WI#832): forced `clean` (a dry run passes), `reset --hard`, a whole-tree
  * checkout or restore, forced checkout/switch, and a `stash` that takes
- * untracked or ignored files. Linear scan over the git invocations.
+ * untracked or ignored files. Long options are read by any GNU-unambiguous
+ * prefix, like the `rm` rules (WI#841). Linear scan over the git invocations.
+ *
+ * The verb rules read the literal verb, so an alias is refused before them
+ * (WI#842): the alias name would be an arbitrary verb they have never seen.
  */
 function checkGitDiscard(segment) {
+  if (hasGitAliasEnv(segment)) return true;
   for (const match of segment.matchAll(GIT_CALL)) {
-    const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
-    const dryRun = hasShortFlag(after, "n") || /(?:^|[ \t])--dry-run(?=[ \t]|$)/.test(after);
+    if (gitAliasDefinition(segment, match.index + 3)) return true;
+    const { verb, after } = gitVerb(segment, match.index + 3);
+    // Parse the verb before reading any options: a long clause full of
+    // ordinary `git log` words then costs one word apiece (WI#824 deadline).
+    if (verb !== "clean" && verb !== "reset" && verb !== "checkout" &&
+        verb !== "restore" && verb !== "switch" && verb !== "stash") continue;
+    const args = segment.slice(after, clauseEnd(segment, after));
+    const dryRun = verb === "clean" &&
+      (hasShortFlag(args, "n") || hasGitLongOption(args, ["--dry-run"]));
     if (verb === "clean" && !dryRun &&
-        (hasShortFlag(after, "fdxX") || /(?:^|[ \t])--force(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(args, "fdxX") || hasGitLongOption(args, ["--force"]))) {
       return true;
     }
-    if (verb === "reset" && /(?:^|[ \t])--hard(?=[ \t]|$)/.test(after)) return true;
-    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(after)) {
+    if (verb === "reset" && hasGitLongOption(args, ["--hard"])) return true;
+    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(args)) {
       return true;
     }
     if ((verb === "checkout" || verb === "switch") &&
-        (hasShortFlag(after, "f") || /(?:^|[ \t])--(?:force|discard-changes)(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(args, "f") || hasGitLongOption(args, ["--force", "--discard-changes"]))) {
       return true;
     }
     if (verb === "stash" &&
-        (hasShortFlag(after, "ua") || /(?:^|[ \t])--(?:include-untracked|all)(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(args, "ua") || hasGitLongOption(args, ["--include-untracked", "--all"]))) {
       return true;
     }
   }
@@ -858,20 +1543,28 @@ function evaluate(command) {
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
-  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ?? checkListeners(command);
+  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ??
+    checkTrustedUserConfig(command) ?? checkListeners(command);
   if (rawDenial) return rawDenial;
   // bash joins every backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
   // rule on the joined text, on its lexically normalised absolute paths and
   // on the word view bash builds, the same three readings rm uses (WI#813,
-  // WI#826).
+  // WI#826). An extra quote-preserving reading separates the shell
+  // punctuation bash glues to a word, so `(git reset --hard)` and
+  // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const punctuation = shellPunctuationView(joined);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
+      (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
+      checkTrustedUserConfig(joined) ??
+      checkTrustedUserConfig(shellWordView(joined)) ??
       checkRawShapes(joined) ??
+      checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
@@ -924,19 +1617,139 @@ function* listenerSegments(text) {
   if (words.length > 0) yield words;
 }
 
-function kimiServiceSubcommand(words, start) {
-  let i = start;
-  for (; i < words.length && words[i].startsWith("-"); i++) {
-    if (words[i] === "--") {
-      i++;
-      break;
+// WI#852: every 2.7.2 command that starts a listener or opens the Remote
+// Control relay. `vis` binds the session visualizer's HTTP port; `rc` (alias
+// `remote`) runs the local server through Remote Control. Re-read
+// `kimi --help` against this set at every bump: a new subcommand is not
+// covered until it is named here.
+const KIMI_SERVICE_SUBCOMMANDS = new Set(["server", "web", "rc", "remote", "vis"]);
+
+// bash glues shell punctuation to a command word: `(kimi`, `$(kimi`,
+// `` `kimi ``, `server)`, `${…}`, `kimi server}`. This reader has no parser,
+// so strip the punctuation a listener word may carry; quoted prompt text is
+// already one word and is unaffected (WI#839).
+function listenerWord(word) {
+  return word.replace(/^[({`$]+/, "").replace(/[)}`]+$/, "");
+}
+
+/** Body between the `(` at openIndex and its matching `)`, or undefined. */
+function listenerParenBody(text, openIndex) {
+  let depth = 0;
+  let quote = "";
+  for (let i = openIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\") {
+      if (quote !== "'") i++;
+      continue;
     }
-    // Kimi's -p and --prompt consume one whole argument. --prompt=value
-    // needs no special case; its value is already part of the option word.
-    if (words[i] === "-p" || words[i] === "--prompt") i++;
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")" && --depth === 0) {
+      return text.slice(openIndex + 1, i);
+    }
   }
-  const subcommand = words[i];
-  return subcommand === "server" || subcommand === "web" ? subcommand : null;
+  return undefined;
+}
+
+/** Body between the backtick at openIndex and the next unescaped backtick. */
+function listenerBacktickBody(text, openIndex) {
+  for (let i = openIndex + 1; i < text.length; i++) {
+    if (text[i] === "\\") i++;
+    else if (text[i] === "`") return text.slice(openIndex + 1, i);
+  }
+  return undefined;
+}
+
+// The bodies bash runs as commands of their own: `$(…)` and backticks
+// outside single quotes. A substitution inside double quotes still runs, so
+// it counts; text in single quotes is literal and is skipped (WI#839).
+function* listenerBodies(text) {
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\") {
+      if (quote !== "'") i++;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = "";
+      continue;
+    }
+    if (quote === '"' && ch === '"') {
+      quote = "";
+      continue;
+    }
+    if (!quote && (ch === "'" || ch === '"')) {
+      quote = ch;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "(") {
+      const body = listenerParenBody(text, i + 1);
+      // An unclosed substitution is a bash syntax error; its remainder is
+      // still scanned rather than skipped, and scanning stops there (linear).
+      yield body ?? text.slice(i + 2);
+      if (body === undefined) return;
+      i += body.length + 1;
+    } else if (ch === "`") {
+      const body = listenerBacktickBody(text, i);
+      yield body ?? text.slice(i + 1);
+      if (body === undefined) return;
+      i += body.length + 1;
+    }
+  }
+}
+
+// `kimi --help` at the pinned CLI version (2.7.2, WI#845). A value-taking
+// option consumes the next word, so the subcommand is the first word that is
+// neither an option nor consumed by one. `-S`/`--session` takes an optional
+// id; consuming it as a value matches what the CLI does with a following word.
+const KIMI_VALUE_OPTIONS = new Set([
+  "-S", "--session", "-m", "--model", "-p", "--prompt", "--output-format",
+  "--skills-dir", "--agent", "--agent-file", "--add-dir",
+]);
+const KIMI_FLAG_OPTIONS = new Set([
+  "-V", "--version", "-c", "--continue", "-y", "--yolo", "--auto", "--plan", "-h", "--help",
+]);
+
+/**
+ * Deny a service subcommand unless every reading of the option words agrees
+ * there is none (WI#845). Only options the table knows are read as the CLI
+ * reads them; an unknown option may or may not consume the next word and the
+ * hook cannot ask the CLI, so both readings are walked and a service
+ * subcommand (`KIMI_SERVICE_SUBCOMMANDS`) reached by either one is a denial.
+ * `--option=value` needs no special case: its value is part of the option
+ * word.
+ */
+function kimiServiceSubcommand(words, start) {
+  const pending = [start];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const i = pending.pop();
+    if (i >= words.length || seen.has(i)) continue;
+    seen.add(i);
+    const word = words[i];
+    // The subcommand word may carry the punctuation bash glues to it
+    // (`server)` in `(kimi -m X server)`), read as in WI#839.
+    if (word === "--") {
+      const after = listenerWord(words[i + 1] ?? "");
+      if (KIMI_SERVICE_SUBCOMMANDS.has(after)) return after;
+      continue;
+    }
+    if (!word.startsWith("-")) {
+      const subcommand = listenerWord(word);
+      if (KIMI_SERVICE_SUBCOMMANDS.has(subcommand)) return subcommand;
+      continue;
+    }
+    if (word.includes("=")) pending.push(i + 1);
+    else if (KIMI_VALUE_OPTIONS.has(word)) pending.push(i + 2);
+    else if (KIMI_FLAG_OPTIONS.has(word)) pending.push(i + 1);
+    else pending.push(i + 1, i + 2);
+  }
+  return null;
 }
 
 const LISTENER_COMMANDS = [
@@ -964,32 +1777,98 @@ function listenerShellBody(words, start) {
   return undefined;
 }
 
+const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/**
+ * Deny a listener started from a find `-exec`/`-ok` body (WI#846). Bash runs
+ * that body exactly as it runs an `xargs` body, which LISTENER_PREFIXES
+ * already reads; the body is the words up to the `;` or `+` terminator. A
+ * quoted or escaped terminator arrives as its own `;` word.
+ */
+function checkFindExecListeners(words, start, depth) {
+  for (let i = start; i < words.length; i++) {
+    if (!FIND_EXEC_ACTIONS.has(words[i])) continue;
+    const body = [];
+    for (i++; i < words.length && words[i] !== ";" && words[i] !== "+"; i++) body.push(words[i]);
+    if (body.length === 0) continue;
+    const denied = checkListenerWords(body, depth + 1);
+    if (denied) return denied;
+  }
+  return null;
+}
+
+/** Classify the command word of one listener segment and its arguments. */
+function checkListenerWords(words, depth) {
+  for (let i = 0; i < words.length; i++) {
+    const raw = words[i];
+    const word = listenerWord(raw);
+    const name = commandBasename(word);
+    if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
+      return "listener started from a task: busybox httpd";
+    }
+    if (LISTENER_PREFIXES.has(raw) || LISTENER_PREFIXES.has(word) ||
+        LISTENER_PREFIXES.has(name) ||
+        /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(raw)) continue;
+
+    if (name === "kimi") {
+      const subcommand = kimiServiceSubcommand(words, i + 1);
+      if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
+    } else if (SHELL_NAME.test(name)) {
+      const body = listenerShellBody(words, i + 1);
+      if (body !== undefined) {
+        if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+        const denied = checkListeners(body, depth + 1);
+        if (denied) return denied;
+      }
+    } else if (name === "find") {
+      const denied = checkFindExecListeners(words, i + 1, depth);
+      if (denied) return denied;
+    } else {
+      const args = words.slice(i + 1).map(listenerWord);
+      const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+      if (rule?.test(args)) return `listener started from a task: ${name}`;
+    }
+    break;
+  }
+  return null;
+}
+
 /** Deny recognized service commands without treating prompt text as a subcommand. */
 function checkListeners(text, depth = 0) {
+  // A substitution or backtick body runs its words as a command, so scan it
+  // the same way even when it sits in an argument (`echo $(kimi server)`).
+  for (const body of listenerBodies(text)) {
+    if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+    const denied = checkListeners(body, depth + 1);
+    if (denied) return denied;
+  }
   for (const words of listenerSegments(text)) {
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i];
-      const name = commandBasename(word);
-      if (name === "busybox" && words[i + 1] === "httpd") return "listener started from a task: busybox httpd";
-      if (LISTENER_PREFIXES.has(word) || LISTENER_PREFIXES.has(name) ||
-          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(word)) continue;
+    const denied = checkListenerWords(words, depth);
+    if (denied) return denied;
+  }
+  return null;
+}
 
-      if (name === "kimi") {
-        const subcommand = kimiServiceSubcommand(words, i + 1);
-        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
-      } else if (SHELL_NAME.test(name)) {
-        const body = listenerShellBody(words, i + 1);
-        if (body !== undefined) {
-          if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
-          const denied = checkListeners(body, depth + 1);
-          if (denied) return denied;
-        }
-      } else {
-        const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
-        if (rule?.test(words.slice(i + 1))) return `listener started from a task: ${name}`;
-      }
-      break;
-    }
+// WI#848: the user-level MCP registration is trusted input, not task state.
+// The CLI spawns every server listed in `$KIMI_CODE_HOME/mcp.json` before the
+// first model turn, outside this Bash hook — the same self-opened inbound
+// path the WI#833 listener rule denies, reached through a file instead of a
+// command. The file is in the task's own home, so a task can rewrite it (a
+// redirect, an interpreter json edit, `sed -i`). These two shapes name the
+// protected file through the config directory; a bare `mcp.json` after
+// `cd`-ing into that directory is caught by the directory rule. A task that
+// builds the path from fragments, or writes it from a script file, is the
+// residual the executor's per-spawn restore covers (WI#848). Ordinary repo
+// work — `grep -rn mcp.json docs/`, `grep -rn KIMI_CODE_HOME .`, reading the
+// read-only /app/config copy — stays allowed.
+const TRUSTED_USER_MCP_FILE =
+  /KIMI_CODE_HOME\b[^\s;&|]{0,24}mcp\.json|\.kimi-code\/mcp\.json/;
+const TRUSTED_USER_CONFIG_DIR =
+  /(?:^|[\s;&|()])(?:cd|pushd)\s+["']?(?:\$?\{?KIMI_CODE_HOME\}?|~\/\.kimi-code|\$\{?HOME\}?\/\.kimi-code|\/home\/kimi\/\.kimi-code)\/?["']?(?=$|[\s;&|)])/;
+
+function checkTrustedUserConfig(text) {
+  if (TRUSTED_USER_MCP_FILE.test(text) || TRUSTED_USER_CONFIG_DIR.test(text)) {
+    return "the user-level Kimi MCP config is trusted state, not task input (WI#848)";
   }
   return null;
 }

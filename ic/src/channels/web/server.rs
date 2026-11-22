@@ -3890,6 +3890,7 @@ mod tests {
             "/api/estimates/counters",
             "/api/estimates/evaluation",
             "/api/estimates/llm",
+            "/api/estimates/gate-waits",
         ] {
             assert_eq!(
                 request_estimates(&app, uri, None).await.status(),
@@ -3924,6 +3925,8 @@ mod tests {
                 "estimates": { "estimate_requests": 7, "estimates_returned": 1, "estimates_withheld": 6 },
                 "observations": { "observations_recorded": 7, "observations_dropped": 0,
                                   "observations_clipped": 0, "duration_values_rejected": 0, "models_evicted": 0 },
+                "jobs": { "estimates_offered": 0, "estimates_withheld": 0,
+                          "completed_runs": 0, "non_completed_runs": 0 },
             })
         );
         assert_eq!(
@@ -3969,8 +3972,36 @@ mod tests {
         assert_eq!(echo["samples"], 6);
         assert_eq!(echo["warmup"]["samples"], 5);
         assert_eq!(echo["prediction_samples"], 1);
-        assert_eq!(echo["paired_samples"], 0);
-        assert!(echo["improvement_percent"].is_null());
+        // Each named baseline reports its own paired subset; echo declares no
+        // duration, so only the model-derived comparison can pair.
+        assert_eq!(echo["declared_baseline"]["samples"], 0);
+        assert!(echo["declared_baseline"]["improvement_percent"].is_null());
+        assert!(echo["comparison_baseline"].is_object());
+        assert!(echo["warmup"]["comparison_baseline"].is_object());
+    }
+
+    #[tokio::test]
+    async fn gate_wait_route_requires_owner_before_touching_engine_state() {
+        let app = estimates_test_router(None);
+        let uri = "/api/estimates/gate-waits";
+        assert_eq!(
+            request_estimates(&app, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_estimates(&app, uri, Some("alice-token"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // No engine store in this router, so the owner sees availability, not
+        // a fabricated empty aggregate or another user's data.
+        assert_eq!(
+            request_estimates(&app, uri, Some("owner-token"))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     async fn settings_request(

@@ -16,6 +16,7 @@ use crate::tools::Tool;
 use super::diagnostics::{
     CategoryPolicy, CategoryPolicySummary, EvaluationSummary, EvaluationTrace, TraceRecord,
 };
+use super::jobs::{JobEstimateCounters, LocalJobKind, job_key};
 use super::learner::{LearnerCounterSnapshot, LearningModel};
 use super::{Actuals, Estimator, MAX_TOOL_NAME_BYTES, RuntimeEstimate};
 
@@ -64,6 +65,7 @@ pub struct ToolEstimates {
 struct EstimationState {
     estimator: Estimator,
     requests: EstimateRequestSnapshot,
+    jobs: JobEstimateCounters,
 }
 
 /// One lookup per tracked execution attempt, independent of hint display.
@@ -91,6 +93,8 @@ impl EstimateRequestSnapshot {
 pub struct ToolEstimateCounters {
     pub estimates: EstimateRequestSnapshot,
     pub observations: LearnerCounterSnapshot,
+    /// Bounded local-job estimates (WI#318 C1). Same owner-only aggregate.
+    pub jobs: JobEstimateCounters,
 }
 
 /// User-scoped diagnostics. Never contains the private learner key, tool
@@ -220,22 +224,22 @@ impl ToolEstimates {
         // arguments themselves are never stored in the learner.
         let baseline_time = tool.estimated_duration(params);
         let baseline_cost = tool.estimated_cost(params);
-        let (estimate, prior_duration_samples) = {
+        let (estimate, trace_capture) = {
             let mut state = self.state.lock().ok()?;
             let estimate = state
                 .estimator
                 .estimate_operation(&key, baseline_time, baseline_cost);
             state.requests.record(estimate.is_some());
-            // Capture the model's age with the prediction, never after the
-            // call or a concurrent completion has trained the learner.
-            let prior_duration_samples = self.trace.as_ref().map(|_| {
-                state
-                    .estimator
-                    .learner()
-                    .get_model(&key)
-                    .map_or(0, |model| model.time_sample_count)
+            // Capture the model's age and early-run anchor with the prediction,
+            // never after the call or a concurrent completion has trained the
+            // learner.
+            let trace_capture = self.trace.as_ref().map(|_| {
+                let model = state.estimator.learner().get_model(&key);
+                let prior_duration_samples = model.map_or(0, |model| model.time_sample_count);
+                let comparison_baseline = model.and_then(LearningModel::early_duration_baseline);
+                (prior_duration_samples, comparison_baseline)
             });
-            (estimate, prior_duration_samples)
+            (estimate, trace_capture)
         };
         let prediction = estimate.map(|estimate| estimate.duration);
         Some(ToolObservation {
@@ -247,13 +251,16 @@ impl ToolEstimates {
                 actual_time: Duration::ZERO,
                 actual_cost: None,
             },
-            trace: prior_duration_samples.map(|prior_duration_samples| TraceRecord {
-                tool: Arc::from(tool_name),
-                baseline: baseline_time,
-                prediction,
-                actual: Duration::ZERO,
-                prior_duration_samples,
-            }),
+            trace: trace_capture.map(
+                |(prior_duration_samples, comparison_baseline)| TraceRecord {
+                    tool: Arc::from(tool_name),
+                    declared_baseline: baseline_time,
+                    comparison_baseline,
+                    prediction,
+                    actual: Duration::ZERO,
+                    prior_duration_samples,
+                },
+            ),
         })
     }
 
@@ -323,8 +330,68 @@ impl ToolEstimates {
             |state| ToolEstimateCounters {
                 estimates: state.requests,
                 observations: state.estimator.learner().counters().snapshot(),
+                jobs: state.jobs,
             },
         )
+    }
+
+    /// Whether job timing views may display a historical duration. This is
+    /// governed by the same opt-in display mode as tool hints; recording and
+    /// the per-tool category policy stay independent of it.
+    pub fn job_display_enabled(&self) -> bool {
+        self.display_enabled()
+    }
+
+    /// Frozen historical duration for a local job about to be dispatched,
+    /// from the model of the same user and job kind. Read-only: it neither
+    /// trains the model nor claims to be a deadline.
+    pub fn estimate_job(&self, user_id: &str, kind: LocalJobKind) -> Option<RuntimeEstimate> {
+        if self.mode == ToolEstimationMode::Disabled {
+            return None;
+        }
+        let key = job_key(user_id, kind)?;
+        let mut state = self.state.lock().ok()?;
+        let estimate = state.estimator.estimate_operation(&key, None, None);
+        state.jobs.record_estimate(estimate.is_some());
+        estimate
+    }
+
+    /// One terminal observation for a local job run (WI#318 C1). The caller
+    /// passes the frozen prediction, if any, so forecast error reflects the
+    /// estimate that was actually shown. Only a successful completion trains
+    /// the duration model; failures and cancellations are counted separately
+    /// because their elapsed time is not a comparable run.
+    pub fn record_job_terminal(
+        &self,
+        user_id: &str,
+        kind: LocalJobKind,
+        elapsed: Duration,
+        completed: bool,
+        predicted: Option<Duration>,
+    ) {
+        if self.mode == ToolEstimationMode::Disabled {
+            return;
+        }
+        let Some(key) = job_key(user_id, kind) else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.jobs.record_terminal(completed);
+        if !completed {
+            return;
+        }
+        state.estimator.record_operation_actuals(
+            &key,
+            Actuals {
+                baseline_time: None,
+                baseline_cost: None,
+                predicted_time: predicted,
+                actual_time: elapsed,
+                actual_cost: None,
+            },
+        );
     }
 
     /// Operator-only aggregate of the held-out evaluation trace. Returns
@@ -421,6 +488,131 @@ mod tests {
     }
 
     #[test]
+    fn job_estimates_stay_withheld_until_warm_and_never_train_failed_runs() {
+        let estimates = ToolEstimates::new(ToolEstimationMode::Observe);
+        for _ in 0..4 {
+            estimates.record_job_terminal(
+                "alice",
+                LocalJobKind::User,
+                Duration::from_secs(90),
+                true,
+                None,
+            );
+        }
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
+        // A failed run may be counted, but its elapsed time is not a
+        // comparable completed run and must not train the model.
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(5),
+            false,
+            None,
+        );
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(90),
+            true,
+            None,
+        );
+
+        let estimate = estimates.estimate_job("alice", LocalJobKind::User).unwrap(); // safety: test
+        assert_eq!(estimate.duration, Duration::from_secs(90));
+        assert_eq!(estimate.cost, None);
+        assert_eq!(estimate.samples, 5);
+        // A different user stays cold, and so does Alice's routine model:
+        // routine runs and user-started jobs are not comparable completions.
+        assert!(estimates.estimate_job("bob", LocalJobKind::User).is_none());
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::Routine)
+                .is_none()
+        );
+
+        let counters = estimates.aggregate_counters().jobs;
+        assert_eq!(counters.completed_runs, 5);
+        assert_eq!(counters.non_completed_runs, 1);
+        // Two cold lookups plus Bob's and Alice's routine model.
+        assert_eq!(counters.estimates_withheld, 4);
+        assert_eq!(counters.estimates_offered, 1);
+    }
+
+    #[test]
+    fn disabled_mode_records_no_job_observations_and_shows_no_timing() {
+        let estimates = ToolEstimates::new(ToolEstimationMode::Disabled);
+        for _ in 0..6 {
+            estimates.record_job_terminal(
+                "alice",
+                LocalJobKind::User,
+                Duration::from_secs(10),
+                true,
+                None,
+            );
+        }
+        assert!(
+            estimates
+                .estimate_job("alice", LocalJobKind::User)
+                .is_none()
+        );
+        assert!(!estimates.job_display_enabled());
+        assert_eq!(
+            estimates.aggregate_counters().jobs,
+            crate::estimation::JobEstimateCounters::default()
+        );
+        assert!(!ToolEstimates::new(ToolEstimationMode::Observe).job_display_enabled());
+        assert!(ToolEstimates::new(ToolEstimationMode::Display).job_display_enabled());
+    }
+
+    #[test]
+    fn job_models_stay_separate_from_tool_categories_and_concurrent_runs_count_once() {
+        let estimates = std::sync::Arc::new(ToolEstimates::new(ToolEstimationMode::Observe));
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let estimates = std::sync::Arc::clone(&estimates);
+                std::thread::spawn(move || {
+                    estimates.record_job_terminal(
+                        "alice",
+                        LocalJobKind::User,
+                        Duration::from_secs(60),
+                        true,
+                        None,
+                    );
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap(); // safety: test
+        }
+        // Cancellations and failures are counted, never trained.
+        estimates.record_job_terminal(
+            "alice",
+            LocalJobKind::User,
+            Duration::from_secs(1),
+            false,
+            None,
+        );
+
+        let estimate = estimates.estimate_job("alice", LocalJobKind::User).unwrap(); // safety: test
+        assert_eq!(estimate.samples, 10);
+        assert_eq!(estimate.duration, Duration::from_secs(60));
+        // Job models use their own key prefix, so the per-tool diagnostics
+        // surface hides them and no tool category is created.
+        assert!(estimates.diagnostics("alice").categories.is_empty());
+        assert_eq!(estimates.aggregate_counters().jobs.completed_runs, 10);
+        assert_eq!(estimates.aggregate_counters().jobs.non_completed_runs, 1);
+    }
+
+    #[test]
     fn category_policy_gates_display_but_keeps_recording() {
         let params = serde_json::json!({});
         let estimates = ToolEstimates::configured(
@@ -500,6 +692,45 @@ mod tests {
         assert_eq!(echo.warmup.samples, 7);
         assert_eq!(echo.cold_start.samples, window + 2);
         assert_eq!(echo.cold_start.prediction_samples, window - 5);
+    }
+
+    #[test]
+    fn evaluation_comparison_baseline_uses_only_prior_runs_and_is_frozen() {
+        let params = serde_json::json!({});
+        let traced = ToolEstimates::configured(
+            ToolEstimationMode::Observe,
+            CategoryPolicy::default(),
+            Some(EvaluationTrace::new(64)),
+        );
+        // The first call has no earlier run to average.
+        let first = traced.begin("alice", &EchoTool, &params).unwrap();
+        assert!(first.trace.as_ref().unwrap().comparison_baseline.is_none());
+        traced.complete(first, Duration::from_secs(4), None);
+
+        // The second call sees the first run's 4 s only, never its own result.
+        let second = traced.begin("alice", &EchoTool, &params).unwrap();
+        assert_eq!(
+            second.trace.as_ref().unwrap().comparison_baseline,
+            Some(Duration::from_secs(4))
+        );
+        traced.complete(second, Duration::from_secs(10), None);
+
+        // The anchor is reported for the withheld warmup period too.
+        let summary = traced.evaluation().unwrap();
+        let echo = &summary.categories[0];
+        assert_eq!(echo.warmup.comparison_baseline.samples, 1);
+        assert_eq!(
+            echo.warmup.comparison_baseline.median_abs_error_ms,
+            Some(6_000.0)
+        );
+        assert_eq!(echo.overall.comparison_baseline.samples, 0);
+
+        // A third call averages the two completed runs for its own anchor.
+        let third = traced.begin("alice", &EchoTool, &params).unwrap();
+        assert_eq!(
+            third.trace.as_ref().unwrap().comparison_baseline,
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]

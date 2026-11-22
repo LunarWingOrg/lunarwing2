@@ -86,13 +86,21 @@ import { appendDelta, applyFinal, isSealedPhase, tailToUtf8Bytes, turnTextOf } f
 
 /** Rule 5a: after a legacy "Interrupted." ack, V1's second "Interrupted." (the aborted turn) is swallowed. */
 export const STRAY_INTERRUPT_WINDOW_MS = 5_000
+/** Longest the daemon can still deliver a reply for a turn durable history shows as Failed: the 610 s wait
+ * budget (`OUTCOME_TIMEOUT`) + the capped step-aware late budget (1800 s) + both 60 s stop graces, i.e.
+ * `LONGEST_LATE_WINDOW` in `ic/src/bridge/router/outcome.rs` (2530 s, pinned by `outcome/tests.rs`; WI#807,
+ * WI#820). WI#837: this must cover the whole late window, or a resynced in-flight turn is sealed ~32 min
+ * before the daemon's late watcher gives up on it. */
+export const LATE_REPLY_WINDOW_MS = 2_530_000
 /** Resync: durable V2 history shows in-flight turns as Failed; a reply can still arrive later (WI#807:
  * the late watcher's budget is step-aware, up to 1800 s), so a later reply lands as `late` (rule 5's note). */
-export const YOUNG_FAILED_TURN_MS = 610_000
+export const YOUNG_FAILED_TURN_MS = LATE_REPLY_WINDOW_MS
 /** Rule 12: the "no reply yet" note. */
 export const NO_REPLY_YET_MS = 15_000
-/** Rule 12: unanswered only after the same stale limit as history recovery. */
-export const UNANSWERED_AFTER_MS = YOUNG_FAILED_TURN_MS
+/** Rule 12 (legacy only): a silent turn is sealed unanswered after 10 min. Deliberately shorter than the
+ * history-recovery window: a message the daemon swallowed (an approval keyword) must not hold its FIFO slot
+ * for the whole late budget. WI#837 split the two thresholds; they were one constant before. */
+export const UNANSWERED_AFTER_MS = 610_000
 /** Rule 13: a daemon start later than the known one by more than this (plus drift) is a restart. */
 export const RESTART_SLACK_MS = 2_000
 /** Rule 13: the client's and the daemon host's clocks may drift apart by up to 1 ms per second. */
@@ -1578,8 +1586,9 @@ export function tickTurns(state: AppState, at: number): AppState {
  * Rule 12, only where silence means something: legacy gateways stream activity, so the turn at the head of the
  * queue with no event 15 s after it was accepted (or after the turn before it ended) is waiting: in the daemon's
  * scheduler behind another channel's turn, or consumed as a control input. It gets the "no reply yet" note and
- * stays first in line, so a late reply still lands on it; only after the stale limit is it sealed unanswered. A
- * legacy socket has no progress events at all; its turns get the 120 s stall notice instead (3.6.2).
+ * stays first in line, so a late reply still lands on it; only after 10 min (`UNANSWERED_AFTER_MS`) is it
+ * sealed unanswered. A legacy socket has no progress events at all; its turns get the 120 s stall notice
+ * instead (3.6.2).
  */
 function markUnanswered(state: AppState, at: number): AppState {
   const caps = state.server?.capabilities

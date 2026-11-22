@@ -50,8 +50,41 @@ the bridge starts before `lunarwing run`. The bridge unit declares
 - `POST /v1/configure`
 - `GET /v1/status`
 - `POST /v1/outbound-rate-limit`
-- `GET /v1/messages?cursor=<n>`
+- `GET /v1/messages?cursor=<n>&limit=<n>`
 - `POST /v1/messages/send`
+
+`GET /v1/messages` returns a bounded page: `limit` defaults to 64 and is
+clamped to 100 so one page always fits inside the daemon's per-callback emit
+limit. The response `cursor` is the cursor of the last message in the page (or
+the cursor the page started after when it is empty), so pollers must persist it verbatim
+and poll again to drain the rest of a larger backlog. Returning the newest
+cursor instead parked the channel on a backlog larger than one page and left
+inbound XMPP wedged after an upgrade (WI#850).
+
+The cursor sequence is per bridge process. If a poller presents a cursor above
+the bridge's current cursor (a bridge restart reset the sequence), the response
+carries the bridge's current cursor so the poller resynchronizes instead of
+waiting forever behind a cursor that can never be reached.
+
+A request that echoes the previous response cursor acknowledges every message
+up to it. The daemon keeps its cursor in memory, so after a daemon-only restart
+(OpenRC restarts the daemon without this bridge) or a re-activated channel it
+polls from zero while this process still holds up to `XMPP_BRIDGE_MAX_MESSAGES`
+delivered messages. A request cursor below the acknowledged one is therefore
+read as such a reset: the page starts after the acknowledged cursor, so nothing
+already delivered comes back as a new inbound turn, and messages that arrived
+while the daemon was down are still served. A page that was handed out but not
+acknowledged is served again, so delivery stays at-least-once (WI#850) up to
+the daemon's in-memory queue: the poller acknowledges a page once it has handed
+it to the agent's queue, so messages still waiting in that queue when the
+daemon restarts are not served again.
+
+Upgrade order does not matter for delivery. An older bridge ignores `limit`
+and returns its whole backlog with its newest cursor; the XMPP guest then
+processes at most one page (64 messages) and persists the cursor of the last
+one it processed, computed from the consecutive cursor sequence, so the rest
+comes back on the next poll instead of being dropped by the host's emit limit.
+An older guest against this bridge gets the default page of 64.
 
 When `XMPP_BRIDGE_TOKEN` is set, requests must include `Authorization: Bearer <token>`.
 The server also rejects non-loopback clients.

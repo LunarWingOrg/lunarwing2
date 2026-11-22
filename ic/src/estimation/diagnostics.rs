@@ -117,7 +117,10 @@ pub struct CategoryPolicySummary {
 #[derive(Debug, Clone)]
 pub(crate) struct TraceRecord {
     pub tool: Arc<str>,
-    pub baseline: Option<Duration>,
+    /// Duration declared by the tool (`Tool::estimated_duration`), if any.
+    pub declared_baseline: Option<Duration>,
+    /// Mean of this model's own earliest valid runs, frozen before the call.
+    pub comparison_baseline: Option<Duration>,
     pub prediction: Option<Duration>,
     pub actual: Duration,
     /// Valid duration samples already known to this user/tool model when the
@@ -189,24 +192,30 @@ struct CategoryAccumulator {
     overall: ErrorAccumulator,
     cold_start: ErrorAccumulator,
     warmup_samples: u64,
-    warmup_baseline_errors: Vec<f64>,
+    warmup_declared_errors: Vec<f64>,
+    warmup_comparison_errors: Vec<f64>,
 }
 
 impl CategoryAccumulator {
     fn push(&mut self, record: &TraceRecord) {
-        let error_ms = |forecast| record.actual.abs_diff(forecast).as_secs_f64() * 1_000.0;
-        let baseline = record
-            .baseline
-            .filter(|&duration| valid_duration(duration).is_some())
-            .map(error_ms);
+        let error_ms =
+            |forecast: Duration| record.actual.abs_diff(forecast).as_secs_f64() * 1_000.0;
+        let usable = |baseline: Option<Duration>| {
+            baseline
+                .filter(|&d| valid_duration(d).is_some())
+                .map(error_ms)
+        };
+        let declared = usable(record.declared_baseline);
+        let comparison = usable(record.comparison_baseline);
         let prediction = record.prediction.map(error_ms);
-        self.overall.push(baseline, prediction);
+        self.overall.push(declared, comparison, prediction);
         if record.prior_duration_samples < COLD_START_SAMPLE_LIMIT {
-            self.cold_start.push(baseline, prediction);
+            self.cold_start.push(declared, comparison, prediction);
         }
         if record.prior_duration_samples < DEFAULT_MIN_SAMPLES {
             self.warmup_samples += 1;
-            self.warmup_baseline_errors.extend(baseline);
+            self.warmup_declared_errors.extend(declared);
+            self.warmup_comparison_errors.extend(comparison);
         }
     }
 
@@ -217,8 +226,8 @@ impl CategoryAccumulator {
             cold_start: self.cold_start.finish(),
             warmup: WarmupSummary {
                 samples: self.warmup_samples,
-                baseline_samples: self.warmup_baseline_errors.len() as u64,
-                median_abs_error_baseline_ms: median(&mut self.warmup_baseline_errors),
+                declared_baseline: WarmupBaseline::new(&mut self.warmup_declared_errors),
+                comparison_baseline: WarmupBaseline::new(&mut self.warmup_comparison_errors),
             },
         }
     }
@@ -228,29 +237,54 @@ impl CategoryAccumulator {
 struct ErrorAccumulator {
     samples: u64,
     prediction_samples: u64,
+    declared: PairAccumulator,
+    comparison: PairAccumulator,
+}
+
+impl ErrorAccumulator {
+    fn push(&mut self, declared: Option<f64>, comparison: Option<f64>, prediction: Option<f64>) {
+        self.samples += 1;
+        self.prediction_samples += u64::from(prediction.is_some());
+        let Some(prediction) = prediction else {
+            return;
+        };
+        if let Some(declared) = declared {
+            self.declared.push(declared, prediction);
+        }
+        if let Some(comparison) = comparison {
+            self.comparison.push(comparison, prediction);
+        }
+    }
+
+    fn finish(self) -> EvaluationMetrics {
+        EvaluationMetrics {
+            samples: self.samples,
+            prediction_samples: self.prediction_samples,
+            coverage: self.prediction_samples as f64 / self.samples.max(1) as f64,
+            declared_baseline: self.declared.finish(),
+            comparison_baseline: self.comparison.finish(),
+        }
+    }
+}
+
+/// Paired baseline and prediction errors over the same retained calls.
+#[derive(Default)]
+struct PairAccumulator {
     baseline_errors: Vec<f64>,
     prediction_errors: Vec<f64>,
 }
 
-impl ErrorAccumulator {
-    fn push(&mut self, baseline: Option<f64>, prediction: Option<f64>) {
-        self.samples += 1;
-        self.prediction_samples += u64::from(prediction.is_some());
-        if let (Some(baseline), Some(prediction)) = (baseline, prediction) {
-            self.baseline_errors.push(baseline);
-            self.prediction_errors.push(prediction);
-        }
+impl PairAccumulator {
+    fn push(&mut self, baseline: f64, prediction: f64) {
+        self.baseline_errors.push(baseline);
+        self.prediction_errors.push(prediction);
     }
 
-    fn finish(mut self) -> EvaluationMetrics {
-        let paired_samples = self.baseline_errors.len() as u64;
+    fn finish(mut self) -> BaselineComparison {
         let baseline = median(&mut self.baseline_errors);
         let prediction = median(&mut self.prediction_errors);
-        EvaluationMetrics {
-            samples: self.samples,
-            prediction_samples: self.prediction_samples,
-            paired_samples,
-            coverage: self.prediction_samples as f64 / self.samples.max(1) as f64,
+        BaselineComparison {
+            samples: self.prediction_errors.len() as u64,
             median_abs_error_baseline_ms: baseline,
             median_abs_error_prediction_ms: prediction,
             improvement_percent: improvement(baseline, prediction),
@@ -269,7 +303,7 @@ pub struct EvaluationSummary {
     pub categories: Vec<EvaluationCategory>,
 }
 
-/// Per-category held-out comparison of baseline versus frozen prediction.
+/// Per-category held-out comparison of baselines versus the frozen prediction.
 #[derive(Debug, Clone, Serialize)]
 pub struct EvaluationCategory {
     pub tool: String,
@@ -279,16 +313,28 @@ pub struct EvaluationCategory {
     pub warmup: WarmupSummary,
 }
 
-/// Prediction coverage on all calls in a cohort, errors on the paired subset.
+/// Prediction coverage on all calls in a cohort, with one paired-error block
+/// per baseline. The field name identifies which baseline each figure uses.
 #[derive(Debug, Clone, Serialize)]
 pub struct EvaluationMetrics {
     pub samples: u64,
     pub prediction_samples: u64,
-    pub paired_samples: u64,
     pub coverage: f64,
+    /// Against duration baselines declared by the tool itself.
+    pub declared_baseline: BaselineComparison,
+    /// Against the mean of the model's own earliest valid completed runs,
+    /// which is frozen before each call and never includes the call itself.
+    pub comparison_baseline: BaselineComparison,
+}
+
+/// Errors on the retained calls where both this baseline and a frozen learned
+/// prediction existed.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineComparison {
+    pub samples: u64,
     pub median_abs_error_baseline_ms: Option<f64>,
     pub median_abs_error_prediction_ms: Option<f64>,
-    /// Positive means the EMA beat the unadjusted baseline.
+    /// Positive means the EMA beat this baseline.
     pub improvement_percent: Option<f64>,
 }
 
@@ -296,8 +342,25 @@ pub struct EvaluationMetrics {
 #[derive(Debug, Clone, Serialize)]
 pub struct WarmupSummary {
     pub samples: u64,
-    pub baseline_samples: u64,
-    pub median_abs_error_baseline_ms: Option<f64>,
+    pub declared_baseline: WarmupBaseline,
+    pub comparison_baseline: WarmupBaseline,
+}
+
+/// Absence of a learned prediction is reported as an unpaired baseline error,
+/// never as a zero error.
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmupBaseline {
+    pub samples: u64,
+    pub median_abs_error_ms: Option<f64>,
+}
+
+impl WarmupBaseline {
+    fn new(errors: &mut [f64]) -> Self {
+        Self {
+            samples: errors.len() as u64,
+            median_abs_error_ms: median(errors),
+        }
+    }
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -373,13 +436,15 @@ mod tests {
     fn record(
         tool: &str,
         prior_duration_samples: u64,
-        baseline: Option<u64>,
+        declared_baseline: Option<u64>,
+        comparison_baseline: Option<u64>,
         prediction: Option<u64>,
         actual: u64,
     ) -> TraceRecord {
         TraceRecord {
             tool: Arc::from(tool),
-            baseline: baseline.map(Duration::from_secs),
+            declared_baseline: declared_baseline.map(Duration::from_secs),
+            comparison_baseline: comparison_baseline.map(Duration::from_secs),
             prediction: prediction.map(Duration::from_secs),
             actual: Duration::from_secs(actual),
             prior_duration_samples,
@@ -394,7 +459,7 @@ mod tests {
         let mut trace = EvaluationTrace::new(MIN_TRACE_CAPACITY);
         for n in 0..MIN_TRACE_CAPACITY + 3 {
             let prediction = (n as u64 >= DEFAULT_MIN_SAMPLES).then_some(1);
-            trace.push(record("http", n as u64, Some(1), prediction, 1));
+            trace.push(record("http", n as u64, Some(1), Some(1), prediction, 1));
         }
         let summary = trace.summary();
         assert_eq!(summary.recorded, MIN_TRACE_CAPACITY);
@@ -406,15 +471,25 @@ mod tests {
     }
 
     #[test]
-    fn trace_summary_pairs_errors_and_reports_warmup_and_early_forecasts_separately() {
+    fn trace_summary_pairs_each_named_baseline_separately() {
         let mut trace = EvaluationTrace::new(MIN_TRACE_CAPACITY);
-        trace.push(record("http", 0, Some(1), None, 10)); // warmup, 9 s error
-        trace.push(record("http", 1, Some(1), None, 21)); // warmup, 20 s error
-        trace.push(record("http", DEFAULT_MIN_SAMPLES, Some(2), Some(3), 4));
+        // warmup, declared 9 s error, no comparison baseline yet
+        trace.push(record("http", 0, Some(1), None, None, 10));
+        // warmup, declared 20 s error, comparison 19 s error
+        trace.push(record("http", 1, Some(1), Some(2), None, 21));
+        trace.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            Some(2),
+            Some(3),
+            Some(3),
+            4,
+        ));
         trace.push(record(
             "http",
             COLD_START_SAMPLE_LIMIT - 1,
             None,
+            Some(100),
             Some(100),
             7,
         ));
@@ -423,6 +498,7 @@ mod tests {
             COLD_START_SAMPLE_LIMIT,
             Some(5),
             Some(7),
+            Some(7),
             11,
         ));
         trace.push(record(
@@ -430,44 +506,115 @@ mod tests {
             COLD_START_SAMPLE_LIMIT + 1,
             Some(0),
             Some(12),
+            Some(12),
             4,
         ));
-        trace.push(record("bash", DEFAULT_MIN_SAMPLES, None, Some(3), 3));
+        trace.push(record(
+            "bash",
+            DEFAULT_MIN_SAMPLES,
+            None,
+            Some(3),
+            Some(3),
+            3,
+        ));
         let summary = trace.summary();
         let http = &summary.categories[1];
         assert_eq!(http.tool, "http");
         assert_eq!(http.overall.samples, 6);
         assert_eq!(http.overall.prediction_samples, 4);
-        assert_eq!(http.overall.paired_samples, 2);
         assert!((http.overall.coverage - 2.0 / 3.0).abs() < f64::EPSILON);
-        assert_eq!(http.overall.median_abs_error_baseline_ms, Some(4_000.0));
-        assert_eq!(http.overall.median_abs_error_prediction_ms, Some(2_500.0));
-        assert_eq!(http.overall.improvement_percent, Some(37.5));
+
+        let declared = &http.overall.declared_baseline;
+        assert_eq!(declared.samples, 2);
+        assert_eq!(declared.median_abs_error_baseline_ms, Some(4_000.0));
+        assert_eq!(declared.median_abs_error_prediction_ms, Some(2_500.0));
+        assert_eq!(declared.improvement_percent, Some(37.5));
+
+        let comparison = &http.overall.comparison_baseline;
+        assert_eq!(comparison.samples, 4);
+        assert_eq!(comparison.median_abs_error_baseline_ms, Some(6_000.0));
+        assert_eq!(comparison.median_abs_error_prediction_ms, Some(6_000.0));
+        assert_eq!(comparison.improvement_percent, Some(0.0));
 
         assert_eq!(http.warmup.samples, 2);
-        assert_eq!(http.warmup.baseline_samples, 2);
-        assert_eq!(http.warmup.median_abs_error_baseline_ms, Some(14_500.0));
+        assert_eq!(http.warmup.declared_baseline.samples, 2);
+        assert_eq!(
+            http.warmup.declared_baseline.median_abs_error_ms,
+            Some(14_500.0)
+        );
+        assert_eq!(http.warmup.comparison_baseline.samples, 1);
+        assert_eq!(
+            http.warmup.comparison_baseline.median_abs_error_ms,
+            Some(19_000.0)
+        );
+
         assert_eq!(http.cold_start.samples, 4);
         assert_eq!(http.cold_start.prediction_samples, 2);
-        assert_eq!(http.cold_start.paired_samples, 1);
         assert!((http.cold_start.coverage - 0.5).abs() < f64::EPSILON);
-        assert_eq!(http.cold_start.improvement_percent, Some(50.0));
+        assert_eq!(http.cold_start.declared_baseline.samples, 1);
+        assert_eq!(
+            http.cold_start.declared_baseline.improvement_percent,
+            Some(50.0)
+        );
+        assert_eq!(http.cold_start.comparison_baseline.samples, 2);
+        assert_eq!(
+            http.cold_start
+                .comparison_baseline
+                .median_abs_error_baseline_ms,
+            Some(47_000.0)
+        );
 
         let bash = &summary.categories[0].overall;
         assert_eq!(bash.prediction_samples, 1);
-        assert_eq!(bash.paired_samples, 0);
-        assert_eq!(bash.median_abs_error_baseline_ms, None);
-        assert_eq!(bash.median_abs_error_prediction_ms, None);
-        assert_eq!(bash.improvement_percent, None);
+        assert_eq!(bash.declared_baseline.samples, 0);
+        assert_eq!(bash.declared_baseline.median_abs_error_baseline_ms, None);
+        assert_eq!(bash.declared_baseline.improvement_percent, None);
+        assert_eq!(bash.comparison_baseline.samples, 1);
+        assert_eq!(
+            bash.comparison_baseline.median_abs_error_baseline_ms,
+            Some(0.0)
+        );
+        assert_eq!(bash.comparison_baseline.improvement_percent, None);
     }
 
     #[test]
     fn trace_summary_does_not_report_improvement_against_a_perfect_baseline() {
         let mut trace = EvaluationTrace::new(MIN_TRACE_CAPACITY);
-        trace.push(record("http", DEFAULT_MIN_SAMPLES, Some(2), Some(2), 2));
+        trace.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            Some(2),
+            Some(2),
+            Some(2),
+            2,
+        ));
         let metrics = &trace.summary().categories[0].overall;
-        assert_eq!(metrics.paired_samples, 1);
-        assert_eq!(metrics.median_abs_error_baseline_ms, Some(0.0));
-        assert_eq!(metrics.improvement_percent, None);
+        assert_eq!(metrics.declared_baseline.samples, 1);
+        assert_eq!(
+            metrics.declared_baseline.median_abs_error_baseline_ms,
+            Some(0.0)
+        );
+        assert_eq!(metrics.declared_baseline.improvement_percent, None);
+        assert_eq!(metrics.comparison_baseline.samples, 1);
+        assert_eq!(metrics.comparison_baseline.improvement_percent, None);
+    }
+
+    #[test]
+    fn serialised_summary_names_the_baseline_behind_each_figure() {
+        let mut trace = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        trace.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            Some(2),
+            Some(3),
+            Some(4),
+            5,
+        ));
+        let json = serde_json::to_value(trace.summary()).unwrap();
+        let category = &json["categories"][0];
+        assert!(category["declared_baseline"].is_object());
+        assert!(category["comparison_baseline"].is_object());
+        assert!(category["warmup"]["declared_baseline"].is_object());
+        assert!(category["warmup"]["comparison_baseline"].is_object());
     }
 }

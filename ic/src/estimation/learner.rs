@@ -13,6 +13,10 @@ use super::Actuals;
 const MAX_MODELS: usize = 1024;
 const MAX_CATEGORY_BYTES: usize = 1024;
 pub(super) const DEFAULT_MIN_SAMPLES: u64 = 5;
+/// Earliest valid durations averaged into the held-out comparison baseline
+/// (WI#318 A4). It matches the warmup window, so the reference is complete
+/// before the first learned estimate is eligible.
+pub(super) const COMPARISON_BASELINE_SAMPLES: u64 = DEFAULT_MIN_SAMPLES;
 const MAX_DURATION_SECS: f64 = 86_400.0;
 const MIN_FACTOR: f64 = 0.01;
 const MAX_FACTOR: f64 = 100.0;
@@ -38,6 +42,11 @@ pub struct LearningModel {
     pub time_error_rate: f64,
     /// Direct duration EMA, used when the tool has no declared baseline.
     pub duration_secs: f64,
+    /// Sum of the first [`COMPARISON_BASELINE_SAMPLES`] valid durations. This is
+    /// an evaluation reference only; it never produces an estimate.
+    early_duration_sum_secs: f64,
+    /// How many early durations `early_duration_sum_secs` covers.
+    early_duration_samples: u64,
     /// Ordering for bounded least-recently-observed eviction.
     last_observation: u64,
 }
@@ -54,8 +63,23 @@ impl Default for LearningModel {
             cost_error_rate: 0.0,
             time_error_rate: 0.0,
             duration_secs: 0.0,
+            early_duration_sum_secs: 0.0,
+            early_duration_samples: 0,
             last_observation: 0,
         }
+    }
+}
+
+impl LearningModel {
+    /// Mean of the earliest valid completed durations, frozen once the warmup
+    /// window is full. The evaluation trace uses it as the model-independent
+    /// comparison baseline; it is never shown as an estimate.
+    pub fn early_duration_baseline(&self) -> Option<Duration> {
+        if self.early_duration_samples == 0 {
+            return None;
+        }
+        let seconds = self.early_duration_sum_secs / self.early_duration_samples as f64;
+        Duration::try_from_secs_f64(seconds).ok()
     }
 }
 
@@ -357,6 +381,10 @@ fn record_duration(model: &mut LearningModel, actuals: &Actuals, seconds: f64, a
         seconds.clamp(model.duration_secs * 0.1, model.duration_secs * 10.0)
     };
     model.duration_secs = smooth(model.duration_secs, bounded, alpha, model.time_sample_count);
+    if model.early_duration_samples < COMPARISON_BASELINE_SAMPLES {
+        model.early_duration_sum_secs += seconds;
+        model.early_duration_samples += 1;
+    }
     if let Some(base) = actuals.baseline_time.and_then(valid_duration) {
         let ratio = (seconds / base).clamp(MIN_FACTOR, MAX_FACTOR);
         model.time_factor = smooth(
@@ -567,6 +595,31 @@ mod tests {
         learner.record_actuals("tool", timing(0));
         learner.record_actuals("tool", timing(u64::MAX));
         assert_eq!(learner.get_model("tool").unwrap().sample_count, count);
+    }
+
+    #[test]
+    fn early_duration_baseline_averages_only_the_first_warmup_samples() {
+        let mut learner = EstimationLearner::new();
+        learner.record_actuals("tool", timing(0));
+        assert!(learner.get_model("tool").is_none());
+
+        for seconds in [2, 4, 6, 8, 10] {
+            learner.record_actuals("tool", timing(seconds));
+        }
+        let model = learner.get_model("tool").unwrap();
+        assert_eq!(model.time_sample_count, COMPARISON_BASELINE_SAMPLES);
+        assert_eq!(
+            model.early_duration_baseline(),
+            Some(Duration::from_secs(6))
+        );
+
+        // Later calls train the EMA but never move the evaluation reference.
+        learner.record_actuals("tool", timing(100));
+        assert_eq!(
+            learner.get_model("tool").unwrap().early_duration_baseline(),
+            Some(Duration::from_secs(6))
+        );
+        assert!(learner.get_model("tool").unwrap().duration_secs > 6.0);
     }
 
     #[test]

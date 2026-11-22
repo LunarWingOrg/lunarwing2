@@ -865,6 +865,11 @@ pub struct JobInfo {
     pub user_id: String,
     pub created_at: String,
     pub started_at: Option<String>,
+    /// Historical duration of comparable completed local runs, frozen when
+    /// the job was dispatched (WI#318 C1). Omitted when timing display is
+    /// off, when the model was still cold, or for sandbox/external jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_duration_secs: Option<u64>,
     /// Job mode (`external:kimi`, `harness`, …), omitted when the job has no
     /// non-default mode. Same omission rule as [`JobDetailResponse`] (WI#479).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -932,6 +937,11 @@ pub struct JobDetailResponse {
     pub stuck: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair_attempts: Option<u32>,
+    /// Measured elapsed time and, when timing display is enabled, the frozen
+    /// historical duration for a local job (WI#318 C1/C4). Remaining time is
+    /// `unknown` for an open-ended job and is never invented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::estimation::JobTimingView>,
 }
 
 // --- Project Files ---

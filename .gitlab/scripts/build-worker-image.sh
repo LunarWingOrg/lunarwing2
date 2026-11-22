@@ -172,6 +172,8 @@ kimicode4lunarwing/scripts/tsconfig.json
 kimicode4lunarwing/scripts/entrypoint_split_test.ts
 kimicode4lunarwing/scripts/entrypoint_config_test.ts
 kimicode4lunarwing/scripts/entrypoint_supervisor_test.ts
+kimicode4lunarwing/scripts/guard_config.ts
+kimicode4lunarwing/scripts/guard_config_test.ts
 kimicode4lunarwing/scripts/headless_command_guard_test.ts
 kimicode4lunarwing/scripts/kimi_cli_contract_test.ts
 kimicode4lunarwing/scripts/kimi_result.ts

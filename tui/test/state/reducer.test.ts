@@ -17,9 +17,11 @@ import {
 } from "../../src/state/model.ts"
 import { reduce } from "../../src/state/reducer.ts"
 import {
+  LATE_REPLY_WINDOW_MS,
   NOTES,
   NO_REPLY_YET_MS,
   UNANSWERED_AFTER_MS,
+  YOUNG_FAILED_TURN_MS,
   activeUserTurnCount,
   canStartTurn,
   focusedApproval,
@@ -1137,6 +1139,10 @@ describe("approvals, errors, threads and connection", () => {
 
     h.advance(610_000)
     h.dispatch({ type: "resync/applied", snapshot })
+    // WI#837: 610 s is the old base window; the daemon's late watcher can still deliver up to 2530 s.
+    expect(h.turn(b).phase).toBe(phaseB)
+    h.advance(LATE_REPLY_WINDOW_MS - 610_000)
+    h.dispatch({ type: "resync/applied", snapshot })
     expect(h.turn(b)).toMatchObject({ phase: "failed", recovered: true, error: { code: "failed" } })
     expect(h.turn(c).phase).toBe(phaseC) // still Processing on the server
 
@@ -1149,6 +1155,14 @@ describe("approvals, errors, threads and connection", () => {
       ["history", "done", "hi there"],
       ["background", "done", "proactive"],
     ])
+  })
+
+  test("history recovery covers the daemon's longest late window; the legacy unanswered seal stays 10 min", () => {
+    // WI#837: LONGEST_LATE_WINDOW = OUTCOME_TIMEOUT (610 s) + LATE_MAX_TIMEOUT (1800 s) + 2 x STOP_GRACE (60 s),
+    // pinned by ic/src/bridge/router/outcome/tests.rs.
+    expect(LATE_REPLY_WINDOW_MS).toBe(2_530_000)
+    expect(YOUNG_FAILED_TURN_MS).toBe(LATE_REPLY_WINDOW_MS)
+    expect(UNANSWERED_AFTER_MS).toBe(610_000)
   })
 
   test("history times are converted to the Clock domain: a performance.now() clock never matches an older turn", () => {
