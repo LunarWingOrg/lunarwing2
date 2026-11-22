@@ -4014,7 +4014,9 @@ auto-approval:
   backslash escaping, so `"sudo"`, `\sudo` and `/usr/bin/sudo` still match the
   privilege rule, a piped interpreter matches through a path or an
   `env`/`exec`/`busybox` prefix (`| /usr/bin/env bash`), and the recursive
-  `chmod`/`chown` rule covers `/` (WI#813). The hook also
+  `chmod`/`chown` rule covers `/` (WI#813) and the GNU long-option
+  abbreviations of `--recursive` (`--recu` and longer, the shortest form
+  getopt accepts — `--recursiv` no longer passes; WI#843). The hook also
   joins shell line continuations for every rule, not only `rm`: bash builds one
   word from a backslash-newline pair, so a continuation inside a denied word is
   checked on the joined text (WI#813). It cannot tell a real quote from an
