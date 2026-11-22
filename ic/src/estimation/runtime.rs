@@ -530,7 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn category_policy_gates_display_but_keeps_recording() {        let params = serde_json::json!({});
+    fn category_policy_gates_display_but_keeps_recording() {
+        let params = serde_json::json!({});
         let estimates = ToolEstimates::configured(
             ToolEstimationMode::Display,
             CategoryPolicy::from_setting(Some("other-tool")),

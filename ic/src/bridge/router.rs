@@ -5605,17 +5605,17 @@ fn mission_run_timing(
     let mut completed: Vec<u64> = threads
         .iter()
         .filter_map(|thread| {
-            thread.completed_at.map(|completed| {
-                (completed - thread.created_at).num_seconds().max(0) as u64
-            })
+            thread
+                .completed_at
+                .map(|completed| (completed - thread.created_at).num_seconds().max(0) as u64)
         })
         .filter(|secs| *secs > 0)
         .collect();
     // `threads` follows `mission.thread_history`, which is oldest first.
     let last_run_elapsed_secs = threads.iter().rev().find_map(|thread| {
-        thread.completed_at.map(|completed| {
-            (completed - thread.created_at).num_seconds().max(0) as u64
-        })
+        thread
+            .completed_at
+            .map(|completed| (completed - thread.created_at).num_seconds().max(0) as u64)
     });
     let running_elapsed_secs = threads
         .iter()
@@ -5659,8 +5659,8 @@ mod mission_run_timing_tests {
             lunarwing_engine::ThreadConfig::default(),
         );
         thread.created_at = now - chrono::Duration::seconds(started_secs_ago);
-        thread.completed_at = duration_secs
-            .map(|duration| thread.created_at + chrono::Duration::seconds(duration));
+        thread.completed_at =
+            duration_secs.map(|duration| thread.created_at + chrono::Duration::seconds(duration));
         thread
     }
 

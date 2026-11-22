@@ -704,6 +704,15 @@ warmup and cold-start metrics; categories without paired data cannot pass the
 accuracy gate. Details:
 [`../../ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 
+Local job and mission-run timing (WI#318 Phase C) use the same
+`LUNARWING_TOOL_ESTIMATES` display switch. In observe mode a local job's
+historical duration is recorded and frozen at dispatch but not shown; `1` adds
+it to `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}` (elapsed and
+remaining are always reported separately, remaining is `unknown` for an
+open-ended job) and to `GET /api/missions/{id}` as `run_timing`. Sandbox and
+external-worker jobs are not estimated. `LUNARWING_TOOL_ESTIMATES_CATEGORIES`
+does not gate jobs or missions — its entries are tool names.
+
 LLM logical-call timing (WI#318 Phase B) is a separate, daemon-wide cache.
 `LUNARWING_LLM_TIMINGS=0` disables it; unset or any other value observes. One
 timer decorates the provider chain built at startup, so v1 chat, local jobs,

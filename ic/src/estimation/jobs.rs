@@ -28,10 +28,7 @@ pub fn job_key(user_id: &str) -> Option<String> {
     if user_id.is_empty() || user_id.len() > 512 {
         return None;
     }
-    Some(format!(
-        "job:{}:{user_id}{LOCAL_JOB_KIND}",
-        user_id.len()
-    ))
+    Some(format!("job:{}:{user_id}{LOCAL_JOB_KIND}", user_id.len()))
 }
 
 /// Counts for the owner-only diagnostics surface. No category names, user

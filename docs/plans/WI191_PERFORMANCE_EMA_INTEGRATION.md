@@ -3,8 +3,10 @@
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
 gating and the evaluation trace are implemented; Phase B1–B4 LLM
 logical-call timing and gate-wait analytics are implemented (owner-only
-diagnostics, no prompt-facing use yet). The held-out tenant evaluation, hint
-rollout and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+diagnostics, no prompt-facing use yet); Phase C1–C4 bounded local-job and
+mission-run estimates are implemented with sandbox/external jobs explicitly
+excluded. The held-out tenant evaluation, hint rollout and Phase D remain in
+progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
@@ -22,8 +24,9 @@ duration-only cache at the provider-chain boundary, surfaced by the owner-only
 counted separately and never train the EMA. It is not yet used in any estimate
 shown to a user. Gate-wait analytics (B4) are implemented separately in
 `ic/src/gate/wait_analytics.rs` (owner-only `GET /api/estimates/gate-waits`),
-whole-job/mission-run estimates, held-out workload
-evaluation and durable caches remain follow-ups; tool calls within those
+and Phase C job/mission-run views are now implemented: the held-out workload
+evaluation (A4), hint rollout (A5) and the conditional durable cache (D1)
+remain follow-ups; tool calls within those
 jobs are covered by this slice. Costs are only learned when actually reported,
 and are not displayed. See the
 [goal-10 evidence record](../ops/history/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
@@ -373,6 +376,27 @@ current-run surface. Extend its run view additively for any advisory
 historical estimate rather than proposing an unrelated viewer; do not claim
 general mission-definition CRUD or alter mission semantics as part of this
 plan. The webhook ingress remains separate.
+
+**Implemented under #318 (C1–C4).** `Scheduler::dispatch_job_inner` freezes a
+historical duration into `JobContext.estimated_duration` before the first
+persist, keyed by the constant, non-sensitive `local` job kind under a private
+per-user learner key. `Worker::run` records exactly one terminal observation
+after one execution loop: only `Completed` trains the duration model;
+`Failed`/`Cancelled` are counted separately; `Stuck` records nothing.
+`job_status`, `GET /api/jobs` and `GET /api/jobs/{id}` report measured elapsed
+separately from the frozen historical duration and report remaining time as
+`unknown`, since a max-iteration limit or worker timeout is not a finite plan.
+Sandbox/container and external-worker jobs are explicitly excluded: they keep
+`estimated_duration` unset and never receive a local-job estimate.
+`GET /api/missions/{id}` derives advisory run timing (completed run count,
+median and last completed-run duration, newest running run's elapsed) from the
+mission's own loaded threads on read; `lunarwing_engine` is untouched, there is
+no second EMA writer, no extra store read and no fire-path write. Job and
+mission timing follow the same opt-in display mode as tool hints; recording
+continues in observe mode. `ic/src/estimation/jobs.rs` holds the bounded
+counters and timing view; tests cover warmup withholding, failed-run
+exclusion, disabled mode, user isolation, display gating and the mission-run
+median.
 
 ### C. Diagnostics — optional read-only surface
 

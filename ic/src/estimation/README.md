@@ -247,6 +247,46 @@ here feeds an estimate or a decision.
   count, mean, maximum and EMA of the observed wait in milliseconds, plus a
   `note` stating that this is not a promise about human response time.
 
+## Job and mission-run estimates (WI#318 Phase C)
+
+Phase C estimates a **bounded run**, never an open-ended conversation, a
+mission's lifetime, or a whole coding job's unknown future steps.
+
+- **Local scheduler jobs only (C1).** `Scheduler::dispatch_job_inner` freezes
+  one historical duration into `JobContext.estimated_duration` before the
+  first persist. The learner category is the constant, non-sensitive `local`
+  kind under a private per-user key; job titles, descriptions and metadata
+  never become keys. Cost is never estimated because no job declares a cost
+  baseline.
+- **One terminal observation.** `Worker::run` records after exactly one
+  execution loop, so the several completion paths cannot train one run twice.
+  Only `Completed` trains the duration model. `Failed` and `Cancelled` are
+  counted separately because their elapsed time is not a comparable run;
+  `Stuck` records nothing so self-repair can still finish the job.
+- **Sandbox and external-worker jobs are excluded (C2).**
+  `ContainerJobManager` and `ExternalWorkerManager` jobs have a different
+  start/terminal mapping; they never receive a local-job estimate just
+  because both paths use `create_job`. Their `estimated_duration` stays unset.
+- **Surfaces (C4).** `job_status`, `GET /api/jobs` and `GET /api/jobs/{id}`
+  report measured elapsed separately from the frozen historical duration and
+  report remaining time as `unknown`. A known remaining time is deliberately
+  not invented from a max-iteration limit or worker timeout, because neither
+  is a finite plan.
+- **Mission runs (C3).** `GET /api/missions/{id}` derives a single run's
+  advisory timing from that mission's own completed threads on read: completed
+  run count, median and last completed-run duration, and the newest running
+  run's elapsed. `lunarwing_engine` is untouched, there is no second EMA
+  writer, no extra store read beyond the threads already loaded for the
+  detail view, and no write on the fire path. A recurring mission's lifetime
+  is never estimated.
+- **Display gating.** Job and mission timing follow the same opt-in display
+  mode as tool hints (`LUNARWING_TOOL_ESTIMATES=1`). Recording continues in
+  observe mode; `0` disables both recording and display. The per-tool category
+  allowlist is not consulted for jobs or missions, whose categories are not
+  tool names.
+- **Never an input to behaviour.** Nothing here feeds scheduling, timeouts,
+  approvals, cost accounting, provider selection or LLM prompts.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
@@ -277,11 +317,13 @@ does not establish the latter workload-level result.
 
 The later slices in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../../../docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md)
-remain follow-ups: bounded whole-job/mission-run views, gate-wait analytics,
-durable aggregate caches and the real-tenant
-held-out evaluation. The diagnostics surface, per-category display gating and
-the opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
-A4 on a tenant and enabling hints (A5) are still operator steps. Tool calls
-*within* a job are covered now; the whole job does not yet have an ETA. This
-cache never changes scheduling, approval policy, timeouts, provider selection,
-or budgets.
+still open: the real-tenant held-out evaluation (A4), enabling hints (A5) and
+the conditional durable aggregate cache (D1). Phase B (LLM timing, gate-wait
+analytics) and Phase C (bounded local-job and mission-run views) are
+implemented; sandbox and external-worker jobs are explicitly excluded from
+job estimates. The diagnostics surface, per-category display gating and the
+opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
+A4 on a tenant and enabling hints (A5) are still operator steps. Whole-job
+remaining time is reported as unknown unless a finite plan actually exists.
+This cache never changes scheduling, approval policy, timeouts, provider
+selection, or budgets.

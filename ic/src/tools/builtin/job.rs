@@ -3780,10 +3780,7 @@ mod tests {
         assert!(timing["elapsed_secs"].as_u64().unwrap() >= 30); // safety: test
 
         let shown = JobStatusTool::new(manager).with_timing_display(true);
-        let result = shown
-            .execute(params, &JobContext::default())
-            .await
-            .unwrap(); // safety: test
+        let result = shown.execute(params, &JobContext::default()).await.unwrap(); // safety: test
         assert_eq!(result.result["timing"]["estimated_total_secs"], 120);
     }
 
