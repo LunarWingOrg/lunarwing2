@@ -20,6 +20,7 @@ import {
 
 import { isAbsolute, join } from "node:path"
 
+import { ensureGuardHook } from "./guard_config.js"
 import { dropLoaderEnv, resolveFromBridgePath, taskIdentity, taskSetprivArgv } from "./task_identity.js"
 import {
   buildTaskPrompt,
@@ -707,6 +708,16 @@ export async function executeTask(
     // (for this or a later session) cannot plant an MCP server the Bash hook
     // never sees. Throws on a failed restore — fail closed rather than spawn.
     restoreTrustedMcpConfig(request.task_id)
+
+    // WI#847: $KIMI_CODE_HOME/config.toml is written by the task-side setup
+    // script as the task uid, so a task can strip its own `[[hooks]]` guard
+    // entry and setup never runs again until the container restarts — every
+    // later task would start unguarded. Re-assert the hook before every spawn;
+    // a config the executor cannot repair fails the task (fail closed) instead
+    // of running it without the PreToolUse guard. Managed shapes (identity
+    // drop or the delegated task runner) treat a missing config as fatal;
+    // host-side dev runs have no managed config and skip the check.
+    ensureGuardHook(env.KIMI_CODE_HOME, request.task_id, Boolean(identity) || Boolean(options?.delegatedRunner))
 
     proc = spawn(spawnBin, spawnArgs, {
       cwd: workDir,
