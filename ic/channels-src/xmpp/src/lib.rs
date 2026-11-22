@@ -23,6 +23,14 @@ const CURSOR_PATH: &str = "cursor.txt";
 const DEFAULT_BRIDGE_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_POLL_INTERVAL_MS: u32 = 30_000;
 
+/// Messages requested per bridge poll.
+///
+/// The bridge clamps pages to the daemon's per-callback emit budget, so one
+/// page can never overflow `on_poll`. Asking for less than the ceiling keeps a
+/// single tick cheap and lets the cursor advance every poll while a large
+/// backlog drains (WI#850).
+const MESSAGES_PAGE_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeConfig {
     display_name: String,
@@ -168,9 +176,10 @@ impl Guest for XmppChannel {
 
         let cursor = read_cursor();
         let url = format!(
-            "{}/v1/messages?cursor={}",
+            "{}/v1/messages?cursor={}&limit={}",
             trim_base_url(&config.bridge_url),
-            cursor
+            cursor,
+            MESSAGES_PAGE_LIMIT
         );
         let response: PollResponse = match request_json("GET", &url, None) {
             Ok(body) => match serde_json::from_slice(&body) {
