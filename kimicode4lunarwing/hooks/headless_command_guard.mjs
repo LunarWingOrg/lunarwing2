@@ -766,14 +766,15 @@ const PERL_DELIMITERS = { "(": ")", "[": "]", "{": "}", "<": ">" };
 function perlDelimitedEnd(code, open) {
   const openCh = code[open];
   const closeCh = PERL_DELIMITERS[openCh] ?? openCh;
+  const paired = openCh !== closeCh;
   let depth = 0;
-  for (let i = open; i < code.length; i++) {
+  for (let i = paired ? open : open + 1; i < code.length; i++) {
     if (code[i] === "\\") {
       i++;
       continue;
     }
-    if (openCh !== closeCh && code[i] === openCh) depth++;
-    else if (code[i] === closeCh && (openCh === closeCh || --depth === 0)) return i + 1;
+    if (paired && code[i] === openCh) depth++;
+    else if (code[i] === closeCh && (!paired || --depth === 0)) return i + 1;
   }
   return -1;
 }
