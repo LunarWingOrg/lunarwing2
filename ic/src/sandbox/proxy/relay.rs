@@ -134,6 +134,32 @@ async fn serve(
     port: u16,
     counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    serve_accepted(listener, port, counter).await
+}
+
+/// The accept source [`serve_accepted`] drives. Only the relay's real
+/// listener and the accept-error test implement it.
+#[cfg(target_os = "linux")]
+trait AcceptConnection {
+    async fn accept(&self) -> std::io::Result<tokio::net::UnixStream>;
+}
+
+#[cfg(target_os = "linux")]
+impl AcceptConnection for tokio::net::UnixListener {
+    async fn accept(&self) -> std::io::Result<tokio::net::UnixStream> {
+        tokio::net::UnixListener::accept(self)
+            .await
+            .map(|(stream, _)| stream)
+    }
+}
+
+/// [`serve`] over an accept source, so a failing `accept` can be exercised.
+#[cfg(target_os = "linux")]
+async fn serve_accepted(
+    listener: impl AcceptConnection,
+    port: u16,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
     loop {
@@ -145,7 +171,7 @@ async fn serve(
             }
             accepted = listener.accept(), if connections.len() < MAX_LIVE_CONNECTIONS => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         backoff.reset();
                         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         connections.spawn(forward(stream, port));
@@ -790,6 +816,53 @@ mod tests {
                 .unwrap();
         queued.write_all(b"x").await.unwrap();
         assert_eq!(served.read_u8().await.unwrap(), b'x');
+    }
+
+    /// WI#834: a failed accept is retried, not fatal. The relay must still
+    /// serve a real connection after a run of `EMFILE`-shaped failures.
+    #[tokio::test]
+    async fn a_failed_accept_is_retried_instead_of_ending_the_relay() {
+        struct FailingAccepts {
+            remaining: std::sync::atomic::AtomicUsize,
+            listener: tokio::net::UnixListener,
+        }
+
+        impl AcceptConnection for FailingAccepts {
+            async fn accept(&self) -> std::io::Result<tokio::net::UnixStream> {
+                use std::sync::atomic::Ordering;
+                if self.remaining.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    return Err(std::io::Error::from_raw_os_error(24)); // EMFILE
+                }
+                self.listener.accept().await.map(|(stream, _)| stream)
+            }
+        }
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("proxy.sock");
+        let relay_listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+
+        let accepts = FailingAccepts {
+            remaining: std::sync::atomic::AtomicUsize::new(3),
+            listener: relay_listener,
+        };
+        let contacts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn(serve_accepted(
+            accepts,
+            port,
+            std::sync::Arc::clone(&contacts),
+        ));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            one_round_trip(&socket, &upstream),
+        )
+        .await
+        .expect("the relay must serve after transient accept failures");
+        // A failed accept is not container contact (WI#836); the served stream is.
+        assert_eq!(contacts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        task.abort();
     }
 
     /// WI#834: a failed accept backs off and is retried, never ending the
