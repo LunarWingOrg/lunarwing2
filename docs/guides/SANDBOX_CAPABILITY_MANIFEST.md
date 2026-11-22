@@ -142,9 +142,14 @@ The shell scan is not a security boundary: Git configuration and scripts can
 change what actually runs, and HTTPS CONNECT does not expose repository paths
 or Git operations to the proxy. Manifest preflight rejects recognized `git
 push` invocations, not just force or delete flags, because even a plain push
-can use repository-local settings. This is not a repository write filter for
-arbitrary shell processes. Use server-side permissions and branch protection
-to enforce repository write policy.
+can use repository-local settings. It likewise rejects the remote transport
+plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and the
+`remote-*` helpers, whether named as a `git` subcommand or invoked by path —
+and command-line configuration overrides of `alias.`, `include.` or
+`includeIf.`, which would otherwise rename or inject the verb the scan sees.
+This is not a repository write filter for arbitrary shell processes. Use
+server-side permissions and branch protection to enforce repository write
+policy.
 
 The grant supplies no credential. The container receives the granted remote
 URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
