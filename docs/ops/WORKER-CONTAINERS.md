@@ -739,8 +739,17 @@ retry/failure event rather than waiting silently for the outer task deadline.
 
 The kimi worker image ships the WI#324 worker-side bridge: a per-task unix
 socket relay in `lunarwing_bridge.ts` plus a thin stdio MCP server
-(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`
-by the entrypoint (write-if-absent; set `"enabled": false` there to opt out).
+(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`.
+Since WI#848 that registration is a root-owned image input
+(`config/mcp.json`, materialized by `entrypoint-task-setup.sh` at every
+container start and re-materialized by `kimi_task_executor.ts` before every
+CLI spawn): the CLI trusts the user-level file without any workspace-trust
+prompt and starts its servers before the first model turn, outside the
+`PreToolUse` Bash hook, so it cannot be task-writable state. Point
+`KIMI_MCP_SOURCE` at another root-owned file to override the entry
+(`{"mcpServers":{}}` or `"enabled": false` opts out); a task's edit to the
+runtime file is reverted before the next session, and the guard denies the
+literal spellings that name it.
 The kimi CLI spawns the shim per task session; the bridge injects
 `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` per task, and the shim
 translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
@@ -4145,7 +4154,21 @@ auto-approval:
   command. Use file editing tools to write that text literally. The container
   remains the security boundary. Unparseable payloads deny. `/app/config` and
   `/app/hooks` are read-only to the runtime user, so a task cannot edit its
-  own guard.
+  own guard. Since WI#848 the hook also denies a command that names the
+  user-level MCP registration through its config directory
+  (`$KIMI_CODE_HOME/mcp.json`, `~/.kimi-code/mcp.json`, the absolute home
+  spelling, and a bare `mcp.json` after `cd`-ing there). That covers the
+  measured shell-redirect, interpreter-json-edit and `sed -i` writes. A path
+  assembled from fragments, or written by a script file, gets past the text
+  rule; `kimi_task_executor.ts` re-materializes the entrypoint's registration
+  before every spawn, so such an edit cannot reach a later session. A nested
+  `kimi -p` a task starts itself reads whatever the file holds at that
+  moment, which stays an accepted residual — the container is the boundary.
+- `entrypoint-task-setup.sh`: materializes `$KIMI_CODE_HOME/mcp.json` from
+  the root-owned `KIMI_MCP_SOURCE` (`/app/config/mcp.json`; WI#848) at every
+  container start, validating it as a JSON object with an `mcpServers`
+  object. It replaces any existing file — the old write-if-absent guard
+  preserved a task's edit across restarts.
 - `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
   that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD` or
   `KIMI_CODE_TRUST_WORKSPACE` (unsets both in CLI and bridge mode), and
@@ -4159,7 +4182,13 @@ auto-approval:
   `KIMI_CODE_PERMISSION_MODE_REMINDER` and `KIMI_CODE_TRUST_WORKSPACE` from
   per-task environments after every merge, so task-controlled
   `context.environment` cannot change the approval policy or grant
-  workspace trust.
+  workspace trust. Since WI#848 the runner (and the legacy in-bridge
+  executor) snapshots `$KIMI_CODE_HOME/mcp.json` at startup and rewrites
+  the file from that snapshot immediately before every spawn. The restore
+  is same-uid best-effort between concurrent tasks, not a boundary: a task
+  can still race the window, and a nested `kimi -p` it starts reads the
+  file as it stands. What it removes is persistence — a finished task's
+  registration cannot reach the next session.
 - mt-admin no longer mounts the tenant SSH-agent socket into the kimi
   container (both the imperative `podman run` and the Quadlet), adds
   `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
