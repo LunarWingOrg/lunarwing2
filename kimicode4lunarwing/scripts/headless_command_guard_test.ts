@@ -902,6 +902,32 @@ test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
   assertAllowed(`perl -e "print \\"unlink\\", \\"/home/kimi/x\\""`)
 })
 
+test("Perl deletion options, list forms and expression operands (WI#851)", () => {
+  // !2681 marked every non-literal operand unverifiable, so File::Path's
+  // option hash and rmtree's legacy verbose/safe flags denied a temp-only
+  // cleanup. They are options, not targets; the path operands are still read.
+  assertAllowed(`perl -MFile::Path -e 'rmtree("/tmp/x", {verbose => 1})'`)
+  assertAllowed(`perl -MFile::Path=remove_tree -e 'remove_tree("/tmp/x", {error => \\my $e})'`)
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/x", 0, 1'`)
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/home/kimi/x", {verbose => 1})'`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/tmp/x", "/home/kimi/y", {verbose => 1})'`, "deletion outside")
+  // An operand is one string literal; a concatenation is an expression whose
+  // result the guard cannot verify, so `..` cannot be appended to a temp path.
+  assertBlocked(`perl -e 'use File::Path; rmtree "/tmp/x/" . "../../workspace"'`, "cannot verify")
+  // glob(…), <…>, qw(…) and the implicit-`$_` target are deletion calls.
+  assertBlocked(`perl -e 'unlink glob("/workspace/*")'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink </workspace/*>'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink qw(/workspace/a /workspace/b)'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink for glob "/workspace/*"'`, "cannot verify")
+  assertBlocked(`perl -e 'for (glob "/workspace/*") { unlink }'`, "cannot verify")
+  // A qw() list of temp paths may pass.
+  assertAllowed(`perl -e 'unlink qw(/tmp/a /tmp/b)'`)
+  // The rows already decided correctly keep their verdicts.
+  assertAllowed(`perl -e 'unlink "/tmp/x" or die "no"'`)
+  assertAllowed(`perl -e 'print "unlink"'`)
+  assertAllowed(`perl -e 'my %h = (unlink => 1); print 1'`)
+})
+
 test("find and rsync delete through the same temp-root test", () => {
   // WI#832: `find -exec unlink` deleted without a deletion action match, and
   // rsync --delete removed whatever the destination had.

@@ -734,6 +734,11 @@ function insideQuotedString(code, index) {
   return quote !== "";
 }
 
+function skipBlanks(code, i) {
+  while (i < code.length && (code[i] === " " || code[i] === "\t")) i++;
+  return i;
+}
+
 /** The value of the Perl string literal that opens at `from` and the index after it. */
 function perlStringLiteral(code, from) {
   const quote = code[from];
@@ -750,36 +755,174 @@ function perlStringLiteral(code, from) {
   return null;
 }
 
+// Perl's paired delimiters; a delimiter without a pair (`q/…/`) closes on
+// itself. Quote-like bodies and File::Path option hashes are skipped with it.
+const PERL_DELIMITERS = { "(": ")", "[": "]", "{": "}", "<": ">" };
+
 /**
- * The operands of a Perl deletion call whose keyword ends at `from`, and
- * whether part of its operand list is not a quoted literal. The call may be
- * spelled with or without parentheses and may take a comma list; every
- * operand is read, because checking only the first leaves the rest unverified
- * (WI#840). Null means the keyword is not a call shape at all (`qw(unlink)`,
- * a reference, a hash key).
+ * The index after the Perl delimiter pair that opens at `open`, or -1 when it
+ * never closes. A backslash escapes the next character and bracket pairs nest.
  */
-function perlDeletionCall(code, from) {
-  let i = from;
-  while (i < code.length && /[ \t]/.test(code[i])) i++;
-  if (code[i] === "(") {
-    i++;
-  } else {
-    const glob = /^glob[ \t]+/.exec(code.slice(i));
-    if (glob !== null) i += glob[0].length;
-    else if (!['"', "'", "$", "@", "%"].includes(code[i] ?? "")) return null;
+function perlDelimitedEnd(code, open) {
+  const openCh = code[open];
+  const closeCh = PERL_DELIMITERS[openCh] ?? openCh;
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (openCh !== closeCh && code[i] === openCh) depth++;
+    else if (code[i] === closeCh && (openCh === closeCh || --depth === 0)) return i + 1;
   }
+  return -1;
+}
+
+/**
+ * The index after the `}` that closes the File::Path option hash at `i`, or
+ * -1. Quotes are skipped so a brace inside an option value does not close it.
+ */
+function perlHashEnd(code, i) {
+  let depth = 0;
+  let quote = "";
+  for (let j = i; j < code.length; j++) {
+    const ch = code[j];
+    if (quote) {
+      if (ch === "\\") j++;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return j + 1;
+  }
+  return -1;
+}
+
+// Quote-like string operators whose body is text, not code: a deletion keyword
+// spelled inside one (`qw(unlink)`) is not a call. `q` must not follow a sigil
+// (so `$q = …` is not read as a literal) and takes a bracketed delimiter
+// (WI#851).
+const PERL_QUOTE_LIKE = /(?<![\w$@%&\\])(?:qw|qq|qx|q)\s*[([{]/g;
+
+/** True when `index` sits inside a Perl quote-like literal (`qw(…)`, `q{…}`). */
+function insidePerlQuoteLike(code, index) {
+  for (const match of code.matchAll(PERL_QUOTE_LIKE)) {
+    const open = match.index + match[0].length - 1;
+    if (open >= index) return false;
+    const end = perlDelimitedEnd(code, open);
+    if (end !== -1 && index < end) return true;
+  }
+  return false;
+}
+
+/** A `qw(…)` list of literal words at `i`, or null when there is none. */
+function perlQuoteWordList(code, i) {
+  if (!code.startsWith("qw", i) || /\w/.test(code[i + 2] ?? "")) return null;
+  const open = skipBlanks(code, i + 2);
+  if (PERL_DELIMITERS[code[open]] === undefined && code[open] !== "/") return null;
+  const end = perlDelimitedEnd(code, open);
+  if (end === -1) return { unverifiable: true };
+  const values = code.slice(open + 1, end - 1).split(/[ \t\n]+/).filter((word) => word.length > 0);
+  return { next: end, values };
+}
+
+/** The pattern a `glob(…)` operand names: a quoted literal or its bare text. */
+function perlGlobTarget(text) {
+  const literal = perlStringLiteral(text, 0);
+  return literal !== null && literal.next === text.length ? literal.value : text;
+}
+
+/** A Perl `glob(…)` or `glob …` operand at `i`, or null when there is none. */
+function perlGlobOperand(code, i) {
+  if (!code.startsWith("glob", i) || /\w/.test(code[i + 4] ?? "")) return null;
+  const open = skipBlanks(code, i + 4);
+  if (code[open] === "(") {
+    const end = perlDelimitedEnd(code, open);
+    if (end === -1) return { unverifiable: true };
+    return { next: end, values: [perlGlobTarget(code.slice(open + 1, end - 1).trim())] };
+  }
+  const literal = perlStringLiteral(code, open);
+  if (literal === null) return { unverifiable: true };
+  return { next: literal.next, values: [literal.value] };
+}
+
+/** A `<…>` glob operand at `i`. */
+function perlAngleOperand(code, i) {
+  const end = code.indexOf(">", i + 1);
+  if (end === -1) return { unverifiable: true };
+  const value = code.slice(i + 1, end).trim();
+  return value.length === 0 ? { unverifiable: true } : { next: end + 1, values: [value] };
+}
+
+/**
+ * One element of a Perl deletion call's operand list: a path target, an
+ * option that is not a target, or an expression the guard cannot verify. The
+ * File::Path option hash and `rmtree`'s legacy numeric verbose/safe flags are
+ * the only options, and only for `rmtree`/`remove_tree` (WI#851).
+ */
+function perlDeletionElement(code, i, options) {
+  const ch = code[i] ?? "";
+  if (options && ch === "{") {
+    const end = perlHashEnd(code, i);
+    return end === -1 ? { unverifiable: true } : { next: end, skipped: true };
+  }
+  if (options && /[0-9]/.test(ch)) {
+    let end = i;
+    while (end < code.length && /[0-9]/.test(code[end])) end++;
+    return { next: end, skipped: true };
+  }
+  if (ch === "<") return perlAngleOperand(code, i);
+  const glob = perlGlobOperand(code, i);
+  if (glob !== null) return glob;
+  const wordList = perlQuoteWordList(code, i);
+  if (wordList !== null) return wordList;
+  const literal = perlStringLiteral(code, i);
+  if (literal !== null) return { next: literal.next, values: [literal.value] };
+  return { unverifiable: true };
+}
+
+/**
+ * True when `i` ends a Perl statement: `;`, a closing block, a comment, the
+ * end of the code, or the low-precedence `or`/`and` a guarded deletion ends
+ * with (`unlink "/tmp/x" or die`).
+ */
+function perlStatementEnd(code, i) {
+  if (i >= code.length) return true;
+  if (";})\n#".includes(code[i])) return true;
+  return /^(?:or|and)(?![\w])|^\|\||^&&|^\/\//.test(code.slice(i));
+}
+
+/**
+ * The operands of a Perl deletion call whose keyword `keyword` ends at `from`,
+ * and whether any part of its operand list is not a single string literal. The
+ * call may be spelled with or without parentheses and may take a comma list;
+ * every operand is read, because checking only the first leaves the rest
+ * unverified (WI#840). `glob(…)`, `<…>`, `qw(…)` and the implicit-`$_` form
+ * are call shapes too (WI#851). Null means the keyword is not a call at all
+ * (a `=>` hash key).
+ */
+function perlDeletionCall(code, from, keyword) {
+  let i = skipBlanks(code, from);
+  if (code.startsWith("=>", i)) return null;
+  const parenthesized = code[i] === "(";
+  if (parenthesized) i++;
+  const options = keyword === "rmtree" || keyword === "remove_tree";
+  const callEnd = (at) => (parenthesized ? code[at] === ")" : perlStatementEnd(code, at));
   const operands = [];
   for (;;) {
-    while (i < code.length && /[ \t]/.test(code[i])) i++;
-    const literal = perlStringLiteral(code, i);
-    if (literal === null) {
-      return { operands, unverifiable: i < code.length && !/[;)\n]/.test(code[i]) };
+    i = skipBlanks(code, i);
+    // No target at all is the implicit `$_` form, which cannot be verified.
+    if (callEnd(i)) return { operands, unverifiable: true };
+    const element = perlDeletionElement(code, i, options);
+    if (element.unverifiable) return { operands, unverifiable: true };
+    if (!element.skipped) operands.push(...element.values);
+    i = skipBlanks(code, element.next);
+    if (code[i] === ",") {
+      i++;
+      continue;
     }
-    operands.push(literal.value);
-    i = literal.next;
-    while (i < code.length && /[ \t]/.test(code[i])) i++;
-    if (code[i] !== ",") return { operands, unverifiable: false };
-    i++;
+    return { operands, unverifiable: !callEnd(i) || operands.length === 0 };
   }
 }
 
@@ -787,14 +930,17 @@ function perlDeletionCall(code, from) {
  * The Perl deletion verdict: `rmtree "dir"`, `unlink glob "dir/*"`,
  * `rmtree("a", "b")`, and a target the guard cannot resolve (WI#832). Every
  * operand of the comma list is read, and the shell escapes of a quoted
- * one-liner are removed before the calls are read (WI#840). A call name
- * inside a string literal (`print "unlink"`) is text, not a call.
+ * one-liner are removed before the calls are read (WI#840). `glob(…)`,
+ * `<…>`, `qw(…)` and the implicit-`$_` forms are calls too, and the File::Path
+ * options of `rmtree`/`remove_tree` are not targets (WI#851). A call name
+ * inside a string literal (`print "unlink"`) or a quote-like literal
+ * (`qw(unlink)`) is text, not a call.
  */
 function perlDeletionVerdict(rawCode) {
   const code = stripOuterShellQuotes(rawCode);
   for (const match of code.matchAll(PERL_DELETE_CALL)) {
-    if (insideQuotedString(code, match.index)) continue;
-    const call = perlDeletionCall(code, match.index + match[0].length);
+    if (insideQuotedString(code, match.index) || insidePerlQuoteLike(code, match.index)) continue;
+    const call = perlDeletionCall(code, match.index + match[0].length, match[0]);
     if (call === null) continue;
     if (call.unverifiable) return "interpreter deletion whose target the guard cannot verify";
     for (const operand of call.operands) {
