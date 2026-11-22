@@ -5611,7 +5611,8 @@ mod tests {
     /// allowlist, and the `gotify_app_token` credential injection all have to
     /// agree for the notification to be accepted. The merge reads
     /// `LUNARWING_BASE_DIR` exactly as the daemon does, so point the process
-    /// at a provisioned base dir.
+    /// at a provisioned test tenant's base dir. The test only reads the
+    /// provisioned config there; its workspace database is temporary.
     ///
     /// ```bash
     /// LUNARWING_BASE_DIR=/path/to/state \
@@ -5628,8 +5629,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual live check; needs a provisioned base dir, a Gotify token, and the built tool"]
     async fn wi831_live_gotify_notification() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use crate::secrets::{
             CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
         };
@@ -5686,11 +5685,7 @@ mod tests {
             .await
             .expect("failed to store the token"); // safety: manual test only
 
-        let backend = LibSqlBackend::new_local(&base_dir.join("wi831-live.db"))
-            .await
-            .expect("should create libsql backend"); // safety: manual test only
-        backend.run_migrations().await.expect("migrations"); // safety: manual test only
-        let db: Arc<dyn Database> = Arc::new(backend);
+        let (db, _db_dir) = crate::testing::test_db().await;
         let workspace = Arc::new(crate::workspace::Workspace::new_with_db("wi831-live", db));
 
         let mut credentials = HashMap::new();
@@ -5821,11 +5816,9 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_preload_merges_host_provisioned_gotify_config_over_store() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use crate::tools::wasm::WorkspaceReader;
 
-        let tmp = tempfile::tempdir().expect("failed to create temp dir"); // safety: test code only
+        let (db, tmp) = crate::testing::test_db().await;
         let base = tmp.path();
         let disk_content = r#"{"url":"https://on-disk.example.org","title":"Operator"}"#;
         let store_content = r#"{"url":"https://workspace-store.example.org"}"#;
@@ -5834,11 +5827,6 @@ mod tests {
         std::fs::write(config_dir.join("gotify.json"), disk_content)
             .expect("failed to write on-disk config"); // safety: test code only
 
-        let backend = LibSqlBackend::new_local(&base.join("wi831.db"))
-            .await
-            .expect("should create libsql backend"); // safety: test code only
-        backend.run_migrations().await.expect("migrations"); // safety: test code only
-        let db: Arc<dyn Database> = Arc::new(backend);
         let workspace = crate::workspace::Workspace::new_with_db("wi831-preload", db);
         workspace
             .write(super::GOTIFY_CONFIG_PATH, store_content)
