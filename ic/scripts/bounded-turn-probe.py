@@ -7,10 +7,10 @@ it asks the agent for exactly N discrete `echo` calls (default 8), waits for
 the turn to end, then reads the record the daemon already writes and reports
 the measurement instead of an impression.
 
-The measurement is read from the daemon's own log ring buffer
-(`GET /api/logs/download`), so it works the same on systemd, OpenRC and
-launchd hosts and needs no journal access. A quiet tenant is the right host:
-the buffer keeps the last 500 entries.
+The measurement is read from the daemon's own log stream
+(`GET /api/logs/events`), which replays its recent history before the live
+tail, so it works the same on systemd, OpenRC and launchd hosts and needs no
+journal access.
 
 Exit codes:
   0  the turn finished inside its budget with the requested step count
@@ -36,7 +36,6 @@ import urllib.request
 
 DEFAULT_STEPS = 8
 DEFAULT_TIMEOUT = 2700
-POLL_SECONDS = 2.0
 TURN_FINISHED = "Turn finished"
 REQUIRED_FIELDS = (
     "thread_id",
@@ -229,21 +228,52 @@ def download_logs(gateway):
     return entries
 
 
-def wait_for_record(gateway, thread_id, timeout, poll_seconds):
+def stream_logs(gateway, timeout):
+    """Yield log entries from `/api/logs/events` until `timeout` runs out.
+
+    The endpoint replays its recent history before the live tail, so opening it
+    after the send still sees anything already logged. That matters on a tenant
+    whose ring buffer churns: polling `/api/logs/download` can miss a record
+    written and evicted between two snapshots, while a stream cannot.
+    """
+    request = urllib.request.Request(
+        f"{gateway.base_url}/api/logs/events",
+        headers={"Authorization": f"Bearer {gateway.token}", "Accept": "text/event-stream"},
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        with urllib.request.urlopen(request, timeout=gateway.timeout) as response:
+            for raw in response:
+                if time.monotonic() >= deadline:
+                    return
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    yield json.loads(line[len("data:") :].strip())
+                except json.JSONDecodeError:
+                    continue
+    except (urllib.error.URLError, OSError) as error:
+        raise ProbeError(f"GET /api/logs/events failed: {error}") from error
+
+
+def wait_for_record(gateway, thread_id, timeout):
     """The turn's `Turn finished` record, or None once `timeout` runs out.
 
     A detached turn logs `phase=late` when the watcher ends it; a turn that
     fits the foreground wait logs `phase=foreground`. Either one means the
-    turn is over, so the first record for the thread is the answer.
+    turn is over, so the first record for the thread is the answer. The
+    history snapshot is checked first because a turn that already ended
+    before the stream opened is in it.
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        records = records_for_thread(log_messages(download_logs(gateway)), thread_id)
-        if records:
-            return records[0]
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(poll_seconds)
+    records = records_for_thread(log_messages(download_logs(gateway)), thread_id)
+    if records:
+        return records[0]
+    for entry in stream_logs(gateway, timeout):
+        record = parse_turn_finished(entry.get("message", ""))
+        if record is not None and record["thread_id"] == thread_id:
+            return record
+    return None
 
 
 def verdict(record, expected_steps):
@@ -279,7 +309,6 @@ def parse_args(argv):
     parser.add_argument("--token-file", help="file holding the gateway bearer token")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--poll", type=float, default=POLL_SECONDS)
     return parser.parse_args(argv)
 
 
@@ -313,14 +342,14 @@ def main(argv=None):
             f"probe: thread {thread_id} message {message_id}; "
             f"waiting up to {args.timeout:.0f} s for {args.steps} tool calls"
         )
-        record = wait_for_record(gateway, thread_id, args.timeout, args.poll)
+        record = wait_for_record(gateway, thread_id, args.timeout)
     except ProbeError as error:
         print(f"probe: {error}", file=sys.stderr)
         return 1
     if record is None:
         print(
             f"probe: no 'Turn finished' record for thread {thread_id} within "
-            f"{args.timeout:.0f} s (the log ring buffer may also have evicted it)",
+            f"{args.timeout:.0f} s",
             file=sys.stderr,
         )
         return 2

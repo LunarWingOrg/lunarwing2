@@ -131,10 +131,11 @@ class VerdictTests(unittest.TestCase):
 
 
 class FakeGateway:
-    """Serves the contract endpoints and a scripted log body."""
+    """Serves the contract endpoints, a history body and a scripted stream."""
 
-    def __init__(self, log_bodies):
-        self.log_bodies = list(log_bodies)
+    def __init__(self, history_body="", stream_entries=()):
+        self.history_body = history_body
+        self.stream_entries = list(stream_entries)
         self.sent = []
 
     def get_json(self, path):
@@ -144,10 +145,7 @@ class FakeGateway:
 
     def get_text(self, path):
         if path == "/api/logs/download":
-            body = self.log_bodies[0]
-            if len(self.log_bodies) > 1:
-                self.log_bodies.pop(0)
-            return body
+            return self.history_body
         raise AssertionError(f"unexpected GET {path}")
 
     def post_json(self, path, payload):
@@ -167,25 +165,38 @@ def log_body(*messages):
     return "\n".join(json.dumps(entry) for entry in entries)
 
 
-class WaitTests(unittest.TestCase):
-    def test_waits_past_a_quiet_poll_until_the_record_lands(self):
-        gateway = FakeGateway(
-            [
-                log_body("unrelated"),
-                log_body(record_line(thread_id="other-thread")),
-                log_body(record_line()),
-            ]
-        )
-        with mock.patch.object(probe.time, "sleep", lambda _seconds: None):
-            record = probe.wait_for_record(gateway, THREAD, timeout=60, poll_seconds=0)
-        self.assertIsNotNone(record)
-        self.assertEqual(record["tool_calls"], 8)
+def entry(message):
+    return {"level": "INFO", "target": "lunarwing", "message": message, "timestamp": "t"}
 
-    def test_gives_up_when_the_timeout_runs_out(self):
-        gateway = FakeGateway([log_body("unrelated")])
-        with mock.patch.object(probe.time, "sleep", lambda _seconds: None):
-            record = probe.wait_for_record(gateway, THREAD, timeout=0, poll_seconds=0)
-        self.assertIsNone(record)
+
+class WaitTests(unittest.TestCase):
+    def test_a_record_already_in_history_is_the_answer(self):
+        gateway = FakeGateway(history_body=log_body(record_line(tool_calls=6)))
+
+        def no_stream(_gateway, _timeout):
+            raise AssertionError("a history hit must not open the stream")
+
+        with mock.patch.object(probe, "stream_logs", no_stream):
+            record = probe.wait_for_record(gateway, THREAD, timeout=60)
+        self.assertEqual(record["tool_calls"], 6)
+
+    def test_the_live_stream_supplies_a_record_the_history_missed(self):
+        # The churning ring buffer no longer holds the record: only the stream
+        # (history replay plus live tail) sees it.
+        gateway = FakeGateway(history_body=log_body("unrelated"))
+
+        def stream(_gateway, _timeout):
+            yield entry(record_line(thread_id="other-thread"))
+            yield entry(record_line(tool_calls=8, phase="late"))
+
+        with mock.patch.object(probe, "stream_logs", stream):
+            record = probe.wait_for_record(gateway, THREAD, timeout=60)
+        self.assertEqual(record["phase"], "late")
+
+    def test_gives_up_when_the_stream_ends_without_a_record(self):
+        gateway = FakeGateway(history_body=log_body("unrelated"))
+        with mock.patch.object(probe, "stream_logs", lambda _g, _t: iter(())):
+            self.assertIsNone(probe.wait_for_record(gateway, THREAD, timeout=60))
 
 
 class SendTests(unittest.TestCase):
