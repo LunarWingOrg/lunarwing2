@@ -4073,6 +4073,11 @@ auto-approval:
   The long options are read by any GNU-unambiguous prefix (`git reset --har`,
   `git clean --for`, `git stash --includ`, `git switch --dis`), the same way
   the `rm` rules already read theirs (WI#841).
+  The git discard rules and the recursive `chmod`/`chown` rule also read the
+  shell punctuation bash glues to a word (WI#853): a subshell `(…)`, a `$(…)`
+  or backtick body (also inside double quotes) and a glued `)` end the word
+  around them, so `(git reset --hard)`, `$(git clean -fdx)` and
+  `(chmod -R 777 /etc)` take the plain spellings' verdicts.
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`mv` into a removed directory, `truncate`
   on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
@@ -4158,8 +4163,8 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 The hook is baked into the Kimi worker image. Tenants pick up WI#795, WI#826,
-WI#829, WI#830, WI#832, WI#833, WI#839 and WI#840 only after rebuilding the
-image with the fix and recreating their workers; see
+WI#829, WI#830, WI#832, WI#833, WI#839, WI#840, WI#841 and WI#853 only after
+rebuilding the image with the fix and recreating their workers; see
 [Rebuilt image rollout](#rebuilt-image-rollout-image-id-contract).
 
 ## LLM endpoints for LLM-backed workers (WI#330)
