@@ -157,6 +157,58 @@ capabilities = ["tool_use"]
   assert.match(config, /^max_output_size = 131072$/m)
 })
 
+test("entrypoint materializes the trusted MCP registration from its source (WI#848)", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-mcp-"))
+  const home = join(root, "home")
+  const configSource = join(root, "source.toml")
+  const mcpSource = join(root, "mcp.json")
+  writeFileSync(configSource, 'default_model = "m"\n')
+  const trusted = '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}\n'
+  writeFileSync(mcpSource, trusted)
+  mkdirSync(home, { recursive: true })
+  // A task's registration must not survive a container start: the old
+  // write-if-absent guard kept it, and the CLI trusts the file.
+  writeFileSync(
+    join(home, "mcp.json"),
+    '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}\n',
+    { mode: 0o600 },
+  )
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_CONFIG_SOURCE: configSource,
+    KIMI_MCP_SOURCE: mcpSource,
+  }
+  delete env.KIMI_MODEL
+  delete env.KIMI_BASE_URL
+  delete env.KIMI_API_KEY
+  delete env.TENSORZERO_API_KEY
+
+  const result = runSetup({ encoding: "utf8", env })
+  assert.equal(result.status, 0, result.stderr)
+  const target = join(home, "mcp.json")
+  assert.equal(readFileSync(target, "utf8"), trusted)
+  assert.equal(statSync(target).mode & 0o777, 0o600)
+
+  // An invalid source fails loudly and leaves the previous registration.
+  writeFileSync(mcpSource, '{"mcpServers":')
+  const invalid = runSetup({ encoding: "utf8", env })
+  assert.notEqual(invalid.status, 0)
+  assert.match(invalid.stderr, /invalid MCP config/)
+  assert.equal(readFileSync(target, "utf8"), trusted)
+
+  // A server map that is not an object is refused too.
+  writeFileSync(mcpSource, '{"mcpServers":[]}')
+  const wrongShape = runSetup({ encoding: "utf8", env })
+  assert.notEqual(wrongShape.status, 0)
+  assert.match(wrongShape.stderr, /"mcpServers" must be an object/)
+
+  // A missing source is a configuration error, not a silent default.
+  const missing = runSetup({ encoding: "utf8", env: { ...env, KIMI_MCP_SOURCE: join(root, "absent.json") } })
+  assert.notEqual(missing.status, 0)
+  assert.match(missing.stderr, /MCP config source not found/)
+})
+
 test("shipped config pins max_output_size for every model under an openai-type provider (WI#412)", () => {
   // kimi-code 2.2.0 (upstream #4091) sends no max_tokens for a model without
   // max_output_size unless the provider type is "kimi"; the lane's provider is
