@@ -1586,8 +1586,9 @@ export function tickTurns(state: AppState, at: number): AppState {
  * Rule 12, only where silence means something: legacy gateways stream activity, so the turn at the head of the
  * queue with no event 15 s after it was accepted (or after the turn before it ended) is waiting: in the daemon's
  * scheduler behind another channel's turn, or consumed as a control input. It gets the "no reply yet" note and
- * stays first in line, so a late reply still lands on it; only after the stale limit is it sealed unanswered. A
- * legacy socket has no progress events at all; its turns get the 120 s stall notice instead (3.6.2).
+ * stays first in line, so a late reply still lands on it; only after 10 min (`UNANSWERED_AFTER_MS`) is it
+ * sealed unanswered. A legacy socket has no progress events at all; its turns get the 120 s stall notice
+ * instead (3.6.2).
  */
 function markUnanswered(state: AppState, at: number): AppState {
   const caps = state.server?.capabilities
