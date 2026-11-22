@@ -884,6 +884,30 @@ test("GNU long-option abbreviations cannot walk past the git discard rules", () 
   assertAllowed("git clean --forces")
 })
 
+test("a wrapped git discard or recursive chmod/chown is denied (WI#853)", () => {
+  // bash runs the body of a subshell, a command substitution and a backtick
+  // body as commands of their own, and the glued punctuation ends the word
+  // around it: `--hard)`, `-fdx)` and `/etc)` must read as the plain words.
+  assertBlocked("(git reset --hard)", "git command")
+  assertBlocked("(git reset --har)", "git command")
+  assertBlocked("$(git clean -fdx)", "git command")
+  assertBlocked("echo $(git checkout -- .)", "git command")
+  assertBlocked("echo $(git checkout -- . )", "git command")
+  assertBlocked("`git reset --hard`", "git command")
+  assertBlocked('echo "$(git clean -fdx)"', "git command")
+  assertBlocked("cd repo && (git reset --hard)", "git command")
+  assertBlocked("(chmod -R 777 /etc)", "recursive")
+  assertBlocked("(chown -R kimi /etc)", "recursive")
+  assertBlocked("`chmod -R 777 /etc`", "recursive")
+  // The unwrapped spellings keep their verdicts.
+  assertBlocked("git reset --hard", "git command")
+  assertBlocked("chmod -R 777 /etc", "recursive")
+  // Read-only git and a wrapped dry-run clean stay ordinary work.
+  assertAllowed("(git status)")
+  assertAllowed("$(git log -1)")
+  assertAllowed("$(git clean -fdn)")
+})
+
 test("the noclobber override writes a block device like a plain redirect", () => {
   assertBlocked("cat x >| /dev/sda1", "block-device")
   assertBlocked("echo pwn >| /dev/mapper/vg-root", "block-device")
