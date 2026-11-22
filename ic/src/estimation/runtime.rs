@@ -530,6 +530,33 @@ mod tests {
     }
 
     #[test]
+    fn job_models_stay_separate_from_tool_categories_and_concurrent_runs_count_once() {
+        let estimates = std::sync::Arc::new(ToolEstimates::new(ToolEstimationMode::Observe));
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let estimates = std::sync::Arc::clone(&estimates);
+                std::thread::spawn(move || {
+                    estimates.record_job_terminal("alice", Duration::from_secs(60), true, None);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap(); // safety: test
+        }
+        // Cancellations and failures are counted, never trained.
+        estimates.record_job_terminal("alice", Duration::from_secs(1), false, None);
+
+        let estimate = estimates.estimate_job("alice").unwrap(); // safety: test
+        assert_eq!(estimate.samples, 10);
+        assert_eq!(estimate.duration, Duration::from_secs(60));
+        // Job models use their own key prefix, so the per-tool diagnostics
+        // surface hides them and no tool category is created.
+        assert!(estimates.diagnostics("alice").categories.is_empty());
+        assert_eq!(estimates.aggregate_counters().jobs.completed_runs, 10);
+        assert_eq!(estimates.aggregate_counters().jobs.non_completed_runs, 1);
+    }
+
+    #[test]
     fn category_policy_gates_display_but_keeps_recording() {
         let params = serde_json::json!({});
         let estimates = ToolEstimates::configured(
