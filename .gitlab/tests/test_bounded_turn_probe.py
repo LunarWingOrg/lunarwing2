@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""WI#807: the bounded-turn probe reads a turn record, never an impression.
+
+The probe's only job is to turn the daemon's `Turn finished` log line into a
+verdict on a task with a known step count. These tests use a fake gateway, so
+they never touch a tenant.
+"""
+
+import importlib.util
+import json
+import pathlib
+import sys
+import unittest
+from unittest import mock
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+PROBE_PATH = ROOT / "ic" / "scripts" / "bounded-turn-probe.py"
+MODULE_NAME = "bounded_turn_probe"
+
+
+def load_probe_module():
+    spec = importlib.util.spec_from_file_location(MODULE_NAME, PROBE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+probe = load_probe_module()
+
+THREAD = "5f0e4a52-6a3e-4a8f-9a1e-2b9d6c1e7a10"
+
+
+def record_line(
+    thread_id=THREAD,
+    phase="foreground",
+    tool_calls=8,
+    budget_secs=610,
+    exhausted="false",
+    elapsed_ms=240_000,
+    outcome="completed",
+):
+    return (
+        f"Turn finished thread_id={thread_id} phase={phase} tool_calls={tool_calls} "
+        f"budget_secs={budget_secs} budget_exhausted={exhausted} "
+        f"elapsed_ms={elapsed_ms} outcome={outcome}"
+    )
+
+
+class TurnRecordParsingTests(unittest.TestCase):
+    def test_parses_the_daemon_turn_finished_line(self):
+        record = probe.parse_turn_finished(record_line())
+        self.assertEqual(
+            record,
+            {
+                "thread_id": THREAD,
+                "phase": "foreground",
+                "tool_calls": 8,
+                "budget_secs": 610,
+                "budget_exhausted": False,
+                "elapsed_ms": 240_000,
+                "outcome": "completed",
+            },
+        )
+
+    def test_reads_the_late_phase_and_an_exhausted_budget(self):
+        record = probe.parse_turn_finished(
+            record_line(phase="late", budget_secs=1_320, exhausted="true", outcome="failed")
+        )
+        self.assertEqual(record["phase"], "late")
+        self.assertEqual(record["budget_secs"], 1_320)
+        self.assertTrue(record["budget_exhausted"])
+
+    def test_ignores_a_line_missing_a_measurement_field(self):
+        line = record_line()
+        without_outcome = line.rsplit(" ", 1)[0]
+        self.assertIsNone(probe.parse_turn_finished(without_outcome))
+
+    def test_ignores_other_log_messages(self):
+        self.assertIsNone(
+            probe.parse_turn_finished(
+                "Turn wait budget exhausted; transferring delivery to late watcher "
+                "thread_id=x tool_calls=0 late_budget_secs=600"
+            )
+        )
+        self.assertIsNone(probe.parse_turn_finished("Late turn budget exhausted; stopping thread"))
+
+    def test_a_non_numeric_field_is_not_a_record(self):
+        self.assertIsNone(probe.parse_turn_finished(record_line(elapsed_ms="soon")))
+
+    def test_selects_only_the_probed_thread(self):
+        messages = [
+            record_line(thread_id="other-thread"),
+            record_line(thread_id=THREAD, tool_calls=3),
+        ]
+        records = probe.records_for_thread(messages, THREAD)
+        self.assertEqual([record["tool_calls"] for record in records], [3])
+
+
+class VerdictTests(unittest.TestCase):
+    def test_a_bounded_task_inside_its_budget_passes(self):
+        reading, code = probe.verdict(
+            probe.parse_turn_finished(record_line()), expected_steps=8
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("FITS: 8 tool calls inside 610 s", reading)
+
+    def test_an_exhausted_budget_is_the_finding(self):
+        reading, code = probe.verdict(
+            probe.parse_turn_finished(
+                record_line(phase="late", budget_secs=1_320, exhausted="true")
+            ),
+            expected_steps=8,
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("EXHAUSTED", reading)
+
+    def test_a_short_step_count_is_reported_as_a_mismatch(self):
+        reading, code = probe.verdict(
+            probe.parse_turn_finished(record_line(tool_calls=5)), expected_steps=8
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("5 of 8 requested tool calls", reading)
+
+    def test_exhaustion_outranks_a_step_mismatch(self):
+        _, code = probe.verdict(
+            probe.parse_turn_finished(record_line(tool_calls=2, exhausted="true")),
+            expected_steps=8,
+        )
+        self.assertEqual(code, 3)
+
+
+class FakeGateway:
+    """Serves the contract endpoints and a scripted log body."""
+
+    def __init__(self, log_bodies):
+        self.log_bodies = list(log_bodies)
+        self.sent = []
+
+    def get_json(self, path):
+        if path == "/api/chat/capabilities":
+            return {"api_version": 1}
+        raise AssertionError(f"unexpected GET {path}")
+
+    def get_text(self, path):
+        if path == "/api/logs/download":
+            body = self.log_bodies[0]
+            if len(self.log_bodies) > 1:
+                self.log_bodies.pop(0)
+            return body
+        raise AssertionError(f"unexpected GET {path}")
+
+    def post_json(self, path, payload):
+        if path == "/api/chat/thread/new":
+            return {"id": THREAD}
+        if path == "/api/chat/send":
+            self.sent.append(payload)
+            return {"message_id": "0b8a6c1e-0000-0000-0000-000000000000", "status": "accepted"}
+        raise AssertionError(f"unexpected POST {path}")
+
+
+def log_body(*messages):
+    entries = [
+        {"level": "INFO", "target": "lunarwing", "message": message, "timestamp": "t"}
+        for message in messages
+    ]
+    return "\n".join(json.dumps(entry) for entry in entries)
+
+
+class WaitTests(unittest.TestCase):
+    def test_waits_past_a_quiet_poll_until_the_record_lands(self):
+        gateway = FakeGateway(
+            [
+                log_body("unrelated"),
+                log_body(record_line(thread_id="other-thread")),
+                log_body(record_line()),
+            ]
+        )
+        with mock.patch.object(probe.time, "sleep", lambda _seconds: None):
+            record = probe.wait_for_record(gateway, THREAD, timeout=60, poll_seconds=0)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["tool_calls"], 8)
+
+    def test_gives_up_when_the_timeout_runs_out(self):
+        gateway = FakeGateway([log_body("unrelated")])
+        with mock.patch.object(probe.time, "sleep", lambda _seconds: None):
+            record = probe.wait_for_record(gateway, THREAD, timeout=0, poll_seconds=0)
+        self.assertIsNone(record)
+
+
+class SendTests(unittest.TestCase):
+    def test_the_prompt_names_the_exact_step_count_and_no_other_tool(self):
+        gateway = FakeGateway([log_body()])
+        probe.send_bounded_task(gateway, THREAD, steps=8)
+        content = gateway.sent[0]["content"]
+        self.assertIn("exactly 8 times", content)
+        self.assertIn("Do not use any other tool", content)
+        self.assertEqual(gateway.sent[0]["thread_id"], THREAD)
+
+
+class TargetTests(unittest.TestCase):
+    def test_a_tenant_resolves_to_its_gateway_port_and_token(self):
+        args = probe.parse_args(["--tenant", "antelope"])
+        with mock.patch.object(
+            probe,
+            "tenant_gateway",
+            return_value=("http://127.0.0.1:10000", "token"),
+        ):
+            self.assertEqual(
+                probe.resolve_target(args), ("http://127.0.0.1:10000", "token")
+            )
+
+    def test_explicit_url_and_token_file_need_no_tenant(self):
+        args = probe.parse_args(["--base-url", "http://127.0.0.1:1", "--token-file", "-"])
+        with mock.patch.object(probe, "open", mock.mock_open(read_data="tok\n"), create=True):
+            self.assertEqual(
+                probe.resolve_target(args), ("http://127.0.0.1:1", "tok")
+            )
+
+    def test_a_missing_target_is_a_harness_error(self):
+        args = probe.parse_args(["--steps", "8"])
+        with self.assertRaises(probe.ProbeError):
+            probe.resolve_target(args)
+
+    def test_zero_steps_is_a_harness_error(self):
+        args = probe.parse_args(
+            ["--base-url", "http://127.0.0.1:1", "--token-file", "-", "--steps", "0"]
+        )
+        with mock.patch.object(probe, "open", mock.mock_open(read_data="tok\n"), create=True):
+            with self.assertRaises(probe.ProbeError):
+                probe.resolve_target(args)
+
+
+if __name__ == "__main__":
+    unittest.main()
