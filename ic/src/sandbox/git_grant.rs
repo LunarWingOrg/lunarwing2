@@ -1153,10 +1153,22 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
     };
     match action.text.as_str() {
         "add" | "set-url" => {
-            let positional: Vec<&Word> = args[1..]
-                .iter()
-                .filter(|word| !word.text.starts_with('-'))
-                .collect();
+            // Parse the option arity, so `-t main` cannot shift the URL to
+            // position 0 and leave the real destination unchecked.
+            let positional = read_positionals(
+                &args[1..],
+                &[
+                    "-f",
+                    "--tags",
+                    "--no-tags",
+                    "--push",
+                    "--add",
+                    "--mirror",
+                    "--fetch",
+                    "--no-fetch",
+                ],
+                &["-t", "--track", "-m", "--master"],
+            )?;
             let Some(url) = positional.get(1) else {
                 return Ok(());
             };
@@ -1622,6 +1634,31 @@ mod tests {
             &grant,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn remote_options_cannot_shift_the_checked_url() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git remote add -t main origin https://evil.example.test/repo.git",
+            "git remote set-url --push origin https://evil.example.test/repo.git",
+            "git remote set-url origin https://evil.example.test/repo.git",
+            "git remote add -m main origin ext::sh -c evil",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git remote add -t main backup file:///workspace/remotes/origin.git",
+            "git remote set-url --push origin /workspace/remotes/origin.git",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| {
+                panic!("{command}: {error}");
+            });
+        }
     }
 
     #[test]
