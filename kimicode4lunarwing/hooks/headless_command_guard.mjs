@@ -983,6 +983,85 @@ function* listenerSegments(text) {
   if (words.length > 0) yield words;
 }
 
+// bash glues shell punctuation to a command word: `(kimi`, `$(kimi`,
+// `` `kimi ``, `server)`, `${…}`, `kimi server}`. This reader has no parser,
+// so strip the punctuation a listener word may carry; quoted prompt text is
+// already one word and is unaffected (WI#839).
+function listenerWord(word) {
+  return word.replace(/^[({`$]+/, "").replace(/[)}`]+$/, "");
+}
+
+/** Body between the `(` at openIndex and its matching `)`, or undefined. */
+function listenerParenBody(text, openIndex) {
+  let depth = 0;
+  let quote = "";
+  for (let i = openIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\") {
+      if (quote !== "'") i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")" && --depth === 0) {
+      return text.slice(openIndex + 1, i);
+    }
+  }
+  return undefined;
+}
+
+/** Body between the backtick at openIndex and the next unescaped backtick. */
+function listenerBacktickBody(text, openIndex) {
+  for (let i = openIndex + 1; i < text.length; i++) {
+    if (text[i] === "\\") i++;
+    else if (text[i] === "`") return text.slice(openIndex + 1, i);
+  }
+  return undefined;
+}
+
+// The bodies bash runs as commands of their own: `$(…)` and backticks
+// outside single quotes. A substitution inside double quotes still runs, so
+// it counts; text in single quotes is literal and is skipped (WI#839).
+function* listenerBodies(text) {
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\") {
+      if (quote !== "'") i++;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = "";
+      continue;
+    }
+    if (quote === '"' && ch === '"') {
+      quote = "";
+      continue;
+    }
+    if (!quote && (ch === "'" || ch === '"')) {
+      quote = ch;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "(") {
+      const body = listenerParenBody(text, i + 1);
+      // An unclosed substitution is a bash syntax error; its remainder is
+      // still scanned rather than skipped, and scanning stops there (linear).
+      yield body ?? text.slice(i + 2);
+      if (body === undefined) return;
+      i += body.length + 1;
+    } else if (ch === "`") {
+      const body = listenerBacktickBody(text, i);
+      yield body ?? text.slice(i + 1);
+      if (body === undefined) return;
+      i += body.length + 1;
+    }
+  }
+}
+
 function kimiServiceSubcommand(words, start) {
   let i = start;
   for (; i < words.length && words[i].startsWith("-"); i++) {
@@ -994,7 +1073,7 @@ function kimiServiceSubcommand(words, start) {
     // needs no special case; its value is already part of the option word.
     if (words[i] === "-p" || words[i] === "--prompt") i++;
   }
-  const subcommand = words[i];
+  const subcommand = listenerWord(words[i] ?? "");
   return subcommand === "server" || subcommand === "web" ? subcommand : null;
 }
 
@@ -1025,13 +1104,24 @@ function listenerShellBody(words, start) {
 
 /** Deny recognized service commands without treating prompt text as a subcommand. */
 function checkListeners(text, depth = 0) {
+  // A substitution or backtick body runs its words as a command, so scan it
+  // the same way even when it sits in an argument (`echo $(kimi server)`).
+  for (const body of listenerBodies(text)) {
+    if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+    const denied = checkListeners(body, depth + 1);
+    if (denied) return denied;
+  }
   for (const words of listenerSegments(text)) {
     for (let i = 0; i < words.length; i++) {
-      const word = words[i];
+      const raw = words[i];
+      const word = listenerWord(raw);
       const name = commandBasename(word);
-      if (name === "busybox" && words[i + 1] === "httpd") return "listener started from a task: busybox httpd";
-      if (LISTENER_PREFIXES.has(word) || LISTENER_PREFIXES.has(name) ||
-          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(word)) continue;
+      if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
+        return "listener started from a task: busybox httpd";
+      }
+      if (LISTENER_PREFIXES.has(raw) || LISTENER_PREFIXES.has(word) ||
+          LISTENER_PREFIXES.has(name) ||
+          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(raw)) continue;
 
       if (name === "kimi") {
         const subcommand = kimiServiceSubcommand(words, i + 1);
@@ -1044,8 +1134,9 @@ function checkListeners(text, depth = 0) {
           if (denied) return denied;
         }
       } else {
+        const args = words.slice(i + 1).map(listenerWord);
         const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
-        if (rule?.test(words.slice(i + 1))) return `listener started from a task: ${name}`;
+        if (rule?.test(args)) return `listener started from a task: ${name}`;
       }
       break;
     }
