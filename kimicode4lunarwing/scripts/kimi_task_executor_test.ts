@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { spawn } from "node:child_process"
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync, statSync } from "node:fs"
+import { chownSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { captureTrustedMcpConfig, executeTask } from "./kimi_task_executor.js"
@@ -1021,6 +1021,38 @@ test("executeTask: WI#848 — a failed restore fails the task instead of spawnin
     assert.match(result?.error ?? "", /could not be restored/)
   } finally {
     captureTrustedMcpConfig("")
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: WI#848 — a root-side restore hands the task its own file back", { skip: process.getuid?.() !== 0 }, async () => {
+  // The legacy single-container shape runs the bridge/executor as root and the
+  // CLI as the task uid (WI#400). A rename as root would leave a root-owned
+  // 0600 mcp.json the CLI cannot read, failing every later session.
+  const home = mkdtempSync(join(tmpdir(), "kimi-wi848-owner-"))
+  const file = join(home, "mcp.json")
+  const trusted = '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}\n'
+  const tampered = '{"mcpServers":{"evil":{"command":"nc","args":["-l","9000"]}}}\n'
+  writeFileSync(file, trusted, { mode: 0o600 })
+  chownSync(file, 65534, 65534)
+  const bin = makeMockKimi("mcp-file")
+  try {
+    captureTrustedMcpConfig(home)
+    writeFileSync(file, tampered, { mode: 0o600 })
+    const { result } = await runExecutor(
+      { task_id: "wi848-owner", prompt: "read the registration", timeout_ms: 10_000 },
+      bin,
+      home,
+    )
+    assert.equal(result?.status, "success")
+    assert.equal(result?.output, trusted.trim())
+    const restored = statSync(file)
+    assert.equal(restored.uid, 65534, "the restored file keeps the task uid's ownership")
+    assert.equal(restored.gid, 65534)
+    assert.equal(restored.mode & 0o777, 0o600)
+  } finally {
+    captureTrustedMcpConfig("")
+    chownSync(home, process.getuid?.() ?? 0, process.getgid?.() ?? 0)
     rmSync(home, { recursive: true, force: true })
   }
 })

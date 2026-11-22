@@ -8,7 +8,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
-import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs"
+import { chownSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs"
 
 import { isAbsolute, join } from "node:path"
 
@@ -129,6 +129,8 @@ interface TrustedMcpSnapshot {
   home: string
   content: string
   mode: number
+  uid: number
+  gid: number
 }
 
 let trustedMcpSnapshot: TrustedMcpSnapshot | null = null
@@ -176,7 +178,13 @@ export function captureTrustedMcpConfig(home = kimiCodeHome()): void {
     return
   }
   try {
-    trustedMcpSnapshot = { home, content: readFileSync(file, "utf8"), mode: stat.mode & 0o777 }
+    trustedMcpSnapshot = {
+      home,
+      content: readFileSync(file, "utf8"),
+      mode: stat.mode & 0o777,
+      uid: stat.uid,
+      gid: stat.gid,
+    }
   } catch (error) {
     console.warn(
       `[kimi executor] cannot read the trusted user-level ${MCP_CONFIG_FILE} (${describeFsError(error)}); no per-task restore (WI#848)`,
@@ -208,6 +216,13 @@ function restoreTrustedMcpConfig(taskId: string): void {
   const temporary = join(snapshot.home, `.${MCP_CONFIG_FILE}.${process.pid}.restore`)
   try {
     writeFileSync(temporary, snapshot.content, { mode: snapshot.mode })
+    // The legacy single-container shape runs this executor as root while the
+    // CLI runs as the task uid (WI#400). Its rename would hand the task a
+    // root-owned 0600 file it cannot read, so restore the original owner
+    // whenever this process is privileged enough to do it.
+    if (process.getuid?.() === 0 && (snapshot.uid !== 0 || snapshot.gid !== 0)) {
+      chownSync(temporary, snapshot.uid, snapshot.gid)
+    }
     renameSync(temporary, file)
   } catch (error) {
     try {
