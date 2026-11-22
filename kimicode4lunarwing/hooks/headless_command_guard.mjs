@@ -647,6 +647,7 @@ const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
  * kept as text. This is a reading, not a parser: it only adds matches.
  */
 function shellPunctuationView(text) {
+  if (!text.includes("(") && !text.includes(")") && !text.includes("`")) return text;
   let view = "";
   let quote = "";
   for (let i = 0; i < text.length; i++) {
@@ -702,23 +703,38 @@ function checkRecursiveRootChange(segment) {
   return false;
 }
 
-/** The git verb after any leading options, and the argument text after it. */
-function gitVerb(rest) {
-  let i = 0;
-  while (i < rest.length) {
-    while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+/** True for a character that ends the current command clause. */
+function isClauseTerminator(ch) {
+  return ch === ";" || ch === "&" || ch === "|" || ch === "\n";
+}
+
+/** The git verb after any leading options, and the index after it. */
+function gitVerb(text, from) {
+  let i = from;
+  while (i < text.length) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
     const start = i;
-    while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
-    const word = rest.slice(start, i);
+    while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
+    const word = text.slice(start, i);
     if (word.length === 0) break;
-    if (!word.startsWith("-")) return { verb: word, after: rest.slice(i) };
+    if (!word.startsWith("-")) return { verb: word, after: i };
     if (word === "-C" || word === "-c") {
       // These options take a value, which is not the verb.
-      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
-      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+      while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
     }
   }
-  return { verb: "", after: "" };
+  return { verb: "", after: text.length };
+}
+
+/** Index of the next clause terminator at or after `from`, or the text end. */
+function clauseEnd(text, from) {
+  let end = text.length;
+  for (const terminator of [";", "&", "|", "\n"]) {
+    const index = text.indexOf(terminator, from);
+    if (index !== -1 && index < end) end = index;
+  }
+  return end;
 }
 
 /** True when any short flag cluster in the text carries one of the letters. */
@@ -752,22 +768,28 @@ function hasGitLongOption(text, options) {
  */
 function checkGitDiscard(segment) {
   for (const match of segment.matchAll(GIT_CALL)) {
-    const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
-    const dryRun = hasShortFlag(after, "n") || hasGitLongOption(after, ["--dry-run"]);
+    const { verb, after } = gitVerb(segment, match.index + 3);
+    // Parse the verb before reading any options: a long clause full of
+    // ordinary `git log` words then costs one word apiece (WI#824 deadline).
+    if (verb !== "clean" && verb !== "reset" && verb !== "checkout" &&
+        verb !== "restore" && verb !== "switch" && verb !== "stash") continue;
+    const args = segment.slice(after, clauseEnd(segment, after));
+    const dryRun = verb === "clean" &&
+      (hasShortFlag(args, "n") || hasGitLongOption(args, ["--dry-run"]));
     if (verb === "clean" && !dryRun &&
-        (hasShortFlag(after, "fdxX") || hasGitLongOption(after, ["--force"]))) {
+        (hasShortFlag(args, "fdxX") || hasGitLongOption(args, ["--force"]))) {
       return true;
     }
-    if (verb === "reset" && hasGitLongOption(after, ["--hard"])) return true;
-    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(after)) {
+    if (verb === "reset" && hasGitLongOption(args, ["--hard"])) return true;
+    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(args)) {
       return true;
     }
     if ((verb === "checkout" || verb === "switch") &&
-        (hasShortFlag(after, "f") || hasGitLongOption(after, ["--force", "--discard-changes"]))) {
+        (hasShortFlag(args, "f") || hasGitLongOption(args, ["--force", "--discard-changes"]))) {
       return true;
     }
     if (verb === "stash" &&
-        (hasShortFlag(after, "ua") || hasGitLongOption(after, ["--include-untracked", "--all"]))) {
+        (hasShortFlag(args, "ua") || hasGitLongOption(args, ["--include-untracked", "--all"]))) {
       return true;
     }
   }
@@ -984,9 +1006,10 @@ function evaluate(command) {
   // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const punctuation = shellPunctuationView(joined);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
-      checkDenyRulesEverywhere(shellPunctuationView(joined)) ??
+      (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
       checkRawShapes(joined) ??
