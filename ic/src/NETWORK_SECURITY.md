@@ -430,9 +430,13 @@ legacy behavior, including any existing egress.
   CONNECT does not expose repository paths or operation types.
 - **The shell scan is best-effort preflight.** It checks recognizable Git
   commands for a granted alias or literal URL, and refuses recognized pushes
-  before execution regardless of flags or configured defaults. It cannot
-  enforce arbitrary shell behavior or Git history policy. A network-disabled
-  manifest needs no grant for ordinary local clone, fetch, or pull.
+  before execution regardless of flags or configured defaults. It also refuses
+  in-command configuration that could change what a later word means
+  (`alias.*`, `include.*`, `includeIf.*`, and the redirecting `remote.*`,
+  `url.*`, `credential.*`, `http.extraheader` keys), `git config` writes to
+  those keys, and shell assignments to `GIT_CONFIG_*`. It cannot enforce
+  arbitrary shell behavior or Git history policy. A network-disabled manifest
+  needs no grant for ordinary local clone, fetch, or pull.
 - **File remotes** must initially canonicalize inside the call's workspace.
   They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
