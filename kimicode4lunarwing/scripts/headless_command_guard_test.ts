@@ -755,6 +755,10 @@ test("a long command of repeated words is decided without rescanning", () => {
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
   // tripped runGuard's kill timeout. The linear scan decides it immediately.
   assertAllowed("chmod -R ".repeat(1500))
+  // The WI#853 punctuation reading is linear too: 14 KB of substitutions and
+  // 12 KB of subshells stay inside the analysis deadline.
+  assertAllowed("$(git log -1) ".repeat(1000))
+  assertAllowed("(git status) ".repeat(1000))
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
@@ -882,6 +886,32 @@ test("GNU long-option abbreviations cannot walk past the git discard rules", () 
   // A longer word is not a prefix of the option and must not be read as one.
   assertAllowed("git reset --harder")
   assertAllowed("git clean --forces")
+})
+
+test("a wrapped git discard or recursive chmod/chown is denied (WI#853)", () => {
+  // bash runs the body of a subshell, a command substitution and a backtick
+  // body as commands of their own, and the glued punctuation ends the word
+  // around it: `--hard)`, `-fdx)` and `/etc)` must read as the plain words.
+  assertBlocked("(git reset --hard)", "git command")
+  assertBlocked("(git reset --har)", "git command")
+  assertBlocked("$(git clean -fdx)", "git command")
+  assertBlocked("echo $(git checkout -- .)", "git command")
+  assertBlocked("echo $(git checkout -- . )", "git command")
+  assertBlocked("`git reset --hard`", "git command")
+  assertBlocked('echo "$(git clean -fdx)"', "git command")
+  assertBlocked("cd repo && (git reset --hard)", "git command")
+  assertBlocked("(chmod -R 777 /etc)", "recursive")
+  assertBlocked("(chown -R kimi /etc)", "recursive")
+  assertBlocked("`chmod -R 777 /etc`", "recursive")
+  // The rm rule already read the wrapped form; keep that verdict pinned.
+  assertBlocked("(rm -rf /etc)", "deletion outside")
+  // The unwrapped spellings keep their verdicts.
+  assertBlocked("git reset --hard", "git command")
+  assertBlocked("chmod -R 777 /etc", "recursive")
+  // Read-only git and a wrapped dry-run clean stay ordinary work.
+  assertAllowed("(git status)")
+  assertAllowed("$(git log -1)")
+  assertAllowed("$(git clean -fdn)")
 })
 
 test("the noclobber override writes a block device like a plain redirect", () => {
