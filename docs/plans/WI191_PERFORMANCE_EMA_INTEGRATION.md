@@ -376,12 +376,16 @@ totals, with eligibility counted at execution start even in observe mode.
 retained calls, with separate warmup and early cold-start coverage.
 `LUNARWING_TOOL_ESTIMATES_CATEGORIES` gates display per canonical tool name
 while recording continues. `LUNARWING_TOOL_ESTIMATES_TRACE` enables the
-bounded, parameter-free records behind the evaluation route. Only `http`
-currently declares a production duration baseline. A missing comparison is
-not a pass; evaluation for other tools needs an agreed baseline or gate.
-Running the evaluation on a real tenant and enabling hints for passing
-categories remain A4/A5 operator steps; this code does not change any approval,
-scheduling or cost behaviour.
+bounded, parameter-free records behind the evaluation route. Each category is
+compared against two named baselines: `declared_baseline` from
+`Tool::estimated_duration` where a tool supplies one (only `http` today), and
+`comparison_baseline`, the mean of the model's own first five valid completed
+runs, frozen before each call. The A4 gate is at least 10% lower median
+absolute error than `comparison_baseline`; the declared comparison is reported
+alongside rather than being required for a category to be judged. A missing or
+empty comparison is not a pass. Running the evaluation on a real tenant and
+enabling hints for passing categories remain A4/A5 operator steps; this code
+does not change any approval, scheduling or cost behaviour.
 
 ## Persistence decision
 
@@ -528,6 +532,16 @@ choices, not evidence that the real-tenant accuracy or overhead gates have run.
    and the other channels must retain their direct, owner-scoped status
    routing. Add tests for the duration-only line, truncation and redaction, and
    do not duplicate the hint where a channel already renders the description.
+4. **A4 compares against a model-derived baseline for every category
+   (maintainer decision, 2026-11-21).** The evaluation trace records the mean
+   of the model's own first five valid completed runs of the same user/tool
+   model, captured at `begin()` with the prediction and never including the
+   evaluated call or anything later. The gate is at least 10% lower median
+   absolute error than that baseline, per category. Where a tool declares
+   `estimated_duration` (`http` today), the trace keeps that comparison too;
+   the summary names which baseline each figure uses. This stays in-memory and
+   parameter-free, adds no storage or hot-path I/O, and leaves the warmup and
+   cold-start cohorts reported separately.
 
 All automatic timeout, scheduling, provider-selection, bid/value, and budget
 decisions based on these estimates are **out of scope** until accuracy and

@@ -135,31 +135,43 @@ recording and hints entirely.
 
 `LUNARWING_TOOL_ESTIMATES_TRACE=1` enables a bounded in-memory ring (2,048
 records; a number selects 16–8,192). Each record stores the canonical tool
-name, unadjusted baseline, frozen EMA prediction, actual duration, and the
-model's valid duration sample count **before the call started**. Only `Ok`
+name, the tool's declared duration baseline, a model-derived comparison
+baseline, the frozen EMA prediction, the actual duration, and the model's
+valid duration sample count **before the call started**. Only `Ok`
 completions are traced; there are no parameters, user identities or trace
 writes to logs, files or the database. The oldest record is evicted when full.
 The owner route copies the retained records and aggregates them after releasing
 the trace lock. Check `evicted` when assessing window coverage.
 
-For each category, `coverage` is the fraction of retained completions with a
-learned prediction. Both median absolute errors (in ms) and
-`improvement_percent` use only the same `paired_samples`: calls with both a
-usable declared baseline (positive and at most one day) and a frozen EMA
-prediction. `warmup` reports counts and baseline-only error for calls started
-before the model had five valid duration samples. `cold_start` reports the
-same coverage and paired metrics as the overall category, but only for calls
-started with fewer than `cold_start_sample_limit` (20) prior valid durations
-in that user/tool model. This includes warmup and the first post-warmup
-forecasts. It is based on model age, not completion order, and starts over
-when a model is evicted or the registry restarts.
+Every category is compared against two named baselines, so the rollout gate no
+longer depends on `http` being the only tool that declares one:
 
-Only `http` currently declares a production duration baseline. Without paired
-samples, both error medians and `improvement_percent` are `null`; a zero
-baseline median also makes improvement undefined. None of these cases passes
-the rollout gate. A comparison baseline for other tools (or a revised gate)
-still needs a maintainer decision. Running the representative tenant
-evaluation and enabling hints for passing categories are separate steps.
+- `declared_baseline` uses `Tool::estimated_duration`, where a tool supplies it.
+- `comparison_baseline` is the mean of the model's own **first five valid
+  completed runs** (the warmup window). It is derived only from earlier calls,
+  frozen at `begin()` with the prediction, and never includes the call being
+  evaluated or anything later. It is `null` until one valid run exists.
+
+For each category, `coverage` is the fraction of retained completions with a
+learned prediction. Each baseline block reports its own median absolute errors
+(in ms), `samples` and `improvement_percent`, computed only over the calls where
+both that baseline and a frozen EMA prediction existed. The two blocks are
+paired over the same retained records but not necessarily the same subset.
+`warmup` reports counts and baseline-only error for calls started before the
+model had five valid duration samples, for both baselines. `cold_start` reports
+the same coverage and paired metrics as the overall category, but only for
+calls started with fewer than `cold_start_sample_limit` (20) prior valid
+durations in that user/tool model. This includes warmup and the first
+post-warmup forecasts. It is based on model age, not completion order, and
+starts over when a model is evicted or the registry restarts.
+
+**Gate definition (per category):** at least 10% lower median absolute error
+than the `comparison_baseline`, with absolute error in seconds, `coverage` and
+sample counts reported. A declared baseline is reported alongside where one
+exists. Without paired samples, an error median or `improvement_percent` is
+`null`; a zero baseline median also makes improvement undefined. None of these
+cases passes the gate. Running the representative tenant evaluation and
+enabling hints for passing categories are separate steps.
 
 ## LLM logical-call timing (WI#318 Phase B)
 
