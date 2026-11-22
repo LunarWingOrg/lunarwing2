@@ -39,10 +39,10 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 - **The shell sandbox accepts a declarative capability manifest (WI#797).** A
   `shell` call may carry a version-1 `capability_manifest` that can only narrow
   what host policy already allows: network mode, filesystem mounts, CPU shares,
-  memory, timeout, and secret *names* (never values). A request that names a
-  secret, a device or an unconfigured extension is refused rather than
-  down-graded, and a manifest refuses a host with no sandbox configuration
-  instead of executing on the host.
+  memory and timeout. A request that carries an unknown key, a secret name, or
+  an extension host policy does not grant is refused rather than down-graded —
+  the generic shell has no secret injection at all — and a manifest refuses a
+  host with no sandbox configuration instead of executing on the host.
 - **A shell call can use git without the container holding a credential
   (WI#816).** `extensions: ["git-remotes"]` grants a read-only, credential-free
   git access to remotes the tenant operator names in `SANDBOX_GIT_REMOTES`; a
@@ -81,13 +81,15 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   bounded at 16 KiB, all objects reject unknown keys, and an unknown version is
   refused with an error naming the field. The request may pick network
   `disabled`/`none` or the exact configured `proxy-enforced`/`tunnel` mode, may
-  select read-only and read-write workspace paths and lower resource ceilings,
-  and may name secrets that host policy already exports. It cannot add a host, a
-  device, a mount flag, a runtime argument, or a fallback; it cannot select
-  FullAccess; and the legacy advisory `proxy` spelling is refused with an
-  actionable message rather than mapped onto another mode. The
-  `capability_evidence` record names the request, the effective policy and the
-  refusals, and never records a secret value. The guide is
+  select read-only and read-write workspace paths and lower resource ceilings.
+  Secret names are refused outright: the generic shell has no secret injection,
+  and worker jobs keep their host-issued credential grants. It cannot add a
+  host, a device, a mount flag, or a runtime argument, and it cannot produce a
+  fallback; it cannot select FullAccess; and the legacy advisory `proxy`
+  spelling is refused with an actionable message rather than mapped onto
+  another mode. The `capability_evidence` record names the request, the
+  effective policy and the refusals, and never records a secret value. The
+  guide is
   [`docs/guides/SANDBOX_CAPABILITY_MANIFEST.md`](docs/guides/SANDBOX_CAPABILITY_MANIFEST.md).
 - **Git remotes are the one grantable extension, and the grant is read-only
   (WI#816).** `SANDBOX_GIT_REMOTES` holds `name=url[,name=url...]`;
@@ -216,8 +218,9 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 - **The bounded-turn probe measures a known-step task (WI#807).**
   `ic/scripts/bounded-turn-probe.py` runs a task with a known step count
   against a live daemon and reads that record's `budget_exhausted`,
-  `tool_calls` and `elapsed_ms`, so "it felt long" is replaced by "eight calls
-  earned 1,320 seconds and it finished inside them". The section is in
+  `tool_calls` and `elapsed_ms`, so "it felt long" becomes "eight calls earned
+  a 1,320-second allowance, and `budget_exhausted` says whether the model
+  finished inside it". No probe run is claimed in this draft. The section is in
   [`docs/ops/PRE-RELEASE-TESTING.md`](docs/ops/PRE-RELEASE-TESTING.md).
 - **The TUI's sealing windows follow the longer late budget (WI#837).**
   `YOUNG_FAILED_TURN_MS` moves from 610,000 to 2,530,000 ms, the daemon's
@@ -228,9 +231,10 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   the history window from `LONGEST_LATE_WINDOW`, and the reducer test states
   the distinction.
 - **A finished message is remembered for the whole late window (WI#820).**
-  The channel manager's finished-message memory derives its TTL from
-  `LONGEST_LATE_WINDOW` instead of a shorter literal, so a late second finish
-  is recognised as a duplicate for as long as the watcher can deliver it.
+  The channel manager's finished-message memory
+  (`ic/src/channels/lifecycle.rs`) derives its TTL from `LONGEST_LATE_WINDOW`
+  instead of a shorter literal, so a late second finish is recognised as a
+  duplicate for as long as the watcher can deliver it.
 - **Skills no longer claim credential-bearing API access (WI#811).**
   `ic/crates/lunarwing_engine/orchestrator/default.py` no longer tells the
   model that every active skill "provides API access with automatic credential
@@ -270,8 +274,9 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 - **`ssh_git` refuses a ref-deleting push (WI#818).** A push refspec whose
   source is empty (`:branch`, or a bare `:`) is refused with `NotAuthorized`
   before git runs, alongside the existing refusal of a leading `-` and of a
-  leading `+`. Before this, only force-push was refused. `docs/ops/SSH-
-  HARNESS-SETUP.md` and `docs/guides/SSH-TOOL-TESTING.md` say so.
+  leading `+`. Before this, only force-push was refused.
+  [`docs/ops/SSH-HARNESS-SETUP.md`](docs/ops/SSH-HARNESS-SETUP.md) and
+  `docs/guides/SSH-TOOL-TESTING.md` say so.
 - **The channel and tool registries patch-bump with their crates (WI#799).**
   Channels are darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19` and xmpp
   `0.1.24`. Every tool whose source or dependencies moved in the sweep is
@@ -323,7 +328,7 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   from `.gitlab/deliverables.json`, resolves each manifest through
   `ic/registry/tools/*.json` to the same source directory a tenant build
   compiles, and runs `cargo build --locked --release --target wasm32-wasip2`,
-  `cargo test --locked` and `cargo clippy --locked --all-targets -D warnings`
+  `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`
   through `.gitlab/scripts/cargo-ci.sh`. The job blocks a merge. The coverage
   check is no longer a substring test (WI#825): an `echo`, a comment or a lone
   `cd` that mentions the path does not count, only an actual cargo compile
