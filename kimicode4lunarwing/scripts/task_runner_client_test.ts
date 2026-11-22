@@ -35,6 +35,12 @@ writeFileSync(
   join(RUNNER_HOME, "config.toml"),
   readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
 )
+// Under root (CI, the image gate) the NL-3/NL-7 runners drop to uid 65534
+// through setpriv, and mkdtemp's 0700 home would hide the config from them, so
+// the guard check would refuse every delegated spawn. The seeded config holds
+// the hook already, so the runner only reads it.
+chmodSync(RUNNER_HOME, 0o755)
+chmodSync(join(RUNNER_HOME, "config.toml"), 0o644)
 process.env.KIMI_CODE_HOME = RUNNER_HOME
 after(() => {
   for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true })
