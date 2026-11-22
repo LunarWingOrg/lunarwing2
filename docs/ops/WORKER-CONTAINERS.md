@@ -4082,6 +4082,14 @@ auto-approval:
   or backtick body (also inside double quotes) and a glued `)` end the word
   around them, so `(git reset --hard)`, `$(git clean -fdx)` and
   `(chmod -R 777 /etc)` take the plain spellings' verdicts.
+  An alias is refused before the verb is read (WI#842): an inline
+  `-c alias.<name>=…` or `--config-env=alias.<name>=…`, the
+  `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS` environment spellings of the same
+  `-c`, and a `git config` call naming an `alias.*` key all deny, because the
+  alias name is an arbitrary verb the rules have never seen
+  (`git -c alias.z='reset --hard' z`). An alias already present in repo
+  config the guard cannot read cheaply remains an accepted residual; the
+  write that plants it is refused.
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`mv` into a removed directory, `truncate`
   on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
