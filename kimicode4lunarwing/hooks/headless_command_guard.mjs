@@ -687,6 +687,14 @@ function isSystemRootPath(candidate) {
   return SYSTEM_ROOTS.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
+// The recursive flag as chmod/chown/chgrp parse it: the short cluster, or the
+// GNU long option, which getopt accepts down to its shortest unique prefix
+// (`--recu`; `--rec` is ambiguous with `--reference` and is an error). A
+// shorter ambiguous prefix or an attached value is rejected by getopt, but
+// matching it costs nothing and keeps the rule fail-closed.
+const RECURSIVE_CHANGE_FLAG =
+  /(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recu[a-z]*)(?=[ \t=]|$)/;
+
 /**
  * Deny a recursive mode/ownership change on a system root, however the root is
  * spelled. A linear scan, not a regex: the regex form rescanned the rest of
@@ -695,7 +703,7 @@ function isSystemRootPath(candidate) {
 function checkRecursiveRootChange(segment) {
   for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
     const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
-    if (!/(?:^|[ \t])(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?=[ \t]|$)/.test(rest)) continue;
+    if (!RECURSIVE_CHANGE_FLAG.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
     }
