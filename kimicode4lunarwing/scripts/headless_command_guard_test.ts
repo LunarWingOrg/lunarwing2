@@ -738,6 +738,24 @@ test("interpreter one-liners delete without parentheses or through a binding", (
   assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
 })
 
+test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
+  // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
+  // in double quotes reaches Perl with the inner quotes unescaped, so
+  // `rmtree \"<path>\"` deletes exactly as `rmtree '<path>'` does.
+  assertBlocked(`perl -e "use File::Path; rmtree \\"/workspace\\""`, "deletion outside")
+  assertBlocked(`perl -e "unlink \\"/etc/passwd\\""`, "deletion outside")
+  assertBlocked(`perl -e "rmdir \\"/workspace/src\\""`, "deletion outside")
+  assertAllowed(`perl -e "use File::Path; rmtree \\"/tmp/wi840-x\\""`)
+  // A Perl deletion takes a comma list; checking only the first operand left
+  // every later path unread.
+  assertBlocked(`perl -e 'unlink "/tmp/wi840-x", "/home/kimi/y"'`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree("/tmp/wi840-x", "/etc/passwd")'`, "deletion outside")
+  assertBlocked(`perl -e "unlink \\"/tmp/wi840-x\\", \\"/etc/passwd\\""`, "deletion outside")
+  assertAllowed(`perl -e 'unlink "/tmp/wi840-a", "/tmp/wi840-b"'`)
+  // Unescaping the shell spelling must not turn a string literal into a call.
+  assertAllowed(`perl -e "print \\"unlink\\", \\"/home/kimi/x\\""`)
+})
+
 test("find and rsync delete through the same temp-root test", () => {
   // WI#832: `find -exec unlink` deleted without a deletion action match, and
   // rsync --delete removed whatever the destination had.
