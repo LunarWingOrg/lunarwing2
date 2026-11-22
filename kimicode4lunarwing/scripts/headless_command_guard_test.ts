@@ -1029,6 +1029,9 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
     "git command")
   assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+  // The environment value is read as one shell word: an `alias.` in a later
+  // argument of the same line is not attributed to the variable.
+  assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
   // Ordinary config and option use stays allowed.
   assertAllowed("git -c user.name=bot commit -m x")
   assertAllowed("git config --get user.email")

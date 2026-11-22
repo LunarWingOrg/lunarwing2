@@ -739,8 +739,17 @@ function clauseEnd(text, from) {
 
 // `GIT_CONFIG_KEY_*` (with `GIT_CONFIG_COUNT`) and `GIT_CONFIG_PARAMETERS` are
 // git's environment spellings of `-c`; an alias planted that way is the same
-// bypass as `-c alias.*` (WI#842).
-const GIT_ALIAS_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=[^;&|\n]*\balias\./;
+// bypass as `-c alias.*` (WI#842). The value is read as one shell word, so an
+// `alias.` later in the same command line is not attributed to this variable.
+const GIT_ALIAS_ENV = /(?:^|[\s;&|(])GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=("[^"]*"|'[^']*'|\S+)/g;
+
+/** True when an environment `-c` spelling in the segment names an alias key. */
+function hasGitAliasEnv(segment) {
+  for (const match of segment.matchAll(GIT_ALIAS_ENV)) {
+    if (/(?:^|[\s'"])alias\./.test(match[1])) return true;
+  }
+  return false;
+}
 
 /** The `<name>` operand of a `git config` call, after option/value pairs. */
 function gitConfigKey(after) {
@@ -813,7 +822,7 @@ function hasGitLongOption(text, options) {
  * (WI#842): the alias name would be an arbitrary verb they have never seen.
  */
 function checkGitDiscard(segment) {
-  if (GIT_ALIAS_ENV.test(segment)) return true;
+  if (hasGitAliasEnv(segment)) return true;
   for (const match of segment.matchAll(GIT_CALL)) {
     const rest = segment.slice(match.index + 3, clauseEnd(segment, match.index + 3));
     if (gitAliasDefinition(rest)) return true;
