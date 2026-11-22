@@ -57,6 +57,8 @@ pub struct AppComponents {
     pub skill_catalog: Option<Arc<SkillCatalog>>,
     pub cost_guard: Arc<crate::agent::cost_guard::CostGuard>,
     pub recording_handle: Option<Arc<RecordingLlm>>,
+    /// Daemon-wide LLM logical-call timing models (WI#318 Phase B).
+    pub llm_timings: Arc<crate::estimation::LlmTimings>,
     pub session: Arc<SessionManager>,
     pub catalog_entries: Vec<crate::extensions::RegistryEntry>,
     pub dev_loaded_tool_names: Vec<String>,
@@ -320,6 +322,7 @@ impl AppBuilder {
     #[allow(clippy::type_complexity)]
     pub async fn init_llm(
         &self,
+        timing_observer: Option<Arc<dyn crate::llm::LlmTimingObserver>>,
     ) -> Result<
         (
             Arc<dyn LlmProvider>,
@@ -328,9 +331,12 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        let (llm, cheap_llm, recording_handle) =
-            crate::llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
-        Ok((llm, cheap_llm, recording_handle))
+        Ok(crate::llm::build_provider_chain(
+            &self.config.llm,
+            self.session.clone(),
+            timing_observer,
+        )
+        .await?)
     }
 
     /// Phase 4: Initialize safety, tools, embeddings, and workspace.
@@ -1141,10 +1147,13 @@ impl AppBuilder {
             }
         }
 
+        let llm_timings = Arc::new(crate::estimation::LlmTimings::from_env());
         let (llm, cheap_llm, recording_handle) = if let Some(llm) = self.llm_override.take() {
+            // Injected providers bypass the chain and do not record timings.
             (llm, None, None)
         } else {
-            self.init_llm().await?
+            self.init_llm(llm_timings.enabled().then(|| llm_timings.clone() as Arc<_>))
+                .await?
         };
         let (safety, tools, embeddings, workspace, workspace_resolver, builder) =
             self.init_tools(&llm).await?;
@@ -1508,6 +1517,7 @@ impl AppBuilder {
             skill_catalog,
             cost_guard,
             recording_handle,
+            llm_timings,
             session: self.session,
             catalog_entries,
             dev_loaded_tool_names,

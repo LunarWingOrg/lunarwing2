@@ -1,8 +1,10 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
-gating and the evaluation trace are implemented; the held-out tenant evaluation
-and hint rollout remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+gating and the evaluation trace are implemented; Phase B1–B3 LLM
+logical-call timing is implemented (owner-only diagnostics, no prompt-facing
+use yet). The held-out tenant evaluation, hint rollout, gate-wait analytics
+(B4) and Phases C/D remain in progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
@@ -13,8 +15,13 @@ of slice 3: per-user registry-owned learning, all three tool execution paths,
 five-sample warmup, and frozen v1/v2 approval hints. Recording defaults to
 observation-only; `LUNARWING_TOOL_ESTIMATES=1` enables hints and `=0` disables
 the cache. It uses existing description
-fields rather than adding estimate DTOs across channel protocols. LLM timing,
-whole-job/mission-run estimates, gate-wait analytics, held-out workload
+fields rather than adding estimate DTOs across channel protocols. Slice 2 (LLM
+logical-call timing) is now implemented as a daemon-wide, in-memory,
+duration-only cache at the provider-chain boundary, surfaced by the owner-only
+`GET /api/estimates/llm`; retries, failover, cache hits and cancellations are
+counted separately and never train the EMA. It is not yet used in any estimate
+shown to a user. Gate-wait analytics (B4),
+whole-job/mission-run estimates, held-out workload
 evaluation and durable caches remain follow-ups; tool calls within those
 jobs are covered by this slice. Costs are only learned when actually reported,
 and are not displayed. See the
@@ -527,3 +534,28 @@ decisions based on these estimates are **out of scope** until accuracy and
 failure modes have been demonstrated separately. Changing any gate's authority,
 expiry, channel/request-ID binding, decision token or redaction contract is
 never a rollout mechanism.
+
+## Phase B implementation choice (B3 carrier)
+
+Implemented under #318 on 2026-11-21; maintainer acceptance remains separate.
+
+**Keep the estimator hook as the single carrier; the observability
+tool/LLM start/end events stay unwired.** `LlmTimingProvider` decorates the
+chain `build_provider_chain` already builds, so it observes exactly the calls
+the caller awaits, needs no new correlation ID, and cannot run twice over the
+same event. The `observability/traits.rs` events still lack a per-invocation
+correlation ID, cost, and timeout classification, and wiring them would add a
+second writer for the same clock. Cost is deliberately not learned here: the
+real per-call charge stays with `CostGuard::record_llm_call`, and the v2
+adapter's `cost_usd: 0.0` is "unavailable", never "free" (B2).
+
+The LLM clock is **completed logical-call latency**, measured outside retry,
+smart routing, failover and the circuit breaker, and inside the response cache.
+A cache hit bypasses the timer. Both streaming clocks start before setup.
+Blocking and streaming dispatches, retries, provider switches and first-chunk
+latency are counted separately. A failed, partial, cancelled or switched call
+does not train. A successful single-provider call (including same-provider
+backoff) trains its selected configured provider/model pair, with a 256-byte
+bound on each label. Diagnostics are the owner-only `GET /api/estimates/llm`;
+`LUNARWING_LLM_TIMINGS=0` disables recording and unset observes. Gate-wait
+analytics (B4) remain open and must stay separate from these runtime EMAs.

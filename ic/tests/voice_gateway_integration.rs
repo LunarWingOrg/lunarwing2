@@ -125,6 +125,7 @@ async fn start_gateway(voice: Option<Arc<VoiceApi>>) -> std::net::SocketAddr {
         log_level_handle: None,
         extension_manager: None,
         tool_registry: None,
+        llm_timings: None,
         store: None,
         job_manager: None,
         external_worker_manager: None,

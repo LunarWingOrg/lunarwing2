@@ -158,17 +158,23 @@ class Relay(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def main():
     # Establish transport before starting the untrusted command. A missing
     # socket, wrong image, or denied mount prevents the command from running.
-    try:
-        _probe()
-    except OSError as error:
-        print(_startup_error(error), file=sys.stderr)
-        return 125
+    #
+    # The listener is bound *before* the probe so that a startup failure and a
+    # running relay differ in one host-visible fact: a live listener can accept
+    # connections, a failed one cannot. The host counts accepted connections
+    # (WI#836); without the bind first, a failure between probe and bind would
+    # look identical to a run whose command never spoke to the relay.
     try:
         relay = Relay(("127.0.0.1", 3128), Handler)
     except OSError as error:
         print(f"lunarwing-proxy-relay: {error}", file=sys.stderr)
         return 125
     with relay:
+        try:
+            _probe()
+        except OSError as error:
+            print(_startup_error(error), file=sys.stderr)
+            return 125
         threading.Thread(target=relay.serve_forever, daemon=True).start()
         result = subprocess.run(["sh", "-c", sys.argv[1]], check=False)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode

@@ -818,6 +818,7 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(ref gw_config) = config.channels.gateway {
         let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
+        gw = gw.with_llm_timings(Arc::clone(&components.llm_timings));
         if let Some(voice) =
             lunarwing::channels::web::voice::VoiceApi::from_config(&config.transcription)
                 .map(std::sync::Arc::new)

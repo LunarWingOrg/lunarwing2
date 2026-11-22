@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { runInNewContext } from "node:vm";
 
 // headless_command_guard.mjs — LunarWing Kimi worker fail-closed command policy
@@ -23,7 +25,8 @@ import { runInNewContext } from "node:vm";
 // (power/privilege/disk destruction, fork bombs, pipe-to-shell, decoded
 // payloads into a shell) plus worker-lane specifics (deletion outside the
 // temp roots whatever tool performs it, block-device writes, git commands
-// that discard uncommitted work, SSH-agent socket use). It is deliberately
+// that discard uncommitted work, SSH agent use — the mount path, the
+// SSH_AUTH_SOCK variable and `ssh-add`). It is deliberately
 // NOT a general command parser: everything it cannot positively classify as
 // safe within its ruleset is allowed unless it matches a deny rule, EXCEPT
 // unparseable input, which denies (fail closed at the transport layer) and
@@ -31,6 +34,11 @@ import { runInNewContext } from "node:vm";
 
 const MAX_COMMAND_CHARS = 16384;
 const RM_SAFE_TEMP_ROOTS = ["/tmp", "/temp", "/var/tmp"];
+// Characters that make bash rewrite a word before the deleting command sees
+// it: parameter and command expansion, quote removal, globs and brace lists.
+// An operand is read as the literal argument, so a word carrying any of them
+// would be checked in one shape and deleted in another (WI#830, from WI#812).
+const RM_SHELL_EXPANDED_CHARS = "$`'\"*?[]{}";
 
 function deny(reason) {
   process.stderr.write(`headless-guard: denied — ${reason}\n`);
@@ -62,15 +70,70 @@ function rmOperands(words, endOfOptions) {
 }
 
 /**
- * The containment test shared by every deletion rule (WI#826): a target is
- * provably inside the temp roots only as a literal path, with no expansion,
- * no `..` segment and no glob.
+ * The containment test shared by every deletion rule (WI#826, WI#830): a
+ * target is provably inside the temp roots only as a literal absolute path,
+ * with no expansion, no `..` segment and no glob, whose *resolved* form is
+ * under a resolved root. Resolving is what makes a symlink under a temp root
+ * useless as a bridge to somewhere else (WI#812, WI#830).
  */
 function isSafeTempPath(operand) {
-  if (operand.length === 0 || operand.startsWith("$") || operand.includes("..")) return false;
-  if (operand.includes("*") || operand.includes("?") || operand.includes("[")) return false;
-  return RM_SAFE_TEMP_ROOTS.some((root) => operand === root || operand.startsWith(`${root}/`));
+  if (!operand.startsWith("/") || operand.includes("..")) return false;
+  for (const ch of operand) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch)) return false;
+  }
+  const resolved = resolveExistingPrefix(operand);
+  if (resolved === null) return false;
+  return RM_RESOLVED_SAFE_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`));
 }
+
+/**
+ * Resolve the longest existing prefix of a path, following symlinks, and
+ * re-attach the components that do not exist yet: a deletion removes those
+ * names rather than traversing them, so there is no symlink to follow there.
+ * Returns null when the prefix cannot be resolved (symlink loop, permission
+ * error), or when a component exists but is a symlink that does not resolve:
+ * its target can be created before the deletion runs, and the name below it
+ * would then be removed through the link.
+ */
+function resolveExistingPrefix(target) {
+  // A trailing slash makes every filesystem call follow the final component,
+  // which hides a dangling link from the check below; realpath treats the two
+  // spellings the same otherwise.
+  let prefix = target.replace(/(.)\/+$/, "$1");
+  const missing = [];
+  for (;;) {
+    try {
+      const resolved = realpathSync.native(prefix);
+      if (missing.length === 0) return resolved;
+      const base = resolved.endsWith("/") ? resolved : `${resolved}/`;
+      return `${base}${missing.reverse().join("/")}`;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return null;
+      if (isDanglingSymlink(prefix)) return null;
+      const parent = dirname(prefix);
+      if (parent === prefix) return null;
+      missing.push(basename(prefix));
+      prefix = parent;
+    }
+  }
+}
+
+function isDanglingSymlink(target) {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Both sides are resolved: a temp root can itself be a symlink (macOS /tmp),
+ * and a target can reach a root through one. A root that cannot be resolved
+ * is dropped, so a broken root can only deny.
+ */
+const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
+  .map((root) => resolveExistingPrefix(root))
+  .filter((root) => root !== null);
 
 /** Split a command tail into bash words (space and tab only). */
 function argumentWords(rest) {
@@ -173,6 +236,16 @@ function isRmLongDeleteOption(word) {
   return option !== undefined && ("--recursive".startsWith(option) || "--force".startsWith(option));
 }
 
+/** True when an `rm` argument text carries a recursive or forced flag. */
+function rmDeleteOption(rest) {
+  const words = rest.split(/[ \t]+/);
+  const endOfOptions = words.indexOf("--");
+  const optionWords = endOfOptions === -1 ? words : words.slice(0, endOfOptions);
+  // Keep the conservative flag test as well as GNU abbreviations.
+  return /(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) ||
+    optionWords.some(isRmLongDeleteOption);
+}
+
 function checkRm(segment) {
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
@@ -183,10 +256,7 @@ function checkRm(segment) {
   // Bash splits words on space and tab here, not JS's broader whitespace set.
   const words = rest.split(/[ \t]+/);
   const endOfOptions = words.indexOf("--");
-  const optionWords = endOfOptions === -1 ? words : words.slice(0, endOfOptions);
-  // Keep the existing conservative flag checks as well as GNU abbreviations.
-  if (!/(^|[ \t])-[a-zA-Z]*[rRfF]|--recursive|--force/.test(rest) &&
-      !optionWords.some(isRmLongDeleteOption)) return null;
+  if (!rmDeleteOption(rest)) return null;
   const operands = rmOperands(words, endOfOptions)
     // `xargs -I {}` fills the placeholder from its input; the feeding find
     // paths are what checkXargsDeletion classifies (WI#826).
@@ -195,21 +265,38 @@ function checkRm(segment) {
     return fromXargs ? null : "rm -r/-f without an explicit operand";
   }
   if (!operands.every(isSafeTempPath)) {
-    return `recursive/forced rm outside ${RM_SAFE_TEMP_ROOTS.join(", ")}: ${operands.join(" ").slice(0, 80)}`;
+    return outsideTempReason("rm", operands);
   }
   return null;
 }
 
 const FIND_CALL = /(?:^|[\s;&|()])find\s+([^;&|\n]*)/g;
-// Deletion actions inside a find expression: `-delete`, `-exec rm`, `-ok rm`.
+// Deletion actions inside a find expression: `-delete`, and `-exec`/`-ok`
+// running a deleting utility (WI#826, WI#832: unlink).
 const FIND_DELETE_ACTION =
-  /(?:^|[\s(])(?:-delete|-exec(?:dir)?\s+(?:[\w.+-]*\/)?rm\b|-ok(?:dir)?\s+(?:[\w.+-]*\/)?rm\b)/;
+  /(?:^|[\s(])(?:-delete|-exec(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b|-ok(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b)/;
 const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b([^;&|\n]*)/g;
 const XARGS_RM = /(?:^|\s)(?:[\w.+-]*\/)?rm(?:\s|$)/;
+const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b([^;&|\n]*)/g;
+// Interpreter options may precede the eval flag (`perl -MFile::Path -e …`),
+// so the eval flag is found by walking the words (oneLinerCode).
 const ONE_LINER_CALL =
-  /(?:^|[\s;&|()])(?:[\w.+-]*\/)?(?:python3?|perl|node|ruby)\s+(?:-[a-zA-Z]*[ceEp][a-zA-Z]*|--eval)\b([^\n]*)/g;
+  /(?:^|[\s;&|()])(?:[\w.+-]*\/)?(python3?|perl|node|ruby)(?:\.\d+)?\b([^\n]*)/g;
 const DELETION_CALL =
-  /\b(?:shutil\.rmtree|rmtree|rmSync|rmdirSync|unlinkSync|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink)|rimraf|unlink|rmdir)\s*\(/g;
+  /\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink)|rmtree|remove_tree|rimraf|rmSync|rmdirSync|unlinkSync|unlink|rmdir)\s*\(/g;
+// The names a one-liner can bind to a deletion, however the binding is spelled.
+const DELETION_SINK_NAMES = new Set([
+  "rmtree", "remove_tree", "rimraf", "rmSync", "rmdirSync", "unlinkSync",
+  "removedirs", "rmdir", "unlink", "remove", "rm",
+]);
+const GETATTR_SINK = /\bgetattr\s*\(\s*([\w.]+)\s*,\s*(['"])([\w$]+)\2\s*\)/g;
+const FROM_IMPORT = /\bfrom\s+([\w.]+)\s+import\s+([^;\n]+)/g;
+const MODULE_IMPORT_ALIAS = /\bimport\s+([\w.]+)\s+as\s+([\w$]+)/g;
+const ASSIGNED_SINK =
+  /\b([A-Za-z_$][\w$]*)\s*=\s*((?:[\w$]+\.)*)(rmtree|remove_tree|rimraf|rmdir|unlink|remove|removedirs|rmSync|rmdirSync|unlinkSync)\b(?!\s*\()/g;
+// Perl calls deletion without parentheses: `rmtree "/x"`, `unlink glob "/x/*"`.
+const PERL_BAREWORD_DELETE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s*(?:glob\s+)?(['"])([^'"]*)\1/g;
+const PERL_BAREWORD_VARIABLE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s+(?:glob\s+)?[$@%]/g;
 const DEVICE_TARGET = /^\/dev\/(?:sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
 const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b([^;&|\n]*)/g;
 const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b([^;&|\n]*)/g;
@@ -261,10 +348,30 @@ function checkXargsDeletion(text) {
   return null;
 }
 
+/**
+ * Deny `rsync --delete`, which deletes whatever the destination has and the
+ * source lacks, and `--remove-source-files` (WI#832). The destination is the
+ * last operand; `--remove-source-files` deletes the operands before it.
+ */
+function checkRsyncDeletion(text) {
+  for (const match of text.matchAll(RSYNC_CALL)) {
+    const words = argumentWords(match[1]).map(stripShellQuotes);
+    const option = words.find((word) => /^--del(?:ete(?:-[a-z-]+)?)?$/.test(word) ||
+      word === "--remove-source-files");
+    if (option === undefined) continue;
+    const operands = words.filter((word) => !word.startsWith("-"));
+    const deleted = option === "--remove-source-files" ? operands.slice(0, -1) : operands.slice(-1);
+    if (deleted.length === 0) return `rsync ${option} without a verifiable target`;
+    if (!deleted.every(isSafeTempPath)) return outsideTempReason(`rsync ${option}`, deleted);
+  }
+  return null;
+}
+
 /** Read a quoted first argument starting after a call's `(`; null if it is not a literal. */
 function quotedFirstArgument(code, from) {
   let i = from;
-  while (i < code.length && /[ \t]/.test(code[i])) i++;
+  // A nested call (`getattr(m, 'rmtree')(…)`) leaves its own `(` here.
+  while (i < code.length && /[ \t(]/.test(code[i])) i++;
   const quote = code[i];
   if (quote !== "'" && quote !== '"' && quote !== "`") return null;
   let value = "";
@@ -279,12 +386,153 @@ function quotedFirstArgument(code, from) {
   return null;
 }
 
-/** Deny rmtree/rmSync-style deletion in a Python, Perl, Ruby or Node one-liner. */
+/**
+ * The code text of an interpreter invocation, or null when the words after the
+ * interpreter carry no eval flag. The eval flag may follow other options
+ * (`perl -MFile::Path -e …`, `node --no-warnings -e …`), so the words are
+ * walked rather than matched by one regex (WI#832).
+ */
+function oneLinerCode(rest) {
+  let i = 0;
+  while (i < rest.length) {
+    while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+    const start = i;
+    while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+    const word = rest.slice(start, i);
+    if (word.length === 0) return null;
+    if (/^(?:--eval|--print)$/.test(word) || /^-[a-zA-Z]*[ceEp][a-zA-Z]*$/.test(word)) {
+      return rest.slice(i);
+    }
+    if (!word.startsWith("-")) return null;
+  }
+  return null;
+}
+
+/**
+ * The names a one-liner binds to a deletion (WI#832): `from shutil import
+ * rmtree as r`, `import shutil as s`, and `r = shutil.rmtree`. Each binding
+ * maps a local name to a dotted module path.
+ */
+function sinkAliases(code) {
+  const aliases = new Map();
+  for (const match of code.matchAll(FROM_IMPORT)) {
+    const module = match[1];
+    for (const piece of match[2].split(",")) {
+      const [imported, local] = piece.trim().split(/\s+as\s+/);
+      const name = imported.trim();
+      if (!DELETION_SINK_NAMES.has(name)) continue;
+      aliases.set((local ?? name).trim(), `${module}.${name}`);
+    }
+  }
+  for (const match of code.matchAll(MODULE_IMPORT_ALIAS)) aliases.set(match[2], match[1]);
+  for (const match of code.matchAll(ASSIGNED_SINK)) {
+    const target = DELETION_SINK_NAMES.has(match[3]) ? `${match[2]}${match[3]}` : match[3];
+    aliases.set(match[1], target);
+  }
+  return aliases;
+}
+
+/** The call name in an alias's dotted path, or null when the path is not a deletion. */
+function aliasSinkName(dotted, aliases) {
+  const head = dotted.split(".")[0];
+  const bound = aliases.get(head);
+  const resolved = bound === undefined ? dotted : bound + dotted.slice(head.length);
+  const name = resolved.split(".").pop();
+  return DELETION_SINK_NAMES.has(name) ? name : null;
+}
+
+/** Every position in a one-liner where a deletion call's argument list starts. */
+function deletionCallOffsets(code, aliases) {
+  const offsets = [];
+  for (const call of code.matchAll(DELETION_CALL)) offsets.push(call.index + call[0].length);
+  for (const match of code.matchAll(GETATTR_SINK)) {
+    if (aliasSinkName(`${match[1]}.${match[3]}`, aliases)) offsets.push(match.index + match[0].length);
+  }
+  for (const name of aliases.keys()) {
+    if (aliasSinkName(name, aliases) === null) continue;
+    const escaped = name.replace(/[$]/g, "\\$");
+    for (const call of code.matchAll(new RegExp(`\\b${escaped}\\s*\\(`, "g"))) {
+      offsets.push(call.index + call[0].length);
+    }
+  }
+  return offsets;
+}
+
+/**
+ * Strip one layer of shell quoting that wraps the whole one-liner body, so the
+ * interpreter's own string literals are the only quotes the readers see:
+ * `'print "unlink"'` becomes `print "unlink"` (WI#832).
+ */
+function stripOuterShellQuotes(code) {
+  const text = code.trim();
+  if (text.length < 2) return text;
+  const quote = text[0];
+  if (quote !== "'" && quote !== '"') return text;
+  let end = -1;
+  for (let i = 1; i < text.length; i++) {
+    if (quote === '"' && text[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (text[i] === quote) end = i;
+  }
+  return end === text.length - 1 ? text.slice(1, -1) : text;
+}
+
+/** True when `index` in the code sits inside a single- or double-quoted string. */
+function insideQuotedString(code, index) {
+  let quote = "";
+  for (let i = 0; i < index; i++) {
+    const ch = code[i];
+    if (ch === "\\" && quote !== "'") {
+      i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+    }
+  }
+  return quote !== "";
+}
+
+/**
+ * The Perl parenthesis-free deletion verdict: `rmtree "dir"`, `unlink glob
+ * "dir/*"`, and a variable operand the guard cannot resolve (WI#832). A call
+ * name inside a string literal (`print "unlink"`) is text, not a call.
+ */
+function perlDeletionVerdict(rawCode) {
+  const code = stripOuterShellQuotes(rawCode);
+  for (const match of code.matchAll(PERL_BAREWORD_DELETE)) {
+    if (insideQuotedString(code, match.index)) continue;
+    if (!isSafeTempPath(match[2])) return outsideTempReason("interpreter deletion", [match[2]]);
+  }
+  for (const match of code.matchAll(PERL_BAREWORD_VARIABLE)) {
+    if (insideQuotedString(code, match.index)) continue;
+    return "interpreter deletion whose target the guard cannot verify";
+  }
+  return null;
+}
+
+/**
+ * Deny interpreter deletion in a one-liner whose target cannot be verified, and
+ * outside the temp roots otherwise (WI#826, WI#832). The deletion is read from
+ * the call shape, from an `getattr(module, 'name')` sink, from a name an
+ * import or assignment bound to a deletion, and from the parenthesis-free Perl
+ * form.
+ */
 function checkInterpreterDeletion(text) {
   for (const invocation of text.matchAll(ONE_LINER_CALL)) {
-    const code = invocation[1];
-    for (const call of code.matchAll(DELETION_CALL)) {
-      const target = quotedFirstArgument(code, call.index + call[0].length);
+    const code = oneLinerCode(invocation[2]);
+    if (code === null) continue;
+    const aliases = sinkAliases(code);
+    if (invocation[1] === "perl") {
+      const perlDenial = perlDeletionVerdict(code);
+      if (perlDenial) return perlDenial;
+    }
+    for (const offset of deletionCallOffsets(code, aliases)) {
+      const target = quotedFirstArgument(code, offset);
       if (target === null) return "interpreter deletion whose target the guard cannot verify";
       if (!isSafeTempPath(target)) return outsideTempReason("interpreter deletion", [target]);
     }
@@ -318,6 +566,7 @@ function checkDeviceWrites(text) {
 function checkRawShapes(text) {
   return checkFindDeletion(text) ??
     checkXargsDeletion(text) ??
+    checkRsyncDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
     checkDecodedPipe(text);
@@ -372,21 +621,38 @@ function gitVerb(rest) {
   return { verb: "", after: "" };
 }
 
+/** True when any short flag cluster in the text carries one of the letters. */
+function hasShortFlag(text, letters) {
+  for (const match of text.matchAll(/(?:^|[ \t])-([a-zA-Z]+)(?=[ \t]|$)/g)) {
+    if ([...match[1]].some((letter) => letters.includes(letter))) return true;
+  }
+  return false;
+}
+
 /**
- * Deny git commands that irrecoverably discard uncommitted work (WI#826):
- * forced `clean`, `reset --hard`, a whole-tree checkout and `stash -u`.
- * Linear scan over the git invocations; dry runs and `git status` pass.
+ * Deny git commands that irrecoverably discard uncommitted work (WI#826,
+ * WI#832): forced `clean` (a dry run passes), `reset --hard`, a whole-tree
+ * checkout or restore, forced checkout/switch, and a `stash` that takes
+ * untracked or ignored files. Linear scan over the git invocations.
  */
 function checkGitDiscard(segment) {
   for (const match of segment.matchAll(GIT_CALL)) {
     const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
-    if (verb === "clean" && /(?:^|[ \t])-[a-zA-Z]*[fdxX]|(?:^|[ \t])--force(?=[ \t]|$)/.test(after)) {
+    const dryRun = hasShortFlag(after, "n") || /(?:^|[ \t])--dry-run(?=[ \t]|$)/.test(after);
+    if (verb === "clean" && !dryRun &&
+        (hasShortFlag(after, "fdxX") || /(?:^|[ \t])--force(?=[ \t]|$)/.test(after))) {
       return true;
     }
     if (verb === "reset" && /(?:^|[ \t])--hard(?=[ \t]|$)/.test(after)) return true;
-    if (verb === "checkout" && /(?:^|[ \t])\.(?=[ \t]*$)/.test(after)) return true;
+    if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(after)) {
+      return true;
+    }
+    if ((verb === "checkout" || verb === "switch") &&
+        (hasShortFlag(after, "f") || /(?:^|[ \t])--(?:force|discard-changes)(?=[ \t]|$)/.test(after))) {
+      return true;
+    }
     if (verb === "stash" &&
-        /(?:^|[ \t])-[a-zA-Z]*u[a-zA-Z]*(?=[ \t]|$)|(?:^|[ \t])--include-untracked(?=[ \t]|$)/.test(after)) {
+        (hasShortFlag(after, "ua") || /(?:^|[ \t])--(?:include-untracked|all)(?=[ \t]|$)/.test(after))) {
       return true;
     }
   }
@@ -409,11 +675,31 @@ function stageCommand(stage) {
   return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1) };
 }
 
+/**
+ * True for a stage that turns an encoded payload back into text (WI#826,
+ * WI#832): `base64 -d`, `xxd -r`, `rev`, a decompressor, `openssl base64 -d`,
+ * `perl`/`python` base64 one-liners, `printf` with hex or octal escapes, and
+ * `tr` — but only when `tr` deletes nothing, because `tr -d '\r'` normalises
+ * text rather than decoding it.
+ */
 function isDecodeStage(stage) {
   const { name, args } = stageCommand(stage);
   if (name === "base64") return args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "--decode");
   if (name === "xxd") return args.some((word) => /^-[a-zA-Z]*r[a-zA-Z]*$/.test(word) || word === "--revert");
-  return name === "rev" || name === "tr";
+  if (name === "openssl") {
+    return args[0] === "base64" && args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "-d");
+  }
+  if (["gzip", "gunzip", "zcat", "bzip2", "bzcat", "bunzip2", "xz", "unxz", "xzcat", "zstd", "unzstd", "zstdcat"]
+    .includes(name)) return true;
+  if (name === "printf") return args.some((word) => /\\x[0-9a-fA-F]{2}|\\[0-7]{3}/.test(word));
+  if (name === "perl") {
+    return args.some((word) => /-M(?:MIME::)?Base64|decode_base64/.test(word));
+  }
+  if (name === "python" || name === "python3") {
+    return args.some((word) => /\bb64decode\b|\ba85decode\b|\bb32decode\b/.test(word));
+  }
+  if (name === "tr") return !args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "--delete");
+  return name === "rev";
 }
 
 /** True when the stage executes its stdin: a shell, or an interpreter one-liner. */
@@ -429,10 +715,46 @@ function isInterpreterStage(stage) {
   return false;
 }
 
-/** Deny a decode command piped into a shell or interpreter (WI#826). */
+/**
+ * Split text on a one-character separator, ignoring separators inside quotes
+ * and after a backslash, so a quoted interpreter body (`-c 'a;b'`) stays one
+ * word for the pipeline rules (WI#832).
+ */
+function splitOutsideQuotes(text, separator) {
+  const pieces = [];
+  let piece = "";
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      piece += ch + text[++i];
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === separator) {
+      pieces.push(piece);
+      piece = "";
+      continue;
+    }
+    piece += ch;
+  }
+  pieces.push(piece);
+  return pieces;
+}
+
+/** The `;`, LF, `&&` and `||` lists of the text, read outside quotes. */
+function commandLists(text) {
+  return splitOutsideQuotes(text, ";").flatMap((piece) => splitOutsideQuotes(piece, "\n"))
+    .flatMap((piece) => piece.split(/&&|\|\|/));
+}
+
+/** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
 function checkDecodedPipe(text) {
-  for (const list of text.split(/[;\n]|&&|\|\|/)) {
-    const stages = list.split("|");
+  for (const list of commandLists(text)) {
+    const stages = splitOutsideQuotes(list, "|");
     for (let i = 1; i < stages.length; i++) {
       if (isInterpreterStage(stages[i]) && isDecodeStage(stages[i - 1])) {
         return "decoded content piped into a shell or interpreter";
@@ -484,12 +806,24 @@ const DENY_RULES = [
     name: "direct block-device write",
     // Device namespaces beyond the legacy names: LVM (/dev/mapper/…) and the
     // udev links (/dev/disk/by-id/…). truncate is only denied at a block device.
+    // The `>|` noclobber override writes the same device as `>` (WI#832).
     pattern:
-      />\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
+      />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
   },
   {
-    name: "SSH agent socket use (worker lane is not a credential broker)",
-    pattern: /\bSSH_AUTH_SOCK\b|\/tmp\/ssh-agent\.sock/,
+    name: "SSH agent use (worker lane is not a credential broker)",
+    // Every lane that mounts an agent shares a directory at /tmp/ssh-agent
+    // with the socket inside, exported as
+    // SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
+    // (ic/scripts/mt-admin-lib/09-worker-config.sh). Matching the directory
+    // covers that real spelling, the socket inside it, and
+    // `ssh -o IdentityAgent=<socket>`; the bare /tmp/ssh-agent.sock literal
+    // is the one spelling no lane uses (WI#829). `ssh-add` is the step that
+    // loads a key into an agent, i.e. the credential-broker action itself.
+    // Direct key-file auth (`ssh -i <key>`, the lane's own ~/.ssh behind
+    // `ssh -T`) stays allowed on purpose — see WORKER-CONTAINERS.md.
+    pattern:
+      /\bSSH_AUTH_SOCK\b|\/tmp\/ssh-agent(?:\.sock)?(?=$|[\/\s"'`.,)\]};|&])|(?:^|[\s;&|()])(?:[\w.+-]*\/)*ssh-add(?![\w-])/,
   },
 ];
 
@@ -524,7 +858,7 @@ function evaluate(command) {
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
-  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command);
+  const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ?? checkListeners(command);
   if (rawDenial) return rawDenial;
   // bash joins every backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -537,11 +871,124 @@ function evaluate(command) {
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       checkDenyRulesEverywhere(shellWordView(joined)) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(shellWordView(joined))) ??
-      checkRawShapes(joined);
+      checkRawShapes(joined) ??
+      (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
       const denied = checkRm(segment);
       if (denied) return denied;
+    }
+  }
+  return null;
+}
+
+// WI#833: keep listener checks separate from the other raw command rules.
+// This recognizes literal command shapes, not general Bash execution.
+const LISTENER_PREFIXES = new Set([
+  "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
+  "xargs", "time", "{}", "if", "then", "elif", "else", "while", "until", "do", "done", "!", "{", "}", "(", ")",
+]);
+
+/** Read simple command words, keeping quoted values (including empty ones) together. */
+function* listenerSegments(text) {
+  let words = [];
+  let word = "";
+  let started = false;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      const next = text[i + 1];
+      word += quote === '"' && !'\\"$`\n'.includes(next) ? ch : text[++i];
+      started = true;
+    } else if (quote) {
+      if (ch === quote) quote = "";
+      else word += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+    } else if (" \t;|&\n".includes(ch)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+      if (";|&\n".includes(ch) && words.length > 0) {
+        yield words;
+        words = [];
+      }
+    } else {
+      word += ch;
+      started = true;
+    }
+  }
+  if (started) words.push(word);
+  if (words.length > 0) yield words;
+}
+
+function kimiServiceSubcommand(words, start) {
+  let i = start;
+  for (; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "--") {
+      i++;
+      break;
+    }
+    // Kimi's -p and --prompt consume one whole argument. --prompt=value
+    // needs no special case; its value is already part of the option word.
+    if (words[i] === "-p" || words[i] === "--prompt") i++;
+  }
+  const subcommand = words[i];
+  return subcommand === "server" || subcommand === "web" ? subcommand : null;
+}
+
+const LISTENER_COMMANDS = [
+  {
+    name: /^python[0-9.]*$/,
+    test: (args) => {
+      const moduleIndex = args.indexOf("-m");
+      return moduleIndex !== -1 && args[moduleIndex + 1] === "http.server";
+    },
+  },
+  {
+    name: /^(?:nc|ncat|netcat)$/,
+    test: (args) => args.some((word) => /^-[a-zA-Z]*l[a-zA-Z]*$/.test(word) || word === "--listen"),
+  },
+  { name: /^socat$/, test: (args) => args.some((word) => /TCP[46]?-LISTEN:/.test(word)) },
+  { name: /^php[0-9.]*$/, test: (args) => args.includes("-S") },
+  { name: /^ruby$/, test: (args) => args.includes("-run") && args.includes("httpd") },
+];
+
+function listenerShellBody(words, start) {
+  for (let i = start; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "--") break;
+    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(words[i])) return words[i + 1];
+  }
+  return undefined;
+}
+
+/** Deny recognized service commands without treating prompt text as a subcommand. */
+function checkListeners(text, depth = 0) {
+  for (const words of listenerSegments(text)) {
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      const name = commandBasename(word);
+      if (name === "busybox" && words[i + 1] === "httpd") return "listener started from a task: busybox httpd";
+      if (LISTENER_PREFIXES.has(word) || LISTENER_PREFIXES.has(name) ||
+          /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(word)) continue;
+
+      if (name === "kimi") {
+        const subcommand = kimiServiceSubcommand(words, i + 1);
+        if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
+      } else if (SHELL_NAME.test(name)) {
+        const body = listenerShellBody(words, i + 1);
+        if (body !== undefined) {
+          if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+          const denied = checkListeners(body, depth + 1);
+          if (denied) return denied;
+        }
+      } else {
+        const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+        if (rule?.test(words.slice(i + 1))) return `listener started from a task: ${name}`;
+      }
+      break;
     }
   }
   return null;
@@ -644,12 +1091,49 @@ function checkRmAssembly(command) {
   return null;
 }
 
+// A symbolic link created anywhere in the same command line makes containment
+// unverifiable for that line: the link does not exist at check time, so a
+// recursive or forced deletion below it resolves as a name to be created and
+// bash then removes through the link (WI#830 AIT-1, from WI#812 review).
+const LINK_CREATORS = new Set(["ln", "cp"]);
+const SYMLINK_FLAG = /^-[a-zA-Z]*s[a-zA-Z]*$|^--symbolic(?:-link)?$/;
+
+/** True when a segment runs `ln`/`cp` with a symbolic-link flag. */
+function createsSymbolicLink(segment) {
+  const words = argumentWords(segment).map(stripShellQuotes);
+  for (let i = 0; i < words.length; i++) {
+    if (!LINK_CREATORS.has(commandBasename(words[i]))) continue;
+    for (let j = i + 1; j < words.length && !/^[;&|]/.test(words[j]); j++) {
+      if (SYMLINK_FLAG.test(words[j])) return true;
+      // A word that is not an option starts the operands; keep scanning, a
+      // later flag is still ln's (`ln a b -s` is accepted by GNU ln).
+    }
+  }
+  return false;
+}
+
+/** Deny a recursive or forced deletion in a line that also creates a symlink. */
+function checkSameLineLink(command) {
+  const readings = new Set(JOIN_READINGS.map(([outside, inside]) => joinLineContinuations(command, outside, inside)));
+  for (const reading of readings) {
+    const view = shellWordView(reading);
+    if (!createsSymbolicLink(view)) continue;
+    for (const segment of commandSegments(view)) {
+      const rest = /\brm[ \t]+(.*)$/s.exec(segment)?.[1];
+      if (rest !== undefined && rmDeleteOption(rest)) {
+        return "recursive/forced rm in a command line that also creates a symbolic link; use a separate call";
+      }
+    }
+  }
+  return null;
+}
+
 // The CLI can allow a hook that misses its 10 s deadline. Interrupt our own
 // synchronous classifier much earlier, including any legacy regex checks.
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command) {
-  return evaluate(command) ?? checkRmAssembly(command);
+  return evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
 }
 
 async function main() {

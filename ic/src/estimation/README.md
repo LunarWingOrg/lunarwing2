@@ -161,6 +161,55 @@ the rollout gate. A comparison baseline for other tools (or a revised gate)
 still needs a maintainer decision. Running the representative tenant
 evaluation and enabling hints for passing categories are separate steps.
 
+## LLM logical-call timing (WI#318 Phase B)
+
+Tool hints answer "how long does this tool take". LLM calls need the same
+treatment at a different boundary, so a separate daemon-wide cache records
+**completed logical-call latency**.
+
+- **One boundary.** `LlmTimingProvider` (`ic/src/llm/timing.rs`) decorates the
+  chain built once by `build_provider_chain`, so v1 chat, local jobs, routines,
+  container execution and the v2 `LlmBridgeAdapter` are measured by the same
+  timer. There is no per-delegate timer and no second writer: the
+  `observability` tool/LLM events remain unused in this implementation.
+- **What trains.** One sample per successful logical call with a known
+  provider/model and no switch. A successful same-provider retry contributes
+  one sample including its backoff, not separate attempt samples. The timer
+  sits outside retry, smart routing, failover and the circuit breaker, but
+  inside the response cache and stream integrity. Cache hits bypass it.
+  Streaming time starts before setup and ends at `Done`; failed, partial or
+  dropped calls do not train.
+- **What is counted separately.** `calls_started`, `completions`, `failures`
+  and `cancellations` count logical calls. `provider_attempts` counts concrete
+  provider dispatches; `retried_calls` and `retry_attempts` count same-provider
+  retries that actually started, including blocking calls and retries that
+  later fail. Attempt counters update when the logical call ends.
+  `provider_switches` counts calls that change provider or model after the first
+  dispatch, including failover and smart-routing escalation; those calls never
+  train. If cooldown selects a fallback as the first and only provider, there
+  is no switch. First content chunk latency, including setup, is summed
+  separately (`first_chunk_samples`, `first_chunk_sum_ms`).
+- **Attribution.** The selected provider freezes a forecast at its first
+  dispatch using the configured provider ID and model (up to 256 bytes each).
+  Concurrent calls do not share attribution, and providers serving the same
+  model name have distinct keys. A LunarWing Cloud model override not matching
+  that provider's configured model still runs, but is counted without training
+  a named model. No request-supplied model label, prompt, result, user identity
+  or URL is stored.
+- **No cost.** Duration only. A real per-call charge stays with
+  `CostGuard::record_llm_call`; the v2 adapter's `cost_usd: 0.0` means
+  "unavailable", so it never becomes a free-cost sample.
+- **Diagnostics.** `GET /api/estimates/llm` is owner-only (403 for other
+  authenticated users, 401 without a token) and reports `mode`,
+  `min_samples`, the counters above, and per-provider/model `duration_ema_ms`,
+  `time_error_ema`, `confidence`, `confidence_label` and the warm
+  `estimate_ms` (absent until five valid samples). No user identity or private
+  key is included.
+- **Setting.** `LUNARWING_LLM_TIMINGS=0` disables recording; unset or any
+  other value observes. It is read once when the chain is built, is not
+  DB-backed, and resets on restart. Nothing here changes behaviour: an
+  estimator failure can never change a call's result.
+
 ## Disable and performance
 
 The default is **observation-only**. Set **`LUNARWING_TOOL_ESTIMATES=1` before
@@ -191,8 +240,8 @@ does not establish the latter workload-level result.
 
 The later slices in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../../../docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md)
-remain follow-ups: LLM logical-call timing, bounded whole-job/mission-run
-views, gate-wait analytics, durable aggregate caches and the real-tenant
+remain follow-ups: bounded whole-job/mission-run views, gate-wait analytics,
+durable aggregate caches and the real-tenant
 held-out evaluation. The diagnostics surface, per-category display gating and
 the opt-in evaluation trace (WI#318 A2/A3/A4 recording) are implemented; running
 A4 on a tenant and enabling hints (A5) are still operator steps. Tool calls

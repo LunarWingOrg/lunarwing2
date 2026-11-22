@@ -89,6 +89,33 @@ Keep the bearer token out of shell history and captured logs. The script checks
 gateway APIs and core subsystems; its header lists the channel, worker,
 provider, rollback, and monitoring checks that remain manual.
 
+### Bounded-turn measurement (WI#807)
+
+A turn that "felt long" is not a data point. `ic/scripts/bounded-turn-probe.py`
+asks the agent for a known number of `echo` calls, waits for the turn to end,
+and reads the daemon's own `Turn finished` record from its log ring buffer, so
+the same measurement works on systemd, OpenRC and launchd hosts:
+
+```bash
+sudo ic/scripts/bounded-turn-probe.py --tenant <tenant> --steps 8
+```
+
+The tenant env file is mode 600, so `--tenant` needs root; an unprivileged run
+takes `--base-url` plus `--token-file` instead.
+
+Exit `0` means the turn finished inside its budget with the requested step
+count; `3` means it used the whole budget (`budget_exhausted=true`) and `4`
+means it finished with a different step count. `2` means no record arrived
+within `--timeout`. Use it for the 9B/27B budget question: a bounded task
+answers "slow, thrashing, or doing a lot of real work" instead of leaving it
+to impression.
+
+The record exists only on a daemon that carries WI#807's `Turn finished`
+line (v2.2.2.0-era). A tenant still running an older binary logs the detached
+turn as `Late turn finished`, so a turn that fits the foreground wait leaves
+no record at all: expect exit `2`, not a measurement, until that tenant is
+upgraded.
+
 ## 4. External-worker matrix
 
 This tier requires Docker Compose and the Python dependencies in

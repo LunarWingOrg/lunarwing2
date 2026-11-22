@@ -45,6 +45,7 @@ use crate::llm::provider::{
 pub struct RigAdapter<M: CompletionModel> {
     model: M,
     model_name: String,
+    timing_provider_id: Option<String>,
     input_cost: Decimal,
     output_cost: Decimal,
     /// Prompt cache retention policy (Anthropic only).
@@ -66,6 +67,7 @@ impl<M: CompletionModel> RigAdapter<M> {
         Self {
             model,
             model_name: name,
+            timing_provider_id: None,
             input_cost,
             output_cost,
             cache_retention: CacheRetention::None,
@@ -106,6 +108,17 @@ impl<M: CompletionModel> RigAdapter<M> {
     pub fn with_unsupported_params(mut self, params: Vec<String>) -> Self {
         self.unsupported_params = params.into_iter().collect();
         self
+    }
+
+    pub(super) fn with_timing_provider_id(mut self, provider_id: &str) -> Self {
+        self.timing_provider_id = Some(provider_id.to_owned());
+        self
+    }
+
+    fn record_dispatch(&self) {
+        if let Some(provider_id) = &self.timing_provider_id {
+            super::timing::record_dispatch(provider_id, Some(&self.model_name));
+        }
     }
 
     /// Strip unsupported fields from a `CompletionRequest` in place.
@@ -792,6 +805,7 @@ where
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let rig_req = self.build_plain_request(request)?;
+        self.record_dispatch();
 
         let response =
             self.model
@@ -833,6 +847,7 @@ where
 
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
         let rig_request = self.build_plain_request(request)?;
+        self.record_dispatch();
         let upstream =
             self.model
                 .stream(rig_request)
@@ -849,6 +864,7 @@ where
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let (rig_req, known_tool_names) = self.build_tool_request(request)?;
+        self.record_dispatch();
 
         let response =
             self.model
@@ -912,6 +928,7 @@ where
         request: ToolCompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
         let (rig_request, _known_tool_names) = self.build_tool_request(request)?;
+        self.record_dispatch();
         let upstream =
             self.model
                 .stream(rig_request)

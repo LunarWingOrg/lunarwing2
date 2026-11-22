@@ -537,6 +537,22 @@ public-only validating proxy:
   makes one bounded attempt before running the command. Mid-run failures use
   `lunarwing-proxy-relay transport: …` so they do not hide the command's exit
   status.
+- relay failure attribution (WI#836): the sandboxed command shares stderr
+  with the relay wrapper, so the marker alone cannot name the proxy. A run is
+  classified `proxy_error` only when the exit code is 125, a line *starts*
+  with `lunarwing-proxy-relay:`, and the host relay accepted no container
+  connection during the run. `ProxyRelay` counts accepts; `relay.py` binds its
+  listener before the startup probe, so a failed startup leaves the count at
+  zero while any run that reached the proxy has at least one. A command that
+  prints the marker itself is reported with its own exit code and stderr.
+- relay connection cap (WI#834): the host relay serves at most 32 container
+  connections at once, the same cap `relay.py` holds in-container. Finished
+  connections are reaped, so the cap bounds live connections only; the
+  execution's lifetime accept count is unbounded. That lifetime count is the
+  WI#836 contact record above; reaping never lowers it. A connection over
+  the cap waits on the socket until a slot frees. A failed `accept` (for example
+  `EMFILE`) is logged and retried after a delay that doubles from 10 ms to 1 s
+  and resets on the next success, instead of ending the relay.
 - diagnosing WI#641: `EACCES` alone does not establish a cause. From a trusted
   checkout on the affected host, run
   `sudo ic/scripts/lunarwing-sandbox-proxy-diag.sh <tenant> [--watch]` while

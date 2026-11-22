@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -81,18 +82,50 @@ test("dangerous-class commands are denied", () => {
   assertBlocked("ls /tmp/ssh-agent.sock", "SSH")
 })
 
+test("the SSH agent mount path and ssh-add are denied (WI#829)", () => {
+  // ic/scripts/mt-admin-lib/09-worker-config.sh mounts a directory at
+  // /tmp/ssh-agent and exports SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock.
+  // The bare /tmp/ssh-agent.sock literal the rule used to match alone never
+  // exists on any lane, and the kimi lane gets no agent mount at all.
+  for (const command of [
+    "ls /tmp/ssh-agent",
+    "ls /tmp/ssh-agent/",
+    "ls /tmp/ssh-agent/ssh-agent.sock",
+    "cat /tmp/ssh-agent/ssh-agent.sock",
+    "ssh -o IdentityAgent=/tmp/ssh-agent/ssh-agent.sock host",
+    "xargs -a /tmp/ssh-agent/ssh-agent.sock true",
+    "ls /tmp//ssh-agent/ssh-agent.sock",
+    "ls /tmp/wi829/../ssh-agent/ssh-agent.sock",
+  ]) {
+    assertBlocked(command, "SSH")
+  }
+  // ssh-add is the step that loads a key into an agent — the credential
+  // broker action itself, whether spelled bare or through a path.
+  assertBlocked("ssh-add /home/kimi/.ssh/id_ed25519", "SSH")
+  assertBlocked("ssh-add", "SSH")
+  assertBlocked("/usr/bin/ssh-add -D", "SSH")
+  // Direct key-file use stays ordinary work: with no agent on this lane it is
+  // how a key-based push authenticates. Denying `-i` but allowing the ambient
+  // ~/.ssh key behind `ssh -T` would be the same credential path twice.
+  assertAllowed("ssh -T git@github.com")
+  assertAllowed("ssh -i /home/kimi/.ssh/id_ed25519 git@github.com")
+  assertAllowed("GIT_SSH_COMMAND='ssh -i /home/kimi/.ssh/id_ed25519' git push origin main")
+  // A different path that merely shares the prefix stays ordinary work.
+  assertAllowed("ls /tmp/ssh-agent-notes")
+})
+
 test("rm word assembly through ${IFS}, quote splices, brace lists and substitution is denied", () => {
   // WI#824: bash builds the command word from these forms, so the raw text
   // never contains a literal `rm` and checkRm walked past the deny class.
-  assertBlocked("rm${IFS}-rf${IFS}/etc", "recursive/forced rm outside")
-  assertBlocked("rm$IFS-rf$IFS/etc", "recursive/forced rm outside")
-  assertBlocked("r''m -rf /etc", "recursive/forced rm outside")
-  assertBlocked('r"m" -rf /etc', "recursive/forced rm outside")
+  assertBlocked("rm${IFS}-rf${IFS}/etc", "deletion outside")
+  assertBlocked("rm$IFS-rf$IFS/etc", "deletion outside")
+  assertBlocked("r''m -rf /etc", "deletion outside")
+  assertBlocked('r"m" -rf /etc', "deletion outside")
   assertBlocked("{rm,-rf,/etc}", "dynamically assembled command word")
-  assertBlocked("$(echo rm) -rf /home/kumo", "recursive/forced rm outside")
-  assertBlocked("echo $(echo rm) -rf /home/kumo", "recursive/forced rm outside")
-  assertBlocked("`echo rm` -rf /home/kumo", "recursive/forced rm outside")
-  assertBlocked("echo `echo rm` -rf /home/kumo", "recursive/forced rm outside")
+  assertBlocked("$(echo rm) -rf /home/kumo", "deletion outside")
+  assertBlocked("echo $(echo rm) -rf /home/kumo", "deletion outside")
+  assertBlocked("`echo rm` -rf /home/kumo", "deletion outside")
+  assertBlocked("echo `echo rm` -rf /home/kumo", "deletion outside")
   // The flag word assembled around a backslash-newline (WI#824 table).
   const continuation = "\\\n"
   assertBlocked(`rm "-r${continuation}f" /etc`, "rm")
@@ -122,7 +155,7 @@ test("ambiguous command words with deletion-style flags are refused without eval
     assertBlocked(`${word} -r ${fixture}`, "dynamically assembled command word")
   }
   assertBlocked(`fixture\${IFS:0:1}-r\${IFS:0:1}${fixture}`, "dynamically assembled command word")
-  assertBlocked(`rm "-r" ${fixture}`, "recursive/forced rm outside")
+  assertBlocked(`rm "-r" ${fixture}`, "deletion outside")
   assertAllowed("mkdir -p build/{debug,release}")
   assertAllowed("cd $(git rev-parse --show-toplevel)")
 })
@@ -168,6 +201,99 @@ test("recursive rm inside temp roots is allowed, outside is denied", () => {
   assertAllowed("rm stale-lockfile")
 })
 
+const RM_SAFE_TEMP_ROOTS = ["/tmp", "/temp", "/var/tmp"]
+
+function isUnderSafeTempRoot(path: string) {
+  return RM_SAFE_TEMP_ROOTS.some((root) => path === root || path.startsWith(`${root}/`))
+}
+
+test("a symlink under a temp root cannot carry any deletion rule outside the safe roots", (t) => {
+  // WI#830 (from WI#812): containment was a string prefix test, so
+  // `ln -s /app/hooks /tmp/gt/hooks` followed by `rm -rf /tmp/gt/hooks/sub`
+  // was allowed and bash deleted inside /app/hooks. WI#826 then made that
+  // test shared by every deletion rule, so `find /tmp/<link>/ -delete` had
+  // the same escape (review note 20829, AJE-2).
+  const target = mkdtempSync(join(process.cwd(), "wi830-target-"))
+  const linkRoot = mkdtempSync("/tmp/wi830-link-")
+  try {
+    const resolvedTarget = realpathSync(target)
+    if (isUnderSafeTempRoot(resolvedTarget)) {
+      t.skip(`scratch target ${resolvedTarget} is inside a temp root`)
+      return
+    }
+    mkdirSync(join(target, "sub"))
+    const link = join(linkRoot, "hooks")
+    symlinkSync(resolvedTarget, link, "dir")
+    // Every deletion rule judges the resolved path.
+    assertBlocked(`rm -rf ${link}/sub`, "deletion outside")
+    assertBlocked(`rm -rf ${link}/sub/`, "deletion outside")
+    assertBlocked(`rm -rf ${link}`, "deletion outside")
+    assertBlocked(`find ${link}/ -mindepth 1 -delete`, "deletion outside")
+    assertBlocked(`find ${link} -delete`, "deletion outside")
+    assertBlocked(`find ${link} -exec rm {} +`, "deletion outside")
+    assertBlocked(`find ${link} | xargs rm -f`, "deletion outside")
+    assertBlocked(`python3 -c "import shutil;shutil.rmtree('${link}/sub')"`, "deletion outside")
+    assertBlocked(`node -e "require('fs').rmSync('${link}/sub',{recursive:true})"`, "deletion outside")
+    // A symlink that resolves back inside the safe root is still containment.
+    mkdirSync(join(linkRoot, "real"))
+    const innerLink = join(linkRoot, "inner")
+    symlinkSync(join(linkRoot, "real"), innerLink, "dir")
+    assertAllowed(`rm -rf ${innerLink}/x`)
+    assertAllowed(`find ${innerLink}/ -mindepth 1 -delete`)
+    // A name the deletion creates rather than traverses has no link to follow.
+    assertAllowed(`rm -rf ${linkRoot}/not-yet-there/sub`)
+    assertAllowed(`find ${linkRoot}/not-yet-there -delete`)
+    // A link that does not resolve yet is refused: its target can be created
+    // before the deletion runs, and the name below it would go through it.
+    const dangling = join(linkRoot, "dangling")
+    symlinkSync(join(resolvedTarget, "later"), dangling, "dir")
+    assertBlocked(`rm -rf ${dangling}/sub`, "deletion outside")
+    assertBlocked(`rm -rf ${dangling}`, "deletion outside")
+    assertBlocked(`find ${dangling}/ -delete`, "deletion outside")
+    assert.ok(existsSync(join(target, "sub")), "guard must not run the deletion")
+  } finally {
+    rmSync(linkRoot, { recursive: true, force: true })
+    rmSync(target, { recursive: true, force: true })
+  }
+})
+
+test("words the shell would rewrite are denied rather than resolved literally", () => {
+  // The hook runs before the shell expands the command, so it must refuse the
+  // expansion rather than resolve the token it sees (WI#830, from WI#812).
+  assertBlocked("rm -rf {/tmp/x,/home/kumo}", "deletion outside")
+  assertBlocked("rm -rf /tmp/x{,/../../home/kumo}", "deletion outside")
+  assertBlocked("rm -rf /tmp/$DIR", "deletion outside")
+  assertBlocked("rm -rf /tmp/'gt'/sub", "deletion outside")
+  assertBlocked("rm -rf ~/project", "deletion outside")
+  assertBlocked("rm -rf $HOME/project", "deletion outside")
+  // The same refusals hold for the non-rm rules, which share the test.
+  assertBlocked("find /tmp/$DIR -delete", "deletion outside")
+  assertBlocked("find /tmp/'gt'/sub -delete", "deletion outside")
+  assertAllowed("rm -rf /tmp/wi830-scratch")
+  assertAllowed("find /tmp/wi830-scratch -delete")
+})
+
+test("a symlink created earlier in the same command line cannot carry a deletion out", () => {
+  // WI#830 AIT-1: the link does not exist at check time, so resolving cannot
+  // see it and the path counts as a name the deletion creates.
+  const outside = "/home/rarity/wi830-check-only-outside"
+  for (const creator of [
+    `ln -s ${outside}`,
+    `ln --symbolic ${outside}`,
+    `cp -s ${outside}`,
+    `cp --symbolic-link ${outside}`,
+  ]) {
+    assertBlocked(`${creator} /tmp/wi830-d/l && rm -rf /tmp/wi830-d/l/sub`, "symbolic link")
+    assertBlocked(`${creator} /tmp/wi830-d/l; rm -rf /tmp/wi830-d/l/sub/`, "symbolic link")
+    assertBlocked(`mkdir -p /tmp/wi830-d/p && ${creator} /tmp/wi830-d/p/l && rm -rf /tmp/wi830-d/p/l/sub`,
+      "symbolic link")
+  }
+  // A line that creates no link, or deletes non-recursively, is unchanged.
+  assertAllowed("ln -s a b && echo hi")
+  assertAllowed("ln -s a b && rm stale-lockfile")
+  assertAllowed("cp -r a b && rm -rf /tmp/wi830-d")
+})
+
 test("dangerous segment inside a compound command is denied", () => {
   assertBlocked("echo hi && sudo id", "privilege")
   assertBlocked("cargo build; shutdown now", "power")
@@ -193,13 +319,13 @@ test("uppercase recursive and force rm flags are denied outside temp roots", () 
 test("rm checks continued lines together and still allows literal temp cleanup", () => {
   const continuation = "\\\n"
   const outsideTemp = "./wi795-check-only-tree"
-  assertBlocked(`rm ${continuation}-rf ${outsideTemp}`, "recursive/forced rm outside")
-  assertBlocked(`rm ${continuation}-rf ${continuation}${outsideTemp}`, "recursive/forced rm outside")
+  assertBlocked(`rm ${continuation}-rf ${outsideTemp}`, "deletion outside")
+  assertBlocked(`rm ${continuation}-rf ${continuation}${outsideTemp}`, "deletion outside")
   assertAllowed(`rm -rf ${continuation}/tmp/wi795-scratch`)
   assertAllowed(`rm -rf /tmp/wi795-scratch ${continuation}&& echo done`)
   // A path split in the middle of a word is also read with the line break as
   // a space, which names /var/t: denied, failing closed (WI#810 review AII-1).
-  assertBlocked(`rm -rf /var/t${continuation}mp/wi795-scratch`, "recursive/forced rm outside")
+  assertBlocked(`rm -rf /var/t${continuation}mp/wi795-scratch`, "deletion outside")
 })
 
 test("an escaped backslash does not continue an rm command onto the next line", () => {
@@ -215,11 +341,11 @@ test("a continued rm is denied after an apostrophe the shell does not quote", ()
   const continuation = "\\\n"
   const outsideTemp = "./wi810-check-only-tree"
   assertBlocked(`cat <<EOF${nl}it's fine${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`cat <<'EOF'${nl}it's fine${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`echo $'it\\'s'${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
 })
 
 test("apostrophes the shell does quote do not stop the join or hide the rm", () => {
@@ -227,13 +353,13 @@ test("apostrophes the shell does quote do not stop the join or hide the rm", () 
   const continuation = "\\\n"
   const outsideTemp = "./wi810-check-only-tree"
   assertBlocked(`cat <<EOF${nl}it's not it's${nl}EOF${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`echo "it's fine"${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`echo hi # it's fine${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`echo it\\'s${nl}rm ${continuation}-rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
 })
 
 test("a backslash-newline inside single quotes is still a continuation", () => {
@@ -241,7 +367,7 @@ test("a backslash-newline inside single quotes is still a continuation", () => {
   // still runs, and the guard cannot tell this quote from an apostrophe.
   const continuation = "\\\n"
   assertBlocked(`rm 'x${continuation}y' -rf ./wi810-check-only-tree`,
-    "recursive/forced rm outside")
+    "deletion outside")
 })
 
 test("a recursive rm under temp roots over a continuation line is still allowed", () => {
@@ -256,8 +382,8 @@ test("rm text in a quoted argument over a backslash-newline is denied, failing c
   // line-break reading sees an rm word. bash never runs it; the text check
   // denied it before WI#810 as well.
   const continuation = "\\\n"
-  assertBlocked(`printf 'a${continuation}rm -rf /etc${continuation}b'`, "recursive/forced rm outside")
-  assertBlocked(`grep -F 'a${continuation}rm -rf /etc${continuation}b' file`, "recursive/forced rm outside")
+  assertBlocked(`printf 'a${continuation}rm -rf /etc${continuation}b'`, "deletion outside")
+  assertBlocked(`grep -F 'a${continuation}rm -rf /etc${continuation}b' file`, "deletion outside")
 })
 
 test("a comment ending in a word and a backslash does not hide the next line's rm", () => {
@@ -267,11 +393,11 @@ test("a comment ending in a word and a backslash does not hide the next line's r
   const nl = "\n"
   const continuation = "\\\n"
   const outsideTemp = "./wi810-check-only-tree"
-  assertBlocked(`bash -c 'true # note a${continuation}rm -rf ${outsideTemp}'`, "recursive/forced rm outside")
-  assertBlocked(`sh -c '# note a${continuation}rm -rf ${outsideTemp}'`, "recursive/forced rm outside")
+  assertBlocked(`bash -c 'true # note a${continuation}rm -rf ${outsideTemp}'`, "deletion outside")
+  assertBlocked(`sh -c '# note a${continuation}rm -rf ${outsideTemp}'`, "deletion outside")
   assertBlocked(`cat <<EOF${nl}it's${nl}EOF${nl}# cleanup a${continuation}rm -rf ${outsideTemp}`,
-    "recursive/forced rm outside")
-  assertBlocked(`echo $'it\\'s' # note a${continuation}rm -rf ${outsideTemp}`, "recursive/forced rm outside")
+    "deletion outside")
+  assertBlocked(`echo $'it\\'s' # note a${continuation}rm -rf ${outsideTemp}`, "deletion outside")
 })
 
 test("a comment pair in quotes and a flag continuation outside them are read together", () => {
@@ -282,29 +408,29 @@ test("a comment pair in quotes and a flag continuation outside them are read tog
   const continuation = "\\\n"
   const outsideTemp = "./wi810-check-only-tree"
   assertBlocked(`bash -c 'true # a${continuation}rm -v '" -${continuation}rf ${outsideTemp}"`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`cat <<EOF${nl}it's${nl}EOF${nl}# x${continuation}rm -v "'" -${continuation}rf ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
   assertBlocked(`bash -c 'true # a${continuation}rm -v '\\ -${continuation}rf\\ ${outsideTemp}`,
-    "recursive/forced rm outside")
+    "deletion outside")
 })
 
 for (const [name, terminator] of [["CR", "\r"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]]) {
   test(`rm treats ${name} as text, not a newline or a word separator`, () => {
-    assertBlocked(`rm -rf ./wi795-check-only-tree ${terminator}x`, "recursive/forced rm outside")
-    assertBlocked(`rm -rf /tmp/wi795-scratch ${terminator}; true`, "recursive/forced rm outside")
+    assertBlocked(`rm -rf ./wi795-check-only-tree ${terminator}x`, "deletion outside")
+    assertBlocked(`rm -rf /tmp/wi795-scratch ${terminator}; true`, "deletion outside")
     assertAllowed(`rm -rf /tmp/wi795${terminator}scratch`)
   })
 }
 
 test("GNU rm long-option abbreviations are checked without mistaking operands for options", () => {
   for (const flags of ["--r", "--rec", "--f", "--fo", "--rec --fo"]) {
-    assertBlocked(`rm ${flags} ./wi795-check-only-tree`, "recursive/forced rm outside")
+    assertBlocked(`rm ${flags} ./wi795-check-only-tree`, "deletion outside")
   }
   assertAllowed("rm --rec --fo /temp/wi795-scratch")
   assertAllowed("rm --dir ./wi795-check-only-tree")
   assertAllowed("rm -- --rec")
-  assertBlocked("rm --rec -- /tmp/wi795-scratch -wi795-check-only-tree", "recursive/forced rm outside")
+  assertBlocked("rm --rec -- /tmp/wi795-scratch -wi795-check-only-tree", "deletion outside")
 })
 
 test("unparseable or malformed payloads fail closed", () => {
@@ -516,9 +642,170 @@ test("the probe commands of runs 500-505 stay ordinary work", () => {
   assertAllowed("rm -rf /tmp/x")
 })
 
+test("a task cannot start kimi service mode (WI#833)", () => {
+  // WI#833 point 1: `kimi` is on PATH in the worker image, and these three
+  // spellings started service mode — an HTTP API (sessions, :wait, /api/v1/kap.md,
+  // MCP management) that is a listener opened by a task (WI#357).
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked("kimi web", "kimi service mode")
+  assertBlocked("kimi web --json", "kimi service mode")
+  assertBlocked("kimi server --port 9000 &", "kimi service mode")
+  assertBlocked("/usr/local/bin/kimi server", "kimi service mode")
+  assertBlocked("kimi --debug server", "kimi service mode")
+  // Through a wrapper, a prefix assignment, a shell one-liner and a loop body.
+  assertBlocked("bash -c 'kimi server'", "kimi service mode")
+  assertBlocked("bash -lc 'kimi web'", "kimi service mode")
+  assertBlocked("env KIMI_X=1 kimi web", "kimi service mode")
+  assertBlocked("cd /app && kimi server", "kimi service mode")
+  assertBlocked("for f in x; do kimi server; done", "kimi service mode")
+  assertBlocked("if true; then kimi server; fi", "kimi service mode")
+  assertBlocked("xargs -I {} kimi server", "kimi service mode")
+  // The subcommands the lane uses keep passing.
+  assertAllowed("kimi -p hello")
+  assertAllowed("kimi -p 'kimi server' --output-format stream-json")
+  assertAllowed("kimi --version")
+  assertAllowed("kimi chat")
+  assertAllowed("kimi mcp serve")
+  // Shell keywords, loops and wrapper flags do not deny ordinary work.
+  assertAllowed("for f in *.rs; do echo $f; done")
+  assertAllowed("if true; then cargo check; fi")
+  assertAllowed("bash -lc 'cargo check -j18'")
+  assertAllowed("find /tmp -print0 | xargs -0 -I {} rm -rf {}")
+  // Reading the words is not running them.
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("echo 'kimi web --json'")
+})
+
+test("a task cannot start any listed listener (WI#833)", () => {
+  // The hook had no listener rule at all, so fixing only the kimi subcommands
+  // would leave the class open (WI#833 study pass-394).
+  assertBlocked("python3 -m http.server 8080", "listener started from a task")
+  assertBlocked("python3 -m http.server 8080 &", "listener started from a task")
+  assertBlocked("nc -l -p 9000", "listener started from a task")
+  assertBlocked("ncat -l 9000", "listener started from a task")
+  assertBlocked("netcat -lp 9000", "listener started from a task")
+  assertBlocked("socat TCP-LISTEN:9000,fork -", "listener started from a task")
+  assertBlocked("busybox httpd -p 8080", "listener started from a task")
+  assertBlocked("php -S 0.0.0.0:8080", "listener started from a task")
+  assertBlocked("ruby -run -e httpd . -p 8080", "listener started from a task")
+  assertBlocked("echo hi | nc -l 9000", "listener started from a task")
+  // The same programs used as clients, or for their version, stay ordinary work.
+  assertAllowed("nc -zv host 80")
+  assertAllowed("curl -sf http://127.0.0.1:8080/health")
+  assertAllowed("php --version")
+  assertAllowed("ruby -v")
+  assertAllowed("socat -V")
+  assertAllowed("python3 -m pytest tests/ -q")
+  assertAllowed("python3 -m json.tool")
+})
+
+test("kimi print-mode prompt values are not service subcommands", () => {
+  assertAllowed("kimi -p server")
+  assertAllowed("kimi --prompt web")
+  assertAllowed("kimi --prompt='check web' --output-format stream-json")
+  assertAllowed('kimi -p "check web; list server notes" --output-format stream-json')
+  assertAllowed(`bash -c 'kimi -p "review web"'`)
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
   // tripped runGuard's kill timeout. The linear scan decides it immediately.
   assertAllowed("chmod -R ".repeat(1500))
+})
+
+test("interpreter one-liners delete without parentheses or through a binding", () => {
+  // WI#832: WI#826 read only a `name(` call with the target in the first
+  // argument, so a parenthesis-free Perl call, an import alias and a getattr
+  // lookup all deleted freely.
+  assertBlocked(`perl -MFile::Path -e 'rmtree "/home/kimi/x"'`, "deletion outside")
+  assertBlocked(`perl -e 'unlink glob "/home/kimi/x/*"'`, "deletion outside")
+  assertBlocked(`python3 -c "from shutil import rmtree as r; r('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil; getattr(shutil, 'rmtree')('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil as s; s.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c "import shutil; f = shutil.rmtree; f('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e 'rmtree $target'`, "cannot verify")
+  // The same readings keep a literal temp target allowed; a glob is not a
+  // literal (as for `rm -rf /tmp/*.log`), so it stays denied.
+  assertAllowed(`perl -MFile::Path -e 'rmtree "/tmp/wi832-x"'`)
+  assertAllowed(`perl -e 'unlink "/tmp/wi832-x/file"'`)
+  assertBlocked(`perl -e 'unlink glob "/tmp/wi832-x/*"'`, "deletion outside")
+  assertAllowed(`python3 -c "from shutil import rmtree as r; r('/tmp/wi832-x')"`)
+  assertAllowed(`python3 -c "import shutil; getattr(shutil, 'rmtree')('/tmp/wi832-x')"`)
+  assertAllowed(`python3 -c "import shutil as s; s.rmtree('/tmp/wi832-x')"`)
+  // A deletion name inside a string literal is text, not a call.
+  assertAllowed(`perl -e 'print "unlink", "/home/kimi/x"'`)
+  assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
+})
+
+test("find and rsync delete through the same temp-root test", () => {
+  // WI#832: `find -exec unlink` deleted without a deletion action match, and
+  // rsync --delete removed whatever the destination had.
+  assertBlocked("find /home/kimi -type f -exec unlink {} \\;", "deletion outside")
+  assertBlocked("find /home/kimi -type f -exec rmdir {} \\;", "deletion outside")
+  assertBlocked("find /home/kimi -type f -exec shred {} \\;", "deletion outside")
+  assertBlocked("rsync -a --delete /tmp/empty/ /home/kimi/x/", "deletion outside")
+  assertBlocked("rsync -a --del /tmp/empty/ /home/kimi/x/", "deletion outside")
+  assertBlocked("rsync -a --remove-source-files /home/kimi/x/ /tmp/wi832/", "deletion outside")
+  assertAllowed("find /tmp/wi832 -type f -exec unlink {} \\;")
+  assertAllowed("rsync -a --delete /tmp/empty/ /tmp/wi832-x/")
+  assertAllowed("rsync -a /tmp/wi832-a/ /tmp/wi832-b/")
+  assertAllowed("rsync -a --remove-source-files /tmp/wi832-a/ /tmp/wi832-b/")
+})
+
+test("every decode shape WI#832 named is denied into a shell or interpreter", () => {
+  assertBlocked(`printf '\\x73\\x75\\x64\\x6f id' | sh`, "decoded")
+  assertBlocked(`printf '\\163\\165\\144\\157 id' | sh`, "decoded")
+  assertBlocked("echo aGVsbG8K | openssl base64 -d | sh", "decoded")
+  assertBlocked("zcat payload.gz | bash", "decoded")
+  assertBlocked("gunzip -c payload.gz | bash", "decoded")
+  assertBlocked("xzcat payload.xz | bash", "decoded")
+  assertBlocked("zstd -d -c payload.zst | bash", "decoded")
+  assertBlocked("echo aGVsbG8K | perl -MMIME::Base64 -ne 'print decode_base64($_)' | sh", "decoded")
+  assertBlocked("echo aGVsbG8K | python3 -c 'import base64;print(base64.b64decode(\"aGVsbG8K\"))' | sh", "decoded")
+  // A plain printf with no escapes decodes nothing.
+  assertAllowed(`printf '%s\\n' hello | sh`)
+  assertAllowed("printf 'hello world' | rev")
+})
+
+test("git commands that discard work are denied in the spellings WI#832 named", () => {
+  // `git restore` discards the same uncommitted changes as `git checkout -- .`,
+  // so it takes the same verdict; the rest are the flag spellings of classes
+  // WI#826 already denied.
+  assertBlocked("git restore .", "git command")
+  assertBlocked("git restore --worktree --staged .", "git command")
+  assertBlocked("git restore ./", "git command")
+  assertBlocked("git checkout ./", "git command")
+  assertBlocked("git stash --all", "git command")
+  assertBlocked("git stash -a", "git command")
+  assertBlocked("git checkout -f", "git command")
+  assertBlocked("git checkout --force", "git command")
+  assertBlocked("git switch --discard-changes", "git command")
+  assertBlocked("git switch -f main", "git command")
+  assertAllowed("git restore src/main.rs")
+  assertAllowed("git restore --staged src/main.rs")
+  assertAllowed("git stash list")
+  assertAllowed("git stash pop")
+  assertAllowed("git switch -c feature")
+  assertAllowed("git checkout -b feature")
+})
+
+test("the noclobber override writes a block device like a plain redirect", () => {
+  assertBlocked("cat x >| /dev/sda1", "block-device")
+  assertBlocked("echo pwn >| /dev/mapper/vg-root", "block-device")
+  assertAllowed("cat x >| /tmp/wi832.out")
+})
+
+test("a dry-run clean and a deleting tr no longer deny (WI#832 false denials)", () => {
+  // `git clean -fdn` is a dry run, like the allowed `git clean -n`; the flag
+  // test had matched the `f` alone.
+  assertBlocked("git clean -fd", "git command")
+  assertBlocked("git clean -fdx", "git command")
+  assertAllowed("git clean -fdn")
+  assertAllowed("git clean -fn")
+  assertAllowed("git clean --dry-run -fd")
+  // `tr -d '\r'` strips carriage returns; it decodes nothing.
+  assertBlocked("echo aGVsbG8K | tr -d '\\n' | rev | sh", "decoded")
+  assertAllowed("cat script.sh | tr -d '\\r' | bash")
+  assertAllowed("cat script.sh | tr -d '\\r' > script.sh.tmp")
 })

@@ -66,6 +66,17 @@ write_tenant_gotify_config "$name" 'https://gotify.example.org' ''
 jq -e 'has("title") | not' "$config" >/dev/null \
   || { echo 'FAIL: empty title was written instead of omitted' >&2; exit 1; }
 
+# WI#831 (AJB-4): a title or URL carrying `"` or `\` must still produce valid
+# JSON with exactly the two expected keys, not a broken document that makes the
+# tool fall back to its compiled-in defaults.
+write_tenant_gotify_config "$name" 'https://gotify.example.org' 'Agent "quoted" \ backslash'
+jq -e '.url and .title' "$config" >/dev/null \
+  || { echo 'FAIL: a quoted title produced invalid JSON' >&2; exit 1; }
+[[ "$(jq -r '.title' "$config")" == 'Agent "quoted" \ backslash' ]] \
+  || { echo 'FAIL: a quoted title was not preserved verbatim' >&2; exit 1; }
+[[ "$(jq -r 'keys | join(",")' "$config")" == 'title,url' ]] \
+  || { echo 'FAIL: a quoted title leaked extra keys into the config' >&2; exit 1; }
+
 # The capability rewrite consumes the URL from that same file, so the
 # allowlist and the tool's effective base URL always name one host.
 gotify_caps="$fixture/state/tools/gotify-tool.capabilities.json"
