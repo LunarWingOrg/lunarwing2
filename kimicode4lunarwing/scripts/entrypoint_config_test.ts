@@ -26,11 +26,13 @@ function handTree(path: string): void {
   if (!lstatSync(path).isDirectory()) return
   for (const name of readdirSync(path)) handTree(join(path, name))
 }
+const bakedMcpPath = fileURLToPath(new URL("../config/mcp.json", import.meta.url))
 function runSetup(options: { encoding: "utf8"; env: NodeJS.ProcessEnv }) {
   const asRoot = process.getuid?.() === 0
   if (asRoot && options.env.KIMI_CODE_HOME) handTree(dirname(options.env.KIMI_CODE_HOME))
   return spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     ...options,
+    env: { KIMI_MCP_SOURCE: bakedMcpPath, ...options.env },
     ...(asRoot ? { uid: SETUP_RUN_ID, gid: SETUP_RUN_ID } : {}),
   })
 }
