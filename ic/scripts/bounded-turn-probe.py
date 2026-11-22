@@ -105,15 +105,6 @@ class Gateway:
         except (urllib.error.URLError, OSError) as error:
             raise ProbeError(f"{method} {path} failed: {error}") from error
 
-    def get_json(self, path):
-        status, body = self._request("GET", path)
-        if status != 200:
-            raise ProbeError(f"GET {path} answered {status}: {body[:200]!r}")
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError as error:
-            raise ProbeError(f"GET {path} did not answer JSON: {error}") from error
-
     def get_text(self, path):
         status, body = self._request("GET", path)
         if status != 200:

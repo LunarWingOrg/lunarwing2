@@ -135,18 +135,12 @@ class VerdictTests(unittest.TestCase):
 class FakeGateway:
     """Serves the contract endpoints, a history body and a scripted stream."""
 
-    def __init__(self, history_body="", stream_entries=()):
+    def __init__(self, history_body=""):
         self.base_url = "http://127.0.0.1:1"
         self.token = "token"
         self.timeout = 60
         self.history_body = history_body
-        self.stream_entries = list(stream_entries)
         self.sent = []
-
-    def get_json(self, path):
-        if path == "/api/chat/capabilities":
-            return {"api_version": 1}
-        raise AssertionError(f"unexpected GET {path}")
 
     def raw_get(self, path):
         if path == "/api/chat/capabilities":
