@@ -4092,11 +4092,17 @@ auto-approval:
   `-c`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` naming a config file, and a
   `git config` call that names such a key (the classic form, `--add`, the
   `set`/`get` subcommands), renames a section into or out of one (the
-  `rename-section` subcommand or `--rename-section` option), or opens
-  `--edit`. A `git config` clause longer than 4 KB is refused unread.
-  Accepted residuals: an alias already in a config file, one the task wrote
-  directly (`>> .git/config`), and one in a file `HOME` or `XDG_CONFIG_HOME`
-  points at; the guard cannot read those cheaply.
+  `rename-section` subcommand or `--rename-section` option), or opens the
+  editor (`edit`, `--edit`, `-e` before the first operand). git's own value
+  options (`-C`, `--work-tree`, `--git-dir`, …) are stepped over, and
+  `git config`'s value options and long-option prefixes are read as git reads
+  them (`--fil` is `--file`). A `git config` clause longer than 4 KB is
+  refused unread. Accepted residuals: an alias already in a config file, one
+  the task wrote directly (`>> .git/config`), one in a file `HOME` or
+  `XDG_CONFIG_HOME` points at, and a key held in a shell variable
+  (`GIT_CONFIG_KEY_0=$k`); the guard cannot read those cheaply. Like the
+  other rules, this one reads quoted text too, so a command that only
+  mentions `git config include.path` can be refused.
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`mv` into a removed directory, `truncate`
   on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is

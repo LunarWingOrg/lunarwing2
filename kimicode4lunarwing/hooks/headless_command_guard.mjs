@@ -708,6 +708,14 @@ function isClauseTerminator(ch) {
   return ch === ";" || ch === "&" || ch === "|" || ch === "\n";
 }
 
+// git's own options that take the next word as their value (`git -C dir`,
+// `git --work-tree dir`). The value is neither the verb nor an option, so a
+// scan of the leading words must step over it.
+const GIT_VALUE_OPTIONS = new Set([
+  "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
+  "--config-env", "--attr-source", "--list-cmds",
+]);
+
 /** The git verb after any leading options, and the index after it. */
 function gitVerb(text, from) {
   let i = from;
@@ -718,7 +726,7 @@ function gitVerb(text, from) {
     const word = text.slice(start, i);
     if (word.length === 0) break;
     if (!word.startsWith("-")) return { verb: word, after: i };
-    if (word === "-C" || word === "-c") {
+    if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb.
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
       while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
@@ -764,40 +772,71 @@ function hasGitAliasEnv(segment) {
   return false;
 }
 
-/** The name operands of a `git config` call, after options and their values. */
-function gitConfigOperands(after) {
+// `git config`'s long options, for resolving the unambiguous prefixes git
+// accepts (`--fil` is `--file`, `--ren` is `--rename-section`).
+const GIT_CONFIG_LONG_OPTIONS = [
+  "global", "system", "local", "worktree", "file", "blob", "get", "get-all",
+  "get-regexp", "get-urlmatch", "get-color", "get-colorbool", "replace-all",
+  "add", "unset", "unset-all", "rename-section", "remove-section", "list",
+  "fixed-value", "edit", "type", "no-type", "null", "name-only", "includes",
+  "no-includes", "show-origin", "show-scope", "default", "comment", "value",
+  "bool", "int", "bool-or-int", "path", "expiry-date", "all", "regexp", "url",
+  "append",
+];
+const GIT_CONFIG_VALUE_LONG = new Set(["file", "blob", "type", "default", "comment", "value"]);
+const GIT_CONFIG_VALUE_SHORT = new Set(["-f", "-t"]);
+
+/** The `git config` long option a `--name` spells, exactly or by unique prefix. */
+function gitConfigLongOption(name) {
+  if (GIT_CONFIG_LONG_OPTIONS.includes(name)) return name;
+  const matches = GIT_CONFIG_LONG_OPTIONS.filter((option) => option.startsWith(name));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * Read a `git config` call: its name operands after options and their
+ * values, whether it opens the editor, and whether it renames a section. An
+ * edit option counts only before the first operand, where git reads it; a
+ * later `-e` is a value (`core.editor 'vim -e'`).
+ */
+function gitConfigCall(after) {
   const words = argumentWords(after);
-  const valueOptions = ["--file", "-f", "--type", "--default", "--blob"];
-  const operands = [];
+  const call = { operands: [], edit: false, rename: false };
   for (let i = 0; i < words.length; i++) {
-    if (valueOptions.includes(words[i])) {
-      i++;
+    const word = words[i];
+    if (word.startsWith("--") && word.length > 2) {
+      const equals = word.indexOf("=");
+      const option = gitConfigLongOption(word.slice(2, equals === -1 ? undefined : equals));
+      if (option === "edit" && call.operands.length === 0) call.edit = true;
+      if (option === "rename-section") call.rename = true;
+      if (equals === -1 && GIT_CONFIG_VALUE_LONG.has(option)) i++;
       continue;
     }
-    if (words[i].startsWith("-")) continue;
-    operands.push(stripShellQuotes(words[i]));
+    if (word.startsWith("-") && word.length > 1) {
+      if (word === "-e" && call.operands.length === 0) call.edit = true;
+      if (GIT_CONFIG_VALUE_SHORT.has(word)) i++;
+      continue;
+    }
+    call.operands.push(stripShellQuotes(word));
   }
-  return operands;
+  return call;
 }
 
 /**
  * True when a `git config` call names a redirecting key (WI#842): the classic
  * `git config alias.z …` form, the modern `set`/`get` subcommands
  * (`git config set alias.z …`), a section rename into or out of one, in the
- * subcommand or the `--rename-section` option form, or `--edit`, whose editor
- * can write any key. Reads of those keys are refused with the writes; other
+ * subcommand or the `--rename-section` option form (or its prefixes), or the
+ * `edit` subcommand and `--edit`/`-e`, whose editor can write any key. Reads of those keys are refused with the writes; other
  * keys stay ordinary config work.
  */
 function gitConfigAliasVerdict(after) {
-  const words = argumentWords(after);
-  if (words.some((word) => word === "-e" || word === "--edit")) return true;
-  const operands = gitConfigOperands(after);
+  const { operands, edit, rename } = gitConfigCall(after);
+  if (edit || operands[0] === "edit") return true;
   if (operands[0] === "rename-section") {
     return operands.slice(1, 3).some((name) => GIT_REDIRECTING_SECTION.test(name));
   }
-  if (words.includes("--rename-section")) {
-    return operands.slice(0, 2).some((name) => GIT_REDIRECTING_SECTION.test(name));
-  }
+  if (rename) return operands.slice(0, 2).some((name) => GIT_REDIRECTING_SECTION.test(name));
   if (operands[0] === "set" || operands[0] === "get") return GIT_REDIRECTING_KEY.test(operands[1] ?? "");
   return GIT_REDIRECTING_KEY.test(operands[0] ?? "");
 }
@@ -823,8 +862,13 @@ function gitAliasDefinition(segment, from) {
     const word = words[i];
     if (!word.startsWith("-")) break;
     let value = "";
-    if (word === "-c" || word === "--config-env") value = stripShellQuotes(words[++i] ?? "");
-    else if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    else if (GIT_VALUE_OPTIONS.has(word)) {
+      // Step over every option value (`git -C . -c alias.z=…`); only a `-c`
+      // or `--config-env` value can name a key.
+      const next = stripShellQuotes(words[++i] ?? "");
+      if (word === "-c" || word === "--config-env") value = next;
+    }
     if (GIT_REDIRECTING_KEY.test(value)) return true;
   }
   if (verb !== "config") return false;

@@ -1069,4 +1069,25 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   assertAllowed("git config --rename-section foo bar")
   assertAllowed("git config --list")
   assertAllowed("git -c core.quotepath=off status")
+  // From the independent read of the fix: git's own value options are
+  // stepped over, git config's value options and long-option prefixes are
+  // read, and an edit option counts only before the first operand.
+  for (const command of [
+    "git -C . -c alias.z='reset --hard' z",
+    "git --work-tree . -c alias.z='reset --hard' z",
+    "git -C . --config-env alias.z=V z",
+    "git config --comment x alias.z 'reset --hard'",
+    "git config -t bool-or-str alias.z 'reset --hard'",
+    "git config --fil .git/config alias.z 'reset --hard'",
+    "git config set --value x alias.z 'reset --hard'",
+    "git config --ren foo alias",
+    "git config edit",
+    "git config --ed",
+    "git --work-tree . reset --hard",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config core.editor 'vim -e'")
+  assertAllowed('git config user.name "Jane -e Doe"')
+  assertAllowed("git -C sub log --oneline")
 })
