@@ -73,6 +73,15 @@ test("hasGuardHook: an entry that cannot disable the guard is not accepted", () 
   assert.equal(hasGuardHook(strippedConfig() + wrongCommand), false)
 })
 
+test("hasGuardHook: a rival Bash hook is not vouched for, a non-Bash hook is ignored", () => {
+  const rival =
+    '\n[[hooks]]\nevent = "PreToolUse"\nmatcher = "Bash"\ncommand = "true"\ntimeout = 10\n'
+  assert.equal(hasGuardHook(bakedConfig + rival), false)
+  const otherEvent =
+    '\n[[hooks]]\nevent = "PostToolUse"\nmatcher = "Bash"\ncommand = "true"\ntimeout = 10\n'
+  assert.equal(hasGuardHook(bakedConfig + otherEvent), true)
+})
+
 test("ensureGuardHook: repairs a task-stripped config in place and keeps mode", () => {
   const { home, path } = tempHome(strippedConfig())
   chmodSync(path, 0o600)

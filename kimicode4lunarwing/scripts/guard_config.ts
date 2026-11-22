@@ -158,7 +158,10 @@ function parseSimpleValue(line: string): { key: string; value: string } | undefi
  * array-of-tables element. Conservative by design: an entry this scan cannot
  * read as a plain string (escapes, quoted header, sub-table) reports false and
  * the caller appends the canonical block, so a false negative is harmless and
- * a false positive is what must not happen.
+ * a false positive is what must not happen. A `PreToolUse`/`Bash` element with
+ * any other command is also rejected: whether the CLI runs every matching
+ * hook or the first one is not pinned by the contract gate, so the lane only
+ * vouches for configs where its own entry is the one that answers for Bash.
  */
 export function hasGuardHook(config: string): boolean {
   let state: ScanState = "none"
@@ -198,7 +201,7 @@ export function hasGuardHook(config: string): boolean {
     values.set(pair.key, pair.value)
   }
   closeElement()
-  return elements.some((element) => {
+  const isCanonical = (element: { values: Map<string, string>; clean: boolean }): boolean => {
     const entries = element.values
     if (!element.clean || entries.size < 3 || entries.size > 4) return false
     for (const key of entries.keys()) {
@@ -210,7 +213,11 @@ export function hasGuardHook(config: string): boolean {
       entries.get("command") === GUARD_HOOK_COMMAND &&
       (entries.get("timeout") === undefined || entries.get("timeout") === "10")
     )
-  })
+  }
+  const answersForBash = (element: { values: Map<string, string> }): boolean =>
+    element.values.get("event") === "PreToolUse" && element.values.get("matcher") === "Bash"
+  const bashEntries = elements.filter(answersForBash)
+  return bashEntries.length > 0 && bashEntries.every(isCanonical)
 }
 
 function errorMessage(error: unknown): string {
@@ -264,7 +271,7 @@ export function ensureGuardHook(home: string | undefined, taskId: string, enforc
   const repaired = config + guardHookBlock()
   if (!hasGuardHook(repaired)) {
     throw new Error(
-      `cannot re-assert the PreToolUse guard hook in ${path}: the file ends inside a string or table, so no appended [[hooks]] entry would register; refusing to spawn task ${taskId} unguarded (WI#847)`,
+      `cannot re-assert the PreToolUse guard hook in ${path}: the file ends inside a string or table, or carries a PreToolUse/Bash hooks entry other than the lane's own, so no appended [[hooks]] entry would be the one answering for Bash; refusing to spawn task ${taskId} unguarded (WI#847)`,
     )
   }
   try {

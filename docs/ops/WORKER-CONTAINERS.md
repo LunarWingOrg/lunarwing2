@@ -4281,7 +4281,11 @@ structure scan that blanks comments and multi-line strings, so a hook entry
 that only *looks* registered (in a comment or a `"""` block) does not count;
 an element carrying any key outside `event`/`matcher`/`command`/`timeout`
 (an `enabled = false`, say) or a `timeout` other than `10` is not accepted
-either. A repair appends the canonical WI#206 block and logs it. Fail-closed:
+either, and neither is a `PreToolUse`/`Bash` element with a different command
+(whether the CLI runs every matching hook or only the first is not pinned by
+the contract gate, so the lane only vouches for configs where its own entry
+answers for Bash). A repair appends the canonical WI#206 block and logs it.
+Fail-closed:
 
 - Managed shapes (identity drop or delegated runner) fail the task when
   `KIMI_CODE_HOME` is unset, when the file is missing/unreadable, or when it
