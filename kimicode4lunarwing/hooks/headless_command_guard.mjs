@@ -294,9 +294,11 @@ const FROM_IMPORT = /\bfrom\s+([\w.]+)\s+import\s+([^;\n]+)/g;
 const MODULE_IMPORT_ALIAS = /\bimport\s+([\w.]+)\s+as\s+([\w$]+)/g;
 const ASSIGNED_SINK =
   /\b([A-Za-z_$][\w$]*)\s*=\s*((?:[\w$]+\.)*)(rmtree|remove_tree|rimraf|rmdir|unlink|remove|removedirs|rmSync|rmdirSync|unlinkSync)\b(?!\s*\()/g;
-// Perl calls deletion without parentheses: `rmtree "/x"`, `unlink glob "/x/*"`.
-const PERL_BAREWORD_DELETE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s*(?:glob\s+)?(['"])([^'"]*)\1/g;
-const PERL_BAREWORD_VARIABLE = /\b(?:unlink|rmdir|rmtree|remove_tree)\b(?!\s*\()\s+(?:glob\s+)?[$@%]/g;
+// Perl calls deletion with or without parentheses: `rmtree "/x"`,
+// `rmtree("/x")`, `unlink glob "/x/*"`. The call head is matched alone and
+// its operands are read by perlDeletionCall, so a comma list is checked in
+// full rather than only its first operand (WI#840).
+const PERL_DELETE_CALL = /\b(?:unlink|rmdir|rmtree|remove_tree)\b/g;
 const DEVICE_TARGET = /^\/dev\/(?:sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
 const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b([^;&|\n]*)/g;
 const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b([^;&|\n]*)/g;
@@ -461,7 +463,10 @@ function deletionCallOffsets(code, aliases) {
 /**
  * Strip one layer of shell quoting that wraps the whole one-liner body, so the
  * interpreter's own string literals are the only quotes the readers see:
- * `'print "unlink"'` becomes `print "unlink"` (WI#832).
+ * `'print "unlink"'` becomes `print "unlink"` (WI#832). A double-quoted shell
+ * word also passes `\"`, `\\`, `\$` and `` \` `` to the interpreter without
+ * the backslash, so those escapes are removed too; the readers then see the
+ * code the interpreter runs, not the shell's spelling of it (WI#840).
  */
 function stripOuterShellQuotes(code) {
   const text = code.trim();
@@ -476,7 +481,9 @@ function stripOuterShellQuotes(code) {
     }
     if (text[i] === quote) end = i;
   }
-  return end === text.length - 1 ? text.slice(1, -1) : text;
+  if (end !== text.length - 1) return text;
+  const inner = text.slice(1, -1);
+  return quote === '"' ? inner.replace(/\\(["\\$`])/g, "$1") : inner;
 }
 
 /** True when `index` in the code sits inside a single- or double-quoted string. */
@@ -497,20 +504,72 @@ function insideQuotedString(code, index) {
   return quote !== "";
 }
 
+/** The value of the Perl string literal that opens at `from` and the index after it. */
+function perlStringLiteral(code, from) {
+  const quote = code[from];
+  if (quote !== "'" && quote !== '"') return null;
+  let value = "";
+  for (let i = from + 1; i < code.length; i++) {
+    if (code[i] === "\\" && i + 1 < code.length) {
+      value += code[++i];
+      continue;
+    }
+    if (code[i] === quote) return { value, next: i + 1 };
+    value += code[i];
+  }
+  return null;
+}
+
 /**
- * The Perl parenthesis-free deletion verdict: `rmtree "dir"`, `unlink glob
- * "dir/*"`, and a variable operand the guard cannot resolve (WI#832). A call
- * name inside a string literal (`print "unlink"`) is text, not a call.
+ * The operands of a Perl deletion call whose keyword ends at `from`, and
+ * whether part of its operand list is not a quoted literal. The call may be
+ * spelled with or without parentheses and may take a comma list; every
+ * operand is read, because checking only the first leaves the rest unverified
+ * (WI#840). Null means the keyword is not a call shape at all (`qw(unlink)`,
+ * a reference, a hash key).
+ */
+function perlDeletionCall(code, from) {
+  let i = from;
+  while (i < code.length && /[ \t]/.test(code[i])) i++;
+  if (code[i] === "(") {
+    i++;
+  } else {
+    const glob = /^glob[ \t]+/.exec(code.slice(i));
+    if (glob !== null) i += glob[0].length;
+    else if (!['"', "'", "$", "@", "%"].includes(code[i] ?? "")) return null;
+  }
+  const operands = [];
+  for (;;) {
+    while (i < code.length && /[ \t]/.test(code[i])) i++;
+    const literal = perlStringLiteral(code, i);
+    if (literal === null) {
+      return { operands, unverifiable: i < code.length && !/[;)\n]/.test(code[i]) };
+    }
+    operands.push(literal.value);
+    i = literal.next;
+    while (i < code.length && /[ \t]/.test(code[i])) i++;
+    if (code[i] !== ",") return { operands, unverifiable: false };
+    i++;
+  }
+}
+
+/**
+ * The Perl deletion verdict: `rmtree "dir"`, `unlink glob "dir/*"`,
+ * `rmtree("a", "b")`, and a target the guard cannot resolve (WI#832). Every
+ * operand of the comma list is read, and the shell escapes of a quoted
+ * one-liner are removed before the calls are read (WI#840). A call name
+ * inside a string literal (`print "unlink"`) is text, not a call.
  */
 function perlDeletionVerdict(rawCode) {
   const code = stripOuterShellQuotes(rawCode);
-  for (const match of code.matchAll(PERL_BAREWORD_DELETE)) {
+  for (const match of code.matchAll(PERL_DELETE_CALL)) {
     if (insideQuotedString(code, match.index)) continue;
-    if (!isSafeTempPath(match[2])) return outsideTempReason("interpreter deletion", [match[2]]);
-  }
-  for (const match of code.matchAll(PERL_BAREWORD_VARIABLE)) {
-    if (insideQuotedString(code, match.index)) continue;
-    return "interpreter deletion whose target the guard cannot verify";
+    const call = perlDeletionCall(code, match.index + match[0].length);
+    if (call === null) continue;
+    if (call.unverifiable) return "interpreter deletion whose target the guard cannot verify";
+    for (const operand of call.operands) {
+      if (!isSafeTempPath(operand)) return outsideTempReason("interpreter deletion", [operand]);
+    }
   }
   return null;
 }
