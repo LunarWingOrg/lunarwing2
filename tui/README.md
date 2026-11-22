@@ -670,7 +670,8 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
   silently (an approval keyword) takes the next reply unless you cancel it with Ctrl+S; a finished turn
   without a reply is resolved by a history resync; generated images are not delivered.
 - Restart detection needs `GET /api/gateway/status` at connect. When that probe fails or times out
-  (3 s), a turn that died in a restart stays open until history shows it Failed for longer than 610 s. A
+  (3 s), a turn that died in a restart stays open until history shows it Failed for longer than 2530 s (the
+  daemon's longest late window, so a late reply can still land). A
   daemon host that was suspended while this TUI ran on another machine reads as a restart, because the
   daemon's uptime does not count the suspend.
 - On V1 gateways, after a credential is accepted through `auth-token`, the daemon leaves credential mode
