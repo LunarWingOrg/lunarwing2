@@ -1065,6 +1065,13 @@ function* listenerSegments(text) {
   if (words.length > 0) yield words;
 }
 
+// WI#852: every 2.7.2 command that starts a listener or opens the Remote
+// Control relay. `vis` binds the session visualizer's HTTP port; `rc` (alias
+// `remote`) runs the local server through Remote Control. Re-read
+// `kimi --help` against this set at every bump: a new subcommand is not
+// covered until it is named here.
+const KIMI_SERVICE_SUBCOMMANDS = new Set(["server", "web", "rc", "remote", "vis"]);
+
 // bash glues shell punctuation to a command word: `(kimi`, `$(kimi`,
 // `` `kimi ``, `server)`, `${…}`, `kimi server}`. This reader has no parser,
 // so strip the punctuation a listener word may carry; quoted prompt text is
@@ -1160,8 +1167,8 @@ const KIMI_FLAG_OPTIONS = new Set([
  * Deny a service subcommand unless every reading of the option words agrees
  * there is none (WI#845). Only options the table knows are read as the CLI
  * reads them; an unknown option may or may not consume the next word and the
- * hook cannot ask the CLI, so both readings are walked and `server` or `web`
- * reached by either one is a denial. `--option=value` needs no special case:
+ * hook cannot ask the CLI, so both readings are walked and a service
+ * subcommand (`KIMI_SERVICE_SUBCOMMANDS`) reached by either one is a denial. `--option=value` needs no special case:
  * its value is part of the option word.
  */
 function kimiServiceSubcommand(words, start) {
@@ -1176,12 +1183,12 @@ function kimiServiceSubcommand(words, start) {
     // (`server)` in `(kimi -m X server)`), read as in WI#839.
     if (word === "--") {
       const after = listenerWord(words[i + 1] ?? "");
-      if (after === "server" || after === "web") return after;
+      if (KIMI_SERVICE_SUBCOMMANDS.has(after)) return after;
       continue;
     }
     if (!word.startsWith("-")) {
       const subcommand = listenerWord(word);
-      if (subcommand === "server" || subcommand === "web") return subcommand;
+      if (KIMI_SERVICE_SUBCOMMANDS.has(subcommand)) return subcommand;
       continue;
     }
     if (word.includes("=")) pending.push(i + 1);
