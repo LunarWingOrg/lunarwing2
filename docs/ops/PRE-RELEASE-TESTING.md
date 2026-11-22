@@ -89,6 +89,24 @@ Keep the bearer token out of shell history and captured logs. The script checks
 gateway APIs and core subsystems; its header lists the channel, worker,
 provider, rollback, and monitoring checks that remain manual.
 
+### Bounded-turn measurement (WI#807)
+
+A turn that "felt long" is not a data point. `ic/scripts/bounded-turn-probe.py`
+asks the agent for a known number of `echo` calls, waits for the turn to end,
+and reads the daemon's own `Turn finished` record from its log ring buffer, so
+the same measurement works on systemd, OpenRC and launchd hosts:
+
+```bash
+ic/scripts/bounded-turn-probe.py --tenant <tenant> --steps 8
+```
+
+Exit `0` means the turn finished inside its budget with the requested step
+count; `3` means it used the whole budget (`budget_exhausted=true`) and `4`
+means it finished with a different step count. `2` means no record arrived
+within `--timeout` (the ring buffer holds 500 entries, so use a quiet tenant).
+Use it for the 9B/27B budget question: a bounded task answers "slow,
+thrashing, or doing a lot of real work" instead of leaving it to impression.
+
 ## 4. External-worker matrix
 
 This tier requires Docker Compose and the Python dependencies in
