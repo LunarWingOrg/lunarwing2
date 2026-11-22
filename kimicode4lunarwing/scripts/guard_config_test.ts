@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { chmodSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, closeSync, ftruncateSync, mkdtempSync, openSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -122,6 +122,19 @@ test("ensureGuardHook: a symlinked config is refused", () => {
   writeFileSync(target, strippedConfig())
   symlinkSync(target, join(home, "config.toml"))
   assert.throws(() => ensureGuardHook(home, "task-link", false), /not a regular file/)
+})
+
+test("ensureGuardHook: an oversized task-owned config is refused, not loaded", () => {
+  // Sparse file: big size, no disk cost. The bridge process is shared with
+  // every other task in the container.
+  const { home, path } = tempHome(undefined)
+  const fd = openSync(path, "w")
+  try {
+    ftruncateSync(fd, 2 * 1024 * 1024)
+  } finally {
+    closeSync(fd)
+  }
+  assert.throws(() => ensureGuardHook(home, "task-huge", false), /over the 1048576-byte limit/)
 })
 
 test("ensureGuardHook: an unrepairable tail fails the task instead of spawning unguarded", () => {

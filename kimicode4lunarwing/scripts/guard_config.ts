@@ -220,6 +220,12 @@ export function hasGuardHook(config: string): boolean {
   return bashEntries.length > 0 && bashEntries.every(isCanonical)
 }
 
+/** Largest config this lane will read: the baked config is ~2.6 KiB and an
+ * operator mount is human-sized. A task-owned file is untrusted input to the
+ * bridge process, so an oversized one is refused rather than loaded — the
+ * bridge is shared with every other task in the container. */
+const MAX_CONFIG_BYTES = 1_048_576
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -257,6 +263,11 @@ export function ensureGuardHook(home: string | undefined, taskId: string, enforc
   if (!stats.isFile()) {
     throw new Error(
       `cannot verify the PreToolUse guard hook: ${path} is not a regular file; refusing to spawn task ${taskId} unguarded (WI#847)`,
+    )
+  }
+  if (stats.size > MAX_CONFIG_BYTES) {
+    throw new Error(
+      `cannot verify the PreToolUse guard hook: ${path} is ${stats.size} bytes, over the ${MAX_CONFIG_BYTES}-byte limit; refusing to load an untrusted config into the bridge for task ${taskId} (WI#847)`,
     )
   }
   let config: string
