@@ -29,7 +29,7 @@ import {
 } from "./lunarwing_runtime.js"
 import { readFileSync } from "node:fs"
 
-import { executeTask } from "./kimi_task_executor.js"
+import { captureTrustedMcpConfig, executeTask } from "./kimi_task_executor.js"
 import { proxyEnvForTask, ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.js"
 import {
   bridgeRunnerSocketPath,
@@ -364,6 +364,11 @@ function handleCancel(payload: unknown, ws: BridgeSocket): void {
 
 function startServer(): void {
   if (!AGENT_AUTH_TOKEN) throw new Error("AGENT_AUTH_TOKEN is required in server mode")
+  // WI#848: freeze the entrypoint's trusted user-level mcp.json before any
+  // task can rewrite it (the split bridge has no home to read — the task
+  // runner takes its own snapshot); the executor re-materializes it before
+  // every local spawn.
+  captureTrustedMcpConfig()
   let connectionCount = 0
   let listening = false
 

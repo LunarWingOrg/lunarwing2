@@ -42,7 +42,7 @@ import { connect, createServer, type Server, type Socket } from "node:net"
 import { chmodSync, lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
-import { executeTask } from "./kimi_task_executor.js"
+import { captureTrustedMcpConfig, executeTask } from "./kimi_task_executor.js"
 import { resolveTaskWorkspace } from "./workspace_path.js"
 import {
   isRecord,
@@ -512,6 +512,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 1
   }
   const runner = new TaskRunner()
+  // WI#848: freeze the entrypoint's trusted user-level mcp.json before any
+  // task can rewrite it; the executor re-materializes it before every spawn.
+  captureTrustedMcpConfig()
   if (listenFd !== null) {
     if (!(await runner.listenFd(listenFd))) {
       console.error(`[task-runner] could not listen on inherited fd ${listenFd}`)
