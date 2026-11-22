@@ -48,6 +48,24 @@ use std::path::{Path, PathBuf};
 
 use crate::sandbox::error::{Result, SandboxError};
 
+/// Container connections the relay serves at once. `relay.py` holds the same
+/// cap in-container, so the host side never queues one the relay would refuse.
+#[cfg(target_os = "linux")]
+const MAX_LIVE_CONNECTIONS: usize = 32;
+
+/// Budget for one connection, including a `CONNECT` tunnel.
+#[cfg(target_os = "linux")]
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// First delay after a failed `accept`. A transient failure (`EMFILE`, a
+/// runtime hiccup) must not end the relay, and must not spin either.
+#[cfg(target_os = "linux")]
+const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Longest delay between failed accepts.
+#[cfg(target_os = "linux")]
+const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub(crate) struct ProxyRelay {
     _directory: tempfile::TempDir,
     channel: PathBuf,
@@ -67,25 +85,7 @@ impl ProxyRelay {
                 reason: format!("cannot create isolated proxy transport: {e}"),
             })?;
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&accepted);
-        let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    connection = listener.accept(), if connections.len() < 32 => {
-                        let Ok((mut stream, _)) = connection else { break };
-                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        connections.spawn(async move {
-                            let _ = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-                                let mut proxy = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-                                tokio::io::copy_bidirectional(&mut stream, &mut proxy).await
-                            }).await;
-                        });
-                    }
-                }
-            }
-            // Task abort aborts every open connection, including CONNECT.
-        });
+        let task = tokio::spawn(serve(listener, port, std::sync::Arc::clone(&accepted)));
         Ok(Self {
             _directory: directory,
             channel,
@@ -115,6 +115,86 @@ impl ProxyRelay {
     /// so it is a fact the command cannot forge from stderr alone.
     pub fn connected(&self) -> bool {
         self.accepted.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+}
+
+/// Serve container connections for one execution.
+///
+/// Finished connections are reaped by the `join_next` arm. Without it the
+/// `JoinSet` only grows, so `len()` is a cumulative accept count rather than
+/// the live count the cap is meant to bound: once 32 connections had ever been
+/// accepted the `accept` arm was disabled for good and `select!` panicked with
+/// no `else` branch (WI#834). A failed `accept` is logged and retried with a
+/// bounded backoff instead of ending the relay, so `EMFILE` or a transient
+/// runtime error cannot silently stop egress. Every accepted stream moves
+/// `counter`, the relay's container-contact record (WI#836).
+#[cfg(target_os = "linux")]
+async fn serve(
+    listener: tokio::net::UnixListener,
+    port: u16,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    let mut backoff = AcceptBackoff::new();
+    loop {
+        tokio::select! {
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    tracing::debug!(%error, "proxy relay connection ended abnormally");
+                }
+            }
+            accepted = listener.accept(), if connections.len() < MAX_LIVE_CONNECTIONS => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        backoff.reset();
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        connections.spawn(forward(stream, port));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "proxy relay accept failed; retrying");
+                        tokio::time::sleep(backoff.next()).await;
+                    }
+                }
+            }
+            // The accept arm is disabled only while a connection is live, so
+            // the join arm is enabled: this is defensive, and keeps `select!`
+            // away from its all-branches-disabled panic.
+            else => break,
+        }
+    }
+    // Dropping the set aborts every open connection, including CONNECT.
+}
+
+/// Copy one container connection to the loopback proxy and back, under the
+/// per-connection budget.
+#[cfg(target_os = "linux")]
+async fn forward(mut stream: tokio::net::UnixStream, port: u16) {
+    let _ = tokio::time::timeout(CONNECTION_TIMEOUT, async {
+        let mut proxy =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        tokio::io::copy_bidirectional(&mut stream, &mut proxy).await
+    })
+    .await;
+}
+
+/// Doubling delay between failed accepts, reset by the next success.
+#[cfg(target_os = "linux")]
+struct AcceptBackoff(std::time::Duration);
+
+#[cfg(target_os = "linux")]
+impl AcceptBackoff {
+    fn new() -> Self {
+        Self(ACCEPT_BACKOFF_MIN)
+    }
+
+    fn reset(&mut self) {
+        self.0 = ACCEPT_BACKOFF_MIN;
+    }
+
+    fn next(&mut self) -> std::time::Duration {
+        let current = self.0;
+        self.0 = self.0.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+        current
     }
 }
 
@@ -635,6 +715,97 @@ mod tests {
         })
         .await
         .expect("an accepted container connect must be observable on the host");
+    }
+
+    /// One complete proxied exchange, closed before the next one starts.
+    async fn one_round_trip(path: &Path, upstream: &tokio::net::TcpListener) {
+        let mut client = tokio::net::UnixStream::connect(path).await.unwrap();
+        let (mut proxy_side, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upstream.accept())
+                .await
+                .expect("the relay must accept the connection")
+                .unwrap();
+        client.write_all(b"x").await.unwrap();
+        assert_eq!(proxy_side.read_u8().await.unwrap(), b'x');
+        proxy_side.write_all(b"y").await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'y');
+    }
+
+    /// WI#834: a finished connection must stop counting toward the cap. With
+    /// no `join_next` arm the `JoinSet` only grew, so the 33rd connection of
+    /// one execution disabled the accept arm and panicked the relay task.
+    #[tokio::test]
+    async fn one_relay_serves_more_than_the_cap_sequentially() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = ProxyRelay::start(listener.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        let path = relay.path().join("proxy.sock");
+        for connection in 0..MAX_LIVE_CONNECTIONS + 8 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                one_round_trip(&path, &listener),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("connection {connection} was not served"));
+        }
+    }
+
+    /// WI#834: the cap bounds live connections, not the execution's lifetime
+    /// accepts. A connection beyond it waits for a slot instead of being lost.
+    #[tokio::test]
+    async fn the_cap_counts_live_connections_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = ProxyRelay::start(listener.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        let path = relay.path().join("proxy.sock");
+
+        let mut live = Vec::with_capacity(MAX_LIVE_CONNECTIONS);
+        for _ in 0..MAX_LIVE_CONNECTIONS {
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (proxy_side, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("every connection below the cap must be served")
+                    .unwrap();
+            live.push((client, proxy_side));
+        }
+
+        // At the cap the next connect queues; the relay does not accept it.
+        let mut queued = tokio::net::UnixStream::connect(&path).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "a connection beyond the cap must wait for a slot"
+        );
+
+        // One slot frees and the queued connection is served.
+        live.pop();
+        let (mut served, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("a queued connection must be served after a slot frees")
+                .unwrap();
+        queued.write_all(b"x").await.unwrap();
+        assert_eq!(served.read_u8().await.unwrap(), b'x');
+    }
+
+    /// WI#834: a failed accept backs off and is retried, never ending the
+    /// relay, and a success resets the delay.
+    #[test]
+    fn accept_backoff_doubles_to_a_ceiling_and_resets_after_a_success() {
+        let mut backoff = AcceptBackoff::new();
+        assert_eq!(backoff.next(), ACCEPT_BACKOFF_MIN);
+        assert_eq!(backoff.next(), ACCEPT_BACKOFF_MIN * 2);
+        assert_eq!(backoff.next(), ACCEPT_BACKOFF_MIN * 4);
+        for _ in 0..16 {
+            backoff.next();
+        }
+        assert_eq!(backoff.next(), ACCEPT_BACKOFF_MAX);
+        backoff.reset();
+        assert_eq!(backoff.next(), ACCEPT_BACKOFF_MIN);
     }
 
     #[tokio::test]
