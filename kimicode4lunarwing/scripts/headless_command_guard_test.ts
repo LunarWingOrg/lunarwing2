@@ -750,6 +750,30 @@ test("kimi print-mode prompt values are not service subcommands", () => {
   assertAllowed(`bash -c 'kimi -p "review web"'`)
 })
 
+test("a value-taking option cannot hide kimi service mode (WI#845)", () => {
+  // Only -p/--prompt consumed a value, so every other option's value was read
+  // as the subcommand and the real one was allowed.
+  assertBlocked("kimi --model X server", "kimi service mode")
+  assertBlocked("kimi -m X server", "kimi service mode")
+  assertBlocked("kimi --output-format stream-json server", "kimi service mode")
+  assertBlocked("kimi --agent-file agent.md web", "kimi service mode")
+  assertBlocked("kimi -S 1 server", "kimi service mode")
+  // Options the 2.7.2 table does not know are read both ways, so a plausible
+  // value cannot hide the subcommand either.
+  assertBlocked("kimi --port 9000 server", "kimi service mode")
+  assertBlocked("kimi --host 0.0.0.0 web", "kimi service mode")
+  assertBlocked("kimi --debug server", "kimi service mode")
+  // The equals forms were already denied; keep them denied.
+  assertBlocked("kimi --model=X server", "kimi service mode")
+  assertBlocked("kimi --output-format=stream-json server", "kimi service mode")
+  assertBlocked("kimi -mX server", "kimi service mode")
+  // Prompt and option values are still not subcommands.
+  assertAllowed("kimi -p 'summarize the server logs'")
+  assertAllowed("kimi --model server -p hello")
+  assertAllowed("kimi -S server -p hello")
+  assertAllowed("kimi --output-format stream-json -p hello")
+})
+
 test("a long command of repeated words is decided without rescanning", () => {
   // The regex form of the recursive-change rule rescanned the rest of the
   // command from every `chmod`; 12 KB of repetitions took ten seconds and
