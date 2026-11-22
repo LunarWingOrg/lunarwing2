@@ -4311,7 +4311,7 @@ immediately before the spawn to keep that window minimal); `mcp.json` in the
 same task-owned home is not re-asserted (a task can register its own MCP
 server, which the CLI spawns at startup outside the hook — the task already
 runs as that uid, so this is guard-evasion, not privilege escalation, and it
-is tracked separately); and `telemetry = false` /
+is a separate change from this one); and `telemetry = false` /
 `dangerous_command_guard = true` in the effective config are not re-checked —
 telemetry is forced off by the executor's `KIMI_DISABLE_TELEMETRY=1` and the
 upstream dangerous-command guard is inert under `-p`, where the hook is the
