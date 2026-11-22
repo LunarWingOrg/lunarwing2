@@ -7,6 +7,7 @@
 
 mod cost;
 mod diagnostics;
+mod jobs;
 mod learner;
 mod llm;
 mod runtime;
@@ -18,6 +19,7 @@ pub use diagnostics::{
     BaselineComparison, CategoryPolicy, CategoryPolicySummary, EvaluationCategory,
     EvaluationMetrics, EvaluationSummary, EvaluationTrace, WarmupBaseline, WarmupSummary,
 };
+pub use jobs::{JobEstimateCounters, JobTimingView, LOCAL_JOB_KIND, job_key};
 pub use learner::{EstimationLearner, LearnerCounterSnapshot, LearnerCounters, LearningModel};
 pub use llm::{
     LlmModelDiagnostics, LlmTimingCounterSnapshot, LlmTimingDiagnostics, LlmTimingMode, LlmTimings,

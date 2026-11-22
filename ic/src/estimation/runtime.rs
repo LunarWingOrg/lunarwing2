@@ -16,6 +16,7 @@ use crate::tools::Tool;
 use super::diagnostics::{
     CategoryPolicy, CategoryPolicySummary, EvaluationSummary, EvaluationTrace, TraceRecord,
 };
+use super::jobs::{JobEstimateCounters, job_key};
 use super::learner::{LearnerCounterSnapshot, LearningModel};
 use super::{Actuals, Estimator, MAX_TOOL_NAME_BYTES, RuntimeEstimate};
 
@@ -64,6 +65,7 @@ pub struct ToolEstimates {
 struct EstimationState {
     estimator: Estimator,
     requests: EstimateRequestSnapshot,
+    jobs: JobEstimateCounters,
 }
 
 /// One lookup per tracked execution attempt, independent of hint display.
@@ -91,6 +93,8 @@ impl EstimateRequestSnapshot {
 pub struct ToolEstimateCounters {
     pub estimates: EstimateRequestSnapshot,
     pub observations: LearnerCounterSnapshot,
+    /// Bounded local-job estimates (WI#318 C1). Same owner-only aggregate.
+    pub jobs: JobEstimateCounters,
 }
 
 /// User-scoped diagnostics. Never contains the private learner key, tool
@@ -326,8 +330,66 @@ impl ToolEstimates {
             |state| ToolEstimateCounters {
                 estimates: state.requests,
                 observations: state.estimator.learner().counters().snapshot(),
+                jobs: state.jobs,
             },
         )
+    }
+
+    /// Whether job timing views may display a historical duration. This is
+    /// governed by the same opt-in display mode as tool hints; recording and
+    /// the per-tool category policy stay independent of it.
+    pub fn job_display_enabled(&self) -> bool {
+        self.display_enabled()
+    }
+
+    /// Frozen historical duration for a local job about to be dispatched.
+    /// Read-only: it neither trains the model nor claims to be a deadline.
+    pub fn estimate_job(&self, user_id: &str) -> Option<RuntimeEstimate> {
+        if self.mode == ToolEstimationMode::Disabled {
+            return None;
+        }
+        let key = job_key(user_id)?;
+        let mut state = self.state.lock().ok()?;
+        let estimate = state.estimator.estimate_operation(&key, None, None);
+        state.jobs.record_estimate(estimate.is_some());
+        estimate
+    }
+
+    /// One terminal observation for a local job run (WI#318 C1). The caller
+    /// passes the frozen prediction, if any, so forecast error reflects the
+    /// estimate that was actually shown. Only a successful completion trains
+    /// the duration model; failures and cancellations are counted separately
+    /// because their elapsed time is not a comparable run.
+    pub fn record_job_terminal(
+        &self,
+        user_id: &str,
+        elapsed: Duration,
+        completed: bool,
+        predicted: Option<Duration>,
+    ) {
+        if self.mode == ToolEstimationMode::Disabled {
+            return;
+        }
+        let Some(key) = job_key(user_id) else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.jobs.record_terminal(completed);
+        if !completed {
+            return;
+        }
+        state.estimator.record_operation_actuals(
+            &key,
+            Actuals {
+                baseline_time: None,
+                baseline_cost: None,
+                predicted_time: predicted,
+                actual_time: elapsed,
+                actual_cost: None,
+            },
+        );
     }
 
     /// Operator-only aggregate of the held-out evaluation trace. Returns

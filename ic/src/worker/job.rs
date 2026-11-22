@@ -216,8 +216,18 @@ impl Worker {
         }
     }
 
-    /// Run the worker until the job is complete or stopped.
-    pub async fn run(self, mut rx: mpsc::Receiver<WorkerMessage>) -> Result<(), Error> {
+    /// Run the worker to a terminal (or Stuck) outcome.
+    ///
+    /// The terminal duration observation is recorded here, after exactly one
+    /// execution loop, so completion paths that mark the job from multiple
+    /// places cannot train the same run twice (WI#318 C1).
+    pub async fn run(self, rx: mpsc::Receiver<WorkerMessage>) -> Result<(), Error> {
+        let result = self.run_inner(rx).await;
+        self.record_job_terminal_observation().await;
+        result
+    }
+
+    async fn run_inner(&self, mut rx: mpsc::Receiver<WorkerMessage>) -> Result<(), Error> {
         tracing::info!("Worker starting for job {}", self.job_id);
 
         // Wait for start signal
@@ -306,6 +316,32 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         }
 
         Ok(())
+    }
+
+    /// One terminal observation for this job's local run. Failed and
+    /// cancelled runs are counted but never train the duration model: their
+    /// elapsed time is not a comparable completed run. Stuck or still-active
+    /// states record nothing so self-repair can finish the job.
+    async fn record_job_terminal_observation(&self) {
+        let Ok(ctx) = self.context_manager().get_context(self.job_id).await else {
+            return;
+        };
+        let completed = match ctx.state {
+            JobState::Completed => true,
+            JobState::Failed | JobState::Cancelled => false,
+            _ => return,
+        };
+        let Some(started_at) = ctx.started_at else {
+            return;
+        };
+        let end = ctx.completed_at.unwrap_or_else(chrono::Utc::now);
+        let elapsed = (end - started_at).to_std().unwrap_or_default();
+        self.tools().estimates().record_job_terminal(
+            &ctx.user_id,
+            elapsed,
+            completed,
+            ctx.estimated_duration,
+        );
     }
 
     /// Run the plan phase and the shared agentic loop.

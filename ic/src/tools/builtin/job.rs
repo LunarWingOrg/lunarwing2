@@ -2515,6 +2515,10 @@ fn job_matches_filter(filter: &str, status: &str) -> bool {
 pub struct JobStatusTool {
     context_manager: Arc<ContextManager>,
     store: Option<Arc<dyn Database>>,
+    /// Whether the daemon's estimation display mode allows showing the
+    /// historical duration frozen for a local job (WI#318 C4). Recording is
+    /// independent of this flag.
+    timing_display: bool,
 }
 
 impl JobStatusTool {
@@ -2522,11 +2526,18 @@ impl JobStatusTool {
         Self {
             context_manager,
             store: None,
+            timing_display: false,
         }
     }
 
     pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Show the frozen historical duration when the daemon allows hints.
+    pub fn with_timing_display(mut self, display: bool) -> Self {
+        self.timing_display = display;
         self
     }
 
@@ -2596,6 +2607,14 @@ impl Tool for JobStatusTool {
                     });
                     return Ok(ToolOutput::success(result, start.elapsed()));
                 }
+                let timing = crate::estimation::JobTimingView::new(
+                    job_ctx.started_at,
+                    job_ctx.completed_at,
+                    self.timing_display
+                        .then_some(job_ctx.estimated_duration)
+                        .flatten(),
+                    chrono::Utc::now(),
+                );
                 let result = serde_json::json!({
                     "job_id": job_id.to_string(),
                     "title": job_ctx.title,
@@ -2605,6 +2624,7 @@ impl Tool for JobStatusTool {
                     "started_at": job_ctx.started_at.map(|t| t.to_rfc3339()),
                     "completed_at": job_ctx.completed_at.map(|t| t.to_rfc3339()),
                     "actual_cost": job_ctx.actual_cost.to_string(),
+                    "timing": timing,
                     "fallback_deliverable": job_ctx.metadata.get("fallback_deliverable"),
                     "partial_output": job_ctx.metadata.get("partial_output"),
                 });
@@ -2624,6 +2644,12 @@ impl Tool for JobStatusTool {
                     let result = serde_json::json!({ "error": "Job not found" });
                     return Ok(ToolOutput::success(result, start.elapsed()));
                 };
+                let timing = crate::estimation::JobTimingView::new(
+                    record.started_at,
+                    record.completed_at,
+                    None,
+                    chrono::Utc::now(),
+                );
                 let result = serde_json::json!({
                     "job_id": record.id.to_string(),
                     "title": record.task,
@@ -2631,6 +2657,7 @@ impl Tool for JobStatusTool {
                     "created_at": record.created_at.to_rfc3339(),
                     "started_at": record.started_at.map(|time| time.to_rfc3339()),
                     "completed_at": record.completed_at.map(|time| time.to_rfc3339()),
+                    "timing": timing,
                     "success": record.success,
                     "failure_reason": record.failure_reason,
                     "project_dir": record.project_dir,

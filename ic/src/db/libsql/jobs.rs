@@ -204,7 +204,7 @@ impl JobStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, title, status, user_id, failure_reason,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at, estimated_time_secs
                 FROM agent_jobs WHERE source = 'direct'
                 ORDER BY created_at DESC
                 "#,
@@ -233,6 +233,10 @@ impl JobStore for LibSqlBackend {
                 created_at: get_ts(&row, 5),
                 started_at: get_opt_ts(&row, 6),
                 completed_at: get_opt_ts(&row, 7),
+                estimated_duration_secs: row
+                    .get::<i64>(8)
+                    .ok()
+                    .and_then(|secs| u64::try_from(secs).ok()),
             });
         }
         Ok(jobs)
@@ -247,7 +251,7 @@ impl JobStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, title, status, user_id, failure_reason,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at, estimated_time_secs
                 FROM agent_jobs WHERE source = 'direct' AND user_id = ?1
                 ORDER BY created_at DESC
                 "#,
@@ -276,6 +280,10 @@ impl JobStore for LibSqlBackend {
                 created_at: get_ts(&row, 5),
                 started_at: get_opt_ts(&row, 6),
                 completed_at: get_opt_ts(&row, 7),
+                estimated_duration_secs: row
+                    .get::<i64>(8)
+                    .ok()
+                    .and_then(|secs| u64::try_from(secs).ok()),
             });
         }
         Ok(jobs)

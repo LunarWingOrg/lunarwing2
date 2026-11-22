@@ -199,28 +199,31 @@ impl Scheduler {
             })
             .unwrap_or(self.config.max_tokens_per_job);
 
+        // WI#318 C1: freeze one advisory historical duration before the first
+        // persist, so `job_status` and the gateway detail view can show it
+        // without a live learner lookup. Duration only — no job declares a
+        // cost baseline, so `estimated_cost` stays unset. Sandbox and
+        // external-worker jobs do not pass through here and are never given
+        // a local-job estimate (C2).
+        let job_estimate = self.tools.estimates().estimate_job(user_id);
+
         // Apply both metadata and token budget in one closure (Issue #813: atomic update).
         // Use update_context_and_get to ensure atomicity: no gap where concurrent workers
         // can modify the context between update and DB persist (Issue #807).
-        let ctx = if let Some(meta) = metadata {
-            self.context_manager
-                .update_context_and_get(job_id, |ctx| {
+        let ctx = self
+            .context_manager
+            .update_context_and_get(job_id, |ctx| {
+                if let Some(meta) = metadata {
                     ctx.metadata = meta;
-                    if max_tokens > 0 {
-                        ctx.max_tokens = max_tokens;
-                    }
-                })
-                .await?
-        } else if max_tokens > 0 {
-            self.context_manager
-                .update_context_and_get(job_id, |ctx| {
+                }
+                if max_tokens > 0 {
                     ctx.max_tokens = max_tokens;
-                })
-                .await?
-        } else {
-            // No metadata or token budget to set; get the initial context
-            self.context_manager.get_context(job_id).await?
-        };
+                }
+                if let Some(estimate) = job_estimate {
+                    ctx.estimated_duration = Some(estimate.duration);
+                }
+            })
+            .await?;
 
         // Persist to DB before scheduling so the worker's FK references are valid.
         // The context was read under the same lock as the update (atomic), preventing
