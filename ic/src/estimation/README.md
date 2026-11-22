@@ -271,7 +271,8 @@ mission's lifetime, or a whole coding job's unknown future steps.
   report measured elapsed separately from the frozen historical duration and
   report remaining time as `unknown`. A known remaining time is deliberately
   not invented from a max-iteration limit or worker timeout, because neither
-  is a finite plan.
+  is a finite plan. `GET /api/jobs/summary` stays counts-only: an aggregate
+  ETA over unrelated jobs has no defined scope, so none is produced.
 - **Mission runs (C3).** `GET /api/missions/{id}` derives a single run's
   advisory timing from that mission's own completed threads on read: completed
   run count, median and last completed-run duration, and the newest running
