@@ -1144,19 +1144,49 @@ function* listenerBodies(text) {
   }
 }
 
+// `kimi --help` at the pinned CLI version (2.7.2, WI#845). A value-taking
+// option consumes the next word, so the subcommand is the first word that is
+// neither an option nor consumed by one. `-S`/`--session` takes an optional
+// id; consuming it as a value matches what the CLI does with a following word.
+const KIMI_VALUE_OPTIONS = new Set([
+  "-S", "--session", "-m", "--model", "-p", "--prompt", "--output-format",
+  "--skills-dir", "--agent", "--agent-file", "--add-dir",
+]);
+const KIMI_FLAG_OPTIONS = new Set([
+  "-V", "--version", "-c", "--continue", "-y", "--yolo", "--auto", "--plan", "-h", "--help",
+]);
+
+/**
+ * Deny a service subcommand unless every reading of the option words agrees
+ * there is none (WI#845). `-S`/`--session [id]` and options the table does not
+ * know may or may not consume the next word, and the hook cannot ask the CLI,
+ * so both readings are walked; `server` or `web` reached by either one is a
+ * denial. `--option=value` needs no special case: its value is part of the
+ * option word.
+ */
 function kimiServiceSubcommand(words, start) {
-  let i = start;
-  for (; i < words.length && words[i].startsWith("-"); i++) {
-    if (words[i] === "--") {
-      i++;
-      break;
+  const pending = [start];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const i = pending.pop();
+    if (i >= words.length || seen.has(i)) continue;
+    seen.add(i);
+    const word = words[i];
+    if (word === "--") {
+      const after = words[i + 1];
+      if (after === "server" || after === "web") return after;
+      continue;
     }
-    // Kimi's -p and --prompt consume one whole argument. --prompt=value
-    // needs no special case; its value is already part of the option word.
-    if (words[i] === "-p" || words[i] === "--prompt") i++;
+    if (!word.startsWith("-")) {
+      if (word === "server" || word === "web") return word;
+      continue;
+    }
+    if (word.includes("=")) pending.push(i + 1);
+    else if (KIMI_VALUE_OPTIONS.has(word)) pending.push(i + 2);
+    else if (KIMI_FLAG_OPTIONS.has(word)) pending.push(i + 1);
+    else pending.push(i + 1, i + 2);
   }
-  const subcommand = listenerWord(words[i] ?? "");
-  return subcommand === "server" || subcommand === "web" ? subcommand : null;
+  return null;
 }
 
 const LISTENER_COMMANDS = [
