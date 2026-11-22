@@ -1010,3 +1010,84 @@ test("a dry-run clean and a deleting tr no longer deny (WI#832 false denials)", 
   assertAllowed("cat script.sh | tr -d '\\r' | bash")
   assertAllowed("cat script.sh | tr -d '\\r' > script.sh.tmp")
 })
+
+test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => {
+  // The verb rules read the literal verb, so `git -c alias.z='reset --hard' z`
+  // was classified as the unknown verb `z` and allowed while git discarded the
+  // change. The alias definition is refused instead of resolved: the value may
+  // live in repo config the guard cannot read cheaply.
+  assertBlocked("git -c alias.z='reset --hard' z", "git command")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
+  assertBlocked("git -c alias.z=status z", "git command")
+  assertBlocked("git --config-env=alias.z=Z z", "git command")
+  assertBlocked("git --config-env alias.z=Z z", "git command")
+  // The repo-config write that plants the same alias is refused too.
+  assertBlocked("git config alias.t1 'reset --hard'", "git command")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  // git's modern config subcommands write the same key: `set` names it after
+  // the subcommand, and `rename-section foo alias` turns a section into aliases.
+  assertBlocked("git config set alias.z 'reset --hard'", "git command")
+  assertBlocked("git config get alias.z", "git command")
+  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
+  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
+  assertBlocked("git config rename-section foo alias", "git command")
+  // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
+  assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "git command")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+  // The environment value is read as one shell word: an `alias.` in a later
+  // argument of the same line is not attributed to the variable.
+  assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
+  // Ordinary config and option use stays allowed.
+  assertAllowed("git -c user.name=bot commit -m x")
+  assertAllowed("git config --get user.email")
+  assertAllowed("git config --local core.hooksPath .githooks")
+  assertAllowed("git status")
+  // git reads section names without regard to case, and an include or a
+  // config file named in the environment defines an alias the same way
+  // (review AKK-1/AKK-2 on !2686).
+  for (const command of [
+    "git -c Alias.z='reset --hard' z",
+    "git -c ALIAS.z='reset --hard' z",
+    "git -c include.path=/tmp/evil.cfg z",
+    "git -c includeIf.gitdir:/workspace/.path=/tmp/evil.cfg z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0=/tmp/evil.cfg git z",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=Alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
+    "GIT_CONFIG_GLOBAL=/tmp/evil.cfg git z",
+    "GIT_CONFIG_SYSTEM=/tmp/evil.cfg git z",
+    "git config Alias.z 'reset --hard'",
+    "git config set Alias.z 'reset --hard'",
+    "git config --file .git/config Alias.z 'reset --hard'",
+    "git config include.path /tmp/evil.cfg",
+    "git config --add include.path /tmp/evil.cfg",
+    "git config --rename-section foo alias",
+    "git config --edit",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config --rename-section foo bar")
+  assertAllowed("git config --list")
+  assertAllowed("git -c core.quotepath=off status")
+  // From the independent read of the fix: git's own value options are
+  // stepped over, git config's value options and long-option prefixes are
+  // read, and an edit option counts only before the first operand.
+  for (const command of [
+    "git -C . -c alias.z='reset --hard' z",
+    "git --work-tree . -c alias.z='reset --hard' z",
+    "git -C . --config-env alias.z=V z",
+    "git config --comment x alias.z 'reset --hard'",
+    "git config -t bool-or-str alias.z 'reset --hard'",
+    "git config --fil .git/config alias.z 'reset --hard'",
+    "git config set --value x alias.z 'reset --hard'",
+    "git config --ren foo alias",
+    "git config edit",
+    "git config --ed",
+    "git --work-tree . reset --hard",
+  ]) {
+    assertBlocked(command, "git command")
+  }
+  assertAllowed("git config core.editor 'vim -e'")
+  assertAllowed('git config user.name "Jane -e Doe"')
+  assertAllowed("git -C sub log --oneline")
+})
