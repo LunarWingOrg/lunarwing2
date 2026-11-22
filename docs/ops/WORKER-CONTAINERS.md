@@ -4070,6 +4070,9 @@ auto-approval:
   and `git stash -a`; `git status`, `git stash` without those flags and
   `git restore <path>` stay ordinary work. `git restore .` takes the same
   verdict as `git checkout -- .`, which discards the same changes (WI#832).
+  The long options are read by any GNU-unambiguous prefix (`git reset --har`,
+  `git clean --for`, `git stash --includ`, `git switch --dis`), the same way
+  the `rm` rules already read theirs (WI#841).
   What remains to the container, named as accepted residuals: deletion by a
   utility this hook does not classify (`mv` into a removed directory, `truncate`
   on a file, `install`, `dd` to a file, `sed -i`), an interpreter body that is
