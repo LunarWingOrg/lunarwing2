@@ -745,7 +745,7 @@ Since WI#848 that registration is a root-owned image input
 container start and re-materialized by `kimi_task_executor.ts` before every
 CLI spawn): the CLI trusts the user-level file without any workspace-trust
 prompt and starts its servers before the first model turn, outside the
-`PreToolUse` Bash hook, so it cannot be task-writable state. Point
+`PreToolUse` Bash hook, so its content cannot come from task state. Point
 `KIMI_MCP_SOURCE` at another root-owned file to override the entry
 (`{"mcpServers":{}}` or `"enabled": false` opts out); a task's edit to the
 runtime file is reverted before the next session, and the guard denies the
