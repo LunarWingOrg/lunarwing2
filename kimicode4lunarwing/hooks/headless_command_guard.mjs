@@ -689,29 +689,44 @@ function hasShortFlag(text, letters) {
 }
 
 /**
+ * True when the argument text carries a long option that GNU getopt resolves
+ * to one of `options`: any prefix of the spelled option counts (`--har` for
+ * `--hard`), the way `isRmLongDeleteOption` reads `rm` (WI#841). A bare `--`
+ * marker, a `--name=value` word and a longer word sharing the letters do not
+ * match; an adjacent redirect ends the option word.
+ */
+function hasGitLongOption(text, options) {
+  for (const match of text.matchAll(/(?:^|[ \t])(--[a-z][a-z-]*)(?=$|[ \t<>])/g)) {
+    if (options.some((option) => option.startsWith(match[1]))) return true;
+  }
+  return false;
+}
+
+/**
  * Deny git commands that irrecoverably discard uncommitted work (WI#826,
  * WI#832): forced `clean` (a dry run passes), `reset --hard`, a whole-tree
  * checkout or restore, forced checkout/switch, and a `stash` that takes
- * untracked or ignored files. Linear scan over the git invocations.
+ * untracked or ignored files. Long options are read by any GNU-unambiguous
+ * prefix, like the `rm` rules (WI#841). Linear scan over the git invocations.
  */
 function checkGitDiscard(segment) {
   for (const match of segment.matchAll(GIT_CALL)) {
     const { verb, after } = gitVerb(segment.slice(match.index + 3).split(/[;&|\n]/, 1)[0]);
-    const dryRun = hasShortFlag(after, "n") || /(?:^|[ \t])--dry-run(?=[ \t]|$)/.test(after);
+    const dryRun = hasShortFlag(after, "n") || hasGitLongOption(after, ["--dry-run"]);
     if (verb === "clean" && !dryRun &&
-        (hasShortFlag(after, "fdxX") || /(?:^|[ \t])--force(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(after, "fdxX") || hasGitLongOption(after, ["--force"]))) {
       return true;
     }
-    if (verb === "reset" && /(?:^|[ \t])--hard(?=[ \t]|$)/.test(after)) return true;
+    if (verb === "reset" && hasGitLongOption(after, ["--hard"])) return true;
     if ((verb === "checkout" || verb === "restore") && /(?:^|[ \t])\.\/?(?=[ \t]*$)/.test(after)) {
       return true;
     }
     if ((verb === "checkout" || verb === "switch") &&
-        (hasShortFlag(after, "f") || /(?:^|[ \t])--(?:force|discard-changes)(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(after, "f") || hasGitLongOption(after, ["--force", "--discard-changes"]))) {
       return true;
     }
     if (verb === "stash" &&
-        (hasShortFlag(after, "ua") || /(?:^|[ \t])--(?:include-untracked|all)(?=[ \t]|$)/.test(after))) {
+        (hasShortFlag(after, "ua") || hasGitLongOption(after, ["--include-untracked", "--all"]))) {
       return true;
     }
   }
