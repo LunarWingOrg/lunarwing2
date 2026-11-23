@@ -1837,7 +1837,15 @@ fn short_push_cluster_forces(word: &str) -> bool {
         && letters.contains('f')
 }
 
-/// A refspec that deletes (`:ref`) or forces (`+ref`) the update.
+/// `--mirror` and every accepted abbreviation of it (`--mirr`, `--mir`, …).
+/// No other push option starts with `--mi`, so the prefix is unambiguous.
+fn push_mirror_flag(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix("--") else {
+        return false;
+    };
+    !rest.is_empty() && "mirror".starts_with(rest) && rest.len() >= 3
+}
+
 /// A refspec that deletes (`:ref`, and `+:ref` — a forced deletion).
 fn refspec_deletes(word: &str) -> bool {
     word.strip_prefix('+').unwrap_or(word).starts_with(':')
@@ -1879,7 +1887,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
             if text == "--delete" || text == "--del" || text.starts_with("--delete=") {
                 return push_deletion(text, grant);
             }
-            if text == "--mirror" {
+            if push_mirror_flag(text) {
                 return Err(denied(
                     "force push is not permitted; --mirror forces every ref",
                 ));
@@ -2668,6 +2676,8 @@ mod tests {
             "git push --force-with-lease=main origin main",
             "git push --force-if-includes origin main",
             "git push --mirror origin",
+            "git push --mirr origin",
+            "git push --mir origin",
         ] {
             let error = check_granted(forced, &grant).unwrap_err();
             assert!(
