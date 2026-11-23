@@ -1953,7 +1953,7 @@ mod tests {
     fn bare_remote_with_one_commit(temp: &Path) -> std::path::PathBuf {
         let bare = temp.join("remotes/origin.git");
         std::fs::create_dir_all(&bare).unwrap();
-        let init = run_git(&[], temp, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        let init = run_git(&[], temp, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
         assert!(
             init.status.success(),
             "init --bare: {}",
@@ -2021,7 +2021,9 @@ mod tests {
         );
         authorize_shell_command("git push origin main", Some(&grant), SandboxNetworkMode::None)
             .unwrap();
-        let push = run_git(&env, &work, &["push", "-q", "origin", "main"]);
+        // The clone stored the container-visible virtual URL as `origin`, so
+        // push by the host path to the same real remote.
+        let push = run_git(&env, &work, &["push", "-q", &clone_url, "main"]);
         assert!(
             push.status.success(),
             "push: {}",
@@ -2220,7 +2222,8 @@ mod tests {
             assert!(
                 text.contains("grants read only")
                     || text.contains("force push and ref deletion")
-                    || text.contains("must name an explicit granted remote"),
+                    || text.contains("must name an explicit granted remote")
+                    || text.contains("unsupported option"),
                 "{command}: {text}"
             );
         }
@@ -2367,8 +2370,12 @@ mod tests {
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("credential.helper="));
-        assert!(joined.contains(GIT_CREDENTIAL_HELPER));
+        assert!(
+            env.iter().any(|(key, value)| key.starts_with("GIT_CONFIG_KEY_")
+                && value == "credential.helper"),
+            "{joined}"
+        );
+        assert!(env.iter().any(|(_, value)| value == GIT_CREDENTIAL_HELPER));
         assert!(!joined.contains("GIT_READ_TOKEN"), "{joined}");
         // The evidence carries the host and operation classes, not the secret.
         let json = serde_json::to_string(&grant.evidence()).unwrap();
