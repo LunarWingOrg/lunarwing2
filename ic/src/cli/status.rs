@@ -49,12 +49,14 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     println!("  {}LunarWing Status{}", fmt::bold(), fmt::reset());
     println!();
 
-    // Version
+    // Version. WI#870: same build identity as the startup banner, so an
+    // operator comparing `lunarwing status` against `daemon.log` sees one
+    // unambiguous build.
     println!(
         "{}",
         fmt::kv_line(
             "Version",
-            &format!("LunarWing v{}", env!("CARGO_PKG_VERSION")),
+            &format!("LunarWing {}", crate::build_info::banner_identity()),
             12,
         )
     );

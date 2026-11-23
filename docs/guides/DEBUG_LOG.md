@@ -7,7 +7,25 @@ LunarWing emits structured events through `tracing`. Do not rely on source line 
 scrubbing, `SANDBOX_TENANT_LOGS`, and init-agnostic MT diagnostics path match
 the current tree. Since v2.2.0.0 (WI#579), the daemon also logs
 `Starting LunarWing v<package-version>` at INFO immediately after initializing
-tracing; look for it when INFO is enabled to confirm the binary version.
+tracing; since WI#870 the line carries the build identity as well:
+
+```text
+Starting LunarWing v2.2.2 (commit f8cf3c08, built 2026-11-23T18:04:11Z)
+```
+
+The commit is embedded by `ic/build.rs` from the checkout's HEAD (`-dirty`
+when tracked files under `ic/` are modified) and the build time from the wall
+clock, or from `SOURCE_DATE_EPOCH` when the builder sets it. Builds without a
+readable `.git` directory — the container image, a `git archive` tree — can
+set `LUNARWING_BUILD_COMMIT` to label themselves; otherwise the field reads
+`unknown`. Two builds of the same version therefore always differ in the
+banner, which is the fingerprint to use when testing rapid rebuilds:
+
+```bash
+grep -m1 "Starting LunarWing" /tenant-logs/daemon.log
+```
+
+`lunarwing status` prints the same identity string.
 
 ## Choose a Log Level
 

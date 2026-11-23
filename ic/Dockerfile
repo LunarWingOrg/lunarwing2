@@ -33,6 +33,12 @@ COPY providers.json providers.json
 # [[bench]] entries in Cargo.toml require bench sources to exist for cargo to parse the manifest
 COPY benches/ benches/
 
+# WI#870: `.git/` is dockerignored, so build.rs cannot derive the commit.
+# Pass it in, e.g. `--build-arg LUNARWING_BUILD_COMMIT=$(git rev-parse --short=8 HEAD)`,
+# so the startup banner identifies the code the image was built from.
+ARG LUNARWING_BUILD_COMMIT=unknown
+ENV LUNARWING_BUILD_COMMIT=${LUNARWING_BUILD_COMMIT}
+
 RUN cargo build --release --bin lunarwing
 
 # Stage 2: Runtime

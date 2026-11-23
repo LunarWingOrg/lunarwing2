@@ -120,7 +120,12 @@ fn format_top_level_error(err: &anyhow::Error) {
 }
 
 fn log_startup_banner() {
-    tracing::info!("Starting LunarWing v{}", env!("CARGO_PKG_VERSION"));
+    // WI#870: the commit and build time disambiguate rebuilds of one version;
+    // see `lunarwing::build_info`.
+    tracing::info!(
+        "Starting LunarWing {}",
+        lunarwing::build_info::banner_identity()
+    );
 }
 
 fn log_supervised_mode(config: lunarwing::config::SupervisedModeConfig) {
@@ -1659,8 +1664,20 @@ mod tests {
 
         assert!(logs_contain("INFO"));
         assert!(logs_contain(&format!(
-            "Starting LunarWing v{}",
-            env!("CARGO_PKG_VERSION")
+            "Starting LunarWing {}",
+            lunarwing::build_info::banner_identity()
+        )));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn startup_banner_identifies_the_build_not_just_the_version() {
+        super::log_startup_banner();
+
+        // WI#870: two builds of one version must not log identical lines.
+        assert!(logs_contain(&format!(
+            "Starting LunarWing v{} (commit ",
+            lunarwing::build_info::VERSION
         )));
     }
 
