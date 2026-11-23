@@ -27,6 +27,18 @@ variables:
   GIT_STRATEGY: fetch
   GIT_DEPTH: "0"
   GIT_SUBMODULE_STRATEGY: none
+  # WI#862: retry the runner's own fetch of this repository. In the 30 days
+  # to 2026-11-22, 23 jobs in 16 pipelines died at "Getting source from Git
+  # repository" before their script ran — 18 on "Could not connect to
+  # server", 16 of those after ~135 s, plus a 300 s timeout, a reset and
+  # three HTTP/2 stream resets. GitLab's default is one attempt.
+  #
+  # Two failed ~135 s connects before a successful fetch add ~270 s, plus
+  # any delay configured by the runner. Three 300 s timeouts would spend
+  # 900 s on the fetch attempts themselves, against the shortest 1800 s
+  # job timeout. This sets the attempt count, not a backoff policy. The
+  # runner retries the whole get_sources stage, even for a permanent failure.
+  GET_SOURCES_ATTEMPTS: "3"
   CARGO_HOME: "$CI_PROJECT_DIR/.ci-cache/cargo"
   CARGO_INCREMENTAL: "0"
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"

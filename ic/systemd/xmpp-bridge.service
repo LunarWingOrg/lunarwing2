@@ -27,6 +27,9 @@ Environment=LUNARWING_BASE_DIR=/var/lib/lunarwing
 Environment=IRONCLAW_BASE_DIR=/var/lib/lunarwing
 Environment=XMPP_BRIDGE_BIND=127.0.0.1:8787
 Environment=XMPP_BRIDGE_MAX_MESSAGES=1024
+# Opt-in stale-queue policy (WI#854): 0 disables expiry; values >=120 expire
+# never-served pending messages at least that old after an equally long poll gap.
+Environment=XMPP_BRIDGE_STALE_QUEUE_SECS=0
 Environment=RUST_LOG=xmpp_bridge=info,info
 
 # Required production config and secrets. At minimum, set XMPP_BRIDGE_TOKEN.

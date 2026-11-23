@@ -14,6 +14,9 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".gitlab/scripts/build-worker-image.sh"
+# BuildKit lines from job 204104 (pipeline 8578, trace lines 1092–1096),
+# with GitLab's timestamps/stream prefixes removed as in the wrapper's log.
+JOB_204104_TRACE = pathlib.Path(__file__).with_name("fixtures") / "job-204104-buildkit.log"
 
 
 class WorkerBuildArgsTests(unittest.TestCase):
@@ -24,10 +27,9 @@ class WorkerBuildArgsTests(unittest.TestCase):
         self.root = pathlib.Path(temporary.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        # Match the slim ci-config tool surface; neither git nor awk is
-        # installed there. Keep the PATH closed so this cannot contact a real
-        # builder or registry even if the production script changes.
-        for name in ("sh", "sha256sum", "cut", "tr", "base64", "mkdir", "grep", "tee", "rm"):
+        # Keep the PATH closed so this cannot contact a real builder or
+        # registry even if the production script changes.
+        for name in ("sh", "sha256sum", "cut", "tr", "base64", "mkdir", "awk", "grep", "tee", "rm"):
             tool = shutil.which(name)
             self.assertIsNotNone(tool, f"required tool {name!r} not found")
             (self.bin / name).symlink_to(tool)
@@ -47,13 +49,6 @@ class WorkerBuildArgsTests(unittest.TestCase):
         )
         self.wrapper = self.root / "opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
         self.write_shim("git", "#!/bin/sh\nprintf '%s\\n' 1700000000\n")
-        # Only metadata_digest() uses awk; emulate that extraction in Python.
-        self.write_shim("awk", f"""#!{sys.executable}
-import json
-import sys
-with open(sys.argv[-1]) as source:
-    print(json.load(source)["containerimage.digest"])
-""")
         # BUILDCTL_MODE steers failure injection without contacting a builder
         # or registry. Each failure mode emits the job-trace signature that the
         # production retry classifier must accept or reject.
@@ -98,6 +93,9 @@ if mode == "fail_compile_after_snapshot_delay_warning":
     print("#12 [builder 3/13] RUN apt-get update", file=sys.stderr)
     print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
     print('ERROR: failed to solve: process "/bin/sh -c make" did not complete successfully: exit code: 2', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_download" and os.environ["DOWNLOAD_FAIL_CALL"] in ("all", str(count)):
+    sys.stderr.write(os.environ["DOWNLOAD_TRACE"])
     sys.exit(1)
 if mode == "fail_compile":
     print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
@@ -147,6 +145,15 @@ for index, argument in enumerate(args):
             return []
         return [int(line) for line in self.sleeps.read_text().split()]
 
+    def run_with_download_trace(self, trace, fail_call="all"):
+        pathlib.Path(self.env["BUILDCTL_STATE"]).unlink(missing_ok=True)
+        self.env.update(BUILDCTL_MODE="fail_download", DOWNLOAD_FAIL_CALL=fail_call, DOWNLOAD_TRACE=trace)
+        return self.run_build()
+
+    @staticmethod
+    def run_error(step, command, code=1):
+        return f'#{step} ERROR: process "{command}" did not complete successfully: exit code: {code}\n'
+
     def test_checkout_digest_reaches_candidate_and_clean_rebuild(self):
         # Changing the checkout catches hardcoded/stale digests; inspect the
         # actual buildctl argv, so dropping the build-arg forwarding is caught.
@@ -161,6 +168,7 @@ for index, argument in enumerate(args):
                 self.assertNotIn("--no-cache", calls[0])
                 self.assertIn("--no-cache", calls[1])
                 for args in calls:
+                    self.assertIn("--progress=plain", args)
                     options = [args[i + 1] for i, arg in enumerate(args) if arg == "--opt"]
                     anchors = [arg for arg in options if arg.startswith("build-arg:LUNARWING_WRAPPER_SHA256=")]
                     self.assertEqual(anchors, [f"build-arg:LUNARWING_WRAPPER_SHA256={digest}"])
@@ -415,10 +423,6 @@ for index, argument in enumerate(args):
         self.assertIn("failure (attempt 1/3)", result.stderr)
         self.assertIn("failure (attempt 2/3)", result.stderr)
         self.assertIn("not retrying", result.stderr)
-        # Conservatively add both full ladders and nine maximum jitter values;
-        # even that unreachable combination stays below runner cccccc's
-        # observed ~10000 s cap, although the YAML permits 8 h.
-        self.assertLessEqual(5715 + 420 + 9 * 29, 10000)
 
     def test_package_resolution_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_package"
@@ -428,6 +432,122 @@ for index, argument in enumerate(args):
         self.assertEqual(len(calls), 1)
         self.assertIn("not retrying", result.stderr)
         self.assertNotIn("transient snapshot.debian.org", result.stderr)
+
+    def test_job_204104_promisor_drop_is_retried(self):
+        trace = JOB_204104_TRACE.read_text(encoding="utf-8")
+        result = self.run_with_download_trace(trace, "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        # Candidate attempt (dropped) + candidate retry + clean rebuild.
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--no-cache", calls[1])
+        self.assertIn("--no-cache", calls[2])
+        self.assertIn("transient download failure (attempt 1/3)", result.stderr)
+        self.assertNotIn("not retrying", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [62])
+
+    def test_job_204104_promisor_failure_without_rpc_error_is_not_retried(self):
+        trace = JOB_204104_TRACE.read_text(encoding="utf-8")
+        result = self.run_with_download_trace(
+            "".join(line for line in trace.splitlines(keepends=True) if "RPC failed" not in line)
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+        self.assertEqual(self.recorded_sleeps(), [])
+
+    def npm_exhausted_trace(self):
+        return (
+            "#14 3.001 npm error code ECONNRESET\n"
+            "#14 3.002 worker-download-retry: transient download retries exhausted (exit 1)\n"
+            + self.run_error(14, "/bin/sh -c wdr_retry 'npm ci' '-' 'npm ci' && npm test")
+        )
+
+    def test_exhausted_npm_download_is_retried_on_both_builds(self):
+        for fail_call, expected in (("1", [False, False, True]), ("2", [False, True, True])):
+            with self.subTest(fail_call=fail_call):
+                result = self.run_with_download_trace(self.npm_exhausted_trace(), fail_call)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+                self.assertEqual(["--no-cache" in args for args in calls], expected)
+                self.assertIn("transient download failure (attempt 1/3)", result.stderr)
+                self.assertEqual(self.recorded_sleeps(), [62])
+
+    def test_persistent_download_failure_exhausts_own_budget(self):
+        result = self.run_with_download_trace(self.npm_exhausted_trace())
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        # Three download attempts, then the candidate gives up; the clean
+        # rebuild never runs.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.recorded_sleeps(), [62, 62])
+        self.assertIn("failure (attempt 1/3)", result.stderr)
+        self.assertIn("failure (attempt 2/3)", result.stderr)
+        self.assertIn("not retrying", result.stderr)
+
+    def test_recovered_download_does_not_retry_later_failing_test(self):
+        for test_step in (14, 18):
+            with self.subTest(same_step=test_step == 14):
+                command = "/bin/bash -o pipefail -c set -eu; "
+                if test_step == 14:
+                    command += "wdr_retry 'pnpm install' '-' 'pnpm install --frozen-lockfile'; "
+                trace = (
+                    "#14 0.681 error: RPC failed; curl 55 Failed sending data to the peer\n"
+                    "#14 0.681 worker-download-retry: attempt 1/3 failed; retrying in 20s\n"
+                    "#14 29.90 Done installing\n"
+                    f"#{test_step} 31.25 FAIL worker.test.ts > expected a supported response, got ECONNRESET\n"
+                    + self.run_error(test_step, command + "pnpm exec vitest run")
+                )
+                result = self.run_with_download_trace(trace)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(self.log.read_text().splitlines()), 1)
+                self.assertIn("not retrying", result.stderr)
+                self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_retry_marker_must_be_terminal_and_belong_to_the_failing_step(self):
+        trace = self.npm_exhausted_trace()
+        progress, error = trace.rstrip("\n").rsplit("\n", 1)
+        cases = {
+            "marker in another step": progress.replace("#14 ", "#7 ") + "\n" + error + "\n",
+            "mismatched exit": trace.replace("exit code: 1", "exit code: 2"),
+            "later output": progress + "\n#14 5.000 FAIL npm test\n" + error + "\n",
+            "second failing step": trace + self.run_error(18, "/bin/sh -c make"),
+        }
+        for label, log in cases.items():
+            with self.subTest(case=label):
+                result = self.run_with_download_trace(log)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(self.log.read_text().splitlines()), 1)
+                self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_pin_and_integrity_failures_are_not_retried(self):
+        # WI#862 point 4: a pin mismatch, EINTEGRITY, a sha256sum -c
+        # mismatch, a failing test in an install-and-test step, and a 403
+        # must each end the job on the first attempt.
+        cases = {
+            "pin mismatch": "error: pathspec 'deadbeef' did not match any file(s) known to git",
+            "EINTEGRITY": "npm error code EINTEGRITY\nnpm error sha512-abc integrity checksum failed",
+            "checksum": "example.rpm: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match",
+            "failing test": "not ok 7 - lunarwing bridge rejects a malformed envelope\n# failed 1 test",
+            "403": "fatal: unable to access 'https://git.lunarwing.org/lunarwing/lunardepth.git/': The requested URL returned error: 403",
+        }
+        for label, line in cases.items():
+            with self.subTest(case=label):
+                trace = "\n".join(f"#14 30.0 {part}" for part in line.splitlines()) + "\n"
+                trace += self.run_error(14, "/bin/sh -c wdr_retry 'npm ci' '-' 'npm ci' && npm test")
+                result = self.run_with_download_trace(trace)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.log.read_text().splitlines()), 1)
+                self.assertIn("not retrying", result.stderr)
+                self.assertNotIn("transient download failure", result.stderr)
+                self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_compile_error_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_compile"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient download failure", result.stderr)
 
     def test_every_worker_dockerfile_apt_call_has_a_time_limit(self):
         for lane in (

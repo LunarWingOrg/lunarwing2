@@ -26,6 +26,7 @@ RUN set -eu; \
 
 WORKDIR /build
 
+COPY pebble4lunarwing/scripts/worker-download-retry.sh /build/worker-download-retry.sh
 COPY pebble4lunarwing/Cargo.toml pebble4lunarwing/Cargo.lock ./bridge/
 COPY pebble4lunarwing/src ./bridge/src
 # Test before the release build: the workspace-path confinement and cron
@@ -35,10 +36,9 @@ RUN cd bridge && cargo test --locked
 RUN cd bridge && cargo build --release --locked
 
 RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
-    git init /build/pebble && \
-    git -C /build/pebble remote add origin https://github.com/nanogpt-community/pebble.git && \
-    git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
-    git -C /build/pebble checkout --detach FETCH_HEAD && \
+    . /build/worker-download-retry.sh && \
+    wdr_retry "pebble pinned fetch and checkout" "rm -rf /build/pebble" \
+      'git init /build/pebble && git -C /build/pebble remote add origin https://github.com/nanogpt-community/pebble.git && git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && git -C /build/pebble checkout --detach FETCH_HEAD' && \
     test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
 # WI#477: opt-in request lifecycle markers let the bridge report accurate
 # request indexes and native retry outcomes without changing normal CLI JSON.
@@ -165,7 +165,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
         *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
       esac; \
-      curl -fsSLo /tmp/rustup-init \
+      rm -f /tmp/rustup-init; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
       echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
       chmod +x /tmp/rustup-init; \
@@ -183,7 +185,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         *) echo "unsupported Go architecture" >&2; exit 1 ;; \
       esac; \
       ARCH=$(dpkg --print-architecture); \
-      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      rm -f /tmp/go.tgz; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
       echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
       tar -C /usr/local -xzf /tmp/go.tgz; \
       rm /tmp/go.tgz; \

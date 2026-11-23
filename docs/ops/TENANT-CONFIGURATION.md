@@ -726,6 +726,11 @@ and reset on restart. `GET /api/estimates/llm` is owner-only and reports the
 duration EMA, confidence, sample counts, dispatches, retries, switches and
 first-chunk timing.
 
+A full `add-tenant` env re-render preserves existing values of
+`LUNARWING_TOOL_ESTIMATES`, `LUNARWING_TOOL_ESTIMATES_CATEGORIES`,
+`LUNARWING_TOOL_ESTIMATES_TRACE`, and `LUNARWING_LLM_TIMINGS`. Unset keys stay
+unset so daemon defaults still apply.
+
 The mt-admin env writer sets `AGENT_AUTO_APPROVE_TOOLS=false` on new tenants.
 Re-rendering preserves an existing canonical override; an older tenant with
 only `AUTO_APPROVE_TOOLS` has that value migrated to the canonical key.

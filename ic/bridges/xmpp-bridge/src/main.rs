@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -17,8 +18,9 @@ use lunarwing::channels::{
 };
 use lunarwing::config::XmppConfig;
 use openclaw_xmpp_bridge_contract::{
-    BridgeMessage, BridgeStatusResponse, ConfigureRequest, ConfigureResponse, MessagesQuery,
-    MessagesResponse, OutboundRateLimitRequest, OutboundRateLimitResponse, SendRequest,
+    BridgeMessage, BridgeStatusResponse, ConfigureRequest, ConfigureResponse, DrainRequest,
+    DrainResponse, MessagesQuery, MessagesResponse, OutboundRateLimitRequest,
+    OutboundRateLimitResponse, SendRequest,
 };
 use secrecy::SecretString;
 use tokio::sync::RwLock;
@@ -76,7 +78,27 @@ struct NormalizedConfig {
 #[derive(Debug, Clone)]
 struct QueuedMessage {
     cursor: u64,
+    /// When this process queued the message. Used for the queue-age report
+    /// and the opt-in stale-queue policy (WI#854).
+    queued_at: Instant,
+    /// Included in a poll response, even if the poller hasn't acknowledged it.
+    served: bool,
     payload: BridgeMessage,
+}
+
+impl QueuedMessage {
+    fn new(cursor: u64, payload: BridgeMessage, now: Instant) -> Self {
+        Self {
+            cursor,
+            queued_at: now,
+            served: false,
+            payload,
+        }
+    }
+
+    fn age_secs(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.queued_at).as_secs()
+    }
 }
 
 #[derive(Default)]
@@ -86,15 +108,14 @@ struct BridgeInner {
     channel: Option<Arc<XmppChannel>>,
     current_cursor: u64,
     messages: VecDeque<QueuedMessage>,
-    /// Highest cursor the poller has acknowledged in this bridge process. A
-    /// poller sends back the cursor of the last page it dispatched and
-    /// persisted, so a request that echoes the last response cursor confirms
-    /// delivery of everything up to it (WI#850).
+    /// Highest cursor acknowledged by the poller or skipped by an explicit
+    /// full drain. A poller sends back the cursor of the last page it
+    /// dispatched and persisted to acknowledge delivery up to it (WI#850).
     acknowledged_cursor: u64,
-    /// Cursor of the most recent `/v1/messages` response. Only a request that
-    /// echoes it advances `acknowledged_cursor`, so an arbitrary cursor cannot
-    /// mark undelivered messages as delivered.
+    /// Cursor of the most recent `/v1/messages` response. A poll must echo it
+    /// to advance `acknowledged_cursor`.
     last_response_cursor: u64,
+    last_poll_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -102,6 +123,8 @@ struct AppState {
     inner: Arc<RwLock<BridgeInner>>,
     expected_token: Option<String>,
     max_messages: usize,
+    /// Minimum poll gap and unserved message age for opt-in expiry; 0 disables it.
+    stale_queue_secs: u64,
 }
 
 #[tokio::main]
@@ -130,11 +153,17 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_MESSAGES);
+    let stale_queue_secs = stale_queue_policy(std::env::var("XMPP_BRIDGE_STALE_QUEUE_SECS"));
+    tracing::info!(
+        stale_queue_secs,
+        "Effective XMPP stale-queue threshold (0 disables expiry)"
+    );
 
     let state = AppState {
         inner: Arc::new(RwLock::new(BridgeInner::default())),
         expected_token,
         max_messages,
+        stale_queue_secs,
     };
 
     let app = build_router(state.clone());
@@ -147,6 +176,29 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn stale_queue_policy(value: Result<String, std::env::VarError>) -> u64 {
+    // Four nominal 30-second guest poll intervals.
+    const MIN_IDLE_SECS: u64 = 120;
+    match value {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) => 0,
+            Ok(secs) if secs >= MIN_IDLE_SECS => secs,
+            _ => {
+                tracing::warn!(
+                    MIN_IDLE_SECS,
+                    "Invalid XMPP_BRIDGE_STALE_QUEUE_SECS; expected 0 or an integer at or above the minimum"
+                );
+                0
+            }
+        },
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => {
+            tracing::warn!("Unreadable XMPP_BRIDGE_STALE_QUEUE_SECS; expiry disabled");
+            0
+        }
+    }
 }
 
 /// Build the bridge router with the production send body limit.
@@ -163,6 +215,7 @@ fn build_router_with_body_limit(state: AppState, max_body_bytes: usize) -> Route
         .route("/v1/status", get(status_handler))
         .route("/v1/outbound-rate-limit", post(outbound_rate_limit_handler))
         .route("/v1/messages", get(messages_handler))
+        .route("/v1/messages/drain", post(drain_handler))
         .route(
             "/v1/messages/send",
             // Only the send route carries base64 attachments, so only it gets
@@ -325,6 +378,8 @@ async fn status_handler(
         running,
         current_cursor,
         queued_messages,
+        pending_messages,
+        oldest_queued_age_secs,
         jid,
         configured_rooms,
         configured_limit,
@@ -336,6 +391,8 @@ async fn status_handler(
             inner.channel.is_some(),
             inner.current_cursor,
             inner.messages.len(),
+            pending_messages(&inner).count(),
+            oldest_queued_age_secs(&inner, Instant::now()),
             inner.jid.clone(),
             inner
                 .configured
@@ -385,6 +442,8 @@ async fn status_handler(
         running,
         current_cursor,
         queued_messages,
+        pending_messages,
+        oldest_queued_age_secs,
         jid,
         configured_rooms,
         rooms_with_presence: presence_diagnostics
@@ -479,24 +538,114 @@ async fn messages_handler(
         .unwrap_or(DEFAULT_MESSAGES_PAGE_LIMIT)
         .clamp(1, MAX_MESSAGES_PAGE_LIMIT);
     let mut inner = state.inner.write().await;
+    let now = Instant::now();
     let start = poll_start(&mut inner, cursor);
-    let page: Vec<&QueuedMessage> = inner
+    let previous_poll = inner.last_poll_at.replace(now);
+    if state.stale_queue_secs > 0
+        && previous_poll.is_some_and(|last| {
+            now.saturating_duration_since(last).as_secs() >= state.stale_queue_secs
+        })
+    {
+        let dropped = drop_queued_messages(&mut inner, Some(state.stale_queue_secs), now);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                stale_queue_secs = state.stale_queue_secs,
+                current_cursor = inner.current_cursor,
+                "Dropped stale never-served inbound messages after a poll gap (WI#854)"
+            );
+        }
+    }
+    let mut messages = Vec::new();
+    let mut next_cursor = start;
+    for message in inner
         .messages
-        .iter()
+        .iter_mut()
         .filter(|message| message.cursor > start)
         .take(limit)
-        .collect();
+    {
+        // Remember every served entry, not just the last response cursor:
+        // a smaller retry or an empty resync can change that cursor.
+        message.served = true;
+        next_cursor = message.cursor;
+        messages.push(message.payload.clone());
+    }
     // Advance only past the messages actually returned. Reporting the bridge's
     // newest cursor here would skip the rest of the backlog as soon as a page
     // is capped (WI#850).
-    let next_cursor = page.last().map_or(start, |message| message.cursor);
     let response = MessagesResponse {
         cursor: resync_cursor(cursor, inner.current_cursor, next_cursor),
-        messages: page.iter().map(|message| message.payload.clone()).collect(),
+        messages,
     };
     inner.last_response_cursor = response.cursor;
 
     Ok(Json(response))
+}
+
+/// Discard queued inbound messages on operator request (WI#854).
+async fn drain_handler(
+    State(state): State<AppState>,
+    Json(request): Json<DrainRequest>,
+) -> Result<Json<DrainResponse>, BridgeError> {
+    if request.all == request.older_than_secs.is_some() {
+        return Err(BridgeError::bad_request(
+            "specify exactly one of all=true or older_than_secs",
+        ));
+    }
+    let mut inner = state.inner.write().await;
+    let now = Instant::now();
+    let drained = drop_queued_messages(&mut inner, request.older_than_secs, now);
+    let remaining = pending_messages(&inner).count();
+    if drained > 0 {
+        tracing::warn!(
+            drained,
+            older_than_secs = ?request.older_than_secs,
+            remaining,
+            current_cursor = inner.current_cursor,
+            "Operator drained queued inbound XMPP messages (WI#854)"
+        );
+    }
+    Ok(Json(DrainResponse {
+        drained,
+        remaining,
+        oldest_queued_age_secs: oldest_queued_age_secs(&inner, now),
+    }))
+}
+
+fn pending_messages(inner: &BridgeInner) -> impl Iterator<Item = &QueuedMessage> {
+    inner
+        .messages
+        .iter()
+        .filter(|message| message.cursor > inner.acknowledged_cursor)
+}
+
+/// Age of the oldest unacknowledged message still retained for the poller.
+fn oldest_queued_age_secs(inner: &BridgeInner, now: Instant) -> Option<u64> {
+    pending_messages(inner)
+        .next()
+        .map(|message| message.age_secs(now))
+}
+
+/// Drop pending entries, keeping served entries for retry unless explicitly
+/// discarding everything. Acknowledged history is always retained.
+fn drop_queued_messages(
+    inner: &mut BridgeInner,
+    older_than_secs: Option<u64>,
+    now: Instant,
+) -> usize {
+    let before = inner.messages.len();
+    let acknowledged = inner.acknowledged_cursor;
+    inner.messages.retain(|message| {
+        message.cursor <= acknowledged
+            || older_than_secs.is_some_and(|limit| message.served || message.age_secs(now) < limit)
+    });
+    let dropped = before - inner.messages.len();
+    // Age-based discard leaves gaps that pagination can skip without
+    // acknowledging a retained retry. Only a full drain can move this cursor.
+    if dropped > 0 && older_than_secs.is_none() {
+        inner.acknowledged_cursor = inner.current_cursor;
+    }
+    dropped
 }
 
 /// The cursor a poll reads after, given what the poller has acknowledged.
@@ -509,9 +658,9 @@ async fn messages_handler(
 /// poll resumes after the last acknowledged message instead: nothing
 /// delivered is replayed, and messages queued while the daemon was down
 /// (cursors above the acknowledged one) are still served. A page that was
-/// handed out but not yet acknowledged is served again, so delivery stays
-/// at-least-once. A cursor ahead of this process is the bridge-restart case
-/// that `resync_cursor` handles; its page is empty either way.
+/// handed out but not yet acknowledged is served again if still retained,
+/// so delivery stays at-least-once. A cursor ahead of this process is the
+/// bridge-restart case that `resync_cursor` handles; its page is empty.
 fn poll_start(inner: &mut BridgeInner, request_cursor: u64) -> u64 {
     if request_cursor > inner.current_cursor {
         return request_cursor;
@@ -627,7 +776,8 @@ async fn enqueue_message(state: &AppState, message: IncomingMessage) {
     let mut inner = state.inner.write().await;
     inner.current_cursor = inner.current_cursor.saturating_add(1);
     let cursor = inner.current_cursor;
-    inner.messages.push_back(QueuedMessage { cursor, payload });
+    let queued = QueuedMessage::new(cursor, payload, Instant::now());
+    inner.messages.push_back(queued);
     while inner.messages.len() > state.max_messages {
         inner.messages.pop_front();
     }
@@ -818,6 +968,7 @@ mod tests {
             inner: Arc::new(RwLock::new(BridgeInner::default())),
             expected_token: None,
             max_messages: DEFAULT_MAX_MESSAGES,
+            stale_queue_secs: 0,
         }
     }
 
@@ -981,25 +1132,29 @@ mod tests {
         for i in 0..count {
             inner.current_cursor += 1;
             let cursor = inner.current_cursor;
-            inner.messages.push_back(QueuedMessage {
-                cursor,
-                payload: BridgeMessage {
-                    message_id: format!("m{i}"),
-                    user_id: "user".to_string(),
-                    sender_id: None,
-                    user_name: None,
-                    content: format!("message {i}"),
-                    thread_id: None,
-                    metadata_json: "{}".to_string(),
-                    attachments: Vec::new(),
-                },
-            });
+            let payload = BridgeMessage {
+                message_id: format!("m{i}"),
+                user_id: "user".to_string(),
+                sender_id: None,
+                user_name: None,
+                content: format!("message {i}"),
+                thread_id: None,
+                metadata_json: "{}".to_string(),
+                attachments: Vec::new(),
+            };
+            let queued = QueuedMessage::new(cursor, payload, Instant::now());
+            inner.messages.push_back(queued);
         }
         drop(inner);
         state
     }
 
     async fn get_messages(router: Router, uri: &str) -> MessagesResponse {
+        let body = get_body(router, uri).await;
+        serde_json::from_slice(&body).expect("parse messages response")
+    }
+
+    async fn get_body(router: Router, uri: &str) -> axum::body::Bytes {
         let mut request = Request::builder()
             .method("GET")
             .uri(uri)
@@ -1015,10 +1170,9 @@ mod tests {
             .await
             .expect("router should answer request");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("read messages body");
-        serde_json::from_slice(&body).expect("parse messages response")
+            .expect("read GET response body")
     }
 
     #[tokio::test]
@@ -1098,19 +1252,18 @@ mod tests {
         for _ in 0..count {
             inner.current_cursor += 1;
             let cursor = inner.current_cursor;
-            inner.messages.push_back(QueuedMessage {
-                cursor,
-                payload: BridgeMessage {
-                    message_id: format!("m{}", cursor - 1),
-                    user_id: "user".to_string(),
-                    sender_id: None,
-                    user_name: None,
-                    content: format!("message {}", cursor - 1),
-                    thread_id: None,
-                    metadata_json: "{}".to_string(),
-                    attachments: Vec::new(),
-                },
-            });
+            let payload = BridgeMessage {
+                message_id: format!("m{}", cursor - 1),
+                user_id: "user".to_string(),
+                sender_id: None,
+                user_name: None,
+                content: format!("message {}", cursor - 1),
+                thread_id: None,
+                metadata_json: "{}".to_string(),
+                attachments: Vec::new(),
+            };
+            let queued = QueuedMessage::new(cursor, payload, Instant::now());
+            inner.messages.push_back(queued);
         }
     }
 
@@ -1197,5 +1350,289 @@ mod tests {
         for (i, id) in delivered.iter().enumerate() {
             assert_eq!(id, &format!("m{i}"), "paging must not skip or reorder");
         }
+    }
+
+    /// Backdate every queued message by `secs` so the stale-queue policy and
+    /// age-bounded drain are testable without sleeping.
+    async fn backdate_backlog(state: &AppState, secs: u64) {
+        let mut inner = state.inner.write().await;
+        let now = Instant::now();
+        let aged = now
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .unwrap_or(now);
+        for message in inner.messages.iter_mut() {
+            message.queued_at = aged;
+        }
+    }
+
+    async fn post_drain(router: Router, body: &str) -> DrainResponse {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages/drain")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210"
+                .parse::<SocketAddr>()
+                .expect("parse peer address"),
+        ));
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("router should answer request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read drain body");
+        serde_json::from_slice(&body).expect("parse drain response")
+    }
+
+    #[tokio::test]
+    async fn drain_all_discards_even_the_unacknowledged_page() {
+        let state = state_with_backlog(5);
+        let router = build_router(state);
+
+        let served = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(served.cursor, 2);
+        let drained = post_drain(router.clone(), r#"{"all":true}"#).await;
+        assert_eq!(
+            drained.drained, 5,
+            "all also discards the unacknowledged page"
+        );
+        assert_eq!(drained.remaining, 0);
+        assert_eq!(drained.oldest_queued_age_secs, None);
+
+        let page = get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        assert!(page.messages.is_empty(), "a drained queue serves nothing");
+        assert_eq!(page.cursor, 5, "the cursor sequence must not reset");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_history_is_not_pending_or_drained() {
+        let state = state_with_backlog(2);
+        backdate_backlog(&state, 600).await;
+        let router = build_router(state.clone());
+        get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        get_messages(router.clone(), "/v1/messages?cursor=2").await;
+        let body = get_body(router.clone(), "/v1/status").await;
+        let status: BridgeStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.queued_messages, 2);
+        assert_eq!(status.pending_messages, 0);
+        assert_eq!(status.oldest_queued_age_secs, None);
+        assert_eq!(
+            post_drain(router.clone(), r#"{"all":true}"#).await.drained,
+            0
+        );
+        enqueue_backlog(&state, 1).await;
+        let body = get_body(router.clone(), "/v1/status").await;
+        let status: BridgeStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.pending_messages, 1);
+        assert!(status.oldest_queued_age_secs.unwrap() < 600);
+        assert_eq!(post_drain(router, r#"{"all":true}"#).await.drained, 1);
+        assert_eq!(state.inner.read().await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_or_unauthorized_drain_leaves_pending_messages() {
+        let state = AppState {
+            expected_token: Some("bridge-token".into()),
+            ..state_with_backlog(2)
+        };
+        let router = build_router(state.clone());
+        let path = "/v1/messages/drain";
+        let peer = "127.0.0.1:43210";
+        let json = br#"{"all":true}"#.to_vec();
+        assert_eq!(
+            post_status(router.clone(), path, json.clone(), None, peer).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_status(
+                router.clone(),
+                path,
+                json,
+                Some("bridge-token"),
+                "192.0.2.1:43210"
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        for (body, expected) in [
+            ("", StatusCode::BAD_REQUEST),
+            ("{}", StatusCode::BAD_REQUEST),
+            (
+                r#"{"all":false,"older_than_secs":null}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"all":true,"older_than_secs":10}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (r#"{"older_than":10}"#, StatusCode::UNPROCESSABLE_ENTITY),
+            ("[true,null]", StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            assert_eq!(
+                post_status(
+                    router.clone(),
+                    path,
+                    body.as_bytes().to_vec(),
+                    Some("bridge-token"),
+                    peer
+                )
+                .await,
+                expected
+            );
+        }
+        let mut request = Request::post(path)
+            .header("authorization", "Bearer bridge-token")
+            .body(Body::from(r#"{"older_than_secs":10}"#))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(pending_messages(&*state.inner.read().await).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_age_threshold_is_inclusive() {
+        let state = state_with_backlog(2);
+        let mut inner = state.inner.write().await;
+        let now = Instant::now();
+        inner.messages[0].queued_at = now - std::time::Duration::from_secs(60);
+        inner.messages[1].queued_at = now - std::time::Duration::from_secs(59);
+        assert_eq!(drop_queued_messages(&mut inner, Some(60), now), 1);
+        assert_eq!(inner.messages[0].cursor, 2, "the younger message remains");
+    }
+
+    #[tokio::test]
+    async fn drain_with_age_bound_keeps_served_and_recent_messages() {
+        let state = state_with_backlog(4);
+        backdate_backlog(&state, 120).await;
+        enqueue_backlog(&state, 2).await;
+        let router = build_router(state.clone());
+
+        let served = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(served.cursor, 2);
+        // A smaller retry must not make the rest of the previously served page
+        // eligible for discard just because the latest response ends sooner.
+        let shorter = get_messages(router.clone(), "/v1/messages?cursor=0&limit=1").await;
+        assert_eq!(shorter.cursor, 1);
+        let drained = post_drain(router.clone(), r#"{"older_than_secs":60}"#).await;
+        assert_eq!(
+            drained.drained, 2,
+            "only aged, unserved messages are discarded"
+        );
+        assert_eq!(
+            drained.remaining, 4,
+            "the unacknowledged page is still pending"
+        );
+        assert!(drained.oldest_queued_age_secs.is_some_and(|age| age >= 120));
+        assert_eq!(state.inner.read().await.acknowledged_cursor, 0);
+
+        let retry = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(retry, served, "the served page survives an age-based drain");
+        let page = get_messages(router.clone(), "/v1/messages?cursor=2").await;
+        let ids: Vec<_> = page
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, ["m4", "m5"], "fresh messages must still be served");
+        assert_eq!(
+            page.cursor, 6,
+            "the next page crosses the discarded cursor gap"
+        );
+        let idle = get_messages(router.clone(), "/v1/messages?cursor=6").await;
+        assert!(idle.messages.is_empty());
+        let reset = get_messages(router, "/v1/messages?cursor=0").await;
+        assert!(reset.messages.is_empty(), "acknowledged pages stay retired");
+    }
+
+    #[tokio::test]
+    async fn drain_with_age_bound_does_not_treat_an_empty_resync_as_delivery() {
+        let state = state_with_backlog(2);
+        backdate_backlog(&state, 120).await;
+        let router = build_router(state);
+
+        let resync = get_messages(router.clone(), "/v1/messages?cursor=99").await;
+        assert!(resync.messages.is_empty());
+        assert_eq!(resync.cursor, 2);
+        let drained = post_drain(router, r#"{"older_than_secs":60}"#).await;
+        assert_eq!(drained.drained, 2, "neither message was served");
+        assert_eq!(drained.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_queue_policy_expires_pending_messages_only_after_poll_gap() {
+        // `state_with_backlog` and the struct update share the same inner
+        // queue, so the policy sees the seeded messages.
+        let state = AppState {
+            stale_queue_secs: 120,
+            ..state_with_backlog(4)
+        };
+        backdate_backlog(&state, 300).await;
+        enqueue_backlog(&state, 2).await;
+        let router = build_router(state.clone());
+
+        // First contact and ordinary pagination preserve even aged messages.
+        let first = get_messages(router.clone(), "/v1/messages?cursor=0&limit=1").await;
+        assert_eq!(first.messages[0].message_id, "m0");
+        let second = get_messages(router.clone(), "/v1/messages?cursor=1&limit=1").await;
+        assert_eq!(second.messages[0].message_id, "m1");
+        state.inner.write().await.last_poll_at =
+            Some(Instant::now() - std::time::Duration::from_secs(120));
+
+        let retry = get_messages(router.clone(), "/v1/messages?cursor=0&limit=1").await;
+        assert_eq!(
+            retry, second,
+            "expiry must not discard an unacknowledged page"
+        );
+        {
+            let inner = state.inner.read().await;
+            let retained: Vec<_> = inner
+                .messages
+                .iter()
+                .map(|message| message.cursor)
+                .collect();
+            assert_eq!(
+                retained,
+                [1, 2, 5, 6],
+                "only aged, unserved entries are gone"
+            );
+            assert_eq!(inner.acknowledged_cursor, 1, "expiry cannot skip the retry");
+        }
+
+        let page = get_messages(router, "/v1/messages?cursor=2").await;
+        let ids: Vec<_> = page
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, ["m4", "m5"], "only the fresh messages may be served");
+    }
+
+    #[test]
+    fn stale_queue_policy_requires_zero_or_at_least_120_seconds() {
+        for value in ["", "60s", " 120", "-1", "119", "0"] {
+            assert_eq!(stale_queue_policy(Ok(value.into())), 0);
+        }
+        assert_eq!(stale_queue_policy(Ok("120".into())), 120);
+        assert_eq!(stale_queue_policy(Err(std::env::VarError::NotPresent)), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_queue_policy_is_off_by_default() {
+        // Preserve the pre-WI#854 behavior unless an operator opts in: an old
+        // backlog is still delivered rather than silently dropped.
+        let state = state_with_backlog(3);
+        backdate_backlog(&state, 86_400).await;
+        let page = get_messages(build_router(state), "/v1/messages?cursor=0").await;
+
+        assert_eq!(page.messages.len(), 3);
     }
 }

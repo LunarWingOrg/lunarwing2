@@ -1722,6 +1722,16 @@ ONBOARD_COMPLETED=true
 HEARTBEAT_ENABLED=false
 RUST_LOG=lunarwing=info
 ENVEOF
+  # WI#318: keep optional estimation overrides without materializing defaults.
+  local estimate_key estimate_value estimate_quoted
+  for estimate_key in LUNARWING_TOOL_ESTIMATES LUNARWING_TOOL_ESTIMATES_CATEGORIES \
+    LUNARWING_TOOL_ESTIMATES_TRACE LUNARWING_LLM_TIMINGS; do
+    if grep -q "^${estimate_key}=" "$env_snapshot"; then
+      estimate_value="$(_env_existing "$env_snapshot" "$estimate_key")"
+      estimate_quoted="$(_quote_env_value "$estimate_value")" || die "invalid value for $estimate_key"
+      printf '%s=%s\n' "$estimate_key" "$estimate_quoted" >> "$staged_env"
+    fi
+  done
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
@@ -1881,15 +1891,26 @@ write_tenant_bridge_env() {
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "" "${daemon_csv:-user@xmpp.localhost}")"
   fi
 
+  rm -f -- "$lunarwing_snapshot"
+  local bridge_snapshot stale_queue_secs
+  _snapshot_tenant_env "$name" "$path" bridge_snapshot
+  stale_queue_secs="$(_read_env_value "$bridge_snapshot" XMPP_BRIDGE_STALE_QUEUE_SECS)"
+  rm -f -- "$bridge_snapshot"
+  if [[ -n "$stale_queue_secs" && ! "$stale_queue_secs" =~ ^[0-9]+$ ]]; then
+    warn_err "invalid XMPP_BRIDGE_STALE_QUEUE_SECS for '$name'; rendering expiry disabled"
+    stale_queue_secs=0
+  fi
+
   # WI#390: write as the tenant through the atomic writer — root never opens
   # xmpp-bridge.env inside the tenant-writable env dir (see proxy.env). The
   # explicit || die keeps the refusal fatal even when errexit is suppressed.
-  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || { rm -f -- "$lunarwing_snapshot"; die "could not safely write $path"; }
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || die "could not safely write $path"
 LUNARWING_BASE_DIR=$state_dir
 IRONCLAW_BASE_DIR=$state_dir
 XMPP_BRIDGE_BIND=127.0.0.1:${bridge_port}
 XMPP_BRIDGE_TOKEN=$bridge_token
 XMPP_BRIDGE_MAX_MESSAGES=256
+XMPP_BRIDGE_STALE_QUEUE_SECS=${stale_queue_secs:-0}
 RUST_LOG=xmpp_bridge=info,info
 
 XMPP_JID=$xmpp_jid
@@ -1904,7 +1925,6 @@ XMPP_ALLOW_PLAINTEXT_FALLBACK=true
 XMPP_RESOURCE=$name
 XMPP_BRIDGE_WAIT_SECONDS=15
 ENVEOF
-  rm -f -- "$lunarwing_snapshot"
   say "wrote: $path"
 }
 

@@ -83,6 +83,26 @@ Raising `MAX_EMITS_PER_EXECUTION` was explicitly rejected: the failure was an
 all-or-nothing batch reject, so a larger cap only moves the backlog size at
 which a channel wedges.
 
+## WI#854: bridge discard controls do not resolve D3
+
+After !2699, D3 is the risk of losing acknowledged messages still queued in
+the daemon's memory when it restarts. D3 remains open. Observe the first live
+hop with !2699 before deciding whether a daemon-side hold or durable handoff
+is needed.
+
+The [bridge discard controls](../reference/custom_bridges/XMPP.md#post-v1messagesdrain)
+are separate: status distinguishes pending entries from the retained replay
+ring; drain requires an explicit discard mode; opt-in expiry runs only after
+a long poll gap. Expiry and age-based drains discard only pending, never-served
+messages, so a still-buffered unacknowledged page can be replayed. An explicit
+full drain (`--all`) also discards that page and gives up its retry. None of
+these controls can protect acknowledged messages in the daemon queue.
+
+Manual discard is relevant only when the bridge survives a daemon-only stop
+(for example, on OpenRC), while polling is stopped and before it resumes.
+Stock systemd service coupling and managed tenant upgrades stop the bridge,
+which clears its in-memory ring without a drain.
+
 ## Current implementation
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
@@ -175,3 +195,6 @@ so the whole-backlog livelock documented above is closed. `messages_handler`
 moved to `main.rs:463-511` and `enqueue_message` to `:560-590`. The residual
 queue-backpressure path (bounded dispatch queue, `reserve_many` await) is
 unchanged and remains a separate, unreproduced risk.
+
+The WI#854 bridge controls do not change daemon-side queue durability.
+No live upgrade hop is claimed here.

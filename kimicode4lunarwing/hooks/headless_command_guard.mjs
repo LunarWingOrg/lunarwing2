@@ -69,6 +69,90 @@ function rmOperands(words, endOfOptions) {
     .filter((token) => !/^\d*>/.test(token));
 }
 
+// Keep these listener-local until the shared quote reader in WI#856 lands.
+function listenerOpeningQuote(text, i) {
+  if (text[i] === "$" && text[i + 1] === "'") return "$'";
+  return text[i] === "'" || text[i] === '"' ? text[i] : "";
+}
+
+function listenerQuoteEscape(text, i, quote) {
+  return text[i] === "\\" && quote !== "'" && i + 1 < text.length &&
+    (quote !== '"' || '\\"$`\n'.includes(text[i + 1]));
+}
+
+/** Read an ordinary literal heredoc delimiter, without performing expansions. */
+function listenerHeredoc(text, i) {
+  if (!text.startsWith("<<", i) || text[i - 1] === "<" || text[i + 2] === "<") return null;
+  const stripTabs = text[i + 2] === "-";
+  const word = /[ \t]*((?:'(?:[^'\n]*)'|"(?:\\[^\n]|[^"\\\n])*"|\\[^\n]|[^ \t\n;|&()<>'"\\])+)/y;
+  word.lastIndex = i + (stripTabs ? 3 : 2);
+  const match = word.exec(text);
+  if (!match) return null;
+  const delimiter = match[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+    (_match, single, double, escaped) => single ?? double?.replace(/\\(["\\$`])/g, "$1") ?? escaped);
+  return { delimiter, stripTabs, end: word.lastIndex };
+}
+
+/** Isolate comments and heredoc lines so data quotes cannot affect later commands. */
+function* listenerRegions(text) {
+  if (!text.includes("#") && !text.includes("<<")) {
+    yield { text, heredoc: false };
+    return;
+  }
+  let start = 0;
+  let parts = [];
+  let quote = "";
+  let atWordStart = true;
+  const heredocs = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
+      if (!quote && text[i] !== "\n") atWordStart = false;
+    } else if (quote) {
+      if (ch === quote.at(-1)) quote = "";
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
+      atWordStart = false;
+    } else if (ch === "#" && atWordStart) {
+      parts.push(text.slice(start, i));
+      const lf = text.indexOf("\n", i);
+      start = lf === -1 ? text.length : lf;
+      i = start - 1;
+    } else if (ch === "<") {
+      const heredoc = listenerHeredoc(text, i);
+      if (heredoc) {
+        heredocs.push(heredoc);
+        i = heredoc.end - 1;
+      }
+      atWordStart = !heredoc;
+    } else if (ch === "\n" && heredocs.length > 0) {
+      parts.push(text.slice(start, i + 1));
+      yield { text: parts.join(""), heredoc: false };
+      parts = [];
+      let next = i + 1;
+      for (const { delimiter, stripTabs } of heredocs) {
+        while (next < text.length) {
+          const lf = text.indexOf("\n", next);
+          const end = lf === -1 ? text.length : lf;
+          const line = text.slice(next, end);
+          next = lf === -1 ? end : end + 1;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+          yield { text: line, heredoc: true };
+        }
+      }
+      heredocs.length = 0;
+      start = next;
+      i = next - 1;
+      atWordStart = true;
+    } else {
+      atWordStart = " \t\n;|&()<>".includes(ch);
+    }
+  }
+  parts.push(text.slice(start));
+  yield { text: parts.join(""), heredoc: false };
+}
+
 /**
  * The containment test shared by every deletion rule (WI#826, WI#830): a
  * target is provably inside the temp roots only as a literal absolute path,
@@ -224,9 +308,16 @@ function shellWordView(command) {
   return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
-/** Split on control operators and LF, leaving other line terminators in the text. */
-function commandSegments(command) {
-  return command.split(/[;|&]{1,2}|\n+/);
+/**
+ * Split on control operators and LF, leaving other line terminators in the
+ * text. The separators are read outside quotes: an argument that legitimately
+ * carries `;`, `|`, `&` or a newline stays in its own command's segment, so
+ * the rest of that command does not read as a segment without the verb
+ * (WI#856). A de-escaped view passes `escapes: false`, because its remaining
+ * backslashes are literal and must not hide a separator.
+ */
+function commandSegments(command, escapes = true) {
+  return splitOutsideQuotes(command, isClauseTerminator, escapes);
 }
 
 function isRmLongDeleteOption(word) {
@@ -270,14 +361,14 @@ function checkRm(segment) {
   return null;
 }
 
-const FIND_CALL = /(?:^|[\s;&|()])find\s+([^;&|\n]*)/g;
+const FIND_CALL = /(?:^|[\s;&|()])find\b/g;
 // Deletion actions inside a find expression: `-delete`, and `-exec`/`-ok`
 // running a deleting utility (WI#826, WI#832: unlink).
 const FIND_DELETE_ACTION =
   /(?:^|[\s(])(?:-delete|-exec(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b|-ok(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b)/;
-const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b([^;&|\n]*)/g;
+const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b/g;
 const XARGS_RM = /(?:^|\s)(?:[\w.+-]*\/)?rm(?:\s|$)/;
-const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b([^;&|\n]*)/g;
+const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b/g;
 // Interpreter options may precede the eval flag (`perl -MFile::Path -e …`),
 // so the eval flag is found by walking the words (oneLinerCode).
 const ONE_LINER_CALL =
@@ -300,8 +391,8 @@ const ASSIGNED_SINK =
 // full rather than only its first operand (WI#840).
 const PERL_DELETE_CALL = /\b(?:unlink|rmdir|rmtree|remove_tree)\b/g;
 const DEVICE_TARGET = /^\/dev\/(?:sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
-const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b([^;&|\n]*)/g;
-const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b([^;&|\n]*)/g;
+const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b/g;
+const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b/g;
 
 /** The start paths of a find invocation: the words before its expression. */
 function findStartPaths(rest) {
@@ -317,31 +408,36 @@ function findStartPaths(rest) {
 
 /** Deny `find -delete`, `-exec rm` and `-ok rm` whose start paths leave the temp roots. */
 function checkFindDeletion(text) {
-  for (const match of text.matchAll(FIND_CALL)) {
-    if (!FIND_DELETE_ACTION.test(match[1])) continue;
-    const paths = findStartPaths(match[1]);
+  for (const { rest } of clauseTails(text, FIND_CALL)) {
+    if (!FIND_DELETE_ACTION.test(rest)) continue;
+    const paths = findStartPaths(rest);
     if (!paths.every(isSafeTempPath)) return outsideTempReason("find", paths);
   }
   return null;
 }
 
-/** The pipeline list that feeds an `xargs` call (pipes stay in the list). */
+/**
+ * The pipeline list that feeds an `xargs` call (pipes stay in the list). The
+ * list boundaries are read outside quotes, so a quoted `;` or newline in an
+ * earlier command does not move the start of the pipeline past its feeding
+ * `find` (WI#856).
+ */
 function feedingPipeline(text, index) {
-  const lists = text.slice(0, index).split(/[;\n]|&&|\|\|/);
+  const lists = commandLists(text.slice(0, index));
   return lists[lists.length - 1] ?? "";
 }
 
 /** The start paths of the last find in a pipeline, or null when there is none. */
 function lastFindPaths(pipeline) {
   let paths = null;
-  for (const match of pipeline.matchAll(FIND_CALL)) paths = findStartPaths(match[1]);
+  for (const { rest } of clauseTails(pipeline, FIND_CALL)) paths = findStartPaths(rest);
   return paths;
 }
 
 /** Deny `xargs rm` unless its feeding find is provably temp-rooted. */
 function checkXargsDeletion(text) {
-  for (const match of text.matchAll(XARGS_CALL)) {
-    if (!XARGS_RM.test(match[1])) continue;
+  for (const { match, rest } of clauseTails(text, XARGS_CALL)) {
+    if (!XARGS_RM.test(rest)) continue;
     const paths = lastFindPaths(feedingPipeline(text, match.index));
     // Without a find in the pipeline the deleted set is unknown; fail closed.
     if (paths === null) return "xargs rm over an input set the guard cannot verify";
@@ -356,8 +452,8 @@ function checkXargsDeletion(text) {
  * last operand; `--remove-source-files` deletes the operands before it.
  */
 function checkRsyncDeletion(text) {
-  for (const match of text.matchAll(RSYNC_CALL)) {
-    const words = argumentWords(match[1]).map(stripShellQuotes);
+  for (const { rest } of clauseTails(text, RSYNC_CALL)) {
+    const words = argumentWords(rest).map(stripShellQuotes);
     const option = words.find((word) => /^--del(?:ete(?:-[a-z-]+)?)?$/.test(word) ||
       word === "--remove-source-files");
     if (option === undefined) continue;
@@ -369,8 +465,8 @@ function checkRsyncDeletion(text) {
   return null;
 }
 
-const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b([^;&|\n]*)/g;
-const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b([^;&|\n]*)/g;
+const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b/g;
+const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b/g;
 // tar's argument-taking short options. Every other letter is a flag, so an
 // old-style first word (`tar cf archive …`) is read letter by letter.
 const TAR_SHORT_ARG = new Set("bCfFgHIKLNTVX");
@@ -585,12 +681,12 @@ function mvOperandProtected(operand) {
 }
 
 function checkMoveAndTarDeletion(text) {
-  for (const match of text.matchAll(MV_CALL)) {
-    const hit = mvOperands(match[1]).find(mvTouchesProtected);
+  for (const { rest } of clauseTails(text, MV_CALL)) {
+    const hit = mvOperands(rest).find(mvTouchesProtected);
     if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
   }
-  for (const match of text.matchAll(TAR_CALL)) {
-    const tar = tarInvocation(match[1]);
+  for (const { rest } of clauseTails(text, TAR_CALL)) {
+    const tar = tarInvocation(rest);
     if (!tar.removeFiles) continue;
     if (tar.unverifiable) return "tar --remove-files over a member list the guard cannot verify";
     if (tar.members.length === 0) return "tar --remove-files without an explicit member";
@@ -998,15 +1094,15 @@ function deviceTarget(word) {
 
 /** Deny block-device writes by `tee` (every operand) and `cp` (its last operand). */
 function checkDeviceWrites(text) {
-  for (const match of text.matchAll(TEE_CALL)) {
-    for (const word of argumentWords(match[1])) {
+  for (const { rest } of clauseTails(text, TEE_CALL)) {
+    for (const word of argumentWords(rest)) {
       if (word.startsWith("-")) continue;
       const target = deviceTarget(word);
       if (target !== null) return `direct block-device write: tee ${target.slice(0, 80)}`;
     }
   }
-  for (const match of text.matchAll(CP_CALL)) {
-    const operands = argumentWords(match[1]).filter((word) => !word.startsWith("-"));
+  for (const { rest } of clauseTails(text, CP_CALL)) {
+    const operands = argumentWords(rest).filter((word) => !word.startsWith("-"));
     const target = operands.length > 0 ? deviceTarget(operands[operands.length - 1]) : null;
     if (target !== null) return `direct block-device write: cp ${target.slice(0, 80)}`;
   }
@@ -1092,11 +1188,12 @@ const RECURSIVE_CHANGE_FLAG =
 /**
  * Deny a recursive mode/ownership change on a system root, however the root is
  * spelled. A linear scan, not a regex: the regex form rescanned the rest of
- * the command from every `chmod` and took ten seconds on 12 KB of them.
+ * the command from every `chmod` and took ten seconds on 12 KB of them. The
+ * clause is read outside quotes, so a quoted argument cannot end it early
+ * (WI#856).
  */
 function checkRecursiveRootChange(segment) {
-  for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
-    const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
+  for (const { rest } of clauseTails(segment, ROOT_CHANGE_CALL)) {
     if (!RECURSIVE_CHANGE_FLAG.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
@@ -1108,6 +1205,115 @@ function checkRecursiveRootChange(segment) {
 /** True for a character that ends the current command clause. */
 function isClauseTerminator(ch) {
   return ch === ";" || ch === "&" || ch === "|" || ch === "\n";
+}
+
+/**
+ * The sorted indices of the unquoted clause terminators in `text`, computed in
+ * one pass and cached for the text a check is walking: the reader is called
+ * once per command word, and rescanning the rest of a 16 KB command from each
+ * of them took the analysis past its deadline (WI#856).
+ */
+let clauseScanText = null;
+let clauseScanEnds = [];
+
+function clauseEnds(text) {
+  if (text === clauseScanText) return clauseScanEnds;
+  const ends = [];
+  for (const i of unquotedOffsets(text)) {
+    if (isClauseTerminator(text[i])) ends.push(i);
+  }
+  clauseScanText = text;
+  clauseScanEnds = ends;
+  return ends;
+}
+
+/**
+ * The text of the command clause that starts at `from`: it runs to the first
+ * control operator or newline, read outside quotes and past a backslash. Every
+ * reader that captures "the rest of the invocation" uses this, so an argument
+ * that carries a separator cannot hide the rest of its command (WI#856).
+ */
+function clauseText(text, from) {
+  const ends = clauseEnds(text);
+  let low = 0;
+  let high = ends.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (ends[middle] < from) low = middle + 1;
+    else high = middle;
+  }
+  return text.slice(from, low < ends.length ? ends[low] : text.length);
+}
+
+/**
+ * The rest of the clause after each command-word match, read once per clause.
+ * A clause is one simple command, so the first match's tail already contains
+ * every later match in it; re-reading and re-parsing that tail for each word
+ * made a 16 KB command of repeated verbs take the analysis past its deadline
+ * (WI#856). Matches arrive in ascending order, so one running clause end is
+ * enough to spot a repeat.
+ */
+function clauseTails(text, pattern) {
+  const tails = [];
+  let clauseStop = -1;
+  for (const match of text.matchAll(pattern)) {
+    const from = match.index + match[0].length;
+    if (from <= clauseStop) continue;
+    const rest = clauseText(text, from);
+    clauseStop = from + rest.length;
+    tails.push({ match, rest });
+  }
+  return tails;
+}
+
+/**
+ * The bash word at `from`, with its quoting removed, and the index after it.
+ * A word ends at space, tab or an unquoted clause terminator, so a quoted
+ * option value that carries a space or a separator reads as one word
+ * (WI#856).
+ */
+function bashWord(text, from) {
+  let i = from;
+  let word = "";
+  let quote = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (isQuoteEscape(text, i, quote)) {
+      word += text[i + 1];
+      i += 2;
+      continue;
+    }
+    if (quote !== "") {
+      if (ch === quote.at(-1)) quote = "";
+      else word += ch;
+      i++;
+      continue;
+    }
+    quote = openingQuote(text, i);
+    if (quote) {
+      i += quote.length;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || isClauseTerminator(ch)) break;
+    word += ch;
+    i++;
+  }
+  return { word, end: i };
+}
+
+/** The bash words of a command text, with their quoting removed. */
+function bashWords(text) {
+  const words = [];
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    if (i >= text.length) break;
+    const { word, end } = bashWord(text, i);
+    if (word.length === 0) break;
+    words.push(word);
+    i = end;
+  }
+  return words;
 }
 
 // git's own options that take the next word as their value (`git -C dir`,
@@ -1123,15 +1329,15 @@ function gitVerb(text, from) {
   let i = from;
   while (i < text.length) {
     while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
-    const start = i;
-    while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
-    const word = text.slice(start, i);
+    const { word, end } = bashWord(text, i);
+    i = end;
     if (word.length === 0) break;
     if (!word.startsWith("-")) return { verb: word, after: i };
     if (GIT_VALUE_OPTIONS.has(word)) {
-      // These options take a value, which is not the verb.
+      // These options take a value, which is not the verb. It is read as one
+      // bash word, so `-C "/tmp/a b"` steps over the value whole (WI#856).
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
-      while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
+      i = bashWord(text, i).end;
     }
   }
   return { verb: "", after: text.length };
@@ -1139,12 +1345,7 @@ function gitVerb(text, from) {
 
 /** Index of the next clause terminator at or after `from`, or the text end. */
 function clauseEnd(text, from) {
-  let end = text.length;
-  for (const terminator of [";", "&", "|", "\n"]) {
-    const index = text.indexOf(terminator, from);
-    if (index !== -1 && index < end) end = index;
-  }
-  return end;
+  return from + clauseText(text, from).length;
 }
 
 // `GIT_CONFIG_KEY_*` (with `GIT_CONFIG_COUNT`) and `GIT_CONFIG_PARAMETERS` are
@@ -1259,16 +1460,19 @@ function gitConfigAliasVerdict(after) {
  */
 function gitAliasDefinition(segment, from) {
   const { verb, after } = gitVerb(segment, from);
-  const words = argumentWords(segment.slice(from, after));
+  // The leading words are read as bash reads them, so a quoted `-C`/`-c`
+  // value that carries a space stays one value and cannot break the option
+  // scan before a later `-c` (WI#856).
+  const words = bashWords(segment.slice(from, after));
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (!word.startsWith("-")) break;
     let value = "";
-    if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    if (word.startsWith("--config-env=")) value = word.slice("--config-env=".length);
     else if (GIT_VALUE_OPTIONS.has(word)) {
       // Step over every option value (`git -C . -c alias.z=…`); only a `-c`
       // or `--config-env` value can name a key.
-      const next = stripShellQuotes(words[++i] ?? "");
+      const next = words[++i] ?? "";
       if (word === "-c" || word === "--config-env") value = next;
     }
     if (GIT_REDIRECTING_KEY.test(value)) return true;
@@ -1400,40 +1604,74 @@ function isInterpreterStage(stage) {
   return false;
 }
 
-/**
- * Split text on a one-character separator, ignoring separators inside quotes
- * and after a backslash, so a quoted interpreter body (`-c 'a;b'`) stays one
- * word for the pipeline rules (WI#832).
- */
-function splitOutsideQuotes(text, separator) {
-  const pieces = [];
-  let piece = "";
+function openingQuote(text, i) {
+  if (text[i] === "$" && text[i + 1] === "'") return "$'";
+  return text[i] === "'" || text[i] === '"' ? text[i] : "";
+}
+
+function isQuoteEscape(text, i, quote) {
+  return text[i] === "\\" && quote !== "'" && i + 1 < text.length;
+}
+
+// Do not let encoded bytes be checked as one word and executed as another.
+// An escaped apostrophe is already handled by the word and clause readers.
+function hasUnverifiableAnsiEscape(text) {
   let quote = "";
   for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
-      piece += ch + text[++i];
+    if (isQuoteEscape(text, i, quote)) {
+      if (quote === "$'" && text[i + 1] !== "'") return true;
+      i++;
+    } else if (quote) {
+      if (text[i] === quote.at(-1)) quote = "";
+    } else {
+      quote = openingQuote(text, i);
+      if (quote) i += quote.length - 1;
+    }
+  }
+  return false;
+}
+
+/** Skip quoted spans (including ANSI-C quotes) without interpreting shell expansions. */
+function* unquotedOffsets(text, escapes = true) {
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    if (escapes && isQuoteEscape(text, i, quote)) {
+      i++;
       continue;
     }
     if (quote) {
-      if (ch === quote) quote = "";
-    } else if (ch === "'" || ch === '"') {
-      quote = ch;
-    } else if (ch === separator) {
-      pieces.push(piece);
-      piece = "";
+      if (text[i] === quote.at(-1)) quote = "";
       continue;
     }
-    piece += ch;
+    quote = openingQuote(text, i);
+    if (quote) i += quote.length - 1;
+    else yield i;
   }
-  pieces.push(piece);
+}
+
+/** Preserve the exact text of each piece; only unquoted separators split it. */
+function splitOutsideQuotes(text, separator, escapes = true) {
+  const pieces = [];
+  let start = 0;
+  for (const i of unquotedOffsets(text, escapes)) {
+    if (i < start) continue;
+    const width = typeof separator === "string"
+      ? Number(text[i] === separator)
+      : Number(separator(text[i], text[i + 1]));
+    if (!width) continue;
+    pieces.push(text.slice(start, i));
+    start = i + width;
+  }
+  pieces.push(text.slice(start));
   return pieces;
 }
 
 /** The `;`, LF, `&&` and `||` lists of the text, read outside quotes. */
 function commandLists(text) {
-  return splitOutsideQuotes(text, ";").flatMap((piece) => splitOutsideQuotes(piece, "\n"))
-    .flatMap((piece) => piece.split(/&&|\|\|/));
+  return splitOutsideQuotes(text, (ch, next) => {
+    if (ch === ";" || ch === "\n") return 1;
+    return ch === next && (ch === "&" || ch === "|") ? 2 : 0;
+  });
 }
 
 /** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
@@ -1577,33 +1815,53 @@ function evaluate(command) {
 
 // WI#833: keep listener checks separate from the other raw command rules.
 // This recognizes literal command shapes, not general Bash execution.
-const LISTENER_PREFIXES = new Set([
-  "command", "env", "exec", "busybox", "nohup", "setsid", "nice", "ionice", "timeout", "npx", "stdbuf",
-  "xargs", "time", "{}", "if", "then", "elif", "else", "while", "until", "do", "done", "!", "{", "}", "(", ")",
-]);
+//
+// WI#858: the rule is a property of the words, not of a closed launcher
+// list. A `kimi` word followed by a service subcommand, or a listener verb
+// with its listener options, is denied at ANY word position outside quotes,
+// so a launcher the hook has never heard of (`taskset`, `chrt`, `flock`,
+// `watch`, `fd -x`, `parallel`, `eval`, `xargs`, `find -exec`, …) cannot
+// hide one. The accepted cost is a refusal of a command that only mentions
+// the words unquoted (`echo kimi server`); quoted text stays data, and so
+// does a `kimi -p` prompt value. Adding launchers one at a time never
+// closes the class, which is why the prefix list is gone.
 
-/** Read simple command words, keeping quoted values (including empty ones) together. */
+/**
+ * Read simple command words, keeping quoted values (including empty ones)
+ * together. A word records whether any of it was quoted, so a brace group
+ * inside quotes stays literal (bash expands only unquoted braces).
+ */
 function* listenerSegments(text) {
   let words = [];
   let word = "";
   let started = false;
+  let quoted = false;
   let quote = "";
+  const flush = () => {
+    if (started) words.push({ text: word, quoted });
+    word = "";
+    started = false;
+    quoted = false;
+  };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
-      const next = text[i + 1];
-      word += quote === '"' && !'\\"$`\n'.includes(next) ? ch : text[++i];
+    if (listenerQuoteEscape(text, i, quote)) {
+      word += text[++i];
       started = true;
+      quoted = true;
     } else if (quote) {
-      if (ch === quote) quote = "";
+      if (ch === quote.at(-1)) quote = "";
       else word += ch;
-    } else if (ch === '"' || ch === "'") {
-      quote = ch;
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
       started = true;
+      quoted = true;
+    } else if (ch === "$" && (text.startsWith("${IFS}", i) ||
+      (text.startsWith("$IFS", i) && !/[A-Za-z0-9_]/.test(text[i + 4] ?? "")))) {
+      flush();
+      i += text[i + 1] === "{" ? 5 : 3;
     } else if (" \t;|&\n".includes(ch)) {
-      if (started) words.push(word);
-      word = "";
-      started = false;
+      flush();
       if (";|&\n".includes(ch) && words.length > 0) {
         yield words;
         words = [];
@@ -1613,7 +1871,7 @@ function* listenerSegments(text) {
       started = true;
     }
   }
-  if (started) words.push(word);
+  flush();
   if (words.length > 0) yield words;
 }
 
@@ -1638,14 +1896,12 @@ function listenerParenBody(text, openIndex) {
   let quote = "";
   for (let i = openIndex; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\") {
-      if (quote !== "'") i++;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) quote = "";
-    } else if (ch === "'" || ch === '"') {
-      quote = ch;
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
+    } else if (quote) {
+      if (ch === quote.at(-1)) quote = "";
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
     } else if (ch === "(") {
       depth++;
     } else if (ch === ")" && --depth === 0) {
@@ -1664,18 +1920,20 @@ function listenerBacktickBody(text, openIndex) {
   return undefined;
 }
 
-// The bodies bash runs as commands of their own: `$(…)` and backticks
-// outside single quotes. A substitution inside double quotes still runs, so
-// it counts; text in single quotes is literal and is skipped (WI#839).
+// The bodies bash runs as commands of their own: `$(…)`, backticks and the
+// process substitutions `<(…)` / `>(…)`, outside single quotes. A
+// substitution inside double quotes still runs, so it counts; text in single
+// quotes is literal and is skipped (WI#839). Process substitution is a path
+// bash reads, and the body runs as a command (WI#858).
 function* listenerBodies(text) {
   let quote = "";
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\") {
-      if (quote !== "'") i++;
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
       continue;
     }
-    if (quote === "'") {
+    if (quote === "'" || quote === "$'") {
       if (ch === "'") quote = "";
       continue;
     }
@@ -1683,14 +1941,19 @@ function* listenerBodies(text) {
       quote = "";
       continue;
     }
-    if (!quote && (ch === "'" || ch === '"')) {
-      quote = ch;
+    if (!quote && (quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
       continue;
     }
     if (ch === "$" && text[i + 1] === "(") {
       const body = listenerParenBody(text, i + 1);
       // An unclosed substitution is a bash syntax error; its remainder is
       // still scanned rather than skipped, and scanning stops there (linear).
+      yield body ?? text.slice(i + 2);
+      if (body === undefined) return;
+      i += body.length + 1;
+    } else if ((ch === "<" || ch === ">") && text[i + 1] === "(") {
+      const body = listenerParenBody(text, i + 1);
       yield body ?? text.slice(i + 2);
       if (body === undefined) return;
       i += body.length + 1;
@@ -1723,33 +1986,33 @@ const KIMI_FLAG_OPTIONS = new Set([
  * subcommand (`KIMI_SERVICE_SUBCOMMANDS`) reached by either one is a denial.
  * `--option=value` needs no special case: its value is part of the option
  * word.
+ *
+ * Every reading moves at least one word ahead, so the walk is a forward-only
+ * table built from the end in one pass (WI#858). Since the property asks at
+ * every `kimi` word, a per-start walk was quadratic: 16 KB of `kimi -x`
+ * took 1.7 s of the 2 s deadline. The table answers each start in O(1).
  */
-function kimiServiceSubcommand(words, start) {
-  const pending = [start];
-  const seen = new Set();
-  while (pending.length > 0) {
-    const i = pending.pop();
-    if (i >= words.length || seen.has(i)) continue;
-    seen.add(i);
+function kimiServiceSubcommands(words) {
+  const found = new Array(words.length + 2).fill(null);
+  for (let i = words.length - 1; i >= 0; i--) {
     const word = words[i];
     // The subcommand word may carry the punctuation bash glues to it
     // (`server)` in `(kimi -m X server)`), read as in WI#839.
     if (word === "--") {
       const after = listenerWord(words[i + 1] ?? "");
-      if (KIMI_SERVICE_SUBCOMMANDS.has(after)) return after;
-      continue;
-    }
-    if (!word.startsWith("-")) {
+      found[i] = KIMI_SERVICE_SUBCOMMANDS.has(after) ? after : null;
+    } else if (!word.startsWith("-")) {
       const subcommand = listenerWord(word);
-      if (KIMI_SERVICE_SUBCOMMANDS.has(subcommand)) return subcommand;
-      continue;
+      found[i] = KIMI_SERVICE_SUBCOMMANDS.has(subcommand) ? subcommand : null;
+    } else if (word.includes("=") || KIMI_FLAG_OPTIONS.has(word)) {
+      found[i] = found[i + 1];
+    } else if (KIMI_VALUE_OPTIONS.has(word)) {
+      found[i] = found[i + 2];
+    } else {
+      found[i] = found[i + 1] ?? found[i + 2];
     }
-    if (word.includes("=")) pending.push(i + 1);
-    else if (KIMI_VALUE_OPTIONS.has(word)) pending.push(i + 2);
-    else if (KIMI_FLAG_OPTIONS.has(word)) pending.push(i + 1);
-    else pending.push(i + 1, i + 2);
   }
-  return null;
+  return found;
 }
 
 const LISTENER_COMMANDS = [
@@ -1781,9 +2044,9 @@ const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
 /**
  * Deny a listener started from a find `-exec`/`-ok` body (WI#846). Bash runs
- * that body exactly as it runs an `xargs` body, which LISTENER_PREFIXES
- * already reads; the body is the words up to the `;` or `+` terminator. A
- * quoted or escaped terminator arrives as its own `;` word.
+ * that body exactly as it runs an `xargs` body; the body is the words up to
+ * the `;` or `+` terminator. A quoted or escaped terminator arrives as its
+ * own `;` word.
  */
 function checkFindExecListeners(words, start, depth) {
   for (let i = start; i < words.length; i++) {
@@ -1797,53 +2060,128 @@ function checkFindExecListeners(words, start, depth) {
   return null;
 }
 
-/** Classify the command word of one listener segment and its arguments. */
+// A launcher that runs its own string as a shell command: `script -c` runs it
+// with `sh -c`, and `eval` joins its words and runs them. Neither is a
+// command position — the words are read wherever they sit (WI#858).
+const SHELL_STRING_LAUNCHERS = new Set(["script"]);
+
+/**
+ * The words bash's brace expansion would also produce from one word
+ * (WI#858): `{kimi,server}` runs `kimi server`. Only an unquoted brace group
+ * holding a comma expands; `{}`, `{x}` and `${…}` stay as they are. The
+ * alternatives replace the word in place, so the expansion keeps its
+ * neighbours. Linear in the input: no cross product.
+ */
+function listenerBraceWords(word) {
+  const open = word.indexOf("{");
+  if (open === -1 || word[open - 1] === "$") return null;
+  const close = word.indexOf("}", open + 1);
+  if (close === -1) return null;
+  const body = word.slice(open + 1, close);
+  if (!body.includes(",") || body.includes("{")) return null;
+  const head = word.slice(0, open);
+  const tail = word.slice(close + 1);
+  return body.split(",").map((part) => head + part + tail);
+}
+
+/** One segment's words, with unquoted brace groups expanded as bash would. */
+function listenerWordList(segment) {
+  const words = [];
+  for (const { text, quoted } of segment) {
+    const alternatives = quoted ? null : listenerBraceWords(text);
+    if (alternatives === null) words.push(text);
+    else for (const alternative of alternatives) {
+      if (alternative !== "") words.push(alternative);
+    }
+  }
+  return words;
+}
+
+/**
+ * Classify every word of one listener segment (WI#858). The rule is a
+ * property, not a command position: any `kimi` word followed by a service
+ * subcommand, any listener verb with its listener options, any shell body and
+ * any `find -exec` body is read wherever it sits. A launcher the hook does
+ * not know therefore cannot hide one. Option words and assignments need no
+ * skipping: `kimi` is matched by name at every index, and the option table
+ * decides what its own arguments are.
+ */
 function checkListenerWords(words, depth) {
+  // One forward-only table per segment, so a segment full of `kimi` words is
+  // linear (WI#858 deadline).
+  let serviceSubcommands;
   for (let i = 0; i < words.length; i++) {
-    const raw = words[i];
-    const word = listenerWord(raw);
+    const word = listenerWord(words[i]);
     const name = commandBasename(word);
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
     }
-    if (LISTENER_PREFIXES.has(raw) || LISTENER_PREFIXES.has(word) ||
-        LISTENER_PREFIXES.has(name) ||
-        /^[A-Za-z_][A-Za-z0-9_]*=|^\d+$|^-/.test(raw)) continue;
-
     if (name === "kimi") {
-      const subcommand = kimiServiceSubcommand(words, i + 1);
+      serviceSubcommands ??= kimiServiceSubcommands(words);
+      const subcommand = serviceSubcommands[i + 1] ?? null;
       if (subcommand !== null) return `kimi service mode from a task: kimi ${subcommand}`;
-    } else if (SHELL_NAME.test(name)) {
+      continue;
+    }
+    if (name === "eval") {
+      // `eval kimi server` and `eval 'kimi server'` both run `kimi server`.
+      const body = words.slice(i + 1).join(" ");
+      if (body.length > 0) {
+        if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
+        const denied = checkListeners(body, depth + 1);
+        if (denied) return denied;
+      }
+      continue;
+    }
+    if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
       const body = listenerShellBody(words, i + 1);
       if (body !== undefined) {
         if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
         const denied = checkListeners(body, depth + 1);
         if (denied) return denied;
       }
-    } else if (name === "find") {
+      continue;
+    }
+    if (name === "find") {
       const denied = checkFindExecListeners(words, i + 1, depth);
       if (denied) return denied;
-    } else {
-      const args = words.slice(i + 1).map(listenerWord);
-      const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
-      if (rule?.test(args)) return `listener started from a task: ${name}`;
+      continue;
     }
-    break;
+    const rule = LISTENER_COMMANDS.find((candidate) => candidate.name.test(name));
+    // Slice only when a listener verb matched: a segment of ordinary words
+    // would otherwise copy its tail once per word (WI#858 deadline).
+    if (rule?.test(words.slice(i + 1).map(listenerWord))) {
+      return `listener started from a task: ${name}`;
+    }
   }
   return null;
 }
 
 /** Deny recognized service commands without treating prompt text as a subcommand. */
 function checkListeners(text, depth = 0) {
-  // A substitution or backtick body runs its words as a command, so scan it
-  // the same way even when it sits in an argument (`echo $(kimi server)`).
+  for (const region of listenerRegions(text)) {
+    const denied = checkListenerRegion(region.text, depth);
+    if (denied) return denied;
+    // Heredocs can be shell input. Check literal words too: quotes in the
+    // data must not hide command shapes from the conservative listener rule.
+    if (region.heredoc && /['"]/.test(region.text)) {
+      const denied = checkListenerRegion(region.text.replace(/['"]/g, " "), depth);
+      if (denied) return denied;
+    }
+  }
+  return null;
+}
+
+function checkListenerRegion(text, depth) {
+  // A substitution, a backtick or a process substitution body runs its words
+  // as a command, so scan it the same way even when it sits in an argument
+  // (`echo $(kimi server)`, `cat <(kimi server)`).
   for (const body of listenerBodies(text)) {
     if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
     const denied = checkListeners(body, depth + 1);
     if (denied) return denied;
   }
-  for (const words of listenerSegments(text)) {
-    const denied = checkListenerWords(words, depth);
+  for (const segment of listenerSegments(text)) {
+    const denied = checkListenerWords(listenerWordList(segment), depth);
     if (denied) return denied;
   }
   return null;
@@ -1956,13 +2294,13 @@ function checkRmAssembly(command) {
     // Check plain IFS separators as spaces without evaluating parameters.
     const separated = words.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, " ");
     const inSubstitution = separated.replace(/\$\(|[`()]/g, " ");
-    for (const segment of commandSegments(inSubstitution)) {
+    for (const segment of commandSegments(inSubstitution, false)) {
       const denied = checkRm(segment);
       if (denied) return denied;
     }
 
     const opaque = maskSubstitutions(separated).replace(/[()]/g, ";");
-    for (const segment of commandSegments(opaque)) {
+    for (const segment of commandSegments(opaque, false)) {
       const denied = checkAmbiguousRm(segment);
       if (denied) return denied;
     }
@@ -1997,7 +2335,7 @@ function checkSameLineLink(command) {
   for (const reading of readings) {
     const view = shellWordView(reading);
     if (!createsSymbolicLink(view)) continue;
-    for (const segment of commandSegments(view)) {
+    for (const segment of commandSegments(view, false)) {
       const rest = /\brm[ \t]+(.*)$/s.exec(segment)?.[1];
       if (rest !== undefined && rmDeleteOption(rest)) {
         return "recursive/forced rm in a command line that also creates a symbolic link; use a separate call";
@@ -2012,7 +2350,14 @@ function checkSameLineLink(command) {
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command) {
-  return evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
+  const denial = evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
+  if (denial) return denial;
+  if (hasUnverifiableAnsiEscape(command) ||
+      (command.includes("\\\n") && JOIN_READINGS.some(([outside, inside]) =>
+        hasUnverifiableAnsiEscape(joinLineContinuations(command, outside, inside))))) {
+    return "unverifiable ANSI-C escape; use literal shell words";
+  }
+  return null;
 }
 
 async function main() {

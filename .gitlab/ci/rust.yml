@@ -190,4 +190,5 @@ rust-test-postgres-integration:
     # WI#370: postgres_cron_retention pins the job_events FK semantics the
     # cron retention sweep depends on (the generic external_worker_integration
     # target is auto-discovered only by the libSQL lane).
-    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features postgres,integration --test workspace_integration --test postgres_settings_migrations --test postgres_cron_retention -- --test-threads=1
+    # WI#318: exercise the saved local-job estimate and its gateway projection.
+    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features postgres,integration --test workspace_integration --test postgres_settings_migrations --test postgres_cron_retention --test job_estimate_postgres -- --test-threads=1
