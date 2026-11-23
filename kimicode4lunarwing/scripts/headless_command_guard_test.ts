@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -27,6 +27,25 @@ import { test } from "node:test"
  */
 
 const guardPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
+
+type ListenerWord = { text: string; quoted: boolean }
+
+async function guardSyntax() {
+  // Test the real readers without changing how the deployed hook starts.
+  // Only the checked-in JS is loaded; fixture shell strings are never executed.
+  const source = readFileSync(guardPath, "utf8").trimEnd()
+  const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
+  assert.ok(source.endsWith(cli))
+  const library = source.slice(0, -cli.length) +
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+  return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
+    commandSegments: (text: string) => string[]
+    clauseText: (text: string, from: number) => string
+    quoteScan: (text: string) => { substitutions: Map<number, number> }
+    listenerSegments: (text: string) => Iterable<ListenerWord[]>
+    listenerWordList: (words: ListenerWord[]) => string[]
+  }
+}
 
 function runGuard(payload: unknown, timeout = 10_000) {
   const input = typeof payload === "string" ? payload : JSON.stringify(payload)
@@ -1678,4 +1697,63 @@ test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", ()
   assertAllowed(String.raw`printf '%s\n' $'it\'s literal'`)
   assertAllowed(String.raw`printf '%s\n' "\x66ixture"`)
   assertAllowed("printf '%s\\n' $'plain text'")
+})
+
+test("only outer operators split an enclosing clause (ALO-1)", async () => {
+  const { commandSegments, clauseText } = await guardSyntax()
+  for (const operator of [";", "|", "&", "\n"]) {
+    const body = `first_fixture a${operator}second_fixture b`
+    for (const argument of ["$(" + body + ")", '"$(' + body + ')"', "<(" + body + ")",
+      ">(" + body + ")", '"`' + body + '`"']) {
+      const clause = `fixture ${argument} tail`
+      const text = `${clause}; next_fixture`
+      assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+      assert.equal(clauseText(text, "fixture ".length), `${argument} tail`)
+    }
+    assert.deepEqual(commandSegments(body), ["first_fixture a", "second_fixture b"])
+  }
+})
+
+test("a heredoc in a substitution keeps the surrounding command intact (ALO-2)", async () => {
+  const { quoteScan, listenerSegments, listenerWordList } = await guardSyntax()
+  const body = "cat <<'TEXT'\nquotes and parens in data: ' \" )\nTEXT\n"
+  const outer = 'fixture "$(' + body + ')" tail\nnext_fixture'
+  assert.equal(quoteScan(outer).substitutions.get(outer.indexOf("$(")), outer.indexOf(')" tail'))
+  const segments = [...listenerSegments(outer)].map(listenerWordList)
+  assert.equal(segments[0].at(-1), "tail")
+  assert.deepEqual(segments[1], ["next_fixture"])
+  assertAllowed(outer)
+})
+
+test("backtick pairing ignores body quotes but respects escaped delimiters (ALO-3)", async () => {
+  const { commandSegments, quoteScan } = await guardSyntax()
+  const opening = 'fixture "`'
+  for (const body of ["sample '", 'sample "', "sample \\` inner '", "sample \\\\"]) {
+    const clause = opening + body + '`" tail'
+    const text = `${clause}; next_fixture`
+    assert.equal(quoteScan(text).substitutions.get(opening.length - 1), opening.length + body.length)
+    assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+  }
+})
+
+test("comments and heredoc data cannot quote the next command (ALO-4)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  for (const prefix of ["fixture # unmatched '\n", "cat <<-TEXT\n\tunmatched \"\n\tTEXT\n",
+    "cat <<'FIRST' <<SECOND\n'\nFIRST\n\"\nSECOND\n"]) {
+    const segments = [...listenerSegments(`${prefix}next_fixture tail`)].map(listenerWordList)
+    assert.deepEqual(segments.at(-1), ["next_fixture", "tail"])
+    assertBlocked(prefix + String.raw`fixture $'\x66ile'`, "unverifiable ANSI-C escape")
+  }
+  const literal = [...listenerSegments('fixture a#b "c # d"')].map(listenerWordList)
+  assert.deepEqual(literal, [["fixture", "a#b", "c # d"]])
+})
+
+test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  const fields = (text: string) => [...listenerSegments(text)].map(listenerWordList)
+  assert.deepEqual(fields("{first,${IFS}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("{first,${IFS:0:1}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("first${IFS}second"), [["first", "second"]])
+  assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
+  assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
 })

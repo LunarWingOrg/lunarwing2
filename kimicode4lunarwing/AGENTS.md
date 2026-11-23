@@ -21,25 +21,27 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 
 ## Guard Quote Handling
 
-Since WI#867 every rule reads one shared quote reader, and it follows bash:
-outside quotes a backslash escapes the next character; inside double quotes
-only `"`, `\`, `$`, a backtick and a newline are escaped, so a backslash
-before any other character is literal text; nothing escapes inside single
-quotes. A `$(…)`, `<(…)`, `>(…)` or backtick substitution opens its own quote
-level, so a nested `"` cannot end the enclosing one:
-`chmod -R 777 "$(echo "a;b")" /etc` denies, while the common
-`echo "$(date +"%F")"` still passes. Before WI#867 the listener rule kept its
-own copies of these readers, and the shared one treated any backslash inside
-double quotes as an escape.
+Since WI#867 the clause splitter, punctuation view and listener scan share
+quote and substitution spans. A backslash escapes the next character outside
+quotes, escapes nothing inside single quotes, and inside double quotes only
+escapes `"`, `\`, `$`, a backtick or a newline. Parenthesized substitutions
+have their own quote context. A backtick body closes at the first unescaped
+backtick, regardless of the quotes in its body. Operators inside a
+substitution split only its own commands, not the enclosing clause. The
+guard scans the body separately without running it.
 
 The guard rejects ANSI-C backslash escapes other than escaped apostrophes
 instead of decoding them. Use literal shell words.
 
-The WI#858 listener scan recognizes ANSI-C quoting, literal unquoted IFS
-separators — including a slice, so `kimi${IFS:0:1}server` denies — skips
-empty unquoted brace alternatives, and isolates comments and heredoc data from
-later commands. Heredoc bodies are still checked as potential shell input.
-This is a text guard, not a boundary against runtime-computed words.
+Comments and literal-delimiter heredocs do not carry quote state into later
+commands. The listener rule still checks heredoc lines as potential shell
+input. For supported literal brace groups it expands the alternatives before
+splitting unquoted IFS markers, including slices; quoted IFS stays data.
+
+The continuation and Git word readers reuse escape helpers but keep separate
+conservative views. This is not a full Bash parser: it does not evaluate
+runtime words or implement general brace expansion. The container and tenant
+egress policy remain the security boundary.
 
 ## Protocol Compatibility
 
