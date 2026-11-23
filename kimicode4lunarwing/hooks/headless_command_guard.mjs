@@ -714,13 +714,40 @@ function quotedFirstArgument(code, from) {
   return null;
 }
 
+// The interpreter options that take the next word as their value. The eval
+// flag is found by walking the words, and a walk that only steps over
+// `-`-prefixed words ends at a value: `perl -I /tmp -e 'unlink(…)'` read as
+// carrying no one-liner, so the deletion rule never ran (WI#869, the same
+// shape as `listenerShellBody`). Only options whose value is a separate word
+// are listed; an attached value (`-I/tmp`, `-Mstrict`) needs no step.
+const INTERPRETER_VALUE_OPTIONS = {
+  perl: new Set(["-I", "-M", "-m", "-D", "-x", "-C", "-F"]),
+  python: new Set(["-X", "-W", "-Q", "-m"]),
+  node: new Set([
+    "-r", "--require", "--loader", "--experimental-loader", "-C", "--conditions",
+    "--input-type",
+  ]),
+  ruby: new Set(["-I", "-r", "-C", "-E", "-T", "--enable"]),
+};
+
+/** The value-option table for an interpreter name, by language family. */
+function interpreterValueOptions(name) {
+  if (name === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
+  if (name === "node") return INTERPRETER_VALUE_OPTIONS.node;
+  if (name === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
+  return INTERPRETER_VALUE_OPTIONS.python;
+}
+
 /**
  * The code text of an interpreter invocation, or null when the words after the
  * interpreter carry no eval flag. The eval flag may follow other options
  * (`perl -MFile::Path -e …`, `node --no-warnings -e …`), so the words are
- * walked rather than matched by one regex (WI#832).
+ * walked rather than matched by one regex (WI#832), and an option that takes
+ * a separate value is stepped over whole so its value cannot end the walk
+ * before the flag (WI#869).
  */
-function oneLinerCode(rest) {
+function oneLinerCode(rest, name) {
+  const values = interpreterValueOptions(name);
   let i = 0;
   while (i < rest.length) {
     while (i < rest.length && /[ \t]/.test(rest[i])) i++;
@@ -730,6 +757,11 @@ function oneLinerCode(rest) {
     if (word.length === 0) return null;
     if (/^(?:--eval|--print)$/.test(word) || /^-[a-zA-Z]*[ceEp][a-zA-Z]*$/.test(word)) {
       return rest.slice(i);
+    }
+    if (values.has(word)) {
+      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      continue;
     }
     if (!word.startsWith("-")) return null;
   }
@@ -1071,7 +1103,7 @@ function perlDeletionVerdict(rawCode) {
  */
 function checkInterpreterDeletion(text) {
   for (const invocation of text.matchAll(ONE_LINER_CALL)) {
-    const code = oneLinerCode(invocation[2]);
+    const code = oneLinerCode(invocation[2], invocation[1]);
     if (code === null) continue;
     const aliases = sinkAliases(code);
     if (invocation[1] === "perl") {
