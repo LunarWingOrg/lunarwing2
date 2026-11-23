@@ -4,18 +4,18 @@
 | Feature | Target |
 |---------|--------|
 | Part 3 of planned overhaul of some LLM engine functionality | v2.2.4.0 |
-| Beta for Desktop/Mobile companion applications for LunarWing (first alpha versions of both should all be available by 2.2.3.0) | v2.2.4.0 |
-| Part 3 of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.4.0 |
 | Lunartica improvements/polish | v2.2.5.0 |
 | Agent Team Coordination improvements | v2.2.5.0 |
 | TPM 2.0 Secret Master Key Storage/Decryption Integration via Clevis | v2.2.6.0 |
 | Lunarvision support for multimodal models | v2.2.6.0 |
 | TensorMoon integration as a first-class, self-maintained LunarWing component (packaging/lifecycle, managed config, vendor posture, observability unification) Unified Inference Routing and evaluations | v2.2.6.0 |
 | IPv6 Network Support | v2.2.6.0 |
+| Part 3 of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.7.0 |
 | Next Generation MCP Engine Part 4 Completion | v2.2.8.0 |
 | DarkIRC key manager & DarkIRC Channel Polishing | v2.2.8.0 |
 | Firstmate/herdr.dev Integration | v2.2.8.0 |
+| Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.2.8.0 |
 | OpenAI API Compatible Responses Support, with or without a custom websocket implementation | v2.2.8.0 |
 | LunarHub (extension marketplace/decentralized binary distribution) — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.3.0.0 |
-| Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.3.2.0 |
+| Beta for Desktop/Mobile companion applications for LunarWing (first alpha versions of both should all be available by 2.2.9.0) | v2.3.0.0 |
 | LunarVoice Two Way Voice Communication Full Completion and dedicated multi-agent server support | v2.3.4.0 |
