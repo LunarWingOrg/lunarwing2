@@ -52,11 +52,14 @@ COPY health_server.py task_runner_bind.py /build/
 # the image build gate fails (inttest 2026-09-22 15:16, barracuda).
 COPY hooks/ /build/hooks/
 COPY config/ /build/config/
+COPY scripts/worker-download-retry.sh /build/worker-download-retry.sh
 
 WORKDIR /build/scripts
-RUN npm ci --ignore-scripts && \
-    npx tsc -p tsconfig.json && \
-    npm test && \
+RUN set -eu; \
+    . /build/worker-download-retry.sh; \
+    wdr_retry "npm ci (bridge scripts)" "rm -rf node_modules" 'npm ci --ignore-scripts'; \
+    npx tsc -p tsconfig.json; \
+    npm test; \
     rm -rf node_modules/.cache
 
 # ── CLI bitness + flag contract gate ─────────────────────────────────────────
@@ -68,7 +71,10 @@ RUN npm ci --ignore-scripts && \
 # place the contract is asserted for real.
 ARG KIMI_CODE_VERSION
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
-RUN npm ci --omit=dev --prefix /opt/kimi-cli && \
+RUN set -eu; \
+    . /build/worker-download-retry.sh; \
+    wdr_retry "npm ci (kimi CLI)" "rm -rf /opt/kimi-cli/node_modules" \
+      'npm ci --omit=dev --prefix /opt/kimi-cli'; \
     PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
       --test-name-pattern "real CLI"
 
@@ -250,8 +256,10 @@ COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # rewrite-timestamp) — flaking the candidate vs clean-rebuild digest gate
 # (worker-kimi-candidate in pipelines 5158, 5263, 5390, 5481, 5734).
 RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
-    npm install -g npm@12.0.2 && \
-    npm ci --omit=dev --prefix /opt/kimi-cli && \
+    . /app/scripts/worker-download-retry.sh && \
+    wdr_retry "npm install -g npm@12.0.2" "-" 'npm install -g npm@12.0.2' && \
+    wdr_retry "npm ci (kimi CLI runtime)" "rm -rf /opt/kimi-cli/node_modules" \
+      'npm ci --omit=dev --prefix /opt/kimi-cli' && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force && \
