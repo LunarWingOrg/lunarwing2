@@ -43,6 +43,7 @@ pub mod app;
 pub mod boot_screen;
 pub mod bootstrap;
 pub mod bridge;
+pub mod build_info;
 pub mod channels;
 pub mod cli;
 pub mod config;
