@@ -346,6 +346,31 @@ assert_eq "rerun preserves LLM_MAX_RETRIES" "$(envval LLM_MAX_RETRIES)" "7"
 assert_eq "rerun preserves disabled billed-empty input-token budget" \
   "$(envval LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET)" "0"
 
+echo "=== runtime estimation env preservation tests ==="
+for key in LUNARWING_TOOL_ESTIMATES LUNARWING_TOOL_ESTIMATES_CATEGORIES \
+  LUNARWING_TOOL_ESTIMATES_TRACE LUNARWING_LLM_TIMINGS; do
+  assert_eq "new tenant leaves $key unset" "$(grep -c "^${key}=" "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+done
+cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LUNARWING_TOOL_ESTIMATES=1
+LUNARWING_TOOL_ESTIMATES_CATEGORIES="http, !web_search"
+LUNARWING_TOOL_ESTIMATES_TRACE=8192
+LUNARWING_LLM_TIMINGS=0
+EOF
+for _ in 1 2; do
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "rerun preserves hint opt-in" "$(envval LUNARWING_TOOL_ESTIMATES)" "1"
+  assert_eq "rerun preserves category gating" "$(envval LUNARWING_TOOL_ESTIMATES_CATEGORIES)" "http, !web_search"
+  assert_eq "rerun preserves trace capacity" "$(envval LUNARWING_TOOL_ESTIMATES_TRACE)" "8192"
+  assert_eq "rerun preserves LLM timing opt-out" "$(envval LUNARWING_LLM_TIMINGS)" "0"
+done
+sed -i '/^LUNARWING_TOOL_ESTIMATES_CATEGORIES=/c\LUNARWING_TOOL_ESTIMATES_CATEGORIES=' \
+  "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves an explicit blank category setting" \
+  "$(grep '^LUNARWING_TOOL_ESTIMATES_CATEGORIES=' "$MT_FIXTURE/env/lunarwing.env")" \
+  'LUNARWING_TOOL_ESTIMATES_CATEGORIES=""'
+
 echo "=== live reasoning opt-in preservation tests ==="
 for reasoning_setting in 1 false 0; do
   sed -i "s/^ENGINE_V2_STREAM_REASONING=.*/ENGINE_V2_STREAM_REASONING=$reasoning_setting/" \

@@ -442,9 +442,9 @@ tenant that runs a build containing the A4 trace and a window of that tenant's
 for this gate.
 
 1. **Start one observation window.** Edit the tenant's
-   `env/lunarwing.env`: set `LUNARWING_TOOL_ESTIMATES_TRACE=1`, leave
-   `LUNARWING_TOOL_ESTIMATES` unset or `observe` so no hints are shown, and
-   keep the default trace capacity (or raise it up to 8,192). Restart with
+   `env/lunarwing.env`: leave `LUNARWING_TOOL_ESTIMATES` unset or `observe` so
+   no hints are shown. Use `LUNARWING_TOOL_ESTIMATES_TRACE=1` for 2,048 records or
+   set `LUNARWING_TOOL_ESTIMATES_TRACE=<capacity>` (16–8,192). Restart with
    `sudo lunarwing-mt-admin.sh restart-tenant <tenant>`; the setting is read
    once at startup. Record the tenant, the deployed commit, and the window
    start and end. A restart resets both the models and the trace ring, so one
@@ -454,20 +454,21 @@ for this gate.
    `/counters` and `/llm` for context) with the tenant's owner bearer token.
    Do not paste the token into the evidence doc or a shell history that is
    committed.
-3. **Judge each category.** Read `overall.gate_pass`: `true` means the
+3. **Judge each category.** Read `categories[].gate_pass`: `true` means the
    category cleared the 10% comparison-baseline gate, `false` means it was
-   judged and regressed, and `null` means it could not be judged (no paired
-   sample, or an undefined improvement) and is not a pass. Report the absolute
-   errors in seconds (`median_abs_error_*_ms / 1000`), `coverage` and
-   `samples` alongside.
+   judged but fell short of 10%, and `null` means it could not be judged (no
+   paired sample or an undefined improvement) and is not a pass. Report
+   `comparison_baseline` errors in seconds (`median_abs_error_*_ms / 1000`)
+   alongside `coverage`, `samples`, and `comparison_baseline.paired_samples`.
    Suppress every category that regresses with
    `LUNARWING_TOOL_ESTIMATES_CATEGORIES=-<tool>`, and record the reason. The
    `declared_baseline` block is reported alongside but does not decide the
    gate. `evicted > 0` means the window outran the ring: record it and repeat
    the window with a larger capacity before trusting coverage.
 4. **Feed the D1 decision.** Compare `cold_start` (`coverage`, `gate_pass`
-   and paired error) with `overall`. D1 is justified only if that measured
-   cold-start loss materially misses the accuracy or coverage goal; otherwise
+   and paired error) with the overall metrics on the category itself. D1 is
+   justified only if the measured cold-start loss materially misses the
+   accuracy or coverage goal; otherwise
    the no-cache decision stands and both the data and the decision are
    recorded.
 5. **Commit the evidence** as `docs/ops/history/<release>_A4_EMA_EVALUATION.md`:
@@ -475,7 +476,8 @@ for this gate.
    the per-category table, the pass/suppress decision for each category, and
    the D1 verdict.
 6. **A5 rollout.** Set `LUNARWING_TOOL_ESTIMATES=1` with the passing set in
-   `LUNARWING_TOOL_ESTIMATES_CATEGORIES`, restart, and confirm hints appear
+   `LUNARWING_TOOL_ESTIMATES_CATEGORIES`. If nothing passes, leave hints off;
+   a blank allowlist permits every category. Restart and confirm hints appear
    only for allowed categories and only after the five-sample warmup. Widen to
    further tenants one at a time after their own windows. Rollback is
    `LUNARWING_TOOL_ESTIMATES=0` or unset plus a restart; never touch gates,

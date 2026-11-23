@@ -7,7 +7,7 @@
 //! projection that feeds `GET /api/jobs`.
 //!
 //! Set `DATABASE_URL` to an isolated test database with LunarWing migrations
-//! available. The test skips when the variable is absent.
+//! available. Local runs skip without it; CI must provide it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,10 @@ async fn postgres_database() -> Option<Arc<dyn Database>> {
 #[tokio::test]
 async fn estimated_duration_round_trips_through_postgres() {
     let Some(db) = postgres_database().await else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must configure DATABASE_URL for the PostgreSQL estimate test"
+        );
         eprintln!("skipping: DATABASE_URL is not configured for PostgreSQL integration tests");
         return;
     };

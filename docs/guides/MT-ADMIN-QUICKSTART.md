@@ -332,7 +332,8 @@ LUNARWING_LLM_TIMINGS=0
 ```
 
 `LUNARWING_TOOL_ESTIMATES=0` disables recording and hints entirely. The
-read-only routes `GET /api/estimates*` need the owner token and add no listener;
+read-only `GET /api/estimates` route shows the authenticated caller's models;
+its aggregate subroutes require the owner token. None adds a listener;
 hints appear only after a five-sample warmup. Enable hints per tenant only after
 that tenant passes the held-out evaluation in
 [`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../plans/WI191_PERFORMANCE_EMA_INTEGRATION.md).
