@@ -668,6 +668,30 @@ managed `wt0` resolver the only joined-run DNS path and keeps custom DNS
 rejected. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
+## Sandbox Git Grant (WI#816/860)
+
+Manifest-backed shell calls can clone, fetch and (with a write grant) push to
+operator-granted remotes. The settings are opt-in, have no defaults, and are
+preserved verbatim by `upgrade-tenant` and every other `lunarwing.env`
+re-render, together with each daemon variable a credential binding names:
+
+```bash
+SANDBOX_GIT_REMOTES=origin=http://git.lan:3000/org/repo.git  # name=url[,name=url...]
+SANDBOX_GIT_WRITE_REMOTES=origin          # names from SANDBOX_GIT_REMOTES that may push
+SANDBOX_GIT_CREDENTIALS=origin=GIT_ORIGIN_TOKEN  # remote=VARIABLE; http:// remotes only
+GIT_ORIGIN_TOKEN="Basic <base64 user:token>"     # the Authorization header value; a secret
+```
+
+The per-call proxy adds the bound header host-side, only to that repository's
+own smart-HTTP endpoints. It forwards a push only to a write-granted remote
+and refuses every ref deletion; protect branches on the forge against force
+pushes. A binding's variable is carried on re-render only when its name is a
+plain environment name and the variable is set; a variable the renderer writes
+itself (for example `LLM_MODEL`) keeps its rendered line. Rules and limits,
+including the public-only destination check that currently refuses
+private-address remotes:
+[`../guides/SANDBOX_CAPABILITY_MANIFEST.md`](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860).
+
 ## Runtime Behavior
 
 ```bash

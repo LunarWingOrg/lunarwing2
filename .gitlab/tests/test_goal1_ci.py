@@ -3546,6 +3546,157 @@ class PebbleRustLaneTests(unittest.TestCase):
         lane_check.assert_called_once()
 
 
+class XmppBridgeRustLaneTests(unittest.TestCase):
+    """WI#864: ic/bridges/xmpp-bridge and its contract crate are excluded
+    from the ic workspace, so no workspace job built, tested or linted them
+    and a broken bridge change could merge green. The rust-xmpp-bridge lane
+    is pinned by config.validate_xmpp_bridge_rust_lane: existence, the
+    .rust-job extends, needs: [], the resolved $CI_RUST_IMAGE image and
+    rust runner tag, the exact MR/branch/tag rules
+    (XMPP_BRIDGE_RUST_LANE_RULES) and the exact script
+    (XMPP_BRIDGE_RUST_LANE_SCRIPT) covering both crates with --locked and
+    clippy -D warnings. The real-tree binding is main() running the
+    validator over the checked-in rust.yml."""
+
+    RUST_JOB = {
+        "image": {"name": "$CI_RUST_IMAGE"},
+        "tags": ["$CI_RUST_RUNNER_TAG"],
+        "before_script": [
+            'df -h "$CI_PROJECT_DIR"',
+            "bash .gitlab/scripts/bootstrap-rust.sh",
+            'bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }',
+        ],
+    }
+
+    def merged(self) -> dict:
+        return {
+            ".rust-job": copy.deepcopy(self.RUST_JOB),
+            "rust-xmpp-bridge": {
+                "extends": ".rust-job",
+                "stage": "test",
+                "needs": [],
+                "rules": copy.deepcopy(list(config.XMPP_BRIDGE_RUST_LANE_RULES)),
+                "script": list(config.XMPP_BRIDGE_RUST_LANE_SCRIPT),
+            },
+        }
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_xmpp_bridge_rust_lane(merged, errors)
+        return errors
+
+    def test_valid_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_real_lane_matches_the_pin(self):
+        # The pinned tuples must equal the checked-in rust.yml lane, so a
+        # lane edit without a tuple update fails here (and in ci-config via
+        # main()). The real .rust-job template comes from defaults.yml.
+        merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            merged.update(config.load_yaml(ROOT / include.lstrip("/")))
+        self.assertEqual(self.errors(merged), [])
+
+    def test_missing_lane_is_caught(self):
+        merged = self.merged()
+        del merged["rust-xmpp-bridge"]
+        self.assertTrue(any(
+            "rust-xmpp-bridge job missing" in error for error in self.errors(merged)
+        ))
+
+    def test_script_covers_both_crates_locked_and_clippy(self):
+        # The acceptance property: both crates build with --locked, pass
+        # their tests, and pass clippy -D warnings — each in its own
+        # invocation (the contract crate is not a member of the bridge
+        # workspace).
+        commands = "\n".join(config.XMPP_BRIDGE_RUST_LANE_SCRIPT)
+        for manifest in (
+            "bridges/xmpp-bridge/Cargo.toml",
+            "openclaw-ports/xmpp/bridge/Cargo.toml",
+        ):
+            with self.subTest(manifest=manifest):
+                self.assertIn(f"test -j2 --locked --manifest-path {manifest}", commands)
+                self.assertIn(
+                    f"clippy -j2 --locked --manifest-path {manifest} "
+                    "--all-targets -- -D warnings",
+                    commands,
+                )
+
+    def test_never_rules_are_caught(self):
+        merged = self.merged()
+        merged["rust-xmpp-bridge"]["rules"] = [{"when": "never"}]
+        self.assertTrue(any(
+            "merge_request_event" in error or "pinned MR/branch/tag" in error
+            for error in self.errors(merged)
+        ))
+
+    def test_dropped_release_tag_rule_is_caught(self):
+        merged = self.merged()
+        merged["rust-xmpp-bridge"]["rules"] = [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
+            {"when": "never"},
+        ]
+        self.assertTrue(any(
+            "pinned MR/branch/tag" in error for error in self.errors(merged)
+        ))
+
+    def test_missing_needs_is_caught(self):
+        merged = self.merged()
+        del merged["rust-xmpp-bridge"]["needs"]
+        self.assertTrue(any("needs: []" in error for error in self.errors(merged)))
+
+    def test_dropped_locked_flag_is_caught(self):
+        merged = self.merged()
+        merged["rust-xmpp-bridge"]["script"] = [
+            command.replace(" --locked", "")
+            for command in merged["rust-xmpp-bridge"]["script"]
+        ]
+        self.assertTrue(any(
+            "exactly the pinned commands" in error for error in self.errors(merged)
+        ))
+
+    def test_prepended_exit_0_is_caught(self):
+        merged = self.merged()
+        merged["rust-xmpp-bridge"]["script"] = (
+            ["exit 0"] + merged["rust-xmpp-bridge"]["script"]
+        )
+        self.assertTrue(any(
+            "exactly the pinned commands" in error for error in self.errors(merged)
+        ))
+
+    def test_job_level_keys_are_caught(self):
+        for key, value in (
+            ("variables", {"CARGO_TERM_COLOR": "never"}),
+            ("hooks", {"pre_get_sources_script": ["true"]}),
+            ("before_script", ["true"]),
+            ("image", {"name": "$CI_RUST_IMAGE"}),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged["rust-xmpp-bridge"][key] = value
+                self.assertTrue(any(
+                    f"must not set job keys ['{key}']" in error
+                    for error in self.errors(merged)
+                ))
+
+    def test_deliverables_classify_both_crates_under_the_lane(self):
+        # The lane is what CI builds; the deliverable classification must
+        # name it, or a future coverage check cannot see the tie.
+        data = json.loads(
+            (ROOT / ".gitlab" / "deliverables.json").read_text(encoding="utf-8")
+        )
+        by_name = {entry["name"]: entry for entry in data["deliverables"]}
+        for name in ("xmpp-bridge", "openclaw-xmpp-bridge-port"):
+            with self.subTest(name=name):
+                self.assertIn("rust-xmpp-bridge", by_name[name]["ci"])
+
+    def test_main_runs_the_xmpp_lane_validator(self):
+        with mock.patch.object(config, "validate_xmpp_bridge_rust_lane") as lane_check:
+            self.assertEqual(config.main(), 0)
+        lane_check.assert_called_once()
+
+
 class TrivyIgnoreTests(unittest.TestCase):
     """WI#361: .gitlab/trivy-ignore entries must use Trivy's real `exp:`
     syntax — getExpirationDate (pkg/result/ignore.go) only CutPrefix's

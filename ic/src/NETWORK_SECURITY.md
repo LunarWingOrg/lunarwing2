@@ -414,39 +414,82 @@ contracts. Existing worker tokens and approved job credential grants are
 unchanged; generic-shell named secret injection and arbitrary mounts or devices
 are not implemented.
 
-### Git remote grant (WI#816)
+### Git remote grant (WI#816, WI#860)
 
-`git-remotes` is an opt-in, credential-free read grant for manifest-backed
-shell calls. The tenant operator sets `SANDBOX_GIT_REMOTES`
-(`name=url[,name=url...]`); unset or empty grants nothing. `git.remotes`
-selects names from that list. Calls without a manifest retain the configured
-legacy behavior, including any existing egress.
+`git-remotes` is an opt-in grant for manifest-backed shell calls. The tenant
+operator sets `SANDBOX_GIT_REMOTES` (`name=url[,name=url...]`); unset or empty
+grants nothing. `git.remotes` selects names from that list. Calls without a
+manifest retain the configured legacy behavior, including any existing egress.
 
-- **The proxy enforces hosts, not repository URLs.** A granted HTTP(S) remote
-  requires `proxy-enforced`. A per-call proxy only permits the selected
-  exact hosts, which must already be on the tenant egress allowlist. It keeps
-  public-IP checks and DNS pinning and uses no credential resolver with access
-  to secrets. It neither changes nor falls back to the shared proxy. HTTPS
-  CONNECT does not expose repository paths or operation types.
+- **The proxy enforces hosts, and for `http://` remotes git writes.** A
+  granted HTTP(S) remote requires `proxy-enforced`. A per-call proxy only
+  permits the selected exact hosts, which must already be on the tenant egress
+  allowlist. It keeps public-IP checks and DNS pinning. It neither changes nor
+  falls back to the shared proxy. HTTPS CONNECT does not expose repository
+  paths or operation types.
+- **Write grant.** `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
+  operation class includes `write`; every other remote stays read-only and
+  refuses `git push` with `capability_denied` before any credential or network
+  work. A write name outside `SANDBOX_GIT_REMOTES` is a configuration load
+  error, so write can never broaden read. Force push is refused in every
+  preflight spelling (`-f`, `--force`, `--force-with-lease`,
+  `--force-if-includes`, `--mirror`, `-qf`, a `+` refspec). Ref deletion
+  (`:ref`, `+:ref`, `:`, `--delete`) is always refused; there is no switch.
+- **The transport decides for `http://` remotes** (WI#860, ALM-1;
+  `sandbox/proxy/git_transport.rs`). The per-call proxy forwards
+  `git-receive-pack` only to a write-granted remote's own repository, host and
+  port, and refuses it everywhere else (any spelling or percent-encoding, any
+  client). It refuses a push whose command list deletes a ref (all-zero new
+  id), signed pushes and compressed or malformed push bodies, every method
+  but `GET`, `HEAD`, `POST` and `OPTIONS`, a `Host` header that is not the
+  request's own host and port, and every `CONNECT` except to a granted
+  `https://` remote's host and port. A bound credential is the matched
+  remote's own, even when two remotes share a host. A non-fast-forward
+  update is not visible in the request and
+  is left to the forge's branch protection; for `https://` remotes the forge
+  is the only write boundary (read-only keys for read grants, protected
+  branches).
 - **The shell scan is best-effort preflight.** It checks recognizable Git
-  commands for a granted alias or literal URL, and refuses recognized pushes
-  before execution regardless of flags or configured defaults. It also refuses
-  in-command configuration that could change what a later word means
-  (`alias.*`, `include.*`, `includeIf.*`, and the redirecting `remote.*`,
-  `url.*`, `credential.*`, `http.extraheader` keys), `git config` writes to
-  those keys, and shell assignments to `GIT_CONFIG_*`. It cannot enforce
-  arbitrary shell behavior or Git history policy. A network-disabled manifest
-  needs no grant for ordinary local clone, fetch, or pull.
+  commands for a granted alias or literal URL, and refuses force and deletion
+  spellings before execution. It also refuses in-command configuration that
+  could change what a later word means (`alias.*`, `include.*`,
+  `includeIf.*`, and the redirecting `remote.*`, `url.*`, `credential.*`,
+  `http.extraheader` keys), `git config` calls that write or rename those
+  keys, and `git config edit`. Literal reads are allowed. It recognizes
+  common assignments and wrappers, clustered shell options such as `-ce`,
+  and literal Git shell bodies. It does not fully model expansion,
+  substitutions, shell input, or evaluated text, so an unread form is not
+  guaranteed to be refused. It cannot enforce arbitrary shell behavior or
+  Git history policy; a script can still write `.git/config`. A
+  network-disabled manifest needs no grant for ordinary local clone, fetch,
+  or pull.
 - **File remotes** must initially canonicalize inside the call's workspace.
   They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
   is unsupported by manifest v1.
-- **Credentials and evidence.** The grant injects no credential. Configured
-  URLs cannot include userinfo, queries, or fragments; errors do not echo
-  supplied values. `capability_evidence.git` records the grant ID, supported
-  egress modes and remote names, transports, hosts and `read` operation class,
-  not a record of actual Git operations. Host-held authentication and push
-  support remain open under WI#816; the separate `ssh_git` tool is unchanged.
+- **Credentials stay host-side.** `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME`
+  binds a granted remote to a daemon environment variable. The per-call proxy
+  resolves that variable and adds the `Authorization` header to the outgoing
+  plain-HTTP request, so no credential value enters the container: not in its
+  environment, files, arguments, process listings or output, and there is no
+  helper socket a process in the run can query. The header is added only to
+  the bound repository's own smart-HTTP endpoints (exact host, port, path and
+  method); another repository or API path on the same host gets none. Only
+  `http://` remotes can be bound; an `https://` binding is a load error
+  because CONNECT is opaque to the proxy. The hop is plain HTTP, so it belongs
+  on a trusted network or an encrypted overlay; the per-call proxy keeps the
+  public-only destination check, so a remote resolving to a private, CGNAT
+  (NetBird's `100.64.0.0/10`) or loopback address is refused today. A
+  binding is applied only when its remote is selected. Modes that cannot carry
+  a network remote (`none`, `tunnel`) fail closed at authorization, so a
+  credential is never silently absent.
+- **Evidence.** Configured URLs cannot include userinfo, queries, or
+  fragments; errors do not echo supplied values. `capability_evidence.git`
+  records the grant ID, supported egress modes and remote names, transports,
+  hosts and operation classes (`read`, plus `write` where granted), and each
+  credential binding as remote plus variable *name* — never a value. It is a
+  record of the grant, not of actual Git operations. The separate `ssh_git`
+  tool is unchanged.
 
 ### Network egress tiers
 

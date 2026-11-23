@@ -120,7 +120,12 @@ fn format_top_level_error(err: &anyhow::Error) {
 }
 
 fn log_startup_banner() {
-    tracing::info!("Starting LunarWing v{}", env!("CARGO_PKG_VERSION"));
+    // WI#870: the commit and build time disambiguate rebuilds of one version;
+    // see `lunarwing::build_info`.
+    tracing::info!(
+        "Starting LunarWing {}",
+        lunarwing::build_info::banner_identity()
+    );
 }
 
 fn log_supervised_mode(config: lunarwing::config::SupervisedModeConfig) {
@@ -435,20 +440,28 @@ async fn async_main() -> anyhow::Result<()> {
     let job_event_tx = orch.job_event_tx;
     let prompt_queue = orch.prompt_queue;
     let docker_status = orch.docker_status;
+    let sandbox_runtime = orch.sandbox_runtime;
 
-    // Derive user-facing warning from docker_status for channel notification
-    let docker_user_warning: Option<String> = match docker_status {
-        lunarwing::sandbox::DockerStatus::NotInstalled => Some(
-            "Sandbox is enabled but Docker is not installed -- \
-             full_job routines will fail until Docker is available."
-                .to_string(),
-        ),
-        lunarwing::sandbox::DockerStatus::NotRunning => Some(
-            "Sandbox is enabled but Docker is not running -- \
-             full_job routines will fail until Docker is started."
-                .to_string(),
-        ),
-        _ => None,
+    // Derive the user-facing warning for channel notification (WI#871).
+    //
+    // Only a genuinely unusable sandbox warrants a user-visible warning. A
+    // podman-only host whose Docker is absent has a working sandbox — the
+    // startup log already names the selected runtime — so it stays quiet.
+    let docker_user_warning: Option<String> = if !config.sandbox.enabled {
+        None
+    } else if sandbox_runtime.is_none() {
+        let hint = match docker_status {
+            lunarwing::sandbox::DockerStatus::NotRunning => {
+                "Docker is installed but not running -- start it, or install podman."
+            }
+            _ => "Install podman or Docker.",
+        };
+        Some(format!(
+            "Sandbox is enabled but no usable container runtime was found -- \
+             sandboxed commands will fail until one is available. {hint}"
+        ))
+    } else {
+        None
     };
 
     // ── Channel setup ──────────────────────────────────────────────────
@@ -993,6 +1006,7 @@ async fn async_main() -> anyhow::Result<()> {
             heartbeat_interval_secs: config.heartbeat.interval_secs,
             sandbox_enabled: config.sandbox.enabled,
             docker_status,
+            sandbox_runtime,
             acp_enabled: config.acp.enabled,
             routines_enabled: config.routines.enabled,
             skills_enabled: config.skills.enabled,
@@ -1650,8 +1664,20 @@ mod tests {
 
         assert!(logs_contain("INFO"));
         assert!(logs_contain(&format!(
-            "Starting LunarWing v{}",
-            env!("CARGO_PKG_VERSION")
+            "Starting LunarWing {}",
+            lunarwing::build_info::banner_identity()
+        )));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn startup_banner_identifies_the_build_not_just_the_version() {
+        super::log_startup_banner();
+
+        // WI#870: two builds of one version must not log identical lines.
+        assert!(logs_contain(&format!(
+            "Starting LunarWing v{} (commit ",
+            lunarwing::build_info::VERSION
         )));
     }
 

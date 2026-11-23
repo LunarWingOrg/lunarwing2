@@ -92,6 +92,36 @@ pub struct OrchestratorSetup {
     pub job_event_tx: Option<broadcast::Sender<(Uuid, String, SseEvent)>>,
     pub prompt_queue: Arc<Mutex<HashMap<Uuid, VecDeque<api::PendingPrompt>>>>,
     pub docker_status: crate::sandbox::DockerStatus,
+    /// Runtime CLI selected for the generic sandbox (WI#871). `None` when the
+    /// sandbox is disabled or no runtime in the probe order is usable.
+    pub sandbox_runtime: Option<crate::sandbox::ContainerRuntime>,
+}
+
+/// One startup diagnostic for the sandbox runtime (WI#871).
+///
+/// The generic sandbox drives the podman or docker CLI directly, so a missing
+/// Docker daemon is not "sandbox disabled". Report the selected runtime by
+/// name, and say `sandbox disabled` only when every probed runtime failed.
+fn log_sandbox_runtime_diagnostic(
+    selection: &crate::sandbox::SandboxRuntimeDetection,
+    docker_status: crate::sandbox::DockerStatus,
+) {
+    match selection.runtime {
+        Some(runtime) => {
+            let job_containers = if docker_status.is_ok() {
+                "job containers: available"
+            } else {
+                "job containers: unavailable (no Docker-compatible API)"
+            };
+            tracing::info!(
+                runtime = runtime.binary(),
+                "{}; {}",
+                selection.summary(),
+                job_containers
+            );
+        }
+        None => tracing::warn!("{}", selection.summary()),
+    }
 }
 
 /// Dependencies for the WI#324 proxied tool path: when present, external
@@ -120,29 +150,17 @@ pub async fn setup_orchestrator(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
     ));
 
-    let docker_status = if config.sandbox.enabled {
-        let detection = crate::sandbox::check_docker().await;
-        match detection.status {
-            crate::sandbox::DockerStatus::Available => {
-                tracing::info!("Docker is available");
-            }
-            crate::sandbox::DockerStatus::NotInstalled => {
-                tracing::warn!(
-                    "Docker is not installed -- sandbox disabled for this session. {}",
-                    detection.platform.install_hint()
-                );
-            }
-            crate::sandbox::DockerStatus::NotRunning => {
-                tracing::warn!(
-                    "Docker is installed but not running -- sandbox disabled for this session. {}",
-                    detection.platform.start_hint()
-                );
-            }
-            crate::sandbox::DockerStatus::Disabled => {}
-        }
-        detection.status
+    let (docker_status, sandbox_runtime) = if config.sandbox.enabled {
+        let docker = crate::sandbox::check_docker().await;
+        // WI#871: select the runtime the generic sandbox will actually drive
+        // (podman-first) and name it, instead of reporting Docker's absence as
+        // a disabled sandbox on a healthy podman-only host.
+        let selection =
+            crate::sandbox::check_sandbox_runtime(config.sandbox.resolved_runtime()).await;
+        log_sandbox_runtime_diagnostic(&selection, docker.status);
+        (docker.status, selection.runtime)
     } else {
-        crate::sandbox::DockerStatus::Disabled
+        (crate::sandbox::DockerStatus::Disabled, None)
     };
 
     // Create broadcast channel for job events (shared by container and external workers).
@@ -239,6 +257,7 @@ pub async fn setup_orchestrator(
         job_event_tx,
         prompt_queue,
         docker_status,
+        sandbox_runtime,
     }
 }
 

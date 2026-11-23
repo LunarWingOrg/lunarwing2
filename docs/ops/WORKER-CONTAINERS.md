@@ -938,20 +938,62 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
-**Git remote grant (WI#816).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
-is unset by default. A manifest can opt into the `git-remotes` read grant.
+**Git remote grant (WI#816, WI#860).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
+is unset by default. A manifest can opt into the `git-remotes` grant.
 For HTTP(S) it requires `proxy-enforced` and narrows that call's proxy to the
-selected, already-allowlisted hosts. It does not enforce repository paths or
-Git operations. File remotes are paths inside `/workspace` and work in any
-supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
-injects no credential, and manifest preflight rejects recognized Git pushes.
-It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
-`url.*`, `credential.*` and `http.extraheader` configuration, `git config`
-writes to those keys, and shell assignments to `GIT_CONFIG_*`.
+selected, already-allowlisted hosts. File remotes are paths inside `/workspace`
+and work in any supported manifest mode (`none`, `proxy-enforced`, or
+`tunnel`).
+
+`SANDBOX_GIT_WRITE_REMOTES=name[,name...]` grants the `write` operation class
+to named remotes from that list; without it every remote stays read-only and
+`git push` is refused with `capability_denied` before any credential or
+network work. A write name outside `SANDBOX_GIT_REMOTES` is a load error.
+Force push is refused in every preflight spelling (`-f`, `--force`,
+`--force-with-lease`, `--force-if-includes`, `--mirror`, `-qf`, `+refspec`).
+Ref deletion is always refused; there is no switch. Manifest preflight is an
+early refusal. For `http://` remotes the per-call proxy is the boundary: it
+forwards `git-receive-pack` only to a write-granted remote's own repository,
+host and port, refuses a push that deletes a ref (all-zero new id), signed or
+compressed push bodies, every method but `GET`, `HEAD`, `POST` and `OPTIONS`,
+a `Host` header that is not the request's own host and port, and every
+`CONNECT` except to a granted `https://` remote. Non-fast-forward updates, and every
+write to an `https://` remote, are left to the forge: read-only deploy keys
+for read grants, protected branches (no force push).
+
+`SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a
+granted `http://` remote to a daemon environment variable holding the
+`Authorization` header value. The per-call proxy resolves it and injects the
+header host-side, so the credential never enters the container — not in its
+environment, files, arguments, process listings or output, and there is no
+helper socket to query. The header goes only to the bound repository's own
+smart-HTTP endpoints (exact host, port, path and method), never to another
+repository or API path on the same host. Only plain `http://` can be bound
+(HTTPS travels in an opaque CONNECT tunnel); an `https://` binding is a load
+error. The hop is plain HTTP, so it belongs on a trusted network or an
+encrypted overlay; the per-call proxy keeps the public-only destination
+check, so a remote resolving to a private, CGNAT (NetBird's `100.64.0.0/10`)
+or loopback address is refused today. A binding is applied only when its remote
+is selected. `none` and `tunnel` carry only `file://` remotes, so a
+credential-bound network remote fails closed there. mt-admin keeps
+`SANDBOX_GIT_REMOTES`, `SANDBOX_GIT_WRITE_REMOTES`, `SANDBOX_GIT_CREDENTIALS`
+and every variable a binding names across `lunarwing.env` re-renders (see
+`docs/ops/TENANT-CONFIGURATION.md`).
+
+The grant also refuses in-command `alias.*`, `include.*`, `includeIf.*`,
+`remote.*`, `url.*`, `credential.*` and `http.extraheader` configuration,
+`git config` calls that write or rename those keys, and `git config edit`.
+Literal reads are allowed. The scan recognizes common shell wrappers,
+clustered `-c` options and literal Git shell bodies, but does not fully model
+expansion, substitutions, evaluated strings or scripts read on stdin. Each
+remote is pinned with an empty `remote.<name>.url` first, which clears the URL
+list while the command retains the host's `GIT_CONFIG_*` entries. If those
+entries are discarded (for example, by clearing the environment), the pin no
+longer applies.
 Calls without a manifest keep their existing Git and egress behavior. See the
-[manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
-for the boundaries and the authentication and push work still open. Worker
-egress allowlists, credential grants, and inbound policy are unchanged.
+[manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860)
+for the boundaries. Worker egress allowlists, credential grants, and inbound
+policy are unchanged.
 
 ## Worker exposure policy (WI#357)
 
@@ -1309,8 +1351,13 @@ Enforced controls (opencode2 lane unless noted):
    reads `eval` bodies, `$(…)`/backtick bodies and process substitutions
    `<(…)`/`>(…)`. It skips empty unquoted brace alternatives, recognizes
    literal unquoted IFS separators, and keeps quotes in comments or
-   heredoc data from hiding later commands. Heredoc text is still checked
-   conservatively because it can be shell input. Quotes in ordinary
+   heredoc data from hiding later commands. Since WI#868 a brace group is
+   expanded on its own unquoted `{`, `,` and `}`, as bash does, so a quoted
+   alternative does not suppress it: `{kimi,"server"}`, `{"kimi",server}`,
+   `{kimi,'server'}` and `{kimi,$'server'}` deny like `{kimi,server}`,
+   while a quoted group (`echo "{kimi,server}"`) or a quoted comma stays
+   literal. Heredoc text is still checked conservatively because it can be
+   shell input. Quotes in ordinary
    arguments and a `kimi -p` prompt value stay data, and the accepted cost
    is a refusal of a command that only mentions the words unquoted
    (`echo kimi server`). Because the property asks at every word, the option
@@ -2487,7 +2534,10 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   rather than only after a fixed launcher list, so `taskset -c 0 kimi
   server`, `eval kimi server`, `script -qc 'kimi server'`, `watch kimi
   server`, `fd -x kimi server`, `cat <(kimi server)` and `{kimi,server}`
-  deny too, and an unknown launcher cannot hide one.
+  deny too, and an unknown launcher cannot hide one. A quoted alternative
+  is the same command (WI#868): `{kimi,"server"}`, `{"kimi",server}`,
+  `{kimi,'server'}` and `{kimi,$'server'}` all deny, because bash expands
+  the group before it removes the quotes.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
 - **ACP session preview restore, `/tasks`, the follow-up behavior setting,

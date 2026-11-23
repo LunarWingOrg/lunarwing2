@@ -333,6 +333,77 @@ assert_eq "rerun preserves SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS" \
 assert_eq "tunnel knobs are rendered once each" \
   "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "8"
 
+echo "=== sandbox git grant env preservation tests (WI#860, ALM-3) ==="
+# The git grant is opt-in: nothing is rendered until an operator sets it.
+assert_eq "no git grant rendered by default" \
+  "$(grep -c '^SANDBOX_GIT_' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+SANDBOX_GIT_REMOTES="origin=http://git.lan:3000/org/repo.git,mirror=http://git.lan/org/mirror.git,bad=http://git.lan/org/bad.git,dup=http://git.lan/org/dup.git,llm=http://git.lan/org/llm.git,missing=http://git.lan/org/missing.git"
+SANDBOX_GIT_WRITE_REMOTES=origin
+SANDBOX_GIT_CREDENTIALS="origin=GIT_ORIGIN_TOKEN, mirror = Git_Mirror_Token ,bad=not-a-name,dup=GIT_ORIGIN_TOKEN,llm=LLM_MODEL,missing=GIT_UNSET_TOKEN,z=SANDBOX_GIT_ALLOW_REF_DELETION,w=EXTRA_DROPPED_KEY"
+GIT_ORIGIN_TOKEN="Basic b3JpZ2luOnNlY3JldA=="
+SANDBOX_GIT_ALLOW_REF_DELETION=true
+EXTRA_DROPPED_KEY=resurrected
+EOF
+printf '%s\n' 'Git_Mirror_Token="Bearer mirror \"quoted\" \\ token"' >>"$MT_FIXTURE/env/lunarwing.env"
+for git_rerun in first second; do
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_REMOTES" "$(envval SANDBOX_GIT_REMOTES)" \
+    "origin=http://git.lan:3000/org/repo.git,mirror=http://git.lan/org/mirror.git,bad=http://git.lan/org/bad.git,dup=http://git.lan/org/dup.git,llm=http://git.lan/org/llm.git,missing=http://git.lan/org/missing.git"
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_WRITE_REMOTES" \
+    "$(envval SANDBOX_GIT_WRITE_REMOTES)" "origin"
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_CREDENTIALS" "$(envval SANDBOX_GIT_CREDENTIALS)" \
+    "origin=GIT_ORIGIN_TOKEN, mirror = Git_Mirror_Token ,bad=not-a-name,dup=GIT_ORIGIN_TOKEN,llm=LLM_MODEL,missing=GIT_UNSET_TOKEN,z=SANDBOX_GIT_ALLOW_REF_DELETION,w=EXTRA_DROPPED_KEY"
+  assert_eq "$git_rerun rerun preserves a bound credential variable" \
+    "$(envval GIT_ORIGIN_TOKEN)" "Basic b3JpZ2luOnNlY3JldA=="
+  assert_eq "$git_rerun rerun preserves a mixed-case, quoted bound variable" \
+    "$(envval Git_Mirror_Token)" 'Bearer mirror "quoted" \ token'
+  assert_eq "$git_rerun rerun writes a variable named twice once" \
+    "$(grep -c '^GIT_ORIGIN_TOKEN=' "$MT_FIXTURE/env/lunarwing.env")" "1"
+  assert_eq "$git_rerun rerun keeps a binding to a rendered key to one line" \
+    "$(grep -c '^LLM_MODEL=' "$MT_FIXTURE/env/lunarwing.env")" "1"
+  assert_eq "$git_rerun rerun renders nothing for an unset bound variable" \
+    "$(grep -c '^GIT_UNSET_TOKEN=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun does not carry an invalid binding name" \
+    "$(grep -c '^not-a-name=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  # F6: only a remote SANDBOX_GIT_REMOTES grants can carry a variable.
+  assert_eq "$git_rerun rerun does not carry a variable bound to an ungranted remote (z)" \
+    "$(grep -c '^SANDBOX_GIT_ALLOW_REF_DELETION=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun does not carry a variable bound to an ungranted remote (w)" \
+    "$(grep -c '^EXTRA_DROPPED_KEY=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun renders the git grant keys once each" \
+    "$(grep -c '^SANDBOX_GIT_' "$MT_FIXTURE/env/lunarwing.env")" "3"
+done
+
+echo "=== sandbox git grant refuses a value it cannot render (WI#860, ALM-3) ==="
+# F5: a bound credential or a grant setting on a CRLF line cannot be written
+# on one line. The render stops in the writer's own shell, names the variable
+# (never its value), and leaves lunarwing.env as it was.
+git_env="$MT_FIXTURE/env/lunarwing.env"
+for git_crlf_case in credential setting; do
+  if [[ "$git_crlf_case" == credential ]]; then
+    printf 'GIT_ORIGIN_TOKEN="Basic Y3JsZjp0b2tlbg=="\r\n' >>"$git_env"
+    git_crlf_name="GIT_ORIGIN_TOKEN (bound by SANDBOX_GIT_CREDENTIALS)"
+  else
+    printf 'SANDBOX_GIT_WRITE_REMOTES=origin\r\n' >>"$git_env"
+    git_crlf_name="SANDBOX_GIT_WRITE_REMOTES in lunarwing.env"
+  fi
+  git_env_before="$(sha256sum <"$git_env")"
+  git_crlf_rc=0
+  git_crlf_err="$( (write_tenant_lunarwing_env fixture-tenant) 2>&1 >/dev/null )" || git_crlf_rc=$?
+  assert_eq "a CRLF $git_crlf_case stops the render" "$git_crlf_rc" "1"
+  assert_eq "the $git_crlf_case refusal names the variable" \
+    "$([[ "$git_crlf_err" == *"$git_crlf_name"* ]] && echo yes || echo "no: $git_crlf_err")" "yes"
+  assert_eq "the $git_crlf_case refusal does not print the value" \
+    "$([[ "$git_crlf_err" != *Y3JsZjp0b2tlbg* ]] && echo yes || echo no)" "yes"
+  assert_eq "a refused $git_crlf_case render leaves lunarwing.env unchanged" \
+    "$(sha256sum <"$git_env")" "$git_env_before"
+  sed -i '$d' "$git_env"
+done
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "the render succeeds again once the CRLF line is gone" \
+  "$(envval GIT_ORIGIN_TOKEN)" "Basic b3JpZ2luOnNlY3JldA=="
+
 echo "=== LLM retry env preservation tests ==="
 assert_eq "default LLM_MAX_RETRIES" "$(envval LLM_MAX_RETRIES)" "3"
 assert_eq "default billed-empty input-token budget" \

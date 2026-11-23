@@ -103,7 +103,7 @@ size is bounded at 16 KiB.
   accepted by the serde-shaped enum for an actionable policy denial, not exposed
   in the published request schema as a supported grant.
 
-## Git remotes (WI#816)
+## Git remotes (WI#816, WI#860)
 
 ```json
 {
@@ -114,8 +114,8 @@ size is bounded at 16 KiB.
 }
 ```
 
-`extensions: ["git-remotes"]` requests a credential-free Git read grant. The
-tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
+`extensions: ["git-remotes"]` requests a Git grant. The tenant operator
+configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
 `git.remotes` can select a subset by name but cannot add a remote.
 
 - HTTP(S) remotes require `proxy-enforced`; `none`, `tunnel`, and advisory
@@ -129,41 +129,147 @@ tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
 - Configured URLs must not contain userinfo, a query, or a fragment. Invalid
   configuration is reported without printing the supplied value.
 
+### Write grant (WI#860)
+
+Read access is the default. `SANDBOX_GIT_WRITE_REMOTES=name[,name...]` grants
+the `write` operation class to named remotes in the same `SANDBOX_GIT_REMOTES`
+list; a name outside that list is a configuration load error, so the write
+grant can never broaden the read grant. Without a write grant, `git push` is
+refused with `capability_denied` before any credential or network work.
+
+- **Force push is refused in every spelling** the preflight can see: `-f`,
+  `--force`, `--force-with-lease[=ref]`, `--force-if-includes`, `--mirror`,
+  short clusters containing `f` (`-qf`), and a `+` refspec.
+- **Ref deletion is refused.** There is no host switch: a `:ref` or `+:ref`
+  refspec, a bare `:` and `--delete`/`--del` are refused by the preflight, and
+  the per-call proxy refuses any deleting push (below).
+- **The preflight is an early, friendly refusal, not the boundary.** A script
+  can still write `.git/config` (`remote.origin.mirror`, `remote.origin.push`,
+  `alias.p`) or reach a remote with a client other than git.
+
+**Where the push happens (plain `http://` remotes).** The per-call git proxy
+reads every smart-HTTP request, so for `http://` remotes it, not the command
+text, decides write and deletion:
+
+- `git-receive-pack` (the advertisement
+  `GET <repo>/info/refs?service=git-receive-pack` and
+  `POST <repo>/git-receive-pack`) is forwarded only to a write-granted remote's
+  own repository, host and port. On a read-only remote, on another repository
+  of the same host, or in any other spelling or encoding, it is refused with
+  `403`, with or without a bound credential and whatever client sent it.
+- A push whose command list deletes a ref (an all-zero new object id) is
+  refused, as are signed pushes (`push-cert`) and compressed, truncated or
+  malformed push bodies.
+- The per-call git proxy forwards only `GET`, `HEAD`, `POST` and `OPTIONS`, on
+  any path: smart HTTP needs nothing else, so WebDAV writes (`git http-push`)
+  are refused however the path is spelled.
+- The upstream `Host` is the request's own host and port: a request whose
+  `Host` header names another virtual host is refused, so a granted request
+  and its credential cannot be steered elsewhere on the same address.
+- `CONNECT` is opened only to the host and port of a granted `https://`
+  remote; every other tunnel, a plain-HTTP remote's host included, is
+  refused, so a client cannot tunnel around these checks.
+- **A non-fast-forward update cannot be seen from the request**, so it is left
+  to the forge: protect the target branches (no force push). For `https://`
+  remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
+  write boundary: give read grants a read-only key and protect branches.
+
+### Credentials (WI#860)
+
+`SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a granted
+remote to a daemon environment variable. The value is the literal
+`Authorization` header value (for example `Basic <base64>` or `Bearer <token>`).
+
+- **The credential stays host-side.** The per-call egress proxy resolves
+  `ENV_NAME` and adds the header to the outgoing request. The container never
+  receives it: not in its environment, files, command arguments, process
+  listings or output. There is no credential helper and no socket a process in
+  the run can query.
+- **The credential reaches only its repository's endpoints.** The header is
+  added only to the bound remote's own smart-HTTP requests (`info/refs`,
+  `git-upload-pack`, and `git-receive-pack` for a write grant) on its exact
+  host and port, and it is that remote's own credential even when two
+  remotes share a host. Another repository on the same host, the forge's API, a
+  dumb-HTTP read and any other path get no credential. Configure the remote's
+  canonical smart-HTTP URL (with `.git` where the forge redirects to it).
+- **Only plain `http://` remotes can be bound.** HTTPS travels in an opaque
+  `CONNECT` tunnel the proxy cannot modify, so binding an `https://` remote is a
+  configuration load error rather than a silent no-op. Use `http://` for
+  credential-bound remotes, or configure the forge to accept an unauthenticated
+  read. The hop from the host to the remote is plain HTTP, so it belongs on a
+  trusted network or an encrypted overlay. The per-call proxy keeps
+  `proxy-enforced`'s public-only destination check, so today a remote whose
+  name resolves to a private, CGNAT (including NetBird's `100.64.0.0/10`) or
+  loopback address is refused.
+- **A binding must name a granted remote**, and is applied only when that
+  remote is selected for the call.
+- **Egress modes.** Credential injection works in `proxy-enforced`, the only
+  mode that carries HTTP(S) remotes. `none` and `tunnel` carry `file://`
+  remotes only; a network remote in either mode is already denied. Credentials
+  are therefore never silently absent: the mode either supports the binding or
+  the call fails closed at authorization.
+
 The manifest preflight checks recognizable Git commands before starting a
 runtime. Use a literal granted URL for cloning and name an explicit granted
-remote for fetch or pull with networking enabled. Unsupported read options
-are denied instead of guessing which argument is the remote. With network
-disabled, ordinary local reads such as `git clone . copy`, `git fetch` and
-`git pull` can run without a grant. Operations that write to the local
+remote for fetch, pull or push with networking enabled. Unsupported read
+options are denied instead of guessing which argument is the remote. With
+network disabled, ordinary local reads such as `git clone . copy`, `git fetch`
+and `git pull` can run without a grant. Operations that write to the local
 workspace still need a writable mount. Calls that omit the manifest retain
 legacy behavior and do not use this preflight or the scoped proxy.
 
 The shell scan is not a security boundary: Git configuration and scripts can
 change what actually runs, and HTTPS CONNECT does not expose repository paths
-or Git operations to the proxy. Manifest preflight rejects recognized `git
-push` invocations, not just force or delete flags, because even a plain push
-can use repository-local settings. It likewise rejects the remote transport
-plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and the
-`remote-*` helpers, whether named as a `git` subcommand or invoked by path.
+or Git operations to the proxy. Manifest preflight rejects the remote
+transport plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and
+the `remote-*` helpers, whether named as a `git` subcommand or invoked by
+path.
 It also refuses in-command configuration that would change what a later word
 means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
-`credential.*` and `http.extraheader` keys, `git config` writes to those same
-keys, and shell assignments to `GIT_CONFIG_*`. These refusals are preflight
-only: a script can still write `.git/config` directly. This is not a
-repository write filter for arbitrary shell processes. Use server-side
-permissions and branch protection to enforce repository write policy.
+`credential.*` keys, HTTP `extraHeader` (including URL-scoped keys),
+`help.autocorrect`, and the Git editor and filesystem monitor keys. It
+refuses `git config` writes and renames involving those keys and refuses
+`git config edit` outright. Literal reads are allowed. It also refuses
+recognized writes to `GIT_CONFIG_*`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR`.
+These refusals are preflight only: a script can still write `.git/config`
+directly. The scan is not a repository write filter for arbitrary shell
+processes: for `http://` remotes the per-call proxy enforces write and deletion
+(see the write grant above), and for everything else, and for non-fast-forward
+updates, use server-side permissions and branch protection.
 
-The grant supplies no credential. The container receives the granted remote
-URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
-`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Host-held
-authentication and push support inside the shell remain open under WI#816.
+The scan recognizes common wrappers, grouping prefixes, separate `-c` script
+operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
+`submodule foreach` and `bisect run` bodies. It does not fully model shell
+expansion (including globs, braces and command substitutions), dynamic
+command names, alias or command lookup, text evaluated by commands such as
+`eval`, `trap` or `env -S`, or shell scripts supplied on stdin. Unsupported
+forms, including indirect writes to shell variables, are not guaranteed
+to be refused.
+Ordinary commands such as `grep git README`, `echo git push`, and
+`env FOO=1 git status`, `timeout 30 git fetch origin`, `bash -c 'git status'`
+keep passing. `git config` is read in the classic form and in the 2.46
+`list`/`get`/`set`/`unset`/`rename-section`/`remove-section`/`edit`
+subcommands, with git's long-option prefixes (`--fil` is `--file`) and the
+rename target checked; any edit is refused, since its editor can write any
+key. `git remote` reads options before the action word, so `git remote -v
+set-url origin <url>` is checked. `git_subcommand` steps over every
+value-taking global option, `--attr-source` included.
+
+The container receives the granted remote URLs as
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Each remote is
+pinned with an empty `remote.<name>.url` first, which clears the URL list, so
+a repository-local URL does not outrank the granted one while the process
+retains the host's Git configuration environment entries.
 The separate host-side `ssh_git` tool is unchanged.
 
 `capability_evidence.git` records the grant identifier, supported egress modes,
-and per-remote name, transport, host and the `read` operation class. It reports
-the grant, not the operation a process actually performed. It never records a
-credential, token, key, URL userinfo, or helper command.
+and per-remote name, transport, host and operation classes (`read`, and
+`write` where granted). It also records each credential binding as the remote
+name plus the daemon variable *name*. It reports the grant, not the operation
+a process actually performed. It never records a credential value, token, key,
+URL userinfo, or helper command.
 
 ## Compatibility and retries
 

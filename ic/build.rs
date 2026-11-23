@@ -1,5 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -10,6 +12,9 @@ fn main() {
 
     // ── Embed bundled skills ────────────────────────────────────────────
     embed_skills(&root);
+
+    // ── Embed build identity ────────────────────────────────────────────
+    embed_build_identity(&root);
 
     // ── Track migrations ────────────────────────────────────────────────
     // refinery's embed_migrations!("migrations") include_str!s each file it
@@ -171,4 +176,111 @@ fn collect_json_files(dir: &Path, out: &mut Vec<String>) {
             out.push(content);
         }
     }
+}
+
+/// Embed the build identity the startup banner prints (WI#870): the source
+/// commit and the build time.
+///
+/// The package version alone cannot distinguish two builds of the same
+/// version, so a tester reading `daemon.log` could not tell which build was
+/// running. The commit answers "what code is this"; the build time separates
+/// rebuilds of one commit (a dirty tree, or two builds of the same checkout).
+///
+/// Overrides, both optional:
+/// - `LUNARWING_BUILD_COMMIT` — for builds without a `.git` directory (the
+///   container image, a `git archive` tree), or when the build account cannot
+///   read the checkout. Defaults to the checkout's HEAD, `-dirty` when
+///   tracked files under the crate differ, and `unknown` otherwise.
+/// - `SOURCE_DATE_EPOCH` — pins the build time for reproducible builds.
+///
+/// Nothing here can fail the build: a missing git or clock degrades to
+/// `unknown` / `0`.
+fn embed_build_identity(root: &Path) {
+    let commit = env::var("LUNARWING_BUILD_COMMIT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| derive_git_commit(root));
+
+    let epoch = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs())
+        })
+        .unwrap_or(0);
+
+    println!("cargo:rustc-env=LUNARWING_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=LUNARWING_BUILD_EPOCH={epoch}");
+    println!("cargo:rerun-if-env-changed=LUNARWING_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    // Cargo stops using its default "any package file changed" heuristic once
+    // a build script emits rerun-if-changed, so the sources have to be
+    // watched explicitly or an edited tree keeps a stale banner.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    watch_git_head(root);
+}
+
+/// Watch the files that move the printed commit, so a tenant upgrade that
+/// advances the branch rebuilds the banner.
+///
+/// `.git/HEAD` alone is not enough: on a branch it only holds
+/// `ref: refs/heads/<branch>`, which does not change when the branch tip
+/// advances — the loose ref (or `packed-refs`) does.
+fn watch_git_head(root: &Path) {
+    let Some(git_dir) = git(root, &["rev-parse", "--absolute-git-dir"]) else {
+        return;
+    };
+    let git_dir = PathBuf::from(git_dir);
+    let mut watched = vec![git_dir.join("HEAD"), git_dir.join("packed-refs")];
+    if let Some(reference) = git(root, &["rev-parse", "--symbolic-full-name", "HEAD"])
+        .filter(|reference| !reference.is_empty())
+    {
+        watched.push(git_dir.join(reference));
+    }
+    for path in watched.iter().filter(|path| path.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// Short HEAD of the checkout, suffixed `-dirty` when tracked files under the
+/// crate have uncommitted changes. `unknown` when git cannot answer.
+fn derive_git_commit(root: &Path) -> String {
+    let revision = match git(root, &["rev-parse", "--short=8", "HEAD"]) {
+        Some(revision) if !revision.is_empty() => revision,
+        _ => return "unknown".to_string(),
+    };
+    // Scoped to the crate and tracked files only: untracked build output must
+    // not mark the tree dirty, and `ic/vendor/` is large enough that a
+    // repo-wide scan would slow every rebuild.
+    let dirty = git(
+        root,
+        &["status", "--porcelain", "--untracked-files=no", "--", "."],
+    )
+    .is_none_or(|status| !status.is_empty());
+    if dirty {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    }
+}
+
+/// Run one git command in `root`, returning trimmed stdout on success.
+fn git(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|text| text.trim().to_string())
 }

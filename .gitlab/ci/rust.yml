@@ -125,6 +125,31 @@ rust-clippy-all:
   script:
     - bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked --all --benches --tests --examples --all-features -- -D warnings
 
+# WI#864: ic/bridges/xmpp-bridge and its contract crate
+# (ic/openclaw-ports/xmpp/bridge) are excluded from the ic workspace, each
+# with its own Cargo.lock, so no workspace job ever compiled, tested or linted
+# them — a broken bridge change could merge with a green pipeline (WI#854's
+# !2707 changed 335 lines of bridge Rust and its pipeline never built it).
+# Both crates run here in their own invocations from ic/ so the vendored
+# source replacement applies (ic/.cargo/config.toml), with --locked and
+# clippy -D warnings. Pinned by validate_config.py
+# (validate_xmpp_bridge_rust_lane). needs: [] keeps every earlier-stage
+# artifact and dotenv variable out of the pinned script.
+rust-xmpp-bridge:
+  extends: .rust-job
+  stage: test
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path bridges/xmpp-bridge/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked --manifest-path bridges/xmpp-bridge/Cargo.toml --all-targets -- -D warnings
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path openclaw-ports/xmpp/bridge/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked --manifest-path openclaw-ports/xmpp/bridge/Cargo.toml --all-targets -- -D warnings
+
 rust-test-lib:
   extends: .rust-job
   stage: test

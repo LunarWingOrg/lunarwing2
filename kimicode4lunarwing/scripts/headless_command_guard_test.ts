@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -27,6 +27,25 @@ import { test } from "node:test"
  */
 
 const guardPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
+
+type ListenerWord = { text: string; quoted: boolean }
+
+async function guardSyntax() {
+  // Test the real readers without changing how the deployed hook starts.
+  // Only the checked-in JS is loaded; fixture shell strings are never executed.
+  const source = readFileSync(guardPath, "utf8").trimEnd()
+  const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
+  assert.ok(source.endsWith(cli))
+  const library = source.slice(0, -cli.length) +
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+  return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
+    commandSegments: (text: string) => string[]
+    clauseText: (text: string, from: number) => string
+    quoteScan: (text: string) => { substitutions: Map<number, number> }
+    listenerSegments: (text: string) => Iterable<ListenerWord[]>
+    listenerWordList: (words: ListenerWord[]) => string[]
+  }
+}
 
 function runGuard(payload: unknown, timeout = 10_000) {
   const input = typeof payload === "string" ? payload : JSON.stringify(payload)
@@ -960,6 +979,28 @@ test("a long command of repeated words is decided without rescanning", () => {
   assertAllowed("kimi ".repeat(3276) + "echo", 2_000)
   assertBlocked("{kimi,server} ".repeat(1200).slice(0, 16_384), "kimi service mode")
   assertBlocked("cat <(kimi server) ".repeat(800).slice(0, 16_384), "kimi service mode")
+  // WI#868 makes the expansion a cross product, so a word of many groups and
+  // a deeply nested group must stay linear in the command length.
+  assertBlocked('{kimi,"server"} '.repeat(1200).slice(0, 16_384), "kimi service mode")
+  // A word whose expansion passes the cap is refused by the cap itself (its
+  // own reason, not the deadline) instead of being read as literal text
+  // (run-530 ALP-1).
+  assertBlocked("{a,b}".repeat(2000).slice(0, 16_384), "brace expansion this large")
+  assertAllowed("echo " + "{".repeat(8_000) + "}".repeat(8_000), 2_000)
+  assertBlocked("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), "brace expansion this large")
+})
+
+test("a brace expansion past the cap is refused, not read as literal (ALP-1)", () => {
+  // Ten `{,}` groups make 2048 copies of `kimi server`; the guard used to
+  // stop expanding at 1024 pending words and allow the rest as literal text,
+  // while bash ran `kimi server kimi ...`.
+  assertBlocked("{,}".repeat(10) + "{kimi,server}", "brace expansion this large")
+  assertBlocked("{,}".repeat(12) + "{kimi,server}", "brace expansion this large")
+  // Below the cap the expansion is read and the listener found.
+  assertBlocked("{,}".repeat(9) + "{kimi,server}", "kimi service mode")
+  // Ordinary expansions stay allowed.
+  assertAllowed("mkdir -p build/{a,b,c}/{debug,release}")
+  assertAllowed("echo " + "{a,b}".repeat(9))
 })
 
 test("empty brace alternatives and literal IFS separators do not hide listener words", () => {
@@ -968,8 +1009,65 @@ test("empty brace alternatives and literal IFS separators do not hide listener w
   }
   assertBlocked("kimi${IFS}server", "kimi service mode")
   assertBlocked("kimi$IFS'server'", "kimi service mode")
+  // WI#867 point 2: a slice of IFS is a separator too, as the rm assembly
+  // check already reads it. bash runs `kimi${IFS:0:1}server` as `kimi server`.
+  assertBlocked("kimi${IFS:0:1}server", "kimi service mode")
+  assertBlocked("kimi${IFS:1:1}server", "kimi service mode")
+  assertBlocked("python3${IFS:0:1}-m${IFS:0:1}http.server", "listener started from a task")
   assertAllowed("kimi -p 'kimi${IFS}server'")
+  assertAllowed("kimi -p 'kimi${IFS:0:1}server'")
   assertAllowed("kimi -p ''")
+})
+
+test("a quoted brace alternative does not suppress the group (WI#868)", () => {
+  // WI#868: the guard expanded a brace word only when the segment recorded
+  // the whole word as unquoted, so one quoted alternative suppressed the
+  // expansion. Bash expands the group first and removes the quotes
+  // afterwards, so each row below runs `kimi server`. Bash 5.3.20 confirmed
+  // every row really runs the listener command.
+  assertBlocked('{kimi,"server"}', "kimi service mode")
+  assertBlocked('{"kimi",server}', "kimi service mode")
+  assertBlocked("{kimi,'server'}", "kimi service mode")
+  assertBlocked("{kimi,$'server'}", "kimi service mode")
+  assertBlocked('{nc,"-l"} 9000', "listener started from a task")
+  assertBlocked('{python3,"-m"} http.server', "listener started from a task")
+  assertBlocked('nohup {kimi,"server"} &', "kimi service mode")
+  assertBlocked('{kimi,"server"} ; ls', "kimi service mode")
+  // The control rows of the same table keep denying.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked('bash -c "kimi server"', "kimi service mode")
+  assertBlocked("{kimi,server}", "kimi service mode")
+  // A quote inside an alternative's word and a nested group are the same
+  // expansion. A prefix or suffix is not: `x{kimi,"server"}` runs `xkimi
+  // xserver`, which is no listener.
+  assertBlocked('{kimi,"ser"ver}', "kimi service mode")
+  assertBlocked("{x,{kimi,server}}", "kimi service mode")
+  assertBlocked("{,{kimi,server}}", "kimi service mode")
+  // Bash's cross product is read too: here one word supplies `kimi` and the
+  // next `server`.
+  assertBlocked('{kim,kimi}{i,} server', "kimi service mode")
+  // A quoted group is still literal, and so is a quoted comma.
+  assertAllowed('echo "{kimi,server}"')
+  assertAllowed("echo '{kimi,server}'")
+  assertAllowed('echo {kimi\\,"server"}')
+  assertAllowed('x{kimi,"server"}')
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("printf '%s\\n' {debug,release}")
+})
+
+test("$$ is the PID parameter, so $$( opens no substitution (ALR-1)", () => {
+  // Bash's parser consumes `$$` as one parameter, so the `(` after it is
+  // literal; bash 5.3 ran the next line in both rows below, which the shared
+  // reader used to hide inside an unclosed `$(`.
+  assertBlocked('echo "$$(x"\nkimi server', "kimi service mode")
+  assertBlocked('echo "}$$(<()"\nnc -l 9000', "listener started from a task")
+  // A real substitution right after the PID is still a substitution.
+  assertBlocked('echo "$$$(kimi server)"', "kimi service mode")
+  assertBlocked('echo "$$$(echo a)"; kimi server', "kimi service mode")
+  assertBlocked('echo "$$"; kimi server', "kimi service mode")
+  // Ordinary PID use stays allowed.
+  assertAllowed('echo "pid $$"')
+  assertAllowed("mkdir -p /tmp/run.$$ && ls /tmp/run.$$")
 })
 
 test("listener quote state follows ANSI-C words, comments, and heredocs", () => {
@@ -1021,6 +1119,97 @@ test("interpreter one-liners delete without parentheses or through a binding", (
   // A deletion name inside a string literal is text, not a call.
   assertAllowed(`perl -e 'print "unlink", "/home/kimi/x"'`)
   assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
+})
+
+test("a launcher option value does not end the walk to the shell body (WI#869)", () => {
+  // WI#869: listenerShellBody stepped over only words starting with `-`, so
+  // an option that takes a separate value ended the walk before the `-c` and
+  // the body was never read. Every row of the item's measured ALLOW table is
+  // a deny now; `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` is the
+  // idiomatic Dockerfile form, so this shape is written without thinking.
+  assertBlocked('bash -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -x -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash +o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -o pipefail -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('bash -O extglob -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('sh -o pipefail -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('setsid bash -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash --rcfile /dev/null -c "kimi server"', "kimi service mode")
+  assertBlocked('bash --init-file /dev/null -c "kimi server"', "kimi service mode")
+  // The `-o` value may also be spelled as a cluster's last letter.
+  assertBlocked('bash -xo pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -c -x "kimi server"', "kimi service mode")
+  assertBlocked('bash -c -- "kimi server"', "kimi service mode")
+  // The control rows keep their verdicts.
+  assertBlocked('bash -c "kimi server"', "kimi service mode")
+  assertAllowed('bash -c "echo hi"')
+  assertAllowed('bash -o pipefail -c "echo hi"')
+  assertAllowed('bash --rcfile /dev/null -c "echo hi"')
+  // A shell's option walk stops at its script-file operand, so a later word
+  // is not a body.
+  assertAllowed("bash -x script.sh")
+})
+
+test("script's own option values do not hide the body it runs (WI#869)", () => {
+  // `script` is a shell-string launcher, but its options are not a shell's:
+  // -c/--command carries the body, every other value-taking option must be
+  // stepped over, and `script -- <command>` runs the words after the marker.
+  assertBlocked("script -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script --command 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -q -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -qec 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -E never -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -- 'kimi server'", "kimi service mode")
+  assertBlocked("script -c 'nc -l 9000' /dev/null", "listener started from a task")
+  assertAllowed("script -c 'echo hi' /dev/null")
+  assertAllowed("script -qc 'echo hi' /dev/null")
+  assertAllowed("script /dev/null -c 'echo hi'")
+  assertAllowed("script -q /dev/null")
+})
+
+test("an interpreter option value does not end the walk to the eval flag (WI#869)", () => {
+  // The same blind spot in oneLinerCode: `perl -I /tmp -e …` ended the walk
+  // at the -I value, so the interpreter deletion rule never read the code.
+  assertBlocked(`perl -I /tmp -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`python3 -X utf8 -c "import shutil;shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -W ignore -c "import shutil;shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(
+    `node --require /x -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  // An option whose value is only ever attached must not eat the next word:
+  // perl runs the `-e` code after a bare `-D` or `-F` (run-531 ALQ-1).
+  assertBlocked(`perl -D -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")' /etc/hostname`, "deletion outside")
+  assertBlocked(`perl -F -e 'use File::Path; rmtree("/home/kimi")'`, "deletion outside")
+  // Attached values (`-I/tmp`, `-Mstrict`) and the allowed rows still work.
+  assertBlocked(`perl -Mstrict -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertAllowed(`perl -I /tmp -e 'unlink("/tmp/wi869-x")'`)
+  assertAllowed(`python3 -X utf8 -c "import shutil;shutil.rmtree('/tmp/wi869-x')"`)
+  assertAllowed(`node --require /x -e "require('fs').rmSync('/tmp/wi869-x',{recursive:true})"`)
+  assertAllowed("python3 -m pytest tests/ -q")
+  assertAllowed("python3 -m json.tool")
+})
+
+test("cp's destination option is the destination it writes (WI#869)", () => {
+  // The cp device-write rule kept every non-dash word as an operand, so the
+  // `-t` value read as a source and the real source as the destination. The
+  // same walk now serves cp and mv (WI#849's operand reader).
+  assertBlocked("cp -t /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory=/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp -t/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp /tmp/a /dev/sda1", "block-device")
+  assertBlocked("cp -S .bak /tmp/a /dev/sda1", "block-device")
+  assertAllowed("cp -t /tmp/wi869-dest /tmp/a")
+  assertAllowed("cp -S .bak a b")
+  assertAllowed("cp a b")
+  // mv's protected-tree rule keeps its verdicts through the shared reader.
+  assertBlocked("mv -t /app/hooks /tmp/a", "protected tree")
+  assertBlocked("mv --target-directory /app/hooks /tmp/a", "protected tree")
+  assertAllowed("mv a b")
+  assertAllowed("mv -S .bak a b")
 })
 
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
@@ -1286,26 +1475,26 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   // was classified as the unknown verb `z` and allowed while git discarded the
   // change. The alias definition is refused instead of resolved: the value may
   // live in repo config the guard cannot read cheaply.
-  assertBlocked("git -c alias.z='reset --hard' z", "git command")
-  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
-  assertBlocked("git -c alias.z=status z", "git command")
-  assertBlocked("git --config-env=alias.z=Z z", "git command")
-  assertBlocked("git --config-env alias.z=Z z", "git command")
+  assertBlocked("git -c alias.z='reset --hard' z", "git alias or include")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git alias or include")
+  assertBlocked("git -c alias.z=status z", "git alias or include")
+  assertBlocked("git --config-env=alias.z=Z z", "git alias or include")
+  assertBlocked("git --config-env alias.z=Z z", "git alias or include")
   // The repo-config write that plants the same alias is refused too.
-  assertBlocked("git config alias.t1 'reset --hard'", "git command")
-  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  assertBlocked("git config alias.t1 'reset --hard'", "git alias or include")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git alias or include")
   // git's modern config subcommands write the same key: `set` names it after
   // the subcommand, and `rename-section foo alias` turns a section into aliases.
-  assertBlocked("git config set alias.z 'reset --hard'", "git command")
-  assertBlocked("git config get alias.z", "git command")
-  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
-  assertBlocked("git config rename-section foo alias", "git command")
+  assertBlocked("git config set alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config get alias.z", "git alias or include")
+  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git alias or include")
+  assertBlocked("git config rename-section foo alias", "git alias or include")
   // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
   assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
-    "git command")
-  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+    "git alias or include")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git alias or include")
   // The environment value is read as one shell word: an `alias.` in a later
   // argument of the same line is not attributed to the variable.
   assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
@@ -1334,7 +1523,7 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --rename-section foo alias",
     "git config --edit",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
   assertAllowed("git config --rename-section foo bar")
   assertAllowed("git config --list")
@@ -1353,13 +1542,39 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --ren foo alias",
     "git config edit",
     "git config --ed",
-    "git --work-tree . reset --hard",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
+  // The trailing row of that list is a discard, not a definition: it belongs
+  // to the discard rule's own name.
+  assertBlocked("git --work-tree . reset --hard", "git command that discards")
   assertAllowed("git config core.editor 'vim -e'")
   assertAllowed('git config user.name "Jane -e Doe"')
   assertAllowed("git -C sub log --oneline")
+})
+
+test("an alias or include refusal carries its own reason (WI#867)", () => {
+  // WI#842 refused these before reading the verb, but reported them as the
+  // git discard rule. The verdicts stay; only the reason changes, so it says
+  // what was refused and why (point 1).
+  for (const command of [
+    "git config alias.st status",
+    "git config --unset alias.x",
+    "git config --edit",
+    "git config --rename-section alias alias2",
+    "git -c alias.z='reset --hard' z",
+    "git config include.path /tmp/evil.cfg",
+  ]) {
+    assertBlocked(command, "git alias or include definition")
+  }
+  // The reason names the definition, not a discard.
+  assertBlocked("git config alias.st status", "does not evaluate alias bodies")
+  // The discard rule keeps its own name for the rows it owns.
+  assertBlocked("git reset --hard", "git command that discards workspace changes")
+  assertBlocked("git clean -fdx", "git command that discards workspace changes")
+  // An ordinary section rename and an ordinary key stay allowed.
+  assertAllowed("git config --rename-section core core2")
+  assertAllowed("git config user.name x")
 })
 
 test("a quoted separator does not hide the rest of its command (WI#856)", () => {
@@ -1441,6 +1656,48 @@ test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => 
   assertAllowed(`printf '%s\\n' ${argument}`)
 })
 
+test("nested quotes inside a substitution read as bash reads them (WI#867)", () => {
+  // Point 4 (AKW-3 on !2709): the reader had one quote context for the whole
+  // command, so a `"` inside `$(…)` ended the outer double quote and the
+  // separator that followed split the command before `/etc` was read.
+  assertBlocked('chmod -R 777 "$(echo "a;b")" /etc', "recursive")
+  assertBlocked('chmod -R 777 "$(echo "a|b")" /etc', "recursive")
+  assertBlocked('chown -R u:u "$(echo "a&b")" /usr', "recursive")
+  assertBlocked('chmod -R 777 "`echo "a;b"`" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x$(echo ";y")" /app/hooks', "deletion outside")
+  assertBlocked('git -C "$(echo "/tmp/a;b")" reset --hard', "git command")
+  // The common nested quote stays ordinary work: `"$(date +"%F")"` is one
+  // double-quoted word, and its inner quotes are literal to bash.
+  assertAllowed('echo "$(date +"%F")" ; ls')
+  assertAllowed('echo "$(date +"%F")"')
+  assertAllowed('x="$(echo "a;b")"')
+  assertAllowed('git log --format="%h $(git branch --show-current)"')
+  assertAllowed("printf '%s\\n' \"$(echo \"$(date +%Y)\")\"")
+})
+
+test("the quote reader follows bash's double-quote escape set (WI#867)", () => {
+  // Point 3 (ALF-2 on !2710): one reader for every rule. Inside double
+  // quotes only `"`, `\`, `$`, a backtick and a newline are escaped, so a
+  // backslash before any other character is literal text that bash keeps.
+  // bash passes `"a\";b"` as the one word `a\";b`, so `/etc` is still an
+  // operand and the root change is denied.
+  assertBlocked('chmod -R 777 "a\\";b" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x\\" ;y" /app/hooks', "deletion outside")
+  // A backslash before `;` or a space is literal, so the separator stays in
+  // the word bash builds (`"a\" ;b"` is `a" ;b`) and `/etc` is still read.
+  assertBlocked('chmod -R 777 "a\\" ;b" /etc', "recursive")
+  assertBlocked('chmod -R 777 "a\\;b" /etc', "recursive")
+  // The literal-backslash rows stay ordinary work without a root operand.
+  assertAllowed('echo "a\\ b"')
+  assertAllowed('echo "a\\;b"')
+  assertAllowed('chmod -R 755 "/tmp/a\\;b"')
+  assertAllowed("printf '%s\\n' \"\\x66ixture\"")
+  assertAllowed("echo \"it's\"")
+  // A substitution's own quotes do not disturb the enclosing one.
+  assertAllowed('echo "$(echo "a b")"')
+  assertAllowed("kimi -p 'start the server'")
+})
+
 test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", () => {
   // The hook only sees text. Use inert fixtures for command, option and path
   // positions; none of these strings is executed.
@@ -1455,4 +1712,63 @@ test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", ()
   assertAllowed(String.raw`printf '%s\n' $'it\'s literal'`)
   assertAllowed(String.raw`printf '%s\n' "\x66ixture"`)
   assertAllowed("printf '%s\\n' $'plain text'")
+})
+
+test("only outer operators split an enclosing clause (ALO-1)", async () => {
+  const { commandSegments, clauseText } = await guardSyntax()
+  for (const operator of [";", "|", "&", "\n"]) {
+    const body = `first_fixture a${operator}second_fixture b`
+    for (const argument of ["$(" + body + ")", '"$(' + body + ')"', "<(" + body + ")",
+      ">(" + body + ")", '"`' + body + '`"']) {
+      const clause = `fixture ${argument} tail`
+      const text = `${clause}; next_fixture`
+      assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+      assert.equal(clauseText(text, "fixture ".length), `${argument} tail`)
+    }
+    assert.deepEqual(commandSegments(body), ["first_fixture a", "second_fixture b"])
+  }
+})
+
+test("a heredoc in a substitution keeps the surrounding command intact (ALO-2)", async () => {
+  const { quoteScan, listenerSegments, listenerWordList } = await guardSyntax()
+  const body = "cat <<'TEXT'\nquotes and parens in data: ' \" )\nTEXT\n"
+  const outer = 'fixture "$(' + body + ')" tail\nnext_fixture'
+  assert.equal(quoteScan(outer).substitutions.get(outer.indexOf("$(")), outer.indexOf(')" tail'))
+  const segments = [...listenerSegments(outer)].map(listenerWordList)
+  assert.equal(segments[0].at(-1), "tail")
+  assert.deepEqual(segments[1], ["next_fixture"])
+  assertAllowed(outer)
+})
+
+test("backtick pairing ignores body quotes but respects escaped delimiters (ALO-3)", async () => {
+  const { commandSegments, quoteScan } = await guardSyntax()
+  const opening = 'fixture "`'
+  for (const body of ["sample '", 'sample "', "sample \\` inner '", "sample \\\\"]) {
+    const clause = opening + body + '`" tail'
+    const text = `${clause}; next_fixture`
+    assert.equal(quoteScan(text).substitutions.get(opening.length - 1), opening.length + body.length)
+    assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+  }
+})
+
+test("comments and heredoc data cannot quote the next command (ALO-4)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  for (const prefix of ["fixture # unmatched '\n", "cat <<-TEXT\n\tunmatched \"\n\tTEXT\n",
+    "cat <<'FIRST' <<SECOND\n'\nFIRST\n\"\nSECOND\n"]) {
+    const segments = [...listenerSegments(`${prefix}next_fixture tail`)].map(listenerWordList)
+    assert.deepEqual(segments.at(-1), ["next_fixture", "tail"])
+    assertBlocked(prefix + String.raw`fixture $'\x66ile'`, "unverifiable ANSI-C escape")
+  }
+  const literal = [...listenerSegments('fixture a#b "c # d"')].map(listenerWordList)
+  assert.deepEqual(literal, [["fixture", "a#b", "c # d"]])
+})
+
+test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  const fields = (text: string) => [...listenerSegments(text)].map(listenerWordList)
+  assert.deepEqual(fields("{first,${IFS}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("{first,${IFS:0:1}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("first${IFS}second"), [["first", "second"]])
+  assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
+  assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
 })
