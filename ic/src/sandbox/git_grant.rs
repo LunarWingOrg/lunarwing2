@@ -168,7 +168,9 @@ impl GitGrantConfig {
             if name.is_empty() {
                 return Err("SANDBOX_GIT_WRITE_REMOTES must not contain an empty name".into());
             }
-            validate_remote_name(name)?;
+            validate_remote_name(name).map_err(|message| {
+                format!("SANDBOX_GIT_WRITE_REMOTES is invalid: {message}")
+            })?;
             let remote = remotes
                 .iter_mut()
                 .find(|remote| remote.name == name)
@@ -404,19 +406,20 @@ fn validate_credential_host(host: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// Secret names use the same grammar as the capability secret list, so a
-/// configuration value cannot carry a credential or a shell metacharacter.
+/// Secret names are daemon environment-variable names (`GIT_READ_TOKEN`), so
+/// either case is allowed; the grammar still excludes `=`, `:`, whitespace and
+/// shell metacharacters, so a configuration value cannot carry a credential.
 fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
     let valid = !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
         });
     if valid {
         Ok(())
     } else {
         Err(
-            "SANDBOX_GIT_CREDENTIALS secret names must be 1-128 lowercase ASCII letters, \
+            "SANDBOX_GIT_CREDENTIALS secret names must be 1-128 ASCII letters, \
              digits, '.', '_' or '-'"
                 .into(),
         )
@@ -1950,6 +1953,12 @@ mod tests {
     fn bare_remote_with_one_commit(temp: &Path) -> std::path::PathBuf {
         let bare = temp.join("remotes/origin.git");
         std::fs::create_dir_all(&bare).unwrap();
+        let init = run_git(&[], temp, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        assert!(
+            init.status.success(),
+            "init --bare: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
         let seed = temp.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
         let base = |args: &[&str]| {
@@ -2209,7 +2218,9 @@ mod tests {
             );
             let text = error.to_string();
             assert!(
-                text.contains("grants read only") || text.contains("force push and ref deletion"),
+                text.contains("grants read only")
+                    || text.contains("force push and ref deletion")
+                    || text.contains("must name an explicit granted remote"),
                 "{command}: {text}"
             );
         }
@@ -2384,7 +2395,7 @@ mod tests {
             "git.example.test=",
             "=TOKEN",
             "*.example.test=TOKEN",
-            "git.example.test=UPPER",
+            "git.example.test=with:colon",
             "git.example.test=with space",
             "git.example.test=TOKEN,git.example.test=OTHER",
         ] {
@@ -2393,9 +2404,9 @@ mod tests {
                 "accepted {bad}"
             );
         }
-        let parsed = GitCredentialBinding::parse_spec("Git.Example.Test=git_token").unwrap();
+        let parsed = GitCredentialBinding::parse_spec("Git.Example.Test=GIT_TOKEN").unwrap();
         assert_eq!(parsed[0].host, "git.example.test");
-        assert_eq!(parsed[0].secret_name, "git_token");
+        assert_eq!(parsed[0].secret_name, "GIT_TOKEN");
     }
 
     #[test]

@@ -1491,7 +1491,7 @@ mod tests {
         for bad in [
             "https://user:token@git.example.test=TOKEN",
             "git.example.test=",
-            "git.example.test=UPPER",
+            "git.example.test=with:colon",
         ] {
             unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", bad) };
             match SandboxModeConfig::resolve(&settings) {
