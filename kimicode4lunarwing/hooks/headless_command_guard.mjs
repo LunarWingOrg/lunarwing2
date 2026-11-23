@@ -1828,34 +1828,39 @@ function evaluate(command) {
 
 /**
  * Read simple command words, keeping quoted values (including empty ones)
- * together. A word records whether any of it was quoted, so a brace group
- * inside quotes stays literal (bash expands only unquoted braces).
+ * together. Each word carries a quote mask beside its text: one `1` per
+ * character that came from a quoted or escaped span, `0` otherwise. Brace
+ * expansion reads its own `{`, `,` and `}` from the mask, because bash
+ * expands the group first and removes the quotes afterwards — a quoted
+ * alternative does not make the group literal (WI#868).
  */
 function* listenerSegments(text) {
   let words = [];
   let word = "";
+  let mask = "";
   let started = false;
-  let quoted = false;
   let quote = "";
+  const append = (ch, quoted) => {
+    word += ch;
+    mask += quoted ? "1" : "0";
+    started = true;
+  };
   const flush = () => {
-    if (started) words.push({ text: word, quoted });
+    if (started) words.push({ text: word, mask });
     word = "";
+    mask = "";
     started = false;
-    quoted = false;
   };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (listenerQuoteEscape(text, i, quote)) {
-      word += text[++i];
-      started = true;
-      quoted = true;
+      append(text[++i], true);
     } else if (quote) {
       if (ch === quote.at(-1)) quote = "";
-      else word += ch;
+      else append(ch, true);
     } else if ((quote = listenerOpeningQuote(text, i))) {
       i += quote.length - 1;
       started = true;
-      quoted = true;
     } else if (ch === "$" && (text.startsWith("${IFS}", i) ||
       (text.startsWith("$IFS", i) && !/[A-Za-z0-9_]/.test(text[i + 4] ?? "")))) {
       flush();
@@ -1867,8 +1872,7 @@ function* listenerSegments(text) {
         words = [];
       }
     } else {
-      word += ch;
-      started = true;
+      append(ch, false);
     }
   }
   flush();
@@ -2067,31 +2071,89 @@ const SHELL_STRING_LAUNCHERS = new Set(["script"]);
 
 /**
  * The words bash's brace expansion would also produce from one word
- * (WI#858): `{kimi,server}` runs `kimi server`. Only an unquoted brace group
- * holding a comma expands; `{}`, `{x}` and `${…}` stay as they are. The
- * alternatives replace the word in place, so the expansion keeps its
- * neighbours. Linear in the input: no cross product.
+ * (WI#858): `{kimi,server}` runs `kimi server`. Bash expands the group
+ * first and removes the quotes afterwards, so quoting an alternative —
+ * `{kimi,"server"}`, `{"kimi",server}`, `{kimi,'server'}`, `{kimi,$'server'}`
+ * — leaves the group a group and only its delimiters decide (WI#868). The
+ * word's quote mask says which `{`, `,` and `}` bash read before it strips
+ * the quotes: an unquoted group holding an unquoted comma expands; `{}`,
+ * `{x}` and `${…}` stay as they are. The alternatives replace the word in
+ * place, so the expansion keeps its neighbours. Linear in the input: no
+ * cross product, and one level of nesting is read.
  */
-function listenerBraceWords(word) {
-  const open = word.indexOf("{");
-  if (open === -1 || word[open - 1] === "$") return null;
-  const close = word.indexOf("}", open + 1);
-  if (close === -1) return null;
-  const body = word.slice(open + 1, close);
-  if (!body.includes(",") || body.includes("{")) return null;
-  const head = word.slice(0, open);
-  const tail = word.slice(close + 1);
-  return body.split(",").map((part) => head + part + tail);
+function listenerBraceWords({ text, mask }) {
+  for (let open = 0; open < text.length; open++) {
+    if (text[open] !== "{" || mask[open] !== "0") continue;
+    if (open > 0 && text[open - 1] === "$" && mask[open - 1] === "0") continue;
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < text.length; i++) {
+      if (mask[i] !== "0") continue;
+      if (text[i] === "{") depth++;
+      else if (text[i] === "}" && --depth === 0) {
+        close = i;
+        break;
+      }
+    }
+    // An unmatched `{` is literal, and so is every later `{` it contains.
+    if (close === -1) return null;
+    const bounds = [open + 1];
+    let nested = 0;
+    for (let i = open + 1; i < close; i++) {
+      if (mask[i] !== "0") continue;
+      const ch = text[i];
+      if (ch === "{") nested++;
+      else if (ch === "}") nested--;
+      else if (ch === "," && nested === 0) bounds.push(i, i + 1);
+    }
+    // No top-level comma: bash expands a nested group instead, if one holds
+    // a comma (`{a{b,c}}` runs `{ab} {ac}`).
+    if (bounds.length === 1) continue;
+    bounds.push(close);
+    const head = text.slice(0, open);
+    const headMask = mask.slice(0, open);
+    const tail = text.slice(close + 1);
+    const tailMask = mask.slice(close + 1);
+    const alternatives = [];
+    for (let i = 0; i < bounds.length; i += 2) {
+      alternatives.push({
+        text: head + text.slice(bounds[i], bounds[i + 1]) + tail,
+        mask: headMask + mask.slice(bounds[i], bounds[i + 1]) + tailMask,
+      });
+    }
+    return alternatives;
+  }
+  return null;
 }
+
+/**
+ * Bash's own cross product, without its blow-up: a word may hold thousands
+ * of groups (`{a,b}` is five bytes), so the expansion stops at a cap and
+ * keeps the rest of the word literal. A listener command needs one word, so
+ * the cap is far above any spelling that would actually run one.
+ */
+const BRACE_WORD_LIMIT = 256;
+const BRACE_SEGMENT_LIMIT = 16_384;
 
 /** One segment's words, with unquoted brace groups expanded as bash would. */
 function listenerWordList(segment) {
   const words = [];
-  for (const { text, quoted } of segment) {
-    const alternatives = quoted ? null : listenerBraceWords(text);
-    if (alternatives === null) words.push(text);
-    else for (const alternative of alternatives) {
-      if (alternative !== "") words.push(alternative);
+  for (const entry of segment) {
+    const pending = [entry];
+    let head = 0;
+    let expansions = 0;
+    while (head < pending.length) {
+      const word = pending[head++];
+      const alternatives = expansions < BRACE_WORD_LIMIT &&
+        words.length + pending.length < BRACE_SEGMENT_LIMIT
+        ? listenerBraceWords(word)
+        : null;
+      if (alternatives === null) {
+        if (word.text !== "") words.push(word.text);
+        continue;
+      }
+      expansions += alternatives.length - 1;
+      pending.push(...alternatives);
     }
   }
   return words;
