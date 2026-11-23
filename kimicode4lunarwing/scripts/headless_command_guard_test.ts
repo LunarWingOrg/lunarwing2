@@ -1258,3 +1258,48 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   assertAllowed('git config user.name "Jane -e Doe"')
   assertAllowed("git -C sub log --oneline")
 })
+
+test("a quoted separator does not hide the rest of its command (WI#856)", () => {
+  // The segment splitter read `;`, `|`, `&` and newlines inside quotes as
+  // command boundaries, so the rule that owned a verb saw only the first half
+  // of the command and the dangerous operand landed in a segment without the
+  // verb (a containment escape for `rm`, not a parse nicety).
+  assertBlocked('chmod -R 777 "a;b" /etc', "recursive")
+  assertBlocked('chmod -R 777 "a|b" /etc', "recursive")
+  assertBlocked('chown -R u:u "a&b" /usr', "recursive")
+  assertBlocked('chmod -R 777 "l1\nl2" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x;y" /app/hooks', "deletion outside")
+  assertBlocked('find /app/hooks -name "a;b" -o -delete', "deletion outside")
+  assertBlocked('git -C "/tmp/r;x" reset --hard', "git command")
+  // git's value options were read by whitespace, so a quoted value carrying a
+  // space became the "verb" and the real verb was invisible.
+  assertBlocked('git -C "/tmp/a b" reset --hard', "git command")
+  assertBlocked('git -c "x=a b" reset --hard', "git command")
+  assertBlocked('git --git-dir "/tmp/a b" reset --hard', "git command")
+  assertBlocked('git -C"/tmp/a b" reset --hard', "git command")
+  // A separator inside an argument stays ordinary work, and so does a
+  // deletion whose only operand is that literal temp path.
+  assertAllowed("grep -rn 'a;b' docs/")
+  assertAllowed("echo 'a;b'")
+  assertAllowed('git log --grep="a|b"')
+  assertAllowed('git commit -m "fix; thing"')
+  assertAllowed('git -C "/tmp/a b" status')
+  assertAllowed('chmod -R 755 "/tmp/a;b"')
+  assertAllowed('rm -rf "/tmp/x;y"')
+  assertAllowed('find /tmp -name "a;b" -delete')
+  assertAllowed('find /tmp -name "a;b" -o -delete')
+  assertAllowed('cp a "/tmp/x;y"')
+  assertAllowed('tar -cf /tmp/a.tar "a;b"')
+  assertAllowed('rsync -a "/tmp/x;y" /tmp/out')
+})
+
+test("a quoted separator does not hide a device write or a protected rename (WI#856)", () => {
+  // The same rest-of-clause capture fed the tee/cp, mv, tar and rsync rules:
+  // each stopped at a separator inside an argument and lost the operand that
+  // followed it.
+  assertBlocked('tee "a;b" /dev/sda', "block-device")
+  assertBlocked('cp "a;b" /dev/sda', "block-device")
+  assertBlocked('mv "a;b" /app/hooks', "protected tree")
+  assertBlocked('tar --remove-files -cf /tmp/a.tar "/tmp/x;y" /app/hooks', "deletion outside")
+  assertBlocked('rsync -a "/tmp/x;y" /app/hooks --delete', "deletion outside")
+})
