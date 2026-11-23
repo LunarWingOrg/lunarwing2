@@ -32,13 +32,17 @@ RUN set -eu; \
     update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
+COPY scripts/worker-download-retry.sh /build/scripts/
 RUN set -eu; \
     test "$LUNARDEPTH_REPOSITORY" = "https://git.lunarwing.org/lunarwing/lunardepth.git"; \
     [[ "$LUNARDEPTH_REF" =~ ^[0-9a-f]{40}$ ]]; \
     [[ "$LUNARDEPTH_COMPATIBILITY_REF" =~ ^[0-9a-f]{40}$ ]]; \
     [[ "$LUNARDEPTH_MODEL_ROUTING_REF" =~ ^[0-9a-f]{40}$ ]]; \
-    git clone --filter=blob:none --no-checkout "$LUNARDEPTH_REPOSITORY" /src; \
-    git -C /src checkout --detach "$LUNARDEPTH_REF"; \
+    . /build/scripts/worker-download-retry.sh; \
+    wdr_retry "LunarDepth source clone" "rm -rf /src" \
+      'git clone --filter=blob:none --no-checkout "$LUNARDEPTH_REPOSITORY" /src'; \
+    wdr_retry "LunarDepth pinned checkout" "rm -rf /src" \
+      'git -C /src checkout --detach "$LUNARDEPTH_REF"'; \
     test "$(git -C /src rev-parse HEAD)" = "$LUNARDEPTH_REF"; \
     git -C /src merge-base --is-ancestor "$LUNARDEPTH_COMPATIBILITY_REF" "$LUNARDEPTH_REF"; \
     git -C /src merge-base --is-ancestor "$LUNARDEPTH_MODEL_ROUTING_REF" "$LUNARDEPTH_REF"; \
@@ -52,7 +56,8 @@ RUN set -eu; \
     grep -q 'allowInsecureHTTP' /src/deepseek-harness/packages/llm/llm-pi-ai/src/config.ts; \
     grep -q 'tensormoon' /src/deepseek-harness/packages/bundle/base/cordis.patch.yml; \
     corepack enable; \
-    corepack prepare pnpm@11.7.0 --activate; \
+    wdr_retry "corepack pnpm download" "-" \
+      'corepack prepare pnpm@11.7.0 --activate'; \
     test "$(pnpm --version)" = "11.7.0"; \
     node /src/scripts/check-toolchain.mjs
 
@@ -61,8 +66,10 @@ RUN python3 /build/scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scri
 
 WORKDIR /src/deepseek-harness
 RUN set -eu; \
+    . /build/scripts/worker-download-retry.sh; \
     before="$(sha256sum pnpm-lock.yaml)"; \
-    pnpm install --frozen-lockfile; \
+    wdr_retry "pnpm frozen-lockfile install" "rm -rf node_modules" \
+      'pnpm install --frozen-lockfile'; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
     pnpm exec tsx native/system/scripts/build.ts; \
     pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
@@ -93,7 +100,8 @@ COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py
 COPY AGENTS.md README.md Dockerfile docker-compose.yml .env.example ./
 WORKDIR /build/scripts
 RUN set -eu; \
-    npm ci --ignore-scripts; \
+    . /build/scripts/worker-download-retry.sh; \
+    wdr_retry "npm ci (bridge scripts)" "rm -rf node_modules" 'npm ci --ignore-scripts'; \
     npx tsc -p tsconfig.json; \
     npm test; \
     python3 -m unittest discover -p '*_test.py'; \
