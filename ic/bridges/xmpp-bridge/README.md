@@ -109,3 +109,36 @@ curl -sS -X POST "$BASE/v1/outbound-rate-limit" \
 
 Set `reset_counter` to `true` if you want to clear the current rolling-hour
 usage at the same time.
+
+## Pre-hop drain and the stale-queue policy
+
+The inbound queue is memory-only and belongs to the bridge process. A backlog
+that built up while the daemon was down is served as fresh turns when the
+daemon polls again, so right after a release hop an operator can see stale
+messages delivered as new work (WI#854).
+
+`POST /v1/messages/drain` discards queued inbound messages. With no body (or
+`{}`) it drains the whole queue; `{"older_than_secs": n}` drains only messages
+that have waited at least `n` seconds. The response carries `drained`,
+`remaining`, and `oldest_queued_age_secs`, and the bridge logs a counted
+warning whenever it discards anything, so a drain is never silent.
+
+```bash
+curl -sS -X POST "$BASE/v1/messages/drain" \
+  -H "Authorization: Bearer $XMPP_BRIDGE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{}' | jq
+```
+
+`scripts/xmpp-drain-queue.sh status|drain [older_than_secs]` wraps the status
+and drain calls for pre-hop hygiene.
+
+To bound the backlog automatically instead of draining by hand, set
+`XMPP_BRIDGE_STALE_QUEUE_SECS` (default `0`, disabled): a poll then drops
+queued messages that have waited at least that long — counted and logged —
+instead of replaying them as new turns. `GET /v1/status` reports
+`oldest_queued_age_secs` so the threshold can be chosen from live data.
+
+Both mechanisms cover the **bridge** queue only. Messages the daemon has
+already polled sit in the daemon's in-memory queue past the acknowledged
+cursor and are unaffected.

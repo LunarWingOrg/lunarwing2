@@ -83,6 +83,31 @@ Raising `MAX_EMITS_PER_EXECUTION` was explicitly rejected: the failure was an
 all-or-nothing batch reject, so a larger cap only moves the backlog size at
 which a channel wedges.
 
+## WI#854: pre-hop drain and stale-queue policy
+
+WI#854's remaining defect after the WI#850 merge was D3: the bridge queue and
+the daemon's inbound queue are both memory-only, and nothing gave an operator a
+pre-hop drain hook. The bridge now ships the mitigation:
+
+- `POST /v1/messages/drain` discards queued inbound messages (all, or only
+  those older than `older_than_secs`) and reports `drained`, `remaining`, and
+  `oldest_queued_age_secs`. Dropped cursors are folded into the acknowledged
+  cursor, so a poller that resets afterwards resumes past them. Every discard
+  is counted and logged.
+- `XMPP_BRIDGE_STALE_QUEUE_SECS` (default `0`, disabled) bounds the queue at
+  poll time: messages that have waited at least that long are dropped with a
+  counted warning instead of being served as fresh turns.
+- `GET /v1/status` reports `oldest_queued_age_secs`, and
+  `ic/scripts/xmpp-drain-queue.sh status|drain [older_than_secs]` wraps the
+  operator calls.
+
+The acknowledged-cursor contract is unchanged: a drain only removes messages
+the poller has not been served. Messages the daemon already polled sit in its
+own in-memory queue past the acknowledged cursor, so a restart still loses
+those — a drain verb cannot recover them. That residual is why the drain is
+pre-hop hygiene, run before the daemon is stopped, not a recovery tool for
+messages already handed over.
+
 ## Current implementation
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
@@ -175,3 +200,10 @@ so the whole-backlog livelock documented above is closed. `messages_handler`
 moved to `main.rs:463-511` and `enqueue_message` to `:560-590`. The residual
 queue-backpressure path (bounded dispatch queue, `reserve_many` await) is
 unchanged and remains a separate, unreproduced risk.
+
+Re-verified on 2026-11-23 for WI#854: D3's mitigation landed in the bridge
+(`POST /v1/messages/drain`, `XMPP_BRIDGE_STALE_QUEUE_SECS`, queue-age status)
+with bridge tests covering the drain, the age-bounded drain, the stale-queue
+drop, and the default-off policy. The daemon-side in-memory queue loss at
+restart is unchanged and documented above; the drain is pre-hop hygiene, not a
+recovery path for messages already polled.
