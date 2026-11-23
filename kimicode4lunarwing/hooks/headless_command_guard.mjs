@@ -337,9 +337,16 @@ function checkFindDeletion(text) {
   return null;
 }
 
-/** The pipeline list that feeds an `xargs` call (pipes stay in the list). */
+/**
+ * The pipeline list that feeds an `xargs` call (pipes stay in the list). The
+ * list boundaries are read outside quotes, so a quoted `;` or newline in an
+ * earlier command does not move the start of the pipeline past its feeding
+ * `find` (WI#856).
+ */
 function feedingPipeline(text, index) {
-  const lists = text.slice(0, index).split(/[;\n]|&&|\|\|/);
+  const lists = splitOutsideQuotes(text.slice(0, index), ";")
+    .flatMap((piece) => splitOutsideQuotes(piece, "\n"))
+    .flatMap((piece) => piece.split(/&&|\|\|/));
   return lists[lists.length - 1] ?? "";
 }
 
