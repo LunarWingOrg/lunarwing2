@@ -1300,7 +1300,19 @@ Enforced controls (opencode2 lane unless noted):
    from task input by default; new listener commands are not covered until
    the hook recognizes them. Since WI#846 the listener rule reads a `find
    -exec`/`-execdir`/`-ok`/`-okdir` body as the command bash runs, the same
-   as an `xargs` body (WI#826 already read both for deletion).
+   as an `xargs` body (WI#826 already read both for deletion). Since WI#858
+   the rule is a property of the words, not a closed launcher list: a `kimi`
+   word followed by a service subcommand, or a listener verb with its
+   listener options, is denied at any word position outside quotes, so a
+   launcher the hook has never heard of (`taskset`, `chrt`, `flock`, `watch`,
+   `script -c`, `fd -x`, `parallel`, `eval`, …) cannot hide one. The rule
+   reads `eval` bodies, `$(…)`/backtick bodies and process substitutions
+   `<(…)`/`>(…)`, and expands an unquoted `{a,b}` brace group as bash does;
+   quoted text and a `kimi -p` prompt value stay data, and the accepted cost
+   is a refusal of a command that only mentions the words unquoted
+   (`echo kimi server`). Because the property asks at every word, the option
+   walk is a forward-only table and 16 KB of `kimi -x` stays inside the 2 s
+   deadline (WI#824).
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a
@@ -2466,7 +2478,12 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   Bash tool could start service mode itself; the guard hook now denies
   `kimi server`, `kimi web`, `kimi rc`/`kimi remote` and `kimi vis` (WI#852;
   and the other listener spellings below) with
-  exit 2, pinned by `scripts/headless_command_guard_test.ts`.
+  exit 2, pinned by `scripts/headless_command_guard_test.ts`. Since WI#858
+  that rule reads the listener words at any word position outside quotes
+  rather than only after a fixed launcher list, so `taskset -c 0 kimi
+  server`, `eval kimi server`, `script -qc 'kimi server'`, `watch kimi
+  server`, `fd -x kimi server`, `cat <(kimi server)` and `{kimi,server}`
+  deny too, and an unknown launcher cannot hide one.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
 - **ACP session preview restore, `/tasks`, the follow-up behavior setting,
