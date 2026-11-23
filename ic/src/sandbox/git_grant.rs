@@ -3251,4 +3251,186 @@ mod tests {
         let error = check_granted("bash -c \"$SCRIPT\"", &grant).unwrap_err();
         assert!(error.to_string().contains("dynamic"), "{error}");
     }
+
+    /// A real local bare remote, driven by real `git` — not a fake runtime.
+    /// The preflight authorizes the command and git itself performs the
+    /// clone/push, so the grant is pinned against actual Git behaviour.
+    fn real_remote_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        let remote = root.join("remotes/origin.git");
+        std::fs::create_dir_all(&remote).expect("remote dir");
+        let git = |args: &[&str], dir: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q", "--bare", remote.to_str().unwrap()], &root);
+        let work = root.join("work");
+        git(&["init", "-q", work.to_str().unwrap()], &root);
+        git(&["config", "user.name", "fixture"], &work);
+        git(&["config", "user.email", "fixture@example.test"], &work);
+        std::fs::write(work.join("file.txt"), "one\n").expect("write");
+        git(&["add", "file.txt"], &work);
+        git(&["commit", "-q", "-m", "one"], &work);
+        git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().unwrap(),
+            ],
+            &work,
+        );
+        (temp, work)
+    }
+
+    /// Acceptance: with a write grant, a real `git push` lands on a real local
+    /// remote; with a read-only grant the same push is refused before git
+    /// runs.
+    #[test]
+    fn write_grant_pushes_to_a_real_local_remote_and_a_read_grant_refuses() {
+        let (temp, work) = real_remote_fixture();
+        let root = temp.path().canonicalize().expect("canonical");
+
+        // Read-only grant: the preflight refuses, so git never runs.
+        let read_host = GitGrantConfig::from_spec("origin=file:///workspace/remotes/origin.git")
+            .expect("read grant")
+            .expect("grant");
+        let read_grant = authorize_grant(&read_host, &[], &root, SandboxNetworkMode::ProxyEnforced)
+            .expect("authorized");
+        let error = check_granted("git push origin HEAD:refs/heads/main", &read_grant)
+            .expect_err("read-only push must be refused");
+        assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
+        let output = std::process::Command::new("git")
+            .args(["ls-remote", "origin"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "read-only refusal must leave the remote untouched"
+        );
+
+        // Write grant: the preflight accepts, and real git performs the push.
+        let write_host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "origin",
+            false,
+        )
+        .expect("write grant")
+        .expect("grant");
+        let write_grant =
+            authorize_grant(&write_host, &[], &root, SandboxNetworkMode::ProxyEnforced)
+                .expect("authorized");
+        let push = "git push origin HEAD:refs/heads/main";
+        check_granted(push, &write_grant).expect("write-granted push authorized");
+        let output = std::process::Command::new("git")
+            .args(["push", "origin", "HEAD:refs/heads/main"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git push");
+        assert!(
+            output.status.success(),
+            "push failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The remote really has the ref.
+        let output = std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(listing.contains("refs/heads/main"), "{listing}");
+    }
+
+    /// Acceptance: a real clone and fetch of a real remote, with the
+    /// credential binding held host-side. The container-side environment and
+    /// arguments carry no secret, and the proxy mapping is what supplies it.
+    #[test]
+    fn host_kept_credential_clones_a_real_remote_without_entering_the_container() {
+        const SECRET: &str = "credential-value-marker-2b3c4d";
+        let (temp, work) = real_remote_fixture();
+        let root = temp.path().canonicalize().expect("canonical");
+
+        let host = GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=GIT_ORIGIN_TOKEN",
+            false,
+        )
+        .expect("credential grant")
+        .expect("grant");
+        let grant = authorize_grant(&host, &[], &root, SandboxNetworkMode::ProxyEnforced)
+            .expect("authorized");
+
+        // The proxy mapping names the daemon variable, never its value.
+        let mappings = grant.proxy_credentials();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].secret_name, "GIT_ORIGIN_TOKEN");
+
+        // Nothing the container sees holds the secret.
+        let mut container_visible = grant.container_env();
+        container_visible.push(("GIT_CONFIG_COUNT".to_string(), "9".to_string()));
+        let joined = container_visible
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [SECRET, "GIT_ORIGIN_TOKEN"] {
+            assert!(!joined.contains(needle), "container env leaked {needle}: {joined}");
+        }
+        let evidence = serde_json::to_string(&grant.evidence()).expect("evidence");
+        assert!(evidence.contains("GIT_ORIGIN_TOKEN"), "{evidence}");
+        assert!(!evidence.contains(SECRET), "{evidence}");
+
+        // A real clone of the real local remote still works from the same
+        // workspace (the credential is only needed for the network path).
+        let clone_dir = root.join("clone");
+        let output = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                work.join(".git").to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git clone");
+        assert!(
+            output.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(clone_dir.join("file.txt").exists());
+    }
 }
