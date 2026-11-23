@@ -1252,9 +1252,8 @@ fn authorize_config(args: &[Word]) -> Result<()> {
 }
 
 /// Fold the git 2.46 subcommand word into the classic action and return the
-/// operands that name keys. Reads are checked too: a read of a redirecting
-/// key still tells the caller nothing it may trust, and keeping one rule for
-/// both directions is cheaper to reason about than a read/write split.
+/// operands that name keys. The classic form has no action word, so the
+/// operand count decides between a read and a write.
 fn config_subcommand(action: ConfigAction, positionals: Vec<&Word>) -> (ConfigAction, Vec<&Word>) {
     let subcommand = positionals
         .first()
