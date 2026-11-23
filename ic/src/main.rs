@@ -435,20 +435,28 @@ async fn async_main() -> anyhow::Result<()> {
     let job_event_tx = orch.job_event_tx;
     let prompt_queue = orch.prompt_queue;
     let docker_status = orch.docker_status;
+    let sandbox_runtime = orch.sandbox_runtime;
 
-    // Derive user-facing warning from docker_status for channel notification
-    let docker_user_warning: Option<String> = match docker_status {
-        lunarwing::sandbox::DockerStatus::NotInstalled => Some(
-            "Sandbox is enabled but Docker is not installed -- \
-             full_job routines will fail until Docker is available."
-                .to_string(),
-        ),
-        lunarwing::sandbox::DockerStatus::NotRunning => Some(
-            "Sandbox is enabled but Docker is not running -- \
-             full_job routines will fail until Docker is started."
-                .to_string(),
-        ),
-        _ => None,
+    // Derive the user-facing warning for channel notification (WI#871).
+    //
+    // Only a genuinely unusable sandbox warrants a user-visible warning. A
+    // podman-only host whose Docker is absent has a working sandbox — the
+    // startup log already names the selected runtime — so it stays quiet.
+    let docker_user_warning: Option<String> = if !config.sandbox.enabled {
+        None
+    } else if sandbox_runtime.is_none() {
+        let hint = match docker_status {
+            lunarwing::sandbox::DockerStatus::NotRunning => {
+                "Docker is installed but not running -- start it, or install podman."
+            }
+            _ => "Install podman or Docker.",
+        };
+        Some(format!(
+            "Sandbox is enabled but no usable container runtime was found -- \
+             sandboxed commands will fail until one is available. {hint}"
+        ))
+    } else {
+        None
     };
 
     // ── Channel setup ──────────────────────────────────────────────────
@@ -993,6 +1001,7 @@ async fn async_main() -> anyhow::Result<()> {
             heartbeat_interval_secs: config.heartbeat.interval_secs,
             sandbox_enabled: config.sandbox.enabled,
             docker_status,
+            sandbox_runtime,
             acp_enabled: config.acp.enabled,
             routines_enabled: config.routines.enabled,
             skills_enabled: config.skills.enabled,

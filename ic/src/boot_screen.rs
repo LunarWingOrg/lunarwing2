@@ -34,6 +34,9 @@ pub struct BootInfo {
     pub heartbeat_interval_secs: u64,
     pub sandbox_enabled: bool,
     pub docker_status: crate::sandbox::detect::DockerStatus,
+    /// Runtime CLI the generic sandbox selected (WI#871). `None` when the
+    /// sandbox is disabled or no runtime is usable.
+    pub sandbox_runtime: Option<crate::sandbox::ContainerRuntime>,
     pub acp_enabled: bool,
     pub routines_enabled: bool,
     pub skills_enabled: bool,
@@ -220,14 +223,9 @@ pub fn print_boot_screen(info: &BootInfo) {
         tags.push("skills".to_string());
     }
 
-    // Sandbox / Docker
+    // Sandbox / runtime
     if info.sandbox_enabled {
-        let suffix = match info.docker_status {
-            crate::sandbox::detect::DockerStatus::Available => "",
-            crate::sandbox::detect::DockerStatus::NotRunning => ":stopped",
-            _ => ":unavail",
-        };
-        tags.push(format!("sandbox{suffix}"));
+        tags.push(sandbox_tag(info.sandbox_runtime));
     }
 
     // Embeddings
@@ -282,10 +280,32 @@ pub fn print_boot_screen(info: &BootInfo) {
     println!();
 }
 
+/// Boot-screen feature tag for the sandbox (WI#871): names the runtime the
+/// sandbox actually drives, so a podman-only host does not read as unavailable.
+fn sandbox_tag(runtime: Option<crate::sandbox::ContainerRuntime>) -> String {
+    match runtime {
+        Some(runtime) => format!("sandbox:{}", runtime.binary()),
+        None => "sandbox:unavail".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::detect::DockerStatus;
+
+    #[test]
+    fn sandbox_tag_names_the_selected_runtime() {
+        assert_eq!(
+            sandbox_tag(Some(crate::sandbox::ContainerRuntime::Podman)),
+            "sandbox:podman"
+        );
+        assert_eq!(
+            sandbox_tag(Some(crate::sandbox::ContainerRuntime::Docker)),
+            "sandbox:docker"
+        );
+        assert_eq!(sandbox_tag(None), "sandbox:unavail");
+    }
 
     #[test]
     fn test_print_boot_screen_full() {
@@ -305,6 +325,7 @@ mod tests {
             heartbeat_interval_secs: 1800,
             sandbox_enabled: true,
             docker_status: DockerStatus::Available,
+            sandbox_runtime: Some(crate::sandbox::ContainerRuntime::Podman),
             acp_enabled: false,
             routines_enabled: true,
             skills_enabled: true,
@@ -339,6 +360,7 @@ mod tests {
             heartbeat_interval_secs: 0,
             sandbox_enabled: false,
             docker_status: DockerStatus::Disabled,
+            sandbox_runtime: None,
             acp_enabled: false,
             routines_enabled: false,
             skills_enabled: false,
@@ -404,6 +426,7 @@ mod tests {
             heartbeat_interval_secs: 0,
             sandbox_enabled: false,
             docker_status: DockerStatus::Disabled,
+            sandbox_runtime: None,
             acp_enabled: false,
             routines_enabled: false,
             skills_enabled: false,
