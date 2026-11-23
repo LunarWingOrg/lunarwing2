@@ -2128,27 +2128,35 @@ function listenerBraceWords({ text, mask }) {
 
 /**
  * Bash's own cross product, without its blow-up: `{a,b}` is five bytes, so a
- * 16 KB word can hold thousands of groups. The expansion stops adding
- * alternatives past this many pending words and keeps the rest literal, which
- * can only miss a listener, never invent one.
+ * 16 KB word can hold thousands of groups. One word may expand to at most this
+ * many words. Past it the guard cannot read the expansion, so the command is
+ * refused rather than read as literal text: keeping the rest literal let
+ * `{,}` ten times plus `{kimi,server}` run `kimi server` (run-530 ALP-1).
  */
 const BRACE_EXPANSION_LIMIT = 1024;
 
-/** One segment's words, with unquoted brace groups expanded as bash would. */
+/**
+ * One segment's words, with unquoted brace groups expanded as bash would, or
+ * null when a word's expansion passes `BRACE_EXPANSION_LIMIT`.
+ */
 function listenerWordList(segment) {
   const words = [];
   for (const entry of segment) {
     const pending = [entry];
     let head = 0;
+    // Words this entry currently stands for: expanded words plus pending
+    // ones. Every group has at least two alternatives, so the words walked
+    // stay under twice this count.
+    let live = 1;
     while (head < pending.length) {
       const word = pending[head++];
-      const alternatives = pending.length <= BRACE_EXPANSION_LIMIT
-        ? listenerBraceWords(word)
-        : null;
+      const alternatives = listenerBraceWords(word);
       if (alternatives === null) {
         if (word.text !== "") words.push(word.text);
         continue;
       }
+      live += alternatives.length - 1;
+      if (live > BRACE_EXPANSION_LIMIT) return null;
       pending.push(...alternatives);
     }
   }
@@ -2239,7 +2247,9 @@ function checkListenerRegion(text, depth) {
     if (denied) return denied;
   }
   for (const segment of listenerSegments(text)) {
-    const denied = checkListenerWords(listenerWordList(segment), depth);
+    const words = listenerWordList(segment);
+    if (words === null) return "cannot check listeners in a brace expansion this large";
+    const denied = checkListenerWords(words, depth);
     if (denied) return denied;
   }
   return null;

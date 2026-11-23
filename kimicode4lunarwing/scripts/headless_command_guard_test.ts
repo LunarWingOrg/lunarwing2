@@ -963,9 +963,25 @@ test("a long command of repeated words is decided without rescanning", () => {
   // WI#868 makes the expansion a cross product, so a word of many groups and
   // a deeply nested group must stay linear in the command length.
   assertBlocked('{kimi,"server"} '.repeat(1200).slice(0, 16_384), "kimi service mode")
-  assertAllowed("{a,b}".repeat(2000).slice(0, 16_384), 2_000)
+  // A word whose expansion passes the cap is refused by the cap itself (its
+  // own reason, not the deadline) instead of being read as literal text
+  // (run-530 ALP-1).
+  assertBlocked("{a,b}".repeat(2000).slice(0, 16_384), "brace expansion this large")
   assertAllowed("echo " + "{".repeat(8_000) + "}".repeat(8_000), 2_000)
-  assertAllowed("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), 2_000)
+  assertBlocked("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), "brace expansion this large")
+})
+
+test("a brace expansion past the cap is refused, not read as literal (ALP-1)", () => {
+  // Ten `{,}` groups make 2048 copies of `kimi server`; the guard used to
+  // stop expanding at 1024 pending words and allow the rest as literal text,
+  // while bash ran `kimi server kimi ...`.
+  assertBlocked("{,}".repeat(10) + "{kimi,server}", "brace expansion this large")
+  assertBlocked("{,}".repeat(12) + "{kimi,server}", "brace expansion this large")
+  // Below the cap the expansion is read and the listener found.
+  assertBlocked("{,}".repeat(9) + "{kimi,server}", "kimi service mode")
+  // Ordinary expansions stay allowed.
+  assertAllowed("mkdir -p build/{a,b,c}/{debug,release}")
+  assertAllowed("echo " + "{a,b}".repeat(9))
 })
 
 test("empty brace alternatives and literal IFS separators do not hide listener words", () => {
