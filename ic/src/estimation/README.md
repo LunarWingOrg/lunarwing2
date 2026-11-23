@@ -171,8 +171,13 @@ than the `comparison_baseline`, with absolute error in seconds, `coverage` and
 sample counts reported. A declared baseline is reported alongside where one
 exists. Without paired samples, an error median or `improvement_percent` is
 `null`; a zero baseline median also makes improvement undefined. None of these
-cases passes the gate. Running the representative tenant evaluation and
-enabling hints for passing categories are separate steps.
+cases passes the gate. Each cohort carries the verdict as `gate_pass`: `true`
+only when `improvement_percent >= 10.0` against the comparison baseline,
+`false` when the category was judged and regressed, and `null` when it could
+not be judged (no paired sample, or an undefined improvement). `gate_pass` on
+`overall` decides the rollout; the `cold_start` verdict feeds the D1 decision.
+Running the representative tenant evaluation and enabling hints for passing
+categories are separate steps.
 
 ## LLM logical-call timing (WI#318 Phase B)
 

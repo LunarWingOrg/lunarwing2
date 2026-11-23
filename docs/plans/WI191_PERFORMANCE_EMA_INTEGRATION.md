@@ -453,18 +453,19 @@ for this gate.
    `/counters` and `/llm` for context) with the tenant's owner bearer token.
    Do not paste the token into the evidence doc or a shell history that is
    committed.
-3. **Judge each category.** For the `overall` block of each category, a pass
-   requires a paired `comparison_baseline` sample count above zero and
-   `improvement_percent >= 10.0`. Report the absolute errors in seconds
-   (`median_abs_error_*_ms / 1000`), `coverage` and `samples`; `null`
-   improvement, zero paired samples or a zero baseline median is not a pass.
+3. **Judge each category.** Read `overall.gate_pass`: `true` means the
+   category cleared the 10% comparison-baseline gate, `false` means it was
+   judged and regressed, and `null` means it could not be judged (no paired
+   sample, or an undefined improvement) and is not a pass. Report the absolute
+   errors in seconds (`median_abs_error_*_ms / 1000`), `coverage` and
+   `samples` alongside.
    Suppress every category that regresses with
    `LUNARWING_TOOL_ESTIMATES_CATEGORIES=-<tool>`, and record the reason. The
    `declared_baseline` block is reported alongside but does not decide the
    gate. `evicted > 0` means the window outran the ring: record it and repeat
    the window with a larger capacity before trusting coverage.
-4. **Feed the D1 decision.** Compare the `cold_start` block (`coverage` and
-   paired error) with `overall`. D1 is justified only if that measured
+4. **Feed the D1 decision.** Compare `cold_start` (`coverage`, `gate_pass`
+   and paired error) with `overall`. D1 is justified only if that measured
    cold-start loss materially misses the accuracy or coverage goal; otherwise
    the no-cache decision stands and both the data and the decision are
    recorded.
