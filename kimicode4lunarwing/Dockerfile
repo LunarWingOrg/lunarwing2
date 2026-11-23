@@ -238,6 +238,8 @@ RUN groupadd --gid 10002 kimi \
 WORKDIR /app
 
 COPY --from=builder /build/scripts/ /app/scripts/
+# WI#862: the CLI install retries its own npm downloads with this helper.
+COPY scripts/worker-download-retry.sh /app/scripts/worker-download-retry.sh
 # /app stays root-owned and read-only to both runtime identities.
 COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py task_runner_bind.py agent_comm_protocol.json ./
 COPY config/ ./config/
