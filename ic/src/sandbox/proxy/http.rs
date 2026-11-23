@@ -2324,7 +2324,7 @@ mod tests {
                     loop {
                         let mut buf = [0u8; 16384];
                         let n = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
+                            std::time::Duration::from_secs(30),
                             conn.read(&mut buf),
                         )
                         .await

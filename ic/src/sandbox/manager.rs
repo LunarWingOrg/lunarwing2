@@ -1590,11 +1590,11 @@ mod tests {
         manager.config.git = crate::sandbox::GitGrantConfig::from_full_spec(
             "origin=http://git.internal/org/repo.git",
             "",
-            "origin=GIT_ORIGIN_TOKEN",
+            "origin=GIT_MANAGER_ARGV_TOKEN",
             false,
         )
         .unwrap();
-        crate::config::inject_single_var("GIT_ORIGIN_TOKEN", SECRET);
+        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", SECRET);
         let manifest: crate::sandbox::CapabilityManifest =
             serde_json::from_value(serde_json::json!({
                 "manifest_version": 1,
@@ -1612,7 +1612,7 @@ mod tests {
             )
             .await;
         manager.shutdown().await;
-        crate::config::inject_single_var("GIT_ORIGIN_TOKEN", "");
+        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", "");
 
         result.expect("scoped proxy run reaches the simulated runtime");
         let calls = state.lock().unwrap();
@@ -1626,7 +1626,7 @@ mod tests {
             "secret in container argv: {joined}"
         );
         assert!(
-            !joined.contains("GIT_ORIGIN_TOKEN"),
+            !joined.contains("GIT_MANAGER_ARGV_TOKEN"),
             "credential variable name in container argv: {joined}"
         );
         assert!(
