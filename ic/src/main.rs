@@ -122,7 +122,10 @@ fn format_top_level_error(err: &anyhow::Error) {
 fn log_startup_banner() {
     // WI#870: the commit and build time disambiguate rebuilds of one version;
     // see `lunarwing::build_info`.
-    tracing::info!("Starting LunarWing {}", lunarwing::build_info::banner_identity());
+    tracing::info!(
+        "Starting LunarWing {}",
+        lunarwing::build_info::banner_identity()
+    );
 }
 
 fn log_supervised_mode(config: lunarwing::config::SupervisedModeConfig) {
