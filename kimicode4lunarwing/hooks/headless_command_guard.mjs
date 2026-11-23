@@ -224,9 +224,18 @@ function shellWordView(command) {
   return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
-/** Split on control operators and LF, leaving other line terminators in the text. */
+/**
+ * Split on control operators and LF, leaving other line terminators in the
+ * text. The separators are read outside quotes: an argument that legitimately
+ * carries `;`, `|`, `&` or a newline stays in its own command's segment, so
+ * the rest of that command does not read as a segment without the verb
+ * (WI#856).
+ */
 function commandSegments(command) {
-  return command.split(/[;|&]{1,2}|\n+/);
+  return splitOutsideQuotes(command, ";")
+    .flatMap((piece) => splitOutsideQuotes(piece, "\n"))
+    .flatMap((piece) => splitOutsideQuotes(piece, "|"))
+    .flatMap((piece) => splitOutsideQuotes(piece, "&"));
 }
 
 function isRmLongDeleteOption(word) {
@@ -1402,8 +1411,10 @@ function isInterpreterStage(stage) {
 
 /**
  * Split text on a one-character separator, ignoring separators inside quotes
- * and after a backslash, so a quoted interpreter body (`-c 'a;b'`) stays one
- * word for the pipeline rules (WI#832).
+ * and after a backslash. A quoted interpreter body (`-c 'a;b'`) stays one
+ * word for the pipeline rules (WI#832), and the segment splitter
+ * (`commandSegments`) reads its control operators the same way, so every
+ * segment-scoped rule sees a quoted argument whole (WI#856).
  */
 function splitOutsideQuotes(text, separator) {
   const pieces = [];
