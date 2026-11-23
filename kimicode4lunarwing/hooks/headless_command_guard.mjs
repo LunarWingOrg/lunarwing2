@@ -563,55 +563,6 @@ function tarLongValueOption(name) {
   return TAR_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
 }
 
-// cp/mv's destination options: `-t`/`--target-directory` names the
-// destination without being an operand word, and `-S`/`--suffix` takes a
-// value that is not a path. A walk that only skips `-`-prefixed words leaves
-// the value as an operand, so `cp -t /dev/sda1 /tmp/a` read `/dev/sda1` as
-// an ordinary operand and `/tmp/a` as the destination (WI#869).
-const CP_TARGET_VALUE_OPTIONS = new Set(["-t", "--target-directory"]);
-
-/**
- * The operands of a `cp`/`mv` invocation in bash-word form, with the value of
- * a separate-value option stepped over and a `-t`/`--target-directory` value
- * reported as the destination it is (WI#869).
- */
-function cpMvOperands(rest) {
-  const words = argumentWords(rest).map(stripShellQuotes);
-  const operands = [];
-  let target;
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    if (word === "--") {
-      operands.push(...words.slice(i + 1));
-      break;
-    }
-    if (word.startsWith("--")) {
-      const equals = word.indexOf("=");
-      const name = word.slice(2, equals === -1 ? undefined : equals);
-      if (CP_TARGET_VALUE_OPTIONS.has(`--${name}`) || "target-directory".startsWith(name)) {
-        const { value, last } = optionValue(equals === -1 ? "" : word.slice(equals + 1), words, i);
-        target = value;
-        i = last;
-      }
-      continue;
-    }
-    if (word.startsWith("-") && word.length > 1) {
-      const cluster = word.slice(1);
-      for (let j = 0; j < cluster.length; j++) {
-        if (cluster[j] !== "t" && cluster[j] !== "S") continue;
-        const { value, last } = optionValue(cluster.slice(j + 1), words, i);
-        if (cluster[j] === "t") target = value;
-        i = last;
-        break;
-      }
-      continue;
-    }
-    operands.push(word);
-  }
-  const filtered = operands.filter((operand) => !/^\d*>/.test(operand));
-  return { operands: filtered, target };
-}
-
 /** Read one tar short-option cluster; returns the index of its last consumed word. */
 function tarCluster(cluster, words, index, state) {
   for (let j = 0; j < cluster.length; j++) {
