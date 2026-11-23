@@ -854,6 +854,7 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
             # depends on must run against real PostgreSQL, not only the
             # libSQL lane where the generic target is auto-discovered.
             "--test postgres_cron_retention",
+            "--test job_estimate_postgres",
         ),
     }
     for job_name, fragments in expected.items():

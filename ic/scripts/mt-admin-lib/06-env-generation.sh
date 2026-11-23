@@ -1722,6 +1722,16 @@ ONBOARD_COMPLETED=true
 HEARTBEAT_ENABLED=false
 RUST_LOG=lunarwing=info
 ENVEOF
+  # WI#318: keep optional estimation overrides without materializing defaults.
+  local estimate_key estimate_value estimate_quoted
+  for estimate_key in LUNARWING_TOOL_ESTIMATES LUNARWING_TOOL_ESTIMATES_CATEGORIES \
+    LUNARWING_TOOL_ESTIMATES_TRACE LUNARWING_LLM_TIMINGS; do
+    if grep -q "^${estimate_key}=" "$env_snapshot"; then
+      estimate_value="$(_env_existing "$env_snapshot" "$estimate_key")"
+      estimate_quoted="$(_quote_env_value "$estimate_value")" || die "invalid value for $estimate_key"
+      printf '%s=%s\n' "$estimate_key" "$estimate_quoted" >> "$staged_env"
+    fi
+  done
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true

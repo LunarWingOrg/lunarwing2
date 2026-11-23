@@ -311,6 +311,35 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles kimi
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode2
 ```
 
+### Runtime estimation (optional, advisory)
+
+New tenants are **observation-only**: each tenant daemon calibrates per-user,
+per-tool runtime models in memory and shows nothing. These settings live in the
+tenant's `env/lunarwing.env`, are read once at startup, and never change
+approval policy, gate expiry, timeouts, scheduling or budgets. Restart the
+tenant with `restart-tenant` after editing them, and expect learned models to
+start over each restart.
+
+```bash
+# Approval hints and job/mission timing display (default: observe only)
+LUNARWING_TOOL_ESTIMATES=1
+# Display gating by canonical tool name; suppressed names keep recording.
+LUNARWING_TOOL_ESTIMATES_CATEGORIES=http,-web_search
+# Bounded held-out evaluation trace (owner-only /api/estimates/evaluation)
+LUNARWING_TOOL_ESTIMATES_TRACE=1
+# Daemon-wide LLM logical-call timing; on unless set to 0
+LUNARWING_LLM_TIMINGS=0
+```
+
+`LUNARWING_TOOL_ESTIMATES=0` disables recording and hints entirely. The
+read-only `GET /api/estimates` route shows the authenticated caller's models;
+its aggregate subroutes require the owner token. None adds a listener;
+hints appear only after a five-sample warmup. Enable hints per tenant only after
+that tenant passes the held-out evaluation in
+[`WI191_PERFORMANCE_EMA_INTEGRATION.md`](../plans/WI191_PERFORMANCE_EMA_INTEGRATION.md).
+Full semantics: [`../ops/TENANT-CONFIGURATION.md`](../ops/TENANT-CONFIGURATION.md)
+and [`../../ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
+
 ### Port drift pre-flight
 
 `ic/scripts/lunarwing-port-drift-preflight.sh` (WI#509) generalizes the WeeChat preflight's env-vs-registry comparison to every service whose port lands in a rendered file. It is read-only, covers both init systems, and never prints secret values (env content is reduced to a port, a host token, or a strict loopback URL before display). A listener or URL host that is not `127.0.0.1` is a FAIL — a non-loopback bind is the WI#357 self-exposure class, not a warning:
