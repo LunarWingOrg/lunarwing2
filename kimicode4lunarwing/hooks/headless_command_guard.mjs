@@ -2036,10 +2036,58 @@ const LISTENER_COMMANDS = [
   { name: /^ruby$/, test: (args) => args.includes("-run") && args.includes("httpd") },
 ];
 
-function listenerShellBody(words, start) {
-  for (let i = start; i < words.length && words[i].startsWith("-"); i++) {
-    if (words[i] === "--") break;
-    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(words[i])) return words[i + 1];
+// Launcher options that take the next word as their value. A walk that only
+// steps over `-`-prefixed words stops at the value and never reaches the `-c`
+// that carries the body, so `bash -o pipefail -c "kimi server"` read as no
+// shell body at all (WI#869).
+const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
+// `script`'s own option list: every entry takes a separate value, and
+// `-c`/`--command` is the one that carries the body. `-t`/`--timing` is
+// absent on purpose — its argument is optional, so it must not eat a word.
+const SCRIPT_VALUE_OPTIONS = new Set([
+  "-I", "--log-in", "-O", "--log-out", "-B", "--log-io", "-T", "--log-timing",
+  "-m", "--logging-format", "-E", "--echo", "-o", "--output-limit",
+  "-c", "--command",
+]);
+
+/**
+ * The shell text a launcher runs, or undefined when it carries none (WI#858).
+ * A shell's `-c` takes its body as the next word, and `script`'s
+ * `-c`/`--command` takes it as the option value; `script -- <command>` runs
+ * the words after the marker. An option that takes a separate value is
+ * stepped over whole, because its value is not the body (`bash -o pipefail -c
+ * "kimi server"`, `bash --rcfile /dev/null -c …`) (WI#869).
+ *
+ * The text after `-c` is returned whole rather than as one word, so a body
+ * split by a further option word (`bash -oc pipefail -c "kimi server"`) is
+ * still read by the property rule.
+ */
+function listenerShellBody(words, start, launcher) {
+  const values = launcher === "script" ? SCRIPT_VALUE_OPTIONS : SHELL_VALUE_OPTIONS;
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      return launcher === "script" ? words.slice(i + 1).join(" ") : undefined;
+    }
+    if (values.has(word)) {
+      // `script -c`/`--command` carries the body itself; every other value
+      // is an option argument that is not a command.
+      if (launcher === "script" && (word === "-c" || word === "--command")) {
+        return words[i + 1];
+      }
+      i++;
+      continue;
+    }
+    if (/^[-+][a-zA-Z]*c[a-zA-Z]*$/.test(word)) return words.slice(i + 1).join(" ");
+    if (word.startsWith("-") || word.startsWith("+")) {
+      // A cluster whose last letter is `o`/`O` takes the next word
+      // (`bash -xo pipefail -c …`); an attached value needs no step.
+      if (/^[-+][a-zA-Z]*[oO]$/.test(word)) i++;
+      continue;
+    }
+    // A shell stops reading options at its script-file operand; `script`
+    // reads its log-file operand and keeps going.
+    if (launcher !== "script") return undefined;
   }
   return undefined;
 }
@@ -2199,7 +2247,7 @@ function checkListenerWords(words, depth) {
       continue;
     }
     if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
-      const body = listenerShellBody(words, i + 1);
+      const body = listenerShellBody(words, i + 1, name);
       if (body !== undefined) {
         if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
         const denied = checkListeners(body, depth + 1);
