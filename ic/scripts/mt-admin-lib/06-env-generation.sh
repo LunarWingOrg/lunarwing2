@@ -1441,6 +1441,32 @@ write_tenant_lunarwing_env() {
   sandbox_tunnel_wireguard_config="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_WIREGUARD_CONFIG)"
   sandbox_tunnel_wireguard_canary="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_WIREGUARD_CANARY)"
   sandbox_tunnel_startup_timeout_secs="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS)"
+  # Sandbox git grant (WI#816, WI#860): opt-in operator settings with no
+  # rendered default, preserved verbatim on re-render together with every
+  # daemon variable a SANDBOX_GIT_CREDENTIALS binding (`remote=NAME`) names.
+  # A bound value is an Authorization header value (a secret: the env file is
+  # written mode 0600, and the value is never printed or passed to another
+  # program). A binding whose name is not a plain environment name is not
+  # carried (the daemon refuses it at load); nothing here is evaluated.
+  local sandbox_git_remotes sandbox_git_write_remotes sandbox_git_credentials
+  sandbox_git_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_REMOTES)"
+  sandbox_git_write_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_WRITE_REMOTES)"
+  sandbox_git_credentials="$(_env_existing "$env_snapshot" SANDBOX_GIT_CREDENTIALS)"
+  local -a sandbox_git_secret_names=() sandbox_git_secret_values=() git_bindings=()
+  local git_binding git_secret_name git_secret_value
+  IFS=',' read -r -a git_bindings <<<"$sandbox_git_credentials"
+  for git_binding in "${git_bindings[@]}"; do
+    [[ "$git_binding" == *=* ]] || continue
+    git_secret_name="${git_binding#*=}"
+    git_secret_name="${git_secret_name#"${git_secret_name%%[![:space:]]*}"}"
+    git_secret_name="${git_secret_name%"${git_secret_name##*[![:space:]]}"}"
+    [[ "$git_secret_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ " ${sandbox_git_secret_names[*]} " != *" $git_secret_name "* ]] || continue
+    git_secret_value="$(_env_existing "$env_snapshot" "$git_secret_name")"
+    [[ -n "$git_secret_value" ]] || continue
+    sandbox_git_secret_names+=("$git_secret_name")
+    sandbox_git_secret_values+=("$git_secret_value")
+  done
 
   # Sensible new-tenant defaults (WI#239): each of these is written into the
   # rendered lunarwing.env with the value below UNLESS the operator has
@@ -1839,6 +1865,26 @@ ENVEOF
       || printf 'SANDBOX_TUNNEL_WIREGUARD_CANARY=%s\n' "$(_quote_env_value "$sandbox_tunnel_wireguard_canary")" >> "$staged_env"
     [[ -z "$sandbox_tunnel_startup_timeout_secs" ]] \
       || printf 'SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=%s\n' "$sandbox_tunnel_startup_timeout_secs" >> "$staged_env"
+  fi
+  # Sandbox git grant (WI#816, WI#860): rendered only when the operator set
+  # it, verbatim, with the credential variables its bindings name. A variable
+  # this writer already rendered above keeps that one line.
+  if [[ -n "${sandbox_git_remotes}${sandbox_git_write_remotes}${sandbox_git_credentials}" ]]; then
+    printf '\n# Sandbox git grant (WI#816, WI#860); preserved on re-render.\n# See docs/guides/SANDBOX_CAPABILITY_MANIFEST.md. Bound credential variables are secrets.\n' >> "$staged_env"
+    [[ -z "$sandbox_git_remotes" ]] \
+      || printf 'SANDBOX_GIT_REMOTES=%s\n' "$(_quote_env_value "$sandbox_git_remotes")" >> "$staged_env"
+    [[ -z "$sandbox_git_write_remotes" ]] \
+      || printf 'SANDBOX_GIT_WRITE_REMOTES=%s\n' "$(_quote_env_value "$sandbox_git_write_remotes")" >> "$staged_env"
+    [[ -z "$sandbox_git_credentials" ]] \
+      || printf 'SANDBOX_GIT_CREDENTIALS=%s\n' "$(_quote_env_value "$sandbox_git_credentials")" >> "$staged_env"
+    local git_secret_index
+    for git_secret_index in "${!sandbox_git_secret_names[@]}"; do
+      if grep -q -- "^${sandbox_git_secret_names[$git_secret_index]}=" "$staged_env"; then
+        continue
+      fi
+      printf '%s=%s\n' "${sandbox_git_secret_names[$git_secret_index]}" \
+        "$(_quote_env_value "${sandbox_git_secret_values[$git_secret_index]}")" >> "$staged_env"
+    done
   fi
   if ! write_tenant_file_atomic "$name" "$path" 600 <"$staged_env"; then
     rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"

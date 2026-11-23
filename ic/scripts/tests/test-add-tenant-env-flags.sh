@@ -333,6 +333,41 @@ assert_eq "rerun preserves SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS" \
 assert_eq "tunnel knobs are rendered once each" \
   "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "8"
 
+echo "=== sandbox git grant env preservation tests (WI#860, ALM-3) ==="
+# The git grant is opt-in: nothing is rendered until an operator sets it.
+assert_eq "no git grant rendered by default" \
+  "$(grep -c '^SANDBOX_GIT_' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+SANDBOX_GIT_REMOTES="origin=http://git.lan:3000/org/repo.git,mirror=http://git.lan/org/mirror.git"
+SANDBOX_GIT_WRITE_REMOTES=origin
+SANDBOX_GIT_CREDENTIALS="origin=GIT_ORIGIN_TOKEN, mirror = Git_Mirror_Token ,bad=not-a-name,dup=GIT_ORIGIN_TOKEN,llm=LLM_MODEL,missing=GIT_UNSET_TOKEN"
+GIT_ORIGIN_TOKEN="Basic b3JpZ2luOnNlY3JldA=="
+EOF
+printf '%s\n' 'Git_Mirror_Token="Bearer mirror \"quoted\" \\ token"' >>"$MT_FIXTURE/env/lunarwing.env"
+for git_rerun in first second; do
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_REMOTES" "$(envval SANDBOX_GIT_REMOTES)" \
+    "origin=http://git.lan:3000/org/repo.git,mirror=http://git.lan/org/mirror.git"
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_WRITE_REMOTES" \
+    "$(envval SANDBOX_GIT_WRITE_REMOTES)" "origin"
+  assert_eq "$git_rerun rerun preserves SANDBOX_GIT_CREDENTIALS" "$(envval SANDBOX_GIT_CREDENTIALS)" \
+    "origin=GIT_ORIGIN_TOKEN, mirror = Git_Mirror_Token ,bad=not-a-name,dup=GIT_ORIGIN_TOKEN,llm=LLM_MODEL,missing=GIT_UNSET_TOKEN"
+  assert_eq "$git_rerun rerun preserves a bound credential variable" \
+    "$(envval GIT_ORIGIN_TOKEN)" "Basic b3JpZ2luOnNlY3JldA=="
+  assert_eq "$git_rerun rerun preserves a mixed-case, quoted bound variable" \
+    "$(envval Git_Mirror_Token)" 'Bearer mirror "quoted" \ token'
+  assert_eq "$git_rerun rerun writes a variable named twice once" \
+    "$(grep -c '^GIT_ORIGIN_TOKEN=' "$MT_FIXTURE/env/lunarwing.env")" "1"
+  assert_eq "$git_rerun rerun keeps a binding to a rendered key to one line" \
+    "$(grep -c '^LLM_MODEL=' "$MT_FIXTURE/env/lunarwing.env")" "1"
+  assert_eq "$git_rerun rerun renders nothing for an unset bound variable" \
+    "$(grep -c '^GIT_UNSET_TOKEN=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun does not carry an invalid binding name" \
+    "$(grep -c '^not-a-name=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun renders the git grant keys once each" \
+    "$(grep -c '^SANDBOX_GIT_' "$MT_FIXTURE/env/lunarwing.env")" "3"
+done
+
 echo "=== LLM retry env preservation tests ==="
 assert_eq "default LLM_MAX_RETRIES" "$(envval LLM_MAX_RETRIES)" "3"
 assert_eq "default billed-empty input-token budget" \
