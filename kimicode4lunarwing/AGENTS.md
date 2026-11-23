@@ -21,10 +21,11 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 
 ## Guard Quote Handling
 
-The WI#856 clause and pipeline scanners keep ordinary quoted
-arguments and ANSI-C quoted words together. They do not decode ANSI-C escapes
-or model nested quote contexts inside command substitutions. Listener-specific
-parsing is tracked separately in WI#858.
+The WI#856 clause and pipeline scanners keep ordinary quoted arguments and
+ANSI-C quoted words together. The guard rejects ANSI-C backslash escapes other
+than escaped apostrophes instead of decoding them. Use literal shell words.
+The scanner does not model nested quote contexts inside command substitutions.
+Listener-specific parsing is tracked separately in WI#858.
 
 ## Protocol Compatibility
 

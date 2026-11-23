@@ -1343,3 +1343,19 @@ test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => 
   assertAllowed(String.raw`git -C $'/tmp/a\' b' status`)
   assertAllowed(`printf '%s\\n' ${argument}`)
 })
+
+test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", () => {
+  // The hook only sees text. Use inert fixtures for command, option and path
+  // positions; none of these strings is executed.
+  for (const escaped of [String.raw`\x66`, String.raw`\146`, String.raw`\u0066`,
+    String.raw`\U00000066`, String.raw`\cF`, String.raw`\t`]) {
+    assertBlocked(`fixture $'${escaped}ile'`, "unverifiable ANSI-C escape")
+  }
+  assertBlocked(String.raw`$'\x66ixture' --help`, "unverifiable ANSI-C escape")
+  assertBlocked(String.raw`git -c $'\x63ore.abbrev=8' status`, "unverifiable ANSI-C escape")
+  assertBlocked(String.raw`git -C $'/tmp/\x66ixture' status`, "unverifiable ANSI-C escape")
+  assertBlocked("fixture $\\\n'\\x66ile'", "unverifiable ANSI-C escape")
+  assertAllowed(String.raw`printf '%s\n' $'it\'s literal'`)
+  assertAllowed(String.raw`printf '%s\n' "\x66ixture"`)
+  assertAllowed("printf '%s\\n' $'plain text'")
+})

@@ -1529,6 +1529,24 @@ function isQuoteEscape(text, i, quote) {
   return text[i] === "\\" && quote !== "'" && i + 1 < text.length;
 }
 
+// Do not let encoded bytes be checked as one word and executed as another.
+// An escaped apostrophe is already handled by the word and clause readers.
+function hasUnverifiableAnsiEscape(text) {
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    if (isQuoteEscape(text, i, quote)) {
+      if (quote === "$'" && text[i + 1] !== "'") return true;
+      i++;
+    } else if (quote) {
+      if (text[i] === quote.at(-1)) quote = "";
+    } else {
+      quote = openingQuote(text, i);
+      if (quote) i += quote.length - 1;
+    }
+  }
+  return false;
+}
+
 /** Skip quoted spans (including ANSI-C quotes) without interpreting shell expansions. */
 function* unquotedOffsets(text, escapes = true) {
   let quote = "";
@@ -2148,7 +2166,14 @@ function checkSameLineLink(command) {
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command) {
-  return evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
+  const denial = evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
+  if (denial) return denial;
+  if (hasUnverifiableAnsiEscape(command) ||
+      (command.includes("\\\n") && JOIN_READINGS.some(([outside, inside]) =>
+        hasUnverifiableAnsiEscape(joinLineContinuations(command, outside, inside))))) {
+    return "unverifiable ANSI-C escape; use literal shell words";
+  }
+  return null;
 }
 
 async function main() {
