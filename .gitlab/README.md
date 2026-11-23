@@ -562,6 +562,27 @@ host's concurrent builds before retrying manually.
   Any
   script edit must update `PEBBLE_RUST_LANE_SCRIPT` (and a deliberate
   bootstrap change `PEBBLE_RUST_LANE_BEFORE_SCRIPT`) in the same commit.
+- `rust-xmpp-bridge`: the XMPP bridge and its contract crate, which sit
+  outside the `ic` workspace (both listed in `ic/Cargo.toml`'s
+  `[workspace] exclude`, each with its own `Cargo.lock`), so no workspace
+  job ever compiled, tested or linted them (WI#864; WI#854's !2707 changed
+  335 lines of bridge Rust with a green pipeline that built none of it).
+  Runs `cargo-ci.sh test -j2 --locked` and `cargo-ci.sh clippy -j2
+  --locked --all-targets -- -D warnings` for `bridges/xmpp-bridge` and,
+  in its own invocation (the contract crate has dev-dependencies and is
+  not a workspace member, so `-p` cannot test it from the bridge
+  workspace), `openclaw-ports/xmpp/bridge`. Both run from `ic/`, so
+  `ic/.cargo/config.toml`'s `vendor/` source replacement applies and the
+  lane needs no crates.io access. Pinned by
+  `validate_xmpp_bridge_rust_lane` (through the shared
+  `validate_pinned_rust_lane` the pebble lane also uses): the extends, the
+  resolved `$CI_RUST_IMAGE` image and `$CI_RUST_RUNNER_TAG` tag, the exact
+  script (`XMPP_BRIDGE_RUST_LANE_SCRIPT`), and the exact MR/branch/tag
+  rules (`XMPP_BRIDGE_RUST_LANE_RULES`), so replacing the rules with
+  `when: never` or dropping a command fails `ci-config`. The lane declares
+  `needs: []` like the pebble lane, so no earlier-stage artifacts or
+  dotenv variables reach the pinned script. Any script edit must update
+  `XMPP_BRIDGE_RUST_LANE_SCRIPT` in the same commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
