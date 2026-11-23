@@ -894,6 +894,12 @@ test("a long command of repeated words is decided without rescanning", () => {
   // 12 KB of subshells stay inside the analysis deadline.
   assertAllowed("$(git log -1) ".repeat(1000))
   assertAllowed("(git status) ".repeat(1000))
+  // The WI#856 clause readers are linear too: 16 KB of one repeated verb
+  // stays one clause, and re-reading its tail per match would trip the
+  // analysis deadline.
+  assertAllowed("mv a ".repeat(2700))
+  assertAllowed('tar -cf /tmp/a.tar "a b" '.repeat(600))
+  assertAllowed("chmod -R ".repeat(1500))
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
