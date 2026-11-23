@@ -1146,6 +1146,26 @@ test("an interpreter option value does not end the walk to the eval flag (WI#869
   assertAllowed("python3 -m json.tool")
 })
 
+test("cp's destination option is the destination it writes (WI#869)", () => {
+  // The cp device-write rule kept every non-dash word as an operand, so the
+  // `-t` value read as a source and the real source as the destination. The
+  // same walk now serves cp and mv (WI#849's operand reader).
+  assertBlocked("cp -t /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory=/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp -t/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp /tmp/a /dev/sda1", "block-device")
+  assertBlocked("cp -S .bak /tmp/a /dev/sda1", "block-device")
+  assertAllowed("cp -t /tmp/wi869-dest /tmp/a")
+  assertAllowed("cp -S .bak a b")
+  assertAllowed("cp a b")
+  // mv's protected-tree rule keeps its verdicts through the shared reader.
+  assertBlocked("mv -t /app/hooks /tmp/a", "protected tree")
+  assertBlocked("mv --target-directory /app/hooks /tmp/a", "protected tree")
+  assertAllowed("mv a b")
+  assertAllowed("mv -S .bak a b")
+})
+
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
   // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
   // in double quotes reaches Perl with the inner quotes unescaped, so
