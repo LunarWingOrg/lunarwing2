@@ -3228,7 +3228,12 @@ mod tests {
     /// branch and a read-grant force push hidden behind a repository alias
     /// are refused at the transport, where the command-text preflight cannot
     /// see them.
-    #[tokio::test]
+    ///
+    /// The git commands run with the blocking `std::process::Command`, so the
+    /// test needs a multi-threaded runtime: on the default current-thread
+    /// runtime a proxied `git push` blocks the only thread the proxy and the
+    /// upstream run on, and the test deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_git_push_through_the_scoped_proxy_is_bounded_at_the_transport() {
         const SECRET: &str = "Basic Z2l0OnB1c2gtbWFya2VyLTFjMmQ=";
         let temp = tempfile::tempdir().unwrap();
