@@ -143,7 +143,8 @@ impl GitGrantConfig {
             return Ok(None);
         }
         let writes = parse_write_names(write_names)?;
-        let mut remotes = Vec::new();        for (index, entry) in spec.split(',').enumerate() {
+        let mut remotes = Vec::new();
+        for (index, entry) in spec.split(',').enumerate() {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
@@ -207,9 +208,9 @@ fn parse_credentials(
         if entry.is_empty() {
             continue;
         }
-        let (remote, secret_env) = entry.split_once('=').ok_or_else(|| {
-            "SANDBOX_GIT_CREDENTIALS entries must be remote=ENV_NAME".to_string()
-        })?;
+        let (remote, secret_env) = entry
+            .split_once('=')
+            .ok_or_else(|| "SANDBOX_GIT_CREDENTIALS entries must be remote=ENV_NAME".to_string())?;
         let (remote, secret_env) = (remote.trim(), secret_env.trim());
         if remote.is_empty() || secret_env.is_empty() {
             return Err(
@@ -1830,7 +1831,9 @@ fn short_push_cluster_forces(word: &str) -> bool {
     };
     !word.starts_with("--")
         && !letters.is_empty()
-        && letters.chars().all(|c| matches!(c, 'f' | 'q' | 'v' | 'n' | 'u'))
+        && letters
+            .chars()
+            .all(|c| matches!(c, 'f' | 'q' | 'v' | 'n' | 'u'))
         && letters.contains('f')
 }
 
@@ -1907,7 +1910,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
              SANDBOX_GIT_WRITE_REMOTES on that remote",
         ));
     };
-    let chosen = preflight.write_remote(remote)?;
+    preflight.write_remote(remote)?;
     for refspec in &positional[1..] {
         if refspec_deletes(&refspec.text) {
             push_deletion(&refspec.text, grant)?;
@@ -1917,7 +1920,6 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
                 "force push is not permitted; a '+' refspec forces the update",
             ));
         }
-        let _ = chosen;
     }
     Ok(())
 }
@@ -2191,7 +2193,8 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_named_remotes_and_rejects_embedded_credentials() {        let parsed = spec();
+    fn config_accepts_named_remotes_and_rejects_embedded_credentials() {
+        let parsed = spec();
         assert_eq!(parsed.remotes.len(), 3);
         assert_eq!(parsed.remotes[0].name, "origin");
         assert_eq!(parsed.remotes[1].host.as_deref(), Some("git.example.test"));
@@ -2737,7 +2740,10 @@ mod tests {
             vec![GitOperationClass::Read, GitOperationClass::Write]
         );
         let json = serde_json::to_string(&evidence).unwrap();
-        assert!(json.contains("\"operations\":[\"read\",\"write\"]"), "{json}");
+        assert!(
+            json.contains("\"operations\":[\"read\",\"write\"]"),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2806,11 +2812,7 @@ mod tests {
                 "origin=not-a-name",
             ),
             // Missing the variable.
-            (
-                "origin=http://git.internal/org/repo.git",
-                "",
-                "origin=",
-            ),
+            ("origin=http://git.internal/org/repo.git", "", "origin="),
             // Bound twice.
             (
                 "origin=http://git.internal/org/repo.git",
@@ -2839,9 +2841,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let grant =
-            authorize_grant(&host, &["upstream".to_string()], &cwd, SandboxNetworkMode::ProxyEnforced)
-                .unwrap();
+        let grant = authorize_grant(
+            &host,
+            &["upstream".to_string()],
+            &cwd,
+            SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
         assert_eq!(grant.credentials.len(), 1);
         assert_eq!(grant.credentials[0].secret_env, "UPSTREAM_TOKEN");
     }
@@ -3290,12 +3296,7 @@ mod tests {
         git(&["add", "file.txt"], &work);
         git(&["commit", "-q", "-m", "one"], &work);
         git(
-            &[
-                "remote",
-                "add",
-                "origin",
-                remote.to_str().unwrap(),
-            ],
+            &["remote", "add", "origin", remote.to_str().unwrap()],
             &work,
         );
         (temp, work)
@@ -3405,7 +3406,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for needle in [SECRET, "GIT_ORIGIN_TOKEN"] {
-            assert!(!joined.contains(needle), "container env leaked {needle}: {joined}");
+            assert!(
+                !joined.contains(needle),
+                "container env leaked {needle}: {joined}"
+            );
         }
         let evidence = serde_json::to_string(&grant.evidence()).expect("evidence");
         assert!(evidence.contains("GIT_ORIGIN_TOKEN"), "{evidence}");
