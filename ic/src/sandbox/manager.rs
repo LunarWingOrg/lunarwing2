@@ -34,7 +34,9 @@ use tokio::sync::RwLock;
 use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
 use crate::sandbox::config::{SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
-use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder, NoCredentialResolver};
+use crate::sandbox::proxy::{
+    EnvCredentialResolver, HttpProxy, NetworkProxyBuilder, NoCredentialResolver,
+};
 use crate::sandbox::tunnel_sidecar::{TunnelSidecar, TunnelSidecarConfig};
 
 /// Output from sandbox execution.
@@ -410,6 +412,39 @@ impl SandboxManager {
         };
         let scoped_port = scoped_proxy.as_ref().map(|(_, port)| *port);
 
+        // Host-kept credentials (WI#860): the container's git helper asks a
+        // daemon-side broker over a Unix socket. The secret value stays in the
+        // daemon; the container sees only the socket directory and a script.
+        let broker = if decision
+            .git
+            .as_ref()
+            .is_some_and(|git| !git.credentials.is_empty())
+        {
+            let git = decision
+                .git
+                .as_ref()
+                .ok_or_else(|| SandboxError::ProxyError {
+                    reason: "git credentials are set without a git grant".into(),
+                })?;
+            let broker =
+                crate::sandbox::git_credential::GitCredentialBroker::create(
+                    &self.config.git_credentials,
+                )?;
+            broker.write_helper()?;
+            Some(broker)
+        } else {
+            None
+        };
+        // The handle and shutdown sender live until this call returns, so the
+        // socket is served for the whole container run and closed afterwards.
+        let _broker_service = match broker.as_ref() {
+            Some(broker) => Some(broker.serve(Arc::new(EnvCredentialResolver)).await?),
+            None => None,
+        };
+        let broker_dir = broker
+            .as_ref()
+            .map(|broker| broker.path().to_string_lossy().into_owned());
+
         // Retry transient container failures (Docker daemon glitches, container
         // creation races) up to MAX_SANDBOX_RETRIES times with exponential backoff.
         const MAX_SANDBOX_RETRIES: u32 = 2;
@@ -428,7 +463,14 @@ impl SandboxManager {
             }
 
             match self
-                .try_execute_in_container(command, cwd, &decision, env.clone(), scoped_port)
+                .try_execute_in_container(
+                    command,
+                    cwd,
+                    &decision,
+                    env.clone(),
+                    scoped_port,
+                    broker_dir.as_deref(),
+                )
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -470,6 +512,7 @@ impl SandboxManager {
         decision: &crate::sandbox::CapabilityDecision,
         env: HashMap<String, String>,
         scoped_port: Option<u16>,
+        credential_broker_dir: Option<&str>,
     ) -> Result<ExecOutput> {
         let network = decision.network;
         // Containment: the mounted directory is agent-chosen, so refuse any
@@ -1467,6 +1510,7 @@ mod tests {
             proxy_port: 0,
             tunnel: None,
             proxy_dir: None,
+            credential_broker_dir: None,
             pids_limit: crate::sandbox::config::DEFAULT_PIDS_LIMIT,
             masked: &[],
             mask_dir: None,

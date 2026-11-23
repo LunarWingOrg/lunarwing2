@@ -346,6 +346,10 @@ pub(crate) struct RunSpec<'a> {
     /// (proxy-enforced and legacy Podman proxy modes). Bind-mounted read-only
     /// at `/run/lunarwing-proxy`.
     pub proxy_dir: Option<&'a str>,
+    /// Host directory holding the per-execution git credential broker
+    /// (WI#860). Bind-mounted read-only at
+    /// [`crate::sandbox::git_grant::GIT_CREDENTIAL_MOUNT`].
+    pub credential_broker_dir: Option<&'a str>,
     /// Per-container process limit (`--pids-limit`).
     pub pids_limit: u32,
     /// Empty host directory used to shadow protected subdirectories of the
@@ -464,6 +468,17 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
             "{}:{}:ro,z",
             logs.display(),
             crate::sandbox::mount_guard::TENANT_LOGS_MOUNT
+        ));
+    }
+
+    // Host-side git credential broker (WI#860): a daemon-chosen directory
+    // holding the helper script and the broker socket. Read-only, so the
+    // container cannot replace the helper; the secret itself never enters.
+    if let Some(broker) = spec.credential_broker_dir {
+        args.push("-v".into());
+        args.push(format!(
+            "{broker}:{}:ro,z",
+            crate::sandbox::git_grant::GIT_CREDENTIAL_MOUNT
         ));
     }
 
@@ -916,6 +931,7 @@ impl CliRunner {
             network,
             proxy_port,
             tunnel,
+            credential_broker_dir,
             protected_paths,
             tenant_logs,
         } = params;
@@ -1007,6 +1023,7 @@ impl CliRunner {
             proxy_port,
             tunnel,
             proxy_dir: proxy_dir_ref,
+            credential_broker_dir,
             pids_limit: default_pids_limit(),
             masked: &masked_destinations,
             mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
@@ -1616,6 +1633,7 @@ mod tests {
             proxy_port,
             tunnel: None,
             proxy_dir: None,
+            credential_broker_dir: None,
             pids_limit: 256,
             masked: &[],
             mask_dir: None,
