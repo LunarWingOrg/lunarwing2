@@ -69,6 +69,90 @@ function rmOperands(words, endOfOptions) {
     .filter((token) => !/^\d*>/.test(token));
 }
 
+// Keep these listener-local until the shared quote reader in WI#856 lands.
+function listenerOpeningQuote(text, i) {
+  if (text[i] === "$" && text[i + 1] === "'") return "$'";
+  return text[i] === "'" || text[i] === '"' ? text[i] : "";
+}
+
+function listenerQuoteEscape(text, i, quote) {
+  return text[i] === "\\" && quote !== "'" && i + 1 < text.length &&
+    (quote !== '"' || '\\"$`\n'.includes(text[i + 1]));
+}
+
+/** Read an ordinary literal heredoc delimiter, without performing expansions. */
+function listenerHeredoc(text, i) {
+  if (!text.startsWith("<<", i) || text[i - 1] === "<" || text[i + 2] === "<") return null;
+  const stripTabs = text[i + 2] === "-";
+  const word = /[ \t]*((?:'(?:[^'\n]*)'|"(?:\\[^\n]|[^"\\\n])*"|\\[^\n]|[^ \t\n;|&()<>'"\\])+)/y;
+  word.lastIndex = i + (stripTabs ? 3 : 2);
+  const match = word.exec(text);
+  if (!match) return null;
+  const delimiter = match[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+    (_match, single, double, escaped) => single ?? double?.replace(/\\(["\\$`])/g, "$1") ?? escaped);
+  return { delimiter, stripTabs, end: word.lastIndex };
+}
+
+/** Isolate comments and heredoc lines so data quotes cannot affect later commands. */
+function* listenerRegions(text) {
+  if (!text.includes("#") && !text.includes("<<")) {
+    yield { text, heredoc: false };
+    return;
+  }
+  let start = 0;
+  let parts = [];
+  let quote = "";
+  let atWordStart = true;
+  const heredocs = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
+      if (!quote && text[i] !== "\n") atWordStart = false;
+    } else if (quote) {
+      if (ch === quote.at(-1)) quote = "";
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
+      atWordStart = false;
+    } else if (ch === "#" && atWordStart) {
+      parts.push(text.slice(start, i));
+      const lf = text.indexOf("\n", i);
+      start = lf === -1 ? text.length : lf;
+      i = start - 1;
+    } else if (ch === "<") {
+      const heredoc = listenerHeredoc(text, i);
+      if (heredoc) {
+        heredocs.push(heredoc);
+        i = heredoc.end - 1;
+      }
+      atWordStart = !heredoc;
+    } else if (ch === "\n" && heredocs.length > 0) {
+      parts.push(text.slice(start, i + 1));
+      yield { text: parts.join(""), heredoc: false };
+      parts = [];
+      let next = i + 1;
+      for (const { delimiter, stripTabs } of heredocs) {
+        while (next < text.length) {
+          const lf = text.indexOf("\n", next);
+          const end = lf === -1 ? text.length : lf;
+          const line = text.slice(next, end);
+          next = lf === -1 ? end : end + 1;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+          yield { text: line, heredoc: true };
+        }
+      }
+      heredocs.length = 0;
+      start = next;
+      i = next - 1;
+      atWordStart = true;
+    } else {
+      atWordStart = " \t\n;|&()<>".includes(ch);
+    }
+  }
+  parts.push(text.slice(start));
+  yield { text: parts.join(""), heredoc: false };
+}
+
 /**
  * The containment test shared by every deletion rule (WI#826, WI#830): a
  * target is provably inside the temp roots only as a literal absolute path,
@@ -1761,17 +1845,21 @@ function* listenerSegments(text) {
   };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
-      const next = text[i + 1];
-      word += quote === '"' && !'\\"$`\n'.includes(next) ? ch : text[++i];
-      started = true;
-    } else if (quote) {
-      if (ch === quote) quote = "";
-      else word += ch;
-    } else if (ch === '"' || ch === "'") {
-      quote = ch;
+    if (listenerQuoteEscape(text, i, quote)) {
+      word += text[++i];
       started = true;
       quoted = true;
+    } else if (quote) {
+      if (ch === quote.at(-1)) quote = "";
+      else word += ch;
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
+      started = true;
+      quoted = true;
+    } else if (ch === "$" && (text.startsWith("${IFS}", i) ||
+      (text.startsWith("$IFS", i) && !/[A-Za-z0-9_]/.test(text[i + 4] ?? "")))) {
+      flush();
+      i += text[i + 1] === "{" ? 5 : 3;
     } else if (" \t;|&\n".includes(ch)) {
       flush();
       if (";|&\n".includes(ch) && words.length > 0) {
@@ -1808,14 +1896,12 @@ function listenerParenBody(text, openIndex) {
   let quote = "";
   for (let i = openIndex; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\") {
-      if (quote !== "'") i++;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) quote = "";
-    } else if (ch === "'" || ch === '"') {
-      quote = ch;
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
+    } else if (quote) {
+      if (ch === quote.at(-1)) quote = "";
+    } else if ((quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
     } else if (ch === "(") {
       depth++;
     } else if (ch === ")" && --depth === 0) {
@@ -1843,11 +1929,11 @@ function* listenerBodies(text) {
   let quote = "";
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\") {
-      if (quote !== "'") i++;
+    if (listenerQuoteEscape(text, i, quote)) {
+      i++;
       continue;
     }
-    if (quote === "'") {
+    if (quote === "'" || quote === "$'") {
       if (ch === "'") quote = "";
       continue;
     }
@@ -1855,8 +1941,8 @@ function* listenerBodies(text) {
       quote = "";
       continue;
     }
-    if (!quote && (ch === "'" || ch === '"')) {
-      quote = ch;
+    if (!quote && (quote = listenerOpeningQuote(text, i))) {
+      i += quote.length - 1;
       continue;
     }
     if (ch === "$" && text[i + 1] === "(") {
@@ -2004,7 +2090,9 @@ function listenerWordList(segment) {
   for (const { text, quoted } of segment) {
     const alternatives = quoted ? null : listenerBraceWords(text);
     if (alternatives === null) words.push(text);
-    else words.push(...alternatives);
+    else for (const alternative of alternatives) {
+      if (alternative !== "") words.push(alternative);
+    }
   }
   return words;
 }
@@ -2070,6 +2158,20 @@ function checkListenerWords(words, depth) {
 
 /** Deny recognized service commands without treating prompt text as a subcommand. */
 function checkListeners(text, depth = 0) {
+  for (const region of listenerRegions(text)) {
+    const denied = checkListenerRegion(region.text, depth);
+    if (denied) return denied;
+    // Heredocs can be shell input. Check literal words too: quotes in the
+    // data must not hide command shapes from the conservative listener rule.
+    if (region.heredoc && /['"]/.test(region.text)) {
+      const denied = checkListenerRegion(region.text.replace(/['"]/g, " "), depth);
+      if (denied) return denied;
+    }
+  }
+  return null;
+}
+
+function checkListenerRegion(text, depth) {
   // A substitution, a backtick or a process substitution body runs its words
   // as a command, so scan it the same way even when it sits in an argument
   // (`echo $(kimi server)`, `cat <(kimi server)`).

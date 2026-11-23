@@ -1307,12 +1307,16 @@ Enforced controls (opencode2 lane unless noted):
    launcher the hook has never heard of (`taskset`, `chrt`, `flock`, `watch`,
    `script -c`, `fd -x`, `parallel`, `eval`, …) cannot hide one. The rule
    reads `eval` bodies, `$(…)`/backtick bodies and process substitutions
-   `<(…)`/`>(…)`, and expands an unquoted `{a,b}` brace group as bash does;
-   quoted text and a `kimi -p` prompt value stay data, and the accepted cost
+   `<(…)`/`>(…)`. It skips empty unquoted brace alternatives, recognizes
+   literal unquoted IFS separators, and keeps quotes in comments or
+   heredoc data from hiding later commands. Heredoc text is still checked
+   conservatively because it can be shell input. Quotes in ordinary
+   arguments and a `kimi -p` prompt value stay data, and the accepted cost
    is a refusal of a command that only mentions the words unquoted
    (`echo kimi server`). Because the property asks at every word, the option
    walk is a forward-only table and 16 KB of `kimi -x` stays inside the 2 s
-   deadline (WI#824).
+   deadline (WI#824). Runtime-computed command words are outside this text
+   check; the container and tenant egress allowlist remain the boundary.
    **Feature flags:** the wrapper's
    `-console_watches,-mcp_events,-artifacts` pin is only as good as the
    pinned source. An unknown entry in `OPENCODE_FLAGS` is ignored without a

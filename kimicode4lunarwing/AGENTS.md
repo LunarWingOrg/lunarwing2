@@ -27,6 +27,11 @@ than escaped apostrophes instead of decoding them. Use literal shell words.
 The scanner does not model nested quote contexts inside command substitutions.
 Listener-specific parsing is tracked separately in WI#858.
 
+The WI#858 listener scan recognizes ANSI-C quoting and literal unquoted IFS
+separators, skips empty unquoted brace alternatives, and isolates comments and
+heredoc data from later commands. Heredoc bodies are still checked as potential
+shell input. This is a text guard, not a boundary against runtime-computed words.
+
 ## Protocol Compatibility
 
 The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and OpenCode workers. The legacy `ironclaw-agent-v1` alias has been removed and is not accepted. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.

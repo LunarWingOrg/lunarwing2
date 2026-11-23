@@ -52,13 +52,13 @@ function assertBlocked(command: string, reasonFragment?: string) {
   }
 }
 
-function assertAllowed(command: string) {
+function assertAllowed(command: string, timeout?: number) {
   const result = runGuard({
     hook_event_name: "PreToolUse",
     session_id: "session_test",
     tool_name: "Bash",
     tool_input: { command },
-  })
+  }, timeout)
   assert.equal(result.status, 0, `expected allow for: ${command}\nstderr: ${result.stderr}`)
 }
 
@@ -956,10 +956,47 @@ test("a long command of repeated words is decided without rescanning", () => {
   // WI#858 asks the listener property at every word, so a segment of `kimi`
   // words or of unknown options must not cost a walk per start: 16 KB of
   // `kimi -x` took 1.7 s of the 2 s deadline before the forward-only table.
-  assertAllowed("kimi -x ".repeat(2047).slice(0, 16_384))
-  assertAllowed("kimi ".repeat(3276).slice(0, 16_384))
+  assertAllowed("kimi -x ".repeat(2048), 2_000)
+  assertAllowed("kimi ".repeat(3276) + "echo", 2_000)
   assertBlocked("{kimi,server} ".repeat(1200).slice(0, 16_384), "kimi service mode")
   assertBlocked("cat <(kimi server) ".repeat(800).slice(0, 16_384), "kimi service mode")
+})
+
+test("empty brace alternatives and literal IFS separators do not hide listener words", () => {
+  for (const words of ["{kimi,} server", "{kimi,} {server,}", "{,kimi} server"]) {
+    assertBlocked(words, "kimi service mode")
+  }
+  assertBlocked("kimi${IFS}server", "kimi service mode")
+  assertBlocked("kimi$IFS'server'", "kimi service mode")
+  assertAllowed("kimi -p 'kimi${IFS}server'")
+  assertAllowed("kimi -p ''")
+})
+
+test("listener quote state follows ANSI-C words, comments, and heredocs", () => {
+  for (const command of [
+    String.raw`echo $'\'' ; kimi server`,
+    String.raw`printf '%s' $'it\'s' && kimi rc`,
+    "echo # \"\nkimi server",
+    "echo # it's\nkimi server",
+    "cat <<EOF\ndon't\nEOF\nkimi server",
+    "cat <<'EOF'\n\"\nEOF\nkimi server",
+    "cat <<-FIRST <<\"SECOND\"\n\t\"\n\tFIRST\n'\nSECOND\nkimi web",
+    "cat <<EOF\nkimi server\nEOF",
+    "bash <<EOF\nkimi server\nEOF",
+    "bash <<EOF\n# stray '\nkimi server\nEOF",
+  ]) {
+    assertBlocked(command, "kimi service mode")
+  }
+  assertBlocked(String.raw`echo $'\'' ; python3 -m http.server`, "listener started from a task")
+  assertBlocked("echo # \"\nnc -l 8080", "listener started from a task")
+  assertAllowed(String.raw`printf '%s\n' $'it\'s' && ls`)
+  assertAllowed('echo hi # "a comment"')
+  assertAllowed('kimi -p "hello # world"')
+  assertAllowed('echo a#"b" ; ls')
+  assertAllowed("echo ok # kimi server")
+  assertAllowed("cat <<'EOF'\ntext contains an apostrophe: don't\nEOF\nls")
+  const heredoc = "cat <<'EOF'\n" + "'\n".repeat(8182) + "EOF\n"
+  assertAllowed(heredoc.padEnd(16_384), 2_000)
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
