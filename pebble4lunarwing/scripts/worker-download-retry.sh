@@ -21,7 +21,7 @@
 # (.gitlab/scripts/build-worker-image.sh) and by mt-admin's build-tenant and
 # upgrade-tenant path (ic/scripts/mt-admin-lib/), so this one helper covers
 # both. The copy in each lane's scripts/ directory must stay byte-identical:
-# .gitlab/tests/test_worker_build_args.py asserts it.
+# .gitlab/tests/test_worker_download_retry.py asserts it.
 
 # Keep in step with the time-budget arithmetic in
 # .gitlab/scripts/build-worker-image.sh: three attempts from a 20 s base add
