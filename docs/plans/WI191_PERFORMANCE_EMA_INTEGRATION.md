@@ -1,12 +1,13 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
 Status: **tool/approval slice shipped in v2.1.4.0; Phase A diagnostics, category
-gating and the evaluation trace are implemented; Phase B1–B4 LLM
+gating and the evaluation trace (including a per-category `gate_pass` verdict)
+are implemented; Phase B1–B4 LLM
 logical-call timing and gate-wait analytics are implemented (owner-only
 diagnostics, no prompt-facing use yet); Phase C1–C4 bounded local-job and
 mission-run estimates are implemented with sandbox/external jobs explicitly
 excluded. The held-out tenant evaluation, hint rollout and Phase D remain in
-progress**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
+progress; their operator procedure is the A4/A5 runbook below**. [Work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191)
 closed that initial scope and is kept as the historical record of the
 completed wiring. [Work item #318](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/318)
 owns the successor phases and is the authoritative backlog and acceptance gate.
