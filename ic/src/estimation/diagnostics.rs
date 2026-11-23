@@ -20,6 +20,9 @@ const MIN_TRACE_CAPACITY: usize = 16;
 const MAX_TRACE_CAPACITY: usize = 8_192;
 /// Include the withheld period plus early forecasts after the five-sample warmup.
 const COLD_START_SAMPLE_LIMIT: u64 = 20;
+/// A4 rollout gate: the learned prediction must beat the model-derived
+/// comparison baseline by at least this much on median absolute error.
+const GATE_MIN_IMPROVEMENT_PERCENT: f64 = 10.0;
 
 /// Per-category display gating (A3).
 ///
@@ -257,12 +260,16 @@ impl ErrorAccumulator {
     }
 
     fn finish(self) -> EvaluationMetrics {
+        let comparison_baseline = self.comparison.finish();
         EvaluationMetrics {
             samples: self.samples,
             prediction_samples: self.prediction_samples,
             coverage: self.prediction_samples as f64 / self.samples.max(1) as f64,
+            gate_pass: comparison_baseline
+                .improvement_percent
+                .map(|improvement| improvement >= GATE_MIN_IMPROVEMENT_PERCENT),
             declared_baseline: self.declared.finish(),
-            comparison_baseline: self.comparison.finish(),
+            comparison_baseline,
         }
     }
 }
@@ -320,6 +327,11 @@ pub struct EvaluationMetrics {
     pub samples: u64,
     pub prediction_samples: u64,
     pub coverage: f64,
+    /// A4 gate verdict against `comparison_baseline` on this cohort: `true`
+    /// only when a paired improvement exists and reaches
+    /// `GATE_MIN_IMPROVEMENT_PERCENT`. `null` (no paired samples, or a zero
+    /// baseline median) is not a pass.
+    pub gate_pass: Option<bool>,
     /// Against duration baselines declared by the tool itself.
     pub declared_baseline: BaselineComparison,
     /// Against the mean of the model's own earliest valid completed runs,
@@ -597,6 +609,63 @@ mod tests {
         assert_eq!(metrics.declared_baseline.improvement_percent, None);
         assert_eq!(metrics.comparison_baseline.samples, 1);
         assert_eq!(metrics.comparison_baseline.improvement_percent, None);
+        assert_eq!(metrics.gate_pass, None);
+    }
+
+    #[test]
+    fn gate_pass_requires_a_ten_percent_paired_improvement() {
+        // Baseline error 100s, prediction error 89s: 11% better, passes.
+        let mut pass = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        pass.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            None,
+            Some(200),
+            Some(111),
+            100,
+        ));
+        let passed = &pass.summary().categories[0].overall;
+        assert_eq!(passed.comparison_baseline.samples, 1);
+        assert_eq!(passed.gate_pass, Some(true));
+
+        // Baseline error 100s, prediction error 95s: only 5% better.
+        let mut weak = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        weak.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            None,
+            Some(200),
+            Some(195),
+            100,
+        ));
+        assert_eq!(weak.summary().categories[0].overall.gate_pass, Some(false));
+
+        // A regressed category is reported as a failure, never as absent.
+        let mut worse = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        worse.push(record(
+            "http",
+            DEFAULT_MIN_SAMPLES,
+            None,
+            Some(200),
+            Some(250),
+            100,
+        ));
+        assert_eq!(worse.summary().categories[0].overall.gate_pass, Some(false));
+    }
+
+    #[test]
+    fn gate_pass_is_null_without_a_paired_comparison_sample() {
+        // No comparison baseline was frozen for this call (first run).
+        let mut trace = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        trace.push(record("http", DEFAULT_MIN_SAMPLES, None, None, Some(5), 5));
+        let metrics = &trace.summary().categories[0].overall;
+        assert_eq!(metrics.comparison_baseline.samples, 0);
+        assert_eq!(metrics.gate_pass, None);
+
+        // A warmed baseline with no learned prediction yet is also not a pass.
+        let mut withheld = EvaluationTrace::new(MIN_TRACE_CAPACITY);
+        withheld.push(record("http", DEFAULT_MIN_SAMPLES, None, Some(10), None, 1));
+        assert_eq!(withheld.summary().categories[0].overall.gate_pass, None);
     }
 
     #[test]
