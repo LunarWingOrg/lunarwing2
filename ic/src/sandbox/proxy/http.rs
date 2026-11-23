@@ -908,6 +908,7 @@ mod tests {
     use crate::sandbox::proxy::allowlist::DomainAllowlist;
     use crate::sandbox::proxy::policy::DefaultPolicyDecider;
     use crate::secrets::{CredentialLocation, CredentialMapping};
+    use std::path::Path;
     use tracing_test::traced_test;
 
     /// Resolves every secret name to a fixed value (for testing).
@@ -2240,6 +2241,301 @@ mod tests {
             !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
             "injected credential leaked into the body-read error log"
         );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#860 end-to-end: a real private git remote over plain HTTP, cloned by
+    /// real `git` through the scoped proxy. The upstream refuses any request
+    /// without the exact `Authorization` header, and the header is added by
+    /// the proxy from a host-side secret. Nothing the container sees holds it.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_injects_a_host_side_git_credential_for_a_real_http_remote() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "Basic Z2l0OnNlY3JldC1tYXJrZXItOWY4ZQ==";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bare = root.join("repo.git");
+        let git = |args: &[&str], dir: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q", "--bare", bare.to_str().unwrap()], &root);
+        let work = root.join("work");
+        git(&["init", "-q", work.to_str().unwrap()], &root);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        git(&["add", "file.txt"], &work);
+        git(&["commit", "-q", "-m", "one"], &work);
+        git(&["remote", "add", "origin", bare.to_str().unwrap()], &work);
+        // Push to whatever the bare repository's HEAD names, so the clone
+        // checks out a branch rather than an unborn HEAD.
+        let head_ref = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .expect("symbolic-ref");
+        let head_ref = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
+        let head_ref = if head_ref.is_empty() {
+            "refs/heads/master".to_string()
+        } else {
+            head_ref
+        };
+        git(
+            &["push", "-q", "origin", &format!("HEAD:{head_ref}")],
+            &work,
+        );
+
+        // A CGI-backed smart-HTTP upstream that requires the exact header and
+        // serves the real bare repository through `git http-backend`.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let project_root = root.clone();
+        let expected = format!("Basic {}", SECRET.trim_start_matches("Basic "));
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let project_root = project_root.clone();
+                let expected = expected.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut head_end = None;
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut buf = [0u8; 16384];
+                        let n = match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            conn.read(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => return,
+                        };
+                        raw.extend_from_slice(&buf[..n]);
+                        if head_end.is_none()
+                            && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                            content_length = head
+                                .lines()
+                                .find(|line| {
+                                    line.to_ascii_lowercase().starts_with("content-length:")
+                                })
+                                .and_then(|line| line.split_once(':'))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            head_end = Some(pos + 4);
+                        }
+                        if let Some(pos) = head_end
+                            && raw.len() >= pos + content_length
+                        {
+                            break;
+                        }
+                    }
+                    let split = head_end.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+                    let body = raw[split..].to_vec();
+                    let authorized = head.lines().any(|line| {
+                        line.to_ascii_lowercase().starts_with("authorization:")
+                            && line
+                                .split_once(':')
+                                .is_some_and(|(_, value)| value.trim() == expected)
+                    });
+                    if !authorized {
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let method = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().next())
+                        .unwrap_or("GET")
+                        .to_string();
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let (script_path, query) = match path.split_once('?') {
+                        Some((path, query)) => (path.to_string(), query.to_string()),
+                        None => (path, String::new()),
+                    };
+                    let content_type = if method == "POST" {
+                        "application/x-git-upload-pack-request"
+                    } else {
+                        "application/x-git-upload-pack-result"
+                    };
+                    let mut child = tokio::process::Command::new("git")
+                        .arg("http-backend")
+                        .env("GIT_PROJECT_ROOT", project_root.to_str().unwrap())
+                        .env("GIT_HTTP_EXPORT_ALL", "1")
+                        .env("REQUEST_METHOD", &method)
+                        .env("PATH_INFO", script_path)
+                        .env("QUERY_STRING", query)
+                        .env("CONTENT_TYPE", content_type)
+                        .env("CONTENT_LENGTH", body.len().to_string())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .expect("git http-backend");
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(&body).await;
+                    }
+                    let out = child.wait_with_output().await.expect("backend output");
+                    let split = out
+                        .stdout
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                        .unwrap_or(out.stdout.len());
+                    let headers = String::from_utf8_lossy(&out.stdout[..split]).to_string();
+                    let body = &out.stdout[split..];
+                    let status = headers
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("status:"))
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_else(|| "200 OK".to_string());
+                    let mut response = format!("HTTP/1.1 {status}\r\n").into_bytes();
+                    for line in headers.lines() {
+                        if line.is_empty() || line.to_ascii_lowercase().starts_with("status:") {
+                            continue;
+                        }
+                        response.extend_from_slice(line.as_bytes());
+                        response.extend_from_slice(b"\r\n");
+                    }
+                    response.extend_from_slice(
+                        format!(
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    response.extend_from_slice(body);
+                    let _ = conn.write_all(&response).await;
+                });
+            }
+        });
+
+        // The proxy the sandbox would start: exact host allowlist plus the
+        // host-side credential binding from `SANDBOX_GIT_CREDENTIALS`.
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping::header(
+            "GIT_ORIGIN_TOKEN",
+            "Authorization",
+            "127.0.0.1",
+        )];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+        let proxy = HttpProxy::new(decider, resolver);
+        let proxy_addr = proxy.start(0).await.unwrap();
+
+        // Real `git clone` through the proxy, as the container would run it.
+        let clone_dir = root.join("clone");
+        let output = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &format!("http://127.0.0.1:{upstream_port}/repo.git"),
+                clone_dir.to_str().unwrap(),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("http_proxy", format!("http://{proxy_addr}"))
+            .env("no_proxy", "")
+            .output()
+            .await
+            .expect("git clone runs");
+        assert!(
+            output.status.success(),
+            "clone failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(clone_dir.join("file.txt").exists());
+
+        // Negative control: the same clone without the credential mapping is
+        // refused by the upstream, so the success above really came from the
+        // proxy's injection and not an unauthenticated read.
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, Vec::new()));
+        let bare_proxy = HttpProxy::new(decider, Arc::new(FixedCredentialResolver(String::new())));
+        let bare_addr = bare_proxy.start(0).await.unwrap();
+        let denied_dir = root.join("denied");
+        let denied = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &format!("http://127.0.0.1:{upstream_port}/repo.git"),
+                denied_dir.to_str().unwrap(),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("http_proxy", format!("http://{bare_addr}"))
+            .env("no_proxy", "")
+            .output()
+            .await
+            .expect("git clone runs");
+        assert!(
+            !denied.status.success(),
+            "an uncredentialed clone must be refused: {}",
+            String::from_utf8_lossy(&denied.stdout)
+        );
+        assert!(!denied_dir.join("file.txt").exists());
+        bare_proxy.stop().await;
+
+        // The container-side view of the same grant carries no secret.
+        let host = crate::sandbox::GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=GIT_ORIGIN_TOKEN",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let grant = crate::sandbox::git_grant::authorize_grant(
+            &host,
+            &[],
+            &root,
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
+        let joined = grant
+            .container_env()
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(SECRET), "{joined}");
+        assert!(!joined.contains("GIT_ORIGIN_TOKEN"), "{joined}");
 
         proxy.stop().await;
         upstream_task.abort();
