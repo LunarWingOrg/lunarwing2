@@ -200,6 +200,11 @@ impl GitGrantAuthorization {
     /// Git configuration passed to the container through `GIT_CONFIG_*` env
     /// entries. Values are granted remote URLs and hardening switches only;
     /// no credential, token, key or credential-helper command is included.
+    ///
+    /// Each remote is pinned with an empty `remote.<name>.url` first: setting
+    /// that key to the empty string clears the URL list, so a repository-local
+    /// URL (written after a clone, and read before these entries) cannot win.
+    /// Measured on git 2.39.5 (image) and 2.56.1 (dev).
     pub fn container_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
@@ -208,6 +213,12 @@ impl GitGrantAuthorization {
         ];
         let mut index = 0usize;
         for remote in &self.remotes {
+            env.push((
+                format!("GIT_CONFIG_KEY_{index}"),
+                format!("remote.{}.url", remote.name),
+            ));
+            env.push((format!("GIT_CONFIG_VALUE_{index}"), String::new()));
+            index += 1;
             env.push((
                 format!("GIT_CONFIG_KEY_{index}"),
                 format!("remote.{}.url", remote.name),
@@ -349,7 +360,7 @@ pub(super) fn authorize_shell_command(
         grant,
         offline: network == SandboxNetworkMode::None,
     };
-    for simple in tokenize_simple_commands(command) {
+    for simple in tokenize_simple_commands(command)? {
         scan_simple_command(&simple, preflight, 0)?;
     }
     Ok(())
@@ -507,7 +518,7 @@ fn is_explicit_local_path(raw: &str) -> bool {
 
 /// Split a shell command into simple commands. Quote-aware; command
 /// separators end a command. Dynamic expansions are flagged, not evaluated.
-fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
+fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut current = String::new();
@@ -548,7 +559,9 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
                 match c {
                     '"' => quote = None,
                     '\\' => {
-                        if let Some(next) = chars.next() {
+                        if let Some(next) = chars.next()
+                            && next != '\n'
+                        {
                             current.push(next);
                         }
                     }
@@ -565,11 +578,21 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
                     quote = Some(c);
                     started = true;
                 }
-                '\\' => {
-                    started = true;
-                    if let Some(next) = chars.next() {
+                '\\' => match chars.next() {
+                    Some('\n') => {}
+                    Some(next) => {
+                        started = true;
                         current.push(next);
                     }
+                    None => return Err(denied("incomplete shell escape")),
+                },
+                '#' if !started => {
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            break;
+                        }
+                    }
+                    finish_command(&mut commands, &mut words);
                 }
                 ';' | '\n' | '|' | '&' | '(' | ')' => {
                     finish_word(&mut words, &mut current, &mut dynamic, &mut started);
@@ -590,15 +613,20 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
             },
         }
     }
+    if quote.is_some() {
+        return Err(denied("unterminated shell quote"));
+    }
     finish_word(&mut words, &mut current, &mut dynamic, &mut started);
     finish_command(&mut commands, &mut words);
-    commands
+    Ok(commands)
 }
 
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
+    // `NAME+=value` appends, and reaches the same variable as `NAME=value`.
+    let name = name.strip_suffix('+').unwrap_or(name);
     !name.is_empty()
         && name.bytes().enumerate().all(|(index, byte)| {
             if index == 0 {
@@ -613,6 +641,114 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
+/// A shell that could be given a `-c` script the scan must read.
+fn is_shell_name(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" | "mksh" | "fish" | "csh" | "tcsh"
+    )
+}
+
+/// Words that are shell syntax rather than a command: the negation and
+/// grouping prefixes, and the reserved words that introduce a command.
+fn is_command_prefix_word(name: &str) -> bool {
+    matches!(
+        name,
+        "!" | "{"
+            | "}"
+            | "if"
+            | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "esac"
+            | "for"
+            | "in"
+            | "case"
+            | "select"
+            | "function"
+    )
+}
+
+/// Shell builtins that print or transform their arguments instead of running
+/// them, so a later `git` word after one of these is data. Anything not here
+/// is treated as a possible wrapper whose arguments could be the command.
+const INERT_COMMANDS: &[&str] = &[
+    "echo", "true", "false", "test", "[", "[[", ":", "cd", "pwd", "exit", "return", "shift",
+    "wait", "type", "hash", "umask", "ulimit", "set", "trap", "jobs", "fg", "bg", "let", "shopt",
+    "alias", "unalias", "times", "help", "history", "getopts", "caller", "disown", "dirs", "pushd",
+    "popd",
+];
+
+/// A simple command whose leading word the scan does not know is refused when
+/// a later word in the same clause names Git, a Git plumbing executable, or a
+/// shell that could run one: the scan cannot tell an ordinary argument from
+/// the command a wrapper runs.
+fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
+    let command = basename(&words[from].text);
+    if INERT_COMMANDS.contains(&command) || matches!(command, "grep" | "which" | "ps" | "ls") {
+        return Ok(());
+    }
+    for word in &words[from + 1..] {
+        if word.dynamic {
+            continue;
+        }
+        let name = basename(&word.text);
+        if name == "git" || is_git_plumbing_executable(name) || is_shell_name(name) {
+            return Err(denied(format!(
+                "a command this preflight cannot read ({command}) names git; use a recognized command form"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Step over a wrapper's option words, returning the index of its first
+/// operand. `value_options` names the options that consume a separate word.
+/// A lone `-` and `--` are options, as GNU wrappers read them.
+fn skip_wrapper_options(words: &[Word], mut index: usize, value_options: &[&str]) -> usize {
+    while index < words.len() {
+        let word = words[index].text.as_str();
+        if word == "--" {
+            return index + 1;
+        }
+        if word == "-" {
+            index += 1;
+            continue;
+        }
+        if !word.starts_with('-') {
+            return index;
+        }
+        index += if value_options.contains(&word) { 2 } else { 1 };
+    }
+    index
+}
+
+/// GNU `env` options that consume the following word.
+const ENV_VALUE_OPTIONS: &[&str] = &[
+    "-u",
+    "--unset",
+    "-a",
+    "--argv0",
+    "-C",
+    "--chdir",
+    "-S",
+    "--split-string",
+    "--env0-from",
+];
+/// GNU `timeout` options that consume the following word.
+const TIMEOUT_VALUE_OPTIONS: &[&str] = &["-s", "--signal", "-k", "--kill-after"];
+/// GNU `nice` options that consume the following word.
+const NICE_VALUE_OPTIONS: &[&str] = &["-n", "--adjustment"];
+/// GNU `time` options that consume the following word.
+const TIME_VALUE_OPTIONS: &[&str] = &["-f", "--format", "-o", "--output"];
+/// `exec -a` names the replacement argv[0].
+const EXEC_VALUE_OPTIONS: &[&str] = &["-a"];
+
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     if depth > 4 {
         return Err(denied(
@@ -626,49 +762,61 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
     }
     while index < words.len() {
         let command = basename(&words[index].text).to_string();
+        if is_command_prefix_word(&command) {
+            index += 1;
+            continue;
+        }
         match command.as_str() {
             "env" => {
-                index += 1;
-                while index < words.len()
-                    && (words[index].text.starts_with('-') || is_assignment(&words[index].text))
+                // `env -S 'cmd args'` splits its value into words, so it is a
+                // shell-shaped string: scan it like one before stepping over.
+                if let Some(value) = words
+                    .get(index + 1)
+                    .and_then(|word| word.text.strip_prefix("--split-string="))
+                    .map(str::to_string)
                 {
+                    let body = Word {
+                        text: value,
+                        dynamic: words[index + 1].dynamic,
+                    };
+                    scan_shell_body(&body, preflight, depth)?;
+                }
+                index = skip_wrapper_options(words, index + 1, ENV_VALUE_OPTIONS);
+                while index < words.len() && is_assignment(&words[index].text) {
                     refuse_config_env_assignment(&words[index])?;
                     index += 1;
                 }
             }
-            "export" => {
-                index += 1;
-                while index < words.len() {
-                    if is_assignment(&words[index].text) {
-                        refuse_config_env_assignment(&words[index])?;
-                    }
-                    index += 1;
+            // Shell builtins that only assign or export names. `declare -x`,
+            // `typeset -x`, `readonly` and `local` reach the same variables
+            // the bare `NAME=value` form does.
+            "export" | "readonly" | "declare" | "typeset" | "local" => {
+                return authorize_declaration(&command, &words[index + 1..]);
+            }
+            "read" | "mapfile" | "readarray" | "unset" => {
+                for operand in &words[index + 1..] {
+                    refuse_git_config_variable(&operand.text)?;
                 }
                 return Ok(());
             }
-            "command" | "exec" | "nohup" | "time" => {
+            "printf" => return authorize_printf(&words[index + 1..]),
+            "command" | "nohup" => index = skip_wrapper_options(words, index + 1, &[]),
+            "exec" => index = skip_wrapper_options(words, index + 1, EXEC_VALUE_OPTIONS),
+            "time" => index = skip_wrapper_options(words, index + 1, TIME_VALUE_OPTIONS),
+            // `timeout [OPTION]... DURATION COMMAND [ARG]...`
+            "timeout" => {
+                index = skip_wrapper_options(words, index + 1, TIMEOUT_VALUE_OPTIONS);
                 index += 1;
-                while index < words.len() && words[index].text.starts_with('-') {
-                    index += 1;
-                }
             }
-            "timeout" if index + 1 < words.len() => {
-                index += 2;
-            }
-            "nice" => {
-                index += 1;
-                while index < words.len() && words[index].text.starts_with('-') {
-                    index += 1;
-                }
-            }
+            "nice" => index = skip_wrapper_options(words, index + 1, NICE_VALUE_OPTIONS),
             "sudo" => {
                 index += 1;
                 index = skip_sudo_options(words, index);
             }
-            "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" => {
+            name if is_shell_name(name) => {
                 return scan_shell_c(words, index, preflight, depth);
             }
-            "git" => return inspect_git_command(&words[index..], preflight),
+            "git" => return inspect_git_command(&words[index..], preflight, depth),
             // Git's plumbing executables are not subcommands, so they bypass
             // `inspect_git_command` entirely when invoked by path. They take
             // the same unscreened remote destinations.
@@ -677,8 +825,37 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
                     "{name} is not supported by manifest Git preflight"
                 )));
             }
-            _ => return Ok(()),
+            _ => return refuse_unread_git_tail(words, index),
         }
+    }
+    Ok(())
+}
+
+fn authorize_declaration(command: &str, args: &[Word]) -> Result<()> {
+    let nameref = matches!(command, "declare" | "typeset" | "local")
+        && args
+            .iter()
+            .take_while(|arg| arg.text.starts_with('-') && arg.text != "--")
+            .any(|arg| arg.text[1..].contains('n'));
+    for arg in args.iter().filter(|word| is_assignment(&word.text)) {
+        refuse_config_env_assignment(arg)?;
+        if nameref && let Some((_, target)) = arg.text.split_once('=') {
+            refuse_git_config_variable(target)?;
+        }
+    }
+    Ok(())
+}
+
+fn authorize_printf(args: &[Word]) -> Result<()> {
+    if let Some(option) = args.first()
+        && let Some(attached) = option.text.strip_prefix("-v")
+    {
+        let name = if attached.is_empty() {
+            args.get(1).map_or("", |word| word.text.as_str())
+        } else {
+            attached
+        };
+        refuse_git_config_variable(name)?;
     }
     Ok(())
 }
@@ -715,6 +892,32 @@ fn skip_sudo_options(words: &[Word], mut index: usize) -> usize {
     index
 }
 
+/// Options a POSIX shell accepts before `-c` that consume the following word.
+/// `-o`/`+o` name a shell option, `-O`/`+O` a `shopt` name, and the long
+/// forms a startup file.
+const SHELL_VALUE_OPTIONS: &[&str] = &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"];
+/// Short shell flags that take no value. Anything else is refused rather than
+/// guessed, since an unknown flag could be the one that changes `-c`.
+const SHELL_FLAGS: &[&str] = &[
+    "-a", "-b", "-e", "-f", "-h", "-k", "-m", "-n", "-p", "-t", "-u", "-v", "-x", "-B", "-C", "-E",
+    "-H", "-P", "-T", "-i", "-l", "-r", "-s", "-D",
+];
+/// Long shell flags that take no value.
+const SHELL_LONG_FLAGS: &[&str] = &[
+    "--posix",
+    "--noprofile",
+    "--norc",
+    "--noediting",
+    "--login",
+    "--verbose",
+    "--debugger",
+    "--restricted",
+    "--dump-strings",
+    "--dump-po-strings",
+    "--help",
+    "--version",
+];
+
 fn scan_shell_c(
     words: &[Word],
     index: usize,
@@ -722,27 +925,51 @@ fn scan_shell_c(
     depth: usize,
 ) -> Result<()> {
     let mut cursor = index + 1;
+    let mut has_command = false;
     while cursor < words.len() {
-        let word = &words[cursor].text;
-        if word == "-c" || (word.starts_with('-') && !word.starts_with("--") && word.contains('c'))
-        {
-            let Some(script) = words.get(cursor + 1) else {
-                return Ok(());
-            };
-            if script.dynamic {
-                return Err(denied(
-                    "dynamic shell script text cannot be authorized for git network access",
-                ));
-            }
-            for simple in tokenize_simple_commands(&script.text) {
-                scan_simple_command(&simple, preflight, depth + 1)?;
-            }
-            return Ok(());
+        let word = &words[cursor];
+        let text = word.text.as_str();
+        if text == "--" {
+            cursor += 1;
+            break;
         }
-        if !word.starts_with('-') {
-            return Ok(());
+        if text == "-" || (!text.starts_with('-') && !text.starts_with('+')) {
+            break;
         }
-        cursor += 1;
+        if word.dynamic {
+            return Err(denied(
+                "dynamic shell option cannot be authorized for git network access",
+            ));
+        }
+        if SHELL_VALUE_OPTIONS.contains(&text) {
+            cursor += 2;
+            continue;
+        }
+        if SHELL_LONG_FLAGS.contains(&text) {
+            cursor += 1;
+            continue;
+        }
+        if text.starts_with("--") {
+            return Err(denied(
+                "unsupported shell option before -c; use a supported invocation",
+            ));
+        }
+        let flags = &text[1..];
+        if flags.chars().all(|flag| {
+            (flag == 'c' && text.starts_with('-'))
+                || SHELL_FLAGS.iter().any(|known| known.ends_with(flag))
+        }) {
+            // `-ce` and `-ec` both take the script as a separate operand.
+            has_command |= flags.contains('c');
+            cursor += 1;
+            continue;
+        }
+        return Err(denied(
+            "unsupported shell option before -c; use a supported invocation",
+        ));
+    }
+    if has_command && let Some(body) = words.get(cursor) {
+        scan_shell_body(body, preflight, depth)?;
     }
     Ok(())
 }
@@ -761,6 +988,10 @@ const REDIRECTING_CONFIG_KEYS: &[&str] = &[
     "url.",
     "credential.",
     "http.extraheader",
+    "help.autocorrect",
+    "core.editor",
+    "core.fsmonitor",
+    "sequence.editor",
     "alias.",
     "include.",
     "includeif.",
@@ -795,9 +1026,10 @@ fn config_overrides(words: &[Word], index: usize) -> Vec<String> {
 /// because Git lowercases section and variable names.
 fn is_redirecting_config_key(raw: &str) -> bool {
     let key = raw.trim().to_ascii_lowercase();
-    REDIRECTING_CONFIG_KEYS.iter().any(|prefix| {
-        key.trim_end_matches('.') == prefix.trim_end_matches('.') || key.starts_with(prefix)
-    })
+    (key.starts_with("http.") && key.ends_with(".extraheader"))
+        || REDIRECTING_CONFIG_KEYS.iter().any(|prefix| {
+            key.trim_end_matches('.') == prefix.trim_end_matches('.') || key.starts_with(prefix)
+        })
 }
 
 fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
@@ -816,11 +1048,136 @@ fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `git config` writes persist an alias, an include, or a remote URL that a
-/// later command would use unseen by the preflight. Reads are unaffected.
+/// What a `git config` call does with the keys it names. `None` is the
+/// classic form, where the number of operands decides between read and write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigAction {
+    None,
+    List,
+    Get,
+    GetRegexp,
+    GetUrlmatch,
+    GetColor,
+    GetColorbool,
+    Write,
+    Unset,
+    RenameSection,
+    RemoveSection,
+    Edit,
+}
+
+/// One `git config` long option: its full spelling, the words it consumes
+/// including itself, and what it makes the call do.
+type ConfigOption = (&'static str, usize, ConfigAction);
+
+/// Every long option `git config` accepts. `--get-color`/`--get-colorbool`
+/// name a colour, not a configuration key, so their operand is not checked.
+#[rustfmt::skip]
+const CONFIG_OPTIONS: &[ConfigOption] = &[
+    ("--global", 1, ConfigAction::None),
+    ("--system", 1, ConfigAction::None),
+    ("--local", 1, ConfigAction::None),
+    ("--worktree", 1, ConfigAction::None),
+    ("--file", 2, ConfigAction::None),
+    ("--blob", 2, ConfigAction::None),
+    ("--type", 2, ConfigAction::None),
+    ("--default", 2, ConfigAction::None),
+    ("--value", 2, ConfigAction::None),
+    ("--url", 2, ConfigAction::None),
+    ("--comment", 2, ConfigAction::Write),
+    ("--list", 1, ConfigAction::List),
+    ("--name-only", 1, ConfigAction::None),
+    ("--show-origin", 1, ConfigAction::None),
+    ("--show-scope", 1, ConfigAction::None),
+    ("--show-names", 1, ConfigAction::None),
+    ("--includes", 1, ConfigAction::None),
+    ("--no-includes", 1, ConfigAction::None),
+    ("--fixed-value", 1, ConfigAction::None),
+    ("--null", 1, ConfigAction::None),
+    ("--all", 1, ConfigAction::None),
+    ("--regexp", 1, ConfigAction::None),
+    ("--append", 1, ConfigAction::Write),
+    ("--get", 1, ConfigAction::Get),
+    ("--get-all", 1, ConfigAction::Get),
+    ("--get-regexp", 1, ConfigAction::GetRegexp),
+    ("--get-urlmatch", 3, ConfigAction::GetUrlmatch),
+    ("--get-color", 3, ConfigAction::GetColor),
+    ("--get-colorbool", 3, ConfigAction::GetColorbool),
+    ("--add", 1, ConfigAction::Write),
+    ("--replace-all", 1, ConfigAction::Write),
+    ("--unset", 1, ConfigAction::Unset),
+    ("--unset-all", 1, ConfigAction::Unset),
+    ("--rename-section", 1, ConfigAction::RenameSection),
+    ("--remove-section", 1, ConfigAction::RemoveSection),
+    ("--edit", 1, ConfigAction::Edit),
+];
+
+/// Resolve a `--name` or `--name=value` the way git does: an exact match
+/// wins, otherwise a prefix must be unambiguous. Anything else is refused
+/// rather than guessed.
+fn resolve_config_option(text: &str) -> Option<(&'static ConfigOption, bool)> {
+    let (flag, attached) = match text.split_once('=') {
+        Some((flag, value)) => (flag, !value.is_empty()),
+        None => (text, false),
+    };
+    if let Some(exact) = CONFIG_OPTIONS.iter().find(|option| option.0 == flag) {
+        return Some((exact, attached));
+    }
+    let mut candidates = CONFIG_OPTIONS
+        .iter()
+        .filter(|option| option.0.starts_with(flag));
+    let first = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some((first, attached))
+}
+
+/// Classify a `git config` short-option cluster. `-lz` is `-l -z`; `-f` takes
+/// the rest of the cluster or the next word as its file.
+fn config_short_option(cluster: &str) -> Option<(usize, ConfigAction)> {
+    let mut action = ConfigAction::None;
+    let mut chars = cluster.chars();
+    while let Some(flag) = chars.next() {
+        match flag {
+            'l' | 'z' | 'a' => {}
+            'e' => action = ConfigAction::Edit,
+            'f' => {
+                let attached: String = chars.collect();
+                return Some((if attached.is_empty() { 2 } else { 1 }, action));
+            }
+            _ => return None,
+        }
+    }
+    Some((1, action))
+}
+
+impl ConfigAction {
+    /// Actions that persist something. A read cannot redirect a later
+    /// command, so only these check the key against the redirecting prefixes.
+    fn writes(self) -> bool {
+        matches!(
+            self,
+            ConfigAction::Write
+                | ConfigAction::Unset
+                | ConfigAction::RenameSection
+                | ConfigAction::RemoveSection
+                | ConfigAction::Edit
+        )
+    }
+}
+
+/// `git config` persists an alias, an include, or a remote URL that a later
+/// command would use unseen by the preflight, so every key the call writes,
+/// renames or edits is checked; an edit is refused outright because its
+/// editor can write any key. A read is checked for a dynamic key only: it
+/// cannot change what a later command does. The `set`/`get`/`unset`/
+/// `rename-section`/`remove-section`/`edit` subcommands of git 2.46 and later
+/// are read with the classic spellings, and long options are read with git's
+/// own prefixes.
 fn authorize_config(args: &[Word]) -> Result<()> {
     let mut positionals: Vec<&Word> = Vec::new();
-    let mut writes = false;
+    let mut action = ConfigAction::None;
     let mut index = 0;
     while index < args.len() {
         let word = &args[index];
@@ -834,15 +1191,20 @@ fn authorize_config(args: &[Word]) -> Result<()> {
             index += 1;
             continue;
         }
-        let classified = if text.starts_with("--") {
-            config_long_option(text)
+        let (consumed, is_action) = if text.starts_with("--") {
+            let Some((option, attached)) = resolve_config_option(text) else {
+                return Err(denied(
+                    "unsupported or ambiguous option in manifest git config; use a full supported option",
+                ));
+            };
+            (if attached { 1 } else { option.1 }, option.2)
         } else {
-            config_short_option(&text[1..])
-        };
-        let Some((consumed, is_write)) = classified else {
-            return Err(denied(
-                "unsupported option in manifest git config; use full supported options",
-            ));
+            let Some(classified) = config_short_option(&text[1..]) else {
+                return Err(denied(
+                    "unsupported option in manifest git config; use full supported options",
+                ));
+            };
+            classified
         };
         if consumed > 1 {
             let values = args.get(index + 1..index + consumed);
@@ -851,145 +1213,141 @@ fn authorize_config(args: &[Word]) -> Result<()> {
                 _ => return Err(denied("git config option requires a literal value")),
             }
         }
-        writes |= is_write;
+        if is_action == ConfigAction::GetUrlmatch {
+            // `--get-urlmatch <name> <url>` names its key as the first value.
+            if let Some(name) = args.get(index + 1) {
+                positionals.push(name);
+            }
+        }
+        if action == ConfigAction::None {
+            action = is_action;
+        }
         index += consumed;
     }
-    // `git config <name>` reads one key. `git config <name> <value>` and any
-    // explicit write flag can persist a redirect.
-    if !writes && positionals.len() < 2 {
-        return Ok(());
-    }
-    let Some(key) = positionals.first() else {
-        return Ok(());
-    };
-    if key.dynamic {
+    let (action, keys) = config_subcommand(action, positionals);
+    if action == ConfigAction::Edit {
         return Err(denied(
-            "dynamic git config key cannot be authorized; name the key literally",
+            "git config edit opens an editor that can write any key; name the keys instead",
         ));
     }
-    if is_redirecting_config_key(&key.text) {
-        return Err(denied(
-            "git config writes that can redirect a granted remote or subcommand are not permitted",
-        ));
+    for key in keys {
+        if key.dynamic {
+            return Err(denied(
+                "dynamic git config key cannot be authorized; name the key literally",
+            ));
+        }
+        if action.writes() && is_redirecting_config_key(&key.text) {
+            return Err(denied(
+                "git config keys that can redirect a granted remote or subcommand are not permitted",
+            ));
+        }
     }
     Ok(())
 }
 
-/// Classify one long `git config` option as `(words consumed, is_write)`.
-/// Anything not listed is refused rather than guessed: an abbreviation could
-/// be a write or could change what the following word means.
-fn config_long_option(text: &str) -> Option<(usize, bool)> {
-    const FLAGS: &[&str] = &[
-        "--global",
-        "--system",
-        "--local",
-        "--worktree",
-        "--get",
-        "--get-all",
-        "--get-regexp",
-        "--list",
-        "--name-only",
-        "--show-origin",
-        "--show-scope",
-        "--show-names",
-        "--includes",
-        "--no-includes",
-        "--fixed-value",
-        "--null",
-        "--all",
-    ];
-    const WRITE_FLAGS: &[&str] = &[
-        "--add",
-        "--replace-all",
-        "--unset",
-        "--unset-all",
-        "--rename-section",
-        "--remove-section",
-        "--edit",
-    ];
-    const VALUE_OPTIONS: &[&str] = &["--file", "--type", "--default", "--blob", "--comment"];
-    const GET_URLMATCH: &str = "--get-urlmatch";
-
-    if let Some((flag, value)) = text.split_once('=') {
-        if flag == GET_URLMATCH && !value.is_empty() {
-            return Some((2, false));
-        }
-        if VALUE_OPTIONS.contains(&flag) && !value.is_empty() {
-            return Some((1, flag == "--comment"));
-        }
-        if FLAGS.contains(&flag) {
-            return Some((1, false));
-        }
-        return WRITE_FLAGS.contains(&flag).then_some((1, true));
+/// Fold the git 2.46 subcommand word into the classic action and return the
+/// operands that name keys. The classic form has no action word, so the
+/// operand count decides between a read and a write.
+fn config_subcommand(action: ConfigAction, positionals: Vec<&Word>) -> (ConfigAction, Vec<&Word>) {
+    let subcommand = positionals
+        .first()
+        .map(|word| word.text.as_str())
+        .filter(|word| {
+            action == ConfigAction::None || (action == ConfigAction::Write && *word == "set")
+        });
+    let (mut action, operands) = match subcommand {
+        Some("list") => (ConfigAction::List, &positionals[1..]),
+        Some("get") => (ConfigAction::Get, &positionals[1..]),
+        Some("set") => (ConfigAction::Write, &positionals[1..]),
+        Some("unset") => (ConfigAction::Unset, &positionals[1..]),
+        Some("rename-section") => (ConfigAction::RenameSection, &positionals[1..]),
+        Some("remove-section") => (ConfigAction::RemoveSection, &positionals[1..]),
+        Some("edit") => (ConfigAction::Edit, &positionals[1..]),
+        _ => (action, &positionals[..]),
+    };
+    // The classic form has no action word: `git config <name>` reads one key
+    // and `git config <name> <value>` writes it.
+    if action == ConfigAction::None && operands.len() >= 2 {
+        action = ConfigAction::Write;
     }
-    if text == GET_URLMATCH {
-        // `--get-urlmatch <name> <url>` consumes two values.
-        return Some((3, false));
-    }
-    if VALUE_OPTIONS.contains(&text) {
-        return Some((2, text == "--comment"));
-    }
-    if FLAGS.contains(&text) {
-        return Some((1, false));
-    }
-    WRITE_FLAGS.contains(&text).then_some((1, true))
-}
-
-/// Classify a `git config` short-option cluster. `-lz` is `-l -z`; `-f` takes
-/// the rest of the cluster or the next word as its file.
-fn config_short_option(cluster: &str) -> Option<(usize, bool)> {
-    let mut writes = false;
-    let mut chars = cluster.chars();
-    while let Some(flag) = chars.next() {
-        match flag {
-            'l' | 'z' | 'a' => {}
-            'e' => writes = true,
-            'f' => {
-                let attached: String = chars.collect();
-                return Some((if attached.is_empty() { 2 } else { 1 }, writes));
-            }
-            _ => return None,
-        }
-    }
-    Some((1, writes))
+    let keys = match action {
+        ConfigAction::RenameSection => operands.iter().take(2).copied().collect(),
+        ConfigAction::None
+        | ConfigAction::Get
+        | ConfigAction::GetUrlmatch
+        | ConfigAction::Write
+        | ConfigAction::Unset
+        | ConfigAction::RemoveSection => operands.iter().take(1).copied().collect(),
+        ConfigAction::List
+        | ConfigAction::GetRegexp
+        | ConfigAction::GetColor
+        | ConfigAction::GetColorbool
+        | ConfigAction::Edit => Vec::new(),
+    };
+    (action, keys)
 }
 
 /// The host pins the granted aliases through `GIT_CONFIG_*` entries. A shell
 /// assignment to one of those names would let the command install an alias or
-/// a helper that the preflight never saw, so refuse the prefix outright.
+/// a helper that the preflight never saw, so refuse the prefix outright. The
+/// name is read through the `+=` append form and the quoting a builtin allows
+/// around an assignment word (`declare -x NAME=value`).
 fn refuse_config_env_assignment(word: &Word) -> Result<()> {
-    let Some((name, _)) = word.text.split_once('=') else {
+    let mut name = word.text.as_str();
+    // `declare`/`export` accept `-x` style flags among the assignments.
+    if name.starts_with('-') {
+        return Ok(());
+    }
+    let Some((raw_name, _)) = name.split_once('=') else {
         return Ok(());
     };
-    if name.trim().starts_with("GIT_CONFIG") {
+    name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    refuse_git_config_variable(name)
+}
+
+fn refuse_git_config_variable(name: &str) -> Result<()> {
+    if name.trim().starts_with("GIT_CONFIG") || matches!(name, "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR")
+    {
         return Err(denied(
-            "shell assignments to GIT_CONFIG_* are not permitted; the host owns git configuration",
+            "shell changes to Git configuration and editor variables are not permitted",
         ));
     }
     Ok(())
 }
 
-/// Find the git subcommand, skipping global options that take a value.
+/// Git global options that consume a separate value word. `--attr-source` is
+/// newer than the image's git, but a missing entry would make the scan read
+/// its value as the subcommand, so the list errs towards over-consuming.
+const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config",
+    "--config-env",
+    "--attr-source",
+    "--super-prefix",
+    "--shallow-file",
+];
+
+/// Find the git subcommand, skipping global options that take a value. A
+/// `--` is not a git option, so it is refused rather than read as one.
 fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxError> {
     let mut index = 1;
     while index < words.len() {
         let word = &words[index].text;
         if word == "--" {
-            return Ok(None);
+            return Err(denied(
+                "git does not accept -- before a subcommand; drop it",
+            ));
         }
         if !word.starts_with('-') {
             return Ok(Some(index));
         }
         refuse_redirecting_config(&config_overrides(words, index))?;
-        let takes_value = matches!(
-            word.as_str(),
-            "-C" | "-c"
-                | "--git-dir"
-                | "--work-tree"
-                | "--namespace"
-                | "--exec-path"
-                | "--config-env"
-        );
+        let takes_value = GIT_GLOBAL_VALUE_OPTIONS.contains(&word.as_str());
         if words[index].dynamic && takes_value {
             return Err(denied(
                 "dynamic git global option value cannot be authorized",
@@ -1000,7 +1358,7 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
     Ok(None)
 }
 
-fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
+fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     let Some(sub_index) = git_subcommand(words)? else {
         return Ok(());
     };
@@ -1044,7 +1402,8 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
         "remote" => authorize_remote_subcommand(args, preflight),
         "config" => authorize_config(args),
         "archive" => authorize_archive(args, preflight),
-        "submodule" => authorize_submodule(args, preflight),
+        "submodule" => authorize_submodule(args, preflight, depth),
+        "rebase" | "bisect" => authorize_shell_bodies(args, sub.text.as_str(), preflight, depth),
         // Porcelain `push` is not the only path to a remote. The plumbing
         // verbs speak the transport protocol directly, take their own
         // destination argument, and are not authorized above, so they must
@@ -1148,7 +1507,26 @@ fn authorize_fetch(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
 }
 
 fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
-    let Some(action) = args.first() else {
+    // `git remote -v` is a listing only when no action word follows it. With
+    // one, git runs the action and `-v` is just verbose.
+    let mut index = 0;
+    while index < args.len() {
+        let word = args[index].text.as_str();
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        if !matches!(word, "-v" | "--verbose" | "--no-verbose" | "--no-progress") {
+            return Err(denied(
+                "unsupported option in manifest git remote; use full supported options",
+            ));
+        }
+        index += 1;
+    }
+    let Some(action) = args.get(index) else {
         return Ok(());
     };
     match action.text.as_str() {
@@ -1156,18 +1534,19 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
             // Parse the option arity, so `-t main` cannot shift the URL to
             // position 0 and leave the real destination unchecked.
             let positional = read_positionals(
-                &args[1..],
+                &args[index + 1..],
                 &[
                     "-f",
                     "--tags",
                     "--no-tags",
                     "--push",
                     "--add",
+                    "--delete",
                     "--mirror",
                     "--fetch",
                     "--no-fetch",
                 ],
-                &["-t", "--track", "-m", "--master"],
+                &["-t", "--track", "-m", "--master", "--mirror"],
             )?;
             let Some(url) = positional.get(1) else {
                 return Ok(());
@@ -1182,6 +1561,16 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
 }
 
 fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    if args
+        .iter()
+        .take_while(|word| word.text != "--")
+        .any(|word| {
+            let flag = word.text.split('=').next().unwrap_or_default();
+            matches!(flag, "--e" | "--ex" | "--exe" | "--exec")
+        })
+    {
+        return Err(denied("git archive cannot override the remote command"));
+    }
     let Some(flag) = args
         .iter()
         .position(|word| word.text == "--remote" || word.text.starts_with("--remote="))
@@ -1200,18 +1589,111 @@ fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     }
 }
 
-fn authorize_submodule(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
-    if args.first().is_none_or(|word| word.text != "add") {
-        return Ok(());
+/// Read a command body git runs through a shell (`rebase --exec`,
+/// `submodule foreach`, `bisect run`). The body is a shell script, so it is
+/// tokenized and scanned like `sh -c`.
+fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    if body.dynamic {
+        return Err(denied(
+            "dynamic shell body cannot be authorized for git network access",
+        ));
     }
-    let positional: Vec<&Word> = args[1..]
+    for simple in tokenize_simple_commands(&body.text)? {
+        scan_simple_command(&simple, preflight, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// `rebase --exec <body>` and `submodule foreach <body>` run their argument
+/// through a shell, which the preflight never read before. `bisect run` runs
+/// the words after it directly, so the whole tail is scanned as one command.
+/// A body that mentions no git is left alone, so ordinary `--exec 'cargo test'`
+/// keeps working.
+fn authorize_shell_bodies(
+    args: &[Word],
+    sub: &str,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let mut index = 0;
+    while index < args.len() {
+        let word = &args[index];
+        let text = word.text.as_str();
+        if text == "--" {
+            break;
+        }
+        let body = if sub == "bisect" {
+            if text != "run" {
+                index += 1;
+                continue;
+            }
+            let tail = &args[index + 1..];
+            if tail.is_empty() {
+                return Ok(());
+            }
+            return scan_simple_command(tail, preflight, depth + 1);
+        } else if let Some(value) = text
+            .strip_prefix("-x")
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let (flag, value) = text.split_once('=')?;
+                matches!(flag, "--ex" | "--exe" | "--exec").then_some(value)
+            })
+        {
+            Some(&Word {
+                text: value.to_string(),
+                dynamic: word.dynamic,
+            })
+        } else if matches!(text, "--ex" | "--exe" | "--exec" | "-x") {
+            index += 1;
+            args.get(index)
+        } else {
+            None
+        };
+        if let Some(body) = body {
+            scan_shell_body(body, preflight, depth)?;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    let prefix = args
         .iter()
-        .filter(|word| !word.text.starts_with('-'))
-        .collect();
-    let Some(url) = positional.first() else {
+        .take_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--cached"))
+        .count();
+    let Some((action, operands)) = args[prefix..].split_first() else {
         return Ok(());
     };
-    preflight.read_remote(url)
+    match action.text.as_str() {
+        "add" => {
+            let positional: Vec<&Word> = operands
+                .iter()
+                .filter(|word| !word.text.starts_with('-'))
+                .collect();
+            let Some(url) = positional.first() else {
+                return Ok(());
+            };
+            preflight.read_remote(url)
+        }
+        "foreach" => {
+            let mut body = operands
+                .iter()
+                .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
+            let first = body.next();
+            let script = if first.is_some_and(|word| word.text == "--") {
+                body.next()
+            } else {
+                first
+            };
+            if let Some(script) = script {
+                scan_shell_body(script, preflight, depth)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Accept only known read options; do not guess the arity of an abbreviation,
@@ -1490,15 +1972,22 @@ mod tests {
             map.get("GIT_CONFIG_KEY_0").map(String::as_str),
             Some("remote.origin.url")
         );
+        // The empty value clears the URL list before the granted URL is
+        // added, so a repository-local URL cannot outrank the host pin.
+        assert_eq!(map.get("GIT_CONFIG_VALUE_0").map(String::as_str), Some(""));
         assert_eq!(
-            map.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+            map.get("GIT_CONFIG_KEY_1").map(String::as_str),
+            Some("remote.origin.url")
+        );
+        assert_eq!(
+            map.get("GIT_CONFIG_VALUE_1").map(String::as_str),
             Some("file:///workspace/remotes/origin.git")
         );
         assert_eq!(
-            map.get("GIT_CONFIG_KEY_1").map(String::as_str),
+            map.get("GIT_CONFIG_KEY_2").map(String::as_str),
             Some("credential.helper")
         );
-        assert_eq!(map.get("GIT_CONFIG_VALUE_1").map(String::as_str), Some(""));
+        assert_eq!(map.get("GIT_CONFIG_VALUE_2").map(String::as_str), Some(""));
         let joined = env
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -1618,7 +2107,7 @@ mod tests {
     fn clone_options_cannot_hide_the_literal_source_from_preflight() {
         let (_temp, grant) = workspace_with_remote();
         for option in ["-c", "--config", "--conf"] {
-            let args = tokenize_simple_commands(&format!("{option} user.name=fixture"));
+            let args = tokenize_simple_commands(&format!("{option} user.name=fixture")).unwrap();
             let error = authorize_clone(
                 &args[0],
                 Preflight {
@@ -1702,6 +2191,7 @@ mod tests {
             "git config -f /workspace/repo/.git/config --get user.name",
             "git config user.name fixture",
             "git config --type bool --get core.bare",
+            "git config --get-urlmatch remote.origin.url https://git.example.test",
             "FOO=1 git status",
             "git -c user.name=fixture commit -m message",
             "git commit -m message",
@@ -1822,6 +2312,310 @@ mod tests {
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
             );
+        }
+    }
+
+    /// WI#857: shapes the preflight used to return `Ok` for without reading
+    /// git at all. Each one is a command that real git acts on.
+    #[test]
+    fn unreadable_shell_shapes_are_refused_instead_of_passing() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            // `env` skipped `-u` but not its value, so `git` became an
+            // argument to `env` and the alias was never read.
+            "env -u FOO git -c alias.p=push p origin HEAD:x",
+            "env -u FOO git push origin main",
+            "env --unset FOO git push origin main",
+            "env -C /tmp git push origin main",
+            // `!` and `{` fell to the catch-all arm.
+            "! git send-pack /workspace/remotes/origin.git HEAD:x",
+            "{ git push origin main; }",
+            "{ git push origin main; } && true",
+            "if true; then git push origin main; fi",
+            "while true; do git push origin main; done",
+            // `timeout` skipped a fixed count of words, so `-s KILL` shifted
+            // the command word.
+            "timeout -s KILL 5 git push origin main",
+            "timeout --signal=KILL 5 git push origin main",
+            "timeout -k 5 5 git push origin main",
+            "nice -n 5 git push origin main",
+            "nice --adjustment 5 git push origin main",
+            "time -f %e git push origin main",
+            "exec -a gitname git push origin main",
+            // `scan_shell_c` stopped at the value of `-o`.
+            "bash -o posix -c 'git push origin main'",
+            "bash --posix -c 'git push origin main'",
+            "bash -O extglob -c 'git push origin main'",
+            "bash --norc -c 'git push origin main'",
+            "sh -ce 'git fetch upstream'",
+            "bash -cex 'git fetch upstream'",
+            "bash -ec 'git fetch upstream'",
+            "bash -c -e -- 'git fetch upstream'",
+            "bash '-cprintf fixture'",
+            // An unknown leading word with git in its tail: the scan could
+            // not tell an argument from the command a wrapper runs.
+            "xargs -n1 git push origin main",
+            "find . -exec git push origin main ;",
+            "flock /tmp/lock git push origin main",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    /// WI#857: the shells and wrappers must not refuse ordinary commands.
+    #[test]
+    fn ordinary_commands_still_pass_the_hardened_parser() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git status",
+            "git config --get user.name",
+            "git config --list",
+            "env FOO=1 git status",
+            "env -u FOO git status",
+            "timeout 30 git fetch origin",
+            "timeout -s KILL 30 git fetch origin",
+            "nice -n 5 git fetch origin",
+            "bash -c 'git status'",
+            "bash -o posix -c 'git status'",
+            "bash -cex 'git status'",
+            "bash -ec 'git status'",
+            "sh -ce 'git status'",
+            "grep git README",
+            "which git",
+            "ps aux | grep bash",
+            "ls /bin/sh",
+            "bash -lc 'git status'",
+            "sh -c 'git fetch origin'",
+            "git remote -v",
+            "echo git push origin main",
+            "printf '%s\\n' git push",
+            "cd repo && git status",
+            "true && git fetch origin",
+            "! git status",
+            "{ git status; }",
+            "env FOO=1 bash -c 'git status'",
+            "timeout 30 bash -c 'git fetch origin'",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#857: `git config` spellings that reach a redirecting key through
+    /// the subcommands, the option forms, the rename target, or an editor.
+    #[test]
+    fn git_config_subcommands_and_prefixes_are_read() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            // The second operand of a rename is the section it writes.
+            "git config zz.p push; git config --rename-section zz alias",
+            "git config --rename-section zz alias",
+            "git config rename-section zz alias",
+            "git config --rename-section alias zz",
+            // An editor can write any key.
+            "git config -e",
+            "git config --edit",
+            "git config edit",
+            "git config --local --edit",
+            "git config -e --local",
+            // git 2.46 subcommands named a checked key as the action word.
+            "git config set alias.p push",
+            "git config unset remote.origin.url",
+            "git config set remote.origin.url https://evil.example.test/r.git",
+            "git config --append alias.p push",
+            "git config set --append alias.fixture status",
+            "git config set --comment fixture alias.fixture status",
+            "git config help.autocorrect 0",
+            // git's own long-option prefixes.
+            "git config --fil /tmp/cfg alias.p push",
+            "git config --renam zz alias",
+            "git config --appe alias.p push",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    /// WI#857: every assignment form the shell accepts, not just
+    /// `NAME=value`.
+    #[test]
+    fn every_git_config_assignment_form_is_refused() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "readonly GIT_CONFIG_KEY_1=alias.p GIT_CONFIG_VALUE_1=push",
+            "declare -x GIT_CONFIG_KEY_1=alias.p",
+            "declare -x GIT_CONFIG_COUNT=1",
+            "typeset -x GIT_CONFIG_COUNT=1",
+            "local GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_PARAMETERS+=\"'alias.p=push'\"",
+            "GIT_CONFIG_COUNT+=1",
+            "export -x GIT_CONFIG_COUNT=1",
+            "export GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_COUNT=1 git status",
+            "env GIT_CONFIG_COUNT=1 git status",
+            "env -u FOO GIT_CONFIG_COUNT=1 git status",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    /// WI#857: the action word of `git remote` sat behind `-v`, so the URL
+    /// check never ran. A repository-local `remote.origin.url` outranks the
+    /// host pin, so this reached another repository.
+    #[test]
+    fn remote_actions_are_read_behind_their_options() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git remote -v set-url origin https://evil.example.test/repo.git",
+            "git remote --verbose add evil https://evil.example.test/repo.git",
+            "git remote -v --no-progress set-url origin https://evil.example.test/repo.git",
+            "git remote -v set-url --push origin https://evil.example.test/repo.git",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git remote -v",
+            "git remote --verbose",
+            "git remote -v set-url origin /workspace/remotes/origin.git",
+            "git remote -v add backup file:///workspace/remotes/origin.git",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#857: `--attr-source` is a newer git option than the image's git,
+    /// but its value must still not be read as the subcommand.
+    #[test]
+    fn git_global_value_options_do_not_shift_the_subcommand() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git --attr-source HEAD -c alias.p=push p origin main",
+            "git --attr-source HEAD push origin main",
+            "git --git-dir /workspace/repo/.git push origin main",
+            "git --work-tree /workspace/repo push origin main",
+            "git --namespace ns push origin main",
+            "git --exec-path /usr/libexec/git-core push origin main",
+            "git -C /workspace/repo push origin main",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD status",
+            "git --git-dir /workspace/repo/.git status",
+            "git -C /workspace/repo status",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#857: bodies git runs through a shell were never read.
+    #[test]
+    fn shell_bodies_git_runs_are_scanned() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "git rebase --exec 'git push origin HEAD' HEAD~1",
+            "git rebase --exec='git push origin HEAD' HEAD~1",
+            "git rebase -x 'git push origin HEAD' HEAD~1",
+            "git rebase -x'git fetch upstream' HEAD~1",
+            "git rebase --exe 'git fetch upstream' HEAD~1",
+            "git rebase -i --exec 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
+            "git submodule foreach 'git push origin main'",
+            "git submodule foreach 'git fetch upstream'",
+            "git submodule foreach --recursive 'git fetch upstream'",
+            "git submodule --quiet foreach 'git fetch upstream'",
+            "git bisect run git push origin main",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git rebase --exec 'cargo test' HEAD~1",
+            "git rebase --exec 'make -j8' --exec 'cargo test' HEAD~1",
+            "git rebase -i HEAD~3",
+            "git submodule foreach 'cargo build'",
+            "git submodule --quiet foreach --recursive 'cargo build'",
+            "git bisect run cargo test",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn shell_comments_continuations_and_incomplete_quotes() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "# unmatched '\ngit fetch upstream",
+            "gi\\\nt fetch upstream",
+            "echo 'unterminated",
+        ] {
+            assert!(check_granted(command, &grant).is_err(), "{command}");
+        }
+        for command in [
+            "git status # unmatched '",
+            "echo ordinary#text",
+            "gi\\\nt status",
+        ] {
+            assert!(check_granted(command, &grant).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn literal_config_destinations_and_git_callbacks_are_refused() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "printf -v GIT_CONFIG_COUNT %s 0",
+            "read GIT_CONFIG_KEY_0",
+            "mapfile GIT_CONFIG_VALUE_0",
+            "declare -n fixture=GIT_CONFIG_COUNT",
+            "unset GIT_CONFIG_COUNT",
+            "GIT_SEQUENCE_EDITOR=true git rebase -i HEAD",
+            "GIT_EDITOR=true git status",
+            "git -c help.autocorrect=0 status",
+            "git -c core.fsmonitor=false status",
+            "git config set sequence.editor true",
+            "git archive --remote=origin --exec=fixture HEAD",
+            "git -c http.https://git.example.test/.extraHeader=fixture status",
+            "git config set http.https://git.example.test/.extraHeader fixture",
+        ] {
+            assert!(check_granted(command, &grant).is_err(), "{command}");
+        }
+        for command in [
+            "printf -v fixture %s allowed",
+            "read fixture",
+            "mapfile fixture",
+            "declare -n fixture=ordinary",
+            "echo GIT_CONFIG_COUNT",
+            "git config http.https://git.example.test/.extraHeader",
+        ] {
+            assert!(check_granted(command, &grant).is_ok(), "{command}");
         }
     }
 

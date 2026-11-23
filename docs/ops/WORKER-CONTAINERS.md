@@ -947,7 +947,13 @@ supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
 injects no credential, and manifest preflight rejects recognized Git pushes.
 It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
 `url.*`, `credential.*` and `http.extraheader` configuration, `git config`
-writes to those keys, and shell assignments to `GIT_CONFIG_*`.
+calls that write or rename those keys, and `git config edit`. Literal reads are
+allowed. The scan recognizes common shell wrappers, clustered `-c` options
+and literal Git shell bodies, but does not fully model expansion, substitutions,
+evaluated strings or scripts read on stdin. Each remote is pinned with an empty
+`remote.<name>.url` first, which clears the URL list while the command retains
+the host's `GIT_CONFIG_*` entries. If those entries are discarded (for example,
+by clearing the environment), the pin no longer applies.
 Calls without a manifest keep their existing Git and egress behavior. See the
 [manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
 for the boundaries and the authentication and push work still open. Worker

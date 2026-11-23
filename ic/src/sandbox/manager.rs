@@ -1531,10 +1531,16 @@ mod tests {
             .find(|args| args.first().is_some_and(|arg| arg == "run"))
             .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        // The granted URL is pinned after an empty value that clears any
+        // repository-local `remote.origin.url` (WI#857).
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-e", "GIT_CONFIG_VALUE_0="])
+        );
         assert!(args.windows(2).any(|pair| pair
             == [
                 "-e",
-                "GIT_CONFIG_VALUE_0=file:///workspace/remotes/origin.git"
+                "GIT_CONFIG_VALUE_1=file:///workspace/remotes/origin.git"
             ]));
         assert!(
             args.windows(2)

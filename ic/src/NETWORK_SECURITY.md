@@ -433,10 +433,14 @@ legacy behavior, including any existing egress.
   before execution regardless of flags or configured defaults. It also refuses
   in-command configuration that could change what a later word means
   (`alias.*`, `include.*`, `includeIf.*`, and the redirecting `remote.*`,
-  `url.*`, `credential.*`, `http.extraheader` keys), `git config` writes to
-  those keys, and shell assignments to `GIT_CONFIG_*`. It cannot enforce
-  arbitrary shell behavior or Git history policy. A network-disabled manifest
-  needs no grant for ordinary local clone, fetch, or pull.
+  `url.*`, `credential.*`, `http.extraheader` keys), `git config` calls that
+  write or rename those keys, and `git config edit`. Literal reads are
+  allowed. It recognizes common assignments and wrappers, clustered shell
+  options such as `-ce`, and literal Git shell bodies. It does not fully
+  model expansion, substitutions, shell input, or evaluated text, so an
+  unread form is not guaranteed to be refused. It cannot enforce arbitrary
+  shell behavior or Git history policy. A network-disabled manifest needs
+  no grant for ordinary local clone, fetch, or pull.
 - **File remotes** must initially canonicalize inside the call's workspace.
   They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
