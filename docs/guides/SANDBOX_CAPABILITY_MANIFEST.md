@@ -148,16 +148,37 @@ plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and the
 It also refuses in-command configuration that would change what a later word
 means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
-`credential.*` and `http.extraheader` keys, `git config` writes to those same
-keys, and shell assignments to `GIT_CONFIG_*`. These refusals are preflight
-only: a script can still write `.git/config` directly. This is not a
-repository write filter for arbitrary shell processes. Use server-side
-permissions and branch protection to enforce repository write policy.
+`credential.*` and `http.extraheader` keys, `git config` calls that write,
+read, rename or edit those same keys, and shell assignments to `GIT_CONFIG_*`.
+These refusals are preflight only: a script can still write `.git/config`
+directly. This is not a repository write filter for arbitrary shell processes.
+Use server-side permissions and branch protection to enforce repository write
+policy.
+
+When the scan cannot fully read a simple command it refuses rather than
+passing it (WI#857). The unread shapes are: an unknown leading word whose
+arguments name `git`, a git plumbing executable or a shell; an option of a
+known wrapper (`env`, `timeout`, `nice`, `time`, `command`, `exec`, `nohup`,
+`sudo`) whose value the scan does not consume; `!` and `{ …; }` grouping; a
+shell option before `-c` (`bash -o posix -c`, `bash --posix -c`, `bash
+-cscript`); and a body git runs through a shell (`rebase --exec`, `submodule
+foreach`, `bisect run`). Ordinary non-git commands, `echo git push`, and
+`env FOO=1 git status`, `timeout 30 git fetch origin`, `bash -c 'git status'`
+keep passing. `git config` is read in the classic form and in the 2.46
+`list`/`get`/`set`/`unset`/`rename-section`/`remove-section`/`edit`
+subcommands, with git's long-option prefixes (`--fil` is `--file`) and the
+rename target checked; any edit is refused, since its editor can write any
+key. `git remote` reads options before the action word, so `git remote -v
+set-url origin <url>` is checked. `git_subcommand` steps over every
+value-taking global option, `--attr-source` included.
 
 The grant supplies no credential. The container receives the granted remote
 URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
-`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Host-held
-authentication and push support inside the shell remain open under WI#816.
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Each remote is
+pinned with an empty `remote.<name>.url` first, which clears the URL list, so
+a repository-local URL written after a clone cannot outrank the granted one.
+Host-held authentication and push support inside the shell remain open under
+WI#816.
 The separate host-side `ssh_git` tool is unchanged.
 
 `capability_evidence.git` records the grant identifier, supported egress modes,

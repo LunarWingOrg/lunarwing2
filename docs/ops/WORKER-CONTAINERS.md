@@ -947,7 +947,16 @@ supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
 injects no credential, and manifest preflight rejects recognized Git pushes.
 It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
 `url.*`, `credential.*` and `http.extraheader` configuration, `git config`
-writes to those keys, and shell assignments to `GIT_CONFIG_*`.
+calls that write, read, rename or edit those keys (classic form and the 2.46
+`set`/`get`/`unset`/`rename-section`/`edit` subcommands, with git's
+long-option prefixes; an edit is refused), `git remote` actions behind
+options (`git remote -v set-url`), and shell assignments to `GIT_CONFIG_*` in
+every assignment form. A shape the scan cannot fully read is refused rather
+than passing: an unknown leading word naming git, an unconsumed wrapper
+option value (`env -u`, `timeout -s`, `nice -n`), `!`/`{ …; }`, a shell
+option before `-c`, and a shell body (`rebase --exec`, `submodule foreach`,
+`bisect run`). Each remote is pinned with an empty `remote.<name>.url` first,
+which clears the URL list, so a repository-local URL cannot outrank the grant.
 Calls without a manifest keep their existing Git and egress behavior. See the
 [manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
 for the boundaries and the authentication and push work still open. Worker
