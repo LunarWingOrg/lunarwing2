@@ -1081,6 +1081,97 @@ test("interpreter one-liners delete without parentheses or through a binding", (
   assertAllowed(`perl -e 'print "rmtree /home/kimi/x"'`)
 })
 
+test("a launcher option value does not end the walk to the shell body (WI#869)", () => {
+  // WI#869: listenerShellBody stepped over only words starting with `-`, so
+  // an option that takes a separate value ended the walk before the `-c` and
+  // the body was never read. Every row of the item's measured ALLOW table is
+  // a deny now; `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` is the
+  // idiomatic Dockerfile form, so this shape is written without thinking.
+  assertBlocked('bash -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -x -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash +o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -o pipefail -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('bash -O extglob -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('sh -o pipefail -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('setsid bash -o pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash --rcfile /dev/null -c "kimi server"', "kimi service mode")
+  assertBlocked('bash --init-file /dev/null -c "kimi server"', "kimi service mode")
+  // The `-o` value may also be spelled as a cluster's last letter.
+  assertBlocked('bash -xo pipefail -c "kimi server"', "kimi service mode")
+  assertBlocked('bash -c -x "kimi server"', "kimi service mode")
+  assertBlocked('bash -c -- "kimi server"', "kimi service mode")
+  // The control rows keep their verdicts.
+  assertBlocked('bash -c "kimi server"', "kimi service mode")
+  assertAllowed('bash -c "echo hi"')
+  assertAllowed('bash -o pipefail -c "echo hi"')
+  assertAllowed('bash --rcfile /dev/null -c "echo hi"')
+  // A shell's option walk stops at its script-file operand, so a later word
+  // is not a body.
+  assertAllowed("bash -x script.sh")
+})
+
+test("script's own option values do not hide the body it runs (WI#869)", () => {
+  // `script` is a shell-string launcher, but its options are not a shell's:
+  // -c/--command carries the body, every other value-taking option must be
+  // stepped over, and `script -- <command>` runs the words after the marker.
+  assertBlocked("script -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script --command 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -q -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -qec 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -E never -c 'kimi server' /dev/null", "kimi service mode")
+  assertBlocked("script -- 'kimi server'", "kimi service mode")
+  assertBlocked("script -c 'nc -l 9000' /dev/null", "listener started from a task")
+  assertAllowed("script -c 'echo hi' /dev/null")
+  assertAllowed("script -qc 'echo hi' /dev/null")
+  assertAllowed("script /dev/null -c 'echo hi'")
+  assertAllowed("script -q /dev/null")
+})
+
+test("an interpreter option value does not end the walk to the eval flag (WI#869)", () => {
+  // The same blind spot in oneLinerCode: `perl -I /tmp -e …` ended the walk
+  // at the -I value, so the interpreter deletion rule never read the code.
+  assertBlocked(`perl -I /tmp -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`python3 -X utf8 -c "import shutil;shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -W ignore -c "import shutil;shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(
+    `node --require /x -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  // An option whose value is only ever attached must not eat the next word:
+  // perl runs the `-e` code after a bare `-D` or `-F` (run-531 ALQ-1).
+  assertBlocked(`perl -D -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")' /etc/hostname`, "deletion outside")
+  assertBlocked(`perl -F -e 'use File::Path; rmtree("/home/kimi")'`, "deletion outside")
+  // Attached values (`-I/tmp`, `-Mstrict`) and the allowed rows still work.
+  assertBlocked(`perl -Mstrict -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertAllowed(`perl -I /tmp -e 'unlink("/tmp/wi869-x")'`)
+  assertAllowed(`python3 -X utf8 -c "import shutil;shutil.rmtree('/tmp/wi869-x')"`)
+  assertAllowed(`node --require /x -e "require('fs').rmSync('/tmp/wi869-x',{recursive:true})"`)
+  assertAllowed("python3 -m pytest tests/ -q")
+  assertAllowed("python3 -m json.tool")
+})
+
+test("cp's destination option is the destination it writes (WI#869)", () => {
+  // The cp device-write rule kept every non-dash word as an operand, so the
+  // `-t` value read as a source and the real source as the destination. The
+  // same walk now serves cp and mv (WI#849's operand reader).
+  assertBlocked("cp -t /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory /dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp --target-directory=/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp -t/dev/sda1 /tmp/a", "block-device")
+  assertBlocked("cp /tmp/a /dev/sda1", "block-device")
+  assertBlocked("cp -S .bak /tmp/a /dev/sda1", "block-device")
+  assertAllowed("cp -t /tmp/wi869-dest /tmp/a")
+  assertAllowed("cp -S .bak a b")
+  assertAllowed("cp a b")
+  // mv's protected-tree rule keeps its verdicts through the shared reader.
+  assertBlocked("mv -t /app/hooks /tmp/a", "protected tree")
+  assertBlocked("mv --target-directory /app/hooks /tmp/a", "protected tree")
+  assertAllowed("mv a b")
+  assertAllowed("mv -S .bak a b")
+})
+
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
   // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
   // in double quotes reaches Perl with the inner quotes unescaped, so

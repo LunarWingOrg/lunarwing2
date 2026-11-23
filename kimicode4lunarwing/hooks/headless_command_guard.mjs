@@ -490,15 +490,30 @@ function optionValue(attached, words, index) {
   return { value: words[index + 1] ?? "", last: index + 1 };
 }
 
+// cp/mv's value-taking options: `-t`/`--target-directory` names the
+// destination without being an operand word, and `-S`/`--suffix` takes a
+// value that is not a path. A walk that only skips `-`-prefixed words leaves
+// the value behind as an operand, so `cp -t /dev/sda1 /tmp/a` read
+// `/dev/sda1` as a source and `/tmp/a` as the destination (WI#869).
+const COPY_SHORT_ARG = new Set("tS");
+const COPY_LONG_ARG = ["target-directory", "suffix"];
+
+/** The value-taking cp/mv long option a name spells, exactly or by prefix. */
+function copyLongValueOption(name) {
+  if (COPY_LONG_ARG.includes(name)) return name;
+  // GNU accepts a unique prefix; `--t` is `--target-directory`.
+  return COPY_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+}
+
 /**
- * The path operands of an `mv` invocation: every source and the destination,
- * including a `-t`/`--target-directory` value, which is a destination without
- * being an operand word. `-S`/`--suffix` takes a value that is not a path
- * (WI#849).
+ * The path operands of a `cp`/`mv` invocation, and the destination a
+ * `-t`/`--target-directory` names without being an operand word (WI#849,
+ * WI#869). `-S`/`--suffix` takes a value that is not a path.
  */
-function mvOperands(rest) {
+function copyOperands(rest) {
   const words = argumentWords(rest).map(stripShellQuotes);
   const operands = [];
+  let target;
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (word === "--") {
@@ -507,23 +522,19 @@ function mvOperands(rest) {
     }
     if (word.startsWith("--")) {
       const equals = word.indexOf("=");
-      const name = word.slice(2, equals === -1 ? undefined : equals);
-      const attached = equals === -1 ? null : word.slice(equals + 1);
-      // GNU mv accepts unique prefixes: `--t` is `--target-directory`.
-      const target = name.length >= 1 && "target-directory".startsWith(name);
-      const suffix = name.length >= 2 && "suffix".startsWith(name);
-      if (!target && !suffix) continue;
-      const { value, last } = optionValue(attached ?? "", words, i);
-      if (target) operands.push(value);
+      const option = copyLongValueOption(word.slice(2, equals === -1 ? undefined : equals));
+      if (option === null) continue;
+      const { value, last } = optionValue(equals === -1 ? "" : word.slice(equals + 1), words, i);
+      if (option === "target-directory") target = value;
       i = last;
       continue;
     }
     if (word.startsWith("-") && word.length > 1) {
       const cluster = word.slice(1);
       for (let j = 0; j < cluster.length; j++) {
-        if (cluster[j] !== "t" && cluster[j] !== "S") continue;
+        if (!COPY_SHORT_ARG.has(cluster[j])) continue;
         const { value, last } = optionValue(cluster.slice(j + 1), words, i);
-        if (cluster[j] === "t") operands.push(value);
+        if (cluster[j] === "t") target = value;
         i = last;
         break;
       }
@@ -532,7 +543,17 @@ function mvOperands(rest) {
     operands.push(word);
   }
   // A redirection target is not an operand (e.g. `2>/tmp/log`).
-  return operands.filter((operand) => !/^\d*>/.test(operand));
+  return { operands: operands.filter((operand) => !/^\d*>/.test(operand)), target };
+}
+
+/**
+ * The path operands of an `mv` invocation: every source and the destination,
+ * including a `-t`/`--target-directory` value, which is a destination without
+ * being an operand word (WI#849).
+ */
+function mvOperands(rest) {
+  const { operands, target } = copyOperands(rest);
+  return target === undefined ? operands : [...operands, target];
 }
 
 /** The argument-taking long option a name spells, exactly or by unique prefix. */
@@ -714,13 +735,44 @@ function quotedFirstArgument(code, from) {
   return null;
 }
 
+// The interpreter options that take the next word as their value. The eval
+// flag is found by walking the words, and a walk that only steps over
+// `-`-prefixed words ends at a value: `perl -I /tmp -e 'unlink(…)'` read as
+// carrying no one-liner, so the deletion rule never ran (WI#869, the same
+// shape as `listenerShellBody`). Only options whose value is a separate word
+// are listed; an attached value (`-I/tmp`, `-Mstrict`) needs no step, and an
+// option whose value can only be attached or is optional (`perl -C`, `-x`,
+// `-D`, `-F`; `ruby -T`) is absent because eating the next word would hide a
+// following `-e`: `perl -D -e '…'` and `perl -F -e '…'` run the code
+// (run-531 ALQ-1).
+const INTERPRETER_VALUE_OPTIONS = {
+  perl: new Set(["-I", "-M", "-m"]),
+  python: new Set(["-X", "-W", "-Q", "-m"]),
+  node: new Set([
+    "-r", "--require", "--loader", "--experimental-loader", "-C", "--conditions",
+    "--input-type",
+  ]),
+  ruby: new Set(["-I", "-r", "-C", "-E", "--enable"]),
+};
+
+/** The value-option table for an interpreter name, by language family. */
+function interpreterValueOptions(name) {
+  if (name === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
+  if (name === "node") return INTERPRETER_VALUE_OPTIONS.node;
+  if (name === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
+  return INTERPRETER_VALUE_OPTIONS.python;
+}
+
 /**
  * The code text of an interpreter invocation, or null when the words after the
  * interpreter carry no eval flag. The eval flag may follow other options
  * (`perl -MFile::Path -e …`, `node --no-warnings -e …`), so the words are
- * walked rather than matched by one regex (WI#832).
+ * walked rather than matched by one regex (WI#832), and an option that takes
+ * a separate value is stepped over whole so its value cannot end the walk
+ * before the flag (WI#869).
  */
-function oneLinerCode(rest) {
+function oneLinerCode(rest, name) {
+  const values = interpreterValueOptions(name);
   let i = 0;
   while (i < rest.length) {
     while (i < rest.length && /[ \t]/.test(rest[i])) i++;
@@ -730,6 +782,11 @@ function oneLinerCode(rest) {
     if (word.length === 0) return null;
     if (/^(?:--eval|--print)$/.test(word) || /^-[a-zA-Z]*[ceEp][a-zA-Z]*$/.test(word)) {
       return rest.slice(i);
+    }
+    if (values.has(word)) {
+      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      continue;
     }
     if (!word.startsWith("-")) return null;
   }
@@ -1071,7 +1128,7 @@ function perlDeletionVerdict(rawCode) {
  */
 function checkInterpreterDeletion(text) {
   for (const invocation of text.matchAll(ONE_LINER_CALL)) {
-    const code = oneLinerCode(invocation[2]);
+    const code = oneLinerCode(invocation[2], invocation[1]);
     if (code === null) continue;
     const aliases = sinkAliases(code);
     if (invocation[1] === "perl") {
@@ -1102,9 +1159,13 @@ function checkDeviceWrites(text) {
     }
   }
   for (const { rest } of clauseTails(text, CP_CALL)) {
-    const operands = argumentWords(rest).filter((word) => !word.startsWith("-"));
-    const target = operands.length > 0 ? deviceTarget(operands[operands.length - 1]) : null;
-    if (target !== null) return `direct block-device write: cp ${target.slice(0, 80)}`;
+    // `-t`/`--target-directory` names the destination without being an
+    // operand word, so `cp -t /dev/sda1 /tmp/a` must read it as the target
+    // (WI#869).
+    const { operands, target } = copyOperands(rest);
+    const destination = target ?? operands[operands.length - 1];
+    const device = destination === undefined ? null : deviceTarget(destination);
+    if (device !== null) return `direct block-device write: cp ${device.slice(0, 80)}`;
   }
   return null;
 }
@@ -2036,10 +2097,58 @@ const LISTENER_COMMANDS = [
   { name: /^ruby$/, test: (args) => args.includes("-run") && args.includes("httpd") },
 ];
 
-function listenerShellBody(words, start) {
-  for (let i = start; i < words.length && words[i].startsWith("-"); i++) {
-    if (words[i] === "--") break;
-    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(words[i])) return words[i + 1];
+// Launcher options that take the next word as their value. A walk that only
+// steps over `-`-prefixed words stops at the value and never reaches the `-c`
+// that carries the body, so `bash -o pipefail -c "kimi server"` read as no
+// shell body at all (WI#869).
+const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
+// `script`'s own option list: every entry takes a separate value, and
+// `-c`/`--command` is the one that carries the body. `-t`/`--timing` is
+// absent on purpose — its argument is optional, so it must not eat a word.
+const SCRIPT_VALUE_OPTIONS = new Set([
+  "-I", "--log-in", "-O", "--log-out", "-B", "--log-io", "-T", "--log-timing",
+  "-m", "--logging-format", "-E", "--echo", "-o", "--output-limit",
+  "-c", "--command",
+]);
+
+/**
+ * The shell text a launcher runs, or undefined when it carries none (WI#858).
+ * A shell's `-c` takes its body as the next word, and `script`'s
+ * `-c`/`--command` takes it as the option value; `script -- <command>` runs
+ * the words after the marker. An option that takes a separate value is
+ * stepped over whole, because its value is not the body (`bash -o pipefail -c
+ * "kimi server"`, `bash --rcfile /dev/null -c …`) (WI#869).
+ *
+ * The text after `-c` is returned whole rather than as one word, so a body
+ * split by a further option word (`bash -oc pipefail -c "kimi server"`) is
+ * still read by the property rule.
+ */
+function listenerShellBody(words, start, launcher) {
+  const values = launcher === "script" ? SCRIPT_VALUE_OPTIONS : SHELL_VALUE_OPTIONS;
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      return launcher === "script" ? words.slice(i + 1).join(" ") : undefined;
+    }
+    if (values.has(word)) {
+      // `script -c`/`--command` carries the body itself; every other value
+      // is an option argument that is not a command.
+      if (launcher === "script" && (word === "-c" || word === "--command")) {
+        return words[i + 1];
+      }
+      i++;
+      continue;
+    }
+    if (/^[-+][a-zA-Z]*c[a-zA-Z]*$/.test(word)) return words.slice(i + 1).join(" ");
+    if (word.startsWith("-") || word.startsWith("+")) {
+      // A cluster whose last letter is `o`/`O` takes the next word
+      // (`bash -xo pipefail -c …`); an attached value needs no step.
+      if (/^[-+][a-zA-Z]*[oO]$/.test(word)) i++;
+      continue;
+    }
+    // A shell stops reading options at its script-file operand; `script`
+    // reads its log-file operand and keeps going.
+    if (launcher !== "script") return undefined;
   }
   return undefined;
 }
@@ -2199,7 +2308,7 @@ function checkListenerWords(words, depth) {
       continue;
     }
     if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
-      const body = listenerShellBody(words, i + 1);
+      const body = listenerShellBody(words, i + 1, name);
       if (body !== undefined) {
         if (depth >= 4) return "cannot check listeners in a deeply nested shell command";
         const denied = checkListeners(body, depth + 1);
