@@ -6,8 +6,6 @@
 //! ask the operator which build was running. The commit and build time are
 //! embedded by `build.rs` and printed alongside the version.
 
-use std::time::{Duration, UNIX_EPOCH};
-
 use chrono::{DateTime, Utc};
 
 /// Package version from `Cargo.toml` (e.g. `2.2.2`).
@@ -61,15 +59,6 @@ fn build_time() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Build time as a `SystemTime`, for callers that need to format or compare
-/// it. `None` for a zero/unknown timestamp.
-pub fn build_system_time() -> Option<std::time::SystemTime> {
-    if BUILD_EPOCH == 0 {
-        return None;
-    }
-    Some(UNIX_EPOCH + Duration::from_secs(BUILD_EPOCH))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,16 +86,10 @@ mod tests {
     }
 
     #[test]
-    fn build_system_time_agrees_with_the_embedded_epoch() {
-        match build_system_time() {
-            Some(time) => {
-                let seconds = time
-                    .duration_since(UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs())
-                    .unwrap_or(0);
-                assert_eq!(seconds, BUILD_EPOCH);
-            }
-            None => assert_eq!(BUILD_EPOCH, 0),
-        }
+    fn parse_epoch_accepts_digits_only() {
+        assert_eq!(parse_epoch("1795458136"), 1_795_458_136);
+        assert_eq!(parse_epoch(""), 0);
+        assert_eq!(parse_epoch("unknown"), 0);
+        assert_eq!(parse_epoch("12a"), 0);
     }
 }
