@@ -433,6 +433,52 @@ empty comparison is not a pass. Running the evaluation on a real tenant and
 enabling hints for passing categories remain A4/A5 operator steps; this code
 does not change any approval, scheduling or cost behaviour.
 
+## A4/A5 held-out evaluation and rollout runbook
+
+This is the operator procedure for the two remaining Phase A steps. It needs a
+tenant that runs a build containing the A4 trace and a window of that tenant's
+**normal** workload; operator-generated or synthetic traffic is not evidence
+for this gate.
+
+1. **Start one observation window.** Edit the tenant's
+   `env/lunarwing.env`: set `LUNARWING_TOOL_ESTIMATES_TRACE=1`, leave
+   `LUNARWING_TOOL_ESTIMATES` unset or `observe` so no hints are shown, and
+   keep the default trace capacity (or raise it up to 8,192). Restart with
+   `sudo lunarwing-mt-admin.sh restart-tenant <tenant>`; the setting is read
+   once at startup. Record the tenant, the deployed commit, and the window
+   start and end. A restart resets both the models and the trace ring, so one
+   window is one process lifetime — never pool samples across restarts.
+2. **Collect.** As the owner, read
+   `GET http://127.0.0.1:<gateway_port>/api/estimates/evaluation` (plus
+   `/counters` and `/llm` for context) with the tenant's owner bearer token.
+   Do not paste the token into the evidence doc or a shell history that is
+   committed.
+3. **Judge each category.** For the `overall` block of each category, a pass
+   requires a paired `comparison_baseline` sample count above zero and
+   `improvement_percent >= 10.0`. Report the absolute errors in seconds
+   (`median_abs_error_*_ms / 1000`), `coverage` and `samples`; `null`
+   improvement, zero paired samples or a zero baseline median is not a pass.
+   Suppress every category that regresses with
+   `LUNARWING_TOOL_ESTIMATES_CATEGORIES=-<tool>`, and record the reason. The
+   `declared_baseline` block is reported alongside but does not decide the
+   gate. `evicted > 0` means the window outran the ring: record it and repeat
+   the window with a larger capacity before trusting coverage.
+4. **Feed the D1 decision.** Compare the `cold_start` block (`coverage` and
+   paired error) with `overall`. D1 is justified only if that measured
+   cold-start loss materially misses the accuracy or coverage goal; otherwise
+   the no-cache decision stands and both the data and the decision are
+   recorded.
+5. **Commit the evidence** as `docs/ops/history/<release>_A4_EMA_EVALUATION.md`:
+   tenant, commit, window, non-secret settings, trace capacity/recorded/evicted,
+   the per-category table, the pass/suppress decision for each category, and
+   the D1 verdict.
+6. **A5 rollout.** Set `LUNARWING_TOOL_ESTIMATES=1` with the passing set in
+   `LUNARWING_TOOL_ESTIMATES_CATEGORIES`, restart, and confirm hints appear
+   only for allowed categories and only after the five-sample warmup. Widen to
+   further tenants one at a time after their own windows. Rollback is
+   `LUNARWING_TOOL_ESTIMATES=0` or unset plus a restart; never touch gates,
+   grants, scheduling or cost accounting to roll back estimates.
+
 ## Persistence decision
 
 **Initial release: daemon-local in-memory model and documented cold starts.**
