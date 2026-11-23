@@ -1889,13 +1889,14 @@ XMPP_BRIDGE_RUST_LANE_SCRIPT = (
 # The lane's full rules list: merge-request pipelines, branch pushes, and
 # protected release tags, like the other Rust gates. Pinned exactly so a
 # `when: never` replacement or a narrowed rule cannot drop the lane silently.
+# The tag rule is built from RELEASE_TAG_PREDICATE, so a release-tag format
+# change updates this lane with the canonical predicate.
 XMPP_BRIDGE_RUST_LANE_RULES = (
     {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
     {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
     {
         "if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ '
-        '/^v\\d+\\.\\d+\\.\\d+\\.\\d+(-rc[1-9]\\d*)?$/'
-        ' && $CI_COMMIT_REF_PROTECTED == "true"'
+        f'/{RELEASE_TAG_PREDICATE}/ && $CI_COMMIT_REF_PROTECTED == "true"'
     },
     {"when": "never"},
 )
