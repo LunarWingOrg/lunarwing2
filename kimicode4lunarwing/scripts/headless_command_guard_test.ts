@@ -1303,3 +1303,17 @@ test("a quoted separator does not hide a device write or a protected rename (WI#
   assertBlocked('tar --remove-files -cf /tmp/a.tar "/tmp/x;y" /app/hooks', "deletion outside")
   assertBlocked('rsync -a "/tmp/x;y" /app/hooks --delete', "deletion outside")
 })
+
+test("a quoted separator does not split the pipeline that feeds an xargs (WI#856)", () => {
+  // feedingPipeline cut the text before xargs at a `;` or newline inside a
+  // quoted argument, so the feeding `find` fell out of the pipeline and the
+  // deleted set read as unverifiable — the same hole in the fail-closed
+  // direction it was written to close.
+  assertAllowed('find /tmp -name "a;b" | xargs rm')
+  assertAllowed('find /tmp -name "a;b" -print0 | xargs -0 rm')
+  assertBlocked('find /app/hooks -name "a;b" | xargs rm', "deletion outside")
+  assertBlocked('find /app/hooks -name "a;b" -print0 | xargs -0 rm', "deletion outside")
+  // The list boundary outside the quotes is still a boundary.
+  assertAllowed('echo "a;b" ; find /tmp -name x | xargs rm')
+  assertBlocked('find /app/hooks -name x | xargs rm', "deletion outside")
+})
