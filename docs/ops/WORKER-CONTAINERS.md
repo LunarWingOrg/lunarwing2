@@ -63,6 +63,45 @@ are unchanged, but the Dockerfile command edits re-key their layers.
 Protected candidate-versus-clean-rebuild digests, all four scans, and the
 opencode2 exposure verifier remain the image acceptance gates.
 
+## Pinned-input download retry (WI#862, 2026-11-23)
+
+A worker image build failed on the first dropped connection to
+`git.lunarwing.org` while a Dockerfile step downloaded a pinned input
+(job 204104, pipeline 8578: `error: RPC failed; curl 55 Failed sending data
+to the peer` in `[builder 4/21]`), and 23 jobs in 16 pipelines died fetching
+this repository before their script ran. Three paths now retry a dropped or
+refused connection, and nothing else.
+
+**CI image builds.** `.gitlab/scripts/build-worker-image.sh` classifies the
+BuildKit log: a three-attempt ladder (`transient_download_failure`) retries
+a dropped connection, and its message names the attempt, the cause and the
+delay. A fatal cause wins over a transient one — `EINTEGRITY`, a frozen-
+lockfile refusal, `sha256sum -c`, a 401/403/404, a test failure or a full
+disk each still ends the job on the first attempt.
+
+**mt-admin worker builds.** mt-admin runs the same lane Dockerfiles with
+`podman build`, whose trace has a different shape, so the retry lives
+*inside* the Dockerfile instead: `scripts/worker-download-retry.sh` (one
+byte-identical copy per lane) is sourced in a RUN and wraps each download
+with `wdr_retry`. It covers the LunarDepth clone and the partial clone's
+on-demand checkout, corepack, every `npm ci`, `pnpm install
+--frozen-lockfile` and `bun install --frozen-lockfile`. The rustup and Go
+toolchain curls (only with `WITH_TOOLCHAINS=true`) use `curl --retry`, so
+nothing extra lands in the final image. A retry starts from a cleaned tree,
+and the pin, lockfile and checksum checks still run once, after it, so an
+integrity failure cannot be retried away. One shared helper therefore
+covers both paths at once.
+
+**The runner's own fetch.** `GET_SOURCES_ATTEMPTS: "3"` in
+`.gitlab/ci/defaults.yml` retries the runner's fetch of this repository;
+the value's reasoning and its timeout budget are written beside it.
+
+Apt is out of scope: `Acquire::Retries` and the snapshot ladder are
+unchanged. Tests: `.gitlab/tests/test_worker_build_args.py` (the real
+204104 trace, plus the never-retry cases) and
+`.gitlab/tests/test_worker_download_retry.py` (the helper against a stub
+command, including exit-status propagation under `set -eu`).
+
 ## APT transport, retry, and client hardening (WI#561, 2026-11-05)
 
 [CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518) requires an
