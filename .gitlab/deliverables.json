@@ -32,7 +32,7 @@
       "manifest": "ic/bridges/xmpp-bridge/Cargo.toml",
       "lockfile": "ic/bridges/xmpp-bridge/Cargo.lock",
       "targets": ["xmpp-bridge"],
-      "ci": ["shell-harnesses"],
+      "ci": ["rust-xmpp-bridge", "shell-harnesses"],
       "triggers": ["ic/bridges/xmpp-bridge/**"]
     },
     {
@@ -173,8 +173,8 @@
       "manifest": "ic/openclaw-ports/xmpp/bridge/Cargo.toml",
       "lockfile": "ic/openclaw-ports/xmpp/bridge/Cargo.lock",
       "targets": ["openclaw-xmpp-bridge-contract"],
-      "ci": [],
-      "comment": "OpenClaw port staging work; keep edits inside ic/openclaw-ports/ per AGENTS.md",
+      "ci": ["rust-xmpp-bridge"],
+      "comment": "OpenClaw port staging work; keep edits inside ic/openclaw-ports/ per AGENTS.md. WI#864: the contract crate is a path dependency of ic/bridges/xmpp-bridge, so rust-xmpp-bridge builds, tests and lints it in its own invocation.",
       "triggers": ["ic/openclaw-ports/**"]
     },
     {
