@@ -1055,6 +1055,21 @@ test("a quoted brace alternative does not suppress the group (WI#868)", () => {
   assertAllowed("printf '%s\\n' {debug,release}")
 })
 
+test("$$ is the PID parameter, so $$( opens no substitution (ALR-1)", () => {
+  // Bash's parser consumes `$$` as one parameter, so the `(` after it is
+  // literal; bash 5.3 ran the next line in both rows below, which the shared
+  // reader used to hide inside an unclosed `$(`.
+  assertBlocked('echo "$$(x"\nkimi server', "kimi service mode")
+  assertBlocked('echo "}$$(<()"\nnc -l 9000', "listener started from a task")
+  // A real substitution right after the PID is still a substitution.
+  assertBlocked('echo "$$$(kimi server)"', "kimi service mode")
+  assertBlocked('echo "$$$(echo a)"; kimi server', "kimi service mode")
+  assertBlocked('echo "$$"; kimi server', "kimi service mode")
+  // Ordinary PID use stays allowed.
+  assertAllowed('echo "pid $$"')
+  assertAllowed("mkdir -p /tmp/run.$$ && ls /tmp/run.$$")
+})
+
 test("listener quote state follows ANSI-C words, comments, and heredocs", () => {
   for (const command of [
     String.raw`echo $'\'' ; kimi server`,

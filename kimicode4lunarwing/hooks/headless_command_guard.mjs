@@ -1771,6 +1771,15 @@ function computeQuoteStates(text, escapes) {
       i = close;
       continue;
     }
+    // `$$` is one parameter, the shell's PID: bash's parser consumes the
+    // second `$`, so a `(` right after `$$` is a literal character and opens
+    // no substitution. Reading it as `$(` hid the rest of the clause:
+    // `echo "$$(x"` then a newline ran the next line (run-531 ALR-1).
+    if (ch === "$" && text[i + 1] === "$" && (quote === "" || quote === '"')) {
+      states[++i] = state;
+      level.wordStart = false;
+      continue;
+    }
     const opensSubstitution = text[i + 1] === "(" &&
       ((ch === "$" && (quote === "" || quote === '"')) ||
         (quote === "" && (ch === "<" || ch === ">")));
