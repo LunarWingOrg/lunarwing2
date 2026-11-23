@@ -1315,8 +1315,13 @@ Enforced controls (opencode2 lane unless noted):
    reads `eval` bodies, `$(…)`/backtick bodies and process substitutions
    `<(…)`/`>(…)`. It skips empty unquoted brace alternatives, recognizes
    literal unquoted IFS separators, and keeps quotes in comments or
-   heredoc data from hiding later commands. Heredoc text is still checked
-   conservatively because it can be shell input. Quotes in ordinary
+   heredoc data from hiding later commands. Since WI#868 a brace group is
+   expanded on its own unquoted `{`, `,` and `}`, as bash does, so a quoted
+   alternative does not suppress it: `{kimi,"server"}`, `{"kimi",server}`,
+   `{kimi,'server'}` and `{kimi,$'server'}` deny like `{kimi,server}`,
+   while a quoted group (`echo "{kimi,server}"`) or a quoted comma stays
+   literal. Heredoc text is still checked conservatively because it can be
+   shell input. Quotes in ordinary
    arguments and a `kimi -p` prompt value stay data, and the accepted cost
    is a refusal of a command that only mentions the words unquoted
    (`echo kimi server`). Because the property asks at every word, the option
@@ -2493,7 +2498,10 @@ effort, fork after in-turn steering, queued prompts, insecure-HTTP composer).
   rather than only after a fixed launcher list, so `taskset -c 0 kimi
   server`, `eval kimi server`, `script -qc 'kimi server'`, `watch kimi
   server`, `fd -x kimi server`, `cat <(kimi server)` and `{kimi,server}`
-  deny too, and an unknown launcher cannot hide one.
+  deny too, and an unknown launcher cannot hide one. A quoted alternative
+  is the same command (WI#868): `{kimi,"server"}`, `{"kimi",server}`,
+  `{kimi,'server'}` and `{kimi,$'server'}` all deny, because bash expands
+  the group before it removes the quotes.
 - **SSH host configuration** is an interactive TUI/settings feature that
   needs a per-host Kimi login; the lane has no login and never runs the TUI.
 - **ACP session preview restore, `/tasks`, the follow-up behavior setting,
