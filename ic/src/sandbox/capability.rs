@@ -1240,7 +1240,6 @@ mod tests {
                 "origin=http://git.internal/org/repo.git",
                 "origin",
                 "origin=GIT_ORIGIN_TOKEN",
-                false,
             )
             .expect("grant spec")
             .expect("grant"),

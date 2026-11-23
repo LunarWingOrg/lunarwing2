@@ -248,12 +248,10 @@ impl SandboxModeConfig {
             Some(spec) => {
                 let write_names = optional_env("SANDBOX_GIT_WRITE_REMOTES")?.unwrap_or_default();
                 let credential_spec = optional_env("SANDBOX_GIT_CREDENTIALS")?.unwrap_or_default();
-                let allow_ref_deletion = parse_bool_env("SANDBOX_GIT_ALLOW_REF_DELETION", false)?;
                 crate::sandbox::GitGrantConfig::from_full_spec(
                     &spec,
                     &write_names,
                     &credential_spec,
-                    allow_ref_deletion,
                 )
                 .map_err(|message| ConfigError::InvalidValue {
                     key: "SANDBOX_GIT_REMOTES".to_string(),
@@ -1418,19 +1416,16 @@ mod tests {
         unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
     }
 
-    /// WI#860: the write list, deletion decision and credential bindings are
-    /// separate host settings; a write name outside the read grant is a load
-    /// error, and an https credential binding is refused (CONNECT is opaque).
+    /// WI#860: the write list and credential bindings are separate host
+    /// settings; a write name outside the read grant is a load error, and an
+    /// https credential binding is refused (CONNECT is opaque). Ref deletion
+    /// has no host switch: it is always refused (the maintainer's decision).
     #[test]
     fn sandbox_git_write_and_credential_env_are_validated() {
         let _guard = crate::config::helpers::lock_env();
         let settings = crate::settings::Settings::default();
 
-        for var in [
-            "SANDBOX_GIT_WRITE_REMOTES",
-            "SANDBOX_GIT_ALLOW_REF_DELETION",
-            "SANDBOX_GIT_CREDENTIALS",
-        ] {
+        for var in ["SANDBOX_GIT_WRITE_REMOTES", "SANDBOX_GIT_CREDENTIALS"] {
             unsafe { std::env::remove_var(var) };
         }
         unsafe {
@@ -1441,12 +1436,10 @@ mod tests {
             )
         };
         unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
-        unsafe { std::env::set_var("SANDBOX_GIT_ALLOW_REF_DELETION", "true") };
         unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "origin=GIT_ORIGIN_TOKEN") };
 
         let cfg = SandboxModeConfig::resolve(&settings).expect("resolve write grant");
         let grant = cfg.git.as_ref().expect("grant");
-        assert!(grant.allow_ref_deletion);
         assert!(
             grant
                 .remotes
@@ -1485,11 +1478,7 @@ mod tests {
             other => panic!("expected InvalidValue for an unknown write remote, got {other:?}"),
         }
 
-        for var in [
-            "SANDBOX_GIT_REMOTES",
-            "SANDBOX_GIT_WRITE_REMOTES",
-            "SANDBOX_GIT_ALLOW_REF_DELETION",
-        ] {
+        for var in ["SANDBOX_GIT_REMOTES", "SANDBOX_GIT_WRITE_REMOTES"] {
             unsafe { std::env::remove_var(var) };
         }
     }

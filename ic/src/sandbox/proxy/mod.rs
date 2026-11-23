@@ -30,6 +30,7 @@
 
 pub mod allowlist;
 mod egress;
+pub mod git_transport;
 pub mod http;
 pub mod policy;
 pub(crate) mod relay;
@@ -54,6 +55,7 @@ pub struct NetworkProxyBuilder {
     credential_resolver: Arc<dyn CredentialResolver>,
     policy: SandboxPolicy,
     public_only: bool,
+    git_transport: Option<git_transport::GitTransportPolicy>,
 }
 
 impl NetworkProxyBuilder {
@@ -65,6 +67,7 @@ impl NetworkProxyBuilder {
             credential_resolver: Arc::new(EnvCredentialResolver),
             policy: SandboxPolicy::ReadOnly,
             public_only: false,
+            git_transport: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl NetworkProxyBuilder {
             // its ACL from the manager policy.
             policy: SandboxPolicy::ReadOnly,
             public_only: config.network == crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+            git_transport: None,
         }
     }
 
@@ -116,6 +120,13 @@ impl NetworkProxyBuilder {
         self
     }
 
+    /// Apply the git smart-HTTP transport checks (WI#860, ALM-1). Only the
+    /// per-call git proxy sets this; the shared tenant proxy never does.
+    pub fn with_git_transport(mut self, policy: git_transport::GitTransportPolicy) -> Self {
+        self.git_transport = Some(policy);
+        self
+    }
+
     /// Build the HTTP proxy.
     pub fn build(self) -> HttpProxy {
         let decider: Arc<dyn NetworkPolicyDecider> = if self.policy.has_full_network() {
@@ -127,7 +138,12 @@ impl NetworkProxyBuilder {
             ))
         };
 
-        HttpProxy::with_egress_policy(decider, self.credential_resolver, self.public_only)
+        HttpProxy::with_git_transport(
+            decider,
+            self.credential_resolver,
+            self.public_only,
+            self.git_transport,
+        )
     }
 
     /// Build and start the proxy on the given port.

@@ -412,7 +412,15 @@ impl SandboxManager {
                     .as_ref()
                     .map(GitGrantAuthorization::proxy_credentials)
                     .unwrap_or_default();
-                Some(self.start_scoped_git_proxy(hosts, credentials).await?)
+                let transport = decision
+                    .git
+                    .as_ref()
+                    .map(GitGrantAuthorization::transport_policy)
+                    .unwrap_or_default();
+                Some(
+                    self.start_scoped_git_proxy(hosts, credentials, transport)
+                        .await?,
+                )
             }
             None => None,
         };
@@ -460,16 +468,21 @@ impl SandboxManager {
     /// Per-call scoped proxy for git remotes. It resolves any host-side
     /// credential binding from the daemon environment and injects the
     /// `Authorization` header itself, so the secret never reaches the
-    /// container (WI#860 route b).
+    /// container (WI#860 route b). It also applies the git smart-HTTP
+    /// transport checks (WI#860, ALM-1): receive-pack only to write-granted
+    /// remotes, no ref deletion, and a bound credential only on its own
+    /// repository's endpoints.
     async fn start_scoped_git_proxy(
         &self,
         hosts: Vec<String>,
         credentials: Vec<crate::secrets::CredentialMapping>,
+        transport: crate::sandbox::proxy::git_transport::GitTransportPolicy,
     ) -> Result<(HttpProxy, u16)> {
         let proxy = NetworkProxyBuilder::from_config(&self.config)
             .with_allowlist(hosts)
             .with_credentials(credentials)
             .with_credential_resolver(Arc::new(EnvCredentialResolver))
+            .with_git_transport(transport)
             .build_and_start(0)
             .await?;
         let addr = proxy.addr().await.ok_or_else(|| SandboxError::ProxyError {
@@ -1591,7 +1604,6 @@ mod tests {
             "origin=http://git.internal/org/repo.git",
             "",
             "origin=GIT_MANAGER_ARGV_TOKEN",
-            false,
         )
         .unwrap();
         crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", SECRET);

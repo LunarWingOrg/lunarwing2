@@ -951,19 +951,33 @@ to named remotes from that list; without it every remote stays read-only and
 network work. A write name outside `SANDBOX_GIT_REMOTES` is a load error.
 Force push is refused in every preflight spelling (`-f`, `--force`,
 `--force-with-lease`, `--force-if-includes`, `--mirror`, `-qf`, `+refspec`).
-Ref deletion follows `SANDBOX_GIT_ALLOW_REF_DELETION` (default `false`).
-Manifest preflight is an early refusal, not the boundary; where a write must
-be bounded, configure the forge (read-only deploy key, protected branches).
+Ref deletion is always refused; there is no switch. Manifest preflight is an
+early refusal. For `http://` remotes the per-call proxy is the boundary: it
+forwards `git-receive-pack` only to a write-granted remote's own repository,
+host and port, refuses a push that deletes a ref (all-zero new id), signed or
+compressed push bodies, WebDAV methods under a granted repository and
+`CONNECT` to the remote's host and port. Non-fast-forward updates, and every
+write to an `https://` remote, are left to the forge: read-only deploy keys
+for read grants, protected branches (no force push).
 
 `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a
 granted `http://` remote to a daemon environment variable holding the
 `Authorization` header value. The per-call proxy resolves it and injects the
 header host-side, so the credential never enters the container — not in its
 environment, files, arguments, process listings or output, and there is no
-helper socket to query. Only plain `http://` can be bound (HTTPS travels in an
-opaque CONNECT tunnel); an `https://` binding is a load error. A binding is
-applied only when its remote is selected. `none` and `tunnel` carry only
-`file://` remotes, so a credential-bound network remote fails closed there.
+helper socket to query. The header goes only to the bound repository's own
+smart-HTTP endpoints (exact host, port, path and method), never to another
+repository or API path on the same host. Only plain `http://` can be bound
+(HTTPS travels in an opaque CONNECT tunnel); an `https://` binding is a load
+error. The hop is plain HTTP, so it belongs on a trusted network or an
+encrypted overlay; the per-call proxy keeps the public-only destination
+check, so a remote resolving to a private, CGNAT (NetBird's `100.64.0.0/10`)
+or loopback address is refused today. A binding is applied only when its remote
+is selected. `none` and `tunnel` carry only `file://` remotes, so a
+credential-bound network remote fails closed there. mt-admin keeps
+`SANDBOX_GIT_REMOTES`, `SANDBOX_GIT_WRITE_REMOTES`, `SANDBOX_GIT_CREDENTIALS`
+and every variable a binding names across `lunarwing.env` re-renders (see
+`docs/ops/TENANT-CONFIGURATION.md`).
 
 The grant also refuses in-command `alias.*`, `include.*`, `includeIf.*`,
 `remote.*`, `url.*`, `credential.*` and `http.extraheader` configuration,

@@ -140,14 +140,34 @@ refused with `capability_denied` before any credential or network work.
 - **Force push is refused in every spelling** the preflight can see: `-f`,
   `--force`, `--force-with-lease[=ref]`, `--force-if-includes`, `--mirror`,
   short clusters containing `f` (`-qf`), and a `+` refspec.
-- **Ref deletion follows the host decision.** By default a `:ref` refspec and
-  `--delete`/`--del` are refused. `SANDBOX_GIT_ALLOW_REF_DELETION=true` turns
-  deletion on for the whole grant; force push stays refused either way.
+- **Ref deletion is refused.** There is no host switch: a `:ref` or `+:ref`
+  refspec, a bare `:` and `--delete`/`--del` are refused by the preflight, and
+  the per-call proxy refuses any deleting push (below).
 - **The preflight is an early, friendly refusal, not the boundary.** A script
   can still write `.git/config` (`remote.origin.mirror`, `remote.origin.push`,
-  `alias.p`) or reach a remote through plumbing the scan does not model. Where
-  the write must actually be bounded, configure the forge: a read-only key for
-  read grants, protected branches (no force, no delete) for write grants.
+  `alias.p`) or reach a remote with a client other than git.
+
+**Where the push happens (plain `http://` remotes).** The per-call git proxy
+reads every smart-HTTP request, so for `http://` remotes it, not the command
+text, decides write and deletion:
+
+- `git-receive-pack` (the advertisement
+  `GET <repo>/info/refs?service=git-receive-pack` and
+  `POST <repo>/git-receive-pack`) is forwarded only to a write-granted remote's
+  own repository, host and port. On a read-only remote, on another repository
+  of the same host, or in any other spelling or encoding, it is refused with
+  `403`, with or without a bound credential and whatever client sent it.
+- A push whose command list deletes a ref (an all-zero new object id) is
+  refused, as are signed pushes (`push-cert`) and compressed, truncated or
+  malformed push bodies.
+- Under a granted repository path only `GET`, `HEAD`, `POST` and `OPTIONS` are
+  forwarded, so WebDAV writes (`git http-push`) are refused.
+- `CONNECT` to a plain-HTTP remote's own host and port is refused, so a client
+  cannot tunnel around these checks.
+- **A non-fast-forward update cannot be seen from the request**, so it is left
+  to the forge: protect the target branches (no force push). For `https://`
+  remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
+  write boundary: give read grants a read-only key and protect branches.
 
 ### Credentials (WI#860)
 
@@ -160,11 +180,21 @@ remote to a daemon environment variable. The value is the literal
   receives it: not in its environment, files, command arguments, process
   listings or output. There is no credential helper and no socket a process in
   the run can query.
+- **The credential reaches only its repository's endpoints.** The header is
+  added only to the bound remote's own smart-HTTP requests (`info/refs`,
+  `git-upload-pack`, and `git-receive-pack` for a write grant) on its exact
+  host and port. Another repository on the same host, the forge's API, a
+  dumb-HTTP read and any other path get no credential. Configure the remote's
+  canonical smart-HTTP URL (with `.git` where the forge redirects to it).
 - **Only plain `http://` remotes can be bound.** HTTPS travels in an opaque
   `CONNECT` tunnel the proxy cannot modify, so binding an `https://` remote is a
   configuration load error rather than a silent no-op. Use `http://` for
   credential-bound remotes, or configure the forge to accept an unauthenticated
-  read.
+  read. The hop from the host to the remote is plain HTTP, so it belongs on a
+  trusted network or an encrypted overlay. The per-call proxy keeps
+  `proxy-enforced`'s public-only destination check, so today a remote whose
+  name resolves to a private, CGNAT (including NetBird's `100.64.0.0/10`) or
+  loopback address is refused.
 - **A binding must name a granted remote**, and is applied only when that
   remote is selected for the call.
 - **Egress modes.** Credential injection works in `proxy-enforced`, the only
@@ -197,9 +227,10 @@ refuses `git config` writes and renames involving those keys and refuses
 `git config edit` outright. Literal reads are allowed. It also refuses
 recognized writes to `GIT_CONFIG_*`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR`.
 These refusals are preflight only: a script can still write `.git/config`
-directly. This is not a repository write filter for arbitrary shell processes.
-Use server-side permissions and branch protection to enforce repository write
-policy.
+directly. The scan is not a repository write filter for arbitrary shell
+processes: for `http://` remotes the per-call proxy enforces write and deletion
+(see the write grant above), and for everything else, and for non-fast-forward
+updates, use server-side permissions and branch protection.
 
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,

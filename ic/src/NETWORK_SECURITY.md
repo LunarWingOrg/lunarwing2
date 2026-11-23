@@ -421,20 +421,31 @@ operator sets `SANDBOX_GIT_REMOTES` (`name=url[,name=url...]`); unset or empty
 grants nothing. `git.remotes` selects names from that list. Calls without a
 manifest retain the configured legacy behavior, including any existing egress.
 
-- **The proxy enforces hosts, not repository URLs.** A granted HTTP(S) remote
-  requires `proxy-enforced`. A per-call proxy only permits the selected
-  exact hosts, which must already be on the tenant egress allowlist. It keeps
-  public-IP checks and DNS pinning. It neither changes nor falls back to the
-  shared proxy. HTTPS CONNECT does not expose repository paths or operation
-  types.
+- **The proxy enforces hosts, and for `http://` remotes git writes.** A
+  granted HTTP(S) remote requires `proxy-enforced`. A per-call proxy only
+  permits the selected exact hosts, which must already be on the tenant egress
+  allowlist. It keeps public-IP checks and DNS pinning. It neither changes nor
+  falls back to the shared proxy. HTTPS CONNECT does not expose repository
+  paths or operation types.
 - **Write grant.** `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
   operation class includes `write`; every other remote stays read-only and
   refuses `git push` with `capability_denied` before any credential or network
   work. A write name outside `SANDBOX_GIT_REMOTES` is a configuration load
   error, so write can never broaden read. Force push is refused in every
-  spelling (`-f`, `--force`, `--force-with-lease`, `--force-if-includes`,
-  `--mirror`, `-qf`, a `+` refspec). Ref deletion (`:ref`, `--delete`) follows
-  `SANDBOX_GIT_ALLOW_REF_DELETION`, off by default.
+  preflight spelling (`-f`, `--force`, `--force-with-lease`,
+  `--force-if-includes`, `--mirror`, `-qf`, a `+` refspec). Ref deletion
+  (`:ref`, `+:ref`, `:`, `--delete`) is always refused; there is no switch.
+- **The transport decides for `http://` remotes** (WI#860, ALM-1;
+  `sandbox/proxy/git_transport.rs`). The per-call proxy forwards
+  `git-receive-pack` only to a write-granted remote's own repository, host and
+  port, and refuses it everywhere else (any spelling or percent-encoding, any
+  client). It refuses a push whose command list deletes a ref (all-zero new
+  id), signed pushes and compressed or malformed push bodies, WebDAV methods
+  under a granted repository path, and `CONNECT` to a plain-HTTP remote's own
+  host and port. A non-fast-forward update is not visible in the request and
+  is left to the forge's branch protection; for `https://` remotes the forge
+  is the only write boundary (read-only keys for read grants, protected
+  branches).
 - **The shell scan is best-effort preflight.** It checks recognizable Git
   commands for a granted alias or literal URL, and refuses force and deletion
   spellings before execution. It also refuses in-command configuration that
@@ -458,11 +469,17 @@ manifest retain the configured legacy behavior, including any existing egress.
   resolves that variable and adds the `Authorization` header to the outgoing
   plain-HTTP request, so no credential value enters the container: not in its
   environment, files, arguments, process listings or output, and there is no
-  helper socket a process in the run can query. Only `http://` remotes can be
-  bound; an `https://` binding is a load error because CONNECT is opaque to
-  the proxy. A binding is applied only when its remote is selected. Modes that
-  cannot carry a network remote (`none`, `tunnel`) fail closed at
-  authorization, so a credential is never silently absent.
+  helper socket a process in the run can query. The header is added only to
+  the bound repository's own smart-HTTP endpoints (exact host, port, path and
+  method); another repository or API path on the same host gets none. Only
+  `http://` remotes can be bound; an `https://` binding is a load error
+  because CONNECT is opaque to the proxy. The hop is plain HTTP, so it belongs
+  on a trusted network or an encrypted overlay; the per-call proxy keeps the
+  public-only destination check, so a remote resolving to a private, CGNAT
+  (NetBird's `100.64.0.0/10`) or loopback address is refused today. A
+  binding is applied only when its remote is selected. Modes that cannot carry
+  a network remote (`none`, `tunnel`) fail closed at authorization, so a
+  credential is never silently absent.
 - **Evidence.** Configured URLs cannot include userinfo, queries, or
   fragments; errors do not echo supplied values. `capability_evidence.git`
   records the grant ID, supported egress modes and remote names, transports,

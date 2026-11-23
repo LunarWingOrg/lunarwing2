@@ -14,19 +14,27 @@
 //! Write grant (WI#860): `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
 //! operation classes include `Write`; every other remote stays read-only, and
 //! a read-only grant still refuses `git push`. Force push is refused in every
-//! spelling; ref deletion is refused unless `SANDBOX_GIT_ALLOW_REF_DELETION`
-//! turns it on.
+//! preflight spelling, and ref deletion is always refused (no host switch).
 //!
 //! Credentials (WI#860): `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME` binds a
 //! granted plain-HTTP remote to a daemon environment variable. The per-call
 //! egress proxy resolves that variable and adds the `Authorization` header
 //! host-side, so the secret never enters the container: not in its
-//! environment, files, arguments, process listings or output. HTTPS travels in
-//! an opaque `CONNECT` tunnel the proxy cannot modify, so an HTTPS remote with
-//! a credential binding is a load error rather than a silent no-op.
+//! environment, files, arguments, process listings or output. The header is
+//! added only to the bound repository's own smart-HTTP endpoints. HTTPS
+//! travels in an opaque `CONNECT` tunnel the proxy cannot modify, so an HTTPS
+//! remote with a credential binding is a load error rather than a silent
+//! no-op.
+//!
+//! Transport checks (WI#860, ALM-1): for plain-HTTP remotes the per-call
+//! proxy is the boundary for write and deletion, see
+//! [`crate::sandbox::proxy::git_transport`]. It refuses `git-receive-pack`
+//! except at a write-granted remote's own endpoints, and refuses a push whose
+//! command list deletes a ref. A non-fast-forward update is left to the
+//! forge's branch protection.
 //!
 //! The manifest shell scan is best-effort preflight, not Git authorization:
-//! it does not control repository paths or Git operations on allowed hosts.
+//! it gives early, friendly refusals and cannot see repository config.
 
 use std::path::{Path, PathBuf};
 
@@ -85,9 +93,6 @@ pub struct GitRemote {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitGrantConfig {
     pub remotes: Vec<GitRemote>,
-    /// Host decision on ref deletion (`SANDBOX_GIT_ALLOW_REF_DELETION`).
-    /// Off by default: `:ref` refspecs and `--delete` are refused.
-    pub allow_ref_deletion: bool,
     /// Per-remote credential source (`SANDBOX_GIT_CREDENTIALS`,
     /// `remote=ENV_NAME`). The value is a daemon-side environment variable
     /// name, resolved host-side only; it never enters the container.
@@ -110,33 +115,27 @@ impl GitGrantConfig {
 
     /// Parse `name=url[,name=url...]`. An empty string means "no grant".
     ///
-    /// Read-only shorthand: no remote is writable and ref deletion is
-    /// refused.
+    /// Read-only shorthand: no remote is writable.
     pub fn from_spec(spec: &str) -> std::result::Result<Option<Self>, String> {
-        Self::from_parts(spec, "", false)
+        Self::from_parts(spec, "")
     }
 
     /// Parse the read grant plus the host's separate write list
-    /// (`SANDBOX_GIT_WRITE_REMOTES`) and deletion decision
-    /// (`SANDBOX_GIT_ALLOW_REF_DELETION`).
+    /// (`SANDBOX_GIT_WRITE_REMOTES`).
     ///
     /// A write name that is not a read remote is a load error, because a
     /// write grant can never broaden the read one.
-    pub fn from_parts(
-        spec: &str,
-        write_names: &str,
-        allow_ref_deletion: bool,
-    ) -> std::result::Result<Option<Self>, String> {
-        Self::from_full_spec(spec, write_names, "", allow_ref_deletion)
+    pub fn from_parts(spec: &str, write_names: &str) -> std::result::Result<Option<Self>, String> {
+        Self::from_full_spec(spec, write_names, "")
     }
 
-    /// Parse the read grant, the write list, the credential bindings
-    /// (`SANDBOX_GIT_CREDENTIALS`) and the deletion decision.
+    /// Parse the read grant, the write list and the credential bindings
+    /// (`SANDBOX_GIT_CREDENTIALS`). Ref deletion has no host setting: it is
+    /// always refused.
     pub fn from_full_spec(
         spec: &str,
         write_names: &str,
         credential_spec: &str,
-        allow_ref_deletion: bool,
     ) -> std::result::Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -192,7 +191,6 @@ impl GitGrantConfig {
         Ok(Some(Self {
             credentials: parse_credentials(credential_spec, &remotes)?,
             remotes,
-            allow_ref_deletion,
         }))
     }
 }
@@ -288,8 +286,6 @@ pub struct GitGrantAuthorization {
     pub remotes: Vec<GitRemote>,
     /// Network modes in which this grant is supported.
     pub egress: Vec<SandboxNetworkMode>,
-    /// Host decision on ref deletion (`:ref`, `--delete`).
-    pub allow_ref_deletion: bool,
     /// Host-side credential bindings, resolved by the per-call proxy.
     pub credentials: Vec<GitCredentialSource>,
 }
@@ -342,22 +338,56 @@ impl GitGrantAuthorization {
     /// Route (b): the proxy adds the `Authorization` header to a plain-HTTP
     /// request, so the secret is resolved and applied on the host and never
     /// enters the container. A remote without a binding contributes nothing.
+    ///
+    /// Each mapping is scoped to the bound repository's own smart-HTTP
+    /// endpoints (WI#860, ALM-1), never the whole host; the git transport
+    /// policy additionally checks the port, query and method.
     pub fn proxy_credentials(&self) -> Vec<crate::secrets::CredentialMapping> {
         let mut mappings = Vec::new();
         for source in &self.credentials {
             let Some(remote) = self.remote_by_name(&source.remote) else {
                 continue;
             };
-            let Some(host) = remote.host.as_ref() else {
+            let Some(transport) =
+                crate::sandbox::proxy::git_transport::GitTransportRemote::from_http_url(
+                    &remote.url,
+                    remote.write,
+                    true,
+                )
+            else {
                 continue;
             };
-            mappings.push(crate::secrets::CredentialMapping::header(
+            let mut mapping = crate::secrets::CredentialMapping::header(
                 source.secret_env.clone(),
                 "Authorization",
-                host.clone(),
-            ));
+                transport.host.clone(),
+            );
+            mapping.path_patterns = transport.credential_paths();
+            mappings.push(mapping);
         }
         mappings
+    }
+
+    /// The smart-HTTP transport policy of this call's per-call git proxy
+    /// (WI#860, ALM-1): every selected plain-HTTP remote with its write class
+    /// and whether a credential is bound to it.
+    pub fn transport_policy(&self) -> crate::sandbox::proxy::git_transport::GitTransportPolicy {
+        let remotes = self
+            .remotes
+            .iter()
+            .filter_map(|remote| {
+                let credentialed = self
+                    .credentials
+                    .iter()
+                    .any(|source| source.remote == remote.name);
+                crate::sandbox::proxy::git_transport::GitTransportRemote::from_http_url(
+                    &remote.url,
+                    remote.write,
+                    credentialed,
+                )
+            })
+            .collect();
+        crate::sandbox::proxy::git_transport::GitTransportPolicy::new(remotes)
     }
 
     /// Secret-free credential evidence: the remote name and the *name* of the
@@ -531,7 +561,6 @@ pub fn authorize_grant(
         cwd: cwd.to_path_buf(),
         remotes: selected,
         egress,
-        allow_ref_deletion: host.allow_ref_deletion,
         credentials,
     })
 }
@@ -1860,7 +1889,9 @@ fn refspec_forces(word: &str) -> bool {
 /// preflight checks that the destination is writable and that no spelling
 /// forces or deletes a ref.
 fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
-    let grant = preflight.grant.ok_or_else(no_grant_denial)?;
+    if preflight.grant.is_none() {
+        return Err(no_grant_denial());
+    }
     let mut positional: Vec<&Word> = Vec::new();
     let mut end_of_options = false;
     let mut index = 0;
@@ -1885,7 +1916,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
                 ));
             }
             if text == "--delete" || text == "--del" || text.starts_with("--delete=") {
-                return push_deletion(text, grant);
+                return Err(push_deletion(text));
             }
             if push_mirror_flag(text) {
                 return Err(denied(
@@ -1940,7 +1971,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     preflight.write_remote(remote)?;
     for refspec in &positional[1..] {
         if refspec_deletes(&refspec.text) {
-            push_deletion(&refspec.text, grant)?;
+            return Err(push_deletion(&refspec.text));
         }
         if refspec_forces(&refspec.text) {
             return Err(denied(
@@ -1951,13 +1982,13 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     Ok(())
 }
 
-fn push_deletion(spelling: &str, grant: &GitGrantAuthorization) -> Result<()> {
-    if grant.allow_ref_deletion {
-        return Ok(());
-    }
-    Err(denied(format!(
-        "ref deletion ('{spelling}') is not permitted by this tenant's git grant"
-    )))
+/// Ref deletion is refused in every spelling the preflight can see (WI#860,
+/// the maintainer's decision; there is no host switch). The per-call git
+/// proxy refuses a deleting push again from its command list.
+fn push_deletion(spelling: &str) -> SandboxError {
+    denied(format!(
+        "ref deletion ('{spelling}') is not permitted through the sandbox git grant"
+    ))
 }
 
 fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -2638,8 +2669,8 @@ mod tests {
         }
     }
 
-    /// A write grant on one remote: push to it is allowed, but force push is
-    /// refused in every spelling and ref deletion is refused by default.
+    /// A write grant on one remote: push to it is allowed, but force push and
+    /// ref deletion are refused in every spelling (deletion has no switch).
     #[test]
     fn write_grant_allows_push_and_refuses_every_force_and_deletion_spelling() {
         let (temp, _) = workspace_with_remote();
@@ -2648,7 +2679,6 @@ mod tests {
             "origin=file:///workspace/remotes/origin.git,\
              upstream=file:///workspace/remotes/upstream.git",
             "origin",
-            false,
         )
         .unwrap()
         .unwrap();
@@ -2726,45 +2756,59 @@ mod tests {
         }
     }
 
-    /// The maintainer's deletion decision is host policy: turning it on
-    /// permits `:ref` and `--delete`, but never a force.
+    /// WI#860 (ALM-1): the per-call proxy's transport policy carries each
+    /// selected plain-HTTP remote's write class and credential binding, and a
+    /// bound credential is scoped to that repository's own endpoints.
     #[test]
-    fn ref_deletion_follows_the_host_decision() {
+    fn transport_policy_carries_write_class_and_scoped_credentials() {
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
-        let host = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
+        let host = GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git,\
+             mirror=http://git.internal:8080/org/mirror.git,\
+             upstream=https://git.example.test/org/repo.git",
             "origin",
-            true,
+            "origin=ORIGIN_TOKEN",
         )
         .unwrap()
         .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
-        for allowed in [
-            "git push --delete origin old-branch",
-            "git push origin :old-branch",
-        ] {
-            check_granted(allowed, &grant).expect(allowed);
-        }
-        let error = check_granted("git push -f origin main", &grant).unwrap_err();
-        assert!(error.to_string().contains("force"), "{error}");
+        let policy = grant.transport_policy();
+        let remotes = policy.remotes();
+        // HTTPS remotes stay opaque CONNECT tunnels and are not listed.
+        assert_eq!(remotes.len(), 2, "{remotes:?}");
+        assert_eq!(remotes[0].host, "git.internal");
+        assert_eq!(remotes[0].port, 80);
+        assert_eq!(remotes[0].repo_path, "/org/repo.git");
+        assert!(remotes[0].write && remotes[0].credentialed);
+        assert_eq!(remotes[1].port, 8080);
+        assert!(!remotes[1].write && !remotes[1].credentialed);
+
+        let mappings = grant.proxy_credentials();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].path_patterns,
+            vec![
+                "/org/repo.git/info/refs".to_string(),
+                "/org/repo.git/git-upload-pack".to_string(),
+                "/org/repo.git/git-receive-pack".to_string(),
+            ]
+        );
+        assert!(mappings[0].matches("git.internal", "/org/repo.git/git-upload-pack"));
+        assert!(!mappings[0].matches("git.internal", "/org/other.git/git-upload-pack"));
+        assert!(!mappings[0].matches("git.internal", "/api/v4/projects"));
+        assert!(!mappings[0].matches("git.internal", "/org/repo.git/../other.git/git-upload-pack"));
     }
 
     #[test]
     fn write_grant_cannot_broaden_the_read_grant() {
-        let error = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "upstream",
-            false,
-        )
-        .unwrap_err();
+        let error =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "upstream")
+                .unwrap_err();
         assert!(error.contains("upstream"), "{error}");
-        let error = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "Origin",
-            false,
-        )
-        .unwrap_err();
+        let error =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "Origin")
+                .unwrap_err();
         assert!(error.contains("remote names"), "{error}");
     }
 
@@ -2772,13 +2816,10 @@ mod tests {
     fn evidence_records_the_write_operation_class() {
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
-        let host = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "origin",
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
         let evidence = grant.evidence();
         assert_eq!(
@@ -2799,7 +2840,6 @@ mod tests {
             "origin=http://git.internal/org/repo.git",
             "origin",
             "origin=GIT_ORIGIN_TOKEN",
-            false,
         )
         .unwrap()
         .unwrap();
@@ -2867,7 +2907,7 @@ mod tests {
             ),
         ] {
             assert!(
-                GitGrantConfig::from_full_spec(spec, writes, credentials, false).is_err(),
+                GitGrantConfig::from_full_spec(spec, writes, credentials).is_err(),
                 "accepted {spec} / {credentials}"
             );
         }
@@ -2883,7 +2923,6 @@ mod tests {
              upstream=http://git.internal/org/other.git",
             "",
             "origin=ORIGIN_TOKEN,upstream=UPSTREAM_TOKEN",
-            false,
         )
         .unwrap()
         .unwrap();
@@ -3382,13 +3421,10 @@ mod tests {
         );
 
         // Write grant: the preflight accepts, and real git performs the push.
-        let write_host = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "origin",
-            false,
-        )
-        .expect("write grant")
-        .expect("grant");
+        let write_host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .expect("write grant")
+                .expect("grant");
         let write_grant =
             authorize_grant(&write_host, &[], &root, SandboxNetworkMode::ProxyEnforced)
                 .expect("authorized");
@@ -3431,7 +3467,6 @@ mod tests {
             "origin=http://git.internal/org/repo.git",
             "",
             "origin=GIT_ORIGIN_TOKEN",
-            false,
         )
         .expect("credential grant")
         .expect("grant");
