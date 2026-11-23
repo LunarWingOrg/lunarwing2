@@ -490,15 +490,95 @@ function optionValue(attached, words, index) {
   return { value: words[index + 1] ?? "", last: index + 1 };
 }
 
+// cp/mv's value-taking options: `-t`/`--target-directory` names the
+// destination without being an operand word, and `-S`/`--suffix` takes a
+// value that is not a path. A walk that only skips `-`-prefixed words leaves
+// the value behind as an operand, so `cp -t /dev/sda1 /tmp/a` read
+// `/dev/sda1` as a source and `/tmp/a` as the destination (WI#869).
+const COPY_SHORT_ARG = new Set("tS");
+const COPY_LONG_ARG = ["target-directory", "suffix"];
+
+/** The value-taking cp/mv long option a name spells, exactly or by prefix. */
+function copyLongValueOption(name) {
+  if (COPY_LONG_ARG.includes(name)) return name;
+  // GNU accepts a unique prefix; `--t` is `--target-directory`.
+  return COPY_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+}
+
+/**
+ * The path operands of a `cp`/`mv` invocation, and the destination a
+ * `-t`/`--target-directory` names without being an operand word (WI#849,
+ * WI#869). `-S`/`--suffix` takes a value that is not a path.
+ */
+function copyOperands(rest) {
+  const words = argumentWords(rest).map(stripShellQuotes);
+  const operands = [];
+  let target;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      operands.push(...words.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const option = copyLongValueOption(word.slice(2, equals === -1 ? undefined : equals));
+      if (option === null) continue;
+      const { value, last } = optionValue(equals === -1 ? "" : word.slice(equals + 1), words, i);
+      if (option === "target-directory") target = value;
+      i = last;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const cluster = word.slice(1);
+      for (let j = 0; j < cluster.length; j++) {
+        if (!COPY_SHORT_ARG.has(cluster[j])) continue;
+        const { value, last } = optionValue(cluster.slice(j + 1), words, i);
+        if (cluster[j] === "t") target = value;
+        i = last;
+        break;
+      }
+      continue;
+    }
+    operands.push(word);
+  }
+  // A redirection target is not an operand (e.g. `2>/tmp/log`).
+  return { operands: operands.filter((operand) => !/^\d*>/.test(operand)), target };
+}
+
 /**
  * The path operands of an `mv` invocation: every source and the destination,
  * including a `-t`/`--target-directory` value, which is a destination without
- * being an operand word. `-S`/`--suffix` takes a value that is not a path
- * (WI#849).
+ * being an operand word (WI#849).
  */
 function mvOperands(rest) {
+  const { operands, target } = copyOperands(rest);
+  return target === undefined ? operands : [...operands, target];
+}
+
+/** The argument-taking long option a name spells, exactly or by unique prefix. */
+function tarLongValueOption(name) {
+  if (TAR_LONG_ARG.includes(name)) return name;
+  if (name.length < 4) return null;
+  return TAR_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+}
+
+// cp/mv's destination options: `-t`/`--target-directory` names the
+// destination without being an operand word, and `-S`/`--suffix` takes a
+// value that is not a path. A walk that only skips `-`-prefixed words leaves
+// the value as an operand, so `cp -t /dev/sda1 /tmp/a` read `/dev/sda1` as
+// an ordinary operand and `/tmp/a` as the destination (WI#869).
+const CP_TARGET_VALUE_OPTIONS = new Set(["-t", "--target-directory"]);
+
+/**
+ * The operands of a `cp`/`mv` invocation in bash-word form, with the value of
+ * a separate-value option stepped over and a `-t`/`--target-directory` value
+ * reported as the destination it is (WI#869).
+ */
+function cpMvOperands(rest) {
   const words = argumentWords(rest).map(stripShellQuotes);
   const operands = [];
+  let target;
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (word === "--") {
@@ -508,14 +588,11 @@ function mvOperands(rest) {
     if (word.startsWith("--")) {
       const equals = word.indexOf("=");
       const name = word.slice(2, equals === -1 ? undefined : equals);
-      const attached = equals === -1 ? null : word.slice(equals + 1);
-      // GNU mv accepts unique prefixes: `--t` is `--target-directory`.
-      const target = name.length >= 1 && "target-directory".startsWith(name);
-      const suffix = name.length >= 2 && "suffix".startsWith(name);
-      if (!target && !suffix) continue;
-      const { value, last } = optionValue(attached ?? "", words, i);
-      if (target) operands.push(value);
-      i = last;
+      if (CP_TARGET_VALUE_OPTIONS.has(`--${name}`) || "target-directory".startsWith(name)) {
+        const { value, last } = optionValue(equals === -1 ? "" : word.slice(equals + 1), words, i);
+        target = value;
+        i = last;
+      }
       continue;
     }
     if (word.startsWith("-") && word.length > 1) {
@@ -523,7 +600,7 @@ function mvOperands(rest) {
       for (let j = 0; j < cluster.length; j++) {
         if (cluster[j] !== "t" && cluster[j] !== "S") continue;
         const { value, last } = optionValue(cluster.slice(j + 1), words, i);
-        if (cluster[j] === "t") operands.push(value);
+        if (cluster[j] === "t") target = value;
         i = last;
         break;
       }
@@ -531,15 +608,8 @@ function mvOperands(rest) {
     }
     operands.push(word);
   }
-  // A redirection target is not an operand (e.g. `2>/tmp/log`).
-  return operands.filter((operand) => !/^\d*>/.test(operand));
-}
-
-/** The argument-taking long option a name spells, exactly or by unique prefix. */
-function tarLongValueOption(name) {
-  if (TAR_LONG_ARG.includes(name)) return name;
-  if (name.length < 4) return null;
-  return TAR_LONG_ARG.find((option) => option.startsWith(name)) ?? null;
+  const filtered = operands.filter((operand) => !/^\d*>/.test(operand));
+  return { operands: filtered, target };
 }
 
 /** Read one tar short-option cluster; returns the index of its last consumed word. */
@@ -719,9 +789,11 @@ function quotedFirstArgument(code, from) {
 // `-`-prefixed words ends at a value: `perl -I /tmp -e 'unlink(…)'` read as
 // carrying no one-liner, so the deletion rule never ran (WI#869, the same
 // shape as `listenerShellBody`). Only options whose value is a separate word
-// are listed; an attached value (`-I/tmp`, `-Mstrict`) needs no step.
+// are listed; an attached value (`-I/tmp`, `-Mstrict`) needs no step, and an
+// optional-value option (`perl -C`, `perl -x`) is absent because eating the
+// next word would hide a following `-e`.
 const INTERPRETER_VALUE_OPTIONS = {
-  perl: new Set(["-I", "-M", "-m", "-D", "-x", "-C", "-F"]),
+  perl: new Set(["-I", "-M", "-m", "-D", "-F"]),
   python: new Set(["-X", "-W", "-Q", "-m"]),
   node: new Set([
     "-r", "--require", "--loader", "--experimental-loader", "-C", "--conditions",
@@ -1134,9 +1206,13 @@ function checkDeviceWrites(text) {
     }
   }
   for (const { rest } of clauseTails(text, CP_CALL)) {
-    const operands = argumentWords(rest).filter((word) => !word.startsWith("-"));
-    const target = operands.length > 0 ? deviceTarget(operands[operands.length - 1]) : null;
-    if (target !== null) return `direct block-device write: cp ${target.slice(0, 80)}`;
+    // `-t`/`--target-directory` names the destination without being an
+    // operand word, so `cp -t /dev/sda1 /tmp/a` must read it as the target
+    // (WI#869).
+    const { operands, target } = copyOperands(rest);
+    const destination = target ?? operands[operands.length - 1];
+    const device = destination === undefined ? null : deviceTarget(destination);
+    if (device !== null) return `direct block-device write: cp ${device.slice(0, 80)}`;
   }
   return null;
 }
