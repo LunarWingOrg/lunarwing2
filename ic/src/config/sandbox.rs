@@ -260,17 +260,17 @@ impl SandboxModeConfig {
             let grant = git
                 .as_mut()
                 .ok_or_else(|| invalid("names remotes but SANDBOX_GIT_REMOTES is empty".into()))?;
-            grant
-                .apply_write_remotes(&write_remotes)
-                .map_err(invalid)?;
+            grant.apply_write_remotes(&write_remotes).map_err(invalid)?;
         }
         let git_credentials = match optional_env("SANDBOX_GIT_CREDENTIALS")? {
-            Some(spec) => crate::sandbox::GitCredentialBinding::parse_spec(&spec).map_err(
-                |message| ConfigError::InvalidValue {
-                    key: "SANDBOX_GIT_CREDENTIALS".to_string(),
-                    message,
-                },
-            )?,
+            Some(spec) => {
+                crate::sandbox::GitCredentialBinding::parse_spec(&spec).map_err(|message| {
+                    ConfigError::InvalidValue {
+                        key: "SANDBOX_GIT_CREDENTIALS".to_string(),
+                        message,
+                    }
+                })?
+            }
             None => Vec::new(),
         };
         let tunnel = SandboxTunnelModeConfig::resolve_env()?;

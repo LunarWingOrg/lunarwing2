@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::sandbox::error::{Result, SandboxError};
-use crate::sandbox::git_grant::{GitCredentialBinding, GIT_CREDENTIAL_SOCKET};
+use crate::sandbox::git_grant::{GIT_CREDENTIAL_SOCKET, GitCredentialBinding};
 use crate::sandbox::proxy::CredentialResolver;
 
 /// The host-side broker for one execution.
@@ -38,7 +38,9 @@ impl GitCredentialBroker {
     pub fn create(bindings: &[GitCredentialBinding]) -> Result<Self> {
         let base = crate::sandbox::proxy::relay::relay_parent_dir().map_err(|error| {
             SandboxError::ProxyError {
-                reason: format!("cannot locate a shared directory for the git credential broker: {error}"),
+                reason: format!(
+                    "cannot locate a shared directory for the git credential broker: {error}"
+                ),
             }
         })?;
         let directory = tempfile::Builder::new()
@@ -129,7 +131,10 @@ impl GitCredentialBroker {
     pub async fn serve(
         &self,
         resolver: std::sync::Arc<dyn CredentialResolver>,
-    ) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::oneshot::Sender<()>)> {
+    ) -> Result<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
         let socket = self.directory.path().join(GIT_CREDENTIAL_SOCKET);
         let listener = UnixListener::bind(&socket).map_err(|error| SandboxError::ProxyError {
             reason: format!("cannot bind the git credential broker socket: {error}"),
@@ -231,7 +236,10 @@ mod tests {
     #[tokio::test]
     async fn broker_answers_only_for_a_bound_host_and_never_logs_the_secret() {
         let broker = GitCredentialBroker::create(&bindings()).unwrap();
-        let (handle, shutdown) = broker.serve(std::sync::Arc::new(FixedResolver)).await.unwrap();
+        let (handle, shutdown) = broker
+            .serve(std::sync::Arc::new(FixedResolver))
+            .await
+            .unwrap();
         let socket = broker.path().join(GIT_CREDENTIAL_SOCKET);
 
         let answer = ask(&socket, "host=git.example.test\nprotocol=https\n\n").await;
@@ -249,7 +257,10 @@ mod tests {
     #[tokio::test]
     async fn broker_returns_nothing_when_the_secret_is_unset() {
         let broker = GitCredentialBroker::create(&bindings()).unwrap();
-        let (handle, shutdown) = broker.serve(std::sync::Arc::new(NoCredentialResolver)).await.unwrap();
+        let (handle, shutdown) = broker
+            .serve(std::sync::Arc::new(NoCredentialResolver))
+            .await
+            .unwrap();
         let socket = broker.path().join(GIT_CREDENTIAL_SOCKET);
         assert_eq!(ask(&socket, "host=git.example.test\n\n").await, "");
         let _ = shutdown.send(());

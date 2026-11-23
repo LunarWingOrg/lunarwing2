@@ -178,9 +178,8 @@ impl GitGrantConfig {
             if name.is_empty() {
                 return Err("SANDBOX_GIT_WRITE_REMOTES must not contain an empty name".into());
             }
-            validate_remote_name(name).map_err(|message| {
-                format!("SANDBOX_GIT_WRITE_REMOTES is invalid: {message}")
-            })?;
+            validate_remote_name(name)
+                .map_err(|message| format!("SANDBOX_GIT_WRITE_REMOTES is invalid: {message}"))?;
             let remote = self
                 .remotes
                 .iter_mut()
@@ -366,7 +365,10 @@ impl GitCredentialBinding {
                 continue;
             }
             let (host, secret_name) = entry.split_once('=').ok_or_else(|| {
-                format!("SANDBOX_GIT_CREDENTIALS entry {} must be host=SECRET_NAME", index + 1)
+                format!(
+                    "SANDBOX_GIT_CREDENTIALS entry {} must be host=SECRET_NAME",
+                    index + 1
+                )
             })?;
             let host = host.trim().to_ascii_lowercase();
             let secret_name = secret_name.trim();
@@ -378,10 +380,7 @@ impl GitCredentialBinding {
             }
             validate_credential_host(&host)?;
             validate_secret_name(secret_name)?;
-            if bindings
-                .iter()
-                .any(|binding: &Self| binding.host == host)
-            {
+            if bindings.iter().any(|binding: &Self| binding.host == host) {
                 return Err("SANDBOX_GIT_CREDENTIALS hosts must be unique".into());
             }
             bindings.push(Self {
@@ -423,9 +422,9 @@ fn validate_credential_host(host: &str) -> std::result::Result<(), String> {
 fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
     let valid = !name.is_empty()
         && name.len() <= 128
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
-        });
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
     if valid {
         Ok(())
     } else {
@@ -1415,9 +1414,22 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
     let positional = read_positionals(
         args,
         &[
-            "-q", "--quiet", "-v", "--verbose", "-u", "--set-upstream", "--progress",
-            "--no-progress", "--porcelain", "--no-verify", "--follow-tags", "--atomic",
-            "--no-atomic", "--dry-run", "--thin", "--no-thin",
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "-u",
+            "--set-upstream",
+            "--progress",
+            "--no-progress",
+            "--porcelain",
+            "--no-verify",
+            "--follow-tags",
+            "--atomic",
+            "--no-atomic",
+            "--dry-run",
+            "--thin",
+            "--no-thin",
         ],
         &[
             "-o",
@@ -1692,7 +1704,8 @@ mod tests {
         let host = GitGrantConfig::from_spec("origin=file:///workspace/remotes/origin.git")
             .unwrap()
             .unwrap();
-        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
+        let grant =
+            authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
         (temp, grant)
     }
 
@@ -1755,7 +1768,8 @@ mod tests {
             SandboxNetworkMode::Tunnel,
             SandboxNetworkMode::Proxy,
         ] {
-            let error = authorize_grant(&network_only, &[], Path::new("/tmp"), mode, &[]).unwrap_err();
+            let error =
+                authorize_grant(&network_only, &[], Path::new("/tmp"), mode, &[]).unwrap_err();
             assert!(error.to_string().contains("git-remotes"), "{error}");
         }
         let grant = authorize_grant(
@@ -1829,8 +1843,8 @@ mod tests {
             let host = GitGrantConfig::from_spec(&format!("origin=file:///workspace/{name}"))
                 .unwrap()
                 .unwrap();
-            let error =
-                authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap_err();
+            let error = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[])
+                .unwrap_err();
             assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
         }
     }
@@ -1964,7 +1978,11 @@ mod tests {
     fn bare_remote_with_one_commit(temp: &Path) -> std::path::PathBuf {
         let bare = temp.join("remotes/origin.git");
         std::fs::create_dir_all(&bare).unwrap();
-        let init = run_git(&[], temp, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
+        let init = run_git(
+            &[],
+            temp,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
         assert!(
             init.status.success(),
             "init --bare: {}",
@@ -2005,8 +2023,12 @@ mod tests {
         .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::None, &[]).unwrap();
         let env = grant.container_env();
-        authorize_shell_command("git clone file:///workspace/remotes/origin.git work", Some(&grant), SandboxNetworkMode::None)
-            .unwrap();
+        authorize_shell_command(
+            "git clone file:///workspace/remotes/origin.git work",
+            Some(&grant),
+            SandboxNetworkMode::None,
+        )
+        .unwrap();
 
         // Real clone, using the virtual path rewritten to the host path the
         // sandbox mount would present.
@@ -2023,15 +2045,23 @@ mod tests {
         // Real push from the clone back to the granted remote.
         std::fs::write(work.join("NEW"), "content\n").unwrap();
         let add = run_git(&env, &work, &["add", "NEW"]);
-        assert!(add.status.success(), "{}", String::from_utf8_lossy(&add.stderr));
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
         let commit = run_git(&env, &work, &["commit", "-q", "-m", "add new"]);
         assert!(
             commit.status.success(),
             "{}",
             String::from_utf8_lossy(&commit.stderr)
         );
-        authorize_shell_command("git push origin main", Some(&grant), SandboxNetworkMode::None)
-            .unwrap();
+        authorize_shell_command(
+            "git push origin main",
+            Some(&grant),
+            SandboxNetworkMode::None,
+        )
+        .unwrap();
         // The clone stored the container-visible virtual URL as `origin`, so
         // push by the host path to the same real remote.
         let push = run_git(&env, &work, &["push", "-q", &clone_url, "main"]);
@@ -2041,7 +2071,13 @@ mod tests {
             String::from_utf8_lossy(&push.stderr)
         );
         let verify = std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "log", "--oneline", "-1"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "log",
+                "--oneline",
+                "-1",
+            ])
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&verify.stdout).contains("add new"));
@@ -2251,7 +2287,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
+        let grant =
+            authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
         (temp, grant)
     }
 
@@ -2265,8 +2302,7 @@ mod tests {
             "git push --atomic origin main",
             "git push origin",
         ] {
-            check_granted(command, &grant)
-                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
         let evidence = grant.evidence();
         assert_eq!(
@@ -2348,12 +2384,9 @@ mod tests {
             let error = bad.unwrap_err();
             assert!(error.contains("SANDBOX_GIT_WRITE_REMOTES"), "{error}");
         }
-        let read_only = GitGrantConfig::parse(
-            "origin=file:///workspace/remotes/origin.git",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
+        let read_only = GitGrantConfig::parse("origin=file:///workspace/remotes/origin.git", &[])
+            .unwrap()
+            .unwrap();
         assert!(!read_only.remotes[0].allows(GitOperationClass::Write));
     }
 
@@ -2382,8 +2415,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            env.iter().any(|(key, value)| key.starts_with("GIT_CONFIG_KEY_")
-                && value == "credential.helper"),
+            env.iter()
+                .any(|(key, value)| key.starts_with("GIT_CONFIG_KEY_")
+                    && value == "credential.helper"),
             "{joined}"
         );
         assert!(env.iter().any(|(_, value)| value == GIT_CREDENTIAL_HELPER));
@@ -2394,14 +2428,8 @@ mod tests {
         assert!(json.contains("git.example.test"));
         // A binding for a host no selected remote uses is refused.
         let other = GitCredentialBinding::parse_spec("other.example.test=TOKEN").unwrap();
-        let error = authorize_grant(
-            &host,
-            &[],
-            &cwd,
-            SandboxNetworkMode::ProxyEnforced,
-            &other,
-        )
-        .unwrap_err();
+        let error = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &other)
+            .unwrap_err();
         assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
         assert!(!error.to_string().contains("TOKEN"));
     }

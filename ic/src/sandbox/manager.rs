@@ -420,10 +420,9 @@ impl SandboxManager {
             .as_ref()
             .is_some_and(|git| !git.credentials.is_empty())
         {
-            let broker =
-                crate::sandbox::git_credential::GitCredentialBroker::create(
-                    &self.config.git_credentials,
-                )?;
+            let broker = crate::sandbox::git_credential::GitCredentialBroker::create(
+                &self.config.git_credentials,
+            )?;
             broker.write_helper()?;
             Some(broker)
         } else {
@@ -1665,10 +1664,9 @@ mod tests {
         let state = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
         manager.config.network_allowlist = vec!["git.example.test".into()];
-        manager.config.git = crate::sandbox::GitGrantConfig::from_spec(
-            "upstream=https://git.example.test/repo.git",
-        )
-        .unwrap();
+        manager.config.git =
+            crate::sandbox::GitGrantConfig::from_spec("upstream=https://git.example.test/repo.git")
+                .unwrap();
         manager.config.git_credentials =
             crate::sandbox::GitCredentialBinding::parse_spec("git.example.test=GIT_READ_TOKEN")
                 .unwrap();
@@ -1700,8 +1698,9 @@ mod tests {
             .unwrap();
         // The broker directory is mounted read-only at the fixed path.
         assert!(
-            args.windows(2).any(|pair| pair[0] == "-v"
-                && pair[1].ends_with(":/run/lunarwing-git-credential:ro,z")),
+            args.windows(2)
+                .any(|pair| pair[0] == "-v"
+                    && pair[1].ends_with(":/run/lunarwing-git-credential:ro,z")),
             "{args:?}"
         );
         // The helper is configured, and the secret is nowhere in the run.
