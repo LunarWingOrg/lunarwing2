@@ -27,6 +27,20 @@ variables:
   GIT_STRATEGY: fetch
   GIT_DEPTH: "0"
   GIT_SUBMODULE_STRATEGY: none
+  # WI#862: retry the runner's own fetch of this repository. In the 30 days
+  # to 2026-11-22, 23 jobs in 16 pipelines died at "Getting source from Git
+  # repository" before their script ran — 18 on "Could not connect to
+  # server", 16 of those after ~135 s, plus a 300 s timeout, a reset and
+  # three HTTP/2 stream resets. GitLab's default is one attempt.
+  #
+  # Three attempts, so two extra ~135 s connect timeouts add ~270 s plus
+  # GitLab's own back-off. The shortest job that fetches this repository is
+  # the 30-minute (1800 s) container job, which leaves ~1530 s for the work
+  # after the fetch; even all three attempts timing out at 300 s (900 s)
+  # fits. A dropped fetch is transient, so the attempts are not wasted on a
+  # permanent failure: a bad ref or a missing repository fails the same way
+  # on every attempt.
+  GET_SOURCES_ATTEMPTS: "3"
   CARGO_HOME: "$CI_PROJECT_DIR/.ci-cache/cargo"
   CARGO_INCREMENTAL: "0"
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
