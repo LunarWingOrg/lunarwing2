@@ -1394,7 +1394,14 @@ function bashWord(text, from) {
       i++;
       continue;
     }
-    if (ch === " " || ch === "\t" || isClauseTerminator(ch)) break;
+    if (ch === " " || ch === "\t" || isClauseTerminator(ch)) {
+      // A separator inside a substitution body is part of the word the
+      // substitution sits in; only the outermost level ends it.
+      if (levels.length === 1) break;
+      word += ch;
+      i++;
+      continue;
+    }
     const opener = openingQuote(text, i);
     if (opener !== "") {
       level.quote = opener;
@@ -1590,6 +1597,27 @@ function gitAliasDefinition(segment, from) {
   return end - after > 4096 || gitConfigAliasVerdict(segment.slice(after, end));
 }
 
+// The reason a git alias or include definition is refused (WI#867). It is a
+// refusal of its own, not a discard: an alias body is an arbitrary verb, and
+// an include pulls in a file that can define one, so the guard refuses the
+// definition because it cannot evaluate what the alias runs.
+const GIT_ALIAS_REASON =
+  "git alias or include definition (the guard does not evaluate alias bodies)";
+
+/**
+ * The reason for a git alias or include definition (WI#842, WI#867). The
+ * refusal is not a discard: an alias body is an arbitrary verb the guard never
+ * reads, so it refuses the definition itself and says so. Returns the reason
+ * text, or null when the segment defines neither.
+ */
+function checkGitAliasDefinition(segment) {
+  if (hasGitAliasEnv(segment)) return GIT_ALIAS_REASON;
+  for (const match of segment.matchAll(GIT_CALL)) {
+    if (gitAliasDefinition(segment, match.index + 3)) return GIT_ALIAS_REASON;
+  }
+  return null;
+}
+
 /** True when any short flag cluster in the text carries one of the letters. */
 function hasShortFlag(text, letters) {
   for (const match of text.matchAll(/(?:^|[ \t])-([a-zA-Z]+)(?=[ \t]|$)/g)) {
@@ -1623,9 +1651,7 @@ function hasGitLongOption(text, options) {
  * (WI#842): the alias name would be an arbitrary verb they have never seen.
  */
 function checkGitDiscard(segment) {
-  if (hasGitAliasEnv(segment)) return true;
   for (const match of segment.matchAll(GIT_CALL)) {
-    if (gitAliasDefinition(segment, match.index + 3)) return true;
     const { verb, after } = gitVerb(segment, match.index + 3);
     // Parse the verb before reading any options: a long clause full of
     // ordinary `git log` words then costs one word apiece (WI#824 deadline).
@@ -1957,6 +1983,14 @@ const DENY_RULES = [
       /\b(curl|wget|fetch|nc|ncat|netcat)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*(?:ba|z|da|a|k)?sh\b|\b(curl|wget)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*python3?\b/,
   },
   {
+    name: "git alias or include definition (the guard does not evaluate alias bodies)",
+    // An alias body is an arbitrary verb and an include pulls in a file that
+    // can define one, so the definition is refused before the verb rules read
+    // the literal verb (WI#842). Since WI#867 this refusal has its own reason
+    // instead of reusing the discard rule's name.
+    check: checkGitAliasDefinition,
+  },
+  {
     name: "git command that discards workspace changes",
     // Irrecoverable discards of uncommitted work in the task workspace
     // (WI#826): forced `git clean`, `git reset --hard`, a whole-tree checkout,
@@ -1998,7 +2032,10 @@ const DENY_RULES = [
 function checkDenyRules(segment) {
   for (const rule of DENY_RULES) {
     const hit = rule.check ? rule.check(segment) : rule.pattern.test(segment);
-    if (hit) return rule.name;
+    if (!hit) continue;
+    // A check may return its own reason text when the rule's name would be
+    // wrong for this row (WI#867, the git alias refusal).
+    return typeof hit === "string" ? hit : rule.name;
   }
   return null;
 }

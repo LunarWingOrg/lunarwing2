@@ -990,7 +990,13 @@ test("empty brace alternatives and literal IFS separators do not hide listener w
   }
   assertBlocked("kimi${IFS}server", "kimi service mode")
   assertBlocked("kimi$IFS'server'", "kimi service mode")
+  // WI#867 point 2: a slice of IFS is a separator too, as the rm assembly
+  // check already reads it. bash runs `kimi${IFS:0:1}server` as `kimi server`.
+  assertBlocked("kimi${IFS:0:1}server", "kimi service mode")
+  assertBlocked("kimi${IFS:1:1}server", "kimi service mode")
+  assertBlocked("python3${IFS:0:1}-m${IFS:0:1}http.server", "listener started from a task")
   assertAllowed("kimi -p 'kimi${IFS}server'")
+  assertAllowed("kimi -p 'kimi${IFS:0:1}server'")
   assertAllowed("kimi -p ''")
 })
 
@@ -1435,26 +1441,26 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   // was classified as the unknown verb `z` and allowed while git discarded the
   // change. The alias definition is refused instead of resolved: the value may
   // live in repo config the guard cannot read cheaply.
-  assertBlocked("git -c alias.z='reset --hard' z", "git command")
-  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
-  assertBlocked("git -c alias.z=status z", "git command")
-  assertBlocked("git --config-env=alias.z=Z z", "git command")
-  assertBlocked("git --config-env alias.z=Z z", "git command")
+  assertBlocked("git -c alias.z='reset --hard' z", "git alias or include")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git alias or include")
+  assertBlocked("git -c alias.z=status z", "git alias or include")
+  assertBlocked("git --config-env=alias.z=Z z", "git alias or include")
+  assertBlocked("git --config-env alias.z=Z z", "git alias or include")
   // The repo-config write that plants the same alias is refused too.
-  assertBlocked("git config alias.t1 'reset --hard'", "git command")
-  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  assertBlocked("git config alias.t1 'reset --hard'", "git alias or include")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git alias or include")
   // git's modern config subcommands write the same key: `set` names it after
   // the subcommand, and `rename-section foo alias` turns a section into aliases.
-  assertBlocked("git config set alias.z 'reset --hard'", "git command")
-  assertBlocked("git config get alias.z", "git command")
-  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
-  assertBlocked("git config rename-section foo alias", "git command")
+  assertBlocked("git config set alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config get alias.z", "git alias or include")
+  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git alias or include")
+  assertBlocked("git config rename-section foo alias", "git alias or include")
   // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
   assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
-    "git command")
-  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+    "git alias or include")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git alias or include")
   // The environment value is read as one shell word: an `alias.` in a later
   // argument of the same line is not attributed to the variable.
   assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
@@ -1483,7 +1489,7 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --rename-section foo alias",
     "git config --edit",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
   assertAllowed("git config --rename-section foo bar")
   assertAllowed("git config --list")
@@ -1502,13 +1508,39 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --ren foo alias",
     "git config edit",
     "git config --ed",
-    "git --work-tree . reset --hard",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
+  // The trailing row of that list is a discard, not a definition: it belongs
+  // to the discard rule's own name.
+  assertBlocked("git --work-tree . reset --hard", "git command that discards")
   assertAllowed("git config core.editor 'vim -e'")
   assertAllowed('git config user.name "Jane -e Doe"')
   assertAllowed("git -C sub log --oneline")
+})
+
+test("an alias or include refusal carries its own reason (WI#867)", () => {
+  // WI#842 refused these before reading the verb, but reported them as the
+  // git discard rule. The verdicts stay; only the reason changes, so it says
+  // what was refused and why (point 1).
+  for (const command of [
+    "git config alias.st status",
+    "git config --unset alias.x",
+    "git config --edit",
+    "git config --rename-section alias alias2",
+    "git -c alias.z='reset --hard' z",
+    "git config include.path /tmp/evil.cfg",
+  ]) {
+    assertBlocked(command, "git alias or include definition")
+  }
+  // The reason names the definition, not a discard.
+  assertBlocked("git config alias.st status", "does not evaluate alias bodies")
+  // The discard rule keeps its own name for the rows it owns.
+  assertBlocked("git reset --hard", "git command that discards workspace changes")
+  assertBlocked("git clean -fdx", "git command that discards workspace changes")
+  // An ordinary section rename and an ordinary key stay allowed.
+  assertAllowed("git config --rename-section core core2")
+  assertAllowed("git config user.name x")
 })
 
 test("a quoted separator does not hide the rest of its command (WI#856)", () => {
@@ -1588,6 +1620,45 @@ test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => 
   assertBlocked(String.raw`git -C $'/tmp/a\' b' reset --hard`, "git command")
   assertAllowed(String.raw`git -C $'/tmp/a\' b' status`)
   assertAllowed(`printf '%s\\n' ${argument}`)
+})
+
+test("nested quotes inside a substitution read as bash reads them (WI#867)", () => {
+  // Point 4 (AKW-3 on !2709): the reader had one quote context for the whole
+  // command, so a `"` inside `$(…)` ended the outer double quote and the
+  // separator that followed split the command before `/etc` was read.
+  assertBlocked('chmod -R 777 "$(echo "a;b")" /etc', "recursive")
+  assertBlocked('chmod -R 777 "$(echo "a|b")" /etc', "recursive")
+  assertBlocked('chown -R u:u "$(echo "a&b")" /usr', "recursive")
+  assertBlocked('chmod -R 777 "`echo "a;b"`" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x$(echo ";y")" /app/hooks', "deletion outside")
+  assertBlocked('git -C "$(echo "/tmp/a;b")" reset --hard', "git command")
+  // The common nested quote stays ordinary work: `"$(date +"%F")"` is one
+  // double-quoted word, and its inner quotes are literal to bash.
+  assertAllowed('echo "$(date +"%F")" ; ls')
+  assertAllowed('echo "$(date +"%F")"')
+  assertAllowed('x="$(echo "a;b")"')
+  assertAllowed('git log --format="%h $(git branch --show-current)"')
+  assertAllowed("printf '%s\\n' \"$(echo \"$(date +%Y)\")\"")
+})
+
+test("the quote reader follows bash's double-quote escape set (WI#867)", () => {
+  // Point 3 (ALF-2 on !2710): one reader for every rule. Inside double
+  // quotes only `"`, `\`, `$`, a backtick and a newline are escaped, so a
+  // backslash before any other character is literal text.
+  assertBlocked('chmod -R 777 "a\\";b" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x\\" ;y" /app/hooks', "deletion outside")
+  // A backslash before a non-special character does not escape the quote
+  // that follows it, so the quoted span ends where bash ends it.
+  assertBlocked('chmod -R 777 "a\\" ;b" /etc', "recursive")
+  // A backslash inside double quotes before a space stays literal: bash
+  // passes `a\ b`, which is one word and no separator.
+  assertAllowed('echo "a\\ b"')
+  assertAllowed('echo "a\\;b"')
+  assertAllowed("printf '%s\\n' \"\\x66ixture\"")
+  assertAllowed("echo \"it's\"")
+  // A substitution's own quotes do not disturb the enclosing one.
+  assertAllowed('echo "$(echo "a b")"')
+  assertAllowed("kimi -p 'start the server'")
 })
 
 test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", () => {
