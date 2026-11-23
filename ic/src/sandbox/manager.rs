@@ -34,7 +34,8 @@ use tokio::sync::RwLock;
 use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
 use crate::sandbox::config::{SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
-use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder, NoCredentialResolver};
+use crate::sandbox::git_grant::GitGrantAuthorization;
+use crate::sandbox::proxy::{EnvCredentialResolver, HttpProxy, NetworkProxyBuilder};
 use crate::sandbox::tunnel_sidecar::{TunnelSidecar, TunnelSidecarConfig};
 
 /// Output from sandbox execution.
@@ -405,7 +406,22 @@ impl SandboxManager {
         // Keep the scoped listener alive across retries. Dropping it closes
         // its shutdown channel; each run owns and cleans up its Unix relay.
         let scoped_proxy = match scoped_hosts {
-            Some(hosts) => Some(self.start_scoped_git_proxy(hosts).await?),
+            Some(hosts) => {
+                let credentials = decision
+                    .git
+                    .as_ref()
+                    .map(GitGrantAuthorization::proxy_credentials)
+                    .unwrap_or_default();
+                let transport = decision
+                    .git
+                    .as_ref()
+                    .map(GitGrantAuthorization::transport_policy)
+                    .unwrap_or_default();
+                Some(
+                    self.start_scoped_git_proxy(hosts, credentials, transport)
+                        .await?,
+                )
+            }
             None => None,
         };
         let scoped_port = scoped_proxy.as_ref().map(|(_, port)| *port);
@@ -449,11 +465,24 @@ impl SandboxManager {
         }))
     }
 
-    async fn start_scoped_git_proxy(&self, hosts: Vec<String>) -> Result<(HttpProxy, u16)> {
+    /// Per-call scoped proxy for git remotes. It resolves any host-side
+    /// credential binding from the daemon environment and injects the
+    /// `Authorization` header itself, so the secret never reaches the
+    /// container (WI#860 route b). It also applies the git smart-HTTP
+    /// transport checks (WI#860, ALM-1): receive-pack only to write-granted
+    /// remotes, no ref deletion, and a bound credential only on its own
+    /// repository's endpoints.
+    async fn start_scoped_git_proxy(
+        &self,
+        hosts: Vec<String>,
+        credentials: Vec<crate::secrets::CredentialMapping>,
+        transport: crate::sandbox::proxy::git_transport::GitTransportPolicy,
+    ) -> Result<(HttpProxy, u16)> {
         let proxy = NetworkProxyBuilder::from_config(&self.config)
             .with_allowlist(hosts)
-            .with_credentials(Vec::new())
-            .with_credential_resolver(Arc::new(NoCredentialResolver))
+            .with_credentials(credentials)
+            .with_credential_resolver(Arc::new(EnvCredentialResolver))
+            .with_git_transport(transport)
             .build_and_start(0)
             .await?;
         let addr = proxy.addr().await.ok_or_else(|| SandboxError::ProxyError {
@@ -1555,6 +1584,75 @@ mod tests {
                     "{arg}"
                 );
             }
+        }
+    }
+
+    /// WI#860 acceptance: no credential value appears in the container's
+    /// environment or arguments. The binding is a host-side proxy mapping;
+    /// the container argv and env carry only the remote URL and the variable
+    /// *name* is absent too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_credential_binding_never_enters_the_container_argv_or_env() {
+        const SECRET: &str = "credential-value-marker-5e6f7a";
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
+        manager.config.policy = SandboxPolicy::WorkspaceWrite;
+        manager.config.network_allowlist = vec!["git.internal".to_string()];
+        manager.config.git = crate::sandbox::GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=GIT_MANAGER_ARGV_TOKEN",
+        )
+        .unwrap();
+        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", SECRET);
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"},
+                "filesystem": {"read_write": ["/workspace"]},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        let result = manager
+            .execute_with_manifest(
+                "git clone http://git.internal/org/repo.git work",
+                temp.path(),
+                &manifest,
+                HashMap::new(),
+            )
+            .await;
+        manager.shutdown().await;
+        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", "");
+
+        result.expect("scoped proxy run reaches the simulated runtime");
+        let calls = state.lock().unwrap();
+        let args = calls
+            .iter()
+            .find(|args| args.first().is_some_and(|arg| arg == "run"))
+            .expect("container run");
+        let joined = args.join("\n");
+        assert!(
+            !joined.contains(SECRET),
+            "secret in container argv: {joined}"
+        );
+        assert!(
+            !joined.contains("GIT_MANAGER_ARGV_TOKEN"),
+            "credential variable name in container argv: {joined}"
+        );
+        // WI#857 (!2719) pins each remote with an empty `remote.<name>.url`
+        // first, so entry 0 is the reset and entry 1 the granted URL.
+        for expected in [
+            "GIT_CONFIG_KEY_0=remote.origin.url",
+            "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=remote.origin.url",
+            "GIT_CONFIG_VALUE_1=http://git.internal/org/repo.git",
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-e", expected]),
+                "{expected} missing from the container argv: {joined}"
+            );
         }
     }
 

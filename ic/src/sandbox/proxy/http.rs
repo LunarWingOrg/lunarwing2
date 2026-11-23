@@ -25,6 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
 use crate::sandbox::error::{Result, SandboxError};
+use crate::sandbox::proxy::git_transport::GitTransportPolicy;
 use crate::sandbox::proxy::policy::{NetworkDecision, NetworkPolicyDecider, NetworkRequest};
 use crate::secrets::CredentialLocation;
 
@@ -37,6 +38,11 @@ struct ProxyState {
     /// Reject non-public destinations and pin DNS for proxy-enforced
     /// containers (WI#155). Advisory-mode clients are unaffected.
     public_only: bool,
+    /// Smart-HTTP transport checks of a per-call git proxy (WI#860, ALM-1):
+    /// receive-pack only to write-granted remotes, no ref deletion, bound
+    /// credentials only on the bound repository's endpoints. `None` on every
+    /// other proxy, whose behaviour is unchanged.
+    git_transport: Option<GitTransportPolicy>,
     /// Request counter for logging.
     request_count: std::sync::atomic::AtomicU64,
     /// Whether the proxy is running.
@@ -98,11 +104,23 @@ impl HttpProxy {
         credential_resolver: Arc<dyn CredentialResolver>,
         public_only: bool,
     ) -> Self {
+        Self::with_git_transport(decider, credential_resolver, public_only, None)
+    }
+
+    /// Create a HTTP proxy that also applies the git smart-HTTP transport
+    /// checks (WI#860, ALM-1). Only the per-call git proxy passes a policy.
+    pub(crate) fn with_git_transport(
+        decider: Arc<dyn NetworkPolicyDecider>,
+        credential_resolver: Arc<dyn CredentialResolver>,
+        public_only: bool,
+        git_transport: Option<GitTransportPolicy>,
+    ) -> Self {
         Self {
             state: Arc::new(ProxyState {
                 decider,
                 credential_resolver,
                 public_only,
+                git_transport,
                 request_count: std::sync::atomic::AtomicU64::new(0),
                 running: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -238,8 +256,61 @@ async fn handle_request(
         }
     };
 
+    // WI#860 (ALM-1): a per-call git proxy decides git writes here, before
+    // any policy decision, credential or network work.
+    let git_url = match state.git_transport.as_ref() {
+        Some(git) => {
+            let Ok(parsed) = url::Url::parse(&uri) else {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid URL".to_string(),
+                ));
+            };
+            let content_type = req
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            // The upstream Host must be the URI authority, or a client could
+            // steer a granted request (and its credential) to another
+            // virtual host on the same address (review F1).
+            let host_values: Vec<String> = req
+                .headers()
+                .get_all(hyper::header::HOST)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("").to_string())
+                .collect();
+            let checked = git
+                .check_request(&network_req.method, &parsed, content_type)
+                .and_then(|()| git.check_host_header(&parsed, &host_values));
+            if let Err(reason) = checked {
+                tracing::info!("Proxy: blocked {} {} - {}", method, uri, reason);
+                return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason)));
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+
     // Make policy decision
     let decision = state.decider.decide(&network_req).await;
+
+    // A bound git credential accompanies only its repository's own endpoints
+    // (exact host, port, path and method), and it is that remote's own
+    // credential: the decider matches host and path only, so two remotes on
+    // one host that differ by port must not trade credentials (review F3).
+    // Anything else on the host is forwarded without one.
+    let decision = match (state.git_transport.as_ref(), git_url.as_ref(), decision) {
+        (Some(git), Some(url), NetworkDecision::AllowWithCredentials { location, .. }) => {
+            match git.credential_for(&network_req.method, url) {
+                Some(secret_name) => NetworkDecision::AllowWithCredentials {
+                    secret_name: secret_name.to_string(),
+                    location,
+                },
+                None => NetworkDecision::Allow,
+            }
+        }
+        (_, _, decision) => decision,
+    };
 
     match decision {
         NetworkDecision::Deny { reason } => {
@@ -288,6 +359,16 @@ async fn handle_connect(
     let decision = state.decider.decide(&network_req).await;
 
     if let NetworkDecision::Deny { reason } = decision {
+        tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
+        return error_response(StatusCode::FORBIDDEN, deny_body(reason));
+    }
+
+    // WI#860 (ALM-1, review F2): a per-call git proxy opens a tunnel only to
+    // a granted https:// remote's host and port; any other tunnel would carry
+    // traffic past the git transport checks.
+    if let Some(git) = state.git_transport.as_ref()
+        && let Err(reason) = git.check_connect(&host, authority.port_u16().unwrap_or(443))
+    {
         tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
         return error_response(StatusCode::FORBIDDEN, deny_body(reason));
     }
@@ -365,6 +446,21 @@ async fn forward_request(
 ) -> std::result::Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let uri = req.uri().clone();
 
+    // WI#860 (ALM-1): what the git transport body check needs, read before
+    // collecting the body consumes the request. Every Content-Encoding value
+    // is kept (an unreadable one as such) so a second header cannot hide a
+    // compressed push.
+    let request_method = req.method().as_str().to_ascii_uppercase();
+    let request_content_encoding: Option<String> = {
+        let values: Vec<String> = req
+            .headers()
+            .get_all(hyper::header::CONTENT_ENCODING)
+            .iter()
+            .map(|value| value.to_str().unwrap_or("unreadable").to_string())
+            .collect();
+        (!values.is_empty()).then(|| values.join(","))
+    };
+
     // Spellings of the injected credential that an upstream may echo back in
     // a response header (WI#395: an always-HTTPS edge answers plain-HTTP
     // requests with `301 Location: https://host/path?name=<secret>`).
@@ -395,6 +491,12 @@ async fn forward_request(
         {
             if name.as_str().eq_ignore_ascii_case("accept-encoding") {
                 accept_encoding = Some(v.to_string());
+                continue;
+            }
+            // WI#860 (review F1): a per-call git proxy never forwards the
+            // client's Host; the upstream request takes the URI authority
+            // (a mismatching Host was already refused in handle_request).
+            if state.git_transport.is_some() && *name == hyper::header::HOST {
                 continue;
             }
             builder = builder.header(name.as_str(), v);
@@ -467,6 +569,24 @@ async fn forward_request(
             ));
         }
     };
+
+    // WI#860 (ALM-1): a push that deletes a ref is refused where it happens.
+    if let Some(git) = state.git_transport.as_ref() {
+        let checked = url::Url::parse(&uri.to_string())
+            .map_err(|_| "invalid URL".to_string())
+            .and_then(|url| {
+                git.check_body(
+                    &request_method,
+                    &url,
+                    request_content_encoding.as_deref(),
+                    &body_bytes,
+                )
+            });
+        if let Err(reason) = checked {
+            tracing::info!("Proxy: blocked {} {} - {}", request_method, uri, reason);
+            return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason)));
+        }
+    }
 
     if !body_bytes.is_empty() {
         builder = builder.body(body_bytes.to_vec());
@@ -908,6 +1028,7 @@ mod tests {
     use crate::sandbox::proxy::allowlist::DomainAllowlist;
     use crate::sandbox::proxy::policy::DefaultPolicyDecider;
     use crate::secrets::{CredentialLocation, CredentialMapping};
+    use std::path::Path;
     use tracing_test::traced_test;
 
     /// Resolves every secret name to a fixed value (for testing).
@@ -2242,6 +2363,1037 @@ mod tests {
         );
 
         proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#860 end-to-end: a real private git remote over plain HTTP, cloned by
+    /// real `git` through the scoped proxy. The upstream refuses any request
+    /// without the exact `Authorization` header, and the header is added by
+    /// the proxy from a host-side secret. Nothing the container sees holds it.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_injects_a_host_side_git_credential_for_a_real_http_remote() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "Basic Z2l0OnNlY3JldC1tYXJrZXItOWY4ZQ==";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bare = root.join("repo.git");
+        let git = |args: &[&str], dir: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q", "--bare", bare.to_str().unwrap()], &root);
+        let work = root.join("work");
+        git(&["init", "-q", work.to_str().unwrap()], &root);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        git(&["add", "file.txt"], &work);
+        git(&["commit", "-q", "-m", "one"], &work);
+        git(&["remote", "add", "origin", bare.to_str().unwrap()], &work);
+        // Push to whatever the bare repository's HEAD names, so the clone
+        // checks out a branch rather than an unborn HEAD.
+        let head_ref = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .expect("symbolic-ref");
+        let head_ref = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
+        let head_ref = if head_ref.is_empty() {
+            "refs/heads/master".to_string()
+        } else {
+            head_ref
+        };
+        git(
+            &["push", "-q", "origin", &format!("HEAD:{head_ref}")],
+            &work,
+        );
+
+        // A CGI-backed smart-HTTP upstream that requires the exact header and
+        // serves the real bare repository through `git http-backend`.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let project_root = root.clone();
+        let expected = format!("Basic {}", SECRET.trim_start_matches("Basic "));
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let project_root = project_root.clone();
+                let expected = expected.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut head_end = None;
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut buf = [0u8; 16384];
+                        let n = match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            conn.read(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => return,
+                        };
+                        raw.extend_from_slice(&buf[..n]);
+                        if head_end.is_none()
+                            && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                            content_length = head
+                                .lines()
+                                .find(|line| {
+                                    line.to_ascii_lowercase().starts_with("content-length:")
+                                })
+                                .and_then(|line| line.split_once(':'))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            head_end = Some(pos + 4);
+                        }
+                        if let Some(pos) = head_end
+                            && raw.len() >= pos + content_length
+                        {
+                            break;
+                        }
+                    }
+                    let split = head_end.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+                    let body = raw[split..].to_vec();
+                    let authorized = head.lines().any(|line| {
+                        line.to_ascii_lowercase().starts_with("authorization:")
+                            && line
+                                .split_once(':')
+                                .is_some_and(|(_, value)| value.trim() == expected)
+                    });
+                    if !authorized {
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let method = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().next())
+                        .unwrap_or("GET")
+                        .to_string();
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let (script_path, query) = match path.split_once('?') {
+                        Some((path, query)) => (path.to_string(), query.to_string()),
+                        None => (path, String::new()),
+                    };
+                    let content_type = if method == "POST" {
+                        "application/x-git-upload-pack-request"
+                    } else {
+                        "application/x-git-upload-pack-result"
+                    };
+                    let mut child = tokio::process::Command::new("git")
+                        .arg("http-backend")
+                        .env("GIT_PROJECT_ROOT", project_root.to_str().unwrap())
+                        .env("GIT_HTTP_EXPORT_ALL", "1")
+                        .env("REQUEST_METHOD", &method)
+                        .env("PATH_INFO", script_path)
+                        .env("QUERY_STRING", query)
+                        .env("CONTENT_TYPE", content_type)
+                        .env("CONTENT_LENGTH", body.len().to_string())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .expect("git http-backend");
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(&body).await;
+                    }
+                    let out = child.wait_with_output().await.expect("backend output");
+                    let split = out
+                        .stdout
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                        .unwrap_or(out.stdout.len());
+                    let headers = String::from_utf8_lossy(&out.stdout[..split]).to_string();
+                    let body = &out.stdout[split..];
+                    let status = headers
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("status:"))
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_else(|| "200 OK".to_string());
+                    let mut response = format!("HTTP/1.1 {status}\r\n").into_bytes();
+                    for line in headers.lines() {
+                        if line.is_empty() || line.to_ascii_lowercase().starts_with("status:") {
+                            continue;
+                        }
+                        response.extend_from_slice(line.as_bytes());
+                        response.extend_from_slice(b"\r\n");
+                    }
+                    response.extend_from_slice(
+                        format!(
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    response.extend_from_slice(body);
+                    let _ = conn.write_all(&response).await;
+                });
+            }
+        });
+
+        // The proxy the sandbox would start: exact host allowlist plus the
+        // host-side credential binding from `SANDBOX_GIT_CREDENTIALS`.
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping::header(
+            "GIT_ORIGIN_TOKEN",
+            "Authorization",
+            "127.0.0.1",
+        )];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+        let proxy = HttpProxy::new(decider, resolver);
+        let proxy_addr = proxy.start(0).await.unwrap();
+
+        // Real `git clone` through the proxy, as the container would run it.
+        let clone_dir = root.join("clone");
+        let output = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &format!("http://127.0.0.1:{upstream_port}/repo.git"),
+                clone_dir.to_str().unwrap(),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("http_proxy", format!("http://{proxy_addr}"))
+            .env("no_proxy", "")
+            .output()
+            .await
+            .expect("git clone runs");
+        assert!(
+            output.status.success(),
+            "clone failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(clone_dir.join("file.txt").exists());
+
+        // Negative control: the same clone without the credential mapping is
+        // refused by the upstream, so the success above really came from the
+        // proxy's injection and not an unauthenticated read.
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, Vec::new()));
+        let bare_proxy = HttpProxy::new(decider, Arc::new(FixedCredentialResolver(String::new())));
+        let bare_addr = bare_proxy.start(0).await.unwrap();
+        let denied_dir = root.join("denied");
+        let denied = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &format!("http://127.0.0.1:{upstream_port}/repo.git"),
+                denied_dir.to_str().unwrap(),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("http_proxy", format!("http://{bare_addr}"))
+            .env("no_proxy", "")
+            .output()
+            .await
+            .expect("git clone runs");
+        assert!(
+            !denied.status.success(),
+            "an uncredentialed clone must be refused: {}",
+            String::from_utf8_lossy(&denied.stdout)
+        );
+        assert!(!denied_dir.join("file.txt").exists());
+        bare_proxy.stop().await;
+
+        // The container-side view of the same grant carries no secret.
+        let host = crate::sandbox::GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=GIT_ORIGIN_TOKEN",
+        )
+        .unwrap()
+        .unwrap();
+        let grant = crate::sandbox::git_grant::authorize_grant(
+            &host,
+            &[],
+            &root,
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
+        let joined = grant
+            .container_env()
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(SECRET), "{joined}");
+        assert!(!joined.contains("GIT_ORIGIN_TOKEN"), "{joined}");
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    // ── WI#860 (ALM-1): the per-call git proxy decides write and deletion ──
+
+    /// Send one raw request through the proxy and read the whole response.
+    async fn send_raw(proxy: std::net::SocketAddr, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy answered in time")
+        .expect("proxy response read");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Read one HTTP/1.1 request (head plus a Content-Length body).
+    async fn read_upstream_request(conn: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut head_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let mut buf = [0u8; 16384];
+            let n =
+                match tokio::time::timeout(std::time::Duration::from_secs(30), conn.read(&mut buf))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => return None,
+                };
+            raw.extend_from_slice(&buf[..n]);
+            if head_end.is_none()
+                && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                content_length = head
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|line| line.split_once(':'))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                head_end = Some(pos + 4);
+            }
+            if let Some(pos) = head_end
+                && raw.len() >= pos + content_length
+            {
+                let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                return Some((head, raw[pos..pos + content_length].to_vec()));
+            }
+        }
+    }
+
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// An upstream that records each request line and its `Authorization`
+    /// value, and answers `200 ok`.
+    async fn recording_upstream() -> (
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let Some((head, _body)) = read_upstream_request(&mut conn).await else {
+                        return;
+                    };
+                    let line = head.lines().next().unwrap_or_default();
+                    let line = line.trim_end_matches(" HTTP/1.1").to_string();
+                    record
+                        .lock()
+                        .unwrap()
+                        .push((line, header_value(&head, "authorization")));
+                    let _ = conn
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, seen, task)
+    }
+
+    /// The per-call git proxy for one remote, the way the sandbox manager
+    /// builds it: exact host allowlist, path-scoped credential mapping and the
+    /// git transport policy.
+    async fn scoped_git_proxy(
+        remote_url: &str,
+        write: bool,
+        secret: &str,
+    ) -> (HttpProxy, std::net::SocketAddr) {
+        use crate::sandbox::proxy::git_transport::GitTransportRemote;
+        let remote =
+            GitTransportRemote::from_http_url(remote_url, write, Some("GIT_ORIGIN_TOKEN".into()))
+                .unwrap();
+        let mut mapping =
+            CredentialMapping::header("GIT_ORIGIN_TOKEN", "Authorization", remote.host.clone());
+        mapping.path_patterns = remote.credential_paths();
+        let decider = Arc::new(DefaultPolicyDecider::new(
+            DomainAllowlist::new(std::slice::from_ref(&remote.host)),
+            vec![mapping],
+        ));
+        let proxy = HttpProxy::with_git_transport(
+            decider,
+            Arc::new(FixedCredentialResolver(secret.to_string())),
+            false,
+            Some(GitTransportPolicy::new(vec![remote])),
+        );
+        let addr = proxy.start(0).await.unwrap();
+        (proxy, addr)
+    }
+
+    /// WI#860 (ALM-1): on a read-only remote no client can push, git or not,
+    /// and the bound credential reaches only the bound repository's own
+    /// endpoints: never another repository or the forge API on the same host.
+    /// Each rule is pinned on its own, without a receive-pack Content-Type.
+    #[tokio::test]
+    async fn scoped_git_proxy_refuses_receive_pack_and_scopes_the_credential() {
+        const SECRET: &str = "Basic c2NvcGVkLWdpdC1jcmVkLTRkNWU=";
+        const PACK_TYPE: &str = "application/x-git-receive-pack-request";
+        let (port, seen, upstream_task) = recording_upstream().await;
+        let (proxy, addr) = scoped_git_proxy(
+            &format!("http://127.0.0.1:{port}/org/repo.git"),
+            false,
+            SECRET,
+        )
+        .await;
+        let authority = format!("127.0.0.1:{port}");
+        let upload_refs = "/org/repo.git/info/refs?service=git-upload-pack";
+
+        for (rule, method, target, content_type, host) in [
+            (
+                "read-only advertisement",
+                "GET",
+                "/org/repo.git/info/refs?service=git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "read-only pack POST",
+                "POST",
+                "/org/repo.git/git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "another repository",
+                "POST",
+                "/org/other.git/git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "encoded service",
+                "POST",
+                "/org/repo.git/git%2Dreceive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method",
+                "PUT",
+                "/org/repo.git/objects/info/packs",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method on an encoded path",
+                "DELETE",
+                "/org/re%70o.git/HEAD",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method on a double-slash path",
+                "PROPFIND",
+                "//org/repo.git/",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "receive-pack content type",
+                "POST",
+                "/org/repo.git/upload",
+                Some(PACK_TYPE),
+                authority.as_str(),
+            ),
+            (
+                "foreign Host on a credentialed endpoint",
+                "GET",
+                upload_refs,
+                None,
+                "other.internal",
+            ),
+            (
+                "Host without the port",
+                "GET",
+                upload_refs,
+                None,
+                "127.0.0.1",
+            ),
+        ] {
+            let body = "0000";
+            let content_type = content_type
+                .map(|value| format!("Content-Type: {value}\r\n"))
+                .unwrap_or_default();
+            let request = format!(
+                "{method} http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: {host}\r\n\
+                 {content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response = send_raw(addr, request.as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{rule}: {method} {target}: {response}"
+            );
+        }
+        // No tunnel opens except to a granted https:// remote (none here):
+        // not the remote's own port, not 443, not git://.
+        for target in [
+            authority.clone(),
+            "127.0.0.1:443".to_string(),
+            "127.0.0.1:9418".to_string(),
+        ] {
+            let response = send_raw(
+                addr,
+                format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "CONNECT {target}: {response}"
+            );
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused request reached the upstream: {:?}",
+            seen.lock().unwrap()
+        );
+
+        for target in [
+            upload_refs,
+            "/org/other.git/info/refs?service=git-upload-pack",
+            "/api/v4/projects",
+        ] {
+            let response = send_raw(
+                addr,
+                format!(
+                    "GET http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{target}: {response}");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .map(|(line, auth)| (line.as_str(), auth.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "GET /org/repo.git/info/refs?service=git-upload-pack",
+                    Some(SECRET)
+                ),
+                ("GET /org/other.git/info/refs?service=git-upload-pack", None),
+                ("GET /api/v4/projects", None),
+            ]
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// Resolves each secret name to its own value (for testing).
+    struct MapCredentialResolver(std::collections::HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl CredentialResolver for MapCredentialResolver {
+        async fn resolve(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+
+    /// WI#860 (review F3): two remotes on one host that differ only by port
+    /// each receive their own credential. The decider matches host and path
+    /// and would hand both the same mapping; the git proxy picks the one
+    /// bound to the remote whose exact host, port and path matched.
+    #[tokio::test]
+    async fn scoped_git_proxy_gives_each_remote_its_own_credential_on_a_shared_host() {
+        use crate::sandbox::proxy::git_transport::GitTransportRemote;
+        let (port_a, seen_a, task_a) = recording_upstream().await;
+        let (port_b, seen_b, task_b) = recording_upstream().await;
+        let remotes = [(port_a, "GIT_A"), (port_b, "GIT_B")].map(|(port, secret)| {
+            GitTransportRemote::from_http_url(
+                &format!("http://127.0.0.1:{port}/org/r.git"),
+                false,
+                Some(secret.to_string()),
+            )
+            .unwrap()
+        });
+        let mappings = remotes
+            .iter()
+            .map(|remote| {
+                let mut mapping = CredentialMapping::header(
+                    remote.secret_env.clone().unwrap(),
+                    "Authorization",
+                    remote.host.clone(),
+                );
+                mapping.path_patterns = remote.credential_paths();
+                mapping
+            })
+            .collect();
+        let decider = Arc::new(DefaultPolicyDecider::new(
+            DomainAllowlist::new(&["127.0.0.1".to_string()]),
+            mappings,
+        ));
+        let resolver = Arc::new(MapCredentialResolver(
+            [("GIT_A", "Basic YTpB"), ("GIT_B", "Basic Yjpi")]
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        ));
+        let proxy = HttpProxy::with_git_transport(
+            decider,
+            resolver,
+            false,
+            Some(GitTransportPolicy::new(remotes.to_vec())),
+        );
+        let addr = proxy.start(0).await.unwrap();
+        for port in [port_a, port_b] {
+            let response = send_raw(
+                addr,
+                format!(
+                    "GET http://127.0.0.1:{port}/org/r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{port}: {response}");
+        }
+        assert_eq!(
+            seen_a.lock().unwrap()[0].1.as_deref(),
+            Some("Basic YTpB"),
+            "remote A got another remote's credential"
+        );
+        assert_eq!(
+            seen_b.lock().unwrap()[0].1.as_deref(),
+            Some("Basic Yjpi"),
+            "remote B got another remote's credential"
+        );
+
+        proxy.stop().await;
+        task_a.abort();
+        task_b.abort();
+    }
+
+    /// WI#860 (ALM-1): on a write grant an ordinary update passes with the
+    /// credential, and a command list that deletes a ref is refused before
+    /// it reaches the forge, whoever wrote it. A compressed body cannot be
+    /// read, so it is refused too.
+    #[tokio::test]
+    async fn scoped_git_proxy_refuses_a_deleting_push_and_forwards_an_update() {
+        const SECRET: &str = "Basic d3JpdGUtZ3JhbnQtY3JlZC05YThi";
+        const OLD: &str = "1111111111111111111111111111111111111111";
+        const NEW: &str = "2222222222222222222222222222222222222222";
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let (port, seen, upstream_task) = recording_upstream().await;
+        let (proxy, addr) = scoped_git_proxy(
+            &format!("http://127.0.0.1:{port}/org/repo.git"),
+            true,
+            SECRET,
+        )
+        .await;
+
+        let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+        let post = |body: &str, extra: &str| {
+            format!(
+                "POST http://127.0.0.1:{port}/org/repo.git/git-receive-pack HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\nContent-Type: application/x-git-receive-pack-request\r\n\
+                 {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let update = format!(
+            "{}0000PACK",
+            pkt(&format!("{OLD} {NEW} refs/heads/main\0report-status"))
+        );
+        let response = send_raw(addr, post(&update, "").as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "update: {response}");
+
+        for (label, body, extra) in [
+            (
+                "deletion",
+                format!(
+                    "{}0000",
+                    pkt(&format!("{OLD} {ZERO} refs/heads/keep\0report-status"))
+                ),
+                "",
+            ),
+            (
+                "deletion after an update",
+                format!(
+                    "{}{}0000PACK",
+                    pkt(&format!("{OLD} {NEW} refs/heads/main\0report-status")),
+                    pkt(&format!("{OLD} {ZERO} refs/heads/keep"))
+                ),
+                "",
+            ),
+            (
+                "sha256 deletion",
+                format!(
+                    "{}0000",
+                    pkt(&format!(
+                        "{} {} refs/heads/keep\0report-status",
+                        "a".repeat(64),
+                        "0".repeat(64)
+                    ))
+                ),
+                "",
+            ),
+            ("gzip", update.clone(), "Content-Encoding: gzip\r\n"),
+            (
+                "truncated",
+                pkt(&format!("{OLD} {NEW} refs/heads/main")),
+                "",
+            ),
+        ] {
+            let response = send_raw(addr, post(&body, extra).as_bytes()).await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{label}: {response}");
+        }
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the ordinary update may reach the forge: {seen:?}"
+        );
+        assert_eq!(seen[0].0, "POST /org/repo.git/git-receive-pack");
+        assert_eq!(seen[0].1.as_deref(), Some(SECRET));
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// A real smart-HTTP upstream (`git http-backend` behind a hand-rolled
+    /// CGI loop) that requires the exact `Authorization` value and has
+    /// receive-pack enabled (`REMOTE_USER` set), the way a forge does.
+    async fn git_backend_upstream(
+        project_root: std::path::PathBuf,
+        expected: String,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let project_root = project_root.clone();
+                let expected = expected.clone();
+                tokio::spawn(async move {
+                    let Some((head, body)) = read_upstream_request(&mut conn).await else {
+                        return;
+                    };
+                    if header_value(&head, "authorization").as_deref() != Some(expected.as_str()) {
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let mut request_line =
+                        head.lines().next().unwrap_or_default().split_whitespace();
+                    let method = request_line.next().unwrap_or("GET").to_string();
+                    let target = request_line.next().unwrap_or("/").to_string();
+                    let (path, query) = match target.split_once('?') {
+                        Some((path, query)) => (path.to_string(), query.to_string()),
+                        None => (target, String::new()),
+                    };
+                    let content_type = header_value(&head, "content-type").unwrap_or_default();
+                    let mut child = tokio::process::Command::new("git")
+                        .arg("http-backend")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_PROJECT_ROOT", project_root.to_str().unwrap())
+                        .env("GIT_HTTP_EXPORT_ALL", "1")
+                        .env("REMOTE_USER", "fixture")
+                        .env("REQUEST_METHOD", &method)
+                        .env("PATH_INFO", path)
+                        .env("QUERY_STRING", query)
+                        .env("CONTENT_TYPE", content_type)
+                        .env("CONTENT_LENGTH", body.len().to_string())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .expect("git http-backend");
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(&body).await;
+                    }
+                    let out = child.wait_with_output().await.expect("backend output");
+                    let split = out
+                        .stdout
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                        .unwrap_or(out.stdout.len());
+                    let headers = String::from_utf8_lossy(&out.stdout[..split]).to_string();
+                    let payload = &out.stdout[split..];
+                    let status = headers
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("status:"))
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_else(|| "200 OK".to_string());
+                    let mut response = format!("HTTP/1.1 {status}\r\n").into_bytes();
+                    for line in headers.lines() {
+                        if line.is_empty() || line.to_ascii_lowercase().starts_with("status:") {
+                            continue;
+                        }
+                        response.extend_from_slice(line.as_bytes());
+                        response.extend_from_slice(b"\r\n");
+                    }
+                    response.extend_from_slice(
+                        format!(
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                    response.extend_from_slice(payload);
+                    let _ = conn.write_all(&response).await;
+                });
+            }
+        });
+        (port, task)
+    }
+
+    /// WI#860 (ALM-1) end to end with real git: through the per-call proxy a
+    /// write grant pushes a commit, while a mirror push that would delete a
+    /// branch and a read-grant force push hidden behind a repository alias
+    /// are refused at the transport, where the command-text preflight cannot
+    /// see them.
+    ///
+    /// The git commands run with the blocking `std::process::Command`, so the
+    /// test needs a multi-threaded runtime: on the default current-thread
+    /// runtime a proxied `git push` blocks the only thread the proxy and the
+    /// upstream run on, and the test deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_git_push_through_the_scoped_proxy_is_bounded_at_the_transport() {
+        const SECRET: &str = "Basic Z2l0OnB1c2gtbWFya2VyLTFjMmQ=";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let git = |args: &[&str], dir: &Path, proxy: Option<std::net::SocketAddr>| {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+                .env_remove("http_proxy")
+                .env_remove("HTTP_PROXY")
+                .env("no_proxy", "");
+            if let Some(proxy) = proxy {
+                command.env("http_proxy", format!("http://{proxy}"));
+            }
+            command.output().expect("git runs")
+        };
+        let ok = |output: std::process::Output, what: &str| {
+            assert!(
+                output.status.success(),
+                "{what}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let rev = |reference: &str| {
+            let output = ok(
+                git(
+                    &["rev-parse", "--verify", "-q", reference],
+                    &root.join("repo.git"),
+                    None,
+                ),
+                reference,
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // A bare remote with `main` and `keep`, seeded over the local path.
+        ok(
+            git(
+                &["init", "-q", "--bare", "-b", "main", "repo.git"],
+                &root,
+                None,
+            ),
+            "init bare",
+        );
+        let seed = root.join("seed");
+        ok(
+            git(
+                &["init", "-q", "-b", "main", seed.to_str().unwrap()],
+                &root,
+                None,
+            ),
+            "init seed",
+        );
+        std::fs::write(seed.join("file.txt"), "one\n").unwrap();
+        ok(git(&["add", "file.txt"], &seed, None), "add");
+        ok(git(&["commit", "-q", "-m", "one"], &seed, None), "commit");
+        let bare = root.join("repo.git");
+        ok(
+            git(
+                &["push", "-q", bare.to_str().unwrap(), "main", "main:keep"],
+                &seed,
+                None,
+            ),
+            "seed push",
+        );
+        let keep = rev("refs/heads/keep");
+
+        let (port, upstream_task) = git_backend_upstream(root.clone(), SECRET.to_string()).await;
+        let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+
+        // Write grant: clone and push a new commit through the proxy.
+        let (write_proxy, write_addr) = scoped_git_proxy(&remote_url, true, SECRET).await;
+        let work = root.join("work");
+        ok(
+            git(
+                &["clone", "-q", &remote_url, work.to_str().unwrap()],
+                &root,
+                Some(write_addr),
+            ),
+            "clone through the write proxy",
+        );
+        std::fs::write(work.join("file.txt"), "two\n").unwrap();
+        ok(
+            git(&["commit", "-q", "-am", "two"], &work, None),
+            "commit two",
+        );
+        ok(
+            git(
+                &["push", "-q", "origin", "HEAD:main"],
+                &work,
+                Some(write_addr),
+            ),
+            "push on a write grant",
+        );
+        let local_head = String::from_utf8_lossy(
+            &ok(git(&["rev-parse", "HEAD"], &work, None), "local head").stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(rev("refs/heads/main"), local_head);
+
+        // Mirror config turns a plain `git push origin` into one that deletes
+        // `keep` (the clone has no local `keep`); the proxy refuses it.
+        ok(
+            git(&["config", "remote.origin.mirror", "true"], &work, None),
+            "mirror config",
+        );
+        let mirror = git(&["push", "origin"], &work, Some(write_addr));
+        assert!(!mirror.status.success(), "a deleting mirror push must fail");
+        assert_eq!(
+            rev("refs/heads/keep"),
+            keep,
+            "keep must survive the refused push"
+        );
+        write_proxy.stop().await;
+
+        // Read grant with a bound credential: an alias hides `push --force`
+        // from any text scan; the advertisement is refused at the proxy.
+        let (read_proxy, read_addr) = scoped_git_proxy(&remote_url, false, SECRET).await;
+        let reader = root.join("reader");
+        ok(
+            git(
+                &["clone", "-q", &remote_url, reader.to_str().unwrap()],
+                &root,
+                Some(read_addr),
+            ),
+            "clone through the read proxy",
+        );
+        let mut config = std::fs::read_to_string(reader.join(".git/config")).unwrap();
+        config.push_str("[alias]\n\tp = push --force\n");
+        std::fs::write(reader.join(".git/config"), config).unwrap();
+        std::fs::write(reader.join("file.txt"), "rewritten\n").unwrap();
+        ok(
+            git(
+                &["commit", "-q", "--amend", "-am", "rewritten"],
+                &reader,
+                None,
+            ),
+            "amend",
+        );
+        let main_before = rev("refs/heads/main");
+        let forced = git(&["p", "origin", "HEAD:main"], &reader, Some(read_addr));
+        assert!(!forced.status.success(), "a read-grant push must fail");
+        assert_eq!(
+            rev("refs/heads/main"),
+            main_before,
+            "main must be unchanged"
+        );
+        read_proxy.stop().await;
+
         upstream_task.abort();
     }
 }
