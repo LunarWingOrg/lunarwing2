@@ -1868,28 +1868,71 @@ PEBBLE_RUST_LANE_SCRIPT = (
     "--manifest-path ../pebble4lunarwing/Cargo.toml",
 )
 
+# WI#864: the XMPP bridge and its contract crate are excluded from the ic
+# workspace (each has its own Cargo.lock), so the workspace Rust jobs never
+# compiled, tested or linted them and a broken bridge change could merge with
+# a green pipeline (WI#854's !2707 changed 335 lines of bridge Rust and its
+# pipeline was green without compiling any of it). Both crates run here in
+# their own invocations from ic/ so the vendored source replacement
+# (ic/.cargo/config.toml) applies, with --locked and clippy -D warnings.
+# A deliberate command change must update this tuple in the same commit.
+XMPP_BRIDGE_RUST_LANE_SCRIPT = (
+    "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "
+    "--manifest-path bridges/xmpp-bridge/Cargo.toml",
+    "bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked "
+    "--manifest-path bridges/xmpp-bridge/Cargo.toml --all-targets -- -D warnings",
+    "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "
+    "--manifest-path openclaw-ports/xmpp/bridge/Cargo.toml",
+    "bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked "
+    "--manifest-path openclaw-ports/xmpp/bridge/Cargo.toml --all-targets -- -D warnings",
+)
+# The lane's full rules list: merge-request pipelines, branch pushes, and
+# protected release tags, like the other Rust gates. Pinned exactly so a
+# `when: never` replacement or a narrowed rule cannot drop the lane silently.
+XMPP_BRIDGE_RUST_LANE_RULES = (
+    {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+    {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
+    {
+        "if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ '
+        '/^v\\d+\\.\\d+\\.\\d+\\.\\d+(-rc[1-9]\\d*)?$/'
+        ' && $CI_COMMIT_REF_PROTECTED == "true"'
+    },
+    {"when": "never"},
+)
 
-def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
-    job = merged.get("worker-pebble-rust")
+
+def validate_pinned_rust_lane(
+    job_name: str, expected_script: tuple, merged: dict, errors: list[str]
+) -> None:
+    """Pin one `.rust-job`-based lane: existence, extends, keys, bootstrap,
+    image, needs, tags, MR rule and the exact script.
+
+    Shared by `worker-pebble-rust` (WI#375 DR-3) and `rust-xmpp-bridge`
+    (WI#864) so the two lanes cannot drift apart: a lane that stops
+    extending `.rust-job`, inherits a template-level `variables`/`hooks`/
+    `parallel`/`inherit` entry, loses `needs: []`, or runs a different
+    script than the pinned tuple fails here.
+    """
+    job = merged.get(job_name)
     if not isinstance(job, dict):
-        errors.append("worker-pebble-rust job missing")
+        errors.append(f"{job_name} job missing")
         return
     if job.get("extends") != ".rust-job":
         errors.append(
-            "worker-pebble-rust must extend .rust-job (the pinned rust "
+            f"{job_name} must extend .rust-job (the pinned rust "
             "toolchain bootstrap and pull-only cache template)"
         )
     unexpected = sorted(set(job) - PEBBLE_RUST_LANE_JOB_KEYS)
     if unexpected:
         errors.append(
-            f"worker-pebble-rust must not set job keys {unexpected}; "
+            f"{job_name} must not set job keys {unexpected}; "
             "job-level variables, parallel matrices, hooks or a "
             "before_script/after_script can bypass the pinned script"
         )
     effective = resolve_extends(job, merged)
     if effective.get(EXTENDS_TRUNCATED_KEY):
         errors.append(
-            f"worker-pebble-rust extends chain exceeds the validation depth "
+            f"{job_name} extends chain exceeds the validation depth "
             f"budget ({EXTENDS_DEPTH_BUDGET}); refusing to certify a "
             "partially resolved job"
         )
@@ -1898,7 +1941,7 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
     )
     if inherited:
         errors.append(
-            f"worker-pebble-rust must not inherit job keys {inherited}; "
+            f"{job_name} must not inherit job keys {inherited}; "
             "template-level variables, hooks, inherit or parallel can bypass "
             "the pinned script"
         )
@@ -1907,7 +1950,7 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
         str(line) for line in before_script
     ] != list(PEBBLE_RUST_LANE_BEFORE_SCRIPT):
         errors.append(
-            "worker-pebble-rust before_script must be exactly the pinned "
+            f"{job_name} before_script must be exactly the pinned "
             f".rust-job bootstrap {list(PEBBLE_RUST_LANE_BEFORE_SCRIPT)!r}"
         )
     # MR !1691 run-137 review IX-1: the .rust-job image is a bare name. An
@@ -1916,7 +1959,7 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
     # so pin the whole value, not just image_name().
     if effective.get("image") not in ("$CI_RUST_IMAGE", {"name": "$CI_RUST_IMAGE"}):
         errors.append(
-            "worker-pebble-rust must resolve to exactly the $CI_RUST_IMAGE "
+            f"{job_name} must resolve to exactly the $CI_RUST_IMAGE "
             "image (no entrypoint or other image keys)"
         )
     # MR !1691 run-137 review IX-2: a lane without needs: [] in a later stage
@@ -1925,29 +1968,58 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
     # exits 0).
     if effective.get("needs") != []:
         errors.append(
-            "worker-pebble-rust must declare needs: [] so no artifacts or "
+            f"{job_name} must declare needs: [] so no artifacts or "
             "dotenv variables from other jobs reach the pinned script"
         )
     if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
-        errors.append(
-            "worker-pebble-rust tags must be exactly ['$CI_RUST_RUNNER_TAG']"
-        )
+        errors.append(f"{job_name} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
     rules = effective.get("rules")
     if isinstance(rules, list) and any(
         isinstance(rule, dict) and "variables" in rule for rule in rules
     ):
         errors.append(
-            "worker-pebble-rust rules must not set variables; "
+            f"{job_name} rules must not set variables; "
             "rules:variables reach the pinned script on the pipelines that "
             "rule matches"
         )
     if not lane_runs_on_merge_requests(job, merged):
-        errors.append("worker-pebble-rust must run on merge_request_event")
+        errors.append(f"{job_name} must run on merge_request_event")
     script = effective.get("script")
-    if not isinstance(script, list) or [str(line) for line in script] != list(PEBBLE_RUST_LANE_SCRIPT):
+    if not isinstance(script, list) or [str(line) for line in script] != list(expected_script):
         errors.append(
-            "worker-pebble-rust script must be exactly the pinned commands "
-            f"{list(PEBBLE_RUST_LANE_SCRIPT)!r} (got {script!r})"
+            f"{job_name} script must be exactly the pinned commands "
+            f"{list(expected_script)!r} (got {script!r})"
+        )
+
+
+def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
+    validate_pinned_rust_lane(
+        "worker-pebble-rust", PEBBLE_RUST_LANE_SCRIPT, merged, errors
+    )
+
+
+def validate_xmpp_bridge_rust_lane(merged: dict, errors: list[str]) -> None:
+    """WI#864: the XMPP bridge and its contract crate get their own Rust
+    lane, so a change to either cannot merge with a green pipeline unless
+    both build with --locked, pass their tests, and pass clippy -D warnings.
+
+    Beyond the shared pinned-lane checks, the full rules list is pinned:
+    the lane must run on merge-request pipelines, branch pushes, and
+    protected release tags (the same coverage as the other Rust gates), and
+    a `when: never` replacement or a narrowed rule fails here.
+    """
+    validate_pinned_rust_lane(
+        "rust-xmpp-bridge", XMPP_BRIDGE_RUST_LANE_SCRIPT, merged, errors
+    )
+    job = merged.get("rust-xmpp-bridge")
+    if not isinstance(job, dict):
+        return
+    effective = resolve_extends(job, merged)
+    rules = effective.get("rules")
+    if not isinstance(rules, list) or rules != list(XMPP_BRIDGE_RUST_LANE_RULES):
+        errors.append(
+            "rust-xmpp-bridge rules must be exactly the pinned MR/branch/tag "
+            f"gate {list(XMPP_BRIDGE_RUST_LANE_RULES)!r} (got {rules!r})"
         )
 
 
@@ -4261,6 +4333,7 @@ def main() -> int:
     validate_deny_toml_advisories(errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_pebble_rust_lane(merged_config, errors)
+    validate_xmpp_bridge_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
     validate_artifact_retention(merged_config, errors)
     validate_worker_versions(errors)
