@@ -1838,8 +1838,9 @@ fn short_push_cluster_forces(word: &str) -> bool {
 }
 
 /// A refspec that deletes (`:ref`) or forces (`+ref`) the update.
+/// A refspec that deletes (`:ref`, and `+:ref` — a forced deletion).
 fn refspec_deletes(word: &str) -> bool {
-    word.starts_with(':')
+    word.strip_prefix('+').unwrap_or(word).starts_with(':')
 }
 
 fn refspec_forces(word: &str) -> bool {
@@ -2681,6 +2682,8 @@ mod tests {
             "git push --del origin old-branch",
             "git push origin :old-branch",
             "git push origin :refs/heads/old-branch",
+            "git push origin :",
+            "git push origin +:old-branch",
         ] {
             let error = check_granted(deleting, &grant).unwrap_err();
             assert!(
