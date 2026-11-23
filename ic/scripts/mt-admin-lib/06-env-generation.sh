@@ -1446,17 +1446,55 @@ write_tenant_lunarwing_env() {
   # daemon variable a SANDBOX_GIT_CREDENTIALS binding (`remote=NAME`) names.
   # A bound value is an Authorization header value (a secret: the env file is
   # written mode 0600, and the value is never printed or passed to another
-  # program). A binding whose name is not a plain environment name is not
-  # carried (the daemon refuses it at load); nothing here is evaluated.
+  # program). A binding is carried only when its remote is one that
+  # SANDBOX_GIT_REMOTES grants and its name is a plain environment name (the
+  # daemon refuses anything else at load); nothing here is evaluated. A value
+  # this writer cannot render on one line (a carriage return or newline, for
+  # example from a CRLF line) stops the render here, in the writer's own
+  # shell, naming the variable and never printing its value.
   local sandbox_git_remotes sandbox_git_write_remotes sandbox_git_credentials
   sandbox_git_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_REMOTES)"
   sandbox_git_write_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_WRITE_REMOTES)"
   sandbox_git_credentials="$(_env_existing "$env_snapshot" SANDBOX_GIT_CREDENTIALS)"
+  local git_setting_name git_setting_value
+  for git_setting_name in SANDBOX_GIT_REMOTES SANDBOX_GIT_WRITE_REMOTES SANDBOX_GIT_CREDENTIALS; do
+    case "$git_setting_name" in
+      SANDBOX_GIT_REMOTES) git_setting_value="$sandbox_git_remotes" ;;
+      SANDBOX_GIT_WRITE_REMOTES) git_setting_value="$sandbox_git_write_remotes" ;;
+      *) git_setting_value="$sandbox_git_credentials" ;;
+    esac
+    if [[ "$git_setting_value" == *$'\r'* || "$git_setting_value" == *$'\n'* ]]; then
+      rm -f -- "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
+      die "tenant '$name': $git_setting_name in lunarwing.env contains a carriage return or newline (a CRLF line?); fix that line and re-run"
+    fi
+  done
   local -a sandbox_git_secret_names=() sandbox_git_secret_values=() git_bindings=()
-  local git_binding git_secret_name git_secret_value
+  local -a git_remote_entries=() git_granted_remotes=()
+  local git_binding git_binding_remote git_secret_name git_secret_value
+  local git_remote_entry git_remote_name git_binding_granted
+  IFS=',' read -r -a git_remote_entries <<<"$sandbox_git_remotes"
+  for git_remote_entry in "${git_remote_entries[@]}"; do
+    [[ "$git_remote_entry" == *=* ]] || continue
+    git_remote_name="${git_remote_entry%%=*}"
+    git_remote_name="${git_remote_name#"${git_remote_name%%[![:space:]]*}"}"
+    git_remote_name="${git_remote_name%"${git_remote_name##*[![:space:]]}"}"
+    if [[ -n "$git_remote_name" ]]; then
+      git_granted_remotes+=("$git_remote_name")
+    fi
+  done
   IFS=',' read -r -a git_bindings <<<"$sandbox_git_credentials"
   for git_binding in "${git_bindings[@]}"; do
     [[ "$git_binding" == *=* ]] || continue
+    git_binding_remote="${git_binding%%=*}"
+    git_binding_remote="${git_binding_remote#"${git_binding_remote%%[![:space:]]*}"}"
+    git_binding_remote="${git_binding_remote%"${git_binding_remote##*[![:space:]]}"}"
+    git_binding_granted=false
+    for git_remote_name in "${git_granted_remotes[@]}"; do
+      if [[ "$git_remote_name" == "$git_binding_remote" ]]; then
+        git_binding_granted=true
+      fi
+    done
+    [[ "$git_binding_granted" == true ]] || continue
     git_secret_name="${git_binding#*=}"
     git_secret_name="${git_secret_name#"${git_secret_name%%[![:space:]]*}"}"
     git_secret_name="${git_secret_name%"${git_secret_name##*[![:space:]]}"}"
@@ -1464,6 +1502,10 @@ write_tenant_lunarwing_env() {
     [[ " ${sandbox_git_secret_names[*]} " != *" $git_secret_name "* ]] || continue
     git_secret_value="$(_env_existing "$env_snapshot" "$git_secret_name")"
     [[ -n "$git_secret_value" ]] || continue
+    if [[ "$git_secret_value" == *$'\r'* || "$git_secret_value" == *$'\n'* ]]; then
+      rm -f -- "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
+      die "tenant '$name': $git_secret_name (bound by SANDBOX_GIT_CREDENTIALS) in lunarwing.env contains a carriage return or newline (a CRLF line?); fix that line and re-run"
+    fi
     sandbox_git_secret_names+=("$git_secret_name")
     sandbox_git_secret_values+=("$git_secret_value")
   done
