@@ -328,8 +328,7 @@ function findStartPaths(rest) {
 
 /** Deny `find -delete`, `-exec rm` and `-ok rm` whose start paths leave the temp roots. */
 function checkFindDeletion(text) {
-  for (const match of text.matchAll(FIND_CALL)) {
-    const rest = clauseText(text, match.index + match[0].length);
+  for (const { rest } of clauseTails(text, FIND_CALL)) {
     if (!FIND_DELETE_ACTION.test(rest)) continue;
     const paths = findStartPaths(rest);
     if (!paths.every(isSafeTempPath)) return outsideTempReason("find", paths);
@@ -353,16 +352,13 @@ function feedingPipeline(text, index) {
 /** The start paths of the last find in a pipeline, or null when there is none. */
 function lastFindPaths(pipeline) {
   let paths = null;
-  for (const match of pipeline.matchAll(FIND_CALL)) {
-    paths = findStartPaths(clauseText(pipeline, match.index + match[0].length));
-  }
+  for (const { rest } of clauseTails(pipeline, FIND_CALL)) paths = findStartPaths(rest);
   return paths;
 }
 
 /** Deny `xargs rm` unless its feeding find is provably temp-rooted. */
 function checkXargsDeletion(text) {
-  for (const match of text.matchAll(XARGS_CALL)) {
-    const rest = clauseText(text, match.index + match[0].length);
+  for (const { match, rest } of clauseTails(text, XARGS_CALL)) {
     if (!XARGS_RM.test(rest)) continue;
     const paths = lastFindPaths(feedingPipeline(text, match.index));
     // Without a find in the pipeline the deleted set is unknown; fail closed.
@@ -378,8 +374,8 @@ function checkXargsDeletion(text) {
  * last operand; `--remove-source-files` deletes the operands before it.
  */
 function checkRsyncDeletion(text) {
-  for (const match of text.matchAll(RSYNC_CALL)) {
-    const words = argumentWords(clauseText(text, match.index + match[0].length)).map(stripShellQuotes);
+  for (const { rest } of clauseTails(text, RSYNC_CALL)) {
+    const words = argumentWords(rest).map(stripShellQuotes);
     const option = words.find((word) => /^--del(?:ete(?:-[a-z-]+)?)?$/.test(word) ||
       word === "--remove-source-files");
     if (option === undefined) continue;
@@ -607,12 +603,12 @@ function mvOperandProtected(operand) {
 }
 
 function checkMoveAndTarDeletion(text) {
-  for (const match of text.matchAll(MV_CALL)) {
-    const hit = mvOperands(clauseText(text, match.index + match[0].length)).find(mvTouchesProtected);
+  for (const { rest } of clauseTails(text, MV_CALL)) {
+    const hit = mvOperands(rest).find(mvTouchesProtected);
     if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
   }
-  for (const match of text.matchAll(TAR_CALL)) {
-    const tar = tarInvocation(clauseText(text, match.index + match[0].length));
+  for (const { rest } of clauseTails(text, TAR_CALL)) {
+    const tar = tarInvocation(rest);
     if (!tar.removeFiles) continue;
     if (tar.unverifiable) return "tar --remove-files over a member list the guard cannot verify";
     if (tar.members.length === 0) return "tar --remove-files without an explicit member";
@@ -1020,16 +1016,15 @@ function deviceTarget(word) {
 
 /** Deny block-device writes by `tee` (every operand) and `cp` (its last operand). */
 function checkDeviceWrites(text) {
-  for (const match of text.matchAll(TEE_CALL)) {
-    for (const word of argumentWords(clauseText(text, match.index + match[0].length))) {
+  for (const { rest } of clauseTails(text, TEE_CALL)) {
+    for (const word of argumentWords(rest)) {
       if (word.startsWith("-")) continue;
       const target = deviceTarget(word);
       if (target !== null) return `direct block-device write: tee ${target.slice(0, 80)}`;
     }
   }
-  for (const match of text.matchAll(CP_CALL)) {
-    const operands = argumentWords(clauseText(text, match.index + match[0].length))
-      .filter((word) => !word.startsWith("-"));
+  for (const { rest } of clauseTails(text, CP_CALL)) {
+    const operands = argumentWords(rest).filter((word) => !word.startsWith("-"));
     const target = operands.length > 0 ? deviceTarget(operands[operands.length - 1]) : null;
     if (target !== null) return `direct block-device write: cp ${target.slice(0, 80)}`;
   }
@@ -1120,8 +1115,7 @@ const RECURSIVE_CHANGE_FLAG =
  * (WI#856).
  */
 function checkRecursiveRootChange(segment) {
-  for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
-    const rest = clauseText(segment, match.index + match[0].length);
+  for (const { rest } of clauseTails(segment, ROOT_CHANGE_CALL)) {
     if (!RECURSIVE_CHANGE_FLAG.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
@@ -1136,14 +1130,19 @@ function isClauseTerminator(ch) {
 }
 
 /**
- * The text of the command clause that starts at `from`: it runs to the first
- * control operator or newline, read outside quotes and past a backslash. Every
- * reader that captures "the rest of the invocation" uses this, so an argument
- * that carries a separator cannot hide the rest of its command (WI#856).
+ * The sorted indices of the unquoted clause terminators in `text`, computed in
+ * one pass and cached for the text a check is walking: the reader is called
+ * once per command word, and rescanning the rest of a 16 KB command from each
+ * of them took the analysis past its deadline (WI#856).
  */
-function clauseText(text, from) {
+let clauseScanText = null;
+let clauseScanEnds = [];
+
+function clauseEnds(text) {
+  if (text === clauseScanText) return clauseScanEnds;
+  const ends = [];
   let quote = "";
-  for (let i = from; i < text.length; i++) {
+  for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
       i++;
@@ -1154,9 +1153,50 @@ function clauseText(text, from) {
       continue;
     }
     if (ch === "'" || ch === '"') quote = ch;
-    else if (isClauseTerminator(ch)) return text.slice(from, i);
+    else if (isClauseTerminator(ch)) ends.push(i);
   }
-  return text.slice(from);
+  clauseScanText = text;
+  clauseScanEnds = ends;
+  return ends;
+}
+
+/**
+ * The text of the command clause that starts at `from`: it runs to the first
+ * control operator or newline, read outside quotes and past a backslash. Every
+ * reader that captures "the rest of the invocation" uses this, so an argument
+ * that carries a separator cannot hide the rest of its command (WI#856).
+ */
+function clauseText(text, from) {
+  const ends = clauseEnds(text);
+  let low = 0;
+  let high = ends.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (ends[middle] < from) low = middle + 1;
+    else high = middle;
+  }
+  return text.slice(from, low < ends.length ? ends[low] : text.length);
+}
+
+/**
+ * The rest of the clause after each command-word match, read once per clause.
+ * A clause is one simple command, so the first match's tail already contains
+ * every later match in it; re-reading and re-parsing that tail for each word
+ * made a 16 KB command of repeated verbs take the analysis past its deadline
+ * (WI#856). Matches arrive in ascending order, so one running clause end is
+ * enough to spot a repeat.
+ */
+function clauseTails(text, pattern) {
+  const tails = [];
+  let clauseStop = -1;
+  for (const match of text.matchAll(pattern)) {
+    const from = match.index + match[0].length;
+    if (from <= clauseStop) continue;
+    const rest = clauseText(text, from);
+    clauseStop = from + rest.length;
+    tails.push({ match, rest });
+  }
+  return tails;
 }
 
 /**
