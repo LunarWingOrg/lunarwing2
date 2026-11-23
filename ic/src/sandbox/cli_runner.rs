@@ -729,6 +729,10 @@ pub struct ExecParams<'a> {
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
     pub tunnel: Option<TunnelRunConfig<'a>>,
+    /// Host directory holding the per-execution git credential broker
+    /// (WI#860). Bind-mounted read-only at
+    /// [`crate::sandbox::git_grant::GIT_CREDENTIAL_MOUNT`].
+    pub credential_broker_dir: Option<&'a str>,
     /// Directories that must never be readable inside the mount (WI#205).
     pub protected_paths: &'a [std::path::PathBuf],
     /// Whether the daemon's scrubbed log copy may be bound at `/tenant-logs`
@@ -2608,6 +2612,7 @@ mod tests {
             network: SandboxNetworkMode::None,
             proxy_port: 0,
             tunnel: None,
+            credential_broker_dir: None,
             protected_paths: &[],
             tenant_logs: false,
         };

@@ -1437,6 +1437,80 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_git_write_remotes_and_credentials_resolve_and_fail_closed() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+        for key in [
+            "SANDBOX_GIT_REMOTES",
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_CREDENTIALS",
+        ] {
+            // SAFETY: Under ENV_MUTEX (restored on drop), no concurrent env access.
+            unsafe { std::env::remove_var(key) };
+        }
+
+        // A write list without a read grant is a configuration error.
+        unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
+        match SandboxModeConfig::resolve(&settings) {
+            Err(ConfigError::InvalidValue { key, .. }) => {
+                assert_eq!(key, "SANDBOX_GIT_WRITE_REMOTES")
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_REMOTES",
+                "origin=file:///workspace/remotes/origin.git,\
+                 upstream=https://git.example.test/org/repo.git",
+            )
+        };
+        unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
+        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "git.example.test=git_read_token") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve");
+        let grant = cfg.git.as_ref().expect("grant");
+        assert!(grant.remotes[0].allows(crate::sandbox::GitOperationClass::Write));
+        assert!(!grant.remotes[1].allows(crate::sandbox::GitOperationClass::Write));
+        assert_eq!(cfg.git_credentials.len(), 1);
+        assert_eq!(cfg.git_credentials[0].secret_name, "git_read_token");
+        let propagated = cfg.to_sandbox_config();
+        assert_eq!(propagated.git_credentials, cfg.git_credentials);
+
+        for bad in [
+            "origin=file:///workspace/remotes/origin.git,upstream=https://git.example.test/org/repo.git",
+        ] {
+            unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", bad) };
+            match SandboxModeConfig::resolve(&settings) {
+                Err(ConfigError::InvalidValue { key, .. }) => {
+                    assert_eq!(key, "SANDBOX_GIT_WRITE_REMOTES")
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+        unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
+        for bad in [
+            "https://user:token@git.example.test=TOKEN",
+            "git.example.test=",
+            "git.example.test=UPPER",
+        ] {
+            unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", bad) };
+            match SandboxModeConfig::resolve(&settings) {
+                Err(ConfigError::InvalidValue { key, .. }) => {
+                    assert_eq!(key, "SANDBOX_GIT_CREDENTIALS")
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+        for key in [
+            "SANDBOX_GIT_REMOTES",
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_CREDENTIALS",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
     fn sandbox_enforce_env_overrides_default() {
         let _guard = crate::config::helpers::lock_env();
         let settings = crate::settings::Settings::default();

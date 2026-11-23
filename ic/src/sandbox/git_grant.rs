@@ -53,16 +53,6 @@ pub enum GitOperationClass {
     Write,
 }
 
-impl GitOperationClass {
-    /// Denial text naming the operation a remote does not grant.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GitTransport {
@@ -1927,6 +1917,125 @@ mod tests {
                 authorize_shell_command(command, None, SandboxNetworkMode::ProxyEnforced),
                 Err(SandboxError::CapabilityDenied { .. })
             ));
+        }
+    }
+
+    /// Run a real `git` command with the same `GIT_CONFIG_*` the container
+    /// receives, against a real local bare remote. This is the WI#860
+    /// acceptance test: no fake runtime, no stub.
+    fn run_git(env: &[(String, String)], cwd: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(cwd);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+            .output()
+            .expect("git is installed")
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Build a bare remote inside the workspace and a local seed repo that
+    /// pushed one commit into it, so a clone has something to check out.
+    fn bare_remote_with_one_commit(temp: &Path) -> std::path::PathBuf {
+        let bare = temp.join("remotes/origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        let seed = temp.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        let base = |args: &[&str]| {
+            let output = run_git(&[], &seed, args);
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        base(&["init", "-q", "-b", "main"]);
+        std::fs::write(seed.join("README"), "fixture\n").unwrap();
+        base(&["add", "README"]);
+        base(&["commit", "-q", "-m", "seed"]);
+        base(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        base(&["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    #[test]
+    fn a_real_clone_and_push_against_a_local_remote_follow_the_grant() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let bare = bare_remote_with_one_commit(temp.path());
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::parse(
+            "origin=file:///workspace/remotes/origin.git",
+            &["origin".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::None, &[]).unwrap();
+        let env = grant.container_env();
+        authorize_shell_command("git clone file:///workspace/remotes/origin.git work", Some(&grant), SandboxNetworkMode::None)
+            .unwrap();
+
+        // Real clone, using the virtual path rewritten to the host path the
+        // sandbox mount would present.
+        let clone_url = bare.to_str().unwrap().to_string();
+        let output = run_git(&env, &cwd, &["clone", "-q", &clone_url, "work"]);
+        assert!(
+            output.status.success(),
+            "clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let work = cwd.join("work");
+        assert!(work.join("README").exists());
+
+        // Real push from the clone back to the granted remote.
+        std::fs::write(work.join("NEW"), "content\n").unwrap();
+        let add = run_git(&env, &work, &["add", "NEW"]);
+        assert!(add.status.success(), "{}", String::from_utf8_lossy(&add.stderr));
+        let commit = run_git(&env, &work, &["commit", "-q", "-m", "add new"]);
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        authorize_shell_command("git push origin main", Some(&grant), SandboxNetworkMode::None)
+            .unwrap();
+        let push = run_git(&env, &work, &["push", "-q", "origin", "main"]);
+        assert!(
+            push.status.success(),
+            "push: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        let verify = std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&verify.stdout).contains("add new"));
+
+        // Force push and ref deletion are refused by preflight and by git
+        // itself once the refspec carries `+`.
+        for command in [
+            "git push --force origin main",
+            "git push origin +main",
+            "git push origin :main",
+            "git push --delete origin main",
+        ] {
+            assert!(
+                authorize_shell_command(command, Some(&grant), SandboxNetworkMode::None).is_err(),
+                "{command} was accepted"
+            );
         }
     }
 

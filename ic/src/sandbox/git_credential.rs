@@ -24,31 +24,6 @@ use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::git_grant::{GitCredentialBinding, GIT_CREDENTIAL_SOCKET};
 use crate::sandbox::proxy::CredentialResolver;
 
-/// A resolved credential for one host. `Debug` is redacted.
-pub struct HostCredential {
-    pub username: String,
-    password: secrecy::SecretString,
-}
-
-impl std::fmt::Debug for HostCredential {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("HostCredential")
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
-    }
-}
-
-impl HostCredential {
-    pub fn new(username: impl Into<String>, password: secrecy::SecretString) -> Self {
-        Self {
-            username: username.into(),
-            password,
-        }
-    }
-}
-
 /// The host-side broker for one execution.
 pub struct GitCredentialBroker {
     directory: tempfile::TempDir,
@@ -238,7 +213,7 @@ async fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
+    use crate::sandbox::proxy::NoCredentialResolver;
 
     struct FixedResolver;
 
@@ -288,7 +263,6 @@ mod tests {
         assert!(script.contains("/run/lunarwing-git-credential/broker.sock"));
         assert!(!script.contains("s3cret"));
         assert!(!script.contains("git_read_token"));
-        let _ = SecretString::from("unused");
     }
 
     async fn ask(socket: &Path, request: &str) -> String {

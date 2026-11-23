@@ -420,12 +420,6 @@ impl SandboxManager {
             .as_ref()
             .is_some_and(|git| !git.credentials.is_empty())
         {
-            let git = decision
-                .git
-                .as_ref()
-                .ok_or_else(|| SandboxError::ProxyError {
-                    reason: "git credentials are set without a git grant".into(),
-                })?;
             let broker =
                 crate::sandbox::git_credential::GitCredentialBroker::create(
                     &self.config.git_credentials,
@@ -578,6 +572,7 @@ impl SandboxManager {
                         dns: dns.as_slice(),
                         resolv_conf: resolv_conf.as_deref(),
                     }),
+                credential_broker_dir,
                 protected_paths: &self.config.protected_paths,
                 tenant_logs: self.config.tenant_logs.enabled(),
             })
@@ -1661,6 +1656,66 @@ mod tests {
         assert_eq!(shared.as_ref().unwrap().request_count(), 0);
         drop(shared);
         manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_credentials_mount_the_broker_and_keep_the_secret_out_of_the_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
+        manager.config.network_allowlist = vec!["git.example.test".into()];
+        manager.config.git = crate::sandbox::GitGrantConfig::from_spec(
+            "upstream=https://git.example.test/repo.git",
+        )
+        .unwrap();
+        manager.config.git_credentials =
+            crate::sandbox::GitCredentialBinding::parse_spec("git.example.test=GIT_READ_TOKEN")
+                .unwrap();
+        // The secret the broker will hand back.
+        crate::config::inject_single_var("GIT_READ_TOKEN", "s3cret-credential-value");
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        manager
+            .execute_with_manifest(
+                "git ls-remote upstream",
+                temp.path(),
+                &manifest,
+                HashMap::new(),
+            )
+            .await
+            .expect("credentialed run reached the simulated runtime");
+        manager.shutdown().await;
+        crate::config::inject_single_var("GIT_READ_TOKEN", "");
+
+        let calls = state.lock().unwrap();
+        let args = calls
+            .iter()
+            .find(|args| args.first().is_some_and(|arg| arg == "run"))
+            .unwrap();
+        // The broker directory is mounted read-only at the fixed path.
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "-v"
+                && pair[1].ends_with(":/run/lunarwing-git-credential:ro,z")),
+            "{args:?}"
+        );
+        // The helper is configured, and the secret is nowhere in the run.
+        let joined = args.join("\n");
+        assert!(joined.contains("credential.helper"));
+        assert!(joined.contains("/run/lunarwing-git-credential/helper.sh"));
+        assert!(
+            !joined.contains("s3cret-credential-value"),
+            "the secret entered the container arguments: {joined}"
+        );
+        assert!(
+            !joined.contains("GIT_READ_TOKEN"),
+            "the secret name entered the container arguments: {joined}"
+        );
     }
 
     #[cfg(unix)]
