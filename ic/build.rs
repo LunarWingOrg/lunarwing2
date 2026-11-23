@@ -220,14 +220,16 @@ fn embed_build_identity(root: &Path) {
 
     // Cargo stops using its default "any package file changed" heuristic once
     // a build script emits rerun-if-changed, so the sources have to be
-    // watched explicitly or an edited tree keeps a stale banner. `.git` is
-    // watched only when present: the container build copies no `.git`.
+    // watched explicitly or an edited tree keeps a stale banner. HEAD is
+    // watched because a checkout/commit moves the printed commit; the index is
+    // not, so a plain `git add` does not force a relink.
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    for path in [".git/HEAD", ".git/index"] {
-        if root.join(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    if let Some(head) = git(root, &["rev-parse", "--absolute-git-dir"])
+        .map(|dir| PathBuf::from(dir).join("HEAD"))
+        .filter(|head| head.exists())
+    {
+        println!("cargo:rerun-if-changed={}", head.display());
     }
 }
 
