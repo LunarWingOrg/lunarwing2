@@ -1883,10 +1883,28 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
                     "force push is not permitted; --mirror forces every ref",
                 ));
             }
+            // `--repo <dest>` names the destination itself; it must be a
+            // write-granted remote, exactly like a positional.
+            if text == "--repo" || text.starts_with("--repo=") {
+                let value = match text.strip_prefix("--repo=") {
+                    Some(value) if !value.is_empty() => Word {
+                        text: value.to_string(),
+                        dynamic: word.dynamic,
+                    },
+                    Some(_) => return Err(denied("git push --repo needs a literal value")),
+                    None => match args.get(index + 1) {
+                        Some(value) if !value.dynamic => value.clone(),
+                        _ => return Err(denied("git push --repo needs a literal value")),
+                    },
+                };
+                preflight.write_remote(&value)?;
+                index += if text == "--repo" { 2 } else { 1 };
+                continue;
+            }
             // Push options that take a value; check the value is literal.
             if matches!(
                 text,
-                "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" | "--signed"
+                "-o" | "--push-option" | "--receive-pack" | "--exec" | "--signed"
             ) {
                 match args.get(index + 1) {
                     Some(value) if !value.dynamic => {}
@@ -2678,6 +2696,21 @@ mod tests {
         // The read-only remote in the same grant still refuses push.
         let error = check_granted("git push upstream main", &grant).unwrap_err();
         assert!(error.to_string().contains("read-only"), "{error}");
+
+        // A destination outside the grant is refused, however it is spelled.
+        for outside in [
+            "git push https://evil.example.test/repo.git main",
+            "git push --repo https://evil.example.test/repo.git main",
+            "git push --repo=https://evil.example.test/repo.git main",
+            "git push --repo origin main",
+            "git push /workspace/remotes/other.git main",
+        ] {
+            let error = check_granted(outside, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{outside}: {error}"
+            );
+        }
     }
 
     /// The maintainer's deletion decision is host policy: turning it on

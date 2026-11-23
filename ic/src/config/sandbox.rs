@@ -1418,6 +1418,82 @@ mod tests {
         unsafe { std::env::remove_var("SANDBOX_GIT_REMOTES") };
     }
 
+    /// WI#860: the write list, deletion decision and credential bindings are
+    /// separate host settings; a write name outside the read grant is a load
+    /// error, and an https credential binding is refused (CONNECT is opaque).
+    #[test]
+    fn sandbox_git_write_and_credential_env_are_validated() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+
+        for var in [
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_ALLOW_REF_DELETION",
+            "SANDBOX_GIT_CREDENTIALS",
+        ] {
+            unsafe { std::env::remove_var(var) };
+        }
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_REMOTES",
+                "origin=http://git.internal/org/repo.git,\
+                 upstream=https://git.example.test/org/repo.git",
+            )
+        };
+        unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
+        unsafe { std::env::set_var("SANDBOX_GIT_ALLOW_REF_DELETION", "true") };
+        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "origin=GIT_ORIGIN_TOKEN") };
+
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve write grant");
+        let grant = cfg.git.as_ref().expect("grant");
+        assert!(grant.allow_ref_deletion);
+        assert!(
+            grant
+                .remotes
+                .iter()
+                .find(|r| r.name == "origin")
+                .unwrap()
+                .write
+        );
+        assert!(
+            !grant
+                .remotes
+                .iter()
+                .find(|r| r.name == "upstream")
+                .unwrap()
+                .write
+        );
+        assert_eq!(grant.credentials.len(), 1);
+        assert_eq!(grant.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+
+        // An https binding cannot be injected through a CONNECT tunnel.
+        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "upstream=GIT_TOKEN") };
+        match SandboxModeConfig::resolve(&settings) {
+            Err(ConfigError::InvalidValue { key, .. }) => {
+                assert_eq!(key, "SANDBOX_GIT_REMOTES")
+            }
+            other => panic!("expected InvalidValue for an https binding, got {other:?}"),
+        }
+
+        // A write name outside the read grant is a load error.
+        unsafe { std::env::remove_var("SANDBOX_GIT_CREDENTIALS") };
+        unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "other") };
+        match SandboxModeConfig::resolve(&settings) {
+            Err(ConfigError::InvalidValue { key, .. }) => {
+                assert_eq!(key, "SANDBOX_GIT_REMOTES")
+            }
+            other => panic!("expected InvalidValue for an unknown write remote, got {other:?}"),
+        }
+
+        for var in [
+            "SANDBOX_GIT_REMOTES",
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_ALLOW_REF_DELETION",
+        ] {
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
     #[test]
     fn sandbox_enforce_env_overrides_default() {
         let _guard = crate::config::helpers::lock_env();
