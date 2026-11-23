@@ -68,7 +68,9 @@ pub enum SandboxReadiness {
     Available,
     /// User explicitly disabled sandboxing (SANDBOX_ENABLED=false).
     DisabledByConfig,
-    /// Sandbox is enabled but Docker is not running or not installed.
+    /// Sandbox is enabled but the Docker-compatible API used for full-job
+    /// worker containers is unreachable. The generic sandbox may still run on
+    /// the podman CLI (WI#871), so this only blocks full-job routines.
     DockerUnavailable,
 }
 
@@ -1451,8 +1453,9 @@ async fn execute_full_job(
         }
         SandboxReadiness::DockerUnavailable => {
             return Err(RoutineError::JobDispatchFailed {
-                reason: "Sandbox is enabled but Docker is not available. \
-                         Install Docker or set SANDBOX_ENABLED=false."
+                reason: "Full-job routines need a Docker-compatible API for worker \
+                         containers, and none is reachable. Start Docker (or point \
+                         DOCKER_HOST at a compatible socket) or set SANDBOX_ENABLED=false."
                     .to_string(),
             });
         }
@@ -3312,12 +3315,13 @@ mod tests {
         assert_ne!(readiness, SandboxReadiness::Available);
 
         let err = crate::error::RoutineError::JobDispatchFailed {
-            reason: "Sandbox is enabled but Docker is not available. \
-                     Install Docker or set SANDBOX_ENABLED=false."
+            reason: "Full-job routines need a Docker-compatible API for worker \
+                     containers, and none is reachable. Start Docker (or point \
+                     DOCKER_HOST at a compatible socket) or set SANDBOX_ENABLED=false."
                 .to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("Docker is not available"));
+        assert!(msg.contains("Docker-compatible API"), "{msg}");
         assert!(msg.contains("SANDBOX_ENABLED"));
     }
 
