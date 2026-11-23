@@ -160,10 +160,15 @@ text, decides write and deletion:
 - A push whose command list deletes a ref (an all-zero new object id) is
   refused, as are signed pushes (`push-cert`) and compressed, truncated or
   malformed push bodies.
-- Under a granted repository path only `GET`, `HEAD`, `POST` and `OPTIONS` are
-  forwarded, so WebDAV writes (`git http-push`) are refused.
-- `CONNECT` to a plain-HTTP remote's own host and port is refused, so a client
-  cannot tunnel around these checks.
+- The per-call git proxy forwards only `GET`, `HEAD`, `POST` and `OPTIONS`, on
+  any path: smart HTTP needs nothing else, so WebDAV writes (`git http-push`)
+  are refused however the path is spelled.
+- The upstream `Host` is the request's own host and port: a request whose
+  `Host` header names another virtual host is refused, so a granted request
+  and its credential cannot be steered elsewhere on the same address.
+- `CONNECT` is opened only to the host and port of a granted `https://`
+  remote; every other tunnel, a plain-HTTP remote's host included, is
+  refused, so a client cannot tunnel around these checks.
 - **A non-fast-forward update cannot be seen from the request**, so it is left
   to the forge: protect the target branches (no force push). For `https://`
   remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
@@ -183,7 +188,8 @@ remote to a daemon environment variable. The value is the literal
 - **The credential reaches only its repository's endpoints.** The header is
   added only to the bound remote's own smart-HTTP requests (`info/refs`,
   `git-upload-pack`, and `git-receive-pack` for a write grant) on its exact
-  host and port. Another repository on the same host, the forge's API, a
+  host and port, and it is that remote's own credential even when two
+  remotes share a host. Another repository on the same host, the forge's API, a
   dumb-HTTP read and any other path get no credential. Configure the remote's
   canonical smart-HTTP URL (with `.git` where the forge redirects to it).
 - **Only plain `http://` remotes can be bound.** HTTPS travels in an opaque

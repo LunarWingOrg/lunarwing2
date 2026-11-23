@@ -955,8 +955,9 @@ Ref deletion is always refused; there is no switch. Manifest preflight is an
 early refusal. For `http://` remotes the per-call proxy is the boundary: it
 forwards `git-receive-pack` only to a write-granted remote's own repository,
 host and port, refuses a push that deletes a ref (all-zero new id), signed or
-compressed push bodies, WebDAV methods under a granted repository and
-`CONNECT` to the remote's host and port. Non-fast-forward updates, and every
+compressed push bodies, every method but `GET`, `HEAD`, `POST` and `OPTIONS`,
+a `Host` header that is not the request's own host and port, and every
+`CONNECT` except to a granted `https://` remote. Non-fast-forward updates, and every
 write to an `https://` remote, are left to the forge: read-only deploy keys
 for read grants, protected branches (no force push).
 

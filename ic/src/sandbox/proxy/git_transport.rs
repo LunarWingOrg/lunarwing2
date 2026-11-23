@@ -13,17 +13,22 @@
 //! - An allowed receive-pack `POST` is refused when its command list deletes
 //!   a ref (an all-zero new object id), when it is a signed push
 //!   (`push-cert`), and when its body is compressed, truncated or malformed.
-//! - Under a granted repository path only `GET`, `HEAD`, `POST` and `OPTIONS`
-//!   are forwarded, so WebDAV writes (`git http-push`) cannot reach it.
+//! - Only `GET`, `HEAD`, `POST` and `OPTIONS` are forwarded, on any path:
+//!   smart HTTP needs nothing else, and WebDAV writes (`git http-push`) need
+//!   the rest.
+//! - The upstream `Host` is the request's URI authority: a request whose
+//!   `Host` header names anything else is refused, so a client cannot steer
+//!   a granted request (or its credential) to another virtual host.
 //! - A bound credential accompanies only a request to the bound remote's own
-//!   smart-HTTP endpoints: exact host, port, path, query and method.
-//! - `CONNECT` to a plain-HTTP remote's own host and port is refused, so a
-//!   client cannot tunnel around these checks.
+//!   smart-HTTP endpoints (exact scheme, host, port, path, query and method),
+//!   and it is that remote's own credential.
+//! - `CONNECT` is allowed only to the host and port of a granted `https://`
+//!   remote, so a client cannot tunnel around these checks.
 //!
 //! A non-fast-forward update cannot be seen from the request alone; it is
 //! left to the forge's branch protection. HTTPS remotes travel in opaque
-//! `CONNECT` tunnels and carry no credential, so these checks do not apply to
-//! them.
+//! `CONNECT` tunnels and carry no credential, so the request checks do not
+//! apply inside them.
 
 /// One plain-HTTP remote selected for a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,13 +40,14 @@ pub struct GitTransportRemote {
     pub repo_path: String,
     /// The host granted this remote the write operation class.
     pub write: bool,
-    /// A host-side credential is bound to this remote.
-    pub credentialed: bool,
+    /// The daemon variable bound to this remote (`SANDBOX_GIT_CREDENTIALS`),
+    /// if any. Only this credential may accompany this remote's requests.
+    pub secret_env: Option<String>,
 }
 
 impl GitTransportRemote {
     /// Build from a granted `http://` remote URL; `None` for any other scheme.
-    pub fn from_http_url(raw: &str, write: bool, credentialed: bool) -> Option<Self> {
+    pub fn from_http_url(raw: &str, write: bool, secret_env: Option<String>) -> Option<Self> {
         let url = url::Url::parse(raw).ok()?;
         if url.scheme() != "http" {
             return None;
@@ -54,7 +60,7 @@ impl GitTransportRemote {
             port,
             repo_path,
             write,
-            credentialed,
+            secret_env,
         })
     }
 
@@ -105,11 +111,32 @@ impl Endpoint {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitTransportPolicy {
     remotes: Vec<GitTransportRemote>,
+    /// `host:port` of each granted `https://` remote: the only `CONNECT`
+    /// targets this proxy opens.
+    tunnels: Vec<(String, u16)>,
 }
 
 impl GitTransportPolicy {
     pub fn new(remotes: Vec<GitTransportRemote>) -> Self {
-        Self { remotes }
+        Self {
+            remotes,
+            tunnels: Vec::new(),
+        }
+    }
+
+    /// Allow `CONNECT` to the host and port of a granted `https://` remote.
+    /// Any other URL is ignored, so it opens no tunnel.
+    pub fn with_https_tunnel(mut self, raw: &str) -> Self {
+        if let Ok(url) = url::Url::parse(raw)
+            && url.scheme() == "https"
+            && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
+        {
+            let target = (normalize_host(host), port);
+            if !self.tunnels.contains(&target) {
+                self.tunnels.push(target);
+            }
+        }
+        self
     }
 
     pub fn remotes(&self) -> &[GitTransportRemote] {
@@ -124,6 +151,9 @@ impl GitTransportPolicy {
         url: &url::Url,
         content_type: Option<&str>,
     ) -> Result<(), String> {
+        if !matches!(method, "GET" | "HEAD" | "POST" | "OPTIONS") {
+            return Err(format!("{method} is refused by the git proxy"));
+        }
         if let Some((remote, endpoint)) = self.endpoint(url) {
             if !endpoint.accepts(method) {
                 return Err(format!("git endpoint does not accept {method}"));
@@ -143,42 +173,43 @@ impl GitTransportPolicy {
                     .to_string(),
             );
         }
-        if self.write_method_under_repo(method, url) {
-            return Err(format!(
-                "{method} under a granted git repository is refused by the git proxy"
-            ));
-        }
         Ok(())
     }
 
-    /// Whether a bound credential may accompany this request: only the bound
-    /// remote's own endpoints, with the method git uses for each.
-    pub fn credential_allowed(&self, method: &str, url: &url::Url) -> bool {
-        match self.endpoint(url) {
-            Some((remote, endpoint)) => {
-                remote.credentialed
-                    && endpoint.accepts(method)
-                    && (remote.write || !endpoint.is_receive_pack())
-            }
-            None => false,
+    /// The upstream `Host` must be the URI authority. `values` are every
+    /// `Host` header of the request (an unreadable one as an empty string);
+    /// none is fine, the upstream request then takes the URI authority.
+    pub fn check_host_header(&self, url: &url::Url, values: &[String]) -> Result<(), String> {
+        match values {
+            [] => Ok(()),
+            [value] if host_header_matches(url, value) => Ok(()),
+            [_] => Err("Host header does not match the request target".to_string()),
+            _ => Err("more than one Host header".to_string()),
         }
     }
 
-    /// A `CONNECT` tunnel to a plain-HTTP remote's own host and port would
-    /// carry HTTP past every check here, so it is refused.
+    /// The bound credential that may accompany this request: the variable
+    /// bound to the remote whose exact host, port and endpoint path the URL
+    /// names, for the method git uses there. `None` for anything else.
+    pub fn credential_for(&self, method: &str, url: &url::Url) -> Option<&str> {
+        let (remote, endpoint) = self.endpoint(url)?;
+        let allowed = endpoint.accepts(method) && (remote.write || !endpoint.is_receive_pack());
+        if allowed {
+            remote.secret_env.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// `CONNECT` is opened only to the host and port of a granted `https://`
+    /// remote. A tunnel anywhere else, a plain-HTTP remote's host included,
+    /// would carry traffic past every check here.
     pub fn check_connect(&self, host: &str, port: u16) -> Result<(), String> {
-        let host = normalize_host(host);
-        if self
-            .remotes
-            .iter()
-            .any(|remote| remote.host == host && remote.port == port)
-        {
-            return Err(
-                "CONNECT to a plain-HTTP git remote is refused; use the remote's http:// URL"
-                    .to_string(),
-            );
+        let target = (normalize_host(host), port);
+        if self.tunnels.contains(&target) {
+            return Ok(());
         }
-        Ok(())
+        Err("CONNECT is allowed only to a granted https:// git remote".to_string())
     }
 
     /// Check the body of a forwarded request. Only a receive-pack `POST` to a
@@ -234,25 +265,38 @@ impl GitTransportPolicy {
                 Some((remote, endpoint))
             })
     }
+}
 
-    /// WebDAV and other write methods under a granted repository path.
-    fn write_method_under_repo(&self, method: &str, url: &url::Url) -> bool {
-        if matches!(method, "GET" | "HEAD" | "POST" | "OPTIONS") {
+/// Whether a `Host` header value names the URL's own authority: the same
+/// host (case-insensitive, without IPv6 brackets or a trailing dot) and the
+/// same port, an absent port meaning the scheme's default.
+fn host_header_matches(url: &url::Url, value: &str) -> bool {
+    let Some(url_host) = url.host_str() else {
+        return false;
+    };
+    let Some(url_port) = url.port_or_known_default() else {
+        return false;
+    };
+    let default_port = if url.scheme() == "https" { 443 } else { 80 };
+    let value = value.trim();
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
             return false;
+        };
+        let port = match after {
+            "" => Some(default_port),
+            after => after
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok()),
+        };
+        (host, port)
+    } else {
+        match value.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().ok()),
+            None => (value, Some(default_port)),
         }
-        let Some(host) = url.host_str().map(normalize_host) else {
-            return false;
-        };
-        let Some(port) = url.port_or_known_default() else {
-            return false;
-        };
-        let path = url.path();
-        self.remotes.iter().any(|remote| {
-            remote.host == host
-                && remote.port == port
-                && (path == remote.repo_path || path.starts_with(&format!("{}/", remote.repo_path)))
-        })
-    }
+    };
+    !host.is_empty() && port == Some(url_port) && normalize_host(host) == normalize_host(url_host)
 }
 
 /// `service=` of an `info/refs` request; anything but exactly one known
@@ -395,15 +439,28 @@ mod tests {
     const NEW: &str = "2222222222222222222222222222222222222222";
     const ZERO: &str = "0000000000000000000000000000000000000000";
 
+    fn secret(name: &str) -> Option<String> {
+        Some(name.to_string())
+    }
+
     fn policy() -> GitTransportPolicy {
         GitTransportPolicy::new(vec![
-            GitTransportRemote::from_http_url("http://git.internal/org/write.git", true, true)
-                .unwrap(),
-            GitTransportRemote::from_http_url("http://git.internal/org/read.git/", false, true)
-                .unwrap(),
-            GitTransportRemote::from_http_url("http://git.internal:8080/org/plain", false, false)
+            GitTransportRemote::from_http_url(
+                "http://git.internal/org/write.git",
+                true,
+                secret("WRITE_TOKEN"),
+            )
+            .unwrap(),
+            GitTransportRemote::from_http_url(
+                "http://git.internal/org/read.git/",
+                false,
+                secret("READ_TOKEN"),
+            )
+            .unwrap(),
+            GitTransportRemote::from_http_url("http://git.internal:8080/org/plain", false, None)
                 .unwrap(),
         ])
+        .with_https_tunnel("https://forge.example.test/org/other.git")
     }
 
     fn url(raw: &str) -> url::Url {
@@ -430,14 +487,14 @@ mod tests {
         let remote = GitTransportRemote::from_http_url(
             "http://Git.Internal.:3000/org/repo.git/",
             true,
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(remote.host, "git.internal");
         assert_eq!(remote.port, 3000);
         assert_eq!(remote.repo_path, "/org/repo.git");
         assert!(
-            GitTransportRemote::from_http_url("https://git.internal/org/repo.git", true, false)
+            GitTransportRemote::from_http_url("https://git.internal/org/repo.git", true, None)
                 .is_none()
         );
         assert_eq!(
@@ -449,7 +506,7 @@ mod tests {
             ]
         );
         let read =
-            GitTransportRemote::from_http_url("http://git.internal/r.git", false, true).unwrap();
+            GitTransportRemote::from_http_url("http://git.internal/r.git", false, None).unwrap();
         assert!(
             !read
                 .credential_paths()
@@ -542,54 +599,106 @@ mod tests {
         );
     }
 
+    /// F4: smart HTTP needs only GET, HEAD, POST and OPTIONS; every other
+    /// method is refused on any path, however the path is spelled.
     #[test]
-    fn webdav_writes_under_a_granted_repository_are_refused() {
+    fn only_smart_http_methods_are_forwarded_on_any_path() {
         let policy = policy();
-        for method in ["PUT", "MKCOL", "MOVE", "DELETE", "PROPPATCH", "LOCK"] {
+        for method in [
+            "PUT", "DELETE", "PROPFIND", "MKCOL", "MOVE", "PATCH", "LOCK",
+        ] {
+            for target in [
+                "http://git.internal/org/read.git/objects/info",
+                "http://git.internal/org/re%61d.git/objects/info",
+                "http://git.internal//org/read.git/objects/info",
+                "http://git.internal/elsewhere/file",
+            ] {
+                assert!(
+                    policy.check_request(method, &url(target), None).is_err(),
+                    "{method} {target}"
+                );
+            }
+        }
+        for method in ["GET", "HEAD", "POST", "OPTIONS"] {
             assert!(
                 policy
-                    .check_request(
-                        method,
-                        &url("http://git.internal/org/read.git/objects/info"),
-                        None
-                    )
-                    .is_err(),
+                    .check_request(method, &url("http://git.internal/elsewhere/file"), None)
+                    .is_ok(),
                 "{method}"
             );
         }
-        // Outside the repository paths the host keeps its WI#816 behaviour.
+    }
+
+    /// F1: the upstream Host is the URI authority, so a foreign Host header
+    /// cannot steer a granted request to another virtual host.
+    #[test]
+    fn host_header_must_name_the_uri_authority() {
+        let policy = policy();
+        let target = url("http://git.internal/org/read.git/git-upload-pack");
+        let on_port = url("http://git.internal:8080/org/plain/git-upload-pack");
+        let ipv6 = url("http://[::1]:8080/repo.git/git-upload-pack");
+        for (url, value) in [
+            (&target, "git.internal"),
+            (&target, "GIT.Internal"),
+            (&target, "git.internal:80"),
+            (&target, "git.internal."),
+            (&on_port, "git.internal:8080"),
+            (&ipv6, "[::1]:8080"),
+        ] {
+            assert!(
+                policy.check_host_header(url, &[value.to_string()]).is_ok(),
+                "{url} {value}"
+            );
+        }
+        assert!(policy.check_host_header(&target, &[]).is_ok());
+        for (url, value) in [
+            (&target, "other.internal"),
+            (&target, "git.internal:8080"),
+            (&target, ""),
+            (&target, "git.internal:"),
+            (&on_port, "git.internal"),
+            (&ipv6, "[::1]"),
+            (&ipv6, "[::2]:8080"),
+        ] {
+            assert!(
+                policy.check_host_header(url, &[value.to_string()]).is_err(),
+                "{url} {value}"
+            );
+        }
         assert!(
             policy
-                .check_request("PUT", &url("http://git.internal/elsewhere/file"), None)
-                .is_ok()
-        );
-        // `/org/read.git-other` is not under `/org/read.git`.
-        assert!(
-            policy
-                .check_request(
-                    "PUT",
-                    &url("http://git.internal/org/read.git-other/x"),
-                    None
+                .check_host_header(
+                    &target,
+                    &["git.internal".to_string(), "other.internal".to_string()]
                 )
-                .is_ok()
+                .is_err()
         );
     }
 
     #[test]
     fn credentials_accompany_only_the_bound_endpoints() {
         let policy = policy();
-        assert!(policy.credential_allowed(
-            "GET",
-            &url("http://git.internal/org/read.git/info/refs?service=git-upload-pack")
-        ));
-        assert!(policy.credential_allowed(
-            "POST",
-            &url("http://git.internal/org/read.git/git-upload-pack")
-        ));
-        assert!(policy.credential_allowed(
-            "POST",
-            &url("http://git.internal/org/write.git/git-receive-pack")
-        ));
+        assert_eq!(
+            policy.credential_for(
+                "GET",
+                &url("http://git.internal/org/read.git/info/refs?service=git-upload-pack")
+            ),
+            Some("READ_TOKEN")
+        );
+        assert_eq!(
+            policy.credential_for(
+                "POST",
+                &url("http://git.internal/org/read.git/git-upload-pack")
+            ),
+            Some("READ_TOKEN")
+        );
+        assert_eq!(
+            policy.credential_for(
+                "POST",
+                &url("http://git.internal/org/write.git/git-receive-pack")
+            ),
+            Some("WRITE_TOKEN")
+        );
         for (method, target) in [
             // Another repository, the forge API, another port.
             ("POST", "http://git.internal/org/other.git/git-upload-pack"),
@@ -607,20 +716,56 @@ mod tests {
             // A remote without a binding.
             ("POST", "http://git.internal:8080/org/plain/git-upload-pack"),
         ] {
-            assert!(
-                !policy.credential_allowed(method, &url(target)),
+            assert_eq!(
+                policy.credential_for(method, &url(target)),
+                None,
                 "{method} {target}"
             );
         }
     }
 
+    /// F3: two remotes on one host that differ only by port each get their
+    /// own credential, whichever mapping a host-and-path match would pick.
     #[test]
-    fn connect_to_a_plain_http_remote_is_refused() {
+    fn each_remote_gets_its_own_credential_on_a_shared_host() {
+        let policy = GitTransportPolicy::new(vec![
+            GitTransportRemote::from_http_url("http://h/org/r.git", false, secret("GIT_A"))
+                .unwrap(),
+            GitTransportRemote::from_http_url("http://h:8080/org/r.git", false, secret("GIT_B"))
+                .unwrap(),
+        ]);
+        assert_eq!(
+            policy.credential_for("POST", &url("http://h/org/r.git/git-upload-pack")),
+            Some("GIT_A")
+        );
+        assert_eq!(
+            policy.credential_for("POST", &url("http://h:8080/org/r.git/git-upload-pack")),
+            Some("GIT_B")
+        );
+    }
+
+    /// F2: CONNECT opens only to a granted https:// remote's host and port.
+    #[test]
+    fn connect_is_allowed_only_to_a_granted_https_remote() {
         let policy = policy();
-        assert!(policy.check_connect("git.internal", 80).is_err());
-        assert!(policy.check_connect("GIT.INTERNAL.", 80).is_err());
-        assert!(policy.check_connect("git.internal", 8080).is_err());
-        assert!(policy.check_connect("git.internal", 443).is_ok());
+        assert!(policy.check_connect("forge.example.test", 443).is_ok());
+        assert!(policy.check_connect("FORGE.example.test.", 443).is_ok());
+        for (host, port) in [
+            ("forge.example.test", 8443),
+            ("git.internal", 80),
+            ("git.internal", 8080),
+            ("git.internal", 443),
+            ("git.internal", 9418),
+            ("elsewhere.test", 443),
+        ] {
+            assert!(policy.check_connect(host, port).is_err(), "{host}:{port}");
+        }
+        assert!(
+            GitTransportPolicy::new(Vec::new())
+                .with_https_tunnel("http://forge.example.test/plain.git")
+                .check_connect("forge.example.test", 80)
+                .is_err()
+        );
     }
 
     #[test]

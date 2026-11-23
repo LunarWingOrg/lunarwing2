@@ -352,7 +352,7 @@ impl GitGrantAuthorization {
                 crate::sandbox::proxy::git_transport::GitTransportRemote::from_http_url(
                     &remote.url,
                     remote.write,
-                    true,
+                    Some(source.secret_env.clone()),
                 )
             else {
                 continue;
@@ -370,24 +370,32 @@ impl GitGrantAuthorization {
 
     /// The smart-HTTP transport policy of this call's per-call git proxy
     /// (WI#860, ALM-1): every selected plain-HTTP remote with its write class
-    /// and whether a credential is bound to it.
+    /// and the variable bound to it, and the host and port of every selected
+    /// `https://` remote as the only `CONNECT` targets.
     pub fn transport_policy(&self) -> crate::sandbox::proxy::git_transport::GitTransportPolicy {
         let remotes = self
             .remotes
             .iter()
             .filter_map(|remote| {
-                let credentialed = self
+                let secret_env = self
                     .credentials
                     .iter()
-                    .any(|source| source.remote == remote.name);
+                    .find(|source| source.remote == remote.name)
+                    .map(|source| source.secret_env.clone());
                 crate::sandbox::proxy::git_transport::GitTransportRemote::from_http_url(
                     &remote.url,
                     remote.write,
-                    credentialed,
+                    secret_env,
                 )
             })
             .collect();
-        crate::sandbox::proxy::git_transport::GitTransportPolicy::new(remotes)
+        self.remotes
+            .iter()
+            .filter(|remote| remote.transport == GitTransport::Https)
+            .fold(
+                crate::sandbox::proxy::git_transport::GitTransportPolicy::new(remotes),
+                |policy, remote| policy.with_https_tunnel(&remote.url),
+            )
     }
 
     /// Secret-free credential evidence: the remote name and the *name* of the
@@ -2780,9 +2788,21 @@ mod tests {
         assert_eq!(remotes[0].host, "git.internal");
         assert_eq!(remotes[0].port, 80);
         assert_eq!(remotes[0].repo_path, "/org/repo.git");
-        assert!(remotes[0].write && remotes[0].credentialed);
+        assert!(remotes[0].write);
+        assert_eq!(remotes[0].secret_env.as_deref(), Some("ORIGIN_TOKEN"));
         assert_eq!(remotes[1].port, 8080);
-        assert!(!remotes[1].write && !remotes[1].credentialed);
+        assert!(!remotes[1].write && remotes[1].secret_env.is_none());
+        // The only tunnel the git proxy opens is the https:// remote's own
+        // host and port (review F2); a plain-HTTP remote gets none.
+        assert!(policy.check_connect("git.example.test", 443).is_ok());
+        for (host, port) in [
+            ("git.example.test", 8443),
+            ("git.internal", 80),
+            ("git.internal", 443),
+            ("git.internal", 8080),
+        ] {
+            assert!(policy.check_connect(host, port).is_err(), "{host}:{port}");
+        }
 
         let mappings = grant.proxy_credentials();
         assert_eq!(mappings.len(), 1);

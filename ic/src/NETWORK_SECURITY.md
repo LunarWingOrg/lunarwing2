@@ -440,9 +440,12 @@ manifest retain the configured legacy behavior, including any existing egress.
   `git-receive-pack` only to a write-granted remote's own repository, host and
   port, and refuses it everywhere else (any spelling or percent-encoding, any
   client). It refuses a push whose command list deletes a ref (all-zero new
-  id), signed pushes and compressed or malformed push bodies, WebDAV methods
-  under a granted repository path, and `CONNECT` to a plain-HTTP remote's own
-  host and port. A non-fast-forward update is not visible in the request and
+  id), signed pushes and compressed or malformed push bodies, every method
+  but `GET`, `HEAD`, `POST` and `OPTIONS`, a `Host` header that is not the
+  request's own host and port, and every `CONNECT` except to a granted
+  `https://` remote's host and port. A bound credential is the matched
+  remote's own, even when two remotes share a host. A non-fast-forward
+  update is not visible in the request and
   is left to the forge's branch protection; for `https://` remotes the forge
   is the only write boundary (read-only keys for read grants, protected
   branches).

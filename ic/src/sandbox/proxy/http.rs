@@ -270,7 +270,19 @@ async fn handle_request(
                 .headers()
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok());
-            if let Err(reason) = git.check_request(&network_req.method, &parsed, content_type) {
+            // The upstream Host must be the URI authority, or a client could
+            // steer a granted request (and its credential) to another
+            // virtual host on the same address (review F1).
+            let host_values: Vec<String> = req
+                .headers()
+                .get_all(hyper::header::HOST)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("").to_string())
+                .collect();
+            let checked = git
+                .check_request(&network_req.method, &parsed, content_type)
+                .and_then(|()| git.check_host_header(&parsed, &host_values));
+            if let Err(reason) = checked {
                 tracing::info!("Proxy: blocked {} {} - {}", method, uri, reason);
                 return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason)));
             }
@@ -283,13 +295,19 @@ async fn handle_request(
     let decision = state.decider.decide(&network_req).await;
 
     // A bound git credential accompanies only its repository's own endpoints
-    // (exact host, port, path and method); anything else on the host is
-    // forwarded without it.
+    // (exact host, port, path and method), and it is that remote's own
+    // credential: the decider matches host and path only, so two remotes on
+    // one host that differ by port must not trade credentials (review F3).
+    // Anything else on the host is forwarded without one.
     let decision = match (state.git_transport.as_ref(), git_url.as_ref(), decision) {
-        (Some(git), Some(url), NetworkDecision::AllowWithCredentials { .. })
-            if !git.credential_allowed(&network_req.method, url) =>
-        {
-            NetworkDecision::Allow
+        (Some(git), Some(url), NetworkDecision::AllowWithCredentials { location, .. }) => {
+            match git.credential_for(&network_req.method, url) {
+                Some(secret_name) => NetworkDecision::AllowWithCredentials {
+                    secret_name: secret_name.to_string(),
+                    location,
+                },
+                None => NetworkDecision::Allow,
+            }
         }
         (_, _, decision) => decision,
     };
@@ -330,15 +348,6 @@ async fn handle_connect(
     let host = authority.host().to_string();
     let target_addr = authority.as_str().to_string();
 
-    // WI#860 (ALM-1): a tunnel to a plain-HTTP git remote would carry HTTP
-    // past the git transport checks.
-    if let Some(git) = state.git_transport.as_ref()
-        && let Err(reason) = git.check_connect(&host, authority.port_u16().unwrap_or(443))
-    {
-        tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
-        return error_response(StatusCode::FORBIDDEN, deny_body(reason));
-    }
-
     // Check if host is allowed
     let network_req = NetworkRequest {
         method: "CONNECT".to_string(),
@@ -350,6 +359,16 @@ async fn handle_connect(
     let decision = state.decider.decide(&network_req).await;
 
     if let NetworkDecision::Deny { reason } = decision {
+        tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
+        return error_response(StatusCode::FORBIDDEN, deny_body(reason));
+    }
+
+    // WI#860 (ALM-1, review F2): a per-call git proxy opens a tunnel only to
+    // a granted https:// remote's host and port; any other tunnel would carry
+    // traffic past the git transport checks.
+    if let Some(git) = state.git_transport.as_ref()
+        && let Err(reason) = git.check_connect(&host, authority.port_u16().unwrap_or(443))
+    {
         tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
         return error_response(StatusCode::FORBIDDEN, deny_body(reason));
     }
@@ -472,6 +491,12 @@ async fn forward_request(
         {
             if name.as_str().eq_ignore_ascii_case("accept-encoding") {
                 accept_encoding = Some(v.to_string());
+                continue;
+            }
+            // WI#860 (review F1): a per-call git proxy never forwards the
+            // client's Host; the upstream request takes the URI authority
+            // (a mismatching Host was already refused in handle_request).
+            if state.git_transport.is_some() && *name == hyper::header::HOST {
                 continue;
             }
             builder = builder.header(name.as_str(), v);
@@ -2747,7 +2772,9 @@ mod tests {
         secret: &str,
     ) -> (HttpProxy, std::net::SocketAddr) {
         use crate::sandbox::proxy::git_transport::GitTransportRemote;
-        let remote = GitTransportRemote::from_http_url(remote_url, write, true).unwrap();
+        let remote =
+            GitTransportRemote::from_http_url(remote_url, write, Some("GIT_ORIGIN_TOKEN".into()))
+                .unwrap();
         let mut mapping =
             CredentialMapping::header("GIT_ORIGIN_TOKEN", "Authorization", remote.host.clone());
         mapping.path_patterns = remote.credential_paths();
@@ -2768,9 +2795,11 @@ mod tests {
     /// WI#860 (ALM-1): on a read-only remote no client can push, git or not,
     /// and the bound credential reaches only the bound repository's own
     /// endpoints: never another repository or the forge API on the same host.
+    /// Each rule is pinned on its own, without a receive-pack Content-Type.
     #[tokio::test]
     async fn scoped_git_proxy_refuses_receive_pack_and_scopes_the_credential() {
         const SECRET: &str = "Basic c2NvcGVkLWdpdC1jcmVkLTRkNWU=";
+        const PACK_TYPE: &str = "application/x-git-receive-pack-request";
         let (port, seen, upstream_task) = recording_upstream().await;
         let (proxy, addr) = scoped_git_proxy(
             &format!("http://127.0.0.1:{port}/org/repo.git"),
@@ -2778,50 +2807,129 @@ mod tests {
             SECRET,
         )
         .await;
+        let authority = format!("127.0.0.1:{port}");
+        let upload_refs = "/org/repo.git/info/refs?service=git-upload-pack";
 
-        for (method, target) in [
-            ("GET", "/org/repo.git/info/refs?service=git-receive-pack"),
-            ("POST", "/org/repo.git/git-receive-pack"),
-            ("POST", "/org/other.git/git-receive-pack"),
-            ("POST", "/org/repo.git/git%2Dreceive-pack"),
-            ("PUT", "/org/repo.git/objects/info/packs"),
+        for (rule, method, target, content_type, host) in [
+            (
+                "read-only advertisement",
+                "GET",
+                "/org/repo.git/info/refs?service=git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "read-only pack POST",
+                "POST",
+                "/org/repo.git/git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "another repository",
+                "POST",
+                "/org/other.git/git-receive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "encoded service",
+                "POST",
+                "/org/repo.git/git%2Dreceive-pack",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method",
+                "PUT",
+                "/org/repo.git/objects/info/packs",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method on an encoded path",
+                "DELETE",
+                "/org/re%70o.git/HEAD",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "method on a double-slash path",
+                "PROPFIND",
+                "//org/repo.git/",
+                None,
+                authority.as_str(),
+            ),
+            (
+                "receive-pack content type",
+                "POST",
+                "/org/repo.git/upload",
+                Some(PACK_TYPE),
+                authority.as_str(),
+            ),
+            (
+                "foreign Host on a credentialed endpoint",
+                "GET",
+                upload_refs,
+                None,
+                "other.internal",
+            ),
+            (
+                "Host without the port",
+                "GET",
+                upload_refs,
+                None,
+                "127.0.0.1",
+            ),
         ] {
             let body = "0000";
+            let content_type = content_type
+                .map(|value| format!("Content-Type: {value}\r\n"))
+                .unwrap_or_default();
             let request = format!(
-                "{method} http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-                 Content-Type: application/x-git-receive-pack-request\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{method} http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: {host}\r\n\
+                 {content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let response = send_raw(addr, request.as_bytes()).await;
             assert!(
                 response.starts_with("HTTP/1.1 403"),
-                "{method} {target}: {response}"
+                "{rule}: {method} {target}: {response}"
             );
         }
-        // A tunnel to the remote's own host and port would bypass the checks.
-        let response = send_raw(
-            addr,
-            format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await;
-        assert!(response.starts_with("HTTP/1.1 403"), "CONNECT: {response}");
+        // No tunnel opens except to a granted https:// remote (none here):
+        // not the remote's own port, not 443, not git://.
+        for target in [
+            authority.clone(),
+            "127.0.0.1:443".to_string(),
+            "127.0.0.1:9418".to_string(),
+        ] {
+            let response = send_raw(
+                addr,
+                format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "CONNECT {target}: {response}"
+            );
+        }
         assert!(
             seen.lock().unwrap().is_empty(),
-            "a refused push reached the upstream: {:?}",
+            "a refused request reached the upstream: {:?}",
             seen.lock().unwrap()
         );
 
         for target in [
-            "/org/repo.git/info/refs?service=git-upload-pack",
+            upload_refs,
             "/org/other.git/info/refs?service=git-upload-pack",
             "/api/v4/projects",
         ] {
             let response = send_raw(
                 addr,
                 format!(
-                    "GET http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                    "GET http://127.0.0.1:{port}{target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -2847,6 +2955,89 @@ mod tests {
         upstream_task.abort();
     }
 
+    /// Resolves each secret name to its own value (for testing).
+    struct MapCredentialResolver(std::collections::HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl CredentialResolver for MapCredentialResolver {
+        async fn resolve(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+
+    /// WI#860 (review F3): two remotes on one host that differ only by port
+    /// each receive their own credential. The decider matches host and path
+    /// and would hand both the same mapping; the git proxy picks the one
+    /// bound to the remote whose exact host, port and path matched.
+    #[tokio::test]
+    async fn scoped_git_proxy_gives_each_remote_its_own_credential_on_a_shared_host() {
+        use crate::sandbox::proxy::git_transport::GitTransportRemote;
+        let (port_a, seen_a, task_a) = recording_upstream().await;
+        let (port_b, seen_b, task_b) = recording_upstream().await;
+        let remotes = [(port_a, "GIT_A"), (port_b, "GIT_B")].map(|(port, secret)| {
+            GitTransportRemote::from_http_url(
+                &format!("http://127.0.0.1:{port}/org/r.git"),
+                false,
+                Some(secret.to_string()),
+            )
+            .unwrap()
+        });
+        let mappings = remotes
+            .iter()
+            .map(|remote| {
+                let mut mapping = CredentialMapping::header(
+                    remote.secret_env.clone().unwrap(),
+                    "Authorization",
+                    remote.host.clone(),
+                );
+                mapping.path_patterns = remote.credential_paths();
+                mapping
+            })
+            .collect();
+        let decider = Arc::new(DefaultPolicyDecider::new(
+            DomainAllowlist::new(&["127.0.0.1".to_string()]),
+            mappings,
+        ));
+        let resolver = Arc::new(MapCredentialResolver(
+            [("GIT_A", "Basic YTpB"), ("GIT_B", "Basic Yjpi")]
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        ));
+        let proxy = HttpProxy::with_git_transport(
+            decider,
+            resolver,
+            false,
+            Some(GitTransportPolicy::new(remotes.to_vec())),
+        );
+        let addr = proxy.start(0).await.unwrap();
+        for port in [port_a, port_b] {
+            let response = send_raw(
+                addr,
+                format!(
+                    "GET http://127.0.0.1:{port}/org/r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{port}: {response}");
+        }
+        assert_eq!(
+            seen_a.lock().unwrap()[0].1.as_deref(),
+            Some("Basic YTpB"),
+            "remote A got another remote's credential"
+        );
+        assert_eq!(
+            seen_b.lock().unwrap()[0].1.as_deref(),
+            Some("Basic Yjpi"),
+            "remote B got another remote's credential"
+        );
+
+        proxy.stop().await;
+        task_a.abort();
+        task_b.abort();
+    }
+
     /// WI#860 (ALM-1): on a write grant an ordinary update passes with the
     /// credential, and a command list that deletes a ref is refused before
     /// it reaches the forge, whoever wrote it. A compressed body cannot be
@@ -2869,7 +3060,7 @@ mod tests {
         let post = |body: &str, extra: &str| {
             format!(
                 "POST http://127.0.0.1:{port}/org/repo.git/git-receive-pack HTTP/1.1\r\n\
-                 Host: 127.0.0.1\r\nContent-Type: application/x-git-receive-pack-request\r\n\
+                 Host: 127.0.0.1:{port}\r\nContent-Type: application/x-git-receive-pack-request\r\n\
                  {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
