@@ -1574,6 +1574,67 @@ mod tests {
         }
     }
 
+    /// WI#860 acceptance: no credential value appears in the container's
+    /// environment or arguments. The binding is a host-side proxy mapping;
+    /// the container argv and env carry only the remote URL and the variable
+    /// *name* is absent too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_credential_binding_never_enters_the_container_argv_or_env() {
+        const SECRET: &str = "credential-value-marker-5e6f7a";
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = manifest_test_manager(&state, SandboxNetworkMode::ProxyEnforced);
+        manager.config.policy = SandboxPolicy::WorkspaceWrite;
+        manager.config.network_allowlist = vec!["git.internal".to_string()];
+        manager.config.git = crate::sandbox::GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=GIT_ORIGIN_TOKEN",
+            false,
+        )
+        .unwrap();
+        crate::config::inject_single_var("GIT_ORIGIN_TOKEN", SECRET);
+        let manifest: crate::sandbox::CapabilityManifest =
+            serde_json::from_value(serde_json::json!({
+                "manifest_version": 1,
+                "network": {"mode": "proxy-enforced"},
+                "filesystem": {"read_write": ["/workspace"]},
+                "extensions": ["git-remotes"]
+            }))
+            .unwrap();
+        let result = manager
+            .execute_with_manifest(
+                "git clone http://git.internal/org/repo.git work",
+                temp.path(),
+                &manifest,
+                HashMap::new(),
+            )
+            .await;
+        manager.shutdown().await;
+        crate::config::inject_single_var("GIT_ORIGIN_TOKEN", "");
+
+        result.expect("scoped proxy run reaches the simulated runtime");
+        let calls = state.lock().unwrap();
+        let args = calls
+            .iter()
+            .find(|args| args.first().is_some_and(|arg| arg == "run"))
+            .expect("container run");
+        let joined = args.join("\n");
+        assert!(
+            !joined.contains(SECRET),
+            "secret in container argv: {joined}"
+        );
+        assert!(
+            !joined.contains("GIT_ORIGIN_TOKEN"),
+            "credential variable name in container argv: {joined}"
+        );
+        assert!(
+            joined.contains("GIT_CONFIG_VALUE_0=http://git.internal/org/repo.git"),
+            "{joined}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn git_grant_relay_enforces_selected_hosts_without_changing_shared_proxy() {
