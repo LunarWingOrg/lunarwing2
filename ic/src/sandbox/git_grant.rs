@@ -103,21 +103,9 @@ impl GitGrantConfig {
 
     /// Parse `name=url[,name=url...]`. An empty string means "no grant".
     pub fn from_spec(spec: &str) -> std::result::Result<Option<Self>, String> {
-        Self::parse(spec, &[])
-    }
-
-    /// Parse the read grant and apply the write list to the same remotes.
-    /// `write_names` is the `SANDBOX_GIT_WRITE_REMOTES` value; it can only
-    /// promote a remote that the read grant already names.
-    pub fn parse(spec: &str, write_names: &[String]) -> std::result::Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() {
-            if write_names.is_empty() {
-                return Ok(None);
-            }
-            return Err(
-                "SANDBOX_GIT_WRITE_REMOTES names remotes but SANDBOX_GIT_REMOTES is empty".into(),
-            );
+            return Ok(None);
         }
         let mut remotes = Vec::new();
         for (index, entry) in spec.split(',').enumerate() {
@@ -156,13 +144,35 @@ impl GitGrantConfig {
             });
         }
         if remotes.is_empty() {
-            if write_names.is_empty() {
-                return Ok(None);
-            }
-            return Err(
-                "SANDBOX_GIT_WRITE_REMOTES names remotes but SANDBOX_GIT_REMOTES is empty".into(),
-            );
+            return Ok(None);
         }
+        Ok(Some(Self { remotes }))
+    }
+
+    /// Parse the read grant and apply the write list to the same remotes.
+    /// `write_names` is the `SANDBOX_GIT_WRITE_REMOTES` value; it can only
+    /// promote a remote that the read grant already names.
+    pub fn parse(spec: &str, write_names: &[String]) -> std::result::Result<Option<Self>, String> {
+        let mut config = Self::from_spec(spec)?;
+        match config.as_mut() {
+            Some(config) => config.apply_write_remotes(write_names)?,
+            None if write_names.is_empty() => {}
+            None => {
+                return Err(
+                    "SANDBOX_GIT_WRITE_REMOTES names remotes but SANDBOX_GIT_REMOTES is empty"
+                        .into(),
+                );
+            }
+        }
+        Ok(config)
+    }
+
+    /// Promote already-configured remotes to `write`. Every name must exist,
+    /// so this can never add a destination.
+    pub fn apply_write_remotes(
+        &mut self,
+        write_names: &[String],
+    ) -> std::result::Result<(), String> {
         for name in write_names {
             let name = name.trim();
             if name.is_empty() {
@@ -171,7 +181,8 @@ impl GitGrantConfig {
             validate_remote_name(name).map_err(|message| {
                 format!("SANDBOX_GIT_WRITE_REMOTES is invalid: {message}")
             })?;
-            let remote = remotes
+            let remote = self
+                .remotes
                 .iter_mut()
                 .find(|remote| remote.name == name)
                 .ok_or_else(|| {
@@ -183,7 +194,7 @@ impl GitGrantConfig {
                 remote.operations.push(GitOperationClass::Write);
             }
         }
-        Ok(Some(Self { remotes }))
+        Ok(())
     }
 }
 
