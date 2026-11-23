@@ -1101,11 +1101,13 @@ const RECURSIVE_CHANGE_FLAG =
 /**
  * Deny a recursive mode/ownership change on a system root, however the root is
  * spelled. A linear scan, not a regex: the regex form rescanned the rest of
- * the command from every `chmod` and took ten seconds on 12 KB of them.
+ * the command from every `chmod` and took ten seconds on 12 KB of them. The
+ * clause is read outside quotes, so a quoted argument cannot end it early
+ * (WI#856).
  */
 function checkRecursiveRootChange(segment) {
   for (const match of segment.matchAll(ROOT_CHANGE_CALL)) {
-    const rest = segment.slice(match.index + match[0].length).split(/[;&|\n]/, 1)[0];
+    const rest = clauseText(segment, match.index + match[0].length);
     if (!RECURSIVE_CHANGE_FLAG.test(rest)) continue;
     for (const pathMatch of rest.matchAll(/(?:^|[ \t])(\/[^ \t;&|]*)/g)) {
       if (isSystemRootPath(stripShellQuotes(pathMatch[1]))) return true;
@@ -1117,6 +1119,80 @@ function checkRecursiveRootChange(segment) {
 /** True for a character that ends the current command clause. */
 function isClauseTerminator(ch) {
   return ch === ";" || ch === "&" || ch === "|" || ch === "\n";
+}
+
+/**
+ * The text of the command clause that starts at `from`: it runs to the first
+ * control operator or newline, read outside quotes and past a backslash. Every
+ * reader that captures "the rest of the invocation" uses this, so an argument
+ * that carries a separator cannot hide the rest of its command (WI#856).
+ */
+function clauseText(text, from) {
+  let quote = "";
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      i++;
+      continue;
+    }
+    if (quote !== "") {
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (isClauseTerminator(ch)) return text.slice(from, i);
+  }
+  return text.slice(from);
+}
+
+/**
+ * The bash word at `from`, with its quoting removed, and the index after it.
+ * A word ends at space, tab or an unquoted clause terminator, so a quoted
+ * option value that carries a space or a separator reads as one word
+ * (WI#856).
+ */
+function bashWord(text, from) {
+  let i = from;
+  let word = "";
+  let quote = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+      word += text[i + 1];
+      i += 2;
+      continue;
+    }
+    if (quote !== "") {
+      if (ch === quote) quote = "";
+      else word += ch;
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || isClauseTerminator(ch)) break;
+    word += ch;
+    i++;
+  }
+  return { word, end: i };
+}
+
+/** The bash words of a command text, with their quoting removed. */
+function bashWords(text) {
+  const words = [];
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    if (i >= text.length) break;
+    const { word, end } = bashWord(text, i);
+    if (word.length === 0) break;
+    words.push(word);
+    i = end;
+  }
+  return words;
 }
 
 // git's own options that take the next word as their value (`git -C dir`,
@@ -1132,15 +1208,15 @@ function gitVerb(text, from) {
   let i = from;
   while (i < text.length) {
     while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
-    const start = i;
-    while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
-    const word = text.slice(start, i);
+    const { word, end } = bashWord(text, i);
+    i = end;
     if (word.length === 0) break;
     if (!word.startsWith("-")) return { verb: word, after: i };
     if (GIT_VALUE_OPTIONS.has(word)) {
-      // These options take a value, which is not the verb.
+      // These options take a value, which is not the verb. It is read as one
+      // bash word, so `-C "/tmp/a b"` steps over the value whole (WI#856).
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
-      while (i < text.length && text[i] !== " " && text[i] !== "\t" && !isClauseTerminator(text[i])) i++;
+      i = bashWord(text, i).end;
     }
   }
   return { verb: "", after: text.length };
@@ -1148,12 +1224,7 @@ function gitVerb(text, from) {
 
 /** Index of the next clause terminator at or after `from`, or the text end. */
 function clauseEnd(text, from) {
-  let end = text.length;
-  for (const terminator of [";", "&", "|", "\n"]) {
-    const index = text.indexOf(terminator, from);
-    if (index !== -1 && index < end) end = index;
-  }
-  return end;
+  return from + clauseText(text, from).length;
 }
 
 // `GIT_CONFIG_KEY_*` (with `GIT_CONFIG_COUNT`) and `GIT_CONFIG_PARAMETERS` are
@@ -1268,16 +1339,19 @@ function gitConfigAliasVerdict(after) {
  */
 function gitAliasDefinition(segment, from) {
   const { verb, after } = gitVerb(segment, from);
-  const words = argumentWords(segment.slice(from, after));
+  // The leading words are read as bash reads them, so a quoted `-C`/`-c`
+  // value that carries a space stays one value and cannot break the option
+  // scan before a later `-c` (WI#856).
+  const words = bashWords(segment.slice(from, after));
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (!word.startsWith("-")) break;
     let value = "";
-    if (word.startsWith("--config-env=")) value = stripShellQuotes(word.slice("--config-env=".length));
+    if (word.startsWith("--config-env=")) value = word.slice("--config-env=".length);
     else if (GIT_VALUE_OPTIONS.has(word)) {
       // Step over every option value (`git -C . -c alias.z=…`); only a `-c`
       // or `--config-env` value can name a key.
-      const next = stripShellQuotes(words[++i] ?? "");
+      const next = words[++i] ?? "";
       if (word === "-c" || word === "--config-env") value = next;
     }
     if (GIT_REDIRECTING_KEY.test(value)) return true;
