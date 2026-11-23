@@ -1903,7 +1903,8 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
         // `branch.<name>.remote`), which the preflight cannot see. Require an
         // explicit write-granted remote.
         return Err(denied(
-            "name an explicit write-granted remote for git push",
+            "name an explicit remote for git push; a write grant requires \
+             SANDBOX_GIT_WRITE_REMOTES on that remote",
         ));
     };
     let chosen = preflight.write_remote(remote)?;
@@ -2190,8 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_named_remotes_and_rejects_embedded_credentials() {
-        let parsed = spec();
+    fn config_accepts_named_remotes_and_rejects_embedded_credentials() {        let parsed = spec();
         assert_eq!(parsed.remotes.len(), 3);
         assert_eq!(parsed.remotes[0].name, "origin");
         assert_eq!(parsed.remotes[1].host.as_deref(), Some("git.example.test"));
@@ -2575,6 +2575,8 @@ mod tests {
     #[test]
     fn preflight_refuses_push_before_git_can_interpret_flags_or_defaults() {
         let (_temp, grant) = workspace_with_remote();
+        // A read-only grant refuses push entirely, with the write-grant
+        // remedy named in the denial.
         for command in [
             "git push",
             "git push origin main",
@@ -2598,10 +2600,250 @@ mod tests {
                 "{command}: {error}"
             );
             assert!(
-                error.to_string().contains("git push is not supported"),
-                "{error}"
+                error.to_string().contains("SANDBOX_GIT_WRITE_REMOTES")
+                    || error.to_string().contains("force")
+                    || error.to_string().contains("deletion"),
+                "{command}: {error}"
             );
         }
+    }
+
+    /// A write grant on one remote: push to it is allowed, but force push is
+    /// refused in every spelling and ref deletion is refused by default.
+    #[test]
+    fn write_grant_allows_push_and_refuses_every_force_and_deletion_spelling() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git,\
+             upstream=file:///workspace/remotes/upstream.git",
+            "origin",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::create_dir_all(cwd.join("remotes/upstream.git")).unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        assert!(grant.remote_by_name("origin").unwrap().write);
+        assert!(!grant.remote_by_name("upstream").unwrap().write);
+
+        for allowed in [
+            "git push origin main",
+            "git push origin HEAD:refs/heads/main",
+            "git push -q origin main",
+            "git push --set-upstream origin main",
+        ] {
+            check_granted(allowed, &grant).expect(allowed);
+        }
+
+        for forced in [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push -qf origin main",
+            "git push origin +main",
+            "git push origin +HEAD:refs/heads/main",
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main origin main",
+            "git push --force-if-includes origin main",
+            "git push --mirror origin",
+        ] {
+            let error = check_granted(forced, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{forced}: {error}"
+            );
+            assert!(error.to_string().contains("force"), "{forced}: {error}");
+        }
+
+        for deleting in [
+            "git push --delete origin old-branch",
+            "git push --del origin old-branch",
+            "git push origin :old-branch",
+            "git push origin :refs/heads/old-branch",
+        ] {
+            let error = check_granted(deleting, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{deleting}: {error}"
+            );
+            assert!(
+                error.to_string().contains("deletion"),
+                "{deleting}: {error}"
+            );
+        }
+
+        // The read-only remote in the same grant still refuses push.
+        let error = check_granted("git push upstream main", &grant).unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+    }
+
+    /// The maintainer's deletion decision is host policy: turning it on
+    /// permits `:ref` and `--delete`, but never a force.
+    #[test]
+    fn ref_deletion_follows_the_host_decision() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "origin",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        for allowed in [
+            "git push --delete origin old-branch",
+            "git push origin :old-branch",
+        ] {
+            check_granted(allowed, &grant).expect(allowed);
+        }
+        let error = check_granted("git push -f origin main", &grant).unwrap_err();
+        assert!(error.to_string().contains("force"), "{error}");
+    }
+
+    #[test]
+    fn write_grant_cannot_broaden_the_read_grant() {
+        let error = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "upstream",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("upstream"), "{error}");
+        let error = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "Origin",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("remote names"), "{error}");
+    }
+
+    #[test]
+    fn evidence_records_the_write_operation_class() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "origin",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        let evidence = grant.evidence();
+        assert_eq!(
+            evidence.remotes[0].operations,
+            vec![GitOperationClass::Read, GitOperationClass::Write]
+        );
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("\"operations\":[\"read\",\"write\"]"), "{json}");
+    }
+
+    #[test]
+    fn credential_bindings_are_host_side_and_secret_free_in_evidence() {
+        const MARKER: &str = "credential-value-marker";
+        let host = GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "origin",
+            "origin=GIT_ORIGIN_TOKEN",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(host.credentials.len(), 1);
+        assert_eq!(host.credentials[0].remote, "origin");
+        assert_eq!(host.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        let mappings = grant.proxy_credentials();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].secret_name, "GIT_ORIGIN_TOKEN");
+        assert_eq!(mappings[0].host_patterns, vec!["git.internal".to_string()]);
+
+        // The container environment carries the remote URL only.
+        let env = grant.container_env();
+        let joined = env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(MARKER), "{joined}");
+        assert!(!joined.contains("GIT_ORIGIN_TOKEN"), "{joined}");
+
+        let json = serde_json::to_string(&grant.evidence()).unwrap();
+        assert!(json.contains("GIT_ORIGIN_TOKEN"), "{json}");
+        assert!(!json.contains(MARKER), "{json}");
+    }
+
+    #[test]
+    fn credential_bindings_reject_https_unbound_remotes_and_bad_names() {
+        for (spec, writes, credentials) in [
+            // HTTPS travels in an opaque CONNECT tunnel.
+            (
+                "origin=https://git.example.test/org/repo.git",
+                "",
+                "origin=GIT_TOKEN",
+            ),
+            // A remote that is not granted.
+            (
+                "origin=http://git.internal/org/repo.git",
+                "",
+                "upstream=GIT_TOKEN",
+            ),
+            // A file remote has no host to bind.
+            (
+                "origin=file:///workspace/remotes/origin.git",
+                "",
+                "origin=GIT_TOKEN",
+            ),
+            // Not an environment name.
+            (
+                "origin=http://git.internal/org/repo.git",
+                "",
+                "origin=not-a-name",
+            ),
+            // Missing the variable.
+            (
+                "origin=http://git.internal/org/repo.git",
+                "",
+                "origin=",
+            ),
+            // Bound twice.
+            (
+                "origin=http://git.internal/org/repo.git",
+                "",
+                "origin=GIT_TOKEN,origin=OTHER_TOKEN",
+            ),
+        ] {
+            assert!(
+                GitGrantConfig::from_full_spec(spec, writes, credentials, false).is_err(),
+                "accepted {spec} / {credentials}"
+            );
+        }
+    }
+
+    /// A credential binding is applied only to the selected remotes.
+    #[test]
+    fn credential_bindings_follow_the_requested_remote_subset() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git,\
+             upstream=http://git.internal/org/other.git",
+            "",
+            "origin=ORIGIN_TOKEN,upstream=UPSTREAM_TOKEN",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let grant =
+            authorize_grant(&host, &["upstream".to_string()], &cwd, SandboxNetworkMode::ProxyEnforced)
+                .unwrap();
+        assert_eq!(grant.credentials.len(), 1);
+        assert_eq!(grant.credentials[0].secret_env, "UPSTREAM_TOKEN");
     }
 
     #[test]
