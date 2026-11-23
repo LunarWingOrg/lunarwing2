@@ -1323,3 +1323,23 @@ test("a quoted separator does not split the pipeline that feeds an xargs (WI#856
   assertAllowed('echo "a;b" ; find /tmp -name x | xargs rm')
   assertBlocked('find /app/hooks -name x | xargs rm', "deletion outside")
 })
+
+test("quoted logical operators stay within their pipeline arguments (WI#856)", () => {
+  for (const operator of ["&&", "||"]) {
+    assertAllowed(`find /tmp -name "a${operator}b" | xargs rm`)
+    assertBlocked(`find /app/hooks -name "a${operator}b" | xargs rm`, "deletion outside")
+    assertBlocked(`base64 -d "a${operator}b" | sh`, "decoded content")
+    assertAllowed(`printf '%s' "a${operator}b" | cat`)
+    assertAllowed(`true ${operator} find /tmp -name x | xargs rm`)
+  }
+})
+
+test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => {
+  const argument = String.raw`$'a\';b'`
+  assertBlocked(`chmod -R 777 ${argument} /etc`, "recursive")
+  assertBlocked(`chown -R u:u ${argument} /usr`, "recursive")
+  assertBlocked(`find /app/hooks -name ${argument} -o -delete`, "deletion outside")
+  assertBlocked(String.raw`git -C $'/tmp/a\' b' reset --hard`, "git command")
+  assertAllowed(String.raw`git -C $'/tmp/a\' b' status`)
+  assertAllowed(`printf '%s\\n' ${argument}`)
+})

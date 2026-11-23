@@ -233,11 +233,7 @@ function shellWordView(command) {
  * backslashes are literal and must not hide a separator.
  */
 function commandSegments(command, escapes = true) {
-  const split = (piece, separator) => splitOutsideQuotes(piece, separator, escapes);
-  return split(command, ";")
-    .flatMap((piece) => split(piece, "\n"))
-    .flatMap((piece) => split(piece, "|"))
-    .flatMap((piece) => split(piece, "&"));
+  return splitOutsideQuotes(command, isClauseTerminator, escapes);
 }
 
 function isRmLongDeleteOption(word) {
@@ -343,9 +339,7 @@ function checkFindDeletion(text) {
  * `find` (WI#856).
  */
 function feedingPipeline(text, index) {
-  const lists = splitOutsideQuotes(text.slice(0, index), ";")
-    .flatMap((piece) => splitOutsideQuotes(piece, "\n"))
-    .flatMap((piece) => piece.split(/&&|\|\|/));
+  const lists = commandLists(text.slice(0, index));
   return lists[lists.length - 1] ?? "";
 }
 
@@ -1141,19 +1135,8 @@ let clauseScanEnds = [];
 function clauseEnds(text) {
   if (text === clauseScanText) return clauseScanEnds;
   const ends = [];
-  let quote = "";
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
-      i++;
-      continue;
-    }
-    if (quote !== "") {
-      if (ch === quote) quote = "";
-      continue;
-    }
-    if (ch === "'" || ch === '"') quote = ch;
-    else if (isClauseTerminator(ch)) ends.push(i);
+  for (const i of unquotedOffsets(text)) {
+    if (isClauseTerminator(text[i])) ends.push(i);
   }
   clauseScanText = text;
   clauseScanEnds = ends;
@@ -1211,20 +1194,20 @@ function bashWord(text, from) {
   let quote = "";
   while (i < text.length) {
     const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+    if (isQuoteEscape(text, i, quote)) {
       word += text[i + 1];
       i += 2;
       continue;
     }
     if (quote !== "") {
-      if (ch === quote) quote = "";
+      if (ch === quote.at(-1)) quote = "";
       else word += ch;
       i++;
       continue;
     }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      i++;
+    quote = openingQuote(text, i);
+    if (quote) {
+      i += quote.length;
       continue;
     }
     if (ch === " " || ch === "\t" || isClauseTerminator(ch)) break;
@@ -1537,44 +1520,56 @@ function isInterpreterStage(stage) {
   return false;
 }
 
-/**
- * Split text on a one-character separator, ignoring separators inside quotes
- * and after a backslash. A quoted interpreter body (`-c 'a;b'`) stays one
- * word for the pipeline rules (WI#832), and the segment splitter
- * (`commandSegments`) reads its control operators the same way, so every
- * segment-scoped rule sees a quoted argument whole (WI#856). A de-escaped
- * view (`shellWordView`) passes `escapes: false`: the backslashes left in it
- * are literal characters, not escapes.
- */
-function splitOutsideQuotes(text, separator, escapes = true) {
-  const pieces = [];
-  let piece = "";
+function openingQuote(text, i) {
+  if (text[i] === "$" && text[i + 1] === "'") return "$'";
+  return text[i] === "'" || text[i] === '"' ? text[i] : "";
+}
+
+function isQuoteEscape(text, i, quote) {
+  return text[i] === "\\" && quote !== "'" && i + 1 < text.length;
+}
+
+/** Skip quoted spans (including ANSI-C quotes) without interpreting shell expansions. */
+function* unquotedOffsets(text, escapes = true) {
   let quote = "";
   for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (escapes && ch === "\\" && quote !== "'" && i + 1 < text.length) {
-      piece += ch + text[++i];
+    if (escapes && isQuoteEscape(text, i, quote)) {
+      i++;
       continue;
     }
     if (quote) {
-      if (ch === quote) quote = "";
-    } else if (ch === "'" || ch === '"') {
-      quote = ch;
-    } else if (ch === separator) {
-      pieces.push(piece);
-      piece = "";
+      if (text[i] === quote.at(-1)) quote = "";
       continue;
     }
-    piece += ch;
+    quote = openingQuote(text, i);
+    if (quote) i += quote.length - 1;
+    else yield i;
   }
-  pieces.push(piece);
+}
+
+/** Preserve the exact text of each piece; only unquoted separators split it. */
+function splitOutsideQuotes(text, separator, escapes = true) {
+  const pieces = [];
+  let start = 0;
+  for (const i of unquotedOffsets(text, escapes)) {
+    if (i < start) continue;
+    const width = typeof separator === "string"
+      ? Number(text[i] === separator)
+      : Number(separator(text[i], text[i + 1]));
+    if (!width) continue;
+    pieces.push(text.slice(start, i));
+    start = i + width;
+  }
+  pieces.push(text.slice(start));
   return pieces;
 }
 
 /** The `;`, LF, `&&` and `||` lists of the text, read outside quotes. */
 function commandLists(text) {
-  return splitOutsideQuotes(text, ";").flatMap((piece) => splitOutsideQuotes(piece, "\n"))
-    .flatMap((piece) => piece.split(/&&|\|\|/));
+  return splitOutsideQuotes(text, (ch, next) => {
+    if (ch === ";" || ch === "\n") return 1;
+    return ch === next && (ch === "&" || ch === "|") ? 2 : 0;
+  });
 }
 
 /** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
