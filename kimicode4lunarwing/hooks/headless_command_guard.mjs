@@ -1188,26 +1188,22 @@ const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
  */
 function shellPunctuationView(text) {
   if (!text.includes("(") && !text.includes(")") && !text.includes("`")) return text;
+  const states = quoteStates(text);
   let view = "";
-  let quote = "";
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+    const state = states[i];
+    // The shared reader decides what a backslash escapes, so a `\"` inside
+    // double quotes is the escape bash reads and a `\;` is literal text.
+    if (isEscapedState(state)) {
       view += ch + text[++i];
       continue;
     }
-    if (quote === "'") {
-      view += ch;
-      if (ch === "'") quote = "";
-    } else if (ch === "'") {
-      quote = "'";
-      view += ch;
-    } else if (ch === '"') {
-      quote = quote === '"' ? "" : '"';
+    if (state === QUOTE_SINGLE || state === QUOTE_OPEN || state === QUOTE_CLOSE) {
       view += ch;
     } else if (ch === "`") {
       view += " ";
-    } else if (ch === "$" && text[i + 1] === "(") {
+    } else if ((ch === "$" || ch === "<" || ch === ">") && text[i + 1] === "(") {
       view += "  ";
       i++;
     } else if (ch === "(" || ch === ")") {
@@ -1317,12 +1313,6 @@ function clauseTails(text, pattern) {
   return tails;
 }
 
-/**
- * The bash word at `from`, with its quoting removed, and the index after it.
- * A word ends at space, tab or an unquoted clause terminator, so a quoted
- * option value that carries a space or a separator reads as one word
- * (WI#856).
- */
 /**
  * The bash word at `from`, with its quoting removed, and the index after it.
  * A word ends at space, tab or an unquoted clause terminator, so a quoted

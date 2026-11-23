@@ -1644,16 +1644,19 @@ test("nested quotes inside a substitution read as bash reads them (WI#867)", () 
 test("the quote reader follows bash's double-quote escape set (WI#867)", () => {
   // Point 3 (ALF-2 on !2710): one reader for every rule. Inside double
   // quotes only `"`, `\`, `$`, a backtick and a newline are escaped, so a
-  // backslash before any other character is literal text.
+  // backslash before any other character is literal text that bash keeps.
+  // bash passes `"a\";b"` as the one word `a\";b`, so `/etc` is still an
+  // operand and the root change is denied.
   assertBlocked('chmod -R 777 "a\\";b" /etc', "recursive")
   assertBlocked('rm -rf "/tmp/x\\" ;y" /app/hooks', "deletion outside")
-  // A backslash before a non-special character does not escape the quote
-  // that follows it, so the quoted span ends where bash ends it.
+  // A backslash before `;` or a space is literal, so the separator stays in
+  // the word bash builds (`"a\" ;b"` is `a" ;b`) and `/etc` is still read.
   assertBlocked('chmod -R 777 "a\\" ;b" /etc', "recursive")
-  // A backslash inside double quotes before a space stays literal: bash
-  // passes `a\ b`, which is one word and no separator.
+  assertBlocked('chmod -R 777 "a\\;b" /etc', "recursive")
+  // The literal-backslash rows stay ordinary work without a root operand.
   assertAllowed('echo "a\\ b"')
   assertAllowed('echo "a\\;b"')
+  assertAllowed('chmod -R 755 "/tmp/a\\;b"')
   assertAllowed("printf '%s\\n' \"\\x66ixture\"")
   assertAllowed("echo \"it's\"")
   // A substitution's own quotes do not disturb the enclosing one.
