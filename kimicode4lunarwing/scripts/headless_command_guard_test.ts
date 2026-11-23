@@ -1137,6 +1137,12 @@ test("an interpreter option value does not end the walk to the eval flag (WI#869
     `node --require /x -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
     "deletion outside",
   )
+  // An option whose value is only ever attached must not eat the next word:
+  // perl runs the `-e` code after a bare `-D` or `-F` (run-531 ALQ-1).
+  assertBlocked(`perl -D -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -F -e 'unlink("/home/kimi/x")' /etc/hostname`, "deletion outside")
+  assertBlocked(`perl -F -e 'use File::Path; rmtree("/home/kimi")'`, "deletion outside")
   // Attached values (`-I/tmp`, `-Mstrict`) and the allowed rows still work.
   assertBlocked(`perl -Mstrict -e 'unlink("/home/kimi/x")'`, "deletion outside")
   assertAllowed(`perl -I /tmp -e 'unlink("/tmp/wi869-x")'`)

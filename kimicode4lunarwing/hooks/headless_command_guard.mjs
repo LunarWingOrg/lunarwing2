@@ -741,16 +741,18 @@ function quotedFirstArgument(code, from) {
 // carrying no one-liner, so the deletion rule never ran (WI#869, the same
 // shape as `listenerShellBody`). Only options whose value is a separate word
 // are listed; an attached value (`-I/tmp`, `-Mstrict`) needs no step, and an
-// optional-value option (`perl -C`, `perl -x`) is absent because eating the
-// next word would hide a following `-e`.
+// option whose value can only be attached or is optional (`perl -C`, `-x`,
+// `-D`, `-F`; `ruby -T`) is absent because eating the next word would hide a
+// following `-e`: `perl -D -e '…'` and `perl -F -e '…'` run the code
+// (run-531 ALQ-1).
 const INTERPRETER_VALUE_OPTIONS = {
-  perl: new Set(["-I", "-M", "-m", "-D", "-F"]),
+  perl: new Set(["-I", "-M", "-m"]),
   python: new Set(["-X", "-W", "-Q", "-m"]),
   node: new Set([
     "-r", "--require", "--loader", "--experimental-loader", "-C", "--conditions",
     "--input-type",
   ]),
-  ruby: new Set(["-I", "-r", "-C", "-E", "-T", "--enable"]),
+  ruby: new Set(["-I", "-r", "-C", "-E", "--enable"]),
 };
 
 /** The value-option table for an interpreter name, by language family. */
