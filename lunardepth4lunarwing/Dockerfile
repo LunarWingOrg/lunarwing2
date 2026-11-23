@@ -39,10 +39,8 @@ RUN set -eu; \
     [[ "$LUNARDEPTH_COMPATIBILITY_REF" =~ ^[0-9a-f]{40}$ ]]; \
     [[ "$LUNARDEPTH_MODEL_ROUTING_REF" =~ ^[0-9a-f]{40}$ ]]; \
     . /build/scripts/worker-download-retry.sh; \
-    wdr_retry "LunarDepth source clone" "rm -rf /src" \
-      'git clone --filter=blob:none --no-checkout "$LUNARDEPTH_REPOSITORY" /src'; \
-    wdr_retry "LunarDepth pinned checkout" "rm -rf /src" \
-      'git -C /src checkout --detach "$LUNARDEPTH_REF"'; \
+    wdr_retry "LunarDepth pinned clone and checkout" "rm -rf /src" \
+      'git clone --filter=blob:none --no-checkout "$LUNARDEPTH_REPOSITORY" /src && git -C /src checkout --detach "$LUNARDEPTH_REF"'; \
     test "$(git -C /src rev-parse HEAD)" = "$LUNARDEPTH_REF"; \
     git -C /src merge-base --is-ancestor "$LUNARDEPTH_COMPATIBILITY_REF" "$LUNARDEPTH_REF"; \
     git -C /src merge-base --is-ancestor "$LUNARDEPTH_MODEL_ROUTING_REF" "$LUNARDEPTH_REF"; \

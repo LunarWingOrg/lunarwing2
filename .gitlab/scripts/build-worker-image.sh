@@ -432,7 +432,7 @@ transient_download_failure() {
     if grep -qE 'unexpected status from [A-Z]+ request to [^ ]*: (401|403|404)([ :]|$)|remote: (Unauthorized|Forbidden|Not Found)|Authentication failed|checksum did NOT match' "$push_attempt_log"; then
         return 1
     fi
-    grep -qE 'RPC failed; curl (18|52|55|56|92)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet|from promisor remote|Could not connect to server|Failed to connect to |Connection reset by peer|Connection timed out|Recv failure|Temporary failure in name resolution|Could not resolve host|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|network timeout|ERR_PNPM_(FETCH|META_FETCH)|Error when performing the request|error: Failed to (install|download)' "$push_attempt_log"
+    grep -qE 'RPC failed; curl (18|52|55|56|92)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet|Could not connect to server|Failed to connect to |Connection reset by peer|Connection timed out|Recv failure|Temporary failure in name resolution|Could not resolve host|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|network timeout|ERR_PNPM_(FETCH|META_FETCH)|Error when performing the request|error: Failed to (install|download)' "$push_attempt_log"
 }
 
 build_image_with_retry() {
