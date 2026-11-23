@@ -896,20 +896,35 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
-**Git remote grant (WI#816).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
-is unset by default. A manifest can opt into the `git-remotes` read grant.
-For HTTP(S) it requires `proxy-enforced` and narrows that call's proxy to the
-selected, already-allowlisted hosts. It does not enforce repository paths or
-Git operations. File remotes are paths inside `/workspace` and work in any
-supported manifest mode (`none`, `proxy-enforced`, or `tunnel`). The grant
-injects no credential, and manifest preflight rejects recognized Git pushes.
-It also refuses in-command `alias.*`, `include.*`, `includeIf.*`, `remote.*`,
-`url.*`, `credential.*` and `http.extraheader` configuration, `git config`
-writes to those keys, and shell assignments to `GIT_CONFIG_*`.
-Calls without a manifest keep their existing Git and egress behavior. See the
-[manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816)
-for the boundaries and the authentication and push work still open. Worker
-egress allowlists, credential grants, and inbound policy are unchanged.
+**Git remote grant (WI#816, WI#860).**
+`SANDBOX_GIT_REMOTES=name=url[,name=url...]` is unset by default. A manifest
+can opt into the `git-remotes` grant. For HTTP(S) it requires
+`proxy-enforced` and narrows that call's proxy to the selected,
+already-allowlisted hosts. It does not enforce repository paths or Git
+operations. File remotes are paths inside `/workspace` and work in any
+supported manifest mode (`none`, `proxy-enforced`, or `tunnel`).
+
+Every remote grants `read`; `SANDBOX_GIT_WRITE_REMOTES=name[,name...]`
+promotes an existing remote to `write`, which authorizes `git push` to it.
+Force push and ref deletion are refused in every spelling, and a push must
+name an explicit write-granted remote.
+
+Host-kept credentials: `SANDBOX_GIT_CREDENTIALS=host=SECRET_NAME[,...]` binds
+a daemon secret to an exact granted host. The daemon serves a git-credential
+broker on a Unix socket, bind-mounted read-only at
+`/run/lunarwing-git-credential`; the container's generated helper asks it, and
+the secret never enters the container's environment, files, arguments or
+output. Credentials and HTTP(S) remotes work only in `proxy-enforced`; `none`
+and `tunnel` carry `file` remotes only and fail closed otherwise.
+
+Manifest preflight also refuses in-command `alias.*`, `include.*`,
+`includeIf.*`, `remote.*`, `url.*`, `credential.*` and `http.extraheader`
+configuration, `git config` writes to those keys, and shell assignments to
+`GIT_CONFIG_*`. Calls without a manifest keep their existing Git and egress
+behavior. See the
+[manifest guide](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860)
+for the boundaries. Worker egress allowlists, credential grants, and inbound
+policy are unchanged.
 
 ## Worker exposure policy (WI#357)
 

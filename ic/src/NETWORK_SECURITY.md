@@ -414,13 +414,16 @@ contracts. Existing worker tokens and approved job credential grants are
 unchanged; generic-shell named secret injection and arbitrary mounts or devices
 are not implemented.
 
-### Git remote grant (WI#816)
+### Git remote grant (WI#816, WI#860)
 
-`git-remotes` is an opt-in, credential-free read grant for manifest-backed
-shell calls. The tenant operator sets `SANDBOX_GIT_REMOTES`
-(`name=url[,name=url...]`); unset or empty grants nothing. `git.remotes`
-selects names from that list. Calls without a manifest retain the configured
-legacy behavior, including any existing egress.
+`git-remotes` is an opt-in grant for manifest-backed shell calls. The tenant
+operator sets `SANDBOX_GIT_REMOTES` (`name=url[,name=url...]`); unset or empty
+grants nothing. `git.remotes` selects names from that list. Calls without a
+manifest retain the configured legacy behavior, including any existing egress.
+
+Every configured remote grants `read`. `SANDBOX_GIT_WRITE_REMOTES`
+(`name[,name...]`) promotes an existing remote to `write`; it cannot add a
+destination. A read-only grant keeps refusing `git push`.
 
 - **The proxy enforces hosts, not repository URLs.** A granted HTTP(S) remote
   requires `proxy-enforced`. A per-call proxy only permits the selected
@@ -429,8 +432,10 @@ legacy behavior, including any existing egress.
   to secrets. It neither changes nor falls back to the shared proxy. HTTPS
   CONNECT does not expose repository paths or operation types.
 - **The shell scan is best-effort preflight.** It checks recognizable Git
-  commands for a granted alias or literal URL, and refuses recognized pushes
-  before execution regardless of flags or configured defaults. It also refuses
+  commands for a granted alias or literal URL. A recognized `git push` must
+  name a write-granted remote, and force push (`+src`, `--force`, `-f`,
+  `--force-with-lease`, `--force-if-includes`, `--mirror`) and ref deletion
+  (`--delete`, `-d`, `--prune`, `:dst`) are refused in every spelling. It also refuses
   in-command configuration that could change what a later word means
   (`alias.*`, `include.*`, `includeIf.*`, and the redirecting `remote.*`,
   `url.*`, `credential.*`, `http.extraheader` keys), `git config` writes to
@@ -441,12 +446,25 @@ legacy behavior, including any existing egress.
   They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
   is unsupported by manifest v1.
-- **Credentials and evidence.** The grant injects no credential. Configured
-  URLs cannot include userinfo, queries, or fragments; errors do not echo
-  supplied values. `capability_evidence.git` records the grant ID, supported
-  egress modes and remote names, transports, hosts and `read` operation class,
-  not a record of actual Git operations. Host-held authentication and push
-  support remain open under WI#816; the separate `ssh_git` tool is unchanged.
+- **Host-kept credentials (WI#860).** `SANDBOX_GIT_CREDENTIALS`
+  (`host=SECRET_NAME[,host=SECRET_NAME...]`) binds a daemon-held secret to an
+  exact granted host. For such a call the daemon serves a git-credential
+  broker on a Unix socket and bind-mounts its directory read-only at
+  `/run/lunarwing-git-credential`; the container's generated helper asks that
+  socket, and the broker answers only for the bound hosts. The secret value
+  never enters the container's environment, files, arguments, process
+  listings or command output. A binding for a host no selected remote uses is
+  a `capability_denied`, and errors never echo the secret name or value.
+- **Credentials and evidence.** Configured URLs cannot include userinfo,
+  queries, or fragments; errors do not echo supplied values.
+  `capability_evidence.git` records the grant ID, supported egress modes and
+  remote names, transports, hosts and operation classes (`read`, plus `write`
+  when granted), not a record of actual Git operations and never a credential.
+  The separate `ssh_git` tool is unchanged.
+- **Egress modes.** `proxy-enforced` carries HTTP(S) remotes and credentials;
+  `none` and `tunnel` carry `file` remotes only, and refuse network remotes
+  and credentials. Advisory `proxy` is refused. The broker adds no egress
+  path: it is a host Unix socket bind-mounted into the run.
 
 ### Network egress tiers
 
