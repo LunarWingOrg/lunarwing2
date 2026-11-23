@@ -245,12 +245,21 @@ impl SandboxModeConfig {
 
         let network = parse_string_env("SANDBOX_NETWORK", ss.network.clone())?;
         let git = match optional_env("SANDBOX_GIT_REMOTES")? {
-            Some(spec) => crate::sandbox::GitGrantConfig::from_spec(&spec).map_err(|message| {
-                ConfigError::InvalidValue {
+            Some(spec) => {
+                let write_names = optional_env("SANDBOX_GIT_WRITE_REMOTES")?.unwrap_or_default();
+                let credential_spec = optional_env("SANDBOX_GIT_CREDENTIALS")?.unwrap_or_default();
+                let allow_ref_deletion = parse_bool_env("SANDBOX_GIT_ALLOW_REF_DELETION", false)?;
+                crate::sandbox::GitGrantConfig::from_full_spec(
+                    &spec,
+                    &write_names,
+                    &credential_spec,
+                    allow_ref_deletion,
+                )
+                .map_err(|message| ConfigError::InvalidValue {
                     key: "SANDBOX_GIT_REMOTES".to_string(),
                     message,
-                }
-            })?,
+                })?
+            }
             None => None,
         };
         let tunnel = SandboxTunnelModeConfig::resolve_env()?;

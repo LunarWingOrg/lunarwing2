@@ -42,6 +42,7 @@ const MAX_URL_LEN: usize = 2048;
 #[serde(rename_all = "kebab-case")]
 pub enum GitOperationClass {
     Read,
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,12 +68,31 @@ pub struct GitRemote {
     pub transport: GitTransport,
     pub host: Option<String>,
     pub canonical: String,
+    /// Host policy grants this remote a write operation class
+    /// (`SANDBOX_GIT_WRITE_REMOTES`). A remote without it stays read-only.
+    pub write: bool,
 }
 
 /// Host configuration parsed from `SANDBOX_GIT_REMOTES`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitGrantConfig {
     pub remotes: Vec<GitRemote>,
+    /// Host decision on ref deletion (`SANDBOX_GIT_ALLOW_REF_DELETION`).
+    /// Off by default: `:ref` refspecs and `--delete` are refused.
+    pub allow_ref_deletion: bool,
+    /// Per-remote credential source (`SANDBOX_GIT_CREDENTIALS`,
+    /// `remote=ENV_NAME`). The value is a daemon-side environment variable
+    /// name, resolved host-side only; it never enters the container.
+    pub credentials: Vec<GitCredentialSource>,
+}
+
+/// A host-side credential binding for one granted remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialSource {
+    pub remote: String,
+    /// Daemon environment variable that holds the `Authorization` header
+    /// value. The variable name is recorded in evidence; its value is not.
+    pub secret_env: String,
 }
 
 impl GitGrantConfig {
@@ -81,13 +101,41 @@ impl GitGrantConfig {
     }
 
     /// Parse `name=url[,name=url...]`. An empty string means "no grant".
+    ///
+    /// Read-only shorthand: no remote is writable and ref deletion is
+    /// refused.
     pub fn from_spec(spec: &str) -> std::result::Result<Option<Self>, String> {
+        Self::from_parts(spec, "", false)
+    }
+
+    /// Parse the read grant plus the host's separate write list
+    /// (`SANDBOX_GIT_WRITE_REMOTES`) and deletion decision
+    /// (`SANDBOX_GIT_ALLOW_REF_DELETION`).
+    ///
+    /// A write name that is not a read remote is a load error, because a
+    /// write grant can never broaden the read one.
+    pub fn from_parts(
+        spec: &str,
+        write_names: &str,
+        allow_ref_deletion: bool,
+    ) -> std::result::Result<Option<Self>, String> {
+        Self::from_full_spec(spec, write_names, "", allow_ref_deletion)
+    }
+
+    /// Parse the read grant, the write list, the credential bindings
+    /// (`SANDBOX_GIT_CREDENTIALS`) and the deletion decision.
+    pub fn from_full_spec(
+        spec: &str,
+        write_names: &str,
+        credential_spec: &str,
+        allow_ref_deletion: bool,
+    ) -> std::result::Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Ok(None);
         }
-        let mut remotes = Vec::new();
-        for (index, entry) in spec.split(',').enumerate() {
+        let writes = parse_write_names(write_names)?;
+        let mut remotes = Vec::new();        for (index, entry) in spec.split(',').enumerate() {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
@@ -119,13 +167,108 @@ impl GitGrantConfig {
                 transport: parsed.transport,
                 host: parsed.host,
                 canonical: parsed.canonical,
+                write: writes.contains(&name.to_string()),
             });
         }
         if remotes.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Self { remotes }))
+        for name in &writes {
+            if !remotes.iter().any(|remote| &remote.name == name) {
+                return Err(format!(
+                    "SANDBOX_GIT_WRITE_REMOTES names '{name}', which is not a SANDBOX_GIT_REMOTES remote"
+                ));
+            }
+        }
+        Ok(Some(Self {
+            credentials: parse_credentials(credential_spec, &remotes)?,
+            remotes,
+            allow_ref_deletion,
+        }))
     }
+}
+
+/// `remote=ENV_NAME,remote=ENV_NAME` credential bindings.
+fn parse_credentials(
+    spec: &str,
+    remotes: &[GitRemote],
+) -> std::result::Result<Vec<GitCredentialSource>, String> {
+    let mut credentials = Vec::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (remote, secret_env) = entry.split_once('=').ok_or_else(|| {
+            "SANDBOX_GIT_CREDENTIALS entries must be remote=ENV_NAME".to_string()
+        })?;
+        let (remote, secret_env) = (remote.trim(), secret_env.trim());
+        if remote.is_empty() || secret_env.is_empty() {
+            return Err(
+                "SANDBOX_GIT_CREDENTIALS entries must have a non-empty remote and variable name"
+                    .into(),
+            );
+        }
+        validate_remote_name(remote)?;
+        if !is_valid_env_name(secret_env) {
+            return Err(format!(
+                "SANDBOX_GIT_CREDENTIALS variable '{secret_env}' must be an environment name"
+            ));
+        }
+        let granted = remotes.iter().find(|entry| entry.name == remote).ok_or_else(|| {
+            format!(
+                "SANDBOX_GIT_CREDENTIALS names '{remote}', which is not a SANDBOX_GIT_REMOTES remote"
+            )
+        })?;
+        if granted.transport != GitTransport::Http {
+            return Err(format!(
+                "SANDBOX_GIT_CREDENTIALS remote '{remote}' must use an http:// URL; \
+                 the proxy can inject a credential only into plain-HTTP requests, and \
+                 https:// travels in an opaque CONNECT tunnel"
+            ));
+        }
+        if credentials
+            .iter()
+            .any(|existing: &GitCredentialSource| existing.remote == remote)
+        {
+            return Err(format!(
+                "SANDBOX_GIT_CREDENTIALS binds remote '{remote}' more than once"
+            ));
+        }
+        credentials.push(GitCredentialSource {
+            remote: remote.to_string(),
+            secret_env: secret_env.to_string(),
+        });
+    }
+    Ok(credentials)
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphabetic() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            }
+        })
+}
+
+/// `name,name` write-list parsing. Empty means "no remote is writable".
+fn parse_write_names(spec: &str) -> std::result::Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        validate_remote_name(entry)?;
+        if !names.iter().any(|name: &String| name == entry) {
+            names.push(entry.to_string());
+        }
+    }
+    Ok(names)
 }
 
 /// The authorized grant for one execution. Host-derived; never request-supplied.
@@ -136,6 +279,8 @@ pub struct GitGrantAuthorization {
     pub remotes: Vec<GitRemote>,
     /// Network modes in which this grant is supported.
     pub egress: Vec<SandboxNetworkMode>,
+    /// Host decision on ref deletion (`:ref`, `--delete`).
+    pub allow_ref_deletion: bool,
 }
 
 /// Secret-free evidence describing the applied grant.
@@ -155,6 +300,17 @@ pub struct EffectiveGitRemote {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub operations: Vec<GitOperationClass>,
+}
+
+impl GitRemote {
+    /// The operation classes this remote is granted, host-side.
+    pub fn operations(&self) -> Vec<GitOperationClass> {
+        if self.write {
+            vec![GitOperationClass::Read, GitOperationClass::Write]
+        } else {
+            vec![GitOperationClass::Read]
+        }
+    }
 }
 
 impl GitGrantAuthorization {
@@ -191,7 +347,7 @@ impl GitGrantAuthorization {
                     name: remote.name.clone(),
                     transport: remote.transport,
                     host: remote.host.clone(),
-                    operations: vec![GitOperationClass::Read],
+                    operations: remote.operations(),
                 })
                 .collect(),
         }
@@ -310,6 +466,7 @@ pub fn authorize_grant(
         cwd: cwd.to_path_buf(),
         remotes: selected,
         egress,
+        allow_ref_deletion: host.allow_ref_deletion,
     })
 }
 
@@ -502,6 +659,34 @@ impl Preflight<'_> {
             return Ok(());
         }
         authorize_url_or_name(word, self.grant)
+    }
+
+    /// Resolve a push destination to a remote the host granted a write class.
+    fn write_remote(self, word: &Word) -> Result<()> {
+        let grant = self.grant.ok_or_else(no_grant_denial)?;
+        if word.dynamic {
+            return Err(denied(
+                "dynamic git remote argument cannot be authorized; name a write-granted remote",
+            ));
+        }
+        let remote = if let Some(remote) = grant.remote_by_name(&word.text) {
+            remote
+        } else {
+            let canonical = canonicalize_command_url(&word.text)?;
+            grant
+                .remotes
+                .iter()
+                .find(|remote| remote.canonical == canonical)
+                .ok_or_else(|| denied("git remote is not in this tenant's host git grant"))?
+        };
+        if !remote.write {
+            return Err(denied(format!(
+                "remote '{}' is read-only in this tenant's git grant; \
+                 a write grant requires SANDBOX_GIT_WRITE_REMOTES",
+                remote.name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1370,11 +1555,10 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
     match sub.text.as_str() {
         "clone" => authorize_clone(args, preflight),
         "fetch" | "pull" => authorize_fetch(args, preflight),
-        // Even a plain push can use config-selected destinations and refspecs.
-        // Do not try to authorize writes from an untrusted shell's text.
-        "push" => Err(denied(
-            "git push is not supported by manifest Git preflight",
-        )),
+        // Push is authorized only on a write-granted remote. Force and
+        // deletion spellings are refused here as an early refusal; the
+        // host-side transport is the boundary.
+        "push" => authorize_push(args, preflight),
         "ls-remote" => {
             let positional = read_positionals(
                 args,
@@ -1558,6 +1742,127 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
         )),
         _ => Ok(()),
     }
+}
+
+/// Options that make a push forced in any spelling the preflight can see.
+/// The transport boundary (host-side credential/relay, or the forge's branch
+/// protection) is the real guard; this list keeps the common shapes from
+/// reaching the network at all.
+fn push_force_flags(word: &str) -> bool {
+    matches!(
+        word,
+        "-f" | "--force" | "--force-with-lease" | "--force-if-includes" | "--mirror"
+    ) || word.starts_with("--force-with-lease=")
+        || word.starts_with("--force-if-includes=")
+}
+
+/// Short-option clusters that contain `f` (`-qf`, `-fq`, `-nf`). A cluster
+/// whose letters are all push flags is force-bearing; anything else is left
+/// to the option parser.
+fn short_push_cluster_forces(word: &str) -> bool {
+    let Some(letters) = word.strip_prefix('-') else {
+        return false;
+    };
+    !word.starts_with("--")
+        && !letters.is_empty()
+        && letters.chars().all(|c| matches!(c, 'f' | 'q' | 'v' | 'n' | 'u'))
+        && letters.contains('f')
+}
+
+/// A refspec that deletes (`:ref`) or forces (`+ref`) the update.
+fn refspec_deletes(word: &str) -> bool {
+    word.starts_with(':')
+}
+
+fn refspec_forces(word: &str) -> bool {
+    word.starts_with('+')
+}
+
+/// `git push` against a write-granted remote, with force and deletion
+/// refused. Every positional after the remote is a refspec or a remote; the
+/// preflight checks that the destination is writable and that no spelling
+/// forces or deletes a ref.
+fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    let grant = preflight.grant.ok_or_else(no_grant_denial)?;
+    let mut positional: Vec<&Word> = Vec::new();
+    let mut end_of_options = false;
+    let mut index = 0;
+    while index < args.len() {
+        let word = &args[index];
+        let text = word.text.as_str();
+        if word.dynamic {
+            return Err(denied(
+                "dynamic git push arguments cannot be authorized; name a granted remote and \
+                 literal refspecs",
+            ));
+        }
+        if !end_of_options && text == "--" {
+            end_of_options = true;
+            index += 1;
+            continue;
+        }
+        if !end_of_options && text.starts_with('-') && text != "-" {
+            if push_force_flags(text) || short_push_cluster_forces(text) {
+                return Err(denied(
+                    "force push is not permitted; a force push is refused in every spelling",
+                ));
+            }
+            if text == "--delete" || text == "--del" || text.starts_with("--delete=") {
+                return push_deletion(text, grant);
+            }
+            if text == "--mirror" {
+                return Err(denied(
+                    "force push is not permitted; --mirror forces every ref",
+                ));
+            }
+            // Push options that take a value; check the value is literal.
+            if matches!(
+                text,
+                "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" | "--signed"
+            ) {
+                match args.get(index + 1) {
+                    Some(value) if !value.dynamic => {}
+                    _ => return Err(denied("git push option requires a literal value")),
+                }
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        positional.push(word);
+        index += 1;
+    }
+    let Some(remote) = positional.first() else {
+        // No destination named: Git uses config (`remote.pushDefault`,
+        // `branch.<name>.remote`), which the preflight cannot see. Require an
+        // explicit write-granted remote.
+        return Err(denied(
+            "name an explicit write-granted remote for git push",
+        ));
+    };
+    let chosen = preflight.write_remote(remote)?;
+    for refspec in &positional[1..] {
+        if refspec_deletes(&refspec.text) {
+            push_deletion(&refspec.text, grant)?;
+        }
+        if refspec_forces(&refspec.text) {
+            return Err(denied(
+                "force push is not permitted; a '+' refspec forces the update",
+            ));
+        }
+        let _ = chosen;
+    }
+    Ok(())
+}
+
+fn push_deletion(spelling: &str, grant: &GitGrantAuthorization) -> Result<()> {
+    if grant.allow_ref_deletion {
+        return Ok(());
+    }
+    Err(denied(format!(
+        "ref deletion ('{spelling}') is not permitted by this tenant's git grant"
+    )))
 }
 
 fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
