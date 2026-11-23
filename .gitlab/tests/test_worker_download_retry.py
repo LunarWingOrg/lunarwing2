@@ -180,6 +180,19 @@ class WorkerDownloadRetryTests(unittest.TestCase):
         self.assertIn("not retrying", result.stderr)
         self.assertEqual(self.recorded_sleeps(), [])
 
+    def test_a_failed_download_stops_a_set_eu_caller(self):
+        # The helper runs inside a RUN under `set -eu`; its own failure must
+        # stop the step. A pipeline member's status is tee's, so this pins
+        # that the wrapped command's status is what the caller sees — both
+        # for a command that returns non-zero and one that calls exit.
+        for body, expected in (("printf 'boom\\n' >&2; exit 7", 7), ("exit 9", 9)):
+            with self.subTest(body=body):
+                self.sleeps.unlink(missing_ok=True)
+                self.write_shim("failing", f"#!/bin/sh\n{body}\n")
+                result = self.run_retry("failing")
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertIn("not retrying", result.stderr)
+
     def test_a_successful_download_does_not_sleep(self):
         self.write_shim("ok", "#!/bin/sh\nprintf '%s\\n' 'cloned'\n")
         result = self.run_retry("ok")

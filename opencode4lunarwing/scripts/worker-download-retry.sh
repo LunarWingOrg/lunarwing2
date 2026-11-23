@@ -56,17 +56,25 @@ wdr_retry() {
     while [ "$_wdr_attempt" -le "$wdr_max_attempts" ]; do
         # Truncated per attempt: an earlier attempt's text must never
         # classify this one.
+        : > "$wdr_attempt_log"
         : > "$wdr_attempt_rc"
-        # tee keeps the download streaming into the build log; the brace group
-        # records the command's real exit status because the pipeline's own
-        # exit status is tee's.
-        { eval "$_wdr_command" 2>&1 || printf '%s\n' "$?" > "$wdr_attempt_rc"; } |
-            tee "$wdr_attempt_log"
+        # tee keeps the download streaming into the build log. The command
+        # runs in a subshell (a pipeline member), so its status is recorded
+        # from an EXIT trap: that survives both a command that returns
+        # non-zero and one that calls exit itself. POSIX sh has no pipefail,
+        # so the pipeline's own status is tee's and is not consulted.
+        ( trap 'printf "%s\n" "$?" > "$wdr_attempt_rc"' EXIT
+          eval "$_wdr_command" ) 2>&1 | tee "$wdr_attempt_log"
         if [ ! -s "$wdr_attempt_rc" ]; then
+            echo "worker-download-retry: '$_wdr_label' left no exit status; treating as a failure" >&2
+            rm -f "$wdr_attempt_log" "$wdr_attempt_rc"
+            return 1
+        fi
+        _wdr_status=$(cat "$wdr_attempt_rc")
+        if [ "$_wdr_status" -eq 0 ]; then
             rm -f "$wdr_attempt_log" "$wdr_attempt_rc"
             return 0
         fi
-        _wdr_status=$(cat "$wdr_attempt_rc")
         if [ "$_wdr_attempt" -lt "$wdr_max_attempts" ] && wdr_transient "$wdr_attempt_log"; then
             # A retry starts from a clean state: a half-fetched checkout or
             # node_modules from the failed attempt is removed first, so no
@@ -84,4 +92,8 @@ wdr_retry() {
             return "$_wdr_status"
         fi
     done
+    # Only reachable if the loop body never returned; a caller under `set -e`
+    # must still see a failure, and a caller not under it must see the
+    # attempt's own status rather than the loop's zero.
+    return "${_wdr_status:-1}"
 }
