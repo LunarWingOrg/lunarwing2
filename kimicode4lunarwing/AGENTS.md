@@ -21,21 +21,32 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 
 ## Guard Quote Handling
 
-The WI#856 clause and pipeline scanners keep ordinary quoted arguments and
-ANSI-C quoted words together. The guard rejects ANSI-C backslash escapes other
-than escaped apostrophes instead of decoding them. Use literal shell words.
-The scanner does not model nested quote contexts inside command substitutions.
-Listener-specific parsing is tracked separately in WI#858.
+Since WI#867 the clause splitter, punctuation view and listener scan share
+quote and substitution spans. A backslash escapes the next character outside
+quotes, escapes nothing inside single quotes, and inside double quotes only
+escapes `"`, `\`, `$`, a backtick or a newline. Parenthesized substitutions
+have their own quote context. A backtick body closes at the first unescaped
+backtick, regardless of the quotes in its body. Operators inside a
+substitution split only its own commands, not the enclosing clause. The
+guard scans the body separately without running it.
 
-The WI#858 listener scan recognizes ANSI-C quoting and literal unquoted IFS
-separators, skips empty unquoted brace alternatives, and isolates comments and
-heredoc data from later commands. Since WI#868 a brace group is expanded when
-its own `{`, `,` and `}` are unquoted, so a quoted alternative no longer
-suppresses it: `{kimi,"server"}`, `{"kimi",server}`, `{kimi,'server'}` and
-`{kimi,$'server'}` all deny like `{kimi,server}`, as bash runs them, while a
-quoted group (`echo "{kimi,server}"`) or a quoted comma stays literal.
-Heredoc bodies are still checked as potential shell input. This is a text
-guard, not a boundary against runtime-computed words.
+The guard rejects ANSI-C backslash escapes other than escaped apostrophes
+instead of decoding them. Use literal shell words.
+
+Comments and literal-delimiter heredocs do not carry quote state into later
+commands. The listener rule still checks heredoc lines as potential shell
+input. For supported literal brace groups it expands the alternatives before
+splitting unquoted IFS markers, including slices; quoted IFS stays data.
+Since WI#868 a brace group is expanded when its own `{`, `,` and `}` are
+unquoted, so a quoted alternative no longer suppresses it: `{kimi,"server"}`,
+`{"kimi",server}`, `{kimi,'server'}` and `{kimi,$'server'}` all deny like
+`{kimi,server}`, as bash runs them, while a quoted group
+(`echo "{kimi,server}"`) or a quoted comma stays literal.
+
+The continuation and Git word readers reuse escape helpers but keep separate
+conservative views. This is not a full Bash parser: it does not evaluate
+runtime words or implement general brace expansion. The container and tenant
+egress policy remain the security boundary.
 
 ## Protocol Compatibility
 

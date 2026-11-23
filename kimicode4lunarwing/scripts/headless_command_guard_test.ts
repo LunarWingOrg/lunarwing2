@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -27,6 +27,25 @@ import { test } from "node:test"
  */
 
 const guardPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
+
+type ListenerWord = { text: string; quoted: boolean }
+
+async function guardSyntax() {
+  // Test the real readers without changing how the deployed hook starts.
+  // Only the checked-in JS is loaded; fixture shell strings are never executed.
+  const source = readFileSync(guardPath, "utf8").trimEnd()
+  const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
+  assert.ok(source.endsWith(cli))
+  const library = source.slice(0, -cli.length) +
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+  return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
+    commandSegments: (text: string) => string[]
+    clauseText: (text: string, from: number) => string
+    quoteScan: (text: string) => { substitutions: Map<number, number> }
+    listenerSegments: (text: string) => Iterable<ListenerWord[]>
+    listenerWordList: (words: ListenerWord[]) => string[]
+  }
+}
 
 function runGuard(payload: unknown, timeout = 10_000) {
   const input = typeof payload === "string" ? payload : JSON.stringify(payload)
@@ -990,7 +1009,13 @@ test("empty brace alternatives and literal IFS separators do not hide listener w
   }
   assertBlocked("kimi${IFS}server", "kimi service mode")
   assertBlocked("kimi$IFS'server'", "kimi service mode")
+  // WI#867 point 2: a slice of IFS is a separator too, as the rm assembly
+  // check already reads it. bash runs `kimi${IFS:0:1}server` as `kimi server`.
+  assertBlocked("kimi${IFS:0:1}server", "kimi service mode")
+  assertBlocked("kimi${IFS:1:1}server", "kimi service mode")
+  assertBlocked("python3${IFS:0:1}-m${IFS:0:1}http.server", "listener started from a task")
   assertAllowed("kimi -p 'kimi${IFS}server'")
+  assertAllowed("kimi -p 'kimi${IFS:0:1}server'")
   assertAllowed("kimi -p ''")
 })
 
@@ -1028,6 +1053,21 @@ test("a quoted brace alternative does not suppress the group (WI#868)", () => {
   assertAllowed('x{kimi,"server"}')
   assertAllowed("grep -rn 'kimi server' .")
   assertAllowed("printf '%s\\n' {debug,release}")
+})
+
+test("$$ is the PID parameter, so $$( opens no substitution (ALR-1)", () => {
+  // Bash's parser consumes `$$` as one parameter, so the `(` after it is
+  // literal; bash 5.3 ran the next line in both rows below, which the shared
+  // reader used to hide inside an unclosed `$(`.
+  assertBlocked('echo "$$(x"\nkimi server', "kimi service mode")
+  assertBlocked('echo "}$$(<()"\nnc -l 9000', "listener started from a task")
+  // A real substitution right after the PID is still a substitution.
+  assertBlocked('echo "$$$(kimi server)"', "kimi service mode")
+  assertBlocked('echo "$$$(echo a)"; kimi server', "kimi service mode")
+  assertBlocked('echo "$$"; kimi server', "kimi service mode")
+  // Ordinary PID use stays allowed.
+  assertAllowed('echo "pid $$"')
+  assertAllowed("mkdir -p /tmp/run.$$ && ls /tmp/run.$$")
 })
 
 test("listener quote state follows ANSI-C words, comments, and heredocs", () => {
@@ -1435,26 +1475,26 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   // was classified as the unknown verb `z` and allowed while git discarded the
   // change. The alias definition is refused instead of resolved: the value may
   // live in repo config the guard cannot read cheaply.
-  assertBlocked("git -c alias.z='reset --hard' z", "git command")
-  assertBlocked("git -c 'alias.z=reset --hard' z", "git command")
-  assertBlocked("git -c alias.z=status z", "git command")
-  assertBlocked("git --config-env=alias.z=Z z", "git command")
-  assertBlocked("git --config-env alias.z=Z z", "git command")
+  assertBlocked("git -c alias.z='reset --hard' z", "git alias or include")
+  assertBlocked("git -c 'alias.z=reset --hard' z", "git alias or include")
+  assertBlocked("git -c alias.z=status z", "git alias or include")
+  assertBlocked("git --config-env=alias.z=Z z", "git alias or include")
+  assertBlocked("git --config-env alias.z=Z z", "git alias or include")
   // The repo-config write that plants the same alias is refused too.
-  assertBlocked("git config alias.t1 'reset --hard'", "git command")
-  assertBlocked("git config --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git command")
+  assertBlocked("git config alias.t1 'reset --hard'", "git alias or include")
+  assertBlocked("git config --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git -C /tmp/repo config --local alias.z 'reset --hard'", "git alias or include")
   // git's modern config subcommands write the same key: `set` names it after
   // the subcommand, and `rename-section foo alias` turns a section into aliases.
-  assertBlocked("git config set alias.z 'reset --hard'", "git command")
-  assertBlocked("git config get alias.z", "git command")
-  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git command")
-  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git command")
-  assertBlocked("git config rename-section foo alias", "git command")
+  assertBlocked("git config set alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config get alias.z", "git alias or include")
+  assertBlocked("git config set --append --global alias.z 'reset --hard'", "git alias or include")
+  assertBlocked("git config set foo.z x && git config rename-section foo alias", "git alias or include")
+  assertBlocked("git config rename-section foo alias", "git alias or include")
   // GIT_CONFIG_KEY_* / GIT_CONFIG_PARAMETERS are git's environment spelling.
   assertBlocked("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.z GIT_CONFIG_VALUE_0='reset --hard' git z",
-    "git command")
-  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git command")
+    "git alias or include")
+  assertBlocked("GIT_CONFIG_PARAMETERS=\"'alias.z=status'\" git z", "git alias or include")
   // The environment value is read as one shell word: an `alias.` in a later
   // argument of the same line is not attributed to the variable.
   assertAllowed("GIT_CONFIG_PARAMETERS=\"'user.name=x'\" git commit -m alias.z")
@@ -1483,7 +1523,7 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --rename-section foo alias",
     "git config --edit",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
   assertAllowed("git config --rename-section foo bar")
   assertAllowed("git config --list")
@@ -1502,13 +1542,39 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
     "git config --ren foo alias",
     "git config edit",
     "git config --ed",
-    "git --work-tree . reset --hard",
   ]) {
-    assertBlocked(command, "git command")
+    assertBlocked(command, "git alias or include")
   }
+  // The trailing row of that list is a discard, not a definition: it belongs
+  // to the discard rule's own name.
+  assertBlocked("git --work-tree . reset --hard", "git command that discards")
   assertAllowed("git config core.editor 'vim -e'")
   assertAllowed('git config user.name "Jane -e Doe"')
   assertAllowed("git -C sub log --oneline")
+})
+
+test("an alias or include refusal carries its own reason (WI#867)", () => {
+  // WI#842 refused these before reading the verb, but reported them as the
+  // git discard rule. The verdicts stay; only the reason changes, so it says
+  // what was refused and why (point 1).
+  for (const command of [
+    "git config alias.st status",
+    "git config --unset alias.x",
+    "git config --edit",
+    "git config --rename-section alias alias2",
+    "git -c alias.z='reset --hard' z",
+    "git config include.path /tmp/evil.cfg",
+  ]) {
+    assertBlocked(command, "git alias or include definition")
+  }
+  // The reason names the definition, not a discard.
+  assertBlocked("git config alias.st status", "does not evaluate alias bodies")
+  // The discard rule keeps its own name for the rows it owns.
+  assertBlocked("git reset --hard", "git command that discards workspace changes")
+  assertBlocked("git clean -fdx", "git command that discards workspace changes")
+  // An ordinary section rename and an ordinary key stay allowed.
+  assertAllowed("git config --rename-section core core2")
+  assertAllowed("git config user.name x")
 })
 
 test("a quoted separator does not hide the rest of its command (WI#856)", () => {
@@ -1590,6 +1656,48 @@ test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => 
   assertAllowed(`printf '%s\\n' ${argument}`)
 })
 
+test("nested quotes inside a substitution read as bash reads them (WI#867)", () => {
+  // Point 4 (AKW-3 on !2709): the reader had one quote context for the whole
+  // command, so a `"` inside `$(…)` ended the outer double quote and the
+  // separator that followed split the command before `/etc` was read.
+  assertBlocked('chmod -R 777 "$(echo "a;b")" /etc', "recursive")
+  assertBlocked('chmod -R 777 "$(echo "a|b")" /etc', "recursive")
+  assertBlocked('chown -R u:u "$(echo "a&b")" /usr', "recursive")
+  assertBlocked('chmod -R 777 "`echo "a;b"`" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x$(echo ";y")" /app/hooks', "deletion outside")
+  assertBlocked('git -C "$(echo "/tmp/a;b")" reset --hard', "git command")
+  // The common nested quote stays ordinary work: `"$(date +"%F")"` is one
+  // double-quoted word, and its inner quotes are literal to bash.
+  assertAllowed('echo "$(date +"%F")" ; ls')
+  assertAllowed('echo "$(date +"%F")"')
+  assertAllowed('x="$(echo "a;b")"')
+  assertAllowed('git log --format="%h $(git branch --show-current)"')
+  assertAllowed("printf '%s\\n' \"$(echo \"$(date +%Y)\")\"")
+})
+
+test("the quote reader follows bash's double-quote escape set (WI#867)", () => {
+  // Point 3 (ALF-2 on !2710): one reader for every rule. Inside double
+  // quotes only `"`, `\`, `$`, a backtick and a newline are escaped, so a
+  // backslash before any other character is literal text that bash keeps.
+  // bash passes `"a\";b"` as the one word `a\";b`, so `/etc` is still an
+  // operand and the root change is denied.
+  assertBlocked('chmod -R 777 "a\\";b" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x\\" ;y" /app/hooks', "deletion outside")
+  // A backslash before `;` or a space is literal, so the separator stays in
+  // the word bash builds (`"a\" ;b"` is `a" ;b`) and `/etc` is still read.
+  assertBlocked('chmod -R 777 "a\\" ;b" /etc', "recursive")
+  assertBlocked('chmod -R 777 "a\\;b" /etc', "recursive")
+  // The literal-backslash rows stay ordinary work without a root operand.
+  assertAllowed('echo "a\\ b"')
+  assertAllowed('echo "a\\;b"')
+  assertAllowed('chmod -R 755 "/tmp/a\\;b"')
+  assertAllowed("printf '%s\\n' \"\\x66ixture\"")
+  assertAllowed("echo \"it's\"")
+  // A substitution's own quotes do not disturb the enclosing one.
+  assertAllowed('echo "$(echo "a b")"')
+  assertAllowed("kimi -p 'start the server'")
+})
+
 test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", () => {
   // The hook only sees text. Use inert fixtures for command, option and path
   // positions; none of these strings is executed.
@@ -1604,4 +1712,63 @@ test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", ()
   assertAllowed(String.raw`printf '%s\n' $'it\'s literal'`)
   assertAllowed(String.raw`printf '%s\n' "\x66ixture"`)
   assertAllowed("printf '%s\\n' $'plain text'")
+})
+
+test("only outer operators split an enclosing clause (ALO-1)", async () => {
+  const { commandSegments, clauseText } = await guardSyntax()
+  for (const operator of [";", "|", "&", "\n"]) {
+    const body = `first_fixture a${operator}second_fixture b`
+    for (const argument of ["$(" + body + ")", '"$(' + body + ')"', "<(" + body + ")",
+      ">(" + body + ")", '"`' + body + '`"']) {
+      const clause = `fixture ${argument} tail`
+      const text = `${clause}; next_fixture`
+      assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+      assert.equal(clauseText(text, "fixture ".length), `${argument} tail`)
+    }
+    assert.deepEqual(commandSegments(body), ["first_fixture a", "second_fixture b"])
+  }
+})
+
+test("a heredoc in a substitution keeps the surrounding command intact (ALO-2)", async () => {
+  const { quoteScan, listenerSegments, listenerWordList } = await guardSyntax()
+  const body = "cat <<'TEXT'\nquotes and parens in data: ' \" )\nTEXT\n"
+  const outer = 'fixture "$(' + body + ')" tail\nnext_fixture'
+  assert.equal(quoteScan(outer).substitutions.get(outer.indexOf("$(")), outer.indexOf(')" tail'))
+  const segments = [...listenerSegments(outer)].map(listenerWordList)
+  assert.equal(segments[0].at(-1), "tail")
+  assert.deepEqual(segments[1], ["next_fixture"])
+  assertAllowed(outer)
+})
+
+test("backtick pairing ignores body quotes but respects escaped delimiters (ALO-3)", async () => {
+  const { commandSegments, quoteScan } = await guardSyntax()
+  const opening = 'fixture "`'
+  for (const body of ["sample '", 'sample "', "sample \\` inner '", "sample \\\\"]) {
+    const clause = opening + body + '`" tail'
+    const text = `${clause}; next_fixture`
+    assert.equal(quoteScan(text).substitutions.get(opening.length - 1), opening.length + body.length)
+    assert.deepEqual(commandSegments(text).map((segment) => segment.trim()), [clause, "next_fixture"])
+  }
+})
+
+test("comments and heredoc data cannot quote the next command (ALO-4)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  for (const prefix of ["fixture # unmatched '\n", "cat <<-TEXT\n\tunmatched \"\n\tTEXT\n",
+    "cat <<'FIRST' <<SECOND\n'\nFIRST\n\"\nSECOND\n"]) {
+    const segments = [...listenerSegments(`${prefix}next_fixture tail`)].map(listenerWordList)
+    assert.deepEqual(segments.at(-1), ["next_fixture", "tail"])
+    assertBlocked(prefix + String.raw`fixture $'\x66ile'`, "unverifiable ANSI-C escape")
+  }
+  const literal = [...listenerSegments('fixture a#b "c # d"')].map(listenerWordList)
+  assert.deepEqual(literal, [["fixture", "a#b", "c # d"]])
+})
+
+test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)", async () => {
+  const { listenerSegments, listenerWordList } = await guardSyntax()
+  const fields = (text: string) => [...listenerSegments(text)].map(listenerWordList)
+  assert.deepEqual(fields("{first,${IFS}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("{first,${IFS:0:1}second} tail"), [["first", "second", "tail"]])
+  assert.deepEqual(fields("first${IFS}second"), [["first", "second"]])
+  assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
+  assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
 })
