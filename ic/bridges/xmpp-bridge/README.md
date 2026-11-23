@@ -73,11 +73,11 @@ polls from zero while this process still holds up to `XMPP_BRIDGE_MAX_MESSAGES`
 delivered messages. A request cursor below the acknowledged one is therefore
 read as such a reset: the page starts after the acknowledged cursor, so nothing
 already delivered comes back as a new inbound turn, and messages that arrived
-while the daemon was down are still served. A page that was handed out but not
-acknowledged is served again, so delivery stays at-least-once (WI#850) up to
-the daemon's in-memory queue: the poller acknowledges a page once it has handed
-it to the agent's queue, so messages still waiting in that queue when the
-daemon restarts are not served again.
+while the daemon was down are served unless discarded. A retained page that
+was handed out but not acknowledged is served again, so delivery stays
+at-least-once (WI#850) up to the daemon's in-memory queue: the poller
+acknowledges a page once it has handed it to the agent's queue, so messages
+still waiting in that queue when the daemon restarts are not served again.
 
 Upgrade order does not matter for delivery. An older bridge ignores `limit`
 and returns its whole backlog with its newest cursor; the XMPP guest then
@@ -119,8 +119,11 @@ it can include a page already served but not yet acknowledged.
 
 `POST /v1/messages/drain` requires a JSON body with exactly one mode:
 `{"all":true}` or `{"older_than_secs":n}` (age at least `n` seconds).
-It discards pending messages only and reports `drained`, `remaining`, and
-`oldest_queued_age_secs`. Nonzero drops are logged.
+An age-based drain discards only pending messages that have never been served,
+leaving any unacknowledged page available for retry. `all` discards all pending
+messages, including any unacknowledged page, and gives up that retry. Both modes
+report `drained`, `remaining`, and `oldest_queued_age_secs`. Nonzero drops are
+logged.
 
 ```bash
 BASE=http://127.0.0.1:8787 ic/scripts/xmpp-drain-queue.sh status
@@ -141,9 +144,10 @@ does not survive those stops.
 
 `XMPP_BRIDGE_STALE_QUEUE_SECS` defaults to `0` (off). A value of at least
 120 enables expiry on the first poll after a gap of at least that many
-seconds. Only pending messages at least that old are dropped. The first
-poll of a new bridge process and normal successive polls do not expire
-messages when their gap is below the threshold. If you opt in, choose a
+seconds. Only never-served pending messages at least that old are dropped;
+a served but unacknowledged page remains available for retry.
+The first poll of a new bridge process and normal successive polls do not
+expire messages when their gap is below the threshold. If you opt in, choose a
 threshold above the configured poll interval and expected processing delays;
 a long processing stall is indistinguishable from poller downtime here.
 Invalid values warn and disable expiry. Managed bridge env

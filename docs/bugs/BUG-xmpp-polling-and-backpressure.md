@@ -93,9 +93,10 @@ is needed.
 The [bridge discard controls](../reference/custom_bridges/XMPP.md#post-v1messagesdrain)
 are separate: status distinguishes pending entries from the retained replay
 ring; drain requires an explicit discard mode; opt-in expiry runs only after
-a long poll gap. These controls affect unacknowledged entries, including any
-served but unacknowledged page. They cannot protect acknowledged messages in
-the daemon queue.
+a long poll gap. Expiry and age-based drains discard only pending, never-served
+messages, so a still-buffered unacknowledged page can be replayed. An explicit
+full drain (`--all`) also discards that page and gives up its retry. None of
+these controls can protect acknowledged messages in the daemon queue.
 
 Manual discard is relevant only when the bridge survives a daemon-only stop
 (for example, on OpenRC), while polling is stopped and before it resumes.

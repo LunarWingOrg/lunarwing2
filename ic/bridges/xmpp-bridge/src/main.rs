@@ -81,6 +81,8 @@ struct QueuedMessage {
     /// When this process queued the message. Used for the queue-age report
     /// and the opt-in stale-queue policy (WI#854).
     queued_at: Instant,
+    /// Included in a poll response, even if the poller hasn't acknowledged it.
+    served: bool,
     payload: BridgeMessage,
 }
 
@@ -89,6 +91,7 @@ impl QueuedMessage {
         Self {
             cursor,
             queued_at: now,
+            served: false,
             payload,
         }
     }
@@ -105,14 +108,12 @@ struct BridgeInner {
     channel: Option<Arc<XmppChannel>>,
     current_cursor: u64,
     messages: VecDeque<QueuedMessage>,
-    /// Highest cursor the poller has acknowledged in this bridge process. A
-    /// poller sends back the cursor of the last page it dispatched and
-    /// persisted, so a request that echoes the last response cursor confirms
-    /// delivery of everything up to it (WI#850).
+    /// Highest cursor acknowledged by the poller or skipped by an explicit
+    /// full drain. A poller sends back the cursor of the last page it
+    /// dispatched and persisted to acknowledge delivery up to it (WI#850).
     acknowledged_cursor: u64,
-    /// Cursor of the most recent `/v1/messages` response. Only a request that
-    /// echoes it advances `acknowledged_cursor`, so an arbitrary cursor cannot
-    /// mark undelivered messages as delivered.
+    /// Cursor of the most recent `/v1/messages` response. A poll must echo it
+    /// to advance `acknowledged_cursor`.
     last_response_cursor: u64,
     last_poll_at: Option<Instant>,
 }
@@ -122,7 +123,7 @@ struct AppState {
     inner: Arc<RwLock<BridgeInner>>,
     expected_token: Option<String>,
     max_messages: usize,
-    /// Minimum poll gap and pending message age for opt-in expiry; 0 disables it.
+    /// Minimum poll gap and unserved message age for opt-in expiry; 0 disables it.
     stale_queue_secs: u64,
 }
 
@@ -551,24 +552,30 @@ async fn messages_handler(
                 dropped,
                 stale_queue_secs = state.stale_queue_secs,
                 current_cursor = inner.current_cursor,
-                "Dropped stale unacknowledged inbound messages after a poll gap (WI#854)"
+                "Dropped stale never-served inbound messages after a poll gap (WI#854)"
             );
         }
     }
-    let start = start.max(inner.acknowledged_cursor);
-    let page: Vec<&QueuedMessage> = inner
+    let mut messages = Vec::new();
+    let mut next_cursor = start;
+    for message in inner
         .messages
-        .iter()
+        .iter_mut()
         .filter(|message| message.cursor > start)
         .take(limit)
-        .collect();
+    {
+        // Remember every served entry, not just the last response cursor:
+        // a smaller retry or an empty resync can change that cursor.
+        message.served = true;
+        next_cursor = message.cursor;
+        messages.push(message.payload.clone());
+    }
     // Advance only past the messages actually returned. Reporting the bridge's
     // newest cursor here would skip the rest of the backlog as soon as a page
     // is capped (WI#850).
-    let next_cursor = page.last().map_or(start, |message| message.cursor);
     let response = MessagesResponse {
         cursor: resync_cursor(cursor, inner.current_cursor, next_cursor),
-        messages: page.iter().map(|message| message.payload.clone()).collect(),
+        messages,
     };
     inner.last_response_cursor = response.cursor;
 
@@ -576,7 +583,6 @@ async fn messages_handler(
 }
 
 /// Discard queued inbound messages on operator request (WI#854).
-///
 async fn drain_handler(
     State(state): State<AppState>,
     Json(request): Json<DrainRequest>,
@@ -620,27 +626,26 @@ fn oldest_queued_age_secs(inner: &BridgeInner, now: Instant) -> Option<u64> {
         .map(|message| message.age_secs(now))
 }
 
-/// Drop a prefix of the pending entries, leaving acknowledged history alone.
+/// Drop pending entries, keeping served entries for retry unless explicitly
+/// discarding everything. Acknowledged history is always retained.
 fn drop_queued_messages(
     inner: &mut BridgeInner,
     older_than_secs: Option<u64>,
     now: Instant,
 ) -> usize {
-    let Some(last) = pending_messages(inner)
-        .take_while(|message| older_than_secs.is_none_or(|limit| message.age_secs(now) >= limit))
-        .last()
-        .map(|message| message.cursor)
-    else {
-        return 0;
-    };
     let before = inner.messages.len();
     let acknowledged = inner.acknowledged_cursor;
-    inner
-        .messages
-        .retain(|message| message.cursor <= acknowledged || message.cursor > last);
-    // A reset poller must resume beyond the entries we deliberately removed.
-    inner.acknowledged_cursor = last;
-    before - inner.messages.len()
+    inner.messages.retain(|message| {
+        message.cursor <= acknowledged
+            || older_than_secs.is_some_and(|limit| message.served || message.age_secs(now) < limit)
+    });
+    let dropped = before - inner.messages.len();
+    // Age-based discard leaves gaps that pagination can skip without
+    // acknowledging a retained retry. Only a full drain can move this cursor.
+    if dropped > 0 && older_than_secs.is_none() {
+        inner.acknowledged_cursor = inner.current_cursor;
+    }
+    dropped
 }
 
 /// The cursor a poll reads after, given what the poller has acknowledged.
@@ -653,9 +658,9 @@ fn drop_queued_messages(
 /// poll resumes after the last acknowledged message instead: nothing
 /// delivered is replayed, and messages queued while the daemon was down
 /// (cursors above the acknowledged one) are still served. A page that was
-/// handed out but not yet acknowledged is served again, so delivery stays
-/// at-least-once. A cursor ahead of this process is the bridge-restart case
-/// that `resync_cursor` handles; its page is empty either way.
+/// handed out but not yet acknowledged is served again if still retained,
+/// so delivery stays at-least-once. A cursor ahead of this process is the
+/// bridge-restart case that `resync_cursor` handles; its page is empty.
 fn poll_start(inner: &mut BridgeInner, request_cursor: u64) -> u64 {
     if request_cursor > inner.current_cursor {
         return request_cursor;
@@ -1384,14 +1389,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_discards_the_whole_queue_and_reports_counts() {
-        // WI#854: the pre-hop drain verb clears the in-memory backlog so a
-        // backlog left from a daemon outage is never served as fresh turns.
+    async fn drain_all_discards_even_the_unacknowledged_page() {
         let state = state_with_backlog(5);
-        let router = build_router(state.clone());
+        let router = build_router(state);
 
+        let served = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(served.cursor, 2);
         let drained = post_drain(router.clone(), r#"{"all":true}"#).await;
-        assert_eq!(drained.drained, 5);
+        assert_eq!(
+            drained.drained, 5,
+            "all also discards the unacknowledged page"
+        );
         assert_eq!(drained.remaining, 0);
         assert_eq!(drained.oldest_queued_age_secs, None);
 
@@ -1498,27 +1506,65 @@ mod tests {
         inner.messages[0].queued_at = now - std::time::Duration::from_secs(60);
         inner.messages[1].queued_at = now - std::time::Duration::from_secs(59);
         assert_eq!(drop_queued_messages(&mut inner, Some(60), now), 1);
-        assert_eq!(inner.acknowledged_cursor, 1);
+        assert_eq!(inner.messages[0].cursor, 2, "the younger message remains");
     }
 
     #[tokio::test]
-    async fn drain_with_age_bound_keeps_recent_messages() {
+    async fn drain_with_age_bound_keeps_served_and_recent_messages() {
         let state = state_with_backlog(4);
         backdate_backlog(&state, 120).await;
         enqueue_backlog(&state, 2).await;
         let router = build_router(state.clone());
 
+        let served = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(served.cursor, 2);
+        // A smaller retry must not make the rest of the previously served page
+        // eligible for discard just because the latest response ends sooner.
+        let shorter = get_messages(router.clone(), "/v1/messages?cursor=0&limit=1").await;
+        assert_eq!(shorter.cursor, 1);
         let drained = post_drain(router.clone(), r#"{"older_than_secs":60}"#).await;
-        assert_eq!(drained.drained, 4, "only the aged prefix is discarded");
-        assert_eq!(drained.remaining, 2);
+        assert_eq!(
+            drained.drained, 2,
+            "only aged, unserved messages are discarded"
+        );
+        assert_eq!(
+            drained.remaining, 4,
+            "the unacknowledged page is still pending"
+        );
+        assert!(drained.oldest_queued_age_secs.is_some_and(|age| age >= 120));
+        assert_eq!(state.inner.read().await.acknowledged_cursor, 0);
 
-        let page = get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        let retry = get_messages(router.clone(), "/v1/messages?cursor=0&limit=2").await;
+        assert_eq!(retry, served, "the served page survives an age-based drain");
+        let page = get_messages(router.clone(), "/v1/messages?cursor=2").await;
         let ids: Vec<_> = page
             .messages
             .iter()
             .map(|message| message.message_id.as_str())
             .collect();
         assert_eq!(ids, ["m4", "m5"], "fresh messages must still be served");
+        assert_eq!(
+            page.cursor, 6,
+            "the next page crosses the discarded cursor gap"
+        );
+        let idle = get_messages(router.clone(), "/v1/messages?cursor=6").await;
+        assert!(idle.messages.is_empty());
+        let reset = get_messages(router, "/v1/messages?cursor=0").await;
+        assert!(reset.messages.is_empty(), "acknowledged pages stay retired");
+    }
+
+    #[tokio::test]
+    async fn drain_with_age_bound_does_not_treat_an_empty_resync_as_delivery() {
+        let state = state_with_backlog(2);
+        backdate_backlog(&state, 120).await;
+        let router = build_router(state);
+
+        let resync = get_messages(router.clone(), "/v1/messages?cursor=99").await;
+        assert!(resync.messages.is_empty());
+        assert_eq!(resync.cursor, 2);
+        let drained = post_drain(router, r#"{"older_than_secs":60}"#).await;
+        assert_eq!(drained.drained, 2, "neither message was served");
+        assert_eq!(drained.remaining, 0);
     }
 
     #[tokio::test]
@@ -1541,20 +1587,33 @@ mod tests {
         state.inner.write().await.last_poll_at =
             Some(Instant::now() - std::time::Duration::from_secs(120));
 
-        let page = get_messages(router.clone(), "/v1/messages?cursor=0").await;
+        let retry = get_messages(router.clone(), "/v1/messages?cursor=0&limit=1").await;
+        assert_eq!(
+            retry, second,
+            "expiry must not discard an unacknowledged page"
+        );
+        {
+            let inner = state.inner.read().await;
+            let retained: Vec<_> = inner
+                .messages
+                .iter()
+                .map(|message| message.cursor)
+                .collect();
+            assert_eq!(
+                retained,
+                [1, 2, 5, 6],
+                "only aged, unserved entries are gone"
+            );
+            assert_eq!(inner.acknowledged_cursor, 1, "expiry cannot skip the retry");
+        }
+
+        let page = get_messages(router, "/v1/messages?cursor=2").await;
         let ids: Vec<_> = page
             .messages
             .iter()
             .map(|message| message.message_id.as_str())
             .collect();
         assert_eq!(ids, ["m4", "m5"], "only the fresh messages may be served");
-
-        let inner = state.inner.read().await;
-        assert_eq!(inner.messages.len(), 3, "acknowledged history is retained");
-        assert_eq!(
-            inner.acknowledged_cursor, 4,
-            "dropped cursors are acknowledged so a reset poller cannot wait on them"
-        );
     }
 
     #[test]

@@ -75,7 +75,7 @@ The WASM channel defaults to reaching the bridge at `http://127.0.0.1:8787`
 | `XMPP_BRIDGE_BIND` | `127.0.0.1:8787` | Listen address. Non-loopback clients are always rejected regardless of bind. |
 | `XMPP_BRIDGE_TOKEN` | _(unset)_ | Bearer token required on every request when set. Empty/unset disables token auth (loopback restriction still applies). |
 | `XMPP_BRIDGE_MAX_MESSAGES` | `2048` | Inbound ring-buffer capacity. Values `<= 0` or unparseable fall back to the default. The production systemd unit sets this to `1024`. |
-| `XMPP_BRIDGE_STALE_QUEUE_SECS` | `0` (disabled) | Opt-in expiry, minimum 120 seconds. On the first poll after at least this long without a poll, discard pending messages at least this old. Invalid values warn and disable expiry. |
+| `XMPP_BRIDGE_STALE_QUEUE_SECS` | `0` (disabled) | Opt-in expiry, minimum 120 seconds. On the first poll after at least this long without a poll, discard pending, never-served messages at least this old. Invalid values warn and disable expiry. |
 | `RUST_LOG` | `info` | Standard `tracing` env filter. |
 | `LUNARWING_BASE_DIR` | _(see bootstrap)_ | Base dir whose `xmpp/` subdir is the default OMEMO store when `omemo_store_dir` is not supplied. `IRONCLAW_BASE_DIR` is still accepted as a legacy alias. |
 
@@ -159,11 +159,12 @@ greater than the request `cursor`.
   its cursor (the daemon keeps it in memory, so a daemon-only restart or a
   re-activated channel polls from zero): the page then starts after the
   acknowledged cursor, so delivered messages are not replayed as new inbound
-  turns, while messages queued meanwhile are still served. A page handed out
-  but not yet acknowledged is served again (at-least-once) (WI#850). The
-  poller acknowledges a page once the daemon has queued it for the agent, so
-  messages still in that in-memory queue at a daemon restart are not served
-  again.
+  turns, while messages queued meanwhile are served unless discarded. A
+  retained page handed out but not yet acknowledged is served again
+  (at-least-once); an explicit full drain (`{"all":true}`) gives up that
+  retry (WI#850, WI#854). The poller acknowledges a page once the daemon has
+  queued it for the agent, so messages still in that in-memory queue at a
+  daemon restart are not served again.
 
 ### `POST /v1/messages/send`
 
@@ -175,7 +176,9 @@ Requires `Content-Type: application/json` and exactly one discard mode:
 `{"all":true}` or `{"older_than_secs":n}` (inclusive age). Missing or invalid
 requests leave the queue unchanged. The response reports `drained`,
 `remaining`, and `oldest_queued_age_secs` for pending entries only; a served
-but unacknowledged page is still pending. Nonzero drops are logged.
+but unacknowledged page is still pending. An age-based drain discards only
+never-served entries, leaving that page available for retry. Only `all` can
+also discard it. Nonzero drops are logged.
 
 Run `ic/scripts/xmpp-drain-queue.sh status` with an explicit loopback `BASE`
 and `XMPP_BRIDGE_TOKEN` before choosing `drain --all` or `drain <seconds>`.

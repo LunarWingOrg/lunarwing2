@@ -29,8 +29,8 @@ Environment:
 
 Commands:
   status             show retained and pending counts and the oldest pending age
-  drain --all        discard all pending inbound messages
-  drain n            discard pending messages that have waited at least n seconds
+  drain --all        discard all pending inbound messages, including a page awaiting retry
+  drain n            discard never-served pending messages at least n seconds old
 
 Notes:
   Run status first. Use drain only to intentionally discard unacknowledged

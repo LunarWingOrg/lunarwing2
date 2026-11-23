@@ -77,9 +77,9 @@ pub struct MessagesResponse {
 /// Select exactly one discard mode for unacknowledged inbound messages.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DrainRequest {
-    /// Explicitly discard all pending messages.
+    /// Explicitly discard all pending messages, including a page awaiting retry.
     pub all: bool,
-    /// Drain only messages that have waited at least this many seconds.
+    /// Drain only never-served pending messages at least this many seconds old.
     pub older_than_secs: Option<u64>,
 }
 

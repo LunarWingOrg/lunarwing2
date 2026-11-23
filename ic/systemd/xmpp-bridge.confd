@@ -19,7 +19,7 @@ xmpp_bridge_base_dir="/var/lib/lunarwing"
 xmpp_bridge_bind="127.0.0.1:8787"
 xmpp_bridge_max_messages="1024"
 # Opt-in stale-queue policy (WI#854): 0 disables expiry; values >=120 expire
-# pending messages at least that old on the first poll after an equally long gap.
+# never-served pending messages at least that old after an equally long poll gap.
 xmpp_bridge_stale_queue_secs="0"
 xmpp_bridge_rust_log="xmpp_bridge=info,info"
 
