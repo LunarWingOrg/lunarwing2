@@ -220,16 +220,31 @@ fn embed_build_identity(root: &Path) {
 
     // Cargo stops using its default "any package file changed" heuristic once
     // a build script emits rerun-if-changed, so the sources have to be
-    // watched explicitly or an edited tree keeps a stale banner. HEAD is
-    // watched because a checkout/commit moves the printed commit; the index is
-    // not, so a plain `git add` does not force a relink.
+    // watched explicitly or an edited tree keeps a stale banner.
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    if let Some(head) = git(root, &["rev-parse", "--absolute-git-dir"])
-        .map(|dir| PathBuf::from(dir).join("HEAD"))
-        .filter(|head| head.exists())
+    watch_git_head(root);
+}
+
+/// Watch the files that move the printed commit, so a tenant upgrade that
+/// advances the branch rebuilds the banner.
+///
+/// `.git/HEAD` alone is not enough: on a branch it only holds
+/// `ref: refs/heads/<branch>`, which does not change when the branch tip
+/// advances — the loose ref (or `packed-refs`) does.
+fn watch_git_head(root: &Path) {
+    let Some(git_dir) = git(root, &["rev-parse", "--absolute-git-dir"]) else {
+        return;
+    };
+    let git_dir = PathBuf::from(git_dir);
+    let mut watched = vec![git_dir.join("HEAD"), git_dir.join("packed-refs")];
+    if let Some(reference) = git(root, &["rev-parse", "--symbolic-full-name", "HEAD"])
+        .filter(|reference| !reference.is_empty())
     {
-        println!("cargo:rerun-if-changed={}", head.display());
+        watched.push(git_dir.join(reference));
+    }
+    for path in watched.iter().filter(|path| path.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 
