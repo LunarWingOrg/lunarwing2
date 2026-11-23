@@ -45,7 +45,8 @@ pebble4lunarwing/patches/wi477-request-events.patch
 pebble4lunarwing/scripts/verify_upstream_lock.py
 pebble4lunarwing/scripts/toolchain-profile.sh
 pebble4lunarwing/scripts/rustup-wrapper.sh
-pebble4lunarwing/scripts/pebble-self-update-guard.sh'
+pebble4lunarwing/scripts/pebble-self-update-guard.sh
+pebble4lunarwing/scripts/worker-download-retry.sh'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 WITH_TOOLCHAINS=false
@@ -65,7 +66,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
 opencode4lunarwing/entrypoint-task-setup.sh
 opencode4lunarwing/config/opencode.json
 opencode4lunarwing/models-dev/api.json
-opencode4lunarwing/scripts/check_models_dev_snapshot.py'
+opencode4lunarwing/scripts/check_models_dev_snapshot.py
+opencode4lunarwing/scripts/worker-download-retry.sh'
         source_ref=f4e363c8295fa90a03dddc451882fffe8fbce357
         build_args="OPENCODE_VERSION=v1.19.6
 OPENCODE_REF=f4e363c8295fa90a03dddc451882fffe8fbce357
@@ -118,7 +120,8 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
 opencode2.4lunarwing/scripts/runtime_smoke.py
 opencode2.4lunarwing/scripts/runtime_smoke_test.py
-opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
+opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh
+opencode2.4lunarwing/scripts/worker-download-retry.sh'
         source_ref=c0ad18b402eb2827fc1ee71c171b1177b3fc02d1
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
@@ -197,7 +200,8 @@ kimicode4lunarwing/scripts/task_runner_test.ts
 kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
-kimicode4lunarwing/scripts/workspace_path.ts'
+kimicode4lunarwing/scripts/workspace_path.ts
+kimicode4lunarwing/scripts/worker-download-retry.sh'
         source_ref=2.7.2
         build_args="KIMI_CODE_VERSION=2.7.2
 WITH_TOOLCHAINS=false
@@ -256,7 +260,8 @@ lunardepth4lunarwing/scripts/prepare_lockfile_deploy_test.py
 lunardepth4lunarwing/scripts/verify_deployed_closure.ts
 lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
-lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
+lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py
+lunardepth4lunarwing/scripts/worker-download-retry.sh'
         source_ref=0472d115e5297093f249c222639431ba8ff0bb78
         build_args="LUNARDEPTH_REPOSITORY=https://git.lunarwing.org/lunarwing/lunardepth.git
 LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78

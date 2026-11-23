@@ -176,7 +176,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
         *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
       esac; \
-      curl -fsSLo /tmp/rustup-init \
+      rm -f /tmp/rustup-init; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
       echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
       chmod +x /tmp/rustup-init; \
@@ -195,7 +197,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         *) echo "unsupported Go architecture" >&2; exit 1 ;; \
       esac; \
       ARCH=$(dpkg --print-architecture); \
-      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      rm -f /tmp/go.tgz; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
       echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
       tar -C /usr/local -xzf /tmp/go.tgz; \
       rm /tmp/go.tgz; \
