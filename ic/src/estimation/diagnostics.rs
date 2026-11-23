@@ -685,5 +685,10 @@ mod tests {
         assert!(category["comparison_baseline"].is_object());
         assert!(category["warmup"]["declared_baseline"].is_object());
         assert!(category["warmup"]["comparison_baseline"].is_object());
+        // The A4 verdict travels with the cohort it was computed on. Here the
+        // prediction error (4s forecast, 5s actual → 1s) beats the 3s baseline
+        // error (2s) by 50%, so the category was judged and passed.
+        assert_eq!(category["gate_pass"], serde_json::json!(true));
+        assert!(category["cold_start"]["gate_pass"].is_boolean());
     }
 }
