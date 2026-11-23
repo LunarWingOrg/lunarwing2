@@ -2779,7 +2779,7 @@ mod tests {
             CredentialMapping::header("GIT_ORIGIN_TOKEN", "Authorization", remote.host.clone());
         mapping.path_patterns = remote.credential_paths();
         let decider = Arc::new(DefaultPolicyDecider::new(
-            DomainAllowlist::new(&[remote.host.clone()]),
+            DomainAllowlist::new(std::slice::from_ref(&remote.host)),
             vec![mapping],
         ));
         let proxy = HttpProxy::with_git_transport(

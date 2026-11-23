@@ -776,7 +776,12 @@ mod tests {
         let create = format!("{ZERO} {NEW} refs/heads/feature\0report-status");
         assert!(
             policy
-                .check_body("POST", &target, None, &push_body(&[update.clone()]))
+                .check_body(
+                    "POST",
+                    &target,
+                    None,
+                    &push_body(std::slice::from_ref(&update))
+                )
                 .is_ok()
         );
         assert!(
@@ -802,7 +807,7 @@ mod tests {
             "0".repeat(64)
         );
         for body in [
-            push_body(&[delete.clone()]),
+            push_body(std::slice::from_ref(&delete)),
             push_body(&[update.clone(), delete]),
             push_body(&[sha256_delete]),
             push_body(&["push-cert\0report-status".to_string()]),
@@ -823,7 +828,12 @@ mod tests {
         // A compressed body cannot be read, so it is refused.
         assert!(
             policy
-                .check_body("POST", &target, Some("gzip"), &push_body(&[update.clone()]))
+                .check_body(
+                    "POST",
+                    &target,
+                    Some("gzip"),
+                    &push_body(std::slice::from_ref(&update))
+                )
                 .is_err()
         );
         assert!(
@@ -832,7 +842,7 @@ mod tests {
                     "POST",
                     &target,
                     Some("identity, gzip"),
-                    &push_body(&[update.clone()])
+                    &push_body(std::slice::from_ref(&update))
                 )
                 .is_err()
         );
@@ -842,7 +852,7 @@ mod tests {
                     "POST",
                     &target,
                     Some("unreadable"),
-                    &push_body(&[update.clone()])
+                    &push_body(std::slice::from_ref(&update))
                 )
                 .is_err()
         );
