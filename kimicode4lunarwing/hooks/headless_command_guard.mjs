@@ -1973,7 +1973,7 @@ const DENY_RULES = [
       /\b(curl|wget|fetch|nc|ncat|netcat)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*(?:ba|z|da|a|k)?sh\b|\b(curl|wget)\b[^|]*\|\s*(?:[\w.+-]*\/)*(?:sudo\s+|env\s+|exec\s+|busybox\s+)*python3?\b/,
   },
   {
-    name: "git alias or include definition (the guard does not evaluate alias bodies)",
+    name: GIT_ALIAS_REASON,
     // An alias body is an arbitrary verb and an include pulls in a file that
     // can define one, so the definition is refused before the verb rules read
     // the literal verb (WI#842). Since WI#867 this refusal has its own reason
