@@ -360,7 +360,7 @@ pub(super) fn authorize_shell_command(
         grant,
         offline: network == SandboxNetworkMode::None,
     };
-    for simple in tokenize_simple_commands(command) {
+    for simple in tokenize_simple_commands(command)? {
         scan_simple_command(&simple, preflight, 0)?;
     }
     Ok(())
@@ -518,7 +518,7 @@ fn is_explicit_local_path(raw: &str) -> bool {
 
 /// Split a shell command into simple commands. Quote-aware; command
 /// separators end a command. Dynamic expansions are flagged, not evaluated.
-fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
+fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut current = String::new();
@@ -559,7 +559,9 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
                 match c {
                     '"' => quote = None,
                     '\\' => {
-                        if let Some(next) = chars.next() {
+                        if let Some(next) = chars.next()
+                            && next != '\n'
+                        {
                             current.push(next);
                         }
                     }
@@ -576,11 +578,21 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
                     quote = Some(c);
                     started = true;
                 }
-                '\\' => {
-                    started = true;
-                    if let Some(next) = chars.next() {
+                '\\' => match chars.next() {
+                    Some('\n') => {}
+                    Some(next) => {
+                        started = true;
                         current.push(next);
                     }
+                    None => return Err(denied("incomplete shell escape")),
+                },
+                '#' if !started => {
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            break;
+                        }
+                    }
+                    finish_command(&mut commands, &mut words);
                 }
                 ';' | '\n' | '|' | '&' | '(' | ')' => {
                     finish_word(&mut words, &mut current, &mut dynamic, &mut started);
@@ -601,9 +613,12 @@ fn tokenize_simple_commands(input: &str) -> Vec<Vec<Word>> {
             },
         }
     }
+    if quote.is_some() {
+        return Err(denied("unterminated shell quote"));
+    }
     finish_word(&mut words, &mut current, &mut dynamic, &mut started);
     finish_command(&mut commands, &mut words);
-    commands
+    Ok(commands)
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -663,45 +678,9 @@ fn is_command_prefix_word(name: &str) -> bool {
 /// them, so a later `git` word after one of these is data. Anything not here
 /// is treated as a possible wrapper whose arguments could be the command.
 const INERT_COMMANDS: &[&str] = &[
-    "echo",
-    "printf",
-    "true",
-    "false",
-    "test",
-    "[",
-    "[[",
-    ":",
-    "cd",
-    "pwd",
-    "exit",
-    "return",
-    "shift",
-    "read",
-    "wait",
-    "type",
-    "hash",
-    "umask",
-    "ulimit",
-    "set",
-    "unset",
-    "trap",
-    "jobs",
-    "fg",
-    "bg",
-    "let",
-    "shopt",
-    "alias",
-    "unalias",
-    "times",
-    "help",
-    "history",
-    "getopts",
-    "mapfile",
-    "readarray",
-    "caller",
-    "disown",
-    "dirs",
-    "pushd",
+    "echo", "true", "false", "test", "[", "[[", ":", "cd", "pwd", "exit", "return", "shift",
+    "wait", "type", "hash", "umask", "ulimit", "set", "trap", "jobs", "fg", "bg", "let", "shopt",
+    "alias", "unalias", "times", "help", "history", "getopts", "caller", "disown", "dirs", "pushd",
     "popd",
 ];
 
@@ -711,7 +690,7 @@ const INERT_COMMANDS: &[&str] = &[
 /// the command a wrapper runs.
 fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
     let command = basename(&words[from].text);
-    if INERT_COMMANDS.contains(&command) {
+    if INERT_COMMANDS.contains(&command) || matches!(command, "grep" | "which" | "ps" | "ls") {
         return Ok(());
     }
     for word in &words[from + 1..] {
@@ -812,15 +791,15 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
             "export" | "readonly" | "declare" | "typeset" | "local" => {
-                index += 1;
-                while index < words.len() {
-                    if is_assignment(&words[index].text) {
-                        refuse_config_env_assignment(&words[index])?;
-                    }
-                    index += 1;
+                return authorize_declaration(&command, &words[index + 1..]);
+            }
+            "read" | "mapfile" | "readarray" | "unset" => {
+                for operand in &words[index + 1..] {
+                    refuse_git_config_variable(&operand.text)?;
                 }
                 return Ok(());
             }
+            "printf" => return authorize_printf(&words[index + 1..]),
             "command" | "nohup" => index = skip_wrapper_options(words, index + 1, &[]),
             "exec" => index = skip_wrapper_options(words, index + 1, EXEC_VALUE_OPTIONS),
             "time" => index = skip_wrapper_options(words, index + 1, TIME_VALUE_OPTIONS),
@@ -848,6 +827,35 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             }
             _ => return refuse_unread_git_tail(words, index),
         }
+    }
+    Ok(())
+}
+
+fn authorize_declaration(command: &str, args: &[Word]) -> Result<()> {
+    let nameref = matches!(command, "declare" | "typeset" | "local")
+        && args
+            .iter()
+            .take_while(|arg| arg.text.starts_with('-') && arg.text != "--")
+            .any(|arg| arg.text[1..].contains('n'));
+    for arg in args.iter().filter(|word| is_assignment(&word.text)) {
+        refuse_config_env_assignment(arg)?;
+        if nameref && let Some((_, target)) = arg.text.split_once('=') {
+            refuse_git_config_variable(target)?;
+        }
+    }
+    Ok(())
+}
+
+fn authorize_printf(args: &[Word]) -> Result<()> {
+    if let Some(option) = args.first()
+        && let Some(attached) = option.text.strip_prefix("-v")
+    {
+        let name = if attached.is_empty() {
+            args.get(1).map_or("", |word| word.text.as_str())
+        } else {
+            attached
+        };
+        refuse_git_config_variable(name)?;
     }
     Ok(())
 }
@@ -917,15 +925,16 @@ fn scan_shell_c(
     depth: usize,
 ) -> Result<()> {
     let mut cursor = index + 1;
+    let mut has_command = false;
     while cursor < words.len() {
         let word = &words[cursor];
         let text = word.text.as_str();
         if text == "--" {
-            return Ok(());
+            cursor += 1;
+            break;
         }
-        if !text.starts_with('-') && !text.starts_with('+') {
-            // A positional is `$0` (and its arguments), not a script.
-            return Ok(());
+        if text == "-" || (!text.starts_with('-') && !text.starts_with('+')) {
+            break;
         }
         if word.dynamic {
             return Err(denied(
@@ -945,42 +954,22 @@ fn scan_shell_c(
                 "unsupported shell option before -c; use a supported invocation",
             ));
         }
-        let flags = text.trim_start_matches(['-', '+']);
-        if let Some(script) = flags.split_once('c').map(|(_, attached)| attached) {
-            // `bash -c script` and `bash -cscript` are the same invocation.
-            let attached = Word {
-                text: script.to_string(),
-                dynamic: word.dynamic,
-            };
-            let body = if script.is_empty() {
-                let Some(script) = words.get(cursor + 1) else {
-                    return Ok(());
-                };
-                script
-            } else {
-                &attached
-            };
-            if body.dynamic {
-                return Err(denied(
-                    "dynamic shell script text cannot be authorized for git network access",
-                ));
-            }
-            for simple in tokenize_simple_commands(&body.text) {
-                scan_simple_command(&simple, preflight, depth + 1)?;
-            }
-            return Ok(());
-        }
+        let flags = &text[1..];
         if flags.chars().all(|flag| {
-            SHELL_FLAGS
-                .iter()
-                .any(|known| known.len() == 2 && known.ends_with(flag))
+            (flag == 'c' && text.starts_with('-'))
+                || SHELL_FLAGS.iter().any(|known| known.ends_with(flag))
         }) {
+            // `-ce` and `-ec` both take the script as a separate operand.
+            has_command |= flags.contains('c');
             cursor += 1;
             continue;
         }
         return Err(denied(
             "unsupported shell option before -c; use a supported invocation",
         ));
+    }
+    if has_command && let Some(body) = words.get(cursor) {
+        scan_shell_body(body, preflight, depth)?;
     }
     Ok(())
 }
@@ -999,6 +988,10 @@ const REDIRECTING_CONFIG_KEYS: &[&str] = &[
     "url.",
     "credential.",
     "http.extraheader",
+    "help.autocorrect",
+    "core.editor",
+    "core.fsmonitor",
+    "sequence.editor",
     "alias.",
     "include.",
     "includeif.",
@@ -1033,9 +1026,10 @@ fn config_overrides(words: &[Word], index: usize) -> Vec<String> {
 /// because Git lowercases section and variable names.
 fn is_redirecting_config_key(raw: &str) -> bool {
     let key = raw.trim().to_ascii_lowercase();
-    REDIRECTING_CONFIG_KEYS.iter().any(|prefix| {
-        key.trim_end_matches('.') == prefix.trim_end_matches('.') || key.starts_with(prefix)
-    })
+    (key.starts_with("http.") && key.ends_with(".extraheader"))
+        || REDIRECTING_CONFIG_KEYS.iter().any(|prefix| {
+            key.trim_end_matches('.') == prefix.trim_end_matches('.') || key.starts_with(prefix)
+        })
 }
 
 fn refuse_redirecting_config(overrides: &[String]) -> Result<()> {
@@ -1258,7 +1252,9 @@ fn config_subcommand(action: ConfigAction, positionals: Vec<&Word>) -> (ConfigAc
     let subcommand = positionals
         .first()
         .map(|word| word.text.as_str())
-        .filter(|_| action == ConfigAction::None);
+        .filter(|word| {
+            action == ConfigAction::None || (action == ConfigAction::Write && *word == "set")
+        });
     let (mut action, operands) = match subcommand {
         Some("list") => (ConfigAction::List, &positionals[1..]),
         Some("get") => (ConfigAction::Get, &positionals[1..]),
@@ -1306,9 +1302,14 @@ fn refuse_config_env_assignment(word: &Word) -> Result<()> {
         return Ok(());
     };
     name = raw_name.strip_suffix('+').unwrap_or(raw_name);
-    if name.trim().starts_with("GIT_CONFIG") {
+    refuse_git_config_variable(name)
+}
+
+fn refuse_git_config_variable(name: &str) -> Result<()> {
+    if name.trim().starts_with("GIT_CONFIG") || matches!(name, "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR")
+    {
         return Err(denied(
-            "shell assignments to GIT_CONFIG_* are not permitted; the host owns git configuration",
+            "shell changes to Git configuration and editor variables are not permitted",
         ));
     }
     Ok(())
@@ -1560,6 +1561,16 @@ fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Resul
 }
 
 fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    if args
+        .iter()
+        .take_while(|word| word.text != "--")
+        .any(|word| {
+            let flag = word.text.split('=').next().unwrap_or_default();
+            matches!(flag, "--e" | "--ex" | "--exe" | "--exec")
+        })
+    {
+        return Err(denied("git archive cannot override the remote command"));
+    }
     let Some(flag) = args
         .iter()
         .position(|word| word.text == "--remote" || word.text.starts_with("--remote="))
@@ -1587,7 +1598,7 @@ fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Resul
             "dynamic shell body cannot be authorized for git network access",
         ));
     }
-    for simple in tokenize_simple_commands(&body.text) {
+    for simple in tokenize_simple_commands(&body.text)? {
         scan_simple_command(&simple, preflight, depth + 1)?;
     }
     Ok(())
@@ -1611,12 +1622,7 @@ fn authorize_shell_bodies(
         if text == "--" {
             break;
         }
-        let body = if sub == "submodule" {
-            if text != "foreach" {
-                return Ok(());
-            }
-            args.get(index + 1)
-        } else if sub == "bisect" {
+        let body = if sub == "bisect" {
             if text != "run" {
                 index += 1;
                 continue;
@@ -1626,13 +1632,21 @@ fn authorize_shell_bodies(
                 return Ok(());
             }
             return scan_simple_command(tail, preflight, depth + 1);
-        } else if let Some(value) = text.strip_prefix("--exec=") {
+        } else if let Some(value) = text
+            .strip_prefix("-x")
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let (flag, value) = text.split_once('=')?;
+                matches!(flag, "--ex" | "--exe" | "--exec").then_some(value)
+            })
+        {
             Some(&Word {
                 text: value.to_string(),
                 dynamic: word.dynamic,
             })
-        } else if text == "--exec" || text == "-x" {
-            args.get(index + 1)
+        } else if matches!(text, "--ex" | "--exe" | "--exec" | "-x") {
+            index += 1;
+            args.get(index)
         } else {
             None
         };
@@ -1645,9 +1659,16 @@ fn authorize_shell_bodies(
 }
 
 fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
-    match args.first().map(|word| word.text.as_str()) {
-        Some("add") => {
-            let positional: Vec<&Word> = args[1..]
+    let prefix = args
+        .iter()
+        .take_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--cached"))
+        .count();
+    let Some((action, operands)) = args[prefix..].split_first() else {
+        return Ok(());
+    };
+    match action.text.as_str() {
+        "add" => {
+            let positional: Vec<&Word> = operands
                 .iter()
                 .filter(|word| !word.text.starts_with('-'))
                 .collect();
@@ -1656,7 +1677,21 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
             };
             preflight.read_remote(url)
         }
-        Some("foreach") => authorize_shell_bodies(args, "submodule", preflight, depth),
+        "foreach" => {
+            let mut body = operands
+                .iter()
+                .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
+            let first = body.next();
+            let script = if first.is_some_and(|word| word.text == "--") {
+                body.next()
+            } else {
+                first
+            };
+            if let Some(script) = script {
+                scan_shell_body(script, preflight, depth)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2072,7 +2107,7 @@ mod tests {
     fn clone_options_cannot_hide_the_literal_source_from_preflight() {
         let (_temp, grant) = workspace_with_remote();
         for option in ["-c", "--config", "--conf"] {
-            let args = tokenize_simple_commands(&format!("{option} user.name=fixture"));
+            let args = tokenize_simple_commands(&format!("{option} user.name=fixture")).unwrap();
             let error = authorize_clone(
                 &args[0],
                 Preflight {
@@ -2312,7 +2347,11 @@ mod tests {
             "bash --posix -c 'git push origin main'",
             "bash -O extglob -c 'git push origin main'",
             "bash --norc -c 'git push origin main'",
-            "bash -c'git push origin main'",
+            "sh -ce 'git fetch upstream'",
+            "bash -cex 'git fetch upstream'",
+            "bash -ec 'git fetch upstream'",
+            "bash -c -e -- 'git fetch upstream'",
+            "bash '-cprintf fixture'",
             // An unknown leading word with git in its tail: the scan could
             // not tell an argument from the command a wrapper runs.
             "xargs -n1 git push origin main",
@@ -2344,7 +2383,13 @@ mod tests {
             "nice -n 5 git fetch origin",
             "bash -c 'git status'",
             "bash -o posix -c 'git status'",
-            "bash -c'git status'",
+            "bash -cex 'git status'",
+            "bash -ec 'git status'",
+            "sh -ce 'git status'",
+            "grep git README",
+            "which git",
+            "ps aux | grep bash",
+            "ls /bin/sh",
             "bash -lc 'git status'",
             "sh -c 'git fetch origin'",
             "git remote -v",
@@ -2383,6 +2428,9 @@ mod tests {
             "git config unset remote.origin.url",
             "git config set remote.origin.url https://evil.example.test/r.git",
             "git config --append alias.p push",
+            "git config set --append alias.fixture status",
+            "git config set --comment fixture alias.fixture status",
+            "git config help.autocorrect 0",
             // git's own long-option prefixes.
             "git config --fil /tmp/cfg alias.p push",
             "git config --renam zz alias",
@@ -2493,9 +2541,13 @@ mod tests {
             "git rebase --exec 'git push origin HEAD' HEAD~1",
             "git rebase --exec='git push origin HEAD' HEAD~1",
             "git rebase -x 'git push origin HEAD' HEAD~1",
+            "git rebase -x'git fetch upstream' HEAD~1",
+            "git rebase --exe 'git fetch upstream' HEAD~1",
             "git rebase -i --exec 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
             "git submodule foreach 'git push origin main'",
             "git submodule foreach 'git fetch upstream'",
+            "git submodule foreach --recursive 'git fetch upstream'",
+            "git submodule --quiet foreach 'git fetch upstream'",
             "git bisect run git push origin main",
         ] {
             let error = check_granted(command, &grant).unwrap_err();
@@ -2509,9 +2561,61 @@ mod tests {
             "git rebase --exec 'make -j8' --exec 'cargo test' HEAD~1",
             "git rebase -i HEAD~3",
             "git submodule foreach 'cargo build'",
+            "git submodule --quiet foreach --recursive 'cargo build'",
             "git bisect run cargo test",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn shell_comments_continuations_and_incomplete_quotes() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "# unmatched '\ngit fetch upstream",
+            "gi\\\nt fetch upstream",
+            "echo 'unterminated",
+        ] {
+            assert!(check_granted(command, &grant).is_err(), "{command}");
+        }
+        for command in [
+            "git status # unmatched '",
+            "echo ordinary#text",
+            "gi\\\nt status",
+        ] {
+            assert!(check_granted(command, &grant).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn literal_config_destinations_and_git_callbacks_are_refused() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "printf -v GIT_CONFIG_COUNT %s 0",
+            "read GIT_CONFIG_KEY_0",
+            "mapfile GIT_CONFIG_VALUE_0",
+            "declare -n fixture=GIT_CONFIG_COUNT",
+            "unset GIT_CONFIG_COUNT",
+            "GIT_SEQUENCE_EDITOR=true git rebase -i HEAD",
+            "GIT_EDITOR=true git status",
+            "git -c help.autocorrect=0 status",
+            "git -c core.fsmonitor=false status",
+            "git config set sequence.editor true",
+            "git archive --remote=origin --exec=fixture HEAD",
+            "git -c http.https://git.example.test/.extraHeader=fixture status",
+            "git config set http.https://git.example.test/.extraHeader fixture",
+        ] {
+            assert!(check_granted(command, &grant).is_err(), "{command}");
+        }
+        for command in [
+            "printf -v fixture %s allowed",
+            "read fixture",
+            "mapfile fixture",
+            "declare -n fixture=ordinary",
+            "echo GIT_CONFIG_COUNT",
+            "git config http.https://git.example.test/.extraHeader",
+        ] {
+            assert!(check_granted(command, &grant).is_ok(), "{command}");
         }
     }
 

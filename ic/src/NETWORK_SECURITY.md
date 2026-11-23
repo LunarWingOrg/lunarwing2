@@ -434,16 +434,13 @@ legacy behavior, including any existing egress.
   in-command configuration that could change what a later word means
   (`alias.*`, `include.*`, `includeIf.*`, and the redirecting `remote.*`,
   `url.*`, `credential.*`, `http.extraheader` keys), `git config` calls that
-  write, read, rename or edit those keys, and shell assignments to
-  `GIT_CONFIG_*` in every form the shell accepts (`NAME=value`, `NAME+=`,
-  `readonly`, `declare -x`/`typeset -x`, `local`). A shape it cannot fully
-  read is refused instead of passing: an unknown leading word whose arguments
-  name `git` or a shell, a wrapper option value it does not consume (`env -u`,
-  `timeout -s`, `nice -n`), `!`/`{ …; }`, a shell option before `-c`, and a
-  shell body (`rebase --exec`, `submodule foreach`, `bisect run`). Ordinary
-  non-git commands still pass. It cannot enforce arbitrary shell behavior or
-  Git history policy. A network-disabled manifest needs no grant for ordinary
-  local clone, fetch, or pull.
+  write or rename those keys, and `git config edit`. Literal reads are
+  allowed. It recognizes common assignments and wrappers, clustered shell
+  options such as `-ce`, and literal Git shell bodies. It does not fully
+  model expansion, substitutions, shell input, or evaluated text, so an
+  unread form is not guaranteed to be refused. It cannot enforce arbitrary
+  shell behavior or Git history policy. A network-disabled manifest needs
+  no grant for ordinary local clone, fetch, or pull.
 - **File remotes** must initially canonicalize inside the call's workspace.
   They work in `none`, `proxy-enforced` (no upstream hosts for a file-only
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
