@@ -639,8 +639,23 @@ fn is_shell_name(name: &str) -> bool {
 fn is_command_prefix_word(name: &str) -> bool {
     matches!(
         name,
-        "!" | "{" | "}" | "if" | "then" | "elif" | "else" | "fi" | "while" | "until" | "do"
-            | "done" | "esac" | "for" | "in" | "case" | "select" | "function"
+        "!" | "{"
+            | "}"
+            | "if"
+            | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "esac"
+            | "for"
+            | "in"
+            | "case"
+            | "select"
+            | "function"
     )
 }
 
@@ -648,10 +663,46 @@ fn is_command_prefix_word(name: &str) -> bool {
 /// them, so a later `git` word after one of these is data. Anything not here
 /// is treated as a possible wrapper whose arguments could be the command.
 const INERT_COMMANDS: &[&str] = &[
-    "echo", "printf", "true", "false", "test", "[", "[[", ":", "cd", "pwd", "exit", "return",
-    "shift", "read", "wait", "type", "hash", "umask", "ulimit", "set", "unset", "trap", "jobs",
-    "fg", "bg", "let", "shopt", "alias", "unalias", "times", "help", "history", "getopts",
-    "mapfile", "readarray", "caller", "disown", "dirs", "pushd", "popd",
+    "echo",
+    "printf",
+    "true",
+    "false",
+    "test",
+    "[",
+    "[[",
+    ":",
+    "cd",
+    "pwd",
+    "exit",
+    "return",
+    "shift",
+    "read",
+    "wait",
+    "type",
+    "hash",
+    "umask",
+    "ulimit",
+    "set",
+    "unset",
+    "trap",
+    "jobs",
+    "fg",
+    "bg",
+    "let",
+    "shopt",
+    "alias",
+    "unalias",
+    "times",
+    "help",
+    "history",
+    "getopts",
+    "mapfile",
+    "readarray",
+    "caller",
+    "disown",
+    "dirs",
+    "pushd",
+    "popd",
 ];
 
 /// A simple command whose leading word the scan does not know is refused when
@@ -840,8 +891,8 @@ const SHELL_VALUE_OPTIONS: &[&str] = &["-o", "+o", "-O", "+O", "--rcfile", "--in
 /// Short shell flags that take no value. Anything else is refused rather than
 /// guessed, since an unknown flag could be the one that changes `-c`.
 const SHELL_FLAGS: &[&str] = &[
-    "-a", "-b", "-e", "-f", "-h", "-k", "-m", "-n", "-p", "-t", "-u", "-v", "-x", "-B", "-C",
-    "-E", "-H", "-P", "-T", "-i", "-l", "-r", "-s", "-D",
+    "-a", "-b", "-e", "-f", "-h", "-k", "-m", "-n", "-p", "-t", "-u", "-v", "-x", "-B", "-C", "-E",
+    "-H", "-P", "-T", "-i", "-l", "-r", "-s", "-D",
 ];
 /// Long shell flags that take no value.
 const SHELL_LONG_FLAGS: &[&str] = &[
@@ -1023,51 +1074,48 @@ enum ConfigAction {
 
 /// One `git config` long option: its full spelling, the words it consumes
 /// including itself, and what it makes the call do.
-struct ConfigOption {
-    name: &'static str,
-    arity: usize,
-    action: ConfigAction,
-}
+type ConfigOption = (&'static str, usize, ConfigAction);
 
 /// Every long option `git config` accepts. `--get-color`/`--get-colorbool`
 /// name a colour, not a configuration key, so their operand is not checked.
+#[rustfmt::skip]
 const CONFIG_OPTIONS: &[ConfigOption] = &[
-    ConfigOption { name: "--global", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--system", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--local", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--worktree", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--file", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--blob", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--type", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--default", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--value", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--url", arity: 2, action: ConfigAction::None },
-    ConfigOption { name: "--comment", arity: 2, action: ConfigAction::Write },
-    ConfigOption { name: "--list", arity: 1, action: ConfigAction::List },
-    ConfigOption { name: "--name-only", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--show-origin", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--show-scope", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--show-names", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--includes", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--no-includes", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--fixed-value", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--null", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--all", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--regexp", arity: 1, action: ConfigAction::None },
-    ConfigOption { name: "--append", arity: 1, action: ConfigAction::Write },
-    ConfigOption { name: "--get", arity: 1, action: ConfigAction::Get },
-    ConfigOption { name: "--get-all", arity: 1, action: ConfigAction::Get },
-    ConfigOption { name: "--get-regexp", arity: 1, action: ConfigAction::GetRegexp },
-    ConfigOption { name: "--get-urlmatch", arity: 3, action: ConfigAction::GetUrlmatch },
-    ConfigOption { name: "--get-color", arity: 3, action: ConfigAction::GetColor },
-    ConfigOption { name: "--get-colorbool", arity: 3, action: ConfigAction::GetColorbool },
-    ConfigOption { name: "--add", arity: 1, action: ConfigAction::Write },
-    ConfigOption { name: "--replace-all", arity: 1, action: ConfigAction::Write },
-    ConfigOption { name: "--unset", arity: 1, action: ConfigAction::Unset },
-    ConfigOption { name: "--unset-all", arity: 1, action: ConfigAction::Unset },
-    ConfigOption { name: "--rename-section", arity: 1, action: ConfigAction::RenameSection },
-    ConfigOption { name: "--remove-section", arity: 1, action: ConfigAction::RemoveSection },
-    ConfigOption { name: "--edit", arity: 1, action: ConfigAction::Edit },
+    ("--global", 1, ConfigAction::None),
+    ("--system", 1, ConfigAction::None),
+    ("--local", 1, ConfigAction::None),
+    ("--worktree", 1, ConfigAction::None),
+    ("--file", 2, ConfigAction::None),
+    ("--blob", 2, ConfigAction::None),
+    ("--type", 2, ConfigAction::None),
+    ("--default", 2, ConfigAction::None),
+    ("--value", 2, ConfigAction::None),
+    ("--url", 2, ConfigAction::None),
+    ("--comment", 2, ConfigAction::Write),
+    ("--list", 1, ConfigAction::List),
+    ("--name-only", 1, ConfigAction::None),
+    ("--show-origin", 1, ConfigAction::None),
+    ("--show-scope", 1, ConfigAction::None),
+    ("--show-names", 1, ConfigAction::None),
+    ("--includes", 1, ConfigAction::None),
+    ("--no-includes", 1, ConfigAction::None),
+    ("--fixed-value", 1, ConfigAction::None),
+    ("--null", 1, ConfigAction::None),
+    ("--all", 1, ConfigAction::None),
+    ("--regexp", 1, ConfigAction::None),
+    ("--append", 1, ConfigAction::Write),
+    ("--get", 1, ConfigAction::Get),
+    ("--get-all", 1, ConfigAction::Get),
+    ("--get-regexp", 1, ConfigAction::GetRegexp),
+    ("--get-urlmatch", 3, ConfigAction::GetUrlmatch),
+    ("--get-color", 3, ConfigAction::GetColor),
+    ("--get-colorbool", 3, ConfigAction::GetColorbool),
+    ("--add", 1, ConfigAction::Write),
+    ("--replace-all", 1, ConfigAction::Write),
+    ("--unset", 1, ConfigAction::Unset),
+    ("--unset-all", 1, ConfigAction::Unset),
+    ("--rename-section", 1, ConfigAction::RenameSection),
+    ("--remove-section", 1, ConfigAction::RemoveSection),
+    ("--edit", 1, ConfigAction::Edit),
 ];
 
 /// Resolve a `--name` or `--name=value` the way git does: an exact match
@@ -1078,12 +1126,12 @@ fn resolve_config_option(text: &str) -> Option<(&'static ConfigOption, bool)> {
         Some((flag, value)) => (flag, !value.is_empty()),
         None => (text, false),
     };
-    if let Some(exact) = CONFIG_OPTIONS.iter().find(|option| option.name == flag) {
+    if let Some(exact) = CONFIG_OPTIONS.iter().find(|option| option.0 == flag) {
         return Some((exact, attached));
     }
     let mut candidates = CONFIG_OPTIONS
         .iter()
-        .filter(|option| option.name.starts_with(flag));
+        .filter(|option| option.0.starts_with(flag));
     let first = candidates.next()?;
     if candidates.next().is_some() {
         return None;
@@ -1155,7 +1203,7 @@ fn authorize_config(args: &[Word]) -> Result<()> {
                     "unsupported or ambiguous option in manifest git config; use a full supported option",
                 ));
             };
-            (if attached { 1 } else { option.arity }, option.action)
+            (if attached { 1 } else { option.1 }, option.2)
         } else {
             let Some(classified) = config_short_option(&text[1..]) else {
                 return Err(denied(
@@ -1207,10 +1255,7 @@ fn authorize_config(args: &[Word]) -> Result<()> {
 /// operands that name keys. Reads are checked too: a read of a redirecting
 /// key still tells the caller nothing it may trust, and keeping one rule for
 /// both directions is cheaper to reason about than a read/write split.
-fn config_subcommand<'a>(
-    action: ConfigAction,
-    positionals: Vec<&'a Word>,
-) -> (ConfigAction, Vec<&'a Word>) {
+fn config_subcommand(action: ConfigAction, positionals: Vec<&Word>) -> (ConfigAction, Vec<&Word>) {
     let subcommand = positionals
         .first()
         .map(|word| word.text.as_str())
