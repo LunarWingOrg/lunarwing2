@@ -340,6 +340,15 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   (no hints) on a malformed rule; `LUNARWING_TOOL_ESTIMATES_TRACE=1` enables
   the bounded held-out trace. Authorization and external-wait gates receive no
   hint, and gate IDs, expiry, redaction and resolution semantics are unchanged.
+- **The A4 rollout gate is reported, not hand-computed (WI#318).** Each
+  category's evaluation cohort now carries `gate_pass`: `true` only when the
+  learned prediction beats the model-derived early-run baseline by at least 10%
+  on median absolute error, `false` when the category was judged and regressed,
+  and `null` when it could not be judged. The verdict is what the tenant
+  evaluation records and what the category allowlist follows; it changes no
+  runtime behaviour and the default remains observe-only. The operator
+  procedure is in
+  [`docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md`](docs/plans/WI191_PERFORMANCE_EMA_INTEGRATION.md).
 
 - **Job and mission timing (WI#318 Phase C).** A local job gets an estimate
   frozen at dispatch from a per-user model kept apart by kind (routine runs and
