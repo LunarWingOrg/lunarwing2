@@ -57,6 +57,9 @@ pub struct SandboxModeConfig {
     /// Per-tenant git remote grant (WI#816): `SANDBOX_GIT_REMOTES` as
     /// `name=url[,name=url...]`. `None` keeps git network access denied.
     pub git: Option<crate::sandbox::GitGrantConfig>,
+    /// Host-kept git credentials (WI#860): `SANDBOX_GIT_CREDENTIALS` as
+    /// `host=SECRET_NAME[,host=SECRET_NAME...]`. Values stay daemon-side.
+    pub git_credentials: Vec<crate::sandbox::GitCredentialBinding>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,6 +196,7 @@ impl Default for SandboxModeConfig {
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
             git: None,
+            git_credentials: Vec::new(),
         }
     }
 }
@@ -231,14 +235,39 @@ impl SandboxModeConfig {
         }
 
         let network = parse_string_env("SANDBOX_NETWORK", ss.network.clone())?;
+        let write_remotes = optional_env("SANDBOX_GIT_WRITE_REMOTES")?
+            .map(|spec| {
+                spec.split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let git = match optional_env("SANDBOX_GIT_REMOTES")? {
-            Some(spec) => crate::sandbox::GitGrantConfig::from_spec(&spec).map_err(|message| {
-                ConfigError::InvalidValue {
-                    key: "SANDBOX_GIT_REMOTES".to_string(),
+            Some(spec) => {
+                crate::sandbox::GitGrantConfig::parse(&spec, &write_remotes).map_err(|message| {
+                    ConfigError::InvalidValue {
+                        key: "SANDBOX_GIT_REMOTES".to_string(),
+                        message,
+                    }
+                })?
+            }
+            None if write_remotes.is_empty() => None,
+            None => {
+                return Err(ConfigError::InvalidValue {
+                    key: "SANDBOX_GIT_WRITE_REMOTES".to_string(),
+                    message: "names remotes but SANDBOX_GIT_REMOTES is empty".to_string(),
+                });
+            }
+        };
+        let git_credentials = match optional_env("SANDBOX_GIT_CREDENTIALS")? {
+            Some(spec) => crate::sandbox::GitCredentialBinding::parse_spec(&spec).map_err(
+                |message| ConfigError::InvalidValue {
+                    key: "SANDBOX_GIT_CREDENTIALS".to_string(),
                     message,
-                }
-            })?,
-            None => None,
+                },
+            )?,
+            None => Vec::new(),
         };
         let tunnel = SandboxTunnelModeConfig::resolve_env()?;
         if network.parse::<crate::sandbox::SandboxNetworkMode>()
@@ -277,6 +306,7 @@ impl SandboxModeConfig {
             )?,
             tunnel,
             git,
+            git_credentials,
         })
     }
 
@@ -350,6 +380,7 @@ impl SandboxModeConfig {
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: self.tenant_logs,
             git: self.git.clone(),
+            git_credentials: self.git_credentials.clone(),
         }
     }
 }
@@ -1048,6 +1079,7 @@ mod tests {
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
             tunnel: SandboxTunnelModeConfig::default(),
             git: None,
+            git_credentials: Vec::new(),
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
@@ -1082,6 +1114,7 @@ mod tests {
             tenant_logs: crate::sandbox::TenantLogsMode::Off,
             tunnel: SandboxTunnelModeConfig::default(),
             git: None,
+            git_credentials: Vec::new(),
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);

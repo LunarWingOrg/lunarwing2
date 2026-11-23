@@ -124,6 +124,7 @@ pub mod config;
 pub mod container;
 pub mod detect;
 pub mod error;
+pub mod git_credential;
 pub mod git_grant;
 pub mod manager;
 pub mod mount_guard;
@@ -149,7 +150,8 @@ pub use detect::{
 };
 pub use error::{Result, SandboxError};
 pub use git_grant::{
-    EffectiveGitCapability, GIT_REMOTE_EXTENSION, GitGrantAuthorization, GitGrantConfig, GitRemote,
+    EffectiveGitCapability, GIT_REMOTE_EXTENSION, GitCredentialBinding, GitGrantAuthorization,
+    GitGrantConfig, GitOperationClass, GitRemote,
 };
 pub use manager::{ExecOutput, SandboxManager, SandboxManagerBuilder};
 pub use proxy::{

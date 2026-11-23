@@ -194,6 +194,11 @@ pub struct SandboxConfig {
     /// Per-tenant git remote grant (WI#816; `SANDBOX_GIT_REMOTES`). `None`
     /// keeps the shell's git network access denied by default.
     pub git: Option<crate::sandbox::git_grant::GitGrantConfig>,
+    /// Host-kept HTTPS credentials for granted git remotes (WI#860;
+    /// `SANDBOX_GIT_CREDENTIALS` as `host=SECRET_NAME[,host=SECRET_NAME...]`).
+    /// The secret value stays in the daemon; the container asks a host-side
+    /// broker through a Unix socket.
+    pub git_credentials: Vec<crate::sandbox::git_grant::GitCredentialBinding>,
 }
 
 impl Default for SandboxConfig {
@@ -215,6 +220,7 @@ impl Default for SandboxConfig {
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: TenantLogsMode::Info,
             git: None,
+            git_credentials: Vec::new(),
         }
     }
 }

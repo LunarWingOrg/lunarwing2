@@ -11,14 +11,22 @@
 //! - `http`/`https` remotes require `proxy-enforced`. The per-call proxy
 //!   restricts egress to selected hosts already on the tenant allowlist.
 //!
-//! Nothing in this module carries a credential. URLs with embedded userinfo
-//! are refused at parse time, the container environment contains only remote
-//! URLs and git hardening switches, and the evidence record contains names,
-//! transports, hosts and operation classes only.
+//! Nothing in this module carries a credential value. URLs with embedded
+//! userinfo are refused at parse time, the container environment contains only
+//! remote URLs, a helper path and git hardening switches, and the evidence
+//! record contains names, transports, hosts and operation classes only.
+//!
+//! Operations are granted per remote by host policy (WI#860):
+//! - every configured remote grants `read`;
+//! - `SANDBOX_GIT_WRITE_REMOTES` names remotes that also grant `write`.
+//!
+//! A write grant still refuses force pushes and ref deletion in every
+//! spelling. Credentials stay host-side: `SANDBOX_GIT_CREDENTIALS` maps a
+//! remote host to a daemon-held secret, and the container's git asks a
+//! host-side broker through a Unix socket ([`crate::sandbox::git_credential`]).
 //!
 //! The manifest shell scan is best-effort preflight, not Git authorization:
 //! it does not control repository paths or Git operations on allowed hosts.
-//! This slice grants no hosted credentials or push capability.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +50,17 @@ const MAX_URL_LEN: usize = 2048;
 #[serde(rename_all = "kebab-case")]
 pub enum GitOperationClass {
     Read,
+    Write,
+}
+
+impl GitOperationClass {
+    /// Denial text naming the operation a remote does not grant.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +86,18 @@ pub struct GitRemote {
     pub transport: GitTransport,
     pub host: Option<String>,
     pub canonical: String,
+    /// Operation classes this remote grants. Always contains `Read`.
+    pub operations: Vec<GitOperationClass>,
+}
+
+impl GitRemote {
+    pub fn allows(&self, operation: GitOperationClass) -> bool {
+        self.operations.contains(&operation)
+    }
+
+    fn grants_write(&self) -> bool {
+        self.allows(GitOperationClass::Write)
+    }
 }
 
 /// Host configuration parsed from `SANDBOX_GIT_REMOTES`.
@@ -82,9 +113,21 @@ impl GitGrantConfig {
 
     /// Parse `name=url[,name=url...]`. An empty string means "no grant".
     pub fn from_spec(spec: &str) -> std::result::Result<Option<Self>, String> {
+        Self::parse(spec, &[])
+    }
+
+    /// Parse the read grant and apply the write list to the same remotes.
+    /// `write_names` is the `SANDBOX_GIT_WRITE_REMOTES` value; it can only
+    /// promote a remote that the read grant already names.
+    pub fn parse(spec: &str, write_names: &[String]) -> std::result::Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() {
-            return Ok(None);
+            if write_names.is_empty() {
+                return Ok(None);
+            }
+            return Err(
+                "SANDBOX_GIT_WRITE_REMOTES names remotes but SANDBOX_GIT_REMOTES is empty".into(),
+            );
         }
         let mut remotes = Vec::new();
         for (index, entry) in spec.split(',').enumerate() {
@@ -119,10 +162,34 @@ impl GitGrantConfig {
                 transport: parsed.transport,
                 host: parsed.host,
                 canonical: parsed.canonical,
+                operations: vec![GitOperationClass::Read],
             });
         }
         if remotes.is_empty() {
-            return Ok(None);
+            if write_names.is_empty() {
+                return Ok(None);
+            }
+            return Err(
+                "SANDBOX_GIT_WRITE_REMOTES names remotes but SANDBOX_GIT_REMOTES is empty".into(),
+            );
+        }
+        for name in write_names {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("SANDBOX_GIT_WRITE_REMOTES must not contain an empty name".into());
+            }
+            validate_remote_name(name)?;
+            let remote = remotes
+                .iter_mut()
+                .find(|remote| remote.name == name)
+                .ok_or_else(|| {
+                    format!(
+                        "SANDBOX_GIT_WRITE_REMOTES names '{name}', which SANDBOX_GIT_REMOTES does not define"
+                    )
+                })?;
+            if !remote.grants_write() {
+                remote.operations.push(GitOperationClass::Write);
+            }
         }
         Ok(Some(Self { remotes }))
     }
@@ -136,7 +203,27 @@ pub struct GitGrantAuthorization {
     pub remotes: Vec<GitRemote>,
     /// Network modes in which this grant is supported.
     pub egress: Vec<SandboxNetworkMode>,
+    /// Container paths of host-kept credentials, keyed by remote host. The
+    /// values are helper endpoints, never credential material.
+    pub credentials: Vec<GitCredentialEndpoint>,
 }
+
+/// One host-side credential endpoint the container may ask for a secret.
+/// The socket lives on the host; the container sees only the bind path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialEndpoint {
+    pub host: String,
+    pub transport: GitTransport,
+    /// Container path of the broker socket directory.
+    pub container_dir: String,
+}
+
+/// Container mount point of the per-call credential broker (WI#860).
+pub const GIT_CREDENTIAL_MOUNT: &str = "/run/lunarwing-git-credential";
+/// Name of the broker socket inside [`GIT_CREDENTIAL_MOUNT`].
+pub const GIT_CREDENTIAL_SOCKET: &str = "broker.sock";
+/// Container path of the generated git credential helper.
+pub const GIT_CREDENTIAL_HELPER: &str = "/run/lunarwing-git-credential/helper.sh";
 
 /// Secret-free evidence describing the applied grant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,15 +278,15 @@ impl GitGrantAuthorization {
                     name: remote.name.clone(),
                     transport: remote.transport,
                     host: remote.host.clone(),
-                    operations: vec![GitOperationClass::Read],
+                    operations: remote.operations.clone(),
                 })
                 .collect(),
         }
     }
 
     /// Git configuration passed to the container through `GIT_CONFIG_*` env
-    /// entries. Values are granted remote URLs and hardening switches only;
-    /// no credential, token, key or credential-helper command is included.
+    /// entries. Values are granted remote URLs, the helper path and hardening
+    /// switches only; no credential, token or key is included.
     pub fn container_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
@@ -217,18 +304,132 @@ impl GitGrantAuthorization {
         }
         // An empty helper resets any helper inherited from the image config,
         // so a credential prompt cannot block the command and no image-level
-        // helper can supply a credential the host did not grant.
+        // helper can supply a credential the host did not grant. It must come
+        // before the broker helper: an empty value clears the helper list.
         env.push((
             format!("GIT_CONFIG_KEY_{index}"),
             "credential.helper".to_string(),
         ));
         env.push((format!("GIT_CONFIG_VALUE_{index}"), String::new()));
-        env.push(("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string()));
+        index += 1;
+        // The helper asks the host broker over the mounted Unix socket. It
+        // receives no secret; the broker decides by host which secret to
+        // hand back, so a non-granted host gets nothing.
+        if !self.credentials.is_empty() {
+            env.push((
+                format!("GIT_CONFIG_KEY_{index}"),
+                "credential.helper".to_string(),
+            ));
+            env.push((
+                format!("GIT_CONFIG_VALUE_{index}"),
+                GIT_CREDENTIAL_HELPER.to_string(),
+            ));
+            index += 1;
+        }
+        env.push(("GIT_CONFIG_COUNT".to_string(), index.to_string()));
         env
+    }
+
+    /// Whether any granted remote accepts a write.
+    pub fn allows_write(&self) -> bool {
+        self.remotes.iter().any(GitRemote::grants_write)
     }
 
     fn remote_by_name(&self, name: &str) -> Option<&GitRemote> {
         self.remotes.iter().find(|remote| remote.name == name)
+    }
+}
+
+/// Host-side credential binding: the secret name is host configuration and
+/// is resolved by the daemon, never passed to the container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialBinding {
+    /// Remote host the credential applies to (exact match).
+    pub host: String,
+    /// Daemon secret name resolved at fetch/push time.
+    pub secret_name: String,
+    /// Username sent with an HTTPS Basic credential.
+    pub username: String,
+}
+
+impl GitCredentialBinding {
+    /// Parse `host=SECRET_NAME[,host=SECRET_NAME...]`. Names are the same
+    /// grammar as remote names, so a value can never smuggle a credential.
+    pub fn parse_spec(spec: &str) -> std::result::Result<Vec<Self>, String> {
+        let mut bindings = Vec::new();
+        for (index, entry) in spec.split(',').enumerate() {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (host, secret_name) = entry.split_once('=').ok_or_else(|| {
+                format!("SANDBOX_GIT_CREDENTIALS entry {} must be host=SECRET_NAME", index + 1)
+            })?;
+            let host = host.trim().to_ascii_lowercase();
+            let secret_name = secret_name.trim();
+            if host.is_empty() || secret_name.is_empty() {
+                return Err(format!(
+                    "SANDBOX_GIT_CREDENTIALS entry {} must have a non-empty host and secret name",
+                    index + 1
+                ));
+            }
+            validate_credential_host(&host)?;
+            validate_secret_name(secret_name)?;
+            if bindings
+                .iter()
+                .any(|binding: &Self| binding.host == host)
+            {
+                return Err("SANDBOX_GIT_CREDENTIALS hosts must be unique".into());
+            }
+            bindings.push(Self {
+                host,
+                secret_name: secret_name.to_string(),
+                username: DEFAULT_CREDENTIAL_USERNAME.to_string(),
+            });
+        }
+        Ok(bindings)
+    }
+
+    pub fn for_host<'a>(bindings: &'a [Self], host: &str) -> Option<&'a Self> {
+        bindings.iter().find(|binding| binding.host == host)
+    }
+}
+
+/// Username presented with an HTTPS token; most forges accept any non-empty
+/// value and ignore it when the token is the password.
+const DEFAULT_CREDENTIAL_USERNAME: &str = "lunarwing";
+
+fn validate_credential_host(host: &str) -> std::result::Result<(), String> {
+    let valid = !host.is_empty()
+        && host.len() <= 255
+        && !host.contains('*')
+        && !host.contains('@')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err("SANDBOX_GIT_CREDENTIALS hosts must be literal lowercase hostnames".into())
+    }
+}
+
+/// Secret names use the same grammar as the capability secret list, so a
+/// configuration value cannot carry a credential or a shell metacharacter.
+fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "SANDBOX_GIT_CREDENTIALS secret names must be 1-128 lowercase ASCII letters, \
+             digits, '.', '_' or '-'"
+                .into(),
+        )
     }
 }
 
@@ -243,6 +444,7 @@ pub fn authorize_grant(
     requested: &[String],
     cwd: &Path,
     network: SandboxNetworkMode,
+    credentials: &[GitCredentialBinding],
 ) -> Result<GitGrantAuthorization> {
     if host.remotes.is_empty() {
         return Err(denied(
@@ -294,11 +496,32 @@ pub fn authorize_grant(
             SandboxNetworkMode::None,
         ]
     };
+    // A credential binds to the exact granted host. A binding for a host that
+    // no selected remote names, or for a `file` remote, would be dead policy
+    // and could hide a typo; refuse it instead of silently ignoring it.
+    let mut credential_endpoints = Vec::new();
+    for binding in credentials {
+        let matching = selected
+            .iter()
+            .find(|remote| remote.host.as_deref() == Some(binding.host.as_str()))
+            .ok_or_else(|| {
+                denied(format!(
+                    "SANDBOX_GIT_CREDENTIALS names host '{}', which no selected remote uses",
+                    binding.host
+                ))
+            })?;
+        credential_endpoints.push(GitCredentialEndpoint {
+            host: binding.host.clone(),
+            transport: matching.transport,
+            container_dir: GIT_CREDENTIAL_MOUNT.to_string(),
+        });
+    }
     Ok(GitGrantAuthorization {
         grant: GIT_GRANT_ID.to_string(),
         cwd: cwd.to_path_buf(),
         remotes: selected,
         egress,
+        credentials: credential_endpoints,
     })
 }
 
@@ -1012,11 +1235,7 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>) -> Result<()> {
     match sub.text.as_str() {
         "clone" => authorize_clone(args, preflight),
         "fetch" | "pull" => authorize_fetch(args, preflight),
-        // Even a plain push can use config-selected destinations and refspecs.
-        // Do not try to authorize writes from an untrusted shell's text.
-        "push" => Err(denied(
-            "git push is not supported by manifest Git preflight",
-        )),
+        "push" => authorize_push(args, preflight),
         "ls-remote" => {
             let positional = read_positionals(
                 args,
@@ -1145,6 +1364,142 @@ fn authorize_fetch(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
         None if preflight.allows_local_read() => Ok(()),
         None => Err(denied("name an explicit granted remote for fetch or pull")),
     }
+}
+
+/// Force-push spellings, matched as exact long options. Any other
+/// unrecognized option is refused by `read_positionals`, so abbreviations
+/// (`--forc`, `--mirr`) cannot slip through this list.
+const FORCE_PUSH_FLAGS: &[&str] = &[
+    "--force",
+    "--force-with-lease",
+    "--force-if-includes",
+    "--mirror",
+    "--delete",
+    "--prune",
+];
+
+fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    let Some(grant) = preflight.grant else {
+        return Err(no_grant_denial());
+    };
+    for word in args {
+        let text = word.text.as_str();
+        if word.dynamic {
+            return Err(denied(
+                "dynamic git push argument cannot be authorized; use literal values",
+            ));
+        }
+        // Short-option clusters (`-qf`) carry the same flags as their long
+        // spellings; `read_positionals` accepts a known cluster as a unit, so
+        // the force/delete letters are checked here.
+        if let Some(cluster) = text.strip_prefix('-')
+            && !text.starts_with("--")
+            && !cluster.is_empty()
+            && cluster.chars().any(|c| matches!(c, 'f' | 'd'))
+        {
+            return Err(denied(format!(
+                "git push option '{text}' carries force or delete; force push and ref deletion are refused"
+            )));
+        }
+        let flag = text.split_once('=').map(|(flag, _)| flag).unwrap_or(text);
+        if FORCE_PUSH_FLAGS.contains(&flag) {
+            return Err(denied(format!(
+                "git push option '{flag}' is not permitted; force push and ref deletion are refused"
+            )));
+        }
+    }
+    let positional = read_positionals(
+        args,
+        &[
+            "-q", "--quiet", "-v", "--verbose", "-u", "--set-upstream", "--progress",
+            "--no-progress", "--porcelain", "--no-verify", "--follow-tags", "--atomic",
+            "--no-atomic", "--dry-run", "--thin", "--no-thin",
+        ],
+        &[
+            "-o",
+            "--push-option",
+            "--repo",
+            "--receive-pack",
+            "--exec",
+            "--recurse-submodules",
+        ],
+    )?;
+    let (remote_word, refspecs) = match positional.split_first() {
+        Some((remote, refspecs)) => (*remote, refspecs),
+        None => {
+            return Err(denied(
+                "git push must name an explicit granted remote; a default destination cannot be authorized",
+            ));
+        }
+    };
+    // `--repo`/`--receive-pack`/`-o` style overrides can retarget the push or
+    // run an arbitrary receive-pack, so only the plain form is authorized.
+    if args.iter().any(|word| {
+        let flag = word
+            .text
+            .split_once('=')
+            .map(|(f, _)| f)
+            .unwrap_or(&word.text);
+        matches!(
+            flag,
+            "--repo"
+                | "--receive-pack"
+                | "--exec"
+                | "--recurse-submodules"
+                | "-o"
+                | "--push-option"
+        )
+    }) {
+        return Err(denied(
+            "git push destination overrides (--repo, --receive-pack, --push-option) are not supported",
+        ));
+    }
+    let remote = match grant.remote_by_name(&remote_word.text) {
+        Some(remote) => remote,
+        None => {
+            // An explicit URL is accepted only if it is an exact granted URL.
+            let canonical = canonicalize_command_url(&remote_word.text)?;
+            grant
+                .remotes
+                .iter()
+                .find(|remote| remote.canonical == canonical)
+                .ok_or_else(|| denied("git remote is not in this tenant's host git grant"))?
+        }
+    };
+    if !remote.grants_write() {
+        return Err(denied(format!(
+            "remote '{}' grants read only; host policy must grant write for git push",
+            remote.name
+        )));
+    }
+    for refspec in refspecs {
+        authorize_push_refspec(&refspec.text, &remote.name)?;
+    }
+    Ok(())
+}
+
+/// A refspec may not force (`+src`), delete (`:dst`), or be a bare `:`.
+fn authorize_push_refspec(refspec: &str, remote_name: &str) -> Result<()> {
+    if refspec.starts_with('+') {
+        return Err(denied(format!(
+            "force-push refspec '{refspec}' is not permitted for remote '{remote_name}'"
+        )));
+    }
+    let (source, destination) = match refspec.split_once(':') {
+        Some((source, destination)) => (source, Some(destination)),
+        None => (refspec, None),
+    };
+    if source.is_empty() || destination == Some("") {
+        return Err(denied(format!(
+            "refspec '{refspec}' has an empty source or destination and would delete a remote ref"
+        )));
+    }
+    if refspec == ":" {
+        return Err(denied(format!(
+            "refspec ':' would push matching branches to remote '{remote_name}'"
+        )));
+    }
+    Ok(())
 }
 
 fn authorize_remote_subcommand(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -1333,7 +1688,7 @@ mod tests {
         let host = GitGrantConfig::from_spec("origin=file:///workspace/remotes/origin.git")
             .unwrap()
             .unwrap();
-        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
         (temp, grant)
     }
 
@@ -1396,7 +1751,7 @@ mod tests {
             SandboxNetworkMode::Tunnel,
             SandboxNetworkMode::Proxy,
         ] {
-            let error = authorize_grant(&network_only, &[], Path::new("/tmp"), mode).unwrap_err();
+            let error = authorize_grant(&network_only, &[], Path::new("/tmp"), mode, &[]).unwrap_err();
             assert!(error.to_string().contains("git-remotes"), "{error}");
         }
         let grant = authorize_grant(
@@ -1404,6 +1759,7 @@ mod tests {
             &[],
             Path::new("/tmp"),
             SandboxNetworkMode::ProxyEnforced,
+            &[],
         )
         .unwrap();
         assert_eq!(grant.egress, [SandboxNetworkMode::ProxyEnforced]);
@@ -1417,10 +1773,10 @@ mod tests {
             SandboxNetworkMode::Tunnel,
             SandboxNetworkMode::ProxyEnforced,
         ] {
-            let grant = authorize_grant(&file_only, &[], &cwd, mode).unwrap();
+            let grant = authorize_grant(&file_only, &[], &cwd, mode, &[]).unwrap();
             assert!(!grant.egress.contains(&SandboxNetworkMode::Proxy));
         }
-        assert!(authorize_grant(&file_only, &[], &cwd, SandboxNetworkMode::Proxy).is_err());
+        assert!(authorize_grant(&file_only, &[], &cwd, SandboxNetworkMode::Proxy, &[]).is_err());
     }
 
     #[test]
@@ -1431,6 +1787,7 @@ mod tests {
             &["upstream".to_string()],
             Path::new("/tmp"),
             SandboxNetworkMode::ProxyEnforced,
+            &[],
         )
         .unwrap();
         assert_eq!(grant.remotes.len(), 1);
@@ -1450,6 +1807,7 @@ mod tests {
             &["other-tenant".to_string()],
             Path::new("/tmp"),
             SandboxNetworkMode::ProxyEnforced,
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
@@ -1468,7 +1826,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let error =
-                authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap_err();
+                authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap_err();
             assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
         }
     }
@@ -1714,6 +2072,8 @@ mod tests {
 
     #[test]
     fn preflight_refuses_push_before_git_can_interpret_flags_or_defaults() {
+        // The fixture grant is read-only: every push is refused, including a
+        // plain one, because the remote does not grant write.
         let (_temp, grant) = workspace_with_remote();
         for command in [
             "git push",
@@ -1725,6 +2085,7 @@ mod tests {
             "git push origin +main",
             "git push --force-with-lease origin main",
             "git push --force-with-lease=main origin main",
+            "git push --force-if-includes origin main",
             "git push --mirror origin",
             "git push --mirr origin",
             "git push --delete origin old-branch",
@@ -1737,11 +2098,195 @@ mod tests {
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
             );
+            let text = error.to_string();
             assert!(
-                error.to_string().contains("git push is not supported"),
-                "{error}"
+                text.contains("grants read only") || text.contains("force push and ref deletion"),
+                "{command}: {text}"
             );
         }
+    }
+
+    fn write_grant() -> (tempfile::TempDir, GitGrantAuthorization) {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remotes/origin.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::parse(
+            "origin=file:///workspace/remotes/origin.git",
+            &["origin".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced, &[]).unwrap();
+        (temp, grant)
+    }
+
+    #[test]
+    fn write_grant_accepts_a_plain_push_and_records_the_operation_class() {
+        let (_temp, grant) = write_grant();
+        for command in [
+            "git push origin main",
+            "git push origin main:refs/heads/main",
+            "git push -u origin feature",
+            "git push --atomic origin main",
+            "git push origin",
+        ] {
+            check_granted(command, &grant)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        let evidence = grant.evidence();
+        assert_eq!(
+            evidence.remotes[0].operations,
+            vec![GitOperationClass::Read, GitOperationClass::Write]
+        );
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("\"write\""));
+    }
+
+    #[test]
+    fn write_grant_still_refuses_force_push_and_ref_deletion_in_every_spelling() {
+        let (_temp, grant) = write_grant();
+        for command in [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push -qf origin main",
+            "git push origin +main",
+            "git push origin +main:main",
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main origin main",
+            "git push --force-if-includes origin main",
+            "git push --mirror origin",
+            "git push --mirr origin",
+            "git push --delete origin old-branch",
+            "git push --del origin old-branch",
+            "git push -d origin old-branch",
+            "git push origin :old-branch",
+            "git push origin main:",
+            "git push --prune origin",
+            "git push origin :",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_without_a_named_remote_or_outside_the_grant_is_refused() {
+        let (_temp, grant) = write_grant();
+        for command in [
+            "git push",
+            "git push --all",
+            "git push $REMOTE main",
+            "git push https://evil.example.test/repo.git main",
+            "git push --repo origin main",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_list_can_only_promote_a_configured_remote() {
+        let config = GitGrantConfig::parse(
+            "origin=file:///workspace/remotes/origin.git",
+            &["origin".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(config.remotes[0].allows(GitOperationClass::Write));
+        for bad in [
+            GitGrantConfig::parse(
+                "origin=file:///workspace/remotes/origin.git",
+                &["upstream".to_string()],
+            ),
+            GitGrantConfig::parse("", &["origin".to_string()]),
+            GitGrantConfig::parse(
+                "origin=file:///workspace/remotes/origin.git",
+                &["Origin".to_string()],
+            ),
+        ] {
+            let error = bad.unwrap_err();
+            assert!(error.contains("SANDBOX_GIT_WRITE_REMOTES"), "{error}");
+        }
+        let read_only = GitGrantConfig::parse(
+            "origin=file:///workspace/remotes/origin.git",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!read_only.remotes[0].allows(GitOperationClass::Write));
+    }
+
+    #[test]
+    fn credentials_bind_to_a_granted_host_and_never_enter_the_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_spec("upstream=https://git.example.test/org/repo.git")
+            .unwrap()
+            .unwrap();
+        let bindings = GitCredentialBinding::parse_spec("git.example.test=GIT_READ_TOKEN").unwrap();
+        let grant = authorize_grant(
+            &host,
+            &[],
+            &cwd,
+            SandboxNetworkMode::ProxyEnforced,
+            &bindings,
+        )
+        .unwrap();
+        assert_eq!(grant.credentials.len(), 1);
+        assert_eq!(grant.credentials[0].host, "git.example.test");
+        let env = grant.container_env();
+        let joined = env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("credential.helper="));
+        assert!(joined.contains(GIT_CREDENTIAL_HELPER));
+        assert!(!joined.contains("GIT_READ_TOKEN"), "{joined}");
+        // The evidence carries the host and operation classes, not the secret.
+        let json = serde_json::to_string(&grant.evidence()).unwrap();
+        assert!(!json.contains("GIT_READ_TOKEN"));
+        assert!(json.contains("git.example.test"));
+        // A binding for a host no selected remote uses is refused.
+        let other = GitCredentialBinding::parse_spec("other.example.test=TOKEN").unwrap();
+        let error = authorize_grant(
+            &host,
+            &[],
+            &cwd,
+            SandboxNetworkMode::ProxyEnforced,
+            &other,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SandboxError::CapabilityDenied { .. }));
+        assert!(!error.to_string().contains("TOKEN"));
+    }
+
+    #[test]
+    fn credential_spec_rejects_embedded_secrets_and_non_host_keys() {
+        for bad in [
+            "https://user:token@git.example.test=TOKEN",
+            "git.example.test=",
+            "=TOKEN",
+            "*.example.test=TOKEN",
+            "git.example.test=UPPER",
+            "git.example.test=with space",
+            "git.example.test=TOKEN,git.example.test=OTHER",
+        ] {
+            assert!(
+                GitCredentialBinding::parse_spec(bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        let parsed = GitCredentialBinding::parse_spec("Git.Example.Test=git_token").unwrap();
+        assert_eq!(parsed[0].host, "git.example.test");
+        assert_eq!(parsed[0].secret_name, "git_token");
     }
 
     #[test]

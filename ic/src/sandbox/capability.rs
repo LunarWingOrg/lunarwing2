@@ -560,6 +560,7 @@ fn authorize_validated(
             &manifest.git.remotes,
             &canonical,
             mode,
+            &config.git_credentials,
         )?)
     } else {
         None
