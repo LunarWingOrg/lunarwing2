@@ -279,14 +279,14 @@ function checkRm(segment) {
   return null;
 }
 
-const FIND_CALL = /(?:^|[\s;&|()])find\s+([^;&|\n]*)/g;
+const FIND_CALL = /(?:^|[\s;&|()])find\b/g;
 // Deletion actions inside a find expression: `-delete`, and `-exec`/`-ok`
 // running a deleting utility (WI#826, WI#832: unlink).
 const FIND_DELETE_ACTION =
   /(?:^|[\s(])(?:-delete|-exec(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b|-ok(?:dir)?\s+(?:[\w.+-]*\/)?(?:rm|unlink|rmdir|shred)\b)/;
-const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b([^;&|\n]*)/g;
+const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b/g;
 const XARGS_RM = /(?:^|\s)(?:[\w.+-]*\/)?rm(?:\s|$)/;
-const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b([^;&|\n]*)/g;
+const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b/g;
 // Interpreter options may precede the eval flag (`perl -MFile::Path -e …`),
 // so the eval flag is found by walking the words (oneLinerCode).
 const ONE_LINER_CALL =
@@ -309,8 +309,8 @@ const ASSIGNED_SINK =
 // full rather than only its first operand (WI#840).
 const PERL_DELETE_CALL = /\b(?:unlink|rmdir|rmtree|remove_tree)\b/g;
 const DEVICE_TARGET = /^\/dev\/(?:sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
-const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b([^;&|\n]*)/g;
-const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b([^;&|\n]*)/g;
+const TEE_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?tee\b/g;
+const CP_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?cp\b/g;
 
 /** The start paths of a find invocation: the words before its expression. */
 function findStartPaths(rest) {
@@ -327,8 +327,9 @@ function findStartPaths(rest) {
 /** Deny `find -delete`, `-exec rm` and `-ok rm` whose start paths leave the temp roots. */
 function checkFindDeletion(text) {
   for (const match of text.matchAll(FIND_CALL)) {
-    if (!FIND_DELETE_ACTION.test(match[1])) continue;
-    const paths = findStartPaths(match[1]);
+    const rest = clauseText(text, match.index + match[0].length);
+    if (!FIND_DELETE_ACTION.test(rest)) continue;
+    const paths = findStartPaths(rest);
     if (!paths.every(isSafeTempPath)) return outsideTempReason("find", paths);
   }
   return null;
@@ -343,14 +344,17 @@ function feedingPipeline(text, index) {
 /** The start paths of the last find in a pipeline, or null when there is none. */
 function lastFindPaths(pipeline) {
   let paths = null;
-  for (const match of pipeline.matchAll(FIND_CALL)) paths = findStartPaths(match[1]);
+  for (const match of pipeline.matchAll(FIND_CALL)) {
+    paths = findStartPaths(clauseText(pipeline, match.index + match[0].length));
+  }
   return paths;
 }
 
 /** Deny `xargs rm` unless its feeding find is provably temp-rooted. */
 function checkXargsDeletion(text) {
   for (const match of text.matchAll(XARGS_CALL)) {
-    if (!XARGS_RM.test(match[1])) continue;
+    const rest = clauseText(text, match.index + match[0].length);
+    if (!XARGS_RM.test(rest)) continue;
     const paths = lastFindPaths(feedingPipeline(text, match.index));
     // Without a find in the pipeline the deleted set is unknown; fail closed.
     if (paths === null) return "xargs rm over an input set the guard cannot verify";
@@ -366,7 +370,7 @@ function checkXargsDeletion(text) {
  */
 function checkRsyncDeletion(text) {
   for (const match of text.matchAll(RSYNC_CALL)) {
-    const words = argumentWords(match[1]).map(stripShellQuotes);
+    const words = argumentWords(clauseText(text, match.index + match[0].length)).map(stripShellQuotes);
     const option = words.find((word) => /^--del(?:ete(?:-[a-z-]+)?)?$/.test(word) ||
       word === "--remove-source-files");
     if (option === undefined) continue;
@@ -378,8 +382,8 @@ function checkRsyncDeletion(text) {
   return null;
 }
 
-const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b([^;&|\n]*)/g;
-const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b([^;&|\n]*)/g;
+const MV_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*mv\b/g;
+const TAR_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)*tar\b/g;
 // tar's argument-taking short options. Every other letter is a flag, so an
 // old-style first word (`tar cf archive …`) is read letter by letter.
 const TAR_SHORT_ARG = new Set("bCfFgHIKLNTVX");
@@ -595,11 +599,11 @@ function mvOperandProtected(operand) {
 
 function checkMoveAndTarDeletion(text) {
   for (const match of text.matchAll(MV_CALL)) {
-    const hit = mvOperands(match[1]).find(mvTouchesProtected);
+    const hit = mvOperands(clauseText(text, match.index + match[0].length)).find(mvTouchesProtected);
     if (hit !== undefined) return `rename of a protected tree or a system root: mv ${hit}`;
   }
   for (const match of text.matchAll(TAR_CALL)) {
-    const tar = tarInvocation(match[1]);
+    const tar = tarInvocation(clauseText(text, match.index + match[0].length));
     if (!tar.removeFiles) continue;
     if (tar.unverifiable) return "tar --remove-files over a member list the guard cannot verify";
     if (tar.members.length === 0) return "tar --remove-files without an explicit member";
@@ -1008,14 +1012,15 @@ function deviceTarget(word) {
 /** Deny block-device writes by `tee` (every operand) and `cp` (its last operand). */
 function checkDeviceWrites(text) {
   for (const match of text.matchAll(TEE_CALL)) {
-    for (const word of argumentWords(match[1])) {
+    for (const word of argumentWords(clauseText(text, match.index + match[0].length))) {
       if (word.startsWith("-")) continue;
       const target = deviceTarget(word);
       if (target !== null) return `direct block-device write: tee ${target.slice(0, 80)}`;
     }
   }
   for (const match of text.matchAll(CP_CALL)) {
-    const operands = argumentWords(match[1]).filter((word) => !word.startsWith("-"));
+    const operands = argumentWords(clauseText(text, match.index + match[0].length))
+      .filter((word) => !word.startsWith("-"));
     const target = operands.length > 0 ? deviceTarget(operands[operands.length - 1]) : null;
     if (target !== null) return `direct block-device write: cp ${target.slice(0, 80)}`;
   }
