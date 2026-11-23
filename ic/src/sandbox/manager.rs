@@ -1641,10 +1641,19 @@ mod tests {
             !joined.contains("GIT_MANAGER_ARGV_TOKEN"),
             "credential variable name in container argv: {joined}"
         );
-        assert!(
-            joined.contains("GIT_CONFIG_VALUE_0=http://git.internal/org/repo.git"),
-            "{joined}"
-        );
+        // WI#857 (!2719) pins each remote with an empty `remote.<name>.url`
+        // first, so entry 0 is the reset and entry 1 the granted URL.
+        for expected in [
+            "GIT_CONFIG_KEY_0=remote.origin.url",
+            "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=remote.origin.url",
+            "GIT_CONFIG_VALUE_1=http://git.internal/org/repo.git",
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-e", expected]),
+                "{expected} missing from the container argv: {joined}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
