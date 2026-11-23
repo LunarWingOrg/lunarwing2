@@ -365,15 +365,20 @@ metadata_digest() {
 # their scans then stopped at the "worker-image.env is missing" guard). Eight
 # attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
 # (~95.25 minutes) of sleeping. The separate three-attempt snapshot ladder
-# adds at most 120+300 = 420 s plus two jitter values; even conservatively
-# adding both complete ladders and nine maximum jitter values gives 6396 s
-# of sleeping, below the roughly 10000 s cap observed on runner cccccc (the
-# YAML permits 8 h). Dockerfile apt calls have their own 240/600 s limits,
-# so a stalled fetch becomes a retryable exit 124 instead of burning that cap.
-# The final attempt on either ladder is never followed by another delay.
+# adds at most 120+300 = 420 s plus two jitter values; the three-attempt
+# download ladder (WI#862) adds at most 60+60 = 120 s plus two jitter
+# values; and the lane Dockerfiles' own in-step retry (worker-download-retry.sh,
+# three attempts from a 20 s base) adds at most 20+40 = 60 s plus two jitter
+# values per wrapped download. Even conservatively adding all three complete
+# ladders and thirteen maximum jitter values gives 6396 s of sleeping, below
+# the roughly 10000 s cap observed on runner cccccc (the YAML permits 8 h).
+# Dockerfile apt calls have their own 240/600 s limits, so a stalled fetch
+# becomes a retryable exit 124 instead of burning that cap.
+# The final attempt on any ladder is never followed by another delay.
 _bwr_max_attempts=8
 _bwr_base_delay=45
 _bwr_snapshot_max_attempts=3
+_bwr_download_max_attempts=3
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -402,12 +407,41 @@ transient_snapshot_failure() {
     grep -qE 'process "([^"\\]|\\.)*snapshot\.debian\.org([^"\\]|\\.)*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
 }
 
+# WI#862: a dropped or refused connection while a Dockerfile step downloads a
+# pinned input. Job 204104 (pipeline 8578) failed in [builder 4/21] on
+# "error: RPC failed; curl 55 Failed sending data to the peer" while the
+# LunarDepth partial clone fetched on demand, then "not retrying".
+#
+# The lane Dockerfiles now retry their own downloads (the shared
+# worker-download-retry.sh helper), so this classifier is a second line of
+# defence for a drop the helper exhausted and for a Dockerfile step that has
+# no helper yet. It covers only the BuildKit path (CI); mt-admin uses
+# `podman build`, whose trace has a different shape, and is covered by the
+# in-Dockerfile helper alone.
+#
+# A fatal cause wins over a transient one: the same step can print a
+# connection error and then the decision that actually stopped it, and a pin,
+# integrity, test or 401/403/404 failure must end the job on the first
+# attempt (WI#559/VK-1: the old snapshot classifier matched too broadly).
+transient_download_failure() {
+    # The checksum and lockfile guards that follow a download print their own
+    # verdict; a failure there is never a network failure.
+    if grep -qE 'EINTEGRITY|ERR_PNPM_OUTDATED_LOCKFILE|ENOSPC|No space left on device' "$push_attempt_log"; then
+        return 1
+    fi
+    if grep -qE 'unexpected status from [A-Z]+ request to [^ ]*: (401|403|404)([ :]|$)|remote: (Unauthorized|Forbidden|Not Found)|Authentication failed|checksum did NOT match' "$push_attempt_log"; then
+        return 1
+    fi
+    grep -qE 'RPC failed; curl (18|52|55|56|92)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet|from promisor remote|Could not connect to server|Failed to connect to |Connection reset by peer|Connection timed out|Recv failure|Temporary failure in name resolution|Could not resolve host|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|network timeout|ERR_PNPM_(FETCH|META_FETCH)|Error when performing the request|error: Failed to (install|download)' "$push_attempt_log"
+}
+
 build_image_with_retry() {
     _bwr_ref=$1
     _bwr_meta=$2
     _bwr_clean=$3
     _bwr_attempt=1
     _bwr_snapshot_attempt=1
+    _bwr_download_attempt=1
     while [ "$_bwr_attempt" -le "$_bwr_max_attempts" ]; do
         : > "$push_attempt_rc"
         # tee keeps the build streaming into the job trace; the brace group
@@ -439,6 +473,19 @@ build_image_with_retry() {
             echo "retrying after a transient snapshot.debian.org failure (attempt $_bwr_snapshot_attempt/$_bwr_snapshot_max_attempts) in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
             _bwr_snapshot_attempt=$((_bwr_snapshot_attempt + 1))
+            _bwr_attempt=$((_bwr_attempt + 1))
+        elif [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] &&
+            [ "$_bwr_download_attempt" -lt "$_bwr_download_max_attempts" ] &&
+            transient_download_failure; then
+            # WI#862: a dropped connection while a pinned input downloads.
+            # The base is short because the Dockerfile helper inside the step
+            # already retried three times; this covers what it exhausted.
+            _bwr_base=60
+            _bwr_jitter=$(( CI_JOB_ID % 30 ))
+            _bwr_delay=$((_bwr_base + _bwr_jitter))
+            echo "transient download failure (attempt $_bwr_download_attempt/$_bwr_download_max_attempts); retrying in ${_bwr_delay}s" >&2
+            sleep "$_bwr_delay"
+            _bwr_download_attempt=$((_bwr_download_attempt + 1))
             _bwr_attempt=$((_bwr_attempt + 1))
         else
             echo "image build attempt $_bwr_attempt/$_bwr_max_attempts failed (exit $_bwr_status); not retrying" >&2

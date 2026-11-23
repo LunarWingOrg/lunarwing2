@@ -99,6 +99,24 @@ if mode == "fail_compile_after_snapshot_delay_warning":
     print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
     print('ERROR: failed to solve: process "/bin/sh -c make" did not complete successfully: exit code: 2', file=sys.stderr)
     sys.exit(1)
+if mode == "fail_download_once" and count == 1:
+    # Real trace, pipeline 8578 / job 204104, [builder 4/21] (WI#862): the
+    # LunarDepth partial clone's on-demand fetch lost the connection.
+    print("#14 [builder  4/21] RUN set -eu; git clone --filter=blob:none --no-checkout /src; git -C /src checkout --detach", file=sys.stderr)
+    print("#14 0.619 Cloning into '/src'...", file=sys.stderr)
+    print("#14 2.434 error: RPC failed; curl 55 Failed sending data to the peer", file=sys.stderr)
+    print("#14 2.434 fatal: expected 'packfile'", file=sys.stderr)
+    print("#14 2.566 fatal: could not fetch e878c9db197bc62497cd2d8bc77bd45609d8fab2 from promisor remote", file=sys.stderr)
+    print('ERROR: process "/bin/bash -o pipefail -c set -eu; git clone --filter=blob:none --no-checkout /src" did not complete successfully: exit code: 128', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_download_always":
+    print("#14 [builder  4/21] RUN npm ci --ignore-scripts", file=sys.stderr)
+    print("npm error code ECONNRESET", file=sys.stderr)
+    print("npm error network request to https://registry.npmjs.org/example failed, reason: read ECONNRESET", file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_download_fatal":
+    print(os.environ["DOWNLOAD_FATAL_TRACE_LINE"], file=sys.stderr)
+    sys.exit(1)
 if mode == "fail_compile":
     print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
     sys.exit(1)
@@ -428,6 +446,72 @@ for index, argument in enumerate(args):
         self.assertEqual(len(calls), 1)
         self.assertIn("not retrying", result.stderr)
         self.assertNotIn("transient snapshot.debian.org", result.stderr)
+
+    def test_job_204104_promisor_drop_is_retried(self):
+        # WI#862: the real trace of pipeline 8578 / job 204104 — a dropped
+        # connection while the LunarDepth partial clone fetched on demand.
+        # The build failed on the first attempt; it must now retry.
+        self.env["BUILDCTL_MODE"] = "fail_download_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        # Candidate attempt (dropped) + candidate retry + clean rebuild.
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--no-cache", calls[1])
+        self.assertIn("--no-cache", calls[2])
+        self.assertIn("transient download failure (attempt 1/3)", result.stderr)
+        self.assertNotIn("not retrying", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [62])
+
+    def test_dropped_npm_registry_connection_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_download_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.log.read_text().splitlines()), 3)
+
+    def test_persistent_download_failure_exhausts_own_budget(self):
+        self.env["BUILDCTL_MODE"] = "fail_download_always"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        # Three download attempts, then the candidate gives up; the clean
+        # rebuild never runs.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.recorded_sleeps(), [62, 62])
+        self.assertIn("failure (attempt 1/3)", result.stderr)
+        self.assertIn("failure (attempt 2/3)", result.stderr)
+        self.assertIn("not retrying", result.stderr)
+
+    def test_pin_and_integrity_failures_are_not_retried(self):
+        # WI#862 point 4: a pin mismatch, EINTEGRITY, a sha256sum -c
+        # mismatch, a failing test in an install-and-test step, and a 403
+        # must each end the job on the first attempt.
+        cases = {
+            "pin mismatch": "error: pathspec 'deadbeef' did not match any file(s) known to git",
+            "EINTEGRITY": "npm error code EINTEGRITY\nnpm error sha512-abc integrity checksum failed",
+            "checksum": "example.rpm: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match",
+            "failing test": "not ok 7 - lunarwing bridge rejects a malformed envelope\n# failed 1 test",
+            "403": "fatal: unable to access 'https://git.lunarwing.org/lunarwing/lunardepth.git/': The requested URL returned error: 403",
+        }
+        for label, line in cases.items():
+            with self.subTest(case=label):
+                (self.root / "buildctl-count").unlink(missing_ok=True)
+                self.env["BUILDCTL_MODE"] = "fail_download_fatal"
+                self.env["DOWNLOAD_FATAL_TRACE_LINE"] = line
+                result = self.run_build()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.log.read_text().splitlines()), 1)
+                self.assertIn("not retrying", result.stderr)
+                self.assertNotIn("transient download failure", result.stderr)
+                self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_compile_error_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_compile"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient download failure", result.stderr)
 
     def test_every_worker_dockerfile_apt_call_has_a_time_limit(self):
         for lane in (
