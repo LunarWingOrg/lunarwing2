@@ -223,13 +223,9 @@ pub fn print_boot_screen(info: &BootInfo) {
         tags.push("skills".to_string());
     }
 
-    // Sandbox / Docker
+    // Sandbox / runtime
     if info.sandbox_enabled {
-        let suffix = match info.sandbox_runtime {
-            Some(runtime) => format!(":{}", runtime.binary()),
-            None => ":unavail".to_string(),
-        };
-        tags.push(format!("sandbox{suffix}"));
+        tags.push(sandbox_tag(info.sandbox_runtime));
     }
 
     // Embeddings
@@ -284,10 +280,32 @@ pub fn print_boot_screen(info: &BootInfo) {
     println!();
 }
 
+/// Boot-screen feature tag for the sandbox (WI#871): names the runtime the
+/// sandbox actually drives, so a podman-only host does not read as unavailable.
+fn sandbox_tag(runtime: Option<crate::sandbox::ContainerRuntime>) -> String {
+    match runtime {
+        Some(runtime) => format!("sandbox:{}", runtime.binary()),
+        None => "sandbox:unavail".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::detect::DockerStatus;
+
+    #[test]
+    fn sandbox_tag_names_the_selected_runtime() {
+        assert_eq!(
+            sandbox_tag(Some(crate::sandbox::ContainerRuntime::Podman)),
+            "sandbox:podman"
+        );
+        assert_eq!(
+            sandbox_tag(Some(crate::sandbox::ContainerRuntime::Docker)),
+            "sandbox:docker"
+        );
+        assert_eq!(sandbox_tag(None), "sandbox:unavail");
+    }
 
     #[test]
     fn test_print_boot_screen_full() {

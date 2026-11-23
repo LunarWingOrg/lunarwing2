@@ -439,25 +439,24 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Derive the user-facing warning for channel notification (WI#871).
     //
-    // `sandbox_runtime` is the CLI the generic sandbox actually drives, so a
-    // missing Docker daemon only affects job containers, not the sandbox.
+    // Only a genuinely unusable sandbox warrants a user-visible warning. A
+    // podman-only host whose Docker is absent has a working sandbox — the
+    // startup log already names the selected runtime — so it stays quiet.
     let docker_user_warning: Option<String> = if !config.sandbox.enabled {
         None
-    } else if let Some(runtime) = sandbox_runtime {
-        match docker_status {
-            lunarwing::sandbox::DockerStatus::Available => None,
-            _ => Some(format!(
-                "Sandbox is running on {}; the Docker-compatible API is unavailable, so \
-                 full_job routines will fail until a Docker-compatible socket is reachable.",
-                runtime.binary()
-            )),
-        }
+    } else if sandbox_runtime.is_none() {
+        let hint = match docker_status {
+            lunarwing::sandbox::DockerStatus::NotRunning => {
+                "Docker is installed but not running -- start it, or install podman."
+            }
+            _ => "Install podman or Docker.",
+        };
+        Some(format!(
+            "Sandbox is enabled but no usable container runtime was found -- \
+             sandboxed commands will fail until one is available. {hint}"
+        ))
     } else {
-        Some(
-            "Sandbox is enabled but no usable container runtime was found (podman or \
-             docker) -- commands will fail until one is installed."
-                .to_string(),
-        )
+        None
     };
 
     // ── Channel setup ──────────────────────────────────────────────────
