@@ -2127,13 +2127,12 @@ function listenerBraceWords({ text, mask }) {
 }
 
 /**
- * Bash's own cross product, without its blow-up: a word may hold thousands
- * of groups (`{a,b}` is five bytes), so the expansion stops at a cap and
- * keeps the rest of the word literal. A listener command needs one word, so
- * the cap is far above any spelling that would actually run one.
+ * Bash's own cross product, without its blow-up: `{a,b}` is five bytes, so a
+ * 16 KB word can hold thousands of groups. The expansion stops adding
+ * alternatives past this many pending words and keeps the rest literal, which
+ * can only miss a listener, never invent one.
  */
-const BRACE_WORD_LIMIT = 256;
-const BRACE_SEGMENT_LIMIT = 16_384;
+const BRACE_EXPANSION_LIMIT = 1024;
 
 /** One segment's words, with unquoted brace groups expanded as bash would. */
 function listenerWordList(segment) {
@@ -2141,18 +2140,15 @@ function listenerWordList(segment) {
   for (const entry of segment) {
     const pending = [entry];
     let head = 0;
-    let expansions = 0;
     while (head < pending.length) {
       const word = pending[head++];
-      const alternatives = expansions < BRACE_WORD_LIMIT &&
-        words.length + pending.length < BRACE_SEGMENT_LIMIT
+      const alternatives = pending.length <= BRACE_EXPANSION_LIMIT
         ? listenerBraceWords(word)
         : null;
       if (alternatives === null) {
         if (word.text !== "") words.push(word.text);
         continue;
       }
-      expansions += alternatives.length - 1;
       pending.push(...alternatives);
     }
   }
