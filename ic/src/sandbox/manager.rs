@@ -34,7 +34,8 @@ use tokio::sync::RwLock;
 use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
 use crate::sandbox::config::{SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
-use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder, NoCredentialResolver};
+use crate::sandbox::git_grant::GitGrantAuthorization;
+use crate::sandbox::proxy::{EnvCredentialResolver, HttpProxy, NetworkProxyBuilder};
 use crate::sandbox::tunnel_sidecar::{TunnelSidecar, TunnelSidecarConfig};
 
 /// Output from sandbox execution.
@@ -405,7 +406,14 @@ impl SandboxManager {
         // Keep the scoped listener alive across retries. Dropping it closes
         // its shutdown channel; each run owns and cleans up its Unix relay.
         let scoped_proxy = match scoped_hosts {
-            Some(hosts) => Some(self.start_scoped_git_proxy(hosts).await?),
+            Some(hosts) => {
+                let credentials = decision
+                    .git
+                    .as_ref()
+                    .map(GitGrantAuthorization::proxy_credentials)
+                    .unwrap_or_default();
+                Some(self.start_scoped_git_proxy(hosts, credentials).await?)
+            }
             None => None,
         };
         let scoped_port = scoped_proxy.as_ref().map(|(_, port)| *port);
@@ -449,11 +457,19 @@ impl SandboxManager {
         }))
     }
 
-    async fn start_scoped_git_proxy(&self, hosts: Vec<String>) -> Result<(HttpProxy, u16)> {
+    /// Per-call scoped proxy for git remotes. It resolves any host-side
+    /// credential binding from the daemon environment and injects the
+    /// `Authorization` header itself, so the secret never reaches the
+    /// container (WI#860 route b).
+    async fn start_scoped_git_proxy(
+        &self,
+        hosts: Vec<String>,
+        credentials: Vec<crate::secrets::CredentialMapping>,
+    ) -> Result<(HttpProxy, u16)> {
         let proxy = NetworkProxyBuilder::from_config(&self.config)
             .with_allowlist(hosts)
-            .with_credentials(Vec::new())
-            .with_credential_resolver(Arc::new(NoCredentialResolver))
+            .with_credentials(credentials)
+            .with_credential_resolver(Arc::new(EnvCredentialResolver))
             .build_and_start(0)
             .await?;
         let addr = proxy.addr().await.ok_or_else(|| SandboxError::ProxyError {

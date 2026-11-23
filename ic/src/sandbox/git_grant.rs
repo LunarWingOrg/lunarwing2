@@ -1,4 +1,4 @@
-//! Host policy for git access from the generic shell sandbox (WI#816).
+//! Host policy for git access from the generic shell sandbox (WI#816, WI#860).
 //!
 //! The grant is the manifest's reserved extension point: a request may ask for
 //! the `git-remotes` extension, and only an explicit, per-tenant host policy
@@ -11,14 +11,22 @@
 //! - `http`/`https` remotes require `proxy-enforced`. The per-call proxy
 //!   restricts egress to selected hosts already on the tenant allowlist.
 //!
-//! Nothing in this module carries a credential. URLs with embedded userinfo
-//! are refused at parse time, the container environment contains only remote
-//! URLs and git hardening switches, and the evidence record contains names,
-//! transports, hosts and operation classes only.
+//! Write grant (WI#860): `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
+//! operation classes include `Write`; every other remote stays read-only, and
+//! a read-only grant still refuses `git push`. Force push is refused in every
+//! spelling; ref deletion is refused unless `SANDBOX_GIT_ALLOW_REF_DELETION`
+//! turns it on.
+//!
+//! Credentials (WI#860): `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME` binds a
+//! granted plain-HTTP remote to a daemon environment variable. The per-call
+//! egress proxy resolves that variable and adds the `Authorization` header
+//! host-side, so the secret never enters the container: not in its
+//! environment, files, arguments, process listings or output. HTTPS travels in
+//! an opaque `CONNECT` tunnel the proxy cannot modify, so an HTTPS remote with
+//! a credential binding is a load error rather than a silent no-op.
 //!
 //! The manifest shell scan is best-effort preflight, not Git authorization:
 //! it does not control repository paths or Git operations on allowed hosts.
-//! This slice grants no hosted credentials or push capability.
 
 use std::path::{Path, PathBuf};
 
@@ -281,6 +289,8 @@ pub struct GitGrantAuthorization {
     pub egress: Vec<SandboxNetworkMode>,
     /// Host decision on ref deletion (`:ref`, `--delete`).
     pub allow_ref_deletion: bool,
+    /// Host-side credential bindings, resolved by the per-call proxy.
+    pub credentials: Vec<GitCredentialSource>,
 }
 
 /// Secret-free evidence describing the applied grant.
@@ -290,6 +300,18 @@ pub struct EffectiveGitCapability {
     pub grant: String,
     pub egress: Vec<SandboxNetworkMode>,
     pub remotes: Vec<EffectiveGitRemote>,
+    /// Host-side credential bindings by remote and variable *name*.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<EffectiveGitCredential>,
+}
+
+/// Secret-free credential evidence. Records which host variable backs which
+/// remote, never the variable's value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveGitCredential {
+    pub remote: String,
+    pub secret_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,6 +336,41 @@ impl GitRemote {
 }
 
 impl GitGrantAuthorization {
+    /// Host-side credential mappings for the per-call egress proxy.
+    ///
+    /// Route (b): the proxy adds the `Authorization` header to a plain-HTTP
+    /// request, so the secret is resolved and applied on the host and never
+    /// enters the container. A remote without a binding contributes nothing.
+    pub fn proxy_credentials(&self) -> Vec<crate::secrets::CredentialMapping> {
+        let mut mappings = Vec::new();
+        for source in &self.credentials {
+            let Some(remote) = self.remote_by_name(&source.remote) else {
+                continue;
+            };
+            let Some(host) = remote.host.as_ref() else {
+                continue;
+            };
+            mappings.push(crate::secrets::CredentialMapping::header(
+                source.secret_env.clone(),
+                "Authorization",
+                host.clone(),
+            ));
+        }
+        mappings
+    }
+
+    /// Secret-free credential evidence: the remote name and the *name* of the
+    /// daemon variable, never its value.
+    fn credential_evidence(&self) -> Vec<EffectiveGitCredential> {
+        self.credentials
+            .iter()
+            .map(|source| EffectiveGitCredential {
+                remote: source.remote.clone(),
+                secret_env: source.secret_env.clone(),
+            })
+            .collect()
+    }
+
     /// Project the tenant ACL onto the exact hosts selected for this call.
     /// Never enable a domain just because it occurs in a configured remote.
     pub(super) fn proxy_hosts(&self, base_allowlist: &[String]) -> Result<Vec<String>> {
@@ -350,6 +407,7 @@ impl GitGrantAuthorization {
                     operations: remote.operations(),
                 })
                 .collect(),
+            credentials: self.credential_evidence(),
         }
     }
 
@@ -461,12 +519,19 @@ pub fn authorize_grant(
             SandboxNetworkMode::None,
         ]
     };
+    let credentials = host
+        .credentials
+        .iter()
+        .filter(|source| selected.iter().any(|remote| remote.name == source.remote))
+        .cloned()
+        .collect();
     Ok(GitGrantAuthorization {
         grant: GIT_GRANT_ID.to_string(),
         cwd: cwd.to_path_buf(),
         remotes: selected,
         egress,
         allow_ref_deletion: host.allow_ref_deletion,
+        credentials,
     })
 }
 
