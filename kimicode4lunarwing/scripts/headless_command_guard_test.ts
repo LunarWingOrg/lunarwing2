@@ -960,6 +960,12 @@ test("a long command of repeated words is decided without rescanning", () => {
   assertAllowed("kimi ".repeat(3276) + "echo", 2_000)
   assertBlocked("{kimi,server} ".repeat(1200).slice(0, 16_384), "kimi service mode")
   assertBlocked("cat <(kimi server) ".repeat(800).slice(0, 16_384), "kimi service mode")
+  // WI#868 makes the expansion a cross product, so a word of many groups and
+  // a deeply nested group must stay linear in the command length.
+  assertBlocked('{kimi,"server"} '.repeat(1200).slice(0, 16_384), "kimi service mode")
+  assertAllowed("{a,b}".repeat(2000).slice(0, 16_384), 2_000)
+  assertAllowed("echo " + "{".repeat(8_000) + "}".repeat(8_000), 2_000)
+  assertAllowed("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), 2_000)
 })
 
 test("empty brace alternatives and literal IFS separators do not hide listener words", () => {
@@ -970,6 +976,42 @@ test("empty brace alternatives and literal IFS separators do not hide listener w
   assertBlocked("kimi$IFS'server'", "kimi service mode")
   assertAllowed("kimi -p 'kimi${IFS}server'")
   assertAllowed("kimi -p ''")
+})
+
+test("a quoted brace alternative does not suppress the group (WI#868)", () => {
+  // WI#868: the guard expanded a brace word only when the segment recorded
+  // the whole word as unquoted, so one quoted alternative suppressed the
+  // expansion. Bash expands the group first and removes the quotes
+  // afterwards, so each row below runs `kimi server`. Bash 5.3.20 confirmed
+  // every row really runs the listener command.
+  assertBlocked('{kimi,"server"}', "kimi service mode")
+  assertBlocked('{"kimi",server}', "kimi service mode")
+  assertBlocked("{kimi,'server'}", "kimi service mode")
+  assertBlocked("{kimi,$'server'}", "kimi service mode")
+  assertBlocked('{nc,"-l"} 9000', "listener started from a task")
+  assertBlocked('{python3,"-m"} http.server', "listener started from a task")
+  assertBlocked('nohup {kimi,"server"} &', "kimi service mode")
+  assertBlocked('{kimi,"server"} ; ls', "kimi service mode")
+  // The control rows of the same table keep denying.
+  assertBlocked("kimi server", "kimi service mode")
+  assertBlocked('bash -c "kimi server"', "kimi service mode")
+  assertBlocked("{kimi,server}", "kimi service mode")
+  // A quote inside an alternative's word and a nested group are the same
+  // expansion. A prefix or suffix is not: `x{kimi,"server"}` runs `xkimi
+  // xserver`, which is no listener.
+  assertBlocked('{kimi,"ser"ver}', "kimi service mode")
+  assertBlocked("{x,{kimi,server}}", "kimi service mode")
+  assertBlocked("{,{kimi,server}}", "kimi service mode")
+  // Bash's cross product is read too: here one word supplies `kimi` and the
+  // next `server`.
+  assertBlocked('{kim,kimi}{i,} server', "kimi service mode")
+  // A quoted group is still literal, and so is a quoted comma.
+  assertAllowed('echo "{kimi,server}"')
+  assertAllowed("echo '{kimi,server}'")
+  assertAllowed('echo {kimi\\,"server"}')
+  assertAllowed('x{kimi,"server"}')
+  assertAllowed("grep -rn 'kimi server' .")
+  assertAllowed("printf '%s\\n' {debug,release}")
 })
 
 test("listener quote state follows ANSI-C words, comments, and heredocs", () => {
