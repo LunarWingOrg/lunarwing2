@@ -21,6 +21,8 @@
 //!   so detection also probes `docker version`/`docker info` via CLI if the
 //!   named pipe is unavailable.
 
+use crate::sandbox::cli_runner::{ContainerRuntime, runtime_probe_order};
+use crate::sandbox::config::SandboxRuntime;
 use crate::sandbox::runtime_path;
 
 /// Docker daemon availability status.
@@ -97,9 +99,100 @@ impl Platform {
 }
 
 /// Result of a Docker detection check.
+#[derive(Debug, Clone, Copy)]
 pub struct DockerDetection {
     pub status: DockerStatus,
     pub platform: Platform,
+}
+
+/// Result of selecting the runtime CLI the generic sandbox will drive.
+///
+/// The generic sandbox shells out to `podman` or `docker` directly, so
+/// Docker's daemon is not the only way to have a working sandbox. This
+/// selection mirrors [`crate::sandbox::cli_runner::CliRunner::detect`]'s
+/// probe order, which is what the sandbox actually uses.
+#[derive(Debug, Clone)]
+pub struct SandboxRuntimeDetection {
+    /// Runtime CLI the sandbox will use; `None` when none is usable.
+    pub runtime: Option<ContainerRuntime>,
+    /// Configured preference that produced this selection.
+    pub configured: SandboxRuntime,
+    /// Every runtime probed, in probe order, with its detection result.
+    /// Probes stop at the first usable runtime, so this is usually shorter
+    /// than the full order.
+    pub tried: Vec<(ContainerRuntime, DockerDetection)>,
+}
+
+impl SandboxRuntimeDetection {
+    /// Startup diagnostic naming the runtime actually selected.
+    ///
+    /// Only reports `sandbox disabled` when every runtime in the probe
+    /// order was unusable (WI#871): a healthy podman-only host must not
+    /// warn about Docker's absence.
+    pub fn summary(&self) -> String {
+        if let Some(runtime) = self.runtime {
+            return format!("sandbox runtime: {}", runtime.binary());
+        }
+        let details: Vec<String> = self
+            .tried
+            .iter()
+            .map(|(runtime, detection)| describe_unusable_runtime(*runtime, detection))
+            .collect();
+        format!(
+            "no usable container runtime -- sandbox disabled for this session: {}",
+            details.join("; ")
+        )
+    }
+}
+
+/// One runtime's failure, with the platform-specific hint that fixes it.
+fn describe_unusable_runtime(runtime: ContainerRuntime, detection: &DockerDetection) -> String {
+    match (runtime, detection.status) {
+        (_, DockerStatus::Available) => format!("{} is available", runtime.binary()),
+        (ContainerRuntime::Podman, DockerStatus::NotInstalled) => {
+            format!("podman is not installed ({})", podman_install_hint())
+        }
+        (ContainerRuntime::Podman, _) => {
+            "podman is installed but `podman version` failed".to_string()
+        }
+        (ContainerRuntime::Docker, DockerStatus::NotInstalled) => format!(
+            "docker is not installed ({})",
+            detection.platform.install_hint()
+        ),
+        (ContainerRuntime::Docker, _) => format!(
+            "docker is installed but not running ({})",
+            detection.platform.start_hint()
+        ),
+    }
+}
+
+/// Select the container runtime the generic sandbox will drive.
+///
+/// Probes in [`crate::sandbox::cli_runner::runtime_probe_order`] and stops at
+/// the first usable runtime, so callers can log what the sandbox will run on
+/// instead of reporting a missing Docker on a podman-backed host (WI#871).
+pub async fn check_sandbox_runtime(preferred: SandboxRuntime) -> SandboxRuntimeDetection {
+    let mut tried = Vec::new();
+    for runtime in runtime_probe_order(preferred) {
+        let detection = match runtime {
+            ContainerRuntime::Podman => check_podman().await,
+            ContainerRuntime::Docker => check_docker().await,
+        };
+        let available = detection.status.is_ok();
+        tried.push((runtime, detection));
+        if available {
+            return SandboxRuntimeDetection {
+                runtime: Some(runtime),
+                configured: preferred,
+                tried,
+            };
+        }
+    }
+    SandboxRuntimeDetection {
+        runtime: None,
+        configured: preferred,
+        tried,
+    }
 }
 
 /// Check whether Docker is installed and running.
@@ -289,5 +382,52 @@ mod tests {
             DockerStatus::Available | DockerStatus::NotInstalled | DockerStatus::NotRunning => {}
             DockerStatus::Disabled => panic!("check_podman should never return Disabled"),
         }
+    }
+
+    fn detection(status: DockerStatus) -> DockerDetection {
+        DockerDetection {
+            status,
+            platform: Platform::Linux,
+        }
+    }
+
+    /// WI#871: a selected runtime is reported by name, never as a Docker
+    /// problem — a podman-only host must not read as "sandbox disabled".
+    #[test]
+    fn sandbox_runtime_summary_names_the_selected_runtime() {
+        let selection = SandboxRuntimeDetection {
+            runtime: Some(ContainerRuntime::Podman),
+            configured: SandboxRuntime::Auto,
+            tried: vec![(ContainerRuntime::Podman, detection(DockerStatus::Available))],
+        };
+        let summary = selection.summary();
+        assert_eq!(summary, "sandbox runtime: podman");
+        assert!(!summary.contains("sandbox disabled"), "{summary}");
+        assert!(!summary.contains("Docker"), "{summary}");
+    }
+
+    #[test]
+    fn sandbox_runtime_summary_only_says_disabled_when_every_runtime_failed() {
+        let selection = SandboxRuntimeDetection {
+            runtime: None,
+            configured: SandboxRuntime::Auto,
+            tried: vec![
+                (
+                    ContainerRuntime::Podman,
+                    detection(DockerStatus::NotInstalled),
+                ),
+                (
+                    ContainerRuntime::Docker,
+                    detection(DockerStatus::NotRunning),
+                ),
+            ],
+        };
+        let summary = selection.summary();
+        assert!(summary.contains("sandbox disabled"), "{summary}");
+        assert!(summary.contains("podman is not installed"), "{summary}");
+        assert!(
+            summary.contains("docker is installed but not running"),
+            "{summary}"
+        );
     }
 }

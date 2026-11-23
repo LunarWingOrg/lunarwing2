@@ -145,7 +145,8 @@ pub use config::{
 };
 pub use container::{ContainerOutput, ContainerRunner, connect_docker};
 pub use detect::{
-    DockerDetection, DockerStatus, Platform, check_docker, check_podman, podman_install_hint,
+    DockerDetection, DockerStatus, Platform, SandboxRuntimeDetection, check_docker, check_podman,
+    check_sandbox_runtime, podman_install_hint,
 };
 pub use error::{Result, SandboxError};
 pub use git_grant::{
