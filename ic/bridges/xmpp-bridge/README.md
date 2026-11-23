@@ -73,11 +73,11 @@ polls from zero while this process still holds up to `XMPP_BRIDGE_MAX_MESSAGES`
 delivered messages. A request cursor below the acknowledged one is therefore
 read as such a reset: the page starts after the acknowledged cursor, so nothing
 already delivered comes back as a new inbound turn, and messages that arrived
-while the daemon was down are still served. A page that was handed out but not
-acknowledged is served again, so delivery stays at-least-once (WI#850) up to
-the daemon's in-memory queue: the poller acknowledges a page once it has handed
-it to the agent's queue, so messages still waiting in that queue when the
-daemon restarts are not served again.
+while the daemon was down are served unless discarded. A retained page that
+was handed out but not acknowledged is served again, so delivery stays
+at-least-once (WI#850) up to the daemon's in-memory queue: the poller
+acknowledges a page once it has handed it to the agent's queue, so messages
+still waiting in that queue when the daemon restarts are not served again.
 
 Upgrade order does not matter for delivery. An older bridge ignores `limit`
 and returns its whole backlog with its newest cursor; the XMPP guest then
@@ -109,3 +109,49 @@ curl -sS -X POST "$BASE/v1/outbound-rate-limit" \
 
 Set `reset_counter` to `true` if you want to clear the current rolling-hour
 usage at the same time.
+
+## Pending inbound messages and optional discard
+
+`GET /v1/status` reports `pending_messages` and `oldest_queued_age_secs`
+(`null` when none are pending). Pending means unacknowledged by the poller;
+it can include a page already served but not yet acknowledged.
+`queued_messages` still counts the entire replay ring.
+
+`POST /v1/messages/drain` requires a JSON body with exactly one mode:
+`{"all":true}` or `{"older_than_secs":n}` (age at least `n` seconds).
+An age-based drain discards only pending messages that have never been served,
+leaving any unacknowledged page available for retry. `all` discards all pending
+messages, including any unacknowledged page, and gives up that retry. Both modes
+report `drained`, `remaining`, and `oldest_queued_age_secs`. Nonzero drops are
+logged.
+
+```bash
+BASE=http://127.0.0.1:8787 ic/scripts/xmpp-drain-queue.sh status
+# Only if you intend to discard messages:
+BASE=http://127.0.0.1:8787 ic/scripts/xmpp-drain-queue.sh drain 3600
+```
+
+Supply `XMPP_BRIDGE_TOKEN` through the environment and use the tenant's
+registered bridge port on multi-tenant hosts. Use `drain --all` only for an
+intentional full discard of pending messages.
+
+Use a manual drain only while the daemon is not polling and the bridge is
+still running, before the daemon resumes. This can apply to a daemon-only
+restart that leaves a separate bridge running (for example, on OpenRC).
+The stock systemd `PartOf=lunarwing.service` coupling and a managed
+`upgrade-tenant` on either init stop the bridge, so its memory-only ring
+does not survive those stops.
+
+`XMPP_BRIDGE_STALE_QUEUE_SECS` defaults to `0` (off). A value of at least
+120 enables expiry on the first poll after a gap of at least that many
+seconds. Only never-served pending messages at least that old are dropped;
+a served but unacknowledged page remains available for retry.
+The first poll of a new bridge process and normal successive polls do not
+expire messages when their gap is below the threshold. If you opt in, choose a
+threshold above the configured poll interval and expected processing delays;
+a long processing stall is indistinguishable from poller downtime here.
+Invalid values warn and disable expiry. Managed bridge env
+re-renders preserve a configured numeric value.
+
+Neither mechanism protects acknowledged messages already queued in the
+daemon at restart. That durability gap (WI#854 D3) remains open.

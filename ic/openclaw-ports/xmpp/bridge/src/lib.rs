@@ -72,6 +72,69 @@ pub struct MessagesResponse {
     pub messages: Vec<BridgeMessage>,
 }
 
+/// Request body for `POST /v1/messages/drain` (WI#854).
+///
+/// Select exactly one discard mode for unacknowledged inbound messages.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DrainRequest {
+    /// Explicitly discard all pending messages, including a page awaiting retry.
+    pub all: bool,
+    /// Drain only never-served pending messages at least this many seconds old.
+    pub older_than_secs: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for DrainRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default)]
+            all: bool,
+            older_than_secs: Option<u64>,
+        }
+
+        struct ObjectOnly;
+        impl<'de> serde::de::Visitor<'de> for ObjectOnly {
+            type Value = DrainRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with named drain options")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Fields {
+                    all,
+                    older_than_secs,
+                } = Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(DrainRequest {
+                    all,
+                    older_than_secs,
+                })
+            }
+        }
+
+        // A derived struct alone also accepts positional arrays. Full discard
+        // must name the `all` field explicitly.
+        deserializer.deserialize_map(ObjectOnly)
+    }
+}
+
+/// Result of a drain: how many queued messages were discarded and what is
+/// left for the poller. Counts are also logged by the bridge, so a drain is
+/// never a silent discard (WI#854).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DrainResponse {
+    #[serde(default)]
+    pub drained: usize,
+    #[serde(default)]
+    pub remaining: usize,
+    /// Age of the oldest message still queued, if any.
+    pub oldest_queued_age_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutboundRateLimitRequest {
     pub max_messages_per_hour: Option<u32>,
@@ -119,6 +182,12 @@ pub struct BridgeStatusResponse {
     pub current_cursor: u64,
     #[serde(default)]
     pub queued_messages: usize,
+    /// Number of retained entries not yet acknowledged by the poller.
+    #[serde(default)]
+    pub pending_messages: usize,
+    /// Age of the oldest pending message, or `None` if there are none.
+    #[serde(default)]
+    pub oldest_queued_age_secs: Option<u64>,
     pub jid: Option<String>,
     #[serde(default)]
     pub configured_rooms: Vec<String>,
@@ -217,5 +286,31 @@ mod tests {
         let decoded: SendRequest = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(decoded, request);
         assert_eq!(decoded.attachments[0].data_base64, "AQID");
+    }
+
+    #[test]
+    fn drain_request_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<DrainRequest>(r#"{"older_than":3600}"#).is_err());
+        assert!(serde_json::from_str::<DrainRequest>("[true,null]").is_err());
+    }
+
+    #[test]
+    fn drain_response_round_trips() {
+        let response = DrainResponse {
+            drained: 3,
+            remaining: 1,
+            oldest_queued_age_secs: Some(42),
+        };
+        let json = serde_json::to_string(&response).expect("serializes");
+        let decoded: DrainResponse = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn status_without_queue_age_deserializes() {
+        // A bridge that predates WI#854 omits the field entirely.
+        let json = r#"{"configured":true,"queued_messages":0}"#;
+        let status: BridgeStatusResponse = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(status.oldest_queued_age_secs, None);
     }
 }
