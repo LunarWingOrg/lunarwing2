@@ -34,6 +34,9 @@ pub struct BootInfo {
     pub heartbeat_interval_secs: u64,
     pub sandbox_enabled: bool,
     pub docker_status: crate::sandbox::detect::DockerStatus,
+    /// Runtime CLI the generic sandbox selected (WI#871). `None` when the
+    /// sandbox is disabled or no runtime is usable.
+    pub sandbox_runtime: Option<crate::sandbox::ContainerRuntime>,
     pub acp_enabled: bool,
     pub routines_enabled: bool,
     pub skills_enabled: bool,
@@ -222,10 +225,9 @@ pub fn print_boot_screen(info: &BootInfo) {
 
     // Sandbox / Docker
     if info.sandbox_enabled {
-        let suffix = match info.docker_status {
-            crate::sandbox::detect::DockerStatus::Available => "",
-            crate::sandbox::detect::DockerStatus::NotRunning => ":stopped",
-            _ => ":unavail",
+        let suffix = match info.sandbox_runtime {
+            Some(runtime) => format!(":{}", runtime.binary()),
+            None => ":unavail".to_string(),
         };
         tags.push(format!("sandbox{suffix}"));
     }
@@ -305,6 +307,7 @@ mod tests {
             heartbeat_interval_secs: 1800,
             sandbox_enabled: true,
             docker_status: DockerStatus::Available,
+            sandbox_runtime: Some(crate::sandbox::ContainerRuntime::Podman),
             acp_enabled: false,
             routines_enabled: true,
             skills_enabled: true,
@@ -339,6 +342,7 @@ mod tests {
             heartbeat_interval_secs: 0,
             sandbox_enabled: false,
             docker_status: DockerStatus::Disabled,
+            sandbox_runtime: None,
             acp_enabled: false,
             routines_enabled: false,
             skills_enabled: false,
@@ -404,6 +408,7 @@ mod tests {
             heartbeat_interval_secs: 0,
             sandbox_enabled: false,
             docker_status: DockerStatus::Disabled,
+            sandbox_runtime: None,
             acp_enabled: false,
             routines_enabled: false,
             skills_enabled: false,

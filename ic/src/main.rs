@@ -435,20 +435,29 @@ async fn async_main() -> anyhow::Result<()> {
     let job_event_tx = orch.job_event_tx;
     let prompt_queue = orch.prompt_queue;
     let docker_status = orch.docker_status;
+    let sandbox_runtime = orch.sandbox_runtime;
 
-    // Derive user-facing warning from docker_status for channel notification
-    let docker_user_warning: Option<String> = match docker_status {
-        lunarwing::sandbox::DockerStatus::NotInstalled => Some(
-            "Sandbox is enabled but Docker is not installed -- \
-             full_job routines will fail until Docker is available."
+    // Derive the user-facing warning for channel notification (WI#871).
+    //
+    // `sandbox_runtime` is the CLI the generic sandbox actually drives, so a
+    // missing Docker daemon only affects job containers, not the sandbox.
+    let docker_user_warning: Option<String> = if !config.sandbox.enabled {
+        None
+    } else if let Some(runtime) = sandbox_runtime {
+        match docker_status {
+            lunarwing::sandbox::DockerStatus::Available => None,
+            _ => Some(format!(
+                "Sandbox is running on {}; the Docker-compatible API is unavailable, so \
+                 full_job routines will fail until a Docker-compatible socket is reachable.",
+                runtime.binary()
+            )),
+        }
+    } else {
+        Some(
+            "Sandbox is enabled but no usable container runtime was found (podman or \
+             docker) -- commands will fail until one is installed."
                 .to_string(),
-        ),
-        lunarwing::sandbox::DockerStatus::NotRunning => Some(
-            "Sandbox is enabled but Docker is not running -- \
-             full_job routines will fail until Docker is started."
-                .to_string(),
-        ),
-        _ => None,
+        )
     };
 
     // ── Channel setup ──────────────────────────────────────────────────
@@ -993,6 +1002,7 @@ async fn async_main() -> anyhow::Result<()> {
             heartbeat_interval_secs: config.heartbeat.interval_secs,
             sandbox_enabled: config.sandbox.enabled,
             docker_status,
+            sandbox_runtime,
             acp_enabled: config.acp.enabled,
             routines_enabled: config.routines.enabled,
             skills_enabled: config.skills.enabled,
