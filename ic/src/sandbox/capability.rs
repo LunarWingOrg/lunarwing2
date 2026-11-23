@@ -1232,6 +1232,47 @@ mod tests {
     }
 
     #[test]
+    fn git_grant_records_the_write_class_and_credential_names_without_values() {
+        let temp = git_workspace();
+        let mut config = git_config("origin=http://git.internal/org/repo.git");
+        config.git = Some(
+            crate::sandbox::GitGrantConfig::from_full_spec(
+                "origin=http://git.internal/org/repo.git",
+                "origin",
+                "origin=GIT_ORIGIN_TOKEN",
+                false,
+            )
+            .expect("grant spec")
+            .expect("grant"),
+        );
+        let manifest = git_manifest(serde_json::json!({
+            "manifest_version": 1,
+            "network": {"mode": "proxy-enforced"},
+            "extensions": ["git-remotes"]
+        }));
+        let decision = authorize_manifest(&manifest, &config, temp.path()).expect("grant");
+        let git = decision.evidence.git.as_ref().expect("git evidence");
+        assert_eq!(
+            git.remotes[0].operations,
+            vec![
+                crate::sandbox::git_grant::GitOperationClass::Read,
+                crate::sandbox::git_grant::GitOperationClass::Write,
+            ]
+        );
+        assert_eq!(git.credentials.len(), 1);
+        assert_eq!(git.credentials[0].remote, "origin");
+        assert_eq!(git.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+        let json = audit_json(&decision.evidence).expect("audit");
+        assert!(
+            json.contains("\"operations\":[\"read\",\"write\"]"),
+            "{json}"
+        );
+        assert!(json.contains("GIT_ORIGIN_TOKEN"), "{json}");
+        // The variable name is recorded; no value is.
+        assert!(!json.contains("Basic "), "{json}");
+    }
+
+    #[test]
     fn git_grant_records_host_operations_and_no_secret_values() {
         let temp = git_workspace();
         let config = git_config(
