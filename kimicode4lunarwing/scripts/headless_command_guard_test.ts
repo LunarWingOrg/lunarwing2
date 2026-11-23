@@ -894,6 +894,12 @@ test("a long command of repeated words is decided without rescanning", () => {
   // 12 KB of subshells stay inside the analysis deadline.
   assertAllowed("$(git log -1) ".repeat(1000))
   assertAllowed("(git status) ".repeat(1000))
+  // The WI#856 clause readers are linear too: 16 KB of one repeated verb
+  // stays one clause, and re-reading its tail per match would trip the
+  // analysis deadline.
+  assertAllowed("mv a ".repeat(2700))
+  assertAllowed('tar -cf /tmp/a.tar "a b" '.repeat(600))
+  assertAllowed("chmod -R ".repeat(1500))
 })
 
 test("interpreter one-liners delete without parentheses or through a binding", () => {
@@ -1257,4 +1263,99 @@ test("a git alias cannot smuggle a discard past the verb rules (WI#842)", () => 
   assertAllowed("git config core.editor 'vim -e'")
   assertAllowed('git config user.name "Jane -e Doe"')
   assertAllowed("git -C sub log --oneline")
+})
+
+test("a quoted separator does not hide the rest of its command (WI#856)", () => {
+  // The segment splitter read `;`, `|`, `&` and newlines inside quotes as
+  // command boundaries, so the rule that owned a verb saw only the first half
+  // of the command and the dangerous operand landed in a segment without the
+  // verb (a containment escape for `rm`, not a parse nicety).
+  assertBlocked('chmod -R 777 "a;b" /etc', "recursive")
+  assertBlocked('chmod -R 777 "a|b" /etc', "recursive")
+  assertBlocked('chown -R u:u "a&b" /usr', "recursive")
+  assertBlocked('chmod -R 777 "l1\nl2" /etc', "recursive")
+  assertBlocked('rm -rf "/tmp/x;y" /app/hooks', "deletion outside")
+  assertBlocked('find /app/hooks -name "a;b" -o -delete', "deletion outside")
+  assertBlocked('git -C "/tmp/r;x" reset --hard', "git command")
+  // git's value options were read by whitespace, so a quoted value carrying a
+  // space became the "verb" and the real verb was invisible.
+  assertBlocked('git -C "/tmp/a b" reset --hard', "git command")
+  assertBlocked('git -c "x=a b" reset --hard', "git command")
+  assertBlocked('git --git-dir "/tmp/a b" reset --hard', "git command")
+  assertBlocked('git -C"/tmp/a b" reset --hard', "git command")
+  // A separator inside an argument stays ordinary work, and so does a
+  // deletion whose only operand is that literal temp path.
+  assertAllowed("grep -rn 'a;b' docs/")
+  assertAllowed("echo 'a;b'")
+  assertAllowed('git log --grep="a|b"')
+  assertAllowed('git commit -m "fix; thing"')
+  assertAllowed('git -C "/tmp/a b" status')
+  assertAllowed('chmod -R 755 "/tmp/a;b"')
+  assertAllowed('rm -rf "/tmp/x;y"')
+  assertAllowed('find /tmp -name "a;b" -delete')
+  assertAllowed('find /tmp -name "a;b" -o -delete')
+  assertAllowed('cp a "/tmp/x;y"')
+  assertAllowed('tar -cf /tmp/a.tar "a;b"')
+  assertAllowed('rsync -a "/tmp/x;y" /tmp/out')
+})
+
+test("a quoted separator does not hide a device write or a protected rename (WI#856)", () => {
+  // The same rest-of-clause capture fed the tee/cp, mv, tar and rsync rules:
+  // each stopped at a separator inside an argument and lost the operand that
+  // followed it.
+  assertBlocked('tee "a;b" /dev/sda', "block-device")
+  assertBlocked('cp "a;b" /dev/sda', "block-device")
+  assertBlocked('mv "a;b" /app/hooks', "protected tree")
+  assertBlocked('tar --remove-files -cf /tmp/a.tar "/tmp/x;y" /app/hooks', "deletion outside")
+  assertBlocked('rsync -a "/tmp/x;y" /app/hooks --delete', "deletion outside")
+})
+
+test("a quoted separator does not split the pipeline that feeds an xargs (WI#856)", () => {
+  // feedingPipeline cut the text before xargs at a `;` or newline inside a
+  // quoted argument, so the feeding `find` fell out of the pipeline and the
+  // deleted set read as unverifiable — the same hole in the fail-closed
+  // direction it was written to close.
+  assertAllowed('find /tmp -name "a;b" | xargs rm')
+  assertAllowed('find /tmp -name "a;b" -print0 | xargs -0 rm')
+  assertBlocked('find /app/hooks -name "a;b" | xargs rm', "deletion outside")
+  assertBlocked('find /app/hooks -name "a;b" -print0 | xargs -0 rm', "deletion outside")
+  // The list boundary outside the quotes is still a boundary.
+  assertAllowed('echo "a;b" ; find /tmp -name x | xargs rm')
+  assertBlocked('find /app/hooks -name x | xargs rm', "deletion outside")
+})
+
+test("quoted logical operators stay within their pipeline arguments (WI#856)", () => {
+  for (const operator of ["&&", "||"]) {
+    assertAllowed(`find /tmp -name "a${operator}b" | xargs rm`)
+    assertBlocked(`find /app/hooks -name "a${operator}b" | xargs rm`, "deletion outside")
+    assertBlocked(`base64 -d "a${operator}b" | sh`, "decoded content")
+    assertAllowed(`printf '%s' "a${operator}b" | cat`)
+    assertAllowed(`true ${operator} find /tmp -name x | xargs rm`)
+  }
+})
+
+test("escaped apostrophes in ANSI-C words do not end the quote (WI#856)", () => {
+  const argument = String.raw`$'a\';b'`
+  assertBlocked(`chmod -R 777 ${argument} /etc`, "recursive")
+  assertBlocked(`chown -R u:u ${argument} /usr`, "recursive")
+  assertBlocked(`find /app/hooks -name ${argument} -o -delete`, "deletion outside")
+  assertBlocked(String.raw`git -C $'/tmp/a\' b' reset --hard`, "git command")
+  assertAllowed(String.raw`git -C $'/tmp/a\' b' status`)
+  assertAllowed(`printf '%s\\n' ${argument}`)
+})
+
+test("ANSI-C encoded words fail closed without evaluating the shell (AKZ-1)", () => {
+  // The hook only sees text. Use inert fixtures for command, option and path
+  // positions; none of these strings is executed.
+  for (const escaped of [String.raw`\x66`, String.raw`\146`, String.raw`\u0066`,
+    String.raw`\U00000066`, String.raw`\cF`, String.raw`\t`]) {
+    assertBlocked(`fixture $'${escaped}ile'`, "unverifiable ANSI-C escape")
+  }
+  assertBlocked(String.raw`$'\x66ixture' --help`, "unverifiable ANSI-C escape")
+  assertBlocked(String.raw`git -c $'\x63ore.abbrev=8' status`, "unverifiable ANSI-C escape")
+  assertBlocked(String.raw`git -C $'/tmp/\x66ixture' status`, "unverifiable ANSI-C escape")
+  assertBlocked("fixture $\\\n'\\x66ile'", "unverifiable ANSI-C escape")
+  assertAllowed(String.raw`printf '%s\n' $'it\'s literal'`)
+  assertAllowed(String.raw`printf '%s\n' "\x66ixture"`)
+  assertAllowed("printf '%s\\n' $'plain text'")
 })
