@@ -45,7 +45,8 @@ pebble4lunarwing/patches/wi477-request-events.patch
 pebble4lunarwing/scripts/verify_upstream_lock.py
 pebble4lunarwing/scripts/toolchain-profile.sh
 pebble4lunarwing/scripts/rustup-wrapper.sh
-pebble4lunarwing/scripts/pebble-self-update-guard.sh'
+pebble4lunarwing/scripts/pebble-self-update-guard.sh
+pebble4lunarwing/scripts/worker-download-retry.sh'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 WITH_TOOLCHAINS=false
@@ -65,7 +66,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
 opencode4lunarwing/entrypoint-task-setup.sh
 opencode4lunarwing/config/opencode.json
 opencode4lunarwing/models-dev/api.json
-opencode4lunarwing/scripts/check_models_dev_snapshot.py'
+opencode4lunarwing/scripts/check_models_dev_snapshot.py
+opencode4lunarwing/scripts/worker-download-retry.sh'
         source_ref=f4e363c8295fa90a03dddc451882fffe8fbce357
         build_args="OPENCODE_VERSION=v1.19.6
 OPENCODE_REF=f4e363c8295fa90a03dddc451882fffe8fbce357
@@ -118,7 +120,8 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
 opencode2.4lunarwing/scripts/runtime_smoke.py
 opencode2.4lunarwing/scripts/runtime_smoke_test.py
-opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
+opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh
+opencode2.4lunarwing/scripts/worker-download-retry.sh'
         source_ref=c0ad18b402eb2827fc1ee71c171b1177b3fc02d1
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
@@ -197,7 +200,8 @@ kimicode4lunarwing/scripts/task_runner_test.ts
 kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
-kimicode4lunarwing/scripts/workspace_path.ts'
+kimicode4lunarwing/scripts/workspace_path.ts
+kimicode4lunarwing/scripts/worker-download-retry.sh'
         source_ref=2.7.2
         build_args="KIMI_CODE_VERSION=2.7.2
 WITH_TOOLCHAINS=false
@@ -256,7 +260,8 @@ lunardepth4lunarwing/scripts/prepare_lockfile_deploy_test.py
 lunardepth4lunarwing/scripts/verify_deployed_closure.ts
 lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
-lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
+lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py
+lunardepth4lunarwing/scripts/worker-download-retry.sh'
         source_ref=0472d115e5297093f249c222639431ba8ff0bb78
         build_args="LUNARDEPTH_REPOSITORY=https://git.lunarwing.org/lunarwing/lunardepth.git
 LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78
@@ -306,7 +311,7 @@ build_image() {
     output_ref=$1
     output_metadata=$2
     clean=$3
-    set -- buildctl-daemonless.sh build
+    set -- buildctl-daemonless.sh build --progress=plain
     [ "$clean" = true ] && set -- "$@" --no-cache
     set -- "$@" \
         --frontend dockerfile.v0 \
@@ -329,7 +334,7 @@ metadata_digest() {
     awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
 }
 
-# Bounded retries for transient registry push and Debian snapshot flakes.
+# Bounded retries for transient registry push, Debian snapshot and download flakes.
 # BuildKit fetches a jwt/auth token per push, and several worker candidates
 # pushing at once trip GitLab's 429 rate limit at the very last step — pipeline
 # 5984 lost the opencode, opencode2 and kimi candidates (and, by cascade, their
@@ -359,16 +364,21 @@ metadata_digest() {
 # 6-attempt/~15-minute window (opencode and pebble each burned all six, and
 # their scans then stopped at the "worker-image.env is missing" guard). Eight
 # attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
-# (~95.25 minutes) of sleeping. The separate three-attempt snapshot ladder
-# adds at most 120+300 = 420 s plus two jitter values; even conservatively
-# adding both complete ladders and nine maximum jitter values gives 6396 s
-# of sleeping, below the roughly 10000 s cap observed on runner cccccc (the
-# YAML permits 8 h). Dockerfile apt calls have their own 240/600 s limits,
-# so a stalled fetch becomes a retryable exit 124 instead of burning that cap.
-# The final attempt on either ladder is never followed by another delay.
+# (~95.25 minutes) of sleeping. Adding the full snapshot (120+300 s) and
+# download (60+60 s) ladders and eleven maximum jitters gives
+# 5715 + 420 + 120 + 11*29 = 6574 s per build phase. This is conservative:
+# all three ladders share the eight-attempt limit. The Dockerfile helper adds
+# at most 20 + 40 + 2*9 = 78 s per wrapped download; Kimi and LunarDepth each
+# wrap four, so even 8*4*78 = 2496 s more gives 9070 s of sleeps per phase.
+# That is below the roughly 10000 s cap observed on runner cccccc (YAML: 8 h),
+# not a wall-clock bound for the job: candidate and clean rebuild each get a
+# ladder, and executing the builds also takes time. Dockerfile apt calls
+# still have their own 240/600 s limits.
+# The final attempt on any ladder is never followed by another delay.
 _bwr_max_attempts=8
 _bwr_base_delay=45
 _bwr_snapshot_max_attempts=3
+_bwr_download_max_attempts=3
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -397,12 +407,53 @@ transient_snapshot_failure() {
     grep -qE 'process "([^"\\]|\\.)*snapshot\.debian\.org([^"\\]|\\.)*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
 }
 
+# WI#862: find the failed RUN in BuildKit plain progress, then read only
+# its timestamped output, not the command header or duplicated error footer.
+# Wrapped steps require the helper's terminal, exit-code-matched signal:
+# a download can recover and then a test in the same RUN can fail.
+# The pre-helper partial checkout in job 204104 is the narrow legacy case:
+# require its terminal promisor failure with a matching RPC transport error.
+transient_download_failure() {
+    awk '
+        NR == FNR {
+            if ($0 ~ /^#[0-9]+ ERROR: process ".*" did not complete successfully: exit code: [0-9]+$/) {
+                if (failed && failed != $1) ambiguous = 1
+                failed = $1
+                status = $NF
+                wrapped = /[[:space:]]wdr_retry[[:space:]]/
+                partial_clone = !wrapped && status == 128 &&
+                    index($0, "git clone --filter=blob:none --no-checkout ") &&
+                    index($0, " checkout --detach ")
+            }
+            next
+        }
+        $1 == failed && sub(/^#[0-9]+ -?[0-9]+(\.[0-9]+)? /, "") && NF {
+            sub(/\r$/, "")
+            last = $0
+            if ($0 ~ /^error: RPC failed; curl (18|52|55|56|92)( |$)/) {
+                rpc_drop = 1
+            } else if ($0 !~ /^fatal: (expected .packfile.|could not fetch [0-9a-f]+ from promisor remote)$/) {
+                rpc_drop = 0
+            }
+        }
+        END {
+            if (!failed || ambiguous) exit 1
+            if (wrapped) {
+                marker = "worker-download-retry: transient download retries exhausted (exit " status ")"
+                exit (last != marker)
+            }
+            exit !(partial_clone && rpc_drop && last ~ /^fatal: could not fetch [0-9a-f]+ from promisor remote$/)
+        }
+    ' "$push_attempt_log" "$push_attempt_log"
+}
+
 build_image_with_retry() {
     _bwr_ref=$1
     _bwr_meta=$2
     _bwr_clean=$3
     _bwr_attempt=1
     _bwr_snapshot_attempt=1
+    _bwr_download_attempt=1
     while [ "$_bwr_attempt" -le "$_bwr_max_attempts" ]; do
         : > "$push_attempt_rc"
         # tee keeps the build streaming into the job trace; the brace group
@@ -434,6 +485,19 @@ build_image_with_retry() {
             echo "retrying after a transient snapshot.debian.org failure (attempt $_bwr_snapshot_attempt/$_bwr_snapshot_max_attempts) in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
             _bwr_snapshot_attempt=$((_bwr_snapshot_attempt + 1))
+            _bwr_attempt=$((_bwr_attempt + 1))
+        elif [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] &&
+            [ "$_bwr_download_attempt" -lt "$_bwr_download_max_attempts" ] &&
+            transient_download_failure; then
+            # WI#862: a dropped connection while a pinned input downloads.
+            # The base is short because the Dockerfile helper inside the step
+            # already retried three times; this covers what it exhausted.
+            _bwr_base=60
+            _bwr_jitter=$(( CI_JOB_ID % 30 ))
+            _bwr_delay=$((_bwr_base + _bwr_jitter))
+            echo "transient download failure (attempt $_bwr_download_attempt/$_bwr_download_max_attempts); retrying in ${_bwr_delay}s" >&2
+            sleep "$_bwr_delay"
+            _bwr_download_attempt=$((_bwr_download_attempt + 1))
             _bwr_attempt=$((_bwr_attempt + 1))
         else
             echo "image build attempt $_bwr_attempt/$_bwr_max_attempts failed (exit $_bwr_status); not retrying" >&2

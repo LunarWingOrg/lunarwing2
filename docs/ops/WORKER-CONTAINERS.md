@@ -63,6 +63,48 @@ are unchanged, but the Dockerfile command edits re-key their layers.
 Protected candidate-versus-clean-rebuild digests, all four scans, and the
 opencode2 exposure verifier remain the image acceptance gates.
 
+## Pinned-input download retry (WI#862, 2026-11-23)
+
+A worker image build failed on the first dropped connection to
+`git.lunarwing.org` while a Dockerfile step downloaded a pinned input
+(job 204104, pipeline 8578: `error: RPC failed; curl 55 Failed sending data
+to the peer` in `[builder 4/21]`), and 23 jobs in 16 pipelines died fetching
+this repository before their script ran. Three paths now retry a dropped or
+refused connection, and nothing else.
+
+**CI image builds.** Candidates and clean rebuilds each have a three-attempt
+download ladder in `.gitlab/scripts/build-worker-image.sh`. It uses only the
+failing BuildKit step's output. For wrapped commands, it requires the helper's
+terminal signal that the last attempt failed on a transient connection error.
+A recovered download cannot trigger a rebuild when a subsequent test fails,
+even within the same `RUN`. The historical checkout trace from job 204104 is
+recognized only with both the RPC drop and the terminal promisor failure.
+
+**mt-admin worker builds.** mt-admin runs the same lane Dockerfiles with
+`podman build`, whose trace has a different shape, so the retry lives
+*inside* the Dockerfile instead: `scripts/worker-download-retry.sh` (one
+byte-identical copy per lane) is sourced in a RUN and wraps each download
+with `wdr_retry`, including LunarDepth's `bash -o pipefail` with `set -eu`.
+It covers the LunarDepth clone and the partial clone's
+on-demand checkout, corepack, every `npm ci`, `pnpm install
+--frozen-lockfile` and `bun install --frozen-lockfile`. The rustup and Go
+toolchain curls (only with `WITH_TOOLCHAINS=true`) use `curl --retry`, so
+no toolchain retry helper is needed. Kimi's runtime-stage install bind-mounts
+the helper for that step only. A retry starts from a cleaned tree. A checksum
+or integrity failure, frozen-lockfile refusal, HTTP 401/403/404 or full disk
+is not a transient download error. Pin checks, other verification and tests
+remain outside the download retry.
+
+**The runner's own fetch.** `GET_SOURCES_ATTEMPTS: "3"` in
+`.gitlab/ci/defaults.yml` configures up to three `get_sources` attempts.
+CI config validation is not runtime evidence: runner acceptance requires
+a job trace showing a second fetch attempt after a failed first attempt.
+
+Apt is out of scope: `Acquire::Retries` and the snapshot ladder are
+unchanged. The build-wrapper tests replay the failing vertex from job 204104
+and check that recovered downloads do not mask genuine failures. The helper
+tests exercise `/bin/sh` and LunarDepth's Bash `pipefail` mode.
+
 ## APT transport, retry, and client hardening (WI#561, 2026-11-05)
 
 [CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518) requires an

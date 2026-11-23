@@ -36,6 +36,8 @@ ARG DEBIAN_SNAPSHOT
 ARG MODELS_DEV_SNAPSHOT_SHA256
 WORKDIR /build
 
+COPY scripts/worker-download-retry.sh /build/worker-download-retry.sh
+
 COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
@@ -56,18 +58,20 @@ RUN set -eu; \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
-    git init /build/opencode && \
-    git -C /build/opencode remote add origin https://github.com/anomalyco/opencode.git && \
-    git -C /build/opencode fetch --depth 1 origin "refs/tags/${OPENCODE_VERSION}" && \
-    test "$(git -C /build/opencode rev-parse FETCH_HEAD)" = "${OPENCODE_REF}" && \
-    git -C /build/opencode checkout --detach "${OPENCODE_REF}" && \
+    . /build/worker-download-retry.sh && \
+    wdr_retry "opencode pinned tag fetch and checkout" "rm -rf /build/opencode" \
+      'git init /build/opencode && git -C /build/opencode remote add origin https://github.com/anomalyco/opencode.git && git -C /build/opencode fetch --depth 1 origin "refs/tags/${OPENCODE_VERSION}" && git -C /build/opencode checkout --detach "${OPENCODE_REF}"' && \
+    test "$(git -C /build/opencode rev-parse HEAD)" = "${OPENCODE_REF}" && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
 # The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
 # used to apply at the v1.18.25 pin is retired: v1.19.6 carries that whitespace
 # repair as a content-equivalent backport, so the fixer is redundant.
-RUN bun install --frozen-lockfile && bun pm cache rm
+RUN . /build/worker-download-retry.sh && \
+    wdr_retry "bun install --frozen-lockfile" "rm -rf node_modules" \
+      'bun install --frozen-lockfile' && \
+    bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
 # The bridge imports @opencode-ai/sdk/v2/client from THIS build's output. Do not hide
@@ -229,7 +233,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
         *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
       esac; \
-      curl -fsSLo /tmp/rustup-init \
+      rm -f /tmp/rustup-init; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
       echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
       chmod +x /tmp/rustup-init; \
@@ -248,7 +254,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         *) echo "unsupported Go architecture" >&2; exit 1 ;; \
       esac; \
       ARCH=$(dpkg --print-architecture); \
-      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      rm -f /tmp/go.tgz; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
       echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
       tar -C /usr/local -xzf /tmp/go.tgz; \
       rm /tmp/go.tgz; \

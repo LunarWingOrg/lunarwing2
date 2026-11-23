@@ -52,11 +52,14 @@ COPY health_server.py task_runner_bind.py /build/
 # the image build gate fails (inttest 2026-09-22 15:16, barracuda).
 COPY hooks/ /build/hooks/
 COPY config/ /build/config/
+COPY scripts/worker-download-retry.sh /build/worker-download-retry.sh
 
 WORKDIR /build/scripts
-RUN npm ci --ignore-scripts && \
-    npx tsc -p tsconfig.json && \
-    npm test && \
+RUN set -eu; \
+    . /build/worker-download-retry.sh; \
+    wdr_retry "npm ci (bridge scripts)" "rm -rf node_modules" 'npm ci --ignore-scripts'; \
+    npx tsc -p tsconfig.json; \
+    npm test; \
     rm -rf node_modules/.cache
 
 # ── CLI bitness + flag contract gate ─────────────────────────────────────────
@@ -68,7 +71,10 @@ RUN npm ci --ignore-scripts && \
 # place the contract is asserted for real.
 ARG KIMI_CODE_VERSION
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
-RUN npm ci --omit=dev --prefix /opt/kimi-cli && \
+RUN set -eu; \
+    . /build/worker-download-retry.sh; \
+    wdr_retry "npm ci (kimi CLI)" "rm -rf /opt/kimi-cli/node_modules" \
+      'npm ci --omit=dev --prefix /opt/kimi-cli'; \
     PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
       --test-name-pattern "real CLI"
 
@@ -170,7 +176,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
         *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
       esac; \
-      curl -fsSLo /tmp/rustup-init \
+      rm -f /tmp/rustup-init; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
       echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
       chmod +x /tmp/rustup-init; \
@@ -189,7 +197,9 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         *) echo "unsupported Go architecture" >&2; exit 1 ;; \
       esac; \
       ARCH=$(dpkg --print-architecture); \
-      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      rm -f /tmp/go.tgz; \
+      curl --retry 2 --retry-delay 5 --retry-connrefused --retry-max-time 180 \
+        -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
       echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
       tar -C /usr/local -xzf /tmp/go.tgz; \
       rm /tmp/go.tgz; \
@@ -249,9 +259,13 @@ COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # records either the base image mtime or SOURCE_DATE_EPOCH (clamped by
 # rewrite-timestamp) — flaking the candidate vs clean-rebuild digest gate
 # (worker-kimi-candidate in pipelines 5158, 5263, 5390, 5481, 5734).
-RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
-    npm install -g npm@12.0.2 && \
-    npm ci --omit=dev --prefix /opt/kimi-cli && \
+# Bind the builder's retry helper only for this RUN; it is not a runtime input.
+RUN --mount=type=bind,from=builder,source=/build/worker-download-retry.sh,target=/tmp/worker-download-retry.sh,ro \
+    test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
+    . /tmp/worker-download-retry.sh && \
+    wdr_retry "npm install -g npm@12.0.2" "-" 'npm install -g npm@12.0.2' && \
+    wdr_retry "npm ci (kimi CLI runtime)" "rm -rf /opt/kimi-cli/node_modules" \
+      'npm ci --omit=dev --prefix /opt/kimi-cli' && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force && \
