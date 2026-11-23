@@ -1422,6 +1422,10 @@ bridgeval() {  # <key>
 # Case 1: no extras and no daemon allowlist → local user
 out="$(run_bridge_writer "")"
 assert_eq "bridge json defaults to local user" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["user@xmpp.localhost"]'
+assert_eq "bridge stale queue expiry defaults off" "$(bridgeval XMPP_BRIDGE_STALE_QUEUE_SECS)" 0
+printf 'XMPP_BRIDGE_STALE_QUEUE_SECS="600"\n' >>"$MT_FIXTURE/env/xmpp-bridge.env"
+write_tenant_bridge_env fixture-tenant "fixture-tenant@xmpp.localhost"
+assert_eq "bridge re-render preserves stale queue policy" "$(bridgeval XMPP_BRIDGE_STALE_QUEUE_SECS)" 600
 
 # A daemon allowlist with no owner must not gain one in the bridge env.
 printf 'XMPP_ALLOW_FROM=user@xmpp.localhost\n' >>"$MT_FIXTURE/env/lunarwing.env"

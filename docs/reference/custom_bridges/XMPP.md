@@ -75,7 +75,7 @@ The WASM channel defaults to reaching the bridge at `http://127.0.0.1:8787`
 | `XMPP_BRIDGE_BIND` | `127.0.0.1:8787` | Listen address. Non-loopback clients are always rejected regardless of bind. |
 | `XMPP_BRIDGE_TOKEN` | _(unset)_ | Bearer token required on every request when set. Empty/unset disables token auth (loopback restriction still applies). |
 | `XMPP_BRIDGE_MAX_MESSAGES` | `2048` | Inbound ring-buffer capacity. Values `<= 0` or unparseable fall back to the default. The production systemd unit sets this to `1024`. |
-| `XMPP_BRIDGE_STALE_QUEUE_SECS` | `0` (disabled) | Opt-in stale-queue policy: a poll drops queued inbound messages that have waited at least this many seconds instead of replaying them as new turns. Drops are counted and logged (WI#854). |
+| `XMPP_BRIDGE_STALE_QUEUE_SECS` | `0` (disabled) | Opt-in expiry, minimum 120 seconds. On the first poll after at least this long without a poll, discard pending messages at least this old. Invalid values warn and disable expiry. |
 | `RUST_LOG` | `info` | Standard `tracing` env filter. |
 | `LUNARWING_BASE_DIR` | _(see bootstrap)_ | Base dir whose `xmpp/` subdir is the default OMEMO store when `omemo_store_dir` is not supplied. `IRONCLAW_BASE_DIR` is still accepted as a legacy alias. |
 
@@ -89,7 +89,7 @@ All routes are versioned under `/v1` and served over loopback only.
 | `GET /v1/status` | Report configuration, connection, OMEMO, room, and rate-limit diagnostics. |
 | `POST /v1/outbound-rate-limit` | Change the live outbound hourly cap without restarting. |
 | `GET /v1/messages?cursor=<n>&limit=<n>` | Return a bounded page of queued inbound messages with a cursor strictly greater than `<n>` (returns immediately — not a long-poll). |
-| `POST /v1/messages/drain` | Discard queued inbound messages (all, or only those older than `older_than_secs`) and report the counts. |
+| `POST /v1/messages/drain` | Explicitly discard pending inbound messages and report the counts. |
 | `POST /v1/messages/send` | Send an outbound message, optionally with base64 attachments. |
 
 ### Authentication
@@ -120,8 +120,9 @@ Notable request handling:
 Returns connection and crypto diagnostics. Fields include:
 
 - `configured`, `running`, `jid`
-- `current_cursor`, `queued_messages`, `oldest_queued_age_secs` (age of the
-  oldest message still waiting for a poll; absent when the queue is empty)
+- `current_cursor`, `queued_messages` (retained replay entries),
+  `pending_messages` (retained but unacknowledged), and
+  `oldest_queued_age_secs` (oldest pending age, or `null` when none are pending)
 - `configured_rooms` (the configured room join list — `allow_rooms`, into
   which any `encrypted_rooms` are merged) and `rooms_with_presence` (rooms that
   have produced MUC presence)
@@ -170,20 +171,19 @@ Sends an outbound message, optionally with base64 attachments.
 
 ### `POST /v1/messages/drain`
 
-Discards queued inbound messages and reports `drained`, `remaining`, and
-`oldest_queued_age_secs`. Omit the body (or send `{}`) to drain the whole
-queue; send `{"older_than_secs": n}` to drain only messages that have waited at
-least `n` seconds. Every discard is counted and logged by the bridge.
+Requires `Content-Type: application/json` and exactly one discard mode:
+`{"all":true}` or `{"older_than_secs":n}` (inclusive age). Missing or invalid
+requests leave the queue unchanged. The response reports `drained`,
+`remaining`, and `oldest_queued_age_secs` for pending entries only; a served
+but unacknowledged page is still pending. Nonzero drops are logged.
 
-This is the pre-hop drain verb (WI#854). The queue is memory-only, so a backlog
-that built up while the daemon was down is otherwise served as fresh turns
-right after a hop. `ic/scripts/xmpp-drain-queue.sh status|drain
-[older_than_secs]` wraps the status and drain calls. To bound the backlog
-automatically, set `XMPP_BRIDGE_STALE_QUEUE_SECS` and the bridge drops aged
-messages at poll time instead of replaying them.
-
-A drain covers the **bridge** queue only: messages the daemon already polled
-sit in its own in-memory queue past the acknowledged cursor and are unaffected.
+Run `ic/scripts/xmpp-drain-queue.sh status` with an explicit loopback `BASE`
+and `XMPP_BRIDGE_TOKEN` before choosing `drain --all` or `drain <seconds>`.
+Discard only from a bridge that survives a daemon-only stop (for example
+on OpenRC) and before polling resumes. Stock systemd service coupling and
+managed tenant upgrades stop the bridge itself, clearing its memory-only
+ring. This is not a recovery mechanism for acknowledged messages in the
+daemon's queue.
 
 ### `POST /v1/outbound-rate-limit`
 

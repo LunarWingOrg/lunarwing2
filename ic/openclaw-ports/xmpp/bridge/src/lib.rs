@@ -74,16 +74,52 @@ pub struct MessagesResponse {
 
 /// Request body for `POST /v1/messages/drain` (WI#854).
 ///
-/// A drain discards queued inbound messages instead of delivering them as new
-/// turns. Operators run it as pre-hop hygiene: the bridge queue is in memory,
-/// so a backlog left over from a daemon outage is otherwise served as fresh
-/// work right after the restart.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Select exactly one discard mode for unacknowledged inbound messages.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DrainRequest {
+    /// Explicitly discard all pending messages.
+    pub all: bool,
     /// Drain only messages that have waited at least this many seconds.
-    /// Omitted or `null` drains the whole queue.
-    #[serde(default)]
     pub older_than_secs: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for DrainRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default)]
+            all: bool,
+            older_than_secs: Option<u64>,
+        }
+
+        struct ObjectOnly;
+        impl<'de> serde::de::Visitor<'de> for ObjectOnly {
+            type Value = DrainRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with named drain options")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Fields {
+                    all,
+                    older_than_secs,
+                } = Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(DrainRequest {
+                    all,
+                    older_than_secs,
+                })
+            }
+        }
+
+        // A derived struct alone also accepts positional arrays. Full discard
+        // must name the `all` field explicitly.
+        deserializer.deserialize_map(ObjectOnly)
+    }
 }
 
 /// Result of a drain: how many queued messages were discarded and what is
@@ -146,9 +182,10 @@ pub struct BridgeStatusResponse {
     pub current_cursor: u64,
     #[serde(default)]
     pub queued_messages: usize,
-    /// Age of the oldest message still queued for the poller (WI#854).
-    /// `None` when the queue is empty. A large age on a healthy bridge means
-    /// the daemon is not polling — the pre-hop drain case.
+    /// Number of retained entries not yet acknowledged by the poller.
+    #[serde(default)]
+    pub pending_messages: usize,
+    /// Age of the oldest pending message, or `None` if there are none.
     #[serde(default)]
     pub oldest_queued_age_secs: Option<u64>,
     pub jid: Option<String>,
@@ -252,9 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn drain_request_without_age_drains_everything() {
-        let request: DrainRequest = serde_json::from_str("{}").expect("deserializes");
-        assert_eq!(request.older_than_secs, None);
+    fn drain_request_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<DrainRequest>(r#"{"older_than":3600}"#).is_err());
+        assert!(serde_json::from_str::<DrainRequest>("[true,null]").is_err());
     }
 
     #[test]

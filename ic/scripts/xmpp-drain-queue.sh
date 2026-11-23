@@ -11,37 +11,31 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-BASE="${BASE:-http://127.0.0.1:8787}"
+BASE="${BASE:-}"
 XMPP_BRIDGE_TOKEN="${XMPP_BRIDGE_TOKEN:-}"
+export -n XMPP_BRIDGE_TOKEN
 
 usage() {
   cat <<'EOF'
 Usage:
   scripts/xmpp-drain-queue.sh status
-  scripts/xmpp-drain-queue.sh drain [older_than_secs]
+  scripts/xmpp-drain-queue.sh drain --all
+  scripts/xmpp-drain-queue.sh drain <older_than_secs>
 
 Environment:
-  BASE               default: http://127.0.0.1:8787
+  BASE               required loopback URL, e.g. http://127.0.0.1:8787
+                     (use the tenant's registered bridge port on MT hosts)
   XMPP_BRIDGE_TOKEN  required
 
 Commands:
-  status             show queued inbound message count and the oldest queue age
-  drain [n]          discard queued inbound messages (all, or only those that
-                     have waited at least n seconds)
+  status             show retained and pending counts and the oldest pending age
+  drain --all        discard all pending inbound messages
+  drain n            discard pending messages that have waited at least n seconds
 
 Notes:
-  The drain verb is pre-hop hygiene (WI#854): the bridge queue is in memory, so
-  a backlog left over from a daemon outage would otherwise be served as fresh
-  turns right after the restart. A drain is explicit, counted, and logged by
-  the bridge -- it never discards silently.
-
-  Run `status` first and drain only when the queued count is unexpected or the
-  oldest age shows messages that can no longer be current. To bound this
-  automatically, enable the opt-in stale-queue policy with
-  XMPP_BRIDGE_STALE_QUEUE_SECS on xmpp-bridge.
-
-  This drains the BRIDGE queue only. Messages the daemon already polled sit in
-  its own in-memory queue and are not affected.
+  Run status first. Use drain only to intentionally discard unacknowledged
+  messages on a surviving bridge, before the daemon resumes polling.
+  This does not protect messages already queued inside the daemon.
 EOF
 }
 
@@ -50,6 +44,16 @@ require_token() {
     echo "error: XMPP_BRIDGE_TOKEN is not set" >&2
     exit 1
   fi
+  if [[ "$XMPP_BRIDGE_TOKEN" =~ [[:cntrl:]] ]]; then
+    echo "error: XMPP_BRIDGE_TOKEN contains control characters" >&2
+    exit 1
+  fi
+}
+
+bridge_curl() {
+  printf 'Authorization: Bearer %s\n' "$XMPP_BRIDGE_TOKEN" |
+    curl --disable --silent --show-error --fail-with-body \
+      --connect-timeout 5 --max-time 30 --noproxy '*' -H @- "$@"
 }
 
 print_json_or_fail() {
@@ -67,38 +71,35 @@ print_json_or_fail() {
 
 show_status() {
   local response
-  response="$(curl -sS "$BASE/v1/status" \
-    -H "Authorization: Bearer $XMPP_BRIDGE_TOKEN")"
+  response="$(bridge_curl "$BASE/v1/status")"
   print_json_or_fail "$response" '{
       configured,
       running,
       queued_messages,
+      pending_messages,
       oldest_queued_age_secs
     }'
 }
 
 drain_queue() {
-  local older_than_secs="${1:-}"
+  local mode="$1"
   local payload
-  if [[ -z "$older_than_secs" ]]; then
-    payload='{}'
+  if [[ "$mode" == --all ]]; then
+    payload='{"all":true}'
   else
-    if ! [[ "$older_than_secs" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$mode" =~ ^(0|[1-9][0-9]*)$ ]]; then
       echo "error: older_than_secs must be a non-negative integer" >&2
       exit 1
     fi
-    payload="$(jq -cn --argjson n "$older_than_secs" '{older_than_secs: $n}')"
+    printf -v payload '{"older_than_secs":%s}' "$mode"
   fi
 
   local response
-  response="$(curl -sS -X POST "$BASE/v1/messages/drain" \
-    -H "Authorization: Bearer $XMPP_BRIDGE_TOKEN" \
+  response="$(bridge_curl -X POST "$BASE/v1/messages/drain" \
     -H 'Content-Type: application/json' \
     -d "$payload")"
   print_json_or_fail "$response"
 }
-
-require_token
 
 if [[ "$#" -eq 0 ]]; then
   usage >&2
@@ -109,6 +110,17 @@ command_name="$1"
 shift
 
 case "$command_name" in
+  status|drain)
+    if ! [[ "$BASE" =~ ^http://(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})/?$ ]]; then
+      echo "error: set BASE to the bridge's explicit loopback HTTP URL and port" >&2
+      exit 1
+    fi
+    BASE="${BASE%/}"
+    require_token
+    ;;
+esac
+
+case "$command_name" in
   status)
     if [[ "$#" -ne 0 ]]; then
       echo "error: status takes no extra arguments" >&2
@@ -117,11 +129,11 @@ case "$command_name" in
     show_status
     ;;
   drain)
-    if [[ "$#" -gt 1 ]]; then
-      echo "error: drain takes at most one argument" >&2
+    if [[ "$#" -ne 1 ]]; then
+      echo "error: drain requires --all or an age in seconds" >&2
       exit 1
     fi
-    drain_queue "${1:-}"
+    drain_queue "$1"
     ;;
   -h|--help|help)
     usage

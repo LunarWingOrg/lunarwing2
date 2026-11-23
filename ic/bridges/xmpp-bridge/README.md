@@ -110,35 +110,44 @@ curl -sS -X POST "$BASE/v1/outbound-rate-limit" \
 Set `reset_counter` to `true` if you want to clear the current rolling-hour
 usage at the same time.
 
-## Pre-hop drain and the stale-queue policy
+## Pending inbound messages and optional discard
 
-The inbound queue is memory-only and belongs to the bridge process. A backlog
-that built up while the daemon was down is served as fresh turns when the
-daemon polls again, so right after a release hop an operator can see stale
-messages delivered as new work (WI#854).
+`GET /v1/status` reports `pending_messages` and `oldest_queued_age_secs`
+(`null` when none are pending). Pending means unacknowledged by the poller;
+it can include a page already served but not yet acknowledged.
+`queued_messages` still counts the entire replay ring.
 
-`POST /v1/messages/drain` discards queued inbound messages. With no body (or
-`{}`) it drains the whole queue; `{"older_than_secs": n}` drains only messages
-that have waited at least `n` seconds. The response carries `drained`,
-`remaining`, and `oldest_queued_age_secs`, and the bridge logs a counted
-warning whenever it discards anything, so a drain is never silent.
+`POST /v1/messages/drain` requires a JSON body with exactly one mode:
+`{"all":true}` or `{"older_than_secs":n}` (age at least `n` seconds).
+It discards pending messages only and reports `drained`, `remaining`, and
+`oldest_queued_age_secs`. Nonzero drops are logged.
 
 ```bash
-curl -sS -X POST "$BASE/v1/messages/drain" \
-  -H "Authorization: Bearer $XMPP_BRIDGE_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{}' | jq
+BASE=http://127.0.0.1:8787 ic/scripts/xmpp-drain-queue.sh status
+# Only if you intend to discard messages:
+BASE=http://127.0.0.1:8787 ic/scripts/xmpp-drain-queue.sh drain 3600
 ```
 
-`scripts/xmpp-drain-queue.sh status|drain [older_than_secs]` wraps the status
-and drain calls for pre-hop hygiene.
+Supply `XMPP_BRIDGE_TOKEN` through the environment and use the tenant's
+registered bridge port on multi-tenant hosts. Use `drain --all` only for an
+intentional full discard of pending messages.
 
-To bound the backlog automatically instead of draining by hand, set
-`XMPP_BRIDGE_STALE_QUEUE_SECS` (default `0`, disabled): a poll then drops
-queued messages that have waited at least that long — counted and logged —
-instead of replaying them as new turns. `GET /v1/status` reports
-`oldest_queued_age_secs` so the threshold can be chosen from live data.
+Use a manual drain only while the daemon is not polling and the bridge is
+still running, before the daemon resumes. This can apply to a daemon-only
+restart that leaves a separate bridge running (for example, on OpenRC).
+The stock systemd `PartOf=lunarwing.service` coupling and a managed
+`upgrade-tenant` on either init stop the bridge, so its memory-only ring
+does not survive those stops.
 
-Both mechanisms cover the **bridge** queue only. Messages the daemon has
-already polled sit in the daemon's in-memory queue past the acknowledged
-cursor and are unaffected.
+`XMPP_BRIDGE_STALE_QUEUE_SECS` defaults to `0` (off). A value of at least
+120 enables expiry on the first poll after a gap of at least that many
+seconds. Only pending messages at least that old are dropped. The first
+poll of a new bridge process and normal successive polls do not expire
+messages when their gap is below the threshold. If you opt in, choose a
+threshold above the configured poll interval and expected processing delays;
+a long processing stall is indistinguishable from poller downtime here.
+Invalid values warn and disable expiry. Managed bridge env
+re-renders preserve a configured numeric value.
+
+Neither mechanism protects acknowledged messages already queued in the
+daemon at restart. That durability gap (WI#854 D3) remains open.
