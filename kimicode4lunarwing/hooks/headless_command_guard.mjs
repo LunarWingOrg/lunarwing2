@@ -229,13 +229,15 @@ function shellWordView(command) {
  * text. The separators are read outside quotes: an argument that legitimately
  * carries `;`, `|`, `&` or a newline stays in its own command's segment, so
  * the rest of that command does not read as a segment without the verb
- * (WI#856).
+ * (WI#856). A de-escaped view passes `escapes: false`, because its remaining
+ * backslashes are literal and must not hide a separator.
  */
-function commandSegments(command) {
-  return splitOutsideQuotes(command, ";")
-    .flatMap((piece) => splitOutsideQuotes(piece, "\n"))
-    .flatMap((piece) => splitOutsideQuotes(piece, "|"))
-    .flatMap((piece) => splitOutsideQuotes(piece, "&"));
+function commandSegments(command, escapes = true) {
+  const split = (piece, separator) => splitOutsideQuotes(piece, separator, escapes);
+  return split(command, ";")
+    .flatMap((piece) => split(piece, "\n"))
+    .flatMap((piece) => split(piece, "|"))
+    .flatMap((piece) => split(piece, "&"));
 }
 
 function isRmLongDeleteOption(word) {
@@ -1493,15 +1495,17 @@ function isInterpreterStage(stage) {
  * and after a backslash. A quoted interpreter body (`-c 'a;b'`) stays one
  * word for the pipeline rules (WI#832), and the segment splitter
  * (`commandSegments`) reads its control operators the same way, so every
- * segment-scoped rule sees a quoted argument whole (WI#856).
+ * segment-scoped rule sees a quoted argument whole (WI#856). A de-escaped
+ * view (`shellWordView`) passes `escapes: false`: the backslashes left in it
+ * are literal characters, not escapes.
  */
-function splitOutsideQuotes(text, separator) {
+function splitOutsideQuotes(text, separator, escapes = true) {
   const pieces = [];
   let piece = "";
   let quote = "";
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (ch === "\\" && quote !== "'" && i + 1 < text.length) {
+    if (escapes && ch === "\\" && quote !== "'" && i + 1 < text.length) {
       piece += ch + text[++i];
       continue;
     }
@@ -2046,13 +2050,13 @@ function checkRmAssembly(command) {
     // Check plain IFS separators as spaces without evaluating parameters.
     const separated = words.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, " ");
     const inSubstitution = separated.replace(/\$\(|[`()]/g, " ");
-    for (const segment of commandSegments(inSubstitution)) {
+    for (const segment of commandSegments(inSubstitution, false)) {
       const denied = checkRm(segment);
       if (denied) return denied;
     }
 
     const opaque = maskSubstitutions(separated).replace(/[()]/g, ";");
-    for (const segment of commandSegments(opaque)) {
+    for (const segment of commandSegments(opaque, false)) {
       const denied = checkAmbiguousRm(segment);
       if (denied) return denied;
     }
@@ -2087,7 +2091,7 @@ function checkSameLineLink(command) {
   for (const reading of readings) {
     const view = shellWordView(reading);
     if (!createsSymbolicLink(view)) continue;
-    for (const segment of commandSegments(view)) {
+    for (const segment of commandSegments(view, false)) {
       const rest = /\brm[ \t]+(.*)$/s.exec(segment)?.[1];
       if (rest !== undefined && rmDeleteOption(rest)) {
         return "recursive/forced rm in a command line that also creates a symbolic link; use a separate call";
