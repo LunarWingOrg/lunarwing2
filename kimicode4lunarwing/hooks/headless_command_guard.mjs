@@ -2080,10 +2080,14 @@ const LISTENER_FIELD_BREAK = "\0";
 
 /**
  * Read simple command words, keeping quoted values (including empty ones)
- * together. A word records whether any of it was quoted, so a brace group
- * inside quotes stays literal (bash expands only unquoted braces). The quote
- * context is the shared reader's, so a substitution's own quotes do not
- * disturb the word around it (WI#867).
+ * together. Each word carries a quote mask beside its text: one `1` per
+ * character that came from a quoted or escaped span (or a substitution's
+ * unknown output), `0` otherwise. Brace expansion reads its own `{`, `,` and
+ * `}` from the mask, because bash expands the group first and removes the
+ * quotes afterwards — a quoted alternative does not make the group literal
+ * (WI#868). The quote context is the shared reader's, so a substitution's own
+ * quotes do not disturb the word around it (WI#867). `quoted` records whether
+ * any of the word was quoted, so a quoted empty word (`""`) stays a word.
  */
 function* listenerSegments(text) {
   const { states, substitutions } = quoteScan(text);
@@ -2092,40 +2096,44 @@ function* listenerSegments(text) {
   let mask = "";
   let started = false;
   let quoted = false;
+  const append = (chars, fromQuotes) => {
+    word += chars;
+    mask += (fromQuotes ? "1" : "0").repeat(chars.length);
+    started = true;
+  };
   const flush = () => {
-    if (started) words.push({ text: word, mask });
+    if (started) words.push({ text: word, mask, quoted });
     word = "";
     mask = "";
     started = false;
+    quoted = false;
   };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     const state = states[i];
     const close = substitutions.get(i);
     if (close !== undefined) {
-      // The body is a separate command; its unknown output is not a literal word.
-      word += "$?";
-      started = true;
+      // The body is a separate command; its unknown output is not a literal
+      // word, and none of it is a brace delimiter.
+      append("$?", true);
       i = close;
     } else if (state === SHELL_DATA) {
       flush();
     } else if (isEscapedState(state)) {
-      word += text[i + 1] ?? "";
+      append(text[i + 1] ?? "", true);
       i++;
-      started = true;
       quoted = true;
     } else if (state === QUOTE_OPEN) {
       if (ch === "$") i++;
       started = true;
       quoted = true;
     } else if (state !== QUOTE_UNQUOTED) {
-      if (state !== QUOTE_CLOSE) word += ch;
+      if (state !== QUOTE_CLOSE) append(ch, true);
     } else {
       const separator = ifsSeparatorLength(text, i);
       if (separator > 0) {
         // Keep the shell word intact until its brace alternatives are known.
-        word += LISTENER_FIELD_BREAK;
-        started = true;
+        append(LISTENER_FIELD_BREAK, false);
         i += separator - 1;
       } else if (" \t;|&\n".includes(ch)) {
         flush();
@@ -2134,8 +2142,7 @@ function* listenerSegments(text) {
           words = [];
         }
       } else {
-        word += ch;
-        started = true;
+        append(ch, false);
       }
     }
   }
@@ -2381,22 +2388,57 @@ function listenerBraceWords({ text, mask }) {
   return null;
 }
 
-/** Apply supported brace expansion before splitting unquoted IFS fields. */
+/**
+ * Bash's own cross product, without its blow-up: `{a,b}` is five bytes, so a
+ * 16 KB word can hold thousands of groups. One word may expand to at most this
+ * many words. Past it the guard cannot read the expansion, so the command is
+ * refused rather than read as literal text: keeping the rest literal let
+ * `{,}` ten times plus `{kimi,server}` run `kimi server` (run-530 ALP-1).
+ */
+const BRACE_EXPANSION_LIMIT = 1024;
+
+/**
+ * One segment's words: brace groups expanded as bash would, then unquoted IFS
+ * markers split into fields (WI#867, WI#868), or null when a word's expansion
+ * passes `BRACE_EXPANSION_LIMIT`.
+ */
 function listenerWordList(segment) {
   const words = [];
-  for (const { text, quoted } of segment) {
-    const alternatives = quoted ? null : listenerBraceWords(text);
-    for (const alternative of alternatives ?? [text]) {
-      if (!alternative.includes(LISTENER_FIELD_BREAK)) {
-        if (alternative !== "" || quoted) words.push(alternative);
-      } else {
-        for (const field of alternative.split(LISTENER_FIELD_BREAK)) {
-          if (field !== "") words.push(field);
-        }
+  for (const entry of segment) {
+    const pending = [entry];
+    let head = 0;
+    // Words this entry currently stands for: expanded words plus pending
+    // ones. Every group has at least two alternatives, so the words walked
+    // stay under twice this count.
+    let live = 1;
+    while (head < pending.length) {
+      const word = pending[head++];
+      const alternatives = listenerBraceWords(word);
+      if (alternatives === null) {
+        pushListenerFields(words, word);
+        continue;
       }
+      live += alternatives.length - 1;
+      if (live > BRACE_EXPANSION_LIMIT) return null;
+      pending.push(...alternatives);
     }
   }
   return words;
+}
+
+/**
+ * Add one expanded word, split at its unquoted IFS markers. An empty word is
+ * kept only when the shell word was quoted (`""`); an empty brace alternative
+ * disappears, as in bash.
+ */
+function pushListenerFields(words, { text, quoted }) {
+  if (!text.includes(LISTENER_FIELD_BREAK)) {
+    if (text !== "" || quoted) words.push(text);
+    return;
+  }
+  for (const field of text.split(LISTENER_FIELD_BREAK)) {
+    if (field !== "") words.push(field);
+  }
 }
 
 /**
