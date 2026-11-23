@@ -103,7 +103,7 @@ size is bounded at 16 KiB.
   accepted by the serde-shaped enum for an actionable policy denial, not exposed
   in the published request schema as a supported grant.
 
-## Git remotes (WI#816)
+## Git remotes (WI#816, WI#860)
 
 ```json
 {
@@ -114,8 +114,8 @@ size is bounded at 16 KiB.
 }
 ```
 
-`extensions: ["git-remotes"]` requests a credential-free Git read grant. The
-tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
+`extensions: ["git-remotes"]` requests a Git grant. The tenant operator
+configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
 `git.remotes` can select a subset by name but cannot add a remote.
 
 - HTTP(S) remotes require `proxy-enforced`; `none`, `tunnel`, and advisory
@@ -129,22 +129,65 @@ tenant operator configures `SANDBOX_GIT_REMOTES` as `name=url[,name=url...]`;
 - Configured URLs must not contain userinfo, a query, or a fragment. Invalid
   configuration is reported without printing the supplied value.
 
+### Write grant (WI#860)
+
+Read access is the default. `SANDBOX_GIT_WRITE_REMOTES=name[,name...]` grants
+the `write` operation class to named remotes in the same `SANDBOX_GIT_REMOTES`
+list; a name outside that list is a configuration load error, so the write
+grant can never broaden the read grant. Without a write grant, `git push` is
+refused with `capability_denied` before any credential or network work.
+
+- **Force push is refused in every spelling** the preflight can see: `-f`,
+  `--force`, `--force-with-lease[=ref]`, `--force-if-includes`, `--mirror`,
+  short clusters containing `f` (`-qf`), and a `+` refspec.
+- **Ref deletion follows the host decision.** By default a `:ref` refspec and
+  `--delete`/`--del` are refused. `SANDBOX_GIT_ALLOW_REF_DELETION=true` turns
+  deletion on for the whole grant; force push stays refused either way.
+- **The preflight is an early, friendly refusal, not the boundary.** A script
+  can still write `.git/config` (`remote.origin.mirror`, `remote.origin.push`,
+  `alias.p`) or reach a remote through plumbing the scan does not model. Where
+  the write must actually be bounded, configure the forge: a read-only key for
+  read grants, protected branches (no force, no delete) for write grants.
+
+### Credentials (WI#860)
+
+`SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a granted
+remote to a daemon environment variable. The value is the literal
+`Authorization` header value (for example `Basic <base64>` or `Bearer <token>`).
+
+- **The credential stays host-side.** The per-call egress proxy resolves
+  `ENV_NAME` and adds the header to the outgoing request. The container never
+  receives it: not in its environment, files, command arguments, process
+  listings or output. There is no credential helper and no socket a process in
+  the run can query.
+- **Only plain `http://` remotes can be bound.** HTTPS travels in an opaque
+  `CONNECT` tunnel the proxy cannot modify, so binding an `https://` remote is a
+  configuration load error rather than a silent no-op. Use `http://` for
+  credential-bound remotes, or configure the forge to accept an unauthenticated
+  read.
+- **A binding must name a granted remote**, and is applied only when that
+  remote is selected for the call.
+- **Egress modes.** Credential injection works in `proxy-enforced`, the only
+  mode that carries HTTP(S) remotes. `none` and `tunnel` carry `file://`
+  remotes only; a network remote in either mode is already denied. Credentials
+  are therefore never silently absent: the mode either supports the binding or
+  the call fails closed at authorization.
+
 The manifest preflight checks recognizable Git commands before starting a
 runtime. Use a literal granted URL for cloning and name an explicit granted
-remote for fetch or pull with networking enabled. Unsupported read options
-are denied instead of guessing which argument is the remote. With network
-disabled, ordinary local reads such as `git clone . copy`, `git fetch` and
-`git pull` can run without a grant. Operations that write to the local
+remote for fetch, pull or push with networking enabled. Unsupported read
+options are denied instead of guessing which argument is the remote. With
+network disabled, ordinary local reads such as `git clone . copy`, `git fetch`
+and `git pull` can run without a grant. Operations that write to the local
 workspace still need a writable mount. Calls that omit the manifest retain
 legacy behavior and do not use this preflight or the scoped proxy.
 
 The shell scan is not a security boundary: Git configuration and scripts can
 change what actually runs, and HTTPS CONNECT does not expose repository paths
-or Git operations to the proxy. Manifest preflight rejects recognized `git
-push` invocations, not just force or delete flags, because even a plain push
-can use repository-local settings. It likewise rejects the remote transport
-plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and the
-`remote-*` helpers, whether named as a `git` subcommand or invoked by path.
+or Git operations to the proxy. Manifest preflight rejects the remote
+transport plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and
+the `remote-*` helpers, whether named as a `git` subcommand or invoked by
+path.
 It also refuses in-command configuration that would change what a later word
 means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
@@ -176,20 +219,20 @@ key. `git remote` reads options before the action word, so `git remote -v
 set-url origin <url>` is checked. `git_subcommand` steps over every
 value-taking global option, `--attr-source` included.
 
-The grant supplies no credential. The container receives the granted remote
-URLs as `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
+The container receives the granted remote URLs as
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries, a reset `credential.helper`,
 `GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_GLOBAL=/dev/null`. Each remote is
 pinned with an empty `remote.<name>.url` first, which clears the URL list, so
 a repository-local URL does not outrank the granted one while the process
 retains the host's Git configuration environment entries.
-Host-held authentication and push support inside the shell remain open under
-WI#816.
 The separate host-side `ssh_git` tool is unchanged.
 
 `capability_evidence.git` records the grant identifier, supported egress modes,
-and per-remote name, transport, host and the `read` operation class. It reports
-the grant, not the operation a process actually performed. It never records a
-credential, token, key, URL userinfo, or helper command.
+and per-remote name, transport, host and operation classes (`read`, and
+`write` where granted). It also records each credential binding as the remote
+name plus the daemon variable *name*. It reports the grant, not the operation
+a process actually performed. It never records a credential value, token, key,
+URL userinfo, or helper command.
 
 ## Compatibility and retries
 
