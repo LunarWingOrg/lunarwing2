@@ -35,7 +35,15 @@ wdr_attempt_rc=/tmp/worker-download-retry.rc
 # win over the transient patterns below, because the same output can carry
 # both a connection error and the decision that actually stopped the step.
 wdr_fatal() {
-    grep -qE "EINTEGRITY|ERR_PNPM_OUTDATED_LOCKFILE|ENOSPC|No space left on device|returned error: (401|403|404)|unexpected status from [A-Z]+ request to [^ ]*: (401|403|404)|remote: (Unauthorized|Forbidden|Not Found)|repository '[^']*' not found|Authentication failed|checksum did NOT match" "$1"
+    grep -qiE \
+        -e 'EINTEGRITY|ERR_PNPM_TARBALL_INTEGRITY|IntegrityCheckFailed|Integrity check failed|checksum did NOT match' \
+        -e 'ERR_PNPM_[A-Z_]*LOCKFILE|lockfile had changes, but lockfile is frozen' \
+        -e 'ENOSPC|No space left on device' \
+        -e '(returned error:|Server answered with HTTP) (401|403|404)([^0-9]|$)' \
+        -e 'unexpected status from [A-Z]+ request to [^ ]*: (401|403|404)([^0-9]|$)' \
+        -e '(^|[[:space:]])(E|ERR_PNPM_FETCH_)(401|403|404)([^[:alnum:]]|$)' \
+        -e 'error: [A-Z]+ https?://[^ ]+ - (401|403|404)([^0-9]|$)' \
+        -e "remote: (Unauthorized|Forbidden|Not Found)|repository '[^']*' not found|Authentication failed" "$1"
 }
 
 # A dropped or refused connection: the edge in front of a pinned input, a
@@ -44,53 +52,67 @@ wdr_transient() {
     if wdr_fatal "$1"; then
         return 1
     fi
-    grep -qE "RPC failed; curl (18|52|55|56|92)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet|Could not connect to server|Failed to connect to |Connection reset by peer|Connection timed out|Recv failure|Temporary failure in name resolution|Could not resolve host|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EPIPE|socket hang up|network timeout|ERR_PNPM_(FETCH|META_FETCH)|Error when performing the request|error: Failed to (install|download)" "$1"
+    # Bun's generic "Failed to install/download" and pnpm's generic fetch
+    # errors don't identify a transport failure. Corepack does distinguish
+    # a fetch exception from an HTTP response in its diagnostic.
+    grep -qiE \
+        -e 'RPC failed; curl (18|52|55|56|92)([^0-9]|$)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet' \
+        -e 'Could not connect to server|Failed to connect to |Connection (reset by peer|refused|timed out)|Recv failure|Temporary failure in name resolution|Could not resolve host' \
+        -e 'ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EPIPE|socket hang up|network timeout' \
+        -e 'Error when performing the request to ' \
+        -e 'error: (ConnectionRefused|ConnectionClosed|ConnectionReset|Timeout) downloading (package manifest|tarball)' "$1"
 }
 
 # wdr_retry <label> <cleanup command, or - for none> <command>
+# Use && to chain dependent downloads: the attempt needs an explicit status.
 wdr_retry() {
     _wdr_label=$1
     _wdr_cleanup=$2
     _wdr_command=$3
     _wdr_attempt=1
     while [ "$_wdr_attempt" -le "$wdr_max_attempts" ]; do
-        # Truncated per attempt: an earlier attempt's text must never
-        # classify this one.
-        : > "$wdr_attempt_log"
-        : > "$wdr_attempt_rc"
-        # tee keeps the download streaming into the build log. The command
-        # runs in a subshell (a pipeline member), so its status is recorded
-        # from an EXIT trap: that survives both a command that returns
-        # non-zero and one that calls exit itself. POSIX sh has no pipefail,
-        # so the pipeline's own status is tee's and is not consulted.
-        ( trap 'printf "%s\n" "$?" > "$wdr_attempt_rc"' EXIT
-          eval "$_wdr_command" ) 2>&1 | tee "$wdr_attempt_log"
-        if [ ! -s "$wdr_attempt_rc" ]; then
-            echo "worker-download-retry: '$_wdr_label' left no exit status; treating as a failure" >&2
+        # tee truncates the log and streams only this attempt's output.
+        # The EXIT trap records the download's status (also for explicit
+        # exit), then returns the status of writing it, not the download.
+        # Guard the pipeline so LunarDepth's -e and pipefail don't abort
+        # classification and a tee or status-file failure stops the build.
+        : > "$wdr_attempt_rc" || return 1
+        if ! ( trap 'printf "%s\n" "$?" > "$wdr_attempt_rc"; exit "$?"' EXIT
+               eval "$_wdr_command" ) 2>&1 | tee "$wdr_attempt_log" ||
+            [ ! -s "$wdr_attempt_rc" ]; then
+            echo "worker-download-retry: could not capture '$_wdr_label' output or exit status" >&2
             rm -f "$wdr_attempt_log" "$wdr_attempt_rc"
             return 1
         fi
         _wdr_status=$(cat "$wdr_attempt_rc")
+        _wdr_retryable=false
+        if [ "$_wdr_status" -ne 0 ] && wdr_transient "$wdr_attempt_log"; then
+            _wdr_retryable=true
+        fi
+        rm -f "$wdr_attempt_log" "$wdr_attempt_rc" || return 1
         if [ "$_wdr_status" -eq 0 ]; then
-            rm -f "$wdr_attempt_log" "$wdr_attempt_rc"
             return 0
         fi
-        if [ "$_wdr_attempt" -lt "$wdr_max_attempts" ] && wdr_transient "$wdr_attempt_log"; then
-            # A retry starts from a clean state: a half-fetched checkout or
-            # node_modules from the failed attempt is removed first, so no
-            # attempt builds from a partial tree.
-            if [ "$_wdr_cleanup" != "-" ]; then
-                eval "$_wdr_cleanup"
-            fi
-            _wdr_delay=$((wdr_base_delay * (1 << (_wdr_attempt - 1)) + $$ % 10))
-            echo "worker-download-retry: attempt $_wdr_attempt/$wdr_max_attempts of '$_wdr_label' failed on a dropped or refused connection; retrying in ${_wdr_delay}s" >&2
-            sleep "$_wdr_delay"
-            _wdr_attempt=$((_wdr_attempt + 1))
-        else
+        if [ "$_wdr_retryable" = false ]; then
             echo "worker-download-retry: attempt $_wdr_attempt/$wdr_max_attempts of '$_wdr_label' failed (exit $_wdr_status); not retrying" >&2
-            rm -f "$wdr_attempt_log" "$wdr_attempt_rc"
             return "$_wdr_status"
         fi
+        if [ "$_wdr_attempt" -eq "$wdr_max_attempts" ]; then
+            # The CI wrapper accepts this only as the failing step's last
+            # output. Recovered downloads never emit it. Keep it on tee's
+            # stream and start a new line even after partial command output.
+            printf '\nworker-download-retry: transient download retries exhausted (exit %s)\n' "$_wdr_status"
+            return "$_wdr_status"
+        fi
+        if [ "$_wdr_cleanup" != "-" ]; then
+            # A retry starts from a clean state: a half-fetched checkout or
+            # node_modules from the failed attempt is removed first.
+            eval "$_wdr_cleanup" || return "$?"
+        fi
+        _wdr_delay=$((wdr_base_delay * (1 << (_wdr_attempt - 1)) + $$ % 10))
+        echo "worker-download-retry: attempt $_wdr_attempt/$wdr_max_attempts of '$_wdr_label' failed on a dropped or refused connection; retrying in ${_wdr_delay}s" >&2
+        sleep "$_wdr_delay" || return "$?"
+        _wdr_attempt=$((_wdr_attempt + 1))
     done
     # Only reachable if the loop body never returned; a caller under `set -e`
     # must still see a failure, and a caller not under it must see the

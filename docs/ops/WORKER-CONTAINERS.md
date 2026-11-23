@@ -72,35 +72,38 @@ to the peer` in `[builder 4/21]`), and 23 jobs in 16 pipelines died fetching
 this repository before their script ran. Three paths now retry a dropped or
 refused connection, and nothing else.
 
-**CI image builds.** `.gitlab/scripts/build-worker-image.sh` classifies the
-BuildKit log: a three-attempt ladder (`transient_download_failure`) retries
-a dropped connection, and its message names the attempt, the cause and the
-delay. A fatal cause wins over a transient one — `EINTEGRITY`, a frozen-
-lockfile refusal, `sha256sum -c`, a 401/403/404, a test failure or a full
-disk each still ends the job on the first attempt.
+**CI image builds.** Candidates and clean rebuilds each have a three-attempt
+download ladder in `.gitlab/scripts/build-worker-image.sh`. It uses only the
+failing BuildKit step's output. For wrapped commands, it requires the helper's
+terminal signal that the last attempt failed on a transient connection error.
+A recovered download cannot trigger a rebuild when a subsequent test fails,
+even within the same `RUN`. The historical checkout trace from job 204104 is
+recognized only with both the RPC drop and the terminal promisor failure.
 
 **mt-admin worker builds.** mt-admin runs the same lane Dockerfiles with
 `podman build`, whose trace has a different shape, so the retry lives
 *inside* the Dockerfile instead: `scripts/worker-download-retry.sh` (one
 byte-identical copy per lane) is sourced in a RUN and wraps each download
-with `wdr_retry`. It covers the LunarDepth clone and the partial clone's
+with `wdr_retry`, including LunarDepth's `bash -o pipefail` with `set -eu`.
+It covers the LunarDepth clone and the partial clone's
 on-demand checkout, corepack, every `npm ci`, `pnpm install
 --frozen-lockfile` and `bun install --frozen-lockfile`. The rustup and Go
 toolchain curls (only with `WITH_TOOLCHAINS=true`) use `curl --retry`, so
-nothing extra lands in the final image. A retry starts from a cleaned tree,
-and the pin, lockfile and checksum checks still run once, after it, so an
-integrity failure cannot be retried away. One shared helper therefore
-covers both paths at once.
+no toolchain retry helper is needed. Kimi's runtime-stage install bind-mounts
+the helper for that step only. A retry starts from a cleaned tree. A checksum
+or integrity failure, frozen-lockfile refusal, HTTP 401/403/404 or full disk
+is not a transient download error. Pin checks, other verification and tests
+remain outside the download retry.
 
 **The runner's own fetch.** `GET_SOURCES_ATTEMPTS: "3"` in
-`.gitlab/ci/defaults.yml` retries the runner's fetch of this repository;
-the value's reasoning and its timeout budget are written beside it.
+`.gitlab/ci/defaults.yml` configures up to three `get_sources` attempts.
+CI config validation is not runtime evidence: runner acceptance requires
+a job trace showing a second fetch attempt after a failed first attempt.
 
 Apt is out of scope: `Acquire::Retries` and the snapshot ladder are
-unchanged. Tests: `.gitlab/tests/test_worker_build_args.py` (the real
-204104 trace, plus the never-retry cases) and
-`.gitlab/tests/test_worker_download_retry.py` (the helper against a stub
-command, including exit-status propagation under `set -eu`).
+unchanged. The build-wrapper tests replay the failing vertex from job 204104
+and check that recovered downloads do not mask genuine failures. The helper
+tests exercise `/bin/sh` and LunarDepth's Bash `pipefail` mode.
 
 ## APT transport, retry, and client hardening (WI#561, 2026-11-05)
 

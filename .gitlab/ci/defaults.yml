@@ -33,13 +33,11 @@ variables:
   # server", 16 of those after ~135 s, plus a 300 s timeout, a reset and
   # three HTTP/2 stream resets. GitLab's default is one attempt.
   #
-  # Three attempts, so two extra ~135 s connect timeouts add ~270 s plus
-  # GitLab's own back-off. The shortest job that fetches this repository is
-  # the 30-minute (1800 s) container job, which leaves ~1530 s for the work
-  # after the fetch; even all three attempts timing out at 300 s (900 s)
-  # fits. A dropped fetch is transient, so the attempts are not wasted on a
-  # permanent failure: a bad ref or a missing repository fails the same way
-  # on every attempt.
+  # Two failed ~135 s connects before a successful fetch add ~270 s, plus
+  # any delay configured by the runner. Three 300 s timeouts would spend
+  # 900 s on the fetch attempts themselves, against the shortest 1800 s
+  # job timeout. This sets the attempt count, not a backoff policy. The
+  # runner retries the whole get_sources stage, even for a permanent failure.
   GET_SOURCES_ATTEMPTS: "3"
   CARGO_HOME: "$CI_PROJECT_DIR/.ci-cache/cargo"
   CARGO_INCREMENTAL: "0"

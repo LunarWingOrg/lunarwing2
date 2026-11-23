@@ -311,7 +311,7 @@ build_image() {
     output_ref=$1
     output_metadata=$2
     clean=$3
-    set -- buildctl-daemonless.sh build
+    set -- buildctl-daemonless.sh build --progress=plain
     [ "$clean" = true ] && set -- "$@" --no-cache
     set -- "$@" \
         --frontend dockerfile.v0 \
@@ -334,7 +334,7 @@ metadata_digest() {
     awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
 }
 
-# Bounded retries for transient registry push and Debian snapshot flakes.
+# Bounded retries for transient registry push, Debian snapshot and download flakes.
 # BuildKit fetches a jwt/auth token per push, and several worker candidates
 # pushing at once trip GitLab's 429 rate limit at the very last step — pipeline
 # 5984 lost the opencode, opencode2 and kimi candidates (and, by cascade, their
@@ -364,16 +364,16 @@ metadata_digest() {
 # 6-attempt/~15-minute window (opencode and pebble each burned all six, and
 # their scans then stopped at the "worker-image.env is missing" guard). Eight
 # attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
-# (~95.25 minutes) of sleeping. The separate three-attempt snapshot ladder
-# adds at most 120+300 = 420 s plus two jitter values; the three-attempt
-# download ladder (WI#862) adds at most 60+60 = 120 s plus two jitter
-# values; and the lane Dockerfiles' own in-step retry (worker-download-retry.sh,
-# three attempts from a 20 s base) adds at most 20+40 = 60 s plus two jitter
-# values per wrapped download. Even conservatively adding all three complete
-# ladders and thirteen maximum jitter values gives 6396 s of sleeping, below
-# the roughly 10000 s cap observed on runner cccccc (the YAML permits 8 h).
-# Dockerfile apt calls have their own 240/600 s limits, so a stalled fetch
-# becomes a retryable exit 124 instead of burning that cap.
+# (~95.25 minutes) of sleeping. Adding the full snapshot (120+300 s) and
+# download (60+60 s) ladders and eleven maximum jitters gives
+# 5715 + 420 + 120 + 11*29 = 6574 s per build phase. This is conservative:
+# all three ladders share the eight-attempt limit. The Dockerfile helper adds
+# at most 20 + 40 + 2*9 = 78 s per wrapped download; Kimi and LunarDepth each
+# wrap four, so even 8*4*78 = 2496 s more gives 9070 s of sleeps per phase.
+# That is below the roughly 10000 s cap observed on runner cccccc (YAML: 8 h),
+# not a wall-clock bound for the job: candidate and clean rebuild each get a
+# ladder, and executing the builds also takes time. Dockerfile apt calls
+# still have their own 240/600 s limits.
 # The final attempt on any ladder is never followed by another delay.
 _bwr_max_attempts=8
 _bwr_base_delay=45
@@ -407,32 +407,44 @@ transient_snapshot_failure() {
     grep -qE 'process "([^"\\]|\\.)*snapshot\.debian\.org([^"\\]|\\.)*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
 }
 
-# WI#862: a dropped or refused connection while a Dockerfile step downloads a
-# pinned input. Job 204104 (pipeline 8578) failed in [builder 4/21] on
-# "error: RPC failed; curl 55 Failed sending data to the peer" while the
-# LunarDepth partial clone fetched on demand, then "not retrying".
-#
-# The lane Dockerfiles now retry their own downloads (the shared
-# worker-download-retry.sh helper), so this classifier is a second line of
-# defence for a drop the helper exhausted and for a Dockerfile step that has
-# no helper yet. It covers only the BuildKit path (CI); mt-admin uses
-# `podman build`, whose trace has a different shape, and is covered by the
-# in-Dockerfile helper alone.
-#
-# A fatal cause wins over a transient one: the same step can print a
-# connection error and then the decision that actually stopped it, and a pin,
-# integrity, test or 401/403/404 failure must end the job on the first
-# attempt (WI#559/VK-1: the old snapshot classifier matched too broadly).
+# WI#862: find the failed RUN in BuildKit plain progress, then read only
+# its timestamped output, not the command header or duplicated error footer.
+# Wrapped steps require the helper's terminal, exit-code-matched signal:
+# a download can recover and then a test in the same RUN can fail.
+# The pre-helper partial checkout in job 204104 is the narrow legacy case:
+# require its terminal promisor failure with a matching RPC transport error.
 transient_download_failure() {
-    # The checksum and lockfile guards that follow a download print their own
-    # verdict; a failure there is never a network failure.
-    if grep -qE 'EINTEGRITY|ERR_PNPM_OUTDATED_LOCKFILE|ENOSPC|No space left on device' "$push_attempt_log"; then
-        return 1
-    fi
-    if grep -qE 'unexpected status from [A-Z]+ request to [^ ]*: (401|403|404)([ :]|$)|remote: (Unauthorized|Forbidden|Not Found)|Authentication failed|checksum did NOT match' "$push_attempt_log"; then
-        return 1
-    fi
-    grep -qE 'RPC failed; curl (18|52|55|56|92)|the remote end hung up unexpectedly|early EOF|unexpected disconnect while reading sideband packet|Could not connect to server|Failed to connect to |Connection reset by peer|Connection timed out|Recv failure|Temporary failure in name resolution|Could not resolve host|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|network timeout|ERR_PNPM_(FETCH|META_FETCH)|Error when performing the request|error: Failed to (install|download)' "$push_attempt_log"
+    awk '
+        NR == FNR {
+            if ($0 ~ /^#[0-9]+ ERROR: process ".*" did not complete successfully: exit code: [0-9]+$/) {
+                if (failed && failed != $1) ambiguous = 1
+                failed = $1
+                status = $NF
+                wrapped = /[[:space:]]wdr_retry[[:space:]]/
+                partial_clone = !wrapped && status == 128 &&
+                    index($0, "git clone --filter=blob:none --no-checkout ") &&
+                    index($0, " checkout --detach ")
+            }
+            next
+        }
+        $1 == failed && sub(/^#[0-9]+ -?[0-9]+(\.[0-9]+)? /, "") && NF {
+            sub(/\r$/, "")
+            last = $0
+            if ($0 ~ /^error: RPC failed; curl (18|52|55|56|92)( |$)/) {
+                rpc_drop = 1
+            } else if ($0 !~ /^fatal: (expected .packfile.|could not fetch [0-9a-f]+ from promisor remote)$/) {
+                rpc_drop = 0
+            }
+        }
+        END {
+            if (!failed || ambiguous) exit 1
+            if (wrapped) {
+                marker = "worker-download-retry: transient download retries exhausted (exit " status ")"
+                exit (last != marker)
+            }
+            exit !(partial_clone && rpc_drop && last ~ /^fatal: could not fetch [0-9a-f]+ from promisor remote$/)
+        }
+    ' "$push_attempt_log" "$push_attempt_log"
 }
 
 build_image_with_retry() {

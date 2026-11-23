@@ -238,8 +238,6 @@ RUN groupadd --gid 10002 kimi \
 WORKDIR /app
 
 COPY --from=builder /build/scripts/ /app/scripts/
-# WI#862: the CLI install retries its own npm downloads with this helper.
-COPY scripts/worker-download-retry.sh /app/scripts/worker-download-retry.sh
 # /app stays root-owned and read-only to both runtime identities.
 COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py task_runner_bind.py agent_comm_protocol.json ./
 COPY config/ ./config/
@@ -261,8 +259,10 @@ COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # records either the base image mtime or SOURCE_DATE_EPOCH (clamped by
 # rewrite-timestamp) — flaking the candidate vs clean-rebuild digest gate
 # (worker-kimi-candidate in pipelines 5158, 5263, 5390, 5481, 5734).
-RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
-    . /app/scripts/worker-download-retry.sh && \
+# Bind the builder's retry helper only for this RUN; it is not a runtime input.
+RUN --mount=type=bind,from=builder,source=/build/worker-download-retry.sh,target=/tmp/worker-download-retry.sh,ro \
+    test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
+    . /tmp/worker-download-retry.sh && \
     wdr_retry "npm install -g npm@12.0.2" "-" 'npm install -g npm@12.0.2' && \
     wdr_retry "npm ci (kimi CLI runtime)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli' && \

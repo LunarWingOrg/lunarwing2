@@ -10,6 +10,7 @@ builder, a registry or a network.
 
 import hashlib
 import pathlib
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ LANES = (
     "lunardepth4lunarwing",
 )
 HELPER = pathlib.Path("scripts/worker-download-retry.sh")
+EXHAUSTED = "worker-download-retry: transient download retries exhausted"
 
 
 class WorkerDownloadRetryTests(unittest.TestCase):
@@ -56,16 +58,18 @@ class WorkerDownloadRetryTests(unittest.TestCase):
             return []
         return [int(line) for line in self.sleeps.read_text().split()]
 
-    def run_retry(self, command, cleanup="-"):
-        script = self.root / "run.sh"
-        script.write_text(
+    def run_retry(self, command, cleanup="-", *, pipefail=False):
+        shell = ["/bin/bash", "-o", "pipefail"] if pipefail else ["sh"]
+        script = (
             "set -eu\n"
             f". '{self.helper}'\n"
-            f"wdr_retry 'fixture download' '{cleanup}' '{command}'\n",
-            encoding="utf-8",
+            f"wdr_attempt_log='{self.root / 'attempt.log'}'\n"
+            f"wdr_attempt_rc='{self.root / 'attempt.rc'}'\n"
+            f"wdr_retry 'fixture download' {shlex.quote(cleanup)} {shlex.quote(command)}\n"
+            "printf '%s\\n' 'continued after download'\n"
         )
         return subprocess.run(
-            ["sh", str(script)],
+            [*shell, "-c", script],
             cwd=self.root,
             env={"PATH": str(self.bin), "HOME": str(self.root)},
             capture_output=True,
@@ -118,7 +122,8 @@ class WorkerDownloadRetryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 128, result.stderr)
         self.assertIn("attempt 1/3", result.stderr)
         self.assertIn("attempt 2/3", result.stderr)
-        self.assertIn("not retrying", result.stderr)
+        self.assertIn(f"{EXHAUSTED} (exit 128)", result.stdout)
+        self.assertNotIn("continued after download", result.stdout)
         self.assertEqual(len(self.recorded_sleeps()), 2)
         first, second = self.recorded_sleeps()
         # Back-off doubles from 20 s; the jitter is the shell's PID mod 10.
@@ -135,11 +140,17 @@ class WorkerDownloadRetryTests(unittest.TestCase):
             "  exit 1\nfi\n"
             "printf '%s\\n' 'cloned'\n",
         )
-        result = self.run_retry("git clone /src", f"rm -f '{marker}'")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        # The cleanup ran, so the second attempt saw a clean tree and passed.
-        self.assertIn("attempt 1/3", result.stderr)
-        self.assertEqual(len(self.recorded_sleeps()), 1)
+        for pipefail in (False, True):
+            with self.subTest(pipefail=pipefail):
+                marker.write_text("half-fetched", encoding="utf-8")
+                self.sleeps.unlink(missing_ok=True)
+                result = self.run_retry("git clone /src && git checkout", f"rm -f '{marker}'", pipefail=pipefail)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # The cleanup ran, so the next attempt saw a clean tree and passed.
+                self.assertIn("attempt 1/3", result.stderr)
+                self.assertEqual(len(self.recorded_sleeps()), 1)
+                self.assertIn("continued after download", result.stdout)
+                self.assertNotIn(EXHAUSTED, result.stdout)
 
     def test_integrity_and_pin_failures_are_not_retried(self):
         cases = {
@@ -151,47 +162,82 @@ class WorkerDownloadRetryTests(unittest.TestCase):
             "403": "The requested URL returned error: 403",
             "401": "The requested URL returned error: 401",
             "404": "The requested URL returned error: 404",
+            "npm refusal": "npm error code E401",
+            "pnpm refusal": "ERR_PNPM_FETCH_403",
+            "Bun refusal": "error: GET https://registry.npmjs.org/example - 403",
+            "Corepack refusal": "Server answered with HTTP 404 when performing the request",
             "full disk": "npm error nospc ENOSPC: no space left on device",
             "test failure": "not ok 7 - bridge rejects a malformed envelope\n# failed 1 test",
+            "ambiguous Bun error": "error: Failed to install example@1.0.0",
+            "ambiguous pnpm error": "ERR_PNPM_META_FETCH_FAIL",
         }
         for label, line in cases.items():
             with self.subTest(case=label):
                 self.sleeps.unlink(missing_ok=True)
                 self.write_shim(
-                    "failing", f"#!/bin/sh\nprintf '%s\\n' '{line}' >&2\nexit 1\n"
+                    "failing", f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(line)} >&2\nexit 1\n"
                 )
                 result = self.run_retry("failing")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("not retrying", result.stderr)
+                self.assertNotIn(EXHAUSTED, result.stdout)
                 self.assertEqual(self.recorded_sleeps(), [], label)
 
     def test_a_connection_error_beside_a_fatal_cause_is_not_retried(self):
         # The same step can print a drop and then the pin verdict that
         # actually stopped it; the fatal cause must win (WI#559/VK-1).
-        self.write_shim(
-            "failing",
-            "#!/bin/sh\n"
-            "printf '%s\\n' 'error: RPC failed; curl 55 Failed sending data to the peer' >&2\n"
-            "printf '%s\\n' 'npm error code EINTEGRITY' >&2\n"
-            "exit 1\n",
-        )
-        result = self.run_retry("failing")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("not retrying", result.stderr)
-        self.assertEqual(self.recorded_sleeps(), [])
+        for verdict in (
+            "npm error code EINTEGRITY",
+            "error: Integrity check failed for tarball: example",
+            "error: IntegrityCheckFailed extracting tarball from example",
+            "ERR_PNPM_TARBALL_INTEGRITY",
+            "ERR_PNPM_OUTDATED_LOCKFILE",
+            "error: GET https://registry.npmjs.org/example - 403",
+        ):
+            with self.subTest(verdict=verdict):
+                self.sleeps.unlink(missing_ok=True)
+                self.write_shim(
+                    "failing",
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' 'error: ConnectionRefused downloading package manifest example' >&2\n"
+                    f"printf '%s\\n' {shlex.quote(verdict)} >&2\n"
+                    "exit 7\n",
+                )
+                result = self.run_retry("failing", pipefail=True)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertIn("not retrying", result.stderr)
+                self.assertNotIn("continued after download", result.stdout)
+                self.assertNotIn(EXHAUSTED, result.stdout)
+                self.assertEqual(self.recorded_sleeps(), [])
+
+    def test_bun_transport_errors_are_retried(self):
+        for error in ("ConnectionRefused", "ConnectionClosed"):
+            with self.subTest(error=error):
+                self.sleeps.unlink(missing_ok=True)
+                self.write_shim(
+                    "bun",
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' 'error: {error} downloading package manifest example' >&2\n"
+                    "exit 1\n",
+                )
+                result = self.run_retry("bun install --frozen-lockfile")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{EXHAUSTED} (exit 1)", result.stdout)
+                self.assertEqual(len(self.recorded_sleeps()), 2)
 
     def test_a_failed_download_stops_a_set_eu_caller(self):
         # The helper runs inside a RUN under `set -eu`; its own failure must
         # stop the step. A pipeline member's status is tee's, so this pins
         # that the wrapped command's status is what the caller sees — both
         # for a command that returns non-zero and one that calls exit.
-        for body, expected in (("printf 'boom\\n' >&2; exit 7", 7), ("exit 9", 9)):
-            with self.subTest(body=body):
-                self.sleeps.unlink(missing_ok=True)
-                self.write_shim("failing", f"#!/bin/sh\n{body}\n")
-                result = self.run_retry("failing")
-                self.assertEqual(result.returncode, expected, result.stderr)
-                self.assertIn("not retrying", result.stderr)
+        self.write_shim("failing", "#!/bin/sh\nexit 7\n")
+        for pipefail in (False, True):
+            for command, expected in (("failing", 7), ("exit 9", 9)):
+                with self.subTest(command=command, pipefail=pipefail):
+                    result = self.run_retry(command, pipefail=pipefail)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertIn("not retrying", result.stderr)
+                    self.assertNotIn("continued after download", result.stdout)
 
     def test_a_successful_download_does_not_sleep(self):
         self.write_shim("ok", "#!/bin/sh\nprintf '%s\\n' 'cloned'\n")
