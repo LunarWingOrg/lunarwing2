@@ -582,10 +582,7 @@ async fn drain_handler(
 
 /// Age of the oldest message still queued for the poller, if any.
 fn oldest_queued_age_secs(inner: &BridgeInner, now: Instant) -> Option<u64> {
-    inner
-        .messages
-        .front()
-        .map(|message| message.age_secs(now))
+    inner.messages.front().map(|message| message.age_secs(now))
 }
 
 /// Drop queued messages from the front while they are old enough.
