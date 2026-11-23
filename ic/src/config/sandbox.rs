@@ -198,6 +198,19 @@ impl Default for SandboxModeConfig {
 }
 
 impl SandboxModeConfig {
+    /// Configured runtime preference, with the same fallback the sandbox
+    /// manager applies: an unparseable value logs and means `auto`.
+    pub fn resolved_runtime(&self) -> crate::sandbox::SandboxRuntime {
+        self.runtime.parse().unwrap_or_else(|e| {
+            tracing::error!(
+                value = %self.runtime,
+                error = %e,
+                "Invalid SANDBOX_RUNTIME; falling back to 'auto' (podman preferred)"
+            );
+            crate::sandbox::SandboxRuntime::Auto
+        })
+    }
+
     pub(crate) fn resolve(settings: &crate::settings::Settings) -> Result<Self, ConfigError> {
         let ss = &settings.sandbox;
 
@@ -301,14 +314,7 @@ impl SandboxModeConfig {
             policy = SandboxPolicy::WorkspaceWrite;
         }
 
-        let runtime = self.runtime.parse().unwrap_or_else(|e| {
-            tracing::error!(
-                value = %self.runtime,
-                error = %e,
-                "Invalid SANDBOX_RUNTIME; falling back to 'auto' (podman preferred)"
-            );
-            crate::sandbox::SandboxRuntime::Auto
-        });
+        let runtime = self.resolved_runtime();
 
         let network = self.network.parse().unwrap_or_else(|e| {
             tracing::error!(
