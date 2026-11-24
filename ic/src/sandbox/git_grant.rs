@@ -2451,14 +2451,26 @@ fn authorize_shell_bodies(
 
 /// The shell script `git submodule foreach` builds from its operand tail.
 ///
-/// Git inserts the first operand verbatim and single-quotes every later one,
-/// so a later operand is exactly one literal shell word while the first may
-/// carry a whole command. Verified against git 2.56.1: `foreach 'echo A  B'
-/// extra` runs `echo A  B 'extra'`, and `foreach printf '<%s>' 'a b' c`
-/// prints `<a b><c>` (WI#880).
+/// The first operand is the script. Later operands are not quoted into it:
+/// git runs `sh -c '<first> "$@"' <first> <later>…`, so they reach the shell
+/// as the positional parameters `$1`, `$2`, … of the first operand, appended
+/// as `"$@"`. Verified against git 2.56.1: `foreach 'printf "[%s]" "$#" "$@";
+/// echo; :' a 'b c'` prints `[2][a][b c]`, and `foreach '"$@" #' printf
+/// '<%s>' ran` prints `<ran>` (WI#880).
+///
+/// The model below appends each later operand as one quoted word, which is
+/// what the trailing `"$@"` expands to. A first operand that expands a
+/// parameter itself (`"$@" #`, `eval "$*"`, `$1 $2`) can run the later
+/// operands somewhere else, where this model would read a comment or an
+/// argument. So when later operands are present, a `$` or a backtick in the
+/// first operand makes the script dynamic, and `scan_shell_body` refuses it.
+/// Git sets none of `$name`, `$sm_path` or `$toplevel` in that form
+/// (`foreach 'echo name=$name' extra` prints `name=`), so no documented use
+/// is lost.
 fn foreach_script(tail: &[&Word]) -> Option<Word> {
     let (command, rest) = tail.split_first()?;
     let mut script = (*command).clone();
+    script.dynamic |= !rest.is_empty() && command.text.contains(['$', '`']);
     for word in rest {
         script.dynamic |= word.dynamic;
         script.text.push(' ');
@@ -3989,9 +4001,10 @@ mod tests {
     }
 
     /// WI#880: `git submodule foreach` builds one script from the whole
-    /// operand tail — the first operand verbatim, every later one
-    /// single-quoted (verified against git 2.56.1). Reading only the first
-    /// word left `foreach sh -c '<body>'` unscanned.
+    /// operand tail — the first operand is the script, and every later one
+    /// is a positional parameter appended as `"$@"` (verified against git
+    /// 2.56.1). Reading only the first word left `foreach sh -c '<body>'`
+    /// unscanned.
     #[test]
     fn submodule_foreach_scans_the_whole_operand_tail() {
         let (temp, _) = workspace_with_remote();
@@ -4053,8 +4066,35 @@ mod tests {
             "git submodule foreach sh -c 'cargo test'",
             "git submodule foreach --recursive sh -c 'make -j8'",
             "git submodule foreach -- sh -c 'cargo test'",
+            // One operand: git sets `$name` and friends, and the body is the
+            // whole script, so an expansion in it stays an ordinary body.
+            "git submodule foreach 'echo $name'",
+            "git submodule foreach --recursive 'echo $sm_path'",
         ] {
             check_granted(command, &write).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        // Later operands are the positional parameters of the first, so a
+        // first operand that expands one can run them where the appended
+        // model reads a comment. Real git 2.56.1 ran each of these shapes.
+        for command in [
+            r#"git submodule foreach '"$@" #' git push -f origin master"#,
+            r#"git submodule foreach '"$@";:' git push -f origin master"#,
+            r#"git submodule foreach 'eval "$*" #' git push -f origin master"#,
+            r#"git submodule foreach 'exec "$@" #' git push -f origin master"#,
+            r#"git submodule foreach '$1 $2 $3 $4 $5 #' git push -f origin master"#,
+            r#"git submodule foreach '${@} #' git push -f origin master"#,
+            r#"git submodule foreach 'eval "$1" #' 'git push -f origin master'"#,
+            r#"git submodule foreach --recursive '"$@" #' git push -f origin master"#,
+            // The accepted cost: with a later operand, a harmless expansion
+            // in the first one is refused too.
+            "git submodule foreach 'echo $name' extra",
+            "git submodule foreach 'echo `pwd`' extra",
+        ] {
+            let error = check_granted(command, &write).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
         }
     }
 
