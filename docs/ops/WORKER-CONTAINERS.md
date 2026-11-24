@@ -1486,9 +1486,12 @@ Enforced controls (opencode2 lane unless noted):
    non-zero when any enabled lane's port refuses a loopback dial, polling for
    `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one probe).
    `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
-   container state plus a bounded, sanitized tail of its bridge and task
-   container logs — the first-failure evidence that was previously only
-   reachable by a hand-run `podman logs` on the host. Start and upgrade log a
+   container state plus a bounded tail of its bridge and task container logs
+   — the first-failure evidence that was previously only reachable by a
+   hand-run `podman logs` on the host. Each line is redacted, best effort
+   (token, key, secret and password values, bearer and cookie headers, URL
+   user parts, strings with a known secret prefix); it is a pattern filter,
+   not a guarantee, so read the output before pasting it anywhere public. Start and upgrade log a
    readiness warning for a dead lane but stay green (the container start
    already succeeded); the strict gate is the separate verb.
 

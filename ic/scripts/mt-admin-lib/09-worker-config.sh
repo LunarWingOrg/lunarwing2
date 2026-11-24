@@ -140,13 +140,45 @@ status_worker_line() {  # <tenant> <lane> <label> <wss port slot>
   fi
 }
 
-# WI#882: the first failure log for one worker lane, read host-side. Kageho's
-# 2.2.1.0 upgrade left both configured workers refusing loopback connections,
-# and the agent-visible scrubbed daemon log had no worker-liveness lines for
-# those ports — the operator had to guess which container died and why. This
-# prints the lane's container state plus a bounded tail of the bridge and task
-# containers' logs, scrubbed through the same display sanitizer as other
-# operator output (a worker log can echo a base URL or a model name).
+# WI#882: a best-effort redaction of credential-shaped values in worker log
+# lines (stdin to stdout). A bridge or task log can carry the WebSocket bearer
+# token in a URL query, an `Authorization` header, an API key from the lane's
+# environment, or a URL with a user part, and `worker-failure-log` output gets
+# pasted into work items. Redacted, keeping the key so the line stays useful:
+#  - a cookie header, to the end of the line;
+#  - the value of any key that ends in token, secret, password, passwd, pwd,
+#    passphrase, auth, authorization, bearer, credential(s), cookie, session,
+#    session_id, signature, api_key or key, written `key=value`, `key: value`
+#    or `"key": "value"`, with an optional Bearer/Basic scheme word;
+#  - a bare `Bearer <token>` or `Basic <base64>`;
+#  - the user part of a URL (`scheme://user:pass@host`);
+#  - strings with a well-known secret prefix (`sk-`, `glpat-`, `ghp_`, ...);
+#  - a JSON web token.
+# This is a pattern filter, not a guarantee: a secret that matches none of the
+# shapes, or one split over two lines, passes. Read the output before pasting
+# it anywhere public. Counters such as `prompt_tokens=12` are left alone (the
+# key must end in the word). Needs GNU sed (`-E`, the `I` flag, `\b`); if sed
+# fails, nothing is printed for that log.
+_worker_log_redact() {
+  local kw='token|secret|password|passwd|pwd|passphrase|authorization|auth|bearer|credentials?|cookie|session[_-]?id|session|signature|api[_-]?key|key'
+  LC_ALL=C sed -E \
+    -e 's/((^|[^A-Za-z0-9_.-])(set-)?cookie["'\'']?[[:space:]]*[:=][[:space:]]*).*/\1[redacted]/I' \
+    -e 's/((^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*('"$kw"')["'\'']?[[:space:]]*[:=][[:space:]]*)((bearer|basic|digest|token)[[:space:]]+)?("[^"]*"|'\''[^'\'']*'\''|[^][[:space:]&,;})"'\'']+)/\1[redacted]/Ig' \
+    -e 's/\b(bearer)[[:space:]]+[A-Za-z0-9._~+\/=-]{12,}/\1 [redacted]/Ig' \
+    -e 's/\b(basic)[[:space:]]+[A-Za-z0-9+\/=]{16,}/\1 [redacted]/Ig' \
+    -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/[:space:]@"'\''<>]+@#\1[redacted]@#g' \
+    -e 's/\b(sk-|glpat-|glrt-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{8,}/\1[redacted]/g' \
+    -e 's/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/[redacted-jwt]/g'
+}
+
+# WI#882: the first failure log for one worker lane, read host-side. The item
+# reports both configured workers unreachable after an upgrade, and the
+# agent-visible daemon log had no worker-liveness lines for their ports, so
+# the operator had to guess which container failed and why. This prints the
+# lane's container state plus a bounded tail of the bridge and task
+# containers' logs. Each line is first redacted (`_worker_log_redact`, best
+# effort) and then passed through the display sanitizer used for other
+# operator output (unprintable bytes escaped, long lines cut).
 worker_failure_log() {  # <tenant> <lane> [lines=40]
   local name="$1" lane="$2" lines="${3:-40}"
   case "$lane" in
@@ -178,11 +210,17 @@ worker_failure_log() {  # <tenant> <lane> [lines=40]
   for target in "$container" "$task_container"; do
     _ctr_inspect "$name" "$target" &>/dev/null || continue
     say "--- last $lines log lines: $target ---"
+    # Redact before the sanitizer cuts the line, so a value that straddles
+    # the cut cannot escape the patterns. A failed read or a failed filter is
+    # said, never replaced by unredacted output.
     _ctr "$name" logs --tail "$lines" "$target" 2>&1 \
+      | _worker_log_redact \
       | while IFS= read -r line; do
           printf '  %s\n' "$(sanitize_display_value "$line" 300)"
-        done
+        done \
+      || say "  (the log of $target could not be read or redacted completely)"
   done
+  say "Redaction is best effort: read this output before pasting it anywhere public."
   return 0
 }
 

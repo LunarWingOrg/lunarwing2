@@ -66,7 +66,11 @@ on this tree before this change:
    dead enabled lane. Poll window `LUNARWING_MT_WORKER_READY_WAIT_SECS`
    (default `0`).
 3. `mt-admin worker-failure-log <tenant> <lane> [lines]` — container state
-   plus a bounded, sanitized tail of the bridge and task container logs.
+   plus a bounded tail of the bridge and task container logs. Each line is
+   redacted, best effort: the values of token, key, secret and password
+   fields, bearer and cookie headers, URL user parts and strings with a
+   known secret prefix are replaced by `[redacted]`. It is a pattern filter,
+   not a guarantee: read the output before pasting it anywhere public.
 4. `_start_tenant_workers` runs the readiness pass and warns on a dead lane
    (advisory; the container start already succeeded).
 5. Daemon: `ExternalWorkerManager::new` logs an explicit

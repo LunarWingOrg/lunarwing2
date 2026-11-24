@@ -726,8 +726,11 @@ Commands:
                                    LUNARWING_MT_WORKER_READY_WAIT_SECS
   worker-failure-log <name> <lane> [lines]
                                    WI#882 first-failure evidence: the lane's
-                                   container state plus a bounded, scrubbed
-                                   tail of its bridge and task container logs
+                                   container state plus a bounded tail of its
+                                   bridge and task container logs, redacted
+                                   (best effort: token/key/password values,
+                                   bearer headers, URL user parts); read it
+                                   before pasting it anywhere public
   worker-listeners <name>          WI#357 exposure audit: list listening
                                    sockets inside the tenant's running worker
                                    containers; fail on any bind or published
