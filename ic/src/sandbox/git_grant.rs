@@ -1519,11 +1519,16 @@ fn scan_shell_c(
     while cursor < words.len() {
         let word = &words[cursor];
         let text = word.text.as_str();
-        if text == "--" {
+        // A lone `-` ends option processing exactly like `--` (bash manual:
+        // "A -- signals the end of options and disables further option
+        // processing"; a lone `-` is the same terminator). bash, dash and
+        // `bash -ce` all run the word after it as the script, so it must be
+        // stepped past rather than scanned as the body itself.
+        if text == "--" || text == "-" {
             cursor += 1;
             break;
         }
-        if text == "-" || (!text.starts_with('-') && !text.starts_with('+')) {
+        if !text.starts_with('-') && !text.starts_with('+') {
             break;
         }
         if word.dynamic {
@@ -3541,6 +3546,12 @@ mod tests {
             "bash -cex 'git fetch upstream'",
             "bash -ec 'git fetch upstream'",
             "bash -c -e -- 'git fetch upstream'",
+            // WI#876: a lone `-` ends option processing like `--`, so the
+            // word after it is the script. It used to be scanned as the body
+            // itself and the real script was never read.
+            "bash -c - 'git push origin main'",
+            "sh -c - 'git push origin main'",
+            "bash -ce - 'git push origin main'",
             "bash '-cprintf fixture'",
             // An unknown leading word with git in its tail: the scan could
             // not tell an argument from the command a wrapper runs.
@@ -3743,6 +3754,9 @@ mod tests {
             "bash -cex 'git status'",
             "bash -ec 'git status'",
             "sh -ce 'git status'",
+            "bash -c - 'git status'",
+            "sh -c - 'git status'",
+            "bash -ce - 'git status'",
             "grep git README",
             "which git",
             "ps aux | grep bash",
