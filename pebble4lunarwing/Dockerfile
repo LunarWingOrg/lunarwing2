@@ -45,6 +45,15 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 COPY pebble4lunarwing/patches/wi477-request-events.patch /tmp/wi477-request-events.patch
 RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
     git -C /build/pebble apply /tmp/wi477-request-events.patch
+# WI#863: the pinned upstream reads the OpenAI Codex model list from
+# `/v1/models`, which the Codex backend does not serve; every fetch failed and
+# the frozen built-in table (ending at gpt-5.5) was always used. The patch
+# reads the real `/models?client_version=...` catalog, merges it with the
+# built-in list so a newer model can never be silently dropped, and refreshes
+# the fallback table.
+COPY pebble4lunarwing/patches/wi863-openai-codex-model-catalog.patch /tmp/wi863-openai-codex-model-catalog.patch
+RUN git -C /build/pebble apply --check /tmp/wi863-openai-codex-model-catalog.patch && \
+    git -C /build/pebble apply /tmp/wi863-openai-codex-model-catalog.patch
 # The pinned upstream checkout ships rustls 0.23.41, which is affected by
 # RUSTSEC-2026-0285 (fixed >= 0.23.45). WI#409 raises the override to 0.23.46
 # for RUSTSEC-2026-0346/0347/0348/0349. Upstream also pins chacha20 0.10.1,
