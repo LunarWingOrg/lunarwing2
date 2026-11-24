@@ -38,7 +38,13 @@ open(sys.argv[1] + "/.readiness-port", "w").write(str(s.getsockname()[1]))
 time.sleep(60)
 PY
 LISTENER_PID=$!
-cleanup() { kill "$LISTENER_PID" 2>/dev/null || true; wait "$LISTENER_PID" 2>/dev/null || true; rm -f "$PWD/.readiness-port"; }
+CONFIG_DIR=""
+cleanup() {
+  kill "$LISTENER_PID" 2>/dev/null || true
+  wait "$LISTENER_PID" 2>/dev/null || true
+  rm -f "$PWD/.readiness-port"
+  [[ -z "$CONFIG_DIR" ]] || rm -rf "$CONFIG_DIR"
+}
 trap cleanup EXIT
 
 for _ in $(seq 1 50); do [[ -s "$PWD/.readiness-port" ]] && break; sleep 0.1; done
@@ -50,11 +56,28 @@ DEAD_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0
 
 sanitize_name() { printf '%s' "$1"; }
 tenant_exists_in_registry() { return 0; }
+# A config with pebble+opencode configured (the two lanes kageho had), so the
+# registry-vs-config block can be asserted in both directions.
+CONFIG_DIR="$(mktemp -d)"
+cat >"$CONFIG_DIR/config.toml" <<'TOML'
+[[sandbox.external_workers]]
+name = "pebble"
+url = "ws://127.0.0.1:20011/ws/agent"
+
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://127.0.0.1:20012/ws/agent"
+
+[[sandbox.external_workers]]
+name = "lunardepth"
+url = "ws://127.0.0.1:20015/ws/agent"
+TOML
 ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }
 ensure_init_system() { INIT_SYSTEM=systemd; }
 tenant_darkirc_enabled() { return 1; }
 tenant_voice_enabled() { return 1; }
 tenant_vision_external() { return 1; }
+tenant_state_dir() { printf '%s' "$CONFIG_DIR"; }
 tenant_worker_enabled() { [[ " pebble opencode opencode2 kimi " == *" $2 "* ]]; }
 _worker_image_refs() {
   printf '%s\n' \
@@ -136,6 +159,14 @@ assert_contains "an absent worker image still reports missing" \
   "lunarwing-worker-opencode:latest: missing"
 assert_contains "an unselected lane is not a false missing" \
   "lunarwing-worker-lunardepth:latest: not selected for tenant"
+
+# WI#882: registry selection vs the daemon's effective config.toml.
+assert_contains "a lane in both registry and config is confirmed" \
+  "Worker config: pebble enabled in registry and configured for the daemon"
+assert_contains "a lane enabled but missing from config is a finding" \
+  "Worker config: opencode2 enabled in registry but MISSING from $CONFIG_DIR/config.toml"
+assert_contains "a lane disabled in registry but still configured is a finding" \
+  "Worker config: lunardepth disabled in registry but still configured in $CONFIG_DIR/config.toml"
 
 # A lane whose container is not running must not cost a loopback dial: the
 # "stopped"/"not created" branches never call _port_in_use.

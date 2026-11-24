@@ -2318,6 +2318,11 @@ status_tenant() {
     fi
   done < <(_worker_image_refs)
 
+  # WI#882: registry selection vs the daemon's effective config. A lane that
+  # is enabled but missing from config.toml is unreachable on every dispatch,
+  # whatever its container says.
+  worker_config_consistency "$name" || true
+
   local vision_container="lunarwing-vision-$name"
   if tenant_vision_external "$name"; then
     local external_vision_url

@@ -212,6 +212,41 @@ check_tenant_worker_readiness() {  # <tenant>
   [[ "${#dead[@]}" -eq 0 ]]
 }
 
+# WI#882: the daemon dials whatever `[[sandbox.external_workers]]` blocks its
+# config carries, so a lane enabled in the ports registry but absent from the
+# config is unreachable no matter how healthy its container looks (and the
+# reverse leaves the daemon dialing a worker the operator thinks is off). This
+# is a read-only, registry-vs-config consistency report: it never edits either.
+# A missing or unreadable config is reported, never assumed consistent.
+worker_config_consistency() {  # <tenant>
+  local name="$1" config_path configured lane status=0
+  config_path="$(tenant_state_dir "$name")/config.toml"
+  if [[ ! -r "$config_path" ]] && [[ "$(id -un)" != "$name" ]]; then
+    configured="$(tenant_cat "$name" "$config_path" 2>/dev/null | grep -oE '^name = "[^"]+"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
+  else
+    configured="$(grep -oE '^name = "[^"]+"' "$config_path" 2>/dev/null | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
+  fi
+  if [[ -z "$configured" ]]; then
+    say "Worker config: no external workers in $config_path (or it is unreadable) — cannot confirm the daemon's effective lanes"
+    return 0
+  fi
+
+  for lane in pebble opencode opencode2 kimi lunardepth; do
+    if tenant_worker_enabled "$name" "$lane"; then
+      if [[ " $configured " == *" $lane "* ]]; then
+        say "Worker config: $lane enabled in registry and configured for the daemon"
+      else
+        say "Worker config: $lane enabled in registry but MISSING from $config_path — the daemon cannot dispatch to it"
+        status=1
+      fi
+    elif [[ " $configured " == *" $lane "* ]]; then
+      say "Worker config: $lane disabled in registry but still configured in $config_path — the daemon will dial a lane the operator disabled"
+      status=1
+    fi
+  done
+  return "$status"
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \
