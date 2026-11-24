@@ -152,5 +152,60 @@ else
 fi
 eval "$_real_port_in_use"
 
+# WI#882: the strict gate (`worker-readiness`) must fail on a dead enabled
+# lane, pass when every enabled lane listens, and skip an intentionally
+# stopped OpenRC lane rather than calling it dead.
+LANE_STATE=([pebble]=true [opencode]=true [opencode2]=true [lunardepth]="" [kimi]=true)
+tenant_worker_desired_running() { return 0; }
+INIT_SYSTEM=systemd
+if check_tenant_worker_readiness alice >/dev/null 2>&1; then
+  fail "the strict gate fails while a selected lane's port is dead"
+else
+  pass "the strict gate fails while a selected lane's port is dead"
+fi
+
+# Every selected lane on the live port: the gate passes.
+ports_get() {  # <tenant> <slot>
+  case "$2" in
+    pebble_wss|opencode_wss|kimi_wss) printf '%s\n' "$LIVE_PORT" ;;
+    opencode2_wss) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+if check_tenant_worker_readiness alice >/dev/null 2>&1; then
+  pass "the strict gate passes when every selected lane listens"
+else
+  fail "the strict gate passes when every selected lane listens"
+fi
+
+# OpenRC: an intentionally stopped lane is not a dead lane.
+INIT_SYSTEM=openrc
+tenant_worker_desired_running() { [[ "$2" != kimi ]]; }
+ports_get() {  # <tenant> <slot>
+  case "$2" in
+    pebble_wss|opencode_wss) printf '%s\n' "$LIVE_PORT" ;;
+    *) return 1 ;;
+  esac
+}
+if check_tenant_worker_readiness alice >/dev/null 2>&1; then
+  pass "an intentionally stopped OpenRC lane is not reported dead"
+else
+  fail "an intentionally stopped OpenRC lane is not reported dead"
+fi
+
+# The wait is a bounded shared window, and a wait of 0 costs no sleep at all.
+unset LUNARWING_MT_WORKER_READY_WAIT_SECS
+[[ "$(_worker_ready_wait_secs)" == "0" ]] \
+  && pass "the readiness wait defaults to no polling" \
+  || fail "the readiness wait defaults to no polling"
+LUNARWING_MT_WORKER_READY_WAIT_SECS=not-a-number
+[[ "$(_worker_ready_wait_secs)" == "0" ]] \
+  && pass "an invalid readiness wait falls back to no polling" \
+  || fail "an invalid readiness wait falls back to no polling"
+LUNARWING_MT_WORKER_READY_WAIT_SECS=3
+[[ "$(_worker_ready_wait_secs)" == "3" ]] \
+  && pass "an explicit readiness wait is honoured" \
+  || fail "an explicit readiness wait is honoured"
+
 (( failures == 0 )) || exit 1
 printf 'ALL TESTS PASSED\n'

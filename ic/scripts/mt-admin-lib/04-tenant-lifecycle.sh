@@ -1270,6 +1270,13 @@ _start_tenant_workers() {
     say "WARNING: tenant '$name' startup degraded; $(_tenant_worker_start_failure_summary)" >&2
     return 1
   fi
+  # WI#882: a green lane pass is not a ready worker. Probe each enabled lane's
+  # published loopback port and name the dead ones, so a container that runs
+  # but never bound its WSS socket is loud at start time instead of only on the
+  # next dispatch. Advisory here: a lane may still be binding (the container
+  # start already succeeded), so this never changes the start's exit status.
+  # `mt-admin worker-readiness <name>` is the strict gate.
+  check_tenant_worker_readiness "$name" || true
   return 0
 }
 

@@ -137,6 +137,81 @@ worker_failure_log() {  # <tenant> <lane> [lines=40]
   return 0
 }
 
+# WI#882: the readiness pass `_start_tenant_workers` runs after every lane. A
+# lane whose container is `.State.Running` can still never have bound its WSS
+# port — that is exactly what Kageho's 2.2.1.0 upgrade left behind: both
+# configured workers refused loopback connections while every start/upgrade
+# reported green, and the only host-side listener audit was the WI#357 exposure
+# scan. Probe each enabled lane's published loopback port once and report the
+# dead ones, so a green start no longer hides an unreachable worker.
+#
+# The wait is opt-in and bounded: `LUNARWING_MT_WORKER_READY_WAIT_SECS`
+# (default 0) turns the single probe into a short poll, for a lane that is
+# known to bind slowly. A shared deadline keeps the cost to one window per
+# tenant, never one per lane. Report-only: a dead lane degrades the start, it
+# never aborts the other lanes.
+WORKER_READY_WAIT_DEFAULT=0
+
+_worker_ready_wait_secs() {
+  local secs="${LUNARWING_MT_WORKER_READY_WAIT_SECS:-$WORKER_READY_WAIT_DEFAULT}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=$WORKER_READY_WAIT_DEFAULT
+  printf '%s' "$secs"
+}
+
+# WI#882: one enabled lane's readiness verdict, as `"<lane> <port> <state>"`.
+# A lane with no allocated WSS slot reports `no-port`; a lane whose container
+# is not running is skipped (start already reported it).
+_worker_lane_readiness() {  # <tenant> <lane> <wss slot>
+  local name="$1" lane="$2" slot="$3" port
+  port="$(ports_get "$name" "$slot" 2>/dev/null || true)"
+  if [[ -z "$port" ]]; then
+    printf '%s - no-port\n' "$lane"
+    return 0
+  fi
+  printf '%s %s %s\n' "$lane" "$port" \
+    "$(_port_in_use "$port" && echo listening || echo dead)"
+}
+
+# WI#882: post-start readiness pass over every enabled lane. Returns non-zero
+# when at least one lane is dead on its port, so the caller can report a
+# degraded start; never stops or restarts a lane itself.
+check_tenant_worker_readiness() {  # <tenant>
+  local name="$1" wait_secs deadline lane slot port verdict
+  local -a pending=() dead=()
+  wait_secs="$(_worker_ready_wait_secs)"
+  deadline=$((SECONDS + wait_secs))
+
+  for lane in pebble opencode kimi opencode2 lunardepth; do
+    tenant_worker_enabled "$name" "$lane" || continue
+    if [[ "${INIT_SYSTEM:-}" == "openrc" ]] && ! tenant_worker_desired_running "$name" "$lane"; then
+      continue
+    fi
+    slot="${lane}_wss"
+    pending+=("$lane")
+  done
+  [[ "${#pending[@]}" -ne 0 ]] || return 0
+
+  # One shared deadline: a slow lane consumes the window for everyone, so the
+  # pass costs at most `wait_secs` no matter how many lanes are configured.
+  while :; do
+    local -a still=()
+    for lane in "${pending[@]}"; do
+      verdict="$(_worker_lane_readiness "$name" "$lane" "${lane}_wss")"
+      if [[ "$verdict" == *" dead" ]]; then still+=("$lane"); fi
+    done
+    pending=("${still[@]}")
+    [[ "${#pending[@]}" -eq 0 || "$SECONDS" -ge "$deadline" ]] && break
+    sleep 1
+  done
+
+  for lane in "${pending[@]}"; do
+    port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
+    say "WARNING: $lane worker for $name is not listening on 127.0.0.1:${port:-<none>}; its container is running but its WSS port is dead. Inspect: $0 worker-failure-log $name $lane" >&2
+    dead+=("$lane")
+  done
+  [[ "${#dead[@]}" -eq 0 ]]
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \

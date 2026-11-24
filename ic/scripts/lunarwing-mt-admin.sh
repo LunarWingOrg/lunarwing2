@@ -719,6 +719,11 @@ Commands:
 
   list-tenants                     Show all tenants with ports and status
   status <name>                    Detailed status for one tenant
+  worker-readiness <name>          WI#882 strict gate: exit non-zero when any
+                                   enabled worker lane's WSS port refuses a
+                                   loopback connection (a running container is
+                                   not a ready worker); waits up to
+                                   LUNARWING_MT_WORKER_READY_WAIT_SECS
   worker-failure-log <name> <lane> [lines]
                                    WI#882 first-failure evidence: the lane's
                                    container state plus a bounded, scrubbed
@@ -1786,6 +1791,18 @@ main() {
     worker-failure-log)
       [[ -n "${1:-}" && -n "${2:-}" ]] || die "usage: worker-failure-log <name> <lane> [lines]"
       worker_failure_log "$@"
+      ;;
+
+    worker-readiness)
+      # WI#882: strict gate — exit non-zero when any enabled lane's WSS port
+      # refuses loopback. `status` reports the same verdict per lane.
+      [[ -n "${1:-}" ]] || die "usage: worker-readiness <name>"
+      local ready_name
+      ready_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$ready_name" || die "tenant '$ready_name' not found in registry"
+      ensure_container_runtime
+      ensure_init_system
+      check_tenant_worker_readiness "$ready_name"
       ;;
 
     worker-egress)
