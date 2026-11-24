@@ -1951,3 +1951,59 @@ test("locale quote normalization leaves other dollar signs literal (ALV-2)", asy
   assert.equal(shellWordLevelView('fixture $$"word"'), "fixture $$word")
   assert.equal(shellWordLevelView('fixture \'$"word"\''), 'fixture \'$"word"\'')
 })
+
+test("a shell body runs the full rule set, not the listener rule alone (WI#874)", () => {
+  // checkListeners recursed into the `bash -c` body with the listener rule
+  // only, so the raw-shape family and checkRm never saw the text bash runs.
+  // Each row below is the item's measured ALLOW set at master; the unwrapped
+  // spelling beside it already denied.
+  assertBlocked('bash -c "tee /dev/sda1"', "block-device")
+  assertBlocked('sh -c "cp /tmp/wi874-a /dev/sda1"', "block-device")
+  assertBlocked('bash -c "\\"tee\\" /dev/sda1"', "block-device")
+  // find/xargs/rsync deletion inside a body.
+  assertBlocked(`bash -c "find /app -name '*.o' -delete"`, "deletion outside")
+  assertBlocked("bash -c 'xargs rm -rf'", "cannot verify")
+  assertBlocked("bash -c 'rsync -a --delete /tmp/wi874-e/ /app/'", "deletion outside")
+  // Interpreter deletion inside a body.
+  assertBlocked(`bash -c 'perl -e "unlink(\\"/etc/passwd\\")"'`, "deletion outside")
+  // Decoded pipe into a shell inside a body.
+  assertBlocked("bash -c 'echo aGVsbG8K | base64 -d | bash'", "decoded")
+  // A deletion the rm rule reads inside a body, and the protected-rename rule.
+  assertBlocked('bash -c "rm -rf /app/hooks"', "deletion outside")
+  assertBlocked("bash -c 'mv /app/hooks /tmp/hooks'", "protected tree")
+  // The same bodies stay ordinary work.
+  assertAllowed('bash -c "echo hi"')
+  assertAllowed("bash -c 'cargo check -j18'")
+  assertAllowed("bash -c 'rm -rf /tmp/wi874-build'")
+  assertAllowed(`bash -c "find /tmp/wi874 -name '*.o' -delete"`)
+  assertAllowed("bash -c 'rsync -a /tmp/wi874-e/ /tmp/wi874-f/'")
+  assertAllowed("bash -c 'tee /tmp/wi874.log'")
+  assertAllowed("bash -c 'cp /tmp/wi874-a /tmp/wi874-b'")
+  // A quoted mention stays data, as at top level.
+  assertAllowed(`bash -c "grep -rn 'find /app -delete' docs/"`)
+})
+
+test("every launcher that runs a shell body gets the body rules (WI#874)", () => {
+  // `script -c` and `eval` run their string the way `bash -c` runs its body,
+  // and the option walk that finds the body is the same one WI#869 fixed.
+  assertBlocked("script -c 'tee /dev/sda1'", "block-device")
+  assertBlocked("script --command 'tee /dev/sda1'", "block-device")
+  assertBlocked("script -qc 'tee /dev/sda1'", "block-device")
+  assertBlocked("eval 'tee /dev/sda1'", "block-device")
+  assertBlocked("eval 'find /app -delete'", "deletion outside")
+  // A nested body keeps the budget and still denies.
+  assertBlocked(`bash -c 'bash -c "tee /dev/sda1"'`, "block-device")
+  assertAllowed("script -c 'echo hi'")
+  assertAllowed("eval 'cargo check -j18'")
+})
+
+test("an env -S command line gets the body rules (WI#874)", () => {
+  // `env -S` is one shell word but a command line to env, so a device write
+  // or a deletion inside it must read as the unwrapped spelling does.
+  assertBlocked('env -S "tee /dev/sda1"', "block-device")
+  assertBlocked('env -S "find /app -delete"', "deletion outside")
+  assertBlocked('env -S "cp /tmp/wi874-a /dev/sda1"', "block-device")
+  assertAllowed('env -S "tee /tmp/wi874.log"')
+  assertAllowed('env -S "cargo check -j18"')
+  assertAllowed(`env -S "grep -rn 'kimi server' ."`)
+})
