@@ -153,6 +153,22 @@ class LockDeltaTests(unittest.TestCase):
         build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
         self.assertIn(f"{patch}\n", build_script)
 
+    def test_openai_codex_catalog_patch_is_a_checked_build_input(self):
+        patch = "pebble4lunarwing/patches/wi863-openai-codex-model-catalog.patch"
+        self.assertTrue((ROOT / patch).is_file())
+        dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"COPY {patch} /tmp/wi863-openai-codex-model-catalog.patch", dockerfile)
+        self.assertIn(
+            "git -C /build/pebble apply --check /tmp/wi863-openai-codex-model-catalog.patch",
+            dockerfile,
+        )
+        self.assertIn(
+            "git -C /build/pebble apply /tmp/wi863-openai-codex-model-catalog.patch",
+            dockerfile,
+        )
+        build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
+        self.assertIn(f"{patch}\n", build_script)
+
     def test_matching_digest_does_not_authorize_package_addition(self):
         with tempfile.TemporaryDirectory() as temporary:
             upstream = pathlib.Path(temporary) / "upstream.lock"
