@@ -1689,7 +1689,10 @@ function stageWords(stage) {
  * options are stepped over, and an `env -S`/`--split-string` value is one
  * word to the shell but a command line to env, so the words env runs replace
  * it (WI#872). Invalid invocations have no stage, and the listener rule
- * separately refuses unverifiable strings.
+ * separately refuses unverifiable strings. A stage the reader cannot resolve
+ * — an unreadable `env -S` string or `env` nesting past the depth bound —
+ * carries `unverifiable`, because an empty name would read as "runs nothing"
+ * and hide the command (WI#885).
  */
 function stageCommandFrom(words, depth) {
   let i = 0;
@@ -1697,8 +1700,9 @@ function stageCommandFrom(words, depth) {
     const name = commandBasename(words[i]);
     if (name === "env") {
       const command = envCommandWords(words, i + 1);
-      if (command === null || command.unverifiable || depth >= MAX_SHELL_BODY_DEPTH) {
-        return { name: "", args: [] };
+      if (command === null) return { name: "", args: [], unverifiable: false };
+      if (command.unverifiable || depth >= MAX_SHELL_BODY_DEPTH) {
+        return { name: "", args: [], unverifiable: true };
       }
       return stageCommandFrom(command.words, depth + 1);
     }
@@ -1706,7 +1710,7 @@ function stageCommandFrom(words, depth) {
     if (!isPrefix) break;
     i++;
   }
-  return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1) };
+  return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1), unverifiable: false };
 }
 
 function stageCommand(stage) {
@@ -1718,10 +1722,12 @@ function stageCommand(stage) {
  * WI#832): `base64 -d`, `xxd -r`, `rev`, a decompressor, `openssl base64 -d`,
  * `perl`/`python` base64 one-liners, `printf` with hex or octal escapes, and
  * `tr` — but only when `tr` deletes nothing, because `tr -d '\r'` normalises
- * text rather than decoding it.
+ * text rather than decoding it. A stage the reader could not resolve counts as
+ * a decode stage, so an unreadable prefix cannot hide the decoder (WI#885).
  */
 function isDecodeStage(stage) {
-  const { name, args } = stageCommand(stage);
+  const { name, args, unverifiable } = stageCommand(stage);
+  if (unverifiable) return true;
   if (name === "base64") return args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "--decode");
   if (name === "xxd") return args.some((word) => /^-[a-zA-Z]*r[a-zA-Z]*$/.test(word) || word === "--revert");
   if (name === "openssl") {
@@ -1740,9 +1746,14 @@ function isDecodeStage(stage) {
   return name === "rev";
 }
 
-/** True when the stage executes its stdin: a shell, or an interpreter one-liner. */
+/**
+ * True when the stage executes its stdin: a shell, or an interpreter
+ * one-liner. A stage the reader could not resolve counts as an interpreter, so
+ * a prefix chain that runs past the depth bound still fails closed (WI#885).
+ */
 function isInterpreterStage(stage) {
-  const { name, args } = stageCommand(stage);
+  const { name, args, unverifiable } = stageCommand(stage);
+  if (unverifiable) return true;
   if (SHELL_NAME.test(name)) return true;
   if (name === "python" || name === "python3") return args.length === 0 || args.includes("-c") || args.includes("-");
   if (name === "perl") return args.some((word) => /^-[a-zA-Z]*[eE]/.test(word));
