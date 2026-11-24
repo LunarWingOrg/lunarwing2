@@ -52,7 +52,7 @@ _ctr() {  # <tenant> [container] <verb> ...
       if [[ "${2:-}" == "-f" ]]; then fmt="${3:-}"; container="${4:-}"; else container="${2:-}"; fi
       [[ -n "${LOGS[$container]+set}" ]] || return 1
       if [[ -z "$fmt" ]]; then printf 'true\n'; return 0; fi
-      printf 'true running sha256:abc\n'
+      printf 'true running sha256:abcdef0123456789\n'
       ;;
     logs)
       local tail="0" container="${*: -1}"
@@ -68,7 +68,7 @@ out="$(worker_failure_log alice pebble 2)"
 
 contains() { [[ "$out" == *"$2"* ]]; }
 if contains x "enabled: true"; then pass "reports lane enablement"; else fail "reports lane enablement"; fi
-if contains x "bridge container: lunarwing-pebble-alice true running sha256:abc"; then
+if contains x "bridge container: lunarwing-pebble-alice running=true status=running image=sha256:abc"; then
   pass "reports the bridge container state and image"
 else fail "reports the bridge container state and image"; printf '%s\n' "$out" >&2; fi
 if contains x "--- last 2 log lines: lunarwing-pebble-alice ---"; then

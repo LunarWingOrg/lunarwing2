@@ -122,7 +122,10 @@ worker_failure_log() {  # <tenant> <lane> [lines=40]
   if [[ -z "$state" ]]; then
     say "bridge container: absent ($container)"
   else
-    say "bridge container: $container $state"
+    # Short image id: the full digest is 64 hex chars and drowns the line.
+    local running status image
+    read -r running status image <<<"$state"
+    say "bridge container: $container running=$running status=$status image=${image:0:12}"
   fi
 
   local target
