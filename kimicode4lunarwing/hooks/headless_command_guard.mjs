@@ -300,6 +300,76 @@ function shellWordLevelView(text) {
   return hasEmptySpan && view.length === wordStart ? view + '""' : view;
 }
 
+// A command word that carries an unquoted parameter expansion or a command
+// substitution can be the plain verb when the variable is empty or unset
+// (`${EMPTY}tee /dev/sda1` runs `tee`), and the guard does not evaluate the
+// shell (WI#883). `RM_DYNAMIC_WORD` is the same predicate `checkRm` already
+// refuses with.
+const GLUED_EXPANSION = /[$`]/;
+
+/**
+ * The words of the text with every unquoted parameter expansion, command
+ * substitution and backtick removed, so a verb glued to an expansion reads as
+ * the verb bash may run (WI#883): `${EMPTY}tee /dev/sda1` reads as
+ * `tee /dev/sda1`, `t${EMPTY}ee` as `tee`, and `$EMPTY"tee"` as `tee`. A
+ * word made only of an expansion becomes empty, which keeps `$EDITOR` and
+ * `"$HOME"/bin/tool` as the ordinary words they are. An expansion inside
+ * quotes is not expanded here: the quoted spelling is the word's own text,
+ * and a raw-shape reader sees it in the quoted views.
+ *
+ * A `${IFS…}` expansion is a word separator, so it becomes a space rather
+ * than disappearing, matching the reading `checkRm` already uses. Only
+ * unquoted expansions are removed; the view is an additional reading that
+ * can add denials, never remove one.
+ */
+function gluedExpansionView(text) {
+  if (!GLUED_EXPANSION.test(text)) return text;
+  const { states, substitutions } = quoteScan(text);
+  let view = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const state = states[i];
+    if (state === QUOTE_UNQUOTED || state === QUOTE_ESCAPED) {
+      const close = substitutions.get(i);
+      if (close !== undefined) {
+        // A substitution body is a command of its own; it cannot be the
+        // verb this word names, so its unknown output is dropped.
+        i = close;
+        continue;
+      }
+      const ifs = ifsSeparatorLength(text, i);
+      if (ifs > 0) {
+        view += " ";
+        i += ifs - 1;
+        continue;
+      }
+      if (ch === "$") {
+        const next = text[i + 1] ?? "";
+        if (/[A-Za-z_]/.test(next)) {
+          // `$NAME` is a parameter; `$$` is the PID and `$'…'`/`$"…"` are
+          // quote openers, which the shared reader already marks.
+          i++;
+          while (i + 1 < text.length && /[A-Za-z0-9_]/.test(text[i + 1])) i++;
+          continue;
+        }
+        if (next === "{") {
+          const end = text.indexOf("}", i + 2);
+          if (end !== -1) {
+            i = end;
+            continue;
+          }
+        }
+        if (/[0-9@*#?$!-]/.test(next)) {
+          i++;
+          continue;
+        }
+      }
+    }
+    view += ch;
+  }
+  return view;
+}
+
 /**
  * Split on control operators and LF, leaving other line terminators in the
  * text. The separators are read outside quotes: an argument that legitimately
@@ -2267,6 +2337,10 @@ function evaluate(command, depth = 0) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
     const punctuation = shellPunctuationView(joined);
     const wordLevel = shellWordLevelView(joined);
+    // A verb glued to an unquoted expansion (`${EMPTY}tee /dev/sda1`) is the
+    // plain verb when the variable is empty or unset, which the raw-shape and
+    // listener readers would otherwise walk past (WI#883).
+    const glued = gluedExpansionView(joined);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
@@ -2282,9 +2356,20 @@ function evaluate(command, depth = 0) {
       // (WI#873). The word-level view, not `shellWordView`, keeps an
       // interpreter operand's own quotes.
       (wordLevel === joined ? null : checkRawShapes(wordLevel)) ??
+      (glued === joined ? null : checkRawShapes(glued)) ??
+      // The glued view leaves a quoted verb quoted (`$EMPTY"tee"` reads as
+      // `"tee"`), so the WI#873 word-level reading applies to it as well.
+      (glued === joined ? null : checkRawShapes(shellWordLevelView(glued))) ??
+      (glued === joined ? null : checkListeners(glued)) ??
+      (glued === joined ? null : checkListeners(shellWordLevelView(glued))) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined, depth));
     if (joinedDenial) return joinedDenial;
+    for (const segment of commandSegments(glued === joined ? joined : glued)) {
+      const denied = checkRm(segment);
+      if (denied) return denied;
+    }
+    if (glued === joined) continue;
     for (const segment of commandSegments(joined)) {
       const denied = checkRm(segment);
       if (denied) return denied;
