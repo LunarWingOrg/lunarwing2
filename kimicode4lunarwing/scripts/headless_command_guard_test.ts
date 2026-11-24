@@ -37,13 +37,14 @@ async function guardSyntax() {
   const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
   assert.ok(source.endsWith(cli))
   const library = source.slice(0, -cli.length) +
-    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView };"
   return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
     commandSegments: (text: string) => string[]
     clauseText: (text: string, from: number) => string
     quoteScan: (text: string) => { substitutions: Map<number, number> }
     listenerSegments: (text: string) => Iterable<ListenerWord[]>
     listenerWordList: (words: ListenerWord[]) => string[]
+    shellWordLevelView: (text: string) => string
   }
 }
 
@@ -1771,4 +1772,61 @@ test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)
   assert.deepEqual(fields("first${IFS}second"), [["first", "second"]])
   assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
   assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
+})
+
+test("one quoted character on the verb does not defeat the raw-shape family (WI#873)", () => {
+    // checkRawShapes ran on `joined` only, so the shell quoting the verb
+    // stripped bash's word away from every raw-shape rule. Each row below is
+    // a rule family in the spellings the WI measured at master, where all of
+    // them were allowed while the deny-rule family still fired.
+    // Device writes (tee/cp).
+    assertBlocked('"tee" /dev/sda1', "block-device");
+    assertBlocked("'tee' /tmp/wi873-a /dev/sda1", "block-device");
+    assertBlocked("\\tee /dev/sda1", "block-device");
+    assertBlocked('"cp" /tmp/wi873-a /dev/sda1', "block-device");
+    // find -delete and find -exec.
+    assertBlocked('"find" /app -name x -delete', "deletion outside");
+    assertBlocked('"find" /app -name x -exec rm {} \\;', "deletion outside");
+    assertBlocked("'find' /app -name x -delete", "deletion outside");
+    // xargs over an unverifiable input set.
+    assertBlocked('"xargs" rm -rf', "cannot verify");
+    // rsync --delete.
+    assertBlocked('"rsync" -a --delete /tmp/wi873-e/ /app/', "deletion outside");
+    // Interpreter one-liner deletion, quoted verb and quoted operand.
+    assertBlocked('"perl" -e \'unlink("/etc/passwd")\'', "deletion outside");
+    assertBlocked('"python3" -c "import shutil;shutil.rmtree(\'/app/x\')"', "deletion outside");
+    // Decoded pipe: the decode stage verb quoted.
+    assertBlocked('echo aGVsbG8K | "base64" -d | bash', "decoded");
+    // The same fixes stay ordinary work when they target a temp root, so the
+    // word view is not denying on the quoting alone.
+    assertAllowed('"tee" /tmp/wi873.out');
+    assertAllowed('"find" /tmp/wi873 -name x -delete');
+    assertAllowed('"perl" -e \'unlink("/tmp/wi873-a")\'');
+    // A quoted character inside an argument (not on the verb) was already
+    // read by the raw spellings; it must stay that way.
+    assertAllowed("tee '/tmp/wi873-a b'");
+})
+
+test("empty quote spans cannot hide a raw-shape verb or path (ALV-1)", () => {
+  assertBlocked('""tee /dev/sda1', "block-device")
+  assertBlocked("tee /dev/s''da1", "block-device")
+  assertAllowed('""tee /dev/null')
+})
+
+test("Bash locale-quoted literals are checked by the raw-shape rules (ALV-2)", () => {
+  assertBlocked('$"tee" /dev/sda1', "block-device")
+  assertBlocked('$""tee /dev/sda1', "block-device")
+  assertAllowed('$"tee" /dev/null')
+})
+
+test("the raw-shape view retains an explicit empty argument (ALV-1)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView(`fixture ''""word w''o""rd`), "fixture word word")
+  assert.equal(shellWordLevelView(`fixture -S "" ''"" $""`), 'fixture -S "" "" ""')
+})
+
+test("locale quote normalization leaves other dollar signs literal (ALV-2)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView('fixture $$"word"'), "fixture $$word")
+  assert.equal(shellWordLevelView('fixture \'$"word"\''), 'fixture \'$"word"\'')
 })
