@@ -174,6 +174,41 @@ text, decides write and deletion:
   remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
   write boundary: give read grants a read-only key and protect branches.
 
+### Non-public remotes (WI#875)
+
+A plain `http://` remote on the LAN or on an overlay (NetBird and other
+`100.64.0.0/10` networks) is a normal deployment. In `proxy-enforced` mode
+the proxy keeps its public-only destination check by default, so such a
+remote must be allowed explicitly:
+
+```
+SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
+```
+
+- **Named granted remotes only.** Each name must be a remote in the same
+  `SANDBOX_GIT_REMOTES` list and must be `http://` or `https://`; a `file://`
+  remote, an unknown name or an empty value is a configuration load error.
+  The allowance opens exactly the named remote's own host and port. Another
+  host on the same subnet, another port on the granted host, and every
+  unnamed remote stay unreachable.
+- **IP-literal LAN and overlay remotes only.** A named remote's URL host must
+  be an RFC 1918 address, an address in the CGNAT range `100.64.0.0/10`, or
+  an IPv6 unique-local address (`fc00::/7`), written as the literal address
+  (`http://192.168.1.20:3000/…`, `http://100.64.0.7/…`). A host name is a
+  configuration load error, and the proxy also refuses a non-public answer
+  for any name, so no DNS answer can move the allowance to another private
+  host. Loopback, link-local, the cloud metadata addresses
+  (`169.254.169.254`, and `100.100.100.200` inside the CGNAT range) and every
+  other non-public address stay refused.
+- **The address is pinned.** The proxy connects to the literal address; a
+  redirect cannot move the connection.
+  If the allowance cannot be applied exactly, the call is refused as before.
+- **The shared tenant proxy is unchanged.** Only the per-call git proxy
+  carries the allowance; the shared proxy still refuses every non-public
+  destination.
+- **Evidence records it.** `capability_evidence.git.remotes[]` carries
+  `"private_destination": true` for each allowed remote.
+
 ### Credentials (WI#860)
 
 `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a granted
@@ -238,12 +273,23 @@ processes: for `http://` remotes the per-call proxy enforces write and deletion
 (see the write grant above), and for everything else, and for non-fast-forward
 updates, use server-side permissions and branch protection.
 
+The scan recognizes GNU `env`'s split-string option in its separate, attached,
+and clustered spellings (`-S body`, `-Sbody`, `-iS body`, `--split-string body`,
+`--split-string=body` and the long-option abbreviations). Preflight uses GNU
+`env`'s literal splitting rules, not shell command separators. It appends the
+remaining arguments, rechecks `env`'s options, and inspects the resulting
+single command. Dynamic expansions and invalid split strings are refused.
+
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies. It does not fully model shell
+`submodule foreach` and `bisect run` bodies. `rebase` exec is read from the
+short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
+`-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
+their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
+option's value rather than an exec. It does not fully model shell
 expansion (including globs, braces and command substitutions), dynamic
 command names, alias or command lookup, text evaluated by commands such as
-`eval`, `trap` or `env -S`, or shell scripts supplied on stdin. Unsupported
+`eval` or `trap`, or shell scripts supplied on stdin. Unsupported
 forms, including indirect writes to shell variables, are not guaranteed
 to be refused.
 Ordinary commands such as `grep git README`, `echo git push`, and

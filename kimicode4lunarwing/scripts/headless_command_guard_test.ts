@@ -37,13 +37,14 @@ async function guardSyntax() {
   const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
   assert.ok(source.endsWith(cli))
   const library = source.slice(0, -cli.length) +
-    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView };"
   return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
     commandSegments: (text: string) => string[]
     clauseText: (text: string, from: number) => string
     quoteScan: (text: string) => { substitutions: Map<number, number> }
     listenerSegments: (text: string) => Iterable<ListenerWord[]>
     listenerWordList: (words: ListenerWord[]) => string[]
+    shellWordLevelView: (text: string) => string
   }
 }
 
@@ -1212,6 +1213,127 @@ test("cp's destination option is the destination it writes (WI#869)", () => {
   assertAllowed("mv -S .bak a b")
 })
 
+test("env -S is a command line, not one word (WI#872)", () => {
+  // GNU env's `-S`/`--split-string` value is one shell word but a whole
+  // command line to env, and `env` was a transparent stage prefix that never
+  // inspected its own options, so every row of the item's measured ALLOW
+  // table named a listener the guard never saw as two words.
+  assertBlocked('env -S "kimi server"', "kimi service mode")
+  assertBlocked("env -S'kimi server'", "kimi service mode")
+  assertBlocked('env --split-string "kimi server"', "kimi service mode")
+  assertBlocked('env --split-string="kimi server"', "kimi service mode")
+  assertBlocked('env -i -S "kimi server"', "kimi service mode")
+  assertBlocked('env -u HOME -S "kimi server"', "kimi service mode")
+  assertBlocked('/usr/bin/env -S "kimi server"', "kimi service mode")
+  assertBlocked('busybox env -S "kimi server"', "kimi service mode")
+  assertBlocked('env -S "kimi web"', "kimi service mode")
+  assertBlocked('env -S "nc -l 9000"', "listener started from a task")
+  assertBlocked('env -S "python3 -m http.server"', "listener started from a task")
+  assertBlocked('env -S "socat TCP-LISTEN:9000 -"', "listener started from a task")
+  // Every option spelling that still reaches the string: an attached value,
+  // a cluster letter, a value-taking option's separate value, and the
+  // long-option abbreviation getopt accepts.
+  assertBlocked('env -Secho hi kimi server', "kimi service mode")
+  assertBlocked('env -iS "kimi server"', "kimi service mode")
+  assertBlocked('env -vS "kimi server"', "kimi service mode")
+  assertBlocked('env -uFOO -S "kimi server"', "kimi service mode")
+  assertBlocked('env -C /tmp -S "kimi server"', "kimi service mode")
+  assertBlocked('env --chdir=/tmp --split-string="kimi server"', "kimi service mode")
+  assertBlocked('env -a name -S "kimi server"', "kimi service mode")
+  assertBlocked('env --s "kimi server"', "kimi service mode")
+  assertBlocked('env --split "kimi server"', "kimi service mode")
+  // env's own COMMAND words still follow the option value, so a listener
+  // after the split string is the same denial.
+  assertBlocked('env -S "echo hi" kimi server', "kimi service mode")
+  // The string is split as coreutils 9.12 splits it: `\_` separates outside
+  // quotes, `#` at a word start begins a comment, and `\c` ends the string.
+  assertBlocked('env -S "kimi\\_server"', "kimi service mode")
+  assertBlocked('env -S "kimi server # a comment"', "kimi service mode")
+  // The control rows of the same table keep denying.
+  assertBlocked("env kimi server", "kimi service mode")
+  assertBlocked("env -i kimi server", "kimi service mode")
+  assertBlocked("env -u HOME kimi server", "kimi service mode")
+  assertBlocked("env FOO=1 kimi server", "kimi service mode")
+  // A string whose words the hook cannot read is refused: `${NAME}` is text
+  // the task chooses, so `${A} server` may be `kimi server`.
+  assertBlocked('env -S "${A} server"', "env -S")
+  assertBlocked('env -S "kimi ${X}"', "env -S")
+  assertBlocked('env -S "kimi $X"', "env -S")
+  assertBlocked('env -S "kimi${IFS}server"', "env -S")
+  // Ordinary work keeps passing, including a quoted comment and `-p`.
+  assertAllowed('env -S "echo hi"')
+  assertAllowed('env -S "echo hi # kimi server"')
+  assertAllowed('env -S "kimi -p hello"')
+  assertAllowed('env -S "cargo check -j18"')
+  // Inside the string the shell's own quotes are gone, so the words are
+  // unquoted: quoting them in the string is what keeps them data, exactly as
+  // for an unsplit command (WI#858's accepted cost).
+  assertAllowed(`env -S "grep -rn 'kimi server' ."`)
+  assertAllowed("env -i cargo check -j18")
+  assertAllowed("env -u HOME cargo check -j18")
+  // `env` stops reading options at its first command word: a later `-S` is
+  // that command's argument, so it splits nothing.
+  assertAllowed('env echo -S "kimi server"')
+  assertAllowed('env - -S "kimi server"')
+  assertAllowed('env -- -S "kimi server"')
+  // A nested body is read the same way in either direction.
+  assertBlocked(`bash -c 'env -S "kimi server"'`, "kimi service mode")
+  assertBlocked(`env -S "bash -c 'kimi server'"`, "kimi service mode")
+})
+
+test("env resolves abbreviated long options before -S (WI#872 ALW-1)", () => {
+  for (const option of ["--ch /tmp", "--u HOME", "--a argv0", "--e /dev/null", "--ch=/tmp"]) {
+    assertBlocked(`env ${option} -S "kimi server"`, "kimi service mode")
+  }
+  // A signal option's optional value is attached, never the next word.
+  assertBlocked('env --block-sig -S "kimi server"', "kimi service mode")
+  assertAllowed('env --ch /tmp -S "echo hi"')
+})
+
+test("env reads split words as options again (WI#872 ALW-2)", () => {
+  assertBlocked(`env -S "-S'kimi server'"`, "kimi service mode")
+  assertBlocked(`env -S "-u HOME -S'kimi server'"`, "kimi service mode")
+  assertBlocked(`env -S '--split-string="kimi server"'`, "kimi service mode")
+  assertBlocked(`env -S '--ch /tmp --s="kimi server"'`, "kimi service mode")
+  // The option can take its value from the original argv after the split.
+  assertBlocked(`env -S "-i -S" "kimi server"`, "kimi service mode")
+  assertAllowed(`env -S "-i -S'echo hi'"`)
+  assertAllowed(`env -S "-- -S 'kimi server'"`)
+  assertAllowed(`env -S "- -S 'kimi server'"`)
+  assertAllowed(`env -S "FOO=1 echo -S 'kimi server'"`)
+  assertBlocked(`env -S "${"-S ".repeat(32)}true"`, "cannot check listeners behind an env -S string")
+})
+
+test("env split strings separate on all unquoted ASCII whitespace (WI#872 ALW-3)", () => {
+  for (const separator of [" ", "\t", "\n", "\r", "\v", "\f"]) {
+    assertBlocked(`env -S "kimi${separator}server"`, "kimi service mode")
+    assertAllowed(`env -S "printf %s 'kimi${separator}server'"`)
+  }
+  // Escapes put a control character in the current word, not between words.
+  assertAllowed('env -S "printf %s kimi\\rserver"')
+})
+
+test("the decode-pipe stage reader steps over env's options (WI#872)", () => {
+  // stageCommand treated `env` as a prefix word and stopped at its first
+  // option, so every env spelling but a bare assignment read as no command
+  // at all. Its options are now walked, and the same split string applies.
+  assertBlocked("echo x | base64 -d | env -i bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env -u FOO bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env -C /tmp bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env --ch /tmp bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env -- bash", "decoded content piped")
+  assertBlocked('echo x | base64 -d | env -S "bash"', "decoded content piped")
+  assertBlocked('echo x | base64 -d | env -S "-i bash"', "decoded content piped")
+  assertBlocked('echo x | env -S "-i base64 -d" | bash', "decoded content piped")
+  assertBlocked('echo x | env -S "base64 -d" | bash', "decoded content piped")
+  assertBlocked('echo x | env -S "base64 -d" | env -S "bash"', "decoded content piped")
+  // The control rows keep their verdicts, and ordinary pipes stay allowed.
+  assertBlocked("echo x | base64 -d | bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env bash", "decoded content piped")
+  assertAllowed("echo hi | base64 -d | env -i grep x")
+  assertAllowed('echo hi | env -S "base64 -d" | grep x')
+})
+
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
   // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
   // in double quotes reaches Perl with the inner quotes unescaped, so
@@ -1771,4 +1893,61 @@ test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)
   assert.deepEqual(fields("first${IFS}second"), [["first", "second"]])
   assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
   assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
+})
+
+test("one quoted character on the verb does not defeat the raw-shape family (WI#873)", () => {
+    // checkRawShapes ran on `joined` only, so the shell quoting the verb
+    // stripped bash's word away from every raw-shape rule. Each row below is
+    // a rule family in the spellings the WI measured at master, where all of
+    // them were allowed while the deny-rule family still fired.
+    // Device writes (tee/cp).
+    assertBlocked('"tee" /dev/sda1', "block-device");
+    assertBlocked("'tee' /tmp/wi873-a /dev/sda1", "block-device");
+    assertBlocked("\\tee /dev/sda1", "block-device");
+    assertBlocked('"cp" /tmp/wi873-a /dev/sda1', "block-device");
+    // find -delete and find -exec.
+    assertBlocked('"find" /app -name x -delete', "deletion outside");
+    assertBlocked('"find" /app -name x -exec rm {} \\;', "deletion outside");
+    assertBlocked("'find' /app -name x -delete", "deletion outside");
+    // xargs over an unverifiable input set.
+    assertBlocked('"xargs" rm -rf', "cannot verify");
+    // rsync --delete.
+    assertBlocked('"rsync" -a --delete /tmp/wi873-e/ /app/', "deletion outside");
+    // Interpreter one-liner deletion, quoted verb and quoted operand.
+    assertBlocked('"perl" -e \'unlink("/etc/passwd")\'', "deletion outside");
+    assertBlocked('"python3" -c "import shutil;shutil.rmtree(\'/app/x\')"', "deletion outside");
+    // Decoded pipe: the decode stage verb quoted.
+    assertBlocked('echo aGVsbG8K | "base64" -d | bash', "decoded");
+    // The same fixes stay ordinary work when they target a temp root, so the
+    // word view is not denying on the quoting alone.
+    assertAllowed('"tee" /tmp/wi873.out');
+    assertAllowed('"find" /tmp/wi873 -name x -delete');
+    assertAllowed('"perl" -e \'unlink("/tmp/wi873-a")\'');
+    // A quoted character inside an argument (not on the verb) was already
+    // read by the raw spellings; it must stay that way.
+    assertAllowed("tee '/tmp/wi873-a b'");
+})
+
+test("empty quote spans cannot hide a raw-shape verb or path (ALV-1)", () => {
+  assertBlocked('""tee /dev/sda1', "block-device")
+  assertBlocked("tee /dev/s''da1", "block-device")
+  assertAllowed('""tee /dev/null')
+})
+
+test("Bash locale-quoted literals are checked by the raw-shape rules (ALV-2)", () => {
+  assertBlocked('$"tee" /dev/sda1', "block-device")
+  assertBlocked('$""tee /dev/sda1', "block-device")
+  assertAllowed('$"tee" /dev/null')
+})
+
+test("the raw-shape view retains an explicit empty argument (ALV-1)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView(`fixture ''""word w''o""rd`), "fixture word word")
+  assert.equal(shellWordLevelView(`fixture -S "" ''"" $""`), 'fixture -S "" "" ""')
+})
+
+test("locale quote normalization leaves other dollar signs literal (ALV-2)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView('fixture $$"word"'), "fixture $$word")
+  assert.equal(shellWordLevelView('fixture \'$"word"\''), 'fixture \'$"word"\'')
 })

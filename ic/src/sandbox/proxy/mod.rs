@@ -36,6 +36,7 @@ pub mod policy;
 pub(crate) mod relay;
 
 pub use allowlist::{DomainAllowlist, DomainPattern, DomainValidationResult};
+pub use egress::PrivateEgress;
 pub use http::{CredentialResolver, EnvCredentialResolver, HttpProxy, NoCredentialResolver};
 pub use policy::{
     AllowAllDecider, DefaultPolicyDecider, DenyAllDecider, NetworkDecision, NetworkPolicyDecider,
@@ -55,6 +56,7 @@ pub struct NetworkProxyBuilder {
     credential_resolver: Arc<dyn CredentialResolver>,
     policy: SandboxPolicy,
     public_only: bool,
+    private_egress: PrivateEgress,
     git_transport: Option<git_transport::GitTransportPolicy>,
 }
 
@@ -67,6 +69,7 @@ impl NetworkProxyBuilder {
             credential_resolver: Arc::new(EnvCredentialResolver),
             policy: SandboxPolicy::ReadOnly,
             public_only: false,
+            private_egress: PrivateEgress::new(),
             git_transport: None,
         }
     }
@@ -86,6 +89,7 @@ impl NetworkProxyBuilder {
             // its ACL from the manager policy.
             policy: SandboxPolicy::ReadOnly,
             public_only: config.network == crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+            private_egress: PrivateEgress::new(),
             git_transport: None,
         }
     }
@@ -127,6 +131,14 @@ impl NetworkProxyBuilder {
         self
     }
 
+    /// Allow exact non-public destinations for this proxy (WI#875). Only the
+    /// per-call git proxy passes an allowance; the shared tenant proxy keeps
+    /// `public_only` and no allowance.
+    pub fn with_private_egress(mut self, private_egress: PrivateEgress) -> Self {
+        self.private_egress = private_egress;
+        self
+    }
+
     /// Build the HTTP proxy.
     pub fn build(self) -> HttpProxy {
         let decider: Arc<dyn NetworkPolicyDecider> = if self.policy.has_full_network() {
@@ -138,11 +150,12 @@ impl NetworkProxyBuilder {
             ))
         };
 
-        HttpProxy::with_git_transport(
+        HttpProxy::with_private_egress(
             decider,
             self.credential_resolver,
             self.public_only,
             self.git_transport,
+            self.private_egress,
         )
     }
 
