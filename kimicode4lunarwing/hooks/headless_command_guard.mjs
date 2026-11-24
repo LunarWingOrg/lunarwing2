@@ -321,10 +321,18 @@ const GLUED_EXPANSION = /[$`]/;
  * than disappearing, matching the reading `checkRm` already uses. Only
  * unquoted expansions are removed; the view is an additional reading that
  * can add denials, never remove one.
+ *
+ * With `defaults`, an operator expansion is read as the word bash may run in
+ * its place instead of being dropped (AME-3 of WI#883): `${X:-tee} /dev/sda1`
+ * reads as `tee /dev/sda1`, `t${X:-e}e` as `tee`, and a double-quoted
+ * `"${X:-tee}"` as `"tee"`. Both readings are real — the variable's own value
+ * or the operator's word — so the caller checks this view beside the plain
+ * one, never in its place.
  */
-function gluedExpansionView(text) {
+function gluedExpansionView(text, defaults = false) {
   if (!GLUED_EXPANSION.test(text)) return text;
   const { states, substitutions } = quoteScan(text);
+  const braceEnds = defaults ? parameterExpansionEnds(text) : null;
   let view = "";
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -353,8 +361,12 @@ function gluedExpansionView(text) {
           continue;
         }
         if (next === "{") {
-          const end = text.indexOf("}", i + 2);
+          const end = defaults ? braceEnds.get(i) ?? -1 : text.indexOf("}", i + 2);
           if (end !== -1) {
+            if (defaults) {
+              const word = parameterOperatorWord(text.slice(i + 2, end));
+              if (word !== null) view += gluedExpansionView(word, true);
+            }
             i = end;
             continue;
           }
@@ -364,10 +376,60 @@ function gluedExpansionView(text) {
           continue;
         }
       }
+    } else if (defaults && state === QUOTE_DOUBLE && ch === "$" && text[i + 1] === "{") {
+      // Inside double quotes the expansion still happens, and its word is
+      // still the text bash may run; the surrounding quotes stay in the view.
+      const end = braceEnds.get(i) ?? -1;
+      const word = end === -1 ? null : parameterOperatorWord(text.slice(i + 2, end));
+      if (word !== null) {
+        view += gluedExpansionView(word, true);
+        i = end;
+        continue;
+      }
     }
     view += ch;
   }
   return view;
+}
+
+// The operators of `${NAME<op>WORD}` after which bash may use WORD in place
+// of the expansion (bash manual, Shell Parameter Expansion): use a default
+// (`:-`, `-`), assign a default (`:=`, `=`), use an alternate value (`:+`,
+// `+`). `:?`/`?` only print WORD, and every other form (`#`, `%`, `/`, `^`,
+// `,`, `@`, a `:offset`) transforms the variable's own value.
+const PARAMETER_WORD_OPERATORS = [":-", ":=", ":+", "-", "=", "+"];
+
+/**
+ * The `}` that closes each `${` of the text, by the index of its `$`. A `}`
+ * closes the innermost open `${`, so nested expansions pair as bash pairs
+ * them; an unclosed `${` has no entry. One pass, so a command full of
+ * expansions is read in linear time (the 2 s analysis deadline).
+ */
+function parameterExpansionEnds(text) {
+  const ends = new Map();
+  const open = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\\") {
+      i++;
+    } else if (text[i] === "$" && text[i + 1] === "{") {
+      open.push(i);
+      i++;
+    } else if (text[i] === "}" && open.length > 0) {
+      ends.set(open.pop(), i);
+    }
+  }
+  return ends;
+}
+
+/** The WORD of a `${NAME<op>WORD}` body when bash may substitute it, else null. */
+function parameterOperatorWord(body) {
+  const name = /^!?(?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?|[0-9]+|[@*#?$!-])/.exec(body);
+  if (name === null) return null;
+  const rest = body.slice(name[0].length);
+  for (const operator of PARAMETER_WORD_OPERATORS) {
+    if (rest.startsWith(operator)) return rest.slice(operator.length);
+  }
+  return null;
 }
 
 /**
@@ -1770,9 +1832,9 @@ function stageCommandFrom(words, depth) {
     const name = commandBasename(words[i]);
     if (name === "env") {
       const command = envCommandWords(words, i + 1);
-      if (command === null) return { name: "", args: [], unverifiable: false };
+      if (command === null) return { name: "", word: "", args: [], unverifiable: false };
       if (command.unverifiable || depth >= MAX_SHELL_BODY_DEPTH) {
-        return { name: "", args: [], unverifiable: true };
+        return { name: "", word: "", args: [], unverifiable: true };
       }
       return stageCommandFrom(command.words, depth + 1);
     }
@@ -1780,7 +1842,8 @@ function stageCommandFrom(words, depth) {
     if (!isPrefix) break;
     i++;
   }
-  return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1), unverifiable: false };
+  const word = words[i] ?? "";
+  return { name: commandBasename(word), word, args: words.slice(i + 1), unverifiable: false };
 }
 
 /**
@@ -1921,11 +1984,13 @@ function awkStdinProgram(rest) {
  * True when the word at `index` runs a program from stdin: a shell, a
  * `source`/`.` of the shell's stdin, or an interpreter with no script
  * operand (WI#883). A word property, like the listener rule (WI#858), so a
- * launcher the hook does not know cannot hide one.
+ * launcher the hook does not know cannot hide one. `eval` is the shell
+ * itself: what it is handed — a substitution that reads stdin, a variable a
+ * `read` filled — runs in this shell, so the word alone counts (AME-1).
  */
 function interpreterAt(words, index) {
   const name = commandBasename(listenerWord(words[index]));
-  if (SHELL_NAME.test(name)) return true;
+  if (SHELL_NAME.test(name) || name === "eval") return true;
   if (name === "source" || name === ".") {
     const operand = words[index + 1];
     return operand !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(operand));
@@ -1955,6 +2020,151 @@ function isInterpreterStage(stage) {
   if (words === null) return true;
   return words.some((_word, index) => interpreterAt(words, index));
 }
+
+// The commands of WI#883's own table that run their first operand as a
+// command. Behind one of them the command word is the first word that is
+// neither an option, nor the separate value of one of the options below, nor
+// a bare number (`nice -n 5`, `timeout 5`, `taskset -c 0`, `ionice -c 3`).
+// The list is the item's table, not a claim that every launcher is known: a
+// launcher outside it keeps the word reading only.
+const STAGE_LAUNCHERS = new Set([
+  "nice", "nohup", "timeout", "command", "setsid", "stdbuf", "taskset",
+  "ionice", "xargs", "time", "chrt",
+]);
+// Launcher options whose value is a separate word that need not be a number
+// (`timeout -s KILL`, `stdbuf -o L`, `xargs -I {}`), read from each manual.
+const STAGE_LAUNCHER_VALUE_OPTIONS = new Map([
+  ["timeout", new Set(["-s", "--signal", "-k", "--kill-after"])],
+  ["stdbuf", new Set(["-i", "--input", "-o", "--output", "-e", "--error"])],
+  ["xargs", new Set(["-I", "-i", "-d", "--delimiter", "-E", "-e", "-a", "--arg-file", "-n", "-P", "-L", "-s"])],
+  ["ionice", new Set(["-c", "--class", "-n", "--classdata", "-p", "--pid"])],
+  ["nice", new Set(["-n", "--adjustment"])],
+  ["time", new Set(["-f", "--format", "-o", "--output"])],
+]);
+const MAX_STAGE_LAUNCHERS = 8;
+
+// Shell words that stand in front of a command inside a compound command,
+// and the ones whose list names no command of its own (`for x in …`).
+const COMPOUND_LEAD_WORDS = new Set(["do", "then", "else", "elif", "while", "until", "if", "!", "{", "("]);
+const COMPOUND_HEAD_ONLY = new Set(["for", "select", "case"]);
+
+/**
+ * True when the command word of one simple command cannot be read (AME-2 of
+ * WI#883): it is, or carries, an expansion or a substitution (`$SHELL`,
+ * `"$SHELL"`, `${SHELL}`, `$(which bash)`, `/bin/$SH`), or it sits behind
+ * `env` nesting past the depth bound. Only the command position is read —
+ * after assignments, `env`/`exec`/`sudo`/`busybox` and the launchers above —
+ * so an expansion used as an argument (`grep "$PATTERN"`, `tee "$OUT"`,
+ * `head -n $N`) stays ordinary.
+ */
+function commandWordUnverifiable(words) {
+  let current = words;
+  for (let hop = 0; hop <= MAX_STAGE_LAUNCHERS; hop++) {
+    let lead = 0;
+    while (lead < current.length && COMPOUND_LEAD_WORDS.has(current[lead])) lead++;
+    current = current.slice(lead);
+    if (current.length === 0 || COMPOUND_HEAD_ONLY.has(current[0])) return false;
+    const { name, word, args, unverifiable } = stageCommandFrom(current, 0);
+    if (unverifiable || GLUED_EXPANSION.test(word)) return true;
+    if (!STAGE_LAUNCHERS.has(name)) return false;
+    const values = STAGE_LAUNCHER_VALUE_OPTIONS.get(name);
+    let next = 0;
+    while (next < args.length && (args[next].startsWith("-") || /^[0-9][0-9A-Za-z.,:-]*$/.test(args[next]))) {
+      next += values?.has(args[next]) ? 2 : 1;
+    }
+    current = args.slice(next);
+  }
+  // More launchers in a row than the guard reads: refuse rather than guess.
+  return true;
+}
+
+/** True when any simple command of the text has a command word the guard cannot read. */
+function runsUnverifiableCommand(text) {
+  for (const list of commandLists(text)) {
+    for (const stage of splitOutsideQuotes(list, "|")) {
+      if (commandWordUnverifiable(stageWords(stage))) return true;
+    }
+  }
+  return false;
+}
+
+// The word that closes each compound command a pipeline stage can open. A
+// subshell is closed by its parenthesis, which is counted, not matched as a
+// word.
+const COMPOUND_CLOSERS = new Map([
+  ["while", "done"], ["until", "done"], ["for", "done"], ["select", "done"],
+  ["if", "fi"], ["case", "esac"], ["{", "}"],
+]);
+const COMPOUND_SKIP_WORDS = new Set(["do", "then", "else", "elif", "!", "time"]);
+
+/** The compound word a list opens in command position (`(` for a subshell), or "". */
+function compoundOpener(text) {
+  const words = text.trim().split(/[ \t]+/);
+  let i = 0;
+  while (i < words.length && COMPOUND_SKIP_WORDS.has(words[i])) i++;
+  const first = words[i] ?? "";
+  if (COMPOUND_CLOSERS.has(first)) return first;
+  return first.startsWith("(") && !first.startsWith("((") ? "(" : "";
+}
+
+/** Unquoted `(` minus `)` in the text; a `$(…)` pair cancels itself. */
+function parenBalance(text) {
+  let depth = 0;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote === "'") {
+      if (ch === "'") quote = "";
+    } else if (ch === "\\") {
+      i++;
+    } else if (quote === '"') {
+      if (ch === '"') quote = "";
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+    }
+  }
+  return depth;
+}
+
+/**
+ * The text a pipeline stage runs when it opens a compound command: the stage
+ * and the following lists up to its closing word (AME-1 of WI#883). A pipe
+ * into `while read l; do eval "$l"; done`, `{ read x; eval "$x"; }` or
+ * `( read x; eval "$x" )` feeds every command of the body, and the `;` lists
+ * otherwise end the stage at the loop's first word. A body with no closing
+ * word runs to the end of the command, which can only add words to read.
+ */
+function compoundStageText(lists, li, stage) {
+  const opener = compoundOpener(stage);
+  if (opener === "") return stage;
+  const closers = opener === "(" ? [] : [COMPOUND_CLOSERS.get(opener)];
+  let parens = parenBalance(stage);
+  let end = li;
+  while ((closers.length > 0 || parens > 0) && end + 1 < lists.length) {
+    end++;
+    const text = lists[end];
+    const first = text.trim().split(/[ \t]+/)[0] ?? "";
+    if (closers.length > 0 && first === closers[closers.length - 1]) {
+      closers.pop();
+    } else {
+      const inner = compoundOpener(text);
+      if (inner !== "" && inner !== "(") closers.push(COMPOUND_CLOSERS.get(inner));
+    }
+    parens += parenBalance(text);
+  }
+  return [stage, ...lists.slice(li + 1, end + 1)].join(";");
+}
+
+// A compound body is read once per decode pipe that feeds it, and a body
+// with no closing word runs to the end of the command. The bodies of one
+// command may add up to this many characters; past it the command is refused
+// instead of read, so many unclosed loops cannot cost a rescan apiece (the
+// 2 s analysis deadline). Closed loops add up to the command's own length.
+const MAX_COMPOUND_SCAN_CHARS = 3 * MAX_COMMAND_CHARS;
 
 // The shared shell-syntax scan (WI#867). Bash escapes with a backslash
 // outside quotes and, inside double quotes, only `"`, `\`, `$`, a backtick and
@@ -2207,10 +2417,23 @@ function commandLists(text) {
 
 /** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
 function checkDecodedPipe(text) {
-  for (const list of commandLists(text)) {
-    const stages = splitOutsideQuotes(list, "|");
+  const lists = commandLists(text);
+  let scanned = 0;
+  for (let li = 0; li < lists.length; li++) {
+    const stages = splitOutsideQuotes(lists[li], "|");
     for (let i = 1; i < stages.length; i++) {
-      if (isInterpreterStage(stages[i]) && isDecodeStage(stages[i - 1])) {
+      if (!isDecodeStage(stages[i - 1])) continue;
+      // The stage a decoder feeds may open a compound command, whose body
+      // reads the same stdin (AME-1). Only a list's last stage can run on
+      // into the following lists.
+      let fed = stages[i];
+      if (i === stages.length - 1 && compoundOpener(fed) !== "") {
+        fed = compoundStageText(lists, li, fed);
+        scanned += fed.length;
+        if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+      }
+      // A command word the guard cannot read may be the shell (AME-2).
+      if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
         return "decoded content piped into a shell or interpreter";
       }
     }
@@ -2341,6 +2564,11 @@ function evaluate(command, depth = 0) {
     // plain verb when the variable is empty or unset, which the raw-shape and
     // listener readers would otherwise walk past (WI#883).
     const glued = gluedExpansionView(joined);
+    // An operator expansion (`${X:-tee}`, `${X:=tee}`, `${X:+tee}`) can run
+    // its own word instead of the variable's value, so that reading is taken
+    // beside the plain one (AME-3 of WI#883).
+    const defaulted = gluedExpansionView(joined, true);
+    const defaultedIsNew = defaulted !== joined && defaulted !== glued;
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
@@ -2362,12 +2590,22 @@ function evaluate(command, depth = 0) {
       (glued === joined ? null : checkRawShapes(shellWordLevelView(glued))) ??
       (glued === joined ? null : checkListeners(glued)) ??
       (glued === joined ? null : checkListeners(shellWordLevelView(glued))) ??
+      (defaultedIsNew ? checkRawShapes(defaulted) : null) ??
+      (defaultedIsNew ? checkRawShapes(shellWordLevelView(defaulted)) : null) ??
+      (defaultedIsNew ? checkListeners(defaulted) : null) ??
+      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted)) : null) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined, depth));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(glued === joined ? joined : glued)) {
       const denied = checkRm(segment);
       if (denied) return denied;
+    }
+    if (defaultedIsNew) {
+      for (const segment of commandSegments(defaulted)) {
+        const denied = checkRm(segment);
+        if (denied) return denied;
+      }
     }
     if (glued === joined) continue;
     for (const segment of commandSegments(joined)) {
