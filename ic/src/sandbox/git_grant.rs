@@ -2449,6 +2449,48 @@ fn authorize_shell_bodies(
     Ok(())
 }
 
+/// The shell script `git submodule foreach` builds from its operand tail.
+///
+/// Git inserts the first operand verbatim and single-quotes every later one,
+/// so a later operand is exactly one literal shell word while the first may
+/// carry a whole command. Verified against git 2.56.1: `foreach 'echo A  B'
+/// extra` runs `echo A  B 'extra'`, and `foreach printf '<%s>' 'a b' c`
+/// prints `<a b><c>` (WI#880).
+fn foreach_script(tail: &[&Word]) -> Option<Word> {
+    let (command, rest) = tail.split_first()?;
+    let mut script = (*command).clone();
+    for word in rest {
+        script.dynamic |= word.dynamic;
+        script.text.push(' ');
+        script.text.push('\'');
+        script.text.push_str(&word.text.replace('\'', r"'\''"));
+        script.text.push('\'');
+    }
+    Some(script)
+}
+
+/// `git submodule foreach` runs its whole operand tail through a shell.
+/// Reading only the first word left `foreach sh -c '<body>'` unscanned.
+fn authorize_submodule_foreach(
+    operands: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let mut tail = operands
+        .iter()
+        .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
+    let first = tail.next();
+    let tail: Vec<&Word> = match first {
+        Some(word) if word.text == "--" => tail.collect(),
+        Some(word) => std::iter::once(word).chain(tail).collect(),
+        None => Vec::new(),
+    };
+    match foreach_script(&tail) {
+        Some(script) => scan_shell_body(&script, preflight, depth),
+        None => Ok(()),
+    }
+}
+
 fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     let prefix = args
         .iter()
@@ -2468,21 +2510,7 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
             };
             preflight.read_remote(url)
         }
-        "foreach" => {
-            let mut body = operands
-                .iter()
-                .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
-            let first = body.next();
-            let script = if first.is_some_and(|word| word.text == "--") {
-                body.next()
-            } else {
-                first
-            };
-            if let Some(script) = script {
-                scan_shell_body(script, preflight, depth)?;
-            }
-            Ok(())
-        }
+        "foreach" => authorize_submodule_foreach(operands, preflight, depth),
         _ => Ok(()),
     }
 }
@@ -3912,6 +3940,20 @@ mod tests {
             "git submodule foreach 'git fetch upstream'",
             "git submodule foreach --recursive 'git fetch upstream'",
             "git submodule --quiet foreach 'git fetch upstream'",
+            // WI#880: the multi-word tail is one script; git quotes each
+            // operand, so `sh -c '<body>'` reaches the shell as one command.
+            "git submodule foreach sh -c 'git push -f origin master'",
+            "git submodule foreach sh -c 'git push origin master'",
+            "git submodule foreach sh -c 'git fetch upstream'",
+            "git submodule foreach --recursive sh -c 'git push -f origin master'",
+            "git submodule --quiet foreach sh -c 'git push -f origin master'",
+            "git submodule foreach bash -c 'git send-pack /workspace/remotes/origin.git HEAD:x'",
+            "git submodule foreach sh -ec 'git push -f origin master'",
+            // A multi-word tail without a shell wrapper is still one command
+            // line: `foreach git push ...` runs git directly.
+            "git submodule foreach git push -f origin master",
+            "git submodule foreach git fetch upstream",
+            "git submodule foreach --recursive git push origin main",
             "git bisect run git push origin main",
         ] {
             let error = check_granted(command, &grant).unwrap_err();
@@ -3934,9 +3976,80 @@ mod tests {
             "git rebase -r HEAD~1",
             "git submodule foreach 'cargo build'",
             "git submodule --quiet foreach --recursive 'cargo build'",
+            // WI#880: ordinary multi-word tails stay usable. `echo` is inert,
+            // and a plain `cargo` tail names no git.
+            "git submodule foreach echo hi there",
+            "git submodule foreach cargo build --release",
+            "git submodule foreach sh -c 'cargo test'",
+            "git submodule foreach --recursive sh -c 'make -j8'",
             "git bisect run cargo test",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#880: `git submodule foreach` builds one script from the whole
+    /// operand tail — the first operand verbatim, every later one
+    /// single-quoted (verified against git 2.56.1). Reading only the first
+    /// word left `foreach sh -c '<body>'` unscanned.
+    #[test]
+    fn submodule_foreach_scans_the_whole_operand_tail() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git,\
+             upstream=file:///workspace/remotes/upstream.git",
+            "origin",
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::create_dir_all(cwd.join("remotes/upstream.git")).unwrap();
+        let write = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        // The four measured rows from the work item: the quoted controls are
+        // refused, and so is the `sh -c` spelling that used to be accepted.
+        for command in [
+            "git submodule foreach 'git push -f origin master'",
+            "git submodule foreach --recursive 'git push -f origin master'",
+            "git submodule foreach sh -c 'git push -f origin master'",
+            "git submodule foreach --recursive sh -c 'git push -f origin master'",
+            // Other spellings of the same multi-word tail.
+            "git submodule foreach bash -c 'git push -f origin master'",
+            "git submodule foreach sh -ec 'git push -f origin master'",
+            "git submodule foreach git push -f origin master",
+            "git submodule foreach env FOO=1 git push -f origin master",
+            "git submodule foreach sh -c 'git push -f origin master; git fetch origin'",
+            // The first operand is verbatim, so a body there is read too.
+            "git submodule foreach 'git push -f origin master' extra",
+        ] {
+            let error = check_granted(command, &write).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(error.to_string().contains("force"), "{command}: {error}");
+        }
+        for command in [
+            // A later operand that names an ungranted remote is still read.
+            "git submodule foreach sh -c 'git fetch upstream'",
+            "git submodule foreach git fetch upstream",
+        ] {
+            let error = check_granted(command, &write).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            // The WI control row: an ordinary body stays accepted.
+            "git submodule foreach 'echo hi'",
+            "git submodule foreach 'cargo build'",
+            "git submodule foreach echo hi there",
+            "git submodule foreach cargo build --release",
+            "git submodule foreach sh -c 'cargo test'",
+            "git submodule foreach --recursive sh -c 'make -j8'",
+            "git submodule foreach -- sh -c 'cargo test'",
+        ] {
+            check_granted(command, &write).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
     }
 
