@@ -53,6 +53,9 @@ fn normalize_host(host: &str) -> String {
 }
 
 /// Resolve a destination that must be public, with no operator allowance.
+/// The shared tenant proxy's contract; a git proxy calls `resolve_egress`
+/// with its grant's allowance instead.
+#[cfg(test)]
 pub(super) async fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     resolve_egress(host, port, &PrivateEgress::new()).await
 }

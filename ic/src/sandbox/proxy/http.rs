@@ -38,6 +38,10 @@ struct ProxyState {
     /// Reject non-public destinations and pin DNS for proxy-enforced
     /// containers (WI#155). Advisory-mode clients are unaffected.
     public_only: bool,
+    /// Non-public destinations the operator allowed for this call, exact
+    /// `host:port` (WI#875). Empty on every proxy but a git proxy with an
+    /// allowance; the shared tenant proxy never carries one.
+    private_egress: crate::sandbox::proxy::egress::PrivateEgress,
     /// Smart-HTTP transport checks of a per-call git proxy (WI#860, ALM-1):
     /// receive-pack only to write-granted remotes, no ref deletion, bound
     /// credentials only on the bound repository's endpoints. `None` on every
@@ -115,11 +119,31 @@ impl HttpProxy {
         public_only: bool,
         git_transport: Option<GitTransportPolicy>,
     ) -> Self {
+        Self::with_private_egress(
+            decider,
+            credential_resolver,
+            public_only,
+            git_transport,
+            crate::sandbox::proxy::egress::PrivateEgress::new(),
+        )
+    }
+
+    /// Create a HTTP proxy with an operator allowance for exact non-public
+    /// destinations (WI#875). Only the per-call git proxy passes one; the
+    /// shared tenant proxy keeps `public_only` with no allowance.
+    pub(crate) fn with_private_egress(
+        decider: Arc<dyn NetworkPolicyDecider>,
+        credential_resolver: Arc<dyn CredentialResolver>,
+        public_only: bool,
+        git_transport: Option<GitTransportPolicy>,
+        private_egress: crate::sandbox::proxy::egress::PrivateEgress,
+    ) -> Self {
         Self {
             state: Arc::new(ProxyState {
                 decider,
                 credential_resolver,
                 public_only,
+                private_egress,
                 git_transport,
                 request_count: std::sync::atomic::AtomicU64::new(0),
                 running: std::sync::atomic::AtomicBool::new(false),
@@ -374,9 +398,16 @@ async fn handle_connect(
     }
 
     // Enforced egress: reject non-public targets and pin the CONNECT to the
-    // resolved public addresses (no re-resolution, no env-proxy bypass).
+    // resolved addresses (no re-resolution, no env-proxy bypass). A git proxy
+    // may carry an operator allowance for the exact granted host and port.
     let pinned = if state.public_only {
-        match super::egress::resolve_public(&host, authority.port_u16().unwrap_or(443)).await {
+        match super::egress::resolve_egress(
+            &host,
+            authority.port_u16().unwrap_or(443),
+            &state.private_egress,
+        )
+        .await
+        {
             Ok(addresses) => Some(addresses),
             Err(reason) => return error_response(StatusCode::FORBIDDEN, deny_body(reason)),
         }
@@ -470,7 +501,7 @@ async fn forward_request(
     // following (redirects re-enter allowlist checks instead of being followed
     // on the host), and no environment proxy settings that could bypass DNS
     // pinning.
-    let client = match forwarding_client(&uri, state.public_only).await {
+    let client = match forwarding_client(&uri, state.public_only, &state.private_egress).await {
         Ok(client) => client,
         Err(reason) => return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason))),
     };
@@ -920,10 +951,12 @@ fn value_contains_reencoded_secret(value: &[u8], secret: &[u8]) -> bool {
 /// host (a 3xx is returned to the container, whose follow-up request
 /// re-enters the allowlist check) and ignore environment proxy settings
 /// (so they cannot bypass DNS pinning). Enforced mode additionally pins
-/// every outbound connection to the previously resolved public addresses.
+/// every outbound connection to the previously resolved addresses; a
+/// non-public address is admitted only for an allowed `host:port` (WI#875).
 async fn forwarding_client(
     uri: &hyper::Uri,
     public_only: bool,
+    private_egress: &super::egress::PrivateEgress,
 ) -> std::result::Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -933,7 +966,7 @@ async fn forwarding_client(
         let url = url::Url::parse(&uri.to_string()).map_err(|_| "invalid proxy URL")?;
         let host = url.host_str().ok_or("missing proxy host")?;
         let port = url.port_or_known_default().ok_or("invalid proxy port")?;
-        let addresses = super::egress::resolve_public(host, port).await?;
+        let addresses = super::egress::resolve_egress(host, port, private_egress).await?;
         builder = builder.resolve_to_addrs(host, &addresses);
     }
     builder
@@ -1238,7 +1271,9 @@ mod tests {
         // redirects come back to the container for re-validation.
         let uri: hyper::Uri = "http://127.0.0.1:1/path".parse().unwrap();
         assert!(
-            forwarding_client(&uri, true).await.is_err(),
+            forwarding_client(&uri, true, &super::egress::PrivateEgress::new())
+                .await
+                .is_err(),
             "non-public targets never reach a forwarding client"
         );
     }

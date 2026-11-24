@@ -11,6 +11,13 @@
 //! - `http`/`https` remotes require `proxy-enforced`. The per-call proxy
 //!   restricts egress to selected hosts already on the tenant allowlist.
 //!
+//! Non-public destinations (WI#875): `SANDBOX_GIT_PRIVATE_REMOTES` names
+//! granted remotes whose exact host and port the operator allows to resolve
+//! to a LAN or overlay address. Only a named remote gets the allowance, only
+//! its own host and port, and only for RFC 1918, CGNAT or IPv6 ULA
+//! addresses: loopback, link-local and the metadata address stay refused.
+//! The shared tenant proxy never carries an allowance.
+//!
 //! Write grant (WI#860): `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
 //! operation classes include `Write`; every other remote stays read-only, and
 //! a read-only grant still refuses `git push`. Force push is refused in every
@@ -87,6 +94,9 @@ pub struct GitRemote {
     /// Host policy grants this remote a write operation class
     /// (`SANDBOX_GIT_WRITE_REMOTES`). A remote without it stays read-only.
     pub write: bool,
+    /// Host policy allows this remote's exact host and port to resolve to a
+    /// LAN or overlay address (`SANDBOX_GIT_PRIVATE_REMOTES`, WI#875).
+    pub allow_private: bool,
 }
 
 /// Host configuration parsed from `SANDBOX_GIT_REMOTES`.
@@ -137,11 +147,25 @@ impl GitGrantConfig {
         write_names: &str,
         credential_spec: &str,
     ) -> std::result::Result<Option<Self>, String> {
+        Self::from_specs(spec, write_names, credential_spec, "")
+    }
+
+    /// Parse the read grant, the write list, the credential bindings and the
+    /// non-public destination allowance (`SANDBOX_GIT_PRIVATE_REMOTES`,
+    /// WI#875). Only an `http`/`https` remote can be named: a `file` remote
+    /// never resolves a name.
+    pub fn from_specs(
+        spec: &str,
+        write_names: &str,
+        credential_spec: &str,
+        private_names: &str,
+    ) -> std::result::Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Ok(None);
         }
         let writes = parse_write_names(write_names)?;
+        let private = parse_write_names(private_names)?;
         let mut remotes = Vec::new();
         for (index, entry) in spec.split(',').enumerate() {
             let entry = entry.trim();
@@ -176,6 +200,7 @@ impl GitGrantConfig {
                 host: parsed.host,
                 canonical: parsed.canonical,
                 write: writes.contains(&name.to_string()),
+                allow_private: private.contains(&name.to_string()),
             });
         }
         if remotes.is_empty() {
@@ -185,6 +210,19 @@ impl GitGrantConfig {
             if !remotes.iter().any(|remote| &remote.name == name) {
                 return Err(format!(
                     "SANDBOX_GIT_WRITE_REMOTES names '{name}', which is not a SANDBOX_GIT_REMOTES remote"
+                ));
+            }
+        }
+        for name in &private {
+            let remote = remotes.iter().find(|remote| &remote.name == name).ok_or_else(|| {
+                format!(
+                    "SANDBOX_GIT_PRIVATE_REMOTES names '{name}', which is not a SANDBOX_GIT_REMOTES remote"
+                )
+            })?;
+            if remote.transport == GitTransport::File {
+                return Err(format!(
+                    "SANDBOX_GIT_PRIVATE_REMOTES names '{name}', which is a file:// remote; \
+                     only an http:// or https:// remote resolves a destination"
                 ));
             }
         }
@@ -319,6 +357,10 @@ pub struct EffectiveGitRemote {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub operations: Vec<GitOperationClass>,
+    /// The operator allowed this remote's exact host and port to resolve to a
+    /// LAN or overlay address (WI#875).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private_destination: bool,
 }
 
 impl GitRemote {
@@ -398,6 +440,25 @@ impl GitGrantAuthorization {
             )
     }
 
+    /// The non-public destinations the operator allowed for this call
+    /// (WI#875): the exact host and port of every selected remote named in
+    /// `SANDBOX_GIT_PRIVATE_REMOTES`. Nothing else is allowed, and a remote
+    /// without the allowance contributes nothing.
+    pub fn private_egress(&self) -> crate::sandbox::proxy::PrivateEgress {
+        let mut allowance = crate::sandbox::proxy::PrivateEgress::new();
+        for remote in self.remotes.iter().filter(|remote| remote.allow_private) {
+            let Some(parsed) = url::Url::parse(&remote.url).ok() else {
+                continue;
+            };
+            let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default())
+            else {
+                continue;
+            };
+            allowance = allowance.allow(host, port);
+        }
+        allowance
+    }
+
     /// Secret-free credential evidence: the remote name and the *name* of the
     /// daemon variable, never its value.
     fn credential_evidence(&self) -> Vec<EffectiveGitCredential> {
@@ -444,6 +505,7 @@ impl GitGrantAuthorization {
                     transport: remote.transport,
                     host: remote.host.clone(),
                     operations: remote.operations(),
+                    private_destination: remote.allow_private,
                 })
                 .collect(),
             credentials: self.credential_evidence(),

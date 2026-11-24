@@ -56,6 +56,8 @@ pub struct SandboxModeConfig {
     pub tunnel: SandboxTunnelModeConfig,
     /// Per-tenant git remote grant (WI#816): `SANDBOX_GIT_REMOTES` as
     /// `name=url[,name=url...]`. `None` keeps git network access denied.
+    /// `SANDBOX_GIT_PRIVATE_REMOTES` names the remotes whose exact host and
+    /// port may resolve to a LAN or overlay address (WI#875).
     pub git: Option<crate::sandbox::GitGrantConfig>,
 }
 
@@ -248,10 +250,13 @@ impl SandboxModeConfig {
             Some(spec) => {
                 let write_names = optional_env("SANDBOX_GIT_WRITE_REMOTES")?.unwrap_or_default();
                 let credential_spec = optional_env("SANDBOX_GIT_CREDENTIALS")?.unwrap_or_default();
-                crate::sandbox::GitGrantConfig::from_full_spec(
+                let private_names =
+                    optional_env("SANDBOX_GIT_PRIVATE_REMOTES")?.unwrap_or_default();
+                crate::sandbox::GitGrantConfig::from_specs(
                     &spec,
                     &write_names,
                     &credential_spec,
+                    &private_names,
                 )
                 .map_err(|message| ConfigError::InvalidValue {
                     key: "SANDBOX_GIT_REMOTES".to_string(),
