@@ -238,6 +238,8 @@ function shellWordView(command) {
   return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
+const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]+$/;
+
 /**
  * The words bash hands the program: one shell quoting level removed from a
  * quoted span that is a plain literal word. Unlike `shellWordView` this does
@@ -249,8 +251,6 @@ function shellWordView(command) {
  * plain word bash runs (`"tee" /dev/sda1`, `\find /app -delete`), which is
  * the spelling the raw-shape family was missing (WI#873).
  */
-const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]+$/;
-
 function shellWordLevelView(text) {
   const states = quoteStates(text);
   let view = "";
