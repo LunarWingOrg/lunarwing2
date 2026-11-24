@@ -3539,6 +3539,41 @@ mod tests {
         (temp, work)
     }
 
+    /// WI#879 acceptance against real git: the clustered spelling really runs
+    /// its exec body, so the preflight row is not describing a spelling git
+    /// ignores. `-ix` runs the body once per rebased commit.
+    #[test]
+    fn clustered_rebase_exec_runs_its_body_in_real_git() {
+        let (temp, work) = real_remote_fixture();
+        let _temp = temp;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_SEQUENCE_EDITOR", "true")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .expect("git runs")
+        };
+        let marker = work.join("clustered-ran.txt");
+        // A second commit gives the rebase something to replay.
+        std::fs::write(work.join("file.txt"), "one\ntwo\n").expect("write");
+        assert!(git(&["commit", "-q", "-am", "two"]).status.success());
+        let body = format!("sh -c 'echo ran >> {}'", marker.display());
+        let output = git(&["rebase", "-ix", &body, "HEAD~1"]);
+        assert!(
+            output.status.success(),
+            "clustered rebase failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(log.contains("Executing:"), "body never ran: {log}");
+        assert!(marker.is_file(), "clustered exec body did not run: {log}");
+    }
+
     /// Acceptance: with a write grant, a real `git push` lands on a real local
     /// remote; with a read-only grant the same push is refused before git
     /// runs.
