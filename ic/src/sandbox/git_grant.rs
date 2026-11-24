@@ -3317,6 +3317,14 @@ mod tests {
             "git rebase -x'git fetch upstream' HEAD~1",
             "git rebase --exe 'git fetch upstream' HEAD~1",
             "git rebase -i --exec 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
+            // WI#879: a short-option cluster containing `x` runs its body too.
+            "git rebase -ix 'git push origin HEAD' HEAD~1",
+            "git rebase -qx 'git push origin HEAD' HEAD~1",
+            "git rebase -vix 'git push origin HEAD' HEAD~1",
+            "git rebase -ix'git push origin HEAD' HEAD~1",
+            "git rebase -nx 'git fetch upstream' HEAD~1",
+            "git rebase -fx 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
+            "git rebase -ixv 'v' HEAD~1",
             "git submodule foreach 'git push origin main'",
             "git submodule foreach 'git fetch upstream'",
             "git submodule foreach --recursive 'git fetch upstream'",
@@ -3333,11 +3341,83 @@ mod tests {
             "git rebase --exec 'cargo test' HEAD~1",
             "git rebase --exec 'make -j8' --exec 'cargo test' HEAD~1",
             "git rebase -i HEAD~3",
+            // WI#879: the clustered spelling stays usable for ordinary bodies,
+            // and a value-taking letter before `x` consumes it.
+            "git rebase -ix 'echo hi' HEAD~1",
+            "git rebase -ixv 'cargo test' HEAD~1",
+            "git rebase -sx recursive HEAD~1",
+            "git rebase -Xx theirs HEAD~1",
+            "git rebase -C3 HEAD~1",
+            "git rebase -r HEAD~1",
             "git submodule foreach 'cargo build'",
             "git submodule --quiet foreach --recursive 'cargo build'",
             "git bisect run cargo test",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#879: the four measured rows, plus the cluster truth table verified
+    /// against real git 2.56.1 (`-ix`/`-vix`/`-nx`/`-fx` run the body;
+    /// `-sx`/`-Xx`/`-C3x`/`-rx` consume `x` as that option's value).
+    #[test]
+    fn clustered_rebase_exec_bodies_are_scanned() {
+        let (_temp, grant) = workspace_with_remote();
+        // The control rows and the clustered row from the work item.
+        for command in [
+            "git rebase -x 'git push -f origin HEAD' HEAD~1",
+            "git rebase --exec='git push -f origin HEAD' HEAD~1",
+            "git rebase -ix 'git push -f origin HEAD' HEAD~1",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(error.to_string().contains("force"), "{command}: {error}");
+        }
+        for command in [
+            "git rebase -ix 'echo CLUSTER_IX_RAN' HEAD~1",
+            "git rebase -ixv 'cargo test' HEAD~1",
+            "git rebase -sx recursive HEAD~1",
+            "git rebase -Xx theirs HEAD~1",
+            "git rebase -C3 HEAD~1",
+            "git rebase -r HEAD~1",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#879: the cluster walk is unit-tested directly, so a regression in
+    /// where the body starts is visible without a grant fixture.
+    #[test]
+    fn rebase_exec_cluster_positions() {
+        let word = |text: &str| Word {
+            text: text.to_string(),
+            dynamic: false,
+        };
+        let body = |text: &str| match rebase_exec(&word(text)) {
+            RebaseExec::Attached(body) => Some(body.text),
+            RebaseExec::NextWord => None,
+            RebaseExec::None => Some(String::from("<none>")),
+        };
+        // A cluster `x` with nothing attached takes the next word.
+        assert_eq!(body("-x"), None);
+        assert_eq!(body("-ix"), None);
+        assert_eq!(body("-vix"), None);
+        assert_eq!(body("--exec"), None);
+        // An attached body starts right after the first `x`.
+        assert_eq!(body("-xbody").as_deref(), Some("body"));
+        assert_eq!(body("-ixbody").as_deref(), Some("body"));
+        assert_eq!(body("-ix=body").as_deref(), Some("=body"));
+        assert_eq!(body("--exec=body").as_deref(), Some("body"));
+        // A value-taking letter before `x` swallows the rest of the cluster.
+        for text in ["-sx", "-Xx", "-C3x", "-rx", "-Sx", "-iSx", "-s"] {
+            assert_eq!(body(text).as_deref(), Some("<none>"), "{text}");
+        }
+        // `-i` alone, long options, and positional words name no body.
+        for text in ["-i", "-v", "--onto", "HEAD~1"] {
+            assert_eq!(body(text).as_deref(), Some("<none>"), "{text}");
         }
     }
 
