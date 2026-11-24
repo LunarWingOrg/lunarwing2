@@ -4029,13 +4029,18 @@ mod tests {
             assert!(error.to_string().contains("force"), "{command}: {error}");
         }
         for command in [
-            // A later operand that names an ungranted remote is still read.
-            "git submodule foreach sh -c 'git fetch upstream'",
-            "git submodule foreach git fetch upstream",
+            // A later operand that names the read-only remote on a write
+            // operation is still read, not just the first word.
+            "git submodule foreach sh -c 'git push upstream main'",
+            "git submodule foreach git push upstream main",
         ] {
             let error = check_granted(command, &write).unwrap_err();
             assert!(
                 matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error.to_string().contains("read-only"),
                 "{command}: {error}"
             );
         }
