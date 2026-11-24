@@ -2043,9 +2043,67 @@ fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Resul
     Ok(())
 }
 
-/// `rebase --exec <body>` and `submodule foreach <body>` run their argument
-/// through a shell, which the preflight never read before. `bisect run` runs
-/// the words after it directly, so the whole tail is scanned as one command.
+/// Letters in a `git rebase` short-option cluster that consume the rest of
+/// the cluster as their value. `x` is the exec flag and is handled
+/// separately because its value is a shell body.
+const REBASE_CLUSTER_VALUE_LETTERS: &[char] = &['C', 'S', 's', 'X', 'r'];
+
+/// The exec body one `git rebase` argument names.
+enum RebaseExec {
+    /// The word carries the body itself (`-x<body>`, `--exec=<body>`).
+    Attached(Word),
+    /// The word is a bare exec flag; the body is the next word.
+    NextWord,
+    /// The word names no exec body.
+    None,
+}
+
+/// Read one `git rebase` argument for an exec body. Git walks a short-option
+/// cluster left to right and a value-taking letter consumes the rest of the
+/// cluster, so `-ix` is `-i -x` (body in the next word), `-ix<body>` and
+/// `-vix<body>` attach the body, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
+/// option's value, not an exec. The first `x` reached before any
+/// value-taking letter is the one whose body git runs (WI#879).
+fn rebase_exec(word: &Word) -> RebaseExec {
+    let text = word.text.as_str();
+    if matches!(text, "--ex" | "--exe" | "--exec") {
+        return RebaseExec::NextWord;
+    }
+    if let Some((flag, value)) = text.split_once('=')
+        && matches!(flag, "--ex" | "--exe" | "--exec")
+    {
+        return RebaseExec::Attached(Word {
+            text: value.to_string(),
+            dynamic: word.dynamic,
+        });
+    }
+    let Some(cluster) = text.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+        return RebaseExec::None;
+    };
+    for (offset, letter) in cluster.char_indices() {
+        if letter == 'x' {
+            // `x` is ASCII, so the next byte starts the attached body.
+            let attached = &cluster[offset + 1..];
+            return if attached.is_empty() {
+                RebaseExec::NextWord
+            } else {
+                RebaseExec::Attached(Word {
+                    text: attached.to_string(),
+                    dynamic: word.dynamic,
+                })
+            };
+        }
+        if REBASE_CLUSTER_VALUE_LETTERS.contains(&letter) {
+            return RebaseExec::None;
+        }
+    }
+    RebaseExec::None
+}
+
+/// `rebase --exec <body>` (and its `-x` cluster spellings) and
+/// `submodule foreach <body>` run their argument through a shell, which the
+/// preflight never read before. `bisect run` runs the words after it
+/// directly, so the whole tail is scanned as one command.
 /// A body that mentions no git is left alone, so ordinary `--exec 'cargo test'`
 /// keeps working.
 fn authorize_shell_bodies(
@@ -2071,26 +2129,18 @@ fn authorize_shell_bodies(
                 return Ok(());
             }
             return scan_simple_command(tail, preflight, depth + 1);
-        } else if let Some(value) = text
-            .strip_prefix("-x")
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                let (flag, value) = text.split_once('=')?;
-                matches!(flag, "--ex" | "--exe" | "--exec").then_some(value)
-            })
-        {
-            Some(&Word {
-                text: value.to_string(),
-                dynamic: word.dynamic,
-            })
-        } else if matches!(text, "--ex" | "--exe" | "--exec" | "-x") {
-            index += 1;
-            args.get(index)
         } else {
-            None
+            match rebase_exec(word) {
+                RebaseExec::Attached(body) => Some(body),
+                RebaseExec::NextWord => {
+                    index += 1;
+                    args.get(index).cloned()
+                }
+                RebaseExec::None => None,
+            }
         };
         if let Some(body) = body {
-            scan_shell_body(body, preflight, depth)?;
+            scan_shell_body(&body, preflight, depth)?;
         }
         index += 1;
     }
