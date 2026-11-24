@@ -1612,10 +1612,10 @@ mod tests {
         manager.config.git = crate::sandbox::GitGrantConfig::from_full_spec(
             "origin=http://git.internal/org/repo.git",
             "",
-            "origin=GIT_MANAGER_ARGV_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_MANAGER_ARGV",
         )
         .unwrap();
-        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", SECRET);
+        crate::config::inject_single_var("SANDBOX_GIT_TOKEN_MANAGER_ARGV", SECRET);
         let manifest: crate::sandbox::CapabilityManifest =
             serde_json::from_value(serde_json::json!({
                 "manifest_version": 1,
@@ -1633,7 +1633,7 @@ mod tests {
             )
             .await;
         manager.shutdown().await;
-        crate::config::inject_single_var("GIT_MANAGER_ARGV_TOKEN", "");
+        crate::config::inject_single_var("SANDBOX_GIT_TOKEN_MANAGER_ARGV", "");
 
         result.expect("scoped proxy run reaches the simulated runtime");
         let calls = state.lock().unwrap();
@@ -1647,7 +1647,7 @@ mod tests {
             "secret in container argv: {joined}"
         );
         assert!(
-            !joined.contains("GIT_MANAGER_ARGV_TOKEN"),
+            !joined.contains("SANDBOX_GIT_TOKEN_MANAGER_ARGV"),
             "credential variable name in container argv: {joined}"
         );
         // WI#857 (!2719) pins each remote with an empty `remote.<name>.url`

@@ -2602,7 +2602,7 @@ mod tests {
         // host-side credential binding from `SANDBOX_GIT_CREDENTIALS`.
         let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
         let mappings = vec![CredentialMapping::header(
-            "GIT_ORIGIN_TOKEN",
+            "SANDBOX_GIT_TOKEN_ORIGIN",
             "Authorization",
             "127.0.0.1",
         )];
@@ -2671,7 +2671,7 @@ mod tests {
         let host = crate::sandbox::GitGrantConfig::from_full_spec(
             "origin=http://git.internal/org/repo.git",
             "",
-            "origin=GIT_ORIGIN_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN",
         )
         .unwrap()
         .unwrap();
@@ -2689,7 +2689,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!joined.contains(SECRET), "{joined}");
-        assert!(!joined.contains("GIT_ORIGIN_TOKEN"), "{joined}");
+        assert!(!joined.contains("SANDBOX_GIT_TOKEN_ORIGIN"), "{joined}");
 
         proxy.stop().await;
         upstream_task.abort();
@@ -2807,11 +2807,17 @@ mod tests {
         secret: &str,
     ) -> (HttpProxy, std::net::SocketAddr) {
         use crate::sandbox::proxy::git_transport::GitTransportRemote;
-        let remote =
-            GitTransportRemote::from_http_url(remote_url, write, Some("GIT_ORIGIN_TOKEN".into()))
-                .unwrap();
-        let mut mapping =
-            CredentialMapping::header("GIT_ORIGIN_TOKEN", "Authorization", remote.host.clone());
+        let remote = GitTransportRemote::from_http_url(
+            remote_url,
+            write,
+            Some("SANDBOX_GIT_TOKEN_ORIGIN".into()),
+        )
+        .unwrap();
+        let mut mapping = CredentialMapping::header(
+            "SANDBOX_GIT_TOKEN_ORIGIN",
+            "Authorization",
+            remote.host.clone(),
+        );
         mapping.path_patterns = remote.credential_paths();
         let decider = Arc::new(DefaultPolicyDecider::new(
             DomainAllowlist::new(std::slice::from_ref(&remote.host)),
