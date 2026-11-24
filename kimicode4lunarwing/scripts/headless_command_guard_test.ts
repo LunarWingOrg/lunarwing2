@@ -1193,6 +1193,45 @@ test("an interpreter option value does not end the walk to the eval flag (WI#869
   assertAllowed("python3 -m json.tool")
 })
 
+test("an unlisted interpreter option does not end the walk to the eval flag (WI#876)", () => {
+  // WI#876: the walk returned at the first word that did not start with `-`,
+  // so an option outside INTERPRETER_VALUE_OPTIONS put its own value there and
+  // the code after the flag was never read. Every row below was measured to
+  // run the `-e`/`-c` code under real node 24 / python 3.14.
+  assertBlocked(
+    `node --disable-warning X -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  assertBlocked(
+    `node --import data:text/javascript, -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  assertBlocked(
+    `node --env-file /dev/null -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  // The same hole on the python side: `--check-hash-based-pycs` takes a
+  // separate value and is not in the table.
+  assertBlocked(
+    `python3 --check-hash-based-pycs always -c "import shutil; shutil.rmtree('/home/kimi/x')"`,
+    "deletion outside",
+  )
+  // The WI#869 row and the controls keep their verdicts.
+  assertBlocked(
+    `node --require /x -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`,
+    "deletion outside",
+  )
+  assertAllowed(
+    `node --env-file /dev/null -e "require('fs').rmSync('/tmp/wi876-x',{recursive:true})"`,
+  )
+  assertAllowed(
+    `python3 --check-hash-based-pycs always -c "import shutil; shutil.rmtree('/tmp/wi876-x')"`,
+  )
+  assertAllowed("python3 -m pytest tests/ -q")
+  assertAllowed("node --version")
+  assertAllowed("node app.js")
+})
+
 test("cp's destination option is the destination it writes (WI#869)", () => {
   // The cp device-write rule kept every non-dash word as an operand, so the
   // `-t` value read as a source and the real source as the destination. The
