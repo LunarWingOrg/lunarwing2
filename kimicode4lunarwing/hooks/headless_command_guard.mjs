@@ -1668,15 +1668,52 @@ function commandBasename(word) {
   return stripShellQuotes(word).replace(/^[({]+/, "").replace(/[)}]+$/, "").split("/").pop() ?? "";
 }
 
-function stageCommand(stage) {
-  const words = argumentWords(stage).map(stripShellQuotes);
+/**
+ * The words of one pipeline stage, read as the listener reader reads a
+ * command line: quotes keep a word together and an unquoted brace group
+ * expands. A brace expansion too large to read falls back to the naive
+ * split, which can only add words.
+ */
+function stageWords(stage) {
+  const words = [];
+  for (const segment of listenerSegments(stage)) {
+    const list = listenerWordList(segment);
+    if (list === null) return argumentWords(stage).map(stripShellQuotes);
+    words.push(...list);
+  }
+  return words;
+}
+
+/**
+ * The command word of a word list, after env/exec/busybox prefixes. `env`'s
+ * options are stepped over, and an `env -S`/`--split-string` value is one
+ * word to the shell but a command line to env, so the words env runs replace
+ * it (WI#872). A split string the hook cannot read claims nothing, which can
+ * only add a denial; the listener rule refuses it by name.
+ */
+function stageCommandFrom(words, depth) {
   let i = 0;
   while (i < words.length) {
-    const isPrefix = STAGE_PREFIXES.includes(commandBasename(words[i])) || /^[A-Za-z_]\w*=/.test(words[i]);
+    const name = commandBasename(words[i]);
+    if (name === "env") {
+      const command = envCommandWords(words, i + 1);
+      if (command === null) return { name: "", args: [] };
+      if (command.unverifiable) return { name: "", args: [] };
+      if (depth >= MAX_SHELL_BODY_DEPTH) return { name: "", args: [] };
+      if (command.split) return stageCommandFrom(command.words, depth + 1);
+      const inner = stageCommandFrom(command.words, depth + 1);
+      if (inner.name !== "") return inner;
+      return { name: "", args: [] };
+    }
+    const isPrefix = STAGE_PREFIXES.includes(name) || /^[A-Za-z_]\w*=/.test(words[i]);
     if (!isPrefix) break;
     i++;
   }
   return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1) };
+}
+
+function stageCommand(stage) {
+  return stageCommandFrom(stageWords(stage), 0);
 }
 
 /**
@@ -2520,6 +2557,157 @@ function pushListenerFields(words, { text, quoted }) {
   }
 }
 
+// GNU env's own value-taking options (`env --help`, coreutils 9.12): a
+// separate value is an option argument, not a command word, so the walk that
+// looks for `-S` steps over it. The signal options take an optional value,
+// which is only ever attached, and so must not eat a word.
+const ENV_VALUE_OPTIONS = new Set(["-u", "--unset", "-C", "--chdir", "-a", "--argv0", "--env0-from"]);
+const ENV_LONG_FLAG = /^--(?:ignore-environment|null|debug|list-signal-handling|help|version|(?:block|default|ignore)-signal)$/;
+
+/**
+ * The words GNU `env -S`/`--split-string` makes of its string, or null when
+ * the string makes env fail before it runs anything. Measured on coreutils
+ * 9.12: unquoted whitespace separates; `'…'` is literal; `"…"` takes the
+ * same escapes; `#` at a word start begins a comment; `\c` ends the string;
+ * `\_` separates outside quotes and is a space inside them; `\f`, `\n`,
+ * `\r`, `\t`, `\v` are the control characters they name, and a tab stays in
+ * its word; only `${NAME}` expands, so a bare `$` or an unknown escape is an
+ * env error. `${NAME}` is unknown text a task can set (`${A} ${B}` runs
+ * `kimi server`), and so is a substitution's unknown output, so both are
+ * reported as unverifiable rather than read as a word.
+ */
+function envSplitStringWords(text) {
+  const escapes = { f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", '"': '"', "'": "'", $: "$" };
+  const words = [];
+  let word = "";
+  let started = false;
+  let unverifiable = false;
+  let quote = "";
+  const flush = () => {
+    if (started) words.push(word);
+    word = "";
+    started = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote === "'") {
+      if (ch === "'") quote = "";
+      else word += ch;
+      continue;
+    }
+    if (ch === "\\") {
+      const escaped = text[++i];
+      if (escaped === "c") break;
+      if (escaped === "_") {
+        if (quote === '"') {
+          word += " ";
+          started = true;
+        } else {
+          flush();
+        }
+        continue;
+      }
+      const value = escapes[escaped];
+      if (value === undefined) return null;
+      word += value;
+      started = true;
+      continue;
+    }
+    if (ch === "$") {
+      // `${NAME}`, `$NAME` and a substitution's unknown output are all text
+      // the task can choose, and env's own expansion only accepts `${NAME}`
+      // anyway, so the words are not readable from the command line.
+      unverifiable = true;
+      started = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = "";
+      else word += ch;
+      started = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\n") {
+      flush();
+      continue;
+    }
+    if (ch === LISTENER_FIELD_BREAK) {
+      // An unquoted `${IFS}` the shell expands into the string: where its
+      // fields fall depends on the task's environment.
+      unverifiable = true;
+      started = true;
+      continue;
+    }
+    if (ch === "#" && !started) break;
+    word += ch;
+    started = true;
+  }
+  if (quote !== "") return null;
+  flush();
+  return unverifiable ? { unverifiable: true } : { words };
+}
+
+/**
+ * The command line an `env` invocation runs: env's own options are stepped
+ * over (a value-taking option consumes its value, `-` is `-i`, `--` ends the
+ * list) and an `-S`/`--split-string` value is split into the words env runs
+ * before them (WI#872). `env` stops reading options at its first assignment
+ * or command word, so `-S` after one is that command's argument, as bash
+ * runs it. Null when the options end without a command; `{ unverifiable }`
+ * when a split string's words cannot be read.
+ */
+function envCommandWords(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    // A mere `-` is `-i` and ends the option list, as does the first
+    // assignment or command word: `env - -S …` runs `-S` as the command.
+    if (!word.startsWith("-") || word === "-") return { words: words.slice(i) };
+    if (word.startsWith("--")) {
+      if (word === "--") return { words: words.slice(i + 1) };
+      const name = word.split("=")[0];
+      // getopt accepts a unique prefix of a long option, so `--s` and
+      // `--split` are `--split-string`.
+      if ("--split-string".startsWith(name)) {
+        const attached = word.length > name.length;
+        const value = attached ? word.slice(name.length + 1) : words[i + 1];
+        if (value === undefined) return null;
+        const split = envSplitStringWords(value);
+        if (split === null || split.unverifiable) return split;
+        const after = i + (attached ? 1 : 2);
+        return { split: true, words: [...split.words, ...words.slice(after)] };
+      }
+      if (word.includes("=") || ENV_LONG_FLAG.test(name)) continue;
+      if (ENV_VALUE_OPTIONS.has(name)) i++;
+      continue;
+    }
+    for (let j = 1; j < word.length; j++) {
+      const letter = word[j];
+      if (letter === "S") {
+        const attached = word.slice(j + 1);
+        const value = attached.length > 0 ? attached : words[i + 1];
+        if (value === undefined) return null;
+        const split = envSplitStringWords(value);
+        if (split === null || split.unverifiable) return split;
+        const after = i + (attached.length > 0 ? 1 : 2);
+        return { split: true, words: [...split.words, ...words.slice(after)] };
+      }
+      // `-u`, `-C` and `-a` take a value: the rest of the cluster or the
+      // next word. `-i`, `-0`, `-v` and an unknown letter read as flags,
+      // which is the reading that still finds a later `-S`.
+      if ("uCa".includes(letter)) {
+        if (j === word.length - 1) i++;
+        break;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Classify every word of one listener segment (WI#858). The rule is a
  * property, not a command position: any `kimi` word followed by a service
@@ -2528,6 +2716,11 @@ function pushListenerFields(words, { text, quoted }) {
  * not know therefore cannot hide one. Option words and assignments need no
  * skipping: `kimi` is matched by name at every index, and the option table
  * decides what its own arguments are.
+ *
+ * An `env -S`/`--split-string` value is one word to the shell but a command
+ * line to env, so it is split into the words env runs before the rule reads
+ * them (WI#872); otherwise `env -S "kimi server"` names a listener the shell
+ * never shows as two words.
  */
 function checkListenerWords(words, depth) {
   // One forward-only table per segment, so a segment full of `kimi` words is
@@ -2538,6 +2731,17 @@ function checkListenerWords(words, depth) {
     const name = commandBasename(word);
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
+    }
+    if (name === "env") {
+      // The words env runs are not the shell's words when `-S` is used.
+      const command = envCommandWords(words, i + 1);
+      if (command?.unverifiable) return "cannot check listeners behind an env -S string";
+      if (command && command.split) {
+        if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
+        const denied = checkListenerWords(command.words, depth + 1);
+        if (denied) return denied;
+      }
+      continue;
     }
     if (name === "kimi") {
       serviceSubcommands ??= kimiServiceSubcommands(words);
