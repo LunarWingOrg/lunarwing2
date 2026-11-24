@@ -884,6 +884,17 @@ impl ExternalWorkerManager {
                 "External workers configured: {}",
                 workers.keys().cloned().collect::<Vec<_>>().join(", ")
             );
+        } else {
+            // WI#882: an empty worker set makes the boot probe return early, so
+            // a tenant whose lanes are enabled in mt-admin's registry but whose
+            // config.toml carries no `[[sandbox.external_workers]]` block used
+            // to log no worker-liveness lines at all — the operator saw a
+            // "Connection refused" on dispatch and nothing in the log to
+            // explain it. Say the absence out loud, once, at boot.
+            tracing::info!(
+                "No external workers configured (no [[sandbox.external_workers]] entries); \
+                 no worker liveness probe will run"
+            );
         }
 
         Self {
@@ -1576,6 +1587,26 @@ impl ExternalWorkerManager {
         let configs = self.probe_configs();
         if configs.is_empty() {
             return;
+        }
+        // WI#882: name the endpoints this probe will dial, at boot, so a log
+        // that reports a worker unreachable also shows the address the daemon
+        // resolved — the Kageho report could not tell which port the daemon
+        // believed it should reach. Host:port only, never a token or path.
+        for (worker, endpoints) in &configs {
+            let displays: Vec<String> = endpoints
+                .iter()
+                .map(|endpoint| probe_endpoint_display(&endpoint.url))
+                .collect();
+            tracing::info!(
+                "External worker liveness probe scheduled for '{}' at {} (first pass in {}s)",
+                worker,
+                if displays.is_empty() {
+                    "no endpoint".to_string()
+                } else {
+                    displays.join(", ")
+                },
+                WORKER_LIVENESS_BOOT_GRACE.as_secs()
+            );
         }
         let probe_state = Arc::clone(&self.probe_state);
 
