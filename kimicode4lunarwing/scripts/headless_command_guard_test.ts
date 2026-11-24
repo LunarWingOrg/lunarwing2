@@ -1772,3 +1772,36 @@ test("literal brace alternatives are formed before unquoted IFS is split (ALP-2)
   assert.deepEqual(fields("'{first,${IFS}second}' tail"), [["{first,${IFS}second}", "tail"]])
   assert.deepEqual(fields("{first, ${IFS}second}"), [["{first,", "second}"]])
 })
+
+test("one quoted character on the verb does not defeat the raw-shape family (WI#873)", () => {
+    // checkRawShapes ran on `joined` only, so the shell quoting the verb
+    // stripped bash's word away from every raw-shape rule. Each row below is
+    // a rule family in the spellings the WI measured at master, where all of
+    // them were allowed while the deny-rule family still fired.
+    // Device writes (tee/cp).
+    assertBlocked('"tee" /dev/sda1', "block-device");
+    assertBlocked("'tee' /tmp/wi873-a /dev/sda1", "block-device");
+    assertBlocked("\\tee /dev/sda1", "block-device");
+    assertBlocked('"cp" /tmp/wi873-a /dev/sda1', "block-device");
+    // find -delete and find -exec.
+    assertBlocked('"find" /app -name x -delete', "deletion outside");
+    assertBlocked('"find" /app -name x -exec rm {} \\;', "deletion outside");
+    assertBlocked("'find' /app -name x -delete", "deletion outside");
+    // xargs over an unverifiable input set.
+    assertBlocked('"xargs" rm -rf', "cannot verify");
+    // rsync --delete.
+    assertBlocked('"rsync" -a --delete /tmp/wi873-e/ /app/', "deletion outside");
+    // Interpreter one-liner deletion, quoted verb and quoted operand.
+    assertBlocked('"perl" -e \'unlink("/etc/passwd")\'', "deletion outside");
+    assertBlocked('"python3" -c "import shutil;shutil.rmtree(\'/app/x\')"', "deletion outside");
+    // Decoded pipe: the decode stage verb quoted.
+    assertBlocked('echo aGVsbG8K | "base64" -d | bash', "decoded");
+    // The same fixes stay ordinary work when they target a temp root, so the
+    // word view is not denying on the quoting alone.
+    assertAllowed('"tee" /tmp/wi873.out');
+    assertAllowed('"find" /tmp/wi873 -name x -delete');
+    assertAllowed('"perl" -e \'unlink("/tmp/wi873-a")\'');
+    // A quoted character inside an argument (not on the verb) was already
+    // read by the raw spellings; it must stay that way.
+    assertAllowed("tee '/tmp/wi873-a b'");
+})
