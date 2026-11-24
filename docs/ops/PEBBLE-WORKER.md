@@ -279,6 +279,18 @@ key; re-run `configure-pebble` (or allow the host yourself with
 `configure-worker-egress <name> --allow nano-gpt.com:443`) before the next
 pebble start.
 
+#### OpenAI Codex model list (WI#863)
+
+The pinned upstream release fetched Codex models from `/v1/models`, an endpoint
+the Codex backend does not serve, so every fetch failed and the frozen built-in
+table (which ended at `gpt-5.5`) was always used — newer OpenAI models could
+not be selected. `pebble4lunarwing/patches/wi863-openai-codex-model-catalog.patch`
+makes the pinned build read the real `/models?client_version=…` catalog,
+including each model's context window and picker visibility, and merges the live
+result with the built-in table so a model the backend hides from an older
+client version is still offered. Refreshing the built-in table remains the
+fallback when the catalog fetch fails; it is no longer the only path.
+
 ### Status
 
 ```bash
