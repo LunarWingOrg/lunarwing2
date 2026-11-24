@@ -1470,6 +1470,28 @@ Enforced controls (opencode2 lane unless noted):
    **clean** — all four lanes showed exactly the expected bridge-WS + 8443
    binds, all mappings host-loopback only.
 
+10. **Lane readiness and first-failure evidence (WI#882).** A running worker
+   container is not a ready worker: after Kageho's 2.2.1.0 upgrade both
+   configured lanes had `.State.Running` containers that refused every
+   loopback connection, `status` printed "running" for each, and the only
+   host-side listener audit was the exposure scan above. `mt-admin status
+   <tenant>` now prints each lane's published WSS port with a
+   `listening` / `dead (no listener on 127.0.0.1)` / `unknown (no WSS port
+   allocated)` verdict, reports each present worker image's
+   `org.opencontainers.image.revision`, and cross-checks the registry's
+   enabled lanes against the tenant's `config.toml`
+   `[[sandbox.external_workers]]` entries (a lane enabled in the registry but
+   absent from the config is unreachable no matter how healthy its container
+   looks). `mt-admin worker-readiness <tenant>` is the strict gate — exit
+   non-zero when any enabled lane's port refuses a loopback dial, polling for
+   `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one probe).
+   `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
+   container state plus a bounded, sanitized tail of its bridge and task
+   container logs — the first-failure evidence that was previously only
+   reachable by a hand-run `podman logs` on the host. Start and upgrade log a
+   readiness warning for a dead lane but stay green (the container start
+   already succeeded); the strict gate is the separate verb.
+
 **!1570 deployment note:** rebuild the worker image and recreate existing
 opencode2 containers through mt-admin to receive the protected boot files.
 Restarting a container on an older image does not apply the new ownership or
