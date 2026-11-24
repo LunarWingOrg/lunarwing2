@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# WI#882: `mt-admin status` must report whether each worker lane's WSS port is
-# actually accepting loopback connections, not just whether its container is
-# `.State.Running`. Kageho's 2.2.1.0 upgrade finished with both configured
-# workers refusing connections while `status` printed "running" for each, and
-# the only listener audit on the host was the WI#357 exposure scan.
+# WI#882: `mt-admin status` must report whether something answers on each
+# worker lane's published WSS port, not just whether its container is
+# `.State.Running` and not just whether the port accepts a connection. A
+# rootless published port is held by a forwarder for as long as the container
+# runs: with nothing listening inside, the connect succeeds and the forwarder
+# then drops the connection at once.
 #
 # Pins:
 #  - a running container whose port refuses -> "dead (no listener on 127.0.0.1)"
-#  - a running container whose port accepts -> "listening"
+#  - a running container whose port accepts and drops at once (end of file or
+#    a reset) -> "dead (accepted on 127.0.0.1 and dropped at once, ...)"
+#  - a running container whose port accepts and keeps the connection open
+#    -> "listening"
 #  - a lane with no allocated WSS slot -> "unknown (no WSS port allocated)"
 #  - a present image line carries its revision (effective worker version)
 #  - the "running (...)" prefix is preserved: lunarwing_mt_onboard's verifier
@@ -26,30 +30,61 @@ fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
-# A real listener so the "listening" branch is exercised against a live socket,
-# and a genuinely closed one for the dead branch. 127.0.0.1 only.
-python3 - "$PWD" <<'PY' &
-import socket, sys, time
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 0))
-s.listen(8)
-open(sys.argv[1] + "/.readiness-port", "w").write(str(s.getsockname()[1]))
-time.sleep(60)
+# Three real listeners on 127.0.0.1, each in its own thread, and a closed port:
+#  - live:  accepts and keeps every connection open, as a bridge does while it
+#           waits for the WebSocket request;
+#  - drop:  accepts and closes at once (what `rootlessport` does with nothing
+#           behind the published port);
+#  - reset: accepts and resets at once (what `pasta` does in the same case).
+# The port files live in a private temporary directory, never in the
+# directory the harness is started from.
+FIXTURE_DIR="$(mktemp -d)"
+python3 - "$FIXTURE_DIR" <<'PY' &
+import os, socket, struct, sys, threading, time
+
+def serve(name, mode):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    s.listen(64)
+    tmp = os.path.join(sys.argv[1], name + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(str(s.getsockname()[1]))
+    os.rename(tmp, os.path.join(sys.argv[1], name + ".port"))
+    held = []
+    while True:
+        conn, _ = s.accept()
+        if mode == "hold":
+            held.append(conn)
+        elif mode == "reset":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()
+        else:
+            conn.close()
+
+for name, mode in (("live", "hold"), ("drop", "close"), ("reset", "reset")):
+    threading.Thread(target=serve, args=(name, mode), daemon=True).start()
+time.sleep(180)
 PY
 LISTENER_PID=$!
 CONFIG_DIR=""
 cleanup() {
   kill "$LISTENER_PID" 2>/dev/null || true
   wait "$LISTENER_PID" 2>/dev/null || true
-  rm -f "$PWD/.readiness-port"
+  rm -rf "$FIXTURE_DIR"
   [[ -z "$CONFIG_DIR" ]] || rm -rf "$CONFIG_DIR"
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 50); do [[ -s "$PWD/.readiness-port" ]] && break; sleep 0.1; done
-LIVE_PORT="$(cat "$PWD/.readiness-port" 2>/dev/null || true)"
-[[ -n "$LIVE_PORT" ]] || { printf 'FAIL: could not start fixture listener\n'; exit 1; }
+for _ in $(seq 1 100); do
+  [[ -s "$FIXTURE_DIR/live.port" && -s "$FIXTURE_DIR/drop.port" && -s "$FIXTURE_DIR/reset.port" ]] && break
+  sleep 0.1
+done
+LIVE_PORT="$(cat "$FIXTURE_DIR/live.port" 2>/dev/null || true)"
+DROP_PORT="$(cat "$FIXTURE_DIR/drop.port" 2>/dev/null || true)"
+RESET_PORT="$(cat "$FIXTURE_DIR/reset.port" 2>/dev/null || true)"
+[[ -n "$LIVE_PORT" && -n "$DROP_PORT" && -n "$RESET_PORT" ]] \
+  || { printf 'FAIL: could not start the fixture listeners\n'; exit 1; }
 
 # A port with nothing bound: bind ephemeral, read it, close it.
 DEAD_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
@@ -89,12 +124,13 @@ _worker_image_refs() {
 }
 say() { printf '%s\n' "$*"; }
 
-# Per-lane fixture state: running lanes get a real port; opencode2 has no slot.
+# Per-lane fixture state: pebble answers, opencode's port refuses, kimi's port
+# accepts and drops, opencode2 has no slot.
 ports_get() {  # <tenant> <slot>
   case "$2" in
     pebble_wss) printf '%s\n' "$LIVE_PORT" ;;
     opencode_wss) printf '%s\n' "$DEAD_PORT" ;;
-    kimi_wss) printf '%s\n' "$DEAD_PORT" ;;
+    kimi_wss) printf '%s\n' "$DROP_PORT" ;;
     opencode2_wss) return 1 ;;
     *) return 1 ;;
   esac
@@ -124,6 +160,35 @@ _ctr() {  # <tenant> [container] <verb> ... — mirrors the real typed wrapper
   esac
 }
 
+# The probe itself, against each kind of port. The two dropped cases get a
+# long hold: the probe returns as soon as the drop arrives, so the bound only
+# matters on a stalled host, where it keeps the assertion from flaking.
+probe_rc() { local rc=0; _worker_port_answers "$1" || rc=$?; printf '%s' "$rc"; }
+[[ "$(WORKER_PORT_HOLD_SECS=0.3 probe_rc "$LIVE_PORT")" == 0 ]] \
+  && pass "the probe answers 0 for a port that keeps the connection open" \
+  || fail "the probe answers 0 for a port that keeps the connection open"
+[[ "$(probe_rc "$DEAD_PORT")" == 1 ]] \
+  && pass "the probe answers 1 for a refused connection" \
+  || fail "the probe answers 1 for a refused connection"
+[[ "$(WORKER_PORT_HOLD_SECS=5 probe_rc "$DROP_PORT")" == 2 ]] \
+  && pass "the probe answers 2 for a port that accepts and closes at once" \
+  || fail "the probe answers 2 for a port that accepts and closes at once"
+# A reset can reach the client before its connect() returns; the kernel then
+# fails the connect itself, so a resetting port reads as refused (1) or as
+# dropped (2) depending on scheduling. Both are dead; only "answers" is wrong.
+reset_rc="$(WORKER_PORT_HOLD_SECS=5 probe_rc "$RESET_PORT")"
+if [[ "$reset_rc" == 1 || "$reset_rc" == 2 ]]; then
+  pass "the probe never answers 0 for a port that accepts and resets at once"
+else
+  fail "the probe never answers 0 for a port that accepts and resets at once (got $reset_rc)"
+fi
+reset_verdict="$(WORKER_PORT_HOLD_SECS=5 worker_wss_readiness "$RESET_PORT")"
+if [[ "$reset_verdict" == "dead ("* ]]; then
+  pass "a reset port reads dead, not listening"
+else
+  fail "a reset port reads dead, not listening (got '$reset_verdict')"
+fi
+
 out="$(status_tenant alice)"
 
 assert_contains() {
@@ -137,10 +202,14 @@ assert_not_contains() {
   if [[ "$out" == *"$unexpected"* ]]; then fail "$label (found '$unexpected')"; else pass "$label"; fi
 }
 
-assert_contains "a live listener is reported listening" \
+assert_contains "a port that keeps the connection open is reported listening" \
   "Pebble worker: running (lunarwing-pebble-alice, WSS port $LIVE_PORT: listening)"
 assert_contains "a refused port is reported dead, naming the loopback address" \
   "OpenCode worker: running (lunarwing-opencode-alice, WSS port $DEAD_PORT: dead (no listener on 127.0.0.1))"
+assert_contains "a port that accepts and drops at once is reported dead, not listening" \
+  "Kimi worker: running (lunarwing-kimi-alice, WSS port $DROP_PORT: dead (accepted on 127.0.0.1 and dropped at once, nothing answers behind the published port))"
+assert_not_contains "a port that accepts and drops is never called listening" \
+  "WSS port $DROP_PORT: listening"
 assert_contains "a lane without an allocated WSS slot says so" \
   "OpenCode 2 worker: running (lunarwing-opencode2-alice, WSS port none: unknown (no WSS port allocated))"
 assert_contains "an absent container is not created" "LunarDepth worker: not created"
@@ -169,22 +238,32 @@ assert_contains "a lane disabled in registry but still configured is a finding" 
   "Worker config: lunardepth disabled in registry but still configured in $CONFIG_DIR/config.toml"
 
 # A lane whose container is not running must not cost a loopback dial: the
-# "stopped"/"not created" branches never call _port_in_use.
-dial_count=0
-_real_port_in_use="$(declare -f _port_in_use)"
-eval "_counting_port_in_use${_real_port_in_use#_port_in_use}"
-_port_in_use() { dial_count=$((dial_count + 1)); _counting_port_in_use "$@"; }
+# "stopped"/"not created" branches never call the probe. The status line calls
+# the probe inside a command substitution, so the count is kept in a file: a
+# shell variable would be incremented in the subshell and lost.
+_real_probe="$(declare -f _worker_port_answers)"
+eval "_counting_probe${_real_probe#_worker_port_answers}"
+_worker_port_answers() { printf 'dial\n' >>"$FIXTURE_DIR/dials"; _counting_probe "$@"; }
+dial_count() { if [[ -f "$FIXTURE_DIR/dials" ]]; then wc -l <"$FIXTURE_DIR/dials"; else printf '0\n'; fi; }
+LANE_STATE=([pebble]=true [opencode]="" [opencode2]="" [lunardepth]="" [kimi]="")
+WORKER_PORT_HOLD_SECS=0.3 status_tenant alice >/dev/null
+if [[ "$(dial_count)" -eq 1 ]]; then
+  pass "one running lane with a port costs exactly one dial (the counter works)"
+else
+  fail "one running lane with a port costs exactly one dial (dialed $(dial_count))"
+fi
+rm -f "$FIXTURE_DIR/dials"
 LANE_STATE=([pebble]=false [opencode]="" [opencode2]="" [lunardepth]="" [kimi]="")
 status_tenant alice >/dev/null
-if [[ "$dial_count" -eq 0 ]]; then
+if [[ "$(dial_count)" -eq 0 ]]; then
   pass "no loopback dial for a stopped or absent lane"
 else
-  fail "no loopback dial for a stopped or absent lane (dialed $dial_count)"
+  fail "no loopback dial for a stopped or absent lane (dialed $(dial_count))"
 fi
-eval "$_real_port_in_use"
+eval "$_real_probe"
 
 # WI#882: the strict gate (`worker-readiness`) must fail on a dead enabled
-# lane, pass when every enabled lane listens, and skip an intentionally
+# lane, pass when every enabled lane answers, and skip an intentionally
 # stopped OpenRC lane rather than calling it dead.
 LANE_STATE=([pebble]=true [opencode]=true [opencode2]=true [lunardepth]="" [kimi]=true)
 tenant_worker_desired_running() { return 0; }
@@ -194,6 +273,32 @@ if check_tenant_worker_readiness alice >/dev/null 2>&1; then
 else
   pass "the strict gate fails while a selected lane's port is dead"
 fi
+
+# Only the accept-and-drop lane is unhealthy: the gate must still fail, and
+# name that lane. This is the rootless case a plain connect cannot see.
+ports_get() {  # <tenant> <slot>
+  case "$2" in
+    pebble_wss|opencode_wss) printf '%s\n' "$LIVE_PORT" ;;
+    kimi_wss) printf '%s\n' "$DROP_PORT" ;;
+    *) return 1 ;;
+  esac
+}
+gate_rc=0
+gate_err="$(check_tenant_worker_readiness alice 2>&1 >/dev/null)" || gate_rc=$?
+if [[ "$gate_rc" -ne 0 && "$gate_err" == *"kimi worker for alice is not listening on 127.0.0.1:$DROP_PORT"* ]]; then
+  pass "the strict gate fails for a lane whose port accepts and drops, and names it"
+else
+  fail "the strict gate fails for a lane whose port accepts and drops, and names it (rc=$gate_rc: $gate_err)"
+fi
+if [[ "$gate_err" != *"pebble worker"* && "$gate_err" != *"opencode worker"* ]]; then
+  pass "the lanes that keep the connection open are not reported"
+else
+  fail "the lanes that keep the connection open are not reported ($gate_err)"
+fi
+
+# The remaining cases probe only ports that keep the connection open or have
+# no slot, so a shorter hold keeps the harness quick without making it flaky.
+WORKER_PORT_HOLD_SECS=0.3
 
 # Every selected lane on the live port: the gate passes.
 ports_get() {  # <tenant> <slot>
@@ -223,6 +328,13 @@ if check_tenant_worker_readiness alice >/dev/null 2>&1; then
 else
   fail "an intentionally stopped OpenRC lane is not reported dead"
 fi
+
+# An invalid hold falls back to the default instead of failing the probe.
+WORKER_PORT_HOLD_SECS=not-a-number
+[[ "$(probe_rc "$DEAD_PORT")" == 1 ]] \
+  && pass "an invalid hold does not break the probe" \
+  || fail "an invalid hold does not break the probe"
+WORKER_PORT_HOLD_SECS=1
 
 # The wait is a bounded shared window, and a wait of 0 costs no sleep at all.
 unset LUNARWING_MT_WORKER_READY_WAIT_SECS

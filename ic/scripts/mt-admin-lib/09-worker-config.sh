@@ -41,24 +41,70 @@ worker_quadlet_start_failed() {  # <tenant> <service> <lane>
   say "WARNING: $lane worker never reached its listener; dispatch will fail with Connection refused until '$service' starts. Inspect: podman logs lunarwing-${lane}-${name}" >&2
 }
 
+# WI#882: how long a connection to a lane's published port must stay open
+# before the lane counts as answering. A forwarder with nothing behind it drops
+# the connection within milliseconds, so one second is ample; a fraction
+# (`0.3`) is accepted for harnesses.
+WORKER_PORT_HOLD_SECS=1
+
+# WI#882: does something behind a lane's published loopback port answer?
+#
+# A plain connect is not enough. Rootless podman publishes a port through a
+# user-space forwarder (`rootlessport` on a bridge network, `pasta` on the
+# default one), and that forwarder accepts on 127.0.0.1 for as long as the
+# container runs, whether or not the bridge inside ever bound its port. With
+# nothing inside, the forwarder then drops the connection at once (end of file
+# or a reset); a bridge that listens keeps it open while it waits for the
+# WebSocket request. So: connect, then wait `WORKER_PORT_HOLD_SECS` for the
+# peer. Still open, or a byte received, is an answer; refused, closed or reset
+# is not. `_port_in_use` keeps its own meaning ("is this port taken") for the
+# ports registry and is not used here.
+#
+# Returns 0 = answers, 1 = connection refused, 2 = accepted and then dropped,
+# 124 = the probe itself timed out. A reset that reaches the client before its
+# connect() returns fails the connect, so a resetting forwarder can read as 1
+# or as 2; both are "does not answer". This is weaker than the daemon's own
+# probe, which completes the WebSocket handshake (WI#464): an answer here does
+# not prove that a job can connect.
+_worker_port_answers() {  # <port>
+  local port="${1:-}" hold="${WORKER_PORT_HOLD_SECS:-1}" rc=0
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [[ "$hold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || hold=1
+  # The outer bound covers the connect and the wait; `${hold%.*}` drops a
+  # fraction so the arithmetic stays integral.
+  timeout -k 1 "$(( ${hold%.*} + 3 ))" bash -c '
+    exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+    IFS= read -r -t "$2" -N 1 -u 3 _byte
+    rc=$?
+    # 0: a byte arrived. >128: the wait ran out with the connection open.
+    # Anything else is end of file or a read error (a reset).
+    if (( rc == 0 || rc > 128 )); then exit 0; fi
+    exit 2
+  ' _ "$port" "$hold" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
 # WI#882: `.State.Running` says nothing about whether the lane's bridge ever
-# bound its WSS port. Kageho's 2.2.1.0 upgrade finished with both configured
-# workers refusing loopback connections while `status` printed "running" for
-# each and the only host-side listener audit was the WI#357 exposure scan. Probe
-# the published loopback port the way the daemon dials it, so a dead lane is
-# visible without a dispatch failure. Empty/absent port (no registry slot) is
-# reported rather than silently treated as healthy.
+# bound its WSS port, and a published port that merely accepts says nothing
+# either (see `_worker_port_answers`). The verdict is "listening" only when the
+# published loopback port accepted the connection and kept it open; a refused
+# connection and one that is accepted and then dropped both read as dead, each
+# with what was seen. Empty/absent port (no registry slot) is reported rather
+# than silently treated as healthy. The daemon's boot probe line in its log
+# (a full WebSocket handshake) remains the stronger check.
 worker_wss_readiness() {  # <port>; prints "listening" or a dead/unknown reason
-  local port="${1:-}"
+  local port="${1:-}" rc=0
   if [[ ! "$port" =~ ^[0-9]+$ ]]; then
     printf 'unknown (no WSS port allocated)'
     return 0
   fi
-  if _port_in_use "$port"; then
-    printf 'listening'
-  else
-    printf 'dead (no listener on 127.0.0.1)'
-  fi
+  _worker_port_answers "$port" || rc=$?
+  case "$rc" in
+    0) printf 'listening' ;;
+    1) printf 'dead (no listener on 127.0.0.1)' ;;
+    2) printf 'dead (accepted on 127.0.0.1 and dropped at once, nothing answers behind the published port)' ;;
+    *) printf 'dead (no answer on 127.0.0.1 within the probe time)' ;;
+  esac
 }
 
 # WI#882: the effective worker image revision (the pin baked into the image),
@@ -142,11 +188,12 @@ worker_failure_log() {  # <tenant> <lane> [lines=40]
 
 # WI#882: the readiness pass `_start_tenant_workers` runs after every lane. A
 # lane whose container is `.State.Running` can still never have bound its WSS
-# port — that is exactly what Kageho's 2.2.1.0 upgrade left behind: both
-# configured workers refused loopback connections while every start/upgrade
-# reported green, and the only host-side listener audit was the WI#357 exposure
-# scan. Probe each enabled lane's published loopback port once and report the
-# dead ones, so a green start no longer hides an unreachable worker.
+# port, and before this pass every start and upgrade reported green whatever
+# the port did; the only host-side listener audit was the WI#357 exposure
+# scan. Probe each enabled lane's published loopback port once
+# (`_worker_port_answers`: the connection must be accepted and kept open) and
+# report the dead ones, so a green start no longer hides a worker that does
+# not answer.
 #
 # The wait is opt-in and bounded: `LUNARWING_MT_WORKER_READY_WAIT_SECS`
 # (default 0) turns the single probe into a short poll, for a lane that is
@@ -172,7 +219,7 @@ _worker_lane_readiness() {  # <tenant> <lane> <wss slot>
     return 0
   fi
   printf '%s %s %s\n' "$lane" "$port" \
-    "$(_port_in_use "$port" && echo listening || echo dead)"
+    "$(_worker_port_answers "$port" && echo listening || echo dead)"
 }
 
 # WI#882: post-start readiness pass over every enabled lane. Returns non-zero
