@@ -2915,6 +2915,104 @@ mod tests {
         );
     }
 
+    /// WI#875: the allowance names granted remotes, is carried on the
+    /// authorization, and reaches only the named remote's exact host and port.
+    #[test]
+    fn private_destination_allowance_is_per_named_remote() {
+        let host = GitGrantConfig::from_specs(
+            "lan=http://192.168.1.20:3000/org/repo.git,\
+             overlay=http://100.64.0.7/org/other.git,\
+             public=https://forge.example.test/org/third.git",
+            "",
+            "",
+            "lan",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(host.remotes[0].allow_private);
+        assert!(!host.remotes[1].allow_private);
+        assert!(!host.remotes[2].allow_private);
+
+        let grant = authorize_grant(&host, &[], Path::new("/tmp"), SandboxNetworkMode::ProxyEnforced)
+            .unwrap();
+        let allowance = grant.private_egress();
+        assert!(!allowance.is_empty());
+        let json = serde_json::to_string(&grant.evidence()).unwrap();
+        assert!(json.contains("\"private_destination\":true"), "{json}");
+        // Only the named remote carries the flag.
+        assert_eq!(json.matches("\"private_destination\":true").count(), 1, "{json}");
+        // The overlay remote's own evidence does not claim the allowance.
+        let overlay = json.split("\"name\":\"overlay\"").nth(1).unwrap();
+        assert!(!overlay.contains("private_destination"), "{json}");
+
+        // Another remote, and another port on the same host, are not allowed.
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let two = GitGrantConfig::from_specs(
+            "lan=http://192.168.1.20:3000/org/repo.git,\
+             other=http://192.168.1.21:3000/org/other.git",
+            "",
+            "",
+            "lan,other",
+        )
+        .unwrap()
+        .unwrap();
+        let narrowed = authorize_grant(
+            &two,
+            &["other".to_string()],
+            &cwd,
+            SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
+        let narrowed_allowance = narrowed.private_egress();
+        assert!(!narrowed_allowance.is_empty());
+        let selected = GitGrantConfig::from_specs(
+            "lan=http://192.168.1.20:3000/org/repo.git",
+            "",
+            "",
+            "lan",
+        )
+        .unwrap()
+        .unwrap();
+        let one = authorize_grant(&selected, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        assert!(!one.private_egress().is_empty());
+        // A remote without the allowance contributes nothing.
+        let plain = GitGrantConfig::from_specs(
+            "lan=http://192.168.1.20:3000/org/repo.git",
+            "",
+            "",
+            "",
+        )
+        .unwrap()
+        .unwrap();
+        let none = authorize_grant(&plain, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        assert!(none.private_egress().is_empty());
+    }
+
+    /// WI#875: the allowance can only name a granted network remote.
+    #[test]
+    fn private_destination_allowance_rejects_unknown_and_file_remotes() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(cwd.join("remotes/origin.git")).unwrap();
+        let error = GitGrantConfig::from_specs(
+            "origin=file:///workspace/remotes/origin.git",
+            "",
+            "",
+            "origin",
+        )
+        .unwrap_err();
+        assert!(error.contains("file://"), "{error}");
+        let error = GitGrantConfig::from_specs(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "",
+            "missing",
+        )
+        .unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+    }
+
     #[test]
     fn credential_bindings_are_host_side_and_secret_free_in_evidence() {
         const MARKER: &str = "credential-value-marker";

@@ -1271,7 +1271,7 @@ mod tests {
         // redirects come back to the container for re-validation.
         let uri: hyper::Uri = "http://127.0.0.1:1/path".parse().unwrap();
         assert!(
-            forwarding_client(&uri, true, &super::egress::PrivateEgress::new())
+            forwarding_client(&uri, true, &crate::sandbox::proxy::PrivateEgress::new())
                 .await
                 .is_err(),
             "non-public targets never reach a forwarding client"
@@ -3430,5 +3430,253 @@ mod tests {
         read_proxy.stop().await;
 
         upstream_task.abort();
+    }
+
+    // ── WI#875: the per-call git proxy reaches a granted LAN/overlay remote ──
+
+    /// An upstream bound to `bind`, recording every request line and the
+    /// client address it came from.
+    async fn upstream_on(
+        bind: &str,
+    ) -> (
+        u16,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let upstream = TcpListener::bind(bind).await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let Some((head, _body)) = read_upstream_request(&mut conn).await else {
+                        return;
+                    };
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    record.lock().unwrap().push(line);
+                    let _ = conn
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, seen, task)
+    }
+
+    /// The git proxy the manager starts for one remote, in proxy-enforced
+    /// mode, with the grant's allowance and no other.
+    async fn enforced_git_proxy(
+        remote_url: &str,
+        allowance: crate::sandbox::proxy::PrivateEgress,
+    ) -> (HttpProxy, std::net::SocketAddr) {
+        use crate::sandbox::proxy::git_transport::GitTransportRemote;
+        let remote = GitTransportRemote::from_http_url(remote_url, false, None).unwrap();
+        let decider = Arc::new(DefaultPolicyDecider::new(
+            DomainAllowlist::new(std::slice::from_ref(&remote.host)),
+            Vec::new(),
+        ));
+        let proxy = HttpProxy::with_private_egress(
+            decider,
+            Arc::new(NoCredentialResolver),
+            true,
+            Some(GitTransportPolicy::new(vec![remote])),
+            allowance,
+        );
+        let addr = proxy.start(0).await.unwrap();
+        (proxy, addr)
+    }
+
+    /// A non-loopback address this host holds, found without parsing
+    /// interfaces: the kernel picks the source address for a routed target.
+    fn lan_ip() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    }
+
+    /// WI#875 acceptance: a granted plain-HTTP remote on a LAN address is
+    /// reachable through the per-call git proxy with the operator's
+    /// allowance, and the shared tenant proxy still refuses it.
+    #[tokio::test]
+    async fn granted_lan_remote_is_reachable_only_through_the_git_proxy() {
+        let Some(lan) = lan_ip() else {
+            return; // A CI container with only loopback.
+        };
+        let (port, seen, upstream) = upstream_on(&format!("{lan}:0")).await;
+        let remote_url = format!("http://{lan}:{port}/org/repo.git");
+        let request = format!(
+            "GET {remote_url}/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: {lan}:{port}\r\nConnection: close\r\n\r\n"
+        );
+
+        // The shared tenant proxy: proxy-enforced, no allowance.
+        let shared = HttpProxy::with_egress_policy(
+            Arc::new(crate::sandbox::proxy::AllowAllDecider),
+            Arc::new(NoCredentialResolver),
+            true,
+        );
+        let shared_addr = shared.start(0).await.unwrap();
+        let refused = send_raw(shared_addr, request.as_bytes()).await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(
+            refused.contains("non-public destination"),
+            "the shared proxy keeps the public-only boundary: {refused}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        shared.stop().await;
+
+        // The per-call git proxy: the grant's allowance admits the remote.
+        let allowance = crate::sandbox::proxy::PrivateEgress::new().allow(&lan.to_string(), port);
+        let (proxy, addr) = enforced_git_proxy(&remote_url, allowance).await;
+        let allowed = send_raw(addr, request.as_bytes()).await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        proxy.stop().await;
+        upstream.abort();
+    }
+
+    /// WI#875 acceptance: through the same proxy, another private address and
+    /// another port on the granted host are refused. Loopback and the
+    /// metadata address stay refused even when the allowance names them.
+    #[tokio::test]
+    async fn git_proxy_allowance_is_exact_host_and_port() {
+        let Some(lan) = lan_ip() else {
+            return; // A CI container with only loopback.
+        };
+        let (port, seen, upstream) = upstream_on(&format!("{lan}:0")).await;
+        let remote_url = format!("http://{lan}:{port}/org/repo.git");
+        let allowance = crate::sandbox::proxy::PrivateEgress::new().allow(&lan.to_string(), port);
+        let (proxy, addr) = enforced_git_proxy(&remote_url, allowance).await;
+
+        // Another private address in the same subnet: refused, and nothing
+        // reaches it (the refusal happens at resolution).
+        let other = match lan {
+            std::net::IpAddr::V4(v4) => {
+                let mut octets = v4.octets();
+                octets[3] = if octets[3] == 200 { 201 } else { 200 };
+                std::net::IpAddr::V4(octets.into())
+            }
+            std::net::IpAddr::V6(_) => return,
+        };
+        let response = send_raw(
+            addr,
+            format!(
+                "GET http://{other}:{port}/org/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: {other}:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "another private address must be refused: {response}"
+        );
+
+        // Another port on the granted host: refused by the allowance.
+        let next_port = port.wrapping_add(1).max(1);
+        let response = send_raw(
+            addr,
+            format!(
+                "GET http://{lan}:{next_port}/org/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: {lan}:{next_port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "another port on the granted host must be refused: {response}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        // An allowance that names loopback or the metadata address still
+        // refuses: those are never LAN or overlay destinations.
+        for (host, port) in [("127.0.0.1", port), ("169.254.169.254", 80)] {
+            let named = crate::sandbox::proxy::PrivateEgress::new().allow(host, port);
+            assert!(
+                crate::sandbox::proxy::egress::resolve_egress(host, port, &named)
+                    .await
+                    .is_err(),
+                "{host}:{port} must stay refused even when the operator names it"
+            );
+        }
+
+        // The allowance is per proxy: the same request without it is refused.
+        let (bare, bare_addr) =
+            enforced_git_proxy(&remote_url, crate::sandbox::proxy::PrivateEgress::new()).await;
+        let refused = send_raw(
+            bare_addr,
+            format!(
+                "GET {remote_url}/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: {lan}:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        bare.stop().await;
+
+        proxy.stop().await;
+        upstream.abort();
+    }
+
+    /// An overlay (CGNAT `100.64.0.0/10`) address this host holds, found the
+    /// same way as [`lan_ip`]: route a datagram toward the overlay range and
+    /// read the source address the kernel picks.
+    fn overlay_ip() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("100.100.100.100:9").ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        let std::net::IpAddr::V4(v4) = ip else {
+            return None;
+        };
+        let octets = v4.octets();
+        (octets[0] == 100 && (64..128).contains(&octets[1])).then_some(ip)
+    }
+
+    /// WI#875 acceptance: an overlay (CGNAT) destination is reachable with
+    /// the operator's allowance, and an address just outside the granted
+    /// host and port still is not.
+    #[tokio::test]
+    async fn allowance_reaches_an_overlay_destination() {
+        let Some(overlay) = overlay_ip() else {
+            return; // No overlay interface on this host.
+        };
+        let bind = format!("{overlay}:0");
+        let (port, seen, upstream) = upstream_on(&bind).await;
+        let remote_url = format!("http://{overlay}:{port}/org/repo.git");
+        let request = format!(
+            "GET {remote_url}/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: {overlay}:{port}\r\nConnection: close\r\n\r\n"
+        );
+
+        // Without the allowance the overlay address is refused.
+        let (bare, bare_addr) =
+            enforced_git_proxy(&remote_url, crate::sandbox::proxy::PrivateEgress::new()).await;
+        let refused = send_raw(bare_addr, request.as_bytes()).await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        bare.stop().await;
+
+        // With it, the pinned connection lands on the overlay address.
+        let allowance =
+            crate::sandbox::proxy::PrivateEgress::new().allow(&overlay.to_string(), port);
+        let (proxy, addr) = enforced_git_proxy(&remote_url, allowance).await;
+        let allowed = send_raw(addr, request.as_bytes()).await;
+        assert!(
+            allowed.starts_with("HTTP/1.1 200"),
+            "an overlay destination must be reachable with the allowance: {allowed}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        proxy.stop().await;
+        upstream.abort();
     }
 }
