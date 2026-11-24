@@ -13,6 +13,7 @@
 #  - the "running (...)" prefix is preserved: lunarwing_mt_onboard's verifier
 #    reads the first word of the line
 #  - no lane connection is attempted for a stopped/absent container
+# shellcheck disable=SC2034  # fixture globals are consumed by sourced helpers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
