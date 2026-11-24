@@ -239,11 +239,15 @@ processes: for `http://` remotes the per-call proxy enforces write and deletion
 updates, use server-side permissions and branch protection.
 
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
-operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies. It does not fully model shell
+operands (including `bash -cex 'git status'`), literal `rebase --exec`,
+`submodule foreach` and `bisect run` bodies, and every spelling of `env`'s
+split-string option (`-S body`, `-Sbody`, `-iS body`, `--split-string body`,
+`--split-string=body` and the long-option abbreviations), whose body is
+spliced with the words that follow it and read as the command `env` runs. It
+does not fully model shell
 expansion (including globs, braces and command substitutions), dynamic
 command names, alias or command lookup, text evaluated by commands such as
-`eval`, `trap` or `env -S`, or shell scripts supplied on stdin. Unsupported
+`eval` or `trap`, or shell scripts supplied on stdin. Unsupported
 forms, including indirect writes to shell variables, are not guaranteed
 to be refused.
 Ordinary commands such as `grep git README`, `echo git push`, and
