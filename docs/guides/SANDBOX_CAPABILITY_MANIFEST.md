@@ -282,7 +282,10 @@ single command. Dynamic expansions and invalid split strings are refused.
 
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies. `rebase` exec is read from the
+`submodule foreach` and `bisect run` bodies. `submodule foreach` is read as
+the whole operand tail: git runs the first operand verbatim and single-quotes
+every later one, so `foreach sh -c '<body>'` is scanned too, not just a
+single quoted body. `rebase` exec is read from the
 short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
 `-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
 their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
