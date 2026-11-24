@@ -72,7 +72,9 @@ worker_image_revision() {  # <tenant> <image ref>
   revision="${revision//$'\n'/ }"
   case "$revision" in
     ""|"<no value>") printf 'unknown' ;;
-    *) printf '%s' "$(sanitize_display_value "$revision" 40)" ;;
+    # 64 keeps a full 40-char commit id (and a release tag) intact; the
+    # default 160 would not, and a truncated revision cannot be matched.
+    *) printf '%s' "$(sanitize_display_value "$revision" 64)" ;;
   esac
 }
 
