@@ -239,25 +239,41 @@ function shellWordView(command) {
 }
 
 /**
- * The words bash hands the program: one shell quoting level removed, with a
- * quote character inside a quoted span kept as text. Unlike `shellWordView`
- * this does not strip a nested level, so a Perl or Python operand keeps the
- * quotes its own language reads (`perl -e 'unlink("/etc/passwd")'`), while a
- * quoted verb reads as the plain word bash runs (`"tee" /dev/sda1`, `\find …`).
- * WI#873.
+ * The words bash hands the program: one shell quoting level removed from a
+ * quoted span that is a plain literal word. Unlike `shellWordView` this does
+ * not touch a span that carries whitespace, a clause separator or an
+ * expansion, so the span stays one word and the clause structure the readers
+ * walk is unchanged (`find /tmp -name "a;b" | xargs rm` keeps its pipe), and
+ * an interpreter operand keeps the quotes its own language reads
+ * (`perl -e 'unlink("/etc/passwd")'`). A quoted or escaped verb reads as the
+ * plain word bash runs (`"tee" /dev/sda1`, `\find /app -delete`), which is
+ * the spelling the raw-shape family was missing (WI#873).
  */
+const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]+$/;
+
 function shellWordLevelView(text) {
   const states = quoteStates(text);
   let view = "";
   for (let i = 0; i < text.length; i++) {
     const state = states[i];
-    if (state === QUOTE_OPEN || state === QUOTE_CLOSE) continue;
     if (isEscapedState(state) && text[i] === "\\") {
       const escaped = text[++i] ?? "";
       if (escaped !== "\n") view += escaped;
       continue;
     }
-    view += text[i];
+    if (state !== QUOTE_OPEN || (text[i] !== "'" && text[i] !== '"')) {
+      // The `$` of a `$'…'` opener is not part of the word bash builds.
+      const ansiOpener = text[i] === "$" && text[i + 1] === "'" && states[i + 1] === QUOTE_OPEN;
+      if (!ansiOpener) view += text[i];
+      continue;
+    }
+    let close = i + 1;
+    while (close < text.length && states[close] !== QUOTE_CLOSE) close++;
+    const body = text.slice(i + 1, close);
+    view += close < text.length && QUOTED_LITERAL_WORD.test(body)
+      ? body
+      : text.slice(i, close + 1);
+    i = close;
   }
   return view;
 }
