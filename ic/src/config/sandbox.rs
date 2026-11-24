@@ -1515,7 +1515,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "SANDBOX_GIT_REMOTES",
-                "lan=http://git.lan:3000/org/repo.git,\
+                "lan=http://192.168.1.20:3000/org/repo.git,\
                  overlay=http://100.64.0.7/org/other.git",
             )
         };

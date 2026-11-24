@@ -225,6 +225,19 @@ impl GitGrantConfig {
                      only an http:// or https:// remote resolves a destination"
                 ));
             }
+            // The allowance trusts no DNS answer, so it names only a remote
+            // whose URL host is a LAN or overlay IP literal (WI#875).
+            let literal = url::Url::parse(&remote.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .is_some_and(|host| crate::sandbox::proxy::PrivateEgress::admits_literal(&host));
+            if !literal {
+                return Err(format!(
+                    "SANDBOX_GIT_PRIVATE_REMOTES names '{name}', whose URL host is not a LAN or \
+                     overlay IP address; the allowance accepts only an IP-literal remote \
+                     (RFC 1918, 100.64.0.0/10 or an IPv6 unique-local address)"
+                ));
+            }
         }
         Ok(Some(Self {
             credentials: parse_credentials(credential_spec, &remotes)?,
@@ -454,6 +467,10 @@ impl GitGrantAuthorization {
             else {
                 continue;
             };
+            // Config load already refuses a non-literal host; never widen.
+            if !crate::sandbox::proxy::PrivateEgress::admits_literal(host) {
+                continue;
+            }
             allowance = allowance.allow(host, port);
         }
         allowance
@@ -2974,7 +2991,11 @@ mod tests {
         )
         .unwrap();
         let narrowed_allowance = narrowed.private_egress();
-        assert!(!narrowed_allowance.is_empty());
+        assert_eq!(
+            narrowed_allowance,
+            crate::sandbox::proxy::PrivateEgress::new().allow("192.168.1.21", 3000),
+            "only the selected remote's literal and port"
+        );
         let selected =
             GitGrantConfig::from_specs("lan=http://192.168.1.20:3000/org/repo.git", "", "", "lan")
                 .unwrap()
@@ -3012,6 +3033,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("missing"), "{error}");
+        // A host name, a public literal and a metadata literal never get the
+        // allowance: it trusts no DNS answer and opens LAN/overlay only.
+        for url in [
+            "http://git.lan:3000/org/repo.git",
+            "http://203.0.113.5/org/repo.git",
+            "http://100.100.100.200/org/repo.git",
+            "http://169.254.169.254/org/repo.git",
+        ] {
+            let error = GitGrantConfig::from_specs(&format!("lan={url}"), "", "", "lan")
+                .expect_err("not an allowable literal");
+            assert!(error.contains("IP-literal"), "{url}: {error}");
+        }
     }
 
     #[test]

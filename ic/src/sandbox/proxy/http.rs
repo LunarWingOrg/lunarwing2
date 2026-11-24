@@ -3500,7 +3500,9 @@ mod tests {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.connect("192.0.2.1:9").ok()?;
         let ip = socket.local_addr().ok()?.ip();
-        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+        // Only a LAN or overlay source address exercises the allowance; a
+        // public one would pass the shared proxy and say nothing.
+        crate::sandbox::proxy::PrivateEgress::admits_literal(&ip.to_string()).then_some(ip)
     }
 
     /// WI#875 acceptance: a granted plain-HTTP remote on a LAN address is
@@ -3509,7 +3511,8 @@ mod tests {
     #[tokio::test]
     async fn granted_lan_remote_is_reachable_only_through_the_git_proxy() {
         let Some(lan) = lan_ip() else {
-            return; // A CI container with only loopback.
+            eprintln!("skipped: this host has no LAN or overlay source address");
+            return;
         };
         let (port, seen, upstream) = upstream_on(&format!("{lan}:0")).await;
         let remote_url = format!("http://{lan}:{port}/org/repo.git");
@@ -3550,7 +3553,8 @@ mod tests {
     #[tokio::test]
     async fn git_proxy_allowance_is_exact_host_and_port() {
         let Some(lan) = lan_ip() else {
-            return; // A CI container with only loopback.
+            eprintln!("skipped: this host has no LAN or overlay source address");
+            return;
         };
         let (port, seen, upstream) = upstream_on(&format!("{lan}:0")).await;
         let remote_url = format!("http://{lan}:{port}/org/repo.git");

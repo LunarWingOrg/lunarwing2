@@ -679,7 +679,7 @@ re-render, together with each daemon variable a credential binding names:
 SANDBOX_GIT_REMOTES=origin=http://git.lan:3000/org/repo.git  # name=url[,name=url...]
 SANDBOX_GIT_WRITE_REMOTES=origin          # names from SANDBOX_GIT_REMOTES that may push
 SANDBOX_GIT_CREDENTIALS=origin=GIT_ORIGIN_TOKEN  # remote=VARIABLE; http:// remotes only
-SANDBOX_GIT_PRIVATE_REMOTES=origin        # names that may resolve to a LAN/overlay address (WI#875)
+SANDBOX_GIT_PRIVATE_REMOTES=origin        # IP-literal LAN/overlay remotes the git proxy may reach (WI#875)
 GIT_ORIGIN_TOKEN="Basic <base64 user:token>"     # the Authorization header value; a secret
 ```
 
@@ -690,10 +690,11 @@ pushes. A binding's variable is carried on re-render only when its name is a
 plain environment name and the variable is set; a variable the renderer writes
 itself (for example `LLM_MODEL`) keeps its rendered line.
 
-`SANDBOX_GIT_PRIVATE_REMOTES` names granted remotes whose exact host and port
-may resolve to a LAN (RFC 1918) or overlay (CGNAT `100.64.0.0/10`, IPv6 ULA)
-address. It opens only the named remote's own host and port, never its subnet;
-loopback, link-local and the metadata address stay refused. Only the per-call
+`SANDBOX_GIT_PRIVATE_REMOTES` names granted remotes whose URL host is a LAN
+(RFC 1918) or overlay (CGNAT `100.64.0.0/10`, IPv6 ULA) IP literal; a host
+name is a load error, because the allowance trusts no DNS answer. It opens
+only the named remote's own address and port, never its subnet; loopback,
+link-local and the metadata addresses stay refused. Only the per-call
 git proxy carries the allowance. Rules and limits:
 [`../guides/SANDBOX_CAPABILITY_MANIFEST.md`](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860).
 

@@ -429,15 +429,16 @@ manifest retain the configured legacy behavior, including any existing egress.
   HTTPS CONNECT does not expose repository paths or operation types.
 - **Non-public destinations need an explicit, per-remote allowance**
   (WI#875). `SANDBOX_GIT_PRIVATE_REMOTES=name[,name...]` names granted
-  remotes whose own host and port may resolve to a LAN (RFC 1918) or overlay
-  (CGNAT `100.64.0.0/10`, IPv6 ULA) address. The allowance travels on the
+  remotes whose URL host is a LAN (RFC 1918) or overlay (CGNAT
+  `100.64.0.0/10`, IPv6 ULA) IP literal. A host name is a load error, and
+  `resolve_egress` refuses a non-public answer for any name, so the allowance
+  trusts no DNS answer. The allowance travels on the
   grant to the per-call git proxy only: the shared tenant proxy keeps
   `public_only` and refuses every non-public destination. It opens the named
   remote's exact host and port, never its subnet: another private address and
   another port on the granted host are still refused. Loopback, link-local
-  and the metadata address stay refused even when the operator names them, so
-  a granted name that re-resolves there cannot reach the host's own services.
-  The proxy keeps pinning the resolved address. An unknown name, or a
+  and the metadata addresses (`169.254.169.254`, and `100.100.100.200` inside
+  the CGNAT range) stay refused even when the operator names them. An unknown name, or a
   `file://` remote, is a configuration load error. Evidence records
   `private_destination: true` per allowed remote.
 - **Write grant.** `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
@@ -493,7 +494,7 @@ manifest retain the configured legacy behavior, including any existing egress.
   on a trusted network or an encrypted overlay. The per-call proxy keeps the
   public-only destination check unless the remote is named in
   `SANDBOX_GIT_PRIVATE_REMOTES` (WI#875), which admits that remote's exact
-  host and port on a LAN or CGNAT (NetBird's `100.64.0.0/10`) address.
+  IP-literal LAN or CGNAT (NetBird's `100.64.0.0/10`) address and port.
   Loopback and link-local stay refused in every case. A
   binding is applied only when its remote is selected. Modes that cannot carry
   a network remote (`none`, `tunnel`) fail closed at authorization, so a
