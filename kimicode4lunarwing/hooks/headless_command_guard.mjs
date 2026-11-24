@@ -2114,14 +2114,14 @@ function checkDenyRulesEverywhere(text) {
 // cannot tell which apostrophe is a real quote (WI#810).
 const JOIN_READINGS = [["", ""], [" ", " "], ["", " "]];
 
-function evaluate(command) {
+function evaluate(command, depth = 0) {
   if (command.length > MAX_COMMAND_CHARS) {
     return `command exceeds ${MAX_COMMAND_CHARS} chars`;
   }
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
   const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ??
-    checkTrustedUserConfig(command) ?? checkListeners(command);
+    checkTrustedUserConfig(command) ?? checkListeners(command, depth);
   if (rawDenial) return rawDenial;
   // Bash can join a backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -2150,7 +2150,7 @@ function evaluate(command) {
       // interpreter operand's own quotes.
       (wordLevel === joined ? null : checkRawShapes(wordLevel)) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
-      (joined === command ? null : checkListeners(joined));
+      (joined === command ? null : checkListeners(joined, depth));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(joined)) {
       const denied = checkRm(segment);
@@ -2420,6 +2420,26 @@ function listenerShellBody(words, start, launcher) {
 }
 
 const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/**
+ * A shell body is a command line of its own, so it gets the rules the
+ * top-level command gets — not just the listener rule (WI#874). Bash runs the
+ * `-c` body as the command it spells, so a device write or a deletion inside
+ * it must be read exactly as the unwrapped spelling is. `listenerShellBody`
+ * hands the body over with its quoting already resolved by the listener word
+ * reader, which is the text bash would run.
+ */
+function checkShellBody(body, depth) {
+  const raw = checkRawShapes(body) ??
+    (shellWordLevelView(body) === body ? null : checkRawShapes(shellWordLevelView(body))) ??
+    checkMoveAndTarDeletion(shellWordView(body));
+  if (raw) return raw;
+  for (const segment of commandSegments(body)) {
+    const denied = checkRm(segment);
+    if (denied) return denied;
+  }
+  return checkListeners(body, depth);
+}
 
 /**
  * Deny a listener started from a find `-exec`/`-ok` body (WI#846). Bash runs
@@ -2756,7 +2776,7 @@ function checkListenerWords(words, depth) {
       const body = words.slice(i + 1).join(" ");
       if (body.length > 0) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
-        const denied = checkListeners(body, depth + 1);
+        const denied = checkShellBody(body, depth + 1);
         if (denied) return denied;
       }
       continue;
@@ -2765,7 +2785,7 @@ function checkListenerWords(words, depth) {
       const body = listenerShellBody(words, i + 1, name);
       if (body !== undefined) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
-        const denied = checkListeners(body, depth + 1);
+        const denied = checkShellBody(body, depth + 1);
         if (denied) return denied;
       }
       continue;
