@@ -1,0 +1,336 @@
+--- a/crates/api/src/client.rs
++++ b/crates/api/src/client.rs
+@@ -14,8 +14,8 @@ use crate::sse::SseParser;
+ use crate::types::{
+     ChatCompletionContent, ChatCompletionFunction, ChatCompletionMessage, ChatCompletionRequest,
+     ChatCompletionResponse, ChatCompletionThinkingConfig, ChatCompletionTool, MessageRequest,
+-    MessageResponse, ModelsResponse, OutputContentBlock, ProviderSelectionResponse,
+-    ReasoningEffort, StreamEvent, Usage,
++    MessageResponse, ModelCapabilities, ModelInfo, ModelsResponse, OutputContentBlock,
++    ProviderSelectionResponse, ReasoningEffort, StreamEvent, Usage,
+ };
+ 
+ const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api";
+@@ -246,6 +246,9 @@ impl NanoGptClient {
+     }
+ 
+     pub async fn fetch_models(&self, detailed: bool) -> Result<ModelsResponse, ApiError> {
++        if self.service == ApiService::OpenAiCodex {
++            return self.fetch_openai_codex_models().await;
++        }
+         let response = self
+             .send_get_request(
+                 "/v1/models",
+@@ -258,6 +261,22 @@ impl NanoGptClient {
+             .map_err(ApiError::from)
+     }
+ 
++    /// The Codex backend serves its own catalog at `/models`, not the
++    /// OpenAI-compatible `/v1/models` the other services use. Its payload is
++    /// keyed `models` (not `data`), uses `slug` for the id, and carries the
++    /// per-model context window plus picker visibility. The backend also gates
++    /// the response on `client_version`, so the caller's version must be sent.
++    async fn fetch_openai_codex_models(&self) -> Result<ModelsResponse, ApiError> {
++        let response = self
++            .send_get_request("/models", &[("client_version", env!("CARGO_PKG_VERSION"))])
++            .await?;
++        let catalog = response
++            .json::<OpenAiCodexModelsResponse>()
++            .await
++            .map_err(ApiError::from)?;
++        Ok(catalog.into_models_response())
++    }
++
+     pub async fn fetch_providers(
+         &self,
+         canonical_id: &str,
+@@ -1427,6 +1446,88 @@ fn opencode_go_prefers_thinking_disabled(model: &str) -> bool {
+     )
+ }
+ 
++#[derive(Debug, Deserialize)]
++struct OpenAiCodexModelsResponse {
++    #[serde(default)]
++    models: Vec<OpenAiCodexCatalogModel>,
++}
++
++#[derive(Debug, Deserialize)]
++struct OpenAiCodexCatalogModel {
++    slug: String,
++    #[serde(default)]
++    display_name: Option<String>,
++    #[serde(default)]
++    description: Option<String>,
++    #[serde(default)]
++    visibility: Option<String>,
++    #[serde(default)]
++    supported_in_api: Option<bool>,
++    #[serde(default)]
++    context_window: Option<u64>,
++    #[serde(default)]
++    max_context_window: Option<u64>,
++    #[serde(default)]
++    input_modalities: Option<Vec<String>>,
++    #[serde(default)]
++    supported_reasoning_levels: Option<Vec<serde_json::Value>>,
++}
++
++impl OpenAiCodexModelsResponse {
++    fn into_models_response(self) -> ModelsResponse {
++        let mut models = self
++            .models
++            .into_iter()
++            .filter(|model| model.visibility.as_deref() != Some("hide"))
++            .filter(|model| model.supported_in_api.unwrap_or(true))
++            .map(OpenAiCodexCatalogModel::into_model_info)
++            .collect::<Vec<_>>();
++        models.sort_by(|left, right| left.id.cmp(&right.id));
++        ModelsResponse {
++            object: "list".to_string(),
++            data: models,
++        }
++    }
++}
++
++impl OpenAiCodexCatalogModel {
++    fn into_model_info(self) -> ModelInfo {
++        let context_length = self.context_window.or(self.max_context_window);
++        let vision = self.input_modalities.as_ref().map(|modalities| {
++            modalities
++                .iter()
++                .any(|modality| modality.eq_ignore_ascii_case("image"))
++        });
++        ModelInfo {
++            id: self.slug.clone(),
++            object: "model".to_string(),
++            created: 0,
++            owned_by: "openai-codex".to_string(),
++            name: Some(
++                self.display_name
++                    .filter(|value| !value.trim().is_empty())
++                    .unwrap_or_else(|| self.slug.clone()),
++            ),
++            description: self.description,
++            context_length,
++            max_output_tokens: None,
++            pricing: None,
++            capabilities: Some(ModelCapabilities {
++                vision,
++                reasoning: Some(self.supported_reasoning_levels.is_some()),
++                tool_calling: Some(true),
++                parallel_tool_calls: Some(true),
++                structured_output: Some(true),
++                pdf_upload: None,
++            }),
++            category: Some("OpenAI Codex".to_string()),
++            cost_estimate: None,
++            tags: Some(vec!["chatgpt-plan".to_string(), "oauth".to_string()]),
++            supports_provider_selection: Some(false),
++        }
++    }
++}
++
+ fn invalid_request_error(message: impl Into<String>) -> ApiError {
+     ApiError::Io(std::io::Error::new(
+         std::io::ErrorKind::InvalidInput,
+--- a/crates/api/tests/client_integration.rs
++++ b/crates/api/tests/client_integration.rs
+@@ -12,6 +12,86 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::TcpListener;
+ use tokio::sync::Mutex;
+ 
++#[tokio::test]
++async fn openai_codex_fetch_models_reads_the_codex_catalog() {
++    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
++    let body = concat!(
++        "{\"models\":[",
++        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2 Sol\",",
++        "\"description\":\"Frontier model\",\"visibility\":\"list\",",
++        "\"supported_in_api\":true,\"context_window\":500000,",
++        "\"max_context_window\":872000,\"input_modalities\":[\"text\",\"image\"],",
++        "\"supported_reasoning_levels\":[{\"effort\":\"high\"}]},",
++        "{\"slug\":\"gpt-5.6-luna\",\"display_name\":\"GPT-5.6 Luna\",",
++        "\"visibility\":\"list\",\"supported_in_api\":true,\"context_window\":272000},",
++        "{\"slug\":\"codex-auto-review\",\"display_name\":\"Codex Auto Review\",",
++        "\"visibility\":\"hide\",\"supported_in_api\":true,\"context_window\":272000},",
++        "{\"slug\":\"api-only-hidden\",\"display_name\":\"API Only\",",
++        "\"visibility\":\"list\",\"supported_in_api\":false}",
++        "]}"
++    );
++    let server = spawn_server(
++        state.clone(),
++        vec![http_response("200 OK", "application/json", body)],
++    )
++    .await;
++
++    let client = NanoGptClient::new("")
++        .with_service(ApiService::OpenAiCodex)
++        .with_openai_codex_auth(api::OpenAiCodexCredentials {
++            access_token: "access-token".to_string(),
++            refresh_token: String::new(),
++            expires_at: None,
++            account_id: Some("org_123".to_string()),
++        })
++        .with_base_url(server.base_url());
++    let response = client
++        .fetch_models(true)
++        .await
++        .expect("codex catalog fetch should succeed");
++
++    let ids = response
++        .data
++        .iter()
++        .map(|model| model.id.as_str())
++        .collect::<Vec<_>>();
++    assert_eq!(ids, vec!["gpt-5.6-luna", "gpt-6.2-sol"]);
++    let sol = response
++        .data
++        .iter()
++        .find(|model| model.id == "gpt-6.2-sol")
++        .expect("sol should be present");
++    assert_eq!(sol.name.as_deref(), Some("GPT-6.2 Sol"));
++    assert_eq!(sol.context_length, Some(500_000));
++    assert_eq!(sol.owned_by, "openai-codex");
++    assert_eq!(
++        sol.capabilities.as_ref().and_then(|caps| caps.vision),
++        Some(true)
++    );
++
++    let captured = state.lock().await;
++    let request = captured.first().expect("server should capture request");
++    assert_eq!(
++        request.path,
++        format!(
++            "/models?client_version={}",
++            env!("CARGO_PKG_VERSION")
++        )
++    );
++    assert_eq!(
++        request.headers.get("originator").map(String::as_str),
++        Some(api::OPENAI_CODEX_ORIGINATOR)
++    );
++    assert_eq!(
++        request.headers.get("authorization").map(String::as_str),
++        Some("Bearer access-token")
++    );
++    assert_eq!(
++        request.headers.get("chatgpt-account-id").map(String::as_str),
++        Some("org_123")
++    );
++}
++
+ #[tokio::test]
+ async fn send_message_posts_json_and_parses_response() {
+     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+--- a/crates/pebble/src/models.rs
++++ b/crates/pebble/src/models.rs
+@@ -376,7 +376,9 @@ pub(crate) fn fetch_service_models(
+         ApiService::NanoGpt => fetch_service_models_via_api(service),
+         ApiService::Synthetic => fetch_synthetic_models(),
+         ApiService::OpenAiCodex => {
+-            fetch_service_models_via_api(service).or_else(|_| Ok(openai_codex_models()))
++            fetch_service_models_via_api(service)
++                .map(merge_codex_catalog)
++                .or_else(|_| Ok(openai_codex_models()))
+         }
+         ApiService::OpencodeGo => {
+             fetch_service_models_via_api(service).or_else(|_| Ok(opencode_go_models()))
+@@ -695,6 +697,16 @@ fn openai_codex_models() -> Vec<CatalogModel> {
+         ("gpt-5.4", "GPT-5.4"),
+         ("gpt-5.4-mini", "GPT-5.4 Mini"),
+         ("gpt-5.5", "GPT-5.5"),
++        ("gpt-5.6-luna", "GPT-5.6 Luna"),
++        ("gpt-5.6-sol", "GPT-5.6 Sol"),
++        ("gpt-5.6-terra", "GPT-5.6 Terra"),
++        ("gpt-6-astra", "GPT-6 Astra"),
++        ("gpt-6-luna", "GPT-6 Luna"),
++        ("gpt-6-sol", "GPT-6 Sol"),
++        ("gpt-6.1-sol", "GPT-6.1 Sol"),
++        ("gpt-6.1-terra", "GPT-6.1 Terra"),
++        ("gpt-6.2-astra", "GPT-6.2 Astra"),
++        ("gpt-6.2-sol", "GPT-6.2 Sol"),
+     ]
+     .into_iter()
+     .map(|(id, name)| CatalogModel {
+@@ -734,6 +746,23 @@ fn openai_codex_models() -> Vec<CatalogModel> {
+     .collect()
+ }
+ 
++/// Keep the live Codex catalog authoritative while still offering the models
++/// this build already knows about. The backend gates its `/models` response on
++/// the caller's `client_version`, so a Pebble release older than a given
++/// model's advertised minimum would otherwise silently drop every newer model.
++fn merge_codex_catalog(mut live: Vec<CatalogModel>) -> Vec<CatalogModel> {
++    let known = openai_codex_models();
++    for fallback in known {
++        if !live
++            .iter()
++            .any(|model| model.info.id == fallback.info.id)
++        {
++            live.push(fallback);
++        }
++    }
++    live
++}
++
+ fn update_model_metadata_cache(state: &mut ModelState, models: &[ModelInfo]) {
+     for model in models {
+         if let Some(max_output_tokens) = model
+@@ -1723,8 +1752,9 @@ mod tests {
+ 
+     use super::{
+         default_context_length_for_model, filtered_model_indices, infer_service_for_model,
+-        openai_codex_models, parse_grok_model_ids, service_from_selector, toggle_favorite,
+-        update_model_metadata_cache, CatalogModel, ModelState, DEFAULT_OPENAI_CONTEXT_LENGTH,
++        merge_codex_catalog, openai_codex_models, parse_grok_model_ids, service_from_selector,
++        toggle_favorite, update_model_metadata_cache, CatalogModel, ModelState,
++        DEFAULT_OPENAI_CONTEXT_LENGTH,
+     };
+ 
+     #[test]
+@@ -1874,11 +1904,45 @@ mod tests {
+         assert!(models
+             .iter()
+             .any(|model| model.info.id == "openai-codex/gpt-5.4"));
++        assert!(models
++            .iter()
++            .any(|model| model.info.id == "openai-codex/gpt-6.2-sol"));
+         assert!(models
+             .iter()
+             .all(|model| { model.info.context_length == Some(DEFAULT_OPENAI_CONTEXT_LENGTH) }));
+     }
+ 
++    #[test]
++    fn merges_live_codex_catalog_with_the_builtin_models() {
++        let live = vec![catalog_model(
++            ApiService::OpenAiCodex,
++            "openai-codex/gpt-6.2-sol",
++            Some("GPT-6.2 Sol"),
++            Some("OpenAI Codex"),
++        )];
++
++        let merged = merge_codex_catalog(live);
++
++        let live_entry = merged
++            .iter()
++            .find(|model| model.info.id == "openai-codex/gpt-6.2-sol")
++            .expect("live model should survive the merge");
++        assert_eq!(live_entry.info.name.as_deref(), Some("GPT-6.2 Sol"));
++        let fallback_entry = merged
++            .iter()
++            .find(|model| model.info.id == "openai-codex/gpt-5.5")
++            .expect("builtin model should fill the gap");
++        assert_eq!(fallback_entry.info.name.as_deref(), Some("GPT-5.5"));
++        let ids = merged
++            .iter()
++            .map(|model| model.info.id.as_str())
++            .collect::<Vec<_>>();
++        let mut deduped = ids.clone();
++        deduped.sort_unstable();
++        deduped.dedup();
++        assert_eq!(deduped.len(), ids.len(), "merge must not duplicate ids");
++    }
++
+     fn model(id: &str, name: Option<&str>, category: Option<&str>) -> ModelInfo {
+         ModelInfo {
+             id: id.to_string(),
