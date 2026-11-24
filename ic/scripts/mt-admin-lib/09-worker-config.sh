@@ -41,6 +41,314 @@ worker_quadlet_start_failed() {  # <tenant> <service> <lane>
   say "WARNING: $lane worker never reached its listener; dispatch will fail with Connection refused until '$service' starts. Inspect: podman logs lunarwing-${lane}-${name}" >&2
 }
 
+# WI#882: how long a connection to a lane's published port must stay open
+# before the lane counts as answering. A forwarder with nothing behind it drops
+# the connection within milliseconds, so one second is ample; a fraction
+# (`0.3`) is accepted for harnesses.
+WORKER_PORT_HOLD_SECS=1
+
+# WI#882: does something behind a lane's published loopback port answer?
+#
+# A plain connect is not enough. Rootless podman publishes a port through a
+# user-space forwarder (`rootlessport` on a bridge network, `pasta` on the
+# default one), and that forwarder accepts on 127.0.0.1 for as long as the
+# container runs, whether or not the bridge inside ever bound its port. With
+# nothing inside, the forwarder then drops the connection at once (end of file
+# or a reset); a bridge that listens keeps it open while it waits for the
+# WebSocket request. So: connect, then wait `WORKER_PORT_HOLD_SECS` for the
+# peer. Still open, or a byte received, is an answer; refused, closed or reset
+# is not. `_port_in_use` keeps its own meaning ("is this port taken") for the
+# ports registry and is not used here.
+#
+# Returns 0 = answers, 1 = connection refused, 2 = accepted and then dropped,
+# 124 = the probe itself timed out. A reset that reaches the client before its
+# connect() returns fails the connect, so a resetting forwarder can read as 1
+# or as 2; both are "does not answer". This is weaker than the daemon's own
+# probe, which completes the WebSocket handshake (WI#464): an answer here does
+# not prove that a job can connect.
+_worker_port_answers() {  # <port>
+  local port="${1:-}" hold="${WORKER_PORT_HOLD_SECS:-1}" rc=0
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [[ "$hold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || hold=1
+  # A wait of zero would read every open connection as dropped.
+  [[ ! "$hold" =~ ^0*(\.0*)?$ ]] || hold=1
+  # The outer bound covers the connect and the wait; `${hold%.*}` drops a
+  # fraction so the arithmetic stays integral.
+  timeout -k 1 "$(( ${hold%.*} + 3 ))" bash -c '
+    exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+    IFS= read -r -t "$2" -N 1 -u 3 _byte
+    rc=$?
+    # 0: a byte arrived. >128: the wait ran out with the connection open.
+    # Anything else is end of file or a read error (a reset).
+    if (( rc == 0 || rc > 128 )); then exit 0; fi
+    exit 2
+  ' _ "$port" "$hold" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# WI#882: `.State.Running` says nothing about whether the lane's bridge ever
+# bound its WSS port, and a published port that merely accepts says nothing
+# either (see `_worker_port_answers`). The verdict is "listening" only when the
+# published loopback port accepted the connection and kept it open; a refused
+# connection and one that is accepted and then dropped both read as dead, each
+# with what was seen. Empty/absent port (no registry slot) is reported rather
+# than silently treated as healthy. The daemon's boot probe line in its log
+# (a full WebSocket handshake) remains the stronger check.
+worker_wss_readiness() {  # <port>; prints "listening" or a dead/unknown reason
+  local port="${1:-}" rc=0
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    printf 'unknown (no WSS port allocated)'
+    return 0
+  fi
+  _worker_port_answers "$port" || rc=$?
+  case "$rc" in
+    0) printf 'listening' ;;
+    1) printf 'dead (no listener on 127.0.0.1)' ;;
+    2) printf 'dead (accepted on 127.0.0.1 and dropped at once, nothing answers behind the published port)' ;;
+    *) printf 'dead (no answer on 127.0.0.1 within the probe time)' ;;
+  esac
+}
+
+# WI#882: the effective worker image revision (the pin baked into the image),
+# so `status` records which worker build a lane actually runs. Never a
+# credential; the revision label is a commit id or a release tag.
+worker_image_revision() {  # <tenant> <image ref>
+  local name="$1" image="$2" revision
+  revision="$(_ctr "$name" image inspect \
+    --format '{{index .Labels "org.opencontainers.image.revision"}}' \
+    "$image" 2>/dev/null || true)"
+  revision="${revision//$'\n'/ }"
+  case "$revision" in
+    ""|"<no value>") printf 'unknown' ;;
+    # 64 keeps a full 40-char commit id (and a release tag) intact; the
+    # default 160 would not, and a truncated revision cannot be matched.
+    *) printf '%s' "$(sanitize_display_value "$revision" 64)" ;;
+  esac
+}
+
+# WI#882: one status line per worker lane, carrying both the container state
+# and the loopback WSS listener verdict. The "running (...)" prefix is kept
+# because lunarwing_mt_onboard's verifier reads the first word of this line.
+status_worker_line() {  # <tenant> <lane> <label> <wss port slot>
+  local name="$1" lane="$2" label="$3" slot="$4"
+  local container="lunarwing-${lane}-${name}" port
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null | grep -q true; then
+    port="$(ports_get "$name" "$slot" 2>/dev/null || true)"
+    say "$label: running ($container, WSS port ${port:-none}: $(worker_wss_readiness "$port"))"
+  elif _ctr_inspect "$name" "$container" &>/dev/null; then
+    say "$label: stopped ($container)"
+  else
+    say "$label: not created"
+  fi
+}
+
+# WI#882: a best-effort redaction of credential-shaped values in worker log
+# lines (stdin to stdout). A bridge or task log can carry the WebSocket bearer
+# token in a URL query, an `Authorization` header, an API key from the lane's
+# environment, or a URL with a user part, and `worker-failure-log` output gets
+# pasted into work items. Redacted, keeping the key so the line stays useful:
+#  - a cookie header, to the end of the line;
+#  - the value of any key that ends in token, secret, password, passwd, pwd,
+#    passphrase, auth, authorization, bearer, credential(s), cookie, session,
+#    session_id, signature, api_key or key, written `key=value`, `key: value`
+#    or `"key": "value"`, with an optional Bearer/Basic scheme word;
+#  - a bare `Bearer <token>` or `Basic <base64>`;
+#  - the user part of a URL (`scheme://user:pass@host`);
+#  - strings with a well-known secret prefix (`sk-`, `glpat-`, `ghp_`, ...);
+#  - a JSON web token.
+# This is a pattern filter, not a guarantee: a secret that matches none of the
+# shapes, or one split over two lines, passes. Read the output before pasting
+# it anywhere public. Counters such as `prompt_tokens=12` are left alone (the
+# key must end in the word). Needs GNU sed (`-E`, the `I` flag, `\b`); if sed
+# fails, nothing is printed for that log.
+_worker_log_redact() {
+  local kw='token|secret|password|passwd|pwd|passphrase|authorization|auth|bearer|credentials?|cookie|session[_-]?id|session|signature|api[_-]?key|key'
+  LC_ALL=C sed -E \
+    -e 's/((^|[^A-Za-z0-9_.-])(set-)?cookie["'\'']?[[:space:]]*[:=][[:space:]]*).*/\1[redacted]/I' \
+    -e 's/((^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*('"$kw"')["'\'']?[[:space:]]*[:=][[:space:]]*)((bearer|basic|digest|token)[[:space:]]+)?("[^"]*"|'\''[^'\'']*'\''|[^][[:space:]&,;})"'\'']+)/\1[redacted]/Ig' \
+    -e 's/\b(bearer)[[:space:]]+[A-Za-z0-9._~+\/=-]{12,}/\1 [redacted]/Ig' \
+    -e 's/\b(basic)[[:space:]]+[A-Za-z0-9+\/=]{16,}/\1 [redacted]/Ig' \
+    -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/[:space:]@"'\''<>]+@#\1[redacted]@#g' \
+    -e 's/\b(sk-|glpat-|glrt-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{8,}/\1[redacted]/g' \
+    -e 's/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/[redacted-jwt]/g'
+}
+
+# WI#882: the first failure log for one worker lane, read host-side. The item
+# reports both configured workers unreachable after an upgrade, and the
+# agent-visible daemon log had no worker-liveness lines for their ports, so
+# the operator had to guess which container failed and why. This prints the
+# lane's container state plus a bounded tail of the bridge and task
+# containers' logs. Each line is first redacted (`_worker_log_redact`, best
+# effort) and then passed through the display sanitizer used for other
+# operator output (unprintable bytes escaped, long lines cut).
+worker_failure_log() {  # <tenant> <lane> [lines=40]
+  local name="$1" lane="$2" lines="${3:-40}"
+  case "$lane" in
+    pebble|opencode|opencode2|kimi|lunardepth) ;;
+    *) die "worker-failure-log supports pebble, opencode, opencode2, kimi or lunardepth (got '$lane')" ;;
+  esac
+  [[ "$lines" =~ ^[1-9][0-9]*$ ]] || die "lines must be a positive integer (got '$lines')"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+
+  local container task_container state
+  container="lunarwing-${lane}-${name}"
+  task_container="$(worker_task_container_name "$lane" "$name")"
+
+  say "=== $lane worker for $name ==="
+  say "enabled: $(tenant_worker_enabled "$name" "$lane" && echo true || echo false)"
+  state="$(_ctr_inspect "$name" -f '{{.State.Running}} {{.State.Status}} {{.Image}}' "$container" 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    say "bridge container: absent ($container)"
+  else
+    # Short image id: the full digest is 64 hex chars and drowns the line.
+    local running status image
+    read -r running status image <<<"$state"
+    say "bridge container: $container running=$running status=$status image=${image:0:12}"
+  fi
+
+  local target
+  for target in "$container" "$task_container"; do
+    _ctr_inspect "$name" "$target" &>/dev/null || continue
+    say "--- last $lines log lines: $target ---"
+    # Redact before the sanitizer cuts the line, so a value that straddles
+    # the cut cannot escape the patterns. A failed read or a failed filter is
+    # said, never replaced by unredacted output.
+    _ctr "$name" logs --tail "$lines" "$target" 2>&1 \
+      | _worker_log_redact \
+      | while IFS= read -r line; do
+          printf '  %s\n' "$(sanitize_display_value "$line" 300)"
+        done \
+      || say "  (the log of $target could not be read or redacted completely)"
+  done
+  say "Redaction is best effort: read this output before pasting it anywhere public."
+  return 0
+}
+
+# WI#882: the readiness pass `_start_tenant_workers` runs after every lane. A
+# lane whose container is `.State.Running` can still never have bound its WSS
+# port, and before this pass every start and upgrade reported green whatever
+# the port did; the only host-side listener audit was the WI#357 exposure
+# scan. Probe each enabled lane's published loopback port once
+# (`_worker_port_answers`: the connection must be accepted and kept open) and
+# report the dead ones, so a green start no longer hides a worker that does
+# not answer.
+#
+# The wait is opt-in and bounded: `LUNARWING_MT_WORKER_READY_WAIT_SECS`
+# (default 0) turns the single probe into a short poll, for a lane that is
+# known to bind slowly. A shared deadline keeps the cost to one window per
+# tenant, never one per lane. Report-only: a dead lane degrades the start, it
+# never aborts the other lanes.
+WORKER_READY_WAIT_DEFAULT=0
+
+_worker_ready_wait_secs() {
+  local secs="${LUNARWING_MT_WORKER_READY_WAIT_SECS:-$WORKER_READY_WAIT_DEFAULT}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=$WORKER_READY_WAIT_DEFAULT
+  printf '%s' "$secs"
+}
+
+# WI#882: one enabled lane's readiness verdict, as `"<lane> <port> <state>"`.
+# A lane with no allocated WSS slot reports `no-port`; a lane whose container
+# is not running is skipped (start already reported it).
+_worker_lane_readiness() {  # <tenant> <lane> <wss slot>
+  local name="$1" lane="$2" slot="$3" port
+  port="$(ports_get "$name" "$slot" 2>/dev/null || true)"
+  if [[ -z "$port" ]]; then
+    printf '%s - no-port\n' "$lane"
+    return 0
+  fi
+  printf '%s %s %s\n' "$lane" "$port" \
+    "$(_worker_port_answers "$port" && echo listening || echo dead)"
+}
+
+# WI#882: post-start readiness pass over every enabled lane. Returns non-zero
+# when at least one lane is dead on its port, so the caller can report a
+# degraded start; never stops or restarts a lane itself.
+check_tenant_worker_readiness() {  # <tenant>
+  local name="$1" wait_secs deadline lane slot port verdict
+  local -a pending=() dead=()
+  wait_secs="$(_worker_ready_wait_secs)"
+  deadline=$((SECONDS + wait_secs))
+
+  for lane in pebble opencode kimi opencode2 lunardepth; do
+    tenant_worker_enabled "$name" "$lane" || continue
+    if [[ "${INIT_SYSTEM:-}" == "openrc" ]] && ! tenant_worker_desired_running "$name" "$lane"; then
+      continue
+    fi
+    slot="${lane}_wss"
+    pending+=("$lane")
+  done
+  [[ "${#pending[@]}" -ne 0 ]] || return 0
+
+  # One shared deadline: a slow lane consumes the window for everyone, so the
+  # pass costs at most `wait_secs` no matter how many lanes are configured.
+  while :; do
+    local -a still=()
+    for lane in "${pending[@]}"; do
+      verdict="$(_worker_lane_readiness "$name" "$lane" "${lane}_wss")"
+      if [[ "$verdict" == *" dead" ]]; then still+=("$lane"); fi
+    done
+    pending=("${still[@]}")
+    [[ "${#pending[@]}" -eq 0 || "$SECONDS" -ge "$deadline" ]] && break
+    sleep 1
+  done
+
+  for lane in "${pending[@]}"; do
+    port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
+    say "WARNING: $lane worker for $name is not listening on 127.0.0.1:${port:-<none>}; its container is running but its WSS port is dead. Inspect: $0 worker-failure-log $name $lane" >&2
+    dead+=("$lane")
+  done
+  [[ "${#dead[@]}" -eq 0 ]]
+}
+
+# WI#882: the daemon dials whatever `[[sandbox.external_workers]]` blocks its
+# config carries, so a lane enabled in the ports registry but absent from the
+# config is unreachable no matter how healthy its container looks (and the
+# reverse leaves the daemon dialing a worker the operator thinks is off). This
+# is a read-only, registry-vs-config consistency report: it never edits either.
+# A missing or unreadable config is reported, never assumed consistent.
+#
+# The config sits in the tenant's own state directory, so root never opens the
+# path itself (WI#390, the same rule as `set_external_worker_tool_allowlist`):
+# the file is read under the tenant account into a root-private copy, bounded
+# in time and size, and only that copy is searched. A link, a named pipe or
+# anything else that is not a regular file reads as unreadable. Only the five
+# known lane names are compared; nothing from the file is printed.
+worker_config_consistency() {  # <tenant>
+  local name="$1" config_path configured="" lane status=0 staged readable=false
+  config_path="$(tenant_state_dir "$name")/config.toml"
+  staged="$(mktemp)" || return 0
+  if tenant_read_regular_file_bounded "$name" "$config_path" >"$staged" 2>/dev/null; then
+    readable=true
+    configured="$(LC_ALL=C grep -aoE '^name = "[^"]+"' "$staged" | cut -d'"' -f2 | sort -u | tr '\n' ' ' || true)"
+  fi
+  rm -f -- "$staged"
+  if [[ "$readable" != true ]]; then
+    say "Worker config: $config_path is missing, is not a regular file, or is unreadable as tenant '$name' — cannot confirm the daemon's effective lanes"
+    return 0
+  fi
+  if [[ -z "$configured" ]]; then
+    say "Worker config: no external workers in $config_path — cannot confirm the daemon's effective lanes"
+    return 0
+  fi
+
+  for lane in pebble opencode opencode2 kimi lunardepth; do
+    if tenant_worker_enabled "$name" "$lane"; then
+      if [[ " $configured " == *" $lane "* ]]; then
+        say "Worker config: $lane enabled in registry and configured for the daemon"
+      else
+        say "Worker config: $lane enabled in registry but MISSING from $config_path — the daemon cannot dispatch to it"
+        status=1
+      fi
+    elif [[ " $configured " == *" $lane "* ]]; then
+      say "Worker config: $lane disabled in registry but still configured in $config_path — the daemon will dial a lane the operator disabled"
+      status=1
+    fi
+  done
+  return "$status"
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \

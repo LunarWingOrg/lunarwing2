@@ -719,6 +719,21 @@ Commands:
 
   list-tenants                     Show all tenants with ports and status
   status <name>                    Detailed status for one tenant
+  worker-readiness <name>          WI#882 strict gate: exit non-zero when any
+                                   enabled worker lane's WSS port refuses a
+                                   loopback connection or drops it at once (a
+                                   running container is not a ready worker,
+                                   and neither is a port that only accepts);
+                                   exit 0 means each port kept a connection
+                                   open, not that a job can connect; waits up
+                                   to LUNARWING_MT_WORKER_READY_WAIT_SECS
+  worker-failure-log <name> <lane> [lines]
+                                   WI#882 first-failure evidence: the lane's
+                                   container state plus a bounded tail of its
+                                   bridge and task container logs, redacted
+                                   (best effort: token/key/password values,
+                                   bearer headers, URL user parts); read it
+                                   before pasting it anywhere public
   worker-listeners <name>          WI#357 exposure audit: list listening
                                    sockets inside the tenant's running worker
                                    containers; fail on any bind or published
@@ -1777,6 +1792,24 @@ main() {
     worker-listeners)
       [[ -n "${1:-}" ]] || die "usage: worker-listeners <name>"
       worker_listeners "$1"
+      ;;
+
+    worker-failure-log)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || die "usage: worker-failure-log <name> <lane> [lines]"
+      worker_failure_log "$@"
+      ;;
+
+    worker-readiness)
+      # WI#882: strict gate — exit non-zero when any enabled lane's WSS port
+      # refuses a loopback connection or drops it at once. `status` reports
+      # the same verdict per lane.
+      [[ -n "${1:-}" ]] || die "usage: worker-readiness <name>"
+      local ready_name
+      ready_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$ready_name" || die "tenant '$ready_name' not found in registry"
+      ensure_container_runtime
+      ensure_init_system
+      check_tenant_worker_readiness "$ready_name"
       ;;
 
     worker-egress)
