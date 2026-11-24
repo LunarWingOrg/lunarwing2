@@ -1016,18 +1016,30 @@ fn skip_wrapper_options(words: &[Word], mut index: usize, value_options: &[&str]
     index
 }
 
-/// GNU `env` options that consume the following word.
-const ENV_VALUE_OPTIONS: &[&str] = &[
-    "-u",
-    "--unset",
-    "-a",
-    "--argv0",
-    "-C",
-    "--chdir",
-    "-S",
-    "--split-string",
-    "--env0-from",
+/// GNU `env` long options that consume the following word.
+const ENV_LONG_VALUE_OPTIONS: &[&str] = &[
+    "argv0",
+    "unset",
+    "chdir",
+    "split-string",
+    "env0-from",
 ];
+/// GNU `env` long options that never consume a separate word. The options
+/// with an optional value (`--block-signal`) take one only in `=` spelling.
+const ENV_LONG_FLAGS: &[&str] = &[
+    "ignore-environment",
+    "null",
+    "block-signal",
+    "default-signal",
+    "ignore-signal",
+    "list-signal-handling",
+    "debug",
+    "help",
+    "version",
+];
+/// GNU `env` short options that consume a value: the rest of the cluster when
+/// it is non-empty, otherwise the following word.
+const ENV_SHORT_VALUE_OPTIONS: &[char] = &['a', 'u', 'C', 'S'];
 /// GNU `timeout` options that consume the following word.
 const TIMEOUT_VALUE_OPTIONS: &[&str] = &["-s", "--signal", "-k", "--kill-after"];
 /// GNU `nice` options that consume the following word.
@@ -1036,6 +1048,178 @@ const NICE_VALUE_OPTIONS: &[&str] = &["-n", "--adjustment"];
 const TIME_VALUE_OPTIONS: &[&str] = &["-f", "--format", "-o", "--output"];
 /// `exec -a` names the replacement argv[0].
 const EXEC_VALUE_OPTIONS: &[&str] = &["-a"];
+
+/// Resolve `env`'s own options from `index`, then its `NAME=VALUE`
+/// assignments, returning the index of the command word. Every spelling of
+/// `-S`/`--split-string` carries a body that `env` splits into words and
+/// appends the following words to, so the body is scanned as the command it
+/// becomes. A spelling the walk cannot classify is refused, not skipped.
+fn scan_env_operands(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let mut index = scan_env_options(words, index, preflight, depth)?;
+    while index < words.len() && is_assignment(&words[index].text) {
+        refuse_config_env_assignment(&words[index])?;
+        index += 1;
+    }
+    Ok(index)
+}
+
+fn scan_env_options(
+    words: &[Word],
+    mut index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    while index < words.len() {
+        let word = &words[index];
+        let text = word.text.as_str();
+        // A lone `-` means `-i`; `--` ends the options.
+        if text == "-" || text == "--" {
+            return Ok(index + 1);
+        }
+        if !text.starts_with('-') {
+            return Ok(index);
+        }
+        if word.dynamic {
+            return Err(denied(
+                "dynamic env option cannot be authorized for git network access",
+            ));
+        }
+        if let Some(rest) = text.strip_prefix("--") {
+            index = scan_env_long_option(words, index, rest, preflight, depth)?;
+            continue;
+        }
+        index = scan_env_short_option(words, index, preflight, depth)?;
+    }
+    Ok(index)
+}
+
+/// One `env` long option (with `--` stripped). Long options abbreviate to any
+/// unambiguous prefix, as GNU `getopt_long` reads them.
+fn scan_env_long_option(
+    words: &[Word],
+    index: usize,
+    rest: &str,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let (name, attached) = match rest.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (rest, None),
+    };
+    let word = &words[index];
+    let value_option = ENV_LONG_VALUE_OPTIONS
+        .iter()
+        .find(|option| !name.is_empty() && option.starts_with(name));
+    if let Some(option) = value_option {
+        let (value, tail) = match attached {
+            Some(value) => (
+                Word {
+                    text: value.to_string(),
+                    dynamic: word.dynamic,
+                },
+                index + 1,
+            ),
+            None => match words.get(index + 1) {
+                Some(value) => (value.clone(), index + 2),
+                None => return Err(denied("env option needs a value")),
+            },
+        };
+        if *option == "split-string" {
+            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
+            return Ok(words.len());
+        }
+        return Ok(tail);
+    }
+    if ENV_LONG_FLAGS
+        .iter()
+        .any(|flag| !name.is_empty() && flag.starts_with(name))
+    {
+        // `--block-signal=PIPE` and friends carry an optional `=` value.
+        return Ok(index + 1);
+    }
+    Err(denied("unsupported env option"))
+}
+
+/// One `env` short-option word (`-i`, `-u FOO`, `-uFOO`, `-iS body`,
+/// `-Sbody`). `-S` is the split-string option; the rest of its cluster, or
+/// the next word, is the body.
+fn scan_env_short_option(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<usize> {
+    let word = &words[index];
+    let cluster = &word.text[1..];
+    for (offset, letter) in cluster.char_indices() {
+        if !ENV_SHORT_VALUE_OPTIONS.contains(&letter) {
+            if matches!(letter, 'i' | '0' | 'v') {
+                continue;
+            }
+            return Err(denied("unsupported env option"));
+        }
+        let attached = &cluster[offset + letter.len_utf8()..];
+        let (value, tail) = if attached.is_empty() {
+            match words.get(index + 1) {
+                Some(value) => (value.clone(), index + 2),
+                None => return Err(denied("env option needs a value")),
+            }
+        } else {
+            (
+                Word {
+                    text: attached.to_string(),
+                    dynamic: word.dynamic,
+                },
+                index + 1,
+            )
+        };
+        if letter == 'S' {
+            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
+            return Ok(words.len());
+        }
+        return Ok(tail);
+    }
+    Ok(index + 1)
+}
+
+/// Scan an `env` split-string body spliced with the words that follow it.
+/// `env` splits the body into words, appends the remaining arguments, and
+/// re-reads the result as its own operand list, so a body that carries `env`
+/// options or names only part of the command is read as the command it runs.
+fn scan_env_split_body(
+    body: &Word,
+    tail: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 4 {
+        return Err(denied(
+            "nested shell command is too deep to authorize statically",
+        ));
+    }
+    if body.dynamic {
+        return Err(denied(
+            "dynamic shell body cannot be authorized for git network access",
+        ));
+    }
+    let mut commands = tokenize_simple_commands(&body.text)?;
+    match commands.last_mut() {
+        Some(last) => last.extend_from_slice(tail),
+        None => commands.push(tail.to_vec()),
+    }
+    for simple in &commands {
+        let command = scan_env_operands(simple, 0, preflight, depth + 1)?;
+        if command < simple.len() {
+            scan_simple_command(&simple[command..], preflight, depth + 1)?;
+        }
+    }
+    Ok(())
+}
 
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     if depth > 4 {
@@ -1055,26 +1239,7 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             continue;
         }
         match command.as_str() {
-            "env" => {
-                // `env -S 'cmd args'` splits its value into words, so it is a
-                // shell-shaped string: scan it like one before stepping over.
-                if let Some(value) = words
-                    .get(index + 1)
-                    .and_then(|word| word.text.strip_prefix("--split-string="))
-                    .map(str::to_string)
-                {
-                    let body = Word {
-                        text: value,
-                        dynamic: words[index + 1].dynamic,
-                    };
-                    scan_shell_body(&body, preflight, depth)?;
-                }
-                index = skip_wrapper_options(words, index + 1, ENV_VALUE_OPTIONS);
-                while index < words.len() && is_assignment(&words[index].text) {
-                    refuse_config_env_assignment(&words[index])?;
-                    index += 1;
-                }
-            }
+            "env" => index = scan_env_operands(words, index + 1, preflight, depth)?,
             // Shell builtins that only assign or export names. `declare -x`,
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
