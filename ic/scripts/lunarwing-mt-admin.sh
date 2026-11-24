@@ -719,6 +719,10 @@ Commands:
 
   list-tenants                     Show all tenants with ports and status
   status <name>                    Detailed status for one tenant
+  worker-failure-log <name> <lane> [lines]
+                                   WI#882 first-failure evidence: the lane's
+                                   container state plus a bounded, scrubbed
+                                   tail of its bridge and task container logs
   worker-listeners <name>          WI#357 exposure audit: list listening
                                    sockets inside the tenant's running worker
                                    containers; fail on any bind or published
@@ -1777,6 +1781,11 @@ main() {
     worker-listeners)
       [[ -n "${1:-}" ]] || die "usage: worker-listeners <name>"
       worker_listeners "$1"
+      ;;
+
+    worker-failure-log)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || die "usage: worker-failure-log <name> <lane> [lines]"
+      worker_failure_log "$@"
       ;;
 
     worker-egress)

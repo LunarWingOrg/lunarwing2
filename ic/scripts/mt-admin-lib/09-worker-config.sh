@@ -94,6 +94,49 @@ status_worker_line() {  # <tenant> <lane> <label> <wss port slot>
   fi
 }
 
+# WI#882: the first failure log for one worker lane, read host-side. Kageho's
+# 2.2.1.0 upgrade left both configured workers refusing loopback connections,
+# and the agent-visible scrubbed daemon log had no worker-liveness lines for
+# those ports — the operator had to guess which container died and why. This
+# prints the lane's container state plus a bounded tail of the bridge and task
+# containers' logs, scrubbed through the same display sanitizer as other
+# operator output (a worker log can echo a base URL or a model name).
+worker_failure_log() {  # <tenant> <lane> [lines=40]
+  local name="$1" lane="$2" lines="${3:-40}"
+  case "$lane" in
+    pebble|opencode|opencode2|kimi|lunardepth) ;;
+    *) die "worker-failure-log supports pebble, opencode, opencode2, kimi or lunardepth (got '$lane')" ;;
+  esac
+  [[ "$lines" =~ ^[1-9][0-9]*$ ]] || die "lines must be a positive integer (got '$lines')"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+
+  local container task_container state
+  container="lunarwing-${lane}-${name}"
+  task_container="$(worker_task_container_name "$lane" "$name")"
+
+  say "=== $lane worker for $name ==="
+  say "enabled: $(tenant_worker_enabled "$name" "$lane" && echo true || echo false)"
+  state="$(_ctr_inspect "$name" -f '{{.State.Running}} {{.State.Status}} {{.Image}}' "$container" 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    say "bridge container: absent ($container)"
+  else
+    say "bridge container: $container $state"
+  fi
+
+  local target
+  for target in "$container" "$task_container"; do
+    _ctr_inspect "$name" "$target" &>/dev/null || continue
+    say "--- last $lines log lines: $target ---"
+    _ctr "$name" logs --tail "$lines" "$target" 2>&1 \
+      | while IFS= read -r line; do
+          printf '  %s\n' "$(sanitize_display_value "$line" 300)"
+        done
+  done
+  return 0
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \
