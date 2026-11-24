@@ -1334,6 +1334,20 @@ test("the decode-pipe stage reader steps over env's options (WI#872)", () => {
   assertAllowed('echo hi | env -S "base64 -d" | grep x')
 })
 
+test("the decode-pipe stage reader fails closed past the depth bound (WI#885)", () => {
+  // `stageCommandFrom` returned an empty command name when `env` nesting hit
+  // MAX_SHELL_BODY_DEPTH, which read as "this stage runs nothing". One extra
+  // `env` therefore hid both the interpreter and the decoder side.
+  for (const interpreter of ["sh", "bash", "python3"]) {
+    assertBlocked(`echo aGk= | base64 -d | env env env env env ${interpreter}`, "decoded content piped")
+  }
+  assertBlocked("echo aGk= | env env env env env base64 -d | sh", "decoded content piped")
+  // The depth-4 spelling keeps its verdict, and a plain command behind the
+  // same prefix chain is still ordinary work.
+  assertBlocked("echo aGk= | base64 -d | env env env env sh", "decoded content piped")
+  assertAllowed("echo hi | env env env env env cat")
+})
+
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {
   // WI#832 read only the single-quoted operand spelling. A one-liner wrapped
   // in double quotes reaches Perl with the inner quotes unescaped, so
