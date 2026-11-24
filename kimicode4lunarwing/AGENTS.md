@@ -33,6 +33,12 @@ guard scans the body separately without running it.
 The guard rejects ANSI-C backslash escapes other than escaped apostrophes
 instead of decoding them. Use literal shell words.
 
+The WI#873 raw-shape word view removes empty quoted spans within a word but
+preserves a standalone empty argument. It checks the literal spelling of Bash
+locale-quoted words (`$"…"`) without looking up translations. The raw-shape
+checks can conservatively deny a one-word quoted mention, just as they can
+deny an unquoted mention.
+
 Comments and literal-delimiter heredocs do not carry quote state into later
 commands. The listener rule still checks heredoc lines as potential shell
 input. For supported literal brace groups it expands the alternatives before

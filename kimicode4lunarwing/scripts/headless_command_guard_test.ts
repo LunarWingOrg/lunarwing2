@@ -37,13 +37,14 @@ async function guardSyntax() {
   const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
   assert.ok(source.endsWith(cli))
   const library = source.slice(0, -cli.length) +
-    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList };"
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView };"
   return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
     commandSegments: (text: string) => string[]
     clauseText: (text: string, from: number) => string
     quoteScan: (text: string) => { substitutions: Map<number, number> }
     listenerSegments: (text: string) => Iterable<ListenerWord[]>
     listenerWordList: (words: ListenerWord[]) => string[]
+    shellWordLevelView: (text: string) => string
   }
 }
 
@@ -1804,4 +1805,28 @@ test("one quoted character on the verb does not defeat the raw-shape family (WI#
     // A quoted character inside an argument (not on the verb) was already
     // read by the raw spellings; it must stay that way.
     assertAllowed("tee '/tmp/wi873-a b'");
+})
+
+test("empty quote spans cannot hide a raw-shape verb or path (ALV-1)", () => {
+  assertBlocked('""tee /dev/sda1', "block-device")
+  assertBlocked("tee /dev/s''da1", "block-device")
+  assertAllowed('""tee /dev/null')
+})
+
+test("Bash locale-quoted literals are checked by the raw-shape rules (ALV-2)", () => {
+  assertBlocked('$"tee" /dev/sda1', "block-device")
+  assertBlocked('$""tee /dev/sda1', "block-device")
+  assertAllowed('$"tee" /dev/null')
+})
+
+test("the raw-shape view retains an explicit empty argument (ALV-1)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView(`fixture ''""word w''o""rd`), "fixture word word")
+  assert.equal(shellWordLevelView(`fixture -S "" ''"" $""`), 'fixture -S "" "" ""')
+})
+
+test("locale quote normalization leaves other dollar signs literal (ALV-2)", async () => {
+  const { shellWordLevelView } = await guardSyntax()
+  assert.equal(shellWordLevelView('fixture $$"word"'), "fixture $$word")
+  assert.equal(shellWordLevelView('fixture \'$"word"\''), 'fixture \'$"word"\'')
 })

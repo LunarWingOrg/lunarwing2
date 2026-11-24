@@ -238,7 +238,7 @@ function shellWordView(command) {
   return command.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
-const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]+$/;
+const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]*$/;
 
 /**
  * The words bash hands the program: one shell quoting level removed from a
@@ -254,28 +254,50 @@ const QUOTED_LITERAL_WORD = /^[^\s;&|`$\\]+$/;
 function shellWordLevelView(text) {
   const states = quoteStates(text);
   let view = "";
+  let wordStart = 0;
+  let hasEmptySpan = false;
   for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
     const state = states[i];
-    if (isEscapedState(state) && text[i] === "\\") {
+    if (state === QUOTE_UNQUOTED && SHELL_TOKEN_BOUNDARIES.includes(ch)) {
+      // A splice contributes no characters, but an empty word is an argument.
+      if (hasEmptySpan && view.length === wordStart) view += '""';
+      view += ch;
+      wordStart = view.length;
+      hasEmptySpan = false;
+      continue;
+    }
+    if (isEscapedState(state) && ch === "\\") {
       const escaped = text[++i] ?? "";
       if (escaped !== "\n") view += escaped;
       continue;
     }
-    if (state !== QUOTE_OPEN || (text[i] !== "'" && text[i] !== '"')) {
-      // The `$` of a `$'…'` opener is not part of the word bash builds.
-      const ansiOpener = text[i] === "$" && text[i + 1] === "'" && states[i + 1] === QUOTE_OPEN;
-      if (!ansiOpener) view += text[i];
+    if (state !== QUOTE_OPEN || (ch !== "'" && ch !== '"')) {
+      if (state === QUOTE_UNQUOTED && ch === "$" && text[i + 1] === "$") {
+        // The PID parameter is not a locale quote opener.
+        view += "$$";
+        i++;
+        continue;
+      }
+      // The `$` of either a $'…' or a $"…" opener is not part of its word.
+      const quotePrefix = ch === "$" && states[i + 1] === QUOTE_OPEN &&
+        ((state === QUOTE_OPEN && text[i + 1] === "'") ||
+          (state === QUOTE_UNQUOTED && text[i + 1] === '"'));
+      if (!quotePrefix) view += ch;
       continue;
     }
     let close = i + 1;
     while (close < text.length && states[close] !== QUOTE_CLOSE) close++;
     const body = text.slice(i + 1, close);
-    view += close < text.length && QUOTED_LITERAL_WORD.test(body)
-      ? body
-      : text.slice(i, close + 1);
+    if (close < text.length && QUOTED_LITERAL_WORD.test(body)) {
+      if (body === "") hasEmptySpan = true;
+      else view += body;
+    } else {
+      view += text.slice(i, close + 1);
+    }
     i = close;
   }
-  return view;
+  return hasEmptySpan && view.length === wordStart ? view + '""' : view;
 }
 
 /**
@@ -2077,6 +2099,7 @@ function evaluate(command) {
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
     const punctuation = shellPunctuationView(joined);
+    const wordLevel = shellWordLevelView(joined);
     const joinedDenial = checkDenyRulesEverywhere(joined) ??
       checkDenyRulesEverywhere(normalizeAbsolutePaths(joined)) ??
       (punctuation === joined ? null : checkDenyRulesEverywhere(punctuation)) ??
@@ -2091,7 +2114,7 @@ function evaluate(command) {
       // `argumentWords`/`stripShellQuotes` expect quote-stripped input
       // (WI#873). The word-level view, not `shellWordView`, keeps an
       // interpreter operand's own quotes.
-      (joined === shellWordLevelView(joined) ? null : checkRawShapes(shellWordLevelView(joined))) ??
+      (wordLevel === joined ? null : checkRawShapes(wordLevel)) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
