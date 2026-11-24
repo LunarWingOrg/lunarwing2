@@ -70,6 +70,8 @@ _worker_port_answers() {  # <port>
   local port="${1:-}" hold="${WORKER_PORT_HOLD_SECS:-1}" rc=0
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
   [[ "$hold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || hold=1
+  # A wait of zero would read every open connection as dropped.
+  [[ ! "$hold" =~ ^0*(\.0*)?$ ]] || hold=1
   # The outer bound covers the connect and the wait; `${hold%.*}` drops a
   # fraction so the arithmetic stays integral.
   timeout -k 1 "$(( ${hold%.*} + 3 ))" bash -c '
