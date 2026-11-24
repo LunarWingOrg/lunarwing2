@@ -2043,9 +2043,67 @@ fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Resul
     Ok(())
 }
 
-/// `rebase --exec <body>` and `submodule foreach <body>` run their argument
-/// through a shell, which the preflight never read before. `bisect run` runs
-/// the words after it directly, so the whole tail is scanned as one command.
+/// Letters in a `git rebase` short-option cluster that consume the rest of
+/// the cluster as their value. `x` is the exec flag and is handled
+/// separately because its value is a shell body.
+const REBASE_CLUSTER_VALUE_LETTERS: &[char] = &['C', 'S', 's', 'X', 'r'];
+
+/// The exec body one `git rebase` argument names.
+enum RebaseExec {
+    /// The word carries the body itself (`-x<body>`, `--exec=<body>`).
+    Attached(Word),
+    /// The word is a bare exec flag; the body is the next word.
+    NextWord,
+    /// The word names no exec body.
+    None,
+}
+
+/// Read one `git rebase` argument for an exec body. Git walks a short-option
+/// cluster left to right and a value-taking letter consumes the rest of the
+/// cluster, so `-ix` is `-i -x` (body in the next word), `-ix<body>` and
+/// `-vix<body>` attach the body, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
+/// option's value, not an exec. The first `x` reached before any
+/// value-taking letter is the one whose body git runs (WI#879).
+fn rebase_exec(word: &Word) -> RebaseExec {
+    let text = word.text.as_str();
+    if matches!(text, "--ex" | "--exe" | "--exec") {
+        return RebaseExec::NextWord;
+    }
+    if let Some((flag, value)) = text.split_once('=')
+        && matches!(flag, "--ex" | "--exe" | "--exec")
+    {
+        return RebaseExec::Attached(Word {
+            text: value.to_string(),
+            dynamic: word.dynamic,
+        });
+    }
+    let Some(cluster) = text.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+        return RebaseExec::None;
+    };
+    for (offset, letter) in cluster.char_indices() {
+        if letter == 'x' {
+            // `x` is ASCII, so the next byte starts the attached body.
+            let attached = &cluster[offset + 1..];
+            return if attached.is_empty() {
+                RebaseExec::NextWord
+            } else {
+                RebaseExec::Attached(Word {
+                    text: attached.to_string(),
+                    dynamic: word.dynamic,
+                })
+            };
+        }
+        if REBASE_CLUSTER_VALUE_LETTERS.contains(&letter) {
+            return RebaseExec::None;
+        }
+    }
+    RebaseExec::None
+}
+
+/// `rebase --exec <body>` (and its `-x` cluster spellings) and
+/// `submodule foreach <body>` run their argument through a shell, which the
+/// preflight never read before. `bisect run` runs the words after it
+/// directly, so the whole tail is scanned as one command.
 /// A body that mentions no git is left alone, so ordinary `--exec 'cargo test'`
 /// keeps working.
 fn authorize_shell_bodies(
@@ -2071,26 +2129,18 @@ fn authorize_shell_bodies(
                 return Ok(());
             }
             return scan_simple_command(tail, preflight, depth + 1);
-        } else if let Some(value) = text
-            .strip_prefix("-x")
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                let (flag, value) = text.split_once('=')?;
-                matches!(flag, "--ex" | "--exe" | "--exec").then_some(value)
-            })
-        {
-            Some(&Word {
-                text: value.to_string(),
-                dynamic: word.dynamic,
-            })
-        } else if matches!(text, "--ex" | "--exe" | "--exec" | "-x") {
-            index += 1;
-            args.get(index)
         } else {
-            None
+            match rebase_exec(word) {
+                RebaseExec::Attached(body) => Some(body),
+                RebaseExec::NextWord => {
+                    index += 1;
+                    args.get(index).cloned()
+                }
+                RebaseExec::None => None,
+            }
         };
         if let Some(body) = body {
-            scan_shell_body(body, preflight, depth)?;
+            scan_shell_body(&body, preflight, depth)?;
         }
         index += 1;
     }
@@ -3267,6 +3317,13 @@ mod tests {
             "git rebase -x'git fetch upstream' HEAD~1",
             "git rebase --exe 'git fetch upstream' HEAD~1",
             "git rebase -i --exec 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
+            // WI#879: a short-option cluster containing `x` runs its body too.
+            "git rebase -ix 'git push origin HEAD' HEAD~1",
+            "git rebase -qx 'git push origin HEAD' HEAD~1",
+            "git rebase -vix 'git push origin HEAD' HEAD~1",
+            "git rebase -ix'git push origin HEAD' HEAD~1",
+            "git rebase -nx 'git fetch upstream' HEAD~1",
+            "git rebase -fx 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
             "git submodule foreach 'git push origin main'",
             "git submodule foreach 'git fetch upstream'",
             "git submodule foreach --recursive 'git fetch upstream'",
@@ -3283,11 +3340,86 @@ mod tests {
             "git rebase --exec 'cargo test' HEAD~1",
             "git rebase --exec 'make -j8' --exec 'cargo test' HEAD~1",
             "git rebase -i HEAD~3",
+            // WI#879: the clustered spelling stays usable for ordinary bodies,
+            // and a value-taking letter before `x` consumes it.
+            "git rebase -ix 'echo hi' HEAD~1",
+            "git rebase -ixv 'cargo test' HEAD~1",
+            "git rebase -sx recursive HEAD~1",
+            "git rebase -Xx theirs HEAD~1",
+            "git rebase -C3 HEAD~1",
+            "git rebase -r HEAD~1",
             "git submodule foreach 'cargo build'",
             "git submodule --quiet foreach --recursive 'cargo build'",
             "git bisect run cargo test",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#879: the four measured rows, plus the cluster truth table verified
+    /// against real git 2.56.1 (`-ix`/`-vix`/`-nx`/`-fx` run the body;
+    /// `-sx`/`-Xx`/`-C3x`/`-rx` consume `x` as that option's value).
+    #[test]
+    fn clustered_rebase_exec_bodies_are_scanned() {
+        let (_temp, grant) = workspace_with_remote();
+        // The control rows and the clustered row from the work item.
+        for command in [
+            "git rebase -x 'git push -f origin HEAD' HEAD~1",
+            "git rebase --exec='git push -f origin HEAD' HEAD~1",
+            "git rebase -ix 'git push -f origin HEAD' HEAD~1",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(error.to_string().contains("force"), "{command}: {error}");
+        }
+        for command in [
+            "git rebase -ix 'echo CLUSTER_IX_RAN' HEAD~1",
+            "git rebase -ixv 'cargo test' HEAD~1",
+            "git rebase -sx recursive HEAD~1",
+            "git rebase -Xx theirs HEAD~1",
+            "git rebase -C3 HEAD~1",
+            "git rebase -r HEAD~1",
+            // Real git makes the attached `v` the body, not the next word;
+            // `v` mentions no git, so this stays accepted.
+            "git rebase -ixv 'git push origin HEAD' HEAD~1",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#879: the cluster walk is unit-tested directly, so a regression in
+    /// where the body starts is visible without a grant fixture.
+    #[test]
+    fn rebase_exec_cluster_positions() {
+        let word = |text: &str| Word {
+            text: text.to_string(),
+            dynamic: false,
+        };
+        let body = |text: &str| match rebase_exec(&word(text)) {
+            RebaseExec::Attached(body) => Some(body.text),
+            RebaseExec::NextWord => None,
+            RebaseExec::None => Some(String::from("<none>")),
+        };
+        // A cluster `x` with nothing attached takes the next word.
+        assert_eq!(body("-x"), None);
+        assert_eq!(body("-ix"), None);
+        assert_eq!(body("-vix"), None);
+        assert_eq!(body("--exec"), None);
+        // An attached body starts right after the first `x`.
+        assert_eq!(body("-xbody").as_deref(), Some("body"));
+        assert_eq!(body("-ixbody").as_deref(), Some("body"));
+        assert_eq!(body("-ix=body").as_deref(), Some("=body"));
+        assert_eq!(body("--exec=body").as_deref(), Some("body"));
+        // A value-taking letter before `x` swallows the rest of the cluster.
+        for text in ["-sx", "-Xx", "-C3x", "-rx", "-Sx", "-iSx", "-s"] {
+            assert_eq!(body(text).as_deref(), Some("<none>"), "{text}");
+        }
+        // `-i` alone, long options, and positional words name no body.
+        for text in ["-i", "-v", "--onto", "HEAD~1"] {
+            assert_eq!(body(text).as_deref(), Some("<none>"), "{text}");
         }
     }
 
@@ -3405,6 +3537,41 @@ mod tests {
             &work,
         );
         (temp, work)
+    }
+
+    /// WI#879 acceptance against real git: the clustered spelling really runs
+    /// its exec body, so the preflight row is not describing a spelling git
+    /// ignores. `-ix` runs the body once per rebased commit.
+    #[test]
+    fn clustered_rebase_exec_runs_its_body_in_real_git() {
+        let (temp, work) = real_remote_fixture();
+        let _temp = temp;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_SEQUENCE_EDITOR", "true")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .expect("git runs")
+        };
+        let marker = work.join("clustered-ran.txt");
+        // A second commit gives the rebase something to replay.
+        std::fs::write(work.join("file.txt"), "one\ntwo\n").expect("write");
+        assert!(git(&["commit", "-q", "-am", "two"]).status.success());
+        let body = format!("sh -c 'echo ran >> {}'", marker.display());
+        let output = git(&["rebase", "-ix", &body, "HEAD~1"]);
+        assert!(
+            output.status.success(),
+            "clustered rebase failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(log.contains("Executing:"), "body never ran: {log}");
+        assert!(marker.is_file(), "clustered exec body did not run: {log}");
     }
 
     /// Acceptance: with a write grant, a real `git push` lands on a real local

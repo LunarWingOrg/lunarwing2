@@ -240,7 +240,11 @@ updates, use server-side permissions and branch protection.
 
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies. It does not fully model shell
+`submodule foreach` and `bisect run` bodies. `rebase` exec is read from the
+short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
+`-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
+their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
+option's value rather than an exec. It does not fully model shell
 expansion (including globs, braces and command substitutions), dynamic
 command names, alias or command lookup, text evaluated by commands such as
 `eval`, `trap` or `env -S`, or shell scripts supplied on stdin. Unsupported
