@@ -938,7 +938,7 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
-**Git remote grant (WI#816, WI#860).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
+**Git remote grant (WI#816, WI#860, WI#875).** `SANDBOX_GIT_REMOTES=name=url[,name=url...]`
 is unset by default. A manifest can opt into the `git-remotes` grant.
 For HTTP(S) it requires `proxy-enforced` and narrows that call's proxy to the
 selected, already-allowlisted hosts. File remotes are paths inside `/workspace`
@@ -971,12 +971,25 @@ smart-HTTP endpoints (exact host, port, path and method), never to another
 repository or API path on the same host. Only plain `http://` can be bound
 (HTTPS travels in an opaque CONNECT tunnel); an `https://` binding is a load
 error. The hop is plain HTTP, so it belongs on a trusted network or an
-encrypted overlay; the per-call proxy keeps the public-only destination
-check, so a remote resolving to a private, CGNAT (NetBird's `100.64.0.0/10`)
-or loopback address is refused today. A binding is applied only when its remote
+encrypted overlay. A binding is applied only when its remote
 is selected. `none` and `tunnel` carry only `file://` remotes, so a
-credential-bound network remote fails closed there. mt-admin keeps
-`SANDBOX_GIT_REMOTES`, `SANDBOX_GIT_WRITE_REMOTES`, `SANDBOX_GIT_CREDENTIALS`
+credential-bound network remote fails closed there.
+
+`SANDBOX_GIT_PRIVATE_REMOTES=name[,name...]` (WI#875) allows a granted
+remote's own host and port to resolve to a LAN (RFC 1918) or overlay (CGNAT
+`100.64.0.0/10`, IPv6 ULA) address, which is how a plain-HTTP remote on the
+LAN or on NetBird is deployed. Without it the per-call proxy keeps the
+public-only destination check and refuses such a remote. The allowance is
+exact: another private address, another port on the granted host, and every
+unnamed remote stay refused. Loopback, link-local and the metadata address
+stay refused even when named, and the proxy keeps pinning the resolved
+address. Only the per-call git proxy carries the allowance; the shared tenant
+proxy still refuses every non-public destination. A `file://` remote, or a
+name outside `SANDBOX_GIT_REMOTES`, is a load error. Capability evidence
+records `private_destination: true` per allowed remote.
+
+mt-admin keeps `SANDBOX_GIT_REMOTES`, `SANDBOX_GIT_WRITE_REMOTES`,
+`SANDBOX_GIT_CREDENTIALS`, `SANDBOX_GIT_PRIVATE_REMOTES`
 and every variable a binding names across `lunarwing.env` re-renders (see
 `docs/ops/TENANT-CONFIGURATION.md`).
 

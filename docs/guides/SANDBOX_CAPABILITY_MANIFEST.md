@@ -174,6 +174,37 @@ text, decides write and deletion:
   remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
   write boundary: give read grants a read-only key and protect branches.
 
+### Non-public remotes (WI#875)
+
+A plain `http://` remote on the LAN or on an overlay (NetBird and other
+`100.64.0.0/10` networks) is a normal deployment. In `proxy-enforced` mode
+the proxy keeps its public-only destination check by default, so such a
+remote must be allowed explicitly:
+
+```
+SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
+```
+
+- **Named granted remotes only.** Each name must be a remote in the same
+  `SANDBOX_GIT_REMOTES` list and must be `http://` or `https://`; a `file://`
+  remote, an unknown name or an empty value is a configuration load error.
+  The allowance opens exactly the named remote's own host and port. Another
+  host on the same subnet, another port on the granted host, and every
+  unnamed remote stay unreachable.
+- **LAN and overlay addresses only.** A named remote may resolve to an
+  RFC 1918 address, the CGNAT range `100.64.0.0/10`, or an IPv6 unique-local
+  address (`fc00::/7`). Loopback, link-local, the cloud metadata address
+  (`169.254.169.254`) and every other non-public address stay refused, so a
+  granted name that re-resolves there cannot reach the host's own services.
+- **DNS is still pinned.** The proxy resolves once and connects to the
+  resolved address; a re-resolution or redirect cannot move the connection.
+  If the allowance cannot be applied exactly, the call is refused as before.
+- **The shared tenant proxy is unchanged.** Only the per-call git proxy
+  carries the allowance; the shared proxy still refuses every non-public
+  destination.
+- **Evidence records it.** `capability_evidence.git.remotes[]` carries
+  `"private_destination": true` for each allowed remote.
+
 ### Credentials (WI#860)
 
 `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a granted
