@@ -17,6 +17,9 @@
 #  - the "running (...)" prefix is preserved: lunarwing_mt_onboard's verifier
 #    reads the first word of the line
 #  - no lane connection is attempted for a stopped/absent container
+#  - the tenant's config.toml is read through the tenant account, never by the
+#    caller on the tenant-writable path; a link, a named pipe or a missing file
+#    there reads as unreadable
 # shellcheck disable=SC2034  # fixture globals are consumed by sourced helpers.
 set -euo pipefail
 
@@ -85,6 +88,25 @@ DROP_PORT="$(cat "$FIXTURE_DIR/drop.port" 2>/dev/null || true)"
 RESET_PORT="$(cat "$FIXTURE_DIR/reset.port" 2>/dev/null || true)"
 [[ -n "$LIVE_PORT" && -n "$DROP_PORT" && -n "$RESET_PORT" ]] \
   || { printf 'FAIL: could not start the fixture listeners\n'; exit 1; }
+
+# A stand-in for `sudo`, first in PATH. The harness tenant `alice` is not a
+# real account, so the real sudo cannot become it. The stand-in records every
+# call and runs exactly one shape: the bounded tenant read
+# (`sudo -n -u alice sh -c ...`). Every other call fails, as it did before.
+mkdir -p "$FIXTURE_DIR/bin"
+export LW_TEST_SUDO_LOG="$FIXTURE_DIR/sudo.log"
+: >"$LW_TEST_SUDO_LOG"
+cat >"$FIXTURE_DIR/bin/sudo" <<'FAKESUDO'
+#!/bin/sh
+printf '%s\n' "$*" >>"$LW_TEST_SUDO_LOG"
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-u" ] && [ "${3:-}" = "alice" ] && [ "${4:-}" = "sh" ] && [ "${5:-}" = "-c" ]; then
+  shift 3
+  exec "$@"
+fi
+exit 1
+FAKESUDO
+chmod 0755 "$FIXTURE_DIR/bin/sudo"
+PATH="$FIXTURE_DIR/bin:$PATH"
 
 # A port with nothing bound: bind ephemeral, read it, close it.
 DEAD_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
@@ -236,6 +258,74 @@ assert_contains "a lane enabled but missing from config is a finding" \
   "Worker config: opencode2 enabled in registry but MISSING from $CONFIG_DIR/config.toml"
 assert_contains "a lane disabled in registry but still configured is a finding" \
   "Worker config: lunardepth disabled in registry but still configured in $CONFIG_DIR/config.toml"
+
+# WI#882 (review AMJ-2): the config sits in the tenant's own state directory,
+# so the caller must not open that path itself. The read above went through
+# the tenant account: the stand-in sudo saw the bounded read for this path.
+if grep -qF -- "-n -u alice sh -c" "$LW_TEST_SUDO_LOG" \
+  && grep -F -- "-n -u alice sh -c" "$LW_TEST_SUDO_LOG" | grep -qF -- "$CONFIG_DIR/config.toml"; then
+  pass "the tenant config is read through the tenant account"
+else
+  fail "the tenant config is read through the tenant account (sudo log: $(tr '\n' '|' <"$LW_TEST_SUDO_LOG"))"
+fi
+
+# A link at the config path is refused, even when it points at a file with
+# worker entries: the report says unreadable and calls no lane configured.
+REAL_CONFIG_DIR="$CONFIG_DIR"
+LINK_DIR="$FIXTURE_DIR/linked-state"
+mkdir -p "$LINK_DIR"
+ln -s "$REAL_CONFIG_DIR/config.toml" "$LINK_DIR/config.toml"
+CONFIG_DIR="$LINK_DIR"
+out="$(worker_config_consistency alice || true)"
+assert_contains "a link at the config path reads as unreadable" \
+  "Worker config: $LINK_DIR/config.toml is missing, is not a regular file, or is unreadable as tenant 'alice'"
+assert_not_contains "no lane is called configured through a link" "configured for the daemon"
+assert_not_contains "no lane is called missing through a link" "MISSING from"
+
+# A named pipe there must neither block the report nor be read.
+PIPE_DIR="$FIXTURE_DIR/pipe-state"
+mkdir -p "$PIPE_DIR"
+mkfifo "$PIPE_DIR/config.toml"
+CONFIG_DIR="$PIPE_DIR"
+# Run under a watchdog: a reader that opens the pipe would wait for ever, and
+# the harness must then fail, not hang.
+( worker_config_consistency alice >"$FIXTURE_DIR/pipe.out" 2>&1 || true ) &
+pipe_pid=$!
+pipe_done=false
+for _ in $(seq 1 80); do
+  if ! kill -0 "$pipe_pid" 2>/dev/null; then pipe_done=true; break; fi
+  sleep 0.1
+done
+if [[ "$pipe_done" == true ]]; then
+  pass "a named pipe at the config path does not block the report"
+else
+  fail "a named pipe at the config path does not block the report (still reading after 8s)"
+  # Release the blocked reader: a writer that opens and closes ends its read.
+  timeout 2 bash -c ': >"$1"' _ "$PIPE_DIR/config.toml" 2>/dev/null || true
+  kill "$pipe_pid" 2>/dev/null || true
+fi
+wait "$pipe_pid" 2>/dev/null || true
+out="$(cat "$FIXTURE_DIR/pipe.out" 2>/dev/null || true)"
+assert_contains "a named pipe at the config path reads as unreadable" \
+  "Worker config: $PIPE_DIR/config.toml is missing, is not a regular file, or is unreadable as tenant 'alice'"
+
+# A missing file is unreadable too, not "consistent".
+CONFIG_DIR="$FIXTURE_DIR/no-such-state"
+out="$(worker_config_consistency alice || true)"
+assert_contains "a missing config reads as unreadable" \
+  "Worker config: $FIXTURE_DIR/no-such-state/config.toml is missing, is not a regular file, or is unreadable as tenant 'alice'"
+
+# When the caller is the tenant, no privilege drop is needed or attempted.
+CONFIG_DIR="$REAL_CONFIG_DIR"
+: >"$LW_TEST_SUDO_LOG"
+out="$(worker_config_consistency "$(id -un)" || true)"
+assert_contains "the tenant itself reads its own config" \
+  "Worker config: pebble enabled in registry and configured for the daemon"
+if [[ ! -s "$LW_TEST_SUDO_LOG" ]]; then
+  pass "no sudo call when the caller is the tenant"
+else
+  fail "no sudo call when the caller is the tenant ($(tr '\n' '|' <"$LW_TEST_SUDO_LOG"))"
+fi
 
 # A lane whose container is not running must not cost a loopback dial: the
 # "stopped"/"not created" branches never call the probe. The status line calls

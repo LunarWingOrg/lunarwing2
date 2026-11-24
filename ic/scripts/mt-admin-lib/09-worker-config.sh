@@ -268,16 +268,28 @@ check_tenant_worker_readiness() {  # <tenant>
 # reverse leaves the daemon dialing a worker the operator thinks is off). This
 # is a read-only, registry-vs-config consistency report: it never edits either.
 # A missing or unreadable config is reported, never assumed consistent.
+#
+# The config sits in the tenant's own state directory, so root never opens the
+# path itself (WI#390, the same rule as `set_external_worker_tool_allowlist`):
+# the file is read under the tenant account into a root-private copy, bounded
+# in time and size, and only that copy is searched. A link, a named pipe or
+# anything else that is not a regular file reads as unreadable. Only the five
+# known lane names are compared; nothing from the file is printed.
 worker_config_consistency() {  # <tenant>
-  local name="$1" config_path configured lane status=0
+  local name="$1" config_path configured="" lane status=0 staged readable=false
   config_path="$(tenant_state_dir "$name")/config.toml"
-  if [[ ! -r "$config_path" ]] && [[ "$(id -un)" != "$name" ]]; then
-    configured="$(tenant_cat "$name" "$config_path" 2>/dev/null | grep -oE '^name = "[^"]+"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
-  else
-    configured="$(grep -oE '^name = "[^"]+"' "$config_path" 2>/dev/null | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
+  staged="$(mktemp)" || return 0
+  if tenant_read_regular_file_bounded "$name" "$config_path" >"$staged" 2>/dev/null; then
+    readable=true
+    configured="$(LC_ALL=C grep -aoE '^name = "[^"]+"' "$staged" | cut -d'"' -f2 | sort -u | tr '\n' ' ' || true)"
+  fi
+  rm -f -- "$staged"
+  if [[ "$readable" != true ]]; then
+    say "Worker config: $config_path is missing, is not a regular file, or is unreadable as tenant '$name' — cannot confirm the daemon's effective lanes"
+    return 0
   fi
   if [[ -z "$configured" ]]; then
-    say "Worker config: no external workers in $config_path (or it is unreadable) — cannot confirm the daemon's effective lanes"
+    say "Worker config: no external workers in $config_path — cannot confirm the daemon's effective lanes"
     return 0
   fi
 
