@@ -1017,13 +1017,7 @@ fn skip_wrapper_options(words: &[Word], mut index: usize, value_options: &[&str]
 }
 
 /// GNU `env` long options that consume the following word.
-const ENV_LONG_VALUE_OPTIONS: &[&str] = &[
-    "argv0",
-    "unset",
-    "chdir",
-    "split-string",
-    "env0-from",
-];
+const ENV_LONG_VALUE_OPTIONS: &[&str] = &["argv0", "unset", "chdir", "split-string", "env0-from"];
 /// GNU `env` long options that never consume a separate word. The options
 /// with an optional value (`--block-signal`) take one only in `=` spelling.
 const ENV_LONG_FLAGS: &[&str] = &[
@@ -3264,9 +3258,10 @@ mod tests {
     fn env_split_string_bodies_are_scanned_in_every_spelling() {
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
-        let host = GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
-            .unwrap()
-            .unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
         for command in [
             // The three measured rows: the `=` control and the two gaps.
@@ -3786,7 +3781,10 @@ mod tests {
             .output()
             .expect("ls-remote");
         let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
-        assert_eq!(before, after, "a refused force push must not move the remote");
+        assert_eq!(
+            before, after,
+            "a refused force push must not move the remote"
+        );
     }
 
     /// Acceptance: a real clone and fetch of a real remote, with the
