@@ -2933,14 +2933,23 @@ mod tests {
         assert!(!host.remotes[1].allow_private);
         assert!(!host.remotes[2].allow_private);
 
-        let grant = authorize_grant(&host, &[], Path::new("/tmp"), SandboxNetworkMode::ProxyEnforced)
-            .unwrap();
+        let grant = authorize_grant(
+            &host,
+            &[],
+            Path::new("/tmp"),
+            SandboxNetworkMode::ProxyEnforced,
+        )
+        .unwrap();
         let allowance = grant.private_egress();
         assert!(!allowance.is_empty());
         let json = serde_json::to_string(&grant.evidence()).unwrap();
         assert!(json.contains("\"private_destination\":true"), "{json}");
         // Only the named remote carries the flag.
-        assert_eq!(json.matches("\"private_destination\":true").count(), 1, "{json}");
+        assert_eq!(
+            json.matches("\"private_destination\":true").count(),
+            1,
+            "{json}"
+        );
         // The overlay remote's own evidence does not claim the allowance.
         let overlay = json.split("\"name\":\"overlay\"").nth(1).unwrap();
         assert!(!overlay.contains("private_destination"), "{json}");
@@ -2966,25 +2975,17 @@ mod tests {
         .unwrap();
         let narrowed_allowance = narrowed.private_egress();
         assert!(!narrowed_allowance.is_empty());
-        let selected = GitGrantConfig::from_specs(
-            "lan=http://192.168.1.20:3000/org/repo.git",
-            "",
-            "",
-            "lan",
-        )
-        .unwrap()
-        .unwrap();
+        let selected =
+            GitGrantConfig::from_specs("lan=http://192.168.1.20:3000/org/repo.git", "", "", "lan")
+                .unwrap()
+                .unwrap();
         let one = authorize_grant(&selected, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
         assert!(!one.private_egress().is_empty());
         // A remote without the allowance contributes nothing.
-        let plain = GitGrantConfig::from_specs(
-            "lan=http://192.168.1.20:3000/org/repo.git",
-            "",
-            "",
-            "",
-        )
-        .unwrap()
-        .unwrap();
+        let plain =
+            GitGrantConfig::from_specs("lan=http://192.168.1.20:3000/org/repo.git", "", "", "")
+                .unwrap()
+                .unwrap();
         let none = authorize_grant(&plain, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
         assert!(none.private_egress().is_empty());
     }

@@ -279,7 +279,9 @@ mod tests {
         );
         let elsewhere = PrivateEgress::new().allow("127.0.0.1", 43211);
         assert!(
-            resolve_egress("127.0.0.1", 43210, &elsewhere).await.is_err(),
+            resolve_egress("127.0.0.1", 43210, &elsewhere)
+                .await
+                .is_err(),
             "an allowance for another port admits nothing"
         );
     }

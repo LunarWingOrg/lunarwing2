@@ -1534,10 +1534,7 @@ mod tests {
             other => panic!("expected InvalidValue for an unknown remote, got {other:?}"),
         }
 
-        for var in [
-            "SANDBOX_GIT_REMOTES",
-            "SANDBOX_GIT_PRIVATE_REMOTES",
-        ] {
+        for var in ["SANDBOX_GIT_REMOTES", "SANDBOX_GIT_PRIVATE_REMOTES"] {
             unsafe { std::env::remove_var(var) };
         }
     }
