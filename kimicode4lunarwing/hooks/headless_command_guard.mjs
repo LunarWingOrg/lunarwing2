@@ -239,6 +239,30 @@ function shellWordView(command) {
 }
 
 /**
+ * The words bash hands the program: one shell quoting level removed, with a
+ * quote character inside a quoted span kept as text. Unlike `shellWordView`
+ * this does not strip a nested level, so a Perl or Python operand keeps the
+ * quotes its own language reads (`perl -e 'unlink("/etc/passwd")'`), while a
+ * quoted verb reads as the plain word bash runs (`"tee" /dev/sda1`, `\find …`).
+ * WI#873.
+ */
+function shellWordLevelView(text) {
+  const states = quoteStates(text);
+  let view = "";
+  for (let i = 0; i < text.length; i++) {
+    const state = states[i];
+    if (state === QUOTE_OPEN || state === QUOTE_CLOSE) continue;
+    if (isEscapedState(state) && text[i] === "\\") {
+      const escaped = text[++i] ?? "";
+      if (escaped !== "\n") view += escaped;
+      continue;
+    }
+    view += text[i];
+  }
+  return view;
+}
+
+/**
  * Split on control operators and LF, leaving other line terminators in the
  * text. The separators are read outside quotes: an argument that legitimately
  * carries `;`, `|`, `&` or a newline stays in its own command's segment, so
@@ -2045,6 +2069,13 @@ function evaluate(command) {
       checkTrustedUserConfig(joined) ??
       checkTrustedUserConfig(shellWordView(joined)) ??
       checkRawShapes(joined) ??
+      // The raw-shape family reads bash's word view too: a quoted or escaped
+      // character on the verb (`"tee" /dev/sda1`, `\find /app -delete`)
+      // leaves every rule intact in bash, and the family's own
+      // `argumentWords`/`stripShellQuotes` expect quote-stripped input
+      // (WI#873). The word-level view, not `shellWordView`, keeps an
+      // interpreter operand's own quotes.
+      (joined === shellWordLevelView(joined) ? null : checkRawShapes(shellWordLevelView(joined))) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       (joined === command ? null : checkListeners(joined));
     if (joinedDenial) return joinedDenial;
