@@ -1176,7 +1176,7 @@ function checkRawShapes(text) {
 const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
 const GIT_CALL = /\bgit\b/g;
 const ROOT_CHANGE_CALL = /\bch(?:mod|own|grp)\b/g;
-const STAGE_PREFIXES = ["sudo", "env", "exec", "busybox"];
+const STAGE_PREFIXES = ["sudo", "exec", "busybox"];
 const SHELL_NAME = /^(?:ba|z|da|a|k)?sh$/;
 
 /**
@@ -1688,8 +1688,8 @@ function stageWords(stage) {
  * The command word of a word list, after env/exec/busybox prefixes. `env`'s
  * options are stepped over, and an `env -S`/`--split-string` value is one
  * word to the shell but a command line to env, so the words env runs replace
- * it (WI#872). A split string the hook cannot read claims nothing, which can
- * only add a denial; the listener rule refuses it by name.
+ * it (WI#872). Invalid invocations have no stage, and the listener rule
+ * separately refuses unverifiable strings.
  */
 function stageCommandFrom(words, depth) {
   let i = 0;
@@ -1697,13 +1697,10 @@ function stageCommandFrom(words, depth) {
     const name = commandBasename(words[i]);
     if (name === "env") {
       const command = envCommandWords(words, i + 1);
-      if (command === null) return { name: "", args: [] };
-      if (command.unverifiable) return { name: "", args: [] };
-      if (depth >= MAX_SHELL_BODY_DEPTH) return { name: "", args: [] };
-      if (command.split) return stageCommandFrom(command.words, depth + 1);
-      const inner = stageCommandFrom(command.words, depth + 1);
-      if (inner.name !== "") return inner;
-      return { name: "", args: [] };
+      if (command === null || command.unverifiable || depth >= MAX_SHELL_BODY_DEPTH) {
+        return { name: "", args: [] };
+      }
+      return stageCommandFrom(command.words, depth + 1);
     }
     const isPrefix = STAGE_PREFIXES.includes(name) || /^[A-Za-z_]\w*=/.test(words[i]);
     if (!isPrefix) break;
@@ -2557,12 +2554,23 @@ function pushListenerFields(words, { text, quoted }) {
   }
 }
 
-// GNU env's own value-taking options (`env --help`, coreutils 9.12): a
-// separate value is an option argument, not a command word, so the walk that
-// looks for `-S` steps over it. The signal options take an optional value,
-// which is only ever attached, and so must not eat a word.
-const ENV_VALUE_OPTIONS = new Set(["-u", "--unset", "-C", "--chdir", "-a", "--argv0", "--env0-from"]);
-const ENV_LONG_FLAG = /^--(?:ignore-environment|null|debug|list-signal-handling|help|version|(?:block|default|ignore)-signal)$/;
+// GNU env's full long-option table (`env --help`, coreutils 9.12). Resolve
+// abbreviations before looking for required arguments. The signal options'
+// optional arguments are always attached, so those options never eat a word.
+const ENV_REQUIRED_LONG_VALUES = new Set(["--unset", "--chdir", "--argv0", "--env0-from", "--split-string"]);
+const ENV_LONG_OPTIONS = [
+  ...ENV_REQUIRED_LONG_VALUES,
+  "--ignore-environment", "--null", "--debug", "--list-signal-handling",
+  "--block-signal", "--default-signal", "--ignore-signal", "--help", "--version",
+];
+// Bound option restarts independently of actual shell/launcher nesting.
+const MAX_ENV_SPLITS = 16;
+
+function envLongOption(name) {
+  if (ENV_LONG_OPTIONS.includes(name)) return name;
+  const matches = ENV_LONG_OPTIONS.filter((option) => option.startsWith(name));
+  return matches.length === 1 ? matches[0] : null;
+}
 
 /**
  * The words GNU `env -S`/`--split-string` makes of its string, or null when
@@ -2632,7 +2640,7 @@ function envSplitStringWords(text) {
       started = true;
       continue;
     }
-    if (ch === " " || ch === "\t" || ch === "\n") {
+    if (" \t\n\r\v\f".includes(ch)) {
       flush();
       continue;
     }
@@ -2653,59 +2661,53 @@ function envSplitStringWords(text) {
 }
 
 /**
- * The command line an `env` invocation runs: env's own options are stepped
- * over (a value-taking option consumes its value, `-` is `-i`, `--` ends the
- * list) and an `-S`/`--split-string` value is split into the words env runs
- * before them (WI#872). `env` stops reading options at its first assignment
- * or command word, so `-S` after one is that command's argument, as bash
- * runs it. Null when the options end without a command; `{ unverifiable }`
- * when a split string's words cannot be read.
+ * The operands of an `env` invocation, after walking its options. Like GNU
+ * env, restart the option walk after replacing `-S` and its value with the
+ * split words plus the remaining argv (WI#872). An assignment, a command
+ * word, `--` or the legacy `-` ends option parsing. Return null for an
+ * invalid split or no operands, and `{ unverifiable: true }` when a split
+ * cannot be read within the bound.
  */
 function envCommandWords(words, start) {
-  for (let i = start; i < words.length; i++) {
+  let splits = 0;
+  let i = start;
+  while (i < words.length) {
     const word = words[i];
-    // A mere `-` is `-i` and ends the option list, as does the first
-    // assignment or command word: `env - -S …` runs `-S` as the command.
-    if (!word.startsWith("-") || word === "-") return { words: words.slice(i) };
+    if (word === "--") {
+      i++;
+      break;
+    }
+    if (word === "-" || !word.startsWith("-")) break;
+    i++;
+    let value;
+    let splitOption;
     if (word.startsWith("--")) {
-      if (word === "--") return { words: words.slice(i + 1) };
-      const name = word.split("=")[0];
-      // getopt accepts a unique prefix of a long option, so `--s` and
-      // `--split` are `--split-string`.
-      if ("--split-string".startsWith(name)) {
-        const attached = word.length > name.length;
-        const value = attached ? word.slice(name.length + 1) : words[i + 1];
-        if (value === undefined) return null;
-        const split = envSplitStringWords(value);
-        if (split === null || split.unverifiable) return split;
-        const after = i + (attached ? 1 : 2);
-        return { split: true, words: [...split.words, ...words.slice(after)] };
-      }
-      if (word.includes("=") || ENV_LONG_FLAG.test(name)) continue;
-      if (ENV_VALUE_OPTIONS.has(name)) i++;
-      continue;
+      const equals = word.indexOf("=");
+      const option = envLongOption(equals === -1 ? word : word.slice(0, equals));
+      // An unknown literal option is invalid in GNU env, but the word may
+      // be assembled by the shell. Keep looking for a later literal -S.
+      if (!ENV_REQUIRED_LONG_VALUES.has(option)) continue;
+      splitOption = option === "--split-string";
+      value = equals === -1 ? words[i++] : word.slice(equals + 1);
+    } else {
+      // The first value-taking letter consumes the rest of the cluster,
+      // or the next argv word. Other letters do not take a value.
+      const index = word.search(/[uCaS]/);
+      if (index === -1) continue;
+      splitOption = word[index] === "S";
+      value = word.slice(index + 1) || words[i++];
     }
-    for (let j = 1; j < word.length; j++) {
-      const letter = word[j];
-      if (letter === "S") {
-        const attached = word.slice(j + 1);
-        const value = attached.length > 0 ? attached : words[i + 1];
-        if (value === undefined) return null;
-        const split = envSplitStringWords(value);
-        if (split === null || split.unverifiable) return split;
-        const after = i + (attached.length > 0 ? 1 : 2);
-        return { split: true, words: [...split.words, ...words.slice(after)] };
-      }
-      // `-u`, `-C` and `-a` take a value: the rest of the cluster or the
-      // next word. `-i`, `-0`, `-v` and an unknown letter read as flags,
-      // which is the reading that still finds a later `-S`.
-      if ("uCa".includes(letter)) {
-        if (j === word.length - 1) i++;
-        break;
-      }
-    }
+    if (value === undefined) return null;
+    if (!splitOption) continue;
+    if (splits >= MAX_ENV_SPLITS) return { unverifiable: true };
+    const split = envSplitStringWords(value);
+    if (split === null || split.unverifiable) return split;
+    splits++;
+    words = [...split.words, ...words.slice(i)];
+    i = 0;
   }
-  return null;
+  if (words[i] === "-") i++;
+  return i < words.length ? { words: words.slice(i), split: splits > 0 } : null;
 }
 
 /**

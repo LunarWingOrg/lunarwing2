@@ -51,12 +51,13 @@ unquoted, so a quoted alternative no longer suppresses it: `{kimi,"server"}`,
 
 The continuation and Git word readers reuse escape helpers but keep separate
 conservative views. Since WI#872 the `env -S`/`--split-string` reader is one
-more: it follows coreutils' own splitting rather than bash's, so a single
-quote is literal inside the string, only `"`, `\\`, `$`, `'` and `_` are
-escapes there (plus `f`/`n`/`r`/`t`/`v`), and a `${NAME}` expansion is
-refused as unverifiable instead of read as a word. This is not a full Bash
-parser: it does not evaluate
-runtime words or implement general brace expansion. The container and tenant
+more: it reads the string as `env` arguments rather than Bash, treating
+unquoted space, tab, LF, CR, VT and FF as separators. The listener and
+decode-pipe checks share the option walk: long options resolve by exact name
+or unique abbreviation, and parsing restarts after each split. A `${NAME}`
+expansion or more than 16 splits in one `env` invocation is refused as
+unverifiable. This is not a full Bash parser: it does not evaluate runtime
+words or implement general brace expansion. The container and tenant
 egress policy remain the security boundary.
 
 ## Protocol Compatibility

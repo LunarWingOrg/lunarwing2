@@ -1281,6 +1281,38 @@ test("env -S is a command line, not one word (WI#872)", () => {
   assertBlocked(`env -S "bash -c 'kimi server'"`, "kimi service mode")
 })
 
+test("env resolves abbreviated long options before -S (WI#872 ALW-1)", () => {
+  for (const option of ["--ch /tmp", "--u HOME", "--a argv0", "--e /dev/null", "--ch=/tmp"]) {
+    assertBlocked(`env ${option} -S "kimi server"`, "kimi service mode")
+  }
+  // A signal option's optional value is attached, never the next word.
+  assertBlocked('env --block-sig -S "kimi server"', "kimi service mode")
+  assertAllowed('env --ch /tmp -S "echo hi"')
+})
+
+test("env reads split words as options again (WI#872 ALW-2)", () => {
+  assertBlocked(`env -S "-S'kimi server'"`, "kimi service mode")
+  assertBlocked(`env -S "-u HOME -S'kimi server'"`, "kimi service mode")
+  assertBlocked(`env -S '--split-string="kimi server"'`, "kimi service mode")
+  assertBlocked(`env -S '--ch /tmp --s="kimi server"'`, "kimi service mode")
+  // The option can take its value from the original argv after the split.
+  assertBlocked(`env -S "-i -S" "kimi server"`, "kimi service mode")
+  assertAllowed(`env -S "-i -S'echo hi'"`)
+  assertAllowed(`env -S "-- -S 'kimi server'"`)
+  assertAllowed(`env -S "- -S 'kimi server'"`)
+  assertAllowed(`env -S "FOO=1 echo -S 'kimi server'"`)
+  assertBlocked(`env -S "${"-S ".repeat(32)}true"`, "cannot check listeners behind an env -S string")
+})
+
+test("env split strings separate on all unquoted ASCII whitespace (WI#872 ALW-3)", () => {
+  for (const separator of [" ", "\t", "\n", "\r", "\v", "\f"]) {
+    assertBlocked(`env -S "kimi${separator}server"`, "kimi service mode")
+    assertAllowed(`env -S "printf %s 'kimi${separator}server'"`)
+  }
+  // Escapes put a control character in the current word, not between words.
+  assertAllowed('env -S "printf %s kimi\\rserver"')
+})
+
 test("the decode-pipe stage reader steps over env's options (WI#872)", () => {
   // stageCommand treated `env` as a prefix word and stopped at its first
   // option, so every env spelling but a bare assignment read as no command
@@ -1288,8 +1320,11 @@ test("the decode-pipe stage reader steps over env's options (WI#872)", () => {
   assertBlocked("echo x | base64 -d | env -i bash", "decoded content piped")
   assertBlocked("echo x | base64 -d | env -u FOO bash", "decoded content piped")
   assertBlocked("echo x | base64 -d | env -C /tmp bash", "decoded content piped")
+  assertBlocked("echo x | base64 -d | env --ch /tmp bash", "decoded content piped")
   assertBlocked("echo x | base64 -d | env -- bash", "decoded content piped")
   assertBlocked('echo x | base64 -d | env -S "bash"', "decoded content piped")
+  assertBlocked('echo x | base64 -d | env -S "-i bash"', "decoded content piped")
+  assertBlocked('echo x | env -S "-i base64 -d" | bash', "decoded content piped")
   assertBlocked('echo x | env -S "base64 -d" | bash', "decoded content piped")
   assertBlocked('echo x | env -S "base64 -d" | env -S "bash"', "decoded content piped")
   // The control rows keep their verdicts, and ordinary pipes stay allowed.
