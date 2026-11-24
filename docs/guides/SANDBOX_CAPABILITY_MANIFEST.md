@@ -215,6 +215,11 @@ SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
 remote to a daemon environment variable. The value is the literal
 `Authorization` header value (for example `Basic <base64>` or `Bearer <token>`).
 
+- **The variable name is dedicated (WI#876).** It must be
+  `SANDBOX_GIT_TOKEN_<NAME>`; any other daemon variable — `LLM_API_KEY`,
+  `DATABASE_URL`, or a plain `GIT_ORIGIN_TOKEN` — is a load error, so a
+  binding cannot ship an unrelated secret to that remote.
+
 - **The credential stays host-side.** The per-call egress proxy resolves
   `ENV_NAME` and adds the header to the outgoing request. The container never
   receives it: not in its environment, files, command arguments, process
@@ -282,7 +287,16 @@ single command. Dynamic expansions and invalid split strings are refused.
 
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies. `rebase` exec is read from the
+`submodule foreach` and `bisect run` bodies. `submodule foreach` is read as
+the whole operand tail, because the later operands are part of what runs:
+git starts the words directly (`foreach sh -c '<body>'`), or, when the first
+operand has a shell metacharacter, runs it as a script with the later
+operands as positional parameters, `"$@"` joined to its end. So a tail is
+scanned too, not just a single quoted body. When later operands are present,
+a first operand that contains `$` or a backtick is refused as dynamic,
+because it could run those operands where the scan does not read them
+(`foreach '"$@" #' git push -f …`); with one operand, `foreach 'echo $name'`
+stays an ordinary body. `rebase` exec is read from the
 short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
 `-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
 their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that

@@ -1447,11 +1447,13 @@ write_tenant_lunarwing_env() {
   # A bound value is an Authorization header value (a secret: the env file is
   # written mode 0600, and the value is never printed or passed to another
   # program). A binding is carried only when its remote is one that
-  # SANDBOX_GIT_REMOTES grants and its name is a plain environment name (the
-  # daemon refuses anything else at load); nothing here is evaluated. A value
-  # this writer cannot render on one line (a carriage return or newline, for
-  # example from a CRLF line) stops the render here, in the writer's own
-  # shell, naming the variable and never printing its value.
+  # SANDBOX_GIT_REMOTES grants and its name is a dedicated
+  # SANDBOX_GIT_TOKEN_<NAME> credential name (WI#876: the daemon refuses any
+  # other name, so a binding cannot ship an unrelated daemon secret such as
+  # LLM_API_KEY as the remote's Authorization header); nothing here is
+  # evaluated. A value this writer cannot render on one line (a carriage return
+  # or newline, for example from a CRLF line) stops the render here, in the
+  # writer's own shell, naming the variable and never printing its value.
   # SANDBOX_GIT_PRIVATE_REMOTES (WI#875) is the operator's allowance for a
   # granted remote whose exact host and port resolve to a LAN or overlay
   # address; it is preserved verbatim like the other three.
@@ -1503,7 +1505,11 @@ write_tenant_lunarwing_env() {
     git_secret_name="${git_binding#*=}"
     git_secret_name="${git_secret_name#"${git_secret_name%%[![:space:]]*}"}"
     git_secret_name="${git_secret_name%"${git_secret_name##*[![:space:]]}"}"
-    [[ "$git_secret_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # WI#876: only a dedicated SANDBOX_GIT_TOKEN_<NAME> binding name is a
+    # credential the daemon will load; any other daemon variable is refused
+    # at load, so it is not carried here either.
+    [[ "$git_secret_name" == SANDBOX_GIT_TOKEN_?* ]] || continue
+    [[ "$git_secret_name" =~ ^SANDBOX_GIT_TOKEN_[A-Za-z0-9_]+$ ]] || continue
     [[ " ${sandbox_git_secret_names[*]} " != *" $git_secret_name "* ]] || continue
     git_secret_value="$(_env_existing "$env_snapshot" "$git_secret_name")"
     [[ -n "$git_secret_value" ]] || continue
@@ -2640,6 +2646,34 @@ tenant_cat() {  # <tenant> <file>
   else
     sudo -u "$name" cat -- "$path"
   fi
+}
+
+# WI#882: a bounded read of one tenant-owned regular file, for report-only
+# callers such as `status`. Root never resolves the tenant-writable path
+# itself (WI#390): the type check and the read both run under the tenant
+# account, so a symbolic link, a named pipe, a device or a directory at the
+# path is refused there. The bounds are held on the caller's side as well: the
+# tenant-side read and the reader of its output each run under their own
+# `timeout`, and the reader stops at <max_bytes>, so neither a path that blocks
+# nor one that never ends can hold up or flood the caller.
+#
+# The content goes to stdout. Non-zero when the path is absent, is a link or
+# not a regular file, cannot be read as the tenant, or a bound was hit. A
+# caller that is neither the tenant nor able to become it without a password
+# gets the same non-zero answer (`sudo -n`): a report must not wait at a
+# prompt.
+tenant_read_regular_file_bounded() {  # <tenant> <file> [max_bytes=1048576] [timeout_secs=5]
+  local name="$1" path="$2" max_bytes="${3:-1048576}" secs="${4:-5}"
+  local -a drop=(sudo -n -u "$name") status
+  [[ "$(id -un)" != "$name" ]] || drop=()
+  [[ "$path" == /* ]] || return 1
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ && "$secs" =~ ^[1-9][0-9]*$ ]] || return 1
+  # shellcheck disable=SC2016  # the script text is expanded by the inner sh.
+  timeout -k 2 "$secs" "${drop[@]}" sh -c \
+    '[ -f "$1" ] && [ ! -L "$1" ] && exec head -c "$2" -- "$1"' sh "$path" "$max_bytes" \
+    | timeout -k 2 "$((secs + 3))" head -c "$max_bytes"
+  status=("${PIPESTATUS[@]}")
+  [[ "${status[0]}" -eq 0 && "${status[1]}" -eq 0 ]]
 }
 
 # chmod as the tenant: chmod follows symlinks, so running it as root on a

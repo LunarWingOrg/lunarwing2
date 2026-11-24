@@ -1,4 +1,6 @@
-# GitLab Container Registry — setup and usage
+# GitLab Container Registry — setup and usage'
+
+## may need another update since migration
 
 Goal: enable GitLab's built-in container registry for `lunarwing/lunarwing2`
 and publish supported external-worker images (`worker-pebble`,

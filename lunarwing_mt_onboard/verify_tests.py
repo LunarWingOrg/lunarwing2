@@ -153,6 +153,47 @@ class RuntimeVerificationTests(unittest.TestCase):
         checks = self.checks(SYSTEMD_STATUS + "Pebble worker: stopped (fixture)\n", workers=("pebble",))
         self.assertFalse(checks[-1].ok)
 
+    def test_running_worker_with_a_dead_wss_port_is_rejected(self):
+        # WI#882: the container is running and its port refuses. A "running"
+        # first word must not hide it.
+        text = SYSTEMD_STATUS + (
+            "Pebble worker: running (lunarwing-pebble-lunarium, "
+            "WSS port 20011: dead (no listener on 127.0.0.1))\n"
+        )
+        checks = self.checks(text, workers=("pebble",))
+        self.assertFalse(checks[-1].ok)
+        self.assertIn("dead", checks[-1].detail)
+
+    def test_running_worker_whose_port_accepts_and_drops_is_rejected(self):
+        # The rootless case: podman's forwarder accepts while the container
+        # runs, and nothing inside listens. mt-admin reports it as dead with
+        # its own reason, and the verifier must reject that form too.
+        text = SYSTEMD_STATUS + (
+            "Pebble worker: running (lunarwing-pebble-lunarium, "
+            "WSS port 20011: dead (accepted on 127.0.0.1 and dropped at once, "
+            "nothing answers behind the published port))\n"
+        )
+        checks = self.checks(text, workers=("pebble",))
+        self.assertFalse(checks[-1].ok)
+        self.assertIn("dropped", checks[-1].detail)
+
+    def test_running_worker_listening_on_its_wss_port_is_accepted(self):
+        text = SYSTEMD_STATUS + (
+            "Pebble worker: running (lunarwing-pebble-lunarium, "
+            "WSS port 20011: listening)\n"
+        )
+        checks = self.checks(text, workers=("pebble",))
+        self.assertTrue(checks[-1].ok)
+
+    def test_lane_with_no_allocated_wss_port_stays_green(self):
+        # No slot is a configuration choice, not a dead lane.
+        text = SYSTEMD_STATUS + (
+            "Pebble worker: running (lunarwing-pebble-lunarium, "
+            "WSS port none: unknown (no WSS port allocated))\n"
+        )
+        checks = self.checks(text, workers=("pebble",))
+        self.assertTrue(checks[-1].ok)
+
     def test_unselected_workers_are_not_required(self):
         self.assertTrue(all(c.ok for c in self.checks(SYSTEMD_STATUS, workers=())))
 

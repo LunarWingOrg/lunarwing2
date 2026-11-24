@@ -1239,7 +1239,7 @@ mod tests {
             crate::sandbox::GitGrantConfig::from_full_spec(
                 "origin=http://git.internal/org/repo.git",
                 "origin",
-                "origin=GIT_ORIGIN_TOKEN",
+                "origin=SANDBOX_GIT_TOKEN_ORIGIN",
             )
             .expect("grant spec")
             .expect("grant"),
@@ -1260,13 +1260,13 @@ mod tests {
         );
         assert_eq!(git.credentials.len(), 1);
         assert_eq!(git.credentials[0].remote, "origin");
-        assert_eq!(git.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+        assert_eq!(git.credentials[0].secret_env, "SANDBOX_GIT_TOKEN_ORIGIN");
         let json = audit_json(&decision.evidence).expect("audit");
         assert!(
             json.contains("\"operations\":[\"read\",\"write\"]"),
             "{json}"
         );
-        assert!(json.contains("GIT_ORIGIN_TOKEN"), "{json}");
+        assert!(json.contains("SANDBOX_GIT_TOKEN_ORIGIN"), "{json}");
         // The variable name is recorded; no value is.
         assert!(!json.contains("Basic "), "{json}");
     }
