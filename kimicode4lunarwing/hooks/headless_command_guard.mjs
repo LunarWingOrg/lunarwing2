@@ -2731,6 +2731,23 @@ function envCommandWords(words, start) {
 }
 
 /**
+ * An `env -S`/`--split-string` value is one shell word but a whole command
+ * line to env, so the words env runs get the same treatment a shell body gets
+ * (WI#874): env's own reader has already removed the shell quoting, so the
+ * words are joined back into the argv text env executes.
+ */
+function checkEnvSplitBody(words, depth) {
+  const body = words.join(" ");
+  const raw = checkRawShapes(body) ?? checkMoveAndTarDeletion(shellWordView(body));
+  if (raw) return raw;
+  for (const segment of commandSegments(body)) {
+    const denied = checkRm(segment);
+    if (denied) return denied;
+  }
+  return checkListenerWords(words, depth);
+}
+
+/**
  * Classify every word of one listener segment (WI#858). The rule is a
  * property, not a command position: any `kimi` word followed by a service
  * subcommand, any listener verb with its listener options, any shell body and
@@ -2760,7 +2777,7 @@ function checkListenerWords(words, depth) {
       if (command?.unverifiable) return "cannot check listeners behind an env -S string";
       if (command && command.split) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
-        const denied = checkListenerWords(command.words, depth + 1);
+        const denied = checkEnvSplitBody(command.words, depth + 1);
         if (denied) return denied;
       }
       continue;
