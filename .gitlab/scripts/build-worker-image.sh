@@ -42,6 +42,7 @@ pebble4lunarwing/src/tool_proxy.rs
 pebble4lunarwing/src/workspace_path.rs
 pebble4lunarwing/upstream/Cargo.lock
 pebble4lunarwing/patches/wi477-request-events.patch
+pebble4lunarwing/patches/wi863-openai-codex-model-catalog.patch
 pebble4lunarwing/scripts/verify_upstream_lock.py
 pebble4lunarwing/scripts/toolchain-profile.sh
 pebble4lunarwing/scripts/rustup-wrapper.sh
