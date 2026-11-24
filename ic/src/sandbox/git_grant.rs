@@ -304,18 +304,6 @@ fn parse_credentials(
     Ok(credentials)
 }
 
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name.bytes().enumerate().all(|(index, byte)| {
-            if index == 0 {
-                byte.is_ascii_alphabetic() || byte == b'_'
-            } else {
-                byte.is_ascii_alphanumeric() || byte == b'_'
-            }
-        })
-}
-
 /// The variable-name prefix a `SANDBOX_GIT_CREDENTIALS` binding may use.
 ///
 /// A binding's value is sent as the `Authorization` header on every request to
