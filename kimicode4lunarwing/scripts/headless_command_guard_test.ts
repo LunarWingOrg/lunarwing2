@@ -2021,3 +2021,96 @@ test("an env -S command line gets the body rules (WI#874)", () => {
   assertAllowed('env -S "cargo check -j18"')
   assertAllowed(`env -S "grep -rn 'kimi server' ."`)
 })
+
+test("a decoded payload behind a launcher or into a stdin interpreter is denied (WI#883)", () => {
+  // Every row of the item's point-1 table. A launcher in front of the
+  // decoder or the interpreter, a `{ …; }` group, a `source`/`.` of the
+  // shell's stdin, and an interpreter given no script argument all hand the
+  // decoded program to the interpreter when the guard allows them.
+  const payload = "ZWNobyBQQVlMT0FECg=="
+  for (const stage of [
+    "nice bash", "nice -n 5 bash", "timeout 5 bash", "command bash",
+    "nohup bash", "setsid bash", "stdbuf -o0 bash", "taskset -c 0 bash",
+    "ionice -c 3 bash", "xargs -0 bash -c", "{ bash; }",
+    "source /dev/stdin", ". /dev/stdin", "perl", "ruby", "node",
+  ]) {
+    assertBlocked(`echo ${payload} | base64 -d | ${stage}`, "decoded")
+  }
+  // The item's point 1c: the stdin spellings and the interpreters the hook
+  // knows. `awk` reads its program from stdin when given none.
+  for (const stage of ["perl -", "ruby -", "awk -f -", "php", "lua", "python3 -", "node -"]) {
+    assertBlocked(`echo ${payload} | base64 -d | ${stage}`, "decoded")
+  }
+  // The launcher gap is symmetric: a launcher in front of the *decoder*
+  // hides it exactly as it hid the interpreter.
+  for (const decode of ["nice base64 -d", "nice -n 5 base64 -d", "nohup base64 -d",
+    "setsid base64 -d", "taskset -c 0 base64 -d", "ionice -c 3 base64 -d",
+    "command base64 -d", "timeout 5 base64 -d", "stdbuf -o0 base64 -d"]) {
+    assertBlocked(`echo ${payload} | ${decode} | bash`, "decoded")
+  }
+  // The controls from the item, unchanged.
+  for (const stage of ["bash", "env bash", "sh", "python3", "/bin/bash", "exec bash", "busybox sh"]) {
+    assertBlocked(`echo ${payload} | base64 -d | ${stage}`, "decoded")
+  }
+  assertBlocked(`echo ${payload} | env -S "base64 -d" | bash`, "decoded")
+  assertBlocked(`echo ${payload} | env -S "base64 -d" | env -S "bash"`, "decoded")
+})
+
+test("ordinary pipes with a launcher keep passing (WI#883)", () => {
+  // Property 3: a launcher around an ordinary stage is not a decode pipe.
+  assertAllowed("echo hi | nice grep x")
+  assertAllowed("cat f.b64 | base64 -d | nice gzip > /tmp/x.gz")
+  assertAllowed("echo hi | base64 | nice bash -c 'cat'")
+  // A decode piped somewhere that does not run it stays ordinary work.
+  assertAllowed("echo aGVsbG8K | base64 -d > /tmp/wi883.out")
+  assertAllowed("echo aGVsbG8K | base64 -d | python3 -m json.tool")
+  assertAllowed("echo hi | base64 -d | env -i grep x")
+  // An interpreter with a script operand reads a file, not the pipe.
+  assertAllowed("echo hi | base64 -d | python3 script.py")
+  assertAllowed("echo hi | base64 -d | node script.js")
+  assertAllowed("echo hi | base64 -d | perl script.pl")
+  assertAllowed("echo hi | base64 -d | ruby script.rb")
+  assertAllowed("echo hi | base64 -d | awk -f script.awk")
+})
+
+test("a verb glued to an empty expansion is read as the verb (WI#883)", () => {
+  // Every row of the item's point-2 table: bash deletes an empty expansion
+  // and the word becomes the plain verb, so each shape reaches the rule the
+  // plain spelling reaches.
+  assertBlocked("${EMPTY}tee /dev/sda1", "block-device")
+  assertBlocked("t${EMPTY}ee /dev/sda1", "block-device")
+  assertBlocked('$EMPTY"tee" /dev/sda1', "block-device")
+  assertBlocked("${EMPTY}find /app -name x -delete", "deletion outside")
+  assertBlocked("${EMPTY}rsync -a --delete /tmp/e/ /app/", "deletion outside")
+  assertBlocked("${EMPTY}cp /tmp/a /dev/sda1", "block-device")
+  // The class reaches every word-position rule, not only the raw shapes.
+  assertBlocked("${EMPTY}kimi server", "kimi service")
+  assertBlocked("${EMPTY}kimi web", "kimi service")
+  assertBlocked("${EMPTY}nc -l 9000", "listener")
+  assertBlocked("${EMPTY}socat TCP-LISTEN:9000 -", "listener")
+  assertBlocked("${EMPTY}python3 -m http.server 8080", "listener")
+  assertBlocked("${EMPTY}mv /home/kimi/.kimi-code /tmp/x", "rename")
+  assertBlocked("${EMPTY}bash -c 'kimi server'", "kimi service")
+  // A glued empty expansion in an argument reaches the option rules too.
+  assertBlocked("kimi ${EMPTY}server", "kimi service")
+  assertBlocked("nc ${EMPTY}-l 9000", "listener")
+  // The spellings bash assembles the same way.
+  assertBlocked("${E}tee /dev/sda1", "block-device")
+  assertBlocked("${EMPTY:-}tee /dev/sda1", "block-device")
+  assertBlocked("`true`tee /dev/sda1", "block-device")
+  assertBlocked("$(true)tee /dev/sda1", "block-device")
+  // The item's controls.
+  assertBlocked("$EMPTY tee /dev/sda1", "block-device")
+  assertBlocked("${EMPTY}rm -rf /app/hooks", "deletion outside")
+  assertBlocked("tee /dev/sda1", "block-device")
+  // A word that is only an expansion stays an ordinary word.
+  assertAllowed('"$HOME"/bin/tool --version')
+  assertAllowed("$EDITOR notes.txt")
+  assertAllowed("cargo check -j18")
+  assertAllowed("taskset -c 0-11 cargo check -j12")
+  assertAllowed("mv \"$HOME/project/a\" \"$HOME/project/b\"")
+  assertAllowed("rm${IFS}-rf${IFS}/tmp/wi824-scratch")
+  assertAllowed("mkdir -p build/{debug,release}")
+  assertAllowed("cd $(git rev-parse --show-toplevel)")
+  assertAllowed("find /tmp -print0 | xargs -0 -I {} rm -rf {}")
+})
