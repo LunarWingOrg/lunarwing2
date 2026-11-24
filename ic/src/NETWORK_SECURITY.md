@@ -482,15 +482,19 @@ manifest retain the configured legacy behavior, including any existing egress.
   grant), or `tunnel` (existing tunnel policy unchanged). Advisory `proxy`
   is unsupported by manifest v1.
 - **Credentials stay host-side.** `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME`
-  binds a granted remote to a daemon environment variable. The per-call proxy
-  resolves that variable and adds the `Authorization` header to the outgoing
-  plain-HTTP request, so no credential value enters the container: not in its
-  environment, files, arguments, process listings or output, and there is no
-  helper socket a process in the run can query. The header is added only to
-  the bound repository's own smart-HTTP endpoints (exact host, port, path and
-  method); another repository or API path on the same host gets none. Only
-  `http://` remotes can be bound; an `https://` binding is a load error
-  because CONNECT is opaque to the proxy. The hop is plain HTTP, so it belongs
+  binds a granted remote to a daemon environment variable. `ENV_NAME` must be
+  a dedicated `SANDBOX_GIT_TOKEN_*` name (WI#876): any other name — including
+  a `LLM_API_KEY`/`DATABASE_URL` that also reaches the resolver through the
+  runtime-override map — is a load error, so a binding cannot send an
+  unrelated daemon secret as that remote's `Authorization` header. The
+  per-call proxy resolves that variable and adds the `Authorization` header to
+  the outgoing plain-HTTP request, so no credential value enters the
+  container: not in its environment, files, arguments, process listings or
+  output, and there is no helper socket a process in the run can query. The
+  header is added only to the bound repository's own smart-HTTP endpoints
+  (exact host, port, path and method); another repository or API path on the
+  same host gets none. Only `http://` remotes can be bound; an `https://`
+  binding is a load error because CONNECT is opaque to the proxy. The hop is plain HTTP, so it belongs
   on a trusted network or an encrypted overlay. The per-call proxy keeps the
   public-only destination check unless the remote is named in
   `SANDBOX_GIT_PRIVATE_REMOTES` (WI#875), which admits that remote's exact

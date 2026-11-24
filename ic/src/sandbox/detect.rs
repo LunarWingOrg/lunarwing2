@@ -143,6 +143,36 @@ impl SandboxRuntimeDetection {
             details.join("; ")
         )
     }
+
+    /// The user-visible warning for a host where the sandbox works but full-job
+    /// (worker) containers cannot start (WI#876).
+    ///
+    /// Full-job routines dispatch over a Docker-compatible API, which the
+    /// generic sandbox does not need: a podman-only host has a healthy sandbox
+    /// and still cannot run a worker container. That host used to get only an
+    /// info log. `None` when either side is fine, or when nothing works at all
+    /// (that case has its own warning).
+    pub fn full_job_warning(&self, docker_status: DockerStatus) -> Option<String> {
+        if self.runtime.is_none() || docker_status.is_ok() {
+            return None;
+        }
+        let runtime = self.runtime?;
+        let hint = match docker_status {
+            DockerStatus::NotRunning => {
+                "Start Docker (or point DOCKER_HOST at a compatible socket)."
+            }
+            DockerStatus::NotInstalled => {
+                "Install Docker, or point DOCKER_HOST at a compatible socket."
+            }
+            _ => "Point DOCKER_HOST at a Docker-compatible socket.",
+        };
+        Some(format!(
+            "Sandbox runs on {} but full-job (worker) containers are unavailable -- \
+             no Docker-compatible API is reachable, so full-job routines will fail \
+             at dispatch. {hint}",
+            runtime.binary()
+        ))
+    }
 }
 
 /// One runtime's failure, with the platform-specific hint that fixes it.

@@ -23,15 +23,17 @@
 //! a read-only grant still refuses `git push`. Force push is refused in every
 //! preflight spelling, and ref deletion is always refused (no host switch).
 //!
-//! Credentials (WI#860): `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME` binds a
-//! granted plain-HTTP remote to a daemon environment variable. The per-call
-//! egress proxy resolves that variable and adds the `Authorization` header
-//! host-side, so the secret never enters the container: not in its
+//! Credentials (WI#860): `SANDBOX_GIT_CREDENTIALS=remote=SANDBOX_GIT_TOKEN_NAME`
+//! binds a granted plain-HTTP remote to a daemon environment variable. The
+//! per-call egress proxy resolves that variable and adds the `Authorization`
+//! header host-side, so the secret never enters the container: not in its
 //! environment, files, arguments, process listings or output. The header is
 //! added only to the bound repository's own smart-HTTP endpoints. HTTPS
 //! travels in an opaque `CONNECT` tunnel the proxy cannot modify, so an HTTPS
 //! remote with a credential binding is a load error rather than a silent
-//! no-op.
+//! no-op. The variable name must carry the dedicated `SANDBOX_GIT_TOKEN_`
+//! prefix (WI#876), so a binding cannot send an unrelated daemon variable
+//! (`LLM_API_KEY`, `DATABASE_URL`) as that remote's `Authorization` header.
 //!
 //! Transport checks (WI#860, ALM-1): for plain-HTTP remotes the per-call
 //! proxy is the boundary for write and deletion, see
@@ -268,9 +270,10 @@ fn parse_credentials(
             );
         }
         validate_remote_name(remote)?;
-        if !is_valid_env_name(secret_env) {
+        if !is_sandbox_git_credential_name(secret_env) {
             return Err(format!(
-                "SANDBOX_GIT_CREDENTIALS variable '{secret_env}' must be an environment name"
+                "SANDBOX_GIT_CREDENTIALS variable '{secret_env}' must be a dedicated \
+                 credential name of the form SANDBOX_GIT_TOKEN_<NAME>"
             ));
         }
         let granted = remotes.iter().find(|entry| entry.name == remote).ok_or_else(|| {
@@ -301,15 +304,25 @@ fn parse_credentials(
     Ok(credentials)
 }
 
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name.bytes().enumerate().all(|(index, byte)| {
-            if index == 0 {
-                byte.is_ascii_alphabetic() || byte == b'_'
-            } else {
-                byte.is_ascii_alphanumeric() || byte == b'_'
-            }
+/// The variable-name prefix a `SANDBOX_GIT_CREDENTIALS` binding may use.
+///
+/// A binding's value is sent as the `Authorization` header on every request to
+/// that remote's endpoints, and the hop is plain HTTP, so the name must not be
+/// able to pick a daemon variable the operator did not mean to expose
+/// (`origin=LLM_API_KEY`, `origin=DATABASE_URL`). The dedicated prefix also
+/// covers names that arrive through the runtime-override map rather than the
+/// unit's own environment (WI#876).
+const GIT_CREDENTIAL_NAME_PREFIX: &str = "SANDBOX_GIT_TOKEN_";
+
+/// `SANDBOX_GIT_TOKEN_<NAME>`, where `<NAME>` is one or more of
+/// `[A-Za-z0-9_]`.
+fn is_sandbox_git_credential_name(name: &str) -> bool {
+    name.strip_prefix(GIT_CREDENTIAL_NAME_PREFIX)
+        .is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         })
 }
 
@@ -1519,11 +1532,16 @@ fn scan_shell_c(
     while cursor < words.len() {
         let word = &words[cursor];
         let text = word.text.as_str();
-        if text == "--" {
+        // A lone `-` ends option processing exactly like `--` (bash manual:
+        // "A -- signals the end of options and disables further option
+        // processing"; a lone `-` is the same terminator). bash, dash and
+        // `bash -ce` all run the word after it as the script, so it must be
+        // stepped past rather than scanned as the body itself.
+        if text == "--" || text == "-" {
             cursor += 1;
             break;
         }
-        if text == "-" || (!text.starts_with('-') && !text.starts_with('+')) {
+        if !text.starts_with('-') && !text.starts_with('+') {
             break;
         }
         if word.dynamic {
@@ -3175,7 +3193,7 @@ mod tests {
              mirror=http://git.internal:8080/org/mirror.git,\
              upstream=https://git.example.test/org/repo.git",
             "origin",
-            "origin=ORIGIN_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN",
         )
         .unwrap()
         .unwrap();
@@ -3188,7 +3206,10 @@ mod tests {
         assert_eq!(remotes[0].port, 80);
         assert_eq!(remotes[0].repo_path, "/org/repo.git");
         assert!(remotes[0].write);
-        assert_eq!(remotes[0].secret_env.as_deref(), Some("ORIGIN_TOKEN"));
+        assert_eq!(
+            remotes[0].secret_env.as_deref(),
+            Some("SANDBOX_GIT_TOKEN_ORIGIN")
+        );
         assert_eq!(remotes[1].port, 8080);
         assert!(!remotes[1].write && remotes[1].secret_env.is_none());
         // The only tunnel the git proxy opens is the https:// remote's own
@@ -3373,20 +3394,20 @@ mod tests {
         let host = GitGrantConfig::from_full_spec(
             "origin=http://git.internal/org/repo.git",
             "origin",
-            "origin=GIT_ORIGIN_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN",
         )
         .unwrap()
         .unwrap();
         assert_eq!(host.credentials.len(), 1);
         assert_eq!(host.credentials[0].remote, "origin");
-        assert_eq!(host.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+        assert_eq!(host.credentials[0].secret_env, "SANDBOX_GIT_TOKEN_ORIGIN");
 
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
         let mappings = grant.proxy_credentials();
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].secret_name, "GIT_ORIGIN_TOKEN");
+        assert_eq!(mappings[0].secret_name, "SANDBOX_GIT_TOKEN_ORIGIN");
         assert_eq!(mappings[0].host_patterns, vec!["git.internal".to_string()]);
 
         // The container environment carries the remote URL only.
@@ -3397,10 +3418,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!joined.contains(MARKER), "{joined}");
-        assert!(!joined.contains("GIT_ORIGIN_TOKEN"), "{joined}");
+        assert!(!joined.contains("SANDBOX_GIT_TOKEN_ORIGIN"), "{joined}");
 
         let json = serde_json::to_string(&grant.evidence()).unwrap();
-        assert!(json.contains("GIT_ORIGIN_TOKEN"), "{json}");
+        assert!(json.contains("SANDBOX_GIT_TOKEN_ORIGIN"), "{json}");
         assert!(!json.contains(MARKER), "{json}");
     }
 
@@ -3411,25 +3432,25 @@ mod tests {
             (
                 "origin=https://git.example.test/org/repo.git",
                 "",
-                "origin=GIT_TOKEN",
+                "origin=SANDBOX_GIT_TOKEN_ORIGIN",
             ),
             // A remote that is not granted.
             (
                 "origin=http://git.internal/org/repo.git",
                 "",
-                "upstream=GIT_TOKEN",
+                "upstream=SANDBOX_GIT_TOKEN_UPSTREAM",
             ),
             // A file remote has no host to bind.
             (
                 "origin=file:///workspace/remotes/origin.git",
                 "",
-                "origin=GIT_TOKEN",
+                "origin=SANDBOX_GIT_TOKEN_ORIGIN",
             ),
             // Not an environment name.
             (
                 "origin=http://git.internal/org/repo.git",
                 "",
-                "origin=not-a-name",
+                "origin=SANDBOX_GIT_TOKEN_bad-name",
             ),
             // Missing the variable.
             ("origin=http://git.internal/org/repo.git", "", "origin="),
@@ -3437,7 +3458,7 @@ mod tests {
             (
                 "origin=http://git.internal/org/repo.git",
                 "",
-                "origin=GIT_TOKEN,origin=OTHER_TOKEN",
+                "origin=SANDBOX_GIT_TOKEN_A,origin=SANDBOX_GIT_TOKEN_B",
             ),
         ] {
             assert!(
@@ -3445,6 +3466,43 @@ mod tests {
                 "accepted {spec} / {credentials}"
             );
         }
+    }
+
+    /// WI#876: a binding may name only a dedicated `SANDBOX_GIT_TOKEN_*`
+    /// variable. Any other daemon name — a plain environment name, the
+    /// `LLM_API_KEY`/`DATABASE_URL` shape the item names, or the bare prefix
+    /// with no suffix — is a load error, so the `Authorization` header can
+    /// never carry an unrelated daemon secret.
+    #[test]
+    fn credential_bindings_reject_names_outside_the_dedicated_prefix() {
+        for name in [
+            "LLM_API_KEY",
+            "DATABASE_URL",
+            "GIT_ORIGIN_TOKEN",
+            "SANDBOX_GIT_TOKEN_",
+            "SANDBOX_GIT_CREDENTIALS",
+            "SANDBOX_GIT_TOKEN",
+            "sanbox_git_token_origin",
+            "SANDBOX_GIT_TOKEN_ORIGIN_TRAILING-DASH",
+        ] {
+            let spec = "origin=http://git.internal/org/repo.git";
+            let credentials = format!("origin={name}");
+            let error = GitGrantConfig::from_full_spec(spec, "", &credentials)
+                .expect_err(&format!("accepted {credentials}"));
+            assert!(
+                error.contains("SANDBOX_GIT_TOKEN_"),
+                "{credentials}: {error}"
+            );
+        }
+        // The dedicated shape still loads.
+        let host = GitGrantConfig::from_full_spec(
+            "origin=http://git.internal/org/repo.git",
+            "",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(host.credentials[0].secret_env, "SANDBOX_GIT_TOKEN_ORIGIN");
     }
 
     /// A credential binding is applied only to the selected remotes.
@@ -3456,7 +3514,7 @@ mod tests {
             "origin=http://git.internal/org/repo.git,\
              upstream=http://git.internal/org/other.git",
             "",
-            "origin=ORIGIN_TOKEN,upstream=UPSTREAM_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN,upstream=SANDBOX_GIT_TOKEN_UPSTREAM",
         )
         .unwrap()
         .unwrap();
@@ -3468,7 +3526,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(grant.credentials.len(), 1);
-        assert_eq!(grant.credentials[0].secret_env, "UPSTREAM_TOKEN");
+        assert_eq!(
+            grant.credentials[0].secret_env,
+            "SANDBOX_GIT_TOKEN_UPSTREAM"
+        );
     }
 
     #[test]
@@ -3588,6 +3649,12 @@ mod tests {
             "bash -cex 'git fetch upstream'",
             "bash -ec 'git fetch upstream'",
             "bash -c -e -- 'git fetch upstream'",
+            // WI#876: a lone `-` ends option processing like `--`, so the
+            // word after it is the script. It used to be scanned as the body
+            // itself and the real script was never read.
+            "bash -c - 'git push origin main'",
+            "sh -c - 'git push origin main'",
+            "bash -ce - 'git push origin main'",
             "bash '-cprintf fixture'",
             // An unknown leading word with git in its tail: the scan could
             // not tell an argument from the command a wrapper runs.
@@ -3790,6 +3857,9 @@ mod tests {
             "bash -cex 'git status'",
             "bash -ec 'git status'",
             "sh -ce 'git status'",
+            "bash -c - 'git status'",
+            "sh -c - 'git status'",
+            "bash -ce - 'git status'",
             "grep git README",
             "which git",
             "ps aux | grep bash",
@@ -4491,7 +4561,7 @@ mod tests {
         let host = GitGrantConfig::from_full_spec(
             "origin=http://git.internal/org/repo.git",
             "",
-            "origin=GIT_ORIGIN_TOKEN",
+            "origin=SANDBOX_GIT_TOKEN_ORIGIN",
         )
         .expect("credential grant")
         .expect("grant");
@@ -4501,7 +4571,7 @@ mod tests {
         // The proxy mapping names the daemon variable, never its value.
         let mappings = grant.proxy_credentials();
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].secret_name, "GIT_ORIGIN_TOKEN");
+        assert_eq!(mappings[0].secret_name, "SANDBOX_GIT_TOKEN_ORIGIN");
 
         // Nothing the container sees holds the secret.
         let mut container_visible = grant.container_env();
@@ -4511,14 +4581,14 @@ mod tests {
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join("\n");
-        for needle in [SECRET, "GIT_ORIGIN_TOKEN"] {
+        for needle in [SECRET, "SANDBOX_GIT_TOKEN_ORIGIN"] {
             assert!(
                 !joined.contains(needle),
                 "container env leaked {needle}: {joined}"
             );
         }
         let evidence = serde_json::to_string(&grant.evidence()).expect("evidence");
-        assert!(evidence.contains("GIT_ORIGIN_TOKEN"), "{evidence}");
+        assert!(evidence.contains("SANDBOX_GIT_TOKEN_ORIGIN"), "{evidence}");
         assert!(!evidence.contains(SECRET), "{evidence}");
 
         // A real clone of the real local remote still works from the same

@@ -963,12 +963,15 @@ for read grants, protected branches (no force push).
 
 `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a
 granted `http://` remote to a daemon environment variable holding the
-`Authorization` header value. The per-call proxy resolves it and injects the
-header host-side, so the credential never enters the container — not in its
-environment, files, arguments, process listings or output, and there is no
-helper socket to query. The header goes only to the bound repository's own
-smart-HTTP endpoints (exact host, port, path and method), never to another
-repository or API path on the same host. Only plain `http://` can be bound
+`Authorization` header value. The name must be a dedicated
+`SANDBOX_GIT_TOKEN_*` one (WI#876): any other daemon variable is a load
+error, so a binding cannot ship an unrelated secret to that remote. The
+per-call proxy resolves it and injects the header host-side, so the credential
+never enters the container — not in its environment, files, arguments,
+process listings or output, and there is no helper socket to query. The
+header goes only to the bound repository's own smart-HTTP endpoints (exact
+host, port, path and method), never to another repository or API path on the
+same host. Only plain `http://` can be bound
 (HTTPS travels in an opaque CONNECT tunnel); an `https://` binding is a load
 error. The hop is plain HTTP, so it belongs on a trusted network or an
 encrypted overlay. A binding is applied only when its remote

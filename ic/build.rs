@@ -231,7 +231,16 @@ fn embed_build_identity(root: &Path) {
 ///
 /// `.git/HEAD` alone is not enough: on a branch it only holds
 /// `ref: refs/heads/<branch>`, which does not change when the branch tip
-/// advances — the loose ref (or `packed-refs`) does.
+/// advances — the loose ref (or `packed-refs`) does. Those two paths are also
+/// the ones that go stale (WI#876): in a worktree `--absolute-git-dir` is the
+/// per-worktree directory while the ref and `packed-refs` live in the common
+/// directory, and after `git gc` the loose ref does not exist at build time so
+/// it is not watched when a later move creates it.
+///
+/// `<git-dir>/logs/HEAD` is written on every HEAD move, in a clone and in a
+/// worktree, and is per-worktree, so watching it covers both cases. It is
+/// resolved with `--git-path` (worktree-aware) and may not exist yet: cargo
+/// accepts a watched path that appears later.
 fn watch_git_head(root: &Path) {
     let Some(git_dir) = git(root, &["rev-parse", "--absolute-git-dir"]) else {
         return;
@@ -242,6 +251,14 @@ fn watch_git_head(root: &Path) {
         .filter(|reference| !reference.is_empty())
     {
         watched.push(git_dir.join(reference));
+    }
+    if let Some(head_log) = git(root, &["rev-parse", "--git-path", "logs/HEAD"]) {
+        let head_log = PathBuf::from(head_log);
+        watched.push(if head_log.is_absolute() {
+            head_log
+        } else {
+            root.join(head_log)
+        });
     }
     for path in watched.iter().filter(|path| path.exists()) {
         println!("cargo:rerun-if-changed={}", path.display());

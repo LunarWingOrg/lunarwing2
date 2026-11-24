@@ -894,6 +894,14 @@ function interpreterValueOptions(name) {
  * walked rather than matched by one regex (WI#832), and an option that takes
  * a separate value is stepped over whole so its value cannot end the walk
  * before the flag (WI#869).
+ *
+ * The walk is fail-closed (WI#876): a word the table does not name does not
+ * end it. An unlisted option with a separate value (`node --env-file /dev/null
+ * -e …`, `node --disable-warning X -e …`, `python3 --check-hash-based-pycs
+ * always -c …`) used to put its value where the walk expected the flag, so the
+ * code was never read. Reading a positional word as if a later flag were the
+ * interpreter's own can only add denials, which is the accepted cost; missing
+ * the flag is not.
  */
 function oneLinerCode(rest, name) {
   const values = interpreterValueOptions(name);
@@ -912,7 +920,6 @@ function oneLinerCode(rest, name) {
       while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
       continue;
     }
-    if (!word.startsWith("-")) return null;
   }
   return null;
 }

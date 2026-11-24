@@ -1445,7 +1445,7 @@ mod tests {
             )
         };
         unsafe { std::env::set_var("SANDBOX_GIT_WRITE_REMOTES", "origin") };
-        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "origin=GIT_ORIGIN_TOKEN") };
+        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "origin=SANDBOX_GIT_TOKEN_ORIGIN") };
 
         let cfg = SandboxModeConfig::resolve(&settings).expect("resolve write grant");
         let grant = cfg.git.as_ref().expect("grant");
@@ -1466,10 +1466,15 @@ mod tests {
                 .write
         );
         assert_eq!(grant.credentials.len(), 1);
-        assert_eq!(grant.credentials[0].secret_env, "GIT_ORIGIN_TOKEN");
+        assert_eq!(grant.credentials[0].secret_env, "SANDBOX_GIT_TOKEN_ORIGIN");
 
         // An https binding cannot be injected through a CONNECT tunnel.
-        unsafe { std::env::set_var("SANDBOX_GIT_CREDENTIALS", "upstream=GIT_TOKEN") };
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_CREDENTIALS",
+                "upstream=SANDBOX_GIT_TOKEN_UPSTREAM",
+            )
+        };
         match SandboxModeConfig::resolve(&settings) {
             Err(ConfigError::InvalidValue { key, .. }) => {
                 assert_eq!(key, "SANDBOX_GIT_REMOTES")

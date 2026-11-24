@@ -678,16 +678,19 @@ re-render, together with each daemon variable a credential binding names:
 ```bash
 SANDBOX_GIT_REMOTES=origin=http://git.lan:3000/org/repo.git  # name=url[,name=url...]
 SANDBOX_GIT_WRITE_REMOTES=origin          # names from SANDBOX_GIT_REMOTES that may push
-SANDBOX_GIT_CREDENTIALS=origin=GIT_ORIGIN_TOKEN  # remote=VARIABLE; http:// remotes only
+SANDBOX_GIT_CREDENTIALS=origin=SANDBOX_GIT_TOKEN_ORIGIN  # remote=VARIABLE; http:// remotes only
 SANDBOX_GIT_PRIVATE_REMOTES=origin        # IP-literal LAN/overlay remotes the git proxy may reach (WI#875)
-GIT_ORIGIN_TOKEN="Basic <base64 user:token>"     # the Authorization header value; a secret
+SANDBOX_GIT_TOKEN_ORIGIN="Basic <base64 user:token>"  # the Authorization header value; a secret
 ```
 
 The per-call proxy adds the bound header host-side, only to that repository's
 own smart-HTTP endpoints. It forwards a push only to a write-granted remote
 and refuses every ref deletion; protect branches on the forge against force
-pushes. A binding's variable is carried on re-render only when its name is a
-plain environment name and the variable is set; a variable the renderer writes
+pushes. A binding's variable must be named `SANDBOX_GIT_TOKEN_*` (WI#876):
+the daemon refuses any other name at load, so a binding cannot send an
+unrelated daemon variable such as `LLM_API_KEY` as the remote's
+`Authorization` header, and mt-admin carries only names in that shape on
+re-render. The variable must also be set; a variable the renderer writes
 itself (for example `LLM_MODEL`) keeps its rendered line.
 
 `SANDBOX_GIT_PRIVATE_REMOTES` names granted remotes whose URL host is a LAN

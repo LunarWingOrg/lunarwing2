@@ -215,6 +215,11 @@ SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
 remote to a daemon environment variable. The value is the literal
 `Authorization` header value (for example `Basic <base64>` or `Bearer <token>`).
 
+- **The variable name is dedicated (WI#876).** It must be
+  `SANDBOX_GIT_TOKEN_<NAME>`; any other daemon variable — `LLM_API_KEY`,
+  `DATABASE_URL`, or a plain `GIT_ORIGIN_TOKEN` — is a load error, so a
+  binding cannot ship an unrelated secret to that remote.
+
 - **The credential stays host-side.** The per-call egress proxy resolves
   `ENV_NAME` and adds the header to the outgoing request. The container never
   receives it: not in its environment, files, command arguments, process
