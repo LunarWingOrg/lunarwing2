@@ -2451,22 +2451,28 @@ fn authorize_shell_bodies(
 
 /// The shell script `git submodule foreach` builds from its operand tail.
 ///
-/// The first operand is the script. Later operands are not quoted into it:
-/// git runs `sh -c '<first> "$@"' <first> <later>…`, so they reach the shell
-/// as the positional parameters `$1`, `$2`, … of the first operand, appended
-/// as `"$@"`. Verified against git 2.56.1: `foreach 'printf "[%s]" "$#" "$@";
+/// With several operands git does one of two things (git 2.56.1, read from
+/// `GIT_TRACE`). When the first operand has no shell metacharacter, it starts
+/// the words directly: `foreach printf '<%s>' 'a b' c` starts `printf` with
+/// three arguments. When it has one (a space counts), it runs `sh -c '<first>
+/// "$@"' <first> <later>…`: the later operands are not quoted into the
+/// script, they are the positional parameters `$1`, `$2`, … of the first
+/// operand, with `"$@"` joined to its end. `foreach 'printf "[%s]" "$#" "$@";
 /// echo; :' a 'b c'` prints `[2][a][b c]`, and `foreach '"$@" #' printf
 /// '<%s>' ran` prints `<ran>` (WI#880).
 ///
-/// The model below appends each later operand as one quoted word, which is
-/// what the trailing `"$@"` expands to. A first operand that expands a
-/// parameter itself (`"$@" #`, `eval "$*"`, `$1 $2`) can run the later
-/// operands somewhere else, where this model would read a comment or an
-/// argument. So when later operands are present, a `$` or a backtick in the
-/// first operand makes the script dynamic, and `scan_shell_body` refuses it.
-/// Git sets none of `$name`, `$sm_path` or `$toplevel` in that form
-/// (`foreach 'echo name=$name' extra` prints `name=`), so no documented use
-/// is lost.
+/// The model below appends each later operand as one quoted word. That is
+/// what both forms run as long as the first operand ends where a word may
+/// follow; where it ends inside a quote the shell stops with a syntax error,
+/// and after a `#` the shell and the model both read a comment. A first
+/// operand that expands a parameter itself (`"$@" #`, `eval "$*"`, `$1 $2`)
+/// can run the later operands somewhere else, where the model would read a
+/// comment or an argument. So when later operands are present, a `$` or a
+/// backtick in the first operand makes the script dynamic, and
+/// `scan_shell_body` refuses it. Git sets none of its own variables (`$name`,
+/// `$sm_path`, `$displaypath`, `$sha1`, `$toplevel`) in that form: `foreach
+/// 'echo name=$name' extra` prints `name= extra`. `git help submodule`
+/// documents one command operand, so no documented use is lost.
 fn foreach_script(tail: &[&Word]) -> Option<Word> {
     let (command, rest) = tail.split_first()?;
     let mut script = (*command).clone();
@@ -2481,8 +2487,9 @@ fn foreach_script(tail: &[&Word]) -> Option<Word> {
     Some(script)
 }
 
-/// `git submodule foreach` runs its whole operand tail through a shell.
-/// Reading only the first word left `foreach sh -c '<body>'` unscanned.
+/// `git submodule foreach` runs its whole operand tail, directly or through
+/// a shell. Reading only the first word left `foreach sh -c '<body>'`
+/// unscanned.
 fn authorize_submodule_foreach(
     operands: &[Word],
     preflight: Preflight<'_>,
@@ -4073,9 +4080,26 @@ mod tests {
         ] {
             check_granted(command, &write).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
+        // A first operand that ends with a command word, and has no `$`,
+        // runs the later operands as that command's words; the appended
+        // model reads the same thing. Real git 2.56.1 ran each shape with
+        // harmless words.
+        for command in [
+            "git submodule foreach 'exec ' git push -f origin master",
+            "git submodule foreach 'command ' git push -f origin master",
+            "git submodule foreach 'true; ' git push -f origin master",
+            "git submodule foreach 'eval ' git push -f origin master",
+        ] {
+            let error = check_granted(command, &write).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
         // Later operands are the positional parameters of the first, so a
         // first operand that expands one can run them where the appended
-        // model reads a comment. Real git 2.56.1 ran each of these shapes.
+        // model reads a comment. Real git 2.56.1 ran the first seven shapes
+        // with harmless words (review note 22474 on !2737).
         for command in [
             r#"git submodule foreach '"$@" #' git push -f origin master"#,
             r#"git submodule foreach '"$@";:' git push -f origin master"#,

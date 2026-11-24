@@ -283,13 +283,15 @@ single command. Dynamic expansions and invalid split strings are refused.
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
 operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
 `submodule foreach` and `bisect run` bodies. `submodule foreach` is read as
-the whole operand tail: git runs the first operand as the script and hands
-every later operand to it as a positional parameter, appended as `"$@"`, so
-`foreach sh -c '<body>'` is scanned too, not just a single quoted body. When
-later operands are present, a first operand that contains `$` or a backtick
-is refused as dynamic, because it could run those operands where the scan
-does not read them (`foreach '"$@" #' git push -f …`); with one operand,
-`foreach 'echo $name'` stays an ordinary body. `rebase` exec is read from the
+the whole operand tail, because the later operands are part of what runs:
+git starts the words directly (`foreach sh -c '<body>'`), or, when the first
+operand has a shell metacharacter, runs it as a script with the later
+operands as positional parameters, `"$@"` joined to its end. So a tail is
+scanned too, not just a single quoted body. When later operands are present,
+a first operand that contains `$` or a backtick is refused as dynamic,
+because it could run those operands where the scan does not read them
+(`foreach '"$@" #' git push -f …`); with one operand, `foreach 'echo $name'`
+stays an ordinary body. `rebase` exec is read from the
 short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
 `-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
 their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
