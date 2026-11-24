@@ -2285,61 +2285,27 @@ status_tenant() {
     say "Nanocode (retired): no container in active runtime store"
   fi
 
-  local pebble_container="lunarwing-pebble-$name"
-  if _ctr_inspect "$name" -f '{{.State.Running}}' "$pebble_container" 2>/dev/null | grep -q true; then
-    say "Pebble worker: running ($pebble_container, WSS port $(ports_get "$name" pebble_wss))"
-  elif _ctr_inspect "$name" "$pebble_container" &>/dev/null; then
-    say "Pebble worker: stopped ($pebble_container)"
-  else
-    say "Pebble worker: not created"
-  fi
-
-  local opencode_container="lunarwing-opencode-$name"
-  if _ctr_inspect "$name" -f '{{.State.Running}}' "$opencode_container" 2>/dev/null | grep -q true; then
-    say "OpenCode worker: running ($opencode_container, WSS port $(ports_get "$name" opencode_wss))"
-  elif _ctr_inspect "$name" "$opencode_container" &>/dev/null; then
-    say "OpenCode worker: stopped ($opencode_container)"
-  else
-    say "OpenCode worker: not created"
-  fi
-
-  local opencode2_container="lunarwing-opencode2-$name"
-  if _ctr_inspect "$name" -f '{{.State.Running}}' "$opencode2_container" 2>/dev/null | grep -q true; then
-    say "OpenCode 2 worker: running ($opencode2_container, WSS port $(ports_get "$name" opencode2_wss))"
-  elif _ctr_inspect "$name" "$opencode2_container" &>/dev/null; then
-    say "OpenCode 2 worker: stopped ($opencode2_container)"
-  else
-    say "OpenCode 2 worker: not created"
-  fi
-
-  local lunardepth_container="lunarwing-lunardepth-$name"
-  if _ctr_inspect "$name" -f '{{.State.Running}}' "$lunardepth_container" 2>/dev/null | grep -q true; then
-    say "LunarDepth worker: running ($lunardepth_container, WSS port $(ports_get "$name" lunardepth_wss))"
-  elif _ctr_inspect "$name" "$lunardepth_container" &>/dev/null; then
-    say "LunarDepth worker: stopped ($lunardepth_container)"
-  else
-    say "LunarDepth worker: not created"
-  fi
-
-  local kimi_container="lunarwing-kimi-$name"
-  if _ctr_inspect "$name" -f '{{.State.Running}}' "$kimi_container" 2>/dev/null | grep -q true; then
-    say "Kimi worker: running ($kimi_container, WSS port $(ports_get "$name" kimi_wss))"
-  elif _ctr_inspect "$name" "$kimi_container" &>/dev/null; then
-    say "Kimi worker: stopped ($kimi_container)"
-  else
-    say "Kimi worker: not created"
-  fi
+  # WI#882: a running container is not a ready worker. Report the loopback WSS
+  # listener verdict beside each lane so an upgrade that left a worker dead on
+  # its socket is visible in `status` instead of only on the next dispatch.
+  status_worker_line "$name" pebble "Pebble worker" pebble_wss
+  status_worker_line "$name" opencode "OpenCode worker" opencode_wss
+  status_worker_line "$name" opencode2 "OpenCode 2 worker" opencode2_wss
+  status_worker_line "$name" lunardepth "LunarDepth worker" lunardepth_wss
+  status_worker_line "$name" kimi "Kimi worker" kimi_wss
 
   # Image presence in the tenant's own store (WI#271): a running/stopped
   # container says nothing about whether the image survived — it only matters
   # at (re)creation time, which is exactly when its absence strands a worker.
+  # WI#882: a present image also reports its revision, so an upgrade that left
+  # a lane on the previous worker build is visible without inspecting by hand.
   say "Worker images:"
   local img_lane img_ref
   while read -r img_lane img_ref; do
     if ! tenant_worker_enabled "$name" "$img_lane"; then
       say "  $img_ref: not selected for tenant"
     elif _ctr "$name" image inspect "$img_ref" &>/dev/null; then
-      say "  $img_ref: present"
+      say "  $img_ref: present (revision $(worker_image_revision "$name" "$img_ref"))"
     else
       say "  $img_ref: missing"
     fi

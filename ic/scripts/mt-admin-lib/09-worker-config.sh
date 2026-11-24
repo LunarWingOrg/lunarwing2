@@ -41,6 +41,57 @@ worker_quadlet_start_failed() {  # <tenant> <service> <lane>
   say "WARNING: $lane worker never reached its listener; dispatch will fail with Connection refused until '$service' starts. Inspect: podman logs lunarwing-${lane}-${name}" >&2
 }
 
+# WI#882: `.State.Running` says nothing about whether the lane's bridge ever
+# bound its WSS port. Kageho's 2.2.1.0 upgrade finished with both configured
+# workers refusing loopback connections while `status` printed "running" for
+# each and the only host-side listener audit was the WI#357 exposure scan. Probe
+# the published loopback port the way the daemon dials it, so a dead lane is
+# visible without a dispatch failure. Empty/absent port (no registry slot) is
+# reported rather than silently treated as healthy.
+worker_wss_readiness() {  # <port>; prints "listening" or a dead/unknown reason
+  local port="${1:-}"
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    printf 'unknown (no WSS port allocated)'
+    return 0
+  fi
+  if _port_in_use "$port"; then
+    printf 'listening'
+  else
+    printf 'dead (no listener on 127.0.0.1)'
+  fi
+}
+
+# WI#882: the effective worker image revision (the pin baked into the image),
+# so `status` records which worker build a lane actually runs. Never a
+# credential; the revision label is a commit id or a release tag.
+worker_image_revision() {  # <tenant> <image ref>
+  local name="$1" image="$2" revision
+  revision="$(_ctr "$name" image inspect \
+    --format '{{index .Labels "org.opencontainers.image.revision"}}' \
+    "$image" 2>/dev/null || true)"
+  revision="${revision//$'\n'/ }"
+  case "$revision" in
+    ""|"<no value>") printf 'unknown' ;;
+    *) printf '%s' "$(sanitize_display_value "$revision" 40)" ;;
+  esac
+}
+
+# WI#882: one status line per worker lane, carrying both the container state
+# and the loopback WSS listener verdict. The "running (...)" prefix is kept
+# because lunarwing_mt_onboard's verifier reads the first word of this line.
+status_worker_line() {  # <tenant> <lane> <label> <wss port slot>
+  local name="$1" lane="$2" label="$3" slot="$4"
+  local container="lunarwing-${lane}-${name}" port
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null | grep -q true; then
+    port="$(ports_get "$name" "$slot" 2>/dev/null || true)"
+    say "$label: running ($container, WSS port ${port:-none}: $(worker_wss_readiness "$port"))"
+  elif _ctr_inspect "$name" "$container" &>/dev/null; then
+    say "$label: stopped ($container)"
+  else
+    say "$label: not created"
+  fi
+}
+
 worker_task_health_command() {
   case "$1" in
     kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \
