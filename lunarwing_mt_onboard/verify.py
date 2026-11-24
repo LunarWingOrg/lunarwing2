@@ -38,7 +38,8 @@ _WORKER_LABELS = {
 }
 
 # WI#882: the WSS readiness verdict `mt-admin status` appends to a running
-# worker line. Only the dead form matters here; `listening` and
+# worker line. Only the dead forms matter here (refused, or accepted and
+# dropped: both start with `dead`); `listening` and
 # `unknown (no WSS port allocated)` both stay green, the latter because a lane
 # with no allocated slot is a configuration choice, not a failed lane.
 _WSS_DEAD_RE = re.compile(r"WSS port [^:]*: dead\b")
@@ -147,8 +148,8 @@ def check_tenant_status(
         running = bool(match and state.split() and state.split()[0] == "running")
         # WI#882: `mt-admin status` reports the lane's published WSS port
         # verdict beside the container state. A running container whose port
-        # refuses a loopback dial is the Kageho 2.2.1.0 failure — the
-        # container is up, dispatch still fails with ECONNREFUSED.
+        # refuses a loopback connection, or accepts it and drops it at once,
+        # cannot take a job whatever `.State.Running` says.
         if running and _WSS_DEAD_RE.search(state):
             running = False
         results.append(CheckResult(container_label, running, state))

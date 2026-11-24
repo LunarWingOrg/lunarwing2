@@ -1471,29 +1471,58 @@ Enforced controls (opencode2 lane unless noted):
    binds, all mappings host-loopback only.
 
 10. **Lane readiness and first-failure evidence (WI#882).** A running worker
-   container is not a ready worker: after Kageho's 2.2.1.0 upgrade both
-   configured lanes had `.State.Running` containers that refused every
-   loopback connection, `status` printed "running" for each, and the only
-   host-side listener audit was the exposure scan above. `mt-admin status
-   <tenant>` now prints each lane's published WSS port with a
-   `listening` / `dead (no listener on 127.0.0.1)` / `unknown (no WSS port
-   allocated)` verdict, reports each present worker image's
-   `org.opencontainers.image.revision`, and cross-checks the registry's
-   enabled lanes against the tenant's `config.toml`
-   `[[sandbox.external_workers]]` entries (a lane enabled in the registry but
-   absent from the config is unreachable no matter how healthy its container
-   looks). `mt-admin worker-readiness <tenant>` is the strict gate — exit
-   non-zero when any enabled lane's port refuses a loopback dial, polling for
-   `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one probe).
-   `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
-   container state plus a bounded tail of its bridge and task container logs
-   — the first-failure evidence that was previously only reachable by a
-   hand-run `podman logs` on the host. Each line is redacted, best effort
-   (token, key, secret and password values, bearer and cookie headers, URL
-   user parts, strings with a known secret prefix); it is a pattern filter,
-   not a guarantee, so read the output before pasting it anywhere public. Start and upgrade log a
-   readiness warning for a dead lane but stay green (the container start
-   already succeeded); the strict gate is the separate verb.
+    container is not a ready worker, and a published port that accepts a
+    connection is not one either. WI#882 reports two configured lanes that the
+    daemon's probe could not reach after an upgrade; the host was not
+    inspected, so the lanes' container states are not known (see
+    `WI882_KAGEHO_WORKER_READINESS.md`). Before that item `status` printed
+    "running" from `.State.Running` alone, and the only host-side listener
+    audit was the exposure scan above. `mt-admin status <tenant>` now prints
+    a verdict beside each running lane's published WSS port:
+
+    - `listening` — the port accepted a loopback connection and kept it open
+      for a second (or answered). Something behind the published port holds
+      connections. It does not show that the bridge completes the handshake
+      or that a job can connect; the daemon's own probe, a full WebSocket
+      handshake whose result is in the daemon log, is the stronger check.
+    - `dead (no listener on 127.0.0.1)` — the connection was refused. On a
+      rootless host that means no forwarder holds the port: the container is
+      not running, or it publishes another port than the registry names.
+    - `dead (accepted on 127.0.0.1 and dropped at once, ...)` — the forwarder
+      of a running container accepted and nothing inside listens. Rootless
+      podman's forwarder accepts for as long as the container runs, so a
+      plain connect cannot tell this case from a healthy lane; the probe
+      therefore waits for the connection to stay open.
+    - `unknown (no WSS port allocated)` — the registry has no port for the
+      lane.
+
+    `status` also reports each present worker image's
+    `org.opencontainers.image.revision`, and cross-checks the registry's
+    enabled lanes against the tenant's `config.toml`
+    `[[sandbox.external_workers]]` entries (a lane enabled in the registry but
+    absent from the config is unreachable no matter how healthy its container
+    looks). The config is read through the tenant account; a path that is a
+    link or not a regular file is reported as unreadable.
+
+    `mt-admin worker-readiness <tenant>` is the strict gate — exit non-zero
+    when any enabled lane's port refuses or drops a loopback connection,
+    polling for `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one
+    probe). Exit 0 means that every enabled lane's port kept a connection
+    open, not that a job can connect.
+
+    `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
+    container state plus a bounded tail of its bridge and task container logs
+    — the first-failure evidence that was previously only reachable by a
+    hand-run `podman logs` on the host. Each line is redacted, best effort
+    (token, key, secret and password values, bearer and cookie headers, URL
+    user parts, strings with a known secret prefix); it is a pattern filter,
+    not a guarantee, so read the output before pasting it anywhere public.
+
+    Start and upgrade log a readiness warning for a dead lane but stay green
+    (the container start already succeeded); the strict gate is the separate
+    verb. A dial to `127.0.0.1` from inside a sandbox container reaches the
+    sandbox's own loopback, never the host port, so it says nothing about a
+    lane: use these verbs on the host, or the daemon's probe lines.
 
 **!1570 deployment note:** rebuild the worker image and recreate existing
 opencode2 containers through mt-admin to receive the protected boot files.

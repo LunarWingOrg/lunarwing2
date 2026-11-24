@@ -154,8 +154,8 @@ class RuntimeVerificationTests(unittest.TestCase):
         self.assertFalse(checks[-1].ok)
 
     def test_running_worker_with_a_dead_wss_port_is_rejected(self):
-        # WI#882: the Kageho 2.2.1.0 shape — the container is running, the
-        # socket refuses. A "running" first word must not hide it.
+        # WI#882: the container is running and its port refuses. A "running"
+        # first word must not hide it.
         text = SYSTEMD_STATUS + (
             "Pebble worker: running (lunarwing-pebble-lunarium, "
             "WSS port 20011: dead (no listener on 127.0.0.1))\n"
@@ -163,6 +163,19 @@ class RuntimeVerificationTests(unittest.TestCase):
         checks = self.checks(text, workers=("pebble",))
         self.assertFalse(checks[-1].ok)
         self.assertIn("dead", checks[-1].detail)
+
+    def test_running_worker_whose_port_accepts_and_drops_is_rejected(self):
+        # The rootless case: podman's forwarder accepts while the container
+        # runs, and nothing inside listens. mt-admin reports it as dead with
+        # its own reason, and the verifier must reject that form too.
+        text = SYSTEMD_STATUS + (
+            "Pebble worker: running (lunarwing-pebble-lunarium, "
+            "WSS port 20011: dead (accepted on 127.0.0.1 and dropped at once, "
+            "nothing answers behind the published port))\n"
+        )
+        checks = self.checks(text, workers=("pebble",))
+        self.assertFalse(checks[-1].ok)
+        self.assertIn("dropped", checks[-1].detail)
 
     def test_running_worker_listening_on_its_wss_port_is_accepted(self):
         text = SYSTEMD_STATUS + (
