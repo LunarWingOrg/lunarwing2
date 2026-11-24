@@ -3324,7 +3324,6 @@ mod tests {
             "git rebase -ix'git push origin HEAD' HEAD~1",
             "git rebase -nx 'git fetch upstream' HEAD~1",
             "git rebase -fx 'git send-pack /workspace/remotes/origin.git HEAD:x' HEAD~1",
-            "git rebase -ixv 'v' HEAD~1",
             "git submodule foreach 'git push origin main'",
             "git submodule foreach 'git fetch upstream'",
             "git submodule foreach --recursive 'git fetch upstream'",
@@ -3383,6 +3382,9 @@ mod tests {
             "git rebase -Xx theirs HEAD~1",
             "git rebase -C3 HEAD~1",
             "git rebase -r HEAD~1",
+            // Real git makes the attached `v` the body, not the next word;
+            // `v` mentions no git, so this stays accepted.
+            "git rebase -ixv 'git push origin HEAD' HEAD~1",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
