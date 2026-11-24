@@ -226,6 +226,9 @@ pub fn print_boot_screen(info: &BootInfo) {
     // Sandbox / runtime
     if info.sandbox_enabled {
         tags.push(sandbox_tag(info.sandbox_runtime));
+        if let Some(tag) = full_job_tag(info.sandbox_runtime, info.docker_status) {
+            tags.push(tag.to_string());
+        }
     }
 
     // Embeddings
@@ -289,10 +292,34 @@ fn sandbox_tag(runtime: Option<crate::sandbox::ContainerRuntime>) -> String {
     }
 }
 
+/// The full-job tag for the boot screen (WI#876): present only when the
+/// sandbox runtime is usable and the Docker-compatible API is not, so a
+/// podman-only host says worker containers are unavailable without the words
+/// "sandbox disabled".
+fn full_job_tag(
+    runtime: Option<crate::sandbox::ContainerRuntime>,
+    docker_status: crate::sandbox::DockerStatus,
+) -> Option<&'static str> {
+    (runtime.is_some() && !docker_status.is_ok()).then_some("full-job:unavail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::detect::DockerStatus;
+
+    /// WI#876: the same warning reaches the channel from the detection.
+    fn full_job_warning(
+        runtime: Option<crate::sandbox::ContainerRuntime>,
+        docker_status: DockerStatus,
+    ) -> Option<String> {
+        crate::sandbox::detect::SandboxRuntimeDetection {
+            runtime,
+            configured: crate::sandbox::SandboxRuntime::Auto,
+            tried: Vec::new(),
+        }
+        .full_job_warning(docker_status)
+    }
 
     #[test]
     fn sandbox_tag_names_the_selected_runtime() {
@@ -305,6 +332,65 @@ mod tests {
             "sandbox:docker"
         );
         assert_eq!(sandbox_tag(None), "sandbox:unavail");
+    }
+
+    /// WI#876: a podman host with no Docker-compatible API keeps its
+    /// `sandbox:podman` tag and gains a separate full-job tag. A podman host
+    /// with the API, and a host with no runtime at all, gain nothing.
+    #[test]
+    fn full_job_tag_names_unavailable_worker_containers() {
+        let podman = Some(crate::sandbox::ContainerRuntime::Podman);
+        assert_eq!(
+            full_job_tag(podman, DockerStatus::NotRunning),
+            Some("full-job:unavail")
+        );
+        assert_eq!(
+            full_job_tag(podman, DockerStatus::NotInstalled),
+            Some("full-job:unavail")
+        );
+        assert_eq!(full_job_tag(podman, DockerStatus::Available), None);
+        assert_eq!(
+            full_job_tag(
+                Some(crate::sandbox::ContainerRuntime::Docker),
+                DockerStatus::Available
+            ),
+            None
+        );
+        // No runtime at all is the `sandbox:unavail` case, not this one.
+        assert_eq!(full_job_tag(None, DockerStatus::NotRunning), None);
+    }
+
+    /// WI#876: the podman-without-an-API boot screen shows both the runtime
+    /// and the full-job tag, and never says the sandbox is disabled.
+    #[test]
+    fn boot_screen_separates_the_sandbox_from_full_job_containers() {
+        let podman_without_api = full_job_warning(
+            Some(crate::sandbox::ContainerRuntime::Podman),
+            DockerStatus::NotRunning,
+        );
+        let podman_without_api = podman_without_api.expect("a warning for podman without an API");
+        assert!(
+            podman_without_api.contains("full-job"),
+            "{podman_without_api}"
+        );
+        assert!(
+            podman_without_api.contains("podman"),
+            "{podman_without_api}"
+        );
+        assert!(
+            !podman_without_api.contains("sandbox disabled"),
+            "{podman_without_api}"
+        );
+        // Podman with an API is fully healthy.
+        assert_eq!(
+            full_job_warning(
+                Some(crate::sandbox::ContainerRuntime::Podman),
+                DockerStatus::Available
+            ),
+            None
+        );
+        // Nothing usable is the sandbox-unavailable warning's job.
+        assert_eq!(full_job_warning(None, DockerStatus::NotRunning), None);
     }
 
     #[test]

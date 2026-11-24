@@ -95,6 +95,10 @@ pub struct OrchestratorSetup {
     /// Runtime CLI selected for the generic sandbox (WI#871). `None` when the
     /// sandbox is disabled or no runtime in the probe order is usable.
     pub sandbox_runtime: Option<crate::sandbox::ContainerRuntime>,
+    /// User-visible warning when the sandbox runtime is usable but full-job
+    /// (worker) containers cannot start (WI#876). `None` when both are fine,
+    /// when the sandbox is disabled, or when no runtime is usable at all.
+    pub full_job_warning: Option<String>,
 }
 
 /// One startup diagnostic for the sandbox runtime (WI#871).
@@ -150,7 +154,7 @@ pub async fn setup_orchestrator(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
     ));
 
-    let (docker_status, sandbox_runtime) = if config.sandbox.enabled {
+    let (docker_status, sandbox_runtime, full_job_warning) = if config.sandbox.enabled {
         let docker = crate::sandbox::check_docker().await;
         // WI#871: select the runtime the generic sandbox will actually drive
         // (podman-first) and name it, instead of reporting Docker's absence as
@@ -158,9 +162,16 @@ pub async fn setup_orchestrator(
         let selection =
             crate::sandbox::check_sandbox_runtime(config.sandbox.resolved_runtime()).await;
         log_sandbox_runtime_diagnostic(&selection, docker.status);
-        (docker.status, selection.runtime)
+        // WI#876: a working sandbox on a host with no Docker-compatible API
+        // still cannot start full-job (worker) containers. That used to be an
+        // info log only, so surface it to the boot screen and the channel.
+        let full_job_warning = selection.full_job_warning(docker.status);
+        if let Some(warning) = &full_job_warning {
+            tracing::warn!("{warning}");
+        }
+        (docker.status, selection.runtime, full_job_warning)
     } else {
-        (crate::sandbox::DockerStatus::Disabled, None)
+        (crate::sandbox::DockerStatus::Disabled, None, None)
     };
 
     // Create broadcast channel for job events (shared by container and external workers).
@@ -258,6 +269,7 @@ pub async fn setup_orchestrator(
         prompt_queue,
         docker_status,
         sandbox_runtime,
+        full_job_warning,
     }
 }
 

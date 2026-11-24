@@ -441,12 +441,15 @@ async fn async_main() -> anyhow::Result<()> {
     let prompt_queue = orch.prompt_queue;
     let docker_status = orch.docker_status;
     let sandbox_runtime = orch.sandbox_runtime;
+    let full_job_warning = orch.full_job_warning;
 
-    // Derive the user-facing warning for channel notification (WI#871).
+    // Derive the user-facing warning for channel notification (WI#871, WI#876).
     //
-    // Only a genuinely unusable sandbox warrants a user-visible warning. A
-    // podman-only host whose Docker is absent has a working sandbox — the
-    // startup log already names the selected runtime — so it stays quiet.
+    // Two distinct failures. A genuinely unusable sandbox warrants the
+    // "no runtime" warning. A podman-only host whose Docker API is absent has
+    // a working sandbox but no way to start full-job (worker) containers, so
+    // it gets the full-job warning instead of staying quiet — the refusal only
+    // appeared at dispatch before (WI#876).
     let docker_user_warning: Option<String> = if !config.sandbox.enabled {
         None
     } else if sandbox_runtime.is_none() {
@@ -461,7 +464,7 @@ async fn async_main() -> anyhow::Result<()> {
              sandboxed commands will fail until one is available. {hint}"
         ))
     } else {
-        None
+        full_job_warning
     };
 
     // ── Channel setup ──────────────────────────────────────────────────
