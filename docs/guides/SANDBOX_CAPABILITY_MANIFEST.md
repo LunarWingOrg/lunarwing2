@@ -238,13 +238,16 @@ processes: for `http://` remotes the per-call proxy enforces write and deletion
 (see the write grant above), and for everything else, and for non-fast-forward
 updates, use server-side permissions and branch protection.
 
+The scan recognizes GNU `env`'s split-string option in its separate, attached,
+and clustered spellings (`-S body`, `-Sbody`, `-iS body`, `--split-string body`,
+`--split-string=body` and the long-option abbreviations). Preflight uses GNU
+`env`'s literal splitting rules, not shell command separators. It appends the
+remaining arguments, rechecks `env`'s options, and inspects the resulting
+single command. Dynamic expansions and invalid split strings are refused.
+
 The scan recognizes common wrappers, grouping prefixes, separate `-c` script
-operands (including `bash -cex 'git status'`), literal `rebase --exec`,
-`submodule foreach` and `bisect run` bodies, and every spelling of `env`'s
-split-string option (`-S body`, `-Sbody`, `-iS body`, `--split-string body`,
-`--split-string=body` and the long-option abbreviations), whose body is
-spliced with the words that follow it and read as the command `env` runs. It
-does not fully model shell
+operands (including `bash -cex 'git status'`), and literal `rebase --exec`,
+`submodule foreach` and `bisect run` bodies. It does not fully model shell
 expansion (including globs, braces and command substitutions), dynamic
 command names, alias or command lookup, text evaluated by commands such as
 `eval` or `trap`, or shell scripts supplied on stdin. Unsupported

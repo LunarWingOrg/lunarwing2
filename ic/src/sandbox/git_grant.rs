@@ -847,10 +847,15 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
                 match c {
                     '"' => quote = None,
                     '\\' => {
-                        if let Some(next) = chars.next()
-                            && next != '\n'
-                        {
-                            current.push(next);
+                        // Bash keeps a backslash before ordinary characters
+                        // in double quotes. A wrapper can interpret it later.
+                        match chars.next() {
+                            Some('\n') | None => {}
+                            Some(next @ ('\\' | '"' | '$' | '`')) => current.push(next),
+                            Some(next) => {
+                                current.push('\\');
+                                current.push(next);
+                            }
                         }
                     }
                     '$' | '`' => {
@@ -1181,6 +1186,70 @@ fn scan_env_short_option(
     Ok(index + 1)
 }
 
+/// Read the literal subset of GNU `env -S` syntax. An env string contributes
+/// arguments to a single invocation, not shell clauses. Refuse any expansion
+/// that would require the env process's runtime environment.
+fn tokenize_env_split_string(input: &str) -> Result<Vec<Word>> {
+    let mut words = Vec::new();
+    let mut current = None::<String>;
+    let mut quote = None;
+    let mut chars = input.chars().peekable();
+    let finish_word = |words: &mut Vec<Word>, current: &mut Option<String>| {
+        if let Some(text) = current.take() {
+            words.push(Word {
+                text,
+                dynamic: false,
+            });
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        let literal = match ch {
+            '\'' | '"' if quote.is_none() || quote == Some(ch) => {
+                quote = if quote.is_none() { Some(ch) } else { None };
+                // Even an empty quoted word is an argument.
+                current.get_or_insert_with(String::new);
+                continue;
+            }
+            ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' if quote.is_none() => {
+                finish_word(&mut words, &mut current);
+                continue;
+            }
+            '#' if current.is_none() => break,
+            '\\' if quote != Some('\'') || matches!(chars.peek(), Some('\\' | '\'')) => {
+                match chars.next() {
+                    Some('_') if quote.is_none() => {
+                        finish_word(&mut words, &mut current);
+                        continue;
+                    }
+                    Some('_') => ' ',
+                    Some('c') if quote.is_none() => break,
+                    Some('f') => '\x0c',
+                    Some('n') => '\n',
+                    Some('r') => '\r',
+                    Some('t') => '\t',
+                    Some('v') => '\x0b',
+                    Some(next @ ('"' | '#' | '$' | '\'' | '\\')) => next,
+                    _ => return Err(denied("invalid env split-string escape")),
+                }
+            }
+            '$' if quote != Some('\'') => {
+                return Err(denied(
+                    "dynamic env split-string expansion cannot be authorized for git network access",
+                ));
+            }
+            '\0' => return Err(denied("NUL byte in env split-string body")),
+            _ => ch,
+        };
+        current.get_or_insert_with(String::new).push(literal);
+    }
+    if quote.is_some() {
+        return Err(denied("unterminated env split-string quote"));
+    }
+    finish_word(&mut words, &mut current);
+    Ok(words)
+}
+
 /// Scan an `env` split-string body spliced with the words that follow it.
 /// `env` splits the body into words, appends the remaining arguments, and
 /// re-reads the result as its own operand list, so a body that carries `env`
@@ -1198,21 +1267,16 @@ fn scan_env_split_body(
     }
     if body.dynamic {
         return Err(denied(
-            "dynamic shell body cannot be authorized for git network access",
+            "dynamic env split-string body cannot be authorized for git network access",
         ));
     }
-    let mut commands = tokenize_simple_commands(&body.text)?;
-    match commands.last_mut() {
-        Some(last) => last.extend_from_slice(tail),
-        None => commands.push(tail.to_vec()),
+    let mut simple = tokenize_env_split_string(&body.text)?;
+    simple.extend_from_slice(tail);
+    let command = scan_env_operands(&simple, 0, preflight, depth + 1)?;
+    if command == simple.len() {
+        return Ok(());
     }
-    for simple in &commands {
-        let command = scan_env_operands(simple, 0, preflight, depth + 1)?;
-        if command < simple.len() {
-            scan_simple_command(&simple[command..], preflight, depth + 1)?;
-        }
-    }
-    Ok(())
+    scan_simple_command(&simple[command..], preflight, depth + 1)
 }
 
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
@@ -3330,6 +3394,91 @@ mod tests {
                 "{command}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn env_split_string_splits_gnu_whitespace_but_not_shell_operators() {
+        for separator in [" ", "\t", "\n", "\r", "\x0b", "\x0c", r"\_"] {
+            // The body contains no real command. All separators form the
+            // same argv, without treating punctuation as shell source.
+            let input = format!("fixture{separator}a;b|c&d(e){separator}last");
+            let words = tokenize_env_split_string(&input).unwrap();
+            let argv: Vec<_> = words.iter().map(|word| word.text.as_str()).collect();
+            assert_eq!(argv, ["fixture", "a;b|c&d(e)", "last"], "{separator:?}");
+            assert!(words.iter().all(|word| !word.dynamic));
+        }
+        let words = tokenize_env_split_string("one\u{a0}two \"a\nb\"").unwrap();
+        assert_eq!(
+            words[0].text, "one\u{a0}two",
+            "only ASCII whitespace splits"
+        );
+        assert_eq!(words[1].text, "a\nb", "quoted whitespace stays in the word");
+    }
+
+    #[test]
+    fn env_split_string_preserves_literal_quotes_escapes_and_comments() {
+        let words = tokenize_env_split_string(
+            r#"fixture "" 'a\_b' "a\_b" 'can\'t' 'back\\slash' \#word mid#word \${NAME} # ignored"#,
+        )
+        .unwrap();
+        let argv: Vec<_> = words.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(
+            argv,
+            [
+                "fixture",
+                "",
+                r"a\_b",
+                "a b",
+                "can't",
+                r"back\slash",
+                "#word",
+                "mid#word",
+                "${NAME}",
+            ]
+        );
+        let words = tokenize_env_split_string(r#"fixture v\f\n\r\t\v\c ignored "#).unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].text, "v\x0c\n\r\t\x0b");
+    }
+
+    #[test]
+    fn env_split_string_refuses_invalid_and_dynamic_bodies() {
+        for body in [
+            r#"fixture "\c""#,
+            r"fixture \q",
+            r"fixture \",
+            "fixture 'unterminated",
+            "fixture ${NAME}",
+            r#"fixture "${NAME}""#,
+        ] {
+            let error = tokenize_env_split_string(body).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{body}: {error}"
+            );
+        }
+        let words = tokenize_env_split_string("fixture '${NAME}'").unwrap();
+        assert_eq!(words[1].text, "${NAME}");
+    }
+
+    #[test]
+    fn env_split_string_preserves_read_remote_checks_across_separators() {
+        let (_temp, grant) = workspace_with_remote();
+        for separator in ["\n", "\x0b", "\x0c", r"\_"] {
+            for quote in ['\'', '"'] {
+                // Only static authorization runs; no fetch is executed.
+                let allowed = format!("env -S {quote}git{separator}fetch{quote} origin");
+                check_granted(&allowed, &grant).unwrap();
+
+                let denied = format!("env -S {quote}git{separator}fetch{quote} unlisted");
+                let error = check_granted(&denied, &grant).unwrap_err();
+                assert!(
+                    matches!(error, SandboxError::CapabilityDenied { .. }),
+                    "{denied:?}: {error}"
+                );
+            }
+        }
+        check_granted("env -S 'git fetch # note\nignored' origin", &grant).unwrap();
     }
 
     /// WI#857: the shells and wrappers must not refuse ordinary commands.
