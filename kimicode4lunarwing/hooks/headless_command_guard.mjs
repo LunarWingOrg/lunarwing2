@@ -1713,21 +1713,57 @@ function stageCommandFrom(words, depth) {
   return { name: commandBasename(words[i] ?? ""), args: words.slice(i + 1), unverifiable: false };
 }
 
-function stageCommand(stage) {
-  return stageCommandFrom(stageWords(stage), 0);
+/**
+ * The words of one pipeline stage, with every `env -S`/`--split-string`
+ * string split into the words env runs (WI#872). A string the hook cannot
+ * read makes the stage unverifiable, which the decode rule treats as a denial
+ * (WI#883). Null when the words cannot be read.
+ */
+function expandStageEnvWords(words, depth) {
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (commandBasename(listenerWord(word)) === "env" && depth < MAX_SHELL_BODY_DEPTH) {
+      const command = envCommandWords(words, i + 1);
+      if (command === null) continue;
+      if (command.unverifiable) return null;
+      if (command.split) {
+        const nested = expandStageEnvWords(command.words, depth + 1);
+        if (nested === null) return null;
+        out.push(word, ...nested);
+        return out;
+      }
+    }
+    out.push(word);
+  }
+  return out;
 }
 
+/** The words of a pipeline stage, or null when an `env -S` string is unreadable. */
+function stagePropertyWords(stage) {
+  return expandStageEnvWords(stageWords(stage), 0);
+}
+
+// The commands that turn an encoded payload back into text (WI#826, WI#832).
+// Only a name in this set is examined, so a stage of ordinary words is read
+// in one pass (WI#883).
+const DECODER_NAMES = new Set([
+  "base64", "xxd", "openssl", "gzip", "gunzip", "zcat", "bzip2", "bzcat",
+  "bunzip2", "xz", "unxz", "xzcat", "zstd", "unzstd", "zstdcat", "printf",
+  "perl", "python", "python3", "tr", "rev",
+]);
+
 /**
- * True for a stage that turns an encoded payload back into text (WI#826,
- * WI#832): `base64 -d`, `xxd -r`, `rev`, a decompressor, `openssl base64 -d`,
+ * True when the word at `index` names a decoder with its decoding option:
+ * `base64 -d`, `xxd -r`, `rev`, a decompressor, `openssl base64 -d`,
  * `perl`/`python` base64 one-liners, `printf` with hex or octal escapes, and
  * `tr` — but only when `tr` deletes nothing, because `tr -d '\r'` normalises
- * text rather than decoding it. A stage the reader could not resolve counts as
- * a decode stage, so an unreadable prefix cannot hide the decoder (WI#885).
+ * text rather than decoding it.
  */
-function isDecodeStage(stage) {
-  const { name, args, unverifiable } = stageCommand(stage);
-  if (unverifiable) return true;
+function decoderAt(words, index) {
+  const name = commandBasename(listenerWord(words[index]));
+  if (!DECODER_NAMES.has(name)) return false;
+  const args = words.slice(index + 1);
   if (name === "base64") return args.some((word) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(word) || word === "--decode");
   if (name === "xxd") return args.some((word) => /^-[a-zA-Z]*r[a-zA-Z]*$/.test(word) || word === "--revert");
   if (name === "openssl") {
@@ -1746,22 +1782,108 @@ function isDecodeStage(stage) {
   return name === "rev";
 }
 
+// Interpreters that run a program read from stdin when they are given no
+// script operand (WI#883). `awk` is the most portable of the set and reads
+// its program from the first operand, so it is walked separately.
+const STDIN_INTERPRETERS = new Set(["perl", "ruby", "node", "python", "python3", "php", "lua", "awk"]);
+
+// The files that name the shell's own stdin: `source /dev/stdin` and
+// `. -` run the decoded text in the current shell (WI#883).
+const STDIN_PROGRAM_FILES = new Set(["/dev/stdin", "-", "/proc/self/fd/0", "/dev/fd/0"]);
+
+// The option that hands an interpreter its program without stdin. `-c` for
+// python is kept as an interpreter reading, as it was before WI#883.
+const INTERPRETER_PROGRAM_FLAG = {
+  perl: /^-[a-zA-Z]*[eE]/,
+  ruby: /^-[a-zA-Z]*e/,
+  node: /^(?:-[a-zA-Z]*[ep]|--eval|--print)(?:$|=)/,
+  python: /^-[a-zA-Z]*c/,
+  python3: /^-[a-zA-Z]*c/,
+  php: /^(?:-[a-zA-Z]*r|--run)(?:$|=)/,
+  lua: /^-[a-zA-Z]*e/,
+};
+
 /**
- * True when the stage executes its stdin: a shell, or an interpreter
- * one-liner. A stage the reader could not resolve counts as an interpreter, so
- * a prefix chain that runs past the depth bound still fails closed (WI#885).
+ * True when an interpreter invocation runs a program it reads from stdin
+ * (WI#883): it names no script operand, or names `-`. An eval flag
+ * (`perl -e`, `node -p`, `python -c`) and python's `-m` supply the program
+ * another way, and a plain operand is a script file.
+ */
+function interpreterStdinProgram(name, rest) {
+  if (name === "awk") return awkStdinProgram(rest);
+  const values = interpreterValueOptions(name);
+  const flag = INTERPRETER_PROGRAM_FLAG[name];
+  let i = 0;
+  while (i < rest.length) {
+    const word = rest[i];
+    if (word === "-") return true;
+    if (word === "--") return (rest[i + 1] ?? "-") === "-";
+    if (!word.startsWith("-")) return false;
+    if (flag !== null && flag !== undefined && flag.test(word)) return true;
+    if ((name === "python" || name === "python3") && (word === "-m" || word === "--module" || /^-m./.test(word))) {
+      return false;
+    }
+    if (values.has(word)) {
+      i += 2;
+      continue;
+    }
+    i++;
+  }
+  return true;
+}
+
+/** awk runs the first non-option operand, and `-f -` names stdin. */
+function awkStdinProgram(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const word = rest[i];
+    if (word === "-f" || word === "--file") return (rest[i + 1] ?? "-") === "-";
+    if (word === "-v" || word === "-F") {
+      i++;
+      continue;
+    }
+    if (word === "-") return true;
+    if (!word.startsWith("-")) return false;
+  }
+  return true;
+}
+
+/**
+ * True when the word at `index` runs a program from stdin: a shell, a
+ * `source`/`.` of the shell's stdin, or an interpreter with no script
+ * operand (WI#883). A word property, like the listener rule (WI#858), so a
+ * launcher the hook does not know cannot hide one.
+ */
+function interpreterAt(words, index) {
+  const name = commandBasename(listenerWord(words[index]));
+  if (SHELL_NAME.test(name)) return true;
+  if (name === "source" || name === ".") {
+    const operand = words[index + 1];
+    return operand !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(operand));
+  }
+  if (!STDIN_INTERPRETERS.has(name)) return false;
+  return interpreterStdinProgram(name, words.slice(index + 1));
+}
+
+/**
+ * True for a stage that turns an encoded payload back into text. The rule is
+ * a property of the words (WI#883), not the stage's command position, so a
+ * launcher (`nice`, `nohup`, `timeout`, `xargs`, …) cannot hide the decoder.
+ */
+function isDecodeStage(stage) {
+  const words = stagePropertyWords(stage);
+  if (words === null) return true;
+  return words.some((_word, index) => decoderAt(words, index));
+}
+
+/**
+ * True when the stage executes its stdin: a shell, an interpreter with no
+ * script operand, or a `source`/`.` of the shell's stdin, at any word
+ * position the stage executes (WI#883).
  */
 function isInterpreterStage(stage) {
-  const { name, args, unverifiable } = stageCommand(stage);
-  if (unverifiable) return true;
-  if (SHELL_NAME.test(name)) return true;
-  if (name === "python" || name === "python3") return args.length === 0 || args.includes("-c") || args.includes("-");
-  if (name === "perl") return args.some((word) => /^-[a-zA-Z]*[eE]/.test(word));
-  if (name === "ruby") return args.some((word) => /^-[a-zA-Z]*e/.test(word));
-  if (name === "node") {
-    return args.some((word) => ["-e", "--eval", "-p", "--print", "-"].includes(word));
-  }
-  return false;
+  const words = stagePropertyWords(stage);
+  if (words === null) return true;
+  return words.some((_word, index) => interpreterAt(words, index));
 }
 
 // The shared shell-syntax scan (WI#867). Bash escapes with a backslash
