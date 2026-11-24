@@ -668,7 +668,7 @@ managed `wt0` resolver the only joined-run DNS path and keeps custom DNS
 rejected. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
-## Sandbox Git Grant (WI#816/860)
+## Sandbox Git Grant (WI#816/860/875)
 
 Manifest-backed shell calls can clone, fetch and (with a write grant) push to
 operator-granted remotes. The settings are opt-in, have no defaults, and are
@@ -679,6 +679,7 @@ re-render, together with each daemon variable a credential binding names:
 SANDBOX_GIT_REMOTES=origin=http://git.lan:3000/org/repo.git  # name=url[,name=url...]
 SANDBOX_GIT_WRITE_REMOTES=origin          # names from SANDBOX_GIT_REMOTES that may push
 SANDBOX_GIT_CREDENTIALS=origin=GIT_ORIGIN_TOKEN  # remote=VARIABLE; http:// remotes only
+SANDBOX_GIT_PRIVATE_REMOTES=origin        # IP-literal LAN/overlay remotes the git proxy may reach (WI#875)
 GIT_ORIGIN_TOKEN="Basic <base64 user:token>"     # the Authorization header value; a secret
 ```
 
@@ -687,9 +688,14 @@ own smart-HTTP endpoints. It forwards a push only to a write-granted remote
 and refuses every ref deletion; protect branches on the forge against force
 pushes. A binding's variable is carried on re-render only when its name is a
 plain environment name and the variable is set; a variable the renderer writes
-itself (for example `LLM_MODEL`) keeps its rendered line. Rules and limits,
-including the public-only destination check that currently refuses
-private-address remotes:
+itself (for example `LLM_MODEL`) keeps its rendered line.
+
+`SANDBOX_GIT_PRIVATE_REMOTES` names granted remotes whose URL host is a LAN
+(RFC 1918) or overlay (CGNAT `100.64.0.0/10`, IPv6 ULA) IP literal; a host
+name is a load error, because the allowance trusts no DNS answer. It opens
+only the named remote's own address and port, never its subnet; loopback,
+link-local and the metadata addresses stay refused. Only the per-call
+git proxy carries the allowance. Rules and limits:
 [`../guides/SANDBOX_CAPABILITY_MANIFEST.md`](../guides/SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860).
 
 ## Runtime Behavior

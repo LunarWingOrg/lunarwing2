@@ -417,8 +417,15 @@ impl SandboxManager {
                     .as_ref()
                     .map(GitGrantAuthorization::transport_policy)
                     .unwrap_or_default();
+                // WI#875: the operator's non-public destination allowance
+                // travels with the grant, never with the proxy mode.
+                let private_egress = decision
+                    .git
+                    .as_ref()
+                    .map(GitGrantAuthorization::private_egress)
+                    .unwrap_or_default();
                 Some(
-                    self.start_scoped_git_proxy(hosts, credentials, transport)
+                    self.start_scoped_git_proxy(hosts, credentials, transport, private_egress)
                         .await?,
                 )
             }
@@ -477,12 +484,14 @@ impl SandboxManager {
         hosts: Vec<String>,
         credentials: Vec<crate::secrets::CredentialMapping>,
         transport: crate::sandbox::proxy::git_transport::GitTransportPolicy,
+        private_egress: crate::sandbox::proxy::PrivateEgress,
     ) -> Result<(HttpProxy, u16)> {
         let proxy = NetworkProxyBuilder::from_config(&self.config)
             .with_allowlist(hosts)
             .with_credentials(credentials)
             .with_credential_resolver(Arc::new(EnvCredentialResolver))
             .with_git_transport(transport)
+            .with_private_egress(private_egress)
             .build_and_start(0)
             .await?;
         let addr = proxy.addr().await.ok_or_else(|| SandboxError::ProxyError {

@@ -174,6 +174,41 @@ text, decides write and deletion:
   remotes, which travel in opaque `CONNECT` tunnels, the forge is the only
   write boundary: give read grants a read-only key and protect branches.
 
+### Non-public remotes (WI#875)
+
+A plain `http://` remote on the LAN or on an overlay (NetBird and other
+`100.64.0.0/10` networks) is a normal deployment. In `proxy-enforced` mode
+the proxy keeps its public-only destination check by default, so such a
+remote must be allowed explicitly:
+
+```
+SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
+```
+
+- **Named granted remotes only.** Each name must be a remote in the same
+  `SANDBOX_GIT_REMOTES` list and must be `http://` or `https://`; a `file://`
+  remote, an unknown name or an empty value is a configuration load error.
+  The allowance opens exactly the named remote's own host and port. Another
+  host on the same subnet, another port on the granted host, and every
+  unnamed remote stay unreachable.
+- **IP-literal LAN and overlay remotes only.** A named remote's URL host must
+  be an RFC 1918 address, an address in the CGNAT range `100.64.0.0/10`, or
+  an IPv6 unique-local address (`fc00::/7`), written as the literal address
+  (`http://192.168.1.20:3000/…`, `http://100.64.0.7/…`). A host name is a
+  configuration load error, and the proxy also refuses a non-public answer
+  for any name, so no DNS answer can move the allowance to another private
+  host. Loopback, link-local, the cloud metadata addresses
+  (`169.254.169.254`, and `100.100.100.200` inside the CGNAT range) and every
+  other non-public address stay refused.
+- **The address is pinned.** The proxy connects to the literal address; a
+  redirect cannot move the connection.
+  If the allowance cannot be applied exactly, the call is refused as before.
+- **The shared tenant proxy is unchanged.** Only the per-call git proxy
+  carries the allowance; the shared proxy still refuses every non-public
+  destination.
+- **Evidence records it.** `capability_evidence.git.remotes[]` carries
+  `"private_destination": true` for each allowed remote.
+
 ### Credentials (WI#860)
 
 `SANDBOX_GIT_CREDENTIALS=remote=ENV_NAME[,remote=ENV_NAME...]` binds a granted

@@ -56,6 +56,8 @@ pub struct SandboxModeConfig {
     pub tunnel: SandboxTunnelModeConfig,
     /// Per-tenant git remote grant (WI#816): `SANDBOX_GIT_REMOTES` as
     /// `name=url[,name=url...]`. `None` keeps git network access denied.
+    /// `SANDBOX_GIT_PRIVATE_REMOTES` names the remotes whose exact host and
+    /// port may resolve to a LAN or overlay address (WI#875).
     pub git: Option<crate::sandbox::GitGrantConfig>,
 }
 
@@ -248,10 +250,13 @@ impl SandboxModeConfig {
             Some(spec) => {
                 let write_names = optional_env("SANDBOX_GIT_WRITE_REMOTES")?.unwrap_or_default();
                 let credential_spec = optional_env("SANDBOX_GIT_CREDENTIALS")?.unwrap_or_default();
-                crate::sandbox::GitGrantConfig::from_full_spec(
+                let private_names =
+                    optional_env("SANDBOX_GIT_PRIVATE_REMOTES")?.unwrap_or_default();
+                crate::sandbox::GitGrantConfig::from_specs(
                     &spec,
                     &write_names,
                     &credential_spec,
+                    &private_names,
                 )
                 .map_err(|message| ConfigError::InvalidValue {
                     key: "SANDBOX_GIT_REMOTES".to_string(),
@@ -1425,7 +1430,11 @@ mod tests {
         let _guard = crate::config::helpers::lock_env();
         let settings = crate::settings::Settings::default();
 
-        for var in ["SANDBOX_GIT_WRITE_REMOTES", "SANDBOX_GIT_CREDENTIALS"] {
+        for var in [
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_CREDENTIALS",
+            "SANDBOX_GIT_PRIVATE_REMOTES",
+        ] {
             unsafe { std::env::remove_var(var) };
         }
         unsafe {
@@ -1478,7 +1487,54 @@ mod tests {
             other => panic!("expected InvalidValue for an unknown write remote, got {other:?}"),
         }
 
-        for var in ["SANDBOX_GIT_REMOTES", "SANDBOX_GIT_WRITE_REMOTES"] {
+        for var in [
+            "SANDBOX_GIT_REMOTES",
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_PRIVATE_REMOTES",
+        ] {
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    /// WI#875: the non-public destination allowance is a separate host
+    /// setting; it reaches the grant, and an unknown or file remote is a
+    /// load error.
+    #[test]
+    fn sandbox_git_private_remotes_env_allows_named_remotes_only() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+
+        for var in [
+            "SANDBOX_GIT_REMOTES",
+            "SANDBOX_GIT_WRITE_REMOTES",
+            "SANDBOX_GIT_CREDENTIALS",
+            "SANDBOX_GIT_PRIVATE_REMOTES",
+        ] {
+            unsafe { std::env::remove_var(var) };
+        }
+        unsafe {
+            std::env::set_var(
+                "SANDBOX_GIT_REMOTES",
+                "lan=http://192.168.1.20:3000/org/repo.git,\
+                 overlay=http://100.64.0.7/org/other.git",
+            )
+        };
+        unsafe { std::env::set_var("SANDBOX_GIT_PRIVATE_REMOTES", "lan") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve allowance");
+        let grant = cfg.git.as_ref().expect("grant");
+        assert!(grant.remotes[0].allow_private);
+        assert!(!grant.remotes[1].allow_private);
+
+        // An unknown name is a load error, not a silently smaller grant.
+        unsafe { std::env::set_var("SANDBOX_GIT_PRIVATE_REMOTES", "missing") };
+        match SandboxModeConfig::resolve(&settings) {
+            Err(ConfigError::InvalidValue { key, .. }) => {
+                assert_eq!(key, "SANDBOX_GIT_REMOTES")
+            }
+            other => panic!("expected InvalidValue for an unknown remote, got {other:?}"),
+        }
+
+        for var in ["SANDBOX_GIT_REMOTES", "SANDBOX_GIT_PRIVATE_REMOTES"] {
             unsafe { std::env::remove_var(var) };
         }
     }

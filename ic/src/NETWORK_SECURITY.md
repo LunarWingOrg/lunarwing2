@@ -414,7 +414,7 @@ contracts. Existing worker tokens and approved job credential grants are
 unchanged; generic-shell named secret injection and arbitrary mounts or devices
 are not implemented.
 
-### Git remote grant (WI#816, WI#860)
+### Git remote grant (WI#816, WI#860, WI#875)
 
 `git-remotes` is an opt-in grant for manifest-backed shell calls. The tenant
 operator sets `SANDBOX_GIT_REMOTES` (`name=url[,name=url...]`); unset or empty
@@ -424,9 +424,23 @@ manifest retain the configured legacy behavior, including any existing egress.
 - **The proxy enforces hosts, and for `http://` remotes git writes.** A
   granted HTTP(S) remote requires `proxy-enforced`. A per-call proxy only
   permits the selected exact hosts, which must already be on the tenant egress
-  allowlist. It keeps public-IP checks and DNS pinning. It neither changes nor
-  falls back to the shared proxy. HTTPS CONNECT does not expose repository
-  paths or operation types.
+  allowlist. It keeps DNS pinning and, unless the grant carries an allowance,
+  the public-IP check. It neither changes nor falls back to the shared proxy.
+  HTTPS CONNECT does not expose repository paths or operation types.
+- **Non-public destinations need an explicit, per-remote allowance**
+  (WI#875). `SANDBOX_GIT_PRIVATE_REMOTES=name[,name...]` names granted
+  remotes whose URL host is a LAN (RFC 1918) or overlay (CGNAT
+  `100.64.0.0/10`, IPv6 ULA) IP literal. A host name is a load error, and
+  `resolve_egress` refuses a non-public answer for any name, so the allowance
+  trusts no DNS answer. The allowance travels on the
+  grant to the per-call git proxy only: the shared tenant proxy keeps
+  `public_only` and refuses every non-public destination. It opens the named
+  remote's exact host and port, never its subnet: another private address and
+  another port on the granted host are still refused. Loopback, link-local
+  and the metadata addresses (`169.254.169.254`, and `100.100.100.200` inside
+  the CGNAT range) stay refused even when the operator names them. An unknown name, or a
+  `file://` remote, is a configuration load error. Evidence records
+  `private_destination: true` per allowed remote.
 - **Write grant.** `SANDBOX_GIT_WRITE_REMOTES` names the remotes whose
   operation class includes `write`; every other remote stays read-only and
   refuses `git push` with `capability_denied` before any credential or network
@@ -477,17 +491,20 @@ manifest retain the configured legacy behavior, including any existing egress.
   method); another repository or API path on the same host gets none. Only
   `http://` remotes can be bound; an `https://` binding is a load error
   because CONNECT is opaque to the proxy. The hop is plain HTTP, so it belongs
-  on a trusted network or an encrypted overlay; the per-call proxy keeps the
-  public-only destination check, so a remote resolving to a private, CGNAT
-  (NetBird's `100.64.0.0/10`) or loopback address is refused today. A
+  on a trusted network or an encrypted overlay. The per-call proxy keeps the
+  public-only destination check unless the remote is named in
+  `SANDBOX_GIT_PRIVATE_REMOTES` (WI#875), which admits that remote's exact
+  IP-literal LAN or CGNAT (NetBird's `100.64.0.0/10`) address and port.
+  Loopback and link-local stay refused in every case. A
   binding is applied only when its remote is selected. Modes that cannot carry
   a network remote (`none`, `tunnel`) fail closed at authorization, so a
   credential is never silently absent.
 - **Evidence.** Configured URLs cannot include userinfo, queries, or
   fragments; errors do not echo supplied values. `capability_evidence.git`
   records the grant ID, supported egress modes and remote names, transports,
-  hosts and operation classes (`read`, plus `write` where granted), and each
-  credential binding as remote plus variable *name* — never a value. It is a
+  hosts and operation classes (`read`, plus `write` where granted), the
+  non-public destination allowance per remote (`private_destination`), and
+  each credential binding as remote plus variable *name* — never a value. It is a
   record of the grant, not of actual Git operations. The separate `ssh_git`
   tool is unchanged.
 

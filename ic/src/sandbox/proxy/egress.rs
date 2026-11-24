@@ -1,10 +1,85 @@
 //! Public-only, DNS-pinned egress for enforced proxy mode. Independent of the
 //! daemon's ALLOW_PRIVATE_IPS setting (which may be needed for its database).
+//!
+//! A per-call git proxy may carry an operator allowance for an exact
+//! IP-literal `host:port` destination (`SANDBOX_GIT_PRIVATE_REMOTES`,
+//! WI#875). Only that literal may be a LAN (RFC 1918) or overlay (CGNAT, IPv6
+//! ULA) address. A host name never gets the allowance, so no DNS answer can
+//! move it to another private host. Loopback, link-local and metadata
+//! addresses (`169.254.169.254`, and `100.100.100.200` inside the CGNAT range)
+//! stay refused even for an allowed literal. The shared tenant proxy carries
+//! no allowance and stays public-only.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+/// Exact `host:port` destinations whose non-public address the operator
+/// allowed for this call. Empty means "public destinations only", which is
+/// every proxy except a git proxy with an allowance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivateEgress {
+    allowed: Vec<(String, u16)>,
+}
+
+impl PrivateEgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allow one exact destination. `host` is normalized like a grant host:
+    /// lowercase, without IPv6 brackets or a trailing dot.
+    pub fn allow(mut self, host: &str, port: u16) -> Self {
+        let host = normalize_host(host);
+        if !self.allowed.iter().any(|(h, p)| *h == host && *p == port) {
+            self.allowed.push((host, port));
+        }
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty()
+    }
+
+    /// True when `host` is an IP literal (an IPv6 one may be bracketed) that
+    /// an allowance can open: RFC 1918, CGNAT or IPv6 unique-local, never
+    /// loopback, link-local or a metadata address. A host name never
+    /// qualifies, because the allowance does not trust DNS (WI#875).
+    pub fn admits_literal(host: &str) -> bool {
+        normalize_host(host)
+            .parse::<IpAddr>()
+            .is_ok_and(is_private_or_overlay)
+    }
+
+    fn contains(&self, host: &str, port: u16) -> bool {
+        let host = normalize_host(host);
+        self.allowed.iter().any(|(h, p)| *h == host && *p == port)
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// Resolve a destination that must be public, with no operator allowance.
+/// The shared tenant proxy's contract; a git proxy calls `resolve_egress`
+/// with its grant's allowance instead.
+#[cfg(test)]
 pub(super) async fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    resolve_egress(host, port, &PrivateEgress::new()).await
+}
+
+/// Resolve a destination and pin the result. Every address must be public
+/// unless the exact `host:port` is in `allowed`; even then the address must
+/// be a private LAN or overlay address, never loopback, link-local or a
+/// metadata address.
+pub(super) async fn resolve_egress(
+    host: &str,
+    port: u16,
+    allowed: &PrivateEgress,
+) -> Result<Vec<SocketAddr>, String> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let addresses: Vec<_> = tokio::time::timeout(
         Duration::from_secs(5),
@@ -14,10 +89,46 @@ pub(super) async fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAd
     .map_err(|_| "DNS lookup timed out".to_string())?
     .map_err(|_| "DNS lookup failed".to_string())?
     .collect();
-    if addresses.is_empty() || addresses.iter().any(|a| !is_public(a.ip())) {
-        return Err("proxy-enforced forbids non-public destination addresses".into());
+    if addresses.is_empty() {
+        return Err("proxy-enforced requires a resolvable destination".into());
+    }
+    if addresses.iter().any(|a| !is_public(a.ip())) {
+        // The allowance opens only an IP-literal destination, so a DNS answer
+        // for a name can never move it to another private host (WI#875).
+        if !allowed.contains(host, port) || host.parse::<IpAddr>().is_err() {
+            return Err("proxy-enforced forbids non-public destination addresses".into());
+        }
+        if addresses.iter().any(|a| !is_private_or_overlay(a.ip())) {
+            return Err(
+                "proxy-enforced forbids loopback, link-local and metadata destination addresses"
+                    .into(),
+            );
+        }
     }
     Ok(addresses)
+}
+
+/// A cloud metadata endpoint served from inside the CGNAT range (Alibaba
+/// Cloud ECS). Refused even for an allowed literal (WI#875).
+const CGNAT_METADATA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// A LAN or overlay address the operator may allow: RFC 1918, the CGNAT
+/// range overlay networks use (minus its metadata endpoint), or an IPv6
+/// unique-local address.
+fn is_private_or_overlay(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip != CGNAT_METADATA
+                && (ip.is_private() || (octets[0] == 100 && (64..128).contains(&octets[1])))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_private_or_overlay(IpAddr::V4(v4));
+            }
+            ip.is_unique_local()
+        }
+    }
 }
 
 fn is_public(ip: IpAddr) -> bool {
@@ -119,5 +230,117 @@ mod tests {
     #[tokio::test]
     async fn localhost_is_never_public() {
         assert!(resolve_public("localhost", 1).await.is_err());
+    }
+
+    #[test]
+    fn allowance_covers_private_and_overlay_ranges_only() {
+        for ip in [
+            "10.1.2.3",
+            "172.16.5.4",
+            "192.168.1.20",
+            "100.64.0.7",
+            "100.127.255.1",
+            "fd00::1",
+            "fd12:3456::9",
+            "::ffff:10.1.2.3",
+        ] {
+            assert!(
+                is_private_or_overlay(ip.parse::<IpAddr>().unwrap()),
+                "must allow {ip}"
+            );
+        }
+        for ip in [
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "1.1.1.1",
+            "100.128.0.1",
+            "2606:4700:4700::1111",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+        ] {
+            assert!(
+                !is_private_or_overlay(ip.parse::<IpAddr>().unwrap()),
+                "must refuse {ip} even when allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn allowance_is_exact_host_and_port() {
+        let allowed = PrivateEgress::new()
+            .allow("Git.LAN.", 3000)
+            .allow("100.64.0.7", 8080);
+        assert!(allowed.contains("git.lan", 3000));
+        assert!(allowed.contains("GIT.LAN", 3000));
+        assert!(allowed.contains("100.64.0.7", 8080));
+        assert!(!allowed.contains("git.lan", 3001));
+        assert!(!allowed.contains("other.lan", 3000));
+        assert!(!allowed.contains("100.64.0.8", 8080));
+        assert!(PrivateEgress::new().is_empty());
+        assert!(!allowed.is_empty());
+    }
+
+    #[test]
+    fn only_lan_or_overlay_ip_literals_can_be_allowed() {
+        for host in [
+            "192.168.1.20",
+            "10.0.0.5",
+            "100.64.0.7",
+            "[fd00::1]",
+            "fd12::9",
+        ] {
+            assert!(PrivateEgress::admits_literal(host), "must admit {host}");
+        }
+        for host in [
+            "git.lan",
+            "git.lan.",
+            "localhost",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.100.100.200",
+            "203.0.113.5",
+            "[::1]",
+            "",
+        ] {
+            assert!(!PrivateEgress::admits_literal(host), "must refuse {host}");
+        }
+    }
+
+    /// A name never gets the allowance, even when its exact `host:port` is
+    /// listed: the refusal is the name rule, before any range check.
+    #[tokio::test]
+    async fn an_allowed_name_is_refused_whatever_it_resolves_to() {
+        let allowed = PrivateEgress::new().allow("localhost", 43210);
+        let error = resolve_egress("localhost", 43210, &allowed)
+            .await
+            .expect_err("a name never gets the allowance");
+        assert!(error.contains("non-public destination"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_destination_resolves_but_loopback_still_fails() {
+        let allowed = PrivateEgress::new().allow("127.0.0.1", 43210);
+        assert!(
+            resolve_egress("127.0.0.1", 43210, &allowed).await.is_err(),
+            "an allowance never admits loopback"
+        );
+        assert!(
+            resolve_egress("127.0.0.1", 43210, &PrivateEgress::new())
+                .await
+                .is_err()
+        );
+        let elsewhere = PrivateEgress::new().allow("127.0.0.1", 43211);
+        assert!(
+            resolve_egress("127.0.0.1", 43210, &elsewhere)
+                .await
+                .is_err(),
+            "an allowance for another port admits nothing"
+        );
     }
 }

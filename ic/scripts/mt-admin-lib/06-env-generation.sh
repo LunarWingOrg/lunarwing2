@@ -1452,15 +1452,20 @@ write_tenant_lunarwing_env() {
   # this writer cannot render on one line (a carriage return or newline, for
   # example from a CRLF line) stops the render here, in the writer's own
   # shell, naming the variable and never printing its value.
-  local sandbox_git_remotes sandbox_git_write_remotes sandbox_git_credentials
+  # SANDBOX_GIT_PRIVATE_REMOTES (WI#875) is the operator's allowance for a
+  # granted remote whose exact host and port resolve to a LAN or overlay
+  # address; it is preserved verbatim like the other three.
+  local sandbox_git_remotes sandbox_git_write_remotes sandbox_git_credentials sandbox_git_private_remotes
   sandbox_git_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_REMOTES)"
   sandbox_git_write_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_WRITE_REMOTES)"
   sandbox_git_credentials="$(_env_existing "$env_snapshot" SANDBOX_GIT_CREDENTIALS)"
+  sandbox_git_private_remotes="$(_env_existing "$env_snapshot" SANDBOX_GIT_PRIVATE_REMOTES)"
   local git_setting_name git_setting_value
-  for git_setting_name in SANDBOX_GIT_REMOTES SANDBOX_GIT_WRITE_REMOTES SANDBOX_GIT_CREDENTIALS; do
+  for git_setting_name in SANDBOX_GIT_REMOTES SANDBOX_GIT_WRITE_REMOTES SANDBOX_GIT_CREDENTIALS SANDBOX_GIT_PRIVATE_REMOTES; do
     case "$git_setting_name" in
       SANDBOX_GIT_REMOTES) git_setting_value="$sandbox_git_remotes" ;;
       SANDBOX_GIT_WRITE_REMOTES) git_setting_value="$sandbox_git_write_remotes" ;;
+      SANDBOX_GIT_PRIVATE_REMOTES) git_setting_value="$sandbox_git_private_remotes" ;;
       *) git_setting_value="$sandbox_git_credentials" ;;
     esac
     if [[ "$git_setting_value" == *$'\r'* || "$git_setting_value" == *$'\n'* ]]; then
@@ -1908,17 +1913,19 @@ ENVEOF
     [[ -z "$sandbox_tunnel_startup_timeout_secs" ]] \
       || printf 'SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=%s\n' "$sandbox_tunnel_startup_timeout_secs" >> "$staged_env"
   fi
-  # Sandbox git grant (WI#816, WI#860): rendered only when the operator set
-  # it, verbatim, with the credential variables its bindings name. A variable
-  # this writer already rendered above keeps that one line.
-  if [[ -n "${sandbox_git_remotes}${sandbox_git_write_remotes}${sandbox_git_credentials}" ]]; then
-    printf '\n# Sandbox git grant (WI#816, WI#860); preserved on re-render.\n# See docs/guides/SANDBOX_CAPABILITY_MANIFEST.md. Bound credential variables are secrets.\n' >> "$staged_env"
+  # Sandbox git grant (WI#816, WI#860, WI#875): rendered only when the
+  # operator set it, verbatim, with the credential variables its bindings
+  # name. A variable this writer already rendered above keeps that one line.
+  if [[ -n "${sandbox_git_remotes}${sandbox_git_write_remotes}${sandbox_git_credentials}${sandbox_git_private_remotes}" ]]; then
+    printf '\n# Sandbox git grant (WI#816, WI#860, WI#875); preserved on re-render.\n# See docs/guides/SANDBOX_CAPABILITY_MANIFEST.md. Bound credential variables are secrets.\n' >> "$staged_env"
     [[ -z "$sandbox_git_remotes" ]] \
       || printf 'SANDBOX_GIT_REMOTES=%s\n' "$(_quote_env_value "$sandbox_git_remotes")" >> "$staged_env"
     [[ -z "$sandbox_git_write_remotes" ]] \
       || printf 'SANDBOX_GIT_WRITE_REMOTES=%s\n' "$(_quote_env_value "$sandbox_git_write_remotes")" >> "$staged_env"
     [[ -z "$sandbox_git_credentials" ]] \
       || printf 'SANDBOX_GIT_CREDENTIALS=%s\n' "$(_quote_env_value "$sandbox_git_credentials")" >> "$staged_env"
+    [[ -z "$sandbox_git_private_remotes" ]] \
+      || printf 'SANDBOX_GIT_PRIVATE_REMOTES=%s\n' "$(_quote_env_value "$sandbox_git_private_remotes")" >> "$staged_env"
     local git_secret_index
     for git_secret_index in "${!sandbox_git_secret_names[@]}"; do
       if grep -q -- "^${sandbox_git_secret_names[$git_secret_index]}=" "$staged_env"; then
