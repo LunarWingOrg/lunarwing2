@@ -3708,12 +3708,10 @@ mod tests {
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
         // Only `origin` is granted, so `upstream` is an ungranted remote.
-        let host = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "origin",
-        )
-        .unwrap()
-        .unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
 
         // A forced push is refused under every spelling of the program.
@@ -3806,12 +3804,10 @@ mod tests {
     fn submodule_helper_foreach_is_read_like_submodule_foreach() {
         let (temp, _) = workspace_with_remote();
         let cwd = temp.path().canonicalize().unwrap();
-        let host = GitGrantConfig::from_parts(
-            "origin=file:///workspace/remotes/origin.git",
-            "origin",
-        )
-        .unwrap()
-        .unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
         let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
 
         for command in [
