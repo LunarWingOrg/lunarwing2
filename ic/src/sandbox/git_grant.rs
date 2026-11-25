@@ -1097,8 +1097,12 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
         if word.dynamic {
             continue;
         }
+        // An unquoted glob in the tail expands before the command runs, so a
+        // pattern that could name a git program counts as naming one.
+        let glob_names_git = word.glob && glob_could_name_git_program(&word.text);
         let name = basename(&word.text);
         if name == "git"
+            || glob_names_git
             || is_git_plumbing_executable(name)
             || is_git_program_word(&word.text)
             || is_shell_name(name)
@@ -1127,9 +1131,55 @@ fn skip_wrapper_options(words: &[Word], mut index: usize, value_options: &[&str]
         if !word.starts_with('-') {
             return index;
         }
-        index += if value_options.contains(&word) { 2 } else { 1 };
+        // `-aNAME` carries the value in the same word; `-a NAME` in the next.
+        let attached = value_options.iter().any(|option| {
+            word.strip_prefix(option)
+                .is_some_and(|rest| !rest.is_empty())
+        });
+        index += if attached {
+            1
+        } else if value_options.contains(&word) {
+            2
+        } else {
+            1
+        };
     }
     index
+}
+
+/// The argv[0] `exec` sets. bash's `exec` reads its own flags as a cluster
+/// (`-c`, `-l`), and `-a` names the replacement argv[0] either attached
+/// (`-aNAME`, `-caNAME`) or in the following word. A cluster that sets no
+/// `-a` leaves argv[0] alone.
+fn exec_argv0(words: &[Word], index: usize) -> Result<Option<Word>> {
+    let mut index = index;
+    while index < words.len() {
+        let word = &words[index];
+        let text = word.text.as_str();
+        if text == "--" || text == "-" {
+            return Ok(None);
+        }
+        if !text.starts_with('-') || text.starts_with("--") {
+            return Ok(None);
+        }
+        let cluster = &text[1..];
+        for (offset, letter) in cluster.char_indices() {
+            if letter != 'a' {
+                continue;
+            }
+            let attached = &cluster[offset + 1..];
+            if attached.is_empty() {
+                return Ok(words.get(index + 1).cloned());
+            }
+            return Ok(Some(Word {
+                text: attached.to_string(),
+                dynamic: word.dynamic,
+                glob: word.glob,
+            }));
+        }
+        index += 1;
+    }
+    Ok(None)
 }
 
 /// GNU `env` long options that consume the following word.
@@ -1159,23 +1209,111 @@ const TIME_VALUE_OPTIONS: &[&str] = &["-f", "--format", "-o", "--output"];
 /// `exec -a` names the replacement argv[0].
 const EXEC_VALUE_OPTIONS: &[&str] = &["-a"];
 
+/// The program an override argv[0] makes git run. `env -a`/`--argv0` and
+/// `exec -a` replace argv[0] without changing the file that runs, and git
+/// dispatches on argv[0]'s basename, so the program's own name stops deciding
+/// what runs once an argv[0] is set.
+enum Argv0Program {
+    /// A basename git does not read as `git-<verb>`: git dispatches on the
+    /// first argument, exactly as it does for `git` itself.
+    Plain,
+    /// A basename `git-<verb>`: git runs that verb on the remaining words.
+    Verb(String),
+}
+
+fn argv0_program(argv0: &Word) -> Result<Argv0Program> {
+    if argv0.dynamic || argv0.glob {
+        return Err(denied(
+            "an argv[0] the preflight cannot read cannot be authorized for git network access",
+        ));
+    }
+    let name = basename(&argv0.text);
+    if name == "git" {
+        return Ok(Argv0Program::Plain);
+    }
+    match git_dashed_program(name) {
+        Some(verb) if is_known_git_verb(verb) => Ok(Argv0Program::Verb(verb.to_string())),
+        // git runs `git-<verb>` from its exec path for any verb, and the
+        // preflight has no way to read one it does not know: refuse rather
+        // than fall back to a program the argv[0] no longer names.
+        Some(_) => Err(denied(
+            "an argv[0] naming a git program this preflight cannot read cannot be authorized",
+        )),
+        None => Ok(Argv0Program::Plain),
+    }
+}
+
+/// Read the command a wrapper (`env`, `exec`) runs once its own options are
+/// consumed. A wrapper that set argv[0] replaces the program word, so the
+/// command is re-read as the program argv[0] names with the following words
+/// as its arguments. A wrapper that set no argv[0] leaves the command as it
+/// stands.
+fn scan_wrapper_command(
+    argv0: Option<&Word>,
+    command: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let Some(argv0) = argv0 else {
+        return scan_simple_command(command, preflight, depth);
+    };
+    let Some(program) = command.first() else {
+        return Ok(());
+    };
+    if program.glob && glob_could_name_git_program(&program.text) {
+        return Err(denied(
+            "a glob that could name a git program cannot be read with an argv[0]",
+        ));
+    }
+    let name = basename(&program.text);
+    let runs_git = name == "git"
+        || git_dashed_program(name).is_some()
+        || is_git_plumbing_executable(name)
+        || program.dynamic;
+    if !runs_git {
+        // An argv[0] cannot change what a non-git program does.
+        return scan_simple_command(command, preflight, depth);
+    }
+    if program.dynamic {
+        return Err(denied(
+            "a dynamic program word cannot be read with an argv[0] for git network access",
+        ));
+    }
+    let mut rewritten = Vec::with_capacity(command.len() + 1);
+    rewritten.push(Word {
+        text: "git".to_string(),
+        dynamic: false,
+        glob: false,
+    });
+    if let Argv0Program::Verb(verb) = argv0_program(argv0)? {
+        rewritten.push(Word {
+            text: verb,
+            dynamic: false,
+            glob: false,
+        });
+    }
+    rewritten.extend_from_slice(&command[1..]);
+    inspect_git_command(&rewritten, preflight, depth)
+}
+
 /// Resolve `env`'s own options from `index`, then its `NAME=VALUE`
-/// assignments, returning the index of the command word. Every spelling of
-/// `-S`/`--split-string` carries a body that `env` splits into words and
-/// appends the following words to, so the body is scanned as the command it
-/// becomes. A spelling the walk cannot classify is refused, not skipped.
+/// assignments, returning the index of the command word and the argv[0] the
+/// options set. Every spelling of `-S`/`--split-string` carries a body that
+/// `env` splits into words and appends the following words to, so the body is
+/// scanned as the command it becomes. A spelling the walk cannot classify is
+/// refused, not skipped.
 fn scan_env_operands(
     words: &[Word],
     index: usize,
     preflight: Preflight<'_>,
     depth: usize,
-) -> Result<usize> {
-    let mut index = scan_env_options(words, index, preflight, depth)?;
+) -> Result<(usize, Option<Word>)> {
+    let (mut index, argv0) = scan_env_options(words, index, preflight, depth)?;
     while index < words.len() && is_assignment(&words[index].text) {
         refuse_config_env_assignment(&words[index])?;
         index += 1;
     }
-    Ok(index)
+    Ok((index, argv0))
 }
 
 fn scan_env_options(
@@ -1183,29 +1321,46 @@ fn scan_env_options(
     mut index: usize,
     preflight: Preflight<'_>,
     depth: usize,
-) -> Result<usize> {
+) -> Result<(usize, Option<Word>)> {
+    let mut argv0 = None;
     while index < words.len() {
         let word = &words[index];
         let text = word.text.as_str();
         // A lone `-` means `-i`; `--` ends the options.
         if text == "-" || text == "--" {
-            return Ok(index + 1);
+            return Ok((index + 1, argv0));
         }
         if !text.starts_with('-') {
-            return Ok(index);
+            return Ok((index, argv0));
         }
         if word.dynamic {
             return Err(denied(
                 "dynamic env option cannot be authorized for git network access",
             ));
         }
-        if let Some(rest) = text.strip_prefix("--") {
-            index = scan_env_long_option(words, index, rest, preflight, depth)?;
-            continue;
+        let (step, set) = match text.strip_prefix("--") {
+            Some(rest) => scan_env_long_option(words, index, rest)?,
+            None => scan_env_short_option(words, index)?,
+        };
+        argv0 = set.or(argv0);
+        match step {
+            EnvOptionStep::Next(next) => index = next,
+            EnvOptionStep::Split { body, tail } => {
+                // `-S` ends the option list: its body plus the words after it
+                // is the command, read with the argv[0] set before it.
+                scan_env_split_command(&body, &words[tail..], argv0.as_ref(), preflight, depth)?;
+                return Ok((words.len(), None));
+            }
         }
-        index = scan_env_short_option(words, index, preflight, depth)?;
     }
-    Ok(index)
+    Ok((index, argv0))
+}
+
+/// What one `env` option does to the walk: advance, or hand a split-string
+/// body to the caller so it can carry the argv[0] set before it.
+enum EnvOptionStep {
+    Next(usize),
+    Split { body: Word, tail: usize },
 }
 
 /// One `env` long option (with `--` stripped). Long options abbreviate to any
@@ -1214,9 +1369,7 @@ fn scan_env_long_option(
     words: &[Word],
     index: usize,
     rest: &str,
-    preflight: Preflight<'_>,
-    depth: usize,
-) -> Result<usize> {
+) -> Result<(EnvOptionStep, Option<Word>)> {
     let (name, attached) = match rest.split_once('=') {
         Some((name, value)) => (name, Some(value)),
         None => (rest, None),
@@ -1241,17 +1394,19 @@ fn scan_env_long_option(
             },
         };
         if *option == "split-string" {
-            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
-            return Ok(words.len());
+            return Ok((EnvOptionStep::Split { body: value, tail }, None));
         }
-        return Ok(tail);
+        // `--argv0` sets the name git dispatches on; the other value options
+        // only change the environment.
+        let argv0 = (*option == "argv0").then_some(value);
+        return Ok((EnvOptionStep::Next(tail), argv0));
     }
     if ENV_LONG_FLAGS
         .iter()
         .any(|flag| !name.is_empty() && flag.starts_with(name))
     {
         // `--block-signal=PIPE` and friends carry an optional `=` value.
-        return Ok(index + 1);
+        return Ok((EnvOptionStep::Next(index + 1), None));
     }
     Err(denied("unsupported env option"))
 }
@@ -1262,9 +1417,7 @@ fn scan_env_long_option(
 fn scan_env_short_option(
     words: &[Word],
     index: usize,
-    preflight: Preflight<'_>,
-    depth: usize,
-) -> Result<usize> {
+) -> Result<(EnvOptionStep, Option<Word>)> {
     let word = &words[index];
     let cluster = &word.text[1..];
     for (offset, letter) in cluster.char_indices() {
@@ -1291,12 +1444,13 @@ fn scan_env_short_option(
             )
         };
         if letter == 'S' {
-            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
-            return Ok(words.len());
+            return Ok((EnvOptionStep::Split { body: value, tail }, None));
         }
-        return Ok(tail);
+        // `-a` is `--argv0`.
+        let argv0 = (letter == 'a').then_some(value);
+        return Ok((EnvOptionStep::Next(tail), argv0));
     }
-    Ok(index + 1)
+    Ok((EnvOptionStep::Next(index + 1), None))
 }
 
 /// Read the literal subset of GNU `env -S` syntax. An env string contributes
@@ -1370,9 +1524,10 @@ fn tokenize_env_split_string(input: &str) -> Result<Vec<Word>> {
 /// `env` splits the body into words, appends the remaining arguments, and
 /// re-reads the result as its own operand list, so a body that carries `env`
 /// options or names only part of the command is read as the command it runs.
-fn scan_env_split_body(
+fn scan_env_split_command(
     body: &Word,
     tail: &[Word],
+    outer_argv0: Option<&Word>,
     preflight: Preflight<'_>,
     depth: usize,
 ) -> Result<()> {
@@ -1388,11 +1543,15 @@ fn scan_env_split_body(
     }
     let mut simple = tokenize_env_split_string(&body.text)?;
     simple.extend_from_slice(tail);
-    let command = scan_env_operands(&simple, 0, preflight, depth + 1)?;
+    let (command, argv0) = scan_env_operands(&simple, 0, preflight, depth + 1)?;
     if command == simple.len() {
         return Ok(());
     }
-    scan_simple_command(&simple[command..], preflight, depth + 1)
+    // `env -a git-push -S 'git -f …'` sets argv[0] in the outer word and the
+    // program in the split body, so the body is read with that argv[0]. The
+    // argv[0] the body's own options set wins, matching env's last-one-wins.
+    let argv0 = argv0.or_else(|| outer_argv0.cloned());
+    scan_wrapper_command(argv0.as_ref(), &simple[command..], preflight, depth + 1)
 }
 
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
@@ -1412,8 +1571,22 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             index += 1;
             continue;
         }
+        // An unquoted glob expands before the command runs, so a word that
+        // could expand to `git` or a `git-<verb>` program is a program the
+        // scan has not read.
+        if words[index].glob && glob_could_name_git_program(&words[index].text) {
+            return Err(denied(
+                "a glob that could name a git program cannot be authorized for git network access",
+            ));
+        }
         match command.as_str() {
-            "env" => index = scan_env_operands(words, index + 1, preflight, depth)?,
+            "env" => {
+                let (next, argv0) = scan_env_operands(words, index + 1, preflight, depth)?;
+                if argv0.is_some() {
+                    return scan_wrapper_command(argv0.as_ref(), &words[next..], preflight, depth);
+                }
+                index = next;
+            }
             // Shell builtins that only assign or export names. `declare -x`,
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
@@ -1428,7 +1601,14 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             }
             "printf" => return authorize_printf(&words[index + 1..]),
             "command" | "nohup" => index = skip_wrapper_options(words, index + 1, &[]),
-            "exec" => index = skip_wrapper_options(words, index + 1, EXEC_VALUE_OPTIONS),
+            "exec" => {
+                let argv0 = exec_argv0(words, index + 1)?;
+                let next = skip_wrapper_options(words, index + 1, EXEC_VALUE_OPTIONS);
+                if argv0.is_some() {
+                    return scan_wrapper_command(argv0.as_ref(), &words[next..], preflight, depth);
+                }
+                index = next;
+            }
             "time" => index = skip_wrapper_options(words, index + 1, TIME_VALUE_OPTIONS),
             // `timeout [OPTION]... DURATION COMMAND [ARG]...`
             "timeout" => {
@@ -2045,6 +2225,12 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         // helper's own option rules; its other subcommands are internal and
         // take arguments this preflight does not read, so they are refused.
         "submodule--helper" => authorize_submodule_helper(args, preflight, depth),
+        // `for-each-repo` runs the words after its options as a git command
+        // in each repository its config key lists. The repositories are
+        // config, which the preflight cannot see, so the operand verb is read
+        // the way any subcommand is; a key the scan cannot resolve is
+        // refused, as aliases are.
+        "for-each-repo" => authorize_for_each_repo(words, sub_index, preflight, depth),
         "rebase" | "bisect" => authorize_shell_bodies(args, sub.text.as_str(), preflight, depth),
         // Porcelain `push` is not the only path to a remote. The plumbing
         // verbs speak the transport protocol directly, take their own
@@ -2055,6 +2241,127 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         ))),
         _ => Ok(()),
     }
+}
+
+/// Read `git for-each-repo`. It takes `--config=<key>` (or `--config <key>`)
+/// and `--keep-going`, then the arguments git runs as a command in every
+/// repository the key lists. The operand tail is a git invocation, so it is
+/// read as one — the config key's repositories are the only thing the scan
+/// cannot see, and the tail's own remote arguments still have to be granted.
+///
+/// The key must be a `-c` override the preflight already refused-or-accepted
+/// above (`git -c x.r=. for-each-repo --config=x.r push …`): a key from the
+/// repository's own config can name repositories the scan never saw, so it is
+/// refused the way an alias is.
+fn authorize_for_each_repo(
+    words: &[Word],
+    sub_index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let args = &words[sub_index + 1..];
+    let mut index = 0;
+    let mut config_key: Option<&Word> = None;
+    while index < args.len() {
+        let word = &args[index];
+        let text = word.text.as_str();
+        if text == "--" {
+            index += 1;
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            break;
+        }
+        if word.dynamic {
+            return Err(denied(
+                "dynamic git for-each-repo option cannot be authorized",
+            ));
+        }
+        if let Some(value) = text.strip_prefix("--config=") {
+            if value.is_empty() {
+                return Err(denied("git for-each-repo --config needs a key"));
+            }
+            config_key = Some(word);
+            index += 1;
+            continue;
+        }
+        // `--config` abbreviates as any other git long option does.
+        if "--config".starts_with(text) {
+            match args.get(index + 1) {
+                Some(value) if !value.dynamic => {
+                    config_key = Some(value);
+                    index += 2;
+                    continue;
+                }
+                _ => return Err(denied("git for-each-repo --config needs a literal key")),
+            }
+        }
+        if "--keep-going".starts_with(text) || text == "--no-keep-going" {
+            index += 1;
+            continue;
+        }
+        return Err(denied(format!(
+            "unsupported git for-each-repo option '{text}'"
+        )));
+    }
+    let Some(key) = config_key else {
+        return Err(denied("git for-each-repo needs an explicit --config key"));
+    };
+    let key_text = key.text.strip_prefix("--config=").unwrap_or(&key.text);
+    let key_text = key_text.trim();
+    if key_text.is_empty() {
+        return Err(denied("git for-each-repo --config needs a key"));
+    }
+    if !for_each_repo_key_is_visible(key_text, words, sub_index) {
+        return Err(denied(
+            "git for-each-repo config key is not set by a -c override the preflight read",
+        ));
+    }
+    let tail = &args[index..];
+    if tail.is_empty() {
+        return Ok(());
+    }
+    // The tail is what git runs: `git <tail>` in each repository. Read the
+    // whole tail as one command, with `git` placed where a subcommand goes.
+    let mut rewritten = Vec::with_capacity(tail.len() + 1);
+    rewritten.push(Word {
+        text: "git".to_string(),
+        dynamic: false,
+        glob: false,
+    });
+    rewritten.extend_from_slice(tail);
+    scan_simple_command(&rewritten, preflight, depth + 1)
+}
+
+/// Whether a `for-each-repo` config key is one a `-c` override set, so the
+/// repository list is a value the preflight can see rather than one the
+/// repository's own config supplies. `--config-env` is excluded: its value is
+/// an environment variable name, so the list is not visible. A `-c key=` with
+/// nothing after it names no repositories and does not count.
+fn for_each_repo_key_is_visible(key: &str, words: &[Word], sub_index: usize) -> bool {
+    words[..sub_index].iter().enumerate().any(|(index, word)| {
+        let text = word.text.as_str();
+        let attached = text
+            .strip_prefix("-c")
+            .filter(|rest| !rest.is_empty() && !text.starts_with("--"));
+        let value = match attached {
+            Some(value) => value,
+            None if text == "-c" || text == "--config" => {
+                match words.get(index + 1).map(|word| word.text.as_str()) {
+                    Some(value) => value,
+                    None => return false,
+                }
+            }
+            None => match text.strip_prefix("--config=") {
+                Some(value) => value,
+                None => return false,
+            },
+        };
+        let Some((name, value)) = value.split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case(key) && !value.trim().is_empty()
+    })
 }
 
 /// Git's remote transport plumbing. `send-pack`/`http-push` write to the
@@ -2120,6 +2427,7 @@ fn is_known_git_verb(verb: &str) -> bool {
             | "archive"
             | "submodule"
             | "submodule--helper"
+            | "for-each-repo"
             | "rebase"
             | "bisect"
     ) || is_remote_transport_plumbing(verb)
@@ -2143,6 +2451,7 @@ const GLOB_GIT_PROGRAM_NAMES: &[&str] = &[
     "git-archive",
     "git-submodule",
     "git-submodule--helper",
+    "git-for-each-repo",
     "git-rebase",
     "git-bisect",
     "git-send-pack",
@@ -2179,12 +2488,14 @@ fn glob_could_name_git_program(pattern: &str) -> bool {
         return true;
     }
     // A `git-core` directory makes any dashed name beside it a git program,
-    // including verbs the list above does not spell out (`git-frobnicate`
-    // still cannot run, but the scan refuses rather than assumes).
-    glob_matches(program, "git-*")
-        && directories
-            .iter()
-            .any(|part| glob_matches(part, "git-core"))
+    // including verbs the list above does not spell out. A program name is
+    // lowercase letters, digits and dashes, so `/usr/lib/git-core/*.txt` is
+    // ordinary data while `…/git-core/git-*` is not.
+    directories.iter().any(|part| glob_matches(part, "git-core"))
+        && program.starts_with("git-")
+        && program
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || "-*?[]!^".contains(character))
 }
 
 /// A parsed `[...]` glob class.
