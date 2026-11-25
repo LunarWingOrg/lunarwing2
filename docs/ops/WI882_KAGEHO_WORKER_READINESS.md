@@ -99,19 +99,22 @@ on this tree before this change:
      waits.
    - `unknown (no WSS port allocated)` — the registry has no port for the
      lane.
-2. `mt-admin worker-readiness <tenant>` — strict gate, exit non-zero when an
-   enabled lane's port refuses or drops the connection. Poll window
-   `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`). Exit 0 means that
-   every enabled lane's port kept a connection open; it does not mean that a
-   job can connect. The daemon's probe line in its log is the stronger check.
+2. `mt-admin worker-readiness <tenant>` — exits non-zero if an enabled lane
+   has no WSS port allocated or its port refuses or drops the connection.
+   The missing-port warning names the registry slot. Unselected lanes and
+   intentionally stopped OpenRC lanes are skipped. Poll window:
+   `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`). Exit 0 means the
+   checked ports answered, not that a job can connect. Onboarding also
+   rejects selected lanes whose status reports a missing or dead WSS port.
 3. `mt-admin worker-failure-log <tenant> <lane> [lines]` — container state
    plus a bounded tail of the bridge and task container logs. Each line is
    redacted, best effort: the values of token, key, secret and password
    fields, bearer and cookie headers, URL user parts and strings with a
    known secret prefix are replaced by `[redacted]`. It is a pattern filter,
    not a guarantee: read the output before pasting it anywhere public.
-4. `_start_tenant_workers` runs the readiness pass and warns on a dead lane
-   (advisory; the container start already succeeded).
+4. `_start_tenant_workers` runs the readiness pass and warns on a missing or
+   unresponsive WSS port. The warning is advisory and does not change the
+   start's exit status.
 5. Daemon: `ExternalWorkerManager::new` logs an explicit
    "No external workers configured" line when the set is empty, and
    `spawn_boot_liveness_probe` logs the resolved `host:port` endpoints it
@@ -148,7 +151,7 @@ repair without a full re-upgrade is:
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh refresh-worker-containers kageho
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant kageho
-sudo ic/scripts/lunarwing-mt-admin.sh worker-readiness kageho    # exit 0 == every enabled lane's port kept a connection open
+sudo ic/scripts/lunarwing-mt-admin.sh worker-readiness kageho    # listener check only
 ```
 
 Then a small task through each backend (`create_job(mode: "pebble")` and
