@@ -503,7 +503,7 @@ const ONE_LINER_NAMES = "(python3?|perl5(?:\\.\\d+)+|perl|nodejs|node|ruby)(?:\\
 // (WI#890). Options may precede the eval flag (`perl -MFile::Path -e …`), so
 // the eval flag is found by walking the words (oneLinerCode).
 const ONE_LINER_CALL = new RegExp(
-  `(?:^|[\\s;&|()"'\`])(?:[^\\s;&|()]*\\/)?${ONE_LINER_NAMES}\\b([^\\n]*)`, "g");
+  `(?:^|[\\s;&|()])(?:[^\\s;&|()]*\\/)?${ONE_LINER_NAMES}\\b([^\\n]*)`, "g");
 // The letters an interpreter's own option syntax uses for its eval flag
 // (python `-c`, perl `-e`/`-E`, node `-e`/`-p`, ruby `-e`), read inside a
 // short-option cluster.
