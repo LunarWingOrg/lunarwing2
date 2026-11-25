@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(requests[0].0, "GET");
         assert_eq!(
             requests[0].1,
-            "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1&ref=feature%2Fwi-315",
+            "/projects/35/search?scope=blobs&search=TODO&per_page=20&page=1&ref=feature%2Fwi-315",
             "the dispatched request URL must carry the encoded ref"
         );
         drop(requests);
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "GET");
         assert_eq!(
-            requests[0].1, "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1",
+            requests[0].1, "/projects/35/search?scope=blobs&search=TODO&per_page=20&page=1",
             "no ref may be appended when the caller omits it"
         );
     }

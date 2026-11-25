@@ -659,21 +659,6 @@ pub fn delete_file(
     Ok(json!({ "deleted": path, "branch": branch }))
 }
 
-pub fn search_projects(
-    client: &GitlabClient,
-    query: &str,
-    per_page: u32,
-    page_number: u32,
-) -> Result<Value, String> {
-    require_nonempty("query", query)?;
-    let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
-        "/search?scope=projects&search={}&per_page={per_page}&page={page_number}",
-        url_encode(query)
-    );
-    client.request_json("GET", &endpoint, None)
-}
-
 pub fn search_issues(
     client: &GitlabClient,
     project: &str,
@@ -682,6 +667,23 @@ pub fn search_issues(
     page_number: u32,
 ) -> Result<Value, String> {
     project_search(client, project, "issues", query, per_page, page_number)
+}
+
+/// Run a project-scoped search through the typed, per-page-capped path so a
+/// broad term degrades to a smaller page instead of exhausting guest memory.
+/// A zero-match query is a normal empty array, never an error.
+fn project_search(
+    client: &GitlabClient,
+    project: &str,
+    scope: &str,
+    query: &str,
+    per_page: u32,
+    page_number: u32,
+) -> Result<Value, String> {
+    require_nonempty("query", query)?;
+    let (per_page, page_number) = search_page(per_page, page_number);
+    let endpoint = project_search_endpoint(project, scope, query, per_page, page_number)?;
+    client.request_typed_page::<SearchHit>(&endpoint)
 }
 
 /// GitLab's project search supports `ref` only for the repository scopes
@@ -697,7 +699,7 @@ pub fn search_blobs(
     page_number: u32,
 ) -> Result<Value, String> {
     let endpoint = search_blobs_endpoint(project, query, ref_, per_page, page_number)?;
-    client.request_json("GET", &endpoint, None)
+    client.request_typed_page::<SearchHit>(&endpoint)
 }
 
 fn search_blobs_endpoint(
@@ -711,7 +713,7 @@ fn search_blobs_endpoint(
     if let Some(ref_) = ref_ {
         require_nonempty("ref", ref_)?;
     }
-    let (per_page, page_number) = page(per_page, page_number);
+    let (per_page, page_number) = search_page(per_page, page_number);
     let mut endpoint = project_search_endpoint(project, "blobs", query, per_page, page_number)?;
     if let Some(ref_) = ref_ {
         endpoint.push_str("&ref=");
@@ -734,24 +736,6 @@ fn project_search_endpoint(
         project_path(project)?,
         url_encode(query)
     ))
-}
-
-fn project_search(
-    client: &GitlabClient,
-    project: &str,
-    scope: &str,
-    query: &str,
-    per_page: u32,
-    page_number: u32,
-) -> Result<Value, String> {
-    require_nonempty("query", query)?;
-    let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
-        "/projects/{}/search?scope={scope}&search={}&per_page={per_page}&page={page_number}",
-        project_path(project)?,
-        url_encode(query)
-    );
-    client.request_json("GET", &endpoint, None)
 }
 
 pub fn list_pipelines(
@@ -862,6 +846,75 @@ pub fn list_jobs(
 ) -> Result<Value, String> {
     let endpoint = jobs_endpoint(project, pipeline_id, per_page, page_number)?;
     client.request_typed_page::<JobSummary>(&endpoint)
+}
+
+/// Per-page clamp for the search actions (WI#891).
+///
+/// Search hits carry the full issue/MR `description`, which dominates the
+/// page: a 100-hit issue search on `lunarwing/lunarwing2` is ~555 KB of JSON.
+/// Parsing that into a `serde_json::Value` tree in the guest's 10 MB sandbox
+/// is several times the raw size, and a refused `memory.grow` aborts the
+/// module as an `unreachable` trap. A smaller page keeps a broad term inside
+/// the budget; `pagination.next_page` continues the scan.
+const SEARCH_MAX_PER_PAGE: u32 = 20;
+
+/// One search hit, reduced to the fields an agent triages by (WI#891).
+///
+/// GitLab's search payload embeds whole issue/MR objects: `description`
+/// alone is ~75% of a full page, plus `author`, `assignees`, `milestone`,
+/// `time_stats`, and `task_completion_status`. Deserializing straight into
+/// this type makes `serde` skip those subtrees while streaming tokens instead
+/// of building their `Value` trees. `web_url` is one hop to the full object.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct SearchHit {
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    iid: Option<u64>,
+    #[serde(default)]
+    project_id: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    web_url: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    basename: Option<String>,
+    /// Blob hits carry the branch/tag the match came from.
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    startline: Option<u64>,
+}
+
+pub fn search_projects(
+    client: &GitlabClient,
+    query: &str,
+    per_page: u32,
+    page_number: u32,
+) -> Result<Value, String> {
+    require_nonempty("query", query)?;
+    let (per_page, page_number) = search_page(per_page, page_number);
+    let endpoint = format!(
+        "/search?scope=projects&search={}&per_page={per_page}&page={page_number}",
+        url_encode(query)
+    );
+    client.request_typed_page::<SearchHit>(&endpoint)
+}
+
+/// Clamp a search page like [`page`] and then apply the tighter search cap.
+fn search_page(per_page: u32, page_number: u32) -> (u32, u32) {
+    let (per_page, page_number) = page(per_page, page_number);
+    (per_page.min(SEARCH_MAX_PER_PAGE), page_number)
 }
 
 /// Build the `list_jobs` endpoint with the global `page()` clamp applied and
