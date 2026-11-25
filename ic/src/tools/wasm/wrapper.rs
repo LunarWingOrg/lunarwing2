@@ -1727,15 +1727,20 @@ impl WasmToolWrapper {
             context: context_json,
         };
 
-        // Call execute using the generated typed interface
+        // Call execute using the generated typed interface. Trap reasons come
+        // from the root cause, not `Display` (which shows only Wasmtime's
+        // backtrace context), and a refused `memory.grow` is reported as the
+        // memory limit it hit (WI#891).
         let response = tool_iface.call_execute(&mut store, &request).map_err(|e| {
-            let error_str = e.to_string();
-            if error_str.contains("out of fuel") {
+            if crate::tools::wasm::trap::is_fuel_exhausted(&e) {
                 WasmError::FuelExhausted { limit: limits.fuel }
-            } else if error_str.contains("unreachable") {
-                WasmError::Trapped("unreachable code executed".to_string())
             } else {
-                WasmError::Trapped(error_str)
+                let denied = store.data().limiter.memory_growth_denied();
+                WasmError::Trapped(crate::tools::wasm::trap::describe_trap(
+                    &e,
+                    limits.memory_bytes,
+                    denied,
+                ))
             }
         })?;
 
