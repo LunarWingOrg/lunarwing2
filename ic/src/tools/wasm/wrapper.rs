@@ -6090,7 +6090,10 @@ mod tests {
             .expect("search output carries items");
         assert_eq!(items.len(), 20, "every hit in the page is returned");
         assert_eq!(items[0]["iid"], 800);
-        assert!(items[0].get("description").is_none(), "heavy fields skipped");
+        assert!(
+            items[0].get("description").is_none(),
+            "heavy fields skipped"
+        );
         assert!(
             rendered.len() < 40_000,
             "retained page must stay small, got {} bytes",

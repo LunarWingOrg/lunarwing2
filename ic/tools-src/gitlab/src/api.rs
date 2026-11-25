@@ -860,54 +860,140 @@ pub fn list_jobs(
 /// the budget; `pagination.next_page` continues the scan.
 const SEARCH_MAX_PER_PAGE: u32 = 20;
 
-/// One search hit, reduced to the fields an agent triages by (WI#891).
+/// Per-hit cap on a blob hit's matched snippet (`data`), in characters
+/// (WI#891). A snippet is normally a few lines around the match, but one
+/// minified or generated line can be arbitrarily long.
+const SEARCH_SNIPPET_MAX_CHARS: usize = 2_000;
+
+/// One search hit as GitLab sends it, reduced to the fields an agent triages
+/// by (WI#891).
 ///
 /// GitLab's search payload embeds whole issue/MR objects: `description`
-/// alone is ~75% of a full page, plus `author`, `assignees`, `milestone`,
-/// `time_stats`, and `task_completion_status`. Deserializing straight into
-/// this type makes `serde` skip those subtrees while streaming tokens instead
-/// of building their `Value` trees. `web_url` is one hop to the full object.
+/// alone is ~75% of a full page, plus `milestone`, `time_stats`, and
+/// `task_completion_status`. Deserializing straight into this type makes
+/// `serde` skip those subtrees while streaming tokens instead of building
+/// their `Value` trees. Nested users keep only their `username`. Absent
+/// fields are left out of the output instead of being emitted as `null`.
+/// `web_url` is one hop to the full object.
 #[derive(Debug, serde::Serialize, Deserialize)]
-struct SearchHit {
-    #[serde(default)]
+struct SearchHitFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     iid: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     project_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     /// Project hits carry a name and namespace path instead of a title.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name_with_namespace: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     path_with_namespace: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     visibility: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<String>,
     /// Echoed so the agent can see the visibility the server authorized.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     confidential: Option<bool>,
-    #[serde(default)]
+    /// Issue hits: label names, as GitLab's search returns them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    labels: Option<Vec<String>>,
+    /// Issue hits: rendered as the author's username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<UserRef>,
+    /// Issue hits: rendered as a list of usernames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignees: Option<Vec<UserRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     web_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     filename: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     basename: Option<String>,
     /// Blob hits carry the branch/tag the match came from.
-    #[serde(default, rename = "ref")]
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     ref_: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     startline: Option<u64>,
+    /// Blob hits: the matched snippet as GitLab sent it. [`SearchHit`] takes
+    /// it out and caps it, so it is never serialized from here.
+    #[serde(default, skip_serializing)]
+    data: Option<String>,
+}
+
+/// One search hit as returned to the agent: [`SearchHitFields`] plus the
+/// blob snippet cut to [`SEARCH_SNIPPET_MAX_CHARS`]. `data_truncated` is
+/// emitted only when the snippet was cut.
+///
+/// Deserialization goes through `SearchHitFields`, so each hit's snippet is
+/// cut as soon as that hit is parsed, before the next one is read.
+#[derive(Debug, serde::Serialize, Deserialize)]
+#[serde(from = "SearchHitFields")]
+struct SearchHit {
+    #[serde(flatten)]
+    fields: SearchHitFields,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    data_truncated: bool,
+}
+
+impl From<SearchHitFields> for SearchHit {
+    fn from(mut fields: SearchHitFields) -> Self {
+        let (data, data_truncated) = match fields.data.take() {
+            Some(snippet) => {
+                let (snippet, truncated) = cap_chars(snippet, SEARCH_SNIPPET_MAX_CHARS);
+                (Some(snippet), truncated)
+            }
+            None => (None, false),
+        };
+        Self {
+            fields,
+            data,
+            data_truncated,
+        }
+    }
+}
+
+/// Keep at most `max_chars` characters of `text`; returns whether it was cut.
+///
+/// The cut index comes from `char_indices`, so it always lands on a char
+/// boundary: multi-byte text cannot make `String::truncate` panic.
+fn cap_chars(mut text: String, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => {
+            text.truncate(cut);
+            text.shrink_to_fit();
+            (text, true)
+        }
+        None => (text, false),
+    }
+}
+
+/// A nested GitLab user (`author`, `assignees[]`) reduced to `username`;
+/// serde skips the rest of the object. Serialized as the bare username.
+#[derive(Debug, Deserialize)]
+struct UserRef {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+impl serde::Serialize for UserRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.username, serializer)
+    }
 }
 
 pub fn search_projects(
@@ -1007,9 +1093,9 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        SEARCH_MAX_PER_PAGE, SearchHit, annotate_mr_changes, merge_requests_endpoint,
-        project_search_endpoint, require_changes, search_blobs_endpoint, search_page,
-        validate_choice, validate_file_path, work_items_endpoint,
+        SEARCH_MAX_PER_PAGE, SEARCH_SNIPPET_MAX_CHARS, SearchHit, annotate_mr_changes, cap_chars,
+        merge_requests_endpoint, project_search_endpoint, require_changes, search_blobs_endpoint,
+        search_page, validate_choice, validate_file_path, work_items_endpoint,
     };
 
     #[test]
@@ -1347,7 +1433,8 @@ mod tests {
     }
 
     /// WI#891: a hit carrying the full issue object keeps the fields an agent
-    /// triages by while dropping the heavy subtrees that dominated the page.
+    /// triages by (labels, author, assignees, closed_at among them) while
+    /// dropping the heavy subtrees that dominated the page.
     #[test]
     fn search_hit_keeps_triage_fields_and_skips_heavy_subtrees() {
         let hit = json!({
@@ -1356,10 +1443,16 @@ mod tests {
             "project_id": 35,
             "title": "search_issues traps on a matching term",
             "description": "x".repeat(16_000),
-            "state": "opened",
+            "state": "closed",
+            "closed_at": "2026-11-25T07:16:00.000Z",
             "web_url": "https://git.example.test/lunarwing/lunarwing2/-/work_items/891",
-            "author": { "id": 4, "username": "kageho" },
-            "assignees": [{ "id": 18, "username": "applejack" }],
+            "labels": ["bug", "in-progress"],
+            "author": { "id": 4, "username": "kageho", "avatar_url": "x".repeat(500) },
+            "assignees": [
+                { "id": 18, "username": "applejack", "state": "active" },
+                { "id": 19, "username": "sweetiebot" },
+            ],
+            "milestone": { "id": 7, "title": "v2.2.2.0", "description": "x".repeat(2_000) },
             "time_stats": { "time_estimate": 0 },
             "task_completion_status": { "count": 0 },
         });
@@ -1369,12 +1462,28 @@ mod tests {
         assert_eq!(rendered["iid"], 891);
         assert_eq!(rendered["project_id"], 35);
         assert_eq!(rendered["title"], "search_issues traps on a matching term");
-        assert_eq!(rendered["state"], "opened");
+        assert_eq!(rendered["state"], "closed");
+        assert_eq!(rendered["closed_at"], "2026-11-25T07:16:00.000Z");
         assert!(rendered["web_url"].is_string());
-        for heavy in ["description", "author", "assignees", "time_stats"] {
+        assert_eq!(rendered["labels"], json!(["bug", "in-progress"]));
+        assert_eq!(rendered["author"], "kageho");
+        assert_eq!(rendered["assignees"], json!(["applejack", "sweetiebot"]));
+        for heavy in [
+            "description",
+            "milestone",
+            "time_stats",
+            "task_completion_status",
+        ] {
             assert!(
                 rendered.get(heavy).is_none(),
                 "{heavy} must be skipped, not carried"
+            );
+        }
+        // Absent fields are left out, not emitted as `null`.
+        for absent in ["name", "path", "ref", "data", "data_truncated"] {
+            assert!(
+                rendered.get(absent).is_none(),
+                "{absent} must not be emitted for an issue hit: {rendered}"
             );
         }
         assert!(
@@ -1384,7 +1493,8 @@ mod tests {
     }
 
     /// WI#891: blob hits keep the location fields the agent needs to open the
-    /// file, including the branch the match came from.
+    /// file, including the branch the match came from, and the matched
+    /// snippet. A long snippet is cut per hit on a char boundary.
     #[test]
     fn search_hit_keeps_blob_location_fields() {
         let hit = json!({
@@ -1402,7 +1512,51 @@ mod tests {
         assert_eq!(rendered["basename"], "wrapper.rs");
         assert_eq!(rendered["ref"], "main");
         assert_eq!(rendered["startline"], 1731);
-        assert!(rendered.get("data").is_none());
+        assert_eq!(rendered["data"], "fn execute() { ... }");
+        assert!(
+            rendered.get("data_truncated").is_none(),
+            "a snippet within the cap is not marked truncated: {rendered}"
+        );
+
+        // The cap falls inside a three-byte char: byte index
+        // SEARCH_SNIPPET_MAX_CHARS is not a char boundary of this text.
+        let long = format!("{}日本語", "x".repeat(SEARCH_SNIPPET_MAX_CHARS - 1));
+        assert!(!long.is_char_boundary(SEARCH_SNIPPET_MAX_CHARS));
+        let summary: SearchHit = serde_json::from_value(json!({
+            "path": "ic/src/generated.rs",
+            "data": long,
+        }))
+        .unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        let data = rendered["data"].as_str().unwrap();
+        assert_eq!(data.chars().count(), SEARCH_SNIPPET_MAX_CHARS);
+        assert!(data.ends_with("x日"), "cut after the first whole char");
+        assert_eq!(rendered["data_truncated"], true);
+    }
+
+    /// WI#891: a multi-byte snippet longer than the cap must not panic (a
+    /// byte-index cut would land inside a char) and is cut to exactly the
+    /// cap, ending on a whole char.
+    #[test]
+    fn search_hit_cuts_a_multibyte_snippet_on_a_char_boundary() {
+        let snippet = "é".repeat(3_000);
+        let summary: SearchHit = serde_json::from_value(json!({
+            "path": "docs/accents.md",
+            "data": snippet,
+        }))
+        .unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        let data = rendered["data"].as_str().unwrap();
+        assert_eq!(data.chars().count(), SEARCH_SNIPPET_MAX_CHARS);
+        assert_eq!(data.len(), 2 * SEARCH_SNIPPET_MAX_CHARS, "two bytes per é");
+        assert!(data.chars().all(|c| c == 'é'), "no partial char kept");
+        assert_eq!(rendered["data_truncated"], true);
+
+        // The helper directly: exactly at the cap is not a cut.
+        let (kept, cut) = cap_chars("é".repeat(5), 5);
+        assert_eq!((kept.as_str(), cut), ("ééééé", false));
+        let (kept, cut) = cap_chars("aé日".to_string(), 2);
+        assert_eq!((kept.as_str(), cut), ("aé", true));
     }
 
     /// WI#891: project hits have no `title`/`iid` — they identify a project

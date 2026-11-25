@@ -51,7 +51,11 @@ pub fn is_fuel_exhausted(error: &anyhow::Error) -> bool {
 /// resource limiter recorded one. An allocation failure that traps as
 /// `unreachable` is reported as a memory limit instead of an unexplained
 /// abort, because the guest's allocator aborts once growth is refused.
-pub fn describe_trap(error: &anyhow::Error, memory_limit: u64, denied_growth: Option<u64>) -> String {
+pub fn describe_trap(
+    error: &anyhow::Error,
+    memory_limit: u64,
+    denied_growth: Option<u64>,
+) -> String {
     let root = root_cause_text(error);
     if let Some(desired) = denied_growth {
         return format!(
@@ -89,7 +93,10 @@ mod tests {
     fn trap_kind_survives_context_layers() {
         let error = anyhow::Error::from(wasmtime::Trap::UnreachableCodeReached)
             .context("error while executing at wasm backtrace:");
-        assert_eq!(trap_kind(&error), Some(wasmtime::Trap::UnreachableCodeReached));
+        assert_eq!(
+            trap_kind(&error),
+            Some(wasmtime::Trap::UnreachableCodeReached)
+        );
 
         let plain = anyhow::anyhow!("GitLab HTTP request failed");
         assert_eq!(trap_kind(&plain), None);
