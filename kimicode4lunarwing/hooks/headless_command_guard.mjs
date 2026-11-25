@@ -66,7 +66,9 @@ function rmOperands(words, endOfOptions) {
     .filter((token, i) => token.length > 0 &&
       (!token.startsWith("-") || (endOfOptions !== -1 && i > endOfOptions)))
     .map((token) => token.replace(/^["']|["']$/g, ""))
-    // A redirection target is not an rm operand (e.g. `2>/dev/null`).
+    // A redirection target is not an rm operand. The caller's words already
+    // come from the redirection-free view (WI#889); this keeps the reading
+    // for a caller that hands over raw words.
     .filter((token) => !/^\d*>/.test(token));
 }
 
