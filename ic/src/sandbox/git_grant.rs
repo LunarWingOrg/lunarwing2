@@ -2690,8 +2690,11 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
         .take_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--cached"))
         .count();
     let Some((action, operands)) = args[prefix..].split_first() else {
-        return Ok(());
+        return Ok(()); // Defaults to status.
     };
+    if action.dynamic {
+        return Err(denied("dynamic git submodule action cannot be authorized"));
+    }
     match action.text.as_str() {
         "add" => {
             let positional: Vec<&Word> = operands
@@ -2704,7 +2707,18 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
             preflight.read_remote(url)
         }
         "foreach" => authorize_submodule_foreach(operands, preflight, depth),
-        _ => Ok(()),
+        "status" | "summary" => Ok(()),
+        "update" => Err(denied(
+            "git submodule update can clone or fetch from an implicit remote; \
+             clone a granted URL or fetch a granted remote by name",
+        )),
+        "init" | "set-url" | "sync" => Err(denied(format!(
+            "git submodule {} changes remote URL configuration that manifest Git preflight does not authorize",
+            action.text
+        ))),
+        _ => Err(denied(
+            "unsupported git submodule action; use add, foreach, status or summary",
+        )),
     }
 }
 
@@ -3113,6 +3127,53 @@ mod tests {
                 "{command}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn submodule_refuses_implicit_remotes_and_unsupported_actions() {
+        let (_temp, read_grant) = workspace_with_remote();
+        for command in [
+            "git submodule update --init",
+            "git submodule update --remote",
+            "git submodule --quiet update --remote --recursive",
+            "git submodule update",
+            "git submodule update --no-fetch",
+            "git-submodule update --init",
+            "git submodule sync",
+            "git submodule -q sync --recursive",
+            "git submodule init",
+            "git submodule set-url deps/fixture file:///workspace/remotes/origin.git",
+            "git submodule unknown-action",
+            "git submodule \"$action\"",
+        ] {
+            let result = check_granted(command, &read_grant);
+            assert!(
+                matches!(result, Err(SandboxError::CapabilityDenied { .. })),
+                "{command}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn submodule_preserves_inspection_and_granted_add() {
+        let (_temp, read_grant) = workspace_with_remote();
+        for command in [
+            "git submodule",
+            "git submodule --cached",
+            "git submodule status --recursive",
+            "git submodule summary",
+            "git submodule foreach 'cargo build'",
+            "git submodule add file:///workspace/remotes/origin.git deps/fixture",
+        ] {
+            check_granted(command, &read_grant)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        let command = "git submodule add file:///workspace/remotes/other.git deps/fixture";
+        let result = check_granted(command, &read_grant);
+        assert!(
+            matches!(result, Err(SandboxError::CapabilityDenied { .. })),
+            "{command}: {result:?}"
+        );
     }
 
     #[test]
