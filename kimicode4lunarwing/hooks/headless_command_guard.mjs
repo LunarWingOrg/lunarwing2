@@ -3358,7 +3358,152 @@ function checkFindExecListeners(words, start, depth) {
 // A launcher that runs its own string as a shell command: `script -c` runs it
 // with `sh -c`, and `eval` joins its words and runs them. Neither is a
 // command position — the words are read wherever they sit (WI#858).
-const SHELL_STRING_LAUNCHERS = new Set(["script"]);
+//
+// WI#887: four more launchers hand a quoted string to a shell with no shell
+// word in the command, so the string is one word to the shell and neither the
+// raw-shape family nor the listener rule saw a command in it. Each reader
+// below returns the bodies that launcher runs, in the words the listener
+// reader has already unquoted; every body gets the full body rule set
+// (`checkShellBody`, WI#874). The launcher is one table entry, not a new
+// rule, so the next such launcher is one entry as well.
+// util-linux `flock --help` (2.42.4): its value options, stepped over before
+// the lock file. `-c`/`--command` is not one of them — flock checks for that
+// literal word *after* the file and runs its value through `sh` — so
+// `flock -c 'cmd' file` is an invalid option and `flock file -x -c 'cmd'`
+// runs `-x` as the program. Reading the word after the file only, as flock
+// does, keeps an ordinary `flock file make -c …` allowed.
+const FLOCK_VALUE_OPTIONS = new Set([
+  "-w", "--timeout", "-E", "--conflict-exit-code", "--start", "--length", "--wait",
+]);
+const FLOCK_COMMAND_OPTIONS = new Set(["-c", "--command"]);
+// util-linux `su --help` (2.42.4) reads its words through getopt, which
+// permutes, so `-c` may sit on either side of the user name; its value may be
+// attached (`-c'cmd'`, `-lc 'cmd'`) or follow as the next word. The other
+// value options are stepped over whole so a value is never read as the body.
+const SU_COMMAND_OPTIONS = new Set(["-c", "--command", "--session-command"]);
+const SU_VALUE_OPTIONS = new Set([
+  "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment",
+]);
+// The short value-taking letters of that set, read letter by letter in a
+// cluster. `m`/`p` (preserve-environment) take nothing.
+const SU_SHORT_VALUE_LETTERS = new Set(["g", "G", "s", "w"]);
+// procps `watch --help` (procps-ng 4.0.7): a value option eats the next
+// word, `-d`/`--differences` takes only an attached value, and the command is
+// the first word that is neither. Everything from there on is the command,
+// which watch joins with spaces before handing it to `sh -c`; watch stops
+// reading options at that word (`watch 'cmd' -n1` runs `cmd -n1`).
+const WATCH_VALUE_OPTIONS = new Set(["-n", "--interval", "-q", "--equexit", "-s", "--shotsdir"]);
+const PARALLEL_ARGUMENT_MARKER = /^:::/;
+// One invocation may name at most this many bodies; past it the whole tail is
+// read as one body, which covers the same words.
+const MAX_LAUNCHER_BODIES = 64;
+
+function shellBodyList(body) {
+  return body === undefined || body === "" ? [] : [body];
+}
+
+/** `flock <file> -c '<string>'`: the body after the file operand (WI#887). */
+function flockShellBodies(words, start) {
+  let i = start;
+  for (; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") {
+      i++;
+      break;
+    }
+    if (FLOCK_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) continue;
+    break;
+  }
+  // The first non-option word is the lock file; flock reads the word after
+  // it as `-c`/`--command` and the one after that as the shell body.
+  if (!FLOCK_COMMAND_OPTIONS.has(words[i + 1] ?? "")) return [];
+  return shellBodyList(words[i + 2]);
+}
+
+/** `su -c '<string>'`: the command option's value, wherever getopt finds it (WI#887). */
+function suShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return [];
+    if (SU_COMMAND_OPTIONS.has(word)) return shellBodyList(words[i + 1]);
+    if (SU_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      if (equals === -1) continue;
+      if (SU_COMMAND_OPTIONS.has(word.slice(0, equals))) return shellBodyList(word.slice(equals + 1));
+      continue;
+    }
+    if (!/^-[a-zA-Z]/.test(word)) continue;
+    // getopt reads a short cluster letter by letter. `c` takes the rest of
+    // the word as its value when anything follows (`-c'cmd'`), otherwise the
+    // next word (`-lc 'cmd'`). A value-taking letter before it (`-sc` is
+    // `-s c`) ends the cluster at that value, so `-sc` carries no body.
+    for (let j = 1; j < word.length; j++) {
+      if (word[j] === "c") return shellBodyList(word.slice(j + 1) || words[i + 1]);
+      if (SU_SHORT_VALUE_LETTERS.has(word[j])) break;
+    }
+  }
+  return [];
+}
+
+/** `watch`'s command: every word from the first non-option one, joined as watch joins it. */
+function watchShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return shellBodyList(words.slice(i + 1).join(" "));
+    if (WATCH_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) continue;
+    return shellBodyList(words.slice(i).join(" "));
+  }
+  return [];
+}
+
+/**
+ * GNU `parallel` runs its command template through a shell, and each
+ * `:::`/`::::` argument is a command line of its own (`parallel ::: 'kimi
+ * server'` runs it). Every run between the markers is read; the option words
+ * before the template are read with it, which can only add denials.
+ */
+function parallelShellBodies(words, start) {
+  const bodies = [];
+  let current = [];
+  for (let i = start; i < words.length; i++) {
+    if (!PARALLEL_ARGUMENT_MARKER.test(words[i])) {
+      current.push(words[i]);
+      continue;
+    }
+    if (current.length > 0) bodies.push(current.join(" "));
+    current = [];
+    if (bodies.length > MAX_LAUNCHER_BODIES) return shellBodyList(words.slice(start).join(" "));
+  }
+  if (current.length > 0) bodies.push(current.join(" "));
+  return bodies;
+}
+
+const SHELL_STRING_LAUNCHERS = new Map([
+  ["script", (words, start) => shellBodyList(listenerShellBody(words, start, "script"))],
+  ["flock", flockShellBodies],
+  ["su", suShellBodies],
+  ["watch", watchShellBodies],
+  ["parallel", parallelShellBodies],
+]);
+
+/** The bodies one launcher word runs through a shell (WI#874, WI#887). */
+function launcherShellBodies(name, words, start) {
+  if (SHELL_NAME.test(name)) return shellBodyList(listenerShellBody(words, start, name));
+  const reader = SHELL_STRING_LAUNCHERS.get(name);
+  return reader === undefined ? [] : reader(words, start);
+}
 
 /**
  * The words bash's brace expansion would also produce from one word
@@ -3710,8 +3855,7 @@ function checkListenerWords(words, depth) {
       continue;
     }
     if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
-      const body = listenerShellBody(words, i + 1, name);
-      if (body !== undefined) {
+      for (const body of launcherShellBodies(name, words, i + 1)) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
         const denied = checkShellBody(body, depth + 1);
         if (denied) return denied;
