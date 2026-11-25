@@ -3722,6 +3722,11 @@ mod tests {
             "/usr/libexec/git-core/git-push -f origin master",
             "env git-push -f origin master",
             "git-push origin +master",
+            "sh -c 'git-push -f origin master'",
+            "true && /usr/lib/git-core/git-push -f origin master",
+            "sudo /usr/lib/git-core/git-push -f origin master",
+            "./git-push -f origin master",
+            "xargs git-push -f origin master",
         ] {
             let error = check_granted(command, &grant).unwrap_err();
             assert!(
