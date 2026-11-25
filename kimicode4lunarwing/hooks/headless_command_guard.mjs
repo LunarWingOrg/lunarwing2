@@ -1589,7 +1589,8 @@ function checkRawShapes(text) {
     checkMoveAndTarDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
-    checkDecodedPipe(text);
+    checkDecodedPipe(text) ??
+    checkSubstitutionShell(text);
 }
 
 const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
@@ -2819,26 +2820,143 @@ function commandLists(text) {
   });
 }
 
-/** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
+/**
+ * The pipeline stages of one list. `|&` pipes stdout and stderr into the next
+ * stage, so it ends a stage exactly as `|` does (WI#889, WI#892).
+ */
+function pipelineStages(list) {
+  return splitOutsideQuotes(list, (ch, next) => (ch === "|" ? (next === "&" ? 2 : 1) : 0));
+}
+
+// The commands that read content from the network (WI#826). A word property,
+// like the decoder and interpreter readings, so a launcher cannot hide one.
+const FETCH_NAMES = new Set(["curl", "wget", "fetch", "nc", "ncat", "netcat"]);
+
+/**
+ * The readings of one stage's words, computed once so the checks below share a
+ * single word scan: whether it decodes, whether it fetches, whether it runs
+ * its stdin as a program, whether it runs its argument as shell text, and
+ * whether its command word cannot be read. A stage whose words cannot be read
+ * carries every reading, as `isDecodeStage`/`isInterpreterStage` do (WI#883,
+ * WI#885).
+ */
+function stageContent(words) {
+  if (words === null) {
+    return { decode: true, fetch: true, stdin: true, shellText: true, unverifiable: true };
+  }
+  return {
+    decode: words.some((_word, index) => decoderAt(words, index)),
+    fetch: words.some((word) => FETCH_NAMES.has(commandBasename(listenerWord(word)))),
+    stdin: words.some((_word, index) => interpreterAt(words, index)),
+    shellText: words.some((_word, index) => runsShellTextAt(words, index)),
+    unverifiable: commandWordUnverifiable(words),
+  };
+}
+
+/**
+ * What a substitution body holds: `"decoded"` for a decode stage, `"remote"`
+ * for a fetch, `"unreadable"` for a command the guard cannot read — the doubt
+ * that must never allow when the body feeds a shell (WI#892) — or null for
+ * ordinary work. Nested substitutions are read the same way.
+ */
+function heldContent(text, depth = 0) {
+  let held = null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const content = stageContent(stagePropertyWords(stage));
+      if (content.fetch) held = held ?? "remote";
+      if (content.decode) held = held ?? "decoded";
+      if (content.unverifiable) held = held ?? "unreadable";
+    }
+  }
+  if (held !== null) return held;
+  if (depth >= MAX_SHELL_BODY_DEPTH) return "unreadable";
+  for (const body of substitutionBodies(text)) {
+    const inner = heldContent(body, depth + 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
+
+/**
+ * Deny a decode or fetch command piped into a shell or interpreter (WI#826,
+ * WI#832, WI#892). A decode or fetch stage anywhere before an interpreter
+ * stage in the same pipeline counts, however many stages lie between: `cat`,
+ * `tee`, `sed` and `head` pass the bytes through untouched.
+ */
 function checkDecodedPipe(text) {
   const lists = commandLists(text);
   let scanned = 0;
   for (let li = 0; li < lists.length; li++) {
-    const stages = splitOutsideQuotes(lists[li], "|");
-    for (let i = 1; i < stages.length; i++) {
-      if (!isDecodeStage(stages[i - 1])) continue;
-      // The stage a decoder feeds may open a compound command, whose body
-      // reads the same stdin (AME-1). Only a list's last stage can run on
-      // into the following lists.
-      let fed = stages[i];
-      if (i === stages.length - 1 && compoundOpener(fed) !== "") {
-        fed = compoundStageText(lists, li, fed);
-        scanned += fed.length;
-        if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+    const stages = pipelineStages(lists[li]);
+    let carried = null;
+    for (let i = 0; i < stages.length; i++) {
+      if (carried !== null) {
+        // The stage a decoder feeds may open a compound command, whose body
+        // reads the same stdin (AME-1). Only a list's last stage can run on
+        // into the following lists.
+        let fed = stages[i];
+        if (i === stages.length - 1 && compoundOpener(fed) !== "") {
+          fed = compoundStageText(lists, li, fed);
+          scanned += fed.length;
+          if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+        }
+        // A command word the guard cannot read may be the shell (AME-2). The
+        // fed stage may be a compound body of several lists, so the whole
+        // body is read, not just its first command word.
+        if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
+          return carried === "decoded"
+            ? "decoded content piped into a shell or interpreter"
+            : "remote content piped into a shell or interpreter";
+        }
       }
-      // A command word the guard cannot read may be the shell (AME-2).
-      if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
-        return "decoded content piped into a shell or interpreter";
+      // The last stage feeds no further stage, so its own reading is not
+      // needed; skipping it keeps a one-stage list at zero word scans.
+      if (i + 1 === stages.length) break;
+      const content = stageContent(stagePropertyWords(stages[i]));
+      if (content.decode) carried = carried ?? "decoded";
+      if (content.fetch) carried = carried ?? "remote";
+    }
+  }
+  return null;
+}
+
+const SUBSTITUTION_SHELL_REASON = "decoded or fetched content run by a shell through a substitution";
+
+// A command substitution (`$(`, a backtick) or a process substitution
+// (`<(`, `>(`) — the shapes `substitutionBodies` yields.
+const SUBSTITUTION_MARKER = /\$\(|`|[<>]\(/;
+
+/**
+ * True when the word at `index` runs its own argument as shell text: a shell,
+ * `eval`, or a `source`/`.` (WI#892). Such a word executes whatever its
+ * argument holds, whether that is a literal string or a substitution's output.
+ */
+function runsShellTextAt(words, index) {
+  const name = commandBasename(listenerWord(words[index]));
+  if (SHELL_NAME.test(name) || name === "eval") return true;
+  return name === "source" || name === ".";
+}
+
+/**
+ * Deny a shell, `eval` or `source` fed by a command substitution, a process
+ * substitution or a here-string that holds a decode stage or a fetch (WI#892):
+ * `sh -c "$(curl …)"`, `eval "$(base64 -d f)"`, `bash <(gunzip -c x.gz)`,
+ * `source <(wget -qO- …)`. The substitution runs first and its output becomes
+ * the shell's own text, so no stage sits between them and the pipe rule above
+ * cannot see it. An unreadable body denies too, as it does in a pipeline.
+ */
+function checkSubstitutionShell(text) {
+  // A substitution is the only way a stage can hold content for a later
+  // shell, so a text without one costs a single scan (WI#892 deadline).
+  if (!SUBSTITUTION_MARKER.test(text)) return null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const words = stagePropertyWords(stage);
+      if (words === null) continue;
+      if (!words.some((_word, index) => runsShellTextAt(words, index))) continue;
+      for (const body of substitutionBodies(stage)) {
+        if (heldContent(body) !== null) return SUBSTITUTION_SHELL_REASON;
       }
     }
   }
