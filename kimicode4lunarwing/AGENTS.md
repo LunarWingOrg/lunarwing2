@@ -37,6 +37,11 @@ still passes, and `/usr/bin/python3 script.py`, `-m pytest`, `node app.js` and
 
 ## Guard Quote Handling
 
+The WI#895 Git body check recognizes both `git submodule foreach` and
+`git submodule--helper foreach`, as well as `git rebase` exec options. It reads
+shell words before passing a body to the guard, so a quoted description of a
+Git command is not treated as a call.
+
 Since WI#867 the clause splitter, punctuation view and listener scan share
 quote and substitution spans. A backslash escapes the next character outside
 quotes, escapes nothing inside single quotes, and inside double quotes only

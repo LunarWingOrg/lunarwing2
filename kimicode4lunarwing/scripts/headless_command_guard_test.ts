@@ -2209,11 +2209,30 @@ test("every spelling git accepts for an exec body is read (WI#895)", () => {
   assertAllowed("git commit -m 'fix git rebase -x kimi server'")
 })
 
+test("the submodule foreach helper gets the same body rules (AMM-1)", () => {
+  for (const [body, reason] of [
+    ["kimi server", "kimi service"],
+    ["nc -l 9000", "listener"],
+    ["tee /dev/sda1", "block-device"],
+  ]) {
+    assertBlocked(`git submodule--helper foreach '${body}'`, reason)
+  }
+  assertBlocked(`bash -c '"git" -C "/tmp/a b" submodule--helper foreach --recursive "tee /dev/sda1"'`, "block-device")
+  assertAllowed("git submodule--helper foreach 'echo hi'")
+})
+
+test("a quoted description of a Git shell body remains data (AMM-3)", () => {
+  assertAllowed(`git commit -m 'see git submodule foreach "nc -l 9000"'`)
+  assertAllowed(`git commit -m 'git rebase -x "kimi server" HEAD'`)
+  assertAllowed(`echo 'git rebase --exec "tee /dev/sda1" HEAD' >> notes.md`)
+})
+
 test("a 16 KB line of repeated git bodies stays inside the deadline (WI#895)", () => {
-  // The clause is read once per git word, so the option walk is linear
-  // (WI#856). Each row below is a whole clause of repeated `git` words.
+  // Both clauses repeat git words without nesting shell bodies. The first
+  // carrier's argument tail is read only once.
   assertAllowed("git rebase -x a ".repeat(1000).slice(0, 16_000))
-  assertAllowed("git submodule foreach ".repeat(700).slice(0, 16_000))
+  assertAllowed(("git submodule foreach echo" + " git submodule status".repeat(800)).slice(0, 16_000))
+  assertBlocked("git submodule foreach ".repeat(10) + "echo hi", "deeply nested shell command")
 })
 
 test("a decoded payload behind a launcher or into a stdin interpreter is denied (WI#883)", () => {

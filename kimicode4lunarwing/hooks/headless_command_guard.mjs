@@ -1932,34 +1932,16 @@ function gitSubmoduleForeachBodies(words) {
   return i < words.length ? [words.slice(i).join(" ")] : [];
 }
 
-/**
- * Deny a listener or a device write carried by a body git runs itself
- * (WI#895). `git submodule foreach` and `git rebase --exec`/`-x` pass their
- * operand to `sh -c`, so the text is a command line the shell runs even
- * though no shell word carries it; `checkShellBody` gives it the rules a
- * `bash -c` body already gets (WI#874).
- */
-function checkGitShellBodies(segment, depth = 0) {
-  // One clause holds one simple command, so a second `git` word in it is an
-  // operand of the first, not a command of its own; reading the clause once
-  // keeps a 16 KB line of repeated `git rebase` linear (WI#856, WI#895).
-  let clauseStop = -1;
-  for (const match of segment.matchAll(GIT_CALL)) {
-    if (match.index + 3 <= clauseStop) continue;
-    const { verb, after } = gitVerb(segment, match.index + 3);
-    if (verb !== "submodule" && verb !== "rebase") continue;
-    const rest = clauseText(segment, after);
-    clauseStop = after + rest.length;
-    // The words are read the way git reads its arguments: quotes group and
-    // a quoted separator stays inside the word.
-    const words = bashWords(rest);
-    const bodies = verb === "rebase" ? gitRebaseExecBodies(words) : gitSubmoduleForeachBodies(words);
-    for (const body of bodies) {
-      if (body.length === 0) continue;
-      if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
-      const denied = checkShellBody(body, depth + 1);
-      if (denied) return denied;
-    }
+/** Return Git's shell bodies, or null if this is not a recognized carrier. */
+function gitShellBodies(words, start) {
+  let i = start;
+  while (i < words.length && words[i].startsWith("-")) {
+    i += GIT_VALUE_OPTIONS.has(words[i]) ? 2 : 1;
+  }
+  const verb = listenerWord(words[i] ?? "");
+  if (verb === "rebase") return gitRebaseExecBodies(words.slice(i + 1));
+  if (verb === "submodule" || verb === "submodule--helper") {
+    return gitSubmoduleForeachBodies(words.slice(i + 1));
   }
   return null;
 }
@@ -2649,13 +2631,6 @@ const DENY_RULES = [
     // and `git stash -u`. Dry runs (`clean -n`), `git stash` without `-u` and
     // `git status` stay ordinary work.
     check: checkGitDiscard,
-  },
-  {
-    name: "listener or device write in a body git runs itself",
-    // `git submodule foreach` and `git rebase --exec`/`-x` hand their
-    // operand to `sh -c`, so the body is a command line no shell word
-    // carries (WI#895). It gets the same rules a `bash -c` body gets.
-    check: checkGitShellBodies,
   },
   {
     name: "recursive mode/ownership change on system roots",
@@ -3397,9 +3372,24 @@ function checkListenerWords(words, depth) {
   // One forward-only table per segment, so a segment full of `kimi` words is
   // linear (WI#858 deadline).
   let serviceSubcommands;
+  let sawGitCarrier = false;
   for (let i = 0; i < words.length; i++) {
     const word = listenerWord(words[i]);
     const name = commandBasename(word);
+    if (name === "git" && !sawGitCarrier) {
+      // Scan a recognized carrier once to keep repeated git words linear.
+      // The word reader keeps an entire quoted description in one argument.
+      const bodies = gitShellBodies(words, i + 1);
+      if (bodies !== null) {
+        sawGitCarrier = true;
+        for (const body of bodies) {
+          if (body.length === 0) continue;
+          if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
+          const denied = checkShellBody(body, depth + 1);
+          if (denied) return denied;
+        }
+      }
+    }
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
     }
