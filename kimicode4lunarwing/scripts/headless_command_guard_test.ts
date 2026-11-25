@@ -2447,6 +2447,64 @@ test("Git refuses unreadable values only where it may run them (WI#898)", () => 
   }
 })
 
+test("Git shell settings are checked across shell assignments (AMZ-1)", () => {
+  // Only the hook sees these strings. The test body would short-circuit.
+  const body = "false && tee /dev/sda1"
+  for (const command of [
+    `export GIT_EDITOR='${body}'; git commit`,
+    `export GIT_SEQUENCE_EDITOR='${body}' && git status`,
+    `export GIT_EXTERNAL_DIFF='${body}'\ngit diff`,
+    `GIT_PAGER='${body}'; export GIT_PAGER`,
+    `declare -x GIT_SSH_COMMAND='${body}'`,
+    `typeset -x VISUAL='${body}'`,
+    `readonly EDITOR='${body}'`,
+    `local PAGER='${body}'`,
+    `set -a; GIT_EDITOR='${body}'`,
+    `GIT_EDITOR+='${body}' git commit`,
+    `GIT_EDITOR='${body}' sh -c 'git commit'`,
+    `GIT_EDITOR='${body}' make commit`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0='${body}'`,
+    `export GIT_CONFIG_KEY_0=core.editor; export GIT_CONFIG_VALUE_0='${body}'`,
+    `export GIT_CONFIG_VALUE_0='${body}'; export GIT_CONFIG_KEY_0=core.editor`,
+    `export GIT_CONFIG_PARAMETERS="'core.editor'='${body}'"`,
+  ]) {
+    assertBlocked(command, "block-device")
+  }
+  assertBlocked('export GIT_EDITOR="$COMMAND"', "cannot verify a Git shell command")
+  assertAllowed("export GIT_EDITOR=true; export EDITOR=vim")
+  assertAllowed('export GIT_CONFIG_KEY_0=user.name; export GIT_CONFIG_VALUE_0="$NAME"')
+  assertAllowed(`printf '%s\\n' "note: GIT_EDITOR=$COMMAND"`)
+})
+
+test("Git's additional pack option, config keys and external transport policy are checked (AMZ-2)", () => {
+  for (const option of ["--exec=", "--exec ", "--exe="]) {
+    assertBlocked(`git ls-remote ${option}'false && tee /dev/sda1' .`, "block-device")
+  }
+  for (const key of ["credential.helper", "trailer.review.cmd", "core.fsmonitor", "man.custom.cmd"]) {
+    assertBlocked(`git -c ${key}='false && tee /dev/sda1' status`, "block-device")
+  }
+  assertBlocked("git -c credential.helper='!tee /dev/sda1' status", "block-device")
+  assertBlocked("git -c credential.helper='fixture; false && tee /dev/sda1' status", "block-device")
+  assertBlocked("GIT_ALLOW_PROTOCOL=https:ext git status", "external command transport")
+  assertBlocked("git -c protocol.ext.allow=always status", "external command transport")
+  assertBlocked("git -c protocol.allow=user status", "external command transport")
+  assertAllowed("GIT_ALLOW_PROTOCOL=https:ssh git status")
+  assertAllowed("git -c protocol.ext.allow=never -c credential.helper=store status")
+  assertAllowed("git ls-remote --exec=git-upload-pack .")
+})
+
+test("Git config writes inspect the stored command and preserve reads (AMZ-3)", () => {
+  const body = "false && tee /dev/sda1"
+  for (const prefix of ["", "--global ", "--local ", "--add ", "--file '/tmp/git config' ", "set --append "]) {
+    assertBlocked(`git config ${prefix}core.editor '${body}'`, "block-device")
+  }
+  assertBlocked('git config set sequence.editor "$COMMAND"', "cannot verify a Git shell command")
+  assertAllowed("git config core.editor vim")
+  assertAllowed("git config set core.pager 'less -FRX'")
+  assertAllowed('git config --get core.editor "$PATTERN"')
+  assertAllowed("git config core.editor")
+})
+
 test("Git carrier options stay within the analysis deadline (WI#898)", () => {
   assertAllowed("git -c core.editor=true commit; ".repeat(500), 2_500)
   assertAllowed("git difftool --extcmd=true ".repeat(600), 2_500)

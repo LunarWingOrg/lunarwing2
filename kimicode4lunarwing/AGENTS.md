@@ -42,6 +42,27 @@ The WI#895 Git body check recognizes both `git submodule foreach` and
 shell words before passing a body to the guard, so a quoted description of a
 Git command is not treated as a call.
 
+WI#898 uses the Git 2.56 command manuals and option parsers for `filter-branch`
+filters, diff and merge tools, grep's pager, pack commands on fetch, pull,
+clone, ls-remote, fetch-pack, push and send-pack, and archive's remote command.
+It checks command-valued settings in `-c`, `--config-env`, clone configuration,
+`git config` writes, and the `GIT_CONFIG_*` environment forms. Covered keys
+include editor, pager, SSH, external diff, merge, filter, pack, credential-helper,
+trailer, fsmonitor and man-viewer settings. Literal assignments to `GIT_EDITOR`,
+`GIT_SEQUENCE_EDITOR`, `VISUAL`, `EDITOR`, `GIT_PAGER`, `PAGER`,
+`GIT_SSH_COMMAND` and `GIT_EXTERNAL_DIFF` are checked across shell clauses,
+including export and declaration forms. The guard refuses explicit enabling
+of Git's external command transport.
+
+A command value that the outer shell can change is refused as unverifiable.
+A single-quoted literal body can pass if it passes the body rules, as in
+`git rebase -x 'cargo test -p $CRATE' main`. Coverage is limited to recognized
+Git command words, options and setting names. Direct helper executables,
+dynamic command or option words, runtime expansion inside the body, settings
+already installed elsewhere, and unlisted settings such as send-email or
+IMAP commands remain outside this check. The container and tenant egress
+policy remain the security boundary.
+
 Since WI#867 the clause splitter, punctuation view and listener scan share
 quote and substitution spans. A backslash escapes the next character outside
 quotes, escapes nothing inside single quotes, and inside double quotes only
