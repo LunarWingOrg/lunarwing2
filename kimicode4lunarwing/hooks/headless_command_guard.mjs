@@ -676,11 +676,31 @@ function rmDeleteOption(rest) {
     optionWords.some(isRmLongDeleteOption);
 }
 
+// A literal, simple cleanup action has its own rm operands, separate from
+// the signals. Leave all other trap shapes to the conservative raw reader.
+const LITERAL_TRAP_REMOVAL = /^[ \t]*trap[ \t]+(?:--[ \t]+)?(['"])(rm[ \t]+[A-Za-z0-9_/ .\t=+-]+)\1(?:[ \t]+(?:[A-Z][A-Z0-9]*|\d+))+[ \t]*$/;
+
+function trapRemovalBody(segment) {
+  return LITERAL_TRAP_REMOVAL.exec(segment)?.[2] ?? segment;
+}
+
+function rmTrapView(text) {
+  if (!text.includes("trap")) return text;
+  let from = 0;
+  let view = "";
+  for (const segment of commandSegments(text)) {
+    from += segment.length;
+    view += trapRemovalBody(segment) + (text[from] ?? "");
+    from++;
+  }
+  return view;
+}
+
 function checkRm(segment) {
   // A redirection is neither a clause end nor an operand (WI#889): the
   // clause is read with its redirections taken out, so `rm 2>&1 -rf /x` is
   // one command and `rm -rf /tmp/x 2> /dev/null` names one path.
-  segment = redirectionFreeView(segment);
+  segment = trapRemovalBody(redirectionFreeView(segment));
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
   // `xargs rm` takes its operands from stdin: the guard classifies that shape
@@ -3014,8 +3034,8 @@ function skipCommandPrefix(words, i) {
       i += words[i + 2] === "{" ? 3 : 1;
     } else if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
       i++;
-    } else if (word === "function") {
-      i += 2;
+    } else if (word === "function" || (/^[A-Za-z_]\w*$/.test(word) && words[i + 1] === "()")) {
+      i += word === "function" && words[i + 2] === "()" ? 3 : 2;
     } else if (word === "case") {
       // `case WORD in` heads a branch list; the branch runs after its pattern.
       const at = words.indexOf("in", i + 1);
@@ -3268,18 +3288,21 @@ function stageWordsWithRedirects(stage) {
   return extra.length === 0 ? read : [...read, ...extra];
 }
 
+function readStage(stage) {
+  const read = stageWordsWithRedirects(stage);
+  if (read === null) return { stage, words: null };
+  const words = splitRedirects(read);
+  const position = commandPosition(words);
+  const { index } = position;
+  return {
+    stage, words, position, content: stageContent(words), redirects: redirectScan(stage).targets,
+    name: index >= 0 ? commandBasename(words[index]) : "",
+    args: index >= 0 ? operandWords(words.slice(index + 1)).operands : [],
+  };
+}
+
 function readPipelines(text) {
-  return runLists(codeView(text)).map((list) => pipelineStages(list).map((stage) => {
-    const read = stageWordsWithRedirects(stage);
-    const words = read === null ? null : splitRedirects(read);
-    return {
-      stage,
-      words,
-      redirects: redirectScan(stage).targets,
-      position: words === null ? null : commandPosition(words),
-      content: words === null ? null : stageContent(words),
-    };
-  }));
+  return runLists(codeView(text)).map((list) => pipelineStages(list).map(readStage));
 }
 
 /**
@@ -3731,6 +3754,7 @@ function functionName(words) {
   let i = 0;
   while (COMPOUND_LEAD_WORDS.has(words[i])) i++;
   if (words[i] === "function") return words[i + 1]?.replace(/\(\)\{?$/, "");
+  if (words[i + 1] === "()") return words[i];
   return FUNCTION_HEAD.test(words[i] ?? "") ? words[i].slice(0, words[i].indexOf("(")) : undefined;
 }
 
@@ -3794,12 +3818,9 @@ function seedContent(pipelines, ctx) {
   for (const pipeline of pipelines) {
     let carried = null;
     for (const entry of pipeline) {
-      const { words, position, content, stage } = entry;
+      const { words, position, content, stage, name } = entry;
       if (words === null) continue;
-      const { index } = position;
-      entry.name = index >= 0 ? commandBasename(words[index]) : "";
-      entry.args = index >= 0 ? operandWords(words.slice(index + 1)).operands : [];
-      entry.assignments = assignmentFacts(words, index, entry.name);
+      entry.assignments = assignmentFacts(words, position.index, name);
       const declared = functionName(words);
       if (declared !== undefined) ctx.functions.add(declared);
       entry.held = stageHeld(entry);
@@ -3861,7 +3882,7 @@ function contentFactCount(ctx) {
 }
 
 /** Facts only grow, including across backward references in function and loop bodies. */
-function writeRunContext(pipelines) {
+function writeRunContext(pipelines, documents) {
   const ctx = {
     written: new Set(), filled: new Set(), descriptors: new Set(), functions: new Set(), executable: new Set(),
     unknown: false, strong: false, sourced: false, positionals: false, exhausted: false,
@@ -3870,6 +3891,7 @@ function writeRunContext(pipelines) {
   for (let pass = 0; pass < MAX_CONTENT_PASSES; pass++) {
     const before = contentFactCount(ctx);
     for (const pipeline of pipelines) carryPipeline(pipeline, ctx);
+    carryDocuments(documents, ctx);
     if (before === contentFactCount(ctx)) return ctx;
   }
   ctx.exhausted = true;
@@ -3966,7 +3988,7 @@ function trapRunReason(entry, args, ctx, depth) {
     if (reason) return reason;
   }
   if (depth >= MAX_SHELL_BODY_DEPTH) return ctx.sourced ? CONTENT_BUDGET_REASON : null;
-  return nestedRunReason(action, ctx, depth) ?? checkSubstitutionCommand(action) ??
+  return nestedRunReason(action, ctx, depth) ?? checkDecodedPipe(action) ?? checkSubstitutionCommand(action) ??
     checkSubstitutionShell(action) ?? (WRITE_RUN_SOURCE.test(action) ? writtenRunReason(action, depth + 1) : null);
 }
 
@@ -4127,8 +4149,9 @@ function runsInPipelines(pipelines, ctx, depth) {
       const { words, position } = entry;
       if (words === null) continue;
       const expands = words.some((word) => refsHeld(word, ctx));
-      // Retain WI#892's word-level shell reading, including unknown launchers.
-      if (expands && words.some((_word, index) => runsShellTextAt(words, index))) return ASSIGNED_RUN_REASON;
+      // A literal dot is a builtin only in command position, not jq's filter.
+      if (expands && words.some((word, index) => runsShellTextAt(words, index) &&
+        (commandBasename(word) !== "." || index === position.index))) return ASSIGNED_RUN_REASON;
       const reason = stageRunReason(entry, ctx, feed, depth);
       if (reason) return reason;
       feed.variable ||= expands;
@@ -4231,7 +4254,21 @@ function hereDocumentHolds(body, ctx) {
   for (const inner of substitutionBodies(body)) {
     if (heldContent(inner) !== null) return true;
   }
-  return refsFilled(body, ctx.filled);
+  return refsHeld(body, ctx);
+}
+
+function carryDocuments(documents, ctx) {
+  for (const document of documents) {
+    if (document.quoted || document.holds || !hereDocumentHolds(document.body, ctx)) continue;
+    document.holds = true;
+    const out = { names: ctx.written, wrote: false, unknown: false };
+    for (const stage of pipelineStages(document.command)) {
+      const words = stageWordsWithRedirects(stage);
+      if (words !== null) stageWrites(splitRedirects(words), out);
+    }
+    ctx.strong ||= out.wrote;
+    ctx.unknown ||= out.unknown;
+  }
 }
 
 /**
@@ -4246,26 +4283,10 @@ function hereDocumentHolds(body, ctx) {
  */
 function writtenRunReason(text, depth = 0) {
   const pipelines = readPipelines(text);
-  const ctx = writeRunContext(pipelines);
+  const documents = [...hereDocuments(text)];
+  const ctx = writeRunContext(pipelines, documents);
   if (ctx.exhausted) return CONTENT_BUDGET_REASON;
   if (ctx.sourced && loopRunsSubstitution(pipelines)) return SUBSTITUTION_SHELL_REASON;
-  // An unquoted here-document expands its body first, so a decode, a fetch
-  // or a filled variable there is the content its command writes
-  // (`cat > f <<EOF` / `$(curl …)` / `EOF`) or runs.
-  const documents = [...hereDocuments(text)];
-  for (const document of documents) {
-    document.holds = !document.quoted && hereDocumentHolds(document.body, ctx);
-    if (!document.holds) continue;
-    const out = { names: ctx.written, wrote: false, unknown: false };
-    for (const stage of pipelineStages(document.command)) {
-      const words = stageWordsWithRedirects(stage);
-      if (words !== null) stageWrites(splitRedirects(words), out);
-    }
-    if (out.wrote) {
-      ctx.strong = true;
-      if (out.unknown) ctx.unknown = true;
-    }
-  }
   writtenExecutables(pipelines, ctx);
   const reason = runsInPipelines(pipelines, ctx, depth);
   if (reason) return reason;
@@ -5758,7 +5779,7 @@ function checkAmbiguousRm(segment) {
 function checkRmAssembly(command) {
   const readings = new Set(JOIN_READINGS.map(([outside, inside]) => joinLineContinuations(command, outside, inside)));
   for (const reading of readings) {
-    const words = shellWordView(reading);
+    const words = shellWordView(rmTrapView(reading));
     // Check plain IFS separators as spaces without evaluating parameters.
     const separated = words.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, " ");
     const inSubstitution = separated.replace(/\$\(|[`()]/g, " ");
