@@ -94,6 +94,7 @@ pub(crate) mod loader;
 mod rate_limiter;
 mod runtime;
 pub(crate) mod storage;
+pub(crate) mod trap;
 pub(crate) mod wrapper;
 
 // Core types
