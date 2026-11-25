@@ -185,14 +185,17 @@ class RuntimeVerificationTests(unittest.TestCase):
         checks = self.checks(text, workers=("pebble",))
         self.assertTrue(checks[-1].ok)
 
-    def test_lane_with_no_allocated_wss_port_stays_green(self):
-        # No slot is a configuration choice, not a dead lane.
+    def test_missing_wss_port_only_blocks_a_selected_worker(self):
         text = SYSTEMD_STATUS + (
             "Pebble worker: running (lunarwing-pebble-lunarium, "
             "WSS port none: unknown (no WSS port allocated))\n"
+            "OpenCode worker: running (lunarwing-opencode-lunarium, "
+            "WSS port 20012: listening)\n"
         )
-        checks = self.checks(text, workers=("pebble",))
-        self.assertTrue(checks[-1].ok)
+        failed = [check for check in self.checks(text) if not check.ok]
+        self.assertEqual([check.label for check in failed], ["Pebble worker"])
+        self.assertIn("no WSS port allocated", failed[0].detail)
+        self.assertTrue(all(check.ok for check in self.checks(text, workers=("opencode",))))
 
     def test_unselected_workers_are_not_required(self):
         self.assertTrue(all(c.ok for c in self.checks(SYSTEMD_STATUS, workers=())))
