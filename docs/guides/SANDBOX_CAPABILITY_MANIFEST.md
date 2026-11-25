@@ -264,6 +264,16 @@ or Git operations to the proxy. Manifest preflight rejects the remote
 transport plumbing — `send-pack`, `fetch-pack`, `http-push`, `http-fetch` and
 the `remote-*` helpers, whether named as a `git` subcommand or invoked by
 path.
+Git's dispatcher runs `git <verb>` as the program `git-<verb>` in its exec
+path (`/usr/lib/git-core/git-push`, or a bare `git-push` on `PATH`), so a
+dashed program is read as the subcommand it stands for: `git-push -f` is
+refused exactly as `git push -f` is, and `git-fetch`, `git-clone`,
+`git-config` and the rest get the subcommand's own checks. A dashed program
+takes the subcommand's arguments, not `git`'s global options, so none are
+skipped ahead of it. `git submodule--helper` — the program behind
+`git submodule` — is read like `git submodule`: its `foreach` body is
+scanned with the helper's own option rules (unambiguous long-option
+abbreviations included), and its other subcommands are refused.
 It also refuses in-command configuration that would change what a later word
 means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
