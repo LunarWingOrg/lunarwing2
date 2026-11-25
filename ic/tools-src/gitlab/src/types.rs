@@ -270,6 +270,10 @@ pub enum GitlabAction {
         commit_message: String,
         last_commit_id: String,
     },
+    /// Hits are returned as a compact triage summary (id/iid/title/state/
+    /// web_url and, for blobs, path/ref/startline); fetch the full object by
+    /// web_url or iid. Pages are capped at 20 hits so a broad term cannot
+    /// exhaust the guest sandbox; use `pagination.next_page` to continue.
     SearchProjects {
         query: String,
         #[serde(default = "default_per_page")]
@@ -286,6 +290,9 @@ pub enum GitlabAction {
         #[serde(default = "default_page")]
         page: u32,
     },
+    /// Hits are returned as a compact location summary (path/filename/ref/
+    /// startline) rather than with each file's matching text. Pages are capped
+    /// at 20 hits; use `pagination.next_page` to continue.
     SearchBlobs {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
