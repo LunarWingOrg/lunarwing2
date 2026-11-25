@@ -989,6 +989,11 @@ test("a long command of repeated words is decided without rescanning", () => {
   assertBlocked("{a,b}".repeat(2000).slice(0, 16_384), "brace expansion this large")
   assertAllowed("echo " + "{".repeat(8_000) + "}".repeat(8_000), 2_000)
   assertBlocked("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), "brace expansion this large")
+  // WI#890 reads the interpreter name as the last part of a path of any
+  // depth, so 16 KB of path parts must not cost a match attempt per start.
+  assertAllowed("/a/b/c/d/e/f/g/h ".repeat(1000).slice(0, 16_384), 2_000)
+  assertAllowed("a/".repeat(8_000).slice(0, 16_384), 2_000)
+  assertAllowed("/usr/bin/node -e ".repeat(900).slice(0, 16_384), 2_000)
 })
 
 test("a brace expansion past the cap is refused, not read as literal (ALP-1)", () => {
