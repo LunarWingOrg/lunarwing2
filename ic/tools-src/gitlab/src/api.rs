@@ -659,21 +659,6 @@ pub fn delete_file(
     Ok(json!({ "deleted": path, "branch": branch }))
 }
 
-pub fn search_projects(
-    client: &GitlabClient,
-    query: &str,
-    per_page: u32,
-    page_number: u32,
-) -> Result<Value, String> {
-    require_nonempty("query", query)?;
-    let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
-        "/search?scope=projects&search={}&per_page={per_page}&page={page_number}",
-        url_encode(query)
-    );
-    client.request_json("GET", &endpoint, None)
-}
-
 pub fn search_issues(
     client: &GitlabClient,
     project: &str,
@@ -682,6 +667,22 @@ pub fn search_issues(
     page_number: u32,
 ) -> Result<Value, String> {
     project_search(client, project, "issues", query, per_page, page_number)
+}
+
+/// Run a project-scoped search through the typed, per-page-capped path so a
+/// broad term degrades to a smaller page instead of exhausting guest memory.
+/// A zero-match query is a normal empty array, never an error.
+fn project_search(
+    client: &GitlabClient,
+    project: &str,
+    scope: &str,
+    query: &str,
+    per_page: u32,
+    page_number: u32,
+) -> Result<Value, String> {
+    require_nonempty("query", query)?;
+    let endpoint = project_search_endpoint(project, scope, query, per_page, page_number)?;
+    client.request_typed_page::<SearchHit>(&endpoint)
 }
 
 /// GitLab's project search supports `ref` only for the repository scopes
@@ -697,7 +698,7 @@ pub fn search_blobs(
     page_number: u32,
 ) -> Result<Value, String> {
     let endpoint = search_blobs_endpoint(project, query, ref_, per_page, page_number)?;
-    client.request_json("GET", &endpoint, None)
+    client.request_typed_page::<SearchHit>(&endpoint)
 }
 
 fn search_blobs_endpoint(
@@ -711,7 +712,6 @@ fn search_blobs_endpoint(
     if let Some(ref_) = ref_ {
         require_nonempty("ref", ref_)?;
     }
-    let (per_page, page_number) = page(per_page, page_number);
     let mut endpoint = project_search_endpoint(project, "blobs", query, per_page, page_number)?;
     if let Some(ref_) = ref_ {
         endpoint.push_str("&ref=");
@@ -722,6 +722,9 @@ fn search_blobs_endpoint(
 
 /// Search URL shared by every project search scope. Split out so the
 /// `blobs` branch filter can be pinned without a live GitLab instance.
+///
+/// The page size is capped here, not at the call sites, so every search
+/// scope inherits the WI#891 bound.
 fn project_search_endpoint(
     project: &str,
     scope: &str,
@@ -729,29 +732,12 @@ fn project_search_endpoint(
     per_page: u32,
     page_number: u32,
 ) -> Result<String, String> {
+    let (per_page, page_number) = search_page(per_page, page_number);
     Ok(format!(
         "/projects/{}/search?scope={scope}&search={}&per_page={per_page}&page={page_number}",
         project_path(project)?,
         url_encode(query)
     ))
-}
-
-fn project_search(
-    client: &GitlabClient,
-    project: &str,
-    scope: &str,
-    query: &str,
-    per_page: u32,
-    page_number: u32,
-) -> Result<Value, String> {
-    require_nonempty("query", query)?;
-    let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
-        "/projects/{}/search?scope={scope}&search={}&per_page={per_page}&page={page_number}",
-        project_path(project)?,
-        url_encode(query)
-    );
-    client.request_json("GET", &endpoint, None)
 }
 
 pub fn list_pipelines(
@@ -864,6 +850,173 @@ pub fn list_jobs(
     client.request_typed_page::<JobSummary>(&endpoint)
 }
 
+/// Per-page clamp for the search actions (WI#891).
+///
+/// Search hits carry the full issue/MR `description`, which dominates the
+/// page: a 100-hit issue search on `lunarwing/lunarwing2` is ~555 KB of JSON.
+/// Parsing that into a `serde_json::Value` tree in the guest's 10 MB sandbox
+/// is several times the raw size, and a refused `memory.grow` aborts the
+/// module as an `unreachable` trap. A smaller page keeps a broad term inside
+/// the budget; `pagination.next_page` continues the scan.
+const SEARCH_MAX_PER_PAGE: u32 = 20;
+
+/// Per-hit cap on a blob hit's matched snippet (`data`), in characters
+/// (WI#891). A snippet is normally a few lines around the match, but one
+/// minified or generated line can be arbitrarily long.
+const SEARCH_SNIPPET_MAX_CHARS: usize = 2_000;
+
+/// One search hit as GitLab sends it, reduced to the fields an agent triages
+/// by (WI#891).
+///
+/// GitLab's search payload embeds whole issue/MR objects: `description`
+/// alone is ~75% of a full page, plus `milestone`, `time_stats`, and
+/// `task_completion_status`. Deserializing straight into this type makes
+/// `serde` skip those subtrees while streaming tokens instead of building
+/// their `Value` trees. Nested users keep only their `username`. Absent
+/// fields are left out of the output instead of being emitted as `null`.
+/// `web_url` is one hop to the full object.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct SearchHitFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    iid: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Project hits carry a name and namespace path instead of a title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name_with_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_with_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    /// Echoed so the agent can see the visibility the server authorized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confidential: Option<bool>,
+    /// Issue hits: label names, as GitLab's search returns them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    labels: Option<Vec<String>>,
+    /// Issue hits: rendered as the author's username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<UserRef>,
+    /// Issue hits: rendered as a list of usernames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignees: Option<Vec<UserRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basename: Option<String>,
+    /// Blob hits carry the branch/tag the match came from.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    ref_: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startline: Option<u64>,
+    /// Blob hits: the matched snippet as GitLab sent it. [`SearchHit`] takes
+    /// it out and caps it, so it is never serialized from here.
+    #[serde(default, skip_serializing)]
+    data: Option<String>,
+}
+
+/// One search hit as returned to the agent: [`SearchHitFields`] plus the
+/// blob snippet cut to [`SEARCH_SNIPPET_MAX_CHARS`]. `data_truncated` is
+/// emitted only when the snippet was cut.
+///
+/// Deserialization goes through `SearchHitFields`, so each hit's snippet is
+/// cut as soon as that hit is parsed, before the next one is read.
+#[derive(Debug, serde::Serialize, Deserialize)]
+#[serde(from = "SearchHitFields")]
+struct SearchHit {
+    #[serde(flatten)]
+    fields: SearchHitFields,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    data_truncated: bool,
+}
+
+impl From<SearchHitFields> for SearchHit {
+    fn from(mut fields: SearchHitFields) -> Self {
+        let (data, data_truncated) = match fields.data.take() {
+            Some(snippet) => {
+                let (snippet, truncated) = cap_chars(snippet, SEARCH_SNIPPET_MAX_CHARS);
+                (Some(snippet), truncated)
+            }
+            None => (None, false),
+        };
+        Self {
+            fields,
+            data,
+            data_truncated,
+        }
+    }
+}
+
+/// Keep at most `max_chars` characters of `text`; returns whether it was cut.
+///
+/// The cut index comes from `char_indices`, so it always lands on a char
+/// boundary: multi-byte text cannot make `String::truncate` panic.
+fn cap_chars(mut text: String, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => {
+            text.truncate(cut);
+            text.shrink_to_fit();
+            (text, true)
+        }
+        None => (text, false),
+    }
+}
+
+/// A nested GitLab user (`author`, `assignees[]`) reduced to `username`;
+/// serde skips the rest of the object. Serialized as the bare username.
+#[derive(Debug, Deserialize)]
+struct UserRef {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+impl serde::Serialize for UserRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.username, serializer)
+    }
+}
+
+pub fn search_projects(
+    client: &GitlabClient,
+    query: &str,
+    per_page: u32,
+    page_number: u32,
+) -> Result<Value, String> {
+    require_nonempty("query", query)?;
+    let (per_page, page_number) = search_page(per_page, page_number);
+    let endpoint = format!(
+        "/search?scope=projects&search={}&per_page={per_page}&page={page_number}",
+        url_encode(query)
+    );
+    client.request_typed_page::<SearchHit>(&endpoint)
+}
+
+/// Clamp a search page like [`page`] and then apply the tighter search cap.
+fn search_page(per_page: u32, page_number: u32) -> (u32, u32) {
+    let (per_page, page_number) = page(per_page, page_number);
+    (per_page.min(SEARCH_MAX_PER_PAGE), page_number)
+}
+
 /// Build the `list_jobs` endpoint with the global `page()` clamp applied and
 /// then the tighter WI#525 per-page clamp on top.
 fn jobs_endpoint(
@@ -940,8 +1093,9 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        annotate_mr_changes, merge_requests_endpoint, project_search_endpoint, require_changes,
-        search_blobs_endpoint, validate_choice, validate_file_path, work_items_endpoint,
+        SEARCH_MAX_PER_PAGE, SEARCH_SNIPPET_MAX_CHARS, SearchHit, annotate_mr_changes, cap_chars,
+        merge_requests_endpoint, project_search_endpoint, require_changes, search_blobs_endpoint,
+        search_page, validate_choice, validate_file_path, work_items_endpoint,
     };
 
     #[test]
@@ -1241,5 +1395,229 @@ mod tests {
             normalised,
             "/projects/35/pipelines/6842/jobs?per_page=1&page=1"
         );
+    }
+
+    /// WI#891: a broad term must not ask for a page larger than the guest can
+    /// parse. The cap sits below the global `page()` ceiling and below the
+    /// 100-hit page that carried ~555 KB of JSON.
+    #[test]
+    fn search_page_clamps_below_the_global_ceiling() {
+        assert_eq!(search_page(100, 1), (SEARCH_MAX_PER_PAGE, 1));
+        assert_eq!(search_page(50, 2), (SEARCH_MAX_PER_PAGE, 2));
+        // A caller asking for less keeps their page size.
+        assert_eq!(search_page(5, 3), (5, 3));
+        // The global clamp still applies underneath.
+        assert_eq!(search_page(0, 0), (1, 1));
+        const { assert!(SEARCH_MAX_PER_PAGE < 100) };
+    }
+
+    /// WI#891: every search action routes through the capped page size, so the
+    /// failing 100-hit request cannot be reissued by a future edit.
+    #[test]
+    fn search_endpoints_apply_the_page_cap() {
+        let issues = project_search_endpoint("35", "issues", "PostgreSQL", 100, 1).unwrap();
+        assert_eq!(
+            issues,
+            "/projects/35/search?scope=issues&search=PostgreSQL&per_page=20&page=1"
+        );
+
+        let blobs = search_blobs_endpoint("35", "PostgreSQL", None, 100, 1).unwrap();
+        assert_eq!(
+            blobs,
+            "/projects/35/search?scope=blobs&search=PostgreSQL&per_page=20&page=1"
+        );
+
+        // A caller asking for fewer hits keeps their page size.
+        let small = project_search_endpoint("35", "issues", "q", 5, 2).unwrap();
+        assert!(small.contains("per_page=5"), "{small}");
+    }
+
+    /// WI#891: a hit carrying the full issue object keeps the fields an agent
+    /// triages by (labels, author, assignees, closed_at among them) while
+    /// dropping the heavy subtrees that dominated the page.
+    #[test]
+    fn search_hit_keeps_triage_fields_and_skips_heavy_subtrees() {
+        let hit = json!({
+            "id": 993,
+            "iid": 891,
+            "project_id": 35,
+            "title": "search_issues traps on a matching term",
+            "description": "x".repeat(16_000),
+            "state": "closed",
+            "closed_at": "2026-11-25T07:16:00.000Z",
+            "web_url": "https://git.example.test/lunarwing/lunarwing2/-/work_items/891",
+            "labels": ["bug", "in-progress"],
+            "author": { "id": 4, "username": "kageho", "avatar_url": "x".repeat(500) },
+            "assignees": [
+                { "id": 18, "username": "applejack", "state": "active" },
+                { "id": 19, "username": "sweetiebot" },
+            ],
+            "milestone": { "id": 7, "title": "v2.2.2.0", "description": "x".repeat(2_000) },
+            "time_stats": { "time_estimate": 0 },
+            "task_completion_status": { "count": 0 },
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(rendered["iid"], 891);
+        assert_eq!(rendered["project_id"], 35);
+        assert_eq!(rendered["title"], "search_issues traps on a matching term");
+        assert_eq!(rendered["state"], "closed");
+        assert_eq!(rendered["closed_at"], "2026-11-25T07:16:00.000Z");
+        assert!(rendered["web_url"].is_string());
+        assert_eq!(rendered["labels"], json!(["bug", "in-progress"]));
+        assert_eq!(rendered["author"], "kageho");
+        assert_eq!(rendered["assignees"], json!(["applejack", "sweetiebot"]));
+        for heavy in [
+            "description",
+            "milestone",
+            "time_stats",
+            "task_completion_status",
+        ] {
+            assert!(
+                rendered.get(heavy).is_none(),
+                "{heavy} must be skipped, not carried"
+            );
+        }
+        // Absent fields are left out, not emitted as `null`.
+        for absent in ["name", "path", "ref", "data", "data_truncated"] {
+            assert!(
+                rendered.get(absent).is_none(),
+                "{absent} must not be emitted for an issue hit: {rendered}"
+            );
+        }
+        assert!(
+            serde_json::to_string(&summary).unwrap().len() < 1_000,
+            "the retained summary must stay small"
+        );
+    }
+
+    /// WI#891: blob hits keep the location fields the agent needs to open the
+    /// file, including the branch the match came from, and the matched
+    /// snippet. A long snippet is cut per hit on a char boundary.
+    #[test]
+    fn search_hit_keeps_blob_location_fields() {
+        let hit = json!({
+            "basename": "wrapper.rs",
+            "filename": "ic/src/tools/wasm/wrapper.rs",
+            "path": "ic/src/tools/wasm/wrapper.rs",
+            "data": "fn execute() { ... }",
+            "ref": "main",
+            "startline": 1731,
+            "project_id": 35,
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["path"], "ic/src/tools/wasm/wrapper.rs");
+        assert_eq!(rendered["basename"], "wrapper.rs");
+        assert_eq!(rendered["ref"], "main");
+        assert_eq!(rendered["startline"], 1731);
+        assert_eq!(rendered["data"], "fn execute() { ... }");
+        assert!(
+            rendered.get("data_truncated").is_none(),
+            "a snippet within the cap is not marked truncated: {rendered}"
+        );
+
+        // The cap falls inside a three-byte char: byte index
+        // SEARCH_SNIPPET_MAX_CHARS is not a char boundary of this text.
+        let long = format!("{}日本語", "x".repeat(SEARCH_SNIPPET_MAX_CHARS - 1));
+        assert!(!long.is_char_boundary(SEARCH_SNIPPET_MAX_CHARS));
+        let summary: SearchHit = serde_json::from_value(json!({
+            "path": "ic/src/generated.rs",
+            "data": long,
+        }))
+        .unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        let data = rendered["data"].as_str().unwrap();
+        assert_eq!(data.chars().count(), SEARCH_SNIPPET_MAX_CHARS);
+        assert!(data.ends_with("x日"), "cut after the first whole char");
+        assert_eq!(rendered["data_truncated"], true);
+    }
+
+    /// WI#891: a multi-byte snippet longer than the cap must not panic (a
+    /// byte-index cut would land inside a char) and is cut to exactly the
+    /// cap, ending on a whole char.
+    #[test]
+    fn search_hit_cuts_a_multibyte_snippet_on_a_char_boundary() {
+        let snippet = "é".repeat(3_000);
+        let summary: SearchHit = serde_json::from_value(json!({
+            "path": "docs/accents.md",
+            "data": snippet,
+        }))
+        .unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        let data = rendered["data"].as_str().unwrap();
+        assert_eq!(data.chars().count(), SEARCH_SNIPPET_MAX_CHARS);
+        assert_eq!(data.len(), 2 * SEARCH_SNIPPET_MAX_CHARS, "two bytes per é");
+        assert!(data.chars().all(|c| c == 'é'), "no partial char kept");
+        assert_eq!(rendered["data_truncated"], true);
+
+        // The helper directly: exactly at the cap is not a cut.
+        let (kept, cut) = cap_chars("é".repeat(5), 5);
+        assert_eq!((kept.as_str(), cut), ("ééééé", false));
+        let (kept, cut) = cap_chars("aé日".to_string(), 2);
+        assert_eq!((kept.as_str(), cut), ("aé", true));
+    }
+
+    /// WI#891: project hits have no `title`/`iid` — they identify a project
+    /// by name and namespace path. Dropping those would make a project search
+    /// return empty objects.
+    #[test]
+    fn search_hit_keeps_project_identity_fields() {
+        let hit = json!({
+            "id": 35,
+            "name": "lunarwing2",
+            "name_with_namespace": "lunarwing / lunarwing2",
+            "path_with_namespace": "lunarwing/lunarwing2",
+            "visibility": "private",
+            "description": "x".repeat(4_000),
+            "namespace": { "id": 12, "full_path": "lunarwing" },
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["name"], "lunarwing2");
+        assert_eq!(rendered["name_with_namespace"], "lunarwing / lunarwing2");
+        assert_eq!(rendered["path_with_namespace"], "lunarwing/lunarwing2");
+        assert_eq!(rendered["visibility"], "private");
+        assert!(rendered.get("description").is_none());
+        assert!(rendered.get("namespace").is_none());
+    }
+
+    /// WI#891: a zero-match search is an ordinary empty array — it must parse
+    /// as an empty hit list, not as a shape error, so "no matches" stays
+    /// distinguishable from a backend failure.
+    #[test]
+    fn zero_match_search_parses_as_an_empty_page() {
+        let hits: Vec<SearchHit> = serde_json::from_str("[]").unwrap();
+        assert!(hits.is_empty());
+
+        let rendered = serde_json::to_value(hits).unwrap();
+        assert_eq!(rendered, json!([]));
+    }
+
+    /// WI#891: confidentiality is server-enforced — the search scope must not
+    /// add a parameter that could widen it (there is no `confidential` or
+    /// `all` flag here), and hits that do carry the flag must keep it intact.
+    #[test]
+    fn search_scope_keeps_server_side_confidentiality_and_echoes_the_flag() {
+        let issues = project_search_endpoint("35", "issues", "security", 20, 1).unwrap();
+        for widening in ["confidential", "all=true", "scope=all"] {
+            assert!(
+                !issues.contains(widening),
+                "search must not widen visibility with {widening}: {issues}"
+            );
+        }
+        assert!(issues.contains("scope=issues"), "{issues}");
+
+        // A confidential hit keeps its flag so the agent can see the state
+        // the server authorized it to see.
+        let confidential = json!({
+            "iid": 890,
+            "title": "command guard finding",
+            "confidential": true,
+        });
+        let summary: SearchHit = serde_json::from_value(confidential).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["confidential"], true);
     }
 }

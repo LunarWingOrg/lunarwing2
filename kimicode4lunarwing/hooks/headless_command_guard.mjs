@@ -66,7 +66,9 @@ function rmOperands(words, endOfOptions) {
     .filter((token, i) => token.length > 0 &&
       (!token.startsWith("-") || (endOfOptions !== -1 && i > endOfOptions)))
     .map((token) => token.replace(/^["']|["']$/g, ""))
-    // A redirection target is not an rm operand (e.g. `2>/dev/null`).
+    // A redirection target is not an rm operand. The caller's words already
+    // come from the redirection-free view (WI#889); this keeps the reading
+    // for a caller that hands over raw words.
     .filter((token) => !/^\d*>/.test(token));
 }
 
@@ -81,6 +83,213 @@ function heredocRedirect(text, i) {
   const delimiter = match[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
     (_match, single, double, escaped) => single ?? double?.replace(/\\(["\\$`])/g, "$1") ?? escaped);
   return { delimiter, stripTabs, end: word.lastIndex };
+}
+
+// WI#889: a redirection may stand anywhere in a simple command, and the words
+// after it are still that command's arguments (`man bash`, REDIRECTION). The
+// reader below blanks every redirection out of the command line and keeps its
+// targets in a list, so a rule reads the words bash runs and a rule about a
+// target still sees it. The forms are `[n]<word`, `[n]>word`, `[n]>|word`,
+// `[n]>>word`, `&>word`, `>&word`, `&>>word`, `[n]<<[-]word`, `[n]<<<word`,
+// `[n]<&word`, `[n]>&word` and `[n]<>word`, each also with `{varname}` in
+// place of `n`, and with or without blanks before the target.
+const REDIRECT_WORD_BREAK = " \t\n;|&()<>";
+
+/** The redirection operator at `i`, or "" when the character starts none. */
+function redirectOperatorAt(text, i) {
+  const ch = text[i];
+  if (ch === "&") {
+    if (text[i + 1] !== ">") return "";
+    return text[i + 2] === ">" ? "&>>" : "&>";
+  }
+  if (ch === ">") {
+    // `>(…)` is a process substitution, not a redirection.
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === ">") return ">>";
+    if (text[i + 1] === "|") return ">|";
+    if (text[i + 1] === "&") return ">&";
+    return ">";
+  }
+  if (ch === "<") {
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === "&") return "<&";
+    if (text[i + 1] === ">") return "<>";
+    if (text[i + 1] !== "<") return "<";
+    if (text[i + 2] === "<") return "<<<";
+    if (text[i + 2] === "-") return "<<-";
+    return "<<";
+  }
+  return "";
+}
+
+/**
+ * The start of the whole redirection token: bash reads a run of digits (or a
+ * `{varname}`) that forms a word of its own immediately before the operator as
+ * the descriptor, so `a2>f` writes fd 1 from the word `a2` while `2>f` writes
+ * fd 2. The digits must be the whole word, which is why the character before
+ * them has to be a word break.
+ */
+function redirectPrefixStart(text, operatorIndex) {
+  // Combined stdout/stderr redirections never take a descriptor prefix.
+  if (text[operatorIndex] === "&") return operatorIndex;
+  let start = operatorIndex;
+  let i = operatorIndex - 1;
+  if (text[i] === "}") {
+    let open = i - 1;
+    while (open >= 0 && /[A-Za-z0-9_]/.test(text[open])) open--;
+    if (open >= 0 && text[open] === "{" && open < i - 1 &&
+        (open === 0 || REDIRECT_WORD_BREAK.includes(text[open - 1]))) {
+      start = open;
+      i = open - 1;
+    }
+  }
+  let digits = 0;
+  while (i >= 0 && text[i] >= "0" && text[i] <= "9") {
+    i--;
+    digits++;
+  }
+  if (digits > 0 && (i < 0 || REDIRECT_WORD_BREAK.includes(text[i]))) start = i + 1;
+  return start;
+}
+
+/** The span of the word a redirection takes as its target, blanks skipped. */
+function redirectWordSpan(text, scan, from) {
+  let i = from;
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  const start = i;
+  while (i < text.length) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close + 1;
+      continue;
+    }
+    if (scan.states[i] === QUOTE_UNQUOTED && REDIRECT_WORD_BREAK.includes(text[i])) break;
+    i++;
+  }
+  return { start, end: Math.min(i, text.length) };
+}
+
+/**
+ * The command line with every redirection blanked out, the targets it wrote
+ * or read, and the here-string bodies, which bash feeds to the command as its
+ * input and which the guard therefore reads as commands. The blanks
+ * keep every other offset where it was. `|&` is bash's shorthand for
+ * `2>&1 |` (`man bash`, Pipelines), so its `&` is blanked and the bar kept.
+ */
+function stripRedirections(text, escapes = true) {
+  const scan = quoteScan(text, escapes);
+  const chars = text.split("");
+  const targets = [];
+  const hereStrings = new Set();
+  for (let i = 0; i < text.length; i++) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close;
+      continue;
+    }
+    if (scan.states[i] !== QUOTE_UNQUOTED) continue;
+    if (text[i] === "|" && text[i + 1] === "&") {
+      chars[i + 1] = " ";
+      i++;
+      continue;
+    }
+    const operator = redirectOperatorAt(text, i);
+    if (operator === "") continue;
+    const start = redirectPrefixStart(text, i);
+    let end = i + operator.length;
+    if (operator === "<<" || operator === "<<-") {
+      const redirect = heredocRedirect(text, i);
+      if (redirect) end = redirect.end;
+    } else {
+      const span = redirectWordSpan(text, scan, i + operator.length);
+      if (span.end > span.start) end = span.end;
+      const target = text.slice(span.start, span.end);
+      if (operator === "<<<") hereStrings.add(target);
+      else if (target.length > 0) {
+        targets.push({ target, operator, write: operator !== "<" && operator !== "<&" });
+      }
+    }
+    for (let j = start; j < end; j++) chars[j] = " ";
+    i = end - 1;
+  }
+  const view = chars.join("");
+  return { view, targets, hereStrings };
+}
+
+let redirectScanText = null;
+let redirectScanEscapes = true;
+let redirectScanResult = null;
+
+function redirectScan(text, escapes = true) {
+  if (text === redirectScanText && escapes === redirectScanEscapes) return redirectScanResult;
+  const result = stripRedirections(text, escapes);
+  redirectScanText = text;
+  redirectScanEscapes = escapes;
+  redirectScanResult = result;
+  return result;
+}
+
+/** The command line with its redirections taken out. */
+function redirectionFreeView(text, escapes = true) {
+  return redirectScan(text, escapes).view;
+}
+
+/**
+ * The index after the redirection whose operator is at `i`, or null when `i`
+ * starts none. A redirection glues to the word before it (`a&>f`), so the
+ * digits or `{varname}` immediately before the operator are part of the token
+ * and must not end the word being read.
+ */
+function redirectionSkip(text, i) {
+  const operator = redirectOperatorAt(text, i);
+  if (operator === "") return null;
+  const scan = quoteScan(text);
+  const start = redirectPrefixStart(text, i);
+  let end = i + operator.length;
+  if (operator === "<<" || operator === "<<-") {
+    const redirect = heredocRedirect(text, i);
+    if (redirect) end = redirect.end;
+  } else {
+    const span = redirectWordSpan(text, scan, i + operator.length);
+    if (span.end > span.start) end = span.end;
+  }
+  return end > start ? end : null;
+}
+
+/**
+ * The index after any redirections standing at or before `i`, with the blanks
+ * between them. A caller that expects a word at `i` uses this to step past a
+ * redirection that stands in the word's place (`git -C 2>/dev/null /tmp/r`).
+ */
+function skipRedirectionAt(text, from) {
+  let i = from;
+  for (;;) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const end = redirectTokenSpan(text, i)?.end ?? null;
+    if (end === null) return i;
+    i = end;
+  }
+}
+
+/**
+ * The redirection token that starts at the word boundary `i`, with its
+ * `[n]`/`{varname}` descriptor prefix, or null when `i` starts none. Only a
+ * token at a word start carries a descriptor: bash reads `a2>f` as the word
+ * `a2` and a plain `>f`, because the digits are not a word of their own.
+ */
+function redirectTokenSpan(text, i) {
+  let operatorIndex = i;
+  if (text[i] >= "0" && text[i] <= "9") {
+    while (operatorIndex < text.length && text[operatorIndex] >= "0" &&
+        text[operatorIndex] <= "9") operatorIndex++;
+  } else if (text[i] === "{") {
+    const name = /^\{[A-Za-z_][A-Za-z0-9_]*\}/.exec(text.slice(i, i + 64));
+    if (name === null) return null;
+    operatorIndex = i + name[0].length;
+  }
+  if (operatorIndex !== i && text[operatorIndex] === "&") return null;
+  const end = redirectionSkip(text, operatorIndex);
+  return end === null ? null : { start: i, end };
 }
 
 /**
@@ -150,8 +359,14 @@ const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
   .filter((root) => root !== null);
 
 /** Split a command tail into bash words (space and tab only). */
+/**
+ * Split a command tail into bash words (space and tab only). A redirection is
+ * not a word, so `tee 2>&1 /dev/sda1` has the one operand `/dev/sda1`, and
+ * `find /tmp/x 2>&1 -delete` the one start path `/tmp/x` (WI#889). The
+ * targets a rule needs are read from `redirectScan`, not from this list.
+ */
 function argumentWords(rest) {
-  return rest.split(/[ \t]+/).filter((word) => word.length > 0);
+  return redirectionFreeView(rest).split(/[ \t]+/).filter((word) => word.length > 0);
 }
 
 function stripShellQuotes(word) {
@@ -462,6 +677,10 @@ function rmDeleteOption(rest) {
 }
 
 function checkRm(segment) {
+  // A redirection is neither a clause end nor an operand (WI#889): the
+  // clause is read with its redirections taken out, so `rm 2>&1 -rf /x` is
+  // one command and `rm -rf /tmp/x 2> /dev/null` names one path.
+  segment = redirectionFreeView(segment);
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
   // `xargs rm` takes its operands from stdin: the guard classifies that shape
@@ -493,10 +712,21 @@ const FIND_DELETE_ACTION =
 const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b/g;
 const XARGS_RM = /(?:^|\s)(?:[\w.+-]*\/)?rm(?:\s|$)/;
 const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b/g;
-// Interpreter options may precede the eval flag (`perl -MFile::Path -e …`),
-// so the eval flag is found by walking the words (oneLinerCode).
-const ONE_LINER_CALL =
-  /(?:^|[\s;&|()])(?:[\w.+-]*\/)?(python3?|perl|node|ruby)(?:\.\d+)?\b([^\n]*)/g;
+// The names one of these interpreters ships under, with the version suffix a
+// name may carry (`python3.11`, `perl5.36.0`). The perl version changes with
+// the base image, so no one version number is held here (WI#890).
+const ONE_LINER_NAMES = "(python3?|perl5(?:\\.\\d+)+|perl|nodejs|node|ruby)(?:\\.\\d+)?";
+// An interpreter may be named by a path of any depth, absolute or relative,
+// with `~`, a variable or a quote in it, so the prefix is every non-blank
+// character up to the last `/` and the name is the last part of the word
+// (WI#890). Options may precede the eval flag (`perl -MFile::Path -e …`), so
+// the eval flag is found by walking the words (oneLinerCode).
+const ONE_LINER_CALL = new RegExp(
+  `(?:^|[\\s;&|()])(?:[^\\s;&|()]*\\/)?${ONE_LINER_NAMES}\\b([^\\n]*)`, "g");
+// The letters an interpreter's own option syntax uses for its eval flag
+// (python `-c`, perl `-e`/`-E`, node `-e`/`-p`, ruby `-e`), read inside a
+// short-option cluster.
+const EVAL_FLAG_LETTERS = { python: "c", perl: "eE", node: "ep", ruby: "e" };
 const DELETION_CALL =
   /\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink)|rmtree|remove_tree|rimraf|rmSync|rmdirSync|unlinkSync|unlink|rmdir)\s*\(/g;
 // The names a one-liner can bind to a deletion, however the binding is spelled.
@@ -879,11 +1109,25 @@ const INTERPRETER_VALUE_OPTIONS = {
   ruby: new Set(["-I", "-r", "-C", "-E", "--enable"]),
 };
 
+/**
+ * The language family of an interpreter name (WI#890): the version suffix and
+ * the second name a name may carry are dropped, so `perl5.36.0` reads as
+ * `perl` and `nodejs` as `node`. The family, not the spelling, chooses the
+ * option tables and the deletion readers.
+ */
+function interpreterFamily(name) {
+  if (/^node/.test(name)) return "node";
+  if (/^perl/.test(name)) return "perl";
+  if (/^ruby/.test(name)) return "ruby";
+  return "python";
+}
+
 /** The value-option table for an interpreter name, by language family. */
 function interpreterValueOptions(name) {
-  if (name === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
-  if (name === "node") return INTERPRETER_VALUE_OPTIONS.node;
-  if (name === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
+  const family = interpreterFamily(name);
+  if (family === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
+  if (family === "node") return INTERPRETER_VALUE_OPTIONS.node;
+  if (family === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
   return INTERPRETER_VALUE_OPTIONS.python;
 }
 
@@ -902,9 +1146,19 @@ function interpreterValueOptions(name) {
  * code was never read. Reading a positional word as if a later flag were the
  * interpreter's own can only add denials, which is the accepted cost; missing
  * the flag is not.
+ *
+ * The code may sit in the flag word itself (WI#890): a short-option cluster
+ * is walked letter by letter as the interpreter reads it, so `-c"…"`, `-Ic"…"`
+ * and `-le'…'` hand over the rest of the word, and `--eval=…` hands over the
+ * text after the `=`. Where the walk cannot tell whether a word is the eval
+ * flag, it keeps walking rather than returning, so doubt cannot allow.
  */
 function oneLinerCode(rest, name) {
   const values = interpreterValueOptions(name);
+  const family = interpreterFamily(name);
+  const letters = EVAL_FLAG_LETTERS[family];
+  // Perl's numeric -0 and -l modifiers can precede more flags in the cluster.
+  const clusterPattern = family === "perl" ? /^-([a-zA-Z0-9]+)(.*)$/ : /^-([a-zA-Z]+)(.*)$/;
   let i = 0;
   while (i < rest.length) {
     while (i < rest.length && /[ \t]/.test(rest[i])) i++;
@@ -912,12 +1166,38 @@ function oneLinerCode(rest, name) {
     while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
     const word = rest.slice(start, i);
     if (word.length === 0) return null;
-    if (/^(?:--eval|--print)$/.test(word) || /^-[a-zA-Z]*[ceEp][a-zA-Z]*$/.test(word)) {
-      return rest.slice(i);
-    }
+    if (/^(?:--eval|--print)$/.test(word)) return rest.slice(i);
+    // `--eval=…`/`--print=…` carry the code in the word itself (WI#890).
+    if (/^--(?:eval|print)=/.test(word)) return word.slice(word.indexOf("=") + 1) + rest.slice(i);
+    // A long value option's separate word is stepped over (WI#869).
     if (values.has(word)) {
       while (i < rest.length && /[ \t]/.test(rest[i])) i++;
       while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      continue;
+    }
+    // A short-option cluster is read the way the interpreter reads it: a
+    // letter that takes a value consumes the rest of the word, and the eval
+    // letter hands it the rest of the word as code, or the next word when
+    // nothing follows (`-c`, `-Ic`, `-le'…'`, `-c"…"`). A cluster that
+    // carries no eval letter is stepped over, and a value option with no
+    // attached text takes the next word (WI#890).
+    const cluster = clusterPattern.exec(word);
+    if (cluster !== null) {
+      const flags = cluster[1];
+      for (let at = 0; at < flags.length; at++) {
+        const letter = flags[at];
+        if (letters.includes(letter)) {
+          const tail = at === flags.length - 1 ? cluster[2] : flags.slice(at + 1) + cluster[2];
+          return tail === "" ? rest.slice(i) : tail + rest.slice(i);
+        }
+        if (values.has(`-${letter}`)) {
+          if (at === flags.length - 1 && cluster[2] === "") {
+            while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+            while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+          }
+          break;
+        }
+      }
       continue;
     }
   }
@@ -1262,7 +1542,7 @@ function checkInterpreterDeletion(text) {
     const code = oneLinerCode(invocation[2], invocation[1]);
     if (code === null) continue;
     const aliases = sinkAliases(code);
-    if (invocation[1] === "perl") {
+    if (interpreterFamily(invocation[1]) === "perl") {
       const perlDenial = perlDeletionVerdict(code);
       if (perlDenial) return perlDenial;
     }
@@ -1309,7 +1589,9 @@ function checkRawShapes(text) {
     checkMoveAndTarDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
-    checkDecodedPipe(text);
+    checkDecodedPipe(text) ??
+    checkSubstitutionShell(text) ??
+    checkWrittenThenRun(text);
 }
 
 const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
@@ -1406,9 +1688,14 @@ let clauseScanEnds = [];
 
 function clauseEnds(text) {
   if (text === clauseScanText) return clauseScanEnds;
+  // A redirection's own operator characters are not control operators: the
+  // `&` of `2>&1`, `&>`, `>&`, `<&` and the bar of `>|` end no clause, and
+  // `|&` keeps its bar (WI#889). The redirection-free view has the same
+  // offsets, so the indices stay valid for `text`.
+  const view = redirectionFreeView(text);
   const ends = [];
-  for (const i of unquotedOffsets(text)) {
-    if (isClauseTerminator(text[i])) ends.push(i);
+  for (const i of unquotedOffsets(view)) {
+    if (isClauseTerminator(view[i])) ends.push(i);
   }
   clauseScanText = text;
   clauseScanEnds = ends;
@@ -1473,7 +1760,7 @@ function bashWord(text, from) {
     const quote = level.quote;
     const ch = text[i];
     if (isQuoteEscape(text, i, quote)) {
-      word += text[i + 1];
+      if (text[i + 1] !== "\n" || quote === "$'") word += text[i + 1];
       i += 2;
       continue;
     }
@@ -1516,6 +1803,20 @@ function bashWord(text, from) {
       i += 2;
       continue;
     }
+    // A redirection is not a word: `git 2>/dev/null reset` reads `reset` as
+    // the verb, and `rm 2>&1 -rf /x` reads `-rf` and `/x` (WI#889). The
+    // scan's quote state says where the operator and its target end. At a
+    // word start the token also carries its `[n]`/`{varname}` descriptor
+    // (`2>/dev/null`), which belongs to the redirection, not to a word. The
+    // test comes before the separator one because `&>f` starts with `&`.
+    if (levels.length === 1) {
+      const skip = word.length === 0 ? redirectTokenSpan(text, i)?.end ?? null
+        : redirectionSkip(text, i);
+      if (skip !== null) {
+        i = skip;
+        continue;
+      }
+    }
     if (ch === " " || ch === "\t" || isClauseTerminator(ch)) {
       // A separator inside a substitution body is part of the word the
       // substitution sits in; only the outermost level ends it.
@@ -1533,7 +1834,7 @@ function bashWord(text, from) {
     word += ch;
     i++;
   }
-  return { word, end: i };
+  return { word, end: i, complete: levels.length === 1 && levels[0].quote === "" };
 }
 
 /** The bash words of a command text, with their quoting removed. */
@@ -1564,13 +1865,24 @@ function gitVerb(text, from) {
   let i = from;
   while (i < text.length) {
     while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const start = i;
     const { word, end } = bashWord(text, i);
     i = end;
-    if (word.length === 0) break;
+    if (word.length === 0) {
+      // A redirection standing where the verb would be is not the verb
+      // (`git 2>/dev/null reset --hard`): the word reader steps over it, so
+      // the walk continues at the word after it (WI#889).
+      if (end > start) continue;
+      break;
+    }
     if (!word.startsWith("-")) return { verb: word, after: i };
     if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb. It is read as one
       // bash word, so `-C "/tmp/a b"` steps over the value whole (WI#856).
+      // A redirection standing where the value would be is not the value
+      // (`git -C 2>/dev/null /tmp/r reset`), so it is stepped over first
+      // (WI#889).
+      i = skipRedirectionAt(text, i);
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
       i = bashWord(text, i).end;
     }
@@ -1800,6 +2112,89 @@ function checkGitDiscard(segment) {
     }
   }
   return false;
+}
+
+// `git submodule foreach <command>` and `git rebase --exec/-x <command>` hand
+// their operand to `sh -c`, so the body is a command line of its own even
+// though no shell word carries it (WI#895). git reads the body from its own
+// argument list, so the guard must walk the same options git walks: a
+// separate or attached value (`--exec=…`, `-x…`), a value at the end of a
+// cluster (`-ix …`), and `foreach`'s own leading options.
+
+// rebase's long options that take the next word as their value.
+const GIT_REBASE_VALUE_OPTIONS = new Set([
+  "--onto", "--whitespace", "--strategy", "--strategy-option", "--trailer", "--empty",
+]);
+// rebase's short options that take the next word when they end a cluster.
+const GIT_REBASE_SHORT_VALUES = "sXC";
+
+/** The bodies a `git rebase` invocation hands to `sh -c`, in argument order. */
+function gitRebaseExecBodies(words) {
+  const bodies = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    // After `--` every word is an operand, so git reads no more options.
+    if (word === "--") break;
+    if (word.startsWith("--") && word.length > 2) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      // `--no-exec` turns the option off; the next word is not a body.
+      if (name.startsWith("no-")) continue;
+      // git resolves an unambiguous prefix (`--ex`, `--exe`), so every
+      // prefix of `exec` names it here, which can only add denials.
+      if ("exec".startsWith(name)) {
+        if (equals !== -1) bodies.push(word.slice(equals + 1));
+        else if (i + 1 < words.length) bodies.push(words[++i]);
+        continue;
+      }
+      if (equals === -1 && GIT_REBASE_VALUE_OPTIONS.has(name)) i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const cluster = word.slice(1);
+      for (let j = 0; j < cluster.length; j++) {
+        if (cluster[j] === "x") {
+          // The rest of the cluster is the body when it carries one
+          // (`-x'kimi server'`); otherwise the next word is (`-ix …`).
+          if (j + 1 < cluster.length) bodies.push(cluster.slice(j + 1));
+          else if (i + 1 < words.length) bodies.push(words[++i]);
+          break;
+        }
+        if (GIT_REBASE_SHORT_VALUES.includes(cluster[j])) {
+          if (j === cluster.length - 1) i++;
+          break;
+        }
+      }
+    }
+    // An operand (`HEAD~1`, a branch) does not end git's option scan.
+  }
+  return bodies;
+}
+
+/** The bodies a `git submodule foreach` invocation hands to `sh -c`. */
+function gitSubmoduleForeachBodies(words) {
+  let i = 0;
+  // `git submodule [--quiet] foreach …`.
+  while (i < words.length && words[i].startsWith("-")) i++;
+  if (words[i] !== "foreach") return [];
+  // `foreach` reads its own options (`-q`, `--recursive`) before the command
+  // operand; every word after the first operand is part of the body.
+  for (i++; i < words.length && words[i].startsWith("-"); i++);
+  return i < words.length ? [words.slice(i).join(" ")] : [];
+}
+
+/** Return Git's shell bodies, or null if this is not a recognized carrier. */
+function gitShellBodies(words, start) {
+  let i = start;
+  while (i < words.length && words[i].startsWith("-")) {
+    i += GIT_VALUE_OPTIONS.has(words[i]) ? 2 : 1;
+  }
+  const verb = listenerWord(words[i] ?? "");
+  if (verb === "rebase") return gitRebaseExecBodies(words.slice(i + 1));
+  if (verb === "submodule" || verb === "submodule--helper") {
+    return gitSubmoduleForeachBodies(words.slice(i + 1));
+  }
+  return null;
 }
 
 /** The command word of a pipeline stage, after env/exec/busybox prefixes. */
@@ -2399,13 +2794,17 @@ function* unquotedOffsets(text, escapes = true) {
 
 /** Preserve the exact text of each piece; only unquoted separators split it. */
 function splitOutsideQuotes(text, separator, escapes = true) {
+  // A redirection's operator characters are not control operators, and the
+  // target is not a word (WI#889). The view keeps every offset, so the
+  // pieces below are the caller's own text.
+  const view = redirectionFreeView(text, escapes);
   const pieces = [];
   let start = 0;
-  for (const i of unquotedOffsets(text, escapes)) {
+  for (const i of unquotedOffsets(view, escapes)) {
     if (i < start) continue;
     const width = typeof separator === "string"
-      ? Number(text[i] === separator)
-      : Number(separator(text[i], text[i + 1]));
+      ? Number(view[i] === separator)
+      : Number(separator(view[i], view[i + 1]));
     if (!width) continue;
     pieces.push(text.slice(start, i));
     start = i + width;
@@ -2422,30 +2821,1381 @@ function commandLists(text) {
   });
 }
 
-/** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
+/**
+ * The pipeline stages of one list. `|&` pipes stdout and stderr into the next
+ * stage, so it ends a stage exactly as `|` does (WI#889, WI#892). A `|` that
+ * follows `>` is the noclobber redirect `>|`, not a bar, so it stays inside
+ * the stage that writes the file.
+ */
+function pipelineStages(list) {
+  const stages = [];
+  let start = 0;
+  for (const i of unquotedOffsets(list)) {
+    if (list[i] !== "|" || list[i - 1] === ">") continue;
+    if (i < start) continue;
+    stages.push(list.slice(start, i));
+    start = i + (list[i + 1] === "&" ? 2 : 1);
+  }
+  stages.push(list.slice(start));
+  return stages;
+}
+
+// The commands that read content from the network (WI#826). A word property,
+// like the decoder and interpreter readings, so a launcher cannot hide one.
+const FETCH_NAMES = new Set(["curl", "wget", "fetch", "nc", "ncat", "netcat"]);
+
+/**
+ * The readings of one stage's words, computed once so the checks below share a
+ * single word scan: whether it decodes, whether it fetches, whether it runs
+ * its stdin as a program, and whether its command word cannot be read. A stage
+ * whose words cannot be read carries every reading, as
+ * `isDecodeStage`/`isInterpreterStage` do (WI#883, WI#885).
+ */
+function stageContent(words) {
+  if (words === null) {
+    return { decode: true, fetch: true, stdin: true, unverifiable: true };
+  }
+  return {
+    decode: words.some((_word, index) => decoderAt(words, index)),
+    fetch: words.some((word) => FETCH_NAMES.has(commandBasename(listenerWord(word)))),
+    stdin: words.some((_word, index) => interpreterAt(words, index)),
+    unverifiable: commandWordUnverifiable(words),
+  };
+}
+
+/**
+ * What a substitution body holds: `"decoded"` for a decode stage, `"remote"`
+ * for a fetch, `"unreadable"` for a command the guard cannot read — the doubt
+ * that must never allow when the body feeds a shell (WI#892) — or null for
+ * ordinary work. Nested substitutions are read the same way.
+ */
+function heldContent(text, depth = 0) {
+  let held = null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const content = stageContent(stagePropertyWords(stage));
+      if (content.fetch) held = held ?? "remote";
+      if (content.decode) held = held ?? "decoded";
+      if (content.unverifiable) held = held ?? "unreadable";
+    }
+  }
+  if (held !== null) return held;
+  if (depth >= MAX_SHELL_BODY_DEPTH) return "unreadable";
+  for (const body of substitutionBodies(text)) {
+    const inner = heldContent(body, depth + 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
+
+/**
+ * Deny a decode or fetch command piped into a shell or interpreter (WI#826,
+ * WI#832, WI#892). A decode or fetch stage anywhere before an interpreter
+ * stage in the same pipeline counts, however many stages lie between: `cat`,
+ * `tee`, `sed` and `head` pass the bytes through untouched.
+ */
 function checkDecodedPipe(text) {
+  // A pipeline is the only way one stage feeds another, so a text without a
+  // bar costs a single scan (WI#892 deadline).
+  if (!text.includes("|")) return null;
   const lists = commandLists(text);
   let scanned = 0;
   for (let li = 0; li < lists.length; li++) {
-    const stages = splitOutsideQuotes(lists[li], "|");
-    for (let i = 1; i < stages.length; i++) {
-      if (!isDecodeStage(stages[i - 1])) continue;
-      // The stage a decoder feeds may open a compound command, whose body
-      // reads the same stdin (AME-1). Only a list's last stage can run on
-      // into the following lists.
-      let fed = stages[i];
-      if (i === stages.length - 1 && compoundOpener(fed) !== "") {
-        fed = compoundStageText(lists, li, fed);
-        scanned += fed.length;
-        if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+    const stages = pipelineStages(lists[li]);
+    let carried = null;
+    for (let i = 0; i < stages.length; i++) {
+      if (carried !== null) {
+        // The stage a decoder feeds may open a compound command, whose body
+        // reads the same stdin (AME-1). Only a list's last stage can run on
+        // into the following lists.
+        let fed = stages[i];
+        if (i === stages.length - 1 && compoundOpener(fed) !== "") {
+          fed = compoundStageText(lists, li, fed);
+          scanned += fed.length;
+          if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+        }
+        // A command word the guard cannot read may be the shell (AME-2). The
+        // fed stage may be a compound body of several lists, so the whole
+        // body is read, not just its first command word.
+        if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
+          return carried === "decoded"
+            ? "decoded content piped into a shell or interpreter"
+            : "remote content piped into a shell or interpreter";
+        }
       }
-      // A command word the guard cannot read may be the shell (AME-2).
-      if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
-        return "decoded content piped into a shell or interpreter";
+      // The last stage feeds no further stage, so its own reading is not
+      // needed; skipping it keeps a one-stage list at zero word scans.
+      if (i + 1 === stages.length) break;
+      const content = stageContent(stagePropertyWords(stages[i]));
+      if (content.decode) carried = carried ?? "decoded";
+      if (content.fetch) carried = carried ?? "remote";
+    }
+  }
+  return null;
+}
+
+const SUBSTITUTION_SHELL_REASON = "decoded or fetched content run by a shell through a substitution";
+
+// A command substitution (`$(`, a backtick) or a process substitution
+// (`<(`, `>(`) — the shapes `substitutionBodies` yields.
+const SUBSTITUTION_MARKER = /\$\(|`|[<>]\(/;
+
+/**
+ * True when the word at `index` runs its own argument as shell text: a shell,
+ * `eval`, or a `source`/`.` (WI#892). Such a word executes whatever its
+ * argument holds, whether that is a literal string or a substitution's output.
+ */
+function runsShellTextAt(words, index) {
+  const name = commandBasename(listenerWord(words[index]));
+  if (SHELL_NAME.test(name) || name === "eval") return true;
+  return name === "source" || name === ".";
+}
+
+/**
+ * The last component of a path word, or null when the shell rewrites it
+ * (WI#892 part 3, AMR-1). The stage that writes a file and the stage that
+ * runs one are compared by this name only: a relative path, an absolute one
+ * and the same file reached after a `cd` all end in it, and a directory part
+ * that holds an expansion (`$HOME/bin/x.sh`, `~/x.sh`) still names the file.
+ * A last component that holds an expansion, a glob, a brace list or a
+ * substitution's output reads as some other name at run time.
+ */
+function pathBasename(word) {
+  const bare = stripShellQuotes(word.replace(/^[({]+/, "").replace(/[)}]+$/, "")).replace(/\/+$/, "");
+  const name = bare.slice(bare.lastIndexOf("/") + 1);
+  if (name === "" || name === "." || name === ".." || (name.startsWith("~") && name === bare)) return null;
+  for (const ch of name) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch) || ch === SUBSTITUTION_MARK) return null;
+  }
+  return name;
+}
+
+// A redirection word as the stage reader leaves it: a descriptor, the
+// operator, and the target when it is attached (`>/tmp/x`, `2>>log`,
+// `<<EOF`). The reader ends a word at `&` and `|`, so `&>`, `&>>` and `>|`
+// arrive as `>`/`>>`, and a duplication (`2>&1`) leaves a bare descriptor
+// number behind as its target.
+const REDIRECT_WORD = /^\d*(<<<|<<-?|<>|<|>>|>)([\s\S]*)$/;
+
+function redirectAt(words, i) {
+  const match = REDIRECT_WORD.exec(words[i] ?? "");
+  if (match === null) return null;
+  const [, op, attached] = match;
+  if (attached !== "") return { op, target: attached, next: i + 1 };
+  return { op, target: words[i + 1], next: i + 2 };
+}
+
+/** The words of a list that are not redirections or their targets, and the files `<` reads. */
+function operandWords(words) {
+  const operands = [];
+  const inputs = [];
+  for (let i = 0; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect === null) {
+      operands.push(words[i]);
+      continue;
+    }
+    if (redirect.op === "<" || redirect.op === "<>") inputs.push(redirect.target);
+    i = redirect.next - 1;
+  }
+  return { operands, inputs };
+}
+
+// `sudo`/`doas` options that take the next word. Both are refused by their
+// own rule; this only keeps the command position readable behind them.
+const SUDO_VALUE_OPTIONS = new Set(["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t", "-T", "-D", "-R"]);
+const FUNCTION_HEAD = /^[A-Za-z_][\w.:-]*\(\)\{?$/;
+
+/** The index past the compound words, assignments, redirections and function head before a command word. */
+function skipCommandPrefix(words, i) {
+  while (i < words.length) {
+    const word = words[i];
+    if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
+      i++;
+    } else if (word === "function") {
+      i += 2;
+    } else if (word === "case") {
+      // `case WORD in` heads a branch list; the branch runs after its pattern.
+      const at = words.indexOf("in", i + 1);
+      i = at === -1 ? words.length : at + 1;
+    } else if (/\)$/.test(word) && !word.startsWith("$") && i + 1 < words.length && redirectAt(words, i + 1) === null) {
+      // A case pattern (`1)`, `(a)`): after a subshell's own `)` only a
+      // redirection may follow, so a word after it means a branch command.
+      i++;
+    } else {
+      const redirect = redirectAt(words, i);
+      if (redirect === null) return i;
+      i = redirect.next;
+    }
+  }
+  return i;
+}
+
+/** The index of env's command word: options, their values and assignments are stepped over. */
+function envOperandStart(words, i) {
+  while (i < words.length) {
+    const word = words[i];
+    if (word === "--" || word === "-") return i + 1;
+    if (/^[A-Za-z_]\w*=/.test(word)) {
+      i++;
+    } else if (!word.startsWith("-")) {
+      return i;
+    } else if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const option = envLongOption(equals === -1 ? word : word.slice(0, equals));
+      i += equals === -1 && ENV_REQUIRED_LONG_VALUES.has(option) ? 2 : 1;
+    } else {
+      const index = word.search(/[uCaS]/);
+      i += index !== -1 && index === word.length - 1 ? 2 : 1;
+    }
+  }
+  return i;
+}
+
+/** The launcher steps of `commandPosition`: the index of the next word to read. */
+function skipLauncher(name, words, i, position) {
+  if (name === "env") return envOperandStart(words, i + 1);
+  if (name === "command") {
+    for (i++; i < words.length && words[i].startsWith("-") && words[i] !== "-"; i++) {
+      if (words[i] === "--") return i + 1;
+      // `command -v`/`-V` looks a name up; it runs nothing.
+      if (/[vV]/.test(words[i])) return -1;
+    }
+    return i;
+  }
+  if (!STAGE_LAUNCHERS.has(name)) {
+    // exec, builtin, busybox, sudo, doas.
+    for (i++; i < words.length && words[i].startsWith("-") && words[i] !== "-"; i++) {
+      if (words[i] === "--") return i + 1;
+      const takesValue = name === "exec" ? words[i].endsWith("a")
+        : (name === "sudo" || name === "doas") && SUDO_VALUE_OPTIONS.has(words[i]);
+      if (takesValue) i++;
+    }
+    return i;
+  }
+  const values = STAGE_LAUNCHER_VALUE_OPTIONS.get(name);
+  for (i++; i < words.length && (words[i].startsWith("-") || /^[0-9][0-9A-Za-z.,:-]*$/.test(words[i])); i++) {
+    const word = words[i];
+    // `xargs -a FILE` hands the file's words to the command as arguments.
+    const argFile = name === "xargs" ? /^(?:-a|--arg-file=?)(.*)$/.exec(word) : null;
+    if (argFile !== null) position.argFiles.push(argFile[1] || words[i + 1]);
+    if (values?.has(word)) i++;
+  }
+  if (name === "xargs") position.xargs = true;
+  return i;
+}
+
+const POSITION_LAUNCHERS = new Set(["env", "exec", "command", "builtin", "busybox", "sudo", "doas", ...STAGE_LAUNCHERS]);
+
+/**
+ * Where one simple command's command word sits (WI#892 AMR-1, AMR-2): after
+ * compound lead words, assignments, redirections, a function-definition head
+ * and the launchers that run their operand — `env`, `exec`, `command`,
+ * `builtin`, `busybox`, `sudo`/`doas` and the item's launcher table, each
+ * with its options. `index` is -1 when the words run no command (`command
+ * -v`, a `for`/`case` head, nothing left) and -2 when more launchers stand in
+ * a row than the reader follows. `xargs` records that the command takes its
+ * arguments from input, and `argFiles` the files an `xargs -a` reads them
+ * from.
+ */
+function commandPosition(words) {
+  const position = { index: -1, xargs: false, argFiles: [] };
+  let i = 0;
+  for (let hop = 0; hop <= MAX_STAGE_LAUNCHERS; hop++) {
+    i = skipCommandPrefix(words, i);
+    if (i >= words.length || COMPOUND_HEAD_ONLY.has(words[i])) return position;
+    const name = commandBasename(words[i]);
+    if (!POSITION_LAUNCHERS.has(name)) {
+      position.index = i;
+      return position;
+    }
+    i = skipLauncher(name, words, i, position);
+    if (i === -1) return position;
+  }
+  position.index = -2;
+  return position;
+}
+
+/**
+ * What a shell invocation runs (WI#892 AMR-1): its script-file operand, its
+ * `-c` command string, or its standard input (`-s`, or no operand at all),
+ * with the files a `<` redirection feeds it and the positional parameters
+ * after the operand (`bash -c '. "$0"' FILE`). An option that takes a value
+ * steps over it, as `listenerShellBody` does.
+ */
+function shellInvocation(args) {
+  const run = { file: undefined, command: undefined, stdin: false, inputs: [], positionals: [], rcfiles: [] };
+  let options = true;
+  let commandMode = false;
+  for (let i = 0; i < args.length; i++) {
+    const redirect = redirectAt(args, i);
+    if (redirect !== null) {
+      if (redirect.op === "<" || redirect.op === "<>") run.inputs.push(redirect.target);
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = args[i];
+    if (options && (word === "--" || word === "-")) {
+      options = false;
+    } else if (options && SHELL_VALUE_OPTIONS.has(word)) {
+      // `--rcfile`/`--init-file` name a file the shell sources.
+      if (word === "--rcfile" || word === "--init-file") run.rcfiles.push(args[i + 1]);
+      i++;
+    } else if (options && /^--(?:rcfile|init-file)=/.test(word)) {
+      run.rcfiles.push(word.slice(word.indexOf("=") + 1));
+    } else if (options && /^[-+]./.test(word)) {
+      if (/^-[a-zA-Z]*c/.test(word)) commandMode = true;
+      if (/^-[a-zA-Z]*s/.test(word)) run.stdin = true;
+      if (/^[-+][a-zA-Z]*[oO]$/.test(word)) i++;
+    } else {
+      options = false;
+      // Later operands are positional parameters.
+      if (run.file !== undefined || run.command !== undefined) {
+        run.positionals.push(word);
+        continue;
+      }
+      if (commandMode) run.command = word;
+      else run.file = word;
+    }
+  }
+  if (run.file === undefined && run.command === undefined) run.stdin = true;
+  return run;
+}
+
+/**
+ * The split of a command line into the lists that run one after another:
+ * `;`, a newline, `&&`, `||`, and a lone `&` that sends the list before it to
+ * the background — that list still runs before or beside the next one
+ * (WI#892 AMR-1). `&>`, `>&`, `<&` and `|&` are redirections and a bar.
+ */
+function runLists(text) {
+  const pieces = [];
+  let start = 0;
+  for (const i of unquotedOffsets(text)) {
+    if (i < start) continue;
+    const ch = text[i];
+    const next = text[i + 1];
+    let width = 0;
+    if (ch === ";" || ch === "\n") width = 1;
+    else if ((ch === "&" || ch === "|") && next === ch) width = 2;
+    else if (ch === "&" && next !== ">" && !"<>|".includes(text[i - 1] ?? "")) width = 1;
+    if (width === 0) continue;
+    pieces.push(text.slice(start, i));
+    start = i + width;
+  }
+  pieces.push(text.slice(start));
+  return pieces;
+}
+
+/**
+ * The text with comments and here-document data blanked (WI#892 AMR-2). The
+ * shared scan marks both as data; a command-position reader that saw a
+ * here-document body as the next list would read a document's text as
+ * commands. Substitution bodies are kept whole. A body a shell reads is
+ * walked separately by `shellHeredocs`.
+ */
+function codeView(text) {
+  if (!text.includes("#") && !text.includes("<<")) return text;
+  const { states, substitutions } = quoteScan(text);
+  let view = "";
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const close = substitutions.get(i);
+    if (close !== undefined) {
+      i = close;
+      continue;
+    }
+    if (states[i] !== SHELL_DATA || text[i] === "\n") continue;
+    let end = i;
+    while (end < text.length && states[end] === SHELL_DATA && text[end] !== "\n" && !substitutions.has(end)) end++;
+    view += text.slice(from, i) + " ".repeat(end - i);
+    from = end;
+    i = end - 1;
+  }
+  return view + text.slice(from);
+}
+
+/**
+ * The words with a redirection glued to the word before it split off: bash
+ * ends a word at an unquoted `<` or `>` (`base64 -d>/tmp/x.sh`), and the
+ * stage reader does not. Digits right before the operator are its
+ * descriptor (`2>log`). A quoted `<`/`>` splits too, which can only add a
+ * redirection reading.
+ */
+function splitRedirects(words) {
+  const split = [];
+  for (const word of words) {
+    let rest = word;
+    for (;;) {
+      const at = rest.search(/[<>]/);
+      if (at <= 0 || /^\d+$/.test(rest.slice(0, at))) break;
+      split.push(rest.slice(0, at));
+      rest = rest.slice(at);
+    }
+    split.push(rest);
+  }
+  return split;
+}
+
+/**
+ * The pipelines of a command line, each stage with its words, its command
+ * position and what its own words do (`stageContent`). The words are read
+ * once per stage: a brace-heavy word costs the reader most of the deadline.
+ */
+/**
+ * The words of a stage with its redirections put back as `<operator> <target>`
+ * pairs at the end. The word reader leaves redirections out (WI#889), and the
+ * write and run readers of WI#892 need `> f`, `>> f`, `&> f`, `>& f` and
+ * `< f`. A descriptor duplication (`2>&1`, `>&2`, `<&3`, `>&-`) names no file
+ * and is left out.
+ */
+function stageWordsWithRedirects(stage) {
+  const read = stagePropertyWords(stage);
+  if (read === null) return null;
+  const extra = [];
+  for (const { target, operator } of redirectScan(stage).targets) {
+    const bare = stripShellQuotes(target);
+    if ((operator === ">&" || operator === "<&") && /^(?:\d+-?|-)$/.test(bare)) continue;
+    // The readers know `>`, `>>` and `<`: `&>`, `>|`, `>&` and `<>` write
+    // like `>`, `&>>` like `>>`, and `<&` with a file reads like `<`.
+    const spelled = { "&>": ">", ">|": ">", ">&": ">", "<>": ">", "&>>": ">>", "<&": "<" }[operator] ?? operator;
+    extra.push(spelled, bare);
+  }
+  // A here-string is the program's input text (`bash <<< "$x"`).
+  for (const text of redirectScan(stage).hereStrings) extra.push("<<<", stripShellQuotes(text));
+  return extra.length === 0 ? read : [...read, ...extra];
+}
+
+function readPipelines(text) {
+  return runLists(codeView(text)).map((list) => pipelineStages(list).map((stage) => {
+    const read = stageWordsWithRedirects(stage);
+    const words = read === null ? null : splitRedirects(read);
+    return {
+      stage,
+      words,
+      position: words === null ? null : commandPosition(words),
+      content: words === null ? null : stageContent(words),
+    };
+  }));
+}
+
+/**
+ * `heldContent` of one stage of `readPipelines`, from the words already read:
+ * its own decode, fetch or unreadable command word, otherwise what its
+ * substitutions hold.
+ */
+function stageHeld(entry) {
+  const { content } = entry;
+  if (content.fetch) return "remote";
+  if (content.decode) return "decoded";
+  if (content.unverifiable) return "unreadable";
+  for (const body of substitutionBodies(entry.stage)) {
+    const inner = heldContent(body, 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
+
+// Descriptor-duplication targets (`2>&1` leaves `1`) and the device files a
+// redirect names are not files a later stage runs.
+function isWrittenFile(target) {
+  const bare = stripShellQuotes(target);
+  return !/^\d*-?$/.test(bare) && !bare.startsWith("/dev/");
+}
+
+/** Record one written file: its last component, or doubt when it cannot be read. */
+function addWritten(out, target) {
+  if (target === undefined || !isWrittenFile(target)) return;
+  out.wrote = true;
+  const name = pathBasename(target);
+  if (name === null) out.unknown = true;
+  else out.names.add(name);
+}
+
+/** A curl/wget output value: `-` is standard output, which the redirect reading covers. */
+function addFetchOutput(out, value) {
+  if (value !== undefined && stripShellQuotes(value) !== "-") addWritten(out, value);
+}
+
+/**
+ * The name curl `-O` and wget save a URL under: the last component of the
+ * URL's path, query and fragment removed, or `fallback` (wget's
+ * `index.html`) when the path ends in `/`. A URL that cannot be read leaves
+ * the name in doubt.
+ */
+function addUrlName(out, url, fallback) {
+  if (url === undefined) return;
+  const bare = stripShellQuotes(url).replace(/[?#][\s\S]*$/, "");
+  const path = bare.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*/, "");
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  out.wrote = true;
+  if (name !== "") addWritten(out, name);
+  else if (fallback !== null) out.names.add(fallback);
+  else out.unknown = true;
+}
+
+// curl's short options that take a value (`curl --help all`, 8.x): the value
+// is the rest of the cluster or the next word.
+const CURL_SHORT_VALUES = new Set("bcCdDeEFHKmPQrtTuUwxXyYz");
+// curl's long options that take a separate value, beside the output ones.
+const CURL_LONG_VALUES = new Set([
+  "header", "data", "data-raw", "data-binary", "data-urlencode", "data-ascii", "json", "form",
+  "form-string", "user", "user-agent", "referer", "request", "proxy", "proxy-user", "write-out",
+  "upload-file", "cookie", "cookie-jar", "continue-at", "dump-header", "cert", "key", "cacert",
+  "capath", "config", "max-time", "connect-timeout", "range", "retry", "retry-delay",
+  "retry-max-time", "resolve", "connect-to", "max-filesize", "limit-rate", "interface",
+  "time-cond", "speed-time", "speed-limit", "oauth2-bearer", "unix-socket", "max-redirs",
+  "dns-servers", "doh-url", "preproxy", "variable", "stderr", "trace", "trace-ascii", "output-dir",
+]);
+
+/**
+ * The files one curl invocation writes (WI#892 AMR-1): `-o`/`--output`, an
+ * `o` anywhere in a short cluster (`-fsSLo PATH`, `-o/PATH`, the value being
+ * the rest of the word or the next one), and with `-O`/`--remote-name` the
+ * URL's last component (`--output-dir` only moves it). `-J` names the file
+ * from the server's reply, which leaves the name in doubt.
+ */
+function curlWrites(words, start, out) {
+  const urls = [];
+  let remoteName = false;
+  let headerName = false;
+  for (let i = start + 1; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = words[i];
+    if (word === "--") {
+      urls.push(...operandWords(words.slice(i + 1)).operands);
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const value = () => (equals === -1 ? words[++i] : word.slice(equals + 1));
+      if (name.length >= 3 && "output".startsWith(name)) addFetchOutput(out, value());
+      else if (name === "url") urls.push(value());
+      else if (name === "remote-name" || name === "remote-name-all") remoteName = true;
+      else if (name === "remote-header-name") headerName = true;
+      else if (CURL_LONG_VALUES.has(name) && equals === -1) i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const output = word.indexOf("o", 1);
+      if (output !== -1) {
+        addFetchOutput(out, word.slice(output + 1) || words[++i]);
+        continue;
+      }
+      for (let k = 1; k < word.length; k++) {
+        if (word[k] === "O") remoteName = true;
+        else if (word[k] === "J") headerName = true;
+        else if (CURL_SHORT_VALUES.has(word[k])) {
+          if (k === word.length - 1) i++;
+          break;
+        }
+      }
+      continue;
+    }
+    urls.push(word);
+  }
+  if (!remoteName) return;
+  for (const url of urls) addUrlName(out, url, null);
+  if (headerName) out.unknown = true;
+}
+
+// wget's short options that take a value (wget 1.25 `--help`; `-n` takes
+// its letters, `-nc`, `-nv`), and its long ones.
+const WGET_SHORT_VALUES = new Set("oaiBeOtTwQlARDXIPUn");
+const WGET_LONG_VALUES = new Set([
+  "output-file", "append-output", "input-file", "base", "config", "execute", "tries", "timeout",
+  "dns-timeout", "connect-timeout", "read-timeout", "wait", "waitretry", "quota", "level",
+  "accept", "reject", "accept-regex", "reject-regex", "domains", "exclude-domains",
+  "include-directories", "exclude-directories", "directory-prefix", "cut-dirs", "user",
+  "password", "http-user", "http-password", "ftp-user", "ftp-password", "proxy-user",
+  "proxy-password", "header", "user-agent", "referer", "post-data", "post-file", "method",
+  "body-data", "body-file", "load-cookies", "save-cookies", "ca-certificate", "ca-directory",
+  "certificate", "private-key", "limit-rate", "bind-address", "restrict-file-names",
+  "default-page", "progress", "secure-protocol", "max-redirect", "local-encoding",
+  "remote-encoding", "compression", "retry-on-http-error", "backups",
+]);
+// wget options after which the saved names are not the URLs' last components.
+const WGET_UNKNOWN_NAMES = new Set([
+  "recursive", "mirror", "page-requisites", "input-file", "content-disposition", "trust-server-names",
+]);
+
+/**
+ * The files one wget invocation writes (WI#892 AMR-1): `-O`/`--output-document`
+ * (`-O PATH`, `-OPATH`, an `O` in a short cluster), otherwise each URL's
+ * last component (`index.html` for a path ending in `/`), wherever
+ * `-P`/`--directory-prefix` puts it. A recursive or input-file download, or
+ * a name taken from the server, leaves the names in doubt.
+ */
+function wgetWrites(words, start, out) {
+  const urls = [];
+  let output;
+  let unknown = false;
+  for (let i = start + 1; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = words[i];
+    if (word === "--") {
+      urls.push(...operandWords(words.slice(i + 1)).operands);
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const isOutput = name.length >= 8 && "output-document".startsWith(name);
+      const value = equals === -1 ? (isOutput || WGET_LONG_VALUES.has(name) ? words[++i] : undefined)
+        : word.slice(equals + 1);
+      if (isOutput) output = value;
+      if (WGET_UNKNOWN_NAMES.has(name)) unknown = true;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      for (let k = 1; k < word.length; k++) {
+        if ("rmpi".includes(word[k])) unknown = true;
+        if (!WGET_SHORT_VALUES.has(word[k])) continue;
+        const value = word.slice(k + 1) || words[++i];
+        if (word[k] === "O") output = value;
+        break;
+      }
+      continue;
+    }
+    urls.push(word);
+  }
+  if (output !== undefined) {
+    addFetchOutput(out, output);
+    return;
+  }
+  if (unknown) {
+    out.wrote = true;
+    out.unknown = true;
+  }
+  for (const url of urls) addUrlName(out, url, "index.html");
+}
+
+// The decompressors that write the decompressed file beside the compressed
+// one, always or with `-d`, and the suffixes they strip.
+const DECOMPRESS_ALWAYS = new Set(["gunzip", "unxz", "bunzip2", "unzstd", "uncompress", "unlzma", "unpigz"]);
+const DECOMPRESS_WITH_D = new Set(["gzip", "xz", "bzip2", "zstd", "lzma", "pigz"]);
+const TAR_ARCHIVE_SUFFIX = /\.t(?:gz|az|xz|bz2?|zst|lz)$/;
+const COMPRESSED_SUFFIX = /(?:\.(?:gz|z|Z|xz|lzma|bz2|bz|zst|lz)|[-_]z|-gz)$/;
+
+/** The file an in-place decompression writes: `gunzip /tmp/x.sh.gz` writes `/tmp/x.sh`. */
+function decompressWrites(words, start, out) {
+  const name = commandBasename(listenerWord(words[start]));
+  let decompress = DECOMPRESS_ALWAYS.has(name);
+  let stdout = false;
+  const operands = [];
+  const { operands: args } = operandWords(words.slice(start + 1));
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i];
+    if (word === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (word === "-o" || word === "--output") {
+      // zstd's own output file.
+      addWritten(out, args[++i]);
+      stdout = true;
+    } else if (word.startsWith("--")) {
+      if (word === "--decompress" || word === "--uncompress") decompress = true;
+      if (["--stdout", "--to-stdout", "--test", "--list"].includes(word)) stdout = true;
+    } else if (word.startsWith("-") && word.length > 1) {
+      if (word.includes("d")) decompress = true;
+      if (/[ctl]/.test(word.slice(1))) stdout = true;
+    } else {
+      operands.push(word);
+    }
+  }
+  if (!decompress || stdout) return;
+  for (const operand of operands) {
+    const base = pathBasename(operand);
+    if (base === null) {
+      out.wrote = true;
+      out.unknown = true;
+      continue;
+    }
+    const stripped = base.replace(TAR_ARCHIVE_SUFFIX, ".tar").replace(COMPRESSED_SUFFIX, "");
+    if (stripped !== base && stripped !== "") addWritten(out, stripped);
+  }
+}
+
+const XXD_VALUE_OPTIONS = new Set(["-c", "-cols", "-g", "-groupsize", "-l", "-len", "-o", "-offset", "-s", "-seek", "-n", "-name", "-R"]);
+
+/** `xxd -r INFILE OUTFILE` writes its second operand. */
+function xxdWrites(words, start, out) {
+  if (!decoderAt(words, start)) return;
+  const operands = [];
+  const { operands: args } = operandWords(words.slice(start + 1));
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("-") && args[i].length > 1) {
+      if (XXD_VALUE_OPTIONS.has(args[i])) i++;
+    } else {
+      operands.push(args[i]);
+    }
+  }
+  if (operands[1] !== undefined) addFetchOutput(out, operands[1]);
+}
+
+// The files that name a program's own standard input as a source operand.
+const STDIN_SOURCE_FILES = new Set(["/dev/stdin", "/proc/self/fd/0", "/dev/fd/0"]);
+
+/**
+ * The file a `cp`/`install` writes from its standard input (`cp /dev/stdin
+ * PATH`, `install -m 755 /dev/stdin PATH`): the last operand, or a file
+ * named `stdin` in a target directory.
+ */
+function copyFromStdinWrites(words, start, out) {
+  const { operands } = operandWords(words.slice(start + 1));
+  if (!operands.some((word) => STDIN_SOURCE_FILES.has(stripShellQuotes(word)))) return;
+  out.wrote = true;
+  out.names.add("stdin");
+  const paths = operands.filter((word) => !word.startsWith("-"));
+  const last = paths[paths.length - 1];
+  if (last !== undefined && !STDIN_SOURCE_FILES.has(stripShellQuotes(last))) addWritten(out, last);
+}
+
+// The commands that put a file's content under another name.
+const COPY_COMMANDS = new Set(["cp", "mv", "ln", "install", "rsync"]);
+
+/**
+ * The names a written file gets again (WI#892 AMR-1): a `cp`, `mv`, `ln`,
+ * `install` or `rsync` of a written file writes its last operand, and a
+ * stage that reads a written file writes its redirect targets
+ * (`cat x.sh > y.sh`). A directory destination keeps the written name.
+ */
+function copiedNames(entry, ctx) {
+  if (!entry.words.some((word) => namesWritten(word, ctx))) return;
+  const out = { names: ctx.written, wrote: false, unknown: false };
+  stageWrites(entry.words, out);
+  const index = entry.position?.index ?? -1;
+  if (index < 0 || !COPY_COMMANDS.has(commandBasename(entry.words[index]))) return;
+  const paths = operandWords(entry.words.slice(index + 1)).operands.filter((word) => !word.startsWith("-"));
+  if (paths.length > 1) addWritten(out, paths[paths.length - 1]);
+}
+
+/** `tee` writes every operand. */
+function teeWrites(words, start, out) {
+  for (const word of operandWords(words.slice(start + 1)).operands) {
+    if (!word.startsWith("-") || word === "-") addWritten(out, word);
+  }
+}
+
+/** `dd of=PATH`. */
+function ddWrites(words, start, out) {
+  for (const word of words.slice(start + 1)) {
+    if (word.startsWith("of=")) addWritten(out, word.slice(3));
+  }
+}
+
+/** `base64 -o PATH` (BSD) and `openssl … -out PATH`. */
+function outputOptionWrites(words, start, out) {
+  for (let i = start + 1; i < words.length; i++) {
+    const word = words[i];
+    if (word === "-o" || word === "--output" || word === "-out") addFetchOutput(out, words[++i]);
+    else if (word.startsWith("--output=")) addFetchOutput(out, word.slice(9));
+  }
+}
+
+const WRITER_READERS = new Map([
+  ["tee", teeWrites], ["dd", ddWrites], ["cp", copyFromStdinWrites], ["install", copyFromStdinWrites],
+  ["curl", curlWrites], ["wget", wgetWrites], ["xxd", xxdWrites], ["base64", outputOptionWrites],
+  ["openssl", outputOptionWrites],
+  ...[...DECOMPRESS_ALWAYS, ...DECOMPRESS_WITH_D].map((name) => [name, decompressWrites]),
+]);
+
+/**
+ * The files one stage writes (WI#892 AMR-1): the targets of `>`, `>>`,
+ * `>|`, `&>`, `&>>` and `N>` redirects, and the writer commands above
+ * wherever they sit in the stage.
+ */
+function stageWrites(words, out) {
+  for (let i = 0; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      if (redirect.op === ">" || redirect.op === ">>") addWritten(out, redirect.target);
+      i = redirect.next - 1;
+      continue;
+    }
+    WRITER_READERS.get(commandBasename(listenerWord(words[i])))?.(words, i, out);
+  }
+}
+
+// The `NAME=` spellings at a word start, the assignments a later stage can
+// read back through `$NAME`.
+const ASSIGNMENT_AT = /(?:^|[\s;&|(])([A-Za-z_]\w*)=/g;
+// The `read` and `mapfile` options that take a value; `read -a` names the
+// array it fills.
+const READ_VALUE_LETTERS = { read: "dinNptu", mapfile: "dnOsuCc", readarray: "dnOsuCc" };
+
+/** The variables a `read`, `mapfile`/`readarray` or `printf -v` fills from its input. */
+function addReadNames(words, position, filled) {
+  if (position === null || position.index < 0) return;
+  const name = commandBasename(words[position.index]);
+  const { operands } = operandWords(words.slice(position.index + 1));
+  if (name === "printf") {
+    const index = operands.indexOf("-v");
+    if (index !== -1 && operands[index + 1] !== undefined) filled.add(operands[index + 1]);
+    return;
+  }
+  if (name !== "read" && name !== "mapfile" && name !== "readarray") return;
+  const names = [];
+  for (let i = 0; i < operands.length; i++) {
+    const word = operands[i];
+    if (!word.startsWith("-") || word.length < 2) {
+      names.push(word);
+      continue;
+    }
+    for (let k = 1; k < word.length; k++) {
+      if (word[k] === "a" && name === "read") {
+        names.push(word.slice(k + 1) || operands[++i]);
+        break;
+      }
+      if (READ_VALUE_LETTERS[name].includes(word[k])) {
+        if (k === word.length - 1) i++;
+        break;
+      }
+    }
+  }
+  if (names.length === 0) names.push(name === "read" ? "REPLY" : "MAPFILE");
+  for (const each of names) if (each !== undefined) filled.add(each);
+}
+
+const filledLengthCache = new WeakMap();
+
+/** The distinct lengths of the filled names, kept while the set does not grow. */
+function filledLengths(filled) {
+  const cached = filledLengthCache.get(filled);
+  if (cached !== undefined && cached.size === filled.size) return cached.lengths;
+  const lengths = [...new Set([...filled].map((name) => name.length))];
+  filledLengthCache.set(filled, { size: filled.size, lengths });
+  return lengths;
+}
+
+/**
+ * True when a word expands a variable a decode or fetch filled. The words
+ * have their quotes removed, so `"$x"_` reads as `$x_`: a filled name that
+ * starts the expanded name counts, as the head's substring reading did.
+ */
+function refsFilled(word, filled) {
+  if (filled.size === 0 || !word.includes("$")) return false;
+  for (const match of word.matchAll(/\$\{?([A-Za-z_]\w*)/g)) {
+    const name = match[1];
+    if (filled.has(name)) return true;
+    for (const length of filledLengths(filled)) {
+      if (length < name.length && filled.has(name.slice(0, length))) return true;
+    }
+  }
+  return false;
+}
+
+/** True when a word names, by its last component, a file a decode or fetch wrote. */
+function namesWritten(word, ctx) {
+  const name = pathBasename(word);
+  return name !== null && ctx.written.has(name);
+}
+
+/** True when a stage's command word is a decoder or a fetch, rather than one of its arguments. */
+function decodesOrFetchesAtCommand(words, position) {
+  const index = position?.index ?? -1;
+  if (index < 0) return false;
+  return decoderAt(words, index) || FETCH_NAMES.has(commandBasename(listenerWord(words[index])));
+}
+
+/** True when a substitution in the stage holds a decode or a fetch. */
+function substitutionDecodesOrFetches(stage) {
+  for (const body of substitutionBodies(stage)) {
+    const held = heldContent(body);
+    if (held === "decoded" || held === "remote") return true;
+  }
+  return false;
+}
+
+/**
+ * What the decodes and fetches of one command line wrote and filled (WI#892
+ * part 3, AMR-1). `written` holds the last components of the files a stage
+ * fed by a decode or a fetch wrote: its own output (`curl -o`, `base64 -d >
+ * f`, `gunzip f.gz`), the content piped into it (`… | base64 -d | dd of=f`),
+ * a substitution's output (`echo "$(curl …)" > f`) or a filled variable
+ * (`echo "$x" > f`). `filled` holds the variables such a stage assigns,
+ * reads or prints into. `unknown` records a written file whose name cannot
+ * be read, and `strong` any write at all; both count only for a stage whose
+ * command word decodes or fetches, a stage fed by one through a pipe, or one
+ * holding such a substitution — a word that merely mentions `curl` does not
+ * put the line in doubt.
+ */
+function writeRunContext(pipelines) {
+  const ctx = { written: new Set(), filled: new Set(), unknown: false, strong: false };
+  for (const pipeline of pipelines) {
+    let carried = null;
+    for (const entry of pipeline) {
+      if (entry.words === null) continue;
+      // The split words also read a decoder glued to its redirect
+      // (`base64 -d>/tmp/x.sh`).
+      const held = stageHeld(entry);
+      if (held !== null) {
+        for (const match of entry.stage.matchAll(ASSIGNMENT_AT)) ctx.filled.add(match[1]);
+      }
+      if (held !== null || carried !== null) addReadNames(entry.words, entry.position, ctx.filled);
+      entry.carried = carried;
+      entry.held = held;
+      if (entry.content.decode) carried = "decoded";
+      if (entry.content.fetch) carried = carried ?? "remote";
+    }
+  }
+  for (const pipeline of pipelines) {
+    let variableFed = false;
+    for (const entry of pipeline) {
+      if (entry.words === null) continue;
+      const expands = entry.words.some((word) => refsFilled(word, ctx.filled));
+      const fed = entry.carried !== null || variableFed || expands;
+      if (fed || entry.held !== null) {
+        const out = { names: ctx.written, wrote: false, unknown: false };
+        stageWrites(entry.words, out);
+        if (out.wrote && (fed || decodesOrFetchesAtCommand(entry.words, entry.position) ||
+            substitutionDecodesOrFetches(entry.stage))) {
+          ctx.strong = true;
+          if (out.unknown) ctx.unknown = true;
+        }
+      } else if (ctx.written.size > 0) {
+        copiedNames(entry, ctx);
+      }
+      if (expands) variableFed = true;
+    }
+  }
+  return ctx;
+}
+
+const WRITTEN_RUN_REASON = "decoded or fetched content written and then run";
+const ASSIGNED_RUN_REASON = "decoded or fetched content assigned and then run";
+
+/**
+ * True when a word the stage executes may be a file a decode or fetch wrote
+ * (WI#892 AMR-1): its last component is a written one; or the guard cannot
+ * read it (`sh "$f"`, `$CMD`) and the line wrote something from a decode or
+ * a fetch; or a written name is in doubt and the word is a shell operand or
+ * a path (`./x`, `/tmp/x`). A bare command name (`jq`, `make`) is looked up
+ * in PATH, so only an exact written name ties it to a written file.
+ */
+function runsWrittenPath(word, operand, ctx) {
+  if (word === undefined) return false;
+  const bare = stripShellQuotes(word.replace(/^[({]+/, "").replace(/[)}]+$/, ""));
+  // A substitution's output is read through its body; `[`, `[[` and `((`
+  // are the shell's own test and arithmetic words.
+  if (bare === "$?" || /^(?:\[\[?|\(\()$/.test(word)) return false;
+  const name = pathBasename(word);
+  if (name === null) return ctx.strong;
+  if (ctx.written.has(name)) return true;
+  return ctx.unknown && (operand || bare.includes("/"));
+}
+
+/**
+ * Why one stage runs decoded or fetched content, or null (WI#892 AMR-1,
+ * AMR-2). The stage is read at its command position only, so `jq .
+ * /tmp/a.json` and `tar -xzf f.tgz -C .` are not runs. A run is: a shell
+ * given a written file, its `-c` string or its input; `source`/`.` given a
+ * written file; `eval` of text that runs one; the written file as the
+ * command word, also behind `exec`, `env`, `nohup`, `timeout N`, `nice`,
+ * `setsid` and the other launchers; a filled variable as the command word;
+ * a shell or a stdin interpreter fed a written file (`sh < f`, `cat f |
+ * sh`, `xargs -a f sh -c`) or a filled variable (`echo "$x" | sh`); and a
+ * shell text or a command word whose substitution reads a written file or a
+ * filled variable (`sh -c "$(cat f)"`, `$(cat f)`).
+ */
+function stageRunReason({ stage, words, position }, ctx, feed, depth) {
+  if (position.index === -2) return ctx.strong || ctx.filled.size > 0 ? WRITTEN_RUN_REASON : null;
+  if (position.index === -1) return null;
+  const word = words[position.index];
+  if (refsFilled(word, ctx.filled)) return ASSIGNED_RUN_REASON;
+  // A path is the file it names, whatever builtin or interpreter its last
+  // component spells (`/tmp/eval`, `/tmp/python3`).
+  if (word.includes("/") && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+  const name = commandBasename(word);
+  const { operands } = operandWords(words.slice(position.index + 1));
+  // A `<` anywhere in the simple command feeds it (`< f sh`).
+  const { inputs } = operandWords(words);
+  inputs.push(...position.argFiles);
+  // An `xargs` in front hands the command its input as arguments, which a
+  // shell (`xargs sh -c`), `eval` or an interpreter runs.
+  let readsInput = false;
+  // Whether a substitution in the stage can be the program text: a shell's
+  // `-c` string or script operand (`bash <(cat f)`), what `eval` runs, or
+  // what a program reading its input is handed (`sh <<< "$(cat f)"`).
+  let runsText = false;
+  let text;
+  if (SHELL_NAME.test(name)) {
+    const run = shellInvocation(words.slice(position.index + 1));
+    if (shellRunsWritten(run, ctx, false)) return WRITTEN_RUN_REASON;
+    text = run.command;
+    readsInput = run.stdin || position.xargs;
+    runsText = run.file === undefined || run.file.includes("$?");
+  } else if (name === "source" || name === ".") {
+    const operand = operands[operands[0] === "--" ? 1 : 0];
+    if (operand !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(operand))) readsInput = true;
+    else if (runsWrittenPath(operand, true, ctx)) return WRITTEN_RUN_REASON;
+    readsInput ||= position.xargs;
+    runsText = readsInput || (operand ?? "").includes("$?");
+  } else if (name === "eval") {
+    text = operands.join(" ");
+    readsInput = position.xargs;
+    runsText = true;
+  } else if (STDIN_INTERPRETERS.has(name)) {
+    readsInput = position.xargs || interpreterStdinProgram(name, operands);
+    runsText = readsInput;
+  } else {
+    // A bare decoder or fetch name is the tool from PATH, not a file the
+    // same line saved under that name (`wget …/jq` then `jq`, but not `curl`).
+    const tool = !word.includes("/") && (FETCH_NAMES.has(name) || DECODER_NAMES.has(name));
+    if (!tool && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+    // A launcher the reader does not know can still start a shell on a
+    // written file (`strace -f sh /tmp/x.sh`), so a shell word later in the
+    // stage is read with its own operand. `.`, `source` and `eval` are shell
+    // builtins no external launcher starts, so as arguments (`jq .`,
+    // `tar -C .`) they are not runs.
+    // It gets the reading it gets at the command position: its operand, an
+    // rc file, its `<` input (`flock l sh < f`, `ssh h bash -s < f`), its
+    // `-c` text and that text's positional parameters. Only an exact written
+    // name counts here, as `grep bash f` may be no run at all.
+    for (let k = position.index + 1; k < words.length; k++) {
+      if (!SHELL_NAME.test(commandBasename(words[k]))) continue;
+      const run = shellInvocation(words.slice(k + 1));
+      if (shellRunsWritten(run, ctx, true)) return WRITTEN_RUN_REASON;
+      if (run.stdin && inputs.some((input) => input !== undefined && namesWritten(input, ctx))) {
+        return WRITTEN_RUN_REASON;
+      }
+      if (run.command !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
+        const inner = runsInPipelines(readPipelines(run.command), ctx, depth + 1);
+        if (inner) return inner;
+      }
+    }
+  }
+  if (text !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
+    const inner = runsInPipelines(readPipelines(text), ctx, depth + 1);
+    if (inner) return inner;
+  }
+  if (readsInput) {
+    if (inputs.some((input) => runsWrittenPath(input, true, ctx))) return WRITTEN_RUN_REASON;
+    if (feed.variable) return ASSIGNED_RUN_REASON;
+    if (feed.file || (ctx.unknown && feed.operand)) return WRITTEN_RUN_REASON;
+  }
+  if (runsText || word.includes("$?")) {
+    for (const body of substitutionBodies(stage)) {
+      // With its redirections: `$(< f)` reads f.
+      const bodyWords = stageWordsWithRedirects(body) ?? stageWords(body);
+      if (bodyWords.some((each) => namesWritten(each, ctx))) return WRITTEN_RUN_REASON;
+      if (bodyWords.some((each) => refsFilled(each, ctx.filled))) return ASSIGNED_RUN_REASON;
+    }
+  }
+  return null;
+}
+
+/**
+ * True when a shell invocation runs a written file: its script operand, an
+ * `--rcfile`/`--init-file`, or a `-c` string's positional parameter
+ * (`bash -c '. "$0"' FILE`). `exact` counts only an exact written name.
+ */
+function shellRunsWritten(run, ctx, exact) {
+  const runs = (each) => each !== undefined &&
+    (exact ? namesWritten(each, ctx) : runsWrittenPath(each, true, ctx));
+  if (runs(run.file) || run.rcfiles.some(runs)) return true;
+  return run.command !== undefined && run.positionals.some((each) => namesWritten(each, ctx));
+}
+
+/** The first stage of the pipelines that runs decoded or fetched content, as `stageRunReason` reads it. */
+function runsInPipelines(pipelines, ctx, depth) {
+  for (const pipeline of pipelines) {
+    // What the stages before this one hand it through the pipe.
+    const feed = { file: false, variable: false, operand: false };
+    for (const entry of pipeline) {
+      const { words, position } = entry;
+      if (words === null) continue;
+      const expands = words.some((word) => refsFilled(word, ctx.filled));
+      // A shell, `eval` or `source` word in the stage that also expands a
+      // filled variable (`sh -c "$x"`, `bash <<< "$x"`), read at any word.
+      if (expands && words.some((_word, index) => runsShellTextAt(words, index))) return ASSIGNED_RUN_REASON;
+      const reason = stageRunReason(entry, ctx, feed, depth);
+      if (reason) return reason;
+      if (expands) feed.variable = true;
+      if (words.some((word) => namesWritten(word, ctx))) feed.file = true;
+      if (position.index >= 0 && position.index + 1 < words.length) feed.operand = true;
+    }
+  }
+  return null;
+}
+
+/** True for an `&` that ends a list (`a & b`, `a && b`), not one in `&>`, `>&`, `<&` or `|&`. */
+function isListAmpersand(text, k) {
+  return text[k] === "&" && text[k + 1] !== ">" && !"<>|".includes(text[k - 1] ?? "");
+}
+
+/**
+ * The here-documents of a command line (WI#892 AMR-2), every one of them in
+ * order: the list the redirect belongs to (up to its line's `;` or `&`, with
+ * its pipeline), the body, and whether the delimiter is quoted. The bodies of
+ * one line follow it in the order of their redirects; a `<<` inside a body is
+ * that body's text.
+ */
+function* hereDocuments(text) {
+  if (!text.includes("<<")) return;
+  const { states } = quoteScan(text);
+  const isRedirect = (i) => text[i - 1] !== "<" && text[i + 2] !== "<" && states[i] === SHELL_DATA;
+  let i = text.indexOf("<<");
+  while (i !== -1) {
+    const first = isRedirect(i) ? heredocRedirect(text, i) : null;
+    const lineEnd = first === null ? -1 : text.indexOf("\n", first.end);
+    if (lineEnd === -1) {
+      i = first === null ? text.indexOf("<<", i + 2) : -1;
+      continue;
+    }
+    // The line's list boundaries, read once.
+    const lineStart = text.lastIndexOf("\n", i - 1) + 1;
+    const cuts = [lineStart];
+    for (let k = lineStart; k < lineEnd; k++) {
+      if (states[k] !== QUOTE_UNQUOTED) continue;
+      if (text[k] === ";" || isListAmpersand(text, k)) cuts.push(k + 1);
+    }
+    const redirects = [];
+    for (let j = i; j !== -1 && j < lineEnd; j = text.indexOf("<<", j + 2)) {
+      const redirect = isRedirect(j) ? heredocRedirect(text, j) : null;
+      if (redirect === null) continue;
+      redirects.push({ at: j, redirect });
+      j = redirect.end - 2;
+    }
+    let next = lineEnd + 1;
+    let cut = 0;
+    for (const { at, redirect } of redirects) {
+      const lines = [];
+      while (next < text.length) {
+        const newline = text.indexOf("\n", next);
+        const end = newline === -1 ? text.length : newline;
+        const line = text.slice(next, end);
+        next = end + 1;
+        if ((redirect.stripTabs ? line.replace(/^\t+/, "") : line) === redirect.delimiter) break;
+        lines.push(line);
+      }
+      while (cut + 1 < cuts.length && cuts[cut + 1] <= at) cut++;
+      const listEnd = cut + 1 < cuts.length ? cuts[cut + 1] - 1 : lineEnd;
+      yield {
+        command: codeView(text.slice(cuts[cut], listEnd)),
+        body: lines.join("\n"),
+        quoted: /['"\\]/.test(text.slice(at + 2, redirect.end)),
+      };
+    }
+    i = next < text.length ? text.indexOf("<<", next) : -1;
+  }
+}
+
+/**
+ * What a here-document's command line does with the body: "shell" or
+ * "interpreter" when a stage runs it as a program at its command position,
+ * "mention" when a shell word sits elsewhere (`docker exec -i c sh`), or
+ * null.
+ */
+function hereDocumentReader(command) {
+  let reader = null;
+  for (const stage of pipelineStages(command)) {
+    const words = stagePropertyWords(stage);
+    if (words === null) return "shell";
+    const { index, xargs } = commandPosition(words);
+    if (index >= 0) {
+      const name = commandBasename(words[index]);
+      const args = words.slice(index + 1);
+      const operands = operandWords(args).operands;
+      if (SHELL_NAME.test(name) && (xargs || shellInvocation(args).stdin)) return "shell";
+      if ((name === "source" || name === ".") && STDIN_PROGRAM_FILES.has(operands[0] ?? "")) return "shell";
+      if (STDIN_INTERPRETERS.has(name) && interpreterStdinProgram(name, operands)) reader = "interpreter";
+    }
+    if (reader === null && words.some((word) => SHELL_NAME.test(commandBasename(word)))) reader = "mention";
+  }
+  return reader;
+}
+
+/** True when an unquoted here-document body expands a decode, a fetch, an unreadable command or a filled variable. */
+function hereDocumentHolds(body, ctx) {
+  for (const inner of substitutionBodies(body)) {
+    if (heldContent(inner) !== null) return true;
+  }
+  return refsFilled(body, ctx.filled);
+}
+
+/**
+ * Deny a decode or fetch whose output a stage of the same command line runs
+ * — through a file it wrote, a variable it filled or a here-document a shell
+ * reads (WI#892 part 3, AMR-1, AMR-2). What was written and filled is read
+ * from the whole line first, so a loop or a function that runs the file
+ * before the line's text reaches the write is read too. Decoding or
+ * downloading to a file without running it stays ordinary work, and a
+ * consumer that does not execute the content (`cat`, `jq`, `tar -xzf`) is
+ * not a run.
+ */
+function writtenRunReason(text, depth = 0) {
+  const pipelines = readPipelines(text);
+  const ctx = writeRunContext(pipelines);
+  // An unquoted here-document expands its body first, so a decode, a fetch
+  // or a filled variable there is the content its command writes
+  // (`cat > f <<EOF` / `$(curl …)` / `EOF`) or runs.
+  const documents = [...hereDocuments(text)];
+  for (const document of documents) {
+    document.holds = !document.quoted && hereDocumentHolds(document.body, ctx);
+    if (!document.holds) continue;
+    const out = { names: ctx.written, wrote: false, unknown: false };
+    for (const stage of pipelineStages(document.command)) {
+      const words = stageWordsWithRedirects(stage);
+      if (words !== null) stageWrites(splitRedirects(words), out);
+    }
+    if (out.wrote) {
+      ctx.strong = true;
+      if (out.unknown) ctx.unknown = true;
+    }
+  }
+  const reason = runsInPipelines(pipelines, ctx, depth);
+  if (reason) return reason;
+  for (const document of documents) {
+    const reader = hereDocumentReader(document.command);
+    if (document.holds && (reader === "shell" || reader === "interpreter")) {
+      return refsFilled(document.body, ctx.filled) ? ASSIGNED_RUN_REASON : SUBSTITUTION_SHELL_REASON;
+    }
+    // The body may be a script (a shell reads it, or `ssh host <<EOF` runs
+    // it elsewhere): every body is read as a command line of its own, with
+    // this line's writes and its own. A decoded substitution at a body's
+    // command position counts only where a shell word reads the body, so a
+    // document that shows one (`cat > notes.md <<'EOF'`) stays data.
+    if (depth < MAX_SHELL_BODY_DEPTH) {
+      const shell = reader === "shell" || reader === "mention";
+      // A body no shell word reads gets this line's exact written names
+      // only: an unquoted `$x` or `$EDITOR` there is text a document shows.
+      const bodyCtx = shell ? ctx : { written: ctx.written, filled: new Set(), unknown: false, strong: false };
+      const inner = (shell ? checkSubstitutionCommand(document.body) : null) ??
+        writtenRunReason(document.body, depth + 1) ??
+        runsInPipelines(readPipelines(document.body), bodyCtx, depth + 1);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+
+// A decode, a fetch, or an expansion or substitution the guard cannot read:
+// the only sources of content a later stage can run, so a text without one
+// costs a single scan (WI#892 deadline). This replaces the head's
+// write-or-assign gate, which skipped `-o/tmp/x`, `-O/tmp/x` and wget's
+// default name. A quote, a backslash or a brace list may spell a name the
+// stage reader resolves (`c\url`, `"cu"rl`, `c{u,}rl`), so it opens the gate
+// too; a brace without a comma expands to nothing new.
+const WRITE_RUN_SOURCE = new RegExp(`[$\`'"\\\\]|${[...FETCH_NAMES, ...DECODER_NAMES].join("|")}`);
+
+// The readers above run once per text view the evaluator builds, and most
+// views of a command are the same string; keep the last few verdicts.
+const writtenRunVerdicts = new Map();
+
+function checkWrittenThenRun(text) {
+  if (!WRITE_RUN_SOURCE.test(text) && !(text.includes("{") && text.includes(","))) return null;
+  if (writtenRunVerdicts.has(text)) return writtenRunVerdicts.get(text);
+  const verdict = writtenRunReason(text);
+  if (writtenRunVerdicts.size >= 16) writtenRunVerdicts.clear();
+  writtenRunVerdicts.set(text, verdict);
+  return verdict;
+}
+
+/**
+ * Deny a shell, `eval` or `source` fed by a command substitution, a process
+ * substitution or a here-string that holds a decode stage or a fetch (WI#892):
+ * `sh -c "$(curl …)"`, `eval "$(base64 -d f)"`, `bash <(gunzip -c x.gz)`,
+ * `source <(wget -qO- …)`. The substitution runs first and its output becomes
+ * the shell's own text, so no stage sits between them and the pipe rule above
+ * cannot see it. An unreadable body denies too, as it does in a pipeline.
+ */
+function checkSubstitutionShell(text) {
+  // A substitution is the only way a stage can hold content for a later
+  // shell, so a text without one costs a single scan (WI#892 deadline).
+  if (!SUBSTITUTION_MARKER.test(text)) return null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const words = stagePropertyWords(stage);
+      if (words === null) continue;
+      if (!words.some((_word, index) => runsShellTextAt(words, index))) continue;
+      for (const body of substitutionBodies(stage)) {
+        if (heldContent(body) !== null) return SUBSTITUTION_SHELL_REASON;
       }
     }
   }
   return null;
+}
+
+const BLOCK_DEVICE_WRITE_PATTERN =
+  />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
+
+const SUBSTITUTION_COMMAND_REASON = "decoded or fetched content run as a command through a substitution";
+
+// Stands in for a held substitution's output in a stage's words. The word
+// readers pass a control byte through as text, and no command word an
+// ordinary task runs carries one.
+const SUBSTITUTION_MARK = "\u0001";
+
+/**
+ * The stage with each top-level substitution whose body holds a decode, a
+ * fetch or a command the guard cannot read replaced by a marker, or null when
+ * no body does.
+ */
+function markHeldSubstitutions(stage) {
+  const { substitutions } = quoteScan(stage);
+  let marked = "";
+  let from = 0;
+  for (let i = 0; i < stage.length; i++) {
+    const close = substitutions.get(i);
+    if (close === undefined) continue;
+    const backtick = stage[i] === "`";
+    const raw = stage.slice(i + (backtick ? 1 : 2), close);
+    if (heldContent(backtick ? raw.replace(/\\([\\$`])/g, "$1") : raw) !== null) {
+      marked += stage.slice(from, i) + SUBSTITUTION_MARK;
+      from = close + 1;
+    }
+    i = close;
+  }
+  return from === 0 ? null : marked + stage.slice(from);
+}
+
+/**
+ * Deny a substitution that holds a decode, a fetch or an unreadable command
+ * at the command position (WI#892 AMR-2). bash runs its output as the command
+ * and its arguments, so `$(echo <b64> | base64 -d)`, the backtick spelling,
+ * `"$(curl …)"`, `env $(…)` and `nice $(…)` run decoded text no other rule
+ * reads. The command position is read after assignments, redirections and
+ * the launchers `commandPosition` follows, so an argument or an assignment
+ * (`echo "$(…)"`, `x=$(…)`) stays data.
+ */
+function substitutionCommandReason(text) {
+  for (const list of runLists(codeView(text))) {
+    for (const stage of pipelineStages(list)) {
+      if (!SUBSTITUTION_MARKER.test(stage)) continue;
+      const marked = markHeldSubstitutions(stage);
+      if (marked === null) continue;
+      const words = stagePropertyWords(marked);
+      if (words === null) return SUBSTITUTION_COMMAND_REASON;
+      const split = splitRedirects(words);
+      const { index } = commandPosition(split);
+      if (index === -2 || (index >= 0 && split[index].includes(SUBSTITUTION_MARK))) {
+        return SUBSTITUTION_COMMAND_REASON;
+      }
+    }
+  }
+  return null;
+}
+
+const substitutionCommandVerdicts = new Map();
+
+function checkSubstitutionCommand(text) {
+  if (!SUBSTITUTION_MARKER.test(text)) return null;
+  if (substitutionCommandVerdicts.has(text)) return substitutionCommandVerdicts.get(text);
+  const verdict = substitutionCommandReason(text);
+  if (substitutionCommandVerdicts.size >= 16) substitutionCommandVerdicts.clear();
+  substitutionCommandVerdicts.set(text, verdict);
+  return verdict;
 }
 
 const DENY_RULES = [
@@ -2499,8 +4249,16 @@ const DENY_RULES = [
     // Device namespaces beyond the legacy names: LVM (/dev/mapper/…) and the
     // udev links (/dev/disk/by-id/…). truncate is only denied at a block device.
     // The `>|` noclobber override writes the same device as `>` (WI#832).
-    pattern:
-      />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
+    // `>&word` and `n>&word` write `word` when it is not a descriptor
+    // number, and `&>word`/`&>>word` write it too, so the target the
+    // redirection reader collected is checked in every write form (WI#889).
+    check: (segment) => {
+      if (BLOCK_DEVICE_WRITE_PATTERN.test(segment)) return true;
+      for (const { target, write } of redirectScan(segment).targets) {
+        if (write && DEVICE_TARGET.test(stripShellQuotes(target))) return true;
+      }
+      return false;
+    },
   },
   {
     name: "SSH agent use (worker lane is not a credential broker)",
@@ -2554,7 +4312,9 @@ function evaluate(command, depth = 0) {
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
   const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ??
-    checkTrustedUserConfig(command) ?? checkListeners(command, depth);
+    checkTrustedUserConfig(command) ?? checkListeners(command, depth) ??
+    // After the listener rule, so `$(nc -l 9000)` keeps its listener reason.
+    checkSubstitutionCommand(command);
   if (rawDenial) return rawDenial;
   // Bash can join a backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -2563,8 +4323,14 @@ function evaluate(command, depth = 0) {
   // WI#826). An extra quote-preserving reading separates the shell
   // punctuation bash glues to a word, so `(git reset --hard)` and
   // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
+  //
+  // Every reading is also taken with its redirections blanked out (WI#889):
+  // a redirection is neither a clause end nor an argument, so a rule must see
+  // the words bash runs. The raw-shape family's own readers step over a
+  // redirection too, which keeps a target visible to a rule about targets.
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const unredirected = redirectionFreeView(joined);
     const punctuation = shellPunctuationView(joined);
     const wordLevel = shellWordLevelView(joined);
     // A verb glued to an unquoted expansion (`${EMPTY}tee /dev/sda1`) is the
@@ -2595,14 +4361,22 @@ function evaluate(command, depth = 0) {
       // The glued view leaves a quoted verb quoted (`$EMPTY"tee"` reads as
       // `"tee"`), so the WI#873 word-level reading applies to it as well.
       (glued === joined ? null : checkRawShapes(shellWordLevelView(glued))) ??
-      (glued === joined ? null : checkListeners(glued)) ??
-      (glued === joined ? null : checkListeners(shellWordLevelView(glued))) ??
+      (glued === joined ? null : checkListeners(glued, depth)) ??
+      (glued === joined ? null : checkListeners(shellWordLevelView(glued), depth)) ??
       (defaultedIsNew ? checkRawShapes(defaulted) : null) ??
       (defaultedIsNew ? checkRawShapes(shellWordLevelView(defaulted)) : null) ??
-      (defaultedIsNew ? checkListeners(defaulted) : null) ??
-      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted)) : null) ??
+      (defaultedIsNew ? checkListeners(defaulted, depth) : null) ??
+      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted), depth) : null) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
-      (joined === command ? null : checkListeners(joined, depth));
+      // The redirection-free reading: a rule sees the words bash runs, and a
+      // target it does not own is still visible to a rule about targets
+      // (WI#889 properties 1, 2 and 6).
+      (unredirected === joined ? null : checkDenyRulesEverywhere(unredirected)) ??
+      (unredirected === joined ? null : checkRawShapes(unredirected)) ??
+      (unredirected === joined ? null : checkMoveAndTarDeletion(shellWordView(unredirected))) ??
+      (unredirected === joined ? null : checkListeners(unredirected, depth)) ??
+      (joined === command ? null : checkListeners(joined, depth)) ??
+      (joined === command ? null : checkSubstitutionCommand(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(glued === joined ? joined : glued)) {
       const denied = checkRm(segment);
@@ -2672,7 +4446,9 @@ function* listenerSegments(text) {
   let mask = "";
   let started = false;
   let quoted = false;
+  let wordStart = -1;
   const append = (chars, fromQuotes) => {
+    if (!started) wordStart = -1;
     word += chars;
     mask += (fromQuotes ? "1" : "0").repeat(chars.length);
     started = true;
@@ -2706,6 +4482,16 @@ function* listenerSegments(text) {
     } else if (state !== QUOTE_UNQUOTED) {
       if (state !== QUOTE_CLOSE) append(ch, true);
     } else {
+      // A redirection is not a word: `kimi 2>&1 server` names the service
+      // subcommand, and `python3 -m 2>/dev/null http.server` the module
+      // (WI#889). The token ends the word it glues to (`a&>f` is `a`), and
+      // only at a word start does it carry a `[n]` descriptor.
+      const skip = started ? redirectionSkip(text, i) : redirectTokenSpan(text, i);
+      if (skip !== null) {
+        flush();
+        i = (typeof skip === "number" ? skip : skip.end) - 1;
+        continue;
+      }
       const separator = ifsSeparatorLength(text, i);
       if (separator > 0) {
         // Keep the shell word intact until its brace alternatives are known.
@@ -2901,7 +4687,7 @@ function checkShellBody(body, depth) {
     const denied = checkRm(segment);
     if (denied) return denied;
   }
-  return checkListeners(body, depth);
+  return checkListeners(body, depth) ?? checkSubstitutionCommand(body);
 }
 
 /**
@@ -2925,7 +4711,238 @@ function checkFindExecListeners(words, start, depth) {
 // A launcher that runs its own string as a shell command: `script -c` runs it
 // with `sh -c`, and `eval` joins its words and runs them. Neither is a
 // command position — the words are read wherever they sit (WI#858).
-const SHELL_STRING_LAUNCHERS = new Set(["script"]);
+//
+// WI#887: four more launchers hand a quoted string to a shell with no shell
+// word in the command, so the string is one word to the shell and neither the
+// raw-shape family nor the listener rule saw a command in it. Each reader
+// below returns the bodies that launcher runs, in the words the listener
+// reader has already unquoted; every body gets the full body rule set
+// (`checkShellBody`, WI#874). The launcher is one table entry, not a new
+// rule, so the next such launcher is one entry as well.
+//
+// util-linux flock 2.42.4 reads its options with getopt_long and the short
+// option string "+sexnoFuw:E:hV?" (read from the binary): the `+` stops the
+// walk at the first word that is not an option, which is the lock file, and
+// `--` ends the options before it. A short cluster is read letter by letter,
+// so the value letter of `-nw 5` or `-nE 1` takes the rest of the word, or
+// the next word when nothing follows (AMK-1). A long option is its exact
+// name, else a unique prefix (`--time`, `--wai`, `--conf`), and
+// `--name=value` carries its value inline. Each name maps to the option it
+// stands for, so two names of one option (`--timeout`/`--wait`,
+// `--nonblocking`/`--nb`) are one match, as getopt_long counts them, while
+// `--n` (`--nonblocking` or `--no-fork`) is ambiguous.
+const FLOCK_LONG_OPTIONS = new Map([
+  ["shared", "s"], ["exclusive", "x"], ["unlock", "u"], ["nonblocking", "n"], ["nb", "n"],
+  ["timeout", "w"], ["wait", "w"], ["conflict-exit-code", "E"], ["close", "o"],
+  ["no-fork", "F"], ["verbose", "verbose"], ["fcntl", "fcntl"], ["start", "start"],
+  ["length", "length"], ["help", "h"], ["version", "V"],
+]);
+const FLOCK_FLAG_OPTIONS = new Set(["s", "e", "x", "n", "o", "F", "u", "h", "V", "?", "verbose", "fcntl"]);
+const FLOCK_VALUE_OPTIONS = new Set(["w", "E", "start", "length"]);
+// `-c`/`--command` is not a getopt option: flock checks for that literal
+// word *after* the file and runs its value through `sh`, so `flock file -x
+// -c 'cmd'` runs `-x` as the program. Reading the word after the file only,
+// as flock does, keeps an ordinary `flock file make -c …` allowed. Before the
+// file 2.42.4 refuses `-c`, `-nc` and `--command` as invalid options; the
+// walk reads them as any word it cannot resolve, so their value still counts
+// as a possible body.
+const FLOCK_COMMAND_OPTIONS = new Set(["-c", "--command"]);
+// util-linux `su --help` (2.42.4) reads its words through getopt, which
+// permutes, so `-c` may sit on either side of the user name; its value may be
+// attached (`-c'cmd'`, `-lc 'cmd'`) or follow as the next word. The other
+// value options are stepped over whole so a value is never read as the body.
+const SU_COMMAND_OPTIONS = new Set(["-c", "--command", "--session-command"]);
+const SU_VALUE_OPTIONS = new Set([
+  "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment",
+]);
+// The short value-taking letters of that set, read letter by letter in a
+// cluster. `m`/`p` (preserve-environment) take nothing.
+const SU_SHORT_VALUE_LETTERS = new Set(["g", "G", "s", "w"]);
+// procps `watch --help` (procps-ng 4.0.7): a value option eats the next
+// word, `-d`/`--differences` takes only an attached value, and the command is
+// the first word that is neither. Everything from there on is the command,
+// which watch joins with spaces before handing it to `sh -c`; watch stops
+// reading options at that word (`watch 'cmd' -n1` runs `cmd -n1`).
+const WATCH_VALUE_OPTIONS = new Set(["-n", "--interval", "-q", "--equexit", "-s", "--shotsdir"]);
+const PARALLEL_ARGUMENT_MARKER = /^:::/;
+// One invocation may name at most this many bodies; past it the whole tail is
+// read as one body, which covers the same words.
+const MAX_LAUNCHER_BODIES = 64;
+
+function shellBodyList(body) {
+  return body === undefined || body === "" ? [] : [body];
+}
+
+/** The flock option a long option name stands for, or undefined when getopt_long cannot resolve it. */
+function flockLongOption(name) {
+  const exact = FLOCK_LONG_OPTIONS.get(name);
+  if (exact !== undefined) return exact;
+  let found;
+  for (const [long, option] of FLOCK_LONG_OPTIONS) {
+    if (!long.startsWith(name)) continue;
+    // A prefix of two different options is ambiguous.
+    if (found !== undefined && found !== option) return undefined;
+    found = option;
+  }
+  return found;
+}
+
+/**
+ * One option word as flock reads it: `step` is 1 when any value it takes is
+ * in the word itself and 2 when it takes the next word. A word getopt_long
+ * cannot resolve (an unknown option or letter, an ambiguous prefix) returns
+ * `doubt`: the text the word carries after that point (`-ncCMD` carries
+ * `CMD`, `--x=CMD` carries `CMD`), since an option the reader does not know
+ * may take it as its value.
+ */
+function flockOptionWord(word) {
+  if (word.startsWith("--")) {
+    const equals = word.indexOf("=");
+    const option = flockLongOption(word.slice(2, equals === -1 ? undefined : equals));
+    if (option === undefined) return { doubt: equals === -1 ? "" : word.slice(equals + 1) };
+    return { step: FLOCK_VALUE_OPTIONS.has(option) && equals === -1 ? 2 : 1 };
+  }
+  for (let j = 1; j < word.length; j++) {
+    if (FLOCK_VALUE_OPTIONS.has(word[j])) return { step: j + 1 < word.length ? 1 : 2 };
+    if (!FLOCK_FLAG_OPTIONS.has(word[j])) return { doubt: word.slice(j + 1) };
+  }
+  return { step: 1 };
+}
+
+// From each word of a clause, where flock's option walk starting there ends:
+// `{ file }`, the lock file's index (the first word that is not an option,
+// or the word after `--`); `{ doubt, carried }`, an option word the walk
+// cannot resolve; or null when an option's value runs past the clause. Every
+// step moves forward, so the table is built from the end in one pass and a
+// clause of many flock words reads each word once (WI#858 deadline).
+const flockWalks = new WeakMap();
+
+function flockWalk(words) {
+  let walk = flockWalks.get(words);
+  if (walk !== undefined) return walk;
+  walk = new Array(words.length + 2).fill(null);
+  for (let i = words.length - 1; i >= 0; i--) {
+    const word = words[i];
+    if (word === "--") {
+      walk[i] = { file: i + 1 };
+    } else if (!word.startsWith("-") || word === "-") {
+      walk[i] = { file: i };
+    } else {
+      const read = flockOptionWord(word);
+      walk[i] = read.doubt === undefined ? walk[i + read.step] : { doubt: i, carried: read.doubt };
+    }
+  }
+  flockWalks.set(words, walk);
+  return walk;
+}
+
+/**
+ * `flock [options] <file> -c '<string>'`: the body after the lock file, with
+ * the options read as flock reads them (WI#887, AMK-1). Doubt never allows:
+ * from an option word the walk cannot resolve, it cannot tell what that word
+ * takes or which word is the file, so the text the word carries and every
+ * later word of the clause are each a possible body. More than
+ * MAX_LAUNCHER_BODIES of them is refused (`null`) rather than read in part;
+ * flock 2.42.4 itself refuses any such word as an invalid option.
+ */
+function flockShellBodies(words, start) {
+  const reached = flockWalk(words)[start];
+  if (reached === null) return [];
+  if (reached.doubt !== undefined) {
+    if (words.length - reached.doubt > MAX_LAUNCHER_BODIES) return null;
+    const bodies = new Set([reached.carried, ...words.slice(reached.doubt + 1)]);
+    bodies.delete("");
+    return [...bodies];
+  }
+  // flock reads the word after the lock file as `-c`/`--command` and the one
+  // after that as the shell body.
+  if (!FLOCK_COMMAND_OPTIONS.has(words[reached.file + 1] ?? "")) return [];
+  return shellBodyList(words[reached.file + 2]);
+}
+
+/** `su -c '<string>'`: the command option's value, wherever getopt finds it (WI#887). */
+function suShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return [];
+    if (SU_COMMAND_OPTIONS.has(word)) return shellBodyList(words[i + 1]);
+    if (SU_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      if (equals === -1) continue;
+      if (SU_COMMAND_OPTIONS.has(word.slice(0, equals))) return shellBodyList(word.slice(equals + 1));
+      continue;
+    }
+    if (!/^-[a-zA-Z]/.test(word)) continue;
+    // getopt reads a short cluster letter by letter. `c` takes the rest of
+    // the word as its value when anything follows (`-c'cmd'`), otherwise the
+    // next word (`-lc 'cmd'`). A value-taking letter before it (`-sc` is
+    // `-s c`) ends the cluster at that value, so `-sc` carries no body.
+    for (let j = 1; j < word.length; j++) {
+      if (word[j] === "c") return shellBodyList(word.slice(j + 1) || words[i + 1]);
+      if (SU_SHORT_VALUE_LETTERS.has(word[j])) break;
+    }
+  }
+  return [];
+}
+
+/** `watch`'s command: every word from the first non-option one, joined as watch joins it. */
+function watchShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return shellBodyList(words.slice(i + 1).join(" "));
+    if (WATCH_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) continue;
+    return shellBodyList(words.slice(i).join(" "));
+  }
+  return [];
+}
+
+/**
+ * GNU `parallel` runs its command template through a shell, and each
+ * `:::`/`::::` argument is a command line of its own (`parallel ::: 'kimi
+ * server'` runs it). Every run between the markers is read; the option words
+ * before the template are read with it, which can only add denials.
+ */
+function parallelShellBodies(words, start) {
+  const bodies = [];
+  let current = [];
+  for (let i = start; i < words.length; i++) {
+    if (!PARALLEL_ARGUMENT_MARKER.test(words[i])) {
+      current.push(words[i]);
+      continue;
+    }
+    if (current.length > 0) bodies.push(current.join(" "));
+    current = [];
+    if (bodies.length > MAX_LAUNCHER_BODIES) return shellBodyList(words.slice(start).join(" "));
+  }
+  if (current.length > 0) bodies.push(current.join(" "));
+  return bodies;
+}
+
+const SHELL_STRING_LAUNCHERS = new Map([
+  ["script", (words, start) => shellBodyList(listenerShellBody(words, start, "script"))],
+  ["flock", flockShellBodies],
+  ["su", suShellBodies],
+  ["watch", watchShellBodies],
+  ["parallel", parallelShellBodies],
+]);
+
+/**
+ * The bodies one launcher word runs through a shell (WI#874, WI#887), or
+ * null when the reader cannot read them all (the caller refuses).
+ */
+function launcherShellBodies(name, words, start) {
+  if (SHELL_NAME.test(name)) return shellBodyList(listenerShellBody(words, start, name));
+  const reader = SHELL_STRING_LAUNCHERS.get(name);
+  return reader === undefined ? [] : reader(words, start);
+}
 
 /**
  * The words bash's brace expansion would also produce from one word
@@ -3228,9 +5245,24 @@ function checkListenerWords(words, depth) {
   // One forward-only table per segment, so a segment full of `kimi` words is
   // linear (WI#858 deadline).
   let serviceSubcommands;
+  let sawGitCarrier = false;
   for (let i = 0; i < words.length; i++) {
     const word = listenerWord(words[i]);
     const name = commandBasename(word);
+    if (name === "git" && !sawGitCarrier) {
+      // Scan a recognized carrier once to keep repeated git words linear.
+      // The word reader keeps an entire quoted description in one argument.
+      const bodies = gitShellBodies(words, i + 1);
+      if (bodies !== null) {
+        sawGitCarrier = true;
+        for (const body of bodies) {
+          if (body.length === 0) continue;
+          if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
+          const denied = checkShellBody(body, depth + 1);
+          if (denied) return denied;
+        }
+      }
+    }
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
     }
@@ -3262,8 +5294,9 @@ function checkListenerWords(words, depth) {
       continue;
     }
     if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
-      const body = listenerShellBody(words, i + 1, name);
-      if (body !== undefined) {
+      const bodies = launcherShellBodies(name, words, i + 1);
+      if (bodies === null) return `cannot check the shell commands ${name} may run`;
+      for (const body of bodies) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
         const denied = checkShellBody(body, depth + 1);
         if (denied) return denied;
@@ -3299,7 +5332,93 @@ function checkListeners(text, depth = 0) {
       if (denied) return denied;
     }
   }
+  // A here-string can feed a shell directly or through a pipeline. Apply
+  // every rule to its contents under the same nesting budget (WI#889).
+  let mayRun;
+  for (const target of redirectScan(text).hereStrings) {
+    if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check a deeply nested shell command";
+    const body = hereStringBody(target);
+    if (body === null) {
+      // An unreadable word is a command line only if something on the line
+      // can run it; `read`, `jq` and `grep` take it as data (AMU-1).
+      mayRun ??= hasHeredoc(text) || lineMayRunInput(redirectScan(text).view, depth);
+      if (mayRun) return "cannot verify here-string contents; use a literal word";
+      continue;
+    }
+    const denied = classify(body, depth + 1);
+    if (denied) return denied;
+  }
   return null;
+}
+
+function hasHeredoc(text) {
+  for (const _line of quoteScan(text).heredocLines) return true;
+  return false;
+}
+
+// Paths that name a descriptor the command inherits: a program given one of
+// them reads its code from a here-string on that descriptor.
+const INHERITED_INPUT_PATH = /^(?:\/dev\/stdin|\/dev\/fd\/\d+|\/proc\/self\/fd\/\d+)$/;
+// Shells and versioned interpreters outside the shared tables.
+const OTHER_INPUT_RUNNERS = /^(?:mksh|rbash|tcsh|csh|fish|yash|posh|oksh|pdksh|(?:python|perl|ruby|node|php|lua)[0-9][0-9.]*)$/;
+// Programs that take their script from a file operand, `-` meaning stdin.
+const STDIN_SCRIPT_READERS = new Set(["gawk", "mawk", "nawk", "awk", "sed", "gsed"]);
+
+/**
+ * Whether anything on a command line can run the text a here-string carries
+ * (WI#889 AMU-1). The line is read whole, with redirections and here-string
+ * words taken out (`view`), its substitution bodies included: a shell or
+ * `eval`, `source`/`.` of standard input, an interpreter with no script
+ * operand (`isInterpreterStage`), a command word the guard cannot read
+ * (`runsUnverifiableCommand`), a program given an inherited descriptor's path
+ * (`/dev/stdin`, `/dev/fd/3`) or a shell or interpreter outside the shared
+ * tables. Reading the whole line, not the stage the here-string is attached
+ * to, covers compound bodies (`while …; done <<< "$x"`, `{ bash; }<<<"$x"`),
+ * `exec` redirections and functions defined on the line. A line with a
+ * here-document is refused by the caller, because its body can shift the
+ * stage split.
+ */
+function lineMayRunInput(view, depth) {
+  for (const list of commandLists(view)) {
+    for (const stage of splitOutsideQuotes(list, "|")) {
+      if (isInterpreterStage(stage) || runsUnverifiableCommand(stage)) return true;
+      const words = stagePropertyWords(stage);
+      if (words === null) return true;
+      for (let i = 0; i < words.length; i++) {
+        const bare = stripShellQuotes(words[i]);
+        const name = commandBasename(listenerWord(words[i]));
+        if (INHERITED_INPUT_PATH.test(bare) || OTHER_INPUT_RUNNERS.test(name)) return true;
+        // A program read from standard input (`gawk -f -`, `sed -f -`).
+        if (STDIN_SCRIPT_READERS.has(name) && words.slice(i + 1).some((w) => /^(?:-|-f-|--file=-)$/.test(stripShellQuotes(w)))) {
+          return true;
+        }
+        // `source`/`.` of a file the guard cannot name (`<(cat)`, `"$F"`).
+        if ((name === "source" || name === ".") && i + 1 < words.length && !/^[\w./~+-]+$/.test(stripShellQuotes(words[i + 1]))) {
+          return true;
+        }
+      }
+    }
+  }
+  for (const body of substitutionBodies(view)) {
+    if (depth + 1 >= MAX_SHELL_BODY_DEPTH) return true;
+    if (lineMayRunInput(body, depth + 1)) return true;
+  }
+  return false;
+}
+
+/** Read one here-string word, which Bash expands without field splitting or globbing. */
+function hereStringBody(target) {
+  const { states, substitutions } = quoteScan(target);
+  if (!target || target.startsWith("~") || substitutions.size > 0 || hasUnverifiableAnsiEscape(target)) {
+    return null;
+  }
+  for (let i = 0; i < target.length; i++) {
+    if (target[i] !== "$" || (states[i] !== QUOTE_UNQUOTED && states[i] !== QUOTE_DOUBLE)) continue;
+    if (/[\w{(*@#?$!\-]/.test(target[i + 1] ?? "") ||
+        (states[i] === QUOTE_UNQUOTED && target[i + 1] === '"')) return null;
+  }
+  const { word, end, complete } = bashWord(target, 0);
+  return complete && end === target.length ? word : null;
 }
 
 function checkListenerRegion(text, depth) {

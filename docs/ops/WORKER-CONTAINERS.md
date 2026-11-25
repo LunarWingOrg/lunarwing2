@@ -1507,11 +1507,13 @@ Enforced controls (opencode2 lane unless noted):
     looks). The config is read through the tenant account; a path that is a
     link or not a regular file is reported as unreadable.
 
-    `mt-admin worker-readiness <tenant>` is the strict gate — exit non-zero
-    when any enabled lane's port refuses or drops a loopback connection,
-    polling for `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one
-    probe). Exit 0 means that every enabled lane's port kept a connection
-    open, not that a job can connect.
+    `mt-admin worker-readiness <tenant>` is the strict gate. It exits non-zero
+    if an enabled lane has no WSS port allocated or its port refuses or drops a
+    loopback connection. Missing-port warnings name the registry slot to check.
+    Unselected lanes and intentionally stopped OpenRC lanes are skipped. The
+    polling window is `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one
+    probe per checked lane). Exit 0 means the checked ports answered, not that
+    a job can connect.
 
     `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
     container state plus a bounded tail of its bridge and task container logs
@@ -1813,7 +1815,7 @@ the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
 
 ### Provenance and image contents
 
-The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `0472d115e5297093f249c222639431ba8ff0bb78` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
+The canonical repository is `https://git.lunarwing.org/lunarwing/lunardepth.git`, pinned to full commit `ca905dfe5e998ebcac29f5c57b5ea04108498468` (source package `0.2.1-alpha.1`). The image build checks out and verifies that exact commit and requires these ancestry markers:
 
 - compatibility/item 9: `17aef23e05cc074c8621d38d159d77d25cb348ca`;
 - TensorMoon routing: `8c610180c84a2f4c27fb2958e6e7dab9e48d476b`.
@@ -1919,6 +1921,14 @@ The full `da06c33b2091546dc38c61b95452ce27a4ce32d5..0472d115e5297093f249c2226394
 Local verification produced rootless candidate `sha256:5555282843d259037f5fee643ab1b5601dbe211b1ee3fd9e6af2e69e438da209`. Its pinned toolchain and frozen-lock checks, 35 focused upstream worker tests, schema-v1 template generation, three-point manifest gates, and network-isolated split-role smoke passed. The generated template declares schema `1` with manifest SHA-256 `826442644989efd99c074be91906710e3eb7f1c1d0a3c18f909014ef87387721`; image-config and exported-rootfs verification passed. Two further real restarts discarded a planted future-schema manifest, writer-lock/takeover/temp files, a hostile `.env` and module, preserved session data, and left the runtime manifest byte-identical to that template.
 
 These are source-review and local rootless results, not claims of protected publication or live gateway inference. The protected candidate/rebuild digest match, protected out-of-band exposure verification, CRITICAL scan, and disposable-tenant TensorZero smoke remain required on the exact head.
+
+### WI#894 bump to ca905dfe5e (test deadline only)
+
+`0472d115..ca905dfe5e998ebcac29f5c57b5ea04108498468` is one test-only commit on the previous pin; the upstream lane does not merge it yet, so the pin is a reviewed branch head, not `master`. `deepseek-harness/packages/api/lunarwing-worker/tests/task.spec.ts` was the whole diff: its shared `request()` helper gave every task `timeoutMs: 1_000`, which `src/task.ts:90` arms as a wall-clock `setTimeout`. Only "enforces the task deadline" intends to reach the deadline (it sets 10 ms); the other tests expect success, a provider error, or a cancellation, so on a loaded runner they hit the 1000 ms deadline first and returned `timed_out` / `Task exceeded 1000 ms`. A failed test fails the image build (Dockerfile line 73), and the candidate and its clean rebuild each run the suite, so one slow test turned three master jobs red (WI#894 jobs 201172 and 208652).
+
+The fix raises the shared default to `timeoutMs: 30_000` — above vitest's 5 s test timeout — and drives the deadline test with fake timers: `MockAdapter.entered` resolves when a model request is in flight, and only then does the test advance 10 ms and assert `timed_out` with the partial output. Only "enforces the task deadline" can observe the deadline. Mutation check: replacing `this.cancel('timed_out')` with a no-op in `src/task.ts` fails exactly that test (4 passed, it times out at 5 s). Under CPU contention (suite pinned to one core beside 24 busy loops) the file passes with the fix; the previous spec failed the same way with `Task exceeded 10 ms` and `output: ''`.
+
+Bump checklist dispositions: the diff adds no exposure or publication surface (test file only), the source package stays `0.2.1-alpha.1`, and both ancestry markers `17aef23e05cc` and `8c610180c84a` remain ancestors. The lockfile, toolchain, Debian snapshot, native inputs, and profile template are byte-identical, so `PROFILE_SCHEMA_VERSION=1` does not move. Every inventory moved together: `lunardepth4lunarwing/Dockerfile`, `.gitlab/scripts/build-worker-image.sh` (source_ref and build_args), `.gitlab/scripts/validate_config.py`, `.gitlab/go/dockerfile-parse/lunardepth.go` and its test, `lunardepth4lunarwing/scripts/{exposure_policy_assert.py,image_config_policy.py,image_config_policy_test.py,runtime_smoke_entrypoint.sh}`. The protected candidate/rebuild digest match, out-of-band exposure verification, CRITICAL scan, and green `worker-lunardepth-candidate` remain required on the MR's pipeline.
 
 ### Ports, rollout, and rollback
 

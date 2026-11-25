@@ -719,14 +719,12 @@ Commands:
 
   list-tenants                     Show all tenants with ports and status
   status <name>                    Detailed status for one tenant
-  worker-readiness <name>          WI#882 strict gate: exit non-zero when any
-                                   enabled worker lane's WSS port refuses a
-                                   loopback connection or drops it at once (a
-                                   running container is not a ready worker,
-                                   and neither is a port that only accepts);
-                                   exit 0 means each port kept a connection
-                                   open, not that a job can connect; waits up
-                                   to LUNARWING_MT_WORKER_READY_WAIT_SECS
+  worker-readiness <name>          WI#882 strict gate: exit non-zero if an enabled
+                                   worker has no allocated WSS port, or its port
+                                   refuses or drops a loopback connection.
+                                   Intentionally stopped OpenRC lanes are skipped.
+                                   Exit 0 does not prove a job can connect.
+                                   Polling window: LUNARWING_MT_WORKER_READY_WAIT_SECS
   worker-failure-log <name> <lane> [lines]
                                    WI#882 first-failure evidence: the lane's
                                    container state plus a bounded tail of its
@@ -1800,9 +1798,6 @@ main() {
       ;;
 
     worker-readiness)
-      # WI#882: strict gate — exit non-zero when any enabled lane's WSS port
-      # refuses a loopback connection or drops it at once. `status` reports
-      # the same verdict per lane.
       [[ -n "${1:-}" ]] || die "usage: worker-readiness <name>"
       local ready_name
       ready_name="$(sanitize_name "$1")"

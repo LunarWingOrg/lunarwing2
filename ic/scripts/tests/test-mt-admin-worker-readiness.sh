@@ -352,71 +352,61 @@ else
 fi
 eval "$_real_probe"
 
-# WI#882: the strict gate (`worker-readiness`) must fail on a dead enabled
-# lane, pass when every enabled lane answers, and skip an intentionally
-# stopped OpenRC lane rather than calling it dead.
-LANE_STATE=([pebble]=true [opencode]=true [opencode2]=true [lunardepth]="" [kimi]=true)
-tenant_worker_desired_running() { return 0; }
+# WI#882: the strict gate fails if a selected lane's port refuses or drops a
+# connection, even when the other selected lanes are healthy.
 INIT_SYSTEM=systemd
-if check_tenant_worker_readiness alice >/dev/null 2>&1; then
-  fail "the strict gate fails while a selected lane's port is dead"
-else
-  pass "the strict gate fails while a selected lane's port is dead"
-fi
-
-# Only the accept-and-drop lane is unhealthy: the gate must still fail, and
-# name that lane. This is the rootless case a plain connect cannot see.
+unset LUNARWING_MT_WORKER_READY_WAIT_SECS
+GATE_PORT="$DEAD_PORT"
 ports_get() {  # <tenant> <slot>
   case "$2" in
-    pebble_wss|opencode_wss) printf '%s\n' "$LIVE_PORT" ;;
-    kimi_wss) printf '%s\n' "$DROP_PORT" ;;
+    pebble_wss|opencode_wss|opencode2_wss) printf '%s\n' "$LIVE_PORT" ;;
+    kimi_wss) printf '%s\n' "$GATE_PORT" ;;
     *) return 1 ;;
   esac
 }
-gate_rc=0
-gate_err="$(check_tenant_worker_readiness alice 2>&1 >/dev/null)" || gate_rc=$?
-if [[ "$gate_rc" -ne 0 && "$gate_err" == *"kimi worker for alice is not listening on 127.0.0.1:$DROP_PORT"* ]]; then
-  pass "the strict gate fails for a lane whose port accepts and drops, and names it"
-else
-  fail "the strict gate fails for a lane whose port accepts and drops, and names it (rc=$gate_rc: $gate_err)"
-fi
-if [[ "$gate_err" != *"pebble worker"* && "$gate_err" != *"opencode worker"* ]]; then
-  pass "the lanes that keep the connection open are not reported"
-else
-  fail "the lanes that keep the connection open are not reported ($gate_err)"
-fi
+for GATE_PORT in "$DEAD_PORT" "$DROP_PORT"; do
+  gate_rc=0
+  out="$(check_tenant_worker_readiness alice 2>&1)" || gate_rc=$?
+  if [[ "$gate_rc" -ne 0 ]]; then
+    pass "the strict gate fails while a selected lane's port is dead ($GATE_PORT)"
+  else
+    fail "the strict gate fails while a selected lane's port is dead ($GATE_PORT)"
+  fi
+  assert_contains "the warning identifies the dead lane and port" \
+    "kimi worker for alice is not listening on 127.0.0.1:$GATE_PORT"
+  assert_not_contains "the warning does not assume the container is running" "its container is running"
+  assert_not_contains "a healthy lane is not reported dead" "pebble worker"
+done
 
-# The remaining cases probe only ports that keep the connection open or have
-# no slot, so a shorter hold keeps the harness quick without making it flaky.
+# Only the live port is probed below, so use a shorter hold.
 WORKER_PORT_HOLD_SECS=0.3
-
-# Every selected lane on the live port: the gate passes.
-ports_get() {  # <tenant> <slot>
-  case "$2" in
-    pebble_wss|opencode_wss|kimi_wss) printf '%s\n' "$LIVE_PORT" ;;
-    opencode2_wss) return 1 ;;
-    *) return 1 ;;
-  esac
-}
+GATE_PORT="$LIVE_PORT"
 if check_tenant_worker_readiness alice >/dev/null 2>&1; then
-  pass "the strict gate passes when every selected lane listens"
+  pass "the strict gate passes when all selected lanes listen and an unselected lane has no slot"
 else
-  fail "the strict gate passes when every selected lane listens"
+  fail "the strict gate passes when all selected lanes listen and an unselected lane has no slot"
 fi
 
-# OpenRC: an intentionally stopped lane is not a dead lane.
-INIT_SYSTEM=openrc
-tenant_worker_desired_running() { [[ "$2" != kimi ]]; }
-ports_get() {  # <tenant> <slot>
-  case "$2" in
-    pebble_wss|opencode_wss) printf '%s\n' "$LIVE_PORT" ;;
-    *) return 1 ;;
-  esac
-}
-if check_tenant_worker_readiness alice >/dev/null 2>&1; then
-  pass "an intentionally stopped OpenRC lane is not reported dead"
+# Select LunarDepth without allocating its slot; that alone must fail the gate.
+tenant_worker_enabled() { return 0; }
+gate_rc=0
+out="$(check_tenant_worker_readiness alice 2>&1)" || gate_rc=$?
+if [[ "$gate_rc" -ne 0 ]]; then
+  pass "the strict gate fails when an enabled lane has no WSS slot"
 else
-  fail "an intentionally stopped OpenRC lane is not reported dead"
+  fail "the strict gate fails when an enabled lane has no WSS slot"
+fi
+assert_contains "the warning identifies the missing lane and registry slot" \
+  "lunardepth worker for alice has no WSS port allocated (lunardepth_wss in the ports registry)"
+assert_not_contains "a missing slot is not reported as a dead socket" "not listening on 127.0.0.1"
+
+# OpenRC: the same missing slot is ignored for an intentionally stopped lane.
+INIT_SYSTEM=openrc
+tenant_worker_desired_running() { [[ "$2" != lunardepth ]]; }
+if check_tenant_worker_readiness alice >/dev/null 2>&1; then
+  pass "an intentionally stopped OpenRC lane is not required to have a slot"
+else
+  fail "an intentionally stopped OpenRC lane is not required to have a slot"
 fi
 
 # An invalid hold falls back to the default instead of failing the probe.

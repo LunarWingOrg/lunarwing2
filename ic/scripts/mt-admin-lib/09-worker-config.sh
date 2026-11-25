@@ -249,8 +249,7 @@ _worker_ready_wait_secs() {
 }
 
 # WI#882: one enabled lane's readiness verdict, as `"<lane> <port> <state>"`.
-# A lane with no allocated WSS slot reports `no-port`; a lane whose container
-# is not running is skipped (start already reported it).
+# A lane with no allocated WSS slot reports `no-port` without dialing.
 _worker_lane_readiness() {  # <tenant> <lane> <wss slot>
   local name="$1" lane="$2" slot="$3" port
   port="$(ports_get "$name" "$slot" 2>/dev/null || true)"
@@ -262,12 +261,11 @@ _worker_lane_readiness() {  # <tenant> <lane> <wss slot>
     "$(_worker_port_answers "$port" && echo listening || echo dead)"
 }
 
-# WI#882: post-start readiness pass over every enabled lane. Returns non-zero
-# when at least one lane is dead on its port, so the caller can report a
-# degraded start; never stops or restarts a lane itself.
+# WI#882: returns non-zero if an enabled lane has no WSS port allocated or
+# its port does not answer. Never stops or restarts a lane itself.
 check_tenant_worker_readiness() {  # <tenant>
-  local name="$1" wait_secs deadline lane slot port verdict
-  local -a pending=() dead=()
+  local name="$1" wait_secs deadline lane port verdict
+  local -a pending=()
   wait_secs="$(_worker_ready_wait_secs)"
   deadline=$((SECONDS + wait_secs))
 
@@ -276,18 +274,16 @@ check_tenant_worker_readiness() {  # <tenant>
     if [[ "${INIT_SYSTEM:-}" == "openrc" ]] && ! tenant_worker_desired_running "$name" "$lane"; then
       continue
     fi
-    slot="${lane}_wss"
     pending+=("$lane")
   done
   [[ "${#pending[@]}" -ne 0 ]] || return 0
 
-  # One shared deadline: a slow lane consumes the window for everyone, so the
-  # pass costs at most `wait_secs` no matter how many lanes are configured.
+  # One shared deadline: a slow lane consumes the polling window for everyone.
   while :; do
     local -a still=()
     for lane in "${pending[@]}"; do
       verdict="$(_worker_lane_readiness "$name" "$lane" "${lane}_wss")"
-      if [[ "$verdict" == *" dead" ]]; then still+=("$lane"); fi
+      [[ "$verdict" == *" listening" ]] || still+=("$lane")
     done
     pending=("${still[@]}")
     [[ "${#pending[@]}" -eq 0 || "$SECONDS" -ge "$deadline" ]] && break
@@ -296,10 +292,13 @@ check_tenant_worker_readiness() {  # <tenant>
 
   for lane in "${pending[@]}"; do
     port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
-    say "WARNING: $lane worker for $name is not listening on 127.0.0.1:${port:-<none>}; its container is running but its WSS port is dead. Inspect: $0 worker-failure-log $name $lane" >&2
-    dead+=("$lane")
+    if [[ -z "$port" ]]; then
+      say "WARNING: $lane worker for $name has no WSS port allocated (${lane}_wss in the ports registry)." >&2
+    else
+      say "WARNING: $lane worker for $name is not listening on 127.0.0.1:$port. Inspect: $0 worker-failure-log $name $lane" >&2
+    fi
   done
-  [[ "${#dead[@]}" -eq 0 ]]
+  [[ "${#pending[@]}" -eq 0 ]]
 }
 
 # WI#882: the daemon dials whatever `[[sandbox.external_workers]]` blocks its

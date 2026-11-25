@@ -53,7 +53,10 @@ The repository's `lunarwing_mt_onboard` CLI and web frontend verify the gateway,
 daemon, PostgreSQL, and selected workers after provisioning. Container checks
 use mt-admin's runtime-backed status lines on both systemd user managers and
 OpenRC, so active daemon units cannot hide a broken Podman store or missing
-worker. Verification failure fails the onboarding job/CLI exit.
+worker. A selected worker fails verification if mt-admin reports a missing
+WSS port allocation or a dead listener, even if its container is running.
+Unselected workers are not required. Verification failure fails the onboarding
+job/CLI exit.
 
 Managed OpenCode and OpenCode 2 worker entries include
 `supports_credentials = false` (WI#474, !1943 ON-1). Config reconciliation also

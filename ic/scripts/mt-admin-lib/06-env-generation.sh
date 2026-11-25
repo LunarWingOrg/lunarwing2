@@ -1508,8 +1508,11 @@ write_tenant_lunarwing_env() {
     # WI#876: only a dedicated SANDBOX_GIT_TOKEN_<NAME> binding name is a
     # credential the daemon will load; any other daemon variable is refused
     # at load, so it is not carried here either.
-    [[ "$git_secret_name" == SANDBOX_GIT_TOKEN_?* ]] || continue
-    [[ "$git_secret_name" =~ ^SANDBOX_GIT_TOKEN_[A-Za-z0-9_]+$ ]] || continue
+    if [[ ! "$git_secret_name" =~ ^SANDBOX_GIT_TOKEN_[A-Za-z0-9_]+$ ]]; then
+      printf "warning: tenant '%s': skipping credential value for remote '%s' bound to '%s' in SANDBOX_GIT_CREDENTIALS (expected SANDBOX_GIT_TOKEN_<NAME>)\n" \
+        "$name" "$(sanitize_display_value "$git_binding_remote")" "$(sanitize_display_value "$git_secret_name")" >&2
+      continue
+    fi
     [[ " ${sandbox_git_secret_names[*]} " != *" $git_secret_name "* ]] || continue
     git_secret_value="$(_env_existing "$env_snapshot" "$git_secret_name")"
     [[ -n "$git_secret_value" ]] || continue
