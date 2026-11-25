@@ -2488,14 +2488,12 @@ fn glob_could_name_git_program(pattern: &str) -> bool {
         return true;
     }
     // A `git-core` directory makes any dashed name beside it a git program,
-    // including verbs the list above does not spell out. A program name is
-    // lowercase letters, digits and dashes, so `/usr/lib/git-core/*.txt` is
-    // ordinary data while `…/git-core/git-*` is not.
+    // including verbs the list above does not spell out. The pattern reaches
+    // the `git-` prefix when it matches that prefix itself — true for `git-*`
+    // and for a bare `*`, false for `*.txt` — so `/usr/lib/git-core/*.txt`
+    // stays ordinary data while `…/git-core/git-*` and `…/git-core/*` do not.
     directories.iter().any(|part| glob_matches(part, "git-core"))
-        && program.starts_with("git-")
-        && program
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || "-*?[]!^".contains(character))
+        && glob_matches(program, "git-")
 }
 
 /// A parsed `[...]` glob class.
@@ -2554,8 +2552,10 @@ fn parse_glob_class(pattern: &[char], open: usize) -> Option<(usize, GlobClass)>
 
 /// Match a shell glob against a literal name. `*` is any run of characters
 /// (including none), `?` exactly one, and `[...]` one character from the
-/// class. Matching a pattern against a name is how the scan decides what a
-/// word could expand to; the filesystem is never consulted.
+/// class. A shell `*` and `?` never match a path separator, so a pattern
+/// cannot reach across a directory boundary; matching a pattern against a name
+/// is how the scan decides what a word could expand to, and the filesystem is
+/// never consulted.
 fn glob_matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
@@ -2567,15 +2567,26 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
         let mut next = vec![false; name.len() + 1];
         let step = match pattern[index] {
             '*' => {
-                let mut hit = false;
-                for (forward, behind) in next.iter_mut().zip(&reachable) {
-                    hit |= *behind;
-                    *forward = hit;
+                // `*` matches the empty run, then any run that never crosses
+                // a `/`: a separator restarts the run from the pattern.
+                let mut hit = reachable[0];
+                next[0] = hit;
+                for position in 1..=name.len() {
+                    if name[position - 1] == '/' {
+                        hit = reachable[position];
+                    } else {
+                        hit |= reachable[position];
+                    }
+                    next[position] = hit;
                 }
                 1
             }
             '?' => {
-                next[1..].copy_from_slice(&reachable[..name.len()]);
+                for (forward, (behind, character)) in
+                    next[1..].iter_mut().zip(reachable.iter().zip(&name))
+                {
+                    *forward = *behind && *character != '/';
+                }
                 1
             }
             '[' => match parse_glob_class(&pattern, index) {
@@ -4351,6 +4362,289 @@ mod tests {
             "cargo build",
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#899 property 1: `env -a`/`--argv0` and `exec -a` set argv[0]
+    /// without changing the program that runs, and git dispatches on argv[0]'s
+    /// basename. Each accepted row of the WI's "Measured" list is refused,
+    /// with its control: the same words without the argv[0] keep passing, so
+    /// the refusal is the argv[0] and not the command shape.
+    #[test]
+    fn argv0_decides_which_git_program_runs() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        // A forced push is the command under every argv[0] spelling the WI
+        // measured, attached and separate, long and short, and behind exec.
+        for command in [
+            "env -a git-push git -f origin master",
+            "env --argv0=git-push git -f origin master",
+            "env --argv0 git-push git -f origin master",
+            "env -agit-push git -f origin master",
+            "env -i -a git-push git -f origin master",
+            "exec -a git-push git -f origin master",
+            "exec -agit-push git -f origin master",
+            "env -a git-push /usr/lib/git-core/git -f origin master",
+            "sh -c 'exec -a git-push git -f origin master'",
+            "true && env -a git-push git -f origin master",
+            "env -a git-submodule--helper git foreach 'git push -f origin master'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // The controls: without an argv[0] the same words are read as plain
+        // git with an unknown subcommand (`-f` is skipped as a global option
+        // and `origin` becomes the verb), so they reach the catch-all and are
+        // accepted. The argv[0] is exactly what changes the verdict.
+        for command in [
+            "git -f origin master",
+            "env -i git -f origin master",
+            "env -i -a git git -f origin master",
+            "exec -a git git -f origin master",
+            "env -a foo git -f origin master",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        // An argv[0] the scan cannot read is refused when the program run is
+        // git, because the basename that decides the program is unknown.
+        for command in [
+            "env -a \"$NAME\" git status",
+            "env -a git-* git -f origin master",
+            "exec -a \"$NAME\" git -f origin master",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // An argv[0] that names a git program the preflight does not read is
+        // refused rather than read as plain git.
+        let error = check_granted("env -a git-frobnicate git status", &grant).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot read"),
+            "git-frobnicate: {error}"
+        );
+        // Ordinary work keeps passing: the argv[0] changes no git program.
+        for command in [
+            "env -i git status",
+            "exec git log --oneline",
+            "env -a cargo cargo build",
+            "env -a rustc rustc --version",
+            "env -u HOME git status",
+            "env -C /workspace git status",
+            "env -a git-push git-push origin main",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#899 property 2: an unquoted glob expands before the command runs,
+    /// so a word that could expand to `git`, a `git-<verb>` program, or a
+    /// program under `git-core` is a program the scan has not read. The match
+    /// is against the name, not the filesystem.
+    #[test]
+    fn globs_that_could_name_git_programs_are_refused() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        for command in [
+            // The WI's measured row: stdbuf with a globbed git-core program.
+            "stdbuf -o0 /usr/lib/git-c?re/git-pu?h -f origin master",
+            "/usr/bin/gi[t] push -f origin master",
+            "gi? push -f origin master",
+            "/usr/lib/git-core/git-* -f origin master",
+            "/usr/lib/git-core/git-pus? -f origin master",
+            "/usr/lib/git-*/git-push -f origin master",
+            // A glob in an unread command's tail, where the program could be
+            // the command the wrapper runs.
+            "xargs /usr/lib/git-c?re/git-pu?h -f origin master",
+            "xargs gi? -f origin master",
+            "find . -name x -exec /usr/lib/git-c*/git-push -f origin master ;",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // A quoted glob is literal, and a glob that cannot name a git program
+        // is ordinary data. `ls` is one of the commands whose tail the scan
+        // does not read, so these keep passing.
+        for command in [
+            "cat '/usr/lib/git-core/*.txt'",
+            "cat /usr/lib/git-core/*.txt",
+            "ls /usr/lib/git-core",
+            "ls /usr/lib/git-c?re",
+            "echo 'git pu?h'",
+            "cat /tmp/*.log",
+            "cargo build --target x86_64-*",
+            "ls /usr/bin/gi*",
+            // The glob is in a command word that is not git and has no git in
+            // its tail, so nothing about git is unread.
+            "cat /usr/lib/git-core/*.txt | wc -l",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#899 property 3: `for-each-repo` runs the words after its options as
+    /// a git command in each repository its config key lists, so those words
+    /// are read as a subcommand. A key the preflight cannot resolve is
+    /// refused, as an alias is.
+    #[test]
+    fn for_each_repo_reads_its_operand_verb() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host =
+            GitGrantConfig::from_parts("origin=file:///workspace/remotes/origin.git", "origin")
+                .unwrap()
+                .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        for command in [
+            // The WI's measured row, and the same push by its other options.
+            "git -c x.r=. for-each-repo --config=x.r push -f origin master",
+            "git -c x.r=. for-each-repo --config x.r push -f origin master",
+            "git -c x.r=. for-each-repo --keep-going --config=x.r push -f origin master",
+            "git -c x.r=. for-each-repo --config=x.r -- push -f origin master",
+            "git -c x.r=. for-each-repo --config=x.r push origin +master",
+            "git -c x.r=. for-each-repo --config=x.r fetch upstream",
+            "git -c x.r=. for-each-repo --config=x.r ls-remote upstream",
+            "git -c x.r=. for-each-repo --config=x.r send-pack origin HEAD:x",
+            "git -c x.r=. for-each-repo --config=x.r submodule foreach 'git push -f origin master'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // A key the scan cannot see is refused, even when the operand would
+        // otherwise pass: the repository list is config the scan never read.
+        for command in [
+            "git for-each-repo --config=x.r version",
+            "git for-each-repo --config=x.r push origin main",
+            "git -c x.r= for-each-repo --config=x.r version",
+            "git -c alias.r=remote for-each-repo --config=alias.r version",
+            "git for-each-repo version",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // A granted operand under a visible key passes; the operand's own
+        // remote check still applies.
+        for command in [
+            "git -c x.r=. for-each-repo --config=x.r version",
+            "git -c x.r=. for-each-repo --config=x.r fetch origin",
+            "git -c x.r=. for-each-repo --config=x.r push origin main",
+            "git -c x.r=. for-each-repo --config=x.r status",
+            // No operand runs the plain repository listing.
+            "git -c x.r=. for-each-repo --config=x.r",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        // `maintenance run` is a task command that itself calls
+        // `for-each-repo` from cron; it stays accepted.
+        for command in ["git maintenance run", "git maintenance start"] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#899: the glob matcher is a unit of its own, so a regression in what
+    /// a pattern matches is visible without a grant fixture.
+    #[test]
+    fn glob_matching_is_the_shell_rule() {
+        for (pattern, name) in [
+            ("git", "git"),
+            ("gi?", "git"),
+            ("gi[t]", "git"),
+            ("g*", "git"),
+            ("*", "git"),
+            ("git-[p]ush", "git-push"),
+            ("git-c?re", "git-core"),
+            ("/usr/lib/git-c?re/git-push", "/usr/lib/git-core/git-push"),
+            // `*` matches one path component.
+            ("/usr/lib/*/git-push", "/usr/lib/git-core/git-push"),
+            ("*.txt", "notes.txt"),
+            ("[a-c]at", "bat"),
+            ("[!x]at", "bat"),
+        ] {
+            assert!(glob_matches(pattern, name), "{pattern} should match {name}");
+        }
+        for (pattern, name) in [
+            ("git", "gitx"),
+            ("gi?", "gi"),
+            ("[a-c]at", "dat"),
+            ("[!b]at", "bat"),
+            ("git-push", "git-pull"),
+            // A shell `*` does not cross `/`, so it cannot span two
+            // directory levels.
+            ("/usr/*/git-push", "/usr/lib/git-core/git-push"),
+            ("git-core/*.txt", "git-core/git-push"),
+            // An unterminated `[` is a literal.
+            ("gi[t", "git"),
+        ] {
+            assert!(
+                !glob_matches(pattern, name),
+                "{pattern} should not match {name}"
+            );
+        }
+    }
+
+    /// WI#899 property 2's name check: the predicate must not refuse an
+    /// ordinary pattern, and must refuse a pattern that could name a program.
+    #[test]
+    fn glob_predicate_names_only_git_programs() {
+        for pattern in [
+            "git",
+            "gi?",
+            "/usr/bin/gi[t]",
+            "/usr/lib/git-c?re/git-pu?h",
+            "/usr/lib/git-core/git-*",
+            "/usr/lib/git-*/git-push",
+            "git-pus*",
+            "git-for-each-*",
+            "*/git-push",
+            // A bare `*` matches the name `git`, so it could expand to it.
+            "/tmp/*",
+            "*",
+        ] {
+            assert!(
+                glob_could_name_git_program(pattern),
+                "{pattern} should name a git program"
+            );
+        }
+        for pattern in [
+            "/usr/lib/git-core/*.txt",
+            "/usr/lib/git-core",
+            "/usr/lib/git-c?re",
+            "*.log",
+            "cargo-*",
+            "x86_64-*",
+            "/usr/lib/git-core/README*",
+        ] {
+            assert!(
+                !glob_could_name_git_program(pattern),
+                "{pattern} should not name a git program"
+            );
         }
     }
 
