@@ -877,6 +877,15 @@ struct SearchHit {
     project_id: Option<u64>,
     #[serde(default)]
     title: Option<String>,
+    /// Project hits carry a name and namespace path instead of a title.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    name_with_namespace: Option<String>,
+    #[serde(default)]
+    path_with_namespace: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
     #[serde(default)]
     state: Option<String>,
     /// Echoed so the agent can see the visibility the server authorized.
@@ -1394,6 +1403,30 @@ mod tests {
         assert_eq!(rendered["ref"], "main");
         assert_eq!(rendered["startline"], 1731);
         assert!(rendered.get("data").is_none());
+    }
+
+    /// WI#891: project hits have no `title`/`iid` — they identify a project
+    /// by name and namespace path. Dropping those would make a project search
+    /// return empty objects.
+    #[test]
+    fn search_hit_keeps_project_identity_fields() {
+        let hit = json!({
+            "id": 35,
+            "name": "lunarwing2",
+            "name_with_namespace": "lunarwing / lunarwing2",
+            "path_with_namespace": "lunarwing/lunarwing2",
+            "visibility": "private",
+            "description": "x".repeat(4_000),
+            "namespace": { "id": 12, "full_path": "lunarwing" },
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["name"], "lunarwing2");
+        assert_eq!(rendered["name_with_namespace"], "lunarwing / lunarwing2");
+        assert_eq!(rendered["path_with_namespace"], "lunarwing/lunarwing2");
+        assert_eq!(rendered["visibility"], "private");
+        assert!(rendered.get("description").is_none());
+        assert!(rendered.get("namespace").is_none());
     }
 
     /// WI#891: a zero-match search is an ordinary empty array — it must parse
