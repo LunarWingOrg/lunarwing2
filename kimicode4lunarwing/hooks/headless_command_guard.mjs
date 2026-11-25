@@ -66,7 +66,9 @@ function rmOperands(words, endOfOptions) {
     .filter((token, i) => token.length > 0 &&
       (!token.startsWith("-") || (endOfOptions !== -1 && i > endOfOptions)))
     .map((token) => token.replace(/^["']|["']$/g, ""))
-    // A redirection target is not an rm operand (e.g. `2>/dev/null`).
+    // A redirection target is not an rm operand. The caller's words already
+    // come from the redirection-free view (WI#889); this keeps the reading
+    // for a caller that hands over raw words.
     .filter((token) => !/^\d*>/.test(token));
 }
 
@@ -81,6 +83,213 @@ function heredocRedirect(text, i) {
   const delimiter = match[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
     (_match, single, double, escaped) => single ?? double?.replace(/\\(["\\$`])/g, "$1") ?? escaped);
   return { delimiter, stripTabs, end: word.lastIndex };
+}
+
+// WI#889: a redirection may stand anywhere in a simple command, and the words
+// after it are still that command's arguments (`man bash`, REDIRECTION). The
+// reader below blanks every redirection out of the command line and keeps its
+// targets in a list, so a rule reads the words bash runs and a rule about a
+// target still sees it. The forms are `[n]<word`, `[n]>word`, `[n]>|word`,
+// `[n]>>word`, `&>word`, `>&word`, `&>>word`, `[n]<<[-]word`, `[n]<<<word`,
+// `[n]<&word`, `[n]>&word` and `[n]<>word`, each also with `{varname}` in
+// place of `n`, and with or without blanks before the target.
+const REDIRECT_WORD_BREAK = " \t\n;|&()<>";
+
+/** The redirection operator at `i`, or "" when the character starts none. */
+function redirectOperatorAt(text, i) {
+  const ch = text[i];
+  if (ch === "&") {
+    if (text[i + 1] !== ">") return "";
+    return text[i + 2] === ">" ? "&>>" : "&>";
+  }
+  if (ch === ">") {
+    // `>(…)` is a process substitution, not a redirection.
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === ">") return ">>";
+    if (text[i + 1] === "|") return ">|";
+    if (text[i + 1] === "&") return ">&";
+    return ">";
+  }
+  if (ch === "<") {
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === "&") return "<&";
+    if (text[i + 1] === ">") return "<>";
+    if (text[i + 1] !== "<") return "<";
+    if (text[i + 2] === "<") return "<<<";
+    if (text[i + 2] === "-") return "<<-";
+    return "<<";
+  }
+  return "";
+}
+
+/**
+ * The start of the whole redirection token: bash reads a run of digits (or a
+ * `{varname}`) that forms a word of its own immediately before the operator as
+ * the descriptor, so `a2>f` writes fd 1 from the word `a2` while `2>f` writes
+ * fd 2. The digits must be the whole word, which is why the character before
+ * them has to be a word break.
+ */
+function redirectPrefixStart(text, operatorIndex) {
+  // Combined stdout/stderr redirections never take a descriptor prefix.
+  if (text[operatorIndex] === "&") return operatorIndex;
+  let start = operatorIndex;
+  let i = operatorIndex - 1;
+  if (text[i] === "}") {
+    let open = i - 1;
+    while (open >= 0 && /[A-Za-z0-9_]/.test(text[open])) open--;
+    if (open >= 0 && text[open] === "{" && open < i - 1 &&
+        (open === 0 || REDIRECT_WORD_BREAK.includes(text[open - 1]))) {
+      start = open;
+      i = open - 1;
+    }
+  }
+  let digits = 0;
+  while (i >= 0 && text[i] >= "0" && text[i] <= "9") {
+    i--;
+    digits++;
+  }
+  if (digits > 0 && (i < 0 || REDIRECT_WORD_BREAK.includes(text[i]))) start = i + 1;
+  return start;
+}
+
+/** The span of the word a redirection takes as its target, blanks skipped. */
+function redirectWordSpan(text, scan, from) {
+  let i = from;
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  const start = i;
+  while (i < text.length) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close + 1;
+      continue;
+    }
+    if (scan.states[i] === QUOTE_UNQUOTED && REDIRECT_WORD_BREAK.includes(text[i])) break;
+    i++;
+  }
+  return { start, end: Math.min(i, text.length) };
+}
+
+/**
+ * The command line with every redirection blanked out, the targets it wrote
+ * or read, and the here-string bodies, which bash feeds to the command as its
+ * input and which the guard therefore reads as commands. The blanks
+ * keep every other offset where it was. `|&` is bash's shorthand for
+ * `2>&1 |` (`man bash`, Pipelines), so its `&` is blanked and the bar kept.
+ */
+function stripRedirections(text, escapes = true) {
+  const scan = quoteScan(text, escapes);
+  const chars = text.split("");
+  const targets = [];
+  const hereStrings = new Set();
+  for (let i = 0; i < text.length; i++) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close;
+      continue;
+    }
+    if (scan.states[i] !== QUOTE_UNQUOTED) continue;
+    if (text[i] === "|" && text[i + 1] === "&") {
+      chars[i + 1] = " ";
+      i++;
+      continue;
+    }
+    const operator = redirectOperatorAt(text, i);
+    if (operator === "") continue;
+    const start = redirectPrefixStart(text, i);
+    let end = i + operator.length;
+    if (operator === "<<" || operator === "<<-") {
+      const redirect = heredocRedirect(text, i);
+      if (redirect) end = redirect.end;
+    } else {
+      const span = redirectWordSpan(text, scan, i + operator.length);
+      if (span.end > span.start) end = span.end;
+      const target = text.slice(span.start, span.end);
+      if (operator === "<<<") hereStrings.add(target);
+      else if (target.length > 0) {
+        targets.push({ target, write: operator !== "<" && operator !== "<&" });
+      }
+    }
+    for (let j = start; j < end; j++) chars[j] = " ";
+    i = end - 1;
+  }
+  const view = chars.join("");
+  return { view, targets, hereStrings };
+}
+
+let redirectScanText = null;
+let redirectScanEscapes = true;
+let redirectScanResult = null;
+
+function redirectScan(text, escapes = true) {
+  if (text === redirectScanText && escapes === redirectScanEscapes) return redirectScanResult;
+  const result = stripRedirections(text, escapes);
+  redirectScanText = text;
+  redirectScanEscapes = escapes;
+  redirectScanResult = result;
+  return result;
+}
+
+/** The command line with its redirections taken out. */
+function redirectionFreeView(text, escapes = true) {
+  return redirectScan(text, escapes).view;
+}
+
+/**
+ * The index after the redirection whose operator is at `i`, or null when `i`
+ * starts none. A redirection glues to the word before it (`a&>f`), so the
+ * digits or `{varname}` immediately before the operator are part of the token
+ * and must not end the word being read.
+ */
+function redirectionSkip(text, i) {
+  const operator = redirectOperatorAt(text, i);
+  if (operator === "") return null;
+  const scan = quoteScan(text);
+  const start = redirectPrefixStart(text, i);
+  let end = i + operator.length;
+  if (operator === "<<" || operator === "<<-") {
+    const redirect = heredocRedirect(text, i);
+    if (redirect) end = redirect.end;
+  } else {
+    const span = redirectWordSpan(text, scan, i + operator.length);
+    if (span.end > span.start) end = span.end;
+  }
+  return end > start ? end : null;
+}
+
+/**
+ * The index after any redirections standing at or before `i`, with the blanks
+ * between them. A caller that expects a word at `i` uses this to step past a
+ * redirection that stands in the word's place (`git -C 2>/dev/null /tmp/r`).
+ */
+function skipRedirectionAt(text, from) {
+  let i = from;
+  for (;;) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const end = redirectTokenSpan(text, i)?.end ?? null;
+    if (end === null) return i;
+    i = end;
+  }
+}
+
+/**
+ * The redirection token that starts at the word boundary `i`, with its
+ * `[n]`/`{varname}` descriptor prefix, or null when `i` starts none. Only a
+ * token at a word start carries a descriptor: bash reads `a2>f` as the word
+ * `a2` and a plain `>f`, because the digits are not a word of their own.
+ */
+function redirectTokenSpan(text, i) {
+  let operatorIndex = i;
+  if (text[i] >= "0" && text[i] <= "9") {
+    while (operatorIndex < text.length && text[operatorIndex] >= "0" &&
+        text[operatorIndex] <= "9") operatorIndex++;
+  } else if (text[i] === "{") {
+    const name = /^\{[A-Za-z_][A-Za-z0-9_]*\}/.exec(text.slice(i, i + 64));
+    if (name === null) return null;
+    operatorIndex = i + name[0].length;
+  }
+  if (operatorIndex !== i && text[operatorIndex] === "&") return null;
+  const end = redirectionSkip(text, operatorIndex);
+  return end === null ? null : { start: i, end };
 }
 
 /**
@@ -150,8 +359,14 @@ const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
   .filter((root) => root !== null);
 
 /** Split a command tail into bash words (space and tab only). */
+/**
+ * Split a command tail into bash words (space and tab only). A redirection is
+ * not a word, so `tee 2>&1 /dev/sda1` has the one operand `/dev/sda1`, and
+ * `find /tmp/x 2>&1 -delete` the one start path `/tmp/x` (WI#889). The
+ * targets a rule needs are read from `redirectScan`, not from this list.
+ */
 function argumentWords(rest) {
-  return rest.split(/[ \t]+/).filter((word) => word.length > 0);
+  return redirectionFreeView(rest).split(/[ \t]+/).filter((word) => word.length > 0);
 }
 
 function stripShellQuotes(word) {
@@ -462,6 +677,10 @@ function rmDeleteOption(rest) {
 }
 
 function checkRm(segment) {
+  // A redirection is neither a clause end nor an operand (WI#889): the
+  // clause is read with its redirections taken out, so `rm 2>&1 -rf /x` is
+  // one command and `rm -rf /tmp/x 2> /dev/null` names one path.
+  segment = redirectionFreeView(segment);
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
   // `xargs rm` takes its operands from stdin: the guard classifies that shape
@@ -1467,9 +1686,14 @@ let clauseScanEnds = [];
 
 function clauseEnds(text) {
   if (text === clauseScanText) return clauseScanEnds;
+  // A redirection's own operator characters are not control operators: the
+  // `&` of `2>&1`, `&>`, `>&`, `<&` and the bar of `>|` end no clause, and
+  // `|&` keeps its bar (WI#889). The redirection-free view has the same
+  // offsets, so the indices stay valid for `text`.
+  const view = redirectionFreeView(text);
   const ends = [];
-  for (const i of unquotedOffsets(text)) {
-    if (isClauseTerminator(text[i])) ends.push(i);
+  for (const i of unquotedOffsets(view)) {
+    if (isClauseTerminator(view[i])) ends.push(i);
   }
   clauseScanText = text;
   clauseScanEnds = ends;
@@ -1534,7 +1758,7 @@ function bashWord(text, from) {
     const quote = level.quote;
     const ch = text[i];
     if (isQuoteEscape(text, i, quote)) {
-      word += text[i + 1];
+      if (text[i + 1] !== "\n" || quote === "$'") word += text[i + 1];
       i += 2;
       continue;
     }
@@ -1577,6 +1801,20 @@ function bashWord(text, from) {
       i += 2;
       continue;
     }
+    // A redirection is not a word: `git 2>/dev/null reset` reads `reset` as
+    // the verb, and `rm 2>&1 -rf /x` reads `-rf` and `/x` (WI#889). The
+    // scan's quote state says where the operator and its target end. At a
+    // word start the token also carries its `[n]`/`{varname}` descriptor
+    // (`2>/dev/null`), which belongs to the redirection, not to a word. The
+    // test comes before the separator one because `&>f` starts with `&`.
+    if (levels.length === 1) {
+      const skip = word.length === 0 ? redirectTokenSpan(text, i)?.end ?? null
+        : redirectionSkip(text, i);
+      if (skip !== null) {
+        i = skip;
+        continue;
+      }
+    }
     if (ch === " " || ch === "\t" || isClauseTerminator(ch)) {
       // A separator inside a substitution body is part of the word the
       // substitution sits in; only the outermost level ends it.
@@ -1594,7 +1832,7 @@ function bashWord(text, from) {
     word += ch;
     i++;
   }
-  return { word, end: i };
+  return { word, end: i, complete: levels.length === 1 && levels[0].quote === "" };
 }
 
 /** The bash words of a command text, with their quoting removed. */
@@ -1625,13 +1863,24 @@ function gitVerb(text, from) {
   let i = from;
   while (i < text.length) {
     while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const start = i;
     const { word, end } = bashWord(text, i);
     i = end;
-    if (word.length === 0) break;
+    if (word.length === 0) {
+      // A redirection standing where the verb would be is not the verb
+      // (`git 2>/dev/null reset --hard`): the word reader steps over it, so
+      // the walk continues at the word after it (WI#889).
+      if (end > start) continue;
+      break;
+    }
     if (!word.startsWith("-")) return { verb: word, after: i };
     if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb. It is read as one
       // bash word, so `-C "/tmp/a b"` steps over the value whole (WI#856).
+      // A redirection standing where the value would be is not the value
+      // (`git -C 2>/dev/null /tmp/r reset`), so it is stepped over first
+      // (WI#889).
+      i = skipRedirectionAt(text, i);
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
       i = bashWord(text, i).end;
     }
@@ -2543,13 +2792,17 @@ function* unquotedOffsets(text, escapes = true) {
 
 /** Preserve the exact text of each piece; only unquoted separators split it. */
 function splitOutsideQuotes(text, separator, escapes = true) {
+  // A redirection's operator characters are not control operators, and the
+  // target is not a word (WI#889). The view keeps every offset, so the
+  // pieces below are the caller's own text.
+  const view = redirectionFreeView(text, escapes);
   const pieces = [];
   let start = 0;
-  for (const i of unquotedOffsets(text, escapes)) {
+  for (const i of unquotedOffsets(view, escapes)) {
     if (i < start) continue;
     const width = typeof separator === "string"
-      ? Number(text[i] === separator)
-      : Number(separator(text[i], text[i + 1]));
+      ? Number(view[i] === separator)
+      : Number(separator(view[i], view[i + 1]));
     if (!width) continue;
     pieces.push(text.slice(start, i));
     start = i + width;
@@ -2591,6 +2844,9 @@ function checkDecodedPipe(text) {
   }
   return null;
 }
+
+const BLOCK_DEVICE_WRITE_PATTERN =
+  />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
 
 const DENY_RULES = [
   {
@@ -2643,8 +2899,16 @@ const DENY_RULES = [
     // Device namespaces beyond the legacy names: LVM (/dev/mapper/…) and the
     // udev links (/dev/disk/by-id/…). truncate is only denied at a block device.
     // The `>|` noclobber override writes the same device as `>` (WI#832).
-    pattern:
-      />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
+    // `>&word` and `n>&word` write `word` when it is not a descriptor
+    // number, and `&>word`/`&>>word` write it too, so the target the
+    // redirection reader collected is checked in every write form (WI#889).
+    check: (segment) => {
+      if (BLOCK_DEVICE_WRITE_PATTERN.test(segment)) return true;
+      for (const { target, write } of redirectScan(segment).targets) {
+        if (write && DEVICE_TARGET.test(stripShellQuotes(target))) return true;
+      }
+      return false;
+    },
   },
   {
     name: "SSH agent use (worker lane is not a credential broker)",
@@ -2707,8 +2971,14 @@ function evaluate(command, depth = 0) {
   // WI#826). An extra quote-preserving reading separates the shell
   // punctuation bash glues to a word, so `(git reset --hard)` and
   // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
+  //
+  // Every reading is also taken with its redirections blanked out (WI#889):
+  // a redirection is neither a clause end nor an argument, so a rule must see
+  // the words bash runs. The raw-shape family's own readers step over a
+  // redirection too, which keeps a target visible to a rule about targets.
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const unredirected = redirectionFreeView(joined);
     const punctuation = shellPunctuationView(joined);
     const wordLevel = shellWordLevelView(joined);
     // A verb glued to an unquoted expansion (`${EMPTY}tee /dev/sda1`) is the
@@ -2739,13 +3009,20 @@ function evaluate(command, depth = 0) {
       // The glued view leaves a quoted verb quoted (`$EMPTY"tee"` reads as
       // `"tee"`), so the WI#873 word-level reading applies to it as well.
       (glued === joined ? null : checkRawShapes(shellWordLevelView(glued))) ??
-      (glued === joined ? null : checkListeners(glued)) ??
-      (glued === joined ? null : checkListeners(shellWordLevelView(glued))) ??
+      (glued === joined ? null : checkListeners(glued, depth)) ??
+      (glued === joined ? null : checkListeners(shellWordLevelView(glued), depth)) ??
       (defaultedIsNew ? checkRawShapes(defaulted) : null) ??
       (defaultedIsNew ? checkRawShapes(shellWordLevelView(defaulted)) : null) ??
-      (defaultedIsNew ? checkListeners(defaulted) : null) ??
-      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted)) : null) ??
+      (defaultedIsNew ? checkListeners(defaulted, depth) : null) ??
+      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted), depth) : null) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
+      // The redirection-free reading: a rule sees the words bash runs, and a
+      // target it does not own is still visible to a rule about targets
+      // (WI#889 properties 1, 2 and 6).
+      (unredirected === joined ? null : checkDenyRulesEverywhere(unredirected)) ??
+      (unredirected === joined ? null : checkRawShapes(unredirected)) ??
+      (unredirected === joined ? null : checkMoveAndTarDeletion(shellWordView(unredirected))) ??
+      (unredirected === joined ? null : checkListeners(unredirected, depth)) ??
       (joined === command ? null : checkListeners(joined, depth));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(glued === joined ? joined : glued)) {
@@ -2816,7 +3093,9 @@ function* listenerSegments(text) {
   let mask = "";
   let started = false;
   let quoted = false;
+  let wordStart = -1;
   const append = (chars, fromQuotes) => {
+    if (!started) wordStart = -1;
     word += chars;
     mask += (fromQuotes ? "1" : "0").repeat(chars.length);
     started = true;
@@ -2850,6 +3129,16 @@ function* listenerSegments(text) {
     } else if (state !== QUOTE_UNQUOTED) {
       if (state !== QUOTE_CLOSE) append(ch, true);
     } else {
+      // A redirection is not a word: `kimi 2>&1 server` names the service
+      // subcommand, and `python3 -m 2>/dev/null http.server` the module
+      // (WI#889). The token ends the word it glues to (`a&>f` is `a`), and
+      // only at a word start does it carry a `[n]` descriptor.
+      const skip = started ? redirectionSkip(text, i) : redirectTokenSpan(text, i);
+      if (skip !== null) {
+        flush();
+        i = (typeof skip === "number" ? skip : skip.end) - 1;
+        continue;
+      }
       const separator = ifsSeparatorLength(text, i);
       if (separator > 0) {
         // Keep the shell word intact until its brace alternatives are known.
@@ -3458,7 +3747,93 @@ function checkListeners(text, depth = 0) {
       if (denied) return denied;
     }
   }
+  // A here-string can feed a shell directly or through a pipeline. Apply
+  // every rule to its contents under the same nesting budget (WI#889).
+  let mayRun;
+  for (const target of redirectScan(text).hereStrings) {
+    if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check a deeply nested shell command";
+    const body = hereStringBody(target);
+    if (body === null) {
+      // An unreadable word is a command line only if something on the line
+      // can run it; `read`, `jq` and `grep` take it as data (AMU-1).
+      mayRun ??= hasHeredoc(text) || lineMayRunInput(redirectScan(text).view, depth);
+      if (mayRun) return "cannot verify here-string contents; use a literal word";
+      continue;
+    }
+    const denied = classify(body, depth + 1);
+    if (denied) return denied;
+  }
   return null;
+}
+
+function hasHeredoc(text) {
+  for (const _line of quoteScan(text).heredocLines) return true;
+  return false;
+}
+
+// Paths that name a descriptor the command inherits: a program given one of
+// them reads its code from a here-string on that descriptor.
+const INHERITED_INPUT_PATH = /^(?:\/dev\/stdin|\/dev\/fd\/\d+|\/proc\/self\/fd\/\d+)$/;
+// Shells and versioned interpreters outside the shared tables.
+const OTHER_INPUT_RUNNERS = /^(?:mksh|rbash|tcsh|csh|fish|yash|posh|oksh|pdksh|(?:python|perl|ruby|node|php|lua)[0-9][0-9.]*)$/;
+// Programs that take their script from a file operand, `-` meaning stdin.
+const STDIN_SCRIPT_READERS = new Set(["gawk", "mawk", "nawk", "awk", "sed", "gsed"]);
+
+/**
+ * Whether anything on a command line can run the text a here-string carries
+ * (WI#889 AMU-1). The line is read whole, with redirections and here-string
+ * words taken out (`view`), its substitution bodies included: a shell or
+ * `eval`, `source`/`.` of standard input, an interpreter with no script
+ * operand (`isInterpreterStage`), a command word the guard cannot read
+ * (`runsUnverifiableCommand`), a program given an inherited descriptor's path
+ * (`/dev/stdin`, `/dev/fd/3`) or a shell or interpreter outside the shared
+ * tables. Reading the whole line, not the stage the here-string is attached
+ * to, covers compound bodies (`while …; done <<< "$x"`, `{ bash; }<<<"$x"`),
+ * `exec` redirections and functions defined on the line. A line with a
+ * here-document is refused by the caller, because its body can shift the
+ * stage split.
+ */
+function lineMayRunInput(view, depth) {
+  for (const list of commandLists(view)) {
+    for (const stage of splitOutsideQuotes(list, "|")) {
+      if (isInterpreterStage(stage) || runsUnverifiableCommand(stage)) return true;
+      const words = stagePropertyWords(stage);
+      if (words === null) return true;
+      for (let i = 0; i < words.length; i++) {
+        const bare = stripShellQuotes(words[i]);
+        const name = commandBasename(listenerWord(words[i]));
+        if (INHERITED_INPUT_PATH.test(bare) || OTHER_INPUT_RUNNERS.test(name)) return true;
+        // A program read from standard input (`gawk -f -`, `sed -f -`).
+        if (STDIN_SCRIPT_READERS.has(name) && words.slice(i + 1).some((w) => /^(?:-|-f-|--file=-)$/.test(stripShellQuotes(w)))) {
+          return true;
+        }
+        // `source`/`.` of a file the guard cannot name (`<(cat)`, `"$F"`).
+        if ((name === "source" || name === ".") && i + 1 < words.length && !/^[\w./~+-]+$/.test(stripShellQuotes(words[i + 1]))) {
+          return true;
+        }
+      }
+    }
+  }
+  for (const body of substitutionBodies(view)) {
+    if (depth + 1 >= MAX_SHELL_BODY_DEPTH) return true;
+    if (lineMayRunInput(body, depth + 1)) return true;
+  }
+  return false;
+}
+
+/** Read one here-string word, which Bash expands without field splitting or globbing. */
+function hereStringBody(target) {
+  const { states, substitutions } = quoteScan(target);
+  if (!target || target.startsWith("~") || substitutions.size > 0 || hasUnverifiableAnsiEscape(target)) {
+    return null;
+  }
+  for (let i = 0; i < target.length; i++) {
+    if (target[i] !== "$" || (states[i] !== QUOTE_UNQUOTED && states[i] !== QUOTE_DOUBLE)) continue;
+    if (/[\w{(*@#?$!\-]/.test(target[i + 1] ?? "") ||
+        (states[i] === QUOTE_UNQUOTED && target[i + 1] === '"')) return null;
+  }
+  const { word, end, complete } = bashWord(target, 0);
+  return complete && end === target.length ? word : null;
 }
 
 function checkListenerRegion(text, depth) {
