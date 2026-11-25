@@ -2366,6 +2366,92 @@ test("a 16 KB line of repeated git bodies stays inside the deadline (WI#895)", (
   assertBlocked("git submodule foreach ".repeat(10) + "echo hi", "deeply nested shell command")
 })
 
+test("Git shell-command carriers receive the body rules (WI#898)", () => {
+  const carriers = [
+    ...["setup", "env-filter", "tree-filter", "index-filter", "parent-filter", "msg-filter",
+      "commit-filter", "tag-name-filter"].map((option) => `git filter-branch --${option} % HEAD`),
+    "git difftool -y -x %", "git difftool -yx%", "git difftool --extcmd=%",
+    "git difftool --tool-cmd %", "git mergetool --tool-cmd %",
+    "git grep -O% x", "git grep -nO% x", "git grep --open-files-in-pager=% x",
+    "git ls-remote --upload-pack=% .", "git fetch --upload-pack=% .",
+    "git clone --upload-pack=% . /tmp/clone", "git clone -qu% . /tmp/clone",
+    "git push --receive-pack=% .", "git push --exec % .",
+    "git archive --remote=. --exec % HEAD",
+    "GIT_SEQUENCE_EDITOR=% git rebase -i HEAD~1", "git -c sequence.editor=% rebase -i HEAD~1",
+    "GIT_EDITOR=% git commit", "git -c core.editor=% commit",
+  ]
+  for (const [body, reason] of [
+    ["kimi server", "kimi service"],
+    ["nc -l 9000", "listener"],
+    ["tee /dev/sda1", "block-device"],
+  ]) {
+    for (const carrier of carriers) {
+      // Only the hook sees these strings. The body also short-circuits if run.
+      assertBlocked(carrier.replace("%", `'false && ${body}'`), reason)
+    }
+  }
+  assertBlocked("git bisect run kimi server", "kimi service")
+})
+
+test("Git's option walk respects boundaries and applies nested body rules (WI#898)", () => {
+  assertBlocked(`bash -c 'git difftool --extc="false && tee /dev/sda1"'`, "block-device")
+  assertBlocked(`git difftool -t meld -x 'false && find /app -delete'`, "deletion outside")
+  assertBlocked(`"git" -C "/tmp/a b" 2>/dev/null -c CORE.EDITOR='false && tee /dev/sda1' commit`, "block-device")
+  assertBlocked(`git fetch --upload-p 'false && tee /dev/sda1' .`, "block-device")
+  assertBlocked(`git pull --upload-pack 'false && tee /dev/sda1' .`, "block-device")
+  assertBlocked(`git fetch-pack --exec='false && tee /dev/sda1' .`, "block-device")
+  assertBlocked(`git send-pack --receive-pack='false && tee /dev/sda1' .`, "block-device")
+  assertBlocked(`git -c mergetool.custom.cmd='false && tee /dev/sda1' mergetool -t custom`, "block-device")
+  assertBlocked(`git clone --config core.editor='false && tee /dev/sda1' . /tmp/clone`, "block-device")
+  assertBlocked(`env -i GIT_EDITOR='false && tee /dev/sda1' /usr/bin/git commit`, "block-device")
+  assertBlocked(`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0='false && tee /dev/sda1' git commit`, "block-device")
+  assertBlocked(`GIT_CONFIG_PARAMETERS="'sequence.editor'='false && tee /dev/sda1'" git rebase -i HEAD~1`, "block-device")
+  assertBlocked(`git filter-branch --setup 'false && tee /dev/sda1' --msg-filter cat HEAD`, "block-device")
+  assertBlocked(`git difftool -x 'bash -c "false && tee /dev/sda1"'`, "block-device")
+})
+
+test("Git refuses unreadable values only where it may run them (WI#898)", () => {
+  for (const command of [
+    'git filter-branch --msg-filter "$FILTER" HEAD',
+    'git difftool --extcmd="$(printf true)"',
+    'git difftool -x"${DIFFTOOL:-true}"',
+    'git grep --open-files-in-pager="$PAGER" x',
+    'git grep -O"$PAGER" x',
+    'git fetch --upload-pack="$PACK" origin',
+    'git clone -u"$PACK" . /tmp/clone',
+    'git push --receive-pack="$(printf true)" origin main',
+    'git archive --remote=origin --exec "$ARCHIVER" HEAD',
+    'git rebase --exec "$EXEC" HEAD',
+    'git submodule foreach "$FOREACH"',
+    'GIT_EDITOR="$(printf true)" git commit',
+    'GIT_SEQUENCE_EDITOR=$SEQUENCE_EDITOR git rebase -i HEAD~1',
+    'git -c core.editor="$EDITOR" commit',
+    'git --config-env=core.editor=EDITOR commit',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=sequence.editor GIT_CONFIG_VALUE_0="$EDITOR" git rebase -i HEAD~1',
+  ]) {
+    assertBlocked(command, "cannot verify a Git shell command")
+  }
+  for (const command of [
+    "git filter-branch --msg-filter 'cat' HEAD", "git difftool -y", "git grep -n foo",
+    "git fetch origin", "git rebase -i HEAD~3", "git commit -m x", "git bisect run cargo test",
+    "GIT_EDITOR=true git commit --amend", "git push -u origin main", "git fetch -u origin",
+    "git grep -O 'note: kimi server'", "git grep -e '-Onc -l 9000'",
+    "git grep foo -- '-Onc -l 9000'", 'git grep -n "$PATTERN"',
+    'git fetch --upload-pack=git-upload-pack "$REMOTE"',
+    `git difftool -- '--extcmd=nc -l 9000'`,
+    'git -c user.name="$NAME" commit -m x',
+    `git filter-branch --msg-filter 'printf "%s\\n" "$GIT_COMMIT"' HEAD`,
+    'git commit -m \'git difftool -x "kimi server"\'',
+  ]) {
+    assertAllowed(command)
+  }
+})
+
+test("Git carrier options stay within the analysis deadline (WI#898)", () => {
+  assertAllowed("git -c core.editor=true commit; ".repeat(500), 2_500)
+  assertAllowed("git difftool --extcmd=true ".repeat(600), 2_500)
+})
+
 test("a decoded payload behind a launcher or into a stdin interpreter is denied (WI#883)", () => {
   // Every row of the item's point-1 table. A launcher in front of the
   // decoder or the interpreter, a `{ …; }` group, a `source`/`.` of the
