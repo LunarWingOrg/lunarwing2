@@ -1083,7 +1083,11 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
             continue;
         }
         let name = basename(&word.text);
-        if name == "git" || is_git_plumbing_executable(name) || is_shell_name(name) {
+        if name == "git"
+            || is_git_plumbing_executable(name)
+            || is_git_program_word(&word.text)
+            || is_shell_name(name)
+        {
             return Err(denied(format!(
                 "a command this preflight cannot read ({command}) names git; use a recognized command form"
             )));
@@ -1427,6 +1431,13 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
                 return Err(denied(format!(
                     "{name} is not supported by manifest Git preflight"
                 )));
+            }
+            // Git's dispatcher runs `git-foo` for `git foo`, and its exec path
+            // holds those programs under the dashed names. Read the dashed
+            // spelling as the subcommand it is, so `git-push -f` cannot pass
+            // where `git push -f` is refused.
+            name if git_dashed_program(name).is_some() => {
+                return inspect_git_dashed_command(words, index, preflight, depth);
             }
             _ => return refuse_unread_git_tail(words, index),
         }
@@ -2010,6 +2021,10 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         "config" => authorize_config(args),
         "archive" => authorize_archive(args, preflight),
         "submodule" => authorize_submodule(args, preflight, depth),
+        // The program behind `git submodule`. Only `foreach` is read, with the
+        // helper's own option rules; its other subcommands are internal and
+        // take arguments this preflight does not read, so they are refused.
+        "submodule--helper" => authorize_submodule_helper(args, preflight, depth),
         "rebase" | "bisect" => authorize_shell_bodies(args, sub.text.as_str(), preflight, depth),
         // Porcelain `push` is not the only path to a remote. The plumbing
         // verbs speak the transport protocol directly, take their own
@@ -2039,6 +2054,78 @@ fn is_remote_transport_plumbing(verb: &str) -> bool {
 fn is_git_plumbing_executable(name: &str) -> bool {
     name.strip_prefix("git-")
         .is_some_and(is_remote_transport_plumbing)
+}
+
+/// Git's dispatcher runs `git <verb>` as the program `git-<verb>` in its exec
+/// path (`/usr/lib/git-core/git-push`, or a bare `git-push` on `PATH`). Return
+/// the subcommand a dashed program name stands for, so the dashed spelling is
+/// read by the same code as the subcommand it is.
+fn git_dashed_program(name: &str) -> Option<&str> {
+    name.strip_prefix("git-").filter(|verb| !verb.is_empty())
+}
+
+/// Whether a word in an unread command's tail names a dashed git program that
+/// the scan would have to read: a program in a git exec directory by path, or
+/// a bare program whose verb is a git subcommand the preflight knows. The verb
+/// test keeps directory and package names (`/usr/lib/git-core`, `git-core`)
+/// from reading as programs.
+fn is_git_program_word(word: &str) -> bool {
+    let name = basename(word);
+    let Some(verb) = git_dashed_program(name) else {
+        return false;
+    };
+    if let Some((directory, _)) = word.rsplit_once('/') {
+        return basename(directory) == "git-core";
+    }
+    is_known_git_verb(verb)
+}
+
+/// The git subcommands the preflight reads, plus the plumbing verbs it refuses.
+/// A dashed program is dispatched to the subcommand of the same name, so these
+/// are the verbs whose dashed spelling changes what runs.
+fn is_known_git_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "clone"
+            | "fetch"
+            | "pull"
+            | "push"
+            | "ls-remote"
+            | "remote"
+            | "config"
+            | "archive"
+            | "submodule"
+            | "submodule--helper"
+            | "rebase"
+            | "bisect"
+    ) || is_remote_transport_plumbing(verb)
+}
+
+/// Read a dashed program (`git-push`, `/usr/lib/git-core/git-clone`) as the
+/// subcommand it stands for. The program takes the subcommand's own
+/// arguments — it does not accept `git`'s global options — so the verb is
+/// placed where `inspect_git_command` looks for it and nothing is skipped
+/// ahead of it.
+fn inspect_git_dashed_command(
+    words: &[Word],
+    index: usize,
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    let Some(verb) = git_dashed_program(basename(&words[index].text)) else {
+        return Ok(());
+    };
+    let mut rewritten = Vec::with_capacity(words.len() - index + 1);
+    rewritten.push(Word {
+        text: "git".to_string(),
+        dynamic: false,
+    });
+    rewritten.push(Word {
+        text: verb.to_string(),
+        dynamic: words[index].dynamic,
+    });
+    rewritten.extend_from_slice(&words[index + 1..]);
+    inspect_git_command(&rewritten, preflight, depth)
 }
 
 fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -2508,6 +2595,18 @@ fn foreach_script(tail: &[&Word]) -> Option<Word> {
 /// `git submodule foreach` runs its whole operand tail, directly or through
 /// a shell. Reading only the first word left `foreach sh -c '<body>'`
 /// unscanned.
+/// `git submodule foreach` options. The porcelain has `--quiet` and
+/// `--recursive`; the `submodule--helper` behind it also accepts their
+/// unambiguous long-option abbreviations (`--q`, `--r`, …), so both spellings
+/// are stepped over here.
+fn is_submodule_foreach_option(word: &str) -> bool {
+    let long = |name: &str| {
+        word.strip_prefix("--")
+            .is_some_and(|given| !given.is_empty() && name.starts_with(given))
+    };
+    matches!(word, "-q" | "--quiet" | "--recursive") || long("quiet") || long("recursive")
+}
+
 fn authorize_submodule_foreach(
     operands: &[Word],
     preflight: Preflight<'_>,
@@ -2515,7 +2614,7 @@ fn authorize_submodule_foreach(
 ) -> Result<()> {
     let mut tail = operands
         .iter()
-        .skip_while(|word| matches!(word.text.as_str(), "-q" | "--quiet" | "--recursive"));
+        .skip_while(|word| is_submodule_foreach_option(&word.text));
     let first = tail.next();
     let tail: Vec<&Word> = match first {
         Some(word) if word.text == "--" => tail.collect(),
@@ -2525,6 +2624,23 @@ fn authorize_submodule_foreach(
     match foreach_script(&tail) {
         Some(script) => scan_shell_body(&script, preflight, depth),
         None => Ok(()),
+    }
+}
+
+/// `git submodule--helper` is the builtin behind `git submodule`. Only its
+/// `foreach` is read, because that is the one subcommand that runs a body the
+/// scan can check; the rest take internal arguments this preflight does not
+/// read, so they are refused rather than allowed to inherit the catch-all.
+fn authorize_submodule_helper(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    let Some((action, operands)) = args.split_first() else {
+        return Ok(());
+    };
+    match action.text.as_str() {
+        "foreach" => authorize_submodule_foreach(operands, preflight, depth),
+        _ => Err(denied(format!(
+            "git submodule--helper {} is not supported by manifest Git preflight",
+            action.text
+        ))),
     }
 }
 
