@@ -1322,7 +1322,7 @@ mod tests {
         assert_eq!(search_page(5, 3), (5, 3));
         // The global clamp still applies underneath.
         assert_eq!(search_page(0, 0), (1, 1));
-        assert!(SEARCH_MAX_PER_PAGE < 100);
+        const { assert!(SEARCH_MAX_PER_PAGE < 100) };
     }
 
     /// WI#891: every search action routes through the capped page size, so the
