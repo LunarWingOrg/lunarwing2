@@ -2847,20 +2847,18 @@ const FETCH_NAMES = new Set(["curl", "wget", "fetch", "nc", "ncat", "netcat"]);
 /**
  * The readings of one stage's words, computed once so the checks below share a
  * single word scan: whether it decodes, whether it fetches, whether it runs
- * its stdin as a program, whether it runs its argument as shell text, and
- * whether its command word cannot be read. A stage whose words cannot be read
- * carries every reading, as `isDecodeStage`/`isInterpreterStage` do (WI#883,
- * WI#885).
+ * its stdin as a program, and whether its command word cannot be read. A stage
+ * whose words cannot be read carries every reading, as
+ * `isDecodeStage`/`isInterpreterStage` do (WI#883, WI#885).
  */
 function stageContent(words) {
   if (words === null) {
-    return { decode: true, fetch: true, stdin: true, shellText: true, unverifiable: true };
+    return { decode: true, fetch: true, stdin: true, unverifiable: true };
   }
   return {
     decode: words.some((_word, index) => decoderAt(words, index)),
     fetch: words.some((word) => FETCH_NAMES.has(commandBasename(listenerWord(word)))),
     stdin: words.some((_word, index) => interpreterAt(words, index)),
-    shellText: words.some((_word, index) => runsShellTextAt(words, index)),
     unverifiable: commandWordUnverifiable(words),
   };
 }
@@ -2897,6 +2895,9 @@ function heldContent(text, depth = 0) {
  * `tee`, `sed` and `head` pass the bytes through untouched.
  */
 function checkDecodedPipe(text) {
+  // A pipeline is the only way one stage feeds another, so a text without a
+  // bar costs a single scan (WI#892 deadline).
+  if (!text.includes("|")) return null;
   const lists = commandLists(text);
   let scanned = 0;
   for (let li = 0; li < lists.length; li++) {
