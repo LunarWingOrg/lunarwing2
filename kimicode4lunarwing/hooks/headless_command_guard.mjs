@@ -339,8 +339,14 @@ const RM_RESOLVED_SAFE_ROOTS = RM_SAFE_TEMP_ROOTS
   .filter((root) => root !== null);
 
 /** Split a command tail into bash words (space and tab only). */
+/**
+ * Split a command tail into bash words (space and tab only). A redirection is
+ * not a word, so `tee 2>&1 /dev/sda1` has the one operand `/dev/sda1`, and
+ * `find /tmp/x 2>&1 -delete` the one start path `/tmp/x` (WI#889). The
+ * targets a rule needs are read from `redirectScan`, not from this list.
+ */
 function argumentWords(rest) {
-  return rest.split(/[ \t]+/).filter((word) => word.length > 0);
+  return redirectionFreeView(rest).split(/[ \t]+/).filter((word) => word.length > 0);
 }
 
 function stripShellQuotes(word) {
@@ -2815,6 +2821,9 @@ function checkDecodedPipe(text) {
   return null;
 }
 
+const BLOCK_DEVICE_WRITE_PATTERN =
+  />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
+
 const DENY_RULES = [
   {
     name: "privilege escalation",
@@ -2869,9 +2878,8 @@ const DENY_RULES = [
     // `>&word` and `n>&word` write `word` when it is not a descriptor
     // number, and `&>word`/`&>>word` write it too, so the target the
     // redirection reader collected is checked in every write form (WI#889).
-    pattern:
-      />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
     check: (segment) => {
+      if (BLOCK_DEVICE_WRITE_PATTERN.test(segment)) return true;
       for (const { target, write } of redirectScan(segment).targets) {
         if (write && DEVICE_TARGET.test(stripShellQuotes(target))) return true;
       }
