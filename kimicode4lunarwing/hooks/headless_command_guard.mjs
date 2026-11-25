@@ -2114,85 +2114,248 @@ function checkGitDiscard(segment) {
   return false;
 }
 
-// `git submodule foreach <command>` and `git rebase --exec/-x <command>` hand
-// their operand to `sh -c`, so the body is a command line of its own even
-// though no shell word carries it (WI#895). git reads the body from its own
-// argument list, so the guard must walk the same options git walks: a
-// separate or attached value (`--exec=…`, `-x…`), a value at the end of a
-// cluster (`-ix …`), and `foreach`'s own leading options.
-
-// rebase's long options that take the next word as their value.
-const GIT_REBASE_VALUE_OPTIONS = new Set([
-  "--onto", "--whitespace", "--strategy", "--strategy-option", "--trailer", "--empty",
+// Shell command options and intervening value options from the Git 2.56
+// command manuals and option parsers (WI#895, WI#898). A pager option with no
+// attached value uses Git's default pager and does not consume a pattern.
+const GIT_UPLOAD_PACK = { "upload-pack": "body" };
+const GIT_RECEIVE_PACK = { "receive-pack": "body", exec: "body" };
+const GIT_FETCH_VALUES = {
+  ...GIT_UPLOAD_PACK,
+  jobs: "value", depth: "value", deepen: "value", "shallow-since": "value",
+  "shallow-exclude": "value", refmap: "value", filter: "value", "server-option": "value",
+  "negotiation-tip": "value", "negotiation-restrict": "value", "negotiation-include": "value",
+};
+const GIT_SHELL_OPTIONS = new Map([
+  ["rebase", {
+    long: { exec: "body", onto: "value", whitespace: "value", strategy: "value",
+      "strategy-option": "value", trailer: "value", empty: "value" },
+    short: { x: "body", s: "value", X: "value", C: "value" },
+  }],
+  ["filter-branch", {
+    long: {
+      setup: "body", "env-filter": "body", "tree-filter": "body", "index-filter": "body",
+      "parent-filter": "body", "msg-filter": "body", "commit-filter": "body", "tag-name-filter": "body",
+      "subdirectory-filter": "value", original: "value", "state-branch": "value",
+    },
+    short: { d: "value" }, exactLong: true, stopAtOperand: true,
+  }],
+  ["difftool", {
+    long: { extcmd: "body", "tool-cmd": "body", tool: "value", "tool-help": "flag" },
+    short: { x: "body", t: "value" },
+  }],
+  ["mergetool", {
+    long: { "tool-cmd": "body", tool: "value", "tool-help": "flag" },
+    short: { O: "inline-value", t: "value" }, exactLong: true, stopAtOperand: true,
+  }],
+  ["grep", {
+    long: { "open-files-in-pager": "inline-body", "only-matching": "flag", "max-depth": "value",
+      "max-count": "value", "before-context": "value", "after-context": "value", context: "value",
+      threads: "value" },
+    short: { O: "inline-body", e: "value", f: "value", m: "value", A: "value", B: "value", C: "value" },
+    stopAtOperand: true,
+  }],
+  ["fetch", { long: GIT_FETCH_VALUES, short: { j: "value", o: "value" } }],
+  ["pull", {
+    long: { ...GIT_FETCH_VALUES, cleanup: "value", strategy: "value", "strategy-option": "value" },
+    short: { j: "value", o: "value", s: "value", X: "value", S: "inline-value" },
+  }],
+  ["clone", {
+    long: { ...GIT_UPLOAD_PACK, config: "config", template: "value", origin: "value", branch: "value",
+      revision: "value", jobs: "value", reference: "value", "reference-if-able": "value",
+      "separate-git-dir": "value", "ref-format": "value", "server-option": "value", depth: "value",
+      "shallow-since": "value", "shallow-exclude": "value", filter: "value", "bundle-uri": "value" },
+    short: { u: "body", c: "config", b: "value", j: "value", o: "value" },
+  }],
+  ["ls-remote", { long: { ...GIT_UPLOAD_PACK, exec: "body", sort: "value", "server-option": "value" }, short: { o: "value" } }],
+  ["fetch-pack", { long: { ...GIT_UPLOAD_PACK, exec: "body", depth: "value" }, exactLong: true }],
+  ["push", {
+    long: { ...GIT_RECEIVE_PACK, repo: "value", "push-option": "value", "recurse-submodules": "value" },
+    short: { o: "value" },
+  }],
+  ["send-pack", { long: { ...GIT_RECEIVE_PACK, remote: "value", "push-option": "value" } }],
+  ["archive", {
+    long: { exec: "body", remote: "value", format: "value", prefix: "value", output: "value",
+      "add-file": "value", "add-virtual-file": "value", mtime: "value" },
+    short: { o: "value" },
+  }],
 ]);
-// rebase's short options that take the next word when they end a cluster.
-const GIT_REBASE_SHORT_VALUES = "sXC";
 
-/** The bodies a `git rebase` invocation hands to `sh -c`, in argument order. */
-function gitRebaseExecBodies(words) {
-  const bodies = [];
-  for (let i = 0; i < words.length; i++) {
+const GIT_SHELL_ENV = new Set([
+  "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "VISUAL", "EDITOR", "GIT_PAGER", "PAGER",
+  "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF",
+]);
+const GIT_SHELL_KEY = /^(?:core\.(?:editor|pager|sshcommand|fsmonitor)|sequence\.editor|pager\..+|(?:difftool|mergetool|browser|man|trailer)\..+\.cmd|credential(?:\..+)?\.helper|diff\.(?:external|.+\.(?:command|textconv))|merge\..+\.driver|filter\..+\.(?:clean|smudge|process)|remote\..+\.(?:uploadpack|receivepack)|interactive\.difffilter|tar\..+\.command|uploadpack\.packobjectshook)$/i;
+const GIT_EXT_POLICY_KEY = /^protocol(?:\.ext)?\.allow$/i;
+const GIT_EXT_REASON = "enabling Git's external command transport is not permitted";
+const GIT_SHELL_UNVERIFIABLE = "cannot verify a Git shell command; use a literal value";
+
+function checkGitShellBody(value, unverifiable, depth) {
+  if (unverifiable) return GIT_SHELL_UNVERIFIABLE;
+  if (!value) return null;
+  if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
+  return checkShellBody(value, depth + 1);
+}
+
+function checkGitShellConfig(assignment, unverifiable, depth) {
+  const equals = assignment.indexOf("=");
+  const key = equals === -1 ? assignment : assignment.slice(0, equals);
+  if (unverifiable && GLUED_EXPANSION.test(key)) return GIT_SHELL_UNVERIFIABLE;
+  const value = equals === -1 ? "" : assignment.slice(equals + 1);
+  if (GIT_EXT_POLICY_KEY.test(key)) {
+    if (unverifiable) return GIT_SHELL_UNVERIFIABLE;
+    return /^(?:always|user)$/i.test(value) ? GIT_EXT_REASON : null;
+  }
+  if (!GIT_SHELL_KEY.test(key)) return null;
+  // Git treats the leading bang as a shell snippet marker for credential helpers.
+  const body = /^credential(?:\..+)?\.helper$/i.test(key) ? value.replace(/^!/, "") : value;
+  return checkGitShellBody(body, unverifiable, depth);
+}
+
+function gitShellLongOption(spec, word) {
+  const equals = word.indexOf("=");
+  const name = word.slice(2, equals === -1 ? undefined : equals);
+  if (name === "" || name.startsWith("no-")) return null;
+  const key = Object.hasOwn(spec.long, name) ? name :
+    !spec.exactLong && Object.keys(spec.long).find((option) => option.startsWith(name));
+  if (!key) return null;
+  return { kind: spec.long[key], attached: equals === -1 ? undefined : word.slice(equals + 1) };
+}
+
+function gitShellShortOption(spec, word) {
+  for (let i = 1; i < word.length; i++) {
+    const kind = spec.short?.[word[i]];
+    if (kind !== undefined) return { kind, attached: word.slice(i + 1) || undefined };
+  }
+  return null;
+}
+
+function checkGitShellOptions(spec, words, start, dynamic, depth) {
+  for (let i = start; i < words.length; i++) {
     const word = words[i];
-    // After `--` every word is an operand, so git reads no more options.
     if (word === "--") break;
-    if (word.startsWith("--") && word.length > 2) {
-      const equals = word.indexOf("=");
-      const name = word.slice(2, equals === -1 ? undefined : equals);
-      // `--no-exec` turns the option off; the next word is not a body.
-      if (name.startsWith("no-")) continue;
-      // git resolves an unambiguous prefix (`--ex`, `--exe`), so every
-      // prefix of `exec` names it here, which can only add denials.
-      if ("exec".startsWith(name)) {
-        if (equals !== -1) bodies.push(word.slice(equals + 1));
-        else if (i + 1 < words.length) bodies.push(words[++i]);
-        continue;
-      }
-      if (equals === -1 && GIT_REBASE_VALUE_OPTIONS.has(name)) i++;
+    if (word === "-" || !word.startsWith("-")) {
+      if (spec.stopAtOperand) break;
       continue;
     }
-    if (word.startsWith("-") && word.length > 1) {
-      const cluster = word.slice(1);
-      for (let j = 0; j < cluster.length; j++) {
-        if (cluster[j] === "x") {
-          // The rest of the cluster is the body when it carries one
-          // (`-x'kimi server'`); otherwise the next word is (`-ix …`).
-          if (j + 1 < cluster.length) bodies.push(cluster.slice(j + 1));
-          else if (i + 1 < words.length) bodies.push(words[++i]);
-          break;
-        }
-        if (GIT_REBASE_SHORT_VALUES.includes(cluster[j])) {
-          if (j === cluster.length - 1) i++;
-          break;
-        }
-      }
-    }
-    // An operand (`HEAD~1`, a branch) does not end git's option scan.
+    const option = word.startsWith("--") ? gitShellLongOption(spec, word) : gitShellShortOption(spec, word);
+    if (!option || option.kind === "flag") continue;
+    const optionDynamic = dynamic?.has(i);
+    const inlineOnly = option.kind === "inline-body" || option.kind === "inline-value";
+    const value = option.attached ?? (inlineOnly ? undefined : words[++i]);
+    if (value === undefined || option.kind.endsWith("value")) continue;
+    const unverifiable = optionDynamic || dynamic?.has(i);
+    const denied = option.kind === "config" ? checkGitShellConfig(value, unverifiable, depth) :
+      checkGitShellBody(value, unverifiable, depth);
+    if (denied) return denied;
   }
-  return bodies;
+  return null;
 }
 
-/** The bodies a `git submodule foreach` invocation hands to `sh -c`. */
-function gitSubmoduleForeachBodies(words) {
-  let i = 0;
-  // `git submodule [--quiet] foreach …`.
+function checkGitSubmoduleBody(words, start, dynamic, depth) {
+  let i = start;
   while (i < words.length && words[i].startsWith("-")) i++;
-  if (words[i] !== "foreach") return [];
-  // `foreach` reads its own options (`-q`, `--recursive`) before the command
-  // operand; every word after the first operand is part of the body.
-  for (i++; i < words.length && words[i].startsWith("-"); i++);
-  return i < words.length ? [words.slice(i).join(" ")] : [];
+  if (words[i] !== "foreach") return null;
+  for (i++; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "--") { i++; break; }
+  }
+  const bodyStart = i;
+  for (; i < words.length; i++) {
+    if (dynamic?.has(i)) return GIT_SHELL_UNVERIFIABLE;
+  }
+  return checkGitShellBody(words.slice(bodyStart).join(" "), false, depth);
 }
 
-/** Return Git's shell bodies, or null if this is not a recognized carrier. */
-function gitShellBodies(words, start) {
+// Inspect writes in both the classic and the `git config set` forms. Keep
+// the original word indices so expansion in a stored value is still visible.
+function checkGitConfigWrite(words, start, dynamic, depth) {
+  const operands = [];
+  let options = true;
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (options && word === "--") {
+      options = false;
+    } else if (options && word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const option = gitConfigLongOption(word.slice(2, equals === -1 ? undefined : equals));
+      if (!option || /^(?:get(?:-.+)?|list|edit|unset(?:-all)?|rename-section|remove-section)$/.test(option)) return null;
+      if (equals === -1 && GIT_CONFIG_VALUE_LONG.has(option)) i++;
+    } else if (options && word.startsWith("-")) {
+      if (GIT_CONFIG_VALUE_SHORT.has(word)) i++;
+      else if (!/^-(?:[ft].+|z)$/.test(word)) return null;
+    } else {
+      if (operands.length === 0 && /^(?:get|list|unset|edit|rename-section|remove-section)$/.test(word)) return null;
+      if (operands.length === 0 && word === "set") continue;
+      operands.push(i);
+      if (operands.length === 2) break;
+      // Once Git has its key, the next word is the value, even if it starts with '-'.
+      options = false;
+    }
+  }
+  if (operands.length < 2) return null;
+  const [key, value] = operands;
+  return checkGitShellConfig(`${words[key]}=${words[value]}`, dynamic?.has(key) || dynamic?.has(value), depth);
+}
+
+function checkGitShellInvocation(words, start, dynamic, checkedVerbs, depth) {
   let i = start;
   while (i < words.length && words[i].startsWith("-")) {
-    i += GIT_VALUE_OPTIONS.has(words[i]) ? 2 : 1;
+    const option = words[i++];
+    const hasValue = GIT_VALUE_OPTIONS.has(option);
+    if (option === "-c" || option === "--config-env" || option.startsWith("--config-env=")) {
+      const valueIndex = hasValue ? i : i - 1;
+      const value = hasValue ? words[i] : option.slice("--config-env=".length);
+      const denied = checkGitShellConfig(value ?? "", option !== "-c" || dynamic?.has(valueIndex), depth);
+      if (denied) return denied;
+    }
+    if (hasValue) i++;
   }
   const verb = listenerWord(words[i] ?? "");
-  if (verb === "rebase") return gitRebaseExecBodies(words.slice(i + 1));
+  if (checkedVerbs.has(verb)) return null;
+  checkedVerbs.add(verb);
   if (verb === "submodule" || verb === "submodule--helper") {
-    return gitSubmoduleForeachBodies(words.slice(i + 1));
+    return checkGitSubmoduleBody(words, i + 1, dynamic, depth);
+  }
+  if (verb === "config") return checkGitConfigWrite(words, i + 1, dynamic, depth);
+  const spec = GIT_SHELL_OPTIONS.get(verb);
+  return spec ? checkGitShellOptions(spec, words, i + 1, dynamic, depth) : null;
+}
+
+function checkGitShellEnvironment(words, dynamic, depth, { keys, values }) {
+  const changed = new Set();
+  for (let i = 0; i < words.length; i++) {
+    const assignment = /^[({]*(GIT_[A-Z0-9_]+|VISUAL|EDITOR|PAGER)\+?=(.*)$/s.exec(words[i]);
+    if (!assignment) continue;
+    const [, name, value] = assignment;
+    const unverifiable = dynamic?.has(i);
+    if (GIT_SHELL_ENV.has(name)) {
+      const denied = checkGitShellBody(value, unverifiable, depth);
+      if (denied) return denied;
+    } else if (name === "GIT_ALLOW_PROTOCOL") {
+      if (unverifiable) return GIT_SHELL_UNVERIFIABLE;
+      if (value.split(":").includes("ext")) return GIT_EXT_REASON;
+    } else if (/^GIT_CONFIG_KEY_\d+$/.test(name)) {
+      if (unverifiable) return GIT_SHELL_UNVERIFIABLE;
+      const index = name.slice("GIT_CONFIG_KEY_".length);
+      keys.set(index, value);
+      changed.add(index);
+    } else if (/^GIT_CONFIG_VALUE_\d+$/.test(name)) {
+      const index = name.slice("GIT_CONFIG_VALUE_".length);
+      values.set(index, { value, unverifiable });
+      changed.add(index);
+    } else if (name === "GIT_CONFIG_PARAMETERS") {
+      if (unverifiable) return GIT_SHELL_UNVERIFIABLE;
+      for (const assignment of bashWords(value)) {
+        const denied = checkGitShellConfig(assignment, false, depth);
+        if (denied) return denied;
+      }
+    }
+  }
+  for (const index of changed) {
+    const key = keys.get(index);
+    const setting = values.get(index);
+    if (key === undefined || setting === undefined) continue;
+    const denied = checkGitShellConfig(`${key}=${setting.value}`, setting.unverifiable, depth);
+    if (denied) return denied;
   }
   return null;
 }
@@ -4428,6 +4591,16 @@ function ifsSeparatorLength(text, i) {
 // an argument. Quoted IFS text is kept verbatim and never becomes a marker.
 const LISTENER_FIELD_BREAK = "\0";
 
+function shellParameterAt(text, index) {
+  return text[index] === "$" && /[\w{(*@#?$!\-]/.test(text[index + 1] ?? "");
+}
+
+function unquotedValueExpands(text, index, word) {
+  const ch = text[index];
+  return shellParameterAt(text, index) || "*?[".includes(ch) ||
+    (ch === "~" && (word === "" || word.endsWith("=")));
+}
+
 /**
  * Read simple command words, keeping quoted values (including empty ones)
  * together. Each word carries a quote mask beside its text: one `1` per
@@ -4438,6 +4611,7 @@ const LISTENER_FIELD_BREAK = "\0";
  * (WI#868). The quote context is the shared reader's, so a substitution's own
  * quotes do not disturb the word around it (WI#867). `quoted` records whether
  * any of the word was quoted, so a quoted empty word (`""`) stays a word.
+ * `dynamic` marks a value the outer shell can change before Git receives it.
  */
 function* listenerSegments(text) {
   const { states, substitutions } = quoteScan(text);
@@ -4446,19 +4620,19 @@ function* listenerSegments(text) {
   let mask = "";
   let started = false;
   let quoted = false;
-  let wordStart = -1;
+  let dynamic = false;
   const append = (chars, fromQuotes) => {
-    if (!started) wordStart = -1;
     word += chars;
     mask += (fromQuotes ? "1" : "0").repeat(chars.length);
     started = true;
   };
   const flush = () => {
-    if (started) words.push({ text: word, mask, quoted });
+    if (started) words.push({ text: word, mask, quoted, dynamic });
     word = "";
     mask = "";
     started = false;
     quoted = false;
+    dynamic = false;
   };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -4468,6 +4642,7 @@ function* listenerSegments(text) {
       // The body is a separate command; its unknown output is not a literal
       // word, and none of it is a brace delimiter.
       append("$?", true);
+      dynamic = true;
       i = close;
     } else if (state === SHELL_DATA) {
       flush();
@@ -4480,6 +4655,7 @@ function* listenerSegments(text) {
       started = true;
       quoted = true;
     } else if (state !== QUOTE_UNQUOTED) {
+      if (state === QUOTE_DOUBLE && shellParameterAt(text, i)) dynamic = true;
       if (state !== QUOTE_CLOSE) append(ch, true);
     } else {
       // A redirection is not a word: `kimi 2>&1 server` names the service
@@ -4496,6 +4672,7 @@ function* listenerSegments(text) {
       if (separator > 0) {
         // Keep the shell word intact until its brace alternatives are known.
         append(LISTENER_FIELD_BREAK, false);
+        dynamic = true;
         i += separator - 1;
       } else if (" \t;|&\n".includes(ch)) {
         flush();
@@ -4504,6 +4681,7 @@ function* listenerSegments(text) {
           words = [];
         }
       } else {
+        if (!dynamic && unquotedValueExpands(text, i, word)) dynamic = true;
         append(ch, false);
       }
     }
@@ -4956,7 +5134,7 @@ function launcherShellBodies(name, words, start) {
  * place, so the expansion keeps its neighbours. Linear in the input: no
  * cross product, and one level of nesting is read.
  */
-function listenerBraceWords({ text, mask }) {
+function listenerBraceWords({ text, mask, dynamic }) {
   for (let open = 0; open < text.length; open++) {
     if (text[open] !== "{" || mask[open] !== "0") continue;
     if (open > 0 && text[open - 1] === "$" && mask[open - 1] === "0") continue;
@@ -4994,6 +5172,7 @@ function listenerBraceWords({ text, mask }) {
       alternatives.push({
         text: head + text.slice(bounds[i], bounds[i + 1]) + tail,
         mask: headMask + mask.slice(bounds[i], bounds[i + 1]) + tailMask,
+        dynamic,
       });
     }
     return alternatives;
@@ -5015,7 +5194,7 @@ const BRACE_EXPANSION_LIMIT = 1024;
  * markers split into fields (WI#867, WI#868), or null when a word's expansion
  * passes `BRACE_EXPANSION_LIMIT`.
  */
-function listenerWordList(segment) {
+function listenerWordList(segment, dynamic) {
   const words = [];
   for (const entry of segment) {
     const pending = [entry];
@@ -5028,7 +5207,11 @@ function listenerWordList(segment) {
       const word = pending[head++];
       const alternatives = listenerBraceWords(word);
       if (alternatives === null) {
+        const start = words.length;
         pushListenerFields(words, word);
+        if (dynamic && word.dynamic) {
+          for (let i = start; i < words.length; i++) dynamic.add(i);
+        }
         continue;
       }
       live += alternatives.length - 1;
@@ -5241,27 +5424,20 @@ function checkEnvSplitBody(words, depth) {
  * them (WI#872); otherwise `env -S "kimi server"` names a listener the shell
  * never shows as two words.
  */
-function checkListenerWords(words, depth) {
+function checkListenerWords(words, depth, dynamic, gitEnvironment = { keys: new Map(), values: new Map() }) {
+  const environmentDenial = checkGitShellEnvironment(words, dynamic, depth, gitEnvironment);
+  if (environmentDenial) return environmentDenial;
   // One forward-only table per segment, so a segment full of `kimi` words is
   // linear (WI#858 deadline).
   let serviceSubcommands;
-  let sawGitCarrier = false;
+  let checkedGitVerbs;
   for (let i = 0; i < words.length; i++) {
     const word = listenerWord(words[i]);
     const name = commandBasename(word);
-    if (name === "git" && !sawGitCarrier) {
-      // Scan a recognized carrier once to keep repeated git words linear.
-      // The word reader keeps an entire quoted description in one argument.
-      const bodies = gitShellBodies(words, i + 1);
-      if (bodies !== null) {
-        sawGitCarrier = true;
-        for (const body of bodies) {
-          if (body.length === 0) continue;
-          if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
-          const denied = checkShellBody(body, depth + 1);
-          if (denied) return denied;
-        }
-      }
+    if (name === "git") {
+      checkedGitVerbs ??= new Set();
+      const denied = checkGitShellInvocation(words, i + 1, dynamic, checkedGitVerbs, depth);
+      if (denied) return denied;
     }
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
@@ -5430,10 +5606,13 @@ function checkListenerRegion(text, depth) {
     const denied = checkListeners(body, depth + 1);
     if (denied) return denied;
   }
+  // Exported settings can be assembled across clauses in one tool call.
+  const gitEnvironment = { keys: new Map(), values: new Map() };
   for (const segment of listenerSegments(text)) {
-    const words = listenerWordList(segment);
+    const dynamic = segment.some((word) => word.dynamic) ? new Set() : undefined;
+    const words = listenerWordList(segment, dynamic);
     if (words === null) return "cannot check listeners in a brace expansion this large";
-    const denied = checkListenerWords(words, depth);
+    const denied = checkListenerWords(words, depth, dynamic, gitEnvironment);
     if (denied) return denied;
   }
   return null;

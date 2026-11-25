@@ -274,8 +274,23 @@ skipped ahead of it. `git submodule--helper` — the program behind
 `git submodule` — is read like `git submodule`: its `foreach` body is
 scanned with the helper's own option rules (unambiguous long-option
 abbreviations included), and its other subcommands are refused.
-It also refuses in-command configuration that would change what a later word
-means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
+
+For `git submodule`, preflight permits the default listing, `status` and
+`summary`, and scans `foreach` bodies. For `add`, it skips supported options
+and validates the repository operand. With a Git grant, that operand must be
+an explicit granted URL or its equivalent absolute `/workspace` path.
+
+Preflight refuses `update` regardless of flags because Git can clone or
+fetch using a URL from `.gitmodules` or local configuration. It also refuses
+`init`, `sync`, and `set-url`, which can change submodule remote URLs.
+Local actions `deinit`, `absorbgitdirs`, and `set-branch` are intentionally
+unsupported. To clone or fetch submodule content, use a literal granted URL
+for `git clone` or name a granted remote in `git fetch`. Git can still fetch
+within already-populated submodules according to its recursion settings.
+Those implicit fetches are outside the command preflight's visibility.
+
+Preflight also refuses in-command configuration that would change what a later
+word means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
 `credential.*` keys, HTTP `extraHeader` (including URL-scoped keys),
 `help.autocorrect`, and the Git editor and filesystem monitor keys. It
