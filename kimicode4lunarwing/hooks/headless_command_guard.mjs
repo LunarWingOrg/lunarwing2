@@ -1590,7 +1590,8 @@ function checkRawShapes(text) {
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
     checkDecodedPipe(text) ??
-    checkSubstitutionShell(text);
+    checkSubstitutionShell(text) ??
+    checkWrittenThenRun(text);
 }
 
 const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
@@ -2937,6 +2938,123 @@ function runsShellTextAt(words, index) {
   if (SHELL_NAME.test(name) || name === "eval") return true;
   return name === "source" || name === ".";
 }
+
+/**
+ * The literal absolute path a word names, or null. Only such a word can be
+ * matched between the stage that writes a file and the stage that runs it:
+ * an expansion, a glob, a brace list or a `..` segment reads as some other
+ * path at run time (WI#892 part 3).
+ */
+function literalRunPath(word) {
+  const bare = stripShellQuotes(word);
+  if (!bare.startsWith("/") || bare.includes("..")) return null;
+  for (const ch of bare) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch) || ch === "~") return null;
+  }
+  return bare;
+}
+
+// A redirect target: `> path`, `>> path`, `>| path`. A process substitution
+// (`>(`) and a descriptor duplication (`2>&1`) name no path.
+const REDIRECT_TARGET = /(?:^|[^<>&])>>?\|?[ \t]*("[^"]*"|'[^']*'|[^\s;&|<>()]+)/g;
+
+/** The literal paths a stage writes: redirects, `tee` operands, curl `-o`, wget `-O`. */
+function stageWritePaths(stage, words) {
+  const paths = [];
+  for (const match of stage.matchAll(REDIRECT_TARGET)) {
+    const path = literalRunPath(match[1]);
+    if (path !== null) paths.push(path);
+  }
+  for (let i = 0; i < words.length; i++) {
+    const name = commandBasename(listenerWord(words[i]));
+    if (name === "tee") {
+      for (const word of words.slice(i + 1)) {
+        const path = literalRunPath(word);
+        if (path !== null) paths.push(path);
+      }
+      break;
+    }
+    if (name !== "curl" && name !== "wget") continue;
+    // curl `-o`/`--output` and wget `-O`/`--output-document`, separate or
+    // attached (`-o/tmp/x`, `--output=/tmp/x`).
+    for (let j = i + 1; j < words.length; j++) {
+      const word = words[j];
+      const attached = /^(?:--output|--output-document)=(.+)$/.exec(word)?.[1] ??
+        /^-o(.+)$/.exec(word)?.[1];
+      const separate = word === "-o" || word === "--output" || word === "--output-document" ||
+        /^-[a-zA-Z]*O$/.test(word);
+      const target = attached ?? (separate ? words[j + 1] : undefined);
+      if (target === undefined) continue;
+      const path = literalRunPath(target);
+      if (path !== null) paths.push(path);
+    }
+  }
+  return paths;
+}
+
+// The `NAME=` spellings at a word start, the assignments a later stage can
+// read back through `$NAME`.
+const ASSIGNMENT_AT = /(?:^|[\s;&|(])([A-Za-z_]\w*)=/g;
+
+/**
+ * Deny a decode or fetch whose output a later stage of the same command line
+ * runs — through a variable it filled (`x=$(…)` then `sh -c "$x"`) or through
+ * a file it wrote (`… > /tmp/x.sh` then `sh /tmp/x.sh`), matched by the same
+ * literal path (WI#892 part 3). Decoding or downloading to a file without
+ * running it stays ordinary work, and a consumer that does not execute the
+ * content (`cat`, `tar -xzf`) is not a run.
+ */
+function checkWrittenThenRun(text) {
+  if (!WRITE_OR_ASSIGN.test(text)) return null;
+  const lists = commandLists(text);
+  const written = []; // { path, order }
+  const assigned = []; // { name, order }
+  let order = 0;
+  for (const list of lists) {
+    const stages = pipelineStages(list);
+    let carried = null;
+    for (const stage of stages) {
+      order++;
+      const words = stagePropertyWords(stage);
+      if (words === null) continue;
+      const held = heldContent(stage);
+      if (held !== null) {
+        for (const match of stage.matchAll(ASSIGNMENT_AT)) {
+          assigned.push({ name: match[1], order });
+        }
+      }
+      if (carried !== null || held !== null) {
+        for (const path of stageWritePaths(stage, words)) written.push({ path, order });
+      }
+      const content = stageContent(words);
+      if (content.decode) carried = "decoded";
+      if (content.fetch) carried = carried ?? "remote";
+      // A stage runs the file it names when the command word is the path
+      // itself (`/tmp/x.sh`) or when a shell, `eval` or `source` names it as
+      // an operand.
+      const runsShell = words.some((_word, index) => runsShellTextAt(words, index));
+      const commandWord = stripShellQuotes(listenerWord(words[0] ?? ""));
+      for (const { path, order: at } of written) {
+        if (at >= order) continue;
+        const named = words.some((word) => stripShellQuotes(listenerWord(word)) === path);
+        if (named && (runsShell || commandWord === path)) {
+          return "decoded or fetched content written and then run";
+        }
+      }
+      if (!runsShell) continue;
+      for (const { name, order: at } of assigned) {
+        if (at < order && words.some((word) => word.includes(`$${name}`) || word.includes(`\${${name}}`))) {
+          return "decoded or fetched content assigned and then run";
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// A redirect, a `tee`, curl's/wget's output option or an assignment: the only
+// shapes that can carry content into a later stage (WI#892 deadline).
+const WRITE_OR_ASSIGN = />|\btee\b|(?:^|[\s;&|(])[A-Za-z_]\w*=|\s-[a-zA-Z]*[oO](?:\s|=|$)|--output/;
 
 /**
  * Deny a shell, `eval` or `source` fed by a command substitution, a process
