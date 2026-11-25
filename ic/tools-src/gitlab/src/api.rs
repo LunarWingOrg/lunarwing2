@@ -681,7 +681,6 @@ fn project_search(
     page_number: u32,
 ) -> Result<Value, String> {
     require_nonempty("query", query)?;
-    let (per_page, page_number) = search_page(per_page, page_number);
     let endpoint = project_search_endpoint(project, scope, query, per_page, page_number)?;
     client.request_typed_page::<SearchHit>(&endpoint)
 }
@@ -713,7 +712,6 @@ fn search_blobs_endpoint(
     if let Some(ref_) = ref_ {
         require_nonempty("ref", ref_)?;
     }
-    let (per_page, page_number) = search_page(per_page, page_number);
     let mut endpoint = project_search_endpoint(project, "blobs", query, per_page, page_number)?;
     if let Some(ref_) = ref_ {
         endpoint.push_str("&ref=");
@@ -724,6 +722,9 @@ fn search_blobs_endpoint(
 
 /// Search URL shared by every project search scope. Split out so the
 /// `blobs` branch filter can be pinned without a live GitLab instance.
+///
+/// The page size is capped here, not at the call sites, so every search
+/// scope inherits the WI#891 bound.
 fn project_search_endpoint(
     project: &str,
     scope: &str,
@@ -731,6 +732,7 @@ fn project_search_endpoint(
     per_page: u32,
     page_number: u32,
 ) -> Result<String, String> {
+    let (per_page, page_number) = search_page(per_page, page_number);
     Ok(format!(
         "/projects/{}/search?scope={scope}&search={}&per_page={per_page}&page={page_number}",
         project_path(project)?,
@@ -877,6 +879,9 @@ struct SearchHit {
     title: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    /// Echoed so the agent can see the visibility the server authorized.
+    #[serde(default)]
+    confidential: Option<bool>,
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
@@ -993,8 +998,9 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        annotate_mr_changes, merge_requests_endpoint, project_search_endpoint, require_changes,
-        search_blobs_endpoint, validate_choice, validate_file_path, work_items_endpoint,
+        SEARCH_MAX_PER_PAGE, SearchHit, annotate_mr_changes, merge_requests_endpoint,
+        project_search_endpoint, require_changes, search_blobs_endpoint, search_page,
+        validate_choice, validate_file_path, work_items_endpoint,
     };
 
     #[test]
@@ -1294,5 +1300,137 @@ mod tests {
             normalised,
             "/projects/35/pipelines/6842/jobs?per_page=1&page=1"
         );
+    }
+
+    /// WI#891: a broad term must not ask for a page larger than the guest can
+    /// parse. The cap sits below the global `page()` ceiling and below the
+    /// 100-hit page that carried ~555 KB of JSON.
+    #[test]
+    fn search_page_clamps_below_the_global_ceiling() {
+        assert_eq!(search_page(100, 1), (SEARCH_MAX_PER_PAGE, 1));
+        assert_eq!(search_page(50, 2), (SEARCH_MAX_PER_PAGE, 2));
+        // A caller asking for less keeps their page size.
+        assert_eq!(search_page(5, 3), (5, 3));
+        // The global clamp still applies underneath.
+        assert_eq!(search_page(0, 0), (1, 1));
+        assert!(SEARCH_MAX_PER_PAGE < 100);
+    }
+
+    /// WI#891: every search action routes through the capped page size, so the
+    /// failing 100-hit request cannot be reissued by a future edit.
+    #[test]
+    fn search_endpoints_apply_the_page_cap() {
+        let issues = project_search_endpoint("35", "issues", "PostgreSQL", 100, 1).unwrap();
+        assert_eq!(
+            issues,
+            "/projects/35/search?scope=issues&search=PostgreSQL&per_page=20&page=1"
+        );
+
+        let blobs = search_blobs_endpoint("35", "PostgreSQL", None, 100, 1).unwrap();
+        assert_eq!(
+            blobs,
+            "/projects/35/search?scope=blobs&search=PostgreSQL&per_page=20&page=1"
+        );
+
+        // A caller asking for fewer hits keeps their page size.
+        let small = project_search_endpoint("35", "issues", "q", 5, 2).unwrap();
+        assert!(small.contains("per_page=5"), "{small}");
+    }
+
+    /// WI#891: a hit carrying the full issue object keeps the fields an agent
+    /// triages by while dropping the heavy subtrees that dominated the page.
+    #[test]
+    fn search_hit_keeps_triage_fields_and_skips_heavy_subtrees() {
+        let hit = json!({
+            "id": 993,
+            "iid": 891,
+            "project_id": 35,
+            "title": "search_issues traps on a matching term",
+            "description": "x".repeat(16_000),
+            "state": "opened",
+            "web_url": "https://git.example.test/lunarwing/lunarwing2/-/work_items/891",
+            "author": { "id": 4, "username": "kageho" },
+            "assignees": [{ "id": 18, "username": "applejack" }],
+            "time_stats": { "time_estimate": 0 },
+            "task_completion_status": { "count": 0 },
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(rendered["iid"], 891);
+        assert_eq!(rendered["project_id"], 35);
+        assert_eq!(rendered["title"], "search_issues traps on a matching term");
+        assert_eq!(rendered["state"], "opened");
+        assert!(rendered["web_url"].is_string());
+        for heavy in ["description", "author", "assignees", "time_stats"] {
+            assert!(
+                rendered.get(heavy).is_none(),
+                "{heavy} must be skipped, not carried"
+            );
+        }
+        assert!(
+            serde_json::to_string(&summary).unwrap().len() < 1_000,
+            "the retained summary must stay small"
+        );
+    }
+
+    /// WI#891: blob hits keep the location fields the agent needs to open the
+    /// file, including the branch the match came from.
+    #[test]
+    fn search_hit_keeps_blob_location_fields() {
+        let hit = json!({
+            "basename": "wrapper.rs",
+            "filename": "ic/src/tools/wasm/wrapper.rs",
+            "path": "ic/src/tools/wasm/wrapper.rs",
+            "data": "fn execute() { ... }",
+            "ref": "main",
+            "startline": 1731,
+            "project_id": 35,
+        });
+        let summary: SearchHit = serde_json::from_value(hit).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["path"], "ic/src/tools/wasm/wrapper.rs");
+        assert_eq!(rendered["basename"], "wrapper.rs");
+        assert_eq!(rendered["ref"], "main");
+        assert_eq!(rendered["startline"], 1731);
+        assert!(rendered.get("data").is_none());
+    }
+
+    /// WI#891: a zero-match search is an ordinary empty array — it must parse
+    /// as an empty hit list, not as a shape error, so "no matches" stays
+    /// distinguishable from a backend failure.
+    #[test]
+    fn zero_match_search_parses_as_an_empty_page() {
+        let hits: Vec<SearchHit> = serde_json::from_str("[]").unwrap();
+        assert!(hits.is_empty());
+
+        let rendered = serde_json::to_value(hits).unwrap();
+        assert_eq!(rendered, json!([]));
+    }
+
+    /// WI#891: confidentiality is server-enforced — the search scope must not
+    /// add a parameter that could widen it (there is no `confidential` or
+    /// `all` flag here), and hits that do carry the flag must keep it intact.
+    #[test]
+    fn search_scope_keeps_server_side_confidentiality_and_echoes_the_flag() {
+        let issues = project_search_endpoint("35", "issues", "security", 20, 1).unwrap();
+        for widening in ["confidential", "all=true", "scope=all"] {
+            assert!(
+                !issues.contains(widening),
+                "search must not widen visibility with {widening}: {issues}"
+            );
+        }
+        assert!(issues.contains("scope=issues"), "{issues}");
+
+        // A confidential hit keeps its flag so the agent can see the state
+        // the server authorized it to see.
+        let confidential = json!({
+            "iid": 890,
+            "title": "command guard finding",
+            "confidential": true,
+        });
+        let summary: SearchHit = serde_json::from_value(confidential).unwrap();
+        let rendered = serde_json::to_value(&summary).unwrap();
+        assert_eq!(rendered["confidential"], true);
     }
 }
