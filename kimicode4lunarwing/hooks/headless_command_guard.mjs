@@ -2866,8 +2866,17 @@ const DENY_RULES = [
     // Device namespaces beyond the legacy names: LVM (/dev/mapper/…) and the
     // udev links (/dev/disk/by-id/…). truncate is only denied at a block device.
     // The `>|` noclobber override writes the same device as `>` (WI#832).
+    // `>&word` and `n>&word` write `word` when it is not a descriptor
+    // number, and `&>word`/`&>>word` write it too, so the target the
+    // redirection reader collected is checked in every write form (WI#889).
     pattern:
       />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/,
+    check: (segment) => {
+      for (const { target, write } of redirectScan(segment).targets) {
+        if (write && DEVICE_TARGET.test(stripShellQuotes(target))) return true;
+      }
+      return false;
+    },
   },
   {
     name: "SSH agent use (worker lane is not a credential broker)",
@@ -2930,8 +2939,14 @@ function evaluate(command, depth = 0) {
   // WI#826). An extra quote-preserving reading separates the shell
   // punctuation bash glues to a word, so `(git reset --hard)` and
   // `$(chmod -R 777 /etc)` read as the commands they run (WI#853).
+  //
+  // Every reading is also taken with its redirections blanked out (WI#889):
+  // a redirection is neither a clause end nor an argument, so a rule must see
+  // the words bash runs. The raw-shape family's own readers step over a
+  // redirection too, which keeps a target visible to a rule about targets.
   for (const [lineBreak, quotedLineBreak] of JOIN_READINGS) {
     const joined = joinLineContinuations(command, lineBreak, quotedLineBreak);
+    const unredirected = redirectionFreeView(joined);
     const punctuation = shellPunctuationView(joined);
     const wordLevel = shellWordLevelView(joined);
     // A verb glued to an unquoted expansion (`${EMPTY}tee /dev/sda1`) is the
@@ -2969,6 +2984,13 @@ function evaluate(command, depth = 0) {
       (defaultedIsNew ? checkListeners(defaulted) : null) ??
       (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted)) : null) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
+      // The redirection-free reading: a rule sees the words bash runs, and a
+      // target it does not own is still visible to a rule about targets
+      // (WI#889 properties 1, 2 and 6).
+      (unredirected === joined ? null : checkDenyRulesEverywhere(unredirected)) ??
+      (unredirected === joined ? null : checkRawShapes(unredirected)) ??
+      (unredirected === joined ? null : checkMoveAndTarDeletion(shellWordView(unredirected))) ??
+      (unredirected === joined ? null : checkListeners(unredirected, depth)) ??
       (joined === command ? null : checkListeners(joined, depth));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(glued === joined ? joined : glued)) {
@@ -3692,6 +3714,12 @@ function checkListeners(text, depth = 0) {
       const denied = checkListenerRegion(line.replace(/['"]/g, " "), depth);
       if (denied) return denied;
     }
+  }
+  // A here-string is the command's input, read as the command line it spells
+  // (`bash <<<"kimi server"`), the way a here-document body is (WI#889).
+  for (const body of redirectScan(text).hereStrings) {
+    const denied = checkListenerRegion(body, depth);
+    if (denied) return denied;
   }
   return null;
 }
