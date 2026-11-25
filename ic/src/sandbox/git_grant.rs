@@ -836,6 +836,9 @@ fn validate_virtual_relative_path(relative: &str) -> std::result::Result<(), Str
 struct Word {
     text: String,
     dynamic: bool,
+    /// The word held an unquoted `*`, `?` or `[`, so the shell expands it
+    /// before the command runs. A quoted glob character stays literal.
+    glob: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -903,21 +906,27 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut dynamic = false;
+    let mut glob = false;
     let mut started = false;
     let mut quote: Option<char> = None;
     let mut chars = input.chars();
 
-    let finish_word =
-        |words: &mut Vec<Word>, current: &mut String, dynamic: &mut bool, started: &mut bool| {
-            if *started {
-                words.push(Word {
-                    text: std::mem::take(current),
-                    dynamic: *dynamic,
-                });
-                *dynamic = false;
-                *started = false;
-            }
-        };
+    let finish_word = |words: &mut Vec<Word>,
+                       current: &mut String,
+                       dynamic: &mut bool,
+                       glob: &mut bool,
+                       started: &mut bool| {
+        if *started {
+            words.push(Word {
+                text: std::mem::take(current),
+                dynamic: *dynamic,
+                glob: *glob,
+            });
+            *dynamic = false;
+            *glob = false;
+            *started = false;
+        }
+    };
     let finish_command = |commands: &mut Vec<Vec<Word>>, words: &mut Vec<Word>| {
         if !words.is_empty() {
             commands.push(std::mem::take(words));
@@ -980,14 +989,20 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
                     finish_command(&mut commands, &mut words);
                 }
                 ';' | '\n' | '|' | '&' | '(' | ')' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
+                    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
                     finish_command(&mut commands, &mut words);
                 }
                 ' ' | '\t' | '\r' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
+                    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
                 }
                 '$' | '`' => {
                     dynamic = true;
+                    current.push(c);
+                    started = true;
+                }
+                // An unquoted glob character expands before the command runs.
+                '*' | '?' | '[' => {
+                    glob = true;
                     current.push(c);
                     started = true;
                 }
@@ -1001,7 +1016,7 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
     if quote.is_some() {
         return Err(denied("unterminated shell quote"));
     }
-    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
+    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
     finish_command(&mut commands, &mut words);
     Ok(commands)
 }
@@ -1216,6 +1231,7 @@ fn scan_env_long_option(
                 Word {
                     text: value.to_string(),
                     dynamic: word.dynamic,
+                    glob: word.glob,
                 },
                 index + 1,
             ),
@@ -1269,6 +1285,7 @@ fn scan_env_short_option(
                 Word {
                     text: attached.to_string(),
                     dynamic: word.dynamic,
+                    glob: word.glob,
                 },
                 index + 1,
             )
@@ -1290,11 +1307,14 @@ fn tokenize_env_split_string(input: &str) -> Result<Vec<Word>> {
     let mut current = None::<String>;
     let mut quote = None;
     let mut chars = input.chars().peekable();
+    // `env -S` splits its own body and execs the result; no shell expands
+    // these words, so a glob character in one stays literal.
     let finish_word = |words: &mut Vec<Word>, current: &mut Option<String>| {
         if let Some(text) = current.take() {
             words.push(Word {
                 text,
                 dynamic: false,
+                glob: false,
             });
         }
     };
@@ -2105,6 +2125,181 @@ fn is_known_git_verb(verb: &str) -> bool {
     ) || is_remote_transport_plumbing(verb)
 }
 
+/// The program names a glob command word could expand to. These are the
+/// programs whose dashed spelling changes which git verb runs, spelled the way
+/// git installs them in its exec path; the transport helpers are listed one by
+/// one because `is_remote_transport_plumbing` names a prefix family a glob
+/// cannot enumerate. `glob_candidate_names_match_the_verb_list` keeps this
+/// list in step with the verbs the scan reads.
+const GLOB_GIT_PROGRAM_NAMES: &[&str] = &[
+    "git",
+    "git-clone",
+    "git-fetch",
+    "git-pull",
+    "git-push",
+    "git-ls-remote",
+    "git-remote",
+    "git-config",
+    "git-archive",
+    "git-submodule",
+    "git-submodule--helper",
+    "git-rebase",
+    "git-bisect",
+    "git-send-pack",
+    "git-fetch-pack",
+    "git-http-push",
+    "git-http-fetch",
+    "git-remote-ext",
+    "git-remote-fd",
+    "git-remote-ftp",
+    "git-remote-ftps",
+    "git-remote-http",
+    "git-remote-https",
+];
+
+/// Whether a glob word could expand to a program the preflight reads: `git`,
+/// a `git-<verb>` program, or any dashed program under a `git-core`
+/// directory. The pattern is matched against those names, never against the
+/// filesystem, so the answer does not depend on what is installed and cannot
+/// be changed by planting a file. A pattern that names none of them —
+/// `/usr/lib/git-core/*.txt` — is ordinary data.
+///
+/// The pattern is split on `/` first because a shell `*` never crosses a path
+/// separator: only the directory parts can name `git-core`, and only the last
+/// part can name the program.
+fn glob_could_name_git_program(pattern: &str) -> bool {
+    let (program, directories) = match pattern.rsplit_once('/') {
+        Some((directories, program)) => (program, directories.split('/').collect::<Vec<_>>()),
+        None => (pattern, Vec::new()),
+    };
+    if GLOB_GIT_PROGRAM_NAMES
+        .iter()
+        .any(|name| glob_matches(program, name))
+    {
+        return true;
+    }
+    // A `git-core` directory makes any dashed name beside it a git program,
+    // including verbs the list above does not spell out (`git-frobnicate`
+    // still cannot run, but the scan refuses rather than assumes).
+    glob_matches(program, "git-*")
+        && directories
+            .iter()
+            .any(|part| glob_matches(part, "git-core"))
+}
+
+/// A parsed `[...]` glob class.
+struct GlobClass {
+    characters: Vec<char>,
+    negated: bool,
+}
+
+impl GlobClass {
+    fn accepts(&self, character: char) -> bool {
+        self.characters.contains(&character) != self.negated
+    }
+}
+
+/// Parse the `[...]` class that starts at `open`, returning the pattern index
+/// just past its `]` and the class. `None` when the bracket is unterminated:
+/// the shell leaves such a `[` literal, and so does the matcher.
+fn parse_glob_class(pattern: &[char], open: usize) -> Option<(usize, GlobClass)> {
+    let mut index = open + 1;
+    let negated = matches!(pattern.get(index), Some('!' | '^'));
+    if negated {
+        index += 1;
+    }
+    let mut characters = Vec::new();
+    let mut first = true;
+    while let Some(&current) = pattern.get(index) {
+        if current == ']' && !first {
+            return Some((
+                index + 1,
+                GlobClass {
+                    characters,
+                    negated,
+                },
+            ));
+        }
+        first = false;
+        // `a-z` names a range; a `-` that ends the class is a literal.
+        let range_end = pattern
+            .get(index + 2)
+            .filter(|_| pattern.get(index + 1) == Some(&'-'))
+            .filter(|end| **end != ']')
+            .copied();
+        match range_end {
+            Some(end) => {
+                characters.extend(current..=end);
+                index += 3;
+            }
+            None => {
+                characters.push(current);
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Match a shell glob against a literal name. `*` is any run of characters
+/// (including none), `?` exactly one, and `[...]` one character from the
+/// class. Matching a pattern against a name is how the scan decides what a
+/// word could expand to; the filesystem is never consulted.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    // `reachable[i]`: the pattern read so far ends just after `name[i]`.
+    let mut reachable = vec![false; name.len() + 1];
+    reachable[0] = true;
+    let mut index = 0;
+    while index < pattern.len() {
+        let mut next = vec![false; name.len() + 1];
+        let step = match pattern[index] {
+            '*' => {
+                let mut hit = false;
+                for (forward, behind) in next.iter_mut().zip(&reachable) {
+                    hit |= *behind;
+                    *forward = hit;
+                }
+                1
+            }
+            '?' => {
+                next[1..].copy_from_slice(&reachable[..name.len()]);
+                1
+            }
+            '[' => match parse_glob_class(&pattern, index) {
+                Some((end, class)) => {
+                    for (forward, (behind, character)) in
+                        next[1..].iter_mut().zip(reachable.iter().zip(&name))
+                    {
+                        *forward = *behind && class.accepts(*character);
+                    }
+                    end - index
+                }
+                None => {
+                    for (forward, (behind, character)) in
+                        next[1..].iter_mut().zip(reachable.iter().zip(&name))
+                    {
+                        *forward = *behind && *character == '[';
+                    }
+                    1
+                }
+            },
+            literal => {
+                for (forward, (behind, character)) in
+                    next[1..].iter_mut().zip(reachable.iter().zip(&name))
+                {
+                    *forward = *behind && *character == literal;
+                }
+                1
+            }
+        };
+        reachable = next;
+        index += step;
+    }
+    reachable[name.len()]
+}
+
 /// Read a dashed program (`git-push`, `/usr/lib/git-core/git-clone`) as the
 /// subcommand it stands for. The program takes the subcommand's own
 /// arguments — it does not accept `git`'s global options — so the verb is
@@ -2123,10 +2318,12 @@ fn inspect_git_dashed_command(
     rewritten.push(Word {
         text: "git".to_string(),
         dynamic: false,
+        glob: false,
     });
     rewritten.push(Word {
         text: verb.to_string(),
         dynamic: words[index].dynamic,
+        glob: false,
     });
     rewritten.extend_from_slice(&words[index + 1..]);
     inspect_git_command(&rewritten, preflight, depth)
@@ -2349,6 +2546,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
                     Some(value) if !value.is_empty() => Word {
                         text: value.to_string(),
                         dynamic: word.dynamic,
+                        glob: false,
                     },
                     Some(_) => return Err(denied("git push --repo needs a literal value")),
                     None => match args.get(index + 1) {
@@ -2431,6 +2629,7 @@ fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
         return preflight.read_remote(&Word {
             text: value.into(),
             dynamic: args[flag].dynamic,
+            glob: false,
         });
     }
     match args.get(flag + 1) {
@@ -2486,6 +2685,7 @@ fn rebase_exec(word: &Word) -> RebaseExec {
         return RebaseExec::Attached(Word {
             text: value.to_string(),
             dynamic: word.dynamic,
+            glob: word.glob,
         });
     }
     let Some(cluster) = text.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
@@ -2501,6 +2701,7 @@ fn rebase_exec(word: &Word) -> RebaseExec {
                 RebaseExec::Attached(Word {
                     text: attached.to_string(),
                     dynamic: word.dynamic,
+                    glob: word.glob,
                 })
             };
         }
@@ -4619,6 +4820,7 @@ mod tests {
         let word = |text: &str| Word {
             text: text.to_string(),
             dynamic: false,
+            glob: false,
         };
         let body = |text: &str| match rebase_exec(&word(text)) {
             RebaseExec::Attached(body) => Some(body.text),
