@@ -2592,9 +2592,6 @@ fn foreach_script(tail: &[&Word]) -> Option<Word> {
     Some(script)
 }
 
-/// `git submodule foreach` runs its whole operand tail, directly or through
-/// a shell. Reading only the first word left `foreach sh -c '<body>'`
-/// unscanned.
 /// `git submodule foreach` options. The porcelain has `--quiet` and
 /// `--recursive`; the `submodule--helper` behind it also accepts their
 /// unambiguous long-option abbreviations (`--q`, `--r`, …), so both spellings
@@ -2607,6 +2604,9 @@ fn is_submodule_foreach_option(word: &str) -> bool {
     matches!(word, "-q" | "--quiet" | "--recursive") || long("quiet") || long("recursive")
 }
 
+/// `git submodule foreach` runs its whole operand tail, directly or through
+/// a shell. Reading only the first word left `foreach sh -c '<body>'`
+/// unscanned.
 fn authorize_submodule_foreach(
     operands: &[Word],
     preflight: Preflight<'_>,
