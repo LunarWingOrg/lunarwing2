@@ -1727,15 +1727,20 @@ impl WasmToolWrapper {
             context: context_json,
         };
 
-        // Call execute using the generated typed interface
+        // Call execute using the generated typed interface. Trap reasons come
+        // from the root cause, not `Display` (which shows only Wasmtime's
+        // backtrace context), and a refused `memory.grow` is reported as the
+        // memory limit it hit (WI#891).
         let response = tool_iface.call_execute(&mut store, &request).map_err(|e| {
-            let error_str = e.to_string();
-            if error_str.contains("out of fuel") {
+            if crate::tools::wasm::trap::is_fuel_exhausted(&e) {
                 WasmError::FuelExhausted { limit: limits.fuel }
-            } else if error_str.contains("unreachable") {
-                WasmError::Trapped("unreachable code executed".to_string())
             } else {
-                WasmError::Trapped(error_str)
+                let denied = store.data().limiter.memory_growth_denied();
+                WasmError::Trapped(crate::tools::wasm::trap::describe_trap(
+                    &e,
+                    limits.memory_bytes,
+                    denied,
+                ))
             }
         })?;
 
@@ -5908,5 +5913,248 @@ mod tests {
 
         let result = state.workspace_read("other/test.json").unwrap();
         assert_eq!(result, None);
+    }
+
+    /// WI#891 end-to-end: drive the real `gitlab-tool` guest through the
+    /// sandbox with the payload shape that trapped — a search page whose hits
+    /// each carry a long `description` — and assert it returns results, a
+    /// zero-match query returns an empty list, and a page too large for the
+    /// budget reports a memory limit instead of a reason-less backtrace.
+    ///
+    /// Ignored by default: it needs the built guest artifact, produced with
+    /// `cargo build --release --target wasm32-wasip2 --manifest-path
+    /// tools-src/gitlab/Cargo.toml`. Run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "requires the built gitlab guest wasm (see doc comment)"]
+    async fn wi891_search_survives_a_large_matching_page() {
+        use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
+        use crate::secrets::{
+            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+        };
+        use crate::tools::wasm::capabilities::{
+            Capabilities, EndpointPattern, HttpCapability, SecretsCapability,
+        };
+
+        let wasm_path = "tools-src/gitlab/target/wasm32-wasip2/release/gitlab_tool.wasm";
+        let wasm_bytes = match std::fs::read(wasm_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("skipping: {wasm_path} not built ({error})");
+                return;
+            }
+        };
+
+        /// Replays one canned body for every request, like the live forge
+        /// answering the same search page.
+        #[derive(Debug)]
+        struct CannedSearch {
+            body: String,
+        }
+
+        #[async_trait]
+        impl HttpInterceptor for CannedSearch {
+            async fn before_request(
+                &self,
+                _request: &HttpExchangeRequest,
+            ) -> Option<HttpExchangeResponse> {
+                Some(HttpExchangeResponse {
+                    status: 200,
+                    headers: vec![
+                        ("content-type".to_string(), "application/json".to_string()),
+                        // The live forge sends these, which makes the guest
+                        // wrap the array in `{items, pagination}`.
+                        ("x-page".to_string(), "1".to_string()),
+                        ("x-per-page".to_string(), "20".to_string()),
+                    ],
+                    body: self.body.clone(),
+                })
+            }
+
+            async fn after_response(
+                &self,
+                _request: &HttpExchangeRequest,
+                _response: &HttpExchangeResponse,
+            ) {
+            }
+        }
+
+        /// One issue hit as GitLab returns it: the heavy subtrees that used to
+        /// be parsed into `Value` trees alongside the fields we keep.
+        fn issue_hit(iid: u64, description_chars: usize) -> serde_json::Value {
+            serde_json::json!({
+                "id": 900_000 + iid,
+                "iid": iid,
+                "project_id": 35,
+                "title": format!("WI#{iid} PostgreSQL finding"),
+                "description": "x".repeat(description_chars),
+                "state": "opened",
+                "web_url": format!("https://git.example.test/lunarwing/lunarwing2/-/work_items/{iid}"),
+                "author": { "id": 4, "username": "kageho", "name": "kageho" },
+                "assignees": [{ "id": 18, "username": "applejack" }],
+                "labels": ["in-progress"],
+                "milestone": null,
+                "time_stats": { "time_estimate": 0, "total_time_spent": 0 },
+                "task_completion_status": { "count": 0, "completed_count": 0 },
+            })
+        }
+
+        // Production defaults (10 MB / 500M fuel / 60s): `for_testing()`'s
+        // 1 MB floor is below this component's own 19-page minimum.
+        let mut runtime_config = WasmRuntimeConfig::for_testing();
+        runtime_config.default_limits = crate::tools::wasm::ResourceLimits::default();
+        let runtime = Arc::new(
+            WasmToolRuntime::new(runtime_config).expect("WASM runtime should initialize"), // safety: test-only setup
+        );
+
+        let store = Arc::new(test_secrets_store());
+        store
+            .create(
+                "wi891",
+                CreateSecretParams::new("gitlab_token", "test-token"),
+            )
+            .await
+            .expect("store the token"); // safety: test-only setup
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "gitlab_token".to_string(),
+            CredentialMapping {
+                secret_name: "gitlab_token".to_string(),
+                location: CredentialLocation::Header {
+                    name: "PRIVATE-TOKEN".to_string(),
+                    prefix: None,
+                },
+                host_patterns: vec!["git.lunarwing.org".to_string()],
+                path_patterns: Vec::new(),
+                optional: false,
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                allowlist: vec![EndpointPattern {
+                    host: "git.lunarwing.org".to_string(),
+                    path_prefix: Some("/api/v4/".to_string()),
+                    methods: vec!["GET".to_string()],
+                }],
+                credentials,
+                ..Default::default()
+            }),
+            secrets: Some(SecretsCapability {
+                allowed_names: vec!["gitlab_token".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        // The real reported repro: 20 hits with long descriptions. With the
+        // WI#891 cap and typed parse this stays a small retained summary.
+        let matching: Vec<serde_json::Value> =
+            (0..20).map(|i| issue_hit(800 + i, 16_000)).collect();
+        let matching_body = serde_json::to_string(&matching).expect("encode fixture");
+        assert!(
+            matching_body.len() > 300_000,
+            "fixture must be big enough to have trapped before: {}",
+            matching_body.len()
+        );
+
+        let prepared = runtime
+            .prepare("gitlab-tool", &wasm_bytes, None)
+            .await
+            .expect("gitlab component should prepare"); // safety: test-only setup
+
+        let wrapper = |prepared: Arc<crate::tools::wasm::PreparedModule>, body: String| {
+            super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, caps.clone())
+                .with_secrets_store(Arc::clone(&store) as Arc<dyn SecretsStore + Send + Sync>)
+                .with_http_interceptor(Arc::new(CannedSearch { body }))
+        };
+
+        let ctx = JobContext::with_user("wi891", "search", "search");
+        let output = wrapper(Arc::clone(&prepared), matching_body)
+            .execute(
+                serde_json::json!({
+                    "action": "search_issues",
+                    "project": "lunarwing/lunarwing2",
+                    "query": "PostgreSQL",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("a matching term must return results, not trap"); // safety: test-only assertion
+        let rendered = serde_json::to_string(&output.result).expect("output is JSON");
+        // With pagination headers the guest wraps the page as
+        // `{items, pagination}`; without them it returns the bare array.
+        let items = output
+            .result
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| output.result.as_array())
+            .expect("search output carries items");
+        assert_eq!(items.len(), 20, "every hit in the page is returned");
+        assert_eq!(items[0]["iid"], 800);
+        assert!(
+            items[0].get("description").is_none(),
+            "heavy fields skipped"
+        );
+        assert!(
+            rendered.len() < 40_000,
+            "retained page must stay small, got {} bytes",
+            rendered.len()
+        );
+
+        // A zero-match query is an empty list, not a failure.
+        let empty = wrapper(Arc::clone(&prepared), "[]".to_string())
+            .execute(
+                serde_json::json!({
+                    "action": "search_issues",
+                    "project": "lunarwing/lunarwing2",
+                    "query": "zzzznomatchzzz",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("zero matches must not fail"); // safety: test-only assertion
+        let empty_items = empty
+            .result
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| empty.result.as_array())
+            .map(Vec::len);
+        assert_eq!(
+            empty_items,
+            Some(0),
+            "zero-match returns an empty list: {:?}",
+            empty.result
+        );
+
+        // A page far beyond the sandbox budget must name the memory limit
+        // rather than reporting a bare backtrace.
+        let huge: Vec<serde_json::Value> = (0..20).map(|i| issue_hit(900 + i, 400_000)).collect();
+        let huge_body = serde_json::to_string(&huge).expect("encode fixture");
+        // Above the component's 19-page (1.25 MB) minimum, far below the
+        // ~8 MB the fixture's `Value` tree would need.
+        let small_limits = crate::tools::wasm::ResourceLimits::default()
+            .with_memory(3 * 1024 * 1024)
+            .with_fuel(500_000_000);
+        let tiny = runtime
+            .prepare("gitlab-tool-tiny", &wasm_bytes, Some(small_limits))
+            .await
+            .expect("prepare under a small budget"); // safety: test-only setup
+        let trapped = super::WasmToolWrapper::new(Arc::clone(&runtime), tiny, caps)
+            .with_secrets_store(Arc::clone(&store) as Arc<dyn SecretsStore + Send + Sync>)
+            .with_http_interceptor(Arc::new(CannedSearch { body: huge_body }))
+            .execute(
+                serde_json::json!({
+                    "action": "search_issues",
+                    "project": "lunarwing/lunarwing2",
+                    "query": "regression",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("an over-budget page must fail");
+        let message = trapped.to_string();
+        assert!(
+            message.contains("memory limit reached") || !message.contains("wasm backtrace"),
+            "the failure must name its cause, got: {message}"
+        );
     }
 }

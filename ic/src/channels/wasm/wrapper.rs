@@ -1517,22 +1517,19 @@ impl WasmChannel {
     }
 
     /// Map WASM execution errors to our error types.
+    ///
+    /// Trap reasons come from the error's root cause; `Display` on a Wasmtime
+    /// trap shows only its backtrace context (WI#891).
     fn map_wasm_error(e: anyhow::Error, name: &str, fuel_limit: u64) -> WasmChannelError {
-        let error_str = e.to_string();
-        if error_str.contains("out of fuel") {
+        if crate::tools::wasm::trap::is_fuel_exhausted(&e) {
             WasmChannelError::FuelExhausted {
                 name: name.to_string(),
                 limit: fuel_limit,
             }
-        } else if error_str.contains("unreachable") {
-            WasmChannelError::Trapped {
-                name: name.to_string(),
-                reason: "unreachable code executed".to_string(),
-            }
         } else {
             WasmChannelError::Trapped {
                 name: name.to_string(),
-                reason: error_str,
+                reason: crate::tools::wasm::trap::root_cause_text(&e),
             }
         }
     }

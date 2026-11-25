@@ -68,6 +68,13 @@ pub struct WasmResourceLimiter {
     memory_limit: u64,
     /// Current memory usage (tracked across all memories).
     memory_used: u64,
+    /// Bytes the guest most recently asked for and was refused, if any.
+    ///
+    /// A denied `memory.grow` surfaces to the guest as an allocation failure,
+    /// which typically aborts the module as an `unreachable` trap. Recording
+    /// the denial lets the host report a memory limit rather than a bare trap
+    /// (WI#891).
+    memory_growth_denied: Option<u64>,
     /// Maximum tables allowed.
     max_tables: u32,
     /// Maximum instances allowed.
@@ -83,6 +90,7 @@ impl WasmResourceLimiter {
         Self {
             memory_limit,
             memory_used: 0,
+            memory_growth_denied: None,
             max_tables: 10,
             max_instances: 10, // Component model needs multiple instances for WASI
         }
@@ -91,6 +99,14 @@ impl WasmResourceLimiter {
     /// Get current memory usage.
     pub fn memory_used(&self) -> u64 {
         self.memory_used
+    }
+
+    /// Bytes the guest asked for and was refused, if any growth was denied.
+    ///
+    /// Read after a trap to attribute an allocation failure to the memory
+    /// limit instead of reporting an unexplained `unreachable`.
+    pub fn memory_growth_denied(&self) -> Option<u64> {
+        self.memory_growth_denied
     }
 
     /// Get the memory limit.
@@ -115,6 +131,7 @@ impl ResourceLimiter for WasmResourceLimiter {
                 limit = self.memory_limit,
                 "WASM memory growth denied: would exceed limit"
             );
+            self.memory_growth_denied = Some(desired_u64);
             return Ok(false);
         }
 
@@ -241,6 +258,24 @@ mod tests {
         // Growth beyond limit should be denied
         let result = limiter.memory_growing(0, 20 * 1024 * 1024, None).unwrap();
         assert!(!result);
+    }
+
+    /// WI#891: a refused growth is remembered so a trap that follows it can be
+    /// reported as a memory limit instead of an unexplained abort.
+    #[test]
+    fn test_resource_limiter_records_the_denied_growth() {
+        let mut limiter = WasmResourceLimiter::new(10 * 1024 * 1024);
+        assert_eq!(limiter.memory_growth_denied(), None);
+
+        assert!(limiter.memory_growing(0, 1024 * 1024, None).unwrap());
+        assert_eq!(
+            limiter.memory_growth_denied(),
+            None,
+            "an allowed growth records nothing"
+        );
+
+        assert!(!limiter.memory_growing(0, 20 * 1024 * 1024, None).unwrap());
+        assert_eq!(limiter.memory_growth_denied(), Some(20 * 1024 * 1024));
     }
 
     #[test]
