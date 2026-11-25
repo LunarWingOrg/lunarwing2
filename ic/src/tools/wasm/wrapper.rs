@@ -5959,10 +5959,13 @@ mod tests {
             ) -> Option<HttpExchangeResponse> {
                 Some(HttpExchangeResponse {
                     status: 200,
-                    headers: vec![(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    )],
+                    headers: vec![
+                        ("content-type".to_string(), "application/json".to_string()),
+                        // The live forge sends these, which makes the guest
+                        // wrap the array in `{items, pagination}`.
+                        ("x-page".to_string(), "1".to_string()),
+                        ("x-per-page".to_string(), "20".to_string()),
+                    ],
                     body: self.body.clone(),
                 })
             }
@@ -5995,9 +5998,12 @@ mod tests {
             })
         }
 
+        // Production defaults (10 MB / 500M fuel / 60s): `for_testing()`'s
+        // 1 MB floor is below this component's own 19-page minimum.
+        let mut runtime_config = WasmRuntimeConfig::for_testing();
+        runtime_config.default_limits = crate::tools::wasm::ResourceLimits::default();
         let runtime = Arc::new(
-            WasmToolRuntime::new(WasmRuntimeConfig::for_testing())
-                .expect("WASM runtime should initialize"), // safety: test-only setup
+            WasmToolRuntime::new(runtime_config).expect("WASM runtime should initialize"), // safety: test-only setup
         );
 
         let store = Arc::new(test_secrets_store());
@@ -6074,10 +6080,13 @@ mod tests {
             .await
             .expect("a matching term must return results, not trap"); // safety: test-only assertion
         let rendered = serde_json::to_string(&output.result).expect("output is JSON");
+        // With pagination headers the guest wraps the page as
+        // `{items, pagination}`; without them it returns the bare array.
         let items = output
             .result
             .get("items")
             .and_then(serde_json::Value::as_array)
+            .or_else(|| output.result.as_array())
             .expect("search output carries items");
         assert_eq!(items.len(), 20, "every hit in the page is returned");
         assert_eq!(items[0]["iid"], 800);
@@ -6100,12 +6109,14 @@ mod tests {
             )
             .await
             .expect("zero matches must not fail"); // safety: test-only assertion
+        let empty_items = empty
+            .result
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| empty.result.as_array())
+            .map(Vec::len);
         assert_eq!(
-            empty
-                .result
-                .get("items")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len),
+            empty_items,
             Some(0),
             "zero-match returns an empty list: {:?}",
             empty.result
@@ -6115,8 +6126,10 @@ mod tests {
         // rather than reporting a bare backtrace.
         let huge: Vec<serde_json::Value> = (0..20).map(|i| issue_hit(900 + i, 400_000)).collect();
         let huge_body = serde_json::to_string(&huge).expect("encode fixture");
+        // Above the component's 19-page (1.25 MB) minimum, far below the
+        // ~8 MB the fixture's `Value` tree would need.
         let small_limits = crate::tools::wasm::ResourceLimits::default()
-            .with_memory(4 * 1024 * 1024)
+            .with_memory(3 * 1024 * 1024)
             .with_fuel(500_000_000);
         let tiny = runtime
             .prepare("gitlab-tool-tiny", &wasm_bytes, Some(small_limits))
