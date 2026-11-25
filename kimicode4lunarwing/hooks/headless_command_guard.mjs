@@ -2771,7 +2771,7 @@ function splitOutsideQuotes(text, separator, escapes = true) {
   // A redirection's operator characters are not control operators, and the
   // target is not a word (WI#889). The view keeps every offset, so the
   // pieces below are the caller's own text.
-  const view = redirectionFreeView(text);
+  const view = redirectionFreeView(text, escapes);
   const pieces = [];
   let start = 0;
   for (const i of unquotedOffsets(view, escapes)) {
