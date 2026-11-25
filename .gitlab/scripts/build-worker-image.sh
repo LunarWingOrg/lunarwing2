@@ -262,9 +262,9 @@ lunardepth4lunarwing/scripts/verify_deployed_closure_test.ts
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
 lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py
 lunardepth4lunarwing/scripts/worker-download-retry.sh'
-        source_ref=0472d115e5297093f249c222639431ba8ff0bb78
+        source_ref=ca905dfe5e998ebcac29f5c57b5ea04108498468
         build_args="LUNARDEPTH_REPOSITORY=https://git.lunarwing.org/lunarwing/lunardepth.git
-LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78
+LUNARDEPTH_REF=ca905dfe5e998ebcac29f5c57b5ea04108498468
 LUNARDEPTH_COMPATIBILITY_REF=17aef23e05cc074c8621d38d159d77d25cb348ca
 LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b
 LUNARDEPTH_PROFILE_SCHEMA_VERSION=1

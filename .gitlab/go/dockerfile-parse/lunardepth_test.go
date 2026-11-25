@@ -45,7 +45,7 @@ func TestLunardepthStructuralFailures(t *testing.T) {
 		{"final root", valid + "USER 0:0\n", "final USER"},
 		{"missing network smoke", replaceLunardepthSmoke(t, valid, "RUN true"), "network-isolated smoke"},
 		{"task port published", valid + "EXPOSE 19091\n", "task port 19091"},
-		{"missing source pin", strings.Replace(valid, "0472d115e5297093f249c222639431ba8ff0bb78", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1), "LUNARDEPTH_REF"},
+		{"missing source pin", strings.Replace(valid, "ca905dfe5e998ebcac29f5c57b5ea04108498468", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1), "LUNARDEPTH_REF"},
 		{"post smoke copy", valid + "COPY --from=builder /opt /ignored\n", "final executable step"},
 		{"post smoke noop run", valid + "RUN set -eu; /bin/true\n", "final executable step"},
 		{"post smoke stage", valid + "FROM scratch AS unchecked\n", "must not add a stage"},

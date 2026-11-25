@@ -539,7 +539,7 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 | WASM runtime | Wasmtime/WASI `36.0.23` in `ic/Cargo.lock` (manifest floor `36.0.22`); `[bans]` denies `wasmtime` before `36.0.20` and `wasmtime-wasi` before `36.0.22` within 36.x; the `wasmtime-internal-cache` patch stays on that line |
 | Channel registry | darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19`, xmpp `0.1.24` |
 | Tool registry | cavepony-tool `0.4.13`, gitlab `0.1.18`, gotify `0.1.9`, llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`, vision-analyze `0.2.4`, voice-transcribe `0.1.10`, web-search `0.2.12` |
-| External workers | Kimi Code `2.7.2`, OpenCode `v1.19.6` (`f4e363c82…`), OpenCode 2 `v2.3.2` (`c0ad18b40…`), Pebble `2d0f3786…`, LunarDepth `0472d115…` |
+| External workers | Kimi Code `2.7.2`, OpenCode `v1.19.6` (`f4e363c82…`), OpenCode 2 `v2.3.2` (`c0ad18b40…`), Pebble `2d0f3786…`, LunarDepth `ca905dfe5…` |
 | Worker toolchain | Debian snapshot `20261105T082236Z`; Node `22.23.4` (Kimi, LunarDepth); pnpm `11.7.0` (LunarDepth); Bun `1.4.4` (OpenCode lanes) |
 | Sandbox | Linux default `proxy-enforced`; `tunnel` opt-in; optional version-1 `capability_manifest` that can only narrow host policy; one credential-free git grant (`git-remotes`) when `SANDBOX_GIT_REMOTES` is set; relay serves 32 live connections and reaps them |
 | Runtime estimation | Observe by default; approval hints need `LUNARWING_TOOL_ESTIMATES=1`; tool models per-user, per-tool; LLM call timing daemon-wide (`LUNARWING_LLM_TIMINGS=0` disables); all in memory, lost on restart |
