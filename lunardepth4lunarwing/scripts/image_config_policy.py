@@ -52,7 +52,7 @@ def validate_config(document: dict) -> None:
     unexpected = set(env) - ALLOWED_ENV
     if unexpected:
         raise ValueError(f"unexpected image environment: {sorted(unexpected)}")
-    if env.get("LUNARDEPTH_IMAGE_REVISION") != "0472d115e5297093f249c222639431ba8ff0bb78":
+    if env.get("LUNARDEPTH_IMAGE_REVISION") != "ca905dfe5e998ebcac29f5c57b5ea04108498468":
         raise ValueError("LunarDepth source revision drifted")
     if env.get("LUNARDEPTH_PROFILE_SCHEMA_VERSION") != "1":
         raise ValueError("profile schema metadata drifted")

@@ -46,7 +46,7 @@ def source_policy(root: Path) -> None:
     dockerfile = (root / "Dockerfile").read_text()
     require(dockerfile, [
         "node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da",
-        "pnpm@11.7.0", "LUNARDEPTH_REF=0472d115e5297093f249c222639431ba8ff0bb78",
+        "pnpm@11.7.0", "LUNARDEPTH_REF=ca905dfe5e998ebcac29f5c57b5ea04108498468",
         "LUNARDEPTH_COMPATIBILITY_REF=17aef23e05cc074c8621d38d159d77d25cb348ca",
         "LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
         "LUNARDEPTH_PROFILE_SCHEMA_VERSION=1", "DEBIAN_SNAPSHOT=20261105T082236Z",
