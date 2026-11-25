@@ -2696,16 +2696,7 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
         return Err(denied("dynamic git submodule action cannot be authorized"));
     }
     match action.text.as_str() {
-        "add" => {
-            let positional: Vec<&Word> = operands
-                .iter()
-                .filter(|word| !word.text.starts_with('-'))
-                .collect();
-            let Some(url) = positional.first() else {
-                return Ok(());
-            };
-            preflight.read_remote(url)
-        }
+        "add" => authorize_submodule_add(operands, preflight),
         "foreach" => authorize_submodule_foreach(operands, preflight, depth),
         "status" | "summary" => Ok(()),
         "update" => Err(denied(
@@ -2720,6 +2711,65 @@ fn authorize_submodule(args: &[Word], preflight: Preflight<'_>, depth: usize) ->
             "unsupported git submodule action; use add, foreach, status or summary",
         )),
     }
+}
+
+/// The porcelain stops parsing options at the repository operand. The helper
+/// receives the remaining operands after its own `--` marker.
+fn authorize_submodule_add(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-b",
+        "--branch",
+        "--name",
+        "--reference",
+        "--ref-format",
+        "--depth",
+    ];
+    let mut args = args.iter();
+    let repository = loop {
+        let Some(arg) = args.next() else {
+            break None;
+        };
+        let word = arg.text.as_str();
+        if arg.dynamic {
+            return Err(denied(
+                "dynamic git submodule add arguments cannot be authorized",
+            ));
+        }
+        match word {
+            "--" => break args.next(),
+            "-f" | "--force" | "-q" | "--quiet" | "--progress" | "--dissociate" => {}
+            _ if VALUE_OPTIONS.contains(&word) => {
+                if args.next().is_none_or(|value| {
+                    value.dynamic || value.text.is_empty() || value.text.starts_with('-')
+                }) {
+                    return Err(denied("git submodule add option requires a literal value"));
+                }
+            }
+            _ if word.starts_with("-b")
+                || (word.starts_with("--")
+                    && word.split_once('=').is_some_and(|(key, value)| {
+                        VALUE_OPTIONS.contains(&key) && !value.is_empty()
+                    })) => {}
+            _ if word.starts_with('-') => {
+                return Err(denied("unsupported option in git submodule add"));
+            }
+            _ => break Some(arg),
+        }
+    };
+    let Some(repository) = repository else {
+        return Err(denied("git submodule add requires an explicit repository"));
+    };
+    // The repository is a URL or path. A grant name alone is not a remote
+    // lookup in this command and can resolve as a relative path instead.
+    if let Some(grant) = preflight.grant {
+        if repository.dynamic {
+            return Err(denied(
+                "dynamic git submodule add repository cannot be authorized",
+            ));
+        }
+        return authorize_literal_remote(&repository.text, grant);
+    }
+    preflight.read_remote(repository)
 }
 
 /// Accept only known read options; do not guess the arity of an abbreviation,
@@ -2787,7 +2837,11 @@ fn authorize_url_or_name(word: &Word, grant: Option<&GitGrantAuthorization>) -> 
     if grant.remote_by_name(&word.text).is_some() {
         return Ok(());
     }
-    let canonical = canonicalize_command_url(&word.text)?;
+    authorize_literal_remote(&word.text, grant)
+}
+
+fn authorize_literal_remote(raw: &str, grant: &GitGrantAuthorization) -> Result<()> {
+    let canonical = canonicalize_command_url(raw)?;
     if grant
         .remotes
         .iter()
@@ -3143,6 +3197,9 @@ mod tests {
             "git submodule -q sync --recursive",
             "git submodule init",
             "git submodule set-url deps/fixture file:///workspace/remotes/origin.git",
+            "git submodule deinit -f deps/fixture",
+            "git submodule absorbgitdirs",
+            "git submodule set-branch -b main deps/fixture",
             "git submodule unknown-action",
             "git submodule \"$action\"",
         ] {
@@ -3174,6 +3231,58 @@ mod tests {
             matches!(result, Err(SandboxError::CapabilityDenied { .. })),
             "{command}: {result:?}"
         );
+    }
+
+    #[test]
+    fn submodule_add_checks_the_repository_after_its_options() {
+        let (_temp, grant) = workspace_with_remote();
+        let granted = "file:///workspace/remotes/origin.git";
+        let ungranted = "file:///workspace/remotes/other.git";
+        for options in [
+            "",
+            "-b origin",
+            "-borigin",
+            "--branch origin",
+            "--branch=origin",
+            "--name origin",
+            "--name=origin",
+            "--reference origin",
+            "--reference=origin",
+            "--ref-format sha1",
+            "--ref-format=sha1",
+            "--depth 1",
+            "--depth=1",
+            "-q -b origin --",
+            "--quiet -f --progress --dissociate --",
+        ] {
+            let prefix = format!("git submodule add {options}");
+            let command = format!("{prefix} {granted} deps/fixture");
+            check_granted(&command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+            let command = format!("{prefix} {ungranted} deps/fixture");
+            let error = check_granted(&command, &grant).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not in this tenant's host git grant"),
+                "{command}: {error}"
+            );
+        }
+        for args in [
+            format!("--bogus {granted}"),
+            format!("--branch= {granted}"),
+            format!("-b \"$BRANCH\" {granted}"),
+            "--name".to_string(),
+            "--".to_string(),
+            "-- \"$REPOSITORY\"".to_string(),
+            "origin deps/fixture".to_string(),
+        ] {
+            let command = format!("git submodule add {args}");
+            let result = check_granted(&command, &grant);
+            assert!(
+                matches!(result, Err(SandboxError::CapabilityDenied { .. })),
+                "{command}: {result:?}"
+            );
+        }
     }
 
     #[test]
