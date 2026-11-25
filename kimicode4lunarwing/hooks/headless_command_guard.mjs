@@ -1775,6 +1775,20 @@ function bashWord(text, from) {
       i += 2;
       continue;
     }
+    // A redirection is not a word: `git 2>/dev/null reset` reads `reset` as
+    // the verb, and `rm 2>&1 -rf /x` reads `-rf` and `/x` (WI#889). The
+    // scan's quote state says where the operator and its target end. At a
+    // word start the token also carries its `[n]`/`{varname}` descriptor
+    // (`2>/dev/null`), which belongs to the redirection, not to a word. The
+    // test comes before the separator one because `&>f` starts with `&`.
+    if (levels.length === 1) {
+      const skip = word.length === 0 ? redirectTokenSpan(text, i)?.end ?? null
+        : redirectionSkip(text, i);
+      if (skip !== null) {
+        i = skip;
+        continue;
+      }
+    }
     if (ch === " " || ch === "\t" || isClauseTerminator(ch)) {
       // A separator inside a substitution body is part of the word the
       // substitution sits in; only the outermost level ends it.
@@ -1782,16 +1796,6 @@ function bashWord(text, from) {
       word += ch;
       i++;
       continue;
-    }
-    // A redirection is not a word: `git 2>/dev/null reset` reads `reset` as
-    // the verb, and `rm 2>&1 -rf /x` reads `-rf` and `/x` (WI#889). The
-    // scan's quote state says where the operator and its target end.
-    if (levels.length === 1) {
-      const skip = redirectionSkip(text, i);
-      if (skip !== null) {
-        i = skip;
-        continue;
-      }
     }
     const opener = openingQuote(text, i);
     if (opener !== "") {
@@ -1833,9 +1837,16 @@ function gitVerb(text, from) {
   let i = from;
   while (i < text.length) {
     while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const start = i;
     const { word, end } = bashWord(text, i);
     i = end;
-    if (word.length === 0) break;
+    if (word.length === 0) {
+      // A redirection standing where the verb would be is not the verb
+      // (`git 2>/dev/null reset --hard`): the word reader steps over it, so
+      // the walk continues at the word after it (WI#889).
+      if (end > start) continue;
+      break;
+    }
     if (!word.startsWith("-")) return { verb: word, after: i };
     if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb. It is read as one
