@@ -274,6 +274,21 @@ skipped ahead of it. `git submodule--helper` — the program behind
 `git submodule` — is read like `git submodule`: its `foreach` body is
 scanned with the helper's own option rules (unambiguous long-option
 abbreviations included), and its other subcommands are refused.
+`git for-each-repo` runs the words after its options as a git command in each
+repository its config key lists, so that operand is read as a subcommand; a
+key the scan cannot see (one not set by a literal `-c` override, or set by
+`--config-env`) is refused, as an alias is.
+Git dispatches on the basename of `argv[0]`, and `env -a`/`--argv0` and
+`exec -a` set it without changing the file that runs, so an argv[0] whose
+basename is `git` or `git-<verb>` decides the program: `env -a git-push git -f
+origin master` is read as `git push -f`. An argv[0] the scan cannot read (an
+expansion, a glob) is refused when the program run is git, and one that names
+a git program the scan does not read is refused rather than read as plain git.
+An unquoted glob (`*`, `?`, `[...]`) in a command word, or in an unread
+command's tail, is refused when the pattern could expand to `git`, a
+`git-<verb>` program, or a program under a `git-core` directory. The pattern
+is matched against those names, not the filesystem, so `/usr/lib/git-core/*.txt`
+is ordinary data and `…/git-c?re/git-pu?h` is not.
 It also refuses in-command configuration that would change what a later word
 means: `-c alias.*`, `-c include.*` and `-c includeIf.*` (which can define an
 alias or rewrite a remote), the redirecting `remote.*`, `url.*`,
