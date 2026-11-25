@@ -3366,6 +3366,7 @@ function checkFindExecListeners(words, start, depth) {
 // reader has already unquoted; every body gets the full body rule set
 // (`checkShellBody`, WI#874). The launcher is one table entry, not a new
 // rule, so the next such launcher is one entry as well.
+//
 // util-linux `flock --help` (2.42.4): its value options, stepped over before
 // the lock file. `-c`/`--command` is not one of them — flock checks for that
 // literal word *after* the file and runs its value through `sh` — so
