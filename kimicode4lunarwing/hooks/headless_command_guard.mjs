@@ -3014,6 +3014,14 @@ function skipCommandPrefix(words, i) {
       i++;
     } else if (word === "function") {
       i += 2;
+    } else if (word === "case") {
+      // `case WORD in` heads a branch list; the branch runs after its pattern.
+      const at = words.indexOf("in", i + 1);
+      i = at === -1 ? words.length : at + 1;
+    } else if (/\)$/.test(word) && !word.startsWith("$") && i + 1 < words.length && redirectAt(words, i + 1) === null) {
+      // A case pattern (`1)`, `(a)`): after a subshell's own `)` only a
+      // redirection may follow, so a word after it means a branch command.
+      i++;
     } else {
       const redirect = redirectAt(words, i);
       if (redirect === null) return i;
@@ -3116,7 +3124,7 @@ function commandPosition(words) {
  * steps over it, as `listenerShellBody` does.
  */
 function shellInvocation(args) {
-  const run = { file: undefined, command: undefined, stdin: false, inputs: [], positionals: [] };
+  const run = { file: undefined, command: undefined, stdin: false, inputs: [], positionals: [], rcfiles: [] };
   let options = true;
   let commandMode = false;
   for (let i = 0; i < args.length; i++) {
@@ -3130,7 +3138,11 @@ function shellInvocation(args) {
     if (options && (word === "--" || word === "-")) {
       options = false;
     } else if (options && SHELL_VALUE_OPTIONS.has(word)) {
+      // `--rcfile`/`--init-file` name a file the shell sources.
+      if (word === "--rcfile" || word === "--init-file") run.rcfiles.push(args[i + 1]);
       i++;
+    } else if (options && /^--(?:rcfile|init-file)=/.test(word)) {
+      run.rcfiles.push(word.slice(word.indexOf("=") + 1));
     } else if (options && /^[-+]./.test(word)) {
       if (/^-[a-zA-Z]*c/.test(word)) commandMode = true;
       if (/^-[a-zA-Z]*s/.test(word)) run.stdin = true;
@@ -3244,8 +3256,13 @@ function stageWordsWithRedirects(stage) {
   for (const { target, operator } of redirectScan(stage).targets) {
     const bare = stripShellQuotes(target);
     if ((operator === ">&" || operator === "<&") && /^(?:\d+-?|-)$/.test(bare)) continue;
-    extra.push(operator === ">&" || operator === "<>" ? ">" : operator, bare);
+    // The readers know `>`, `>>` and `<`: `&>`, `>|`, `>&` and `<>` write
+    // like `>`, `&>>` like `>>`, and `<&` with a file reads like `<`.
+    const spelled = { "&>": ">", ">|": ">", ">&": ">", "<>": ">", "&>>": ">>", "<&": "<" }[operator] ?? operator;
+    extra.push(spelled, bare);
   }
+  // A here-string is the program's input text (`bash <<< "$x"`).
+  for (const text of redirectScan(stage).hereStrings) extra.push("<<<", stripShellQuotes(text));
   return extra.length === 0 ? read : [...read, ...extra];
 }
 
@@ -3650,11 +3667,30 @@ function addReadNames(words, position, filled) {
   for (const each of names) if (each !== undefined) filled.add(each);
 }
 
-/** True when a word expands a variable a decode or fetch filled. */
+const filledLengthCache = new WeakMap();
+
+/** The distinct lengths of the filled names, kept while the set does not grow. */
+function filledLengths(filled) {
+  const cached = filledLengthCache.get(filled);
+  if (cached !== undefined && cached.size === filled.size) return cached.lengths;
+  const lengths = [...new Set([...filled].map((name) => name.length))];
+  filledLengthCache.set(filled, { size: filled.size, lengths });
+  return lengths;
+}
+
+/**
+ * True when a word expands a variable a decode or fetch filled. The words
+ * have their quotes removed, so `"$x"_` reads as `$x_`: a filled name that
+ * starts the expanded name counts, as the head's substring reading did.
+ */
 function refsFilled(word, filled) {
   if (filled.size === 0 || !word.includes("$")) return false;
   for (const match of word.matchAll(/\$\{?([A-Za-z_]\w*)/g)) {
-    if (filled.has(match[1])) return true;
+    const name = match[1];
+    if (filled.has(name)) return true;
+    for (const length of filledLengths(filled)) {
+      if (length < name.length && filled.has(name.slice(0, length))) return true;
+    }
   }
   return false;
 }
@@ -3777,6 +3813,9 @@ function stageRunReason({ stage, words, position }, ctx, feed, depth) {
   if (position.index === -1) return null;
   const word = words[position.index];
   if (refsFilled(word, ctx.filled)) return ASSIGNED_RUN_REASON;
+  // A path is the file it names, whatever builtin or interpreter its last
+  // component spells (`/tmp/eval`, `/tmp/python3`).
+  if (word.includes("/") && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
   const name = commandBasename(word);
   const { operands } = operandWords(words.slice(position.index + 1));
   // A `<` anywhere in the simple command feeds it (`< f sh`).
@@ -3792,11 +3831,7 @@ function stageRunReason({ stage, words, position }, ctx, feed, depth) {
   let text;
   if (SHELL_NAME.test(name)) {
     const run = shellInvocation(words.slice(position.index + 1));
-    if (runsWrittenPath(run.file, true, ctx)) return WRITTEN_RUN_REASON;
-    // A `-c` string runs its positional parameters as easily as its text.
-    if (run.command !== undefined && run.positionals.some((each) => namesWritten(each, ctx))) {
-      return WRITTEN_RUN_REASON;
-    }
+    if (shellRunsWritten(run, ctx, false)) return WRITTEN_RUN_REASON;
     text = run.command;
     readsInput = run.stdin || position.xargs;
     runsText = run.file === undefined || run.file.includes("$?");
@@ -3823,10 +3858,21 @@ function stageRunReason({ stage, words, position }, ctx, feed, depth) {
     // stage is read with its own operand. `.`, `source` and `eval` are shell
     // builtins no external launcher starts, so as arguments (`jq .`,
     // `tar -C .`) they are not runs.
+    // It gets the reading it gets at the command position: its operand, an
+    // rc file, its `<` input (`flock l sh < f`, `ssh h bash -s < f`), its
+    // `-c` text and that text's positional parameters. Only an exact written
+    // name counts here, as `grep bash f` may be no run at all.
     for (let k = position.index + 1; k < words.length; k++) {
       if (!SHELL_NAME.test(commandBasename(words[k]))) continue;
       const run = shellInvocation(words.slice(k + 1));
-      if (run.file !== undefined && namesWritten(run.file, ctx)) return WRITTEN_RUN_REASON;
+      if (shellRunsWritten(run, ctx, true)) return WRITTEN_RUN_REASON;
+      if (run.stdin && inputs.some((input) => input !== undefined && namesWritten(input, ctx))) {
+        return WRITTEN_RUN_REASON;
+      }
+      if (run.command !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
+        const inner = runsInPipelines(readPipelines(run.command), ctx, depth + 1);
+        if (inner) return inner;
+      }
     }
   }
   if (text !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
@@ -3840,12 +3886,25 @@ function stageRunReason({ stage, words, position }, ctx, feed, depth) {
   }
   if (runsText || word.includes("$?")) {
     for (const body of substitutionBodies(stage)) {
-      const bodyWords = stageWords(body);
+      // With its redirections: `$(< f)` reads f.
+      const bodyWords = stageWordsWithRedirects(body) ?? stageWords(body);
       if (bodyWords.some((each) => namesWritten(each, ctx))) return WRITTEN_RUN_REASON;
       if (bodyWords.some((each) => refsFilled(each, ctx.filled))) return ASSIGNED_RUN_REASON;
     }
   }
   return null;
+}
+
+/**
+ * True when a shell invocation runs a written file: its script operand, an
+ * `--rcfile`/`--init-file`, or a `-c` string's positional parameter
+ * (`bash -c '. "$0"' FILE`). `exact` counts only an exact written name.
+ */
+function shellRunsWritten(run, ctx, exact) {
+  const runs = (each) => each !== undefined &&
+    (exact ? namesWritten(each, ctx) : runsWrittenPath(each, true, ctx));
+  if (runs(run.file) || run.rcfiles.some(runs)) return true;
+  return run.command !== undefined && run.positionals.some((each) => namesWritten(each, ctx));
 }
 
 /** The first stage of the pipelines that runs decoded or fetched content, as `stageRunReason` reads it. */
@@ -3870,44 +3929,65 @@ function runsInPipelines(pipelines, ctx, depth) {
   return null;
 }
 
+/** True for an `&` that ends a list (`a & b`, `a && b`), not one in `&>`, `>&`, `<&` or `|&`. */
+function isListAmpersand(text, k) {
+  return text[k] === "&" && text[k + 1] !== ">" && !"<>|".includes(text[k - 1] ?? "");
+}
+
 /**
- * The here-documents of a command line (WI#892 AMR-2): the command line the
- * redirect belongs to, the body, and whether the delimiter is quoted. Only
- * the first here-document of a line is read; one that sits inside an earlier
- * body is that body's text.
+ * The here-documents of a command line (WI#892 AMR-2), every one of them in
+ * order: the list the redirect belongs to (up to its line's `;` or `&`, with
+ * its pipeline), the body, and whether the delimiter is quoted. The bodies of
+ * one line follow it in the order of their redirects; a `<<` inside a body is
+ * that body's text.
  */
 function* hereDocuments(text) {
   if (!text.includes("<<")) return;
   const { states } = quoteScan(text);
-  let from = 0;
-  for (let i = text.indexOf("<<"); i !== -1; i = text.indexOf("<<", i + 2)) {
-    if (i < from || text[i - 1] === "<" || text[i + 2] === "<" || states[i] !== SHELL_DATA) continue;
-    const redirect = heredocRedirect(text, i);
-    if (redirect === null) continue;
-    const lf = text.indexOf("\n", redirect.end);
-    if (lf === -1) continue;
-    const lines = [];
-    let next = lf + 1;
-    while (next < text.length) {
-      const newline = text.indexOf("\n", next);
-      const end = newline === -1 ? text.length : newline;
-      const line = text.slice(next, end);
-      next = end + 1;
-      if ((redirect.stripTabs ? line.replace(/^\t+/, "") : line) === redirect.delimiter) break;
-      lines.push(line);
+  const isRedirect = (i) => text[i - 1] !== "<" && text[i + 2] !== "<" && states[i] === SHELL_DATA;
+  let i = text.indexOf("<<");
+  while (i !== -1) {
+    const first = isRedirect(i) ? heredocRedirect(text, i) : null;
+    const lineEnd = first === null ? -1 : text.indexOf("\n", first.end);
+    if (lineEnd === -1) {
+      i = first === null ? text.indexOf("<<", i + 2) : -1;
+      continue;
     }
-    from = next;
-    let start = i;
-    // Back to the start of the line or of the list; the line before may end
-    // an earlier body, whose newline the scan marks as data.
-    while (start > 0 && text[start - 1] !== "\n" && !(";&".includes(text[start - 1]) && states[start - 1] === QUOTE_UNQUOTED)) {
-      start--;
+    // The line's list boundaries, read once.
+    const lineStart = text.lastIndexOf("\n", i - 1) + 1;
+    const cuts = [lineStart];
+    for (let k = lineStart; k < lineEnd; k++) {
+      if (states[k] !== QUOTE_UNQUOTED) continue;
+      if (text[k] === ";" || isListAmpersand(text, k)) cuts.push(k + 1);
     }
-    yield {
-      command: codeView(text.slice(start, lf)),
-      body: lines.join("\n"),
-      quoted: /['"\\]/.test(text.slice(i + 2, redirect.end)),
-    };
+    const redirects = [];
+    for (let j = i; j !== -1 && j < lineEnd; j = text.indexOf("<<", j + 2)) {
+      const redirect = isRedirect(j) ? heredocRedirect(text, j) : null;
+      if (redirect === null) continue;
+      redirects.push({ at: j, redirect });
+      j = redirect.end - 2;
+    }
+    let next = lineEnd + 1;
+    let cut = 0;
+    for (const { at, redirect } of redirects) {
+      const lines = [];
+      while (next < text.length) {
+        const newline = text.indexOf("\n", next);
+        const end = newline === -1 ? text.length : newline;
+        const line = text.slice(next, end);
+        next = end + 1;
+        if ((redirect.stripTabs ? line.replace(/^\t+/, "") : line) === redirect.delimiter) break;
+        lines.push(line);
+      }
+      while (cut + 1 < cuts.length && cuts[cut + 1] <= at) cut++;
+      const listEnd = cut + 1 < cuts.length ? cuts[cut + 1] - 1 : lineEnd;
+      yield {
+        command: codeView(text.slice(cuts[cut], listEnd)),
+        body: lines.join("\n"),
+        quoted: /['"\\]/.test(text.slice(at + 2, redirect.end)),
+      };
+    }
+    i = next < text.length ? text.indexOf("<<", next) : -1;
   }
 }
 
@@ -3981,11 +4061,19 @@ function writtenRunReason(text, depth = 0) {
     if (document.holds && (reader === "shell" || reader === "interpreter")) {
       return refsFilled(document.body, ctx.filled) ? ASSIGNED_RUN_REASON : SUBSTITUTION_SHELL_REASON;
     }
-    // The body is the shell's own script: a command line of its own, read
-    // with this line's writes and its own.
-    if ((reader === "shell" || reader === "mention") && depth < MAX_SHELL_BODY_DEPTH) {
-      const inner = checkSubstitutionCommand(document.body) ?? writtenRunReason(document.body, depth + 1) ??
-        runsInPipelines(readPipelines(document.body), ctx, depth + 1);
+    // The body may be a script (a shell reads it, or `ssh host <<EOF` runs
+    // it elsewhere): every body is read as a command line of its own, with
+    // this line's writes and its own. A decoded substitution at a body's
+    // command position counts only where a shell word reads the body, so a
+    // document that shows one (`cat > notes.md <<'EOF'`) stays data.
+    if (depth < MAX_SHELL_BODY_DEPTH) {
+      const shell = reader === "shell" || reader === "mention";
+      // A body no shell word reads gets this line's exact written names
+      // only: an unquoted `$x` or `$EDITOR` there is text a document shows.
+      const bodyCtx = shell ? ctx : { written: ctx.written, filled: new Set(), unknown: false, strong: false };
+      const inner = (shell ? checkSubstitutionCommand(document.body) : null) ??
+        writtenRunReason(document.body, depth + 1) ??
+        runsInPipelines(readPipelines(document.body), bodyCtx, depth + 1);
       if (inner) return inner;
     }
   }
@@ -3999,7 +4087,7 @@ function writtenRunReason(text, depth = 0) {
 // default name. A quote, a backslash or a brace list may spell a name the
 // stage reader resolves (`c\url`, `"cu"rl`, `c{u,}rl`), so it opens the gate
 // too; a brace without a comma expands to nothing new.
-const WRITE_RUN_SOURCE = /[$`'"\\]|curl|wget|fetch|nc|base64|xxd|openssl|zip|zcat|bz|xz|zstd|printf|perl|python|\btr\b|\brev\b/;
+const WRITE_RUN_SOURCE = new RegExp(`[$\`'"\\\\]|${[...FETCH_NAMES, ...DECODER_NAMES].join("|")}`);
 
 // The readers above run once per text view the evaluator builds, and most
 // views of a command are the same string; keep the last few verdicts.
