@@ -206,7 +206,7 @@ function stripRedirections(text, escapes = true) {
       const target = text.slice(span.start, span.end);
       if (operator === "<<<") hereStrings.add(target);
       else if (target.length > 0) {
-        targets.push({ target, operator, write: operator !== "<" && operator !== "<&" });
+        targets.push({ target, operator, fd: text.slice(start, i), write: operator !== "<" && operator !== "<&" });
       }
     }
     for (let j = start; j < end; j++) chars[j] = " ";
@@ -3010,7 +3010,9 @@ const FUNCTION_HEAD = /^[A-Za-z_][\w.:-]*\(\)\{?$/;
 function skipCommandPrefix(words, i) {
   while (i < words.length) {
     const word = words[i];
-    if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
+    if (word === "coproc") {
+      i += words[i + 2] === "{" ? 3 : 1;
+    } else if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
       i++;
     } else if (word === "function") {
       i += 2;
@@ -3273,6 +3275,7 @@ function readPipelines(text) {
     return {
       stage,
       words,
+      redirects: redirectScan(stage).targets,
       position: words === null ? null : commandPosition(words),
       content: words === null ? null : stageContent(words),
     };
@@ -3570,13 +3573,9 @@ const COPY_COMMANDS = new Set(["cp", "mv", "ln", "install", "rsync"]);
  * stage that reads a written file writes its redirect targets
  * (`cat x.sh > y.sh`). A directory destination keeps the written name.
  */
-function copiedNames(entry, ctx) {
-  if (!entry.words.some((word) => namesWritten(word, ctx))) return;
-  const out = { names: ctx.written, wrote: false, unknown: false };
-  stageWrites(entry.words, out);
-  const index = entry.position?.index ?? -1;
-  if (index < 0 || !COPY_COMMANDS.has(commandBasename(entry.words[index]))) return;
-  const paths = operandWords(entry.words.slice(index + 1)).operands.filter((word) => !word.startsWith("-"));
+function copiedNames(name, args, out) {
+  if (!COPY_COMMANDS.has(name)) return;
+  const paths = args.filter((word) => !word.startsWith("-"));
   if (paths.length > 1) addWritten(out, paths[paths.length - 1]);
 }
 
@@ -3629,7 +3628,9 @@ function stageWrites(words, out) {
 
 // The `NAME=` spellings at a word start, the assignments a later stage can
 // read back through `$NAME`.
-const ASSIGNMENT_AT = /(?:^|[\s;&|(])([A-Za-z_]\w*)=/g;
+const ASSIGNMENT_AT = /(?:^|[\s;&|(])([A-Za-z_]\w*)\+?=/g;
+const ASSIGNMENT_WORD = /^([A-Za-z_]\w*)\+?=([\s\S]*)$/;
+const DECLARATION_COMMANDS = new Set(["export", "declare", "local", "readonly", "typeset"]);
 // The `read` and `mapfile` options that take a value; `read -a` names the
 // array it fills.
 const READ_VALUE_LETTERS = { read: "dinNptu", mapfile: "dnOsuCc", readarray: "dnOsuCc" };
@@ -3695,6 +3696,15 @@ function refsFilled(word, filled) {
   return false;
 }
 
+const POSITIONAL_EXPANSION = /\$(?:[@*0-9]|\{(?:[@*]|\d+)(?=\W))/;
+const INDIRECT_EXPANSION = /\$\{![A-Za-z_]/;
+
+function refsHeld(word, ctx) {
+  return refsFilled(word, ctx.filled) ||
+    (ctx.positionals && POSITIONAL_EXPANSION.test(word)) ||
+    (ctx.sourced && INDIRECT_EXPANSION.test(word));
+}
+
 /** True when a word names, by its last component, a file a decode or fetch wrote. */
 function namesWritten(word, ctx) {
   const name = pathBasename(word);
@@ -3717,58 +3727,152 @@ function substitutionDecodesOrFetches(stage) {
   return false;
 }
 
-/**
- * What the decodes and fetches of one command line wrote and filled (WI#892
- * part 3, AMR-1). `written` holds the last components of the files a stage
- * fed by a decode or a fetch wrote: its own output (`curl -o`, `base64 -d >
- * f`, `gunzip f.gz`), the content piped into it (`… | base64 -d | dd of=f`),
- * a substitution's output (`echo "$(curl …)" > f`) or a filled variable
- * (`echo "$x" > f`). `filled` holds the variables such a stage assigns,
- * reads or prints into. `unknown` records a written file whose name cannot
- * be read, and `strong` any write at all; both count only for a stage whose
- * command word decodes or fetches, a stage fed by one through a pipe, or one
- * holding such a substitution — a word that merely mentions `curl` does not
- * put the line in doubt.
- */
-function writeRunContext(pipelines) {
-  const ctx = { written: new Set(), filled: new Set(), unknown: false, strong: false };
+function functionName(words) {
+  let i = 0;
+  while (COMPOUND_LEAD_WORDS.has(words[i])) i++;
+  if (words[i] === "function") return words[i + 1]?.replace(/\(\)\{?$/, "");
+  return FUNCTION_HEAD.test(words[i] ?? "") ? words[i].slice(0, words[i].indexOf("(")) : undefined;
+}
+
+function assignmentFacts(words, index, name) {
+  const prefix = words.slice(0, index < 0 ? words.length : index);
+  const declaration = DECLARATION_COMMANDS.has(name) ? words.slice(index + 1) : [];
+  const nameref = (name === "declare" || name === "typeset" || name === "local") &&
+    declaration.some((word) => /^-[a-zA-Z]*n[a-zA-Z]*$/.test(word));
+  return [...prefix, ...declaration].flatMap((word) => {
+    const match = ASSIGNMENT_WORD.exec(word);
+    if (match === null) return [];
+    const [, variable, value] = match;
+    return [{ variable, value, alias: nameref && /^[A-Za-z_]\w*$/.test(value) }];
+  });
+}
+
+function carryAssignments(assignments, ctx) {
+  for (const { variable, value, alias } of assignments) {
+    if (refsHeld(value, ctx) || (alias && ctx.filled.has(value))) ctx.filled.add(variable);
+    if (alias && ctx.filled.has(variable)) ctx.filled.add(value);
+  }
+}
+
+function descriptorFile(word) {
+  const path = stripShellQuotes(word ?? "");
+  if (path === "/dev/stdin") return "0";
+  return /^(?:\/dev\/fd\/|\/proc\/self\/fd\/)(\d+)$/.exec(path)?.[1];
+}
+
+/** `exec` retains these bindings; other redirections are local to their stage. */
+function inputDescriptors(entry, ctx) {
+  if (entry.redirects.length === 0) return ctx.descriptors;
+  const inputs = new Set(ctx.descriptors);
+  for (const { fd, operator, target } of entry.redirects) {
+    if (operator !== "<" && operator !== "<>" && operator !== "<&") continue;
+    const from = operator === "<&" ? /^(\d+)-?$/.exec(stripShellQuotes(target))?.[1] : descriptorFile(target);
+    const filled = from === undefined ? runsWrittenPath(target, true, ctx) : inputs.has(from);
+    if (filled) inputs.add(fd || "0");
+  }
+  return inputs;
+}
+
+function stageReadsWritten(entry, ctx) {
+  if (!ctx.strong && ctx.written.size === 0 && ctx.descriptors.size === 0) return false;
+  const dd = entry.name === "dd";
+  const descriptors = inputDescriptors(entry, ctx);
+  return descriptors.has("0") || entry.words.some((word) => {
+    const path = dd && word.startsWith("if=") ? word.slice(3) : word;
+    return namesWritten(path, ctx) || descriptors.has(descriptorFile(path));
+  });
+}
+
+function extractsArchive(name, args) {
+  if (name === "unzip") return !args.some((word) => /^-[a-zA-Z]*[ltpZ]/.test(word));
+  if (name !== "tar" && name !== "bsdtar") return false;
+  return args.some((word, i) => word === "--extract" || word === "--get" ||
+    ((i === 0 || word.startsWith("-")) && /^-?[a-zA-Z]*x[a-zA-Z]*$/.test(word)));
+}
+
+function seedContent(pipelines, ctx) {
   for (const pipeline of pipelines) {
     let carried = null;
     for (const entry of pipeline) {
-      if (entry.words === null) continue;
-      // The split words also read a decoder glued to its redirect
-      // (`base64 -d>/tmp/x.sh`).
-      const held = stageHeld(entry);
-      if (held !== null) {
-        for (const match of entry.stage.matchAll(ASSIGNMENT_AT)) ctx.filled.add(match[1]);
+      const { words, position, content, stage } = entry;
+      if (words === null) continue;
+      const { index } = position;
+      entry.name = index >= 0 ? commandBasename(words[index]) : "";
+      entry.args = index >= 0 ? operandWords(words.slice(index + 1)).operands : [];
+      entry.assignments = assignmentFacts(words, index, entry.name);
+      const declared = functionName(words);
+      if (declared !== undefined) ctx.functions.add(declared);
+      entry.held = stageHeld(entry);
+      entry.source = decodesOrFetchesAtCommand(words, position) ||
+        (SUBSTITUTION_MARKER.test(stage) && substitutionDecodesOrFetches(stage));
+      ctx.sourced ||= entry.source;
+      if (entry.held !== null) {
+        for (const match of stage.matchAll(ASSIGNMENT_AT)) ctx.filled.add(match[1]);
       }
-      if (held !== null || carried !== null) addReadNames(entry.words, entry.position, ctx.filled);
+      if (entry.held !== null || carried !== null) addReadNames(words, position, ctx.filled);
       entry.carried = carried;
-      entry.held = held;
-      if (entry.content.decode) carried = "decoded";
-      if (entry.content.fetch) carried = carried ?? "remote";
+      if (content.decode) carried = "decoded";
+      if (content.fetch) carried = carried ?? "remote";
     }
   }
-  for (const pipeline of pipelines) {
-    let variableFed = false;
-    for (const entry of pipeline) {
-      if (entry.words === null) continue;
-      const expands = entry.words.some((word) => refsFilled(word, ctx.filled));
-      const fed = entry.carried !== null || variableFed || expands;
-      if (fed || entry.held !== null) {
-        const out = { names: ctx.written, wrote: false, unknown: false };
-        stageWrites(entry.words, out);
-        if (out.wrote && (fed || decodesOrFetchesAtCommand(entry.words, entry.position) ||
-            substitutionDecodesOrFetches(entry.stage))) {
-          ctx.strong = true;
-          if (out.unknown) ctx.unknown = true;
-        }
-      } else if (ctx.written.size > 0) {
-        copiedNames(entry, ctx);
-      }
-      if (expands) variableFed = true;
-    }
+}
+
+function carryWritten(entry, ctx, fed, readsFile) {
+  const out = { names: ctx.written, wrote: false, unknown: false };
+  if (fed || readsFile || entry.held !== null) stageWrites(entry.words, out);
+  if (readsFile) copiedNames(entry.name, entry.args, out);
+  if ((fed || readsFile) && extractsArchive(entry.name, entry.args)) {
+    out.wrote = true;
+    out.unknown = true;
   }
+  if (out.wrote && (fed || readsFile || entry.source)) {
+    ctx.strong = true;
+    ctx.unknown ||= out.unknown;
+  }
+}
+
+function carryPipeline(pipeline, ctx) {
+  let stream = false;
+  for (const entry of pipeline) {
+    const { words, position, name, args } = entry;
+    if (words === null) continue;
+    carryAssignments(entry.assignments, ctx);
+    const expands = words.some((word) => refsHeld(word, ctx));
+    const readsFile = stageReadsWritten(entry, ctx);
+    const fed = entry.carried !== null || stream || expands;
+    if (fed || readsFile) addReadNames(words, position, ctx.filled);
+    if (entry.source || expands) {
+      ctx.positionals ||= (name === "set" && args[0] === "--") || ctx.functions.has(name);
+    }
+    carryWritten(entry, ctx, fed, readsFile);
+    if (position.index === -1 && words[skipCommandPrefix(words, 0)] === "exec") {
+      for (const fd of inputDescriptors(entry, ctx)) ctx.descriptors.add(fd);
+    }
+    stream ||= expands || readsFile || (entry.source && SUBSTITUTION_MARKER.test(entry.stage));
+  }
+}
+
+const MAX_CONTENT_PASSES = 32;
+const CONTENT_BUDGET_REASON = "cannot finish tracing decoded or fetched content; use simpler commands";
+
+function contentFactCount(ctx) {
+  return ctx.written.size + ctx.filled.size + ctx.descriptors.size +
+    Number(ctx.unknown) + Number(ctx.strong) + Number(ctx.positionals);
+}
+
+/** Facts only grow, including across backward references in function and loop bodies. */
+function writeRunContext(pipelines) {
+  const ctx = {
+    written: new Set(), filled: new Set(), descriptors: new Set(), functions: new Set(), executable: new Set(),
+    unknown: false, strong: false, sourced: false, positionals: false, exhausted: false,
+  };
+  seedContent(pipelines, ctx);
+  for (let pass = 0; pass < MAX_CONTENT_PASSES; pass++) {
+    const before = contentFactCount(ctx);
+    for (const pipeline of pipelines) carryPipeline(pipeline, ctx);
+    if (before === contentFactCount(ctx)) return ctx;
+  }
+  ctx.exhausted = true;
   return ctx;
 }
 
@@ -3795,104 +3899,184 @@ function runsWrittenPath(word, operand, ctx) {
   return ctx.unknown && (operand || bare.includes("/"));
 }
 
-/**
- * Why one stage runs decoded or fetched content, or null (WI#892 AMR-1,
- * AMR-2). The stage is read at its command position only, so `jq .
- * /tmp/a.json` and `tar -xzf f.tgz -C .` are not runs. A run is: a shell
- * given a written file, its `-c` string or its input; `source`/`.` given a
- * written file; `eval` of text that runs one; the written file as the
- * command word, also behind `exec`, `env`, `nohup`, `timeout N`, `nice`,
- * `setsid` and the other launchers; a filled variable as the command word;
- * a shell or a stdin interpreter fed a written file (`sh < f`, `cat f |
- * sh`, `xargs -a f sh -c`) or a filled variable (`echo "$x" | sh`); and a
- * shell text or a command word whose substitution reads a written file or a
- * filled variable (`sh -c "$(cat f)"`, `$(cat f)`).
- */
-function stageRunReason({ stage, words, position }, ctx, feed, depth) {
-  if (position.index === -2) return ctx.strong || ctx.filled.size > 0 ? WRITTEN_RUN_REASON : null;
-  if (position.index === -1) return null;
-  const word = words[position.index];
-  if (refsFilled(word, ctx.filled)) return ASSIGNED_RUN_REASON;
-  // A path is the file it names, whatever builtin or interpreter its last
-  // component spells (`/tmp/eval`, `/tmp/python3`).
-  if (word.includes("/") && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
-  const name = commandBasename(word);
-  const { operands } = operandWords(words.slice(position.index + 1));
-  // A `<` anywhere in the simple command feeds it (`< f sh`).
-  const { inputs } = operandWords(words);
-  inputs.push(...position.argFiles);
-  // An `xargs` in front hands the command its input as arguments, which a
-  // shell (`xargs sh -c`), `eval` or an interpreter runs.
-  let readsInput = false;
-  // Whether a substitution in the stage can be the program text: a shell's
-  // `-c` string or script operand (`bash <(cat f)`), what `eval` runs, or
-  // what a program reading its input is handed (`sh <<< "$(cat f)"`).
-  let runsText = false;
-  let text;
-  if (SHELL_NAME.test(name)) {
-    const run = shellInvocation(words.slice(position.index + 1));
-    if (shellRunsWritten(run, ctx, false)) return WRITTEN_RUN_REASON;
-    text = run.command;
-    readsInput = run.stdin || position.xargs;
-    runsText = run.file === undefined || run.file.includes("$?");
-  } else if (name === "source" || name === ".") {
-    const operand = operands[operands[0] === "--" ? 1 : 0];
-    if (operand !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(operand))) readsInput = true;
-    else if (runsWrittenPath(operand, true, ctx)) return WRITTEN_RUN_REASON;
-    readsInput ||= position.xargs;
-    runsText = readsInput || (operand ?? "").includes("$?");
-  } else if (name === "eval") {
-    text = operands.join(" ");
-    readsInput = position.xargs;
-    runsText = true;
-  } else if (STDIN_INTERPRETERS.has(name)) {
-    readsInput = position.xargs || interpreterStdinProgram(name, operands);
-    runsText = readsInput;
-  } else {
-    // A bare decoder or fetch name is the tool from PATH, not a file the
-    // same line saved under that name (`wget …/jq` then `jq`, but not `curl`).
-    const tool = !word.includes("/") && (FETCH_NAMES.has(name) || DECODER_NAMES.has(name));
-    if (!tool && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
-    // A launcher the reader does not know can still start a shell on a
-    // written file (`strace -f sh /tmp/x.sh`), so a shell word later in the
-    // stage is read with its own operand. `.`, `source` and `eval` are shell
-    // builtins no external launcher starts, so as arguments (`jq .`,
-    // `tar -C .`) they are not runs.
-    // It gets the reading it gets at the command position: its operand, an
-    // rc file, its `<` input (`flock l sh < f`, `ssh h bash -s < f`), its
-    // `-c` text and that text's positional parameters. Only an exact written
-    // name counts here, as `grep bash f` may be no run at all.
-    for (let k = position.index + 1; k < words.length; k++) {
-      if (!SHELL_NAME.test(commandBasename(words[k]))) continue;
-      const run = shellInvocation(words.slice(k + 1));
-      if (shellRunsWritten(run, ctx, true)) return WRITTEN_RUN_REASON;
-      if (run.stdin && inputs.some((input) => input !== undefined && namesWritten(input, ctx))) {
-        return WRITTEN_RUN_REASON;
-      }
-      if (run.command !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
-        const inner = runsInPipelines(readPipelines(run.command), ctx, depth + 1);
-        if (inner) return inner;
-      }
+const SCRIPT_INTERPRETER = new RegExp(`^(?:${ONE_LINER_NAMES}|php(?:\\d+(?:\\.\\d+)*)?)$`);
+const PHP_VALUE_OPTIONS = new Set(["-c", "-d", "-z", "--php-ini", "--define", "--zend-extension"]);
+
+function interpreterOption(word, flags, values) {
+  if (/^--(?:eval|print|run|file)(?:=|$)/.test(word)) {
+    return { kind: word.startsWith("--file") ? "file" : "code", value: word.split(/=(.*)/s)[1] };
+  }
+  if (word.startsWith("--")) return values.has(word) ? { kind: "option" } : null;
+  for (let i = 1; i < word.length; i++) {
+    const letter = word[i];
+    const value = word.slice(i + 1) || undefined;
+    if (flags.includes(letter)) return { kind: "code", value };
+    if (flags === "r" && letter === "f") return { kind: "file", value };
+    if (values.has(`-${letter}`)) return { kind: "option", value };
+  }
+  return null;
+}
+
+/** The code or file an interpreter runs, not the remaining script arguments. */
+function interpreterProgram(name, args) {
+  const php = name.startsWith("php");
+  const family = php ? "php" : interpreterFamily(name);
+  const flags = php ? "r" : EVAL_FLAG_LETTERS[family];
+  const values = php ? PHP_VALUE_OPTIONS : INTERPRETER_VALUE_OPTIONS[family];
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i];
+    if (word === "--") return { file: args[i + 1] };
+    if (!word.startsWith("-") || word === "-") return { file: word };
+    if (family === "python" && (word.startsWith("-m") || word === "--module")) break;
+    const option = interpreterOption(word, flags, values);
+    if (option === null) continue;
+    const value = option.value ?? args[++i];
+    if (option.kind !== "option") return { [option.kind]: value };
+  }
+  return {};
+}
+
+function trapAction(args) {
+  const action = args[args[0] === "--" ? 1 : 0];
+  return action && action !== "-" && !/^-[lp]+$/.test(action) ? action : undefined;
+}
+
+function nestedRunReason(text, ctx, depth) {
+  if (text === undefined || depth >= MAX_SHELL_BODY_DEPTH) return null;
+  return runsInPipelines(readPipelines(text), ctx, depth + 1);
+}
+
+function substitutionRunReason(stage, ctx, direct = false) {
+  for (const body of substitutionBodies(stage)) {
+    if (direct && heldContent(body) !== null) return SUBSTITUTION_SHELL_REASON;
+    // With its redirections: `$(< f)` reads f.
+    const words = stageWordsWithRedirects(body) ?? stageWords(body);
+    if (words.some((word) => namesWritten(word, ctx))) return WRITTEN_RUN_REASON;
+    if (words.some((word) => refsHeld(word, ctx))) return ASSIGNED_RUN_REASON;
+  }
+  return null;
+}
+
+function trapRunReason(entry, args, ctx, depth) {
+  const action = trapAction(args);
+  if (action === undefined) return null;
+  if (refsHeld(action, ctx)) return ASSIGNED_RUN_REASON;
+  if (action.includes("$?")) {
+    const reason = substitutionRunReason(entry.stage, ctx, true);
+    if (reason) return reason;
+  }
+  if (depth >= MAX_SHELL_BODY_DEPTH) return ctx.sourced ? CONTENT_BUDGET_REASON : null;
+  return nestedRunReason(action, ctx, depth) ?? checkSubstitutionCommand(action) ??
+    checkSubstitutionShell(action) ?? (WRITE_RUN_SOURCE.test(action) ? writtenRunReason(action, depth + 1) : null);
+}
+
+// Obvious data operands are not candidate programs. For an unmodelled
+// launcher, a path it may execute is not safe just because its name is new.
+const CONTENT_DATA_COMMANDS = new Set([
+  ...COPY_COMMANDS, ...DECODER_NAMES, ...FETCH_NAMES, "[", "[[", "test", ":", "echo", "cat", "tee", "dd",
+  "read", "mapfile", "readarray", "ls", "stat", "file", "wc", "grep", "rg", "sed", "awk", "head", "tail", "cut",
+  "sort", "uniq", "diff", "cmp", "jq", "chmod", "chown", "chgrp", "rm", "mkdir", "cd", "touch", "readlink",
+  "realpath", "tar", "bsdtar", "unzip", "git", "export", "declare", "typeset", "local", "readonly", "set",
+]);
+
+function findRunsWritten(args, ctx) {
+  if (ctx.written.size === 0 && !ctx.unknown) return false;
+  for (let i = 0; i < args.length; i++) {
+    if (!FIND_EXEC_ACTIONS.has(args[i])) continue;
+    const body = [];
+    for (i++; i < args.length && args[i] !== ";" && args[i] !== "+"; i++) body.push(args[i]);
+    const { index } = commandPosition(body);
+    if (index < 0) continue;
+    const name = commandBasename(body[index]);
+    if (body[index].includes("{}") || runsWrittenPath(body[index], false, ctx)) return true;
+    const takesProgram = SHELL_NAME.test(name) || SCRIPT_INTERPRETER.test(name) || !CONTENT_DATA_COMMANDS.has(name);
+    if (takesProgram && body.slice(index + 1).some((word) => word.includes("{}") || namesWritten(word, ctx))) {
+      return true;
     }
   }
-  if (text !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
-    const inner = runsInPipelines(readPipelines(text), ctx, depth + 1);
+  return false;
+}
+
+function maybeRunsOperand(name, args, ctx) {
+  if (name === "find") return findRunsWritten(args, ctx);
+  if (CONTENT_DATA_COMMANDS.has(name) || ctx.functions.has(name)) return false;
+  return args.some((word) => ctx.executable.has(pathBasename(word)) ||
+    (word.includes("/") && !word.startsWith("-") && runsWrittenPath(word, false, ctx)));
+}
+
+function unmodelledRunReason(words, start, ctx, inputs, depth) {
+  for (let k = start; k < words.length; k++) {
+    const name = commandBasename(words[k]);
+    if (!SHELL_NAME.test(name)) continue;
+    const run = shellInvocation(words.slice(k + 1));
+    if (shellRunsWritten(run, ctx, true)) return WRITTEN_RUN_REASON;
+    if (run.stdin && inputs.some((input) => input !== undefined && namesWritten(input, ctx))) return WRITTEN_RUN_REASON;
+    const inner = nestedRunReason(run.command, ctx, depth);
     if (inner) return inner;
   }
-  if (readsInput) {
-    if (inputs.some((input) => runsWrittenPath(input, true, ctx))) return WRITTEN_RUN_REASON;
+  return null;
+}
+
+/** Separate the program from ordinary argv for each command-position runner. */
+function stageProgram(name, args, shellArgs) {
+  if (SHELL_NAME.test(name)) {
+    const shell = shellInvocation(shellArgs);
+    return { file: shell.file, text: shell.command, stdin: shell.stdin, shell,
+      substitution: shell.file === undefined || shell.file.includes("$?") };
+  }
+  if (name === "source" || name === ".") {
+    const file = args[args[0] === "--" ? 1 : 0];
+    const stdin = file !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(file));
+    return { file: stdin ? undefined : file, stdin, substitution: stdin || file?.includes("$?") };
+  }
+  if (name === "eval") return { text: args.join(" "), substitution: true };
+  const stdin = STDIN_INTERPRETERS.has(name) && interpreterStdinProgram(name, args);
+  if (!SCRIPT_INTERPRETER.test(name)) return stdin ? { stdin, substitution: true } : null;
+  const { file, code } = interpreterProgram(name, args);
+  const script = STDIN_PROGRAM_FILES.has(file) ? undefined : file;
+  const direct = (code ?? script)?.includes("$?");
+  return { file: script, code, stdin, direct, substitution: stdin || direct };
+}
+
+function programRunReason(program, entry, ctx, feed, inputs, depth) {
+  const { file, code, shell, text, stdin, direct, substitution } = program;
+  const descriptors = inputDescriptors(entry, ctx);
+  if (shell && shellRunsWritten(shell, ctx, false)) return WRITTEN_RUN_REASON;
+  if (runsWrittenPath(file, true, ctx) || descriptors.has(descriptorFile(file))) return WRITTEN_RUN_REASON;
+  if (refsHeld(code ?? "", ctx) || refsHeld(file ?? "", ctx)) return ASSIGNED_RUN_REASON;
+  const inner = nestedRunReason(text, ctx, depth);
+  if (inner) return inner;
+  if (stdin || entry.position.xargs) {
+    if (descriptors.has("0") || inputs.some((input) => runsWrittenPath(input, true, ctx))) return WRITTEN_RUN_REASON;
     if (feed.variable) return ASSIGNED_RUN_REASON;
     if (feed.file || (ctx.unknown && feed.operand)) return WRITTEN_RUN_REASON;
   }
-  if (runsText || word.includes("$?")) {
-    for (const body of substitutionBodies(stage)) {
-      // With its redirections: `$(< f)` reads f.
-      const bodyWords = stageWordsWithRedirects(body) ?? stageWords(body);
-      if (bodyWords.some((each) => namesWritten(each, ctx))) return WRITTEN_RUN_REASON;
-      if (bodyWords.some((each) => refsFilled(each, ctx.filled))) return ASSIGNED_RUN_REASON;
-    }
+  return substitution ? substitutionRunReason(entry.stage, ctx, direct) : null;
+}
+
+function stageRunReason(entry, ctx, feed, depth) {
+  const { stage, words, position } = entry;
+  const { index } = position;
+  if (index === -2) return ctx.strong || ctx.filled.size > 0 ? WRITTEN_RUN_REASON : null;
+  if (index === -1) return null;
+  const word = words[index];
+  if (refsHeld(word, ctx) || (ctx.sourced && POSITIONAL_EXPANSION.test(word))) return ASSIGNED_RUN_REASON;
+  if (word.includes("/") && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+  const name = commandBasename(word);
+  const args = operandWords(words.slice(index + 1)).operands;
+  const { inputs } = operandWords(words);
+  inputs.push(...position.argFiles);
+  const program = stageProgram(name, args, words.slice(index + 1));
+  if (program) return programRunReason(program, entry, ctx, feed, inputs, depth);
+  if (name === "trap") {
+    const reason = trapRunReason(entry, args, ctx, depth);
+    if (reason) return reason;
   }
-  return null;
+  const tool = !word.includes("/") && (FETCH_NAMES.has(name) || DECODER_NAMES.has(name));
+  if (!tool && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+  if (maybeRunsOperand(name, args, ctx)) return WRITTEN_RUN_REASON;
+  return unmodelledRunReason(words, index + 1, ctx, inputs, depth) ??
+    (word.includes("$?") ? substitutionRunReason(stage, ctx) : null);
 }
 
 /**
@@ -3907,23 +4091,49 @@ function shellRunsWritten(run, ctx, exact) {
   return run.command !== undefined && run.positionals.some((each) => namesWritten(each, ctx));
 }
 
-/** The first stage of the pipelines that runs decoded or fetched content, as `stageRunReason` reads it. */
+function loopRunsSubstitution(pipelines) {
+  const loops = [];
+  for (const read of pipelines.flat()) {
+    if (read.words === null) continue;
+    const opener = compoundOpener(read.stage);
+    if (COMPOUND_CLOSERS.get(opener) === "done") loops.push(false);
+    if (loops.length === 0) continue;
+    if (read.words[0] === "done") {
+      const runs = loops.pop();
+      if (runs && read.redirects.some(({ operator, target }) => operator === "<" && target.startsWith("<(") &&
+        substitutionDecodesOrFetches(target))) return true;
+      if (runs && loops.length > 0) loops[loops.length - 1] = true;
+    } else if (read.position.index >= 0 && runsShellTextAt(read.words, read.position.index)) {
+      loops[loops.length - 1] = true;
+    }
+  }
+  return false;
+}
+
+function writtenExecutables(pipelines, ctx) {
+  for (const { name, args } of pipelines.flat()) {
+    if (name !== "chmod" || !args.some((word) => /^[ugoa]*\+[rwxXst]*x/.test(word))) continue;
+    for (const word of args) {
+      if (runsWrittenPath(word, false, ctx)) ctx.executable.add(pathBasename(word));
+    }
+  }
+}
+
+/** The first stage of the pipelines that runs decoded or fetched content. */
 function runsInPipelines(pipelines, ctx, depth) {
   for (const pipeline of pipelines) {
-    // What the stages before this one hand it through the pipe.
     const feed = { file: false, variable: false, operand: false };
     for (const entry of pipeline) {
       const { words, position } = entry;
       if (words === null) continue;
-      const expands = words.some((word) => refsFilled(word, ctx.filled));
-      // A shell, `eval` or `source` word in the stage that also expands a
-      // filled variable (`sh -c "$x"`, `bash <<< "$x"`), read at any word.
+      const expands = words.some((word) => refsHeld(word, ctx));
+      // Retain WI#892's word-level shell reading, including unknown launchers.
       if (expands && words.some((_word, index) => runsShellTextAt(words, index))) return ASSIGNED_RUN_REASON;
       const reason = stageRunReason(entry, ctx, feed, depth);
       if (reason) return reason;
-      if (expands) feed.variable = true;
-      if (words.some((word) => namesWritten(word, ctx))) feed.file = true;
-      if (position.index >= 0 && position.index + 1 < words.length) feed.operand = true;
+      feed.variable ||= expands;
+      feed.file ||= stageReadsWritten(entry, ctx);
+      feed.operand ||= position.index >= 0 && position.index + 1 < words.length;
     }
   }
   return null;
@@ -4037,6 +4247,8 @@ function hereDocumentHolds(body, ctx) {
 function writtenRunReason(text, depth = 0) {
   const pipelines = readPipelines(text);
   const ctx = writeRunContext(pipelines);
+  if (ctx.exhausted) return CONTENT_BUDGET_REASON;
+  if (ctx.sourced && loopRunsSubstitution(pipelines)) return SUBSTITUTION_SHELL_REASON;
   // An unquoted here-document expands its body first, so a decode, a fetch
   // or a filled variable there is the content its command writes
   // (`cat > f <<EOF` / `$(curl …)` / `EOF`) or runs.
@@ -4054,6 +4266,7 @@ function writtenRunReason(text, depth = 0) {
       if (out.unknown) ctx.unknown = true;
     }
   }
+  writtenExecutables(pipelines, ctx);
   const reason = runsInPipelines(pipelines, ctx, depth);
   if (reason) return reason;
   for (const document of documents) {
@@ -4070,7 +4283,10 @@ function writtenRunReason(text, depth = 0) {
       const shell = reader === "shell" || reader === "mention";
       // A body no shell word reads gets this line's exact written names
       // only: an unquoted `$x` or `$EDITOR` there is text a document shows.
-      const bodyCtx = shell ? ctx : { written: ctx.written, filled: new Set(), unknown: false, strong: false };
+      const bodyCtx = shell ? ctx : {
+        ...ctx, filled: new Set(), descriptors: new Set(), executable: new Set(),
+        unknown: false, strong: false, sourced: false, positionals: false,
+      };
       const inner = (shell ? checkSubstitutionCommand(document.body) : null) ??
         writtenRunReason(document.body, depth + 1) ??
         runsInPipelines(readPipelines(document.body), bodyCtx, depth + 1);
