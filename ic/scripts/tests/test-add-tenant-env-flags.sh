@@ -342,13 +342,16 @@ SANDBOX_GIT_REMOTES="origin=http://git.lan:3000/org/repo.git,mirror=http://git.l
 SANDBOX_GIT_WRITE_REMOTES=origin
 SANDBOX_GIT_CREDENTIALS="origin=SANDBOX_GIT_TOKEN_ORIGIN, mirror = SANDBOX_GIT_TOKEN_MIRROR ,bad=SANDBOX_GIT_TOKEN_bad-name,dup=SANDBOX_GIT_TOKEN_ORIGIN,llm=LLM_MODEL,missing=SANDBOX_GIT_TOKEN_UNSET,z=SANDBOX_GIT_TOKEN_REFDEL,w=EXTRA_DROPPED_KEY,ext=EXTRA_DAEMON_SECRET"
 SANDBOX_GIT_TOKEN_ORIGIN="Basic b3JpZ2luOnNlY3JldA=="
+SANDBOX_GIT_TOKEN_bad-name=invalid-suffix-fixture-value
+SANDBOX_GIT_TOKEN_REFDEL=ungranted-remote-fixture-value
 SANDBOX_GIT_ALLOW_REF_DELETION=true
 EXTRA_DROPPED_KEY=resurrected
 EXTRA_DAEMON_SECRET=unrelated-daemon-value
 EOF
 printf '%s\n' 'SANDBOX_GIT_TOKEN_MIRROR="Bearer mirror \"quoted\" \\ token"' >>"$MT_FIXTURE/env/lunarwing.env"
+git_render_log="$MT_FIXTURE/git-render.log"
 for git_rerun in first second; do
-  write_tenant_lunarwing_env fixture-tenant
+  write_tenant_lunarwing_env fixture-tenant >"$git_render_log" 2>&1
   assert_eq "$git_rerun rerun preserves SANDBOX_GIT_REMOTES" "$(envval SANDBOX_GIT_REMOTES)" \
     "origin=http://git.lan:3000/org/repo.git,mirror=http://git.lan/org/mirror.git,bad=http://git.lan/org/bad.git,dup=http://git.lan/org/dup.git,llm=http://git.lan/org/llm.git,missing=http://git.lan/org/missing.git,ext=http://git.lan/org/ext.git"
   assert_eq "$git_rerun rerun preserves SANDBOX_GIT_WRITE_REMOTES" \
@@ -371,15 +374,24 @@ for git_rerun in first second; do
   # the render does not carry its value either.
   assert_eq "$git_rerun rerun does not carry a binding outside SANDBOX_GIT_TOKEN_*" \
     "$(grep -c '^EXTRA_DAEMON_SECRET=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun names the granted remote and out-of-prefix variable" \
+    "$(grep -cF "remote 'ext' bound to 'EXTRA_DAEMON_SECRET'" "$git_render_log" || true)" "1"
+  assert_eq "$git_rerun rerun names the granted remote and invalid token suffix" \
+    "$(grep -cF "remote 'bad' bound to 'SANDBOX_GIT_TOKEN_bad-name'" "$git_render_log" || true)" "1"
+  assert_eq "$git_rerun rerun does not print skipped credential values" \
+    "$(grep -cE 'unrelated-daemon-value|invalid-suffix-fixture-value' "$git_render_log" || true)" "0"
   # F6: only a remote SANDBOX_GIT_REMOTES grants can carry a variable.
-  assert_eq "$git_rerun rerun does not carry a variable bound to an ungranted remote (z)" \
-    "$(grep -c '^SANDBOX_GIT_ALLOW_REF_DELETION=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  assert_eq "$git_rerun rerun does not carry a token bound to an ungranted remote (z)" \
+    "$(grep -c '^SANDBOX_GIT_TOKEN_REFDEL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
   assert_eq "$git_rerun rerun does not carry a variable bound to an ungranted remote (w)" \
     "$(grep -c '^EXTRA_DROPPED_KEY=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
-  # Three grant settings plus the two bound SANDBOX_GIT_TOKEN_* variables
-  # (WI#876 names them under the same prefix).
-  assert_eq "$git_rerun rerun renders the git grant keys once each" \
-    "$(grep -cE '^(SANDBOX_GIT_REMOTES|SANDBOX_GIT_WRITE_REMOTES|SANDBOX_GIT_CREDENTIALS|SANDBOX_GIT_TOKEN_ORIGIN|SANDBOX_GIT_TOKEN_MIRROR)=' "$MT_FIXTURE/env/lunarwing.env")" "5"
+  assert_eq "$git_rerun rerun does not warn about the invalid name for ungranted remote w" \
+    "$(grep -cF 'EXTRA_DROPPED_KEY' "$git_render_log" || true)" "0"
+  assert_eq "$git_rerun rerun does not carry the unsupported ref-deletion key" \
+    "$(grep -c '^SANDBOX_GIT_ALLOW_REF_DELETION=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+  # Count every git grant key: three settings and the two bound tokens.
+  assert_eq "$git_rerun rerun renders exactly five git grant keys" \
+    "$(grep -c '^SANDBOX_GIT_' "$MT_FIXTURE/env/lunarwing.env" || true)" "5"
 done
 
 echo "=== sandbox git grant refuses a value it cannot render (WI#860, ALM-3) ==="
@@ -387,6 +399,7 @@ echo "=== sandbox git grant refuses a value it cannot render (WI#860, ALM-3) ===
 # on one line. The render stops in the writer's own shell, names the variable
 # (never its value), and leaves lunarwing.env as it was.
 git_env="$MT_FIXTURE/env/lunarwing.env"
+sed -i 's/^SANDBOX_GIT_CREDENTIALS=.*/SANDBOX_GIT_CREDENTIALS=origin=SANDBOX_GIT_TOKEN_ORIGIN,mirror=SANDBOX_GIT_TOKEN_MIRROR/' "$git_env"
 for git_crlf_case in credential setting; do
   if [[ "$git_crlf_case" == credential ]]; then
     printf 'SANDBOX_GIT_TOKEN_ORIGIN="Basic Y3JsZjp0b2tlbg=="\r\n' >>"$git_env"

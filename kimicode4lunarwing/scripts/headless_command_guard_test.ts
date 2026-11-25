@@ -1479,10 +1479,13 @@ test("the decode-pipe stage reader fails closed past the depth bound (WI#885)", 
     assertBlocked(`echo aGk= | base64 -d | env env env env env ${interpreter}`, "decoded content piped")
   }
   assertBlocked("echo aGk= | env env env env env base64 -d | sh", "decoded content piped")
-  // The depth-4 spelling keeps its verdict, and a plain command behind the
-  // same prefix chain is still ordinary work.
+  assertBlocked('echo aGk= | base64 -d | env -S "env env env env sh"', "decoded content piped")
+  assertBlocked('echo aGk= | base64 -d | env env env env -S "env sh"', "decoded content piped")
+  // The depth-4 spelling keeps its verdict, while a plain command or no
+  // command at all behind the prefix chain stays allowed.
   assertBlocked("echo aGk= | base64 -d | env env env env sh", "decoded content piped")
   assertAllowed("echo hi | env env env env env cat")
+  assertAllowed("echo aGk= | base64 -d | env env env env env")
 })
 
 test("escaped quotes and every Perl deletion operand are read (WI#840)", () => {

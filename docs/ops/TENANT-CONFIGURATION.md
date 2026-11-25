@@ -689,9 +689,11 @@ and refuses every ref deletion; protect branches on the forge against force
 pushes. A binding's variable must be named `SANDBOX_GIT_TOKEN_*` (WI#876):
 the daemon refuses any other name at load, so a binding cannot send an
 unrelated daemon variable such as `LLM_API_KEY` as the remote's
-`Authorization` header, and mt-admin carries only names in that shape on
-re-render. The variable must also be set; a variable the renderer writes
-itself (for example `LLM_MODEL`) keeps its rendered line.
+`Authorization` header. On re-render, mt-admin carries only variables with
+valid names bound to granted remotes. For a granted remote with an invalid
+variable name, it warns with the remote and variable name, never the value.
+The variable must also be set; a variable the renderer writes itself (for
+example `LLM_MODEL`) keeps its rendered line.
 
 `SANDBOX_GIT_PRIVATE_REMOTES` names granted remotes whose URL host is a LAN
 (RFC 1918) or overlay (CGNAT `100.64.0.0/10`, IPv6 ULA) IP literal; a host
