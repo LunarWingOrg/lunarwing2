@@ -206,7 +206,7 @@ function stripRedirections(text, escapes = true) {
       const target = text.slice(span.start, span.end);
       if (operator === "<<<") hereStrings.add(target);
       else if (target.length > 0) {
-        targets.push({ target, write: operator !== "<" && operator !== "<&" });
+        targets.push({ target, operator, write: operator !== "<" && operator !== "<&" });
       }
     }
     for (let j = start; j < end; j++) chars[j] = " ";
@@ -1589,7 +1589,9 @@ function checkRawShapes(text) {
     checkMoveAndTarDeletion(text) ??
     checkInterpreterDeletion(text) ??
     checkDeviceWrites(text) ??
-    checkDecodedPipe(text);
+    checkDecodedPipe(text) ??
+    checkSubstitutionShell(text) ??
+    checkWrittenThenRun(text);
 }
 
 const SYSTEM_ROOTS = ["/etc", "/usr", "/var", "/home", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/srv"];
@@ -2819,26 +2821,1306 @@ function commandLists(text) {
   });
 }
 
-/** Deny a decode command piped into a shell or interpreter (WI#826, WI#832). */
+/**
+ * The pipeline stages of one list. `|&` pipes stdout and stderr into the next
+ * stage, so it ends a stage exactly as `|` does (WI#889, WI#892). A `|` that
+ * follows `>` is the noclobber redirect `>|`, not a bar, so it stays inside
+ * the stage that writes the file.
+ */
+function pipelineStages(list) {
+  const stages = [];
+  let start = 0;
+  for (const i of unquotedOffsets(list)) {
+    if (list[i] !== "|" || list[i - 1] === ">") continue;
+    if (i < start) continue;
+    stages.push(list.slice(start, i));
+    start = i + (list[i + 1] === "&" ? 2 : 1);
+  }
+  stages.push(list.slice(start));
+  return stages;
+}
+
+// The commands that read content from the network (WI#826). A word property,
+// like the decoder and interpreter readings, so a launcher cannot hide one.
+const FETCH_NAMES = new Set(["curl", "wget", "fetch", "nc", "ncat", "netcat"]);
+
+/**
+ * The readings of one stage's words, computed once so the checks below share a
+ * single word scan: whether it decodes, whether it fetches, whether it runs
+ * its stdin as a program, and whether its command word cannot be read. A stage
+ * whose words cannot be read carries every reading, as
+ * `isDecodeStage`/`isInterpreterStage` do (WI#883, WI#885).
+ */
+function stageContent(words) {
+  if (words === null) {
+    return { decode: true, fetch: true, stdin: true, unverifiable: true };
+  }
+  return {
+    decode: words.some((_word, index) => decoderAt(words, index)),
+    fetch: words.some((word) => FETCH_NAMES.has(commandBasename(listenerWord(word)))),
+    stdin: words.some((_word, index) => interpreterAt(words, index)),
+    unverifiable: commandWordUnverifiable(words),
+  };
+}
+
+/**
+ * What a substitution body holds: `"decoded"` for a decode stage, `"remote"`
+ * for a fetch, `"unreadable"` for a command the guard cannot read — the doubt
+ * that must never allow when the body feeds a shell (WI#892) — or null for
+ * ordinary work. Nested substitutions are read the same way.
+ */
+function heldContent(text, depth = 0) {
+  let held = null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const content = stageContent(stagePropertyWords(stage));
+      if (content.fetch) held = held ?? "remote";
+      if (content.decode) held = held ?? "decoded";
+      if (content.unverifiable) held = held ?? "unreadable";
+    }
+  }
+  if (held !== null) return held;
+  if (depth >= MAX_SHELL_BODY_DEPTH) return "unreadable";
+  for (const body of substitutionBodies(text)) {
+    const inner = heldContent(body, depth + 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
+
+/**
+ * Deny a decode or fetch command piped into a shell or interpreter (WI#826,
+ * WI#832, WI#892). A decode or fetch stage anywhere before an interpreter
+ * stage in the same pipeline counts, however many stages lie between: `cat`,
+ * `tee`, `sed` and `head` pass the bytes through untouched.
+ */
 function checkDecodedPipe(text) {
+  // A pipeline is the only way one stage feeds another, so a text without a
+  // bar costs a single scan (WI#892 deadline).
+  if (!text.includes("|")) return null;
   const lists = commandLists(text);
   let scanned = 0;
   for (let li = 0; li < lists.length; li++) {
-    const stages = splitOutsideQuotes(lists[li], "|");
-    for (let i = 1; i < stages.length; i++) {
-      if (!isDecodeStage(stages[i - 1])) continue;
-      // The stage a decoder feeds may open a compound command, whose body
-      // reads the same stdin (AME-1). Only a list's last stage can run on
-      // into the following lists.
-      let fed = stages[i];
-      if (i === stages.length - 1 && compoundOpener(fed) !== "") {
-        fed = compoundStageText(lists, li, fed);
-        scanned += fed.length;
-        if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+    const stages = pipelineStages(lists[li]);
+    let carried = null;
+    for (let i = 0; i < stages.length; i++) {
+      if (carried !== null) {
+        // The stage a decoder feeds may open a compound command, whose body
+        // reads the same stdin (AME-1). Only a list's last stage can run on
+        // into the following lists.
+        let fed = stages[i];
+        if (i === stages.length - 1 && compoundOpener(fed) !== "") {
+          fed = compoundStageText(lists, li, fed);
+          scanned += fed.length;
+          if (scanned > MAX_COMPOUND_SCAN_CHARS) return "decoded content piped into a shell or interpreter";
+        }
+        // A command word the guard cannot read may be the shell (AME-2). The
+        // fed stage may be a compound body of several lists, so the whole
+        // body is read, not just its first command word.
+        if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
+          return carried === "decoded"
+            ? "decoded content piped into a shell or interpreter"
+            : "remote content piped into a shell or interpreter";
+        }
       }
-      // A command word the guard cannot read may be the shell (AME-2).
-      if (isInterpreterStage(fed) || runsUnverifiableCommand(fed)) {
-        return "decoded content piped into a shell or interpreter";
+      // The last stage feeds no further stage, so its own reading is not
+      // needed; skipping it keeps a one-stage list at zero word scans.
+      if (i + 1 === stages.length) break;
+      const content = stageContent(stagePropertyWords(stages[i]));
+      if (content.decode) carried = carried ?? "decoded";
+      if (content.fetch) carried = carried ?? "remote";
+    }
+  }
+  return null;
+}
+
+const SUBSTITUTION_SHELL_REASON = "decoded or fetched content run by a shell through a substitution";
+
+// A command substitution (`$(`, a backtick) or a process substitution
+// (`<(`, `>(`) — the shapes `substitutionBodies` yields.
+const SUBSTITUTION_MARKER = /\$\(|`|[<>]\(/;
+
+/**
+ * True when the word at `index` runs its own argument as shell text: a shell,
+ * `eval`, or a `source`/`.` (WI#892). Such a word executes whatever its
+ * argument holds, whether that is a literal string or a substitution's output.
+ */
+function runsShellTextAt(words, index) {
+  const name = commandBasename(listenerWord(words[index]));
+  if (SHELL_NAME.test(name) || name === "eval") return true;
+  return name === "source" || name === ".";
+}
+
+/**
+ * The last component of a path word, or null when the shell rewrites it
+ * (WI#892 part 3, AMR-1). The stage that writes a file and the stage that
+ * runs one are compared by this name only: a relative path, an absolute one
+ * and the same file reached after a `cd` all end in it, and a directory part
+ * that holds an expansion (`$HOME/bin/x.sh`, `~/x.sh`) still names the file.
+ * A last component that holds an expansion, a glob, a brace list or a
+ * substitution's output reads as some other name at run time.
+ */
+function pathBasename(word) {
+  const bare = stripShellQuotes(word.replace(/^[({]+/, "").replace(/[)}]+$/, "")).replace(/\/+$/, "");
+  const name = bare.slice(bare.lastIndexOf("/") + 1);
+  if (name === "" || name === "." || name === ".." || (name.startsWith("~") && name === bare)) return null;
+  for (const ch of name) {
+    if (RM_SHELL_EXPANDED_CHARS.includes(ch) || ch === SUBSTITUTION_MARK) return null;
+  }
+  return name;
+}
+
+// A redirection word as the stage reader leaves it: a descriptor, the
+// operator, and the target when it is attached (`>/tmp/x`, `2>>log`,
+// `<<EOF`). The reader ends a word at `&` and `|`, so `&>`, `&>>` and `>|`
+// arrive as `>`/`>>`, and a duplication (`2>&1`) leaves a bare descriptor
+// number behind as its target.
+const REDIRECT_WORD = /^\d*(<<<|<<-?|<>|<|>>|>)([\s\S]*)$/;
+
+function redirectAt(words, i) {
+  const match = REDIRECT_WORD.exec(words[i] ?? "");
+  if (match === null) return null;
+  const [, op, attached] = match;
+  if (attached !== "") return { op, target: attached, next: i + 1 };
+  return { op, target: words[i + 1], next: i + 2 };
+}
+
+/** The words of a list that are not redirections or their targets, and the files `<` reads. */
+function operandWords(words) {
+  const operands = [];
+  const inputs = [];
+  for (let i = 0; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect === null) {
+      operands.push(words[i]);
+      continue;
+    }
+    if (redirect.op === "<" || redirect.op === "<>") inputs.push(redirect.target);
+    i = redirect.next - 1;
+  }
+  return { operands, inputs };
+}
+
+// `sudo`/`doas` options that take the next word. Both are refused by their
+// own rule; this only keeps the command position readable behind them.
+const SUDO_VALUE_OPTIONS = new Set(["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t", "-T", "-D", "-R"]);
+const FUNCTION_HEAD = /^[A-Za-z_][\w.:-]*\(\)\{?$/;
+
+/** The index past the compound words, assignments, redirections and function head before a command word. */
+function skipCommandPrefix(words, i) {
+  while (i < words.length) {
+    const word = words[i];
+    if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
+      i++;
+    } else if (word === "function") {
+      i += 2;
+    } else if (word === "case") {
+      // `case WORD in` heads a branch list; the branch runs after its pattern.
+      const at = words.indexOf("in", i + 1);
+      i = at === -1 ? words.length : at + 1;
+    } else if (/\)$/.test(word) && !word.startsWith("$") && i + 1 < words.length && redirectAt(words, i + 1) === null) {
+      // A case pattern (`1)`, `(a)`): after a subshell's own `)` only a
+      // redirection may follow, so a word after it means a branch command.
+      i++;
+    } else {
+      const redirect = redirectAt(words, i);
+      if (redirect === null) return i;
+      i = redirect.next;
+    }
+  }
+  return i;
+}
+
+/** The index of env's command word: options, their values and assignments are stepped over. */
+function envOperandStart(words, i) {
+  while (i < words.length) {
+    const word = words[i];
+    if (word === "--" || word === "-") return i + 1;
+    if (/^[A-Za-z_]\w*=/.test(word)) {
+      i++;
+    } else if (!word.startsWith("-")) {
+      return i;
+    } else if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const option = envLongOption(equals === -1 ? word : word.slice(0, equals));
+      i += equals === -1 && ENV_REQUIRED_LONG_VALUES.has(option) ? 2 : 1;
+    } else {
+      const index = word.search(/[uCaS]/);
+      i += index !== -1 && index === word.length - 1 ? 2 : 1;
+    }
+  }
+  return i;
+}
+
+/** The launcher steps of `commandPosition`: the index of the next word to read. */
+function skipLauncher(name, words, i, position) {
+  if (name === "env") return envOperandStart(words, i + 1);
+  if (name === "command") {
+    for (i++; i < words.length && words[i].startsWith("-") && words[i] !== "-"; i++) {
+      if (words[i] === "--") return i + 1;
+      // `command -v`/`-V` looks a name up; it runs nothing.
+      if (/[vV]/.test(words[i])) return -1;
+    }
+    return i;
+  }
+  if (!STAGE_LAUNCHERS.has(name)) {
+    // exec, builtin, busybox, sudo, doas.
+    for (i++; i < words.length && words[i].startsWith("-") && words[i] !== "-"; i++) {
+      if (words[i] === "--") return i + 1;
+      const takesValue = name === "exec" ? words[i].endsWith("a")
+        : (name === "sudo" || name === "doas") && SUDO_VALUE_OPTIONS.has(words[i]);
+      if (takesValue) i++;
+    }
+    return i;
+  }
+  const values = STAGE_LAUNCHER_VALUE_OPTIONS.get(name);
+  for (i++; i < words.length && (words[i].startsWith("-") || /^[0-9][0-9A-Za-z.,:-]*$/.test(words[i])); i++) {
+    const word = words[i];
+    // `xargs -a FILE` hands the file's words to the command as arguments.
+    const argFile = name === "xargs" ? /^(?:-a|--arg-file=?)(.*)$/.exec(word) : null;
+    if (argFile !== null) position.argFiles.push(argFile[1] || words[i + 1]);
+    if (values?.has(word)) i++;
+  }
+  if (name === "xargs") position.xargs = true;
+  return i;
+}
+
+const POSITION_LAUNCHERS = new Set(["env", "exec", "command", "builtin", "busybox", "sudo", "doas", ...STAGE_LAUNCHERS]);
+
+/**
+ * Where one simple command's command word sits (WI#892 AMR-1, AMR-2): after
+ * compound lead words, assignments, redirections, a function-definition head
+ * and the launchers that run their operand — `env`, `exec`, `command`,
+ * `builtin`, `busybox`, `sudo`/`doas` and the item's launcher table, each
+ * with its options. `index` is -1 when the words run no command (`command
+ * -v`, a `for`/`case` head, nothing left) and -2 when more launchers stand in
+ * a row than the reader follows. `xargs` records that the command takes its
+ * arguments from input, and `argFiles` the files an `xargs -a` reads them
+ * from.
+ */
+function commandPosition(words) {
+  const position = { index: -1, xargs: false, argFiles: [] };
+  let i = 0;
+  for (let hop = 0; hop <= MAX_STAGE_LAUNCHERS; hop++) {
+    i = skipCommandPrefix(words, i);
+    if (i >= words.length || COMPOUND_HEAD_ONLY.has(words[i])) return position;
+    const name = commandBasename(words[i]);
+    if (!POSITION_LAUNCHERS.has(name)) {
+      position.index = i;
+      return position;
+    }
+    i = skipLauncher(name, words, i, position);
+    if (i === -1) return position;
+  }
+  position.index = -2;
+  return position;
+}
+
+/**
+ * What a shell invocation runs (WI#892 AMR-1): its script-file operand, its
+ * `-c` command string, or its standard input (`-s`, or no operand at all),
+ * with the files a `<` redirection feeds it and the positional parameters
+ * after the operand (`bash -c '. "$0"' FILE`). An option that takes a value
+ * steps over it, as `listenerShellBody` does.
+ */
+function shellInvocation(args) {
+  const run = { file: undefined, command: undefined, stdin: false, inputs: [], positionals: [], rcfiles: [] };
+  let options = true;
+  let commandMode = false;
+  for (let i = 0; i < args.length; i++) {
+    const redirect = redirectAt(args, i);
+    if (redirect !== null) {
+      if (redirect.op === "<" || redirect.op === "<>") run.inputs.push(redirect.target);
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = args[i];
+    if (options && (word === "--" || word === "-")) {
+      options = false;
+    } else if (options && SHELL_VALUE_OPTIONS.has(word)) {
+      // `--rcfile`/`--init-file` name a file the shell sources.
+      if (word === "--rcfile" || word === "--init-file") run.rcfiles.push(args[i + 1]);
+      i++;
+    } else if (options && /^--(?:rcfile|init-file)=/.test(word)) {
+      run.rcfiles.push(word.slice(word.indexOf("=") + 1));
+    } else if (options && /^[-+]./.test(word)) {
+      if (/^-[a-zA-Z]*c/.test(word)) commandMode = true;
+      if (/^-[a-zA-Z]*s/.test(word)) run.stdin = true;
+      if (/^[-+][a-zA-Z]*[oO]$/.test(word)) i++;
+    } else {
+      options = false;
+      // Later operands are positional parameters.
+      if (run.file !== undefined || run.command !== undefined) {
+        run.positionals.push(word);
+        continue;
+      }
+      if (commandMode) run.command = word;
+      else run.file = word;
+    }
+  }
+  if (run.file === undefined && run.command === undefined) run.stdin = true;
+  return run;
+}
+
+/**
+ * The split of a command line into the lists that run one after another:
+ * `;`, a newline, `&&`, `||`, and a lone `&` that sends the list before it to
+ * the background — that list still runs before or beside the next one
+ * (WI#892 AMR-1). `&>`, `>&`, `<&` and `|&` are redirections and a bar.
+ */
+function runLists(text) {
+  const pieces = [];
+  let start = 0;
+  for (const i of unquotedOffsets(text)) {
+    if (i < start) continue;
+    const ch = text[i];
+    const next = text[i + 1];
+    let width = 0;
+    if (ch === ";" || ch === "\n") width = 1;
+    else if ((ch === "&" || ch === "|") && next === ch) width = 2;
+    else if (ch === "&" && next !== ">" && !"<>|".includes(text[i - 1] ?? "")) width = 1;
+    if (width === 0) continue;
+    pieces.push(text.slice(start, i));
+    start = i + width;
+  }
+  pieces.push(text.slice(start));
+  return pieces;
+}
+
+/**
+ * The text with comments and here-document data blanked (WI#892 AMR-2). The
+ * shared scan marks both as data; a command-position reader that saw a
+ * here-document body as the next list would read a document's text as
+ * commands. Substitution bodies are kept whole. A body a shell reads is
+ * walked separately by `shellHeredocs`.
+ */
+function codeView(text) {
+  if (!text.includes("#") && !text.includes("<<")) return text;
+  const { states, substitutions } = quoteScan(text);
+  let view = "";
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const close = substitutions.get(i);
+    if (close !== undefined) {
+      i = close;
+      continue;
+    }
+    if (states[i] !== SHELL_DATA || text[i] === "\n") continue;
+    let end = i;
+    while (end < text.length && states[end] === SHELL_DATA && text[end] !== "\n" && !substitutions.has(end)) end++;
+    view += text.slice(from, i) + " ".repeat(end - i);
+    from = end;
+    i = end - 1;
+  }
+  return view + text.slice(from);
+}
+
+/**
+ * The words with a redirection glued to the word before it split off: bash
+ * ends a word at an unquoted `<` or `>` (`base64 -d>/tmp/x.sh`), and the
+ * stage reader does not. Digits right before the operator are its
+ * descriptor (`2>log`). A quoted `<`/`>` splits too, which can only add a
+ * redirection reading.
+ */
+function splitRedirects(words) {
+  const split = [];
+  for (const word of words) {
+    let rest = word;
+    for (;;) {
+      const at = rest.search(/[<>]/);
+      if (at <= 0 || /^\d+$/.test(rest.slice(0, at))) break;
+      split.push(rest.slice(0, at));
+      rest = rest.slice(at);
+    }
+    split.push(rest);
+  }
+  return split;
+}
+
+/**
+ * The pipelines of a command line, each stage with its words, its command
+ * position and what its own words do (`stageContent`). The words are read
+ * once per stage: a brace-heavy word costs the reader most of the deadline.
+ */
+/**
+ * The words of a stage with its redirections put back as `<operator> <target>`
+ * pairs at the end. The word reader leaves redirections out (WI#889), and the
+ * write and run readers of WI#892 need `> f`, `>> f`, `&> f`, `>& f` and
+ * `< f`. A descriptor duplication (`2>&1`, `>&2`, `<&3`, `>&-`) names no file
+ * and is left out.
+ */
+function stageWordsWithRedirects(stage) {
+  const read = stagePropertyWords(stage);
+  if (read === null) return null;
+  const extra = [];
+  for (const { target, operator } of redirectScan(stage).targets) {
+    const bare = stripShellQuotes(target);
+    if ((operator === ">&" || operator === "<&") && /^(?:\d+-?|-)$/.test(bare)) continue;
+    // The readers know `>`, `>>` and `<`: `&>`, `>|`, `>&` and `<>` write
+    // like `>`, `&>>` like `>>`, and `<&` with a file reads like `<`.
+    const spelled = { "&>": ">", ">|": ">", ">&": ">", "<>": ">", "&>>": ">>", "<&": "<" }[operator] ?? operator;
+    extra.push(spelled, bare);
+  }
+  // A here-string is the program's input text (`bash <<< "$x"`).
+  for (const text of redirectScan(stage).hereStrings) extra.push("<<<", stripShellQuotes(text));
+  return extra.length === 0 ? read : [...read, ...extra];
+}
+
+function readPipelines(text) {
+  return runLists(codeView(text)).map((list) => pipelineStages(list).map((stage) => {
+    const read = stageWordsWithRedirects(stage);
+    const words = read === null ? null : splitRedirects(read);
+    return {
+      stage,
+      words,
+      position: words === null ? null : commandPosition(words),
+      content: words === null ? null : stageContent(words),
+    };
+  }));
+}
+
+/**
+ * `heldContent` of one stage of `readPipelines`, from the words already read:
+ * its own decode, fetch or unreadable command word, otherwise what its
+ * substitutions hold.
+ */
+function stageHeld(entry) {
+  const { content } = entry;
+  if (content.fetch) return "remote";
+  if (content.decode) return "decoded";
+  if (content.unverifiable) return "unreadable";
+  for (const body of substitutionBodies(entry.stage)) {
+    const inner = heldContent(body, 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
+
+// Descriptor-duplication targets (`2>&1` leaves `1`) and the device files a
+// redirect names are not files a later stage runs.
+function isWrittenFile(target) {
+  const bare = stripShellQuotes(target);
+  return !/^\d*-?$/.test(bare) && !bare.startsWith("/dev/");
+}
+
+/** Record one written file: its last component, or doubt when it cannot be read. */
+function addWritten(out, target) {
+  if (target === undefined || !isWrittenFile(target)) return;
+  out.wrote = true;
+  const name = pathBasename(target);
+  if (name === null) out.unknown = true;
+  else out.names.add(name);
+}
+
+/** A curl/wget output value: `-` is standard output, which the redirect reading covers. */
+function addFetchOutput(out, value) {
+  if (value !== undefined && stripShellQuotes(value) !== "-") addWritten(out, value);
+}
+
+/**
+ * The name curl `-O` and wget save a URL under: the last component of the
+ * URL's path, query and fragment removed, or `fallback` (wget's
+ * `index.html`) when the path ends in `/`. A URL that cannot be read leaves
+ * the name in doubt.
+ */
+function addUrlName(out, url, fallback) {
+  if (url === undefined) return;
+  const bare = stripShellQuotes(url).replace(/[?#][\s\S]*$/, "");
+  const path = bare.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*/, "");
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  out.wrote = true;
+  if (name !== "") addWritten(out, name);
+  else if (fallback !== null) out.names.add(fallback);
+  else out.unknown = true;
+}
+
+// curl's short options that take a value (`curl --help all`, 8.x): the value
+// is the rest of the cluster or the next word.
+const CURL_SHORT_VALUES = new Set("bcCdDeEFHKmPQrtTuUwxXyYz");
+// curl's long options that take a separate value, beside the output ones.
+const CURL_LONG_VALUES = new Set([
+  "header", "data", "data-raw", "data-binary", "data-urlencode", "data-ascii", "json", "form",
+  "form-string", "user", "user-agent", "referer", "request", "proxy", "proxy-user", "write-out",
+  "upload-file", "cookie", "cookie-jar", "continue-at", "dump-header", "cert", "key", "cacert",
+  "capath", "config", "max-time", "connect-timeout", "range", "retry", "retry-delay",
+  "retry-max-time", "resolve", "connect-to", "max-filesize", "limit-rate", "interface",
+  "time-cond", "speed-time", "speed-limit", "oauth2-bearer", "unix-socket", "max-redirs",
+  "dns-servers", "doh-url", "preproxy", "variable", "stderr", "trace", "trace-ascii", "output-dir",
+]);
+
+/**
+ * The files one curl invocation writes (WI#892 AMR-1): `-o`/`--output`, an
+ * `o` anywhere in a short cluster (`-fsSLo PATH`, `-o/PATH`, the value being
+ * the rest of the word or the next one), and with `-O`/`--remote-name` the
+ * URL's last component (`--output-dir` only moves it). `-J` names the file
+ * from the server's reply, which leaves the name in doubt.
+ */
+function curlWrites(words, start, out) {
+  const urls = [];
+  let remoteName = false;
+  let headerName = false;
+  for (let i = start + 1; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = words[i];
+    if (word === "--") {
+      urls.push(...operandWords(words.slice(i + 1)).operands);
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const value = () => (equals === -1 ? words[++i] : word.slice(equals + 1));
+      if (name.length >= 3 && "output".startsWith(name)) addFetchOutput(out, value());
+      else if (name === "url") urls.push(value());
+      else if (name === "remote-name" || name === "remote-name-all") remoteName = true;
+      else if (name === "remote-header-name") headerName = true;
+      else if (CURL_LONG_VALUES.has(name) && equals === -1) i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const output = word.indexOf("o", 1);
+      if (output !== -1) {
+        addFetchOutput(out, word.slice(output + 1) || words[++i]);
+        continue;
+      }
+      for (let k = 1; k < word.length; k++) {
+        if (word[k] === "O") remoteName = true;
+        else if (word[k] === "J") headerName = true;
+        else if (CURL_SHORT_VALUES.has(word[k])) {
+          if (k === word.length - 1) i++;
+          break;
+        }
+      }
+      continue;
+    }
+    urls.push(word);
+  }
+  if (!remoteName) return;
+  for (const url of urls) addUrlName(out, url, null);
+  if (headerName) out.unknown = true;
+}
+
+// wget's short options that take a value (wget 1.25 `--help`; `-n` takes
+// its letters, `-nc`, `-nv`), and its long ones.
+const WGET_SHORT_VALUES = new Set("oaiBeOtTwQlARDXIPUn");
+const WGET_LONG_VALUES = new Set([
+  "output-file", "append-output", "input-file", "base", "config", "execute", "tries", "timeout",
+  "dns-timeout", "connect-timeout", "read-timeout", "wait", "waitretry", "quota", "level",
+  "accept", "reject", "accept-regex", "reject-regex", "domains", "exclude-domains",
+  "include-directories", "exclude-directories", "directory-prefix", "cut-dirs", "user",
+  "password", "http-user", "http-password", "ftp-user", "ftp-password", "proxy-user",
+  "proxy-password", "header", "user-agent", "referer", "post-data", "post-file", "method",
+  "body-data", "body-file", "load-cookies", "save-cookies", "ca-certificate", "ca-directory",
+  "certificate", "private-key", "limit-rate", "bind-address", "restrict-file-names",
+  "default-page", "progress", "secure-protocol", "max-redirect", "local-encoding",
+  "remote-encoding", "compression", "retry-on-http-error", "backups",
+]);
+// wget options after which the saved names are not the URLs' last components.
+const WGET_UNKNOWN_NAMES = new Set([
+  "recursive", "mirror", "page-requisites", "input-file", "content-disposition", "trust-server-names",
+]);
+
+/**
+ * The files one wget invocation writes (WI#892 AMR-1): `-O`/`--output-document`
+ * (`-O PATH`, `-OPATH`, an `O` in a short cluster), otherwise each URL's
+ * last component (`index.html` for a path ending in `/`), wherever
+ * `-P`/`--directory-prefix` puts it. A recursive or input-file download, or
+ * a name taken from the server, leaves the names in doubt.
+ */
+function wgetWrites(words, start, out) {
+  const urls = [];
+  let output;
+  let unknown = false;
+  for (let i = start + 1; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      i = redirect.next - 1;
+      continue;
+    }
+    const word = words[i];
+    if (word === "--") {
+      urls.push(...operandWords(words.slice(i + 1)).operands);
+      break;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      const isOutput = name.length >= 8 && "output-document".startsWith(name);
+      const value = equals === -1 ? (isOutput || WGET_LONG_VALUES.has(name) ? words[++i] : undefined)
+        : word.slice(equals + 1);
+      if (isOutput) output = value;
+      if (WGET_UNKNOWN_NAMES.has(name)) unknown = true;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      for (let k = 1; k < word.length; k++) {
+        if ("rmpi".includes(word[k])) unknown = true;
+        if (!WGET_SHORT_VALUES.has(word[k])) continue;
+        const value = word.slice(k + 1) || words[++i];
+        if (word[k] === "O") output = value;
+        break;
+      }
+      continue;
+    }
+    urls.push(word);
+  }
+  if (output !== undefined) {
+    addFetchOutput(out, output);
+    return;
+  }
+  if (unknown) {
+    out.wrote = true;
+    out.unknown = true;
+  }
+  for (const url of urls) addUrlName(out, url, "index.html");
+}
+
+// The decompressors that write the decompressed file beside the compressed
+// one, always or with `-d`, and the suffixes they strip.
+const DECOMPRESS_ALWAYS = new Set(["gunzip", "unxz", "bunzip2", "unzstd", "uncompress", "unlzma", "unpigz"]);
+const DECOMPRESS_WITH_D = new Set(["gzip", "xz", "bzip2", "zstd", "lzma", "pigz"]);
+const TAR_ARCHIVE_SUFFIX = /\.t(?:gz|az|xz|bz2?|zst|lz)$/;
+const COMPRESSED_SUFFIX = /(?:\.(?:gz|z|Z|xz|lzma|bz2|bz|zst|lz)|[-_]z|-gz)$/;
+
+/** The file an in-place decompression writes: `gunzip /tmp/x.sh.gz` writes `/tmp/x.sh`. */
+function decompressWrites(words, start, out) {
+  const name = commandBasename(listenerWord(words[start]));
+  let decompress = DECOMPRESS_ALWAYS.has(name);
+  let stdout = false;
+  const operands = [];
+  const { operands: args } = operandWords(words.slice(start + 1));
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i];
+    if (word === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (word === "-o" || word === "--output") {
+      // zstd's own output file.
+      addWritten(out, args[++i]);
+      stdout = true;
+    } else if (word.startsWith("--")) {
+      if (word === "--decompress" || word === "--uncompress") decompress = true;
+      if (["--stdout", "--to-stdout", "--test", "--list"].includes(word)) stdout = true;
+    } else if (word.startsWith("-") && word.length > 1) {
+      if (word.includes("d")) decompress = true;
+      if (/[ctl]/.test(word.slice(1))) stdout = true;
+    } else {
+      operands.push(word);
+    }
+  }
+  if (!decompress || stdout) return;
+  for (const operand of operands) {
+    const base = pathBasename(operand);
+    if (base === null) {
+      out.wrote = true;
+      out.unknown = true;
+      continue;
+    }
+    const stripped = base.replace(TAR_ARCHIVE_SUFFIX, ".tar").replace(COMPRESSED_SUFFIX, "");
+    if (stripped !== base && stripped !== "") addWritten(out, stripped);
+  }
+}
+
+const XXD_VALUE_OPTIONS = new Set(["-c", "-cols", "-g", "-groupsize", "-l", "-len", "-o", "-offset", "-s", "-seek", "-n", "-name", "-R"]);
+
+/** `xxd -r INFILE OUTFILE` writes its second operand. */
+function xxdWrites(words, start, out) {
+  if (!decoderAt(words, start)) return;
+  const operands = [];
+  const { operands: args } = operandWords(words.slice(start + 1));
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("-") && args[i].length > 1) {
+      if (XXD_VALUE_OPTIONS.has(args[i])) i++;
+    } else {
+      operands.push(args[i]);
+    }
+  }
+  if (operands[1] !== undefined) addFetchOutput(out, operands[1]);
+}
+
+// The files that name a program's own standard input as a source operand.
+const STDIN_SOURCE_FILES = new Set(["/dev/stdin", "/proc/self/fd/0", "/dev/fd/0"]);
+
+/**
+ * The file a `cp`/`install` writes from its standard input (`cp /dev/stdin
+ * PATH`, `install -m 755 /dev/stdin PATH`): the last operand, or a file
+ * named `stdin` in a target directory.
+ */
+function copyFromStdinWrites(words, start, out) {
+  const { operands } = operandWords(words.slice(start + 1));
+  if (!operands.some((word) => STDIN_SOURCE_FILES.has(stripShellQuotes(word)))) return;
+  out.wrote = true;
+  out.names.add("stdin");
+  const paths = operands.filter((word) => !word.startsWith("-"));
+  const last = paths[paths.length - 1];
+  if (last !== undefined && !STDIN_SOURCE_FILES.has(stripShellQuotes(last))) addWritten(out, last);
+}
+
+// The commands that put a file's content under another name.
+const COPY_COMMANDS = new Set(["cp", "mv", "ln", "install", "rsync"]);
+
+/**
+ * The names a written file gets again (WI#892 AMR-1): a `cp`, `mv`, `ln`,
+ * `install` or `rsync` of a written file writes its last operand, and a
+ * stage that reads a written file writes its redirect targets
+ * (`cat x.sh > y.sh`). A directory destination keeps the written name.
+ */
+function copiedNames(entry, ctx) {
+  if (!entry.words.some((word) => namesWritten(word, ctx))) return;
+  const out = { names: ctx.written, wrote: false, unknown: false };
+  stageWrites(entry.words, out);
+  const index = entry.position?.index ?? -1;
+  if (index < 0 || !COPY_COMMANDS.has(commandBasename(entry.words[index]))) return;
+  const paths = operandWords(entry.words.slice(index + 1)).operands.filter((word) => !word.startsWith("-"));
+  if (paths.length > 1) addWritten(out, paths[paths.length - 1]);
+}
+
+/** `tee` writes every operand. */
+function teeWrites(words, start, out) {
+  for (const word of operandWords(words.slice(start + 1)).operands) {
+    if (!word.startsWith("-") || word === "-") addWritten(out, word);
+  }
+}
+
+/** `dd of=PATH`. */
+function ddWrites(words, start, out) {
+  for (const word of words.slice(start + 1)) {
+    if (word.startsWith("of=")) addWritten(out, word.slice(3));
+  }
+}
+
+/** `base64 -o PATH` (BSD) and `openssl … -out PATH`. */
+function outputOptionWrites(words, start, out) {
+  for (let i = start + 1; i < words.length; i++) {
+    const word = words[i];
+    if (word === "-o" || word === "--output" || word === "-out") addFetchOutput(out, words[++i]);
+    else if (word.startsWith("--output=")) addFetchOutput(out, word.slice(9));
+  }
+}
+
+const WRITER_READERS = new Map([
+  ["tee", teeWrites], ["dd", ddWrites], ["cp", copyFromStdinWrites], ["install", copyFromStdinWrites],
+  ["curl", curlWrites], ["wget", wgetWrites], ["xxd", xxdWrites], ["base64", outputOptionWrites],
+  ["openssl", outputOptionWrites],
+  ...[...DECOMPRESS_ALWAYS, ...DECOMPRESS_WITH_D].map((name) => [name, decompressWrites]),
+]);
+
+/**
+ * The files one stage writes (WI#892 AMR-1): the targets of `>`, `>>`,
+ * `>|`, `&>`, `&>>` and `N>` redirects, and the writer commands above
+ * wherever they sit in the stage.
+ */
+function stageWrites(words, out) {
+  for (let i = 0; i < words.length; i++) {
+    const redirect = redirectAt(words, i);
+    if (redirect !== null) {
+      if (redirect.op === ">" || redirect.op === ">>") addWritten(out, redirect.target);
+      i = redirect.next - 1;
+      continue;
+    }
+    WRITER_READERS.get(commandBasename(listenerWord(words[i])))?.(words, i, out);
+  }
+}
+
+// The `NAME=` spellings at a word start, the assignments a later stage can
+// read back through `$NAME`.
+const ASSIGNMENT_AT = /(?:^|[\s;&|(])([A-Za-z_]\w*)=/g;
+// The `read` and `mapfile` options that take a value; `read -a` names the
+// array it fills.
+const READ_VALUE_LETTERS = { read: "dinNptu", mapfile: "dnOsuCc", readarray: "dnOsuCc" };
+
+/** The variables a `read`, `mapfile`/`readarray` or `printf -v` fills from its input. */
+function addReadNames(words, position, filled) {
+  if (position === null || position.index < 0) return;
+  const name = commandBasename(words[position.index]);
+  const { operands } = operandWords(words.slice(position.index + 1));
+  if (name === "printf") {
+    const index = operands.indexOf("-v");
+    if (index !== -1 && operands[index + 1] !== undefined) filled.add(operands[index + 1]);
+    return;
+  }
+  if (name !== "read" && name !== "mapfile" && name !== "readarray") return;
+  const names = [];
+  for (let i = 0; i < operands.length; i++) {
+    const word = operands[i];
+    if (!word.startsWith("-") || word.length < 2) {
+      names.push(word);
+      continue;
+    }
+    for (let k = 1; k < word.length; k++) {
+      if (word[k] === "a" && name === "read") {
+        names.push(word.slice(k + 1) || operands[++i]);
+        break;
+      }
+      if (READ_VALUE_LETTERS[name].includes(word[k])) {
+        if (k === word.length - 1) i++;
+        break;
+      }
+    }
+  }
+  if (names.length === 0) names.push(name === "read" ? "REPLY" : "MAPFILE");
+  for (const each of names) if (each !== undefined) filled.add(each);
+}
+
+const filledLengthCache = new WeakMap();
+
+/** The distinct lengths of the filled names, kept while the set does not grow. */
+function filledLengths(filled) {
+  const cached = filledLengthCache.get(filled);
+  if (cached !== undefined && cached.size === filled.size) return cached.lengths;
+  const lengths = [...new Set([...filled].map((name) => name.length))];
+  filledLengthCache.set(filled, { size: filled.size, lengths });
+  return lengths;
+}
+
+/**
+ * True when a word expands a variable a decode or fetch filled. The words
+ * have their quotes removed, so `"$x"_` reads as `$x_`: a filled name that
+ * starts the expanded name counts, as the head's substring reading did.
+ */
+function refsFilled(word, filled) {
+  if (filled.size === 0 || !word.includes("$")) return false;
+  for (const match of word.matchAll(/\$\{?([A-Za-z_]\w*)/g)) {
+    const name = match[1];
+    if (filled.has(name)) return true;
+    for (const length of filledLengths(filled)) {
+      if (length < name.length && filled.has(name.slice(0, length))) return true;
+    }
+  }
+  return false;
+}
+
+/** True when a word names, by its last component, a file a decode or fetch wrote. */
+function namesWritten(word, ctx) {
+  const name = pathBasename(word);
+  return name !== null && ctx.written.has(name);
+}
+
+/** True when a stage's command word is a decoder or a fetch, rather than one of its arguments. */
+function decodesOrFetchesAtCommand(words, position) {
+  const index = position?.index ?? -1;
+  if (index < 0) return false;
+  return decoderAt(words, index) || FETCH_NAMES.has(commandBasename(listenerWord(words[index])));
+}
+
+/** True when a substitution in the stage holds a decode or a fetch. */
+function substitutionDecodesOrFetches(stage) {
+  for (const body of substitutionBodies(stage)) {
+    const held = heldContent(body);
+    if (held === "decoded" || held === "remote") return true;
+  }
+  return false;
+}
+
+/**
+ * What the decodes and fetches of one command line wrote and filled (WI#892
+ * part 3, AMR-1). `written` holds the last components of the files a stage
+ * fed by a decode or a fetch wrote: its own output (`curl -o`, `base64 -d >
+ * f`, `gunzip f.gz`), the content piped into it (`… | base64 -d | dd of=f`),
+ * a substitution's output (`echo "$(curl …)" > f`) or a filled variable
+ * (`echo "$x" > f`). `filled` holds the variables such a stage assigns,
+ * reads or prints into. `unknown` records a written file whose name cannot
+ * be read, and `strong` any write at all; both count only for a stage whose
+ * command word decodes or fetches, a stage fed by one through a pipe, or one
+ * holding such a substitution — a word that merely mentions `curl` does not
+ * put the line in doubt.
+ */
+function writeRunContext(pipelines) {
+  const ctx = { written: new Set(), filled: new Set(), unknown: false, strong: false };
+  for (const pipeline of pipelines) {
+    let carried = null;
+    for (const entry of pipeline) {
+      if (entry.words === null) continue;
+      // The split words also read a decoder glued to its redirect
+      // (`base64 -d>/tmp/x.sh`).
+      const held = stageHeld(entry);
+      if (held !== null) {
+        for (const match of entry.stage.matchAll(ASSIGNMENT_AT)) ctx.filled.add(match[1]);
+      }
+      if (held !== null || carried !== null) addReadNames(entry.words, entry.position, ctx.filled);
+      entry.carried = carried;
+      entry.held = held;
+      if (entry.content.decode) carried = "decoded";
+      if (entry.content.fetch) carried = carried ?? "remote";
+    }
+  }
+  for (const pipeline of pipelines) {
+    let variableFed = false;
+    for (const entry of pipeline) {
+      if (entry.words === null) continue;
+      const expands = entry.words.some((word) => refsFilled(word, ctx.filled));
+      const fed = entry.carried !== null || variableFed || expands;
+      if (fed || entry.held !== null) {
+        const out = { names: ctx.written, wrote: false, unknown: false };
+        stageWrites(entry.words, out);
+        if (out.wrote && (fed || decodesOrFetchesAtCommand(entry.words, entry.position) ||
+            substitutionDecodesOrFetches(entry.stage))) {
+          ctx.strong = true;
+          if (out.unknown) ctx.unknown = true;
+        }
+      } else if (ctx.written.size > 0) {
+        copiedNames(entry, ctx);
+      }
+      if (expands) variableFed = true;
+    }
+  }
+  return ctx;
+}
+
+const WRITTEN_RUN_REASON = "decoded or fetched content written and then run";
+const ASSIGNED_RUN_REASON = "decoded or fetched content assigned and then run";
+
+/**
+ * True when a word the stage executes may be a file a decode or fetch wrote
+ * (WI#892 AMR-1): its last component is a written one; or the guard cannot
+ * read it (`sh "$f"`, `$CMD`) and the line wrote something from a decode or
+ * a fetch; or a written name is in doubt and the word is a shell operand or
+ * a path (`./x`, `/tmp/x`). A bare command name (`jq`, `make`) is looked up
+ * in PATH, so only an exact written name ties it to a written file.
+ */
+function runsWrittenPath(word, operand, ctx) {
+  if (word === undefined) return false;
+  const bare = stripShellQuotes(word.replace(/^[({]+/, "").replace(/[)}]+$/, ""));
+  // A substitution's output is read through its body; `[`, `[[` and `((`
+  // are the shell's own test and arithmetic words.
+  if (bare === "$?" || /^(?:\[\[?|\(\()$/.test(word)) return false;
+  const name = pathBasename(word);
+  if (name === null) return ctx.strong;
+  if (ctx.written.has(name)) return true;
+  return ctx.unknown && (operand || bare.includes("/"));
+}
+
+/**
+ * Why one stage runs decoded or fetched content, or null (WI#892 AMR-1,
+ * AMR-2). The stage is read at its command position only, so `jq .
+ * /tmp/a.json` and `tar -xzf f.tgz -C .` are not runs. A run is: a shell
+ * given a written file, its `-c` string or its input; `source`/`.` given a
+ * written file; `eval` of text that runs one; the written file as the
+ * command word, also behind `exec`, `env`, `nohup`, `timeout N`, `nice`,
+ * `setsid` and the other launchers; a filled variable as the command word;
+ * a shell or a stdin interpreter fed a written file (`sh < f`, `cat f |
+ * sh`, `xargs -a f sh -c`) or a filled variable (`echo "$x" | sh`); and a
+ * shell text or a command word whose substitution reads a written file or a
+ * filled variable (`sh -c "$(cat f)"`, `$(cat f)`).
+ */
+function stageRunReason({ stage, words, position }, ctx, feed, depth) {
+  if (position.index === -2) return ctx.strong || ctx.filled.size > 0 ? WRITTEN_RUN_REASON : null;
+  if (position.index === -1) return null;
+  const word = words[position.index];
+  if (refsFilled(word, ctx.filled)) return ASSIGNED_RUN_REASON;
+  // A path is the file it names, whatever builtin or interpreter its last
+  // component spells (`/tmp/eval`, `/tmp/python3`).
+  if (word.includes("/") && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+  const name = commandBasename(word);
+  const { operands } = operandWords(words.slice(position.index + 1));
+  // A `<` anywhere in the simple command feeds it (`< f sh`).
+  const { inputs } = operandWords(words);
+  inputs.push(...position.argFiles);
+  // An `xargs` in front hands the command its input as arguments, which a
+  // shell (`xargs sh -c`), `eval` or an interpreter runs.
+  let readsInput = false;
+  // Whether a substitution in the stage can be the program text: a shell's
+  // `-c` string or script operand (`bash <(cat f)`), what `eval` runs, or
+  // what a program reading its input is handed (`sh <<< "$(cat f)"`).
+  let runsText = false;
+  let text;
+  if (SHELL_NAME.test(name)) {
+    const run = shellInvocation(words.slice(position.index + 1));
+    if (shellRunsWritten(run, ctx, false)) return WRITTEN_RUN_REASON;
+    text = run.command;
+    readsInput = run.stdin || position.xargs;
+    runsText = run.file === undefined || run.file.includes("$?");
+  } else if (name === "source" || name === ".") {
+    const operand = operands[operands[0] === "--" ? 1 : 0];
+    if (operand !== undefined && STDIN_PROGRAM_FILES.has(stripShellQuotes(operand))) readsInput = true;
+    else if (runsWrittenPath(operand, true, ctx)) return WRITTEN_RUN_REASON;
+    readsInput ||= position.xargs;
+    runsText = readsInput || (operand ?? "").includes("$?");
+  } else if (name === "eval") {
+    text = operands.join(" ");
+    readsInput = position.xargs;
+    runsText = true;
+  } else if (STDIN_INTERPRETERS.has(name)) {
+    readsInput = position.xargs || interpreterStdinProgram(name, operands);
+    runsText = readsInput;
+  } else {
+    // A bare decoder or fetch name is the tool from PATH, not a file the
+    // same line saved under that name (`wget …/jq` then `jq`, but not `curl`).
+    const tool = !word.includes("/") && (FETCH_NAMES.has(name) || DECODER_NAMES.has(name));
+    if (!tool && runsWrittenPath(word, false, ctx)) return WRITTEN_RUN_REASON;
+    // A launcher the reader does not know can still start a shell on a
+    // written file (`strace -f sh /tmp/x.sh`), so a shell word later in the
+    // stage is read with its own operand. `.`, `source` and `eval` are shell
+    // builtins no external launcher starts, so as arguments (`jq .`,
+    // `tar -C .`) they are not runs.
+    // It gets the reading it gets at the command position: its operand, an
+    // rc file, its `<` input (`flock l sh < f`, `ssh h bash -s < f`), its
+    // `-c` text and that text's positional parameters. Only an exact written
+    // name counts here, as `grep bash f` may be no run at all.
+    for (let k = position.index + 1; k < words.length; k++) {
+      if (!SHELL_NAME.test(commandBasename(words[k]))) continue;
+      const run = shellInvocation(words.slice(k + 1));
+      if (shellRunsWritten(run, ctx, true)) return WRITTEN_RUN_REASON;
+      if (run.stdin && inputs.some((input) => input !== undefined && namesWritten(input, ctx))) {
+        return WRITTEN_RUN_REASON;
+      }
+      if (run.command !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
+        const inner = runsInPipelines(readPipelines(run.command), ctx, depth + 1);
+        if (inner) return inner;
+      }
+    }
+  }
+  if (text !== undefined && depth < MAX_SHELL_BODY_DEPTH) {
+    const inner = runsInPipelines(readPipelines(text), ctx, depth + 1);
+    if (inner) return inner;
+  }
+  if (readsInput) {
+    if (inputs.some((input) => runsWrittenPath(input, true, ctx))) return WRITTEN_RUN_REASON;
+    if (feed.variable) return ASSIGNED_RUN_REASON;
+    if (feed.file || (ctx.unknown && feed.operand)) return WRITTEN_RUN_REASON;
+  }
+  if (runsText || word.includes("$?")) {
+    for (const body of substitutionBodies(stage)) {
+      // With its redirections: `$(< f)` reads f.
+      const bodyWords = stageWordsWithRedirects(body) ?? stageWords(body);
+      if (bodyWords.some((each) => namesWritten(each, ctx))) return WRITTEN_RUN_REASON;
+      if (bodyWords.some((each) => refsFilled(each, ctx.filled))) return ASSIGNED_RUN_REASON;
+    }
+  }
+  return null;
+}
+
+/**
+ * True when a shell invocation runs a written file: its script operand, an
+ * `--rcfile`/`--init-file`, or a `-c` string's positional parameter
+ * (`bash -c '. "$0"' FILE`). `exact` counts only an exact written name.
+ */
+function shellRunsWritten(run, ctx, exact) {
+  const runs = (each) => each !== undefined &&
+    (exact ? namesWritten(each, ctx) : runsWrittenPath(each, true, ctx));
+  if (runs(run.file) || run.rcfiles.some(runs)) return true;
+  return run.command !== undefined && run.positionals.some((each) => namesWritten(each, ctx));
+}
+
+/** The first stage of the pipelines that runs decoded or fetched content, as `stageRunReason` reads it. */
+function runsInPipelines(pipelines, ctx, depth) {
+  for (const pipeline of pipelines) {
+    // What the stages before this one hand it through the pipe.
+    const feed = { file: false, variable: false, operand: false };
+    for (const entry of pipeline) {
+      const { words, position } = entry;
+      if (words === null) continue;
+      const expands = words.some((word) => refsFilled(word, ctx.filled));
+      // A shell, `eval` or `source` word in the stage that also expands a
+      // filled variable (`sh -c "$x"`, `bash <<< "$x"`), read at any word.
+      if (expands && words.some((_word, index) => runsShellTextAt(words, index))) return ASSIGNED_RUN_REASON;
+      const reason = stageRunReason(entry, ctx, feed, depth);
+      if (reason) return reason;
+      if (expands) feed.variable = true;
+      if (words.some((word) => namesWritten(word, ctx))) feed.file = true;
+      if (position.index >= 0 && position.index + 1 < words.length) feed.operand = true;
+    }
+  }
+  return null;
+}
+
+/** True for an `&` that ends a list (`a & b`, `a && b`), not one in `&>`, `>&`, `<&` or `|&`. */
+function isListAmpersand(text, k) {
+  return text[k] === "&" && text[k + 1] !== ">" && !"<>|".includes(text[k - 1] ?? "");
+}
+
+/**
+ * The here-documents of a command line (WI#892 AMR-2), every one of them in
+ * order: the list the redirect belongs to (up to its line's `;` or `&`, with
+ * its pipeline), the body, and whether the delimiter is quoted. The bodies of
+ * one line follow it in the order of their redirects; a `<<` inside a body is
+ * that body's text.
+ */
+function* hereDocuments(text) {
+  if (!text.includes("<<")) return;
+  const { states } = quoteScan(text);
+  const isRedirect = (i) => text[i - 1] !== "<" && text[i + 2] !== "<" && states[i] === SHELL_DATA;
+  let i = text.indexOf("<<");
+  while (i !== -1) {
+    const first = isRedirect(i) ? heredocRedirect(text, i) : null;
+    const lineEnd = first === null ? -1 : text.indexOf("\n", first.end);
+    if (lineEnd === -1) {
+      i = first === null ? text.indexOf("<<", i + 2) : -1;
+      continue;
+    }
+    // The line's list boundaries, read once.
+    const lineStart = text.lastIndexOf("\n", i - 1) + 1;
+    const cuts = [lineStart];
+    for (let k = lineStart; k < lineEnd; k++) {
+      if (states[k] !== QUOTE_UNQUOTED) continue;
+      if (text[k] === ";" || isListAmpersand(text, k)) cuts.push(k + 1);
+    }
+    const redirects = [];
+    for (let j = i; j !== -1 && j < lineEnd; j = text.indexOf("<<", j + 2)) {
+      const redirect = isRedirect(j) ? heredocRedirect(text, j) : null;
+      if (redirect === null) continue;
+      redirects.push({ at: j, redirect });
+      j = redirect.end - 2;
+    }
+    let next = lineEnd + 1;
+    let cut = 0;
+    for (const { at, redirect } of redirects) {
+      const lines = [];
+      while (next < text.length) {
+        const newline = text.indexOf("\n", next);
+        const end = newline === -1 ? text.length : newline;
+        const line = text.slice(next, end);
+        next = end + 1;
+        if ((redirect.stripTabs ? line.replace(/^\t+/, "") : line) === redirect.delimiter) break;
+        lines.push(line);
+      }
+      while (cut + 1 < cuts.length && cuts[cut + 1] <= at) cut++;
+      const listEnd = cut + 1 < cuts.length ? cuts[cut + 1] - 1 : lineEnd;
+      yield {
+        command: codeView(text.slice(cuts[cut], listEnd)),
+        body: lines.join("\n"),
+        quoted: /['"\\]/.test(text.slice(at + 2, redirect.end)),
+      };
+    }
+    i = next < text.length ? text.indexOf("<<", next) : -1;
+  }
+}
+
+/**
+ * What a here-document's command line does with the body: "shell" or
+ * "interpreter" when a stage runs it as a program at its command position,
+ * "mention" when a shell word sits elsewhere (`docker exec -i c sh`), or
+ * null.
+ */
+function hereDocumentReader(command) {
+  let reader = null;
+  for (const stage of pipelineStages(command)) {
+    const words = stagePropertyWords(stage);
+    if (words === null) return "shell";
+    const { index, xargs } = commandPosition(words);
+    if (index >= 0) {
+      const name = commandBasename(words[index]);
+      const args = words.slice(index + 1);
+      const operands = operandWords(args).operands;
+      if (SHELL_NAME.test(name) && (xargs || shellInvocation(args).stdin)) return "shell";
+      if ((name === "source" || name === ".") && STDIN_PROGRAM_FILES.has(operands[0] ?? "")) return "shell";
+      if (STDIN_INTERPRETERS.has(name) && interpreterStdinProgram(name, operands)) reader = "interpreter";
+    }
+    if (reader === null && words.some((word) => SHELL_NAME.test(commandBasename(word)))) reader = "mention";
+  }
+  return reader;
+}
+
+/** True when an unquoted here-document body expands a decode, a fetch, an unreadable command or a filled variable. */
+function hereDocumentHolds(body, ctx) {
+  for (const inner of substitutionBodies(body)) {
+    if (heldContent(inner) !== null) return true;
+  }
+  return refsFilled(body, ctx.filled);
+}
+
+/**
+ * Deny a decode or fetch whose output a stage of the same command line runs
+ * — through a file it wrote, a variable it filled or a here-document a shell
+ * reads (WI#892 part 3, AMR-1, AMR-2). What was written and filled is read
+ * from the whole line first, so a loop or a function that runs the file
+ * before the line's text reaches the write is read too. Decoding or
+ * downloading to a file without running it stays ordinary work, and a
+ * consumer that does not execute the content (`cat`, `jq`, `tar -xzf`) is
+ * not a run.
+ */
+function writtenRunReason(text, depth = 0) {
+  const pipelines = readPipelines(text);
+  const ctx = writeRunContext(pipelines);
+  // An unquoted here-document expands its body first, so a decode, a fetch
+  // or a filled variable there is the content its command writes
+  // (`cat > f <<EOF` / `$(curl …)` / `EOF`) or runs.
+  const documents = [...hereDocuments(text)];
+  for (const document of documents) {
+    document.holds = !document.quoted && hereDocumentHolds(document.body, ctx);
+    if (!document.holds) continue;
+    const out = { names: ctx.written, wrote: false, unknown: false };
+    for (const stage of pipelineStages(document.command)) {
+      const words = stageWordsWithRedirects(stage);
+      if (words !== null) stageWrites(splitRedirects(words), out);
+    }
+    if (out.wrote) {
+      ctx.strong = true;
+      if (out.unknown) ctx.unknown = true;
+    }
+  }
+  const reason = runsInPipelines(pipelines, ctx, depth);
+  if (reason) return reason;
+  for (const document of documents) {
+    const reader = hereDocumentReader(document.command);
+    if (document.holds && (reader === "shell" || reader === "interpreter")) {
+      return refsFilled(document.body, ctx.filled) ? ASSIGNED_RUN_REASON : SUBSTITUTION_SHELL_REASON;
+    }
+    // The body may be a script (a shell reads it, or `ssh host <<EOF` runs
+    // it elsewhere): every body is read as a command line of its own, with
+    // this line's writes and its own. A decoded substitution at a body's
+    // command position counts only where a shell word reads the body, so a
+    // document that shows one (`cat > notes.md <<'EOF'`) stays data.
+    if (depth < MAX_SHELL_BODY_DEPTH) {
+      const shell = reader === "shell" || reader === "mention";
+      // A body no shell word reads gets this line's exact written names
+      // only: an unquoted `$x` or `$EDITOR` there is text a document shows.
+      const bodyCtx = shell ? ctx : { written: ctx.written, filled: new Set(), unknown: false, strong: false };
+      const inner = (shell ? checkSubstitutionCommand(document.body) : null) ??
+        writtenRunReason(document.body, depth + 1) ??
+        runsInPipelines(readPipelines(document.body), bodyCtx, depth + 1);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+
+// A decode, a fetch, or an expansion or substitution the guard cannot read:
+// the only sources of content a later stage can run, so a text without one
+// costs a single scan (WI#892 deadline). This replaces the head's
+// write-or-assign gate, which skipped `-o/tmp/x`, `-O/tmp/x` and wget's
+// default name. A quote, a backslash or a brace list may spell a name the
+// stage reader resolves (`c\url`, `"cu"rl`, `c{u,}rl`), so it opens the gate
+// too; a brace without a comma expands to nothing new.
+const WRITE_RUN_SOURCE = new RegExp(`[$\`'"\\\\]|${[...FETCH_NAMES, ...DECODER_NAMES].join("|")}`);
+
+// The readers above run once per text view the evaluator builds, and most
+// views of a command are the same string; keep the last few verdicts.
+const writtenRunVerdicts = new Map();
+
+function checkWrittenThenRun(text) {
+  if (!WRITE_RUN_SOURCE.test(text) && !(text.includes("{") && text.includes(","))) return null;
+  if (writtenRunVerdicts.has(text)) return writtenRunVerdicts.get(text);
+  const verdict = writtenRunReason(text);
+  if (writtenRunVerdicts.size >= 16) writtenRunVerdicts.clear();
+  writtenRunVerdicts.set(text, verdict);
+  return verdict;
+}
+
+/**
+ * Deny a shell, `eval` or `source` fed by a command substitution, a process
+ * substitution or a here-string that holds a decode stage or a fetch (WI#892):
+ * `sh -c "$(curl …)"`, `eval "$(base64 -d f)"`, `bash <(gunzip -c x.gz)`,
+ * `source <(wget -qO- …)`. The substitution runs first and its output becomes
+ * the shell's own text, so no stage sits between them and the pipe rule above
+ * cannot see it. An unreadable body denies too, as it does in a pipeline.
+ */
+function checkSubstitutionShell(text) {
+  // A substitution is the only way a stage can hold content for a later
+  // shell, so a text without one costs a single scan (WI#892 deadline).
+  if (!SUBSTITUTION_MARKER.test(text)) return null;
+  for (const list of commandLists(text)) {
+    for (const stage of pipelineStages(list)) {
+      const words = stagePropertyWords(stage);
+      if (words === null) continue;
+      if (!words.some((_word, index) => runsShellTextAt(words, index))) continue;
+      for (const body of substitutionBodies(stage)) {
+        if (heldContent(body) !== null) return SUBSTITUTION_SHELL_REASON;
       }
     }
   }
@@ -2847,6 +4129,74 @@ function checkDecodedPipe(text) {
 
 const BLOCK_DEVICE_WRITE_PATTERN =
   />\|?\s*\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\bof=\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)|\btruncate\b[^;&|]*\s+\/dev\/(sd|vd|nvme|hd|mmcblk|loop|mapper\/|disk\/by-)/;
+
+const SUBSTITUTION_COMMAND_REASON = "decoded or fetched content run as a command through a substitution";
+
+// Stands in for a held substitution's output in a stage's words. The word
+// readers pass a control byte through as text, and no command word an
+// ordinary task runs carries one.
+const SUBSTITUTION_MARK = "\u0001";
+
+/**
+ * The stage with each top-level substitution whose body holds a decode, a
+ * fetch or a command the guard cannot read replaced by a marker, or null when
+ * no body does.
+ */
+function markHeldSubstitutions(stage) {
+  const { substitutions } = quoteScan(stage);
+  let marked = "";
+  let from = 0;
+  for (let i = 0; i < stage.length; i++) {
+    const close = substitutions.get(i);
+    if (close === undefined) continue;
+    const backtick = stage[i] === "`";
+    const raw = stage.slice(i + (backtick ? 1 : 2), close);
+    if (heldContent(backtick ? raw.replace(/\\([\\$`])/g, "$1") : raw) !== null) {
+      marked += stage.slice(from, i) + SUBSTITUTION_MARK;
+      from = close + 1;
+    }
+    i = close;
+  }
+  return from === 0 ? null : marked + stage.slice(from);
+}
+
+/**
+ * Deny a substitution that holds a decode, a fetch or an unreadable command
+ * at the command position (WI#892 AMR-2). bash runs its output as the command
+ * and its arguments, so `$(echo <b64> | base64 -d)`, the backtick spelling,
+ * `"$(curl …)"`, `env $(…)` and `nice $(…)` run decoded text no other rule
+ * reads. The command position is read after assignments, redirections and
+ * the launchers `commandPosition` follows, so an argument or an assignment
+ * (`echo "$(…)"`, `x=$(…)`) stays data.
+ */
+function substitutionCommandReason(text) {
+  for (const list of runLists(codeView(text))) {
+    for (const stage of pipelineStages(list)) {
+      if (!SUBSTITUTION_MARKER.test(stage)) continue;
+      const marked = markHeldSubstitutions(stage);
+      if (marked === null) continue;
+      const words = stagePropertyWords(marked);
+      if (words === null) return SUBSTITUTION_COMMAND_REASON;
+      const split = splitRedirects(words);
+      const { index } = commandPosition(split);
+      if (index === -2 || (index >= 0 && split[index].includes(SUBSTITUTION_MARK))) {
+        return SUBSTITUTION_COMMAND_REASON;
+      }
+    }
+  }
+  return null;
+}
+
+const substitutionCommandVerdicts = new Map();
+
+function checkSubstitutionCommand(text) {
+  if (!SUBSTITUTION_MARKER.test(text)) return null;
+  if (substitutionCommandVerdicts.has(text)) return substitutionCommandVerdicts.get(text);
+  const verdict = substitutionCommandReason(text);
+  if (substitutionCommandVerdicts.size >= 16) substitutionCommandVerdicts.clear();
+  substitutionCommandVerdicts.set(text, verdict);
+  return verdict;
+}
 
 const DENY_RULES = [
   {
@@ -2962,7 +4312,9 @@ function evaluate(command, depth = 0) {
   // Structural rules (fork bombs) see the whole command: segment splitting
   // on ;|& would shred the very shape they match. Keep them on the raw text.
   const rawDenial = checkDenyRulesEverywhere(command) ?? checkRawShapes(command) ??
-    checkTrustedUserConfig(command) ?? checkListeners(command, depth);
+    checkTrustedUserConfig(command) ?? checkListeners(command, depth) ??
+    // After the listener rule, so `$(nc -l 9000)` keeps its listener reason.
+    checkSubstitutionCommand(command);
   if (rawDenial) return rawDenial;
   // Bash can join a backslash-LF pair into the word around it, so a rule
   // anchored on a word never matches the raw text (`su\<LF>do`). Run every
@@ -3023,7 +4375,8 @@ function evaluate(command, depth = 0) {
       (unredirected === joined ? null : checkRawShapes(unredirected)) ??
       (unredirected === joined ? null : checkMoveAndTarDeletion(shellWordView(unredirected))) ??
       (unredirected === joined ? null : checkListeners(unredirected, depth)) ??
-      (joined === command ? null : checkListeners(joined, depth));
+      (joined === command ? null : checkListeners(joined, depth)) ??
+      (joined === command ? null : checkSubstitutionCommand(joined));
     if (joinedDenial) return joinedDenial;
     for (const segment of commandSegments(glued === joined ? joined : glued)) {
       const denied = checkRm(segment);
@@ -3334,7 +4687,7 @@ function checkShellBody(body, depth) {
     const denied = checkRm(segment);
     if (denied) return denied;
   }
-  return checkListeners(body, depth);
+  return checkListeners(body, depth) ?? checkSubstitutionCommand(body);
 }
 
 /**
