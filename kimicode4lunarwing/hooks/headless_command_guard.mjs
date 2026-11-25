@@ -231,10 +231,10 @@ function redirectionFreeView(text, escapes = true) {
 }
 
 /**
- * The index after the redirection that starts at or just before `i`, or null
- * when `i` starts none. A redirection glues to the word before it (`a&>f`),
- * so the digits or `{varname}` immediately before the operator are part of
- * the token and must not end the word being read.
+ * The index after the redirection whose operator is at `i`, or null when `i`
+ * starts none. A redirection glues to the word before it (`a&>f`), so the
+ * digits or `{varname}` immediately before the operator are part of the token
+ * and must not end the word being read.
  */
 function redirectionSkip(text, i) {
   const operator = redirectOperatorAt(text, i);
@@ -250,6 +250,26 @@ function redirectionSkip(text, i) {
     if (span.end > span.start) end = span.end;
   }
   return end > start ? end : null;
+}
+
+/**
+ * The redirection token that starts at the word boundary `i`, with its
+ * `[n]`/`{varname}` descriptor prefix, or null when `i` starts none. Only a
+ * token at a word start carries a descriptor: bash reads `a2>f` as the word
+ * `a2` and a plain `>f`, because the digits are not a word of their own.
+ */
+function redirectTokenSpan(text, i) {
+  let operatorIndex = i;
+  if (text[i] >= "0" && text[i] <= "9") {
+    while (operatorIndex < text.length && text[operatorIndex] >= "0" &&
+        text[operatorIndex] <= "9") operatorIndex++;
+  } else if (text[i] === "{") {
+    const name = /^\{[A-Za-z_][A-Za-z0-9_]*\}/.exec(text.slice(i, i + 64));
+    if (name === null) return null;
+    operatorIndex = i + name[0].length;
+  }
+  const end = redirectionSkip(text, operatorIndex);
+  return end === null ? null : { start: i, end };
 }
 
 /**
@@ -3008,7 +3028,9 @@ function* listenerSegments(text) {
   let mask = "";
   let started = false;
   let quoted = false;
+  let wordStart = -1;
   const append = (chars, fromQuotes) => {
+    if (!started) wordStart = -1;
     word += chars;
     mask += (fromQuotes ? "1" : "0").repeat(chars.length);
     started = true;
@@ -3042,6 +3064,16 @@ function* listenerSegments(text) {
     } else if (state !== QUOTE_UNQUOTED) {
       if (state !== QUOTE_CLOSE) append(ch, true);
     } else {
+      // A redirection is not a word: `kimi 2>&1 server` names the service
+      // subcommand, and `python3 -m 2>/dev/null http.server` the module
+      // (WI#889). The token ends the word it glues to (`a&>f` is `a`), and
+      // only at a word start does it carry a `[n]` descriptor.
+      const skip = started ? redirectionSkip(text, i) : redirectTokenSpan(text, i);
+      if (skip !== null) {
+        flush();
+        i = (typeof skip === "number" ? skip : skip.end) - 1;
+        continue;
+      }
       const separator = ifsSeparatorLength(text, i);
       if (separator > 0) {
         // Keep the shell word intact until its brace alternatives are known.
