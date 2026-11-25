@@ -37,7 +37,7 @@ async function guardSyntax() {
   const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
   assert.ok(source.endsWith(cli))
   const library = source.slice(0, -cli.length) +
-    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView };"
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView, oneLinerCode };"
   return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
     commandSegments: (text: string) => string[]
     clauseText: (text: string, from: number) => string
@@ -45,6 +45,7 @@ async function guardSyntax() {
     listenerSegments: (text: string) => Iterable<ListenerWord[]>
     listenerWordList: (words: ListenerWord[]) => string[]
     shellWordLevelView: (text: string) => string
+    oneLinerCode: (rest: string, name: string) => string | null
   }
 }
 
@@ -1291,6 +1292,27 @@ test("a one-liner's code is read in every form the interpreter accepts (WI#890)"
   assertAllowed(`python3 -c"print(1)"`)
   assertAllowed(`node --eval="console.log(1)"`)
   assertAllowed(`perl -pe's/a/b/' f`)
+})
+
+test("Perl option clusters keep scanning after numeric modifiers (AMN-1)", async () => {
+  const { oneLinerCode } = await guardSyntax()
+  const code = "'print 42'"
+  for (const name of ["perl", "perl5.36.0"]) {
+    for (const flag of ["-l0e", "-0e", "-00e", "-0777e", "-l012e", "-wl0e"]) {
+      assert.equal(oneLinerCode(` ${flag} ${code}`, name)?.trim(), code)
+      assert.equal(oneLinerCode(` ${flag}${code}`, name), code)
+    }
+  }
+  assert.equal(oneLinerCode(" -0777 input.txt", "perl"), null)
+  assert.equal(oneLinerCode(" -l0ne 'print' f", "perl")?.trim(), "'print' f")
+  assert.equal(oneLinerCode(" -0777 -pe 's/a/b/' f", "perl")?.trim(), "'s/a/b/' f")
+  for (const name of ["perl", "perl5.36.0"]) {
+    for (const flag of ["-l0e", "-0e", "-00e", "-0777e", "-l012e", "-wl0e"]) {
+      assertBlocked(`${name} ${flag} 'unlink(\"/home/kimi/x\")'`, "deletion outside")
+    }
+  }
+  assertAllowed("/usr/bin/perl -l0ne 'print' f")
+  assertAllowed("perl -0777 -pe 's/a/b/' f")
 })
 
 test("every name the image ships for an interpreter is read as it (WI#890)", () => {

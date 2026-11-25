@@ -936,7 +936,10 @@ function interpreterValueOptions(name) {
  */
 function oneLinerCode(rest, name) {
   const values = interpreterValueOptions(name);
-  const letters = EVAL_FLAG_LETTERS[interpreterFamily(name)];
+  const family = interpreterFamily(name);
+  const letters = EVAL_FLAG_LETTERS[family];
+  // Perl's numeric -0 and -l modifiers can precede more flags in the cluster.
+  const clusterPattern = family === "perl" ? /^-([a-zA-Z0-9]+)(.*)$/ : /^-([a-zA-Z]+)(.*)$/;
   let i = 0;
   while (i < rest.length) {
     while (i < rest.length && /[ \t]/.test(rest[i])) i++;
@@ -959,7 +962,7 @@ function oneLinerCode(rest, name) {
     // nothing follows (`-c`, `-Ic`, `-le'…'`, `-c"…"`). A cluster that
     // carries no eval letter is stepped over, and a value option with no
     // attached text takes the next word (WI#890).
-    const cluster = /^-([a-zA-Z]+)(.*)$/.exec(word);
+    const cluster = clusterPattern.exec(word);
     if (cluster !== null) {
       const flags = cluster[1];
       for (let at = 0; at < flags.length; at++) {

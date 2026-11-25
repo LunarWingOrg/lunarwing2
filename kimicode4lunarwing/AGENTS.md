@@ -29,9 +29,10 @@ family whose option table and deletion reader apply. The code is read in every
 form the interpreter's own option syntax accepts: a separate word, attached to
 the flag (`-c"…"`, `-e'…'`), attached to a flag cluster (`-Ic"…"`, `-le'…'`),
 and `--eval=…`/`--print=…`, so the short-option cluster is walked letter by
-letter and a letter that takes a value consumes the rest of its word. The
-temp-root test is unchanged, so a deletion inside `/tmp` still passes, and
-`/usr/bin/python3 script.py`, `-m pytest`, `node app.js` and
+letter and a letter that takes a value consumes the rest of its word. Perl's
+numeric `-0` and `-l` modifiers remain in that walk, so a later eval flag is
+still read. The temp-root test is unchanged, so a deletion inside `/tmp`
+still passes, and `/usr/bin/python3 script.py`, `-m pytest`, `node app.js` and
 `/usr/bin/perl -pe 's/a/b/' f` stay ordinary work.
 
 ## Guard Quote Handling
