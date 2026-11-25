@@ -206,7 +206,7 @@ function stripRedirections(text, escapes = true) {
       const target = text.slice(span.start, span.end);
       if (operator === "<<<") hereStrings.add(target);
       else if (target.length > 0) {
-        targets.push({ target, write: operator !== "<" && operator !== "<&" });
+        targets.push({ target, operator, write: operator !== "<" && operator !== "<&" });
       }
     }
     for (let j = start; j < end; j++) chars[j] = " ";
@@ -3230,9 +3230,28 @@ function splitRedirects(words) {
  * position and what its own words do (`stageContent`). The words are read
  * once per stage: a brace-heavy word costs the reader most of the deadline.
  */
+/**
+ * The words of a stage with its redirections put back as `<operator> <target>`
+ * pairs at the end. The word reader leaves redirections out (WI#889), and the
+ * write and run readers of WI#892 need `> f`, `>> f`, `&> f`, `>& f` and
+ * `< f`. A descriptor duplication (`2>&1`, `>&2`, `<&3`, `>&-`) names no file
+ * and is left out.
+ */
+function stageWordsWithRedirects(stage) {
+  const read = stagePropertyWords(stage);
+  if (read === null) return null;
+  const extra = [];
+  for (const { target, operator } of redirectScan(stage).targets) {
+    const bare = stripShellQuotes(target);
+    if ((operator === ">&" || operator === "<&") && /^(?:\d+-?|-)$/.test(bare)) continue;
+    extra.push(operator === ">&" || operator === "<>" ? ">" : operator, bare);
+  }
+  return extra.length === 0 ? read : [...read, ...extra];
+}
+
 function readPipelines(text) {
   return runLists(codeView(text)).map((list) => pipelineStages(list).map((stage) => {
-    const read = stagePropertyWords(stage);
+    const read = stageWordsWithRedirects(stage);
     const words = read === null ? null : splitRedirects(read);
     return {
       stage,
@@ -3947,7 +3966,7 @@ function writtenRunReason(text, depth = 0) {
     if (!document.holds) continue;
     const out = { names: ctx.written, wrote: false, unknown: false };
     for (const stage of pipelineStages(document.command)) {
-      const words = stagePropertyWords(stage);
+      const words = stageWordsWithRedirects(stage);
       if (words !== null) stageWrites(splitRedirects(words), out);
     }
     if (out.wrote) {
