@@ -493,10 +493,21 @@ const FIND_DELETE_ACTION =
 const XARGS_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?xargs\b/g;
 const XARGS_RM = /(?:^|\s)(?:[\w.+-]*\/)?rm(?:\s|$)/;
 const RSYNC_CALL = /(?:^|[\s;&|()])(?:[\w.+-]*\/)?rsync\b/g;
-// Interpreter options may precede the eval flag (`perl -MFile::Path -e …`),
-// so the eval flag is found by walking the words (oneLinerCode).
-const ONE_LINER_CALL =
-  /(?:^|[\s;&|()])(?:[\w.+-]*\/)?(python3?|perl|node|ruby)(?:\.\d+)?\b([^\n]*)/g;
+// The names one of these interpreters ships under, with the version suffix a
+// name may carry (`python3.11`, `perl5.36.0`). The perl version changes with
+// the base image, so no one version number is held here (WI#890).
+const ONE_LINER_NAMES = "(python3?|perl5(?:\\.\\d+)+|perl|nodejs|node|ruby)(?:\\.\\d+)?";
+// An interpreter may be named by a path of any depth, absolute or relative,
+// with `~`, a variable or a quote in it, so the prefix is every non-blank
+// character up to the last `/` and the name is the last part of the word
+// (WI#890). Options may precede the eval flag (`perl -MFile::Path -e …`), so
+// the eval flag is found by walking the words (oneLinerCode).
+const ONE_LINER_CALL = new RegExp(
+  `(?:^|[\\s;&|()])(?:[^\\s;&|()]*\\/)?${ONE_LINER_NAMES}\\b([^\\n]*)`, "g");
+// The letters an interpreter's own option syntax uses for its eval flag
+// (python `-c`, perl `-e`/`-E`, node `-e`/`-p`, ruby `-e`), read inside a
+// short-option cluster.
+const EVAL_FLAG_LETTERS = { python: "c", perl: "eE", node: "ep", ruby: "e" };
 const DELETION_CALL =
   /\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink)|rmtree|remove_tree|rimraf|rmSync|rmdirSync|unlinkSync|unlink|rmdir)\s*\(/g;
 // The names a one-liner can bind to a deletion, however the binding is spelled.
@@ -879,11 +890,25 @@ const INTERPRETER_VALUE_OPTIONS = {
   ruby: new Set(["-I", "-r", "-C", "-E", "--enable"]),
 };
 
+/**
+ * The language family of an interpreter name (WI#890): the version suffix and
+ * the second name a name may carry are dropped, so `perl5.36.0` reads as
+ * `perl` and `nodejs` as `node`. The family, not the spelling, chooses the
+ * option tables and the deletion readers.
+ */
+function interpreterFamily(name) {
+  if (/^node/.test(name)) return "node";
+  if (/^perl/.test(name)) return "perl";
+  if (/^ruby/.test(name)) return "ruby";
+  return "python";
+}
+
 /** The value-option table for an interpreter name, by language family. */
 function interpreterValueOptions(name) {
-  if (name === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
-  if (name === "node") return INTERPRETER_VALUE_OPTIONS.node;
-  if (name === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
+  const family = interpreterFamily(name);
+  if (family === "perl") return INTERPRETER_VALUE_OPTIONS.perl;
+  if (family === "node") return INTERPRETER_VALUE_OPTIONS.node;
+  if (family === "ruby") return INTERPRETER_VALUE_OPTIONS.ruby;
   return INTERPRETER_VALUE_OPTIONS.python;
 }
 
@@ -902,9 +927,19 @@ function interpreterValueOptions(name) {
  * code was never read. Reading a positional word as if a later flag were the
  * interpreter's own can only add denials, which is the accepted cost; missing
  * the flag is not.
+ *
+ * The code may sit in the flag word itself (WI#890): a short-option cluster
+ * is walked letter by letter as the interpreter reads it, so `-c"…"`, `-Ic"…"`
+ * and `-le'…'` hand over the rest of the word, and `--eval=…` hands over the
+ * text after the `=`. Where the walk cannot tell whether a word is the eval
+ * flag, it keeps walking rather than returning, so doubt cannot allow.
  */
 function oneLinerCode(rest, name) {
   const values = interpreterValueOptions(name);
+  const family = interpreterFamily(name);
+  const letters = EVAL_FLAG_LETTERS[family];
+  // Perl's numeric -0 and -l modifiers can precede more flags in the cluster.
+  const clusterPattern = family === "perl" ? /^-([a-zA-Z0-9]+)(.*)$/ : /^-([a-zA-Z]+)(.*)$/;
   let i = 0;
   while (i < rest.length) {
     while (i < rest.length && /[ \t]/.test(rest[i])) i++;
@@ -912,12 +947,38 @@ function oneLinerCode(rest, name) {
     while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
     const word = rest.slice(start, i);
     if (word.length === 0) return null;
-    if (/^(?:--eval|--print)$/.test(word) || /^-[a-zA-Z]*[ceEp][a-zA-Z]*$/.test(word)) {
-      return rest.slice(i);
-    }
+    if (/^(?:--eval|--print)$/.test(word)) return rest.slice(i);
+    // `--eval=…`/`--print=…` carry the code in the word itself (WI#890).
+    if (/^--(?:eval|print)=/.test(word)) return word.slice(word.indexOf("=") + 1) + rest.slice(i);
+    // A long value option's separate word is stepped over (WI#869).
     if (values.has(word)) {
       while (i < rest.length && /[ \t]/.test(rest[i])) i++;
       while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      continue;
+    }
+    // A short-option cluster is read the way the interpreter reads it: a
+    // letter that takes a value consumes the rest of the word, and the eval
+    // letter hands it the rest of the word as code, or the next word when
+    // nothing follows (`-c`, `-Ic`, `-le'…'`, `-c"…"`). A cluster that
+    // carries no eval letter is stepped over, and a value option with no
+    // attached text takes the next word (WI#890).
+    const cluster = clusterPattern.exec(word);
+    if (cluster !== null) {
+      const flags = cluster[1];
+      for (let at = 0; at < flags.length; at++) {
+        const letter = flags[at];
+        if (letters.includes(letter)) {
+          const tail = at === flags.length - 1 ? cluster[2] : flags.slice(at + 1) + cluster[2];
+          return tail === "" ? rest.slice(i) : tail + rest.slice(i);
+        }
+        if (values.has(`-${letter}`)) {
+          if (at === flags.length - 1 && cluster[2] === "") {
+            while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+            while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+          }
+          break;
+        }
+      }
       continue;
     }
   }
@@ -1262,7 +1323,7 @@ function checkInterpreterDeletion(text) {
     const code = oneLinerCode(invocation[2], invocation[1]);
     if (code === null) continue;
     const aliases = sinkAliases(code);
-    if (invocation[1] === "perl") {
+    if (interpreterFamily(invocation[1]) === "perl") {
       const perlDenial = perlDeletionVerdict(code);
       if (perlDenial) return perlDenial;
     }

@@ -37,7 +37,7 @@ async function guardSyntax() {
   const cli = 'main().catch(() => deny("guard failed unexpectedly"));'
   assert.ok(source.endsWith(cli))
   const library = source.slice(0, -cli.length) +
-    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView };"
+    "export { commandSegments, clauseText, quoteScan, listenerSegments, listenerWordList, shellWordLevelView, oneLinerCode };"
   return await import("data:text/javascript;base64," + Buffer.from(library).toString("base64")) as {
     commandSegments: (text: string) => string[]
     clauseText: (text: string, from: number) => string
@@ -45,6 +45,7 @@ async function guardSyntax() {
     listenerSegments: (text: string) => Iterable<ListenerWord[]>
     listenerWordList: (words: ListenerWord[]) => string[]
     shellWordLevelView: (text: string) => string
+    oneLinerCode: (rest: string, name: string) => string | null
   }
 }
 
@@ -989,6 +990,11 @@ test("a long command of repeated words is decided without rescanning", () => {
   assertBlocked("{a,b}".repeat(2000).slice(0, 16_384), "brace expansion this large")
   assertAllowed("echo " + "{".repeat(8_000) + "}".repeat(8_000), 2_000)
   assertBlocked("echo " + "{x,".repeat(4_000) + "y" + "}".repeat(4_000), "brace expansion this large")
+  // WI#890 reads the interpreter name as the last part of a path of any
+  // depth, so 16 KB of path parts must not cost a match attempt per start.
+  assertAllowed("/a/b/c/d/e/f/g/h ".repeat(1000).slice(0, 16_384), 2_000)
+  assertAllowed("a/".repeat(8_000).slice(0, 16_384), 2_000)
+  assertAllowed("/usr/bin/node -e ".repeat(900).slice(0, 16_384), 2_000)
 })
 
 test("a brace expansion past the cap is refused, not read as literal (ALP-1)", () => {
@@ -1230,6 +1236,98 @@ test("an unlisted interpreter option does not end the walk to the eval flag (WI#
   assertAllowed("python3 -m pytest tests/ -q")
   assertAllowed("node --version")
   assertAllowed("node app.js")
+})
+
+test("a one-liner is read behind any interpreter path (WI#890)", () => {
+  // ONE_LINER_CALL allowed at most one directory before the name, so every
+  // absolute path to a real interpreter in the worker image went unread:
+  // /usr/bin/python3, /usr/bin/perl and /usr/local/bin/node.
+  assertBlocked(`/usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/bin/perl -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/local/bin/node -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  // Any number of directory parts, relative or absolute, with `~` or a
+  // variable in the path, and quoted.
+  for (const prefix of ["/bin/", "/usr/bin/", "/usr/local/bin/", "../bin/", "/opt/x/bin/", "~/bin/", "$HOME/bin/", "//usr/bin/"]) {
+    assertBlocked(`${prefix}node -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  }
+  assertBlocked(`"/usr/bin/python3" -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  // Behind a launcher and inside a shell body.
+  assertBlocked(`env /usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`timeout 5 /usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`bash -c '/usr/bin/python3 -c "import shutil; shutil.rmtree(\\"/home/kimi/x\\")"'`, "interpreter deletion")
+  // The temp-root test and ordinary uses keep their verdicts.
+  assertAllowed(`/usr/bin/python3 -c "import shutil; shutil.rmtree('/tmp/wi890-x')"`)
+  assertAllowed(`/usr/local/bin/node -e "require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`/usr/bin/python3 -c "print(1)"`)
+  assertAllowed("/usr/bin/python3 script.py")
+  assertAllowed("/usr/bin/python3 -m pytest -q")
+  assertAllowed("/usr/bin/env python3 script.py")
+  assertAllowed("/usr/local/bin/node app.js")
+  assertAllowed("/usr/local/bin/node server.js")
+  assertAllowed("/usr/local/bin/node --version")
+  assertAllowed("/usr/bin/perl -pe 's/a/b/' f")
+})
+
+test("a one-liner's code is read in every form the interpreter accepts (WI#890)", () => {
+  // oneLinerCode matched the eval flag only as a whole word, so the code
+  // attached to the flag was never read. Each attached form below runs under
+  // the interpreter's own option syntax.
+  assertBlocked(`python3 -c"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c'import shutil; shutil.rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`python3 -Ic"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -I -c"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -e'use File::Path; rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -e"use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e'rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -le'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`node --eval="require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  // The same code after a blank keeps denying.
+  assertBlocked(`node --eval "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`node -pe "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`perl -le "unlink('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -I -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  // The temp-root test and the no-deletion rows keep their verdicts.
+  assertAllowed(`python3 -c"import shutil; shutil.rmtree('/tmp/wi890-x')"`)
+  assertAllowed(`node --eval="require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`python3 -c"print(1)"`)
+  assertAllowed(`node --eval="console.log(1)"`)
+  assertAllowed(`perl -pe's/a/b/' f`)
+})
+
+test("Perl option clusters keep scanning after numeric modifiers (AMN-1)", async () => {
+  const { oneLinerCode } = await guardSyntax()
+  const code = "'print 42'"
+  for (const name of ["perl", "perl5.36.0"]) {
+    for (const flag of ["-l0e", "-0e", "-00e", "-0777e", "-l012e", "-wl0e"]) {
+      assert.equal(oneLinerCode(` ${flag} ${code}`, name)?.trim(), code)
+      assert.equal(oneLinerCode(` ${flag}${code}`, name), code)
+    }
+  }
+  assert.equal(oneLinerCode(" -0777 input.txt", "perl"), null)
+  assert.equal(oneLinerCode(" -l0ne 'print' f", "perl")?.trim(), "'print' f")
+  assert.equal(oneLinerCode(" -0777 -pe 's/a/b/' f", "perl")?.trim(), "'s/a/b/' f")
+  for (const name of ["perl", "perl5.36.0"]) {
+    for (const flag of ["-l0e", "-0e", "-00e", "-0777e", "-l012e", "-wl0e"]) {
+      assertBlocked(`${name} ${flag} 'unlink(\"/home/kimi/x\")'`, "deletion outside")
+    }
+  }
+  assertAllowed("/usr/bin/perl -l0ne 'print' f")
+  assertAllowed("perl -0777 -pe 's/a/b/' f")
+})
+
+test("every name the image ships for an interpreter is read as it (WI#890)", () => {
+  // /usr/local/bin/nodejs is a link to node and /usr/bin/perl5.36.0 is the
+  // same file as /usr/bin/perl in the lane's base image. The perl version
+  // changes with the base image, so the pattern must not hold one version.
+  assertBlocked(`nodejs -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`/usr/local/bin/nodejs -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`perl5.36.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/bin/perl5.36.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl5.40.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertAllowed(`nodejs -e "require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`perl5.36.0 -e "use File::Path; rmtree('/tmp/wi890-x')"`)
+  assertAllowed("nodejs --version")
+  assertAllowed("nodejs app.js")
 })
 
 test("cp's destination option is the destination it writes (WI#869)", () => {
