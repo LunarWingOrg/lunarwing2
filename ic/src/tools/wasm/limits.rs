@@ -260,6 +260,24 @@ mod tests {
         assert!(!result);
     }
 
+    /// WI#891: a refused growth is remembered so a trap that follows it can be
+    /// reported as a memory limit instead of an unexplained abort.
+    #[test]
+    fn test_resource_limiter_records_the_denied_growth() {
+        let mut limiter = WasmResourceLimiter::new(10 * 1024 * 1024);
+        assert_eq!(limiter.memory_growth_denied(), None);
+
+        assert!(limiter.memory_growing(0, 1024 * 1024, None).unwrap());
+        assert_eq!(
+            limiter.memory_growth_denied(),
+            None,
+            "an allowed growth records nothing"
+        );
+
+        assert!(!limiter.memory_growing(0, 20 * 1024 * 1024, None).unwrap());
+        assert_eq!(limiter.memory_growth_denied(), Some(20 * 1024 * 1024));
+    }
+
     #[test]
     fn test_fuel_config() {
         let config = FuelConfig::default();
