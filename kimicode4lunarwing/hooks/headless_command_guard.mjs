@@ -83,6 +83,175 @@ function heredocRedirect(text, i) {
   return { delimiter, stripTabs, end: word.lastIndex };
 }
 
+// WI#889: a redirection may stand anywhere in a simple command, and the words
+// after it are still that command's arguments (`man bash`, REDIRECTION). The
+// reader below blanks every redirection out of the command line and keeps its
+// targets in a list, so a rule reads the words bash runs and a rule about a
+// target still sees it. The forms are `[n]<word`, `[n]>word`, `[n]>|word`,
+// `[n]>>word`, `&>word`, `>&word`, `&>>word`, `[n]<<[-]word`, `[n]<<<word`,
+// `[n]<&word`, `[n]>&word` and `[n]<>word`, each also with `{varname}` in
+// place of `n`, and with or without blanks before the target.
+const REDIRECT_WORD_BREAK = " \t\n;|&()<>";
+
+/** The redirection operator at `i`, or "" when the character starts none. */
+function redirectOperatorAt(text, i) {
+  const ch = text[i];
+  if (ch === "&") {
+    if (text[i + 1] !== ">") return "";
+    return text[i + 2] === ">" ? "&>>" : "&>";
+  }
+  if (ch === ">") {
+    // `>(…)` is a process substitution, not a redirection.
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === ">") return ">>";
+    if (text[i + 1] === "|") return ">|";
+    if (text[i + 1] === "&") return ">&";
+    return ">";
+  }
+  if (ch === "<") {
+    if (text[i + 1] === "(") return "";
+    if (text[i + 1] === "&") return "<&";
+    if (text[i + 1] === ">") return "<>";
+    if (text[i + 1] !== "<") return "<";
+    if (text[i + 2] === "<") return "<<<";
+    if (text[i + 2] === "-") return "<<-";
+    return "<<";
+  }
+  return "";
+}
+
+/**
+ * The start of the whole redirection token: bash reads a run of digits (or a
+ * `{varname}`) that forms a word of its own immediately before the operator as
+ * the descriptor, so `a2>f` writes fd 1 from the word `a2` while `2>f` writes
+ * fd 2. The digits must be the whole word, which is why the character before
+ * them has to be a word break.
+ */
+function redirectPrefixStart(text, operatorIndex) {
+  let start = operatorIndex;
+  let i = operatorIndex - 1;
+  if (text[i] === "}") {
+    let open = i - 1;
+    while (open >= 0 && /[A-Za-z0-9_]/.test(text[open])) open--;
+    if (open >= 0 && text[open] === "{" && open < i - 1 &&
+        (open === 0 || REDIRECT_WORD_BREAK.includes(text[open - 1]))) {
+      start = open;
+      i = open - 1;
+    }
+  }
+  let digits = 0;
+  while (i >= 0 && text[i] >= "0" && text[i] <= "9") {
+    i--;
+    digits++;
+  }
+  if (digits > 0 && (i < 0 || REDIRECT_WORD_BREAK.includes(text[i]))) start = i + 1;
+  return start;
+}
+
+/** The span of the word a redirection takes as its target, blanks skipped. */
+function redirectWordSpan(text, scan, from) {
+  let i = from;
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  const start = i;
+  while (i < text.length) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close + 1;
+      continue;
+    }
+    if (scan.states[i] === QUOTE_UNQUOTED && REDIRECT_WORD_BREAK.includes(text[i])) break;
+    i++;
+  }
+  return { start, end: Math.min(i, text.length) };
+}
+
+/**
+ * The command line with every redirection blanked out, the targets it wrote
+ * or read, and the here-string bodies, which bash feeds to the command as its
+ * input and which the listener rule therefore reads as commands. The blanks
+ * keep every other offset where it was. `|&` is bash's shorthand for
+ * `2>&1 |` (`man bash`, Pipelines), so its `&` is blanked and the bar kept.
+ */
+function stripRedirections(text, escapes = true) {
+  const scan = quoteScan(text, escapes);
+  const chars = text.split("");
+  const targets = [];
+  const hereStrings = [];
+  for (let i = 0; i < text.length; i++) {
+    const close = scan.substitutions.get(i);
+    if (close !== undefined) {
+      i = close;
+      continue;
+    }
+    if (scan.states[i] !== QUOTE_UNQUOTED) continue;
+    if (text[i] === "|" && text[i + 1] === "&") {
+      chars[i + 1] = " ";
+      i++;
+      continue;
+    }
+    const operator = redirectOperatorAt(text, i);
+    if (operator === "") continue;
+    const start = redirectPrefixStart(text, i);
+    let end = i + operator.length;
+    if (operator === "<<" || operator === "<<-") {
+      const redirect = heredocRedirect(text, i);
+      if (redirect) end = redirect.end;
+    } else {
+      const span = redirectWordSpan(text, scan, i + operator.length);
+      if (span.end > span.start) end = span.end;
+      const target = text.slice(span.start, span.end);
+      if (operator === "<<<") hereStrings.push(stripShellQuotes(target));
+      else if (target.length > 0) {
+        targets.push({ target, write: operator !== "<" && operator !== "<&" });
+      }
+    }
+    for (let j = start; j < end; j++) chars[j] = " ";
+    i = end - 1;
+  }
+  const view = chars.join("");
+  return { view, targets, hereStrings };
+}
+
+let redirectScanText = null;
+let redirectScanEscapes = true;
+let redirectScanResult = null;
+
+function redirectScan(text, escapes = true) {
+  if (text === redirectScanText && escapes === redirectScanEscapes) return redirectScanResult;
+  const result = stripRedirections(text, escapes);
+  redirectScanText = text;
+  redirectScanEscapes = escapes;
+  redirectScanResult = result;
+  return result;
+}
+
+/** The command line with its redirections taken out. */
+function redirectionFreeView(text, escapes = true) {
+  return redirectScan(text, escapes).view;
+}
+
+/**
+ * The index after the redirection that starts at or just before `i`, or null
+ * when `i` starts none. A redirection glues to the word before it (`a&>f`),
+ * so the digits or `{varname}` immediately before the operator are part of
+ * the token and must not end the word being read.
+ */
+function redirectionSkip(text, i) {
+  const operator = redirectOperatorAt(text, i);
+  if (operator === "") return null;
+  const scan = quoteScan(text);
+  const start = redirectPrefixStart(text, i);
+  let end = i + operator.length;
+  if (operator === "<<" || operator === "<<-") {
+    const redirect = heredocRedirect(text, i);
+    if (redirect) end = redirect.end;
+  } else {
+    const span = redirectWordSpan(text, scan, i + operator.length);
+    if (span.end > span.start) end = span.end;
+  }
+  return end > start ? end : null;
+}
+
 /**
  * The containment test shared by every deletion rule (WI#826, WI#830): a
  * target is provably inside the temp roots only as a literal absolute path,
@@ -462,6 +631,10 @@ function rmDeleteOption(rest) {
 }
 
 function checkRm(segment) {
+  // A redirection is neither a clause end nor an operand (WI#889): the
+  // clause is read with its redirections taken out, so `rm 2>&1 -rf /x` is
+  // one command and `rm -rf /tmp/x 2> /dev/null` names one path.
+  segment = redirectionFreeView(segment);
   const match = /\brm[ \t]+(.*)$/s.exec(segment);
   if (!match) return null;
   // `xargs rm` takes its operands from stdin: the guard classifies that shape
@@ -1467,9 +1640,14 @@ let clauseScanEnds = [];
 
 function clauseEnds(text) {
   if (text === clauseScanText) return clauseScanEnds;
+  // A redirection's own operator characters are not control operators: the
+  // `&` of `2>&1`, `&>`, `>&`, `<&` and the bar of `>|` end no clause, and
+  // `|&` keeps its bar (WI#889). The redirection-free view has the same
+  // offsets, so the indices stay valid for `text`.
+  const view = redirectionFreeView(text);
   const ends = [];
-  for (const i of unquotedOffsets(text)) {
-    if (isClauseTerminator(text[i])) ends.push(i);
+  for (const i of unquotedOffsets(view)) {
+    if (isClauseTerminator(view[i])) ends.push(i);
   }
   clauseScanText = text;
   clauseScanEnds = ends;
@@ -1584,6 +1762,16 @@ function bashWord(text, from) {
       word += ch;
       i++;
       continue;
+    }
+    // A redirection is not a word: `git 2>/dev/null reset` reads `reset` as
+    // the verb, and `rm 2>&1 -rf /x` reads `-rf` and `/x` (WI#889). The
+    // scan's quote state says where the operator and its target end.
+    if (levels.length === 1) {
+      const skip = redirectionSkip(text, i);
+      if (skip !== null) {
+        i = skip;
+        continue;
+      }
     }
     const opener = openingQuote(text, i);
     if (opener !== "") {
@@ -2543,13 +2731,17 @@ function* unquotedOffsets(text, escapes = true) {
 
 /** Preserve the exact text of each piece; only unquoted separators split it. */
 function splitOutsideQuotes(text, separator, escapes = true) {
+  // A redirection's operator characters are not control operators, and the
+  // target is not a word (WI#889). The view keeps every offset, so the
+  // pieces below are the caller's own text.
+  const view = redirectionFreeView(text);
   const pieces = [];
   let start = 0;
-  for (const i of unquotedOffsets(text, escapes)) {
+  for (const i of unquotedOffsets(view, escapes)) {
     if (i < start) continue;
     const width = typeof separator === "string"
-      ? Number(text[i] === separator)
-      : Number(separator(text[i], text[i + 1]));
+      ? Number(view[i] === separator)
+      : Number(separator(view[i], view[i + 1]));
     if (!width) continue;
     pieces.push(text.slice(start, i));
     start = i + width;
