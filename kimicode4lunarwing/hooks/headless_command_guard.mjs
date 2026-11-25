@@ -253,6 +253,21 @@ function redirectionSkip(text, i) {
 }
 
 /**
+ * The index after any redirections standing at or before `i`, with the blanks
+ * between them. A caller that expects a word at `i` uses this to step past a
+ * redirection that stands in the word's place (`git -C 2>/dev/null /tmp/r`).
+ */
+function skipRedirectionAt(text, from) {
+  let i = from;
+  for (;;) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    const end = redirectTokenSpan(text, i)?.end ?? null;
+    if (end === null) return i;
+    i = end;
+  }
+}
+
+/**
  * The redirection token that starts at the word boundary `i`, with its
  * `[n]`/`{varname}` descriptor prefix, or null when `i` starts none. Only a
  * token at a word start carries a descriptor: bash reads `a2>f` as the word
@@ -1857,6 +1872,10 @@ function gitVerb(text, from) {
     if (GIT_VALUE_OPTIONS.has(word)) {
       // These options take a value, which is not the verb. It is read as one
       // bash word, so `-C "/tmp/a b"` steps over the value whole (WI#856).
+      // A redirection standing where the value would be is not the value
+      // (`git -C 2>/dev/null /tmp/r reset`), so it is stepped over first
+      // (WI#889).
+      i = skipRedirectionAt(text, i);
       while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
       i = bashWord(text, i).end;
     }
