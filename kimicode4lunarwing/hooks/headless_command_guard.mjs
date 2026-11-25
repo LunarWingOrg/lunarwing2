@@ -3358,7 +3358,238 @@ function checkFindExecListeners(words, start, depth) {
 // A launcher that runs its own string as a shell command: `script -c` runs it
 // with `sh -c`, and `eval` joins its words and runs them. Neither is a
 // command position — the words are read wherever they sit (WI#858).
-const SHELL_STRING_LAUNCHERS = new Set(["script"]);
+//
+// WI#887: four more launchers hand a quoted string to a shell with no shell
+// word in the command, so the string is one word to the shell and neither the
+// raw-shape family nor the listener rule saw a command in it. Each reader
+// below returns the bodies that launcher runs, in the words the listener
+// reader has already unquoted; every body gets the full body rule set
+// (`checkShellBody`, WI#874). The launcher is one table entry, not a new
+// rule, so the next such launcher is one entry as well.
+//
+// util-linux flock 2.42.4 reads its options with getopt_long and the short
+// option string "+sexnoFuw:E:hV?" (read from the binary): the `+` stops the
+// walk at the first word that is not an option, which is the lock file, and
+// `--` ends the options before it. A short cluster is read letter by letter,
+// so the value letter of `-nw 5` or `-nE 1` takes the rest of the word, or
+// the next word when nothing follows (AMK-1). A long option is its exact
+// name, else a unique prefix (`--time`, `--wai`, `--conf`), and
+// `--name=value` carries its value inline. Each name maps to the option it
+// stands for, so two names of one option (`--timeout`/`--wait`,
+// `--nonblocking`/`--nb`) are one match, as getopt_long counts them, while
+// `--n` (`--nonblocking` or `--no-fork`) is ambiguous.
+const FLOCK_LONG_OPTIONS = new Map([
+  ["shared", "s"], ["exclusive", "x"], ["unlock", "u"], ["nonblocking", "n"], ["nb", "n"],
+  ["timeout", "w"], ["wait", "w"], ["conflict-exit-code", "E"], ["close", "o"],
+  ["no-fork", "F"], ["verbose", "verbose"], ["fcntl", "fcntl"], ["start", "start"],
+  ["length", "length"], ["help", "h"], ["version", "V"],
+]);
+const FLOCK_FLAG_OPTIONS = new Set(["s", "e", "x", "n", "o", "F", "u", "h", "V", "?", "verbose", "fcntl"]);
+const FLOCK_VALUE_OPTIONS = new Set(["w", "E", "start", "length"]);
+// `-c`/`--command` is not a getopt option: flock checks for that literal
+// word *after* the file and runs its value through `sh`, so `flock file -x
+// -c 'cmd'` runs `-x` as the program. Reading the word after the file only,
+// as flock does, keeps an ordinary `flock file make -c …` allowed. Before the
+// file 2.42.4 refuses `-c`, `-nc` and `--command` as invalid options; the
+// walk reads them as any word it cannot resolve, so their value still counts
+// as a possible body.
+const FLOCK_COMMAND_OPTIONS = new Set(["-c", "--command"]);
+// util-linux `su --help` (2.42.4) reads its words through getopt, which
+// permutes, so `-c` may sit on either side of the user name; its value may be
+// attached (`-c'cmd'`, `-lc 'cmd'`) or follow as the next word. The other
+// value options are stepped over whole so a value is never read as the body.
+const SU_COMMAND_OPTIONS = new Set(["-c", "--command", "--session-command"]);
+const SU_VALUE_OPTIONS = new Set([
+  "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment",
+]);
+// The short value-taking letters of that set, read letter by letter in a
+// cluster. `m`/`p` (preserve-environment) take nothing.
+const SU_SHORT_VALUE_LETTERS = new Set(["g", "G", "s", "w"]);
+// procps `watch --help` (procps-ng 4.0.7): a value option eats the next
+// word, `-d`/`--differences` takes only an attached value, and the command is
+// the first word that is neither. Everything from there on is the command,
+// which watch joins with spaces before handing it to `sh -c`; watch stops
+// reading options at that word (`watch 'cmd' -n1` runs `cmd -n1`).
+const WATCH_VALUE_OPTIONS = new Set(["-n", "--interval", "-q", "--equexit", "-s", "--shotsdir"]);
+const PARALLEL_ARGUMENT_MARKER = /^:::/;
+// One invocation may name at most this many bodies; past it the whole tail is
+// read as one body, which covers the same words.
+const MAX_LAUNCHER_BODIES = 64;
+
+function shellBodyList(body) {
+  return body === undefined || body === "" ? [] : [body];
+}
+
+/** The flock option a long option name stands for, or undefined when getopt_long cannot resolve it. */
+function flockLongOption(name) {
+  const exact = FLOCK_LONG_OPTIONS.get(name);
+  if (exact !== undefined) return exact;
+  let found;
+  for (const [long, option] of FLOCK_LONG_OPTIONS) {
+    if (!long.startsWith(name)) continue;
+    // A prefix of two different options is ambiguous.
+    if (found !== undefined && found !== option) return undefined;
+    found = option;
+  }
+  return found;
+}
+
+/**
+ * One option word as flock reads it: `step` is 1 when any value it takes is
+ * in the word itself and 2 when it takes the next word. A word getopt_long
+ * cannot resolve (an unknown option or letter, an ambiguous prefix) returns
+ * `doubt`: the text the word carries after that point (`-ncCMD` carries
+ * `CMD`, `--x=CMD` carries `CMD`), since an option the reader does not know
+ * may take it as its value.
+ */
+function flockOptionWord(word) {
+  if (word.startsWith("--")) {
+    const equals = word.indexOf("=");
+    const option = flockLongOption(word.slice(2, equals === -1 ? undefined : equals));
+    if (option === undefined) return { doubt: equals === -1 ? "" : word.slice(equals + 1) };
+    return { step: FLOCK_VALUE_OPTIONS.has(option) && equals === -1 ? 2 : 1 };
+  }
+  for (let j = 1; j < word.length; j++) {
+    if (FLOCK_VALUE_OPTIONS.has(word[j])) return { step: j + 1 < word.length ? 1 : 2 };
+    if (!FLOCK_FLAG_OPTIONS.has(word[j])) return { doubt: word.slice(j + 1) };
+  }
+  return { step: 1 };
+}
+
+// From each word of a clause, where flock's option walk starting there ends:
+// `{ file }`, the lock file's index (the first word that is not an option,
+// or the word after `--`); `{ doubt, carried }`, an option word the walk
+// cannot resolve; or null when an option's value runs past the clause. Every
+// step moves forward, so the table is built from the end in one pass and a
+// clause of many flock words reads each word once (WI#858 deadline).
+const flockWalks = new WeakMap();
+
+function flockWalk(words) {
+  let walk = flockWalks.get(words);
+  if (walk !== undefined) return walk;
+  walk = new Array(words.length + 2).fill(null);
+  for (let i = words.length - 1; i >= 0; i--) {
+    const word = words[i];
+    if (word === "--") {
+      walk[i] = { file: i + 1 };
+    } else if (!word.startsWith("-") || word === "-") {
+      walk[i] = { file: i };
+    } else {
+      const read = flockOptionWord(word);
+      walk[i] = read.doubt === undefined ? walk[i + read.step] : { doubt: i, carried: read.doubt };
+    }
+  }
+  flockWalks.set(words, walk);
+  return walk;
+}
+
+/**
+ * `flock [options] <file> -c '<string>'`: the body after the lock file, with
+ * the options read as flock reads them (WI#887, AMK-1). Doubt never allows:
+ * from an option word the walk cannot resolve, it cannot tell what that word
+ * takes or which word is the file, so the text the word carries and every
+ * later word of the clause are each a possible body. More than
+ * MAX_LAUNCHER_BODIES of them is refused (`null`) rather than read in part;
+ * flock 2.42.4 itself refuses any such word as an invalid option.
+ */
+function flockShellBodies(words, start) {
+  const reached = flockWalk(words)[start];
+  if (reached === null) return [];
+  if (reached.doubt !== undefined) {
+    if (words.length - reached.doubt > MAX_LAUNCHER_BODIES) return null;
+    const bodies = new Set([reached.carried, ...words.slice(reached.doubt + 1)]);
+    bodies.delete("");
+    return [...bodies];
+  }
+  // flock reads the word after the lock file as `-c`/`--command` and the one
+  // after that as the shell body.
+  if (!FLOCK_COMMAND_OPTIONS.has(words[reached.file + 1] ?? "")) return [];
+  return shellBodyList(words[reached.file + 2]);
+}
+
+/** `su -c '<string>'`: the command option's value, wherever getopt finds it (WI#887). */
+function suShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return [];
+    if (SU_COMMAND_OPTIONS.has(word)) return shellBodyList(words[i + 1]);
+    if (SU_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("=");
+      if (equals === -1) continue;
+      if (SU_COMMAND_OPTIONS.has(word.slice(0, equals))) return shellBodyList(word.slice(equals + 1));
+      continue;
+    }
+    if (!/^-[a-zA-Z]/.test(word)) continue;
+    // getopt reads a short cluster letter by letter. `c` takes the rest of
+    // the word as its value when anything follows (`-c'cmd'`), otherwise the
+    // next word (`-lc 'cmd'`). A value-taking letter before it (`-sc` is
+    // `-s c`) ends the cluster at that value, so `-sc` carries no body.
+    for (let j = 1; j < word.length; j++) {
+      if (word[j] === "c") return shellBodyList(word.slice(j + 1) || words[i + 1]);
+      if (SU_SHORT_VALUE_LETTERS.has(word[j])) break;
+    }
+  }
+  return [];
+}
+
+/** `watch`'s command: every word from the first non-option one, joined as watch joins it. */
+function watchShellBodies(words, start) {
+  for (let i = start; i < words.length; i++) {
+    const word = words[i];
+    if (word === "--") return shellBodyList(words.slice(i + 1).join(" "));
+    if (WATCH_VALUE_OPTIONS.has(word)) {
+      i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) continue;
+    return shellBodyList(words.slice(i).join(" "));
+  }
+  return [];
+}
+
+/**
+ * GNU `parallel` runs its command template through a shell, and each
+ * `:::`/`::::` argument is a command line of its own (`parallel ::: 'kimi
+ * server'` runs it). Every run between the markers is read; the option words
+ * before the template are read with it, which can only add denials.
+ */
+function parallelShellBodies(words, start) {
+  const bodies = [];
+  let current = [];
+  for (let i = start; i < words.length; i++) {
+    if (!PARALLEL_ARGUMENT_MARKER.test(words[i])) {
+      current.push(words[i]);
+      continue;
+    }
+    if (current.length > 0) bodies.push(current.join(" "));
+    current = [];
+    if (bodies.length > MAX_LAUNCHER_BODIES) return shellBodyList(words.slice(start).join(" "));
+  }
+  if (current.length > 0) bodies.push(current.join(" "));
+  return bodies;
+}
+
+const SHELL_STRING_LAUNCHERS = new Map([
+  ["script", (words, start) => shellBodyList(listenerShellBody(words, start, "script"))],
+  ["flock", flockShellBodies],
+  ["su", suShellBodies],
+  ["watch", watchShellBodies],
+  ["parallel", parallelShellBodies],
+]);
+
+/**
+ * The bodies one launcher word runs through a shell (WI#874, WI#887), or
+ * null when the reader cannot read them all (the caller refuses).
+ */
+function launcherShellBodies(name, words, start) {
+  if (SHELL_NAME.test(name)) return shellBodyList(listenerShellBody(words, start, name));
+  const reader = SHELL_STRING_LAUNCHERS.get(name);
+  return reader === undefined ? [] : reader(words, start);
+}
 
 /**
  * The words bash's brace expansion would also produce from one word
@@ -3710,8 +3941,9 @@ function checkListenerWords(words, depth) {
       continue;
     }
     if (SHELL_NAME.test(name) || SHELL_STRING_LAUNCHERS.has(name)) {
-      const body = listenerShellBody(words, i + 1, name);
-      if (body !== undefined) {
+      const bodies = launcherShellBodies(name, words, i + 1);
+      if (bodies === null) return `cannot check the shell commands ${name} may run`;
+      for (const body of bodies) {
         if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
         const denied = checkShellBody(body, depth + 1);
         if (denied) return denied;

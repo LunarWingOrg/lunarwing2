@@ -2162,6 +2162,137 @@ test("an env -S command line gets the body rules (WI#874)", () => {
   assertAllowed(`env -S "grep -rn 'kimi server' ."`)
 })
 
+test("a launcher that runs a quoted string through a shell gets the body rules (WI#887)", () => {
+  // `flock -c`, `watch`, `su -c` and GNU `parallel` hand their string to a
+  // shell with no shell word in the command, so the string is one word to the
+  // shell and neither the raw-shape family nor the listener rule saw a
+  // command in it. Every row of the item's table denies, with the unwrapped
+  // spelling it matches.
+  assertBlocked('flock /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock /tmp/wi887.l --command "tee /dev/sda1"', "block-device")
+  assertBlocked('flock /tmp/wi887.l -c "find /app -name x -delete"', "deletion outside")
+  assertBlocked('flock /tmp/wi887.l -c "kimi server"', "kimi service mode")
+  assertBlocked('flock /tmp/wi887.l -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('flock /tmp/wi887.l -c "python3 -m http.server 8080"', "listener started from a task")
+  assertBlocked('watch -n1 "tee /dev/sda1"', "block-device")
+  assertBlocked('watch "find /app -name x -delete"', "deletion outside")
+  assertBlocked('watch -n1 "kimi server"', "kimi service mode")
+  assertBlocked('watch "nc -l 9000"', "listener started from a task")
+  assertBlocked('su -c "tee /dev/sda1"', "block-device")
+  assertBlocked('su kimi -c "tee /dev/sda1"', "block-device")
+  assertBlocked('su -c "kimi server"', "kimi service mode")
+  assertBlocked('su -c "nc -l 9000"', "listener started from a task")
+  assertBlocked('parallel ::: "tee /dev/sda1"', "block-device")
+  assertBlocked('parallel ::: "kimi server"', "kimi service mode")
+  // The rest of the body rule set reaches the same strings, not just the
+  // listener rule: the protected rename, the interpreter deletion and the
+  // decoded pipe all read inside the launcher's string (WI#874).
+  assertBlocked('flock /tmp/wi887.l -c "mv /app/hooks /tmp/hooks"', "protected tree")
+  assertBlocked(`watch 'perl -e "unlink(\\"/etc/passwd\\")"'`, "deletion outside")
+  assertBlocked("su -c 'echo aGVsbG8K | base64 -d | bash'", "decoded")
+  assertBlocked('parallel ::: "rsync -a --delete /tmp/wi887-e/ /app/"', "deletion outside")
+  // The unwrapped spellings the item measured as controls keep their verdicts,
+  // and an `rm` behind a launcher already denied: the body rule set reads it.
+  assertBlocked("flock /tmp/wi887.l tee /dev/sda1", "block-device")
+  assertBlocked("flock /tmp/wi887.l kimi server", "kimi service mode")
+  assertBlocked("watch tee /dev/sda1", "block-device")
+  assertBlocked('flock /tmp/wi887.l -c "rm -rf /home/kimi/x"', "deletion outside")
+  assertBlocked('watch "rm -rf /home/kimi/x"', "deletion outside")
+  assertBlocked('su -c "rm -rf /home/kimi/x"', "deletion outside")
+  assertBlocked('parallel ::: "rm -rf /home/kimi/x"', "deletion outside")
+  // Ordinary uses keep passing (the item's property 2), in every spelling
+  // each launcher accepts.
+  assertAllowed("flock /tmp/wi887-build.lock make -j8")
+  assertAllowed('flock /tmp/wi887.l -c "cargo build"')
+  assertAllowed('flock -n /tmp/wi887.l -c "cargo build"')
+  assertAllowed('watch -n5 "git status"')
+  assertAllowed("watch -n5 git status")
+  assertAllowed('su kimi -c "cargo check"')
+  assertAllowed('su -c "cargo check"')
+  assertAllowed('parallel ::: "cargo check" "cargo test"')
+  assertAllowed("parallel -j4 ::: ls wc")
+  // A `-c` that belongs to another command is not a launcher body.
+  assertAllowed('git commit -c "tee /dev/sda1"')
+  assertAllowed('grep -c "kimi server" file')
+  assertAllowed('grep -rn "flock -c \\"kimi server\\"" docs/')
+})
+
+test("a launcher body is read in the spelling the launcher itself reads (WI#887)", () => {
+  // `flock` reads `-c` only after the lock file and runs the rest of the
+  // command as a program, so `flock file make -c …` is an ordinary build.
+  assertBlocked('flock -w 5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock --timeout=5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock -x /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertAllowed("flock /tmp/wi887.l make -c 4")
+  // flock reads its options with getopt_long (AMK-1): the value letter of a
+  // short cluster takes the rest of the word or the next one, and a long
+  // option resolves by a unique prefix. flock 2.42.4 runs the `-c` body of
+  // each of these spellings.
+  for (const options of ["-nw 5", "-xw 5", "--time 5", "--wai 5", "--conf 1", "-nE 1"]) {
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "kimi server"`, "kimi service mode")
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "tee /dev/sda1"`, "block-device")
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "find /app -name x -delete"`, "deletion outside")
+    assertAllowed(`flock ${options} /tmp/wi887.l -c "cargo build"`)
+  }
+  assertBlocked('flock -nw5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock --time=5 -- /tmp/wi887.l -c "kimi server"', "kimi service mode")
+  assertAllowed('flock -n /tmp/wi887.l -c "echo hi"')
+  assertAllowed("flock -w 5 /tmp/wi887.l make")
+  assertAllowed("flock --time 5 /tmp/wi887.l make -c 4")
+  assertAllowed("flock -s /tmp/wi887.l cat f")
+  // Doubt never allows: after an option word the walk cannot resolve (an
+  // unknown letter or name, an ambiguous prefix such as `--n`, or a `-c`
+  // before the file, which flock 2.42.4 refuses) every later word is a
+  // possible body, and more of them than the reader checks is refused.
+  assertBlocked('flock -Z 5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock --bogus 5 /tmp/wi887.l -c "kimi server"', "kimi service mode")
+  assertBlocked('flock --n 5 /tmp/wi887.l -c "find /app -name x -delete"', "deletion outside")
+  assertBlocked('flock -nc "kimi server" /tmp/wi887.l', "kimi service mode")
+  assertBlocked('flock -nc"tee /dev/sda1" /tmp/wi887.l', "block-device")
+  assertBlocked('flock --comm "tee /dev/sda1" /tmp/wi887.l', "block-device")
+  assertBlocked(`flock -Z /tmp/wi887.l ${"a ".repeat(70)}`, "cannot check the shell commands flock may run")
+  // util-linux `su` permutes its words, so the user name may sit either side
+  // of the option, and getopt takes an attached value.
+  assertBlocked('su kimi -c "tee /dev/sda1"', "block-device")
+  assertBlocked('su -lc "tee /dev/sda1"', "block-device")
+  assertBlocked('su -c"tee /dev/sda1"', "block-device")
+  assertBlocked('su --session-command "tee /dev/sda1"', "block-device")
+  assertBlocked('su --command="tee /dev/sda1"', "block-device")
+  assertBlocked('su -s /bin/bash -c "tee /dev/sda1"', "block-device")
+  assertBlocked('su -s /bin/bash -lc "tee /dev/sda1"', "block-device")
+  assertAllowed('su -s /bin/bash kimi -c "cargo check"')
+  // procps `watch` joins every word from its command onward with spaces and
+  // hands the line to `sh -c`; a later `-n1` is part of the command.
+  assertBlocked('watch "tee /dev/sda1" -n1', "block-device")
+  assertBlocked('watch -s /tmp/wi887 "kimi server"', "kimi service mode")
+  assertBlocked('watch -- "tee /dev/sda1"', "block-device")
+  assertBlocked('watch -d "nc -l 9000"', "listener started from a task")
+  assertAllowed("watch -n 1 -d date")
+  assertAllowed("watch -- date")
+  // GNU `parallel` runs each `:::` argument as a command line, and its
+  // template when no marker is given.
+  assertBlocked('parallel "tee /dev/sda1"', "block-device")
+  assertBlocked('parallel -j2 ::: "tee /dev/sda1"', "block-device")
+  assertBlocked('parallel ::: "cargo build" "tee /dev/sda1"', "block-device")
+  assertBlocked('parallel ::: "nc -l 9000"', "listener started from a task")
+  assertBlocked('parallel ::: "python3 -m http.server 8080"', "listener started from a task")
+  assertAllowed('parallel ::: "cargo check" "cargo test"')
+  // A body nests under the same budget as any other shell body.
+  assertBlocked(`flock /tmp/wi887.l -c "bash -c 'tee /dev/sda1'"`, "block-device")
+  assertBlocked(`watch "flock /tmp/wi887.l -c 'kimi server'"`, "kimi service mode")
+  assertBlocked(`bash -c "flock /tmp/wi887.l -c 'kimi server'"`, "kimi service mode")
+  // A command line of launcher words stays inside the analysis deadline. Each
+  // is one launcher per clause, so the reads are flat rather than nested.
+  assertAllowed('flock /tmp/wi887.l -c "echo hi"; '.repeat(600).slice(0, 16_384), 2_000)
+  assertAllowed('flock -nw 5 /tmp/wi887.l -c "echo hi"; '.repeat(450).slice(0, 16_384), 2_000)
+  // One clause of flock words whose option walks overlap reads each word
+  // once: every `--wai` takes the next `flock` as its value.
+  assertAllowed("flock --wai ".repeat(1400).slice(0, 16_384), 2_000)
+  assertAllowed("watch -n1 date; ".repeat(1100).slice(0, 16_384), 2_000)
+  assertAllowed('su -c "echo hi"; '.repeat(1100).slice(0, 16_384), 2_000)
+  assertAllowed('parallel ::: "echo hi"; '.repeat(700).slice(0, 16_384), 2_000)
+})
+
 test("git's own shell bodies get the body rules (WI#895)", () => {
   // `git submodule foreach <cmd>` and `git rebase --exec/-x <cmd>` hand the
   // operand to `sh -c`, but the guard had no submodule or rebase handling, so
