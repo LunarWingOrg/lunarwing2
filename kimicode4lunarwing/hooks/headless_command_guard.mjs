@@ -1863,6 +1863,89 @@ function checkGitDiscard(segment) {
   return false;
 }
 
+// `git submodule foreach <command>` and `git rebase --exec/-x <command>` hand
+// their operand to `sh -c`, so the body is a command line of its own even
+// though no shell word carries it (WI#895). git reads the body from its own
+// argument list, so the guard must walk the same options git walks: a
+// separate or attached value (`--exec=…`, `-x…`), a value at the end of a
+// cluster (`-ix …`), and `foreach`'s own leading options.
+
+// rebase's long options that take the next word as their value.
+const GIT_REBASE_VALUE_OPTIONS = new Set([
+  "--onto", "--whitespace", "--strategy", "--strategy-option", "--trailer", "--empty",
+]);
+// rebase's short options that take the next word when they end a cluster.
+const GIT_REBASE_SHORT_VALUES = "sXC";
+
+/** The bodies a `git rebase` invocation hands to `sh -c`, in argument order. */
+function gitRebaseExecBodies(words) {
+  const bodies = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    // After `--` every word is an operand, so git reads no more options.
+    if (word === "--") break;
+    if (word.startsWith("--") && word.length > 2) {
+      const equals = word.indexOf("=");
+      const name = word.slice(2, equals === -1 ? undefined : equals);
+      // `--no-exec` turns the option off; the next word is not a body.
+      if (name.startsWith("no-")) continue;
+      // git resolves an unambiguous prefix (`--ex`, `--exe`), so every
+      // prefix of `exec` names it here, which can only add denials.
+      if ("exec".startsWith(name)) {
+        if (equals !== -1) bodies.push(word.slice(equals + 1));
+        else if (i + 1 < words.length) bodies.push(words[++i]);
+        continue;
+      }
+      if (equals === -1 && GIT_REBASE_VALUE_OPTIONS.has(name)) i++;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const cluster = word.slice(1);
+      for (let j = 0; j < cluster.length; j++) {
+        if (cluster[j] === "x") {
+          // The rest of the cluster is the body when it carries one
+          // (`-x'kimi server'`); otherwise the next word is (`-ix …`).
+          if (j + 1 < cluster.length) bodies.push(cluster.slice(j + 1));
+          else if (i + 1 < words.length) bodies.push(words[++i]);
+          break;
+        }
+        if (GIT_REBASE_SHORT_VALUES.includes(cluster[j])) {
+          if (j === cluster.length - 1) i++;
+          break;
+        }
+      }
+    }
+    // An operand (`HEAD~1`, a branch) does not end git's option scan.
+  }
+  return bodies;
+}
+
+/** The bodies a `git submodule foreach` invocation hands to `sh -c`. */
+function gitSubmoduleForeachBodies(words) {
+  let i = 0;
+  // `git submodule [--quiet] foreach …`.
+  while (i < words.length && words[i].startsWith("-")) i++;
+  if (words[i] !== "foreach") return [];
+  // `foreach` reads its own options (`-q`, `--recursive`) before the command
+  // operand; every word after the first operand is part of the body.
+  for (i++; i < words.length && words[i].startsWith("-"); i++);
+  return i < words.length ? [words.slice(i).join(" ")] : [];
+}
+
+/** Return Git's shell bodies, or null if this is not a recognized carrier. */
+function gitShellBodies(words, start) {
+  let i = start;
+  while (i < words.length && words[i].startsWith("-")) {
+    i += GIT_VALUE_OPTIONS.has(words[i]) ? 2 : 1;
+  }
+  const verb = listenerWord(words[i] ?? "");
+  if (verb === "rebase") return gitRebaseExecBodies(words.slice(i + 1));
+  if (verb === "submodule" || verb === "submodule--helper") {
+    return gitSubmoduleForeachBodies(words.slice(i + 1));
+  }
+  return null;
+}
+
 /** The command word of a pipeline stage, after env/exec/busybox prefixes. */
 function commandBasename(word) {
   return stripShellQuotes(word).replace(/^[({]+/, "").replace(/[)}]+$/, "").split("/").pop() ?? "";
@@ -3289,9 +3372,24 @@ function checkListenerWords(words, depth) {
   // One forward-only table per segment, so a segment full of `kimi` words is
   // linear (WI#858 deadline).
   let serviceSubcommands;
+  let sawGitCarrier = false;
   for (let i = 0; i < words.length; i++) {
     const word = listenerWord(words[i]);
     const name = commandBasename(word);
+    if (name === "git" && !sawGitCarrier) {
+      // Scan a recognized carrier once to keep repeated git words linear.
+      // The word reader keeps an entire quoted description in one argument.
+      const bodies = gitShellBodies(words, i + 1);
+      if (bodies !== null) {
+        sawGitCarrier = true;
+        for (const body of bodies) {
+          if (body.length === 0) continue;
+          if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check listeners in a deeply nested shell command";
+          const denied = checkShellBody(body, depth + 1);
+          if (denied) return denied;
+        }
+      }
+    }
     if (name === "busybox" && listenerWord(words[i + 1] ?? "") === "httpd") {
       return "listener started from a task: busybox httpd";
     }

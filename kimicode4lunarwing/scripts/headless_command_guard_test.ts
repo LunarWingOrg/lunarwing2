@@ -2162,6 +2162,79 @@ test("an env -S command line gets the body rules (WI#874)", () => {
   assertAllowed(`env -S "grep -rn 'kimi server' ."`)
 })
 
+test("git's own shell bodies get the body rules (WI#895)", () => {
+  // `git submodule foreach <cmd>` and `git rebase --exec/-x <cmd>` hand the
+  // operand to `sh -c`, but the guard had no submodule or rebase handling, so
+  // a body carried by git was read by no rule. Every row below is the item's
+  // measured ALLOW set at master `2e4e544e5`.
+  assertBlocked("git submodule foreach 'kimi server'", "kimi service")
+  assertBlocked("git submodule foreach 'python3 -m http.server 9000'", "listener")
+  assertBlocked("git submodule foreach 'nc -l 9000'", "listener")
+  assertBlocked("git submodule foreach 'tee /dev/sda1'", "block-device")
+  assertBlocked("git rebase --exec 'tee /dev/sda1' HEAD", "block-device")
+  assertBlocked("git rebase --exec='nc -l 9000' HEAD", "listener")
+  assertBlocked("git rebase -x 'kimi server' HEAD", "kimi service")
+  // The same bodies stay ordinary work.
+  assertAllowed("git submodule foreach 'echo hi'")
+  assertAllowed("git rebase -x 'cargo test' HEAD~1")
+})
+
+test("every spelling git accepts for an exec body is read (WI#895)", () => {
+  // The body arrives attached (`-x<body>`, `--exec=<body>`), at the end of a
+  // cluster (`-ix <body>`), behind an unambiguous long prefix (`--ex`,
+  // `--exe`), or behind git's own leading options.
+  assertBlocked("git rebase -x'nc -l 9000' HEAD", "listener")
+  assertBlocked("git rebase -ix 'kimi server' HEAD", "kimi service")
+  assertBlocked("git rebase --ex 'kimi server' HEAD", "kimi service")
+  assertBlocked("git rebase --exe 'kimi server' HEAD", "kimi service")
+  assertBlocked("git -C /tmp rebase -x 'kimi server' HEAD", "kimi service")
+  assertBlocked("git submodule --quiet foreach 'tee /dev/sda1'", "block-device")
+  assertBlocked("git submodule foreach --recursive 'nc -l 9000'", "listener")
+  // A body is a command line, so the other body rules reach it too.
+  assertBlocked("git rebase --exec 'rm -rf /app/hooks' HEAD", "deletion outside")
+  assertBlocked("git submodule foreach 'find /app -delete'", "deletion outside")
+  // git's own value options are stepped over, and `--no-exec` carries none.
+  assertBlocked("git rebase -s recursive -x 'kimi server' HEAD", "kimi service")
+  assertBlocked("git rebase -X theirs -x 'kimi server' HEAD", "kimi service")
+  assertBlocked("git rebase --onto main -x 'kimi server' master", "kimi service")
+  assertAllowed("git rebase --no-exec 'kimi server' HEAD~1")
+  // Ordinary rebase and submodule work keeps passing.
+  assertAllowed("git rebase -i HEAD~3")
+  assertAllowed("git rebase --onto main master")
+  assertAllowed("git rebase --continue")
+  assertAllowed("git rebase --empty=drop HEAD~1")
+  assertAllowed("git submodule update --init --recursive")
+  assertAllowed("git submodule status")
+  // A quoted mention is data, as for every other body reader.
+  assertAllowed("git commit -m 'fix git rebase -x kimi server'")
+})
+
+test("the submodule foreach helper gets the same body rules (AMM-1)", () => {
+  for (const [body, reason] of [
+    ["kimi server", "kimi service"],
+    ["nc -l 9000", "listener"],
+    ["tee /dev/sda1", "block-device"],
+  ]) {
+    assertBlocked(`git submodule--helper foreach '${body}'`, reason)
+  }
+  assertBlocked(`bash -c '"git" -C "/tmp/a b" submodule--helper foreach --recursive "tee /dev/sda1"'`, "block-device")
+  assertAllowed("git submodule--helper foreach 'echo hi'")
+})
+
+test("a quoted description of a Git shell body remains data (AMM-3)", () => {
+  assertAllowed(`git commit -m 'see git submodule foreach "nc -l 9000"'`)
+  assertAllowed(`git commit -m 'git rebase -x "kimi server" HEAD'`)
+  assertAllowed(`echo 'git rebase --exec "tee /dev/sda1" HEAD' >> notes.md`)
+})
+
+test("a 16 KB line of repeated git bodies stays inside the deadline (WI#895)", () => {
+  // Both clauses repeat git words without nesting shell bodies. The first
+  // carrier's argument tail is read only once.
+  assertAllowed("git rebase -x a ".repeat(1000).slice(0, 16_000))
+  assertAllowed(("git submodule foreach echo" + " git submodule status".repeat(800)).slice(0, 16_000))
+  assertBlocked("git submodule foreach ".repeat(10) + "echo hi", "deeply nested shell command")
+})
+
 test("a decoded payload behind a launcher or into a stdin interpreter is denied (WI#883)", () => {
   // Every row of the item's point-1 table. A launcher in front of the
   // decoder or the interpreter, a `{ …; }` group, a `source`/`.` of the
