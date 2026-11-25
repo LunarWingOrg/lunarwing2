@@ -941,6 +941,12 @@ function oneLinerCode(rest, name) {
     if (/^(?:--eval|--print)$/.test(word)) return rest.slice(i);
     // `--eval=…`/`--print=…` carry the code in the word itself (WI#890).
     if (/^--(?:eval|print)=/.test(word)) return word.slice(word.indexOf("=") + 1) + rest.slice(i);
+    // A long value option's separate word is stepped over (WI#869).
+    if (values.has(word)) {
+      while (i < rest.length && /[ \t]/.test(rest[i])) i++;
+      while (i < rest.length && !/[ \t]/.test(rest[i])) i++;
+      continue;
+    }
     // A short-option cluster is read the way the interpreter reads it: a
     // letter that takes a value consumes the rest of the word, and the eval
     // letter hands it the rest of the word as code, or the next word when
