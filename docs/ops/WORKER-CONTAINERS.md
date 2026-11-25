@@ -1507,11 +1507,13 @@ Enforced controls (opencode2 lane unless noted):
     looks). The config is read through the tenant account; a path that is a
     link or not a regular file is reported as unreadable.
 
-    `mt-admin worker-readiness <tenant>` is the strict gate — exit non-zero
-    when any enabled lane's port refuses or drops a loopback connection,
-    polling for `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one
-    probe). Exit 0 means that every enabled lane's port kept a connection
-    open, not that a job can connect.
+    `mt-admin worker-readiness <tenant>` is the strict gate. It exits non-zero
+    if an enabled lane has no WSS port allocated or its port refuses or drops a
+    loopback connection. Missing-port warnings name the registry slot to check.
+    Unselected lanes and intentionally stopped OpenRC lanes are skipped. The
+    polling window is `LUNARWING_MT_WORKER_READY_WAIT_SECS` (default `0`, one
+    probe per checked lane). Exit 0 means the checked ports answered, not that
+    a job can connect.
 
     `mt-admin worker-failure-log <tenant> <lane> [lines]` prints the lane's
     container state plus a bounded tail of its bridge and task container logs
