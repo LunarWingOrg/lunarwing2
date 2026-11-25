@@ -2482,6 +2482,8 @@ test("a redirection word is not the word a rule reads (WI#889)", () => {
   // The value-taking option and the verb behind it.
   assertBlocked("kimi -m k2 2>/dev/null server", "kimi service")
   assertBlocked("git -C /tmp/r 2>/dev/null reset --hard", "discard")
+  assertBlocked("git -C 2>/dev/null /tmp/r reset --hard", "discard")
+  assertBlocked("git --git-dir 2>/dev/null /tmp/r reset --hard", "discard")
   // An interpreter one-liner keeps being read behind a redirection.
   assertBlocked('node 2>/dev/null -e "require(\'fs\').rmSync(\'/home/kimi/x\',{recursive:true})"',
     "deletion outside")
