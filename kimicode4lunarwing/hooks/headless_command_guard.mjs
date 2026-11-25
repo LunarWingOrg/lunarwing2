@@ -2823,10 +2823,21 @@ function commandLists(text) {
 
 /**
  * The pipeline stages of one list. `|&` pipes stdout and stderr into the next
- * stage, so it ends a stage exactly as `|` does (WI#889, WI#892).
+ * stage, so it ends a stage exactly as `|` does (WI#889, WI#892). A `|` that
+ * follows `>` is the noclobber redirect `>|`, not a bar, so it stays inside
+ * the stage that writes the file.
  */
 function pipelineStages(list) {
-  return splitOutsideQuotes(list, (ch, next) => (ch === "|" ? (next === "&" ? 2 : 1) : 0));
+  const stages = [];
+  let start = 0;
+  for (const i of unquotedOffsets(list)) {
+    if (list[i] !== "|" || list[i - 1] === ">") continue;
+    if (i < start) continue;
+    stages.push(list.slice(start, i));
+    start = i + (list[i + 1] === "&" ? 2 : 1);
+  }
+  stages.push(list.slice(start));
+  return stages;
 }
 
 // The commands that read content from the network (WI#826). A word property,
