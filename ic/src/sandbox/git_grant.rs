@@ -989,11 +989,23 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
                     finish_command(&mut commands, &mut words);
                 }
                 ';' | '\n' | '|' | '&' | '(' | ')' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
+                    finish_word(
+                        &mut words,
+                        &mut current,
+                        &mut dynamic,
+                        &mut glob,
+                        &mut started,
+                    );
                     finish_command(&mut commands, &mut words);
                 }
                 ' ' | '\t' | '\r' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
+                    finish_word(
+                        &mut words,
+                        &mut current,
+                        &mut dynamic,
+                        &mut glob,
+                        &mut started,
+                    );
                 }
                 '$' | '`' => {
                     dynamic = true;
@@ -1016,7 +1028,13 @@ fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
     if quote.is_some() {
         return Err(denied("unterminated shell quote"));
     }
-    finish_word(&mut words, &mut current, &mut dynamic, &mut glob, &mut started);
+    finish_word(
+        &mut words,
+        &mut current,
+        &mut dynamic,
+        &mut glob,
+        &mut started,
+    );
     finish_command(&mut commands, &mut words);
     Ok(commands)
 }
@@ -1414,10 +1432,7 @@ fn scan_env_long_option(
 /// One `env` short-option word (`-i`, `-u FOO`, `-uFOO`, `-iS body`,
 /// `-Sbody`). `-S` is the split-string option; the rest of its cluster, or
 /// the next word, is the body.
-fn scan_env_short_option(
-    words: &[Word],
-    index: usize,
-) -> Result<(EnvOptionStep, Option<Word>)> {
+fn scan_env_short_option(words: &[Word], index: usize) -> Result<(EnvOptionStep, Option<Word>)> {
     let word = &words[index];
     let cluster = &word.text[1..];
     for (offset, letter) in cluster.char_indices() {
@@ -2492,7 +2507,9 @@ fn glob_could_name_git_program(pattern: &str) -> bool {
     // the `git-` prefix when it matches that prefix itself — true for `git-*`
     // and for a bare `*`, false for `*.txt` — so `/usr/lib/git-core/*.txt`
     // stays ordinary data while `…/git-core/git-*` and `…/git-core/*` do not.
-    directories.iter().any(|part| glob_matches(part, "git-core"))
+    directories
+        .iter()
+        .any(|part| glob_matches(part, "git-core"))
         && glob_matches(program, "git-")
 }
 
