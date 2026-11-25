@@ -927,6 +927,12 @@ function interpreterValueOptions(name) {
  * code was never read. Reading a positional word as if a later flag were the
  * interpreter's own can only add denials, which is the accepted cost; missing
  * the flag is not.
+ *
+ * The code may sit in the flag word itself (WI#890): a short-option cluster
+ * is walked letter by letter as the interpreter reads it, so `-c"…"`, `-Ic"…"`
+ * and `-le'…'` hand over the rest of the word, and `--eval=…` hands over the
+ * text after the `=`. Where the walk cannot tell whether a word is the eval
+ * flag, it keeps walking rather than returning, so doubt cannot allow.
  */
 function oneLinerCode(rest, name) {
   const values = interpreterValueOptions(name);
@@ -959,8 +965,8 @@ function oneLinerCode(rest, name) {
       for (let at = 0; at < flags.length; at++) {
         const letter = flags[at];
         if (letters.includes(letter)) {
-          const attached = at === flags.length - 1 ? cluster[2] : flags.slice(at + 1) + cluster[2];
-          return attached === "" ? rest.slice(i) : attached + rest.slice(i);
+          const tail = at === flags.length - 1 ? cluster[2] : flags.slice(at + 1) + cluster[2];
+          return tail === "" ? rest.slice(i) : tail + rest.slice(i);
         }
         if (values.has(`-${letter}`)) {
           if (at === flags.length - 1 && cluster[2] === "") {
