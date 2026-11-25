@@ -101,21 +101,22 @@ raw-shape readers all read that view, so `rm 2>&1 -rf /x`, `git 2>/dev/null
 reset --hard` and `kimi 2>/dev/null server` read as the commands bash runs.
 The forms are `[n]<word`, `[n]>word`, `[n]>|word`, `[n]>>word`, `&>word`,
 `>&word`, `&>>word`, `[n]<<[-]word`, `[n]<<<word`, `[n]<&word`, `[n]>&word`
-and `[n]<>word`, each also with `{varname}` in place of `n`, with or without
-blanks before the target. The digits or `{varname}` count as the descriptor
-only as a word of their own, so `a2>f` writes fd 1 from the word `a2`.
+and `[n]<>word`, with `{varname}` in place of `n` where a descriptor is
+accepted, and with or without blanks before the target. The digits or
+`{varname}` count as the descriptor only as a word of their own. The
+combined output forms `&>` and `&>>` take no descriptor, so `2&>f`
+retains `2` as an argument.
 
 The `&` of `2>&1`, `<&0`, `&>`, `>&` and the bar of `>|` are operator
 characters, not control operators; `|&` is bash's `2>&1 |`, so its bar
 splits a pipeline and its `&` does not. A target a write rule owns is still
 seen: `>&word`, `n>&word`, `&>word` and `&>>word` at a block device deny,
-and `truncate`/`of=` keep their own readings. A here-string's body is read
-as the command line it spells, the way a here-document body is, so
-`bash <<<"kimi server"` denies. A here-document body, a process substitution
-(`<(…)`, `>(…)`) and a substitution inside a target (`>$(kimi server)`) keep
-their existing readings. A command's redirections do not change its verdict
-otherwise: `rm -rf /tmp/x 2> /dev/null` and `make 2>&1 | tee build.log` stay
-ordinary work.
+and `truncate`/`of=` keep their own readings. The guard removes shell
+quoting from each here-string word and applies the full command rule set to
+the resulting body. Here-string expansions with unknown results are refused.
+Temporary-file cleanup can put redirections before or after the operands.
+For example, `rm 2> /dev/null -rf /tmp/x` and `rm </dev/null -rf /tmp/x`
+both pass.
 
 ## Protocol Compatibility
 

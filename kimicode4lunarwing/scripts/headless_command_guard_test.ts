@@ -2530,8 +2530,45 @@ test("a here-string that reaches a shell is read as commands (WI#889)", () => {
   assertBlocked('bash <<<"kimi server"', "kimi service")
   assertBlocked('bash <<< "kimi server"', "kimi service")
   assertBlocked('bash <<<"nc -l 9000"', "listener")
+  assertBlocked("bash <<<$'kimi server'", "kimi service")
+  assertBlocked("bash <<<kimi\\ server", "kimi service")
+  assertBlocked('bash <<<k"imi "server', "kimi service")
+  assertBlocked("bash <<<$'nc -l 9000'", "listener")
   // The same text in a here-document denies, and keeps denying.
   assertBlocked("bash <<E\nkimi server\nE", "kimi service")
+})
+
+test("here-strings get the full guard rule set (WI#889 AML-1)", () => {
+  for (const command of [
+    "sh <<<'rm -rf /home/kimi/x'",
+    'bash <<<"rm -rf /home/kimi/x"',
+    'bash <<< "rm -rf /home/kimi/x"',
+    "bash <<<$'rm -rf /home/kimi/x'",
+    'bash 0<<<"rm -rf /home/kimi/x"',
+    'cat <<<"rm -rf /home/kimi/x" | bash',
+    "wc -l <<<'rm -rf /home/kimi/x'",
+  ]) assertBlocked(command, "rm")
+  assertBlocked('bash <<<"tee /dev/sda1"', "block-device")
+  assertBlocked('bash <<<"find /app -name x -delete"', "deletion outside")
+  assertBlocked('bash <<<"echo aGk= | base64 -d | sh"', "decoded content piped")
+  assertBlocked(`bash <<< "sh <<<'rm -rf /home/kimi/x'"`, "rm")
+  assertAllowed('bash <<<"rm -rf /tmp/x"')
+  assertAllowed('cat <<<""')
+})
+
+test("unverifiable here-string expansions fail closed (WI#889 AML-2)", () => {
+  assertBlocked('bash <<<"$body"', "cannot verify here-string")
+  assertBlocked('bash <<<"$(printf %s hello)"', "cannot verify here-string")
+  assertBlocked(String.raw`bash <<<$'echo\x20hello'`, "cannot verify here-string")
+  assertAllowed("cat <<<'$body'")
+})
+
+test("combined output redirects preserve the preceding operand (WI#889 AML-3)", () => {
+  for (const operator of ["&>", "&>>"]) {
+    assertBlocked(`rm 2${operator}/dev/null -rf /tmp/x`, "rm")
+    assertBlocked(`rm {fd}${operator}/dev/null -rf /tmp/x`, "rm")
+    assertAllowed(`rm -rf /tmp/x ${operator}/dev/null`)
+  }
 })
 
 test("a redirection does not refuse ordinary commands (WI#889)", () => {
@@ -2579,6 +2616,8 @@ test("the false refusals of the old reading are read correctly (WI#889)", () => 
     "rm -rf /tmp/x > /dev/null 2>&1",
     "rm -f /tmp/x.log 2> /dev/null",
     "rm -rf /tmp/x </dev/null",
+    "rm 2> /dev/null -rf /tmp/x",
+    "rm </dev/null -rf /tmp/x",
     "rm -rf 2>&1 /tmp/x",
     "rm -rf &>/dev/null /tmp/x",
   ]) {

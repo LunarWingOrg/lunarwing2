@@ -130,6 +130,8 @@ function redirectOperatorAt(text, i) {
  * them has to be a word break.
  */
 function redirectPrefixStart(text, operatorIndex) {
+  // Combined stdout/stderr redirections never take a descriptor prefix.
+  if (text[operatorIndex] === "&") return operatorIndex;
   let start = operatorIndex;
   let i = operatorIndex - 1;
   if (text[i] === "}") {
@@ -170,7 +172,7 @@ function redirectWordSpan(text, scan, from) {
 /**
  * The command line with every redirection blanked out, the targets it wrote
  * or read, and the here-string bodies, which bash feeds to the command as its
- * input and which the listener rule therefore reads as commands. The blanks
+ * input and which the guard therefore reads as commands. The blanks
  * keep every other offset where it was. `|&` is bash's shorthand for
  * `2>&1 |` (`man bash`, Pipelines), so its `&` is blanked and the bar kept.
  */
@@ -178,7 +180,7 @@ function stripRedirections(text, escapes = true) {
   const scan = quoteScan(text, escapes);
   const chars = text.split("");
   const targets = [];
-  const hereStrings = [];
+  const hereStrings = new Set();
   for (let i = 0; i < text.length; i++) {
     const close = scan.substitutions.get(i);
     if (close !== undefined) {
@@ -202,7 +204,7 @@ function stripRedirections(text, escapes = true) {
       const span = redirectWordSpan(text, scan, i + operator.length);
       if (span.end > span.start) end = span.end;
       const target = text.slice(span.start, span.end);
-      if (operator === "<<<") hereStrings.push(stripShellQuotes(target));
+      if (operator === "<<<") hereStrings.add(target);
       else if (target.length > 0) {
         targets.push({ target, write: operator !== "<" && operator !== "<&" });
       }
@@ -285,6 +287,7 @@ function redirectTokenSpan(text, i) {
     if (name === null) return null;
     operatorIndex = i + name[0].length;
   }
+  if (operatorIndex !== i && text[operatorIndex] === "&") return null;
   const end = redirectionSkip(text, operatorIndex);
   return end === null ? null : { start: i, end };
 }
@@ -1755,7 +1758,7 @@ function bashWord(text, from) {
     const quote = level.quote;
     const ch = text[i];
     if (isQuoteEscape(text, i, quote)) {
-      word += text[i + 1];
+      if (text[i + 1] !== "\n" || quote === "$'") word += text[i + 1];
       i += 2;
       continue;
     }
@@ -1829,7 +1832,7 @@ function bashWord(text, from) {
     word += ch;
     i++;
   }
-  return { word, end: i };
+  return { word, end: i, complete: levels.length === 1 && levels[0].quote === "" };
 }
 
 /** The bash words of a command text, with their quoting removed. */
@@ -3006,12 +3009,12 @@ function evaluate(command, depth = 0) {
       // The glued view leaves a quoted verb quoted (`$EMPTY"tee"` reads as
       // `"tee"`), so the WI#873 word-level reading applies to it as well.
       (glued === joined ? null : checkRawShapes(shellWordLevelView(glued))) ??
-      (glued === joined ? null : checkListeners(glued)) ??
-      (glued === joined ? null : checkListeners(shellWordLevelView(glued))) ??
+      (glued === joined ? null : checkListeners(glued, depth)) ??
+      (glued === joined ? null : checkListeners(shellWordLevelView(glued), depth)) ??
       (defaultedIsNew ? checkRawShapes(defaulted) : null) ??
       (defaultedIsNew ? checkRawShapes(shellWordLevelView(defaulted)) : null) ??
-      (defaultedIsNew ? checkListeners(defaulted) : null) ??
-      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted)) : null) ??
+      (defaultedIsNew ? checkListeners(defaulted, depth) : null) ??
+      (defaultedIsNew ? checkListeners(shellWordLevelView(defaulted), depth) : null) ??
       checkMoveAndTarDeletion(shellWordView(joined)) ??
       // The redirection-free reading: a rule sees the words bash runs, and a
       // target it does not own is still visible to a rule about targets
@@ -3744,13 +3747,31 @@ function checkListeners(text, depth = 0) {
       if (denied) return denied;
     }
   }
-  // A here-string is the command's input, read as the command line it spells
-  // (`bash <<<"kimi server"`), the way a here-document body is (WI#889).
-  for (const body of redirectScan(text).hereStrings) {
-    const denied = checkListenerRegion(body, depth);
+  // A here-string can feed a shell directly or through a pipeline. Apply
+  // every rule to its contents under the same nesting budget (WI#889).
+  for (const target of redirectScan(text).hereStrings) {
+    if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check a deeply nested shell command";
+    const body = hereStringBody(target);
+    if (body === null) return "cannot verify here-string contents; use a literal word";
+    const denied = classify(body, depth + 1);
     if (denied) return denied;
   }
   return null;
+}
+
+/** Read one here-string word, which Bash expands without field splitting or globbing. */
+function hereStringBody(target) {
+  const { states, substitutions } = quoteScan(target);
+  if (!target || target.startsWith("~") || substitutions.size > 0 || hasUnverifiableAnsiEscape(target)) {
+    return null;
+  }
+  for (let i = 0; i < target.length; i++) {
+    if (target[i] !== "$" || (states[i] !== QUOTE_UNQUOTED && states[i] !== QUOTE_DOUBLE)) continue;
+    if (/[\w{(*@#?$!\-]/.test(target[i + 1] ?? "") ||
+        (states[i] === QUOTE_UNQUOTED && target[i + 1] === '"')) return null;
+  }
+  const { word, end, complete } = bashWord(target, 0);
+  return complete && end === target.length ? word : null;
 }
 
 function checkListenerRegion(text, depth) {
