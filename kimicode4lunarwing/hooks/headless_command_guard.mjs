@@ -3749,14 +3749,76 @@ function checkListeners(text, depth = 0) {
   }
   // A here-string can feed a shell directly or through a pipeline. Apply
   // every rule to its contents under the same nesting budget (WI#889).
+  let mayRun;
   for (const target of redirectScan(text).hereStrings) {
     if (depth >= MAX_SHELL_BODY_DEPTH) return "cannot check a deeply nested shell command";
     const body = hereStringBody(target);
-    if (body === null) return "cannot verify here-string contents; use a literal word";
+    if (body === null) {
+      // An unreadable word is a command line only if something on the line
+      // can run it; `read`, `jq` and `grep` take it as data (AMU-1).
+      mayRun ??= hasHeredoc(text) || lineMayRunInput(redirectScan(text).view, depth);
+      if (mayRun) return "cannot verify here-string contents; use a literal word";
+      continue;
+    }
     const denied = classify(body, depth + 1);
     if (denied) return denied;
   }
   return null;
+}
+
+function hasHeredoc(text) {
+  for (const _line of quoteScan(text).heredocLines) return true;
+  return false;
+}
+
+// Paths that name a descriptor the command inherits: a program given one of
+// them reads its code from a here-string on that descriptor.
+const INHERITED_INPUT_PATH = /^(?:\/dev\/stdin|\/dev\/fd\/\d+|\/proc\/self\/fd\/\d+)$/;
+// Shells and versioned interpreters outside the shared tables.
+const OTHER_INPUT_RUNNERS = /^(?:mksh|rbash|tcsh|csh|fish|yash|posh|oksh|pdksh|(?:python|perl|ruby|node|php|lua)[0-9][0-9.]*)$/;
+// Programs that take their script from a file operand, `-` meaning stdin.
+const STDIN_SCRIPT_READERS = new Set(["gawk", "mawk", "nawk", "awk", "sed", "gsed"]);
+
+/**
+ * Whether anything on a command line can run the text a here-string carries
+ * (WI#889 AMU-1). The line is read whole, with redirections and here-string
+ * words taken out (`view`), its substitution bodies included: a shell or
+ * `eval`, `source`/`.` of standard input, an interpreter with no script
+ * operand (`isInterpreterStage`), a command word the guard cannot read
+ * (`runsUnverifiableCommand`), a program given an inherited descriptor's path
+ * (`/dev/stdin`, `/dev/fd/3`) or a shell or interpreter outside the shared
+ * tables. Reading the whole line, not the stage the here-string is attached
+ * to, covers compound bodies (`while …; done <<< "$x"`, `{ bash; }<<<"$x"`),
+ * `exec` redirections and functions defined on the line. A line with a
+ * here-document is refused by the caller, because its body can shift the
+ * stage split.
+ */
+function lineMayRunInput(view, depth) {
+  for (const list of commandLists(view)) {
+    for (const stage of splitOutsideQuotes(list, "|")) {
+      if (isInterpreterStage(stage) || runsUnverifiableCommand(stage)) return true;
+      const words = stagePropertyWords(stage);
+      if (words === null) return true;
+      for (let i = 0; i < words.length; i++) {
+        const bare = stripShellQuotes(words[i]);
+        const name = commandBasename(listenerWord(words[i]));
+        if (INHERITED_INPUT_PATH.test(bare) || OTHER_INPUT_RUNNERS.test(name)) return true;
+        // A program read from standard input (`gawk -f -`, `sed -f -`).
+        if (STDIN_SCRIPT_READERS.has(name) && words.slice(i + 1).some((w) => /^(?:-|-f-|--file=-)$/.test(stripShellQuotes(w)))) {
+          return true;
+        }
+        // `source`/`.` of a file the guard cannot name (`<(cat)`, `"$F"`).
+        if ((name === "source" || name === ".") && i + 1 < words.length && !/^[\w./~+-]+$/.test(stripShellQuotes(words[i + 1]))) {
+          return true;
+        }
+      }
+    }
+  }
+  for (const body of substitutionBodies(view)) {
+    if (depth + 1 >= MAX_SHELL_BODY_DEPTH) return true;
+    if (lineMayRunInput(body, depth + 1)) return true;
+  }
+  return false;
 }
 
 /** Read one here-string word, which Bash expands without field splitting or globbing. */

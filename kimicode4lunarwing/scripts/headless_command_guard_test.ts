@@ -2563,6 +2563,59 @@ test("unverifiable here-string expansions fail closed (WI#889 AML-2)", () => {
   assertAllowed("cat <<<'$body'")
 })
 
+test("an unreadable here-string is refused only where its reader runs it (WI#889 AMU-1)", () => {
+  for (const command of [
+    'sh <<< "$X"',
+    'env bash <<< "$X"',
+    'nice -n 5 sh <<< "$X"',
+    'python3 <<< "$X"',
+    'source /dev/stdin <<< "$X"',
+    'eval "$(cat)" <<< "$X"',
+    '"$SHELL" <<< "$X"',
+    '{ bash; } <<< "$X"',
+    'while read -r l; do eval "$l"; done <<< "$X"',
+    'read -r a <<< "$X"; bash <<< "$X"',
+    'bash <<< ~/x.sh',
+    // Second read: glued closers, here-documents, exec, functions, bodies
+    // inside substitutions, descriptor paths and other shells.
+    'while read -r l; do eval "$l"; done<<<"$X"',
+    '{ bash; }<<<"$X"',
+    'if read l; then eval "$l"; fi<<<"$X"',
+    '(bash; :) <<< "$X"',
+    "cat <<EOF\n'\nEOF\nbash -s \\' <<< \"$X\"",
+    'exec <<< "$X"; bash',
+    'exec 3<<< "$X"; bash <&3',
+    'f(){ bash; }; f <<< "$X"',
+    '{ echo $(sh); } <<< "$X"',
+    'perl /dev/stdin <<< "$X"',
+    'source /dev/fd/3 3<<< "$X"',
+    'mksh <<< "$X"',
+    'python3.12 <<< "$X"',
+    'gawk -f - <<< "$X"',
+    'sed -f - /dev/null <<< "$X"',
+    '{ source <(cat); } <<< "$X"',
+    // `python3 -c` counts as running its input, as in the decode-pipe rule.
+    'python3 -c "import sys; print(sys.stdin.read())" <<< "$x"',
+  ]) {
+    assertBlocked(command, "cannot verify here-string")
+  }
+  for (const command of [
+    'read -r a b <<< "$line"',
+    'IFS=: read -r x y <<< "$v"',
+    'read -r ver <<< "$(node --version)"',
+    'mapfile -t arr <<< "$(ls)"',
+    'while read -r f; do echo "$f"; done <<< "$files"',
+    'jq -r .name <<< "$json"',
+    'grep -q foo <<< "$out"',
+    'wc -l <<< "$files"',
+    'bc <<< "$a + $b"',
+    'git apply <<< "$patch"',
+    'cat <<< ~/notes',
+  ]) {
+    assertAllowed(command)
+  }
+})
+
 test("combined output redirects preserve the preceding operand (WI#889 AML-3)", () => {
   for (const operator of ["&>", "&>>"]) {
     assertBlocked(`rm 2${operator}/dev/null -rf /tmp/x`, "rm")

@@ -113,7 +113,13 @@ splits a pipeline and its `&` does not. A target a write rule owns is still
 seen: `>&word`, `n>&word`, `&>word` and `&>>word` at a block device deny,
 and `truncate`/`of=` keep their own readings. The guard removes shell
 quoting from each here-string word and applies the full command rule set to
-the resulting body. Here-string expansions with unknown results are refused.
+the resulting body. A here-string word the guard cannot read (an expansion,
+a substitution, `~`) is refused when anything on the command line could run
+it: a shell or `eval`, `source`/`.` of standard input, an interpreter with
+no script operand, a program given `/dev/stdin` or `/dev/fd/N`, or a command
+word the guard cannot read, substitutions included; and on any line that
+also holds a here-document. Otherwise the line can only read it as data, so
+`read -r a <<< "$line"` and `jq . <<< "$json"` stay ordinary.
 Temporary-file cleanup can put redirections before or after the operands.
 For example, `rm 2> /dev/null -rf /tmp/x` and `rm </dev/null -rf /tmp/x`
 both pass.
