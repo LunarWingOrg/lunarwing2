@@ -2224,6 +2224,33 @@ test("a launcher body is read in the spelling the launcher itself reads (WI#887)
   assertBlocked('flock --timeout=5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
   assertBlocked('flock -x /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
   assertAllowed("flock /tmp/wi887.l make -c 4")
+  // flock reads its options with getopt_long (AMK-1): the value letter of a
+  // short cluster takes the rest of the word or the next one, and a long
+  // option resolves by a unique prefix. flock 2.42.4 runs the `-c` body of
+  // each of these spellings.
+  for (const options of ["-nw 5", "-xw 5", "--time 5", "--wai 5", "--conf 1", "-nE 1"]) {
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "kimi server"`, "kimi service mode")
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "tee /dev/sda1"`, "block-device")
+    assertBlocked(`flock ${options} /tmp/wi887.l -c "find /app -name x -delete"`, "deletion outside")
+    assertAllowed(`flock ${options} /tmp/wi887.l -c "cargo build"`)
+  }
+  assertBlocked('flock -nw5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock --time=5 -- /tmp/wi887.l -c "kimi server"', "kimi service mode")
+  assertAllowed('flock -n /tmp/wi887.l -c "echo hi"')
+  assertAllowed("flock -w 5 /tmp/wi887.l make")
+  assertAllowed("flock --time 5 /tmp/wi887.l make -c 4")
+  assertAllowed("flock -s /tmp/wi887.l cat f")
+  // Doubt never allows: after an option word the walk cannot resolve (an
+  // unknown letter or name, an ambiguous prefix such as `--n`, or a `-c`
+  // before the file, which flock 2.42.4 refuses) every later word is a
+  // possible body, and more of them than the reader checks is refused.
+  assertBlocked('flock -Z 5 /tmp/wi887.l -c "tee /dev/sda1"', "block-device")
+  assertBlocked('flock --bogus 5 /tmp/wi887.l -c "kimi server"', "kimi service mode")
+  assertBlocked('flock --n 5 /tmp/wi887.l -c "find /app -name x -delete"', "deletion outside")
+  assertBlocked('flock -nc "kimi server" /tmp/wi887.l', "kimi service mode")
+  assertBlocked('flock -nc"tee /dev/sda1" /tmp/wi887.l', "block-device")
+  assertBlocked('flock --comm "tee /dev/sda1" /tmp/wi887.l', "block-device")
+  assertBlocked(`flock -Z /tmp/wi887.l ${"a ".repeat(70)}`, "cannot check the shell commands flock may run")
   // util-linux `su` permutes its words, so the user name may sit either side
   // of the option, and getopt takes an attached value.
   assertBlocked('su kimi -c "tee /dev/sda1"', "block-device")
@@ -2257,6 +2284,10 @@ test("a launcher body is read in the spelling the launcher itself reads (WI#887)
   // A command line of launcher words stays inside the analysis deadline. Each
   // is one launcher per clause, so the reads are flat rather than nested.
   assertAllowed('flock /tmp/wi887.l -c "echo hi"; '.repeat(600).slice(0, 16_384), 2_000)
+  assertAllowed('flock -nw 5 /tmp/wi887.l -c "echo hi"; '.repeat(450).slice(0, 16_384), 2_000)
+  // One clause of flock words whose option walks overlap reads each word
+  // once: every `--wai` takes the next `flock` as its value.
+  assertAllowed("flock --wai ".repeat(1400).slice(0, 16_384), 2_000)
   assertAllowed("watch -n1 date; ".repeat(1100).slice(0, 16_384), 2_000)
   assertAllowed('su -c "echo hi"; '.repeat(1100).slice(0, 16_384), 2_000)
   assertAllowed('parallel ::: "echo hi"; '.repeat(700).slice(0, 16_384), 2_000)
