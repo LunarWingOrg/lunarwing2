@@ -1232,6 +1232,77 @@ test("an unlisted interpreter option does not end the walk to the eval flag (WI#
   assertAllowed("node app.js")
 })
 
+test("a one-liner is read behind any interpreter path (WI#890)", () => {
+  // ONE_LINER_CALL allowed at most one directory before the name, so every
+  // absolute path to a real interpreter in the worker image went unread:
+  // /usr/bin/python3, /usr/bin/perl and /usr/local/bin/node.
+  assertBlocked(`/usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/bin/perl -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/local/bin/node -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  // Any number of directory parts, relative or absolute, with `~` or a
+  // variable in the path, and quoted.
+  for (const prefix of ["/bin/", "/usr/bin/", "/usr/local/bin/", "../bin/", "/opt/x/bin/", "~/bin/", "$HOME/bin/", "//usr/bin/"]) {
+    assertBlocked(`${prefix}node -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  }
+  assertBlocked(`"/usr/bin/python3" -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  // Behind a launcher and inside a shell body.
+  assertBlocked(`env /usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`timeout 5 /usr/bin/python3 -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`bash -c '/usr/bin/python3 -c "import shutil; shutil.rmtree(\\"/home/kimi/x\\")"'`, "interpreter deletion")
+  // The temp-root test and ordinary uses keep their verdicts.
+  assertAllowed(`/usr/bin/python3 -c "import shutil; shutil.rmtree('/tmp/wi890-x')"`)
+  assertAllowed(`/usr/local/bin/node -e "require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`/usr/bin/python3 -c "print(1)"`)
+  assertAllowed("/usr/bin/python3 script.py")
+  assertAllowed("/usr/bin/python3 -m pytest -q")
+  assertAllowed("/usr/bin/env python3 script.py")
+  assertAllowed("/usr/local/bin/node app.js")
+  assertAllowed("/usr/local/bin/node server.js")
+  assertAllowed("/usr/local/bin/node --version")
+  assertAllowed("/usr/bin/perl -pe 's/a/b/' f")
+})
+
+test("a one-liner's code is read in every form the interpreter accepts (WI#890)", () => {
+  // oneLinerCode matched the eval flag only as a whole word, so the code
+  // attached to the flag was never read. Each attached form below runs under
+  // the interpreter's own option syntax.
+  assertBlocked(`python3 -c"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -c'import shutil; shutil.rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`python3 -Ic"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -I -c"import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -e'use File::Path; rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -e"use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl -MFile::Path -e'rmtree("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`perl -le'unlink("/home/kimi/x")'`, "deletion outside")
+  assertBlocked(`node --eval="require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  // The same code after a blank keeps denying.
+  assertBlocked(`node --eval "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`node -pe "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`perl -le "unlink('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`python3 -I -c "import shutil; shutil.rmtree('/home/kimi/x')"`, "deletion outside")
+  // The temp-root test and the no-deletion rows keep their verdicts.
+  assertAllowed(`python3 -c"import shutil; shutil.rmtree('/tmp/wi890-x')"`)
+  assertAllowed(`node --eval="require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`python3 -c"print(1)"`)
+  assertAllowed(`node --eval="console.log(1)"`)
+  assertAllowed(`perl -pe's/a/b/' f`)
+})
+
+test("every name the image ships for an interpreter is read as it (WI#890)", () => {
+  // /usr/local/bin/nodejs is a link to node and /usr/bin/perl5.36.0 is the
+  // same file as /usr/bin/perl in the lane's base image. The perl version
+  // changes with the base image, so the pattern must not hold one version.
+  assertBlocked(`nodejs -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`/usr/local/bin/nodejs -e "require('fs').rmSync('/home/kimi/x',{recursive:true})"`, "deletion outside")
+  assertBlocked(`perl5.36.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`/usr/bin/perl5.36.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertBlocked(`perl5.40.0 -e "use File::Path; rmtree('/home/kimi/x')"`, "deletion outside")
+  assertAllowed(`nodejs -e "require('fs').rmSync('/tmp/wi890-x',{recursive:true})"`)
+  assertAllowed(`perl5.36.0 -e "use File::Path; rmtree('/tmp/wi890-x')"`)
+  assertAllowed("nodejs --version")
+  assertAllowed("nodejs app.js")
+})
+
 test("cp's destination option is the destination it writes (WI#869)", () => {
   // The cp device-write rule kept every non-dash word as an operand, so the
   // `-t` value read as a source and the real source as the destination. The
