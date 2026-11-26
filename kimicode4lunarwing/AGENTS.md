@@ -35,6 +35,27 @@ still read. The temp-root test is unchanged, so a deletion inside `/tmp`
 still passes, and `/usr/bin/python3 script.py`, `-m pytest`, `node app.js` and
 `/usr/bin/perl -pe 's/a/b/' f` stay ordinary work.
 
+## Guard Scope
+
+The command guard is a guard against naive use. Its purpose is to refuse the
+plain spelling of a command that a task must not run: the command itself, and
+the same command as a body behind `bash -c` or `eval`, in a here-document or
+in a here-string. What it reads beyond the plain spelling is described in this
+file. That coverage is not extended. The container and tenant egress policy
+remain the security boundary.
+
+Other spellings of a refused command are outside the guard's scope. By the
+maintainer's decision of 2026-11-26 these are documented limits, not defects:
+
+- WI#907: literal text handed to a shell another way, such as
+  `echo 'kimi server' | sh`, a file written and then run, a variable given to
+  `eval` or `sh -c`, or a `trap` action.
+- WI#904: the further routes, listed in that item, by which decoded or fetched
+  content reaches a shell, such as `x=$(curl …); y=$x; $y`.
+- WI#909: Git's own listeners (`git daemon`, `git instaweb`), and Git programs
+  named by their dashed path, such as
+  `/usr/lib/git-core/git-rebase -x '<body>'`.
+
 ## Guard Quote Handling
 
 The WI#895 Git body check recognizes both `git submodule foreach` and
