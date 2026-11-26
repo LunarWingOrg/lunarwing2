@@ -21,6 +21,19 @@ never against a commit message or a merge-request description. The
 section-by-section record of what each statement was checked against, and the
 disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 
+**Refresh, 2026-11-26.** The draft was re-read against the tree at
+`83c2b6f19eba1c337412dfa2e5d4fd733d105333` and extended with work merged after
+the first draft's last edit (`3c06ddcd`, 2026-11-25 — 95 non-merge commits
+behind that tip, and 394 behind it since the baseline the draft cites,
+`c7aab1ae…`): the git-preflight items WI#886, WI#888 and WI#905, the
+command-guard items WI#887, WI#889, WI#892, WI#895, WI#898 and WI#906, the
+GitLab-tool and WASM-trap work in WI#891, the worker-readiness gate WI#882 and
+the credential-binding warning WI#893. It also records the maintainer's
+2026-11-26 decision that closes WI#904, WI#907 and WI#909 as documented guard
+limits rather than defects. One factual error in the first draft was corrected
+in the same pass: the tool-registry row still carried the pre-WI#891 `gitlab`
+version.
+
 ## Highlights
 
 - **The crate baseline moves to `2.2.2` (WI#799).** The daemon, its five
@@ -123,6 +136,47 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   and it reads the option arity of `remote add`/`set-url` so the checked word
   is the URL. These are preflight refusals: the grant still carries no
   credential, and the per-call proxy still bounds egress.
+- **A dashed program and `git submodule--helper` are read as the subcommand
+  they are (WI#886).** Git's dispatcher runs `git <verb>` as the program
+  `git-<verb>` in its exec path (`/usr/lib/git-core/git-push`, or a bare
+  `git-push` on `PATH`), so `git-push -f` is refused exactly as `git push -f`
+  is, and `git-fetch`, `git-clone`, `git-config` and the rest get the
+  subcommand's own checks. A dashed program takes the subcommand's arguments,
+  not `git`'s global options, so none are skipped ahead of it.
+  `git submodule--helper` — the program behind `git submodule` — is read like
+  `git submodule`: its `foreach` body is scanned with the helper's own option
+  rules (unambiguous long-option abbreviations included), and its other
+  subcommands are refused.
+- **`git submodule` is authorized per action (WI#888).** The default listing,
+  `status` and `summary` are permitted and a `foreach` body is scanned. `add`
+  skips supported options and validates the repository operand, which under a
+  grant must be an explicit granted URL or its equivalent absolute
+  `/workspace` path. `update` is refused regardless of flags, because Git can
+  clone or fetch using a URL from `.gitmodules` or local configuration; so are
+  `init`, `sync` and `set-url`, which can change submodule remote URLs.
+  `deinit`, `absorbgitdirs` and `set-branch` are intentionally unsupported.
+  Before this, the action dispatch fell through to `Ok(())`, so `update
+  --init`/`--remote` and `sync` reached `.gitmodules` remotes with no grant
+  check. Git can still fetch within already-populated submodules according to
+  its recursion settings; those implicit fetches stay outside the preflight's
+  visibility.
+- **An `argv[0]` override, a glob and `for-each-repo` are read (WI#905).**
+  For `env -a`/`--argv0` and `exec -a`, the preflight reads the final
+  `argv[0]` by basename when the executable is Git, so a replacement such as
+  `git-fetch` uses the fetch checks; an expansion in Git's `argv[0]` is
+  refused. Unquoted globs that name Git programs are refused in command
+  positions and in the arguments of wrappers the preflight cannot read: it
+  looks for a literal character or a single-character class in the final path
+  component and checks the pattern against Git program names, including dashed
+  names in `git-core`. Generic patterns such as `*`, `dir/*` and `???` pass,
+  and a single `case` pattern at a pattern delimiter is exempt. When Bash
+  enables `extglob` with `-O extglob` or a literal `shopt -s extglob`, extended
+  globs in command words are refused. Literal brace lists and ranges expand
+  into separate arguments before the scan reads commands, wrapper arguments,
+  or Git options and operands; quoted and escaped braces stay literal, as does
+  `{}`, and a brace expansion the preflight cannot resolve is refused. For
+  `git for-each-repo`, the arguments after the recognized options are checked
+  as a Git command, including global options after the `--` separator.
 - **The relay's accept loop no longer dies at 32 connections (WI#834).** The
   host relay (`ic/src/sandbox/proxy/relay.rs`) reaps finished connections, so
   its 32-connection cap bounds live connections only and the lifetime
@@ -239,6 +293,121 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   of a literal path no lane uses (WI#829); direct key-file auth stays allowed
   on purpose. Two false denials were removed in the same pass (WI#832). Every
   rule is pinned by `scripts/headless_command_guard_test.ts`.
+- **A redirection is read out of the line before any rule sees it (WI#889).**
+  The clause, word, segment, listener, git-verb and raw-shape readers all step
+  over every form of `man bash` REDIRECTION (`[n]<word`, `[n]>word`,
+  `[n]>|word`, `[n]>>word`, `&>word`, `>&word`, `&>>word`, `[n]<<[-]word`,
+  `[n]<<<word`, `[n]<&word`, `[n]>&word`, `[n]<>word`, each also with
+  `{varname}` and with or without blanks), so `rm 2>&1 -rf /home/kimi/x`,
+  `git 2>/dev/null reset --hard`, `kimi 2>/dev/null server` and
+  `bash 2>/dev/null -c "kimi server"` deny like the plain spellings, while the
+  false refusals the old reading made (`rm -rf /tmp/x 2> /dev/null`,
+  `rm -rf /tmp/x </dev/null`, `rm -rf 2>&1 /tmp/x`) pass. `|&` is bash's
+  `2>&1 |`, so its bar splits a pipeline (`curl … |& sh` denies); a
+  redirection's own `&`/bar are not control operators; a write target stays
+  visible to the device rule (`>&/dev/sda1`); and a here-string body is read
+  as the command line it spells (`bash <<<"kimi server"` denies).
+- **A launcher that runs a quoted string through a shell is one table entry
+  (WI#887).** `flock <file> -c`/`--command`, `watch`'s command, `su
+  -c`/`--command`/`--session-command` and GNU `parallel`'s template and `:::`
+  arguments all hand their body to the full body check, so
+  `flock /tmp/l -c "tee /dev/sda1"`, `watch -n1 "nc -l 9000"`, `su -c "kimi
+  server"` and `parallel ::: "python3 -m http.server 8080"` deny like the
+  unwrapped spellings, while `flock /tmp/build.lock make -j8`,
+  `watch -n5 "git status"`, `su kimi -c "cargo check"` and
+  `parallel ::: "cargo check"` stay ordinary work. Each reader follows its
+  launcher's own option walk: flock reads its options as util-linux flock's
+  `getopt_long` does (a short cluster letter by letter, a long option by exact
+  name or unique prefix, `--name=value` inline, `--` ending the options) and
+  reads `-c` only after the lock file; where it cannot resolve an option word
+  (an unknown option, an ambiguous prefix, a `-c` before the file) doubt never
+  allows — the text that word carries and every later word are each read as a
+  possible body, and a clause with more than 64 words from that word on is
+  refused. su permutes its words through `getopt`, watch joins every word from
+  its first non-option one and hands the line to `sh -c`, and parallel reads
+  its template and each `:::` argument as a command line. A `-c` that belongs
+  to another command (`git commit -c`, `grep -c`) is not a launcher body.
+- **The decode and fetch rules are distance-free (WI#892).** In one pipeline a
+  decode stage, or a `curl`/`wget`/`fetch`/`nc`/`ncat`/`netcat` stage, anywhere
+  before an interpreter stage counts, so `echo <b64> | base64 -d | cat | tee
+  /tmp/x | sh`, `gunzip -c x.gz | cat | sh` and `curl … | head -c 100000 | bash`
+  deny. A shell, `eval` or `source`/`.` fed by a command substitution, a
+  process substitution or a here-string that holds a decode stage or a fetch
+  denies too (`sh -c "$(curl …)"`, `bash <(gunzip -c x.gz)`). A file counts as
+  written when a stage fed by a decode or a fetch names it as a redirect
+  target, a `tee` operand, `dd of=`, the destination of `cp`/`install` from
+  `/dev/stdin`, curl `-o`/`--output`, wget `-O`/`--output-document`, the URL's
+  last component for curl `-O` and for wget without `-O`, an in-place
+  `gunzip`/`unxz`/`bunzip2`/`unzstd`, or `xxd -r IN OUT`; a `cp`/`mv`/`ln`/
+  `install` or a redirect that copies a written file writes its destination
+  too. Written and run files are compared by their last component only, so a
+  relative path, an absolute one and the file reached after a `cd` match.
+  Anywhere in the same command line a written file denies when it is executed
+  — as a shell's script operand, `--rcfile`/`--init-file` or a `-c` string's
+  positional parameter, by `source`/`.`, as the command word, as a shell's `<`
+  input, piped into a shell or a stdin interpreter, through a substitution in
+  a shell's text, or by a shell word behind a launcher the guard does not
+  know. Where the guard cannot read a written name, a later shell operand or a
+  path run (`sh x`, `./x`) denies; a bare command name (`jq`, `make`) is found
+  in `PATH` and matches only a written file of that exact name. Only the
+  command position executes, so a written file read by `jq .`, `tar -xzf … -C
+  .`, `cp … .`, `wc -l` or `tar -czf` stays ordinary work, as does decoding or
+  downloading to a file without running it; an interpreter given the file
+  (`python3 x.py`) is outside the rule. A variable filled from such a
+  substitution denies when a shell, `eval` or `source` word in the same stage
+  expands it, when it is the command word, or when it is piped into a shell.
+  A here-document that a shell or a stdin interpreter reads denies when its
+  delimiter is unquoted and its body holds such a substitution or such a
+  variable, and every here-document body of every line is checked as a command
+  line of its own. Ordinary substitutions stay data: `bash -c "$(cat
+  build.sh)"`, `bash <(cat build.sh)`, `eval "$(ssh-agent -s)"`, `source
+  <(kubectl completion bash)`.
+- **The bodies git runs itself are read (WI#895).** `git submodule [opts]
+  foreach <tail>` and `git rebase … --exec/-x <body>` pass their operand to
+  `sh -c`, so the tail gets the same full rule set, in the separate, attached
+  (`--exec=<body>`, `-x<body>`), clustered (`-ix <body>`) and long-prefix
+  (`--ex`, `--exe`) spellings, with `--no-exec` carrying none and `foreach`'s
+  own leading options (`--quiet`, `--recursive`) stepped over. `git submodule
+  foreach 'kimi server'`, `git submodule foreach 'tee /dev/sda1'`, `git rebase
+  --exec='nc -l 9000' HEAD` and `git rebase -ix 'kimi server' HEAD` deny like
+  the unwrapped spellings while `git submodule foreach 'echo hi'` and `git
+  rebase -x 'cargo test' HEAD~1` still pass. The clause is read once per git
+  word, so 16 KB of repeated `git rebase` stays inside the deadline.
+- **The guard reads the git carriers and settings that run a command
+  (WI#898, WI#906).** WI#898 covers `filter-branch` filters, diff and merge
+  tools, grep's pager, pack commands on fetch, pull, clone, ls-remote,
+  fetch-pack, push and send-pack, and archive's remote command, using the Git
+  2.56 command manuals and option parsers. It checks command-valued settings
+  in `-c`, `--config-env`, clone configuration, `git config` writes and the
+  `GIT_CONFIG_*` environment forms, over keys that include editor, pager, SSH,
+  external diff, merge, filter, pack, credential-helper,
+  `trailer.<name>.cmd`/`trailer.<name>.command`, fsmonitor and man-viewer, and
+  it refuses explicit enabling of Git's external command transport. WI#906
+  then separates a real assignment from an argument that only looks like one:
+  for the eight names `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`,
+  `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, `EDITOR`, `VISUAL` and `PAGER`, it
+  reads bare and command-prefix assignments, operands of `export`, `declare`,
+  `typeset`, `readonly` and `local`, and `env` assignments before its command,
+  and no longer refuses an assignment-shaped argument to another program whose
+  value holds an expansion (`echo "EDITOR=$EDITOR"`). A Git command value or
+  an assignment to one of the eight names that the outer shell can change is
+  refused as unverifiable, even without Git on the line — `export
+  PAGER=less` passes, `export PAGER="${PAGER:-less}"` does not. Literal values
+  are still checked as shell bodies even in arguments.
+- **The guard's scope is a documented decision (WI#904, WI#907, WI#909).** By
+  the maintainer's decision of 2026-11-26 the guard is a guard against naive
+  use, not a security boundary, and its coverage is not extended to further
+  spellings of a command it already refuses. `kimicode4lunarwing/AGENTS.md`
+  now carries a **Guard Scope** section naming the three limits: literal text
+  handed to a shell another way (`echo 'kimi server' | sh`, a file written and
+  then run, a variable given to `eval` or `sh -c`, a `trap` action — WI#907);
+  the further routes by which decoded or fetched content reaches a shell
+  (`x=$(curl …); y=$x; $y` — WI#904); and Git's own listeners (`git daemon`,
+  `git instaweb`) plus Git programs named by their dashed path
+  (`/usr/lib/git-core/git-rebase -x '<body>'` — WI#909). The container and
+  tenant egress policy remain the boundary. Every example in the section was
+  run through the hook: the plain spellings are refused and the named limits
+  pass.
 - **A Perl deletion behind shell quoting is denied (WI#840).** The guard
   removes the shell escapes of a quoted one-liner before it reads the Perl
   deletion calls, so an escaped quote no longer hides an
@@ -363,8 +532,26 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
   takes `project`, `iid` and an optional `access_raw_diffs`, and
   `list_merge_requests` gained `source_branch`, `target_branch` and
   `all_pages`. `unapprove_merge_request` is the counterpart of the existing
-  approve action. The tool is at `0.1.18`; the plugin wrappers and their tests
+  approve action. The tool is at `0.1.19`; the plugin wrappers and their tests
   carry the new actions.
+- **The GitLab tool's search is bounded and typed (WI#891).** Every
+  project-scoped search runs through one per-page-capped path: the page size is
+  clamped to 20 at the call site's own boundary rather than at each caller, so a
+  `search_issues`/`search_blobs`/`search_projects` page cannot grow with the
+  server's own limit. A blob hit's matched snippet (`data`) is cut to 2,000
+  characters with a `data_truncated` flag, and a hit keeps its triage fields —
+  project identity and blob location — while heavy subtrees are skipped. The
+  term is matched rather than trapped on a known matching value, and the
+  response is parsed typed instead of by string. The tool is at `0.1.19`.
+- **A WASM trap now reports its cause (WI#891).** Wasmtime attaches a
+  backtrace as an anyhow context on every trap, and anyhow's plain `Display`
+  prints only the outermost context, so every trap reported as a reason-less
+  backtrace. `ic/src/tools/wasm/trap.rs` classifies traps structurally: it
+  reads the root cause, downcasts to `wasmtime::Trap` in preference to string
+  matching, matches Wasmtime 36's fuel wording, and folds a recorded
+  `memory.grow` denial into a memory-limit explanation. A refused memory
+  growth is recorded as a denial rather than surfacing as a bare trap. The
+  tool and channel lanes use the same structural classification.
 - **`ssh_git` refuses a ref-deleting push (WI#818).** A push refspec whose
   source is empty (`:branch`, or a bare `:`) is refused with `NotAuthorized`
   before git runs, alongside the existing refusal of a leading `-` and of a
@@ -486,6 +673,22 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 - **The startup guide names LunarDepth in the lane order.** The shared
   startup pass was already `pebble opencode kimi opencode2 lunardepth` at
   v2.2.1.0; only the guide sentence changed.
+- **Worker readiness fails an enabled lane with no WSS port (WI#882).** A lane
+  that has no allocated WSS slot in the ports registry now reports `no-port`
+  without dialing, and the readiness pass returns non-zero for it; before, a
+  lane with no port was skipped as though it were deselected, so onboarding
+  could succeed on a tenant whose enabled lane had nowhere to listen. A lane
+  whose port is allocated but does not answer still reports as not listening,
+  with the `worker-failure-log` hint. All lanes share one polling deadline, so
+  a slow lane consumes the window for everyone, and the pass never stops or
+  restarts a lane itself. `mt-admin`'s help now describes a missing worker
+  port, and the onboarding worker-readiness contract and the Kageho runbook
+  state the requirement.
+- **An invalid credential binding warns instead of failing silently
+  (WI#893).** When `SANDBOX_GIT_CREDENTIALS` binds a remote to a name that is
+  not a `SANDBOX_GIT_TOKEN_<NAME>` secret, the env render now prints a warning
+  naming the tenant, the remote and the binding, and skips that binding
+  instead of emitting a credential variable nothing will read.
 - **The relay's limits and its failure attribution are documented (WI#834,
   WI#836).** `ic/src/NETWORK_SECURITY.md` now states the 32-live-connection
   cap, that finished connections are reaped while the lifetime accept count
@@ -538,7 +741,7 @@ disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
 | Owned packages / core Rust | Eleven packages at `2.2.2` (daemon, five workspace crates, XMPP bridge, four WASM channels); all eight inter-crate path requirements at `2.2.2`; Rust 2024, MSRV `1.96.1` |
 | WASM runtime | Wasmtime/WASI `36.0.23` in `ic/Cargo.lock` (manifest floor `36.0.22`); `[bans]` denies `wasmtime` before `36.0.20` and `wasmtime-wasi` before `36.0.22` within 36.x; the `wasmtime-internal-cache` patch stays on that line |
 | Channel registry | darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19`, xmpp `0.1.24` |
-| Tool registry | cavepony-tool `0.4.13`, gitlab `0.1.18`, gotify `0.1.9`, llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`, vision-analyze `0.2.4`, voice-transcribe `0.1.10`, web-search `0.2.12` |
+| Tool registry | cavepony-tool `0.4.13`, gitlab `0.1.19`, gotify `0.1.9`, llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`, vision-analyze `0.2.4`, voice-transcribe `0.1.10`, web-search `0.2.12` |
 | External workers | Kimi Code `2.7.2`, OpenCode `v1.19.6` (`f4e363c82…`), OpenCode 2 `v2.3.2` (`c0ad18b40…`), Pebble `2d0f3786…`, LunarDepth `ca905dfe5…` |
 | Worker toolchain | Debian snapshot `20261105T082236Z`; Node `22.23.4` (Kimi, LunarDepth); pnpm `11.7.0` (LunarDepth); Bun `1.4.4` (OpenCode lanes) |
 | Sandbox | Linux default `proxy-enforced`; `tunnel` opt-in; optional version-1 `capability_manifest` that can only narrow host policy; one credential-free git grant (`git-remotes`) when `SANDBOX_GIT_REMOTES` is set; relay serves 32 live connections and reaps them |
@@ -639,12 +842,20 @@ do not replace those gates.
   the systemd user unit `lunarwing service install` writes, which sets no
   `UMask`. Run the daemon through a shipped unit if job directories must not be
   group- or world-readable.
-- **The Kimi guard reads text, not a shell.** Launchers outside its closed
-  list (`eval`, `taskset`, `flock`, `script -c`, `watch`), process
-  substitution `<(…)`, brace expansion, `rename` and interpreter renames still
-  pass, as do the git preflight's unread shell shapes (`env -u`, `!`,
-  `{ … }`, `timeout -s`, `nice -n`). The egress allowlist and the container
-  remain the boundary.
+- **The Kimi guard reads text, not a shell.** Its coverage is bounded and, by
+  the maintainer's decision of 2026-11-26, is not extended further (WI#904,
+  WI#907, WI#909): literal text handed to a shell another way
+  (`echo 'kimi server' | sh`, a file written and then run, a variable given to
+  `eval` or `sh -c`, a `trap` action), the further routes by which decoded or
+  fetched content reaches a shell (`x=$(curl …); y=$x; $y`), and Git's own
+  listeners (`git daemon`, `git instaweb`) and Git programs named by their
+  dashed path are documented limits, not defects. `rename` and interpreter
+  renames still pass, as do the git preflight's unread shell shapes (`env -u`,
+  `!`, `{ … }`, `timeout -s`, `nice -n`). WI#887 closed `flock -c`, `watch`,
+  `su -c` and `parallel` as launchers, and WI#858 already reads `eval`,
+  `taskset`, `script -c`, process substitutions `<(…)` and brace expansion, so
+  those are no longer limits. The egress allowlist and the container remain
+  the boundary.
 - **The shell git grant carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
