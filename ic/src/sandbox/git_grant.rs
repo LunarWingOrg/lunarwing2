@@ -1423,7 +1423,7 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             name if is_shell_name(name) => {
                 return scan_shell_c(words, index, preflight, depth);
             }
-            "git" => return inspect_git_command(&words[index..], preflight, depth),
+            "git" => return inspect_git_command(&words[index + 1..], preflight, depth),
             // Git's plumbing executables are not subcommands, so they bypass
             // `inspect_git_command` entirely when invoked by path. They take
             // the same unscreened remote destinations.
@@ -1954,7 +1954,7 @@ const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
 /// Find the git subcommand, skipping global options that take a value. A
 /// `--` is not a git option, so it is refused rather than read as one.
 fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxError> {
-    let mut index = 1;
+    let mut index = 0;
     while index < words.len() {
         let word = &words[index].text;
         if word == "--" {
@@ -1965,13 +1965,15 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
         if !word.starts_with('-') {
             return Ok(Some(index));
         }
-        refuse_redirecting_config(&config_overrides(words, index))?;
         let takes_value = GIT_GLOBAL_VALUE_OPTIONS.contains(&word.as_str());
-        if words[index].dynamic && takes_value {
+        if words[index].dynamic
+            || (takes_value && words.get(index + 1).is_some_and(|value| value.dynamic))
+        {
             return Err(denied(
                 "dynamic git global option value cannot be authorized",
             ));
         }
+        refuse_redirecting_config(&config_overrides(words, index))?;
         index += if takes_value { 2 } else { 1 };
     }
     Ok(None)
@@ -2020,6 +2022,7 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         "remote" => authorize_remote_subcommand(args, preflight),
         "config" => authorize_config(args),
         "archive" => authorize_archive(args, preflight),
+        "for-each-repo" => authorize_for_each_repo(args, preflight, depth),
         "submodule" => authorize_submodule(args, preflight, depth),
         // The program behind `git submodule`. Only `foreach` is read, with the
         // helper's own option rules; its other subcommands are internal and
@@ -2035,6 +2038,53 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         ))),
         _ => Ok(()),
     }
+}
+
+fn authorize_for_each_repo(args: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    if depth >= 4 {
+        return Err(denied("nested git for-each-repo is too deep to authorize"));
+    }
+    let (has_config, command) = for_each_repo_command(args)?;
+    if !has_config || command.is_empty() {
+        return Err(denied(
+            "git for-each-repo requires a config key and command",
+        ));
+    }
+    inspect_git_command(command, preflight, depth + 1)
+}
+
+fn for_each_repo_command(mut args: &[Word]) -> Result<(bool, &[Word])> {
+    let mut has_config = false;
+    while let Some((word, tail)) = args.split_first() {
+        if word.dynamic {
+            return Err(denied(
+                "dynamic git for-each-repo operand cannot be authorized",
+            ));
+        }
+        match word.text.as_str() {
+            "--" => return Ok((has_config, tail)),
+            "--keep-going" | "--no-keep-going" => args = tail,
+            "--config" => {
+                let Some((key, rest)) = tail.split_first() else {
+                    return Err(denied("git for-each-repo requires a literal config key"));
+                };
+                if key.dynamic || key.text.is_empty() || key.text.starts_with('-') {
+                    return Err(denied("git for-each-repo requires a literal config key"));
+                }
+                has_config = true;
+                args = rest;
+            }
+            option if option.starts_with("--config=") && option.len() > "--config=".len() => {
+                has_config = true;
+                args = tail;
+            }
+            option if option.starts_with('-') => {
+                return Err(denied("unsupported git for-each-repo option"));
+            }
+            _ => break,
+        }
+    }
+    Ok((has_config, args))
 }
 
 /// Git's remote transport plumbing. `send-pack`/`http-push` write to the
@@ -2098,6 +2148,7 @@ fn is_known_git_verb(verb: &str) -> bool {
             | "remote"
             | "config"
             | "archive"
+            | "for-each-repo"
             | "submodule"
             | "submodule--helper"
             | "rebase"
@@ -2119,11 +2170,7 @@ fn inspect_git_dashed_command(
     let Some(verb) = git_dashed_program(basename(&words[index].text)) else {
         return Ok(());
     };
-    let mut rewritten = Vec::with_capacity(words.len() - index + 1);
-    rewritten.push(Word {
-        text: "git".to_string(),
-        dynamic: false,
-    });
+    let mut rewritten = Vec::with_capacity(words.len() - index);
     rewritten.push(Word {
         text: verb.to_string(),
         dynamic: words[index].dynamic,
@@ -3232,6 +3279,58 @@ mod tests {
             }
         }
         check_granted("git push origin {main,dev}", &write_grant).unwrap();
+    }
+
+    #[test]
+    fn for_each_repo_checks_the_git_command_it_runs() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for (command, control) in [
+            (
+                "git -c x.r=. for-each-repo --config=x.r push -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "git -c x.r=. for-each-repo --config=x.r ls-remote https://evil.example.test/x.git",
+                "git ls-remote https://evil.example.test/x.git",
+            ),
+            (
+                "git for-each-repo --config x.r --keep-going -- -c alias.p=push p origin master",
+                "git -c alias.p=push p origin master",
+            ),
+            (
+                "git-for-each-repo --config=x.r -- -C repo push -f origin master",
+                "git -C repo push -f origin master",
+            ),
+            (
+                r#"git for-each-repo --config=x.r "$verb" origin master"#,
+                r#"git "$verb" origin master"#,
+            ),
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                let expected = check_granted(control, grant).unwrap_err().to_string();
+                let actual = check_granted(command, grant).unwrap_err().to_string();
+                assert_eq!(actual, expected, "{command}");
+            }
+        }
+        for command in [
+            "git for-each-repo --config=x.r --unknown status",
+            r#"git for-each-repo --config="$key" status"#,
+            "git for-each-repo --config=x.r --",
+        ] {
+            assert!(check_granted(command, &write_grant).is_err(), "{command}");
+        }
+        check_granted(
+            "git for-each-repo --config=maintenance.repo maintenance run",
+            &read_grant,
+        )
+        .unwrap();
+        check_granted(
+            "git for-each-repo --config x.r -- -C repo fetch origin",
+            &read_grant,
+        )
+        .unwrap();
     }
 
     #[test]
