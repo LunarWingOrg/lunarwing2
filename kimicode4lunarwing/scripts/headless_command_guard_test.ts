@@ -3193,3 +3193,83 @@ test("the parent's denials hold through case, launchers, rc files, paths, names 
   assertAllowed("(cd /tmp && ls) > /tmp/l.txt")
   assertAllowed(`${C}; flock /tmp/l make`)
 })
+
+test("literal stdout that a shell runs receives the shell body rules (WI#907)", () => {
+  const producer = "echo 'kimi server'"
+  for (const sink of [
+    "sh", "env sh", "nice bash", "command sh", "bash -s", "sh -", "/bin/sh", "busybox sh", "dash", "zsh",
+    "bash -i", "source /dev/stdin", ". /dev/stdin", "xargs -0 sh -c", "cat | sh", "tee /dev/null | sh",
+  ]) assertBlocked(`${producer} | ${sink}`, "kimi service mode")
+  for (const row of [
+    `${producer} |& sh`, `(${producer}) | sh`, `{ ${producer}; } | bash`,
+    "printf '%s\\n' 'kimi server' | sh", "echo -e 'kimi\\x20server' | sh", "echo -n 'kimi server' | sh",
+    "echo $'kimi server' | sh", "printf 'kimi server' | sh", "printf 'k%sserver' 'imi ' | sh",
+    "echo 'ki''mi server' | sh", "echo 'echo hi; kimi server' | sh", "echo 'kimi server &' | sh",
+    "cat <<<'kimi server' | sh", "sh <<< 'kimi server'", "cat <<'END' | sh\nkimi server\nEND\n",
+    "kimi server", "bash -c 'kimi server'", "echo kimi server | bash",
+  ]) assertBlocked(row, "kimi service mode")
+  for (const row of [
+    `echo "python3 -m http.server 9000" | bash`, "echo 'socat TCP-LISTEN:9000 -' | sh",
+    "echo 'busybox httpd -p 9000' | sh",
+  ]) assertBlocked(row, "listener started from a task")
+  for (const row of ["echo 'tee /dev/sda1' | sh", "echo 'cp /tmp/a /dev/sda1' | sh"]) {
+    assertBlocked(row, "direct block-device write")
+  }
+  assertBlocked("echo 'find /app -name x -delete' | sh", "deletion outside")
+  assertBlocked("echo 'rsync -a --delete /tmp/e/ /app/' | sh", "deletion outside")
+  assertBlocked("echo 'echo aGk= | base64 -d | sh' | sh", "decoded content")
+  assertBlocked("echo 'nc -l 9000' | sh") // May already match the remote-content rule.
+  assertBlocked("echo 'rm -rf /home/kimi/x' | sh")
+  assertBlocked("echo 'dd if=/tmp/a of=/dev/sda1' | sh")
+})
+
+test("literal text written in a file or assigned in the line is checked when run (WI#907)", () => {
+  for (const [body, reason] of [["kimi server", "kimi service mode"], ["tee /dev/sda1", "direct block-device write"]]) {
+    for (const row of [
+      `echo '${body}' > /tmp/x.sh; sh /tmp/x.sh`, `echo '${body}' > x.sh; . ./x.sh`,
+      `echo '${body}' > /tmp/x.sh; chmod +x /tmp/x.sh; /tmp/x.sh`,
+      `printf '%s\\n' '${body}' | tee x.sh >/dev/null; source x.sh`,
+      `cat <<'END' > x.sh\n${body}\nEND\nsh x.sh`, `cat <<< '${body}' > x.sh; bash < x.sh`,
+      `x='${body}'; sh -c "$x"`, `x='${body}'; eval "$x"`, `x='${body}'; echo "$x" | sh`,
+    ]) assertBlocked(row, reason)
+  }
+})
+
+test("a trap action is a shell body, not a quoted mention (WI#907)", () => {
+  for (const row of [
+    "trap 'kimi server' EXIT", 'trap "kimi server" EXIT', "trap -- 'kimi server' ERR", "trap 'kimi server' 0",
+    "trap 'kimi server' DEBUG", "trap 'nc -l 9000' EXIT", "trap 'python3 -m http.server 9000' INT TERM",
+    "trap 'socat TCP-LISTEN:9000 -' EXIT", "trap 'tee /dev/sda1' EXIT", "trap 'cp /tmp/a /dev/sda1' EXIT",
+    "trap 'find /app -name x -delete' EXIT", "trap 'echo hi; kimi server' EXIT", "trap 'kimi server' EXIT; exit 0",
+  ]) assertBlocked(row)
+  for (const row of [
+    "trap 'echo done' EXIT", "trap - EXIT", "trap '' INT", "trap 'kill $pid' EXIT", "trap cleanup EXIT",
+    `trap 'echo "kimi server stopped"' EXIT`, `echo trap 'kimi server' EXIT`,
+  ]) assertAllowed(row)
+})
+
+test("data arguments, pre-existing input, and ordinary literal shell scripts still pass (WI#907)", () => {
+  for (const row of [
+    "echo 'echo hi' | sh", "printf 'ls -la\\n' | bash", "echo 'set -e; make' | bash",
+    "printf 'cd /tmp && ls\\n' | sh", "echo 'python3 -m pytest -q' | bash",
+    "echo y | sh ./install.sh", "echo y | bash install.sh --yes", "printf 'y\\n' | sh -c 'read a; echo $a'",
+    `echo 'kimi server' | bash -c 'read x; echo "$x"'`, "echo 'kimi server' | sh < /dev/null",
+    "echo 'kimi server' | grep kimi", "echo 'tee /dev/sda1' | wc -c", 'echo "run: kimi server" | tee notes.md',
+    "echo 'kimi server' > notes.txt", "echo 'kimi server' > ./notes.sh; sh /tmp/notes.sh",
+    `sh -c "$BODY"`, `echo "$BODY" | sh`, `printf '%s' "$(date)" | sh`, "cat existing.sh | sh",
+    "echo 'tee /dev/sda1' | python3", "echo 'echo hi' > x.sh; sh x.sh",
+    `x='echo hi'; eval "$x"`, `x='kimi server'; echo '$x' | sh`,
+    "printf '%04d' 2 | wc -c", "echo -e 'a\\u0020b' > notes.txt",
+  ]) assertAllowed(row)
+})
+
+test("unreadable literal formatting fails closed at a shell sink (WI#907)", () => {
+  assertBlocked("printf '%04d' 2 | sh", "cannot verify literal shell input")
+  assertBlocked("echo -e 'a\\u0020b' | sh", "cannot verify literal shell input")
+  assertBlocked("printf '%04d' 2 > x.sh; sh x.sh", "cannot verify literal shell input")
+})
+
+test("long repeated literal inputs stay within the analysis deadline (WI#907)", () => {
+  const stage = `x='echo hi'; sh -c "$x"; `
+  assertAllowed(stage.repeat(Math.floor(16_384 / stage.length)) + ":", 3_000)
+})
