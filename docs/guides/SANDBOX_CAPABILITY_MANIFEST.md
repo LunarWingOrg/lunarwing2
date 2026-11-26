@@ -275,6 +275,36 @@ skipped ahead of it. `git submodule--helper` — the program behind
 scanned with the helper's own option rules (unambiguous long-option
 abbreviations included), and its other subcommands are refused.
 
+For `env -a` or `--argv0` and `exec -a`, preflight reads the final `argv[0]`
+by basename when the executable is Git. A replacement such as `git-fetch`
+uses the fetch checks. An expansion in Git's `argv[0]` is refused. Use
+`git push` directly for a push to a write-granted remote because preflight
+refuses dispatch to `git-push` through an `argv[0]` override.
+
+Preflight refuses unquoted globs that specifically name Git programs in
+command positions or in the arguments of wrappers it cannot read. It looks
+for a literal character or a single-character class in the final path
+component and checks the pattern against Git program names, including dashed
+names in `git-core`. A literal shell basename in an unread wrapper's
+arguments is checked even when its directory contains a glob. A single
+`case` pattern at a pattern delimiter is exempt from command glob checks.
+The lexer still scans the words in every command clause. Generic patterns
+such as `*`, `dir/*`, and `???` pass this check. They can select Git in a
+prepared directory, just as a link under another name can run Git. Preflight
+does not consult the filesystem to resolve command names or expand globs in
+Git option and operand words. When Bash enables `extglob` with `-O extglob` or a
+literal `shopt -s extglob`, preflight refuses extended globs in command words.
+
+Literal brace lists and ranges expand into separate arguments before the
+scan reads commands, wrapper arguments, or Git options and operands.
+Quoted and escaped braces remain literal, as does `{}`. Preflight refuses
+brace expansions it cannot resolve within its limits in command words and
+Git arguments.
+
+For `git for-each-repo`, preflight checks the arguments after the recognized
+options as a Git command, including global options after the `--` separator.
+Git resolves the repository list from the supplied configuration key.
+
 For `git submodule`, preflight permits the default listing, `status` and
 `summary`, and scans `foreach` bodies. For `add`, it skips supported options
 and validates the repository operand. With a Git grant, that operand must be
@@ -325,9 +355,9 @@ stays an ordinary body. `rebase` exec is read from the
 short-option cluster the way git reads it: a value-taking letter (`-s`, `-X`,
 `-C`, `-S`, `-r`) consumes the rest of the cluster, so `-ix` and `-vix` run
 their body, `-ix<body>` attaches it, and `-sx`/`-Xx`/`-C3x`/`-rx` are that
-option's value rather than an exec. It does not fully model shell
-expansion (including globs, braces and command substitutions), dynamic
-command names, alias or command lookup, text evaluated by commands such as
+option's value rather than an exec. The scan reads ANSI-C quoted words such
+as `$'git'`. It does not fully model runtime shell expansion, dynamic command
+names, alias or command lookup, text evaluated by commands such as
 `eval` or `trap`, or shell scripts supplied on stdin. Unsupported
 forms, including indirect writes to shell variables, are not guaranteed
 to be refused.
