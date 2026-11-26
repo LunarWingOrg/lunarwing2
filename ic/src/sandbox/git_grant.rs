@@ -968,8 +968,8 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
     }
     for word in &words[from + 1..] {
         let name = basename(&word.text);
-        if matches!(word.expansion, Expansion::GitGlob | Expansion::Extglob)
-            || (!word.dynamic
+        if word.expansion == Expansion::GitGlob
+            || (!word.needs_expansion()
                 && (name == "git"
                     || is_git_plumbing_executable(name)
                     || is_git_program_word(&word.text)
@@ -2107,18 +2107,32 @@ fn inspect_git_argv0(
     let name = basename(&argv0.text);
     let git_executable = executable == "git" || git_dashed_program(executable).is_some();
     let git_name = name == "git" || git_dashed_program(name).is_some();
-    if (git_executable && argv0.needs_expansion()) || (git_name && program.needs_expansion()) {
+    if program.dynamic
+        || (git_executable && argv0.needs_expansion())
+        || (git_name && program.needs_expansion())
+    {
         return Some(Err(denied(
             "dynamic git program or argv[0] cannot be authorized",
         )));
     }
-    if is_git_plumbing_executable(executable) || (!git_executable && !program.dynamic) {
+    if !git_executable || is_git_plumbing_executable(executable) {
         return None;
     }
-    if name == "git" {
-        return Some(inspect_git_command(args, preflight, depth));
-    }
-    git_dashed_program(name).map(|verb| inspect_git_verb(verb, args, preflight, depth))
+    let result = match name {
+        "git" => inspect_git_command(args, preflight, depth),
+        _ => inspect_git_verb(git_dashed_program(name)?, args, preflight, depth),
+    };
+    Some(result.and_then(|()| {
+        if name == "git-push" {
+            return Err(denied(
+                "use git push directly instead of an argv[0] override",
+            ));
+        }
+        if let Some(verb) = git_dashed_program(executable).filter(|_| executable != name) {
+            return inspect_git_verb(verb, args, preflight, depth);
+        }
+        Ok(())
+    }))
 }
 
 fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -3412,14 +3426,6 @@ mod tests {
                 "git push origin +master",
             ),
             (
-                "exec -a git-fetch -a git-push git origin master",
-                "git push origin master",
-            ),
-            (
-                "env -a git-fetch --argv0 /usr/bin/git-push git origin master",
-                "git push origin master",
-            ),
-            (
                 "exec -ca/usr/bin/git-push git -f origin master",
                 "git push -f origin master",
             ),
@@ -3442,13 +3448,18 @@ mod tests {
             r#"env -a "$name" git status"#,
             r#"env --argv0="$name" git status"#,
             r#"exec -a "$name" git status"#,
+            "exec -a git-fetch -a git-push git origin master",
+            "env -a git-fetch --argv0 /usr/bin/git-push git origin master",
+            "env -a git-push git origin master",
         ] {
-            assert!(check_granted(command, &write_grant).is_err(), "{command}");
+            for grant in [&read_grant, &write_grant] {
+                assert!(check_granted(command, grant).is_err(), "{command}");
+            }
         }
+        check_granted("git push origin master", &write_grant).unwrap();
         for command in [
             "env -a git-push --argv0=git-fetch git origin",
             "exec -a git-push -a git-fetch git origin",
-            "env -a git-push git origin master",
         ] {
             check_granted(command, &write_grant)
                 .unwrap_or_else(|error| panic!("{command}: {error}"));
