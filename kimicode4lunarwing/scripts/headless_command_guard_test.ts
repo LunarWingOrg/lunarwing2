@@ -3199,6 +3199,7 @@ test("literal stdout that a shell runs receives the shell body rules (WI#907)", 
   for (const sink of [
     "sh", "env sh", "nice bash", "command sh", "bash -s", "sh -", "/bin/sh", "busybox sh", "dash", "zsh",
     "bash -i", "source /dev/stdin", ". /dev/stdin", "xargs -0 sh -c", "cat | sh", "tee /dev/null | sh",
+    `env -S 'sh -s'`, `nice env -S 'sh -s'`,
   ]) assertBlocked(`${producer} | ${sink}`, "kimi service mode")
   for (const row of [
     `${producer} |& sh`, `(${producer}) | sh`, `{ ${producer}; } | bash`,
@@ -3267,6 +3268,8 @@ test("unreadable literal formatting fails closed at a shell sink (WI#907)", () =
   assertBlocked("printf '%04d' 2 | sh", "cannot verify literal shell input")
   assertBlocked("echo -e 'a\\u0020b' | sh", "cannot verify literal shell input")
   assertBlocked("printf '%04d' 2 > x.sh; sh x.sh", "cannot verify literal shell input")
+  assertBlocked("printf '%04d' 2 > ./env; ./env", "cannot verify literal shell input")
+  assertBlocked(`{ x='%04d'; printf "$x" 2; } | sh`, "cannot verify literal shell input")
 })
 
 test("long repeated literal inputs stay within the analysis deadline (WI#907)", () => {
