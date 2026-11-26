@@ -3212,6 +3212,176 @@ mod tests {
     }
 
     #[test]
+    fn git_specific_globs_are_refused_in_command_positions_and_unread_tails() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for program in [
+            "/usr/bin/gi[t]",
+            "/usr/bin/g[[:alpha:]]t",
+            "/usr/bin/gi[[=t=]]",
+            "/usr/bin/gi[[.t.]]",
+            "/usr/bin/g[[:unknown:]]t",
+            "gi?",
+            "g?t",
+            "/usr/bin/g[h-j]t",
+            "/usr/bin/[g]it",
+            "/usr/lib/git-core/git-pus?",
+            "/usr/lib/git-core/git-*",
+            "/usr/lib/git-core/git-pus[[:alpha:]]",
+        ] {
+            for wrapper in ["", "env -i ", "stdbuf -o0 "] {
+                let command = format!("{wrapper}{program} push -f origin master");
+                for grant in [&read_grant, &write_grant] {
+                    let error = check_granted(&command, grant).unwrap_err();
+                    assert!(
+                        matches!(error, SandboxError::CapabilityDenied { .. }),
+                        "{command}"
+                    );
+                    assert!(check_granted("git push -f origin master", grant).is_err());
+                }
+            }
+        }
+        for command in [
+            "stdbuf -o0 /usr/lib/git-c?re/git-pu?h -f origin master",
+            "env -a 'git-push' /usr/bin/gi[t] -f origin master",
+            "env -a git-pus? git -f origin master",
+            "env --argv0=git-pus? git -f origin master",
+            "exec -agit-pus? git -f origin master",
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                assert!(check_granted(command, grant).is_err(), "{command}");
+            }
+        }
+        for command in [
+            "cat '/usr/bin/gi[t]'",
+            r"cat /usr/bin/gi\[t\]",
+            "cat /usr/bin/g[[:digit:]]t",
+            "cat /usr/lib/git-core/git-*.txt",
+            "env -a 'git-pus?' git status",
+            "env --argv0='git-pus?' git status",
+        ] {
+            check_granted(command, &write_grant)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn brace_expansion_is_read_before_git_dispatch_and_argument_checks() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for (command, control) in [
+            ("{git,} push -f origin master", "git push -f origin master"),
+            ("{git,push,-f,origin,master}", "git push -f origin master"),
+            (
+                "{/usr/bin/git,push,-f,origin,master}",
+                "git push -f origin master",
+            ),
+            ("git {push,-f,origin,master}", "git push -f origin master"),
+            ("git {push,} -f origin master", "git push -f origin master"),
+            (
+                "git {-c,alias.p=push,p} -f origin master",
+                "git -c alias.p=push p -f origin master",
+            ),
+            (
+                "env -a git-push {git,} -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "env {-a,git-push,git} -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "sh -c '{git,} push -f origin master'",
+                "git push -f origin master",
+            ),
+            ("git push origin {+master,}", "git push origin +master"),
+            ("git push origin {+,}master", "git push origin +master"),
+            (
+                "git push --forc{e,} origin master",
+                "git push --force --forc origin master",
+            ),
+            (
+                "git push -{f,} origin master",
+                "git push -f - origin master",
+            ),
+            ("git fetch {unlisted,origin}", "git fetch unlisted origin"),
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                let expected = check_granted(control, grant).unwrap_err().to_string();
+                let actual = check_granted(command, grant).unwrap_err().to_string();
+                assert_eq!(actual, expected, "{command}");
+            }
+        }
+        for command in [
+            "stdbuf -o0 {git,} push -f origin master",
+            "git status && stdbuf -o0 g{i,i}t status",
+            r#"{$name,git} status"#,
+            r#"git status {x,"$path"}"#,
+            r#"git -c {a,$key} status"#,
+            "git status {1..1000000000}",
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                assert!(check_granted(command, grant).is_err(), "{command}");
+            }
+        }
+        for command in [
+            "cat '{git,}'",
+            r"cat \{git,\}",
+            r"cat {git\,}",
+            "git status -- '{1..1000000000}'",
+        ] {
+            check_granted(command, &write_grant)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn ansi_c_words_and_extended_globs_receive_git_preflight() {
+        let (_temp, mut grant) = workspace_with_remote();
+        grant.remotes[0].write = true;
+        let control = check_granted("git push -f origin master", &grant)
+            .unwrap_err()
+            .to_string();
+        for command in [
+            "$'git' push -f origin master",
+            r"$'\x67it' push -f origin master",
+            r"$'g\151t' push -f origin master",
+            r"$'git\0ignored' push -f origin master",
+        ] {
+            assert_eq!(
+                check_granted(command, &grant).unwrap_err().to_string(),
+                control,
+                "{command}"
+            );
+        }
+        for operator in ['@', '+', '?', '*', '!'] {
+            for command in [
+                format!("bash -O extglob -c '/usr/bin/{operator}(git) push -f origin master'"),
+                format!(
+                    "bash -c 'shopt -s extglob; /usr/bin/{operator}(git) push -f origin master'"
+                ),
+            ] {
+                assert!(check_granted(&command, &grant).is_err(), "{command}");
+            }
+        }
+        for command in [
+            "bash -O extglob -c 'case x in @(x|y)) echo yes;; g*) echo no;; esac'",
+            "case x in git) echo y;; esac",
+            "cat '$\"git\"'",
+            "cat '/usr/bin/@(git)'",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        let case_body = "case x in x) git push -f origin master;; g*) echo y;; esac";
+        assert_eq!(
+            check_granted(case_body, &grant).unwrap_err().to_string(),
+            control
+        );
+    }
+
+    #[test]
     fn env_and_exec_use_the_last_git_argv0() {
         let (_temp, read_grant) = workspace_with_remote();
         let mut write_grant = read_grant.clone();
