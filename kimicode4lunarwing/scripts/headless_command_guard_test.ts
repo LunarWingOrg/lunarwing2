@@ -2505,6 +2505,99 @@ test("Git config writes inspect the stored command and preserve reads (AMZ-3)", 
   assertAllowed("git config core.editor")
 })
 
+test("expanded Git environment-shaped arguments stay data (WI#906)", () => {
+  for (const command of [
+    'echo "EDITOR=$EDITOR"',
+    'echo EDITOR=$EDITOR',
+    'echo "GIT_EDITOR=$GIT_EDITOR PAGER=$PAGER"',
+    'printf "%s\\n" "EDITOR=$EDITOR"',
+    'make EDITOR="$EDITOR" docs',
+    'docker run -e EDITOR="$EDITOR" img true',
+    'make GIT_EDITOR="$X" commit',
+    'printf \'%s\\n\' "GIT_EDITOR=$COMMAND"',
+    'echo env EDITOR=$EDITOR',
+    'env -u "EDITOR=$EDITOR" cat',
+    'env -i -- printf "%s\\n" "EDITOR=$EDITOR"',
+    'env -S "echo" EDITOR=$EDITOR',
+  ]) {
+    assertAllowed(command)
+  }
+})
+
+test("Git environment checks still read assignments and literal argument bodies (WI#906)", () => {
+  for (const command of [
+    'export PAGER="${PAGER:-less}"',
+    'export EDITOR="${EDITOR:-vi}"',
+    'EDITOR=$EDITOR crontab -e',
+    'PAGER=$PAGER man ls',
+    'export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519"',
+    'export GIT_EDITOR="$COMMAND"',
+    'GIT_EDITOR="$COMMAND" git commit',
+    'GIT_EDITOR="$COMMAND"',
+    '(OTHER=value GIT_EDITOR+="$COMMAND" true)',
+    'time -p EDITOR=$EDITOR true',
+    'command export -- GIT_PAGER="$COMMAND"',
+    'declare -x VISUAL="$COMMAND"',
+    'typeset EDITOR="$COMMAND"',
+    'builtin readonly PAGER="$COMMAND"',
+    'setup() { local GIT_EXTERNAL_DIFF="$COMMAND"; }',
+    'env -i -- EDITOR=$EDITOR true',
+    'env -C /tmp OTHER=value PAGER=$PAGER true',
+    'env -S "OTHER=value" PAGER=$PAGER true',
+    'env -S "env -i" PAGER=$PAGER true',
+  ]) {
+    assertBlocked(command, "cannot verify a Git shell command")
+  }
+  for (const command of [
+    "make GIT_EDITOR='kimi server' commit",
+    "docker run -e GIT_EDITOR='kimi server' img git commit",
+    "ssh host GIT_EDITOR='kimi server' git commit",
+    'echo "GIT_EDITOR=kimi server"',
+  ]) {
+    assertBlocked(command, "kimi service")
+  }
+  for (const command of [
+    "export GIT_EDITOR=true; export EDITOR=vim",
+    "export PAGER=cat",
+    "PAGER=cat git log",
+    "EDITOR=vi crontab -e",
+    "make EDITOR=vim docs",
+    "docker run -e PAGER=cat img git log",
+    "echo 'set GIT_EDITOR=true before the rebase'",
+  ]) {
+    assertAllowed(command)
+  }
+})
+
+test("Git trailer command and cmd use the same shell body checks (WI#906)", () => {
+  for (const [body, reason] of [
+    ["kimi server", "kimi service"],
+    ["nc -l 9000", "listener"],
+    ["tee /dev/sda1", "block-device"],
+  ]) {
+    assertBlocked(`git -c trailer.x.command='${body}' interpret-trailers --trailer x`, reason)
+  }
+  for (const command of [
+    "git config trailer.x.command 'kimi server'",
+    "git -c trailer.x.cmd='kimi server' commit --trailer x=1",
+    "git config trailer.x.cmd 'kimi server'",
+    "git clone -c trailer.x.command='kimi server' . /tmp/clone",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=trailer.x.command GIT_CONFIG_VALUE_0='kimi server' git commit --trailer x=1",
+    `GIT_CONFIG_PARAMETERS="'trailer.x.command'='kimi server'" git commit --trailer x=1`,
+  ]) {
+    assertBlocked(command, "kimi service")
+  }
+  assertBlocked('git -c trailer.x.command="$CMD" commit --trailer x=1', "cannot verify a Git shell command")
+  for (const command of [
+    `git -c trailer.sign.command='echo "Signed-off-by: A <a@example.org>"' commit --trailer sign`,
+    "git -c trailer.sign.cmd='git config user.name' commit --trailer sign",
+    "git -c trailer.x.key=Reviewed-by commit --trailer x=me",
+    "git commit --trailer 'Reviewed-by: A'",
+  ]) {
+    assertAllowed(command)
+  }
+})
+
 test("Git carrier options stay within the analysis deadline (WI#898)", () => {
   assertAllowed("git -c core.editor=true commit; ".repeat(500), 2_500)
   assertAllowed("git difftool --extcmd=true ".repeat(600), 2_500)
