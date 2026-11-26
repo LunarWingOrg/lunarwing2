@@ -3184,6 +3184,80 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_globs_and_brace_lists_still_pass_preflight() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for command in [
+            "cat *",
+            "cat docs/*",
+            "wc -l *",
+            "rm -f build/*",
+            "cp src/* /tmp/out/",
+            "chmod +x scripts/*",
+            "tar czf a.tgz *",
+            "du -sh *",
+            "rsync -a src/* dst/",
+            "sed -i s/a/b/ *",
+            "pytest tests/*",
+            "python3 tool.py *",
+            "cat ???",
+            "cat [a-z]*",
+            r#"for f in *; do echo "$f"; done"#,
+            "case $x in g*) echo y;; esac",
+            "git status && cat *",
+            "ls *",
+            "grep foo *",
+            "git add *",
+            "git add src/*",
+            "cat /usr/lib/git-core/*.txt",
+            "mkdir -p src/{a,b,c}",
+            "cp config.{yml,bak}",
+            "touch {1..5}.txt",
+            "rm -f build/{a,b}.o",
+            "for i in {1..3}; do echo $i; done",
+            "git add src/{a,b}.rs",
+            "git diff HEAD~{1,2}",
+            "git checkout -- src/{a,b}.rs",
+            "git fetch origin {main,dev}",
+            r#"echo "{git,push}""#,
+            "awk '{print $1}' file",
+            "jq '{a: .b}' data.json",
+            "find . -name '*.rs' -exec wc -l {} +",
+            "xargs -I{} cp {} /tmp/out/",
+            "curl -s https://example.org/{a,b}.json",
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                check_granted(command, grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+            }
+        }
+        check_granted("git push origin {main,dev}", &write_grant).unwrap();
+    }
+
+    #[test]
+    fn ordinary_wrappers_and_git_verbs_still_pass_preflight() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for command in [
+            "env -i git status",
+            "exec git log --oneline",
+            "ls /usr/lib/git-core",
+            "git maintenance run",
+            "env -a git git status",
+            "env -a prog ./tool --flag",
+            "exec -a login bash",
+            "env -a git-fetch git origin",
+            "git -c x.r=. for-each-repo --config=x.r status",
+            "git -c x.r=. for-each-repo --config=x.r fetch origin",
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                check_granted(command, grant).unwrap_or_else(|error| panic!("{command}: {error}"));
+            }
+        }
+    }
+
+    #[test]
     fn submodule_refuses_implicit_remotes_and_unsupported_actions() {
         let (_temp, read_grant) = workspace_with_remote();
         for command in [
