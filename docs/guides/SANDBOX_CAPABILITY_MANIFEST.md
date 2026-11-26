@@ -288,7 +288,8 @@ component and checks the pattern against Git program names, including dashed
 names in `git-core`. Generic patterns such as `*`, `dir/*`, and `???` pass
 this check. They can select Git in a prepared directory, just as a link
 under another name can run Git. Preflight does not consult the filesystem to
-resolve those names. Extended glob syntax in a command word is refused.
+resolve those names. When Bash enables `extglob` with `-O extglob` or a
+literal `shopt -s extglob`, preflight refuses extended globs in command words.
 
 Literal brace lists and ranges expand into separate arguments before the
 scan reads commands, wrapper arguments, or Git options and operands.
