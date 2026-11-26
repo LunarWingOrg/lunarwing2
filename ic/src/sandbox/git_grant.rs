@@ -53,6 +53,10 @@ use crate::sandbox::config::SandboxNetworkMode;
 use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::proxy::allowlist::{DomainAllowlist, extract_host};
 
+mod shell_words;
+
+use shell_words::{Expansion, Word, tokenize_simple_commands};
+
 /// The reserved manifest extension that expresses a git remote grant request.
 pub const GIT_REMOTE_EXTENSION: &str = "git-remotes";
 /// Stable identifier of the host grant recorded in capability evidence.
@@ -832,12 +836,6 @@ fn validate_virtual_relative_path(relative: &str) -> std::result::Result<(), Str
 // Shell command scanning
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct Word {
-    text: String,
-    dynamic: bool,
-}
-
 #[derive(Clone, Copy)]
 struct Preflight<'a> {
     grant: Option<&'a GitGrantAuthorization>,
@@ -894,116 +892,6 @@ fn is_explicit_local_path(raw: &str) -> bool {
                     !path.contains(':') && validate_virtual_relative_path(path).is_ok()
                 })
             })
-}
-
-/// Split a shell command into simple commands. Quote-aware; command
-/// separators end a command. Dynamic expansions are flagged, not evaluated.
-fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
-    let mut commands = Vec::new();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut dynamic = false;
-    let mut started = false;
-    let mut quote: Option<char> = None;
-    let mut chars = input.chars();
-
-    let finish_word =
-        |words: &mut Vec<Word>, current: &mut String, dynamic: &mut bool, started: &mut bool| {
-            if *started {
-                words.push(Word {
-                    text: std::mem::take(current),
-                    dynamic: *dynamic,
-                });
-                *dynamic = false;
-                *started = false;
-            }
-        };
-    let finish_command = |commands: &mut Vec<Vec<Word>>, words: &mut Vec<Word>| {
-        if !words.is_empty() {
-            commands.push(std::mem::take(words));
-        }
-    };
-
-    while let Some(c) = chars.next() {
-        match quote {
-            Some('\'') => {
-                started = true;
-                if c == '\'' {
-                    quote = None;
-                } else {
-                    current.push(c);
-                }
-            }
-            Some('"') => {
-                started = true;
-                match c {
-                    '"' => quote = None,
-                    '\\' => {
-                        // Bash keeps a backslash before ordinary characters
-                        // in double quotes. A wrapper can interpret it later.
-                        match chars.next() {
-                            Some('\n') | None => {}
-                            Some(next @ ('\\' | '"' | '$' | '`')) => current.push(next),
-                            Some(next) => {
-                                current.push('\\');
-                                current.push(next);
-                            }
-                        }
-                    }
-                    '$' | '`' => {
-                        dynamic = true;
-                        current.push(c);
-                    }
-                    _ => current.push(c),
-                }
-            }
-            Some(_) => unreachable!("quote state is ' or \""),
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    started = true;
-                }
-                '\\' => match chars.next() {
-                    Some('\n') => {}
-                    Some(next) => {
-                        started = true;
-                        current.push(next);
-                    }
-                    None => return Err(denied("incomplete shell escape")),
-                },
-                '#' if !started => {
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            break;
-                        }
-                    }
-                    finish_command(&mut commands, &mut words);
-                }
-                ';' | '\n' | '|' | '&' | '(' | ')' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
-                    finish_command(&mut commands, &mut words);
-                }
-                ' ' | '\t' | '\r' => {
-                    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
-                }
-                '$' | '`' => {
-                    dynamic = true;
-                    current.push(c);
-                    started = true;
-                }
-                _ => {
-                    current.push(c);
-                    started = true;
-                }
-            },
-        }
-    }
-    if quote.is_some() {
-        return Err(denied("unterminated shell quote"));
-    }
-    finish_word(&mut words, &mut current, &mut dynamic, &mut started);
-    finish_command(&mut commands, &mut words);
-    Ok(commands)
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -1079,14 +967,13 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
         return Ok(());
     }
     for word in &words[from + 1..] {
-        if word.dynamic {
-            continue;
-        }
         let name = basename(&word.text);
-        if name == "git"
-            || is_git_plumbing_executable(name)
-            || is_git_program_word(&word.text)
-            || is_shell_name(name)
+        if matches!(word.expansion, Expansion::GitGlob | Expansion::Extglob)
+            || (!word.dynamic
+                && (name == "git"
+                    || is_git_plumbing_executable(name)
+                    || is_git_program_word(&word.text)
+                    || is_shell_name(name)))
         {
             return Err(denied(format!(
                 "a command this preflight cannot read ({command}) names git; use a recognized command form"
@@ -1154,13 +1041,7 @@ fn wrapper_option_value(
     attached: Option<&str>,
 ) -> Result<(Word, usize)> {
     if let Some(attached) = attached {
-        return Ok((
-            Word {
-                text: attached.to_string(),
-                dynamic: words[index].dynamic,
-            },
-            index + 1,
-        ));
+        return Ok((words[index].with_text(attached), index + 1));
     }
     words
         .get(index + 1)
@@ -1185,14 +1066,14 @@ fn scan_env_operands(
         if !text.starts_with('-') {
             break;
         }
-        if word.dynamic {
-            return Err(denied("dynamic env option cannot be authorized"));
-        }
         let (option, tail) = if let Some(rest) = text.strip_prefix("--") {
             parse_env_long_option(words, index, rest)?
         } else {
             parse_env_short_option(words, index)?
         };
+        if word.needs_expansion() && !matches!(option, EnvOption::Argv0(_)) {
+            return Err(denied("dynamic env option cannot be authorized"));
+        }
         index = tail;
         match option {
             EnvOption::Skip => {}
@@ -1275,9 +1156,6 @@ fn scan_exec_operands(words: &[Word], mut index: usize) -> Result<(usize, Option
         else {
             break;
         };
-        if word.dynamic {
-            return Err(denied("dynamic exec option cannot be authorized"));
-        }
         let rest = cluster.trim_start_matches(['c', 'l']);
         login |= cluster[..cluster.len() - rest.len()].contains('l');
         if let Some(attached) = rest.strip_prefix('a') {
@@ -1310,10 +1188,7 @@ fn tokenize_env_split_string(input: &str) -> Result<Vec<Word>> {
     let mut chars = input.chars().peekable();
     let finish_word = |words: &mut Vec<Word>, current: &mut Option<String>| {
         if let Some(text) = current.take() {
-            words.push(Word {
-                text,
-                dynamic: false,
-            });
+            words.push(Word::default().with_text(text));
         }
     };
 
@@ -1380,7 +1255,7 @@ fn scan_env_split_body(
             "nested shell command is too deep to authorize statically",
         ));
     }
-    if body.dynamic {
+    if body.needs_expansion() {
         return Err(denied(
             "dynamic env split-string body cannot be authorized for git network access",
         ));
@@ -1419,18 +1294,27 @@ fn scan_wrapped_command(
         {
             return result;
         }
-        let command = basename(&words[index].text).to_string();
-        if is_command_prefix_word(&command) {
+        let word = &words[index];
+        if matches!(
+            word.expansion,
+            Expansion::GitGlob | Expansion::Extglob | Expansion::UnexpandedBrace
+        ) {
+            return Err(denied(
+                "shell expansion in a command word cannot be authorized",
+            ));
+        }
+        let command = basename(&word.text);
+        if is_command_prefix_word(command) {
             index += 1;
             continue;
         }
-        match command.as_str() {
+        match command {
             "env" => (index, argv0) = scan_env_operands(words, index + 1, preflight, depth, None)?,
             // Shell builtins that only assign or export names. `declare -x`,
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
             "export" | "readonly" | "declare" | "typeset" | "local" => {
-                return authorize_declaration(&command, &words[index + 1..]);
+                return authorize_declaration(command, &words[index + 1..]);
             }
             "read" | "mapfile" | "readarray" | "unset" => {
                 for operand in &words[index + 1..] {
@@ -2001,8 +1885,8 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
             return Ok(Some(index));
         }
         let takes_value = GIT_GLOBAL_VALUE_OPTIONS.contains(&word.as_str());
-        if words[index].dynamic
-            || (takes_value && words.get(index + 1).is_some_and(|value| value.dynamic))
+        if words[index].needs_expansion()
+            || (takes_value && words.get(index + 1).is_some_and(Word::needs_expansion))
         {
             return Err(denied(
                 "dynamic git global option value cannot be authorized",
@@ -2014,12 +1898,24 @@ fn git_subcommand(words: &[Word]) -> std::result::Result<Option<usize>, SandboxE
     Ok(None)
 }
 
+fn refuse_unexpanded_git_braces(words: &[Word]) -> Result<()> {
+    if words
+        .iter()
+        .any(|word| word.expansion == Expansion::UnexpandedBrace)
+    {
+        return Err(denied(
+            "brace expansion in Git arguments cannot be authorized",
+        ));
+    }
+    Ok(())
+}
+
 fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
     let Some(sub_index) = git_subcommand(words)? else {
         return Ok(());
     };
     let sub = &words[sub_index];
-    if sub.dynamic {
+    if sub.needs_expansion() {
         return Err(denied("dynamic git subcommand cannot be authorized"));
     }
     inspect_git_verb(&sub.text, &words[sub_index + 1..], preflight, depth)
@@ -2031,6 +1927,7 @@ fn inspect_git_verb(
     preflight: Preflight<'_>,
     depth: usize,
 ) -> Result<()> {
+    refuse_unexpanded_git_braces(args)?;
     match verb {
         "clone" => authorize_clone(args, preflight),
         "fetch" | "pull" => authorize_fetch(args, preflight),
@@ -2099,7 +1996,7 @@ fn authorize_for_each_repo(args: &[Word], preflight: Preflight<'_>, depth: usize
 fn for_each_repo_command(mut args: &[Word]) -> Result<(bool, &[Word])> {
     let mut has_config = false;
     while let Some((word, tail)) = args.split_first() {
-        if word.dynamic && word.text.starts_with('-') {
+        if word.needs_expansion() && word.text.starts_with('-') {
             return Err(denied(
                 "dynamic git for-each-repo option cannot be authorized",
             ));
@@ -2111,7 +2008,7 @@ fn for_each_repo_command(mut args: &[Word]) -> Result<(bool, &[Word])> {
                 let Some((key, rest)) = tail.split_first() else {
                     return Err(denied("git for-each-repo requires a literal config key"));
                 };
-                if key.dynamic || key.text.is_empty() || key.text.starts_with('-') {
+                if key.needs_expansion() || key.text.is_empty() || key.text.starts_with('-') {
                     return Err(denied("git for-each-repo requires a literal config key"));
                 }
                 has_config = true;
@@ -2210,7 +2107,7 @@ fn inspect_git_argv0(
     let name = basename(&argv0.text);
     let git_executable = executable == "git" || git_dashed_program(executable).is_some();
     let git_name = name == "git" || git_dashed_program(name).is_some();
-    if (git_executable && argv0.dynamic) || (git_name && program.dynamic) {
+    if (git_executable && argv0.needs_expansion()) || (git_name && program.needs_expansion()) {
         return Some(Err(denied(
             "dynamic git program or argv[0] cannot be authorized",
         )));
@@ -2438,10 +2335,7 @@ fn authorize_push(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
             // write-granted remote, exactly like a positional.
             if text == "--repo" || text.starts_with("--repo=") {
                 let value = match text.strip_prefix("--repo=") {
-                    Some(value) if !value.is_empty() => Word {
-                        text: value.to_string(),
-                        dynamic: word.dynamic,
-                    },
+                    Some(value) if !value.is_empty() => word.with_text(value),
                     Some(_) => return Err(denied("git push --repo needs a literal value")),
                     None => match args.get(index + 1) {
                         Some(value) if !value.dynamic => value.clone(),
@@ -2520,10 +2414,7 @@ fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
         return Ok(());
     };
     if let Some(value) = args[flag].text.strip_prefix("--remote=") {
-        return preflight.read_remote(&Word {
-            text: value.into(),
-            dynamic: args[flag].dynamic,
-        });
+        return preflight.read_remote(&args[flag].with_text(value));
     }
     match args.get(flag + 1) {
         Some(remote) => preflight.read_remote(remote),
@@ -2535,7 +2426,7 @@ fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
 /// `submodule foreach`, `bisect run`). The body is a shell script, so it is
 /// tokenized and scanned like `sh -c`.
 fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Result<()> {
-    if body.dynamic {
+    if body.needs_expansion() {
         return Err(denied(
             "dynamic shell body cannot be authorized for git network access",
         ));
@@ -2575,10 +2466,7 @@ fn rebase_exec(word: &Word) -> RebaseExec {
     if let Some((flag, value)) = text.split_once('=')
         && matches!(flag, "--ex" | "--exe" | "--exec")
     {
-        return RebaseExec::Attached(Word {
-            text: value.to_string(),
-            dynamic: word.dynamic,
-        });
+        return RebaseExec::Attached(word.with_text(value));
     }
     let Some(cluster) = text.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
         return RebaseExec::None;
@@ -2590,10 +2478,7 @@ fn rebase_exec(word: &Word) -> RebaseExec {
             return if attached.is_empty() {
                 RebaseExec::NextWord
             } else {
-                RebaseExec::Attached(Word {
-                    text: attached.to_string(),
-                    dynamic: word.dynamic,
-                })
+                RebaseExec::Attached(word.with_text(attached))
             };
         }
         if REBASE_CLUSTER_VALUE_LETTERS.contains(&letter) {
@@ -5078,10 +4963,7 @@ mod tests {
     /// where the body starts is visible without a grant fixture.
     #[test]
     fn rebase_exec_cluster_positions() {
-        let word = |text: &str| Word {
-            text: text.to_string(),
-            dynamic: false,
-        };
+        let word = |text: &str| Word::default().with_text(text);
         let body = |text: &str| match rebase_exec(&word(text)) {
             RebaseExec::Attached(body) => Some(body.text),
             RebaseExec::NextWord => None,
