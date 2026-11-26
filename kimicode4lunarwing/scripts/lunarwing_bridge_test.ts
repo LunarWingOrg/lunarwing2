@@ -82,13 +82,13 @@ const KILL_GRACE_MS = 3_000
  *
  * A bare `child.kill("SIGTERM")` only queues the signal: the process can
  * outlive it holding a stdio pipe open, which keeps the runner's event loop
- * alive until the 120 s per-test timeout. SIGKILL after a short grace
+ * alive until the 300 s per-file test timeout. SIGKILL after a short grace
  * bounds a bridge that ignores or outlives SIGTERM. This is hygiene, not a
  * credited pipeline fix (run-205 NQ-3): the file-level hang shape is
  * pipeline 6252's kimi candidate (job 127798: one `not ok -
- * lunarwing_bridge_test.js` at the 120 s testTimeoutFailure with no
- * subtest output), whose cause was never root-caused, and 6308's kimi
- * candidate was not a hang at all (163 pass / 2 fail / 0 cancelled /
+ * lunarwing_bridge_test.js` with a `testTimeoutFailure` at the old 120 s
+ * limit and no subtest output), whose cause was never root-caused, and 6308's
+ * kimi candidate was not a hang at all (163 pass / 2 fail / 0 cancelled /
  * 4 skipped — the `/proc` EACCES failures !1876 fixed).
  */
 async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> {
