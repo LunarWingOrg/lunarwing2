@@ -728,7 +728,7 @@ fn glob_class(mut atoms: &[Atom]) -> Option<(GlobAtom, usize)> {
         .first()
         .is_some_and(|atom| atom.is('!') || atom.is('^'));
     atoms = &atoms[usize::from(negated)..];
-    let mut mask = 0;
+    let mut mask = 0u128;
     let mut first = true;
     let mut uncertain = false;
     while let Some((atom, tail)) = atoms.split_first() {
