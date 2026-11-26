@@ -13,7 +13,7 @@
 | Part 3 of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.7.0 |
 | Next Generation MCP Engine Part 4 Completion | v2.2.8.0 |
 | DarkIRC key manager & DarkIRC Channel Polishing | v2.2.8.0 |
-| Firstmate/herdr.dev Integration | v2.2.8.0 |
+| Firstmate/herdr.dev Integration via Wingtip | v2.2.8.0 |
 | Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.2.8.0 |
 | OpenAI API Compatible Responses Support, with or without a custom websocket implementation | v2.2.8.0 |
 | LunarHub (extension marketplace/decentralized binary distribution) — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.3.0.0 |
