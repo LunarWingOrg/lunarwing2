@@ -716,7 +716,7 @@ pub(super) fn authorize_shell_command(
         grant,
         offline: network == SandboxNetworkMode::None,
     };
-    for simple in tokenize_simple_commands(command)? {
+    for simple in tokenize_simple_commands(command, false)? {
         scan_simple_command(&simple, preflight, 0)?;
     }
     Ok(())
@@ -1459,6 +1459,7 @@ fn scan_shell_c(
 ) -> Result<()> {
     let mut cursor = index + 1;
     let mut has_command = false;
+    let mut extglob = false;
     while cursor < words.len() {
         let word = &words[cursor];
         let text = word.text.as_str();
@@ -1474,12 +1475,21 @@ fn scan_shell_c(
         if !text.starts_with('-') && !text.starts_with('+') {
             break;
         }
-        if word.dynamic {
+        if word.needs_expansion() {
             return Err(denied(
                 "dynamic shell option cannot be authorized for git network access",
             ));
         }
         if SHELL_VALUE_OPTIONS.contains(&text) {
+            if matches!(text, "-O" | "+O") {
+                let option = words.get(cursor + 1);
+                if option.is_some_and(Word::needs_expansion) {
+                    return Err(denied("dynamic shell option name cannot be authorized"));
+                }
+                if option.is_some_and(|word| word.text == "extglob") {
+                    extglob = text == "-O";
+                }
+            }
             cursor += 2;
             continue;
         }
@@ -1507,7 +1517,7 @@ fn scan_shell_c(
         ));
     }
     if has_command && let Some(body) = words.get(cursor) {
-        scan_shell_body(body, preflight, depth)?;
+        scan_shell_body_with_options(body, preflight, depth, extglob)?;
     }
     Ok(())
 }
@@ -2440,12 +2450,21 @@ fn authorize_archive(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
 /// `submodule foreach`, `bisect run`). The body is a shell script, so it is
 /// tokenized and scanned like `sh -c`.
 fn scan_shell_body(body: &Word, preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    scan_shell_body_with_options(body, preflight, depth, false)
+}
+
+fn scan_shell_body_with_options(
+    body: &Word,
+    preflight: Preflight<'_>,
+    depth: usize,
+    extglob: bool,
+) -> Result<()> {
     if body.needs_expansion() {
         return Err(denied(
             "dynamic shell body cannot be authorized for git network access",
         ));
     }
-    for simple in tokenize_simple_commands(&body.text)? {
+    for simple in tokenize_simple_commands(&body.text, extglob)? {
         scan_simple_command(&simple, preflight, depth + 1)?;
     }
     Ok(())
@@ -3388,11 +3407,17 @@ mod tests {
         ] {
             check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
-        let case_body = "case x in x) git push -f origin master;; g*) echo y;; esac";
-        assert_eq!(
-            check_granted(case_body, &grant).unwrap_err().to_string(),
-            control
-        );
+        for command in [
+            "case x in x) git push -f origin master;; g*) echo y;; esac",
+            "!(git push -f origin master)",
+            "bash -O extglob +O extglob -c '!(git push -f origin master)'",
+        ] {
+            assert_eq!(
+                check_granted(command, &grant).unwrap_err().to_string(),
+                control,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -3647,7 +3672,8 @@ mod tests {
     fn clone_options_cannot_hide_the_literal_source_from_preflight() {
         let (_temp, grant) = workspace_with_remote();
         for option in ["-c", "--config", "--conf"] {
-            let args = tokenize_simple_commands(&format!("{option} user.name=fixture")).unwrap();
+            let args =
+                tokenize_simple_commands(&format!("{option} user.name=fixture"), false).unwrap();
             let error = authorize_clone(
                 &args[0],
                 Preflight {
