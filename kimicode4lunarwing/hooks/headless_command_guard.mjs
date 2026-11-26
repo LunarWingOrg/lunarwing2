@@ -153,7 +153,7 @@ function redirectPrefixStart(text, operatorIndex) {
 }
 
 /** The span of the word a redirection takes as its target, blanks skipped. */
-function redirectWordSpan(text, scan, from) {
+function redirectWordSpan(text, scan, from, stopAtData = false) {
   let i = from;
   while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
   const start = i;
@@ -164,6 +164,7 @@ function redirectWordSpan(text, scan, from) {
       continue;
     }
     if (scan.states[i] === QUOTE_UNQUOTED && REDIRECT_WORD_BREAK.includes(text[i])) break;
+    if (stopAtData && scan.states[i] === SHELL_DATA) break;
     i++;
   }
   return { start, end: Math.min(i, text.length) };
@@ -289,7 +290,7 @@ function redirectTokenSpan(text, i) {
   }
   if (operatorIndex !== i && text[operatorIndex] === "&") return null;
   const end = redirectionSkip(text, operatorIndex);
-  return end === null ? null : { start: i, end };
+  return end === null ? null : { start: i, end, operatorIndex };
 }
 
 /**
@@ -2788,17 +2789,21 @@ function shellLevel(opener = -1, inherited = QUOTE_UNQUOTED) {
 }
 
 /** Skip queued heredocs without feeding their bytes back into the quote state. */
-function skipHeredocs(text, from, heredocs, lines) {
+function skipHeredocs(text, from, heredocs, lines, inputs) {
   let next = from;
-  for (const { delimiter, stripTabs } of heredocs) {
+  for (const { delimiter, stripTabs, at, end: targetEnd } of heredocs) {
+    let body = "";
     while (next < text.length) {
       const lf = text.indexOf("\n", next);
       const end = lf === -1 ? text.length : lf;
       const line = text.slice(next, end);
       next = lf === -1 ? end : end + 1;
-      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+      const content = stripTabs ? line.replace(/^\t+/, "") : line;
+      if (content === delimiter) break;
+      if (inputs) body += content + (lf === -1 ? "" : "\n");
       lines?.push(line);
     }
+    inputs?.set(at, { body, quoted: /['"\\]/.test(text.slice(at + 2, targetEnd)) });
   }
   return next;
 }
@@ -2816,6 +2821,7 @@ function computeQuoteStates(text, escapes) {
   const states = new Uint8Array(text.length);
   const substitutions = new Map();
   const heredocLines = [];
+  const heredocInputs = new Map();
   const levels = [shellLevel()];
   for (let i = 0; i < text.length; i++) {
     const level = levels[levels.length - 1];
@@ -2886,14 +2892,14 @@ function computeQuoteStates(text, escapes) {
     } else if (ch === "<" && text[i + 1] === "<") {
       const redirect = heredocRedirect(text, i);
       if (redirect) {
-        level.heredocs.push(redirect);
+        level.heredocs.push({ ...redirect, at: i });
         states.fill(SHELL_DATA, i, redirect.end);
         i = redirect.end - 1;
       }
       level.wordStart = true;
     } else if (ch === "\n" && level.heredocs.length !== 0) {
       const next = skipHeredocs(text, i + 1, level.heredocs,
-        levels.length === 1 ? heredocLines : null);
+        levels.length === 1 ? heredocLines : null, levels.length === 1 ? heredocInputs : null);
       states.fill(SHELL_DATA, i + 1, next);
       level.heredocs.length = 0;
       level.wordStart = true;
@@ -2906,7 +2912,7 @@ function computeQuoteStates(text, escapes) {
   for (const { opener } of levels) {
     if (opener !== -1) substitutions.set(opener, text.length);
   }
-  return { states, substitutions, heredocLines };
+  return { states, substitutions, heredocLines, heredocInputs };
 }
 
 // The scan is recomputed once per text and kept for the readers walking it: a
@@ -4865,7 +4871,7 @@ function checkShellBody(body, depth) {
     const denied = checkRm(segment);
     if (denied) return denied;
   }
-  return checkListeners(body, depth) ?? checkSubstitutionCommand(body);
+  return checkListeners(body, depth) ?? checkSubstitutionCommand(body) ?? checkLiteralShellInput(body, depth);
 }
 
 /**
@@ -5776,12 +5782,420 @@ function checkSameLineLink(command) {
   return null;
 }
 
+// WI#907: opaque runtime data is outside this check. A literal that exceeds
+// the analysis budget or uses unsupported output syntax is not opaque data.
+const UNVERIFIABLE_LITERAL = Symbol();
+const LITERAL_INPUT_REASON = "cannot verify literal shell input; use simpler echo or printf syntax";
+const LITERAL_FLOW_WORD = /[|<>=\\'"`]|trap\b/;
+const LITERAL_PARAMETER = /\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/y;
+
+function literalRedirect(text, scan, token) {
+  const { start, operatorIndex: at, end } = token;
+  const op = redirectOperatorAt(text, at);
+  const fd = start === at ? (op.startsWith("<") ? "0" : "1") : text.slice(start, at);
+  if (op === "<<" || op === "<<-") return { op, fd, document: scan.heredocInputs.get(at), end };
+  const span = redirectWordSpan(text, scan, at + op.length, true);
+  return { op, fd, span, end: span.end };
+}
+
+function* literalTokens(text, scan) {
+  for (let i = 0; i < text.length;) {
+    const state = scan.states[i];
+    const ch = text[i];
+    if ((state === SHELL_DATA && !scan.heredocInputs.has(i)) ||
+        (state === QUOTE_UNQUOTED && (ch === " " || ch === "\t"))) {
+      i++;
+      continue;
+    }
+    const token = (state === QUOTE_UNQUOTED || scan.heredocInputs.has(i)) && redirectTokenSpan(text, i);
+    if (token) {
+      const redirect = literalRedirect(text, scan, token);
+      yield { redirect };
+      i = redirect.end;
+      continue;
+    }
+    if (state === QUOTE_UNQUOTED && "\n;|&()".includes(ch)) {
+      const pair = text.slice(i, i + 2);
+      const op = pair === "||" || pair === "&&" || pair === "|&" ? pair : ch;
+      yield { op };
+      i += op.length;
+      continue;
+    }
+    const span = redirectWordSpan(text, scan, i, true);
+    if (span.end <= i) { // An incomplete or unsupported redirection.
+      i++;
+    } else {
+      yield { span };
+      i = span.end;
+    }
+  }
+}
+
+function literalStage() {
+  return { words: [], redirects: [], group: null, pipe: false };
+}
+
+function hasLiteralStage(stage) {
+  return stage.group !== null || stage.words.length !== 0 || stage.redirects.length !== 0;
+}
+
+function literalStages(text, scan) {
+  let stages = [];
+  let stage = literalStage();
+  const stack = [];
+  for (const { span, op, redirect } of literalTokens(text, scan)) {
+    const punctuation = op ?? (span && text.slice(span.start, span.end));
+    if ((punctuation === "(" || punctuation === "{") && !hasLiteralStage(stage)) {
+      if (stack.length >= MAX_STAGE_LAUNCHERS) return null;
+      stage.group = [];
+      const closer = punctuation === "(" ? ")" : "}";
+      stack.push({ stages, stage, closer });
+      stages = stage.group;
+      stage = literalStage();
+    } else if (punctuation === stack.at(-1)?.closer && punctuation !== undefined) {
+      if (hasLiteralStage(stage)) stages.push(stage);
+      const parent = stack.pop();
+      ({ stages, stage } = parent);
+      stage.subshell = punctuation === ")";
+    } else if (redirect) {
+      stage.redirects.push(redirect);
+    } else if (span) {
+      stage.words.push(span);
+    } else if (hasLiteralStage(stage)) {
+      stage.pipe = op === "|" || op === "|&";
+      stages.push(stage);
+      stage = literalStage();
+    }
+  }
+  if (stack.length !== 0) return null;
+  if (hasLiteralStage(stage)) stages.push(stage);
+  return stages;
+}
+
+function literalWord(ctx, span, bindings, noFields = false) {
+  const { text, scan } = ctx;
+  let value = "";
+  let expanded = false;
+  for (let i = span.start; i < span.end; i++) {
+    const ch = text[i];
+    const state = scan.states[i];
+    if (scan.substitutions.has(i)) return {};
+    if (state === QUOTE_OPEN || state === QUOTE_CLOSE) continue;
+    if (isEscapedState(state)) {
+      const next = text[++i];
+      if (state === QUOTE_ANSI_ESCAPED && next !== "'") return { value: UNVERIFIABLE_LITERAL, expanded };
+      if (next !== "\n") value += next;
+      continue;
+    }
+    if ((state === QUOTE_UNQUOTED || state === QUOTE_DOUBLE) && shellParameterAt(text, i)) {
+      LITERAL_PARAMETER.lastIndex = i;
+      const match = LITERAL_PARAMETER.exec(text);
+      if (!match || LITERAL_PARAMETER.lastIndex > span.end) return {};
+      const bound = bindings.get(match[1] ?? match[2]);
+      if (bound === undefined) return {};
+      if (bound === UNVERIFIABLE_LITERAL) return { value: bound, expanded: true };
+      value += state === QUOTE_UNQUOTED && !noFields ? bound.trim().replace(/[ \t\n]+/g, " ") : bound;
+      expanded = true;
+      i = LITERAL_PARAMETER.lastIndex - 1;
+    } else if (state === QUOTE_UNQUOTED &&
+        ((!noFields && "*?[{".includes(ch)) || (ch === "~" && i === span.start))) {
+      return {};
+    } else {
+      value += ch;
+    }
+    if (value.length > MAX_COMMAND_CHARS) return { value: UNVERIFIABLE_LITERAL, expanded };
+  }
+  return { value, expanded };
+}
+
+const PRINT_ESCAPE_VALUES = new Map([
+  ["a", "\x07"], ["b", "\b"], ["e", "\x1b"], ["E", "\x1b"], ["f", "\f"],
+  ["n", "\n"], ["r", "\r"], ["t", "\t"], ["v", "\v"], ["\\", "\\"],
+]);
+
+function printEscape(text, at, format) {
+  const letter = text[at + 1];
+  if (PRINT_ESCAPE_VALUES.has(letter)) return { text: PRINT_ESCAPE_VALUES.get(letter), end: at + 2 };
+  if (letter === "c" && !format) return { text: "", stop: true, end: text.length };
+  const rest = text.slice(at + 1, at + 5);
+  const hex = /^x([\da-f]{1,2})/i.exec(rest);
+  const octal = (format ? /^([0-7]{1,3})/ : /^0([0-7]{0,3})/).exec(rest);
+  if (!hex && !octal) return null;
+  const digits = (hex ?? octal)[1];
+  const byte = digits === "" ? 0 : Number.parseInt(digits, hex ? 16 : 8);
+  if (byte >= 128) return null;
+  return { text: String.fromCharCode(byte), end: at + 1 + (hex ?? octal)[0].length };
+}
+
+function printEscaped(text) {
+  let value = "";
+  for (let i = 0; i < text.length;) {
+    const escape = text.indexOf("\\", i);
+    if (escape === -1) return { text: value + text.slice(i) };
+    const byte = printEscape(text, escape, false);
+    if (byte === null) return { text: UNVERIFIABLE_LITERAL };
+    value += text.slice(i, escape) + byte.text;
+    if (byte.stop) return { text: value, stop: true };
+    i = byte.end;
+  }
+  return { text: value };
+}
+
+function joinLiteral(left, right) {
+  if (left === UNVERIFIABLE_LITERAL || right === UNVERIFIABLE_LITERAL) return UNVERIFIABLE_LITERAL;
+  if (left === undefined || right === undefined) return undefined;
+  return left.length + right.length <= MAX_COMMAND_CHARS ? left + right : UNVERIFIABLE_LITERAL;
+}
+
+function literalEcho(args) {
+  let newline = true;
+  let escapes = false;
+  let start = 0;
+  for (; typeof args[start] === "string" && /^-[eEn]+$/.test(args[start]); start++) {
+    if (args[start].includes("n")) newline = false;
+    const last = Math.max(args[start].lastIndexOf("e"), args[start].lastIndexOf("E"));
+    if (last >= 0) escapes = args[start][last] === "e";
+  }
+  let body = "";
+  for (let i = start; i < args.length; i++) {
+    body = joinLiteral(body, i === start ? "" : " ");
+    body = joinLiteral(body, args[i]);
+    if (typeof body !== "string") return body;
+  }
+  const read = escapes ? printEscaped(body) : { text: body };
+  return joinLiteral(read.text, newline && !read.stop ? "\n" : "");
+}
+
+function printfTemplate(format) {
+  const parts = [];
+  let from = 0;
+  for (let i = 0; i < format.length;) {
+    if (format[i] !== "\\" && format[i] !== "%") { i++; continue; }
+    if (i > from) parts.push({ text: format.slice(from, i) });
+    const marker = format[i + 1];
+    if (format[i] === "\\") {
+      const escape = printEscape(format, i, true);
+      if (escape === null) return null;
+      parts.push(escape);
+      i = escape.end;
+    } else {
+      if (marker === "%") parts.push({ text: "%" });
+      else if (marker === "s" || marker === "b") parts.push({ conversion: marker });
+      else return null;
+      i += 2;
+    }
+    from = i;
+  }
+  if (from < format.length) parts.push({ text: format.slice(from) });
+  return parts;
+}
+
+function literalPrintf(args) {
+  const start = args[0] === "--" ? 1 : 0;
+  const format = args[start];
+  if (typeof format !== "string" || format === "-v") return typeof format === "string" ? undefined : format;
+  const parts = printfTemplate(format);
+  if (parts === null) return UNVERIFIABLE_LITERAL;
+  let index = start + 1;
+  let result = "";
+  do {
+    const before = index;
+    for (const part of parts) {
+      const arg = part.conversion ? (index < args.length ? args[index++] : "") : part.text;
+      const read = part.conversion === "b" && typeof arg === "string" ? printEscaped(arg) : { text: arg };
+      result = joinLiteral(result, read.text);
+      if (typeof result !== "string" || read.stop) return result;
+    }
+    if (index === before) break;
+  } while (index < args.length);
+  return result;
+}
+
+function literalPath(value, cwd) {
+  return typeof value === "string" && value !== "" && !value.includes("\0") ? resolvePath(cwd, value) : null;
+}
+
+function literalFile(ctx, state, arg) {
+  return ctx.files.get(literalPath(arg, state.cwd));
+}
+
+function literalWrite(ctx, target, body, append) {
+  if (target !== null && target !== "/dev/null") {
+    ctx.files.set(target, append ? joinLiteral(ctx.files.get(target) ?? "", body) : body);
+  }
+}
+
+function literalCat(args, ctx, state, input) {
+  const files = args.filter((arg, index) => arg !== "-u" && (arg !== "--" || index !== 0));
+  if (files.length === 0) return input;
+  let output = "";
+  for (const file of files) {
+    const value = STDIN_PROGRAM_FILES.has(file) ? input : literalFile(ctx, state, file);
+    output = joinLiteral(output, value);
+  }
+  return output;
+}
+
+function literalTee(args, ctx, state, input) {
+  let append = false;
+  let options = true;
+  for (const arg of args) {
+    if (options && arg === "--") options = false;
+    else if (options && (typeof arg === "string" && arg.startsWith("-"))) {
+      append ||= arg === "--append" || /^-[ai]*a[ai]*$/.test(arg);
+    } else literalWrite(ctx, literalPath(arg, state.cwd), input, append);
+  }
+  return input;
+}
+
+function literalHeredoc(document, bindings) {
+  if (!document || document.quoted) return document?.body;
+  const { body } = document;
+  let output = "";
+  let from = 0;
+  for (const match of body.matchAll(/\\[\\$`\n]|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|`|\$[\w{(*@#?$!\-]/g)) {
+    output = joinLiteral(output, body.slice(from, match.index));
+    const word = match[0];
+    const value = word[0] === "\\" ? word[1].replace("\n", "")
+      : bindings.get(word.startsWith("${") ? word.slice(2, -1) : word.slice(1));
+    output = joinLiteral(output, value);
+    if (typeof output !== "string") return output;
+    from = match.index + word.length;
+  }
+  return joinLiteral(output, body.slice(from));
+}
+
+function literalRoutes(stage, ctx, state, input) {
+  let output;
+  for (const { op, fd, span, document } of stage.redirects) {
+    const word = span && literalWord(ctx, span, state.vars, op === "<<<").value;
+    if (fd === "0") {
+      if (op === "<<" || op === "<<-") input = literalHeredoc(document, state.vars);
+      else if (op === "<<<") input = joinLiteral(word, "\n");
+      else if ((op === "<" || op === "<>") && STDIN_PROGRAM_FILES.has(word)) continue;
+      else input = (op === "<" || op === "<>") ? literalFile(ctx, state, word) : undefined;
+    } else if (fd === "1" && op.startsWith(">") || op.startsWith("&>")) {
+      const path = literalPath(word, state.cwd);
+      const append = op.endsWith(">>");
+      if (!append && op !== ">&") literalWrite(ctx, path, "", false);
+      output = { path, append };
+    }
+  }
+  return { input, output };
+}
+
+function checkLiteralBody(body, ctx) {
+  if (body === UNVERIFIABLE_LITERAL) return LITERAL_INPUT_REASON;
+  if (!body || ctx.checked.has(body)) return null;
+  if (ctx.depth >= MAX_SHELL_BODY_DEPTH) return "cannot check a deeply nested shell command";
+  ctx.scanChars += body.length;
+  if (ctx.scanChars > MAX_COMPOUND_SCAN_CHARS) return LITERAL_INPUT_REASON;
+  ctx.checked.add(body);
+  return classify(body.replaceAll("\0", ""), ctx.depth + 1);
+}
+
+function literalShellBody(name, args, position, input, ctx, state) {
+  const words = args.map(({ value }) => typeof value === "string" ? value : "\0");
+  if (SHELL_NAME.test(name)) {
+    const run = shellInvocation(words);
+    if (run.command !== undefined) return args.find(({ expanded, value }, i) =>
+      expanded && words[i] === run.command && value !== undefined)?.value;
+    if (position.xargs) {
+      if (!words.some((word) => /^-[a-zA-Z]*c/.test(word)) || run.file !== undefined) return undefined;
+      return position.argFiles.length === 0 ? input : literalFile(ctx, state, position.argFiles[0]);
+    }
+    if (run.stdin || STDIN_PROGRAM_FILES.has(run.file)) return input;
+    return literalFile(ctx, state, run.file);
+  }
+  const tail = args.slice(words[0] === "--" ? 1 : 0);
+  if (name === "eval" && tail.some(({ expanded }) => expanded)) {
+    return tail.reduce((body, { value }, i) => joinLiteral(joinLiteral(body, i === 0 ? "" : " "), value), "");
+  }
+  if (name === "trap" && tail.length >= 2 && !/^-(?:[lp]*|-help)$/.test(words[args.length - tail.length])) {
+    return tail[0].value;
+  }
+  if (name === "." || name === "source") {
+    return STDIN_PROGRAM_FILES.has(tail[0]?.value) ? input : literalFile(ctx, state, tail[0]?.value);
+  }
+  return undefined;
+}
+
+function literalArgv(stage, ctx, state, isolated) {
+  let start = 0;
+  const assigned = [];
+  while (start < stage.words.length) {
+    const { start: at, end } = stage.words[start];
+    const prefix = /^[A-Za-z_]\w*=/.exec(ctx.text.slice(at, end));
+    if (!prefix) break;
+    assigned.push([prefix[0].slice(0, -1), literalWord(ctx, { start: at + prefix[0].length, end }, state.vars, true).value]);
+    start++;
+  }
+  if (!isolated && start === stage.words.length) {
+    for (const [key, value] of assigned) state.vars.set(key, value);
+  }
+  return stage.words.slice(start).map((span) => literalWord(ctx, span, state.vars));
+}
+
+function literalCommand(stage, ctx, state, input, isolated) {
+  const words = literalArgv(stage, ctx, state, isolated);
+  const values = words.map(({ value }) => value);
+  const argv = values.map((value) => typeof value === "string" ? value : "\0");
+  const position = commandPosition(argv);
+  if (position.index < 0) return undefined;
+  const command = argv[position.index];
+  const name = commandBasename(command);
+  const args = values.slice(position.index + 1);
+  const file = !POSITION_LAUNCHERS.has(name) && command.includes("/") ? literalFile(ctx, state, command) : undefined;
+  const body = file ?? literalShellBody(name, words.slice(position.index + 1), position, input, ctx, state);
+  ctx.reason = checkLiteralBody(body, ctx);
+  if (ctx.reason) return undefined;
+  if (name === "echo") return literalEcho(args);
+  if (name === "printf") return literalPrintf(args);
+  if (name === "cat") return literalCat(args, ctx, state, input);
+  if (name === "tee") return literalTee(args, ctx, state, input);
+  if (name === "cd" && !isolated) state.cwd = literalPath(args[0], state.cwd) ?? state.cwd;
+  return name === "cd" || name === ":" || name === "true" ? "" : undefined;
+}
+
+function runLiteralStages(stages, ctx, state, stdin, collect) {
+  let feed;
+  let piped = false;
+  let stdout = "";
+  for (const stage of stages) {
+    const isolated = piped || stage.pipe || stage.subshell;
+    const { input, output } = literalRoutes(stage, ctx, state, piped ? feed : stdin);
+    const inner = stage.group === null ? state : isolated ? { cwd: state.cwd, vars: new Map(state.vars) } : state;
+    let printed = stage.group === null ? literalCommand(stage, ctx, inner, input, isolated)
+      : runLiteralStages(stage.group, ctx, inner, input, true);
+    if (ctx.reason) break;
+    if (output) {
+      literalWrite(ctx, output.path, printed, output.append);
+      printed = "";
+    }
+    piped = stage.pipe;
+    if (piped) feed = printed;
+    else if (collect) stdout = joinLiteral(stdout, printed);
+  }
+  return stdout;
+}
+
+function checkLiteralShellInput(text, depth) {
+  if (!LITERAL_FLOW_WORD.test(text)) return null;
+  const scan = quoteScan(text);
+  const stages = literalStages(text, scan);
+  if (stages === null) return null;
+  const ctx = { text, scan, depth, files: new Map(), checked: new Set(), scanChars: 0, reason: null };
+  runLiteralStages(stages, ctx, { vars: new Map(), cwd: process.cwd() }, undefined, false);
+  return ctx.reason;
+}
+
 // The CLI can allow a hook that misses its 10 s deadline. Interrupt our own
 // synchronous classifier much earlier, including any legacy regex checks.
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command, depth = 0) {
-  const denial = evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command);
+  const denial = evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command) ??
+    checkLiteralShellInput(command, depth);
   if (denial) return denial;
   if (hasUnverifiableAnsiEscape(command) ||
       (command.includes("\\\n") && JOIN_READINGS.some(([outside, inside]) =>
