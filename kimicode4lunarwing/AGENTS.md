@@ -69,14 +69,23 @@ clone, ls-remote, fetch-pack, push and send-pack, and archive's remote command.
 It checks command-valued settings in `-c`, `--config-env`, clone configuration,
 `git config` writes, and the `GIT_CONFIG_*` environment forms. Covered keys
 include editor, pager, SSH, external diff, merge, filter, pack, credential-helper,
-trailer, fsmonitor and man-viewer settings. Literal assignments to `GIT_EDITOR`,
-`GIT_SEQUENCE_EDITOR`, `VISUAL`, `EDITOR`, `GIT_PAGER`, `PAGER`,
-`GIT_SSH_COMMAND` and `GIT_EXTERNAL_DIFF` are checked across shell clauses,
-including export and declaration forms. The guard refuses explicit enabling
-of Git's external command transport.
+`trailer.<name>.cmd` and `trailer.<name>.command`, fsmonitor and man-viewer
+settings. The guard refuses explicit enabling of Git's external command transport.
 
-A command value that the outer shell can change is refused as unverifiable.
-A single-quoted literal body can pass if it passes the body rules, as in
+The eight environment names checked across shell clauses are `GIT_EDITOR`,
+`GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`,
+`EDITOR`, `VISUAL` and `PAGER`. For these names, WI#906 distinguishes bare and
+command-prefix assignments, operands of `export`, `declare`, `typeset`,
+`readonly` and `local`, and `env` assignments before its command, from
+assignment-shaped arguments to other programs.
+
+A Git command value or an assignment to one of the eight names that the outer
+shell can change is refused as unverifiable, even without Git on the line.
+For example, use `export PAGER=less` instead of `export PAGER="${PAGER:-less}"`.
+An assignment-shaped argument to another program whose value holds an
+expansion (such as `echo "EDITOR=$EDITOR"`) no longer triggers that refusal.
+Literal values are still checked as shell bodies even in arguments. A
+single-quoted literal body can pass if it passes the body rules, as in
 `git rebase -x 'cargo test -p $CRATE' main`. Coverage is limited to recognized
 Git command words, options and setting names. Direct helper executables,
 dynamic command or option words, runtime expansion inside the body, settings

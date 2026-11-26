@@ -2184,7 +2184,7 @@ const GIT_SHELL_ENV = new Set([
   "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "VISUAL", "EDITOR", "GIT_PAGER", "PAGER",
   "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF",
 ]);
-const GIT_SHELL_KEY = /^(?:core\.(?:editor|pager|sshcommand|fsmonitor)|sequence\.editor|pager\..+|(?:difftool|mergetool|browser|man|trailer)\..+\.cmd|credential(?:\..+)?\.helper|diff\.(?:external|.+\.(?:command|textconv))|merge\..+\.driver|filter\..+\.(?:clean|smudge|process)|remote\..+\.(?:uploadpack|receivepack)|interactive\.difffilter|tar\..+\.command|uploadpack\.packobjectshook)$/i;
+const GIT_SHELL_KEY = /^(?:core\.(?:editor|pager|sshcommand|fsmonitor)|sequence\.editor|pager\..+|(?:difftool|mergetool|browser|man)\..+\.cmd|trailer\..+\.(?:cmd|command)|credential(?:\..+)?\.helper|diff\.(?:external|.+\.(?:command|textconv))|merge\..+\.driver|filter\..+\.(?:clean|smudge|process)|remote\..+\.(?:uploadpack|receivepack)|interactive\.difffilter|tar\..+\.command|uploadpack\.packobjectshook)$/i;
 const GIT_EXT_POLICY_KEY = /^protocol(?:\.ext)?\.allow$/i;
 const GIT_EXT_REASON = "enabling Git's external command transport is not permitted";
 const GIT_SHELL_UNVERIFIABLE = "cannot verify a Git shell command; use a literal value";
@@ -2320,14 +2320,58 @@ function checkGitShellInvocation(words, start, dynamic, checkedVerbs, depth) {
   return spec ? checkGitShellOptions(spec, words, i + 1, dynamic, depth) : null;
 }
 
+const GIT_SHELL_DECLARATIONS = new Set(["export", "declare", "typeset", "readonly", "local"]);
+
+function markEnvAssignments({ words, start }, firstOriginal, offset, assignments) {
+  let i = start;
+  // env takes NAME=VALUE operands until its first command word.
+  for (; words[i]?.includes("="); i++) {
+    if (i >= firstOriginal) assignments.add(i + offset);
+  }
+  return i;
+}
+
+function gitShellAssignmentPositions(words) {
+  const assignments = new Set();
+  const originalLength = words.length;
+  let firstOriginal = 0;
+  let shellBuiltin = true;
+  let i = skipCommandPrefix(words, 0, assignments);
+  while (i >= 0 && i < words.length) {
+    const word = words[i].replace(/^\(+/, "");
+    if (shellBuiltin && GIT_SHELL_DECLARATIONS.has(word)) {
+      for (i++; i < words.length; i++) assignments.add(i);
+      break;
+    }
+    const name = commandBasename(word);
+    if (!POSITION_LAUNCHERS.has(name)) break;
+    shellBuiltin &&= word === "command" || word === "builtin";
+    if (name !== "env") {
+      i = skipLauncher(name, words, i, { argFiles: [] });
+      continue;
+    }
+    const env = envOperandView(words, i + 1);
+    if (!env?.words) break;
+    // -S can insert words; only the original suffix has outer-shell flags.
+    const original = Math.min(words.length - firstOriginal, env.words.length - env.firstOriginal);
+    words = env.words;
+    firstOriginal = words.length - original;
+    i = markEnvAssignments(env, firstOriginal, originalLength - words.length, assignments);
+  }
+  return assignments;
+}
+
 function checkGitShellEnvironment(words, dynamic, depth, { keys, values }) {
   const changed = new Set();
+  let assignments;
   for (let i = 0; i < words.length; i++) {
     const assignment = /^[({]*(GIT_[A-Z0-9_]+|VISUAL|EDITOR|PAGER)\+?=(.*)$/s.exec(words[i]);
     if (!assignment) continue;
     const [, name, value] = assignment;
     const unverifiable = dynamic?.has(i);
     if (GIT_SHELL_ENV.has(name)) {
+      // Keep checking literal bodies everywhere, even in another program's argv.
+      if (unverifiable && !(assignments ??= gitShellAssignmentPositions(words)).has(i)) continue;
       const denied = checkGitShellBody(value, unverifiable, depth);
       if (denied) return denied;
     } else if (name === "GIT_ALLOW_PROTOCOL") {
@@ -3170,11 +3214,17 @@ const SUDO_VALUE_OPTIONS = new Set(["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-
 const FUNCTION_HEAD = /^[A-Za-z_][\w.:-]*\(\)\{?$/;
 
 /** The index past the compound words, assignments, redirections and function head before a command word. */
-function skipCommandPrefix(words, i) {
+function skipCommandPrefix(words, i, assignments) {
   while (i < words.length) {
-    const word = words[i];
-    if (COMPOUND_LEAD_WORDS.has(word) || /^[A-Za-z_]\w*\+?=/.test(word) || FUNCTION_HEAD.test(word)) {
+    // The listener view can leave a subshell's opening parenthesis glued to a word.
+    const word = assignments === undefined ? words[i] : words[i].replace(/^\(+(?=[^(])/, "");
+    if (/^[A-Za-z_]\w*\+?=/.test(word)) {
+      assignments?.add(i);
       i++;
+    } else if (COMPOUND_LEAD_WORDS.has(word) || FUNCTION_HEAD.test(word)) {
+      i++;
+    } else if (assignments?.size === 0 && word === "time") {
+      i += words[i + 1] === "-p" ? 2 : 1;
     } else if (word === "function") {
       i += 2;
     } else if (word === "case") {
@@ -5349,10 +5399,12 @@ function envSplitStringWords(text) {
  * split words plus the remaining argv (WI#872). An assignment, a command
  * word, `--` or the legacy `-` ends option parsing. Return null for an
  * invalid split or no operands, and `{ unverifiable: true }` when a split
- * cannot be read within the bound.
+ * cannot be read within the bound. `firstOriginal` marks where the suffix
+ * of original words begins, after any words inserted by `-S`.
  */
-function envCommandWords(words, start) {
+function envOperandView(words, start) {
   let splits = 0;
+  let originalTail = words.length;
   let i = start;
   while (i < words.length) {
     const word = words[i];
@@ -5386,11 +5438,17 @@ function envCommandWords(words, start) {
     const split = envSplitStringWords(value);
     if (split === null || split.unverifiable) return split;
     splits++;
+    originalTail = Math.min(originalTail, words.length - i);
     words = [...split.words, ...words.slice(i)];
     i = 0;
   }
   if (words[i] === "-") i++;
-  return i < words.length ? { words: words.slice(i), split: splits > 0 } : null;
+  return i < words.length ? { words, start: i, split: splits > 0, firstOriginal: words.length - originalTail } : null;
+}
+
+function envCommandWords(words, start) {
+  const env = envOperandView(words, start);
+  return env?.words ? { words: env.words.slice(env.start), split: env.split } : env;
 }
 
 /**
