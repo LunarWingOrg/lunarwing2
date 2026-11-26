@@ -3251,6 +3251,7 @@ mod tests {
         write_grant.remotes[0].write = true;
         for program in [
             "/usr/bin/gi[t]",
+            "/usr/bin/g['i']t",
             "/usr/bin/g[[:alpha:]]t",
             "/usr/bin/gi[[=t=]]",
             "/usr/bin/gi[[.t.]]",
@@ -3277,6 +3278,7 @@ mod tests {
         }
         for command in [
             "stdbuf -o0 /usr/lib/git-c?re/git-pu?h -f origin master",
+            "/usr/lib/git-core/git-pus[[:alpha:]] -f origin master",
             "env -a 'git-push' /usr/bin/gi[t] -f origin master",
             "env -a git-pus? git -f origin master",
             "env --argv0=git-pus? git -f origin master",
@@ -3411,6 +3413,9 @@ mod tests {
             "case x in x) git push -f origin master;; g*) echo y;; esac",
             "!(git push -f origin master)",
             "bash -O extglob +O extglob -c '!(git push -f origin master)'",
+            "echo $(git push -f origin master)",
+            r#"echo "${value:-$(git push -f origin master)}""#,
+            "bash -O extglob -c 'echo @($(git push -f origin master))'",
         ] {
             assert_eq!(
                 check_granted(command, &grant).unwrap_err().to_string(),
