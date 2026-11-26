@@ -1141,145 +1141,163 @@ const TIMEOUT_VALUE_OPTIONS: &[&str] = &["-s", "--signal", "-k", "--kill-after"]
 const NICE_VALUE_OPTIONS: &[&str] = &["-n", "--adjustment"];
 /// GNU `time` options that consume the following word.
 const TIME_VALUE_OPTIONS: &[&str] = &["-f", "--format", "-o", "--output"];
-/// `exec -a` names the replacement argv[0].
-const EXEC_VALUE_OPTIONS: &[&str] = &["-a"];
 
-/// Resolve `env`'s own options from `index`, then its `NAME=VALUE`
-/// assignments, returning the index of the command word. Every spelling of
-/// `-S`/`--split-string` carries a body that `env` splits into words and
-/// appends the following words to, so the body is scanned as the command it
-/// becomes. A spelling the walk cannot classify is refused, not skipped.
-fn scan_env_operands(
-    words: &[Word],
-    index: usize,
-    preflight: Preflight<'_>,
-    depth: usize,
-) -> Result<usize> {
-    let mut index = scan_env_options(words, index, preflight, depth)?;
-    while index < words.len() && is_assignment(&words[index].text) {
-        refuse_config_env_assignment(&words[index])?;
-        index += 1;
-    }
-    Ok(index)
+enum EnvOption {
+    Skip,
+    Argv0(Word),
+    Split(Word),
 }
 
-fn scan_env_options(
+fn wrapper_option_value(
+    words: &[Word],
+    index: usize,
+    attached: Option<&str>,
+) -> Result<(Word, usize)> {
+    if let Some(attached) = attached {
+        return Ok((
+            Word {
+                text: attached.to_string(),
+                dynamic: words[index].dynamic,
+            },
+            index + 1,
+        ));
+    }
+    words
+        .get(index + 1)
+        .cloned()
+        .map(|value| (value, index + 2))
+        .ok_or_else(|| denied("wrapper option needs a value"))
+}
+
+fn scan_env_operands(
     words: &[Word],
     mut index: usize,
     preflight: Preflight<'_>,
     depth: usize,
-) -> Result<usize> {
-    while index < words.len() {
-        let word = &words[index];
+    mut argv0: Option<Word>,
+) -> Result<(usize, Option<Word>)> {
+    while let Some(word) = words.get(index) {
         let text = word.text.as_str();
-        // A lone `-` means `-i`; `--` ends the options.
-        if text == "-" || text == "--" {
-            return Ok(index + 1);
+        if matches!(text, "-" | "--") {
+            index += 1;
+            break;
         }
         if !text.starts_with('-') {
-            return Ok(index);
+            break;
         }
         if word.dynamic {
-            return Err(denied(
-                "dynamic env option cannot be authorized for git network access",
-            ));
+            return Err(denied("dynamic env option cannot be authorized"));
         }
-        if let Some(rest) = text.strip_prefix("--") {
-            index = scan_env_long_option(words, index, rest, preflight, depth)?;
-            continue;
+        let (option, tail) = if let Some(rest) = text.strip_prefix("--") {
+            parse_env_long_option(words, index, rest)?
+        } else {
+            parse_env_short_option(words, index)?
+        };
+        index = tail;
+        match option {
+            EnvOption::Skip => {}
+            EnvOption::Argv0(value) => argv0 = Some(value),
+            EnvOption::Split(body) => {
+                scan_env_split_body(&body, &words[index..], preflight, depth, argv0)?;
+                return Ok((words.len(), None));
+            }
         }
-        index = scan_env_short_option(words, index, preflight, depth)?;
     }
-    Ok(index)
+    while let Some(word) = words.get(index).filter(|word| is_assignment(&word.text)) {
+        refuse_config_env_assignment(word)?;
+        index += 1;
+    }
+    Ok((index, argv0))
 }
 
-/// One `env` long option (with `--` stripped). Long options abbreviate to any
-/// unambiguous prefix, as GNU `getopt_long` reads them.
-fn scan_env_long_option(
-    words: &[Word],
-    index: usize,
-    rest: &str,
-    preflight: Preflight<'_>,
-    depth: usize,
-) -> Result<usize> {
-    let (name, attached) = match rest.split_once('=') {
-        Some((name, value)) => (name, Some(value)),
-        None => (rest, None),
-    };
-    let word = &words[index];
+fn parse_env_long_option(words: &[Word], index: usize, rest: &str) -> Result<(EnvOption, usize)> {
+    let (name, attached) = rest
+        .split_once('=')
+        .map_or((rest, None), |(name, value)| (name, Some(value)));
     let value_option = ENV_LONG_VALUE_OPTIONS
         .iter()
         .find(|option| !name.is_empty() && option.starts_with(name));
     if let Some(option) = value_option {
-        let (value, tail) = match attached {
-            Some(value) => (
-                Word {
-                    text: value.to_string(),
-                    dynamic: word.dynamic,
-                },
-                index + 1,
-            ),
-            None => match words.get(index + 1) {
-                Some(value) => (value.clone(), index + 2),
-                None => return Err(denied("env option needs a value")),
-            },
+        let (value, tail) = wrapper_option_value(words, index, attached)?;
+        let option = match *option {
+            "split-string" => EnvOption::Split(value),
+            "argv0" => EnvOption::Argv0(value),
+            _ => EnvOption::Skip,
         };
-        if *option == "split-string" {
-            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
-            return Ok(words.len());
-        }
-        return Ok(tail);
+        return Ok((option, tail));
     }
     if ENV_LONG_FLAGS
         .iter()
         .any(|flag| !name.is_empty() && flag.starts_with(name))
     {
-        // `--block-signal=PIPE` and friends carry an optional `=` value.
-        return Ok(index + 1);
+        return Ok((EnvOption::Skip, index + 1));
     }
     Err(denied("unsupported env option"))
 }
 
-/// One `env` short-option word (`-i`, `-u FOO`, `-uFOO`, `-iS body`,
-/// `-Sbody`). `-S` is the split-string option; the rest of its cluster, or
-/// the next word, is the body.
-fn scan_env_short_option(
-    words: &[Word],
-    index: usize,
-    preflight: Preflight<'_>,
-    depth: usize,
-) -> Result<usize> {
-    let word = &words[index];
-    let cluster = &word.text[1..];
+fn parse_env_short_option(words: &[Word], index: usize) -> Result<(EnvOption, usize)> {
+    let cluster = &words[index].text[1..];
     for (offset, letter) in cluster.char_indices() {
+        if matches!(letter, 'i' | '0' | 'v') {
+            continue;
+        }
         if !ENV_SHORT_VALUE_OPTIONS.contains(&letter) {
-            if matches!(letter, 'i' | '0' | 'v') {
-                continue;
-            }
             return Err(denied("unsupported env option"));
         }
         let attached = &cluster[offset + letter.len_utf8()..];
-        let (value, tail) = if attached.is_empty() {
-            match words.get(index + 1) {
-                Some(value) => (value.clone(), index + 2),
-                None => return Err(denied("env option needs a value")),
-            }
-        } else {
-            (
-                Word {
-                    text: attached.to_string(),
-                    dynamic: word.dynamic,
-                },
-                index + 1,
-            )
+        let (value, tail) = wrapper_option_value(
+            words,
+            index,
+            Some(attached).filter(|value| !value.is_empty()),
+        )?;
+        let option = match letter {
+            'S' => EnvOption::Split(value),
+            'a' => EnvOption::Argv0(value),
+            _ => EnvOption::Skip,
         };
-        if letter == 'S' {
-            scan_env_split_body(&value, &words[tail..], preflight, depth)?;
-            return Ok(words.len());
-        }
-        return Ok(tail);
+        return Ok((option, tail));
     }
-    Ok(index + 1)
+    Ok((EnvOption::Skip, index + 1))
+}
+
+fn scan_exec_operands(words: &[Word], mut index: usize) -> Result<(usize, Option<Word>)> {
+    let mut argv0 = None;
+    let mut login = false;
+    while let Some(word) = words.get(index) {
+        if word.text == "--" {
+            index += 1;
+            break;
+        }
+        let Some(cluster) = word
+            .text
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty())
+        else {
+            break;
+        };
+        if word.dynamic {
+            return Err(denied("dynamic exec option cannot be authorized"));
+        }
+        let rest = cluster.trim_start_matches(['c', 'l']);
+        login |= cluster[..cluster.len() - rest.len()].contains('l');
+        if let Some(attached) = rest.strip_prefix('a') {
+            let (value, tail) = wrapper_option_value(
+                words,
+                index,
+                Some(attached).filter(|value| !value.is_empty()),
+            )?;
+            argv0 = Some(value);
+            index = tail;
+        } else if rest.is_empty() {
+            index += 1;
+        } else {
+            return Err(denied("unsupported exec option"));
+        }
+    }
+    if login && let Some(value) = &mut argv0 {
+        value.text.insert(0, '-');
+    }
+    Ok((index, argv0))
 }
 
 /// Read the literal subset of GNU `env -S` syntax. An env string contributes
@@ -1355,6 +1373,7 @@ fn scan_env_split_body(
     tail: &[Word],
     preflight: Preflight<'_>,
     depth: usize,
+    argv0: Option<Word>,
 ) -> Result<()> {
     if depth > 4 {
         return Err(denied(
@@ -1368,32 +1387,45 @@ fn scan_env_split_body(
     }
     let mut simple = tokenize_env_split_string(&body.text)?;
     simple.extend_from_slice(tail);
-    let command = scan_env_operands(&simple, 0, preflight, depth + 1)?;
-    if command == simple.len() {
-        return Ok(());
-    }
-    scan_simple_command(&simple[command..], preflight, depth + 1)
+    let (command, argv0) = scan_env_operands(&simple, 0, preflight, depth + 1, argv0)?;
+    scan_wrapped_command(&simple[command..], preflight, depth + 1, argv0)
 }
 
 fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -> Result<()> {
+    let mut index = 0;
+    while index < words.len() && is_assignment(&words[index].text) {
+        refuse_config_env_assignment(&words[index])?;
+        index += 1;
+    }
+    scan_wrapped_command(&words[index..], preflight, depth, None)
+}
+
+fn scan_wrapped_command(
+    words: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+    mut argv0: Option<Word>,
+) -> Result<()> {
     if depth > 4 {
         return Err(denied(
             "nested shell command is too deep to authorize statically",
         ));
     }
     let mut index = 0;
-    while index < words.len() && is_assignment(&words[index].text) {
-        refuse_config_env_assignment(&words[index])?;
-        index += 1;
-    }
     while index < words.len() {
+        if let Some(argv0) = argv0.take()
+            && let Some(result) =
+                inspect_git_argv0(&words[index], &argv0, &words[index + 1..], preflight, depth)
+        {
+            return result;
+        }
         let command = basename(&words[index].text).to_string();
         if is_command_prefix_word(&command) {
             index += 1;
             continue;
         }
         match command.as_str() {
-            "env" => index = scan_env_operands(words, index + 1, preflight, depth)?,
+            "env" => (index, argv0) = scan_env_operands(words, index + 1, preflight, depth, None)?,
             // Shell builtins that only assign or export names. `declare -x`,
             // `typeset -x`, `readonly` and `local` reach the same variables
             // the bare `NAME=value` form does.
@@ -1408,7 +1440,7 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             }
             "printf" => return authorize_printf(&words[index + 1..]),
             "command" | "nohup" => index = skip_wrapper_options(words, index + 1, &[]),
-            "exec" => index = skip_wrapper_options(words, index + 1, EXEC_VALUE_OPTIONS),
+            "exec" => (index, argv0) = scan_exec_operands(words, index + 1)?,
             "time" => index = skip_wrapper_options(words, index + 1, TIME_VALUE_OPTIONS),
             // `timeout [OPTION]... DURATION COMMAND [ARG]...`
             "timeout" => {
@@ -1436,8 +1468,11 @@ fn scan_simple_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
             // holds those programs under the dashed names. Read the dashed
             // spelling as the subcommand it is, so `git-push -f` cannot pass
             // where `git push -f` is refused.
-            name if git_dashed_program(name).is_some() => {
-                return inspect_git_dashed_command(words, index, preflight, depth);
+            name if let Some(verb) = git_dashed_program(name) => {
+                if words[index].dynamic {
+                    return Err(denied("dynamic git subcommand cannot be authorized"));
+                }
+                return inspect_git_verb(verb, &words[index + 1..], preflight, depth);
             }
             _ => return refuse_unread_git_tail(words, index),
         }
@@ -1987,8 +2022,16 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
     if sub.dynamic {
         return Err(denied("dynamic git subcommand cannot be authorized"));
     }
-    let args = &words[sub_index + 1..];
-    match sub.text.as_str() {
+    inspect_git_verb(&sub.text, &words[sub_index + 1..], preflight, depth)
+}
+
+fn inspect_git_verb(
+    verb: &str,
+    args: &[Word],
+    preflight: Preflight<'_>,
+    depth: usize,
+) -> Result<()> {
+    match verb {
         "clone" => authorize_clone(args, preflight),
         "fetch" | "pull" => authorize_fetch(args, preflight),
         // Push is authorized only on a write-granted remote. Force and
@@ -2028,7 +2071,7 @@ fn inspect_git_command(words: &[Word], preflight: Preflight<'_>, depth: usize) -
         // helper's own option rules; its other subcommands are internal and
         // take arguments this preflight does not read, so they are refused.
         "submodule--helper" => authorize_submodule_helper(args, preflight, depth),
-        "rebase" | "bisect" => authorize_shell_bodies(args, sub.text.as_str(), preflight, depth),
+        "rebase" | "bisect" => authorize_shell_bodies(args, verb, preflight, depth),
         // Porcelain `push` is not the only path to a remote. The plumbing
         // verbs speak the transport protocol directly, take their own
         // destination argument, and are not authorized above, so they must
@@ -2056,9 +2099,9 @@ fn authorize_for_each_repo(args: &[Word], preflight: Preflight<'_>, depth: usize
 fn for_each_repo_command(mut args: &[Word]) -> Result<(bool, &[Word])> {
     let mut has_config = false;
     while let Some((word, tail)) = args.split_first() {
-        if word.dynamic {
+        if word.dynamic && word.text.starts_with('-') {
             return Err(denied(
-                "dynamic git for-each-repo operand cannot be authorized",
+                "dynamic git for-each-repo option cannot be authorized",
             ));
         }
         match word.text.as_str() {
@@ -2156,27 +2199,29 @@ fn is_known_git_verb(verb: &str) -> bool {
     ) || is_remote_transport_plumbing(verb)
 }
 
-/// Read a dashed program (`git-push`, `/usr/lib/git-core/git-clone`) as the
-/// subcommand it stands for. The program takes the subcommand's own
-/// arguments — it does not accept `git`'s global options — so the verb is
-/// placed where `inspect_git_command` looks for it and nothing is skipped
-/// ahead of it.
-fn inspect_git_dashed_command(
-    words: &[Word],
-    index: usize,
+fn inspect_git_argv0(
+    program: &Word,
+    argv0: &Word,
+    args: &[Word],
     preflight: Preflight<'_>,
     depth: usize,
-) -> Result<()> {
-    let Some(verb) = git_dashed_program(basename(&words[index].text)) else {
-        return Ok(());
-    };
-    let mut rewritten = Vec::with_capacity(words.len() - index);
-    rewritten.push(Word {
-        text: verb.to_string(),
-        dynamic: words[index].dynamic,
-    });
-    rewritten.extend_from_slice(&words[index + 1..]);
-    inspect_git_command(&rewritten, preflight, depth)
+) -> Option<Result<()>> {
+    let executable = basename(&program.text);
+    let name = basename(&argv0.text);
+    let git_executable = executable == "git" || git_dashed_program(executable).is_some();
+    let git_name = name == "git" || git_dashed_program(name).is_some();
+    if (git_executable && argv0.dynamic) || (git_name && program.dynamic) {
+        return Some(Err(denied(
+            "dynamic git program or argv[0] cannot be authorized",
+        )));
+    }
+    if is_git_plumbing_executable(executable) || (!git_executable && !program.dynamic) {
+        return None;
+    }
+    if name == "git" {
+        return Some(inspect_git_command(args, preflight, depth));
+    }
+    git_dashed_program(name).map(|verb| inspect_git_verb(verb, args, preflight, depth))
 }
 
 fn authorize_clone(args: &[Word], preflight: Preflight<'_>) -> Result<()> {
@@ -3279,6 +3324,80 @@ mod tests {
             }
         }
         check_granted("git push origin {main,dev}", &write_grant).unwrap();
+    }
+
+    #[test]
+    fn env_and_exec_use_the_last_git_argv0() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for (command, control) in [
+            (
+                "env -a git-push git -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "env --argv0=git-push git -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "exec -a git-push git -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "env -a git-submodule--helper git foreach 'git push -f origin master'",
+                "git submodule--helper foreach 'git push -f origin master'",
+            ),
+            (
+                "exec -a git -a git-push git -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "exec -a git-fetch -a git-push git origin +master",
+                "git push origin +master",
+            ),
+            (
+                "exec -a git-fetch -a git-push git origin master",
+                "git push origin master",
+            ),
+            (
+                "env -a git-fetch --argv0 /usr/bin/git-push git origin master",
+                "git push origin master",
+            ),
+            (
+                "exec -ca/usr/bin/git-push git -f origin master",
+                "git push -f origin master",
+            ),
+            (
+                "env -a git-push -S 'git -f' origin master",
+                "git push -f origin master",
+            ),
+            (
+                "env -S '-a git -ia git-push git -f' origin master",
+                "git push -f origin master",
+            ),
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                let expected = check_granted(control, grant).map_err(|error| error.to_string());
+                let actual = check_granted(command, grant).map_err(|error| error.to_string());
+                assert_eq!(actual, expected, "{command}");
+            }
+        }
+        for command in [
+            r#"env -a "$name" git status"#,
+            r#"env --argv0="$name" git status"#,
+            r#"exec -a "$name" git status"#,
+        ] {
+            assert!(check_granted(command, &write_grant).is_err(), "{command}");
+        }
+        for command in [
+            "env -a git-push --argv0=git-fetch git origin",
+            "exec -a git-push -a git-fetch git origin",
+            "env -a git-push git origin master",
+        ] {
+            check_granted(command, &write_grant)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
     }
 
     #[test]
