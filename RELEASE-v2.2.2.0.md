@@ -9,31 +9,6 @@
 
 **Release Date:** PLACEHOLDER — the maintainer sets the release date at the tag.
 
-**Draft status:** first draft, written 2026-11-22. Built from the work merged
-into `aragents/kimil00p/v2.2.2.0` since the tag `v2.2.1.0`
-(`git log --first-parent v2.2.1.0..HEAD`), from the closed work items labelled
-`2.2.2.0`, and from the Known Limitations of
-[`docs/releases/RELEASE-v2.2.1.0.md`](docs/releases/RELEASE-v2.2.1.0.md).
-Every statement about a mechanism was checked against the tree at
-`c7aab1ae47a22bc98d9a5a8990329043e7c83242` (the branch tip when this draft was
-written), or against the committed operations record where a run is cited —
-never against a commit message or a merge-request description. The
-section-by-section record of what each statement was checked against, and the
-disposition of every v2.2.1.0 Known Limitation, is a note on WI#802.
-
-**Refresh, 2026-11-26.** The draft was re-read against the tree at
-`83c2b6f19eba1c337412dfa2e5d4fd733d105333` and extended with work merged after
-the first draft's last edit (`3c06ddcd`, 2026-11-25 — 95 non-merge commits
-behind that tip, and 394 behind it since the baseline the draft cites,
-`c7aab1ae…`): the git-preflight items WI#886, WI#888 and WI#905, the
-command-guard items WI#887, WI#889, WI#892, WI#895, WI#898 and WI#906, the
-GitLab-tool and WASM-trap work in WI#891, the worker-readiness gate WI#882 and
-the credential-binding warning WI#893. It also records the maintainer's
-2026-11-26 decision that closes WI#904, WI#907 and WI#909 as documented guard
-limits rather than defects. One factual error in the first draft was corrected
-in the same pass: the tool-registry row still carried the pre-WI#891 `gitlab`
-version.
-
 ## Highlights
 
 - **The crate baseline moves to `2.2.2` (WI#799).** The daemon, its five
