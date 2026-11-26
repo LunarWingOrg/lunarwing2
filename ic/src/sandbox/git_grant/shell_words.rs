@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::ops::Range;
 use std::str::Chars;
@@ -7,6 +8,7 @@ use super::{Result, denied, is_command_prefix_word};
 const MAX_BRACE_WORDS: usize = 256;
 const MAX_BRACE_DEPTH: usize = 16;
 const MAX_BRACE_BYTES: usize = 64 * 1024;
+const MAX_EXPANSION_DEPTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Expansion {
@@ -259,12 +261,39 @@ impl Lexer {
         };
         if let Some((open, close)) = group {
             let body = read_group(chars, open, close)?;
-            if open != '{' {
+            if open == '{' {
+                self.parameter_substitutions(&body, depth + 1)?;
+            } else {
                 self.commands
                     .extend(tokenize(&body, self.extglob_enabled, depth + 1)?);
             }
             self.push_text(&body, Kind::Dynamic);
             self.push(close, Kind::Dynamic);
+        }
+        Ok(())
+    }
+
+    fn parameter_substitutions(&mut self, body: &str, depth: usize) -> Result<()> {
+        if depth > MAX_EXPANSION_DEPTH {
+            return Err(denied("nested shell expansion is too deep to authorize"));
+        }
+        let mut chars = body.chars().peekable();
+        let mut quote = None;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' if quote != Some('\'') => {
+                    chars.next();
+                }
+                '\'' | '"' if quote.is_none() || quote == Some(ch) => {
+                    quote = if quote.is_none() { Some(ch) } else { None };
+                }
+                '$' | '`' if quote != Some('\'') => {
+                    let start = self.atoms.len();
+                    self.dynamic(ch, &mut chars, depth)?;
+                    self.atoms.truncate(start);
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -275,7 +304,7 @@ pub(super) fn tokenize_simple_commands(input: &str, extglob: bool) -> Result<Vec
 }
 
 fn tokenize(input: &str, extglob: bool, depth: usize) -> Result<Vec<Vec<Word>>> {
-    if depth > 4 {
+    if depth > MAX_EXPANSION_DEPTH {
         return Err(denied("nested shell expansion is too deep to authorize"));
     }
     let mut lexer = Lexer {
@@ -297,9 +326,11 @@ fn tokenize(input: &str, extglob: bool, depth: usize) -> Result<Vec<Vec<Word>>> 
             }
             '$' | '`' => lexer.dynamic(ch, &mut chars, depth)?,
             '(' if lexer.extglob_starts_here() => {
+                let body = read_group(&mut chars, '(', ')')?;
+                lexer.parameter_substitutions(&body, depth + 1)?;
                 lexer.extglob_word = true;
                 lexer.push('(', Kind::Literal);
-                lexer.push_text(&read_group(&mut chars, '(', ')')?, Kind::Literal);
+                lexer.push_text(&body, Kind::Literal);
                 lexer.push(')', Kind::Literal);
             }
             '#' if lexer.atoms.is_empty() => {
@@ -725,6 +756,7 @@ fn classify_glob(atoms: &[Atom]) -> Expansion {
 }
 
 fn glob_pattern(atoms: &[Atom]) -> (Vec<GlobAtom>, bool) {
+    let atoms = without_quote_markers(atoms);
     let unquoted_bracket = atoms
         .iter()
         .rposition(|atom| atom.is(']'))
@@ -735,23 +767,37 @@ fn glob_pattern(atoms: &[Atom]) -> (Vec<GlobAtom>, bool) {
     while let Some(atom) = atoms.get(index) {
         index += 1;
         let part = match (atom.kind, atom.ch) {
-            (Kind::Quote, _) => continue,
             (Kind::Unquoted, '*') => GlobAtom::Star,
             (Kind::Unquoted, '?') => GlobAtom::Any,
-            (Kind::Unquoted, '[') if index <= unquoted_bracket => match glob_class(&atoms[index..])
-            {
-                Some((class, length)) => {
-                    index += length;
-                    class
+            (Kind::Unquoted, '[') if index <= unquoted_bracket => {
+                match glob_class(&atoms[index..=unquoted_bracket]) {
+                    Some((class, length)) => {
+                        index += length;
+                        class
+                    }
+                    None => GlobAtom::Literal('['),
                 }
-                None => GlobAtom::Literal('['),
-            },
+            }
             (_, ch) => GlobAtom::Literal(ch),
         };
         has_glob |= !matches!(part, GlobAtom::Literal(_));
         pattern.push(part);
     }
     (pattern, has_glob)
+}
+
+fn without_quote_markers(atoms: &[Atom]) -> Cow<'_, [Atom]> {
+    if atoms.iter().any(|atom| atom.kind == Kind::Quote) {
+        Cow::Owned(
+            atoms
+                .iter()
+                .copied()
+                .filter(|atom| atom.kind != Kind::Quote)
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(atoms)
+    }
 }
 
 fn glob_class(mut atoms: &[Atom]) -> Option<(GlobAtom, usize)> {
@@ -812,7 +858,12 @@ fn posix_element(atoms: &[Atom]) -> Option<(Option<u128>, &[Atom])> {
     }
     let end = body
         .windows(2)
-        .position(|pair| pair[0].is(marker.ch) && pair[1].is(']'))?;
+        .enumerate()
+        .take_while(|(index, pair)| {
+            (*index == 0 && marker.ch != ':') || !(pair[0].is('[') || pair[0].is(']'))
+        })
+        .find(|(_, pair)| pair[0].is(marker.ch) && pair[1].is(']'))?
+        .0;
     let content = &body[..end];
     let mask = match (marker.ch, content) {
         (':', content) => ascii_class(&content.iter().map(|atom| atom.ch).collect::<String>()),
