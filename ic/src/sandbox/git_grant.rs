@@ -968,12 +968,13 @@ fn refuse_unread_git_tail(words: &[Word], from: usize) -> Result<()> {
     }
     for word in &words[from + 1..] {
         let name = basename(&word.text);
+        // A glob in a directory component can leave the shell basename literal.
         if word.expansion == Expansion::GitGlob
+            || (!word.dynamic && is_shell_name(name))
             || (!word.needs_expansion()
                 && (name == "git"
                     || is_git_plumbing_executable(name)
-                    || is_git_program_word(&word.text)
-                    || is_shell_name(name)))
+                    || is_git_program_word(&word.text)))
         {
             return Err(denied(format!(
                 "a command this preflight cannot read ({command}) names git; use a recognized command form"
@@ -3422,6 +3423,59 @@ mod tests {
                 control,
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn case_like_data_does_not_hide_later_git_commands() {
+        let (_temp, read_grant) = workspace_with_remote();
+        let mut write_grant = read_grant.clone();
+        write_grant.remotes[0].write = true;
+        for template in [
+            "a=(case x); {command}",
+            "declare -a a=(case x)\n{command}",
+            "a+=(case x)\n{command}",
+            "for case in a; do {command}; done",
+            "for in in case x; do\n{command}\ndone",
+            "select case in a; do {command}; done",
+            "case x in x) true;; esac>/dev/null; {command}",
+            "case x in\nx) true;;\nesac</dev/null\n{command}",
+            "case x in x) true;; esac>>/tmp/log; {command}",
+            "cat <<'EOF'\ncase sensitivity note\nEOF\n{command}",
+            "case x in\nx|g*) {command};;\nesac",
+            "echo a\r#b; {command}",
+        ] {
+            for grant in [&read_grant, &write_grant] {
+                let denied = template.replace("{command}", "git fetch missing-remote");
+                let allowed = template.replace("{command}", "git status");
+                let expected = check_granted("git fetch missing-remote", grant).unwrap_err();
+                assert_eq!(
+                    check_granted(&denied, grant).unwrap_err().to_string(),
+                    expected.to_string(),
+                    "{denied:?}"
+                );
+                check_granted(&allowed, grant)
+                    .unwrap_or_else(|error| panic!("{allowed:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn unread_wrappers_still_check_literal_shell_basenames() {
+        let (_temp, grant) = workspace_with_remote();
+        for command in [
+            "flock /tmp/fixture /b?n/sh -c 'git status'",
+            "stdbuf -o0 /b?n/sh -c 'git status'",
+            "xargs /b?n/sh -c 'git status'",
+            "flock /tmp/fixture /*/bash fixture.sh",
+        ] {
+            assert!(check_granted(command, &grant).is_err(), "{command}");
+        }
+        for command in [
+            "env /b?n/sh -c 'git status'",
+            "flock /tmp/fixture cat docs/*",
+        ] {
+            check_granted(command, &grant).unwrap_or_else(|error| panic!("{command}: {error}"));
         }
     }
 

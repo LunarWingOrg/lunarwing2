@@ -116,40 +116,45 @@ impl Lexer {
             && self.atoms.iter().map(|atom| atom.ch).eq(keyword.chars())
     }
 
-    fn case_syntax(&mut self) -> bool {
+    fn track_case_word(&mut self) -> bool {
         match self.case.last().copied() {
-            Some(CasePhase::Subject) => {
-                self.set_case_phase(CasePhase::In);
-                true
+            Some(CasePhase::Subject) => self.set_case_phase(CasePhase::In),
+            Some(CasePhase::In) if self.keyword("in") => {
+                self.set_case_phase(CasePhase::Pattern);
+                return true;
             }
             Some(CasePhase::In) => {
-                if self.keyword("in") {
-                    self.set_case_phase(CasePhase::Pattern);
-                }
-                true
+                self.case.pop();
             }
-            Some(CasePhase::Pattern) => {
-                if self.keyword("esac") {
-                    self.case.pop();
-                }
-                true
+            Some(CasePhase::Pattern | CasePhase::Body)
+                if self.case_end_word() && self.before_command() =>
+            {
+                self.case.pop();
             }
+            Some(CasePhase::Pattern) => {}
             _ if self.keyword("case") && self.before_command() => {
                 self.case.push(CasePhase::Subject);
-                true
             }
-            _ if self.keyword("esac") && self.before_command() && !self.case.is_empty() => {
-                self.case.pop();
-                true
-            }
-            _ => false,
+            _ => {}
         }
+        false
+    }
+
+    fn case_end_word(&self) -> bool {
+        let prefix = self.atoms.get(..4).unwrap_or_default();
+        prefix.iter().all(|atom| atom.kind == Kind::Unquoted)
+            && prefix.iter().map(|atom| atom.ch).eq("esac".chars())
+            && self
+                .atoms
+                .get(4)
+                .is_none_or(|atom| atom.is('<') || atom.is('>'))
     }
 
     fn before_command(&self) -> bool {
-        self.words
-            .iter()
-            .all(|word| is_command_prefix_word(&word.text))
+        self.words.iter().all(|word| {
+            is_command_prefix_word(&word.text)
+                && !matches!(word.text.as_str(), "for" | "select" | "in")
+        })
     }
 
     fn set_case_phase(&mut self, phase: CasePhase) {
@@ -159,7 +164,8 @@ impl Lexer {
     }
 
     fn finish_word(&mut self) {
-        if !self.atoms.is_empty() && !self.case_syntax() {
+        if !self.atoms.is_empty() {
+            let case_header_end = self.track_case_word();
             let first = self.words.len();
             let mut budget = BraceBudget::default();
             if expand_braces(
@@ -175,6 +181,9 @@ impl Lexer {
                 let mut word = source_word(&self.atoms, self.extglob_word);
                 word.expansion = Expansion::UnexpandedBrace;
                 self.words.push(word);
+            }
+            if case_header_end {
+                self.finish_command();
             }
         }
         self.atoms.clear();
@@ -202,11 +211,30 @@ impl Lexer {
 
     fn separator(&mut self, ch: char, chars: &mut Peekable<Chars<'_>>) {
         self.finish_word();
-        if self.case.last() == Some(&CasePhase::Pattern) {
-            if ch == ')' {
-                self.set_case_phase(CasePhase::Body);
+        match self.case.last().copied() {
+            Some(CasePhase::Pattern) => {
+                // Only a single pattern at a pattern delimiter is exempt from
+                // glob classification. Keep every word and every clause in
+                // the scan, even if our case-state guess was wrong.
+                if matches!(ch, ')' | '|')
+                    && self.words.len() == 1
+                    && let Some(pattern) = self.words.last_mut()
+                    && matches!(pattern.expansion, Expansion::GitGlob | Expansion::Extglob)
+                {
+                    pattern.expansion = Expansion::None;
+                }
+                match ch {
+                    ')' => self.set_case_phase(CasePhase::Body),
+                    '|' | '(' | '\n' => {}
+                    _ => {
+                        self.case.pop();
+                    }
+                }
             }
-            return;
+            Some(CasePhase::Subject | CasePhase::In) if ch != '\n' => {
+                self.case.pop();
+            }
+            _ => {}
         }
         self.finish_command();
         if ch == ';'
@@ -338,7 +366,7 @@ fn tokenize(input: &str, extglob: bool, depth: usize) -> Result<Vec<Vec<Word>>> 
                 lexer.separator('\n', &mut chars);
             }
             ';' | '\n' | '|' | '&' | '(' | ')' => lexer.separator(ch, &mut chars),
-            ' ' | '\t' | '\r' => lexer.finish_word(),
+            ' ' | '\t' => lexer.finish_word(),
             _ => lexer.push(ch, Kind::Unquoted),
         }
     }

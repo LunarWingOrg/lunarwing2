@@ -285,10 +285,14 @@ Preflight refuses unquoted globs that specifically name Git programs in
 command positions or in the arguments of wrappers it cannot read. It looks
 for a literal character or a single-character class in the final path
 component and checks the pattern against Git program names, including dashed
-names in `git-core`. Generic patterns such as `*`, `dir/*`, and `???` pass
-this check. They can select Git in a prepared directory, just as a link
-under another name can run Git. Preflight does not consult the filesystem to
-resolve those names. When Bash enables `extglob` with `-O extglob` or a
+names in `git-core`. A literal shell basename in an unread wrapper's
+arguments is checked even when its directory contains a glob. A single
+`case` pattern at a pattern delimiter is exempt from command glob checks.
+The lexer still scans the words in every command clause. Generic patterns
+such as `*`, `dir/*`, and `???` pass this check. They can select Git in a
+prepared directory, just as a link under another name can run Git. Preflight
+does not consult the filesystem to resolve command names or expand globs in
+Git option and operand words. When Bash enables `extglob` with `-O extglob` or a
 literal `shopt -s extglob`, preflight refuses extended globs in command words.
 
 Literal brace lists and ranges expand into separate arguments before the
