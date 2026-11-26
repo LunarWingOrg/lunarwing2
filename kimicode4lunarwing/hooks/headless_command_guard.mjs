@@ -3267,14 +3267,14 @@ const POSITION_LAUNCHERS = new Set(["env", "exec", "command", "builtin", "busybo
  * arguments from input, and `argFiles` the files an `xargs -a` reads them
  * from.
  */
-function commandPosition(words) {
+function commandPosition(words, stopAt) {
   const position = { index: -1, xargs: false, argFiles: [] };
   let i = 0;
   for (let hop = 0; hop <= MAX_STAGE_LAUNCHERS; hop++) {
     i = skipCommandPrefix(words, i);
     if (i >= words.length || COMPOUND_HEAD_ONLY.has(words[i])) return position;
     const name = commandBasename(words[i]);
-    if (!POSITION_LAUNCHERS.has(name)) {
+    if (stopAt?.(words[i], name) || !POSITION_LAUNCHERS.has(name)) {
       position.index = i;
       return position;
     }
@@ -5852,7 +5852,7 @@ function literalStages(text, scan) {
       stack.push({ stages, stage, closer });
       stages = stage.group;
       stage = literalStage();
-    } else if (punctuation === stack.at(-1)?.closer && punctuation !== undefined) {
+    } else if (punctuation && punctuation === stack.at(-1)?.closer && (op === ")" || !hasLiteralStage(stage))) {
       if (hasLiteralStage(stage)) stages.push(stage);
       const parent = stack.pop();
       ({ stages, stage } = parent);
@@ -6136,18 +6136,43 @@ function literalArgv(stage, ctx, state, isolated) {
   return stage.words.slice(start).map((span) => literalWord(ctx, span, state.vars));
 }
 
+function literalInvocation(words, isWritten) {
+  for (let hop = 0; hop <= MAX_STAGE_LAUNCHERS; hop++) {
+    const argv = words.map(({ value }) => typeof value === "string" ? value : "\0");
+    const position = commandPosition(argv, (word, name) => name === "env" || isWritten(word));
+    if (position.index < 0) return null;
+    const command = argv[position.index];
+    const name = commandBasename(command);
+    if (name !== "env" || isWritten(command)) {
+      return { command, name, position, tail: words.slice(position.index + 1) };
+    }
+    const split = envCommandWords(argv, position.index + 1)?.words;
+    if (!split) return null;
+    // Preserve variable provenance on the untouched suffix of env's argv.
+    let from = argv.length;
+    let count = split.length;
+    while (count > 0 && from > position.index + 1 && split[count - 1] === argv[from - 1]) {
+      count--;
+      from--;
+    }
+    words = [...words.slice(0, position.index), ...split.slice(0, count).map((value) => ({ value })), ...words.slice(from)];
+  }
+  return null;
+}
+
 function literalCommand(stage, ctx, state, input, isolated) {
   const words = literalArgv(stage, ctx, state, isolated);
-  const values = words.map(({ value }) => value);
-  const argv = values.map((value) => typeof value === "string" ? value : "\0");
-  const position = commandPosition(argv);
-  if (position.index < 0) return undefined;
-  const command = argv[position.index];
-  const name = commandBasename(command);
-  const args = values.slice(position.index + 1);
-  const file = !POSITION_LAUNCHERS.has(name) && command.includes("/") ? literalFile(ctx, state, command) : undefined;
-  const body = file ?? literalShellBody(name, words.slice(position.index + 1), position, input, ctx, state);
-  ctx.reason = checkLiteralBody(body, ctx);
+  if (words.length === 0) return "";
+  const isWritten = (word) => ctx.files.size > 0 && word.includes("/") && ctx.files.has(literalPath(word, state.cwd));
+  const call = literalInvocation(words, isWritten);
+  if (call === null) return undefined;
+  const { command, name, position, tail } = call;
+  const args = tail.map(({ value }) => value);
+  if (isWritten(command)) {
+    ctx.reason = checkLiteralBody(literalFile(ctx, state, command), ctx);
+    return undefined;
+  }
+  ctx.reason = checkLiteralBody(literalShellBody(name, tail, position, input, ctx, state), ctx);
   if (ctx.reason) return undefined;
   if (name === "echo") return literalEcho(args);
   if (name === "printf") return literalPrintf(args);
@@ -6194,7 +6219,7 @@ function checkLiteralShellInput(text, depth) {
 const ANALYSIS_TIMEOUT_MS = 2_000;
 
 function classify(command, depth = 0) {
-  const denial = evaluate(command) ?? checkRmAssembly(command) ?? checkSameLineLink(command) ??
+  const denial = evaluate(command, depth) ?? checkRmAssembly(command) ?? checkSameLineLink(command) ??
     checkLiteralShellInput(command, depth);
   if (denial) return denial;
   if (hasUnverifiableAnsiEscape(command) ||
