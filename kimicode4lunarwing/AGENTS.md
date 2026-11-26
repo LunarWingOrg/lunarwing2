@@ -148,6 +148,24 @@ Temporary-file cleanup can put redirections before or after the operands.
 For example, `rm 2> /dev/null -rf /tmp/x` and `rm </dev/null -rf /tmp/x`
 both pass.
 
+## Guard Literal Shell Input
+
+WI#907 checks text spelled out in `echo`, `printf`, here-strings and
+here-documents when the same command line hands it to a shell as commands.
+It follows `|` and `|&` through `cat` and `tee` and simple groups, tracks
+literal file writes and reads by their normalized paths, and recognizes
+same-line literal assignments expanded in a producer, `sh -c`, or `eval`.
+A `trap` action is also checked as a shell body, after `--` if present.
+Every recovered body gets the guard's command checks under its existing
+size, nesting and time limits; the guard never runs the text.
+
+A shell taking commands from a script operand or `-c` does not execute its
+piped input. Ordinary data sinks do not trigger this check. A shell sink
+refuses unsupported literal escapes or `printf` conversions rather than
+assuming the output is safe. This pass does not look up external variables,
+evaluate substitutions, read pre-existing files, or track literal input to
+non-shell interpreters; the existing rules still apply to those commands.
+
 ## Protocol Compatibility
 
 The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and OpenCode workers. The legacy `ironclaw-agent-v1` alias has been removed and is not accepted. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
