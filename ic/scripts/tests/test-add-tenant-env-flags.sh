@@ -350,6 +350,8 @@ EXTRA_DAEMON_SECRET=unrelated-daemon-value
 EOF
 printf '%s\n' 'SANDBOX_GIT_TOKEN_MIRROR="Bearer mirror \"quoted\" \\ token"' >>"$MT_FIXTURE/env/lunarwing.env"
 git_render_log="$MT_FIXTURE/git-render.log"
+git_warning_prefix="warning: tenant 'fixture-tenant': the daemon will refuse SANDBOX_GIT_CREDENTIALS at startup while it has"
+git_warning_fix="Rename the credential variable to SANDBOX_GIT_TOKEN_<NAME> and update the binding, or remove the binding."
 for git_rerun in first second; do
   write_tenant_lunarwing_env fixture-tenant >"$git_render_log" 2>&1
   assert_eq "$git_rerun rerun preserves SANDBOX_GIT_REMOTES" "$(envval SANDBOX_GIT_REMOTES)" \
@@ -374,10 +376,10 @@ for git_rerun in first second; do
   # the render does not carry its value either.
   assert_eq "$git_rerun rerun does not carry a binding outside SANDBOX_GIT_TOKEN_*" \
     "$(grep -c '^EXTRA_DAEMON_SECRET=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
-  assert_eq "$git_rerun rerun names the granted remote and out-of-prefix variable" \
-    "$(grep -cF "remote 'ext' bound to 'EXTRA_DAEMON_SECRET'" "$git_render_log" || true)" "1"
-  assert_eq "$git_rerun rerun names the granted remote and invalid token suffix" \
-    "$(grep -cF "remote 'bad' bound to 'SANDBOX_GIT_TOKEN_bad-name'" "$git_render_log" || true)" "1"
+  assert_eq "$git_rerun rerun explains refusal and fix for the out-of-prefix variable" \
+    "$(grep -cFx "$git_warning_prefix remote 'ext' bound to 'EXTRA_DAEMON_SECRET'. $git_warning_fix" "$git_render_log" || true)" "1"
+  assert_eq "$git_rerun rerun explains refusal and fix for the invalid token suffix" \
+    "$(grep -cFx "$git_warning_prefix remote 'bad' bound to 'SANDBOX_GIT_TOKEN_bad-name'. $git_warning_fix" "$git_render_log" || true)" "1"
   assert_eq "$git_rerun rerun does not print skipped credential values" \
     "$(grep -cE 'unrelated-daemon-value|invalid-suffix-fixture-value' "$git_render_log" || true)" "0"
   # F6: only a remote SANDBOX_GIT_REMOTES grants can carry a variable.
