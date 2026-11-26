@@ -567,8 +567,8 @@ version.
   daemon and rebuild the WASM channel (registry 0.1.25).
 - **The channel and tool registries patch-bump with their crates (WI#799).**
   Channels are darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19` and xmpp
-  `0.1.24`. Every tool whose source or dependencies moved in the sweep is
-  patch-bumped: cavepony-tool `0.4.13`, gitlab `0.1.18`, gotify `0.1.9`,
+  `0.1.25`. Every tool whose source or dependencies moved in the sweep is
+  patch-bumped: cavepony-tool `0.4.13`, gitlab `0.1.19`, gotify `0.1.9`,
   llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`,
   vision-analyze `0.2.4`, voice-transcribe `0.1.10` and web-search `0.2.12`.
 
@@ -684,11 +684,13 @@ version.
   restarts a lane itself. `mt-admin`'s help now describes a missing worker
   port, and the onboarding worker-readiness contract and the Kageho runbook
   state the requirement.
-- **An invalid credential binding warns instead of failing silently
-  (WI#893).** When `SANDBOX_GIT_CREDENTIALS` binds a remote to a name that is
-  not a `SANDBOX_GIT_TOKEN_<NAME>` secret, the env render now prints a warning
-  naming the tenant, the remote and the binding, and skips that binding
-  instead of emitting a credential variable nothing will read.
+- **An invalid credential binding blocks tenant startup (WI#893, WI#901).**
+  If a granted remote is bound to a variable whose name does not match
+  `SANDBOX_GIT_TOKEN_<NAME>`, the env render warns that the daemon will refuse
+  `SANDBOX_GIT_CREDENTIALS` at startup and names the tenant, the remote and the
+  variable. The render keeps the binding in the setting, so the tenant cannot
+  start until you rename the credential variable to `SANDBOX_GIT_TOKEN_<NAME>`
+  and update the binding, or remove the binding.
 - **The relay's limits and its failure attribution are documented (WI#834,
   WI#836).** `ic/src/NETWORK_SECURITY.md` now states the 32-live-connection
   cap, that finished connections are reaped while the lifetime accept count
@@ -740,7 +742,7 @@ version.
 |---|---|
 | Owned packages / core Rust | Eleven packages at `2.2.2` (daemon, five workspace crates, XMPP bridge, four WASM channels); all eight inter-crate path requirements at `2.2.2`; Rust 2024, MSRV `1.96.1` |
 | WASM runtime | Wasmtime/WASI `36.0.23` in `ic/Cargo.lock` (manifest floor `36.0.22`); `[bans]` denies `wasmtime` before `36.0.20` and `wasmtime-wasi` before `36.0.22` within 36.x; the `wasmtime-internal-cache` patch stays on that line |
-| Channel registry | darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19`, xmpp `0.1.24` |
+| Channel registry | darkirc `0.1.18`, multica `0.1.22`, weechat `0.2.19`, xmpp `0.1.25` |
 | Tool registry | cavepony-tool `0.4.13`, gitlab `0.1.19`, gotify `0.1.9`, llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`, vision-analyze `0.2.4`, voice-transcribe `0.1.10`, web-search `0.2.12` |
 | External workers | Kimi Code `2.7.2`, OpenCode `v1.19.6` (`f4e363c82…`), OpenCode 2 `v2.3.2` (`c0ad18b40…`), Pebble `2d0f3786…`, LunarDepth `ca905dfe5…` |
 | Worker toolchain | Debian snapshot `20261105T082236Z`; Node `22.23.4` (Kimi, LunarDepth); pnpm `11.7.0` (LunarDepth); Bun `1.4.4` (OpenCode lanes) |
@@ -850,12 +852,10 @@ do not replace those gates.
   fetched content reaches a shell (`x=$(curl …); y=$x; $y`), and Git's own
   listeners (`git daemon`, `git instaweb`) and Git programs named by their
   dashed path are documented limits, not defects. `rename` and interpreter
-  renames still pass, as do the git preflight's unread shell shapes (`env -u`,
-  `!`, `{ … }`, `timeout -s`, `nice -n`). WI#887 closed `flock -c`, `watch`,
-  `su -c` and `parallel` as launchers, and WI#858 already reads `eval`,
-  `taskset`, `script -c`, process substitutions `<(…)` and brace expansion, so
-  those are no longer limits. The egress allowlist and the container remain
-  the boundary.
+  renames still pass. WI#887 closed `flock -c`, `watch`, `su -c` and `parallel`
+  as launchers, and WI#858 already reads `eval`, `taskset`, `script -c`,
+  process substitutions `<(…)` and brace expansion, so those are no longer
+  limits. The egress allowlist and the container remain the boundary.
 - **The shell git grant carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
