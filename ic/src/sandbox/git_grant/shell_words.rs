@@ -96,7 +96,8 @@ struct Lexer {
     words: Vec<Word>,
     atoms: Vec<Atom>,
     case: Vec<CasePhase>,
-    extglob: bool,
+    extglob_enabled: bool,
+    extglob_word: bool,
 }
 
 impl Lexer {
@@ -131,23 +132,22 @@ impl Lexer {
                 }
                 true
             }
-            _ if self
-                .words
-                .iter()
-                .all(|word| is_command_prefix_word(&word.text)) =>
-            {
-                if self.keyword("case") {
-                    self.case.push(CasePhase::Subject);
-                    true
-                } else if self.keyword("esac") && !self.case.is_empty() {
-                    self.case.pop();
-                    true
-                } else {
-                    false
-                }
+            _ if self.keyword("case") && self.before_command() => {
+                self.case.push(CasePhase::Subject);
+                true
+            }
+            _ if self.keyword("esac") && self.before_command() && !self.case.is_empty() => {
+                self.case.pop();
+                true
             }
             _ => false,
         }
+    }
+
+    fn before_command(&self) -> bool {
+        self.words
+            .iter()
+            .all(|word| is_command_prefix_word(&word.text))
     }
 
     fn set_case_phase(&mut self, phase: CasePhase) {
@@ -160,21 +160,42 @@ impl Lexer {
         if !self.atoms.is_empty() && !self.case_syntax() {
             let first = self.words.len();
             let mut budget = BraceBudget::default();
-            if expand_braces(&self.atoms, self.extglob, &mut self.words, &mut budget, 0).is_err() {
+            if expand_braces(
+                &self.atoms,
+                self.extglob_word,
+                &mut self.words,
+                &mut budget,
+                0,
+            )
+            .is_err()
+            {
                 self.words.truncate(first);
-                let mut word = source_word(&self.atoms, self.extglob);
+                let mut word = source_word(&self.atoms, self.extglob_word);
                 word.expansion = Expansion::UnexpandedBrace;
                 self.words.push(word);
             }
         }
         self.atoms.clear();
-        self.extglob = false;
+        self.extglob_word = false;
     }
 
     fn finish_command(&mut self) {
-        if !self.words.is_empty() {
-            self.commands.push(std::mem::take(&mut self.words));
+        if self.words.is_empty() {
+            return;
         }
+        let command_index = self
+            .words
+            .iter()
+            .position(|word| !is_command_prefix_word(&word.text));
+        if let Some((command, options)) =
+            command_index.and_then(|index| self.words[index..].split_first())
+            && command.text == "shopt"
+            && options.iter().any(|word| word.text == "extglob")
+            && options.iter().any(|word| word.text == "-s")
+        {
+            self.extglob_enabled = true;
+        }
+        self.commands.push(std::mem::take(&mut self.words));
     }
 
     fn separator(&mut self, ch: char, chars: &mut Peekable<Chars<'_>>) {
@@ -196,9 +217,11 @@ impl Lexer {
     }
 
     fn extglob_starts_here(&self) -> bool {
-        self.atoms
-            .last()
-            .is_some_and(|atom| atom.kind == Kind::Unquoted && "@+?*!".contains(atom.ch))
+        self.extglob_enabled
+            && self
+                .atoms
+                .last()
+                .is_some_and(|atom| atom.kind == Kind::Unquoted && "@+?*!".contains(atom.ch))
     }
 
     fn quoted(&mut self, quote: char, chars: &mut Peekable<Chars<'_>>, depth: usize) -> Result<()> {
@@ -237,7 +260,8 @@ impl Lexer {
         if let Some((open, close)) = group {
             let body = read_group(chars, open, close)?;
             if open != '{' {
-                self.commands.extend(tokenize(&body, depth + 1)?);
+                self.commands
+                    .extend(tokenize(&body, self.extglob_enabled, depth + 1)?);
             }
             self.push_text(&body, Kind::Dynamic);
             self.push(close, Kind::Dynamic);
@@ -246,15 +270,18 @@ impl Lexer {
     }
 }
 
-pub(super) fn tokenize_simple_commands(input: &str) -> Result<Vec<Vec<Word>>> {
-    tokenize(input, 0)
+pub(super) fn tokenize_simple_commands(input: &str, extglob: bool) -> Result<Vec<Vec<Word>>> {
+    tokenize(input, extglob, 0)
 }
 
-fn tokenize(input: &str, depth: usize) -> Result<Vec<Vec<Word>>> {
+fn tokenize(input: &str, extglob: bool, depth: usize) -> Result<Vec<Vec<Word>>> {
     if depth > 4 {
         return Err(denied("nested shell expansion is too deep to authorize"));
     }
-    let mut lexer = Lexer::default();
+    let mut lexer = Lexer {
+        extglob_enabled: extglob,
+        ..Lexer::default()
+    };
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
@@ -270,7 +297,7 @@ fn tokenize(input: &str, depth: usize) -> Result<Vec<Vec<Word>>> {
             }
             '$' | '`' => lexer.dynamic(ch, &mut chars, depth)?,
             '(' if lexer.extglob_starts_here() => {
-                lexer.extglob = true;
+                lexer.extglob_word = true;
                 lexer.push('(', Kind::Literal);
                 lexer.push_text(&read_group(&mut chars, '(', ')')?, Kind::Literal);
                 lexer.push(')', Kind::Literal);
@@ -482,6 +509,7 @@ fn brace_group(atoms: &[Atom]) -> std::result::Result<Option<BraceGroup>, ()> {
         .filter(|(_, atom)| atom.kind == Kind::Unquoted)
     {
         match atom.ch {
+            '{' if stack.len() == MAX_BRACE_DEPTH => return Err(()),
             '{' => stack.push((index, Vec::new())),
             ',' => {
                 if let Some((_, commas)) = stack.last_mut() {
@@ -678,26 +706,29 @@ fn classify_glob(atoms: &[Atom]) -> Expansion {
                 }
         )
     });
+    let directories = directory.split(|atom| atom.ch == '/');
+    if !has_glob && !directories.clone().any(|part| glob_pattern(part).1) {
+        return Expansion::None;
+    }
     let git_name = anchored && GIT_PROGRAMS.iter().any(|name| glob_matches(&pattern, name));
     let git_core = anchored
-        && has_glob
         && !git_name
-        && directory
-            .split(|atom| atom.ch == '/')
+        && matches_dashed_prefix(&pattern)
+        && directories
+            .clone()
             .any(|part| glob_matches(&glob_pattern(part).0, "git-core"));
-    if (git_name && has_glob)
-        || (git_name && !directory.is_empty() && glob_pattern(directory).1)
-        || (git_core && matches_dashed_prefix(&pattern))
-    {
+    if git_name || git_core {
         Expansion::GitGlob
-    } else if has_glob || glob_pattern(directory).1 {
-        Expansion::Glob
     } else {
-        Expansion::None
+        Expansion::Glob
     }
 }
 
 fn glob_pattern(atoms: &[Atom]) -> (Vec<GlobAtom>, bool) {
+    let unquoted_bracket = atoms
+        .iter()
+        .rposition(|atom| atom.is(']'))
+        .unwrap_or_default();
     let mut pattern = Vec::new();
     let mut has_glob = false;
     let mut index = 0;
@@ -707,7 +738,8 @@ fn glob_pattern(atoms: &[Atom]) -> (Vec<GlobAtom>, bool) {
             (Kind::Quote, _) => continue,
             (Kind::Unquoted, '*') => GlobAtom::Star,
             (Kind::Unquoted, '?') => GlobAtom::Any,
-            (Kind::Unquoted, '[') => match glob_class(&atoms[index..]) {
+            (Kind::Unquoted, '[') if index <= unquoted_bracket => match glob_class(&atoms[index..])
+            {
                 Some((class, length)) => {
                     index += length;
                     class
