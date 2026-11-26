@@ -8,3 +8,4 @@
 * start dev of tensormoon up again
 * MCafe 4SIGM
 * CUA
+* CU WASM tool
