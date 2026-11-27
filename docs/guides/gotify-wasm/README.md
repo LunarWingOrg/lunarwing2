@@ -2,11 +2,7 @@
 
 A WASM tool for LunarWing that sends push notifications to a self-hosted Gotify server.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** Registry manifest,
-capability sidecar, and crate all use `0.1.10`. The compiled-in defaults
-(`https://gotify.darkc.sobe.world`, title `LunarWing`) and the
-`configure-gotify`/`--gotify-url`/`--gotify-title` mt-admin paths are the
-starting point for the configuration below.
+The registry manifest and WASM source crate are both version `0.1.10`.
 
 ## Build and Install
 
@@ -19,13 +15,15 @@ lunarwing registry install gotify --build
 
 `registry install --build` uses the manifest in `ic/registry/tools/gotify.json`, builds the WASM component from source, and installs its capability sidecar. Configure the token separately as described under [Secrets](#secrets).
 
-For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install both `gotify.wasm` and `gotify.capabilities.json` below `${LUNARWING_BASE_DIR:-$HOME/.lunarwing}/tools/`, then restart LunarWing.
+For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install `gotify.wasm` and `gotify.capabilities.json` in the running instance's `<base_dir>/tools/` directory, then restart LunarWing. The bare daemon uses `~/.ironclaw` when neither base-directory environment variable is set.
 
 ## Configuration
 
 ### Gotify URL and Title
 
-By default the tool sends notifications to `https://gotify.darkc.sobe.world` with the title `LunarWing`. Both are configurable via the workspace config.
+Configure your own Gotify base URL before sending notifications. The guest
+falls back to `DEFAULT_GOTIFY_URL` in `lunarwing-gotify-tool/src/lib.rs`
+and the title `LunarWing` when it has no usable configuration.
 
 **1. Workspace document** — create `config/gotify.json` in the agent's workspace (the database-backed workspace store, e.g. with the agent's `memory_write`):
 
@@ -33,11 +31,19 @@ By default the tool sends notifications to `https://gotify.darkc.sobe.world` wit
 {"url": "https://your-gotify.example.com", "title": "My Agent"}
 ```
 
-**2. On-disk operator config** — the host also reads `<LUNARWING_BASE_DIR>/workspace/config/gotify.json` at tool-execution time and merges it into the tool's workspace view. On a multi-tenant host `LUNARWING_BASE_DIR` is the tenant state directory, so this is where `lunarwing-mt-admin.sh add-tenant --gotify-url` and `configure-gotify` write the file. The on-disk file takes precedence over a workspace document: mt-admin rewrites the capability allowlist from that same file, so the effective URL and the allowlist always name the same host. Symlinked files and files over 64 KiB are ignored.
+**2. On-disk operator config** — for `gotify` and `gotify-tool` with a workspace
+read grant covering `config/gotify.json`, the WASM wrapper adds the on-disk
+file after successfully listing the workspace. A readable regular file of at most 64 KiB at
+`<LUNARWING_BASE_DIR>/workspace/config/gotify.json` takes precedence over the
+workspace document. The reader skips a symlink at the file itself. A failed
+workspace listing leaves the preload empty. In a managed tenant, mt-admin
+writes the file under the tenant state directory.
 
 The tool appends `/message` automatically, so provide just the base URL. The `title` field is optional — if omitted, the compiled-in default (`LunarWing`) is used. The title serves as the default for notifications when the caller doesn't specify one explicitly.
 
-**3. Capabilities file** — edit `gotify.capabilities.json` to allow HTTP to the new host. Update both the `allowlist` host and the `credentials.host_patterns`:
+**3. Capabilities file** — update the installed sidecar to allow requests to
+the new host. Registry installs use `gotify.capabilities.json`. MT admin
+`install-wasm` uses `gotify-tool.capabilities.json`. Update both the `allowlist` host and the `credentials.host_patterns`:
 
 ```json
 {
@@ -66,7 +72,9 @@ The tool appends `/message` automatically, so provide just the base URL. The `ti
 }
 ```
 
-Both changes take effect on restart — no WASM rebuild needed. In a multi-tenant deployment, do not hand-edit either one: `configure-gotify` writes the workspace config and rewrites the capabilities host together.
+Restart after changing the installed capability file to reload the allowlist.
+The WASM wrapper reads the workspace config on each execution. In a managed
+tenant, use `configure-gotify` to keep the two files in step.
 
 If no config is found or it is unparseable, the tool falls back to the compiled-in defaults (URL and title).
 
@@ -81,17 +89,23 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent \
   --llm-base-url https://llm.example.com/v1 \
   --gotify-url https://gotify.example.com --gotify-title "My Agent"
 ```
-Writes `<tenant state>/workspace/config/gotify.json` at provisioning time. That is `<LUNARWING_BASE_DIR>/workspace/config/gotify.json`, which the daemon merges into the tool's workspace view on every execution. The capabilities file is automatically rewritten from the same URL when WASM tools are installed (`install-wasm`), and by `configure-gotify` immediately.
+Provisioning writes `<tenant state>/workspace/config/gotify.json`. MT admin
+`install-wasm` reads the configured URL and updates the installed
+`gotify-tool.capabilities.json` allowlist and credential host pattern.
 
 To reconfigure an existing tenant:
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-gotify myagent https://new-gotify.example.com "My Agent"
 ```
-Rewrites both the workspace config and the capability allowlist/credential host pattern, so the tool and the allowlist move together.
+This writes the on-disk config and updates `gotify-tool.capabilities.json`
+if it is already installed. Restart the tenant to load the updated sidecar.
 
 **Test harness** (`lunarwing-xmpp-test-env.sh`):
 
-Set `LUNARWING_TEST_GOTIFY_URL` and optionally `LUNARWING_TEST_GOTIFY_TITLE` before running `install-wasm`. URL defaults to `https://gotify.darkc.sobe.world`.
+Set `LUNARWING_TEST_GOTIFY_URL` and optionally `LUNARWING_TEST_GOTIFY_TITLE` before
+running `install-wasm`. An unset URL selects the harness script
+`ic/scripts/lunarwing-xmpp-test-env.sh`'s built-in endpoint. Set the URL explicitly
+to test against your own server.
 
 **Environment variables:**
 
@@ -148,6 +162,7 @@ For routine prompts that use Gotify, see `ic/docs/GOTIFY_ROUTINE_PROMPT.md`.
 
 The tool runs inside the WASM sandbox. It cannot read secrets or environment variables directly. The host runtime:
 
-1. Reads `config/gotify.json` into the tool's workspace view when the tool calls `workspace-read` — the on-disk operator file (`<base_dir>/workspace/config/gotify.json`) first, then the workspace document
-2. Injects the `gotify_app_token` into the HTTP request's `X-Gotify-Key` header at the host boundary
-3. Validates the outbound URL against the capabilities allowlist before sending
+1. Preloads the workspace document and overlays the eligible on-disk operator
+   file. The guest looks up `config/gotify.json` with `workspace-read`.
+2. Checks the outbound URL against the capability allowlist.
+3. Injects `gotify_app_token` as `X-Gotify-Key` on requests to matching hosts.
