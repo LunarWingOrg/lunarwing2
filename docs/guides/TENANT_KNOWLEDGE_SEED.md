@@ -182,10 +182,10 @@ without importing directly, run `sync-knowledge-sources`.
   wires the shared MCP read-only but never arms the seed. `upgrade-tenant`
   patches the tenant env but does not set the seed flag. Env regeneration
   only carries an existing value forward (including an explicit `=0` opt-out).
-- **The bootstrap runs exactly once per tenant.** A state file
-  (`knowledge_seed_state.json`, see below) is written once the pass has walked
-  every discovered note; later startups skip that bootstrap entirely. The
-  separate refresh cadence can still add paths published afterward.
+- **A completed bootstrap is not repeated.** The daemon records completion in
+  `knowledge_seed_state.json` after walking every discovered note. Later startups
+  skip bootstrap only if that marker is valid. The separate refresh cadence can
+  still add paths published afterward.
 - **Never overwrites.** Both bootstrap and refresh skip a note whose workspace path already exists
   byte-for-byte, so operator-authored notes survive even a forced re-seed. The
   only writes to existing paths repair a previous seed pass's own stranded
@@ -200,8 +200,10 @@ without importing directly, run `sync-knowledge-sources`.
   bodies, invalid slugs) are warned in the log and recorded in the state file,
   but never crash the agent and never turn the one-shot seed into a per-boot
   rescan.
-- **Crash-safe.** A crash mid-pass leaves no state marker, so the next startup
-  simply resumes (already-imported notes are skipped as existing).
+- **Crash-safe.** After the pass, the daemon syncs a temporary marker and
+  atomically renames it into place. If no valid marker is present, the next
+  enabled startup retries bootstrap and skips already-imported notes. The
+  daemon warns when it finds an invalid or unreadable marker.
 - **Missing checkout retries.** If the checkout directory is not present at
   startup, the pass is skipped with a warning and retried on the next startup
   (no marker is written).
@@ -246,7 +248,8 @@ After provisioning and the first `start-tenant`:
 
    ```json
    {
-     "seeded_at": "...",
+     "schema_version": 1,
+     "seeded_at": "2026-08-22T17:00:00Z",
      "source_home": "/var/cache/lunarwing/lw2studymcp",
      "notes_seeded": 1249,
      "notes_skipped_existing": 4,
@@ -254,8 +257,9 @@ After provisioning and the first `start-tenant`:
    }
    ```
 
-   `notes_failed` entries are upstream junk notes (empty bodies, invalid
-   slugs); they are counted and never retried per boot.
+   Complete older markers without `schema_version` still prevent a rerun.
+   `notes_failed` counts individual import failures; while the marker is valid,
+   bootstrap does not retry those notes on each boot.
 
 4. **Store populated:** the tenant's PostgreSQL contains
    `study-notes/<agent>/<topic>.md` documents (verification run: 1,249
@@ -291,7 +295,8 @@ After provisioning and the first `start-tenant`:
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` present but no seed log | `LW2STUDYMCP_HOME` unset, or checkout missing (double-check warning in daemon log) | `configure-study-mcp <name> --sync` |
 | `knowledge seed: ... not found; will retry on next startup` | Checkout directory missing at startup | Re-sync via `configure-study-mcp <name> --sync`, then restart the tenant |
 | `N note(s) failed ... seed is complete and will not rerun` | Upstream junk notes (empty bodies, invalid slugs) counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
-| Daemon restarted mid-import | No seed marker written; bootstrap resumes from scratch | Nothing; already-imported notes are skipped |
+| Daemon restarted mid-import | No valid completion marker was published; bootstrap retries | Nothing; already-imported notes are skipped |
+| `invalid or unreadable completion marker` | The existing marker cannot prove completion | Bootstrap retries automatically. If the warning repeats, check the checkout and state directory permissions |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
 | Refresh succeeds but an upstream edit is absent | Additive mode never replaces an existing path | Expected; wait for the hosted revisioned-delta implementation or resolve manually |
 

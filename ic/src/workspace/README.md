@@ -443,11 +443,12 @@ Scopes: reads span the caller's private scope plus the shared herd scope
   (`$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md`) into the
   tenant's private scope, preserving the canonical metadata (status,
   confidence, studied timestamp, source commit, tags, staleness thresholds).
-  A JSON state file (`knowledge_seed_state.json` under the base dir, recording
-  seeded/skipped/failed counts) makes the pass run at most once; note paths
-  that already exist are always skipped, so the seed itself never repopulates
-  the store and operator-authored notes are never overwritten. Per-note
-  failures are logged and recorded in the state file without blocking the
+  The daemon atomically publishes `knowledge_seed_state.json` under the base
+  directory after the pass, recording seeded/skipped/failed counts. Only a
+  valid completion marker suppresses bootstrap on later startups; complete
+  markers from before schema versioning still count. Without a valid marker,
+  the next enabled startup retries the import and skips already-imported notes.
+  Per-note failures are logged and recorded without blocking the
   marker, so unimportable upstream notes cannot turn the one-shot seed into a
   per-boot rescan. The env flag is written only on the add-tenant path — never
   by `configure-study-mcp` or `upgrade-tenant` — so existing tenants upgraded
