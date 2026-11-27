@@ -45,6 +45,14 @@ For a true positive, revocation or rotation must be complete before acceptance.
 | 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml` 1.2.2+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_edit/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_edit` 0.25.20+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml_edit` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
 | 2026-11-21 | `aacffdd477516e7890993af69e0810e7bf806ceb:ic/vendor/toml_parser/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_parser` 1.1.6+spec-1.1.0 (v2.2.2.0 crate sweep, WI#799). The file is cargo's checksum manifest: SHA-256 digests of the crate's files, not a credential. The package digest in it equals the `toml_parser` checksum in `ic/Cargo.lock`. Same class as the existing `.cargo-checksum.json` pins recorded above. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/clap_builder/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `clap_builder` 4.6.10 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/hickory-proto/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `hickory-proto` 0.26.4 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `russh` 0.65.4 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/sha2/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `sha2` 0.11.2 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml` 1.2.3+spec-1.1.0 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml_edit/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_edit` 0.25.21+spec-1.1.0 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml_parser/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `toml_parser` 1.1.7+spec-1.1.0 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
+| 2026-11-27 | `7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/zlib-rs/.cargo-checksum.json:generic-api-key:1` | False positive | Vendored `zlib-rs` 0.6.9 (WI#911). The cargo checksum manifest contains SHA-256 digests, not credentials. Its package digest matches `ic/Cargo.lock`, and the listed file digests match the vendored files. |
 
 No new fingerprints were accepted by the change that introduced this log.
 
@@ -66,6 +74,12 @@ fixtures, and the baseline was updated through the draft/review/accept flow of
 `.gitlab/scripts/refresh-secret-history-baseline.py` before merge. Each is a
 cargo checksum manifest whose package digest equals the crate's checksum in
 `ic/Cargo.lock`; none records a secret value or matched content.
+
+The v2.2.3.0 sweep (WI#911) added 8 checksum-manifest fingerprints
+in vendor commit `7e006a555`. The baseline was drafted after that commit
+and refreshed in the same merge request after checking each package digest
+against its lock and each listed file digest against the vendored tree.
+Only the exact fingerprints were accepted; no matched values are recorded.
 
 ## Historical baseline triage closure (WI#575)
 
