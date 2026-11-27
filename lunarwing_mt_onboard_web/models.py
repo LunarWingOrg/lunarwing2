@@ -221,6 +221,9 @@ class ImportRequest(RequestModel):
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
+    with_opencode2: bool = False
+    opencode2_model: str = ""
+    opencode2_base_url: str = ""
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
@@ -255,6 +258,9 @@ class ImportRequest(RequestModel):
             with_pebble=self.with_pebble,
             with_opencode=self.with_opencode,
             with_kimi=self.with_kimi,
+            with_opencode2=self.with_opencode2,
+            opencode2_model=self.opencode2_model.strip(),
+            opencode2_base_url=self.opencode2_base_url.strip(),
             with_toolchains=self.with_toolchains,
             with_vision=self.with_vision,
             docker_group=self.docker_group,
