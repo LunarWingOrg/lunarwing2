@@ -32,11 +32,12 @@ and the title `LunarWing` when it has no usable configuration.
 ```
 
 **2. On-disk operator config** — for `gotify` and `gotify-tool` with a workspace
-read grant covering `config/gotify.json`, the WASM wrapper preloads that path
-before execution. A readable regular file of at most 64 KiB at
+read grant covering `config/gotify.json`, the WASM wrapper adds the on-disk
+file after successfully listing the workspace. A readable regular file of at most 64 KiB at
 `<LUNARWING_BASE_DIR>/workspace/config/gotify.json` takes precedence over the
-workspace document. The reader skips a symlink at the file itself. In a managed
-tenant, mt-admin writes the file under the tenant state directory.
+workspace document. The reader skips a symlink at the file itself. A failed
+workspace listing leaves the preload empty. In a managed tenant, mt-admin
+writes the file under the tenant state directory.
 
 The tool appends `/message` automatically, so provide just the base URL. The `title` field is optional — if omitted, the compiled-in default (`LunarWing`) is used. The title serves as the default for notifications when the caller doesn't specify one explicitly.
 
