@@ -51,8 +51,10 @@ XMPP_ALLOW_ROOMS=coordination@conference.example.org
 At startup, `migrate_native_xmpp_to_installable` copies the resolved room list
 into `extensions.xmpp.setup_fields.rooms` when the daemon has XMPP credentials,
 the installable channel, and a settings store. The legacy `xmpp_allow_rooms`
-setting is the fallback when `XMPP_ALLOW_ROOMS` is unset or empty. For a tenant
-configured through extension setup alone, set the XMPP `rooms` field there.
+setting is the fallback when `XMPP_ALLOW_ROOMS` is unset or empty. A re-run
+of `add-tenant` resets `XMPP_ALLOW_ROOMS` to empty. The `ic/scripts/upgrade-tenant.sh`
+wrapper restores that key from its environment backup. For a tenant configured
+through extension setup alone, set the XMPP `rooms` field there.
 
 For direct configure calls, `ic/scripts/xmpp-configure.sh` accepts
 `XMPP_ALLOW_ROOMS_JSON` in its environment. Keep the same room in each tenant's
