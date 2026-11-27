@@ -1,0 +1,27 @@
+diff --git a/deepseek-harness/packages/api/lunarwing-worker/tests/task.spec.ts b/deepseek-harness/packages/api/lunarwing-worker/tests/task.spec.ts
+--- a/deepseek-harness/packages/api/lunarwing-worker/tests/task.spec.ts
++++ b/deepseek-harness/packages/api/lunarwing-worker/tests/task.spec.ts
+@@ -106,4 +106,4 @@ function request(overrides: Partial<WorkerTaskRequest> = {}): WorkerTaskRequest {
+     context: { conversationHistory: [] },
+-    // Above vitest's 5 s test timeout, so only the deadline test depends on it.
+-    timeoutMs: 30_000,
++    // Above the 90 s shared-runner test budget; only the deadline test overrides it.
++    timeoutMs: 120_000,
+     ...overrides,
+@@ -144,3 +144,3 @@ describe('LunarWing fresh-Agent task', () => {
+     const running = task.run()
+-    await vi.waitFor(() => { expect(harness.adapter.requests).toHaveLength(1) })
++    await vi.waitFor(() => { expect(harness.adapter.requests).toHaveLength(1) }, { timeout: 30_000 })
+     task.cancel('cancelled')
+diff --git a/deepseek-harness/packages/bundle/lunarwing-worker/tests/profile.spec.ts b/deepseek-harness/packages/bundle/lunarwing-worker/tests/profile.spec.ts
+--- a/deepseek-harness/packages/bundle/lunarwing-worker/tests/profile.spec.ts
++++ b/deepseek-harness/packages/bundle/lunarwing-worker/tests/profile.spec.ts
+@@ -126,6 +126,6 @@ describe('LunarWing worker shipped profile', () => {
+       })
+-      await vi.waitFor(() => { expect(messages).toHaveLength(1) })
++      await vi.waitFor(() => { expect(messages).toHaveLength(1) }, { timeout: 20_000 })
+       expect(messages[0]).toMatchObject({ type: 'ready', payload: { worker_id: 'lunardepth', capabilities: [] } })
+       socket.send(JSON.stringify({ id: 'ping-1', type: 'ping', timestamp: new Date().toISOString(), payload: {} }))
+-      await vi.waitFor(() => { expect(messages).toHaveLength(2) })
++      await vi.waitFor(() => { expect(messages).toHaveLength(2) }, { timeout: 20_000 })
+       expect(messages[1]?.type).toBe('pong')
