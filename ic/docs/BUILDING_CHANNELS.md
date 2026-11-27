@@ -6,6 +6,13 @@ This guide covers how to build WASM channel modules for LunarWing.
 
 Channels are WASM components that handle communication with external messaging platforms (XMPP, WeeChat, DarkIRC, etc.). They run in a sandboxed environment and communicate with the host via the WIT (WebAssembly Interface Types) interface.
 
+The host's callback timeout defaults to 30 seconds. Returning a timeout to the
+caller does not cancel guest code already running on a blocking thread. Each
+callback's WASM store also uses the module's resource timeout (60 seconds by
+default) as a separate, coarse-grained epoch deadline. That deadline can trap
+executing guest code but cannot interrupt an in-progress host call. Fuel and
+memory limits still apply.
+
 ## Directory Structure
 
 ```

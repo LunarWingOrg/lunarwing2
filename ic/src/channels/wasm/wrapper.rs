@@ -56,8 +56,6 @@ use crate::error::ChannelError;
 use crate::pairing::PairingStore;
 use crate::safety::LeakDetector;
 use crate::secrets::SecretsStore;
-use crate::tools::wasm::LogLevel;
-use crate::tools::wasm::WasmResourceLimiter;
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
 };
@@ -68,6 +66,7 @@ use crate::tools::wasm::http_security::{
 };
 #[cfg(test)]
 use crate::tools::wasm::http_security::{encoded_spellings, form_encode_secret};
+use crate::tools::wasm::{EPOCH_TICK_INTERVAL, LogLevel, WasmResourceLimiter};
 
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
@@ -1468,9 +1467,16 @@ impl WasmChannel {
                 .map_err(|e| WasmChannelError::Config(format!("Failed to set fuel: {}", e)))?;
         }
 
-        // Configure epoch deadline for timeout backup
+        // The module's timeout backs up the separate caller-facing timeout.
+        // Allow for a partial first tick so the epoch trap doesn't fire early.
+        let ticks = limits
+            .timeout
+            .as_nanos()
+            .div_ceil(EPOCH_TICK_INTERVAL.as_nanos())
+            + 1;
+        // Wasmtime adds the delta to its current epoch, so leave headroom.
+        store.set_epoch_deadline(ticks.min(u128::from(u64::MAX / 2)) as u64);
         store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
 
         // Set up resource limiter
         store.limiter(|data| &mut data.limiter);
@@ -4179,6 +4185,41 @@ mod tests {
             Arc::new(PairingStore::new()),
             None,
         )
+    }
+
+    #[test]
+    fn test_channel_epoch_deadline_uses_module_timeout() {
+        let mut channel = create_test_channel();
+        Arc::get_mut(&mut channel.prepared).unwrap().limits.timeout =
+            std::time::Duration::from_secs(20);
+        let engine = channel.runtime.engine();
+        let module = wasmtime::Module::new(engine, r#"(module (func (export "noop")))"#).unwrap();
+        let mut store = WasmChannel::create_store(
+            &channel.runtime,
+            &channel.prepared,
+            &channel.capabilities,
+            HashMap::new(),
+            Vec::new(),
+            Arc::clone(&channel.pairing_store),
+            channel.allowed_bridge_origins.clone(),
+        )
+        .unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let noop = instance
+            .get_typed_func::<(), ()>(&mut store, "noop")
+            .unwrap();
+
+        for _ in 0..20 {
+            engine.increment_epoch();
+        }
+        noop.call(&mut store, ())
+            .expect("store must outlast the 5s caller timeout under its separate 20s budget");
+
+        for _ in 0..21 {
+            engine.increment_epoch();
+        }
+        let error = noop.call(&mut store, ()).unwrap_err();
+        assert_eq!(error.downcast_ref(), Some(&wasmtime::Trap::Interrupt));
     }
 
     #[tokio::test]
