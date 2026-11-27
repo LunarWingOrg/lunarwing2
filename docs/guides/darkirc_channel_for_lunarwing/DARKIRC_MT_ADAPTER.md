@@ -2,11 +2,9 @@
 
 **Status:** As-built. LunarWing provisions a dedicated DarkIRC daemon and HTTP adapter for every DarkIRC-enabled tenant.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** Per-tenant topology,
-mt-admin ownership commands, adapter env contract, and the 3000 ms polling
-floor match the current tree. The WI#376 legacy OpenRC proxy-unit migration
-still refuses DarkIRC OpenRC lifecycle calls until `render-units --all-proxies`
-succeeds; see [`MT-ADMIN-QUICKSTART.md` §8](../MT-ADMIN-QUICKSTART.md).
+On hosts with legacy OpenRC proxy units, the WI#376 migration guard refuses
+DarkIRC lifecycle calls until `render-units --all-proxies` succeeds.
+See [MT admin day-to-day operations](../MT-ADMIN-QUICKSTART.md#8-day-to-day-operations).
 
 This document describes the adapter boundary. Operational contact-key exchange and recovery procedures are in [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md); build and installation steps are in [`DARKIRC_BUILD_GUIDE.md`](DARKIRC_BUILD_GUIDE.md).
 
@@ -98,7 +96,9 @@ The adapter:
 - paces outbound chunks;
 - journals queued outbound messages when MT configuration enables the durable path.
 
-The channel's 3000 ms polling minimum and host callback capacity are independent from IRC send pacing. Review both sides before changing throughput limits.
+The guest requests a 3-second poll by default. The daemon enforces a
+30-second floor when converting channel capabilities and validating the poll
+request. The callback capacity and interval are separate from IRC send pacing.
 
 ## Contact-Key Isolation
 
