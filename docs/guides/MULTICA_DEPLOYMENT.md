@@ -7,12 +7,8 @@ LunarWing ships two registry extensions for Multica/Lunartica:
 
 This integration is available on the current LunarWing source tree; it is not tied to the retired `1.1.0-new-lunartica` branch.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The channel registry is
-`0.1.22`, the bridge registry/capability version is `0.1.12`, and the WASM
-channel crate is `2.2.2`. The 30-second `poll_interval_ms` clamp, token-presence
-polling gate, required-field validation, and redacted runtime-startup status
-match `ic/channels-src/multica/src/lib.rs` and the extension manager. Referenced
-skill, manifests, and smoke-test scripts are present.
+The channel registry manifest is `0.1.22`, the bridge registry manifest is
+`0.1.12`, and the WASM channel crate is `2.2.2`.
 
 ## Prerequisites
 
@@ -21,7 +17,9 @@ skill, manifests, and smoke-test scripts are present.
 - A unique daemon identifier for this LunarWing instance.
 - A server URL allowed by the installed extension capability policy.
 
-Use HTTPS for remote servers. Plain HTTP remote URLs are rejected by LunarWing's normal outbound URL safety policy unless the deployment explicitly enables private-network access.
+Use HTTPS for remote servers. The WASM host also checks the installed HTTP
+allowlist and uses its own private-address policy. The daemon configuration
+setting `ALLOW_PRIVATE_IPS` does not override those checks.
 
 ## Install the Extensions
 
