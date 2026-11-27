@@ -5,8 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** Read the behavior sections below
-as the current contract. Relevant release changes include:
+The following release changes provide context for the current execution path:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
   WI#321 warns when stored records cannot load and when default projects
@@ -103,10 +102,10 @@ ic/crates/lunarwing_engine/src/
     policy.rs             PolicyEngine (deterministic allow/deny/approve)
     planner.rs            Capability planning logic
   gate/                   Execution gates (approval, auth, rate limits)
-    pipeline.rs           GatePipeline (composes gates in sequence)
+    pipeline.rs           Ordered GatePipeline abstraction (only instantiated by tests)
     mod.rs                GateDecision, GateResolution, ExecutionMode, ResumeKind
     tool_tier.rs          Tool-tier gate logic
-    lease.rs              Lease-gated approval
+    lease.rs              LeaseGate abstraction (only instantiated by tests)
   runtime/                Thread lifecycle management
     manager.rs            ThreadManager (spawn, stop, inject messages, join threads)
     conversation.rs       ConversationManager (routes UI messages to threads)
@@ -116,14 +115,14 @@ ic/crates/lunarwing_engine/src/
     messaging.rs          ThreadSignal, ThreadOutcome, ThreadFailureKind, signal channels
     skill_feedback.rs     Skill usage feedback events (feature-gated)
   executor/               Step execution
-    loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
-    structured.rs         Tier 0: structured tool call execution
+    loop_engine.rs        ExecutionLoop (prepares the thread, runs the orchestrator, persists the outcome)
+    structured.rs         Standalone structured-call executor (only called by tests)
     scripting.rs          Tier 1: embedded Python via Monty (CodeAct/RLM)
-    compaction.rs         Context compaction when approaching model context limit
+    compaction.rs         Standalone compaction helper (outside the running step loop)
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
     llm_stream.rs         LLM streaming support
-    orchestrator.rs       Self-modifiable Python execution layer (CodeAct orchestrator)
+    orchestrator.rs       Python step-loop runner and live structured-call dispatch (Tier 0)
   memory/                 Memory document system
     store.rs              MemoryStore (project-scoped doc CRUD)
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
@@ -159,7 +158,9 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 
 ## Execution Loop
 
-`ExecutionLoop::run()` is the core loop that replaces the v1 `run_agentic_loop()`. It handles three `LlmResponse` variants:
+`ExecutionLoop::run()` prepares the Engine V2 thread and calls
+`execute_orchestrator`. The Python orchestrator drives the step loop for three
+`LlmResponse` variants:
 
 ```
 1. Check signals (Stop, InjectMessage) via mpsc::Receiver
@@ -282,14 +283,16 @@ signals, this is monitor-only. See the
 
 ### Two Execution Tiers
 
-**Tier 0 -- Structured Tool Calls** (`executor/structured.rs`):
+**Tier 0 -- Structured Tool Calls** (`executor/orchestrator.rs`):
 
-Standard tool/function calling. The LLM returns structured `ActionCall` objects. For each call:
-1. Find the capability lease that grants this action
-2. Check the policy engine (allow/deny/approve)
-3. Consume one use from the lease (if use-limited)
-4. Execute via `EffectExecutor`
-5. Record the `ActionResult`
+When the LLM returns structured `ActionCall` objects, the [default Python
+orchestrator](../../ic/crates/lunarwing_engine/orchestrator/default.py) calls `__execute_actions_parallel__`, which dispatches to
+`handle_execute_actions_parallel` in Rust. `handle_execute_action` serves the
+separate `__execute_action__` host function. The handlers look up the lease,
+evaluate policy when the action has a definition, consume one lease use, and
+call `EffectExecutor`. The batch handler runs eligible calls concurrently and
+returns results in call order. `structured.rs::execute_action_calls` implements
+a separate path exercised only by its own tests.
 
 Before lease lookup, `LlmResponse::from_action_calls` consumes CodeAct
 final-answer pseudo-actions (`FINAL`, `FINAL(...)`, `FINAL_VAR`, and malformed
@@ -379,9 +382,9 @@ Key characteristics:
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
-- **Action limit**: each model step can attempt at most 50 tool actions. The cap
-  applies independently to structured batches, CodeAct blocks, and the combined
-  single/parallel action host calls made by the Python orchestrator.
+- **Action limit**: the host resets a shared 50-action allowance at
+  `__llm_complete__`. The structured action handlers and nested CodeAct blocks
+  draw from that same allowance until the next model call.
 - **Host-clock OS calls**: `date.today()` and `datetime.now(tz)` are served from
   the host clock (`OsFunction::DateToday`/`DateTimeNow` — Monty has no clock, so
   these suspend to the host like tool calls). Naive `datetime.now()` returns UTC;
@@ -409,7 +412,11 @@ Key characteristics:
 
 ### Python Orchestrator
 
-The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execution layer that can replace the compiled Rust `ExecutionLoop::run()` loop:
+`ExecutionLoop::run()` always delegates step iteration to the Python
+orchestrator through `executor/orchestrator.rs`. The Rust entry point loads
+the checkpoint, prepares the thread, and persists the outcome.
+`ORCHESTRATOR_SELF_MODIFY` controls selection of the compiled-in or
+Store-versioned Python source.
 
 - Executes via Monty with resource limits
 - Exposes host functions: `__llm_complete__`, `__execute_code_step__`,
@@ -425,7 +432,9 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   prompt. Stored overlays, including those with `source: compiled_in`, are inert
   while disabled. Compiled v0 seeding and failure bookkeeping use the host-only
   `Store::save_internal_memory_doc` path; model metadata is never write authority.
-- Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
+- Uses compiled-in v0 when self-modification is disabled or no stored version
+  is eligible. After three consecutive failures, the loader skips the latest
+  stored version and can select an earlier one.
 - Nudges short roleplay or retry prose back into a `repl` block for non-conversational
   goals, with a default two-attempt cap; substantive prose and short conversational
   goals remain valid terminal responses. Syntax-invalid `repl` blocks use the same
@@ -479,9 +488,8 @@ Memory-retrieval and compaction content is LLM-adjacent data. Retrieved
 content is labeled and neutralized before it can masquerade as engine-authored
 state; for compaction summaries, see the compaction entry below:
 
-- `__retrieve_docs__` is the live retrieval path (the dead `executor/context.rs`
-  doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
-  projected false assurance). Its handler neutralizes role-token openers in
+- `__retrieve_docs__` in `executor/orchestrator.rs` is the live retrieval path.
+  Its handler neutralizes role-token openers in
   returned doc content and stamps each doc with
   `"provenance": "untrusted_memory_retrieval"`, document ID, optional source
   thread ID, visibility scope, and update timestamp. The default orchestrator
@@ -596,26 +604,32 @@ CapabilityLease {
 
 1. **Grant**: `LeaseManager::grant()` creates a lease for a thread
 2. **Check**: `LeaseManager::check()` verifies the lease is valid (not expired, not revoked, uses remaining)
-3. **Consume**: `LeaseManager::consume_use()` decrements the use counter
+3. **Consume**: `LeaseManager::consume_use()` records one use against the lease limit
 4. **Revoke**: `LeaseManager::revoke()` permanently disables the lease
 5. **Expire**: `LeaseManager::expire_stale()` cleans up time-expired leases
 
 ### Policy Engine
 
-The `PolicyEngine` evaluates actions against leases deterministically:
+`PolicyEngine` validates lease validity and action coverage. The library also
+supports effect-based rules and approval decisions, with precedence
+`Deny > RequireApproval > Allow`. For example, `evaluate_with_provenance()`
+can require approval for an LLM-generated call whose action definition declares
+`Financial` or `WriteExternal` effects.
 
-- **Priority**: `Deny > RequireApproval > Allow`
-- **Effect types**: `ReadLocal`, `ReadExternal`, `WriteLocal`, `WriteExternal`, `CredentialedNetwork`, `Compute`, `Financial`
-- Every action declares its side effects via `EffectType`. The policy engine uses these for allow/deny decisions
-- **Provenance types**: origin labels exist for user, system, tool, LLM, and
-  memory-retrieval data. `PolicyEngine::evaluate_with_provenance()` implements
-  targeted approval rules for LLM-generated or tool-sourced data. Structured,
-  scripting, and orchestrator action dispatch all call the provenance-aware
-  evaluator for LLM-generated action inputs.
+In the daemon, `init_engine` in `ic/src/bridge/router.rs` creates a policy engine
+without global rules or denied effect types. The orchestrator action handlers
+and the CodeAct dispatcher call the evaluator with an empty capability-policy
+list when they find a matching action definition. The bridge supplies registry
+actions with an empty `effects` list and `requires_approval: false`, so those
+preflight calls only check leases. Runtime tool approval is enforced by
+`EffectBridgeAdapter::execute_action_internal`, which evaluates the tool's
+approval requirement on the normalized parameters and checks thread, user,
+and supervision state.
 
 ## Execution Gates
 
-Unified gate abstraction for all pre-execution checks (approval, auth, rate limits):
+The engine gate types describe pre-execution decisions and how a paused thread
+can resume:
 
 ```
 GateDecision:
@@ -639,7 +653,16 @@ ExecutionMode:
   Interactive | InteractiveAutoApprove | Autonomous | Container
 ```
 
-**Gate pipeline** (`GatePipeline`): composes multiple gates in sequence. The first `Pause` or `Deny` wins.
+`GatePipeline` evaluates gates in ascending priority and returns the first
+`Pause` or `Deny`. Its constructors are used only by tests. In production,
+the action handlers in `executor/orchestrator.rs` check policy and leases,
+and `EffectBridgeAdapter::execute_action` calls `execute_action_internal`
+in `ic/src/bridge/effect_adapter.rs` for the host-side checks. The bridge
+checks tool permissions, approval tiers, supervision, hooks, and credential
+readiness, with dedicated rate limits for mission verbs. `ic/src/main.rs`
+constructs `CoordinationGate` when a coordination store exists.
+`init_engine` in `ic/src/bridge/router.rs` passes it to the effect adapter,
+which calls it directly.
 
 **Resolution flow**:
 1. Gate returns `Pause` -- `PendingGate` is inserted into the in-memory store
@@ -1497,12 +1520,12 @@ only; v1 also denies update/fire, which v2 keeps as steering) — so creating,
 deleting or resuming a mission stays with the foreground conversation (which
 can be supervised via `AGENT_SUPERVISED_MODE` or `lunarwing --supervised`).
 Run-spawning approval prompts disclose fan-out. The owner-scoped steering
-reach that remains is deliberate and stays open. One related seam remains
-by design: the structured-tier policy preflight
-(`executor/structured.rs`) evaluates policy from `available_actions`, which
-stays registry-only so the model-visible catalog does not duplicate the
-verbs — policy is therefore not consulted for the mission verbs, neither
-per call nor at lease grant.
+reach that remains is deliberate and stays open. The lease planner grants
+mission actions by thread type, and the orchestrator checks for a covering
+lease at dispatch. `EffectBridgeAdapter::available_actions` supplies only
+registry actions to `PolicyEngine`, so mission verbs have no `PolicyEngine`
+evaluation at lease grant or dispatch. The bridge checks mission permissions,
+supervision, rate limits, and hooks in `gate_mission_call`.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
@@ -2272,7 +2295,8 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 # Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
 # (existing tenant values preserved on re-render; ENGINE_V2=false is the only
 #  durable opt-out — a value like `none` is an ignored unknown entry)
-SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
+SKILL_SELF_IMPROVEMENT=false   # Bare default; mt-admin renders true for new tenants.
+                               # Gates skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
 ORCHESTRATOR_SELF_MODIFY=false # Runtime default: compiled orchestrator v0, no
@@ -2283,7 +2307,8 @@ ORCHESTRATOR_SELF_MODIFY=false # Runtime default: compiled orchestrator v0, no
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM
                                         # calls awaited in a ResolveFutures round; on
                                         # expiry the task is aborted and the call
-                                        # resolves as an error. Default: 300
+                                        # resolves as an error. Bare default: 300 s.
+                                        # mt-admin renders 7999 s for new tenants.
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per step.
                                         # Default: 1 when unset (mt-admin tenants are
                                         # provisioned with 2); clamped to 0-3; 0 disables
@@ -2344,7 +2369,10 @@ process.
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
-**WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The orchestrator's hardcoded policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the *same* hardcoded deadline — `tool_async_timeout_secs` (default 300s, env escape hatch `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`) — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.
+**Deferred calls (WI#88).** Within a CodeAct `ResolveFutures` round, deferred
+LLM calls and deferred tool calls use the same `tool_async_timeout_secs` limit.
+The resolver aborts a task that exceeds the limit and returns a call error to
+the model. A call does not get a second deadline or an automatic retry.
 
 ## Build & Test
 
@@ -2364,12 +2392,16 @@ protocol-channel delivery, or recovery across a real tenant restart.
 ## Key Design Decisions
 
 1. **No dependency on main crate** -- clean separation, testable in isolation
-2. **No safety logic in engine** -- sanitization/leak detection applied at the adapter boundary (`EffectExecutor` impl)
+2. **Defense at multiple boundaries** -- the engine neutralizes role-token openers in
+   inference inputs and redacts event parameters. Host tool-output sanitation and
+   leak detection run at the effect adapter boundary.
 3. **Event sourcing from day one** -- threads persist significant lifecycle and execution events
 4. **Tier 0 + Tier 1** -- structured tool calls and embedded Python via Monty coexist
 5. **Engine owns its message type** -- `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
-6. **RLM pattern** -- context as variable (not attention input), recursive `llm_query()`, compact output metadata between steps
-7. **Fail-closed by construction** -- `GateDecision` has no `None` variant, `ResumeKind` is a closed enum
+6. **RLM pattern** -- context as variables, recursive `llm_query()`, and bounded
+   step output formatted by the Python orchestrator
+7. **Typed gate results** -- `GateDecision` represents allow, pause, or deny,
+   and `ResumeKind` describes the expected continuation
 8. **Never delete LLM output** -- engine workspace files are preserved; only
    in-memory caches are evicted (V1 compatibility history is dual-written to the
    relational database)
