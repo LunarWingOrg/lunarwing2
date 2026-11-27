@@ -1,8 +1,9 @@
 # Supervised Mode
 
-Supervised mode is LunarWing's human-in-the-loop setting for tool execution. An Engine V2 foreground thread requires explicit approval before running an
-otherwise permitted tool action, regardless of its normal approval tier or
-an auto-approve setting. See [Scope](#scope) for what it does not cover.
+Supervised mode is LunarWing's human-in-the-loop setting for tool execution.
+When enabled, an Engine V2 foreground thread requires explicit approval before
+running an otherwise permitted tool action, regardless of its normal approval
+tier or any auto-approve setting. See [Scope](#scope) for where it applies.
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
