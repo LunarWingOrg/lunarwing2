@@ -48,7 +48,8 @@ cd darkirc_channel_for_lunarwing/darkirc
 taskset -c 0-11 cargo build --release -j12 --target wasm32-wasip2
 ```
 
-Use the committed `build.sh` only after reviewing its install destination. It can install directly into `${LUNARWING_HOME:-$HOME/.lunarwing}/channels/`.
+Use the registry workflow to install the result. The legacy `build.sh`
+probes for an older WIT layout and has its own install destination.
 
 ## Build the DarkIRC Daemon for MT
 
@@ -124,9 +125,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete \
 
 Use the initiator's `offer_id` from `prepare` for the initiator's `--exchange-id`.
 Transfer the offer before `respond` and the response before `complete`. Verify
-each peer fingerprint through an independent trusted channel. The runbook covers
-the responder's separate `complete` step and how to apply changes through a
-controlled restart. [DarkIRC multi-tenant runbook](../../ops/DARKIRC-MULTITENANT.md)
+each peer fingerprint through an independent trusted channel. The responder
+also completes the exchange with its own local exchange ID. MT admin always
+defers activation. Follow the runbook for the supported Stage A procedure.
+[DarkIRC multi-tenant runbook](../../ops/DARKIRC-MULTITENANT.md)
 
 ## Message Limits
 
