@@ -2,11 +2,8 @@
 
 Use these checks to validate the SSH paths described in [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md). Setup and recovery procedures live in [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md).
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The four delivery paths
-(built-in `ssh`, `ssh_git`, WASM `ssh` registry `0.1.10`, and worker SSH), the
-`[[ssh.hosts]]` allowlist, and the WASM `ssh.allowed_hosts` capability match
-the current tree. Worker SSH is available only in task containers that receive
-the socket; Kimi deliberately receives no mount (WI#206).
+The WASM `ssh` registry manifest is version `0.1.10`. Worker SSH requires a
+task container with the mounted SSH-agent socket.
 
 The built-in `ssh`, `ssh_git`, and WASM `ssh` tools accept a host from the
 configured `[[ssh.hosts]]` allowlist. Replace `<ssh-host>` in those tests with
@@ -97,7 +94,7 @@ The WASM guest is sandboxed, but the actual SSH operation runs in the host funct
 
 ## 4. Worker SSH
 
-Create a disposable Pebble, OpenCode, or OpenCode 2 worker job that runs a read-only SSH command using the injected `SSH_AUTH_SOCK`. Do not use Kimi for this tier: its lane intentionally has no SSH-agent mount. Before dispatch, run `sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>` and confirm the destination host and port are allowed; the signing socket does not grant network reachability. Confirm the worker performs normal OpenSSH host-key verification; the in-process `HostKeyVerifier` is not used in this path.
+Create a disposable Pebble, OpenCode, or OpenCode 2 worker job that runs a read-only SSH command using the injected `SSH_AUTH_SOCK`. Kimi and LunarDepth have no SSH-agent mount. Before dispatch, run `sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <tenant>` and confirm the destination host and port are allowed; the signing socket does not grant network reachability. Confirm the worker performs normal OpenSSH host-key verification; the in-process `HostKeyVerifier` is not used in this path.
 
 Use worker mode for multi-step jobs where container isolation matters. A successful built-in `ssh` test proves neither the worker container's `known_hosts` configuration nor its egress policy.
 
