@@ -4,15 +4,9 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** New tenant envs default
-to `SANDBOX_NETWORK=proxy-enforced` on Linux; mt-admin fills the value only
-when unset and preserves `none`,
-`proxy-enforced`, `tunnel`, and legacy advisory `proxy` on re-render. The managed
-sandbox image includes the pinned Python development suite. Required LLM
-endpoints, worker source validation, `worker-listeners` and `worker-egress`
-audits, WeeChat coordinated rotation, and OpenRC proxy migration remain part of
-the supported lifecycle. See `ic/src/NETWORK_SECURITY.md` §5 for network tiers
-and the default allowlist.
+On Linux, mt-admin fills an unset `SANDBOX_NETWORK` with `proxy-enforced` and
+preserves existing values when re-rendering, including legacy advisory `proxy`.
+See [network tiers and default allowlist](../../ic/src/NETWORK_SECURITY.md).
 
 For per-tenant instructions and identity editing, use the gateway's
 **Settings → System Prompt** panel. See [Tenant System Prompts](TENANT-SYSTEM-PROMPTS.md)
@@ -79,7 +73,7 @@ Do not install Python packages into an externally managed system interpreter wit
 Run the script from the checkout and branch that the tenant should follow:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant \
   --tensorzero-url 'https://tensorzero.example.com'
 ```
 
@@ -91,24 +85,24 @@ Useful opt-ins and opt-outs include:
 
 ```bash
 # Add the tenant user to the docker/podman group (explicit opt-in — see note)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant --docker-group \
   --tensorzero-url https://tensorzero.example.com
 
 # Enable the per-tenant TensorZero proxy (upstream is REQUIRED — see below)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant --enable-proxy \
   --tensorzero-url https://tensorzero.internal.example:7070
 
 # Enable the per-tenant DarkIRC daemon and adapter
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant --enable-darkirc \
   --tensorzero-url https://tensorzero.example.com
 
-# Seed the tenant's knowledge store with the full shared lw2studymcp
-# study-notes base (one-shot, first boot only; read-only shared MCP included)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp \
+# Import eligible study notes at first boot and enable additive refresh.
+# The shared Study Notes MCP is read-only.
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant --with-study-mcp \
   --tensorzero-url https://tensorzero.example.com
 
 # Skip automatic WeeChat relay bootstrap
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap \
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant example-tenant --no-weechat-bootstrap \
   --tensorzero-url https://tensorzero.example.com
 ```
 
@@ -162,8 +156,8 @@ Long builds should run in `tmux`:
 
 ```bash
 tmux new-session -s lunarwing-tenant-build
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm
-sudo ic/scripts/lunarwing-mt-admin.sh install-wasm ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant example-tenant --with-wasm
+sudo ic/scripts/lunarwing-mt-admin.sh install-wasm example-tenant
 ```
 
 MT admin serializes tenant builds to avoid concurrent memory pressure. `--with-wasm` builds current registry channel/tool sources; `install-wasm` publishes the resulting artifacts and capability sidecars into the tenant state directories. On a fresh install, it assigns ownership to the tenant before patching WeeChat's generic capability ports to the allocated tenant ports; a separate `start-tenant` is not required for that patch.
@@ -198,17 +192,23 @@ Run only the builds selected for the deployment. Nanocode is retired; its regist
 ## 6. Start and Verify
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh status example-tenant
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
+
+If the tenant uses external workers, run `worker-readiness example-tenant` as
+a separate check. It exits nonzero if an enabled lane lacks a WSS port or the
+port does not answer. OpenRC lanes marked stopped are skipped. `start-tenant`
+reports those readiness failures as warnings. `LUNARWING_MT_WORKER_READY_WAIT_SECS`
+sets one polling window shared by the lanes. It defaults to `0` (one probe).
 
 The exact service graph depends on selected features. Core LunarWing, PostgreSQL, XMPP, optional proxy, WeeChat, adapter, DarkIRC, LunarVision, orchestrator, and workers must not be summarized as a fixed service count.
 
 On rootless-podman hosts, a tenant can start failing with `cannot re-exec process to join the existing user namespace` (WI#142 — stale userns pairing after tenant churn; see [`../bugs/BUG-workload-scope-podman-userns.md`](../bugs/BUG-workload-scope-podman-userns.md)). Repair through MT admin rather than manual `podman system migrate` as root:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh fix-podman-userns ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh fix-podman-userns example-tenant
 ```
 
 The command probes first and is a no-op on a healthy pairing; on the join signature it stops the tenant, cleans stale `pause.pid` state, runs `podman system migrate` as the tenant user, and restarts with health-gated sidecar recreation.
@@ -218,7 +218,7 @@ If a component fails, keep using MT admin to inspect the tenant and then read th
 For an authenticated gateway login, obtain the tenant token in a private terminal:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh tokens ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh tokens example-tenant
 ```
 
 Do not capture that output in shared logs. The gateway binds to the tenant's registry `gateway` port on loopback by default. Use an SSH tunnel or an approved tunnel provider for remote access.
@@ -230,20 +230,20 @@ Wingtip (`tui/`) runs as a desktop user, who owns the microphone, clipboard and 
 ```bash
 # Dedicated, revocable client token; refused (nothing written) unless the running
 # daemon lists client_tokens in GET /api/chat/capabilities (today's daemons do not)
-sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --expires-in-days 90
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access example-tenant --for-user desktop-user --expires-in-days 90
 # Stopgap for daemons that predate client tokens: copy the master token (warned)
-sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --use-master-token
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access example-tenant --for-user desktop-user --use-master-token
 # Invalidate every copy of the master token and restart the tenant
-sudo ic/scripts/lunarwing-mt-admin.sh rotate-gateway-token ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-gateway-token example-tenant
 # Registered client-token labels and dates (never tokens or digests)
-sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --list
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access example-tenant --list
 # Remove one user's access
-sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --revoke
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access example-tenant --for-user desktop-user --revoke
 ```
 
-- **Desktop file.** A grant writes `~sun/.config/wingtip/tenants/ruffles.json` (0600, owned by `sun`, in 0700 directories) with the gateway URL, `tenant_uid` and the token. Root writes it as `sun` and refuses a symlinked path component or destination. Nothing prints a token or a digest.
+- **Desktop file.** A grant writes `~desktop-user/.config/wingtip/tenants/example-tenant.json` (0600, owned by `desktop-user`, in 0700 directories) with the gateway URL, `tenant_uid` and the token. Root writes it as `desktop-user` and refuses a symlinked path component or destination. Nothing prints a token or a digest.
 - **Who.** `--for-user` is required (no `$SUDO_USER` default); root, accounts below `UID_MIN` and tenant accounts are refused.
-- **Client tokens (default).** The grant first reads `GET /api/chat/capabilities` with the master token (loopback URL and listener-owner rules as for the probe) and refuses, writing nothing, unless the daemon lists the `client_tokens` feature (today's daemons do not); when the gateway is down or the owner check fails, support is undetermined and the grant proceeds with a printed reason. It then mints a token and registers only its SHA-256 under the label `tui:<user>` in `/home/<tenant>/lunarwing/state/gateway-client-tokens.json` (0600, owned by the tenant). Daemons with client-token support reload that file every 2 s, so grants and revocations need no restart on systemd or OpenRC. Client-token mode is refused when the tenant env sets `GATEWAY_CLIENT_TOKENS_FILE` to `none` or to another file, or when `LUNARWING_BASE_DIR` is not the tenant state directory. The registry is read as the tenant and only if the daemon would load it too: a regular file with one link, owned by the tenant, without group or other access, at most 64 KiB; a symlink, FIFO, hard link, looser mode or larger file is refused and left unchanged, and a grant never writes a registry over 64 KiB.
+- **Client tokens (default).** The grant first reads `GET /api/chat/capabilities` with the master token (loopback URL and listener-owner rules as for the probe) and refuses, writing nothing, unless the daemon lists the `client_tokens` feature (today's daemons do not); when the gateway is down or the owner check fails, support is undetermined and the grant proceeds with a printed reason. It then mints a token and registers only its SHA-256 under the label `tui:<user>` in `/home/<tenant>/lunarwing/state/gateway-client-tokens.json` (0600, owned by the tenant). The current daemon does not read that registry. The planned client-token loader is tracked as Wingtip milestone M2b. Client-token mode is refused when the tenant env sets `GATEWAY_CLIENT_TOKENS_FILE` to `none` or to another file, or when `LUNARWING_BASE_DIR` is not the tenant state directory. The registry is read as the tenant and only if the daemon would load it too: a regular file with one link, owned by the tenant, without group or other access, at most 64 KiB; a symlink, FIFO, hard link, looser mode or larger file is refused and left unchanged, and a grant never writes a registry over 64 KiB.
 - **Master token (stopgap).** `--use-master-token` copies `GATEWAY_AUTH_TOKEN` and records `token_kind: "master"`. It works with today's daemons but carries full gateway API access and is revocable only by `rotate-gateway-token <tenant>`, which also invalidates the web login, the worker token fallback and the DarkIRC and Brave key uploads. `--expires-in-days` is refused with it. It also removes an earlier `tui:<user>` client-token entry from the registry (reported as `removed:`), so a superseded client token cannot come back to life after `upgrade-tenant`; a registry that cannot be rewritten only produces a warning, because the master token does not use it.
 - **URL.** A tenant bound to `0.0.0.0`, `::` or `localhost` gets `http://127.0.0.1:<gateway port>`; `::1` becomes `[::1]`; a specific address is kept (with a clear-text warning). `--url-host <ip>` overrides. DNS names are refused because the client cannot verify their listener owner locally; use `localhost` or an IP literal.
 - **Verification.** `GET /api/health` without the token, then up to four `GET /api/gateway/status` probes 2 s apart with the token in a `curl -K` config (never argv). The token goes only to a loopback URL (`127.x.y.z` as a plain dotted quad, or `[::1]`) and only while `/proc/net/tcp` and `tcp6` show the gateway port held by the tenant uid alone, with one of its listeners on the URL's address, its wildcard (`0.0.0.0`, `::`) or its v4-mapped form. A tenant listening on `127.0.0.5` does not cover `--url-host 127.0.0.1`, nor an IPv4 socket `[::1]`. `--no-verify` skips the probes.
@@ -264,14 +264,14 @@ Fresh tenants bootstrap WeeChat's version-4 `api` relay automatically when depen
 Recover a skipped/failed bootstrap with:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay ruffles
-sudo ic/scripts/lunarwing-weechat-preflight.sh ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay example-tenant
+sudo ic/scripts/lunarwing-weechat-preflight.sh example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant example-tenant
 ```
 
 Rotate an already-configured relay password with
-`sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password ruffles`.
-On an older tenant, first run `render-units ruffles` from the updated checkout
+`sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password example-tenant`.
+On an older tenant, first run `render-units example-tenant` from the updated checkout
 so the shared credential start barrier is installed. Rotation briefly stops and
 restarts the running WeeChat, adapter, and daemon; it preserves the literal
 environment expression in `relay.conf` and refuses mismatched existing env
@@ -284,12 +284,12 @@ For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.
 ## 8. Day-to-Day Operations
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh status example-tenant
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
-sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh render-units ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh patch-env ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh render-units example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh patch-env example-tenant
 ```
 
 `render-units` reconciles generated systemd-user/OpenRC definitions after source updates. `patch-env` fills current managed values without licensing manual secret inspection.
@@ -305,10 +305,10 @@ Until that sweep succeeds, the OpenRC dispatch guard exempts only `help` (includ
 Use the worker lifecycle commands for one worker rather than restarting the entire tenant when possible:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles pebble
-sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode
-sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles kimi
-sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode2
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker example-tenant pebble
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker example-tenant opencode
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker example-tenant kimi
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker example-tenant opencode2
 ```
 
 ### Runtime estimation (optional, advisory)
@@ -346,7 +346,7 @@ and [`../../ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
 
 ```bash
 sudo ic/scripts/lunarwing-port-drift-preflight.sh          # every tenant
-sudo ic/scripts/lunarwing-port-drift-preflight.sh ruffles  # one tenant
+sudo ic/scripts/lunarwing-port-drift-preflight.sh example-tenant  # one tenant
 ```
 
 It cross-checks `lunarwing.env` (gateway/http/orchestrator/coord_admin/adapter/worker WSS ports, the XMPP/relay/adapter/darkirc/vision/voice URLs, and the `DATABASE_URL` port), `xmpp-bridge.env`'s `XMPP_BRIDGE_BIND`, `proxy.env` plus the rendered proxy unit's `--port` on either init, `darkirc-adapter.env` and `darkirc_config.toml` for darkirc tenants, and every systemd Quadlet's `PublishPort` host ports. A wrong *existing* port is a FAIL, except for `COORD_ADMIN_PORT`: its mismatch is a WARN because even a full re-render preserves an explicit value. A missing value is a WARN (the next render back-fills it); a missing Quadlet is INFO (OpenRC and rootful Docker hosts legitimately have none). Non-loopback Quadlet `PublishPort`s (including a host-less `PORT:CONTAINER` mapping) and proxy `--bind` values are FAILs too. Run it after manual env edits, restores, or partial upgrades, and resolve FAILs before restarting. The WeeChat relay credential checks stay in `lunarwing-weechat-preflight.sh`. `upgrade-preflight.sh` invokes this verifier per tenant as a non-fatal note, so drift is surfaced during an upgrade assessment without changing its STOP/GO verdict.
@@ -354,10 +354,10 @@ It cross-checks `lunarwing.env` (gateway/http/orchestrator/coord_admin/adapter/w
 For init-agnostic diagnostics, prefer the read-only inspection verbs over raw `psql`/`ps`/`pgrep` against tenant state (WI#268):
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh psql ruffles -c 'SELECT ...'
-sudo ic/scripts/lunarwing-mt-admin.sh daemon-pid ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh worker-listeners ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh worker-egress ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh psql example-tenant -c 'SELECT ...'
+sudo ic/scripts/lunarwing-mt-admin.sh daemon-pid example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh worker-listeners example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh worker-egress example-tenant
 ```
 
 `psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. `worker-listeners` (v2.1.6.0, WI#357) is the read-only worker-exposure audit: it lists listening sockets inside the tenant's running worker containers from the host side and fails on any bind or published port mapping outside the loopback contract. `worker-egress` (WI#424) separately inspects the per-tenant network, DNS/static hosts, container attachment, and live nftables reject policy; it is read-only and does not repair an unsafe configuration. Both enforce the rule that workers must never self-expose; see [`../ops/WORKER-CONTAINERS.md`](../ops/WORKER-CONTAINERS.md). The original operator procedure and Engine V2 prompt-overlay audit that motivated the first two verbs are in the [v2.1.4.0 audit record](../ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
@@ -367,38 +367,39 @@ sudo ic/scripts/lunarwing-mt-admin.sh worker-egress ruffles
 Create guarded tenant database backups through MT admin:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh list-backups ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh list-backups example-tenant
 ```
 
 Restore is destructive to the tenant database and requires the tenant daemon stopped, the tenant's PostgreSQL running, plus explicit `--yes`. `stop-tenant` stops PostgreSQL too, so start it alone with `start-pg` before restoring:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh start-pg ruffles
-sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant ruffles /absolute/path/backup.dump --yes
-sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh start-pg example-tenant
+sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant example-tenant /absolute/path/backup.dump --yes
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant example-tenant
 ```
 
 Use `upgrade-tenant` only with a reviewed target ref and a clean tenant checkout. Run it in `tmux`; it performs backup, fetch/checkout, build, service rendering, environment reconciliation, and restart under lifecycle locking. The default `--sandbox-image auto` also refreshes a managed sandbox image only when its Dockerfile/snapshot digest changed; `always` forces a build and `never` skips it. Every tenant cargo build runs `ic/scripts/vendor-artifact-guard.sh` first, which cleans vendored crates that were patched in place since the tenant's last build (cargo never re-checks vendored sources). The first guarded upgrade of an existing tenant therefore rebuilds rig-core once.
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant ruffles \
+sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant example-tenant \
   --target <reviewed-ref> --sandbox-image auto
 ```
 
 Removing a tenant without `--purge` retains recoverable data according to MT admin policy. `--purge` is irreversible:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant example-tenant
 # destructive; use only after backup and explicit review:
-sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant ruffles --purge
+sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant example-tenant --purge
 ```
 
 ## 10. Production Checklist
 
 - [ ] MT admin `doctor` passes for selected host components.
 - [ ] MT admin `status <tenant>` reports the tenant service graph healthy.
+- [ ] MT admin `worker-readiness <tenant>` passes when external workers are enabled.
 - [ ] Protected environment and secret files retain restrictive ownership/modes.
 - [ ] Gateway and webhook authentication are enabled.
 - [ ] Desktop TUI access is granted with `tui-access`, never by copying `tokens` output.
