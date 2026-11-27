@@ -2,11 +2,6 @@
 
 `ic/scripts/create-tenant.sh` is the convenience wrapper for provisioning one multi-tenant LunarWing instance. It delegates lifecycle work to `ic/scripts/lunarwing-mt-admin.sh`; use the MT admin directly for ongoing start, stop, status, build, and removal operations.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The wrapper's `--minimal`,
-`--no-pebble`, required LLM endpoint forwarding, and retired-Nanocode rejection
-match `ic/scripts/create-tenant.sh`. For `--with-study-mcp`, provision the new
-tenant through MT admin directly.
-
 ## Before You Run It
 
 - Run the script from the checkout and branch that the tenant should use. The wrapper's plan prints its checkout's branch and commit. MT admin clones from that checkout by default, or from `LUNARWING_MT_SOURCE_REPO` when supplied.
@@ -42,12 +37,12 @@ The default full flow calls MT admin to add the tenant, sets up the WASM toolcha
 
 Since v2.1.6.0 (WI#330) a tenant LLM endpoint is required and there is no built-in default: pass `--tensorzero-url <url>` (the wrapper never passes `--enable-proxy`, so the daemon dials this TensorZero gateway directly at its `/openai/v1` surface) or `--llm-base-url <url>` (direct endpoint), or export the wrapper's own `TENSORZERO_URL`/`LLM_BASE_URL` env overrides, or export the mt-admin fleet `LUNARWING_MT_TENSORZERO_URL`/`LUNARWING_MT_LLM_BASE_URL`; without one, `add-tenant` refuses before any tenant state exists.
 
-Do not use retired Nanocode flags. The script rejects `--nanocode`, `--with-nanocode`, and `--no-nanocode`; Pebble is the supported external worker.
+Do not use retired Nanocode flags. The script rejects `--nanocode`, `--with-nanocode`, and `--no-nanocode`; The wrapper selects Pebble for its optional worker build.
 
 This wrapper does not accept `--with-study-mcp`. To seed a new tenant's
 knowledge store from the shared lw2studymcp study notes, use MT admin in place
-of the wrapper. The startup import skips existing notes and does not repeat
-once its completion marker is saved:
+of the wrapper. The bootstrap preserves existing notes subject to the
+[repair cases in the seed guide](TENANT_KNOWLEDGE_SEED.md#safety-invariants).
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant acme --with-study-mcp \
