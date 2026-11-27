@@ -6,16 +6,6 @@ the gateway with their normal bearer token; the gateway holds the sidecar
 credential server-side (`VOICE_AUTH_TOKEN`) and clients never see it. This is
 the LunarWing-side half of desktop goal #19 (`lunarwing/lunarwing2desktop`).
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The enabling knobs,
-loopback-only `VOICE_SERVICE_URL` invariants, default sidecar port (8090),
-422/503/504 status preservation, synthesis-duration pre-flight (including the
-speed-scaled estimate), and integration test match `ic/src/channels/web/voice.rs`
-and `ic/tests/voice_gateway_integration.rs`. The M2a status document carries
-`stt`, `tts`, `provider` and `rate_limit`; `GET /api/chat/capabilities` also
-advertises voice ([GATEWAY_CHAT_API.md](GATEWAY_CHAT_API.md)), and the error
-section identifies plain-text bodies. Sidecar admission bounds remain documented
-in `projects/voice-sidecar/README.md`, not duplicated as gateway behavior.
-
 ## Canonical Documentation
 
 - [`projects/voice-sidecar/README.md`](../../projects/voice-sidecar/README.md) — sidecar API, configuration, deployment
@@ -56,10 +46,12 @@ the proxy for anything else.
 
 ## Gateway Endpoints
 
-All routes sit behind the standard gateway auth middleware (bearer token from
-`GATEWAY_AUTH_TOKEN` or `GATEWAY_USER_TOKENS`; DB-backed tokens are not
-available in this build) and share the gateway's CORS and security-header
-layers.
+All routes use the gateway bearer token and share its CORS and security-header
+layers. `GatewayChannel::new` in `ic/src/channels/web/mod.rs` uses the single
+configured token (`GATEWAY_AUTH_TOKEN` or `channels.gateway_auth_token`), or
+generates one when unset. The daemon currently parses `GATEWAY_USER_TOKENS`
+without installing those tokens in the request authenticator. DB-backed
+authentication is also unavailable.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
@@ -170,7 +162,7 @@ problem.
 | `unavailable` | 503 | Voice API not configured, or sidecar reports unavailable (sidecar 503) |
 | `upstream_error` | 500 | Sidecar rejected the gateway credential (sidecar 401) |
 | `upstream_error` | 502 | Other sidecar failure (unreachable, malformed/oversize response) |
-| `upstream_timeout` | 504 | Sidecar request timed out (sidecar 504, or the gateway proxy budget — always strictly larger than the sidecar's own — expired) |
+| `upstream_timeout` | 504 | Sidecar returned 504 or the gateway's configured proxy budget expired |
 
 Three kinds of error are answered before a voice handler runs, and their
 bodies are **plain text**, not the JSON shape above. Clients must check
