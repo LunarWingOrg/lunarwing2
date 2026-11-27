@@ -228,10 +228,10 @@ the final step of tenant provisioning (unless `--no-health` is passed). The full
    wire the Study Notes MCP (`--with-study-mcp`), and build the vision sidecar
    image if it is missing. A successful new-tenant Study Notes setup also appends
    `KNOWLEDGE_SEED_FROM_STUDY_MCP=1`. On first startup the daemon seeds
-   eligible missing notes. It preserves existing note content except when
-   filling a blank row with no parseable knowledge-note metadata. See the
-   [seed guide](../guides/TENANT_KNOWLEDGE_SEED.md#safety-invariants) for the
-   repair rules. `configure-study-mcp` and `upgrade-tenant` leave the seed
+   eligible missing notes. When the workspace lookup succeeds, it preserves
+   existing content except when filling a blank row with no parseable
+   knowledge-note metadata. The [seed guide](../guides/TENANT_KNOWLEDGE_SEED.md#safety-invariants)
+   describes the repair rules and the lookup-error behavior. `configure-study-mcp` and `upgrade-tenant` leave the seed
    flag as configured. `--with-study-mcp` additionally
    enables the additive knowledge refresh cadence
    (`KNOWLEDGE_SYNC_ENABLED=true` plus its cadence/bound defaults) and installs
