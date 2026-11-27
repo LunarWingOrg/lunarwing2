@@ -144,6 +144,18 @@ class RuntimeVerificationTests(unittest.TestCase):
                 text += "Kimi worker: not created\nOpenCode 2 worker: not created\n"
                 self.assertTrue(all(c.ok for c in self.checks(text, tenant)))
 
+    def test_selected_lunardepth_requires_a_listening_worker(self):
+        for tenant, text in (("lunarium", SYSTEMD_STATUS), ("gentoo-t", OPENRC_STATUS)):
+            with self.subTest(tenant=tenant):
+                if "PostgreSQL:" not in text:
+                    text += "PostgreSQL: running (lunarwing-pg-gentoo-t)\n"
+                worker = f"LunarDepth worker: running (lunarwing-lunardepth-{tenant}, WSS port 20417: "
+                healthy = self.checks(text + worker + "listening)\n", tenant, workers=("lunardepth",))
+                self.assertTrue(all(check.ok for check in healthy))
+                for status in ("", "LunarDepth worker: not created\n", worker + "dead (no listener))\n"):
+                    checks = self.checks(text + status, tenant, workers=("lunardepth",))
+                    self.assertEqual([check.label for check in checks if not check.ok], ["LunarDepth worker"])
+
     def test_missing_selected_worker_line_fails_closed(self):
         checks = self.checks(SYSTEMD_STATUS, workers=("pebble",))
         self.assertFalse(checks[-1].ok)
