@@ -130,9 +130,10 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    `false`, and `0` are skipped without warnings, and a hand-edited `yes`/`on`
    cannot leave the host refreshing a source the daemon refuses to start with.
    Each root-owned scheduler snapshot carries its own OpenRC proxy contract,
-   so it does not source a sibling checkout or the host health library. Snapshots
-   are pruned to the newest five releases
-   (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`). `upgrade-tenant` republishes
+   and runs from the staged checkout. Snapshot pruning starts when the count
+   exceeds `LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 1`. The default keep
+   value is five, and pruning protects the newly published snapshot.
+   `upgrade-tenant` republishes
    an existing snapshot from the upgraded-from checkout (stamped in
    `STAGED-FROM`); when the hourly schedule was removed or disabled, it
    refreshes the staged files and leaves the removal in place — an upgrade
