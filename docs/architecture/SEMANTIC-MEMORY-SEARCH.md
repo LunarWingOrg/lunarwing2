@@ -2,8 +2,7 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
-was checked. The database-backed workspace
+The database-backed workspace
 remains the shared document/chunk store for memory and native knowledge tools.
 Current changes at its boundaries include:
 
@@ -588,9 +587,10 @@ not call the workspace hybrid-search pipeline:
 | Workspace (`src/workspace/`) | User scope plus configured read scopes | Hybrid FTS + vector with RRF fusion | v1 agent, memory/knowledge tools, system prompt |
 | Engine memory (`crates/lunarwing_engine/src/memory/`) | Project + user scope | Keyword retrieval from MemoryDocs | v2 engine execution context |
 
-The Engine `RetrievalEngine` selects summaries, lessons, skills, and other
-MemoryDocs for execution context. Agent-facing semantic search remains the
-workspace tool path; Study Notes use a specialized backend FTS query over the
+The orchestrator's `__retrieve_docs__` handler calls `RetrievalEngine::retrieve_context`
+for ordinary recall. It excludes skills, which have a separate activation
+path, and engine-maintenance records. Agent-facing semantic search remains the
+workspace tool path. Study Notes use a specialized backend FTS query over the
 same document/chunk store.
 
 ## Performance Characteristics
