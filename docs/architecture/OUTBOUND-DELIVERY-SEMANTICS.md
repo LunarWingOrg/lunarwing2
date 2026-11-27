@@ -1,16 +1,5 @@
 # Outbound Message Delivery Semantics
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
-was checked. Defines what a successful
-`message`-tool send means and what the native XMPP channel guarantees about
-outbound stanzas. WI#270 established acceptance wording; WI#277 added durable
-spooling. The initiating incident was a mission recording "Delivered via XMPP"
-after an enqueue acknowledgement, followed by a restart losing the queued stanza.
-It also defines the per-message lifecycle the agent reports to the channel that
-produced a message ([Message lifecycle and turn outcomes](#message-lifecycle-and-turn-outcomes),
-added 2026-11-03), which the gateway maps to its `turn_started`/`turn_finished`
-events.
-
 Source anchors: `MessageTool::execute` and `resolve_message_target` in
 `ic/src/tools/builtin/message.rs`; `queue_outbound_with_attachments` and
 `OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT` in `ic/src/channels/xmpp/mod.rs`;
@@ -263,8 +252,9 @@ Rules (`OutcomeHints`):
 - A `Finished` with any outcome but `detached` marks the message finished. A
   hint recorded after that is dropped (no `Finished` would consume it), and
   `has_finished` tells the late watcher not to report a second `Finished`.
-- At most 1024 hints and 1024 finished messages are kept, each for at most 30
-  minutes, behind a std mutex that is never held across an `.await`.
+- The table keeps at most 1024 hints and 1024 finished messages. Both use
+  `OutcomeHints::TTL`, derived from the longest Engine V2 late-turn window
+  (42 minutes 10 seconds). The mutex is released before any `.await`.
 - V1 records no hint once the soft timeout has fired (the loop has already
   reported `timed_out`).
 - The late watcher rates its late result the same way (a late reply that a
