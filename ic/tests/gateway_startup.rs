@@ -21,6 +21,7 @@ async fn gateway_user_tokens_are_rejected_by_daemon_startup() {
             .env("HOME", instance.path())
             .env("LUNARWING_BASE_DIR", instance.path())
             .env("GATEWAY_ENABLED", enabled)
+            .env("GATEWAY_PORT", "0")
             .env("GATEWAY_USER_TOKENS", user_tokens)
             .kill_on_drop(true);
         if let Some(token) = owner_token {
