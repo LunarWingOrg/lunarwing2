@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import call, patch
 
 from lunarwing_mt_onboard import provisioner
@@ -44,6 +45,7 @@ class TestTenantNameValidation(unittest.TestCase):
             "opencode-",
             "kimi-",
             "opencode2-",
+            "lunardepth-",
             "weechat-",
         ):
             with self.subTest(prefix=prefix):
@@ -420,6 +422,35 @@ class TestProvisionerArgs(unittest.TestCase):
         self.assertNotIn("--with-opencode2-model", add_args)
         self.assertNotIn("--with-opencode2-base-url", add_args)
 
+    def test_lunardepth_provisioning_stages_and_cleans_up_a_private_key_file(self):
+        key = "depth-fixture-only-value"
+        config = TenantConfig(
+            name="alpha",
+            workers=[WorkerType.LUNARDEPTH],
+            lunardepth_model="tensorzero::function_name::demo",
+            lunardepth_base_url="https://depth.example.test/openai/v1",
+            lunardepth_api_key=key,
+        )
+        with patch.object(provisioner, "ensure_mt_admin", return_value="/fake/mt-admin.sh"):
+            with provisioner.add_tenant_command(config) as args:
+                self.assertIn("--with-lunardepth", args)
+                self.assertEqual(args[args.index("--lunardepth-model") + 1], config.lunardepth_model)
+                self.assertEqual(args[args.index("--lunardepth-base-url") + 1], config.lunardepth_base_url)
+                self.assertNotIn(key, args)
+                key_file = Path(args[args.index("--lunardepth-api-key-file") + 1])
+                self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(key_file.read_text(), key + "\n")
+            self.assertFalse(key_file.exists())
+            self.assertEqual(
+                provisioner.build_build_tenant_args(config),
+                ["/fake/mt-admin.sh", "build-tenant", "alpha", "--with-wasm", "--with-lunardepth"],
+            )
+        saved = config.to_dict()
+        self.assertNotIn("lunardepth_api_key", saved)
+        self.assertNotIn(key, repr(config))
+        self.assertEqual(TenantConfig.from_dict(saved), config)
+        self.assertEqual(TenantConfig.from_dict(saved).lunardepth_api_key, "")
+
     def test_no_workers_selected_emits_no_worker_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, "lunarwing-mt-admin.sh")
@@ -441,6 +472,7 @@ class TestProvisionerArgs(unittest.TestCase):
             "--with-opencode",
             "--with-kimi",
             "--with-opencode2",
+            "--with-lunardepth",
         ):
             self.assertNotIn(flag, add_args)
 
