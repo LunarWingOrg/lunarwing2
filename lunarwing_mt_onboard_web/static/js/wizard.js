@@ -407,7 +407,8 @@
     simpleForm(host, 'Import a tenant', 'stage-only by default; start requires old host stopped', (b, data) => {
       Object.assign(data, {
         bundle: '', name: '', apply: false, start: false, old_stopped: false, force: false,
-        with_opencode: false, with_kimi: false, with_toolchains: false,
+        with_opencode: false, with_kimi: false, with_opencode2: false,
+        opencode2_model: '', opencode2_base_url: '', with_toolchains: false,
         with_pebble: false, with_vision: false, docker_group: false,
         owner_scope: '', passphrase: '',
       });
@@ -420,6 +421,13 @@
       b.appendChild(checkField(data, 'force', 'Force import (--force)'));
       const workers = h('div', { class: 'subgroup' });
       workers.appendChild(checkField(data, 'with_opencode', 'Build opencode worker'));
+      const opencode2 = h('div', { class: 'subgroup hidden' });
+      workers.appendChild(checkField(data, 'with_opencode2', 'Restore OpenCode 2 worker', (checked) => {
+        opencode2.classList.toggle('hidden', !checked);
+      }));
+      opencode2.appendChild(textField(data, 'opencode2_model', 'OpenCode 2 model override (optional)', {}));
+      opencode2.appendChild(textField(data, 'opencode2_base_url', 'OpenCode 2 base URL override (optional)', {}));
+      workers.appendChild(opencode2);
       workers.appendChild(checkField(data, 'with_kimi', 'Build kimi worker'));
       workers.appendChild(checkField(data, 'with_toolchains', 'Include worker toolchains'));
       workers.appendChild(checkField(data, 'with_pebble', 'Build pebble worker'));
@@ -433,6 +441,8 @@
         bundle: data.bundle.trim(),
         name: data.name.trim(),
         owner_scope: data.owner_scope.trim(),
+        opencode2_model: data.with_opencode2 ? data.opencode2_model.trim() : '',
+        opencode2_base_url: data.with_opencode2 ? data.opencode2_base_url.trim() : '',
       }),
       {
         validate: (d) => (!d.bundle.trim() ? 'bundle path is required' : d.start && !d.old_stopped ? 'confirm the old host is stopped before requesting start' : d.bundle.trim().toLowerCase().endsWith('.7z') && !d.passphrase ? 'bundle passphrase is required for .7z import' : d.name.trim() ? validateName(d.name.trim()) : null),
