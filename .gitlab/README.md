@@ -587,6 +587,14 @@ host's concurrent builds before retrying manually.
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
   workspace integration target against disposable pgvector/PostgreSQL 16.
+- WI#935: `rust-test-libsql-integration` explicitly runs the ten targets that
+  require `libsql,integration` and `html_to_markdown`. It uses `-j1`, no debug
+  info, and serial test execution, in a separate job from `rust-test-libsql`.
+  `engine_v2_irc_wasm` and `engine_v2_wasm_tool` require the component files
+  supplied by `wasm-channel-test-artifacts` (DarkIRC, WeeChat, and test echo).
+  `rust-test-wasm-channels` runs the DarkIRC, WeeChat, XMPP, and Multica unit
+  suites natively. Both jobs are required on MRs into the release branch;
+  no WI#935 suites are deliberately omitted.
 - Explicit onboarding, web, Kawarimi, and DarkIRC Python suites with zero skips.
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
 - `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
