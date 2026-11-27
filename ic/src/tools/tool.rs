@@ -228,6 +228,12 @@ pub struct ToolOutput {
     /// Raw output before sanitization (for debugging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Validated images returned next to the text result (for example a
+    /// screenshot from an MCP server). Runtime-only: never serialized, never
+    /// part of `result`, so the text safety pipeline, previews and every
+    /// persistence sink keep seeing text only. See `crate::tools::images`.
+    #[serde(skip)]
+    pub images: Vec<crate::tools::images::ToolImage>,
 }
 
 impl ToolOutput {
@@ -238,6 +244,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
     }
 
@@ -248,6 +255,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
     }
 
@@ -260,6 +268,12 @@ impl ToolOutput {
     /// Set the raw output.
     pub fn with_raw(mut self, raw: impl Into<String>) -> Self {
         self.raw = Some(raw.into());
+        self
+    }
+
+    /// Attach validated images (see `crate::tools::images`).
+    pub fn with_images(mut self, images: Vec<crate::tools::images::ToolImage>) -> Self {
+        self.images = images;
         self
     }
 }
@@ -400,6 +414,15 @@ pub trait Tool: Send + Sync {
     /// name-based defense-in-depth. The autonomous catalog, scheduler, job/MCP
     /// workers and Engine V2 execution adapter enforce this opt-out.
     fn allows_autonomous_execution(&self) -> bool {
+        true
+    }
+
+    /// Whether this tool may run in a shared conversation (a group chat or
+    /// room where people other than the owner read the replies). Tools that
+    /// act on or reveal the owner's private environment, such as desktop
+    /// control, opt out: v1 and Engine V2 refuse them there before execution,
+    /// whatever their approval tier. Default: allowed.
+    fn allows_shared_conversation(&self) -> bool {
         true
     }
 

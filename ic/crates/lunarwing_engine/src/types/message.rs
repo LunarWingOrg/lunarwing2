@@ -65,6 +65,30 @@ impl fmt::Debug for TransientContentPart {
     }
 }
 
+/// Images one action returned, handed from the host to the engine so the
+/// next model request can show them. Runtime-only: never serialized, and the
+/// parts' `Debug` output reports sizes, not bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionImages {
+    /// Provider or CodeAct call id of the action (may be empty).
+    pub call_id: String,
+    /// Action (tool) name, shown to the model next to the images.
+    pub action_name: String,
+    pub parts: Vec<TransientContentPart>,
+}
+
+impl ActionImages {
+    /// Decoded bytes held by this batch.
+    pub fn byte_len(&self) -> usize {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                TransientContentPart::Image { mime_type, data } => mime_type.len() + data.len(),
+            })
+            .sum()
+    }
+}
+
 /// A message in a thread's conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMessage {

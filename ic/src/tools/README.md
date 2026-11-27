@@ -212,6 +212,74 @@ consumers) still returns full structs; only the agent-facing `tool_list`
 output is bounded. The same pagination contract is the model for fixing
 `mission_list` and `list_issues`, which share the truncation family.
 
+### Tool-result images (multimodal tool output)
+
+A tool can return validated images next to its text result
+(`ToolOutput::with_images`, type `crate::tools::ToolImage`). Images never go
+into `ToolOutput.result`, are never serialized (`#[serde(skip)]`) and print
+only their type and size in `Debug`, so truncation, leak detection,
+previews, transcripts and every persistence sink keep seeing text only.
+
+- **Validation** (`tools/images.rs`): the type comes from magic bytes (PNG,
+  JPEG, GIF, WebP), never from the declared MIME type, plus a cheap
+  structural check (PNG IHDR/IEND and dimensions, JPEG end marker, GIF
+  trailer, WebP RIFF size) so a truncated image cannot fail every later
+  request. Per tool result: at most 4 images, 5 MiB each, 7 MiB total; the
+  base64 length is checked before decoding. Note that stdio and unix MCP
+  transports cap one JSON-RPC line at 4 MiB (`mcp/transport.rs`), so a
+  server on those transports must keep a result under about 3 MiB of image
+  data or the connection is closed.
+- **MCP** (`mcp/client.rs`): results are read with the specification's
+  field names (`isError`, `mimeType`, `structuredContent`); the legacy
+  snake_case spellings are still accepted. `image` blocks become
+  `ToolImage`s. Embedded text resources are included as text, resource
+  links are listed by URI, and audio, binary resources, unknown block types
+  and images over the limits are replaced by a note, so one unexpected
+  block no longer fails the whole result. `isError: true` is a tool
+  failure and never forwards images.
+- **Delivery**: `execute_tool_with_safety_rich` returns text plus images.
+  The v1 chat loop (`agent/tool_images.rs`) and Engine V2
+  (`bridge/action_images.rs`, `lunarwing_engine::executor::action_images`)
+  put a step's (batch's) images on one user-role message after that step's
+  tool results, in call order and labelled with tool name and call id,
+  because no backend the daemon talks to accepts images in a tool-role
+  message. A step shows at most 8 images and 8 MiB (the rest get a note);
+  only the newest 3 image-bearing steps, within 8 MiB, are resent within a
+  turn or run. Nothing is persisted. Smart routing never classifies a
+  request by this message and keeps image-bearing requests on the primary
+  model.
+- **Shared conversations** (group chats, rooms): tool-result images are
+  never shown there (a note replaces them), because the model's
+  description would reach everyone in the room.
+- **Text-only paths** (`execute_tool_with_safety`: approval resumes, jobs,
+  routines, container and scheduler paths) add a note such as
+  `[1 image returned by this tool not shown to the model: ...]`, so the
+  model knows it is missing content.
+- **Switch**: `TOOL_RESULT_IMAGES=false` (or `0`/`off`) stops forwarding
+  for models without vision; the note is added instead. Default: on.
+
+### MCP servers that act on the user's desktop
+
+`lunarwing mcp add` takes two operator safety flags (persisted in
+`McpServerConfig`):
+
+- `--interactive-only` (`interactive_only`): the server's tools never run
+  in autonomous contexts (routines, background jobs, missions, Engine V2
+  background threads) or in shared conversations.
+  `McpToolWrapper::allows_autonomous_execution` and
+  `Tool::allows_shared_conversation` return `false`; every autonomous path
+  already checks the first, and the v1 preflight and the Engine V2 effect
+  adapter refuse the second in shared conversations before approval is
+  considered. `lunarwing mcp update` and extension reinstalls keep the
+  setting; `lunarwing mcp add` for an existing name replaces the whole
+  entry, so repeat the flag there.
+- `--require-approval <TOOL>` (repeatable, `always_require_approval`): the
+  raw MCP tool must be approved on every call, even when the session
+  auto-approves tools.
+
+The Wayland computer-use connector in `projects/computer-use/` is the
+intended user of both; its README has the full registration commands.
+
 ### What Goes in Tools (capabilities.json)
 
 - API endpoints the tool needs (HTTP allowlist)

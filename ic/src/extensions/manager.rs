@@ -3104,6 +3104,9 @@ impl ExtensionManager {
             new_config.description = existing.description.clone();
         }
         new_config.always_require_approval = existing.always_require_approval.clone();
+        // Operator safety setting: an update must not silently re-enable
+        // autonomous use of the server's tools.
+        new_config.interactive_only = existing.interactive_only;
         if new_config.provenance.is_none() {
             new_config.provenance = existing.provenance.clone();
         }
@@ -7740,7 +7743,8 @@ done
             std::collections::HashMap::new(),
             std::collections::HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
         )
-        .with_always_require_approval(["write_data"]);
+        .with_always_require_approval(["write_data"])
+        .with_interactive_only(true);
         manager
             .install_mcp_config(original, "test")
             .await
@@ -7765,6 +7769,10 @@ done
         assert_eq!(
             updated.always_require_approval,
             vec!["write_data".to_string()]
+        );
+        assert!(
+            updated.interactive_only,
+            "an update must not re-enable autonomous use"
         );
         assert!(matches!(
             updated.effective_transport(),

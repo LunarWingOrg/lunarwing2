@@ -189,6 +189,7 @@ here while they are still present in `proposals/`.
 | [`APP_BUILDER_DIRECTION.md`](proposals/APP_BUILDER_DIRECTION.md) | Open | Unscoped App Builder enhancement idea |
 | [`CARGO_TESTS_FIX.md`](proposals/CARGO_TESTS_FIX.md) | Partial | Ten test fixes landed; six architectural test cases remain deferred |
 | [`CHAOS_FOLLOWUP_TESTS.md`](proposals/CHAOS_FOLLOWUP_TESTS.md) | Partial | Truncated-state coverage landed; most proposed chaos cases remain open |
+| [`COMPUTER_USE_WAYLAND.md`](proposals/COMPUTER_USE_WAYLAND.md) | Implemented / live acceptance pending | Tool-result images to the model (v1 and Engine V2), MCP wire fixes, `--interactive-only`, and the Wayland desktop connector in `projects/computer-use/` |
 | [`COOL_THINGS_THAT_HERMES_AGENT_HAS.md`](proposals/COOL_THINGS_THAT_HERMES_AGENT_HAS.md) | Historical | Roadmap snapshot with several shipped ideas and a larger open wishlist |
 | [`DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md`](proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md) | Open / security-gated | Post-Stage-A key-exchange roadmap with explicit live-isolation and leak-test gates |
 | [`DARKIRC_SECURE_KEY_EXCHANGE.md`](proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) | Stage A acceptance pending | Phase 0/1 and Stage A command surface implemented; current immutable-release H3 evidence remains required on systemd and OpenRC |

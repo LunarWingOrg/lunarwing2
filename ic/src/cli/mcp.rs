@@ -207,6 +207,17 @@ pub struct McpAddArgs {
     /// network namespace (stdio transport, Linux)
     #[arg(long)]
     pub sandbox_network_isolated: bool,
+
+    /// Only run this server's tools in private interactive turns: never in
+    /// routines, background jobs, missions or shared conversations
+    /// (recommended for desktop control)
+    #[arg(long)]
+    pub interactive_only: bool,
+
+    /// Raw MCP tool name that must be approved on every call, even when the
+    /// session auto-approves tools (can be repeated)
+    #[arg(long = "require-approval", value_name = "TOOL")]
+    pub require_approval: Vec<String>,
 }
 
 /// Arguments for the `mcp update` subcommand.
@@ -635,6 +646,17 @@ fn apply_add_metadata(
     }
     if let Some(description) = &args.description {
         config = config.with_description(description);
+    }
+    if args.interactive_only {
+        config = config.with_interactive_only(true);
+    }
+    if !args.require_approval.is_empty() {
+        config = config.with_always_require_approval(
+            args.require_approval
+                .iter()
+                .map(|tool| tool.trim())
+                .filter(|tool| !tool.is_empty()),
+        );
     }
     if let Some(sandbox) = sandbox {
         config = config.with_sandbox(sandbox);
@@ -1302,6 +1324,9 @@ fn build_update_config(
     config.header_secrets = existing.header_secrets.clone();
     config.description = existing.description.clone();
     config.always_require_approval = existing.always_require_approval.clone();
+    // Operator safety setting: an update must not re-enable autonomous or
+    // shared-conversation use of the server's tools.
+    config.interactive_only = existing.interactive_only;
     // Retain only the pin associated with the selected local runtime.
     config.provenance = existing.provenance.clone().map(|mut provenance| {
         match config.effective_transport() {
@@ -2064,6 +2089,56 @@ mod tests {
     }
 
     #[test]
+    fn interactive_only_and_require_approval_flags_reach_the_server_config() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "desktop",
+            "--transport",
+            "stdio",
+            "--command",
+            "/usr/bin/python3",
+            "--interactive-only",
+            "--require-approval",
+            "desktop_type_text",
+            "--require-approval",
+            "desktop_key",
+        ])
+        .expect("parse desktop flags");
+        let McpCommand::Add(args) = parsed.cmd else {
+            panic!("expected add command");
+        };
+        let config = apply_add_metadata(
+            McpServerConfig::new_stdio("desktop", "/usr/bin/python3", Vec::new(), HashMap::new()),
+            &args,
+            None,
+        )
+        .expect("config builds");
+        assert!(config.interactive_only);
+        assert_eq!(
+            config.always_require_approval,
+            vec!["desktop_type_text".to_string(), "desktop_key".to_string()]
+        );
+
+        let json = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(json["interactive_only"], true);
+        let plain = McpServerConfig::new_stdio("plain", "cat", Vec::new(), HashMap::new());
+        let json = serde_json::to_value(&plain).expect("serialize");
+        assert!(
+            json.get("interactive_only").is_none(),
+            "default stays off and is not written"
+        );
+    }
+
+    #[test]
     fn test_mcp_sandbox_flags_parse_and_build() {
         use clap::Parser;
 
@@ -2279,6 +2354,38 @@ mod tests {
         let provenance = updated.provenance.expect("provenance retained");
         assert_eq!(provenance.trust, PackageTrust::Pinned);
         assert!(provenance.command_sha256.is_some());
+    }
+
+    #[test]
+    fn build_update_keeps_interactive_only_for_every_transport() {
+        // Regression: `mcp update` rebuilt the config from scratch and
+        // silently cleared interactive_only, re-enabling autonomous use.
+        let stdio = McpServerConfig::new_stdio("desktop", "connector", vec![], HashMap::new())
+            .with_interactive_only(true);
+        let unix = McpServerConfig::new_unix("desktop", "/run/user/1000/desktop.sock")
+            .with_interactive_only(true);
+        for (existing, transport, url, command) in [
+            (&stdio, None, None, None),
+            (&stdio, Some("stdio"), None, Some("/usr/bin/ssh")),
+            (&stdio, Some("http"), Some("https://mcp.example.com"), None),
+            (&unix, None, None, None),
+        ] {
+            let args = McpUpdateArgs {
+                name: "desktop".to_string(),
+                url: url.map(str::to_string),
+                transport: transport.map(str::to_string),
+                placement: None,
+                command: command.map(str::to_string),
+                cmd_args: None,
+                env: None,
+                secret_env: None,
+            };
+            let updated = build_update_config(&args, existing).expect("build update config");
+            assert!(
+                updated.interactive_only,
+                "interactive_only lost on update to {transport:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

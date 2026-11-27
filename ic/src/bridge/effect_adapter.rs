@@ -20,6 +20,7 @@ use lunarwing_engine::{
     ThreadExecutionContext, ThreadId,
 };
 
+use crate::bridge::action_images::ActionImageMailbox;
 use crate::bridge::auth_manager::{AuthCheckResult, AuthManager};
 use crate::bridge::generated_images::GeneratedImageStash;
 use crate::context::JobContext;
@@ -57,6 +58,9 @@ pub struct EffectBridgeAdapter {
     /// Images returned by image tools in channel threads, until the router
     /// forwards their `ActionExecuted` event (TUI design 8.3.6).
     generated_images: GeneratedImageStash,
+    /// Tool-result images (for example screenshots) until the engine's next
+    /// model request for the thread that ran the action.
+    action_images: ActionImageMailbox,
 }
 
 impl EffectBridgeAdapter {
@@ -77,6 +81,7 @@ impl EffectBridgeAdapter {
             auth_manager: RwLock::new(None),
             coordination_gate: RwLock::new(None),
             generated_images: GeneratedImageStash::default(),
+            action_images: ActionImageMailbox::default(),
         }
     }
 
@@ -688,14 +693,42 @@ impl EffectBridgeAdapter {
         parameters: &serde_json::Value,
         job_ctx: &JobContext,
         context: &ThreadExecutionContext,
-    ) -> Result<String, crate::error::Error> {
+    ) -> Result<crate::tools::execute::RichToolOutput, crate::error::Error> {
         if let Some(answer) = self
             .engine_capability_tool_info(lookup_name, parameters, context)
             .await
         {
-            return answer;
+            return answer.map(|content| crate::tools::execute::RichToolOutput {
+                content,
+                images: Vec::new(),
+            });
         }
-        crate::tools::execute::execute_tool_with_safety(
+        // Shared conversations never show tool-result images: the model's
+        // description of them would reach everyone in the room.
+        let text_only_reason = if context.shared_conversation {
+            Some("images are not shown in shared conversations")
+        } else if !crate::tools::images::tool_result_images_enabled() {
+            Some("tool-result images are disabled (TOOL_RESULT_IMAGES=false)")
+        } else {
+            None
+        };
+        if let Some(reason) = text_only_reason {
+            // Text only: the pipeline notes any images it drops.
+            return crate::tools::execute::execute_tool_with_safety_text_only(
+                &self.tools,
+                &self.safety,
+                lookup_name,
+                parameters.clone(),
+                job_ctx,
+                reason,
+            )
+            .await
+            .map(|content| crate::tools::execute::RichToolOutput {
+                content,
+                images: Vec::new(),
+            });
+        }
+        crate::tools::execute::execute_tool_with_safety_rich(
             &self.tools,
             &self.safety,
             lookup_name,
@@ -703,6 +736,37 @@ impl EffectBridgeAdapter {
             job_ctx,
         )
         .await
+    }
+
+    /// Park the images a successful action returned until the engine's next
+    /// model request for this thread. The text result is unaffected.
+    fn park_action_images(
+        &self,
+        action_name: &str,
+        images: Vec<crate::tools::ToolImage>,
+        context: &ThreadExecutionContext,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        let parts = images
+            .into_iter()
+            .map(|image| {
+                let (mime_type, data) = image.into_parts();
+                lunarwing_engine::TransientContentPart::Image {
+                    mime_type: mime_type.to_string(),
+                    data,
+                }
+            })
+            .collect();
+        self.action_images.put(
+            context.thread_id,
+            lunarwing_engine::ActionImages {
+                call_id: context.current_call_id.clone().unwrap_or_default(),
+                action_name: action_name.to_string(),
+                parts,
+            },
+        );
     }
 
     /// Gate a `mission_*` capability call before dispatch (WI#308).
@@ -1400,6 +1464,15 @@ impl EffectBridgeAdapter {
             let normalized_parameters =
                 crate::tools::prepare_tool_params(tool.as_ref(), &parameters);
             let requirement = tool.requires_approval(&normalized_parameters);
+            if context.shared_conversation && !tool.allows_shared_conversation() {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{}' cannot run in shared conversations. Ask the user to \
+                         message me directly to use this tool.",
+                        action_name
+                    ),
+                });
+            }
             if context.shared_conversation && requirement.is_required() {
                 return Err(Self::gate_paused(
                     "approval",
@@ -1598,6 +1671,11 @@ impl EffectBridgeAdapter {
 
         match result {
             Ok(output) => {
+                let crate::tools::execute::RichToolOutput {
+                    content: output,
+                    images,
+                } = output;
+                self.park_action_images(action_name, images, context);
                 // Before sanitizing truncates the sentinel (TUI design 8.3.6).
                 self.stash_generated_image(lookup_name, &output, context);
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
@@ -1776,6 +1854,10 @@ impl EffectExecutor for EffectBridgeAdapter {
     ) -> Result<ActionResult, EngineError> {
         self.execute_action_internal(action_name, parameters, lease, context, false)
             .await
+    }
+
+    async fn take_action_images(&self, thread_id: ThreadId) -> Vec<lunarwing_engine::ActionImages> {
+        self.action_images.take(thread_id)
     }
 
     async fn available_actions(
@@ -2623,6 +2705,117 @@ mod tests {
             run_sentinel_tool(&adapter, tool, context).await;
             assert_eq!(adapter.generated_images.len(), 0, "{tool} {context:?}");
         }
+    }
+
+    /// Returns text plus one validated PNG, like a desktop screenshot.
+    struct ScreenshotTool;
+
+    #[async_trait]
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> &str {
+            "desktop_screenshot"
+        }
+
+        fn description(&self) -> &str {
+            "Return a screenshot"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let png = crate::tools::ToolImage::from_bytes(crate::tools::images::TEST_PNG.to_vec())
+                .expect("png");
+            Ok(
+                ToolOutput::text("frame 2, 1280x800", std::time::Duration::from_millis(1))
+                    .with_images(vec![png]),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_images_are_handed_to_the_engine_per_thread() {
+        let adapter = make_adapter();
+        adapter.tools.register(Arc::new(ScreenshotTool)).await;
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let other_thread = lunarwing_engine::ThreadId::new();
+
+        let result = adapter
+            .execute_action(
+                "desktop_screenshot",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(thread_id, Some("shot-1")),
+            )
+            .await
+            .expect("screenshot executes");
+
+        // The text the engine receives is unchanged and carries no image bytes.
+        assert!(!result.is_error);
+        assert_eq!(result.output, serde_json::json!("frame 2, 1280x800"));
+        assert!(adapter.take_action_images(other_thread).await.is_empty());
+        let images = adapter.take_action_images(thread_id).await;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].call_id, "shot-1");
+        assert_eq!(images[0].action_name, "desktop_screenshot");
+        assert!(matches!(
+            images[0].parts.as_slice(),
+            [lunarwing_engine::TransientContentPart::Image { mime_type, data }]
+                if mime_type == "image/png" && data.as_slice() == crate::tools::images::TEST_PNG
+        ));
+        assert!(
+            adapter.take_action_images(thread_id).await.is_empty(),
+            "taken once"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_conversations_never_hand_images_to_the_engine() {
+        let adapter = make_adapter();
+        adapter.tools.register(Arc::new(ScreenshotTool)).await;
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let mut context = exec_ctx(thread_id, Some("shot-1"));
+        context.shared_conversation = true;
+
+        let result = adapter
+            .execute_action(
+                "desktop_screenshot",
+                serde_json::json!({}),
+                &lease(),
+                &context,
+            )
+            .await
+            .expect("screenshot executes");
+
+        let text = result.output.as_str().expect("text result");
+        assert!(text.starts_with("frame 2, 1280x800\n[1 image returned by this tool not shown"));
+        assert!(text.contains("shared conversations"));
+        assert!(adapter.take_action_images(thread_id).await.is_empty());
+    }
+
+    #[test]
+    fn engine_and_host_share_tool_image_labels_and_budgets() {
+        assert_eq!(
+            lunarwing_engine::ACTION_IMAGES_MESSAGE_PREFIX,
+            crate::tools::images::TOOL_IMAGES_MESSAGE_PREFIX
+        );
+        assert_eq!(
+            lunarwing_engine::executor::action_images::MAX_ACTION_IMAGE_BYTES,
+            crate::tools::images::MAX_TOOL_IMAGE_BYTES_PER_REQUEST
+        );
+        assert_eq!(
+            lunarwing_engine::executor::action_images::MAX_ACTION_IMAGE_STEPS,
+            crate::tools::images::MAX_RETAINED_TOOL_IMAGE_STEPS
+        );
+        assert_eq!(
+            lunarwing_engine::executor::action_images::MAX_ACTION_IMAGES_PER_STEP,
+            crate::tools::images::MAX_TOOL_IMAGES_PER_STEP
+        );
     }
 
     #[tokio::test]

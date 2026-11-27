@@ -12,7 +12,7 @@ use lunarwing_common::{
 
 use crate::types::capability::{ActionDef, CapabilityLease};
 use crate::types::error::EngineError;
-use crate::types::message::{MessageRole, ThreadMessage};
+use crate::types::message::{ActionImages, MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
 use crate::types::step::{ActionResult, StepId};
 use crate::types::thread::{ThreadId, ThreadType};
@@ -111,6 +111,17 @@ pub trait EffectExecutor: Send + Sync {
     /// [`EffectExecutor::available_actions`] instead.
     async fn registered_actions(&self) -> Result<Vec<ActionDef>, EngineError> {
         self.available_actions(&[]).await
+    }
+
+    /// Take the images that successful actions of `thread_id` returned since
+    /// the previous call, oldest first (for example desktop screenshots).
+    ///
+    /// The engine calls this before each main model request and shows the
+    /// images to the model next to the step that produced them. Images are
+    /// runtime-only: they are never persisted with the thread. Executors that
+    /// produce no images keep the default.
+    async fn take_action_images(&self, _thread_id: ThreadId) -> Vec<ActionImages> {
+        Vec::new()
     }
 }
 
