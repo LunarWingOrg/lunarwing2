@@ -8,12 +8,9 @@ LunarWing reaches IRC networks through a per-instance WeeChat relay. The current
 
 The adapter-to-WeeChat hop is WebSocket; the sandboxed channel-to-adapter hop is HTTP. See [`../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md`](../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md) for the current message flow, configuration precedence, sender principals, latency model, and known limitations.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The registry manifest is
-`0.2.20` and the WASM channel crate is `2.2.3`. Source/registry paths,
-capability schema, mt-admin bootstrap/recovery commands, and the preflight
-script match the current tree. WI#577 makes a non-empty managed
-`RELAY_PASSWORD` override a stale per-owner store secret during both setup and
-host HTTP credential injection; the store remains the fallback.
+The registry manifest is `0.2.20` and the WASM channel crate is `2.2.3`.
+A non-empty managed `RELAY_PASSWORD` takes priority over the per-owner store
+secret during channel setup and host HTTP credential injection (WI#577).
 
 ## Source and Registry
 
@@ -27,10 +24,11 @@ The old nested install and troubleshooting guides were archived under `docs/guid
 
 ## Multi-Tenant Setup
 
-MT admin configures WeeChat by default when adding a tenant. It:
-
-- allocates `weechat` and `weechat_adapter` ports from `/etc/lunarwing/ports.json`;
-- generates a per-tenant relay password;
+MT admin allocates `weechat` and `weechat_adapter` ports in
+`/etc/lunarwing/ports.json` and generates a per-tenant relay password. It
+attempts WeeChat relay setup when adding a tenant unless
+`--no-weechat-bootstrap` is set. A failed bootstrap leaves the base tenant
+provisioned and prints a recovery command. On successful setup, MT admin:
 - writes only `RELAY_PASSWORD` to the protected `env/weechat.env` consumed by WeeChat;
 - stores `${env:RELAY_PASSWORD}` literally in `relay.conf` rather than the resolved value;
 - binds the relay to `127.0.0.1` and disables relay IPv6 before binding;
@@ -144,7 +142,7 @@ IRC identity is not cryptographic. WeeChat sender principals are network-qualifi
 
 1. MT admin `status <tenant>` reports the expected init state for WeeChat, its adapter, and LunarWing; host `doctor` checks general MT prerequisites.
 2. The preflight script confirms the relay type, bind address, port, and protected password wiring.
-3. The adapter health endpoint responds on the tenant's `weechat_adapter` port.
+3. On the tenant's `weechat_adapter` port, `/api/health` reports `ws_connected: true`. A response with `status: "degraded"` means the adapter is reachable but its relay connection is down.
 4. A configured IRC connection receives a direct message and channel message according to policy.
 5. Pairing rejects an unknown sender until approved.
 6. Outbound replies reach the correct network-qualified buffer.
