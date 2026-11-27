@@ -122,6 +122,7 @@ ic/crates/lunarwing_engine/src/
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
     llm_stream.rs         LLM streaming support
+    action_images.rs      Transient model-request images from tool results
     orchestrator.rs       Python step-loop runner and live structured-call dispatch (Tier 0)
   memory/                 Memory document system
     store.rs              MemoryStore (project-scoped doc CRUD)
@@ -349,8 +350,8 @@ Follow-ups that still
 cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
 context_overflow recovery (the model again sees `{items: [...` with no
 cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:1018-1019`,
-the Engine v2 500-byte preview in `ic/src/bridge/router.rs:4264-4294` built
-from the 1000-byte event preview in
+the 500-byte Engine V2 preview that `tool_call_summaries` in
+`ic/src/bridge/router.rs` builds from the 1000-byte event preview in
 `ic/crates/lunarwing_engine/src/types/event.rs:235-248`,
 shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
 The v1 earlier-turn 1000-byte tool-result cut in
@@ -1519,13 +1520,12 @@ alongside the Research-thread refusal — partial v1 parity (create/delete
 only; v1 also denies update/fire, which v2 keeps as steering) — so creating,
 deleting or resuming a mission stays with the foreground conversation (which
 can be supervised via `AGENT_SUPERVISED_MODE` or `lunarwing --supervised`).
-Run-spawning approval prompts disclose fan-out. The owner-scoped steering
-reach that remains is deliberate and stays open. The lease planner grants
-mission actions by thread type, and the orchestrator checks for a covering
-lease at dispatch. `EffectBridgeAdapter::available_actions` supplies only
-registry actions to `PolicyEngine`, so mission verbs have no `PolicyEngine`
-evaluation at lease grant or dispatch. The bridge checks mission permissions,
-supervision, rate limits, and hooks in `gate_mission_call`.
+Run-spawning approval prompts disclose fan-out. The orchestrator requires a
+covering lease at dispatch. Lease planning does not call `PolicyEngine`, and
+`EffectBridgeAdapter::available_actions` supplies only registry actions for
+policy evaluation at dispatch. The bridge enforces the thread-type restrictions
+above and checks permissions, supervision, rate limits, and hooks in
+`gate_mission_call`.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
@@ -1761,16 +1761,17 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 - Keeps action discovery split by purpose: `registered_actions()` returns the
   unscoped live tool catalog only for late-tool lease planning, while
   `available_actions(leases)` advertises only actions covered by a supplied,
-  currently valid lease. Execution prompts therefore cannot expose a tool that
-  the thread is not allowed to call.
+  currently valid lease. The adapter still applies runtime restrictions when a
+  leased action is called.
 - The thread-type-aware `LeasePlanner` still decides which registered actions a
   resumed thread may gain. In particular, mission leases exclude administrative
   and autonomous-denylisted actions such as `create_job`; foreground leases keep
   them behind their normal interactive gates.
 - Before executing a registry tool, including an approval resume, the adapter
   rejects non-foreground calls when `allows_autonomous_execution()` is false.
-  Both secrets tools opt out; `secret_delete` additionally requires approval
-  for each foreground deletion and ignores persistent `always_allow` grants.
+  The secrets tools and MCP tools on `interactive_only` servers or pinned to
+  per-call approval opt out. `secret_delete` requires approval for each
+  foreground deletion and ignores persistent `always_allow` grants.
   Daemon discovery and engine lease planning share the autonomous denylist,
   including `ssh`/`ssh_git`; per-tool opt-outs are independently rechecked.
 
@@ -2208,9 +2209,10 @@ transcript, checkpoints, events or traces. A step is identified by a
 fingerprint of its result message; when compaction removes that message, its
 images go with it. The stash resends up to three recent image-bearing steps,
 with an 8 MiB aggregate limit. Older steps keep their text results. Failed
-MCP calls drop their images. On approval resume, the new orchestrator run
-drains the mailbox before its first request. Restarting drops all stashed
-images. `TOOL_RESULT_IMAGES=false` disables forwarding and adds an omission
+MCP calls drop their images. On approval resume, the model receives the
+approved action’s text result. The new orchestrator run drains the mailbox
+before its first request, dropping any images from that action. Restarting
+drops all stashed images. `TOOL_RESULT_IMAGES=false` disables forwarding and adds an omission
 note when a tool returns images.
 
 ### Local Compatibility Proof
@@ -2224,8 +2226,9 @@ channel contract remains final-response-only and ignores stream chunks.
 
 Validate deployed XMPP, DarkIRC, and WeeChat bridges on a disposable tenant.
 With Engine V2 enabled, a bare daemon routes only the gateway unless
-`ENGINE_V2_CHANNELS` names eligible channels. MT admin supplies
-`xmpp,weechat,darkirc` on initial provisioning.
+`ENGINE_V2_CHANNELS` names eligible channels. `add-tenant` supplies
+`xmpp,weechat,darkirc` whenever the stored value is missing or empty, including
+on re-runs. Set `ENGINE_V2=false` to disable Engine V2 across all channels.
 
 ## External Trait Boundaries
 
@@ -2292,8 +2295,9 @@ ENGINE_V2_CHANNELS=            # Gateway only (runtime default)
 ENGINE_V2_CHANNELS=xmpp        # Add XMPP
 ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 # Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
-# (existing tenant values preserved on re-render; ENGINE_V2=false is the only
-#  durable opt-out — a value like `none` is an ignored unknown entry)
+# Nonempty tenant values survive re-render. `ENGINE_V2=false` disables all
+# V2 routing. To route only the gateway, keep V2 enabled and set a nonempty
+# allowlist without eligible channels (for example, `none`, an ignored entry).
 SKILL_SELF_IMPROVEMENT=false   # Bare default; mt-admin renders true for new tenants.
                                # Gates skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
