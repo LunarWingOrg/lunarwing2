@@ -53,6 +53,9 @@ class ImportConfig:
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
+    with_opencode2: bool = False
+    opencode2_model: str = ""
+    opencode2_base_url: str = ""
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
@@ -84,6 +87,9 @@ class ImportConfig:
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
             "with_kimi": self.with_kimi,
+            "with_opencode2": self.with_opencode2,
+            "opencode2_model": self.opencode2_model,
+            "opencode2_base_url": self.opencode2_base_url,
             "with_toolchains": self.with_toolchains,
             "with_vision": self.with_vision,
             "docker_group": self.docker_group,
@@ -110,6 +116,9 @@ class ImportConfig:
             with_pebble=_bool_value(data.get("with_pebble", False)),
             with_opencode=_bool_value(data.get("with_opencode", False)),
             with_kimi=_bool_value(data.get("with_kimi", False)),
+            with_opencode2=_bool_value(data.get("with_opencode2", False)),
+            opencode2_model=_str_value(data.get("opencode2_model", "")),
+            opencode2_base_url=_str_value(data.get("opencode2_base_url", "")),
             with_toolchains=_bool_value(data.get("with_toolchains", False)),
             with_vision=_bool_value(data.get("with_vision", False)),
             docker_group=_bool_value(data.get("docker_group", False)),
@@ -165,6 +174,14 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--with-opencode")
     if cfg.with_kimi:
         args.append("--with-kimi")
+    if cfg.with_opencode2:
+        args.append("--with-opencode2")
+    for flag, value in (
+        ("--opencode2-model", cfg.opencode2_model),
+        ("--opencode2-base-url", cfg.opencode2_base_url),
+    ):
+        if value:
+            args.extend([flag, value])
     if cfg.with_toolchains:
         args.append("--with-toolchains")
     if cfg.with_vision:

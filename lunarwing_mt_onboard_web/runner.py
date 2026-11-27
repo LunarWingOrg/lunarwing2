@@ -207,7 +207,8 @@ def run_provision_job(job: Job, req: ProvisionRequest, *, log_dir: str | None = 
 
         # add-tenant
         announce("add-tenant", f"Creating tenant '{cfg.name}'")
-        rc = _run_phase(job, provisioner.build_add_tenant_args(cfg), "add-tenant", audit)
+        with provisioner.add_tenant_command(cfg) as argv:
+            rc = _run_phase(job, argv, "add-tenant", audit)
         summary.append({"name": "add-tenant", "ok": rc == 0, "code": rc})
         if _halt(job, rc):
             return _finish(job, audit, summary)

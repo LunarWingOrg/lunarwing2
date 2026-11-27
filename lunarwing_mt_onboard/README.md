@@ -11,7 +11,7 @@ Guides an operator through the full provisioning lifecycle for a new tenant:
 2. Secrets generation (gateway token, PG password, SECRETS_MASTER_KEY)
 3. LLM provider configuration
 4. XMPP and Gotify channel setup
-5. External worker selection (Pebble, OpenCode, OpenCode 2, Kimi Code)
+5. External worker selection (Pebble, OpenCode, OpenCode 2, Kimi Code, LunarDepth)
 6. Build (with live log output)
 7. Start and post-start verification
 
@@ -48,6 +48,11 @@ sudo python3 -m lunarwing_mt_onboard
 ```bash
 sudo python3 -m lunarwing_mt_onboard --resume /path/to/tenant.json
 ```
+
+LunarDepth requires its own OpenAI-compatible API root, complete TensorMoon or
+TensorZero function model ID, and per-tenant API key. Saved plans keep the URL
+and model but omit the key. Enter it again when resuming interactively or pass
+`--lunardepth-api-key-file /path/to/key` when using a private key file.
 
 ### Non-interactive (CI / bulk provisioning)
 

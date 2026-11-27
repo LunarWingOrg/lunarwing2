@@ -53,6 +53,11 @@ class ProvisionRequest(RequestModel):
     kimi_model: str = ""
     kimi_base_url: str = ""
     kimi_api_key: str = ""
+    lunardepth_model: str = ""
+    lunardepth_base_url: str = ""
+    lunardepth_api_key: SecretStr = Field(
+        default_factory=lambda: SecretStr(""), exclude=True, repr=False
+    )
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -73,10 +78,15 @@ class ProvisionRequest(RequestModel):
         unknown_workers = sorted(set(self.workers) - _VALID_WORKERS)
         if unknown_workers:
             raise ValueError(f"unknown workers: {', '.join(unknown_workers)}")
+        if WorkerType.LUNARDEPTH.value in self.workers:
+            error = self.to_tenant_config().validate_lunardepth()
+            if error:
+                raise ValueError(error)
         return self
 
     def to_tenant_config(self) -> TenantConfig:
         workers = [WorkerType(w) for w in self.workers]
+        with_lunardepth = WorkerType.LUNARDEPTH in workers
         return TenantConfig(
             name=self.name.strip(),
             gateway_host=self.gateway_host.strip() or "127.0.0.1",
@@ -120,6 +130,11 @@ class ProvisionRequest(RequestModel):
                 self.kimi_base_url.strip() if WorkerType.KIMI in workers else ""
             ),
             kimi_api_key=(self.kimi_api_key if WorkerType.KIMI in workers else ""),
+            lunardepth_model=self.lunardepth_model.strip() if with_lunardepth else "",
+            lunardepth_base_url=self.lunardepth_base_url.strip() if with_lunardepth else "",
+            lunardepth_api_key=(
+                self.lunardepth_api_key.get_secret_value() if with_lunardepth else ""
+            ),
             llm_api_key=self.llm_api_key,
             secrets_master_key=self.secrets_master_key.strip(),
             no_ssh=self.no_ssh,
@@ -206,6 +221,9 @@ class ImportRequest(RequestModel):
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
+    with_opencode2: bool = False
+    opencode2_model: str = ""
+    opencode2_base_url: str = ""
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
@@ -240,6 +258,9 @@ class ImportRequest(RequestModel):
             with_pebble=self.with_pebble,
             with_opencode=self.with_opencode,
             with_kimi=self.with_kimi,
+            with_opencode2=self.with_opencode2,
+            opencode2_model=self.opencode2_model.strip(),
+            opencode2_base_url=self.opencode2_base_url.strip(),
             with_toolchains=self.with_toolchains,
             with_vision=self.with_vision,
             docker_group=self.docker_group,

@@ -27,7 +27,9 @@
 #
 # Usage (run as root on the new host):
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
-#        [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
+#        [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--with-toolchains]
+#        [--opencode2-model <model>] [--opencode2-base-url <url>]
+#        [--with-lunardepth --lunardepth-model <model> --lunardepth-base-url <url> --lunardepth-api-key-file <path>]
 #        [--with-vision] [--docker-group]
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--resume] [--force]
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
@@ -44,15 +46,14 @@ BUNDLE_DARKIRC_MANIFEST_MODE_OK=false
 BUNDLE_FORMAT=""
 KAWARIMI_ARCHIVE_PASS=""
 
-# These are the only values the exporter is allowed to carry into a live
-# tenant environment.  Import treats the bundle as untrusted input: an
-# arbitrary KEY=value line must never become a service setting.
+# Import treats the bundle as untrusted input. Only the keys below are accepted.
+# The tenant-side merge ignores legacy Nanocode and LunarDepth entries.
 IMPORT_LUNARWING_KEYS=(
   SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
   XMPP_ALLOW_ROOMS XMPP_ENCRYPTED_ROOMS XMPP_ALLOW_PLAINTEXT_FALLBACK
-  XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL NANOCODE_MODEL OPENCODE_MODEL KIMI_MODEL
+  XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL NANOCODE_MODEL OPENCODE_MODEL KIMI_MODEL OPENCODE2_MODEL
   KIMI_API_KEY GOTIFY_URL GATEWAY_HOST MASCOT_ENABLED HTTP_HOST LLM_BASE_URL NANOCODE_BASE_URL
-  OPENCODE_BASE_URL KIMI_BASE_URL
+  OPENCODE_BASE_URL KIMI_BASE_URL OPENCODE2_BASE_URL
   LUNARDEPTH_BASE_URL LUNARDEPTH_MODEL LUNARDEPTH_ALLOW_INSECURE_HTTP
   LUNARDEPTH_ALLOW_PLACEHOLDER_KEY LUNARDEPTH_API_KEY
 )
@@ -72,6 +73,9 @@ WITH_DOCKER_GROUP=false
 WITH_PEBBLE=false
 WITH_OPENCODE=false
 WITH_KIMI=false
+WITH_OPENCODE2=false
+OPENCODE2_MODEL_OVERRIDE=""
+OPENCODE2_BASE_URL_OVERRIDE=""
 WITH_LUNARDEPTH=false
 LUNARDEPTH_MODEL=""
 LUNARDEPTH_BASE_URL=""
@@ -134,6 +138,9 @@ while [[ $# -gt 0 ]]; do
     --with-pebble)   WITH_PEBBLE=true; shift ;;
     --with-opencode)   WITH_OPENCODE=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
+    --with-opencode2)  WITH_OPENCODE2=true; shift ;;
+    --opencode2-model) need_value "$@"; OPENCODE2_MODEL_OVERRIDE="$2"; shift 2 ;;
+    --opencode2-base-url) need_value "$@"; OPENCODE2_BASE_URL_OVERRIDE="$2"; shift 2 ;;
     --with-lunardepth) WITH_LUNARDEPTH=true; shift ;;
     --lunardepth-model) need_value "$@"; LUNARDEPTH_MODEL="$2"; shift 2 ;;
     --lunardepth-base-url) need_value "$@"; LUNARDEPTH_BASE_URL="$2"; shift 2 ;;
@@ -342,6 +349,7 @@ validate_manifest() {
     seen["$key"]=1
     case "$kind:$key" in
       lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:MASCOT_ENABLED|lunarwing:HTTP_HOST) ;;
+      lunarwing:OPENCODE2_MODEL|lunarwing:OPENCODE2_BASE_URL) ;;
       bridge:XMPP_JID|bridge:XMPP_PASSWORD|bridge:XMPP_DM_POLICY|bridge:XMPP_ALLOW_FROM_JSON|bridge:XMPP_ALLOW_ROOMS_JSON|bridge:XMPP_ENCRYPTED_ROOMS_JSON|bridge:XMPP_DEVICE_ID|bridge:XMPP_ALLOW_PLAINTEXT_FALLBACK) ;;
       vision:VL_URL|vision:VL_MODEL|vision:LUNARWING_AUTH_TOKEN) ;;
       *) die "$kind manifest contains unsupported key '$key'" ;;
@@ -660,6 +668,8 @@ inject_keys() {  # <manifest> <live_env> <allowed-key> ...
           key = line
           sub(/=.*/, "", key)
           if (key == ENVIRON["TARGET_SKIP_KEY"] || key == "NANOCODE_MODEL" || key == "NANOCODE_BASE_URL") continue
+          # Worker routes were supplied to add-tenant. Ignore legacy LunarDepth manifest entries.
+          if (key ~ /^LUNARDEPTH_/ || key == "OPENCODE2_MODEL" || key == "OPENCODE2_BASE_URL") continue
           if (key in replacement) exit 74
           replacement[key] = line
           order[++count] = key
@@ -789,7 +799,11 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--resume] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--resume]
+  [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--with-toolchains]
+  [--opencode2-model <model>] [--opencode2-base-url <url>]
+  [--with-lunardepth --lunardepth-model <model> --lunardepth-base-url <url> --lunardepth-api-key-file <path>]
+  [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ ! -L "$BUNDLE" ]] || die "bundle path must not be a symlink"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
@@ -1053,6 +1067,15 @@ OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
 KIMI_BASE_URL="$(manifest_value KIMI_BASE_URL)"
+OPENCODE2_MODEL="${OPENCODE2_MODEL_OVERRIDE:-$(manifest_value OPENCODE2_MODEL)}"
+OPENCODE2_BASE_URL="${OPENCODE2_BASE_URL_OVERRIDE:-$(manifest_value OPENCODE2_BASE_URL)}"
+[[ "$OPENCODE2_MODEL" != *[[:cntrl:]]* ]] || die "OpenCode 2 model must not contain control characters"
+if [[ -n "$OPENCODE2_BASE_URL" ]]; then
+  [[ "$OPENCODE2_BASE_URL" =~ ^https?:// && "${OPENCODE2_BASE_URL#*://}" != *@* ]] \
+    || die "OpenCode 2 base URL must be an HTTP(S) URL without userinfo"
+  [[ "$OPENCODE2_BASE_URL" != *[[:space:][:cntrl:]]* ]] \
+    || die "OpenCode 2 base URL must not contain whitespace or control characters"
+fi
 GOTIFY_URL="$(manifest_value GOTIFY_URL)"
 if $WITH_LUNARDEPTH; then
   [[ -n "$LUNARDEPTH_BASE_URL" && -n "$LUNARDEPTH_MODEL" ]] \
@@ -1080,6 +1103,8 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
 [[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
 [[ -n "$KIMI_BASE_URL" ]] && add_args+=(--kimi-base-url "$KIMI_BASE_URL")
+[[ -n "$OPENCODE2_MODEL" ]] && add_args+=(--opencode2-model "$OPENCODE2_MODEL")
+[[ -n "$OPENCODE2_BASE_URL" ]] && add_args+=(--opencode2-base-url "$OPENCODE2_BASE_URL")
 # KIMI_API_KEY is secret-bearing. add-tenant generates placeholder config;
 # manifest injection below replaces it without exposing value through argv/logs.
 [[ -n "$GOTIFY_URL" ]] && add_args+=(--gotify-url "$GOTIFY_URL")
@@ -1091,6 +1116,7 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
+$WITH_OPENCODE2 && add_args+=(--with-opencode2)
 $WITH_LUNARDEPTH && add_args+=(--with-lunardepth --lunardepth-model "$LUNARDEPTH_MODEL" --lunardepth-base-url "$LUNARDEPTH_BASE_URL")
 [[ -z "$LUNARDEPTH_API_KEY_FILE" ]] || add_args+=(--lunardepth-api-key-file "$LUNARDEPTH_API_KEY_FILE")
 [[ "$LUNARDEPTH_ALLOW_INSECURE" != "true" ]] || add_args+=(--lunardepth-allow-insecure-http)
@@ -1118,6 +1144,7 @@ build_args=(build-tenant "$TENANT" --with-wasm)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
 $WITH_OPENCODE && build_args+=(--with-opencode)
 $WITH_KIMI && build_args+=(--with-kimi)
+$WITH_OPENCODE2 && build_args+=(--with-opencode2)
 $WITH_LUNARDEPTH && build_args+=(--with-lunardepth)
 $WITH_TOOLCHAINS && build_args+=(--with-toolchains)
 run "$MT" "${build_args[@]}"
