@@ -49,6 +49,11 @@ Encrypted `.7z` imports require the bundle passphrase even for dry-run because
 the metadata must be decrypted before validation. A real export requires a
 confirmed passphrase of at least 12 characters before it can stop services.
 
+Use **Restore OpenCode 2 worker** to select that lane during import. The optional
+model and base URL fields override values in the bundle. For a LunarDepth
+migration, use the shell importer with a destination route and key as described
+in the [migration guide](../docs/ops/MT-MACHINE-MIGRATION.md#3-import--cut-over-on-the-new-host).
+
 The upgrade form drives `lunarwing-mt-admin.sh upgrade-tenant`, accepts a branch,
 tag, or commit such as `v2.0.2.0`, and applies immediately after explicit
 confirmation. Backup and service-unit rendering remain enabled by default.
