@@ -47,11 +47,9 @@ import { runInNewContext } from "node:vm"
  * provider was contacted — everything the contract needs, in a few seconds
  * instead of the full ~60s+ retry exhaustion.
  *
- * Self-skip: when no real kimi binary is on PATH (host dev machines) all
- * four tests skip. In the worker image build (`npm test` in the Dockerfile) the
- * gate asserts the contract for real — `bin/kimi` is on PATH there; if the
- * build layout ever changes, KIMI_BIN can point at the installed CLI
- * explicitly.
+ * The four upstream contract tests skip when no Kimi binary is available on
+ * a developer host. The offline image gate sets KIMI_BIN and
+ * KIMI_WORKER_TEST_BUNDLE explicitly and requires the installed CLI.
  */
 
 interface ParsedResult {
@@ -137,7 +135,9 @@ async function probeRealKimi(): Promise<string | undefined> {
   return undefined
 }
 
+const workerBundle = process.env.KIMI_WORKER_TEST_BUNDLE
 const realKimi = await probeRealKimi()
+if (workerBundle && !realKimi) throw new Error("The offline worker gate requires a runnable Kimi CLI")
 const contractOpts: { skip: boolean; timeout: number } = { skip: realKimi === undefined, timeout: 60_000 }
 const realKimiBin = realKimi ?? "kimi"
 
@@ -465,7 +465,6 @@ test("worker feedback patch rejects unreviewed versions and bundle drift", async
   }
 })
 
-const workerBundle = process.env.KIMI_WORKER_TEST_BUNDLE
 if (workerBundle) {
   test("real CLI worker bundle refuses TUI feedback before resolving a target", async () => {
     const source = readFileSync(workerBundle, "utf8")
