@@ -22,7 +22,7 @@
       "manifest": "ic/Cargo.toml",
       "lockfile": "ic/Cargo.lock",
       "targets": ["lunarwing", "lunarwing_common", "lunarwing_safety", "lunarwing_skills", "lunarwing_engine", "lunarwing_health_metrics"],
-      "ci": ["rust-check-default", "rust-check-postgres", "rust-check-libsql", "rust-check-all-features", "rust-test-lib", "rust-test-libsql", "rust-test-postgres-integration", "rustfmt", "rust-clippy-all", "cargo-deny", "cargo-metadata", "rust-msrv-check"],
+      "ci": ["rust-check-default", "rust-check-postgres", "rust-check-libsql", "rust-check-all-features", "rust-test-lib", "rust-test-libsql", "rust-test-libsql-integration", "rust-test-postgres-integration", "rustfmt", "rust-clippy-all", "cargo-deny", "cargo-metadata", "rust-msrv-check"],
       "triggers": ["ic/**", ".cargo/config.toml"]
     },
     {
@@ -42,7 +42,7 @@
       "manifest": "ic/channels-src/xmpp/Cargo.toml",
       "lockfile": "ic/channels-src/xmpp/Cargo.lock",
       "targets": ["xmpp-channel"],
-      "ci": ["wasm-channel-test-artifacts"],
+      "ci": ["wasm-channel-test-artifacts", "rust-test-wasm-channels"],
       "triggers": ["ic/channels-src/xmpp/**", "lunarwing_weechat_wss/channel.wit"]
     },
     {
@@ -52,7 +52,7 @@
       "manifest": "ic/channels-src/multica/Cargo.toml",
       "lockfile": "ic/channels-src/multica/Cargo.lock",
       "targets": ["multica-channel"],
-      "ci": ["registry-json"],
+      "ci": ["registry-json", "rust-test-wasm-channels"],
       "triggers": ["ic/channels-src/multica/**"]
     },
     {
@@ -163,7 +163,7 @@
       "manifest": "ic/tests/fixtures/test-echo-tool/Cargo.toml",
       "lockfile": "ic/tests/fixtures/test-echo-tool/Cargo.lock",
       "targets": ["test-echo-tool"],
-      "ci": [],
+      "ci": ["wasm-channel-test-artifacts"],
       "triggers": ["ic/tests/fixtures/test-echo-tool/**"]
     },
     {
@@ -184,7 +184,7 @@
       "manifest": "lunarwing_weechat_wss/weechat_relay/Cargo.toml",
       "lockfile": "lunarwing_weechat_wss/weechat_relay/Cargo.lock",
       "targets": ["weechat-relay-channel"],
-      "ci": ["wasm-channel-test-artifacts", "shell-harnesses"],
+      "ci": ["wasm-channel-test-artifacts", "rust-test-wasm-channels", "shell-harnesses"],
       "triggers": ["lunarwing_weechat_wss/**"]
     },
     {
@@ -194,7 +194,7 @@
       "manifest": "darkirc_channel_for_lunarwing/darkirc/Cargo.toml",
       "lockfile": "darkirc_channel_for_lunarwing/darkirc/Cargo.lock",
       "targets": ["darkirc-channel"],
-      "ci": ["python-unit"],
+      "ci": ["python-unit", "wasm-channel-test-artifacts", "rust-test-wasm-channels"],
       "triggers": ["darkirc_channel_for_lunarwing/**"]
     },
     {
