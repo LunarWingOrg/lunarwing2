@@ -20,7 +20,8 @@ and pinned epoch can produce the same banner.
 grep -m1 "Starting LunarWing" /tenant-logs/daemon.log
 ```
 
-`lunarwing status` prints the same identity string.
+`lunarwing status` prints the identity embedded in the CLI binary. Check the
+daemon log to identify the running service when the CLI came from a different build.
 
 ## Choose a Log Level
 
