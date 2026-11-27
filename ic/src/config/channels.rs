@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use secrecy::SecretString;
-use serde::Deserialize;
 
 use crate::bootstrap::lunarwing_base_dir;
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env};
@@ -63,20 +62,10 @@ pub struct GatewayConfig {
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
-    /// Legacy multi-user token map; rejected by daemon configuration.
-    pub user_tokens: Option<HashMap<String, UserTokenConfig>>,
     /// WebSocket ping interval in seconds (default: 30).
     pub ws_ping_interval_secs: u64,
     /// WebSocket idle timeout in seconds (default: 120).
     pub ws_idle_timeout_secs: u64,
-}
-
-/// Per-user token configuration for multi-user mode.
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserTokenConfig {
-    pub user_id: String,
-    #[serde(default)]
-    pub workspace_read_scopes: Vec<String>,
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -272,7 +261,6 @@ impl ChannelsConfig {
                 user_id,
                 workspace_read_scopes,
                 memory_layers,
-                user_tokens: None,
                 ws_ping_interval_secs: parse_optional_env(
                     "WS_PING_INTERVAL_SECS",
                     settings.agent.ws_ping_interval_secs,
@@ -518,7 +506,6 @@ mod tests {
             user_id: "default".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
-            user_tokens: None,
             mascot_enabled: false,
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,
@@ -539,7 +526,6 @@ mod tests {
             user_id: "anon".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
-            user_tokens: None,
             mascot_enabled: false,
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,

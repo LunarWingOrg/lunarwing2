@@ -40,7 +40,6 @@ fn gateway() -> GatewayChannel {
         user_id: USER.to_string(),
         workspace_read_scopes: Vec::new(),
         memory_layers: Vec::new(),
-        user_tokens: None,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
     };

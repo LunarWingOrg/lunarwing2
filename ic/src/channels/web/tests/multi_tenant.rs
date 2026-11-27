@@ -151,7 +151,6 @@ fn gateway_config() -> GatewayConfig {
         user_id: "gateway-sender".to_string(),
         workspace_read_scopes: Vec::new(),
         memory_layers: Vec::new(),
-        user_tokens: None,
         mascot_enabled: false,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
@@ -191,7 +190,6 @@ fn gateway_auth_token_is_scrubbed_from_daemon_logs() {
 fn with_owner_scope_updates_gateway_owner_scope_in_multi_user_mode() {
     let mut gateway = GatewayChannel::new(gateway_config(), "gateway-sender".to_string());
     gateway.auth = two_user_auth().into();
-    gateway.config.user_tokens = Some(HashMap::new());
     let gateway = gateway.with_owner_scope("owner-scope");
 
     assert_eq!(gateway.state.owner_id, "owner-scope");
