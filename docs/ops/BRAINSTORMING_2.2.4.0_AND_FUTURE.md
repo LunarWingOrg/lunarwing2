@@ -6,6 +6,6 @@
 * catch up on web gateway features
 * catch up on web provisioning tool features and ensure it still works fine
 * start dev of tensormoon up again
-* MCafe 4SIGM
-* CUA
+* MCafe 4SIGM ORDA
+* CUA Standard
 * CU WASM tool
