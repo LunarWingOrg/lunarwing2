@@ -8,7 +8,7 @@
 > and protocol-1 socket contracts.
 >
 > Renamed from `git-ironclaw-unix-socket-repl-server-repo` in LunarWing 1.1.9.
-> External URLs below still name that original upstream repository.
+> The template uses a placeholder GitLab project below.
 
 
 
@@ -25,14 +25,14 @@ Already a pro? Just edit this README.md and make it your own. Want to make it ea
 
 ```
 cd existing_repo
-git remote add origin https://git.sobe.world/cmc/git-ironclaw-unix-socket-repl-server-repo.git
+git remote add origin https://gitlab.example.org/example/unix-socket-repl-server.git
 git branch -M main
 git push -uf origin main
 ```
 
 ## Integrate with your tools
 
-* [Set up project integrations](https://git.sobe.world/cmc/git-ironclaw-unix-socket-repl-server-repo/-/settings/integrations)
+* [Set up project integrations](https://gitlab.example.org/example/unix-socket-repl-server/-/settings/integrations)
 
 ## Collaborate with your team
 
