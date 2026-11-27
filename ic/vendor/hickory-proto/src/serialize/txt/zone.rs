@@ -175,17 +175,17 @@ impl<'a> Parser<'a> {
                             // if CharData, then Name then ttl_class_type
                             Token::CharData(data) => {
                                 cx.current_name = Some(Name::parse(&data, cx.origin.as_ref())?);
-                                State::TtlClassType
+                                State::TtlClassType { rr_started: true }
                             }
 
                             // @ is a placeholder for specifying the current origin
                             Token::At => {
                                 cx.current_name.clone_from(&cx.origin); // TODO a COW or RC would reduce copies...
-                                State::TtlClassType
+                                State::TtlClassType { rr_started: true }
                             }
 
                             // if blank, then nothing or ttl_class_type
-                            Token::Blank => State::TtlClassType,
+                            Token::Blank => State::TtlClassType { rr_started: false },
                             Token::EOL => State::StartLine, // probably a comment
                             _ => return Err(ParseError::UnexpectedToken(t)),
                         }
@@ -200,8 +200,8 @@ impl<'a> Parser<'a> {
                     State::Origin => {
                         match t {
                             Token::CharData(data) => {
-                                // TODO an origin was specified, should this be legal? definitely confusing...
-                                cx.origin = Some(Name::parse(&data, None)?);
+                                // a relative name is relative to the current origin (RFC 1035 section 5.1)
+                                cx.origin = Some(Name::parse(&data, cx.origin.as_ref())?);
                                 State::StartLine
                             }
                             _ => return Err(ParseError::UnexpectedToken(t)),
@@ -256,7 +256,7 @@ impl<'a> Parser<'a> {
                             return Err(ParseError::UnexpectedToken(t));
                         }
                     },
-                    State::TtlClassType => {
+                    State::TtlClassType { rr_started } => {
                         match t {
                             // if number, TTL
                             // Token::Number(num) => ttl = Some(*num),
@@ -266,14 +266,21 @@ impl<'a> Parser<'a> {
                                 let result: ParseResult<u32> = parse_ttl(&data);
                                 if let Ok(ttl) = result {
                                     cx.ttl.this = Some(ttl);
-                                    State::TtlClassType // hm, should this go to just ClassType?
+                                    State::TtlClassType { rr_started: true } // hm, should this go to just ClassType?
                                 } else {
                                     // if can parse DNSClass, then class
                                     data.make_ascii_uppercase();
                                     let result = DNSClass::from_str(&data);
                                     if let Ok(parsed) = result {
+                                        // RFC 1035 section 3.6: NONE and ANY (`*`) are only
+                                        // valid as QCLASS values, not as the class of a record.
+                                        if matches!(parsed, DNSClass::NONE | DNSClass::ANY) {
+                                            return Err(ParseError::from(format!(
+                                                "query-only class {data} is not allowed in a zone file"
+                                            )));
+                                        }
                                         cx.class = parsed;
-                                        State::TtlClassType
+                                        State::TtlClassType { rr_started: true }
                                     } else {
                                         // if can parse RecordType, then RecordType
                                         cx.rtype = Some(RecordType::from_str(&data)?);
@@ -282,8 +289,10 @@ impl<'a> Parser<'a> {
                                 }
                             }
                             // could be nothing if started with blank and is a comment, i.e. EOL
+                            Token::EOL if !rr_started => State::StartLine,
+                            // an owner, TTL or class was given, but no type
                             Token::EOL => {
-                                State::StartLine // next line
+                                return Err(ParseError::from("record type not specified"));
                             }
                             _ => return Err(ParseError::UnexpectedToken(t)),
                         }
@@ -314,8 +323,12 @@ impl<'a> Parser<'a> {
             }
 
             // Extra flush at the end for the case of missing endline
-            if let State::Record(record_parts) = mem::replace(&mut state, State::StartLine) {
-                cx.insert(record_parts)?;
+            match mem::replace(&mut state, State::StartLine) {
+                State::Record(record_parts) => cx.insert(record_parts)?,
+                State::TtlClassType { rr_started: true } => {
+                    return Err(ParseError::from("record type not specified"));
+                }
+                _ => {}
             }
 
             stack -= 1;
@@ -432,9 +445,10 @@ impl Context {
 }
 
 enum State {
-    StartLine,    // start of line, @, $<WORD>, Name, Blank
-    TtlClassType, // [<TTL>] [<class>] <type>,
-    Ttl,          // $TTL <time>
+    StartLine, // start of line, @, $<WORD>, Name, Blank
+    // [<TTL>] [<class>] <type>; `rr_started` is set once an owner, TTL or class was given
+    TtlClassType { rr_started: bool },
+    Ttl, // $TTL <time>
     Record(Vec<String>),
     Include(Option<String>), // $INCLUDE <filename>
     Origin,
@@ -467,6 +481,116 @@ mod tests {
                     .to_string()
                     .contains("FAULTY-RECORD-TYPE"),
             "unexpected success: {:#?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_missing_record_type() {
+        // https://github.com/hickory-dns/hickory-dns/issues/3952
+        for rr in [
+            "www 3600 IN",
+            "www IN",
+            "www 3600",
+            "www",
+            "@ 3600 IN",
+            " 3600 IN",
+            "www 3600 IN ; comment",
+        ] {
+            for eol in ["\n", ""] {
+                let zone_data = format!("$ORIGIN example.com.\n$TTL 3600\n{rr}{eol}");
+                let result = Parser::new(zone_data, None, None).parse();
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|e| e.to_string().contains("record type not specified")),
+                    "unexpected result for {rr:?}: {result:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_relative_origin() {
+        let zone_data = "$ORIGIN example.com.
+$TTL 3600
+$ORIGIN sub
+www IN A 192.0.2.1
+$ORIGIN deeper
+@ IN A 192.0.2.2
+";
+        let (_, records) = Parser::new(zone_data, None, None).parse().unwrap();
+        let owners = records
+            .values()
+            .map(|rrset| rrset.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners,
+            ["deeper.sub.example.com.", "www.sub.example.com."],
+            "unexpected owners: {owners:?}"
+        );
+    }
+
+    #[test]
+    fn test_blank_and_comment_lines() {
+        let zone_data = [
+            "$ORIGIN example.com.",
+            "$TTL 3600",
+            "",
+            "\t ",
+            "; comment",
+            "   ; indented comment",
+            "www 3600 IN A 192.0.2.1",
+            " \t",
+        ]
+        .join("\n");
+        let (origin, records) = Parser::new(zone_data, None, None).parse().unwrap();
+        assert_eq!(origin, Name::from_str("example.com.").unwrap());
+        assert_eq!(records.len(), 1);
+        let rrset = records.values().next().unwrap();
+        assert_eq!(rrset.name(), &Name::from_str("www.example.com.").unwrap());
+        assert_eq!(rrset.record_type(), RecordType::A);
+    }
+
+    #[test]
+    fn test_query_only_class_is_rejected() {
+        // https://github.com/hickory-dns/hickory-dns/issues/3956
+        for rr in [
+            "www 3600 ANY A 192.0.2.1",
+            "www 3600 * A 192.0.2.1",
+            "www 3600 NONE A 192.0.2.1",
+            "www ANY 3600 A 192.0.2.1",
+            "www 3600 any A 192.0.2.1",
+        ] {
+            let zone_data = format!("$ORIGIN example.com.\n{rr}\n");
+            let result = Parser::new(zone_data, None, None).parse();
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("query-only class")),
+                "unexpected result for {rr:?}: {result:#?}"
+            );
+        }
+
+        for rr in ["www 3600 IN A 192.0.2.1", "www 3600 CH A 192.0.2.1"] {
+            let zone_data = format!("$ORIGIN example.com.\n{rr}\n");
+            Parser::new(zone_data, None, None).parse().unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_txt_record_is_rejected() {
+        let domain = Name::from_str("example.com.").unwrap();
+
+        let zone_data = r#"$ORIGIN example.com.
+empty 300 IN TXT
+"#;
+
+        let result = Parser::new(zone_data, None, Some(domain)).parse();
+
+        assert!(
+            result.is_err(),
+            "an empty TXT record should be rejected: {:#?}",
             result
         );
     }

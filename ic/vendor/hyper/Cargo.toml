@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.63"
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 authors = ["Sean McArthur <sean@seanmonstar.com>"]
 build = false
 include = [
@@ -67,6 +67,7 @@ subdirectory = false
 from = "capi/include/hyper.h"
 
 [features]
+__deny_warnings = []
 capi = []
 client = [
     "dep:want",
@@ -203,7 +204,7 @@ version = "0.1"
 version = "0.2.4"
 
 [dev-dependencies.pretty_env_logger]
-version = "0.5"
+version = "0.6"
 
 [dev-dependencies.serde]
 version = "1.0"
@@ -270,7 +271,6 @@ inline_trait_bounds = "allow"
 items_after_statements = "allow"
 let_underscore_must_use = "allow"
 let_underscore_untyped = "allow"
-let_unit_value = "allow"
 match_wild_err_arm = "allow"
 min_ident_chars = "allow"
 missing_assert_message = "allow"
@@ -291,10 +291,8 @@ pattern_type_mismatch = "allow"
 pub_use = "allow"
 pub_with_shorthand = "allow"
 question_mark_used = "allow"
-redundant_closure_for_method_calls = "allow"
 redundant_else = "allow"
 renamed_function_params = "allow"
-rest_pattern_accessible_field = "allow"
 same_name_method = "allow"
 self_named_module_files = "deny"
 semicolon_inside_block = "allow"
@@ -308,11 +306,10 @@ std_instead_of_core = "allow"
 struct_excessive_bools = "allow"
 struct_field_names = "allow"
 too_many_lines = "allow"
-trivially_copy_pass_by_ref = "allow"
 type_complexity = "allow"
 unnecessary_rest_pattern = "allow"
 unnecessary_safety_comment = "allow"
-unnested_or_patterns = "allow"
+unneeded_field_pattern = "allow"
 unreachable = "allow"
 unseparated_literal_suffix = "allow"
 unused_async = "allow"

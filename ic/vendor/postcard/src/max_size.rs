@@ -263,6 +263,30 @@ impl<const N: usize> MaxSize for heapless::String<N> {
     const POSTCARD_MAX_SIZE: usize = <[u8; N]>::POSTCARD_MAX_SIZE + varint_size(N);
 }
 
+#[cfg(feature = "heapless-v0_8")]
+#[cfg_attr(docsrs, doc(cfg(feature = "heapless-v0_8")))]
+impl<T: MaxSize, const N: usize> MaxSize for heapless_v0_8::Vec<T, N> {
+    const POSTCARD_MAX_SIZE: usize = <[T; N]>::POSTCARD_MAX_SIZE + varint_size(N);
+}
+
+#[cfg(feature = "heapless-v0_8")]
+#[cfg_attr(docsrs, doc(cfg(feature = "heapless-v0_8")))]
+impl<const N: usize> MaxSize for heapless_v0_8::String<N> {
+    const POSTCARD_MAX_SIZE: usize = <[u8; N]>::POSTCARD_MAX_SIZE + varint_size(N);
+}
+
+#[cfg(feature = "heapless-v0_9")]
+#[cfg_attr(docsrs, doc(cfg(feature = "heapless-v0_9")))]
+impl<T: MaxSize, const N: usize> MaxSize for heapless_v0_9::Vec<T, N> {
+    const POSTCARD_MAX_SIZE: usize = <[T; N]>::POSTCARD_MAX_SIZE + varint_size(N);
+}
+
+#[cfg(feature = "heapless-v0_9")]
+#[cfg_attr(docsrs, doc(cfg(feature = "heapless-v0_9")))]
+impl<const N: usize> MaxSize for heapless_v0_9::String<N> {
+    const POSTCARD_MAX_SIZE: usize = <[u8; N]>::POSTCARD_MAX_SIZE + varint_size(N);
+}
+
 #[cfg(all(feature = "nalgebra-v0_33", feature = "experimental-derive"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "nalgebra-v0_33")))]
 impl<T, const R: usize, const C: usize> MaxSize
@@ -290,7 +314,18 @@ impl<T: MaxSize + nalgebra_v0_33::Scalar> MaxSize for nalgebra_v0_33::Quaternion
     const POSTCARD_MAX_SIZE: usize = nalgebra_v0_33::Vector4::<T>::POSTCARD_MAX_SIZE;
 }
 
-#[cfg(feature = "heapless")]
+#[cfg(all(feature = "enum-map-v3_0", feature = "experimental-derive"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "enum-map-v3_0")))]
+impl<K: enum_map_v3_0::Enum<Array<V>: MaxSize>, V> MaxSize for enum_map_v3_0::EnumMap<K, V> {
+    // K::Array is guaranteed to be [T; N]
+    const POSTCARD_MAX_SIZE: usize = K::Array::POSTCARD_MAX_SIZE;
+}
+
+#[cfg(any(
+    feature = "heapless",
+    feature = "heapless-v0_8",
+    feature = "heapless-v0_9"
+))]
 const fn varint_size(max_n: usize) -> usize {
     const BITS_PER_BYTE: usize = 8;
     const BITS_PER_VARINT_BYTE: usize = 7;

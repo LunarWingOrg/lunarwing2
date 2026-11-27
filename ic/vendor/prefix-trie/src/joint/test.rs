@@ -1,7 +1,7 @@
 use crate::joint::{JointPrefix, JointPrefixMap, JointPrefixSet};
 use crate::*;
 use ipnet::{Ipv4Net, Ipv6Net};
-use num_traits::{NumCast, PrimInt};
+use num_traits::NumCast;
 use std::fmt::Debug;
 
 fn ipv4<P: Prefix>(s: &str) -> P {
@@ -9,7 +9,7 @@ fn ipv4<P: Prefix>(s: &str) -> P {
     let r = ip.addr().to_bits();
     let len = ip.prefix_len();
 
-    let type_len = P::zero().repr().count_zeros() as usize;
+    let type_len = P::num_bits() as usize;
     assert!(type_len == 32);
 
     let r: <P as Prefix>::R = <<P as Prefix>::R as NumCast>::from(r).unwrap();
@@ -21,7 +21,7 @@ fn ipv6<P: Prefix>(s: &str) -> P {
     let r = ip.addr().to_bits();
     let len = ip.prefix_len();
 
-    let type_len = P::zero().repr().count_zeros() as usize;
+    let type_len = P::num_bits() as usize;
     assert!(type_len == 128);
 
     let r: <P as Prefix>::R = <<P as Prefix>::R as NumCast>::from(r).unwrap();
@@ -124,6 +124,49 @@ mod set {
         );
     }
 
+    #[test]
+    fn is_covered_in_aggregate_tiles_siblings<P: JointPrefix + Debug + PartialEq>() {
+        // No single member covers the parent, but the two halves tile its entire range.
+        let mut set: JointPrefixSet<P> = JointPrefixSet::new();
+        set.insert(ip("10.0.0.0/9"));
+        set.insert(ip("10.128.0.0/9"));
+        assert!(!set.is_covered(&ip("10.0.0.0/8")));
+        assert!(set.is_covered_in_aggregate(&ip("10.0.0.0/8")));
+
+        set.insert(ip("2001:db8::/33"));
+        set.insert(ip("2001:db8:8000::/33"));
+        assert!(!set.is_covered(&ip("2001:db8::/32")));
+        assert!(set.is_covered_in_aggregate(&ip("2001:db8::/32")));
+    }
+
+    #[test]
+    fn is_covered_in_aggregate_partial_tiling_is_false<P: JointPrefix + Debug + PartialEq>() {
+        // Only one half of the parent is present; its range is not fully covered either way.
+        let mut set: JointPrefixSet<P> = JointPrefixSet::new();
+        set.insert(ip("10.0.0.0/9"));
+        assert!(!set.is_covered(&ip("10.0.0.0/8")));
+        assert!(!set.is_covered_in_aggregate(&ip("10.0.0.0/8")));
+
+        set.insert(ip("2001:db8::/33"));
+        assert!(!set.is_covered(&ip("2001:db8::/32")));
+        assert!(!set.is_covered_in_aggregate(&ip("2001:db8::/32")));
+    }
+
+    #[test]
+    fn is_covered_in_aggregate_matches_is_covered_for_ancestor_member<
+        P: JointPrefix + Debug + PartialEq,
+    >() {
+        // A direct covering ancestor member is caught by both, no tiling needed.
+        let mut set: JointPrefixSet<P> = JointPrefixSet::new();
+        set.insert(ip("10.0.0.0/8"));
+        assert!(set.is_covered(&ip("10.1.2.0/24")));
+        assert!(set.is_covered_in_aggregate(&ip("10.1.2.0/24")));
+
+        set.insert(ip("2001:db8::/32"));
+        assert!(set.is_covered(&ip("2001:db8:1::/48")));
+        assert!(set.is_covered_in_aggregate(&ip("2001:db8:1::/48")));
+    }
+
     #[instantiate_tests(<::either::Either<(u32, u8), (u128, u8)>>)]
     mod either {}
 
@@ -138,6 +181,12 @@ mod set {
     #[cfg(feature = "cidr")]
     #[instantiate_tests(<::cidr::IpCidr>)]
     mod cidr {}
+}
+
+#[test]
+fn set_iter_default_is_empty() {
+    type P = either::Either<(u32, u8), (u128, u8)>;
+    assert_eq!(crate::joint::set::Iter::<P>::default().count(), 0);
 }
 
 #[generic_tests::define]
@@ -230,6 +279,52 @@ mod map {
                 (ip("2001:2::/32"), &4)
             ]
         );
+    }
+
+    #[test]
+    fn is_covered_in_aggregate_tiles_siblings_regardless_of_value<
+        P: JointPrefix + Debug + PartialEq,
+    >() {
+        // No single entry covers the parent, but the two halves tile its entire range. Coverage
+        // only tracks which addresses are present, not whether the values agree.
+        let mut map: JointPrefixMap<P, usize> = JointPrefixMap::new();
+        map.insert(ip("10.0.0.0/9"), 1);
+        map.insert(ip("10.128.0.0/9"), 2);
+        assert!(!map.is_covered(&ip("10.0.0.0/8")));
+        assert!(map.is_covered_in_aggregate(&ip("10.0.0.0/8")));
+
+        map.insert(ip("2001:db8::/33"), 3);
+        map.insert(ip("2001:db8:8000::/33"), 4);
+        assert!(!map.is_covered(&ip("2001:db8::/32")));
+        assert!(map.is_covered_in_aggregate(&ip("2001:db8::/32")));
+    }
+
+    #[test]
+    fn is_covered_in_aggregate_partial_tiling_is_false<P: JointPrefix + Debug + PartialEq>() {
+        // Only one half of the parent is present; its range is not fully covered either way.
+        let mut map: JointPrefixMap<P, usize> = JointPrefixMap::new();
+        map.insert(ip("10.0.0.0/9"), 1);
+        assert!(!map.is_covered(&ip("10.0.0.0/8")));
+        assert!(!map.is_covered_in_aggregate(&ip("10.0.0.0/8")));
+
+        map.insert(ip("2001:db8::/33"), 3);
+        assert!(!map.is_covered(&ip("2001:db8::/32")));
+        assert!(!map.is_covered_in_aggregate(&ip("2001:db8::/32")));
+    }
+
+    #[test]
+    fn is_covered_in_aggregate_matches_is_covered_for_ancestor_member<
+        P: JointPrefix + Debug + PartialEq,
+    >() {
+        // A direct covering ancestor entry is caught by both, no tiling needed.
+        let mut map: JointPrefixMap<P, usize> = JointPrefixMap::new();
+        map.insert(ip("10.0.0.0/8"), 1);
+        assert!(map.is_covered(&ip("10.1.2.0/24")));
+        assert!(map.is_covered_in_aggregate(&ip("10.1.2.0/24")));
+
+        map.insert(ip("2001:db8::/32"), 2);
+        assert!(map.is_covered(&ip("2001:db8:1::/48")));
+        assert!(map.is_covered_in_aggregate(&ip("2001:db8:1::/48")));
     }
 
     #[instantiate_tests(<::either::Either<(u32, u8), (u128, u8)>>)]

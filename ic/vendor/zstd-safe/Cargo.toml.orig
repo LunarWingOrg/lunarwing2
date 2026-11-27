@@ -2,7 +2,7 @@
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 name = "zstd-safe"
 build = "build.rs"
-version = "8.3.0"
+version = "8.4.0"
 description = "Safe low-level bindings for the zstd compression library."
 keywords = ["zstd", "zstandard", "compression"]
 categories = ["api-bindings", "compression"]
@@ -17,7 +17,7 @@ exclude = ["update_consts.sh"]
 features = ["experimental", "arrays", "std", "zdict_builder", "doc-cfg"]
 
 [dependencies]
-zstd-sys = { path = "zstd-sys", version = "2.1.3", default-features = false }
+zstd-sys = { path = "zstd-sys", version = "2.2.0", default-features = false }
 
 [features]
 default = ["legacy", "arrays", "zdict_builder"]
@@ -28,9 +28,11 @@ experimental = ["zstd-sys/experimental"]
 legacy = ["zstd-sys/legacy"]
 pkg-config = ["zstd-sys/pkg-config"]
 vendored = ["zstd-sys/vendored"]
-alloc = [] # Implements WriteBuf for Vec.
+alloc = [] # Implements WriteBuf for Vec; makes CDict a shared handle.
 std = ["alloc", "zstd-sys/std"] # Also implements WriteBuf for Cursor.
-zstdmt = ["zstd-sys/zstdmt"]
+# Worker threads need the shared dictionary handles of `alloc`, see
+# `CCtx::ref_cdict()`.
+zstdmt = ["zstd-sys/zstdmt", "alloc"]
 thin = ["zstd-sys/thin"]
 arrays = []
 cmake = ["zstd-sys/cmake"]

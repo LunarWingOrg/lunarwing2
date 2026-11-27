@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "toml"
-version = "1.2.2+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 build = false
 include = [
     "/build.rs",
@@ -195,7 +195,7 @@ features = ["alloc"]
 default-features = false
 
 [dependencies.toml_parser]
-version = "1.1.6"
+version = "1.1.7"
 features = ["alloc"]
 optional = true
 default-features = false

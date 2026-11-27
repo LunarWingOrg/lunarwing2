@@ -1,6 +1,6 @@
 [package]
 name = "async-compression"
-version = "0.4.52"
+version = "0.4.54"
 description = """
 Adaptors between compression crates and Rust's modern asynchronous IO types.
 """
@@ -35,6 +35,10 @@ all-algorithms = [
     "zstd",
 ]
 
+# implementations
+futures-io = ["dep:futures-io", "dep:pin-project-lite"]
+tokio = ["dep:tokio", "dep:pin-project-lite"]
+
 # algorithms
 brotli = ["compression-codecs/brotli"]
 # Unstable, also requires `--cfg async_compression_unstable`.
@@ -53,14 +57,17 @@ zstd = ["compression-codecs/zstd"]
 zstdmt = ["compression-codecs/zstdmt", "zstd"]
 # Unstable, also requires `--cfg async_compression_unstable`.
 zstd-mzstd = ["compression-codecs/zstd-mzstd"]
+# Unstable, also requires `--cfg async_compression_unstable`.
+zstd-zrip = ["compression-codecs/zstd-zrip"]
 
 
 [dependencies]
 # core dependencies
-pin-project-lite.workspace = true
 compression-codecs.workspace = true
 compression-core.workspace = true
 # optional dependencies
+# only the `futures-io` and `tokio` adaptors use `pin_project!`
+pin-project-lite = { workspace = true, optional = true }
 futures-io = { version = "0.3", default-features = false, features = [
     "std",
 ], optional = true }
@@ -97,6 +104,10 @@ workspace = true
 [[test]]
 name = "brotli"
 required-features = ["brotli"]
+
+[[test]]
+name = "brotli-large-window"
+required-features = ["brotli", "tokio"]
 
 [[test]]
 name = "brotli-mbrotli"
@@ -143,11 +154,19 @@ name = "zstd-mzstd"
 required-features = ["zstd-mzstd"]
 
 [[test]]
+name = "zstd-zrip"
+required-features = ["zstd-zrip"]
+
+[[test]]
 name = "zstd-dict"
 required-features = ["zstd", "tokio"]
 
 [[test]]
 name = "zstd-window-size"
+required-features = ["zstd", "tokio"]
+
+[[test]]
+name = "zstd-http-window"
 required-features = ["zstd", "tokio"]
 
 [[example]]

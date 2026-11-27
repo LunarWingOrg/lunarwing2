@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.64"
 name = "zstd-sys"
-version = "2.1.3+zstd.1.5.7"
+version = "2.2.0+zstd.1.6.0"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 links = "zstd"

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "hickory-proto"
-version = "0.26.3"
+version = "0.26.4"
 authors = ["The contributors to Hickory DNS"]
 build = false
 autolib = false
@@ -168,7 +168,7 @@ features = ["critical-section"]
 default-features = false
 
 [dependencies.prefix-trie]
-version = "0.8.4"
+version = "0.10"
 optional = true
 
 [dependencies.rand]
