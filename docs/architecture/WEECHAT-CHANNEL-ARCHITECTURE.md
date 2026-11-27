@@ -4,9 +4,8 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
-was checked. The host minimum remains
-30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
+The WeeChat host minimum is 30,000 ms (`MIN_POLL_INTERVAL_MS`). The guest
+requests 3 seconds. Long-poll
 delivery is immediate only while a wait is active. `default_dm_policy` is
 `pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
 shared filter for both ingestion modes. Since v2.2.0.0 (WI#577), a non-empty
@@ -19,12 +18,6 @@ build path and tenant adapter path therefore refer to the same channel tree.
 Operational changes must go through mt-admin for both systemd user managers and
 OpenRC. Relay password rotation uses the shared credential start barrier;
 [WeeChat operations](../ops/WEECHAT-SERVICES.md) owns its deployment/recovery steps.
-
-> **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
-> showed that message delivery through this channel has several independent, *invisible*
-> failure modes, and that the "WebSocket adapter" was actually drained by slow HTTP polling
-> (since replaced by a long-poll path, §3). Every incident re-derived the data flow and config
-> rules from scratch. This is the authoritative reference so that doesn't happen again.
 
 Line numbers below drift; treat them as hints, not contracts. Source of truth:
 `ic/channels-src/weechat/src/lib.rs` (the WASM channel — the registry entry
@@ -214,11 +207,11 @@ so delivery is near-immediate **while that request is active**. The adapter capt
 buffer's first line, so there is no separate buffer-discovery delay, but the host may not start the
 next wait until its next 30s interval tick.
 
-**Timeout hierarchy (hard constraint):** `adapter wait ≤20s  <  WASM HTTP 25s  <  host
-callback_timeout 30s`. The host loop below is unchanged; each `on_poll` blocks in
-`/api/wait` up to ~20s, returns, and waits for the next host interval tick. If `/api/wait` is missing (old
-adapter) or returns an unparseable body, the WASM logs it and falls back to **poll mode** for the
-rest of the session.
+The adapter caps its wait at 20 seconds. The guest allows 25 seconds for the
+HTTP request, and the default channel runtime lets the caller wait 30 seconds
+for the callback. A 404 or an unparseable 200 response from `/api/wait`
+makes the guest switch to **poll mode** until the channel restarts. Other
+HTTP statuses and transport errors are logged without changing the mode.
 
 ### Poll mode (fallback / old adapters) — 30s effective floor
 
@@ -231,36 +224,27 @@ Each channel gets its own polling task:
 ```
 loop {
     interval_timer.tick().await;     // effective interval >=30s, MissedTickBehavior::Skip
-    execute_poll().await;            // runs the WASM on_poll to completion
+    execute_poll().await;            // waits for the callback result or times out
 }
 ```
 
-`tick` and `execute_poll` are **sequential**. The start-to-start cadence is at
-least the poll interval, but a slow callback can cross scheduled ticks and
-extend it further. `MissedTickBehavior::Skip` advances to a future tick instead
-of running missed ticks back-to-back.
+The polling task awaits each callback result before polling the timer again.
+The timer uses `MissedTickBehavior::Skip`, so it does not replay a backlog of
+missed ticks. The WeeChat guest requests **3 seconds** by default and its
+capabilities declare 3000 ms. Schema conversion and `validate_poll_interval()`
+clamp the requested interval to at least **30 seconds**.
 
-```
-effective cadence  >=  poll_interval
-```
+`execute_poll` applies the runtime's caller-facing timeout of 30 seconds by
+default. If it expires, the polling task returns a timeout while any already
+running blocking task can continue. `WasmChannelRuntime::new` starts a separate
+channel-engine epoch ticker, which advances every 500 ms. `WasmChannel::create_store`
+sets a Wasmtime guest deadline from the prepared module's timeout (60 seconds
+with the default loader), rounded up to ticks with one extra tick. The epoch
+trap applies while Wasmtime is executing guest code. Host HTTP calls have their
+own request timeouts.
 
-- The WeeChat guest requests **3s** (`default_poll_interval()=3` and
-  `.max(3000)` in `lib.rs`), and its capabilities file also declares 3000ms.
-  The host ignores that lower floor: `MIN_POLL_INTERVAL_MS` is **30,000ms** in
-  `ic/src/channels/wasm/capabilities.rs`, and schema conversion plus
-  `validate_poll_interval()` clamp every channel to at least 30s.
-- **`cycle_duration`** is bounded above by **`callback_timeout` = 30s**
-  (`ic/src/channels/wasm/runtime.rs`), the `tokio::time::timeout` wrapping the WASM call.
-
-The effective polling floor is therefore 30s. A callback that reaches the
-timeout can extend the gap further; `MissedTickBehavior::Skip` prevents a burst
-of catch-up calls afterward.
-
-This same host loop drives **both** modes. In long-poll mode `cycle_duration` is
-the up-to-20s `/api/wait` block. Once it returns, the task waits for the next
-30s interval tick; an early event can therefore be followed by a substantial
-idle window. In poll mode the cycle is usually short and the 30s host tick
-paces it.
+Both ingestion modes use this timer. An early `/api/wait` return can leave a
+substantial idle window before the next tick.
 
 ### Per-cycle cost (poll mode)
 
@@ -275,9 +259,9 @@ WASM instance is also created per poll (`create_store` + `instantiate_component`
 | Per-buffer lines | `GET /api/buffers/<buf>/lines` | **2s** (was 5s) | every poll, ×N buffers |
 | Buffer-list refresh | `GET /api/buffers` | 5s | every ~30 polls, or when empty |
 
-Worst-case cycle ≈ `1.5 + 2 + 2·N` s (was `2 + 3 + 5·N`). In the normal case
-(responsive local adapter) each call returns in milliseconds, but the host
-still paces callbacks at a minimum 30s interval.
+For a cycle with a probe and `N` buffers, the listed request budgets sum to
+`1.5 + 2 + 2·N` seconds, plus 5 seconds if it also refreshes the buffer list.
+The host applies its callback timeout separately.
 
 ### Seeing the real cadence (poll mode)
 
@@ -353,8 +337,8 @@ So the live precedence is:
 
 A leftover `extensions.weechat.setup_fields` row **shadows the caps config and the env for
 ordinary fields it contains**. The classic symptom: *"I edited the installed `capabilities.json`
-(or the env) and nothing changed."* This caused hours of confusion on `sunburst` — stale
-`dm_policy` and `networks` values in that row overrode every edit. The managed relay-password
+(or the env) and nothing changed."* Stale `dm_policy` and `networks` values in
+that row can override those edits. The managed relay-password
 exception above does not make other deployment fields immune to this trap.
 
 Use mt-admin's tenant-local database entry point; no connection URL needs to be

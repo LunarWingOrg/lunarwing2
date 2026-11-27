@@ -5,11 +5,6 @@ custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale provider
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The resolver,
-custom command, settings write guard, doctor checks and V24 migrations were
-checked against the tree, along with the rest of this page. This is not a live
-migration test.
-
 This guide concerns daemon/webhook exposure, not the separate opt-in sandbox
 egress overlay in [`SANDBOX_TUNNEL_NETWORKING.md`](SANDBOX_TUNNEL_NETWORKING.md).
 
@@ -41,11 +36,14 @@ TUNNEL_CUSTOM_COMMAND=example-tunnel --port {port} --host {host}
 TUNNEL_CUSTOM_URL_PATTERN=tunnel.example.com
 ```
 
-To have LunarWing discover the public URL, set a pattern and use a command that
-prints the URL on stdout. The pattern is a substring, not a regular expression.
-Without a pattern, or if no printed URL matches it within the discovery window,
-the custom provider reports its local HTTP target instead. The command is split
-on whitespace after placeholder substitution; it is not evaluated by a shell.
+Set a pattern and have the command print its public HTTPS URL on stdout.
+Print the URL on its own line so discovery tests the intended address. For
+each line, the extractor selects the first `https://` match, or the first
+`http://` match if the line contains no HTTPS URL, and reads to the first
+whitespace. It tests the extracted URL for the configured substring.
+If the pattern is unset or no URL matches during discovery, the provider
+reports the local HTTP target. LunarWing substitutes the placeholders and
+splits the command on whitespace before executing it directly.
 
 Externally managed HTTPS endpoint:
 
@@ -105,7 +103,9 @@ settings APIs reject their reintroduction.
    reports the expected HTTPS URL. Shipped services and managed tenants set
    `CLI_ENABLED=false`, so they do not print that screen: inspect startup logs
    for failures and verify the configured provider's public endpoint instead.
-3. Test authenticated webhook and gateway routes through that URL.
+3. Check the public endpoint, then test a protected route such as
+   `GET /api/gateway/status` with the gateway bearer token or send a test
+   webhook with its configured secret.
 4. Confirm retired vendor exposure is disabled when no longer required.
 
 NetBird daemon enrollment and lifecycle remain operator-managed on both systemd

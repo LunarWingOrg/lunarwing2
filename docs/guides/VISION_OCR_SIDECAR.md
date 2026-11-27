@@ -2,11 +2,7 @@
 
 The service in `projects/ocr-sidecar/` provides Tesseract OCR and optional vision-language analysis for LunarWing. The daemon uses it automatically for inbound image attachments when `VISION_SERVICE_URL` is configured; the `vision-analyze` WASM tool uses the same host-injected service URL and credential.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The `vision-analyze`
-registry and capability sidecar are `0.2.5`. Canonical doc links, the endpoint
-table, `configure-vision-external`/`configure-vision-local` mt-admin commands,
-and ports-registry guidance match the current tree; the host contract here is
-unchanged.
+The `vision-analyze` registry manifest is version `0.2.5`.
 
 ## Canonical Documentation
 
@@ -36,7 +32,7 @@ A single-node default deployment exposes the main API on `OCR_PORT=8088` and the
 | `GET /v1/vision/metrics` | main API | JSON usage metrics |
 | `GET /metrics` | main API | Prometheus metrics |
 | `GET /openapi.json` | main API | OpenAPI document |
-| `GET /health` | dedicated operational port | Health check; no bearer token required |
+| `GET /health` | dedicated operational port and main API compatibility alias | Unauthenticated health check. Use the operational port for new deployments. |
 | `GET /vision/metrics` | dedicated operational port | JSON metrics for the host health pipeline |
 
 Unversioned `/ocr`, `/vision/analyze`, and `/vision/metrics` routes remain compatibility aliases, but new API integrations should use `/v1/...`. The dedicated operational listener intentionally exposes only `/health` and unversioned `/vision/metrics`.

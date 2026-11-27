@@ -1,29 +1,21 @@
 # Seeding a New Tenant with the Study Notes Knowledge Base
 
 This guide documents how to provision a new multi-tenant LunarWing instance so
-that it starts with the **entire contents** of the project's shared study-notes
+that it imports eligible notes from the project's shared study-notes
 knowledge base — the [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git)
 study-notes MCP checkout — imported into the tenant's own, private knowledge
 store on first boot.
 
-Seeding is designed for **new tenants only**. It runs exactly once and never
-overwrites anything. Tenants provisioned with `--with-study-mcp` also opt in to
-a separate additive refresh cadence that imports newly published paths without
-changing existing notes. Existing tenants upgraded to a seed-capable binary are
-neither seeded nor opted in automatically.
-
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The seeding and additive
-refresh flows are unchanged. The stale-marking sweep has no 1,000-note scan cap:
-`knowledge_list_notes` pages the whole store with a keyset cursor (500-row
-pages, 100k safety ceiling), and the independent `KNOWLEDGE_SWEEP_ENABLED`
-cadence still runs when mt-admin renders `HEARTBEAT_ENABLED=false`. A seeded
-tenant's full corpus is therefore sweepable; the roughly 1,250-note figure below
-is only the August 2026 snapshot, not a fixed corpus size.
+Seeding is designed for **new tenants only**. A completed bootstrap pass is
+recorded in a state file. Tenants provisioned with `--with-study-mcp` also opt
+in to a separate additive refresh cadence that imports newly published paths.
+Both passes preserve notes they can read, subject to the repair cases below. An
+upgrade alone does not arm either pass.
 
 ## What the tenant gets
 
-A seeded tenant's private knowledge store contains every note from the shared
-[lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git) checkout (roughly
+A seeded tenant's private knowledge store contains the notes successfully imported
+from the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git) checkout (roughly
 1,250 curated codebase-study notes as of the August 2026 verification run),
 imported into its own workspace as `study-notes/<agent>/<topic>.md` documents
 with the canonical study-notes metadata preserved (status, confidence, studied
@@ -61,8 +53,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name>
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
 ```
 
-On the daemon's first startup, a background task imports every note from the
-synced checkout into the tenant's private knowledge store. The host source
+On the daemon's first startup, a background task imports eligible notes from
+the synced checkout into the tenant's private knowledge store. The host source
 scheduler and tenant cadence then keep adding newly published paths.
 
 ## What `--with-study-mcp` actually does
@@ -101,12 +93,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <name>
 When the daemon starts with `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` and
 `LW2STUDYMCP_HOME` set, a background startup task
 (`run_knowledge_seed_once` in `ic/src/workspace/knowledge_seed.rs`, spawned
-from `ic/src/app.rs`) walks every note under
-`$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md` and imports each
-into the tenant's private knowledge store as `study-notes/<agent>/<topic>.md`
-workspace documents. Writes go through the normal workspace pipeline, so
-chunking, full-text search, and embeddings behave exactly as for notes the
-agent creates itself.
+from `ic/src/app.rs`) walks eligible note files under
+`$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md` and imports them
+as private `study-notes/<agent>/<topic>.md` workspace documents. The normal
+workspace write path indexes the imported content.
 
 Imported notes keep the canonical lw2studymcp metadata: status, confidence,
 studied timestamp (RFC 3339 or bare ISO date), source commit, tags, staleness
@@ -117,6 +107,10 @@ what gets seeded (hence step 1 above always syncing to latest upstream first).
 As of the August 2026 verification run that was ~1,249 notes out of ~1,267
 checkout files; the remainder were skipped for documented reasons
 (invalid topic slugs, empty upstream bodies).
+
+The daemon schedules staleness checks independently of heartbeat when
+`KNOWLEDGE_SWEEP_ENABLED` is enabled. It scans each selected scope using
+500-row keyset pages with a 100,000-row safety limit.
 
 ## How automatic refresh works
 
@@ -135,10 +129,12 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    (case-insensitive) enable sync — the same values the daemon accepts. Unset,
    `false`, and `0` are skipped without warnings, and a hand-edited `yes`/`on`
    cannot leave the host refreshing a source the daemon refuses to start with.
-   Each root-owned scheduler snapshot carries its own OpenRC proxy contract,
-   so it does not source a sibling checkout or the host health library. Snapshots
-   are pruned to the newest five releases
-   (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`). `upgrade-tenant` republishes
+   The root scheduler runs the frozen release under `current`. That release
+   carries its own OpenRC proxy contract, so it does not source the operator
+   checkout or the host health library. Snapshot pruning starts when the count
+   exceeds `LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 1`. The default keep
+   value is five, and pruning protects the newly published snapshot.
+   `upgrade-tenant` republishes
    an existing snapshot from the upgraded-from checkout (stamped in
    `STAGED-FROM`); when the hourly schedule was removed or disabled, it
    refreshes the staged files and leaves the removal in place — an upgrade
@@ -147,20 +143,22 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    that is refused or fails changes neither the schedule nor the staged copy.
    `doctor` reports
    the staged commit and flags a snapshot that has outlived its schedule.
-3. Each tenant daemon independently checks on its configured cadence (six hours
-   by default, with deterministic startup jitter). When the revision changes it
-   scans the checkout and imports only missing paths.
+3. Each enabled tenant daemon independently checks on its configured cadence
+   (six hours by default, with deterministic startup jitter). When the revision
+   changes it scans the checkout to import missing paths and repair eligible
+   existing rows.
 4. The daemon writes `knowledge_sync_state.json` under its state directory with
    the completed revision, attempt/success timestamps, backoff state, and last
    run counts. A cross-process lock collapses daemon and CLI runs.
 
-The default pass caps are 500 new notes and 10 MiB. Deferred records are picked
-up in bounded follow-up passes. Failures keep the last good native corpus and
-retry with exponential backoff. The source marker is checked before and after a
-scan, so a pass crossing a host update is rejected and safely replayed.
+Each refresh pass defaults to 500 new notes and 10 MiB of new source files.
+Deferred records are picked up in follow-up passes. If the generation marker
+changes during import, the pass leaves the completed revision unchanged and
+retries with backoff. Writes that already succeeded stay in the workspace.
 
-This mode is deliberately labeled `additive`: it imports new paths, but does not
-apply upstream edits, status changes, supersedure, tombstones, or deletions. It
+Additive refresh imports new paths and repairs eligible rows as described
+below. Imported notes keep their local content and status across upstream
+edits, supersedure, tombstones, and deletions. It
 reports a Git revision rather than claiming exact parity with the hosted MCP.
 Those complete semantics require the revisioned hosted delta contract described
 in `docs/ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
@@ -182,28 +180,29 @@ without importing directly, run `sync-knowledge-sources`.
   wires the shared MCP read-only but never arms the seed. `upgrade-tenant`
   patches the tenant env but does not set the seed flag. Env regeneration
   only carries an existing value forward (including an explicit `=0` opt-out).
-- **A completed bootstrap is not repeated.** The daemon records completion in
-  `knowledge_seed_state.json` after walking every discovered note. Later startups
-  skip bootstrap only if that marker is valid. The separate refresh cadence can
-  still add paths published afterward.
-- **Never overwrites.** Both bootstrap and refresh skip a note whose workspace path already exists
-  byte-for-byte, so operator-authored notes survive even a forced re-seed. The
-  only writes to existing paths repair a previous seed pass's own stranded
-  rows (a byte-for-byte seeded body missing provenance metadata gets the
-  metadata restored; an empty placeholder row from a mid-pass crash gets
-  filled). Operator content never matches those shapes byte-for-byte.
+- **Bootstrap completion marker.** After visiting the discovered notes, the
+  daemon publishes `knowledge_seed_state.json`. Later startups skip bootstrap
+  only if that marker is valid. The separate refresh cadence still adds newly
+  published paths.
+- **Existing rows and repair.** Both passes skip an existing path with parseable
+  knowledge-note metadata regardless of its body. Without that metadata, a body
+  that exactly matches the rendered seed note gets a metadata-only repair. A
+  whitespace-only body is filled with the seed note and given metadata, including
+  an empty row created by an operator. Other bodies are left alone. A failed
+  workspace lookup is treated as a missing row. If a subsequent write succeeds,
+  it can replace an existing note (WI#932).
 - **Wire namespace stays reserved.** Checkout directories under the
   coordination wire prefix (`coord-*`) are never imported, so seeded notes
   cannot collide with coordination wire notes. Dotfiles, non-Markdown files,
   and invalid slugs are also skipped.
-- **Failures never block.** Individual note failures (unreadable files, empty
-  bodies, invalid slugs) are warned in the log and recorded in the state file,
-  but never crash the agent and never turn the one-shot seed into a per-boot
-  rescan.
-- **Crash-safe.** After the pass, the daemon syncs a temporary marker and
-  atomically renames it into place. If no valid marker is present, the next
-  enabled startup retries bootstrap and skips already-imported notes. The
-  daemon warns when it finds an invalid or unreadable marker.
+- **Per-note failures.** Bootstrapping logs unreadable files and rejected
+  bodies, records their count, and continues. Invalid slugs are skipped
+  during enumeration.
+- **Interrupted bootstrap.** After the pass, the daemon syncs a temporary
+  marker and atomically renames it into place. If the daemon stops before that,
+  or the marker is invalid or unreadable, the next enabled startup scans again
+  and skips or repairs existing paths as above. The daemon warns when it finds
+  an invalid or unreadable marker.
 - **Missing checkout retries.** If the checkout directory is not present at
   startup, the pass is skipped with a warning and retried on the next startup
   (no marker is written).
@@ -258,7 +257,8 @@ After provisioning and the first `start-tenant`:
    ```
 
    Complete older markers without `schema_version` still prevent a rerun.
-   `notes_failed` counts individual import failures; while the marker is valid,
+   `notes_failed` counts import failures, such as unreadable source files,
+   empty bodies, or workspace write errors. While the marker is valid,
    bootstrap does not retry those notes on each boot.
 
 4. **Store populated:** the tenant's PostgreSQL contains
@@ -284,8 +284,8 @@ After provisioning and the first `start-tenant`:
   and restart. Env regeneration preserves both choices.
 - **Populating an existing, long-lived tenant:** configure and publish the
   checkout, enable sync, then run `refresh-knowledge <name>`. The same additive
-  importer fills missing paths while curated/operator-authored paths remain
-  untouched; deleting the seed marker or impersonating a new add is unnecessary.
+  importer fills missing paths and applies the repair rules to rows it reads.
+  Keep the existing seed marker in place.
 
 ## Troubleshooting
 
@@ -294,11 +294,11 @@ After provisioning and the first `start-tenant`:
 | No flag in tenant env | Provisioned without `--with-study-mcp`, or it failed non-fatally | Use `configure-study-mcp <name> --sync --enable-knowledge-sync`, restart, then `refresh-knowledge <name>` |
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` present but no seed log | `LW2STUDYMCP_HOME` unset, or checkout missing (double-check warning in daemon log) | `configure-study-mcp <name> --sync` |
 | `knowledge seed: ... not found; will retry on next startup` | Checkout directory missing at startup | Re-sync via `configure-study-mcp <name> --sync`, then restart the tenant |
-| `N note(s) failed ... seed is complete and will not rerun` | Upstream junk notes (empty bodies, invalid slugs) counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
-| Daemon restarted mid-import | No valid completion marker was published; bootstrap retries | Nothing; already-imported notes are skipped |
+| `N note(s) failed ... seed is complete and will not rerun` | Import failures counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
+| Daemon restarted before writing the marker | The next bootstrap scans the checkout again | Already-imported notes are skipped or repaired as described above |
 | `invalid or unreadable completion marker` | The existing marker cannot prove completion | Bootstrap retries automatically. If the warning repeats, check the checkout and state directory permissions |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
-| Refresh succeeds but an upstream edit is absent | Additive mode never replaces an existing path | Expected; wait for the hosted revisioned-delta implementation or resolve manually |
+| Refresh succeeds but an upstream edit is absent | Additive mode preserves existing notes it can read outside the documented repair cases | Resolve manually if needed |
 
 ## Related documents
 

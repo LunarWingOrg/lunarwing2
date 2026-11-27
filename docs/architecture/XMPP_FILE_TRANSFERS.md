@@ -1,7 +1,6 @@
 # XMPP File Transfer Support
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
-was checked. Transfer contracts live in
+Transfer contracts live in
 `ic/src/channels/xmpp/mod.rs`, the standalone bridge, the WASM channel/host,
 and `ic/src/vision_enrichment.rs`. Size limits described as MiB below use
 1024 × 1024 bytes; the 100,000-byte extracted-text cap is decimal.
@@ -207,7 +206,14 @@ Encrypted file shares are handled end-to-end:
 
 ## Security Notes
 
-- Inbound downloads fetch sender-supplied URLs through an egress guard (`policy_checked_download_client`): https-only by default (plain http only when `ALLOW_PRIVATE_IPS=1`), embedded credentials rejected, DNS resolved up front with non-public addresses (private/loopback/link-local/CGNAT/ULA/unspecified/broadcast/multicast) blocked unless `ALLOW_PRIVATE_IPS=1` opts out, the client pinned to the validated addresses (anti-rebind), and redirects plus environment proxies disabled. Both download paths (`download_oob_file`, `download_aesgcm_file`) use it.
+- `download_oob_file` and `download_aesgcm_file` use
+  `policy_checked_download_client` for sender-supplied URLs. It rejects
+  embedded credentials, pins the resolved addresses, and disables redirects
+  and environment proxies. The downloading process must use HTTPS and
+  public addresses unless its own environment sets `ALLOW_PRIVATE_IPS=1`.
+  For a managed XMPP channel that process is `xmpp-bridge`. MT admin sets
+  `ALLOW_PRIVATE_IPS=1` for the daemon in `lunarwing.env`. It omits the setting
+  from the generated `xmpp-bridge.env`, so the bridge keeps the stricter policy.
 - Size limits are enforced during streaming, and the per-stanza URL count and download concurrency are bounded, so a crafted stanza cannot exhaust memory or stall the connection.
 - The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations. Both checks run as middleware (`authorize_middleware`) **before** any request body is buffered, so unauthenticated or non-loopback requests are rejected with 401/403 without the `Json` extractor reading the body. `/v1/messages/send` bodies are bounded at 70 MiB (`MAX_SEND_BODY_BYTES`) — sized to the host's 50 MiB outbound attachment cap plus base64 inflation — so a photo-sized send is never rejected by axum's 2 MiB default body limit while a runaway client still cannot exhaust bridge memory. The raised limit is scoped to the send route only; every other bridge route keeps the 2 MiB default, closing the pre-auth memory-amplification window from `docs/ops/history/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md` (concurrent unauthenticated 70 MiB POSTs to control routes).
 - Automatic LunarVision requests use operator-configured HTTPS, or HTTP for `localhost`, loopback IPs, and `host.containers.internal`; `vision_endpoint` validates the origin shape but does not apply the sender-URL DNS-pinning policy. The client disables redirects and environment proxies, injects `VISION_AUTH_TOKEN` from `SecretString`, and caps responses and extracted text. An incompatible URL disables enrichment without aborting daemon startup. A fixed prompt is sent with the image; the incoming message text is not sent. Enrichment runs inside `handle_message` after inbound hooks, under the ordinary message supervisor's timeout.

@@ -186,8 +186,9 @@ SANDBOX_GIT_PRIVATE_REMOTES=origin[,name...]
 ```
 
 - **Named granted remotes only.** Each name must be a remote in the same
-  `SANDBOX_GIT_REMOTES` list and must be `http://` or `https://`; a `file://`
-  remote, an unknown name or an empty value is a configuration load error.
+  `SANDBOX_GIT_REMOTES` list and must be `http://` or `https://`. An empty
+  setting grants no private destinations. A `file://` remote or an unknown
+  name is a configuration load error.
   The allowance opens exactly the named remote's own host and port. Another
   host on the same subnet, another port on the granted host, and every
   unnamed remote stay unreachable.
@@ -237,10 +238,10 @@ remote to a daemon environment variable. The value is the literal
   configuration load error rather than a silent no-op. Use `http://` for
   credential-bound remotes, or configure the forge to accept an unauthenticated
   read. The hop from the host to the remote is plain HTTP, so it belongs on a
-  trusted network or an encrypted overlay. The per-call proxy keeps
-  `proxy-enforced`'s public-only destination check, so today a remote whose
-  name resolves to a private, CGNAT (including NetBird's `100.64.0.0/10`) or
-  loopback address is refused.
+  trusted network or an encrypted overlay. The public-only destination check
+  still applies unless the remote has the explicit IP-literal allowance in
+  [Non-public remotes](#non-public-remotes-wi875). Loopback destinations and
+  DNS names that resolve to private addresses are refused.
 - **A binding must name a granted remote**, and is applied only when that
   remote is selected for the call.
 - **Egress modes.** Credential injection works in `proxy-enforced`, the only
@@ -449,6 +450,5 @@ The focused `sandbox::capability` unit suite includes wall-clock samples of the
 pure decision/audit serialization work; canonical mount validation also walks
 the existing host filesystem. WI#797 local measurement on the development host: about 20 µs per decision
 including canonical mount checks, and about 15 µs per JSON audit serialization
-(mean of 20 decisions and 1000 serializations, warmed test build). These are
-samples for local documentation, not a portable performance guarantee or an
-unattended benchmark.
+(mean of 20 decisions and 1000 serializations, warmed test build). The
+measurement date is unrecorded and the numbers are unverified for this release.

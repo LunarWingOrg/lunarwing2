@@ -18,11 +18,7 @@ sudo -u <tenant> LUNARWING_BASE_DIR=/home/<tenant>/lunarwing/state \
 
 ### Example
 
-*
-```bash
-sudo -u ruffles LUNARWING_BASE_DIR=/home/ruffles/lunarwing/state /home/ruffles/lunarwing/ic/target/release/lunarwing pairing approve weechat XXXXXXX
-```
-
+The command above uses a tenant name and a pairing code specific to the deployment.
 
 ## Multi-Tenant Port Mismatch
 
