@@ -1,12 +1,10 @@
 # SSH Agent Harness
 
-**Status:** As-built; source revalidated 2026-11-20 for v2.2.2.0
-(`9c96220bb2`), including the full page.
 Source symbols below define the contract; historical dependency versions and
 static test counts are not deployment health evidence.
 
 WI#454 split each worker lane into a non-root bridge/task pair. The SSH-agent
-socket directory now mounts into the lane's **task** container
+socket directory mounts into the Pebble, OpenCode, and OpenCode 2 **task** containers
 (`TASK_MOUNTS` in `ic/scripts/mt-admin-lib/09-worker-config.sh`), which runs the
 agent code; the bridge identity holds the hub credential and does not get the
 agent socket, while the task container gets neither the bridge home nor its PID
@@ -36,8 +34,7 @@ verification, see the operator guide linked above.
 
 The SSH Agent harness gives LunarWing worker **task** containers (the second half
 of each lane's non-root bridge/task pair — Pebble, OpenCode, and
-OpenCode 2; the Kimi Code lane no longer mounts the socket — WI#206 removed it
-because a headless auto-approved executor must not hold host credentials) a
+OpenCode 2. Kimi Code and LunarDepth do not receive the socket) a
 signing socket and gives interactive chat the built-in `ssh`,
 `ssh_git`, and WASM `ssh` delivery paths. `ssh`, `ssh_git`, and `create_job` are
 excluded from autonomous jobs and routines; the harness does not make direct SSH
@@ -231,10 +228,7 @@ may be uploaded later).
 
 ### 4.3 Injection into workers (out-of-process, via `mt-admin`)
 
-The Rust daemon does **not** push credentials into workers, and the worker code
-paths (`orchestrator/external_worker.rs`, `tools/builtin/job.rs`,
-`context/state.rs`, `channels/wasm/wrapper.rs`) contain **no SSH code** at all.
-Injection is done entirely by `ic/scripts/lunarwing-mt-admin.sh` (since the
+The SSH signing socket is mounted by `ic/scripts/lunarwing-mt-admin.sh` (since the
 v2.0.8.0 refactor a thin composition root over `mt-admin-lib/NN-*.sh` — the
 socket pre-creation and daemon-first ordering live in
 `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh`, and the worker bind-mounts in
