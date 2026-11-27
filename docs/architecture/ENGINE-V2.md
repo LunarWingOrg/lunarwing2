@@ -5,8 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** Read the behavior sections below
-as the current contract. Relevant release changes include:
+The following release changes provide context for the current execution path:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
   WI#321 warns when stored records cannot load and when default projects
@@ -103,7 +102,7 @@ ic/crates/lunarwing_engine/src/
     policy.rs             PolicyEngine (deterministic allow/deny/approve)
     planner.rs            Capability planning logic
   gate/                   Execution gates (approval, auth, rate limits)
-    pipeline.rs           GatePipeline (composes gates in sequence)
+    pipeline.rs           Ordered GatePipeline abstraction (only instantiated by tests)
     mod.rs                GateDecision, GateResolution, ExecutionMode, ResumeKind
     tool_tier.rs          Tool-tier gate logic
     lease.rs              Lease-gated approval
@@ -116,14 +115,14 @@ ic/crates/lunarwing_engine/src/
     messaging.rs          ThreadSignal, ThreadOutcome, ThreadFailureKind, signal channels
     skill_feedback.rs     Skill usage feedback events (feature-gated)
   executor/               Step execution
-    loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
-    structured.rs         Tier 0: structured tool call execution
+    loop_engine.rs        ExecutionLoop (prepares the thread, runs the orchestrator, persists the outcome)
+    structured.rs         Standalone structured-call executor (only called by tests)
     scripting.rs          Tier 1: embedded Python via Monty (CodeAct/RLM)
-    compaction.rs         Context compaction when approaching model context limit
+    compaction.rs         Standalone compaction helper (outside the running step loop)
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
     llm_stream.rs         LLM streaming support
-    orchestrator.rs       Self-modifiable Python execution layer (CodeAct orchestrator)
+    orchestrator.rs       Python step-loop runner and live structured-call dispatch (Tier 0)
   memory/                 Memory document system
     store.rs              MemoryStore (project-scoped doc CRUD)
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
@@ -159,7 +158,9 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 
 ## Execution Loop
 
-`ExecutionLoop::run()` is the core loop that replaces the v1 `run_agentic_loop()`. It handles three `LlmResponse` variants:
+`ExecutionLoop::run()` prepares the Engine V2 thread and calls
+`execute_orchestrator`. The Python orchestrator drives the step loop for three
+`LlmResponse` variants:
 
 ```
 1. Check signals (Stop, InjectMessage) via mpsc::Receiver
@@ -282,14 +283,16 @@ signals, this is monitor-only. See the
 
 ### Two Execution Tiers
 
-**Tier 0 -- Structured Tool Calls** (`executor/structured.rs`):
+**Tier 0 -- Structured Tool Calls** (`executor/orchestrator.rs`):
 
-Standard tool/function calling. The LLM returns structured `ActionCall` objects. For each call:
-1. Find the capability lease that grants this action
-2. Check the policy engine (allow/deny/approve)
-3. Consume one use from the lease (if use-limited)
-4. Execute via `EffectExecutor`
-5. Record the `ActionResult`
+When the LLM returns structured `ActionCall` objects, `orchestrator/default.py`
+calls `__execute_actions_parallel__`, which dispatches to
+`handle_execute_actions_parallel` in Rust. `handle_execute_action` serves the
+separate `__execute_action__` host function. The handlers look up the lease,
+evaluate policy when the action has a definition, consume one lease use, and
+call `EffectExecutor`. The batch handler runs eligible calls concurrently and
+returns results in call order. `structured.rs::execute_action_calls` implements
+a separate path exercised only by its own tests.
 
 Before lease lookup, `LlmResponse::from_action_calls` consumes CodeAct
 final-answer pseudo-actions (`FINAL`, `FINAL(...)`, `FINAL_VAR`, and malformed
@@ -409,7 +412,11 @@ Key characteristics:
 
 ### Python Orchestrator
 
-The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execution layer that can replace the compiled Rust `ExecutionLoop::run()` loop:
+`ExecutionLoop::run()` always delegates step iteration to the Python
+orchestrator through `executor/orchestrator.rs`. The Rust entry point loads
+the checkpoint, prepares the thread, and persists the outcome.
+`ORCHESTRATOR_SELF_MODIFY` controls selection of the compiled-in or
+Store-versioned Python source.
 
 - Executes via Monty with resource limits
 - Exposes host functions: `__llm_complete__`, `__execute_code_step__`,
@@ -609,13 +616,15 @@ The `PolicyEngine` evaluates actions against leases deterministically:
 - Every action declares its side effects via `EffectType`. The policy engine uses these for allow/deny decisions
 - **Provenance types**: origin labels exist for user, system, tool, LLM, and
   memory-retrieval data. `PolicyEngine::evaluate_with_provenance()` implements
-  targeted approval rules for LLM-generated or tool-sourced data. Structured,
-  scripting, and orchestrator action dispatch all call the provenance-aware
-  evaluator for LLM-generated action inputs.
+  targeted approval rules for LLM-generated or tool-sourced data. The
+  orchestrator action handlers and the CodeAct dispatcher in
+  `executor/scripting.rs` use it for LLM-generated action inputs when they
+  have an action definition.
 
 ## Execution Gates
 
-Unified gate abstraction for all pre-execution checks (approval, auth, rate limits):
+The engine gate types describe pre-execution decisions and how a paused thread
+can resume:
 
 ```
 GateDecision:
@@ -639,7 +648,14 @@ ExecutionMode:
   Interactive | InteractiveAutoApprove | Autonomous | Container
 ```
 
-**Gate pipeline** (`GatePipeline`): composes multiple gates in sequence. The first `Pause` or `Deny` wins.
+`GatePipeline` evaluates gates in ascending priority and returns the first
+`Pause` or `Deny`. Its constructors are used only by tests. In production,
+the action handlers in `executor/orchestrator.rs` check policy and leases,
+and `EffectBridgeAdapter::execute_action` calls `execute_action_internal`
+in `ic/src/bridge/effect_adapter.rs` for the host-side checks. The bridge
+checks tool permissions, approval tiers, supervision, hooks, and credential
+readiness, with dedicated rate limits for mission verbs. `ic/src/main.rs`
+wires `CoordinationGate` into the effect bridge, which invokes it directly.
 
 **Resolution flow**:
 1. Gate returns `Pause` -- `PendingGate` is inserted into the in-memory store
@@ -1497,12 +1513,11 @@ only; v1 also denies update/fire, which v2 keeps as steering) — so creating,
 deleting or resuming a mission stays with the foreground conversation (which
 can be supervised via `AGENT_SUPERVISED_MODE` or `lunarwing --supervised`).
 Run-spawning approval prompts disclose fan-out. The owner-scoped steering
-reach that remains is deliberate and stays open. One related seam remains
-by design: the structured-tier policy preflight
-(`executor/structured.rs`) evaluates policy from `available_actions`, which
-stays registry-only so the model-visible catalog does not duplicate the
-verbs — policy is therefore not consulted for the mission verbs, neither
-per call nor at lease grant.
+reach that remains is deliberate and stays open. For structured calls, the
+orchestrator handlers only evaluate `PolicyEngine` when `available_actions`
+returns a matching action definition. `EffectBridgeAdapter::available_actions`
+returns registry actions, so mission verbs are instead checked by the bridge
+when dispatched.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
