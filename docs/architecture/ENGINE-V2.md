@@ -432,7 +432,9 @@ Store-versioned Python source.
   prompt. Stored overlays, including those with `source: compiled_in`, are inert
   while disabled. Compiled v0 seeding and failure bookkeeping use the host-only
   `Store::save_internal_memory_doc` path; model metadata is never write authority.
-- Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
+- Uses compiled-in v0 when self-modification is disabled or no stored version
+  is eligible. After three consecutive failures, the loader skips the latest
+  stored version and can select an earlier one.
 - Nudges short roleplay or retry prose back into a `repl` block for non-conversational
   goals, with a default two-attempt cap; substantive prose and short conversational
   goals remain valid terminal responses. Syntax-invalid `repl` blocks use the same
@@ -486,9 +488,8 @@ Memory-retrieval and compaction content is LLM-adjacent data. Retrieved
 content is labeled and neutralized before it can masquerade as engine-authored
 state; for compaction summaries, see the compaction entry below:
 
-- `__retrieve_docs__` is the live retrieval path (the dead `executor/context.rs`
-  doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
-  projected false assurance). Its handler neutralizes role-token openers in
+- `__retrieve_docs__` in `executor/orchestrator.rs` is the live retrieval path.
+  Its handler neutralizes role-token openers in
   returned doc content and stamps each doc with
   `"provenance": "untrusted_memory_retrieval"`, document ID, optional source
   thread ID, visibility scope, and update timestamp. The default orchestrator
@@ -655,7 +656,9 @@ and `EffectBridgeAdapter::execute_action` calls `execute_action_internal`
 in `ic/src/bridge/effect_adapter.rs` for the host-side checks. The bridge
 checks tool permissions, approval tiers, supervision, hooks, and credential
 readiness, with dedicated rate limits for mission verbs. `ic/src/main.rs`
-wires `CoordinationGate` into the effect bridge, which invokes it directly.
+constructs `CoordinationGate` when a coordination store exists.
+`init_engine` in `ic/src/bridge/router.rs` passes it to the effect adapter,
+which calls it directly.
 
 **Resolution flow**:
 1. Gate returns `Pause` -- `PendingGate` is inserted into the in-memory store
@@ -2327,7 +2330,10 @@ process.
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
-**WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The engine's policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the same `tool_async_timeout_secs` value — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.
+**Deferred calls (WI#88).** Within a CodeAct `ResolveFutures` round, deferred
+LLM calls and deferred tool calls use the same `tool_async_timeout_secs` limit.
+The resolver aborts a task that exceeds the limit and returns a call error to
+the model. A call does not get a second deadline or an automatic retry.
 
 ## Build & Test
 
