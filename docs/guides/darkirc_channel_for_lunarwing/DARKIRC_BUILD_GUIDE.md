@@ -88,8 +88,13 @@ The source of truth is `darkirc_channel_for_lunarwing/darkirc/darkirc.capabiliti
 - `adapter_url`, sourced from `DARKIRC_ADAPTER_URL`;
 - loopback-only HTTP allowlist and credential host patterns;
 - channel-scoped workspace prefix `channels/darkirc/`;
-- polling enabled with a 3000 ms minimum interval;
+- polling enabled with a declared minimum of 3000 ms;
 - default DM policy `pairing`.
+
+The guest requests a 3-second interval by default. The daemon clamps the
+capability and callback interval to at least 30 seconds. The guest reads
+`poll_interval_seconds` from its config. The `poll_interval_ms` value in the
+sidecar's `config` object does not set that guest field.
 
 Do not copy an old JSON example over the current capability file. Schema and credential-location fields are versioned with the WIT/host interface.
 
