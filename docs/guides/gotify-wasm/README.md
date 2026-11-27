@@ -15,7 +15,7 @@ lunarwing registry install gotify --build
 
 `registry install --build` uses the manifest in `ic/registry/tools/gotify.json`, builds the WASM component from source, and installs its capability sidecar. Configure the token separately as described under [Secrets](#secrets).
 
-For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install both `gotify.wasm` and `gotify.capabilities.json` below `${LUNARWING_BASE_DIR:-$HOME/.lunarwing}/tools/`, then restart LunarWing.
+For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install `gotify.wasm` and `gotify.capabilities.json` in the running instance's `<base_dir>/tools/` directory, then restart LunarWing. The bare daemon uses `~/.ironclaw` when neither base-directory environment variable is set.
 
 ## Configuration
 
@@ -40,7 +40,9 @@ tenant, mt-admin writes the file under the tenant state directory.
 
 The tool appends `/message` automatically, so provide just the base URL. The `title` field is optional — if omitted, the compiled-in default (`LunarWing`) is used. The title serves as the default for notifications when the caller doesn't specify one explicitly.
 
-**3. Capabilities file** — edit `gotify.capabilities.json` to allow HTTP to the new host. Update both the `allowlist` host and the `credentials.host_patterns`:
+**3. Capabilities file** — update the installed sidecar to allow requests to
+the new host. Registry installs use `gotify.capabilities.json`. MT admin
+`install-wasm` uses `gotify-tool.capabilities.json`. Update both the `allowlist` host and the `credentials.host_patterns`:
 
 ```json
 {
