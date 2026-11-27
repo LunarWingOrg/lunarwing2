@@ -154,8 +154,9 @@ Deferred records are picked up in follow-up passes. If the generation marker
 changes during import, the pass leaves the completed revision unchanged and
 retries with backoff. Writes that already succeeded stay in the workspace.
 
-This mode is deliberately labeled `additive`: it imports new paths, but does not
-apply upstream edits, status changes, supersedure, tombstones, or deletions. It
+Additive refresh imports new paths and repairs eligible rows as described
+below. Imported notes keep their local content and status across upstream
+edits, supersedure, tombstones, and deletions. It
 reports a Git revision rather than claiming exact parity with the hosted MCP.
 Those complete semantics require the revisioned hosted delta contract described
 in `docs/ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
@@ -287,7 +288,7 @@ After provisioning and the first `start-tenant`:
 | `N note(s) failed ... seed is complete and will not rerun` | Import failures counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
 | Daemon restarted before writing the marker | The next bootstrap scans the checkout again | Already-imported notes are skipped or repaired as described above |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
-| Refresh succeeds but an upstream edit is absent | Additive mode never replaces an existing path | Expected; wait for the hosted revisioned-delta implementation or resolve manually |
+| Refresh succeeds but an upstream edit is absent | Additive mode preserves existing notes outside the documented repair cases | Resolve manually if needed |
 
 ## Related documents
 
