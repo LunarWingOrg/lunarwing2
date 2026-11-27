@@ -106,7 +106,7 @@ Room membership is established at startup. After editing the env files, restart 
 
 ## Verify with coord-doctor
 
-`mt-admin coord-doctor <tenant>` is a read-only, init-agnostic check of the whole operator surface:
+`mt-admin coord-doctor <tenant>` reports room configuration and bridge status:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-a
