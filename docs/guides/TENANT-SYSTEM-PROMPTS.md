@@ -4,11 +4,10 @@ Available in v2.1.4.0 (WI#220). Open the tenant's web gateway, authenticate,
 and select **Settings → System Prompt**. The displayed **Workspace scope** is
 the database scope selected by your token, not necessarily the OS account name.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The prompt-editor
-handlers, workspace preview composition, and Engine V2 initialization snapshot
-match the current tree. Routes still resolve in the gateway's web channel and
-`system_prompt_for_context_tz` remains the preview entry point; activation
-still requires a manager restart and a new conversation.
+The gateway mounts the editor routes from
+`ic/src/channels/web/handlers/prompts.rs`. The preview handler calls
+`Workspace::system_prompt_for_context_tz()`. The Engine V2 bridge captures
+workspace instructions when `init_engine` initializes the thread manager.
 
 ## Editing
 
