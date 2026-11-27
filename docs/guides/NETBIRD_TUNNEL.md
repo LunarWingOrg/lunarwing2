@@ -8,14 +8,8 @@ operator-managed.
 This integration targets self-hosted NetBird. It does not require NetBird Cloud
 or a LunarWing-side management API token.
 
-**Revalidated against source 2026-11-20 (v2.2.2.0 `9c96220bb2`).** The full
-page was checked. `netbird expose`
-process management, `TUNNEL_NETBIRD_NAME_PREFIX`/`TUNNEL_NETBIRD_CUSTOM_DOMAIN`,
-and the V24 legacy-provider scrub match `ic/src/tunnel/`, `ic/src/config/tunnel.rs`,
-and `ic/migrations/`. This is inbound daemon/gateway exposure. The opt-in,
-egress-only sandbox sidecar is documented separately in
-[`SANDBOX_TUNNEL_NETWORKING.md`](SANDBOX_TUNNEL_NETWORKING.md); never reuse this
-guide's peer or setup key for that boundary.
+Use a separate peer and setup key for the opt-in sandbox sidecar.
+[Sandbox tunnel networking](SANDBOX_TUNNEL_NETWORKING.md)
 
 ## Scope
 
@@ -165,9 +159,10 @@ lunarwing doctor
 With CLI enabled and no `--message`, the interactive boot screen reports
 provider `netbird` plus the HTTPS URL. Shipped services and managed tenants set
 `CLI_ENABLED=false` and do not print that screen; use debug startup logs to see
-the reported URL without exposing gateway tokens. Test an authenticated health
-or webhook route through that URL. Stop LunarWing, then verify NetBird removes
-the ephemeral service.
+the reported URL. For gateway exposure, check unauthenticated `GET /api/health`
+for reachability and use authenticated `GET /api/gateway/status` to confirm
+access. For webhook exposure, test a webhook with its configured secret.
+Stop LunarWing, then verify NetBird removes the ephemeral service.
 
 Common failures:
 

@@ -2,11 +2,8 @@
 
 This runbook covers a PostgreSQL-backed, single-instance migration. LunarWing retains the IronClaw migration lineage and applies newer Refinery migrations at startup, but a forward migration is not a rollback plan. Test with a cloned database and copied state directory before touching the original instance.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The migration chain
-(`ic/migrations/`, currently through V28), `LUNARWING_BASE_DIR` precedence,
-service install paths, and `lunarwing-agent-v1`-only worker subprotocol match
-the current tree. V28 revokes always-granted secret-deletion authority; the
-`ironclaw-agent-v1` alias remains removed.
+The migration chain through V28 is under `ic/migrations/`. V28 revokes
+always-granted secret-deletion authority.
 
 For a multi-tenant target, use [`MIGRATE_IRONCLAW_TO_MT.md`](MIGRATE_IRONCLAW_TO_MT.md) instead.
 
@@ -90,7 +87,8 @@ Do not rename the database merely for cosmetic consistency. If a rename is opera
 
 ## 5. Install and Start the Service
 
-LunarWing's service command supports systemd and OpenRC:
+For systemd user services and launchd, run these commands as the intended
+service account.
 
 ```bash
 lunarwing service install
@@ -100,15 +98,15 @@ lunarwing service status
 
 Review the rendered service before enabling it. The committed systemd production template expects the binary at `/usr/local/bin/lunarwing`, state under `/var/lib/lunarwing`, and protected environment at `/etc/lunarwing/lunarwing.env`; adjust the deployment consistently rather than editing only `ExecStart`.
 
-For OpenRC, use the committed `.openrc` and `.confd` templates or `lunarwing service install`. Do not translate a systemd-only runbook into ad hoc OpenRC commands.
+On OpenRC, use the committed templates or run the service commands through
+`sudo` from the intended service account. Invoke the target build by absolute
+path if the privileged PATH does not contain `lunarwing`.
 
 Every service installer refuses a root daemon before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicitly set (WI#574/WI#613). On systemd and launchd, run the installer as the intended unprivileged service account without `sudo`. On OpenRC, run it through `sudo` from that account; the resolved runtime identity must have both a non-zero uid and a non-zero primary gid. Prefer a dedicated unprivileged account and verify the resolved identity rather than relying on its name. The setup wizard does not offer an install that these checks would refuse; it prints one line that says so and gives the installer's reason.
 
-If the watchdog is required, install the current init-appropriate assets after the main service is healthy:
-
-```bash
-sudo ic/scripts/install-lunarwing-watchdog.sh
-```
+If you need the watchdog, run `ic/scripts/install-lunarwing-watchdog.sh`
+after the main service is healthy. Use `sudo` on systemd and OpenRC. On
+macOS, run it as the service account to install the user LaunchAgent.
 
 ## 6. Update Integrations
 

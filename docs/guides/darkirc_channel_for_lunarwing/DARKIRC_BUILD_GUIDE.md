@@ -8,11 +8,7 @@ LunarWing's DarkIRC integration has three components:
 
 Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The registry manifest is
-`0.1.19` and the WASM channel crate is `2.2.3`. The capability file (3000 ms
-poll floor, loopback allowlist, `pairing` DM default), source/registry symlink,
-and `darkirc-contact prepare/respond/complete` exchange commands match the
-current tree.
+The registry manifest version is `0.1.19`. The WASM source crate version is `2.2.3`.
 
 ## Source Layout
 
@@ -52,7 +48,8 @@ cd darkirc_channel_for_lunarwing/darkirc
 taskset -c 0-11 cargo build --release -j12 --target wasm32-wasip2
 ```
 
-Use the committed `build.sh` only after reviewing its install destination. It can install directly into `${LUNARWING_HOME:-$HOME/.lunarwing}/channels/`.
+Use the registry workflow to install the result. The legacy `build.sh`
+probes for an older WIT layout and has its own install destination.
 
 ## Build the DarkIRC Daemon for MT
 
@@ -92,8 +89,15 @@ The source of truth is `darkirc_channel_for_lunarwing/darkirc/darkirc.capabiliti
 - `adapter_url`, sourced from `DARKIRC_ADAPTER_URL`;
 - loopback-only HTTP allowlist and credential host patterns;
 - channel-scoped workspace prefix `channels/darkirc/`;
-- polling enabled with a 3000 ms minimum interval;
+- polling enabled with a declared minimum of 3000 ms;
 - default DM policy `pairing`.
+
+Set `config.poll_interval_ms` in the sidecar to an integer number of
+milliseconds. The guest requests at least 3,000 ms, and the LunarWing host
+applies a separate 30,000 ms minimum. The default therefore schedules polls
+30 seconds apart. For example, `"poll_interval_ms": 45250` schedules polls
+45.25 seconds apart. If `poll_interval_seconds` is also set, that legacy value
+takes precedence. Remove it when switching to the millisecond key.
 
 Do not copy an old JSON example over the current capability file. Schema and credential-location fields are versioned with the WIT/host interface.
 
@@ -111,12 +115,22 @@ lunarwing pairing approve darkirc <code>
 DarkIRC encrypted-contact configuration is a separate operator workflow. Each contact has `dm_chacha_public` and `my_dm_chacha_secret` values in protected daemon configuration. Use the typed MT admin exchange commands rather than copying private keys manually:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact>
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact>
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare \
+  "$tenant_a" "$contact_b" --out offer.json --json
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond \
+  "$tenant_b" "$contact_a" --in offer.json --out response.json \
+  --expect-peer-fingerprint "$fingerprint_a" --json
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete \
+  "$tenant_a" "$contact_b" --in response.json --exchange-id "$offer_id_a" \
+  --expect-peer-fingerprint "$fingerprint_b" --json
 ```
 
-Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) for the full artifact and fingerprint exchange. Independently verify the peer fingerprint; do not accept one received over the same untrusted path as the exchange artifact.
+Use the initiator's `offer_id` from `prepare` for the initiator's `--exchange-id`.
+Transfer the offer before `respond` and the response before `complete`. Verify
+each peer fingerprint through an independent trusted channel. The responder
+also completes the exchange with its own local exchange ID. MT admin always
+defers activation. Follow the runbook for the supported Stage A procedure.
+[DarkIRC multi-tenant runbook](../../ops/DARKIRC-MULTITENANT.md)
 
 ## Message Limits
 

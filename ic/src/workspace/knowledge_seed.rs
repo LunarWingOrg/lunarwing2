@@ -14,15 +14,12 @@
 //! - **New tenants only.** The env flag is written exclusively on the
 //!   add-tenant path; existing tenants upgraded to a seed-capable binary
 //!   never carry it and are never seeded.
-//! - **Runs once.** A JSON state file records the completed pass; later
-//!   startups skip the seed entirely, so the store is never repopulated.
-//!   Per-note failures (unreadable or invalid files) are logged and recorded
-//!   in the state file but do not block the marker — upstream junk notes must
-//!   not turn the one-shot seed into a per-boot rescan. A crash mid-pass
-//!   leaves no marker, so the next startup simply resumes (already-seeded
-//!   notes are skipped); an operator can force a full re-seed by deleting
-//!   the state file, which is safe because existing notes are never
-//!   overwritten.
+//! - **Runs once.** A valid JSON state file records a completed pass and
+//!   suppresses bootstrap on later startups. Per-note failures are logged
+//!   and recorded without blocking the marker, which is published atomically
+//!   after the pass. If no valid marker is present, the next enabled startup
+//!   retries the import. An operator can force a re-seed by deleting the
+//!   state file.
 //! - **Never overwrites.** A note whose workspace path already exists is
 //!   skipped, so operator-authored notes survive even a forced re-seed. The
 //!   only writes to existing paths are repairs of a previous pass's own
@@ -37,8 +34,11 @@
 //! Best-effort: individual note failures are logged and counted but never
 //! propagated, so the agent never crashes because a seed pass failed.
 
+use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,7 @@ const NOTES_DIR: &str = "agent-notes-by-agent";
 
 /// State file recording a completed seed pass (JSON).
 const SEED_STATE_FILE: &str = "knowledge_seed_state.json";
+const SEED_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Metadata comment markers of the canonical lw2studymcp note format.
 const METADATA_MARKER: &str = "<!-- study-notes-metadata";
@@ -119,12 +120,18 @@ impl KnowledgeSeedReport {
 /// Persisted proof that the seed already ran.
 #[derive(Debug, Serialize, Deserialize)]
 struct KnowledgeSeedState {
+    #[serde(default = "legacy_seed_state_version")]
+    schema_version: u32,
     seeded_at: DateTime<Utc>,
     source_home: PathBuf,
     notes_seeded: u32,
     notes_skipped_existing: u32,
     /// Notes that failed to import (logged during the pass).
     notes_failed: u32,
+}
+
+fn legacy_seed_state_version() -> u32 {
+    1
 }
 
 /// One candidate note file discovered in the checkout.
@@ -146,9 +153,9 @@ enum SeedOutcome {
 ///
 /// Writes are plain workspace documents, so chunking/FTS/embedding behave
 /// exactly as for `knowledge_submit_note`. The pass is idempotent: existing
-/// notes are skipped. The state file is written once the pass has walked
-/// every discovered note — per-note failures are logged and recorded in it,
-/// never propagated — so a completed pass never rescans on later startups.
+/// notes are skipped. The state file is published once the pass has walked
+/// every discovered note, even if individual notes failed. Later startups
+/// skip the pass only when that file contains a valid completion marker.
 pub async fn run_knowledge_seed_once(
     workspace: &Workspace,
     config: &KnowledgeSeedConfig,
@@ -160,12 +167,20 @@ pub async fn run_knowledge_seed_once(
         };
     }
     let state_file = config.state_dir.join(SEED_STATE_FILE);
-    if state_file.exists() {
-        tracing::debug!("knowledge seed: skipping (already seeded)");
-        return KnowledgeSeedReport {
-            skipped: true,
-            ..Default::default()
-        };
+    match load_state(&state_file) {
+        Ok(Some(_)) => {
+            tracing::debug!("knowledge seed: skipping (already seeded)");
+            return KnowledgeSeedReport {
+                skipped: true,
+                ..Default::default()
+            };
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            path = %state_file.display(),
+            %error,
+            "knowledge seed: invalid or unreadable completion marker; retrying bootstrap"
+        ),
     }
 
     let report = run_additive_knowledge_import(
@@ -181,14 +196,19 @@ pub async fn run_knowledge_seed_once(
         );
         return report;
     }
-    if report.notes_failed > 0 {
+    if let Err(error) = save_state(&state_file, config, &report) {
+        tracing::warn!(
+            path = %state_file.display(),
+            %error,
+            "knowledge seed: failed to persist completion marker"
+        );
+    } else if report.notes_failed > 0 {
         tracing::warn!(
             "knowledge seed: {} note(s) failed (recorded in {}); seed is complete and will not rerun",
             report.notes_failed,
             state_file.display()
         );
     }
-    save_state(&state_file, config, &report);
     report
 }
 
@@ -558,27 +578,56 @@ fn parse_tags(json: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
     Ok(tags)
 }
 
-/// Persist the completed-seed marker. Failure to write only means the seed
-/// reruns (idempotently) on the next startup, so it is logged, not raised.
-fn save_state(state_file: &Path, config: &KnowledgeSeedConfig, report: &KnowledgeSeedReport) {
+fn load_state(path: &Path) -> anyhow::Result<Option<KnowledgeSeedState>> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let state: KnowledgeSeedState = serde_json::from_slice(&raw)?;
+    anyhow::ensure!(
+        state.schema_version == SEED_STATE_SCHEMA_VERSION,
+        "unsupported schema version {}",
+        state.schema_version
+    );
+    Ok(Some(state))
+}
+
+fn save_state(
+    path: &Path,
+    config: &KnowledgeSeedConfig,
+    report: &KnowledgeSeedReport,
+) -> anyhow::Result<()> {
     let state = KnowledgeSeedState {
+        schema_version: SEED_STATE_SCHEMA_VERSION,
         seeded_at: Utc::now(),
         source_home: config.source_home.clone(),
         notes_seeded: report.notes_seeded,
         notes_skipped_existing: report.notes_skipped_existing,
         notes_failed: report.notes_failed,
     };
-    match serde_json::to_string_pretty(&state) {
-        Ok(json) => {
-            if let Err(error) = std::fs::write(state_file, json) {
-                tracing::warn!(
-                    "knowledge seed: failed to write state file {}: {error}",
-                    state_file.display()
-                );
-            }
-        }
-        Err(error) => tracing::warn!("knowledge seed: failed to serialize state: {error}"),
-    }
+    let json = serde_json::to_vec_pretty(&state).context("serialize completion marker")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).context("create completion marker directory")?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{SEED_STATE_FILE}.{}.", std::process::id()))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .context("create temporary completion marker")?;
+    temp.write_all(&json)
+        .and_then(|()| temp.as_file().sync_all())
+        .context("write and sync temporary completion marker")?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .context("publish completion marker")?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .context("sync completion marker directory")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -769,19 +818,19 @@ mod tests {
                 "# Wire\n\nskip me\n",
             );
 
-            let state_dir = tempfile::tempdir().expect("state");
             let config = KnowledgeSeedConfig {
                 enabled: true,
                 source_home: fixture.path().to_path_buf(),
-                state_dir: state_dir.path().to_path_buf(),
+                state_dir: fixture.path().join("state"),
             };
+            let state_file = config.state_dir.join(SEED_STATE_FILE);
 
             let report = run_knowledge_seed_once(&workspace, &config).await;
             assert_eq!(report.notes_found, 2);
             assert_eq!(report.notes_seeded, 2);
             assert_eq!(report.notes_failed, 0);
             assert!(!report.skipped);
-            assert!(state_dir.path().join(SEED_STATE_FILE).exists());
+            assert!(state_file.is_file());
 
             // Metadata survives the round trip.
             let doc = workspace
@@ -819,7 +868,7 @@ mod tests {
 
             // Forced re-seed (operator deletes the marker) imports only new
             // notes and never overwrites existing ones.
-            std::fs::remove_file(state_dir.path().join(SEED_STATE_FILE)).expect("remove marker");
+            std::fs::remove_file(state_file).expect("remove marker");
             workspace
                 .write(
                     "study-notes/rarity/mt-admin-lock.md",
@@ -842,6 +891,86 @@ mod tests {
                     .await
                     .is_ok()
             );
+        }
+
+        #[tokio::test]
+        async fn retries_bootstrap_and_replaces_invalid_completion_markers() {
+            let (db, _db_dir) = crate::testing::test_db().await;
+            let workspace = Workspace::new_with_db("alice", db);
+            let fixture = tempfile::tempdir().expect("fixture");
+            let config = KnowledgeSeedConfig {
+                enabled: true,
+                source_home: fixture.path().to_path_buf(),
+                state_dir: fixture.path().to_path_buf(),
+            };
+            let state_file = config.state_dir.join(SEED_STATE_FILE);
+            let unsupported = serde_json::json!({
+                "schema_version": SEED_STATE_SCHEMA_VERSION + 1,
+                "seeded_at": "2026-08-22T17:00:00Z",
+                "source_home": fixture.path(),
+                "notes_seeded": 0,
+                "notes_skipped_existing": 0,
+                "notes_failed": 0,
+            })
+            .to_string();
+            for (topic, marker) in [
+                ("empty", ""),
+                ("truncated", r#"{"seeded_at":"#),
+                ("incomplete", r#"{"schema_version":1}"#),
+                ("unsupported-version", unsupported.as_str()),
+            ] {
+                std::fs::write(&state_file, marker).expect("invalid marker fixture");
+                write_note(
+                    &fixture.path().join(NOTES_DIR),
+                    "rarity",
+                    &format!("{topic}.md"),
+                    "# Fixture\n\nRecovered note.\n",
+                );
+
+                let report = run_knowledge_seed_once(&workspace, &config).await;
+                assert!(!report.skipped, "{topic}");
+                assert_eq!(report.notes_seeded, 1, "{topic}");
+                let note = workspace
+                    .read_primary(&note_path("rarity", topic))
+                    .await
+                    .expect("missing note was imported");
+                assert!(note.content.contains("Recovered note."));
+                let state = load_state(&state_file)
+                    .expect("valid replacement")
+                    .expect("completion marker");
+                assert_eq!(state.notes_seeded, 1, "{topic}");
+            }
+        }
+
+        #[tokio::test]
+        async fn complete_legacy_marker_still_skips_bootstrap() {
+            let (db, _db_dir) = crate::testing::test_db().await;
+            let workspace = Workspace::new_with_db("alice", db);
+            let fixture = tempfile::tempdir().expect("fixture");
+            write_note(
+                &fixture.path().join(NOTES_DIR),
+                "rarity",
+                "late-note.md",
+                "# Late\n\nmust not import\n",
+            );
+            let config = KnowledgeSeedConfig {
+                enabled: true,
+                source_home: fixture.path().to_path_buf(),
+                state_dir: fixture.path().to_path_buf(),
+            };
+            let legacy = serde_json::json!({
+                "seeded_at": "2026-08-22T17:00:00Z",
+                "source_home": "/previous/checkout",
+                "notes_seeded": 42,
+                "notes_skipped_existing": 3,
+                "notes_failed": 1,
+            });
+            std::fs::write(config.state_dir.join(SEED_STATE_FILE), legacy.to_string())
+                .expect("legacy marker fixture");
+
+            let report = run_knowledge_seed_once(&workspace, &config).await;
+            assert!(report.skipped);
+            assert_eq!(report.notes_found, 0);
         }
 
         #[tokio::test]

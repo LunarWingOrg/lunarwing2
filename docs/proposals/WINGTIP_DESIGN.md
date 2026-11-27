@@ -2687,7 +2687,7 @@ All new attachment ids are `<prefix>-<uuid v4>` from `decode_images()`: `web-ima
 ### 9.1 Why a new verb
 
 - The desktop user `sun` owns the microphone, clipboard and Hex session (`/run/user/1000`, 0700) but cannot read tenant sockets, env files or tokens: tenant homes are 0700 and daemons run with `UMask=0077` (`ic/scripts/mt-admin-lib/07-units-systemd.sh:978`, `:1054`; `08-units-openrc.sh:916`, `:1127`). A socket TUI run as the tenant loses mic and clipboard access, so tenants are reached through the gateway.
-- Only the master token can authenticate today: `GATEWAY_USER_TOKENS` is parsed but never wired into auth (`ic/src/config/channels.rs:66-69`; `GatewayChannel::new` builds a single-token state, `ic/src/channels/web/mod.rs:85-101`), and DB auth is a stub (`ic/src/channels/web/auth.rs:171-185`). The master token also feeds DarkIRC and Brave uploads, the worker fallback and the readiness probe, so rotating it is disruptive and no verb does it.
+- Only the master token can authenticate today: daemon configuration rejects a non-empty `GATEWAY_USER_TOKENS` (`ic/src/config/channels.rs`), and DB auth is a stub (`ic/src/channels/web/auth.rs`). The master token also feeds DarkIRC and Brave uploads, the worker fallback and the readiness probe, so rotating it is disruptive and no verb does it.
 - `mt-admin tokens [name]` prints master tokens in clear (`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:2258-2288`); `tui-access` must not imitate it.
 
 ### 9.2 Command

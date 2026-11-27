@@ -2,15 +2,6 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The referenced ops
-runbook, `ic/scripts/release-test.sh`, and channel/worker/multi-tenant tiers
-were checked against the current tree. The checklist now covers the v2.1.9
-response/cache and worker-source baselines plus v2.2 sandbox networking and
-storage diagnostics, Multica startup errors, WeeChat rotation, billed-empty
-retry bounds, legacy steering, and redacted mission-load diagnostics. Older
-versioned entries below remain useful regression tiers, not claims that they
-were rerun for this documentation change.
-
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
 ## Before Testing
@@ -114,7 +105,11 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 
 - [ ] Provision a disposable tenant through `ic/scripts/lunarwing-mt-admin.sh` or its thin onboard wrapper.
 - [ ] Verify port allocation and registry entries, including `vision_service` and `vision_health` when OCR is enabled.
-- [ ] Run MT admin `status <tenant>` plus host `doctor`; do not substitute bare system-bus `systemctl`.
+- [ ] Run MT admin `status <tenant>` plus host `doctor`. With external workers,
+  also run `worker-readiness <tenant>` and confirm it refuses an enabled lane
+  with a missing WSS allocation or an unresponsive port. Use MT admin for
+  tenant status on both init systems. Never substitute bare system-bus
+  `systemctl` for that check.
 - [ ] Verify systemd user-manager behavior on systemd hosts.
 - [ ] **Service-mode workload environment scrub** (v2.2.0.0, WI#612) — from `ic/` on a host with a working systemd user manager, run `XDG_RUNTIME_DIR=/run/user/$(id -u) LUNARWING_REQUIRE_SYSTEMD_TESTS=1 taskset -c 0-11 cargo test -j12 --lib tools::process::tests -- --test-threads=12`. The `XDG_RUNTIME_DIR` assignment reaches the user bus even from a `sudo -u` or `su` shell that does not inherit it; `LUNARWING_REQUIRE_SYSTEMD_TESTS=1` turns the exact-environment test's usual skip into a failure when no user manager is available. CI has no user manager and ordinarily reports that skip as `ok`; do not count it as coverage.
 - [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
@@ -134,7 +129,8 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Confirm watchdog/self-heal alerts and restart limits behave as documented.
 - [ ] **Pending-gates corrupt-file quarantine** (v2.1.5.0, WI#299) — with a gate paused in `pending-gates.json`, corrupt the file (invalid JSON) and restart the engine: the unparseable file is renamed to `pending-gates.json.corrupt-<unix-millis>` (warn-level log naming both paths), saves proceed against fresh empty state, and the orphaned Waiting threads fail at boot reconciliation. Also confirm temp/lock files are created `0600` and a save replaces the live inode atomically (see `../architecture/ENGINE-V2.md`).
 - [ ] **Redacted mission-load diagnostics** (v2.2.0.0, WI#576) — remove `goal` from a disposable Active mission and restart: it stays dropped, WARN includes its validated id/path, `error_kind=data`, and `missing_field="goal"`, and no goal text appears. Unknown variants, invalid values, forged field names, and full Serde errors must not reach WARN; full detail remains DEBUG-only.
-- [ ] **Startup version evidence** (v2.2.0.0, WI#579; build identity v2.2.2.0, WI#870) — confirm the first INFO operational log after tracing starts is `Starting LunarWing v<package-version> (commit <sha>, built <rfc3339>)` and matches the deployed binary, including one systemd-user and one OpenRC installation where available. Rebuild the same version without changing the version and confirm the `grep -m1 "Starting LunarWing" daemon.log` line differs between the two builds.
+- [ ] **Startup version evidence** (v2.2.0.0, WI#579; build identity v2.2.2.0, WI#870) — confirm the first INFO operational log after tracing starts is `Starting LunarWing v<package-version> (commit <sha>, built <rfc3339>)` and matches the deployed binary, including one systemd-user and one OpenRC installation where available. Confirm the banner changes when the source revision changes. If the revision
+  and `SOURCE_DATE_EPOCH` are the same, the two banners can match.
 
 ## Cleanup and Sign-Off
 

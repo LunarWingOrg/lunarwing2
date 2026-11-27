@@ -81,6 +81,9 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
   — static audit of the Engine V2 learning loop: verified overlay/orchestrator
   versioning defects, skill/capability boundary proposals, evidence and
   evaluation gates, and a prioritized acceptance-test backlog (WI#793).
+- [`WI920_MSRV_MIGRATION_SCOPE.md`](WI920_MSRV_MIGRATION_SCOPE.md) —
+  dependency candidates that fit Rust 1.96.1 after the v2.2.3.0 sweep, with
+  separate review gates for Wasmtime, rig-core, and HTML converter upgrades.
 - The current `AGENT_GOALS_*.md` file is the active pre-release checklist.
 - Current v2.1.6.0 release evidence:
   [`v2.1.6.0_CARGO_DENY_AUDIT.md`](v2.1.6.0_CARGO_DENY_AUDIT.md) (dependency

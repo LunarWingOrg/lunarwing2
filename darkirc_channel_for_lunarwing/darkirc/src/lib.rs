@@ -87,13 +87,28 @@ struct DarkircConfig {
     #[serde(default, deserialize_with = "deserialize_string_vec_or_empty")]
     allow_from: Vec<String>,
 
-    // Poll interval in seconds (minimum 3).
-    #[serde(default = "default_poll_interval")]
-    poll_interval_seconds: u32,
+    #[serde(default)]
+    poll_interval_ms: Option<u32>,
+
+    #[serde(default)]
+    poll_interval_seconds: Option<u32>,
 
     // Tenant identifier for workspace path isolation (NEW)
     #[serde(default = "default_tenant_id")]
     tenant_id: String,
+}
+
+const MIN_POLL_INTERVAL_MS: u32 = 3_000;
+
+impl DarkircConfig {
+    fn requested_poll_interval_ms(&self) -> u32 {
+        // Existing seconds overrides can coexist with the sidecar's millisecond default.
+        self.poll_interval_seconds
+            .map(|seconds| seconds.saturating_mul(1_000))
+            .or(self.poll_interval_ms)
+            .unwrap_or(MIN_POLL_INTERVAL_MS)
+            .max(MIN_POLL_INTERVAL_MS)
+    }
 }
 
 fn default_adapter_url() -> String {
@@ -102,10 +117,6 @@ fn default_adapter_url() -> String {
 
 fn default_dm_policy() -> String {
     "pairing".to_string()
-}
-
-fn default_poll_interval() -> u32 {
-    3
 }
 
 fn default_tenant_id() -> String {
@@ -275,15 +286,12 @@ impl Guest for DarkircChannel {
             }
         }
 
-        // Enforce minimum 3s poll interval
-        let interval_ms = (config.poll_interval_seconds.max(3) * 1000).max(3000);
-
         Ok(ChannelConfig {
             display_name: "DarkIRC".to_string(),
             // DarkIRC is P2P over Tor ─ no inbound webhooks needed
             http_endpoints: vec![],
             poll: Some(PollConfig {
-                interval_ms,
+                interval_ms: config.requested_poll_interval_ms(),
                 enabled: true,
             }),
         })
@@ -1219,7 +1227,7 @@ mod tests {
         assert_eq!(config.adapter_url, "");
         assert_eq!(config.dm_policy, "pairing");
         assert!(config.allow_from.is_empty());
-        assert_eq!(config.poll_interval_seconds, 3);
+        assert_eq!(config.requested_poll_interval_ms(), 3_000);
     }
 
     #[test]
@@ -1228,13 +1236,29 @@ mod tests {
             "adapter_url": "http://10.0.0.5:7000",
             "dm_policy": "allowlist",
             "allow_from": ["sun", "kageho"],
-            "poll_interval_seconds": 5
+            "poll_interval_ms": 5500
         }"#;
         let config: DarkircConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.adapter_url, "http://10.0.0.5:7000");
         assert_eq!(config.dm_policy, "allowlist");
         assert_eq!(config.allow_from, vec!["sun", "kageho"]);
-        assert_eq!(config.poll_interval_seconds, 5);
+        assert_eq!(config.requested_poll_interval_ms(), 5_500);
+    }
+
+    #[test]
+    fn test_config_poll_interval_bounds_and_legacy_override() {
+        for (json, expected_ms) in [
+            (r#"{"poll_interval_ms":0}"#, 3_000),
+            (r#"{"poll_interval_seconds":1}"#, 3_000),
+            (
+                r#"{"poll_interval_seconds":45,"poll_interval_ms":3000}"#,
+                45_000,
+            ),
+            (r#"{"poll_interval_seconds":4294967295}"#, u32::MAX),
+        ] {
+            let config: DarkircConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(config.requested_poll_interval_ms(), expected_ms, "{json}");
+        }
     }
 
     #[test]

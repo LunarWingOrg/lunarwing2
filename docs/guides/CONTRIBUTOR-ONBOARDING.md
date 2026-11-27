@@ -28,20 +28,15 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-11-21, target release 2.2.3.0):**
+**Current development target: v2.2.3.0.**
 
-- v2.1.9.0 (Kaitei) shipped 2026-11-08 with safer response caching and malformed
-  final-answer recovery, operator-controlled worker source archives, protocol-1
-  REPL hardening, and filesystem health monitoring. See
-  `docs/releases/RELEASE-v2.1.9.0.md` for that compatibility baseline.
+- The v2.2.2.0 release is the starting point for this cycle. Its release
+  notes cover the shell capability manifest, scoped Git grants, and worker
+  readiness. [v2.2.2.0 release notes](../../RELEASE-v2.2.2.0.md)
 - The v2.2.0.0 pre-release checklist (`docs/ops/AGENT_GOALS_2.2.0.0.md`) was the
   authoritative freeze list until it was retired on 2026-11-16; it is kept as
-  history. The v2.2.3.0 crate sweep moved every LunarWing-owned package and
-  path requirement to 2.2.3; the sandbox now defaults
-  to kernel-enforced `proxy-enforced` on Linux and has an opt-in egress-only
-  tunnel tier; Multica startup diagnostics, relay-password rotation, OpenRC
-  identity checks, storage errors, mission-log redaction, retry budgets, and
-  legacy steering have also landed. These remain Tier 3 areas even after merge.
+  history. `ic/Cargo.toml` declares daemon package version `2.2.3` for
+  this cycle.
 - Since 2026-11-16 work is handed out through work items, not through the
   goals file: an item's assignee does the work, and the MR is titled
   "WI #N: …". Do not rely on a work-item list copied into onboarding text:
@@ -93,8 +88,7 @@ That's not gatekeeping, it's how we keep the blast radius small.
 
 ## 5. The review stack (set expectations)
 
-The core review team is small. Reviews are done by **humans plus orchestrator agents**
-(Ruffles and friends — yes, really). For day-one contributors:
+The core review team is small. Reviews are done by humans and review agents. For day-one contributors:
 
 - **Tier 1 diffs** go fast. Hours to a day.
 - **Tier 2** goes through at least one design pass.
@@ -145,4 +139,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-20 (subsystem spec paths). Update §2 whenever freeze status changes.*
+*Update §2 whenever freeze status changes.*

@@ -1,7 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Created:** 2026-06-13. **Source revalidated:** 2026-11-20, v2.2.2.0
-(`9c96220bb2`); the full page was checked.
+**Created:** 2026-06-13.
 **Status:** Reference — documents current behavior, not a proposal.
 **Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
 [multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),
@@ -228,9 +227,12 @@ the final step of tenant provisioning (unless `--no-health` is passed). The full
 5. Bootstrap the WeeChat relay, provision the SSH harness, optionally sync and
    wire the Study Notes MCP (`--with-study-mcp`), and build the vision sidecar
    image if it is missing. A successful new-tenant Study Notes setup also appends
-   `KNOWLEDGE_SEED_FROM_STUDY_MCP=1`; first daemon startup then imports the synced
-   notes once without overwriting existing paths. `configure-study-mcp` and
-   `upgrade-tenant` do not arm that seed. `--with-study-mcp` additionally
+   `KNOWLEDGE_SEED_FROM_STUDY_MCP=1`. On first startup the daemon seeds
+   eligible missing notes. When the workspace lookup succeeds, it preserves
+   existing content except when filling a blank row with no parseable
+   knowledge-note metadata. The [seed guide](../guides/TENANT_KNOWLEDGE_SEED.md#safety-invariants)
+   describes the repair rules and the lookup-error behavior. `configure-study-mcp` and `upgrade-tenant` leave the seed
+   flag as configured. `--with-study-mcp` additionally
    enables the additive knowledge refresh cadence
    (`KNOWLEDGE_SYNC_ENABLED=true` plus its cadence/bound defaults) and installs
    the root-owned source scheduler (mt-admin module `14-knowledge-sync.sh`) so

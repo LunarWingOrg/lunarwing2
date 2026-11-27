@@ -4828,6 +4828,46 @@ On networks with TLS-intercepting proxies (e.g., corporate networks), Docker bui
 
 ## v2.2.3.0 worker upstream re-check — WI#916 (2026-11-27)
 
+### Post-window re-check (15:06Z)
+
+**No pins moved.** SweetieBot posted the evidence and the maintainer choices in
+[WI#916 note 23433](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23433).
+Release times are from npm's `time` map for `dist-tags.latest` and GitHub's
+`published_at` for the stable tags resolved by `git ls-remote --tags` on
+`anomalyco/opencode`.
+
+| Lane | Newest stable | Published (UTC) | 24-hour boundary (UTC) | Result |
+|---|---|---|---|---|
+| Kimi | `2.8.1` | 2026-11-26 11:55:36.675 | 2026-11-27 11:55:36.675 | Eligible; keep `2.7.2` pending the exposure decision |
+| OpenCode 2 | `v2.4.2` at `fc31a485317970bcf6be7b431a9830aaef875731` | 2026-11-26 00:59:05 | 2026-11-27 00:59:05 | Eligible; keep `v2.3.2` pending the exposure decision |
+| OpenCode v1 | `v1.19.6` at `f4e363c8295fa90a03dddc451882fffe8fbce357` | 2026-11-17 07:21:32 | 2026-11-18 07:21:32 | Re-checked; no newer stable v1 tag |
+
+- **Kimi:** the `2.8.1` tarball's SHA-512 matched the registry and the temporary
+  npm lock. Installed in a throwaway prefix at 15:09:21Z, after the window.
+  The KAP feedback and attachment routes identified in `2.7.3` remain;
+  dropping task-supplied `KIMI_CODE_FEEDBACK_BASE_URL` is not a feedback off
+  switch. The note also asks for decisions on the changed interactive,
+  provider, and session behavior. No new listener subcommand was identified.
+  On the real CLI in a loopback-only namespace, the contract tests passed
+  4/4 and a mock provider received the actual hook denial of `kimi web` as a
+  tool error (an inert local shim stood in for the command). The hook alone
+  refused 25/25 in-scope listener inputs without executing them. The candidate
+  source still defaults to allow if the CLI's hook deadline expires or the
+  hook errors; an explicit exit 2 still blocks. These are host tests and
+  source findings, not image evidence.
+- **OpenCode 2:** the candidate still gates Console watches and artifact
+  operations, but it removed `mcp_events` and defaults automations to on.
+  The unchanged OpenTunnel compile-out succeeds on retained `v2.3.2` source
+  and stops before stubbing `v2.4.2` on flag resolver/registry drift. The
+  existing maintainer questions still apply. No pin moved, so there is no
+  candidate image for `console_policy_eval.py` or full bumped-image checks.
+- **Record only:** `nanogpt-community/pebble` HEAD still equals the image pin
+  `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`. `lunarwing/lunardepth` on GitLab
+  still has HEAD `4106cd15771d8c94d73bab22541fb4a980390de8`, ahead of image pin
+  `ca905dfe5e998ebcac29f5c57b5ea04108498468`. Neither ref changed.
+
+### Intake re-check (09:07Z, historical)
+
 **Release review on hold; no pins moved.** SweetieBot recorded the release
 metadata, source findings, and maintainer choices in
 [WI#916 note 23349](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23349).

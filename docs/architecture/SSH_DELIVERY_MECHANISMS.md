@@ -1,7 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built; source revalidated 2026-11-20 for v2.2.2.0
-(`9c96220bb2`), including the full page. Worker socket
+Worker socket
 mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
 units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
 `ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
@@ -9,8 +8,7 @@ Since the WI#454 non-root split, the agent-socket mount is attached to the
 lane's **task** container (`TASK_MOUNTS` in `09-worker-config.sh`), not a single
 worker container. WI#424 adds a separate network requirement for worker SSH: the
 tenant's egress allowlist must permit the destination host and port. The signing
-socket does not grant network reachability. Kimi still receives no SSH-agent
-mount (WI#206).
+socket does not grant network reachability. Kimi and LunarDepth receive no SSH-agent mount.
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -196,7 +194,9 @@ key). Keys never leave the agent.
   traversal, and symlink escape are rejected).
 - **Safety extras:** env-scrubbed subprocess (no gateway secrets leak to git),
   `GIT_TERMINAL_PROMPT=0`, `pull --ff-only`, **force-push (`+ref`) blocked**,
-  option-injection guards, 64 KiB output cap, timeout + child kill.
+  option-injection guards, a 64 KiB capture cap per stream, and child kill
+  on timeout. Push also refuses refspecs with an empty source, including the
+  bare matching-branches `:`.
 - **Private-key algorithms:** **Ed25519 and ECDSA only**, as in the russh command
   path. `ssh_git` does not inspect `SSHHostConfig.key_type`, but the shared agent
   decoder rejects RSA by parsed algorithm before any identity can be loaded.

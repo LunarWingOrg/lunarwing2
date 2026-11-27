@@ -2,12 +2,6 @@
 
 This runbook moves one PostgreSQL-backed IronClaw instance into a tenant managed by `ic/scripts/lunarwing-mt-admin.sh`. Rehearse with a dump and copied state before the final cutover.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** Every referenced
-mt-admin subcommand (`add-tenant`, `list-tenants`, `status`, `stop-tenant`,
-`restore-tenant`, `build-tenant`, `start-tenant`, `doctor`, `restart-tenant`)
-matches the current script. The guarded restore path, required tenant LLM
-endpoint, state directory layout, and ports-registry guidance are current.
-
 For a single-instance target, see [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](MIGRATE_IRONCLAW_TO_LUNARWING.md). For a libSQL source, see [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](MIGRATE_IRONCLAW_LIBSQL_TO_MT.md).
 
 ## Safety Rules
@@ -81,7 +75,10 @@ Use explicit `--host`, `--port`, and `--username` values as required by the sour
 
 ## 4. Restore Through MT Admin
 
-The restore command is intentionally destructive to the **target tenant database**: it verifies the archive format, requires `--yes`, refuses a running daemon, and uses a single transaction.
+The restore command checks the `PGDMP` header and requires `--yes`, a running
+PostgreSQL container, and a daemon it can confirm is stopped. It uses
+`pg_restore --single-transaction --clean --if-exists`, which drops and
+recreates the objects in the archive in the **target tenant database**.
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <tenant>

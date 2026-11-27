@@ -393,7 +393,7 @@ impl AppBuilder {
                 .with_search_config(&self.config.search);
 
             if let Some(ref emb) = embeddings {
-                ws = ws.with_embeddings_cached(emb.clone(), emb_cache_config.clone());
+                ws = ws.with_embeddings_cached(emb.clone(), emb_cache_config);
             }
 
             // Wire workspace-level settings (read scopes, memory layers)
@@ -408,40 +408,12 @@ impl AppBuilder {
             ws = ws.with_memory_layers(self.config.workspace.memory_layers.clone());
             let ws = Arc::new(ws);
 
-            // Detect multi-tenant mode: when GATEWAY_USER_TOKENS is configured,
-            // each authenticated user needs their own workspace scope. Use
-            // WorkspacePool (which implements WorkspaceResolver) to create
-            // per-user workspaces on demand instead of sharing the startup
-            // workspace across all users.
-            let is_multi_tenant = self
-                .config
-                .channels
-                .gateway
-                .as_ref()
-                .is_some_and(|gw| gw.user_tokens.is_some());
-
-            if is_multi_tenant {
-                let pool = Arc::new(crate::channels::web::server::WorkspacePool::new(
-                    Arc::clone(db),
-                    embeddings.clone(),
-                    emb_cache_config,
-                    self.config.search.clone(),
-                    self.config.workspace.clone(),
-                ));
-                tools.register_memory_tools_with_resolver(pool.clone());
-                tools.register_knowledge_tools_with_resolver(pool.clone());
-                workspace_resolver = Some(pool);
-                tracing::info!(
-                    "Memory tools configured with per-user workspace resolver (multi-tenant mode)"
-                );
-            } else {
-                tools.register_memory_tools(Arc::clone(&ws));
-                let resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver> = Arc::new(
-                    crate::tools::builtin::memory::FixedWorkspaceResolver::new(Arc::clone(&ws)),
-                );
-                tools.register_knowledge_tools_with_resolver(Arc::clone(&resolver));
-                workspace_resolver = Some(resolver);
-            }
+            tools.register_memory_tools(Arc::clone(&ws));
+            let resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver> = Arc::new(
+                crate::tools::builtin::memory::FixedWorkspaceResolver::new(Arc::clone(&ws)),
+            );
+            tools.register_knowledge_tools_with_resolver(Arc::clone(&resolver));
+            workspace_resolver = Some(resolver);
 
             Some(ws)
         } else {
