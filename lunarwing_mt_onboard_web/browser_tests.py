@@ -261,6 +261,38 @@ class OnboardBrowserTests(unittest.TestCase):
         result = self._wait_for_result(success=False)
         self.assertIn("FAIL", result)
 
+    def test_lunardepth_provisioning_requires_a_route_and_key(self) -> None:
+        self._open_mode("provision")
+        next_button = self.page.get_by_role("button", name="Next")
+        name = self._field("Tenant name")
+        name.fill("lunardepth-reserved")
+        next_button.click()
+        self.assertIn("reserved prefix", self.page.locator(".field-error").inner_text())
+        name.fill("depth-demo")
+        next_button.click()
+        next_button.click()
+
+        self._checkbox("lunardepth (LunarDepth worker)").check()
+        next_button.click()
+        self.assertIn("explicit API base URL", self.page.locator(".field-error").inner_text())
+        self._field("LunarDepth API base URL").fill("https://depth.example.test/openai/v1")
+        self._field("LunarDepth model ID").fill("tensormoon::function_name::demo")
+        next_button.click()
+        self.assertIn("per-tenant API key", self.page.locator(".field-error").inner_text())
+
+        secret = "browser-fixture-only-value"
+        key_field = self._field("LunarDepth per-tenant API key")
+        self.assertEqual(key_field.get_attribute("type"), "password")
+        key_field.fill(secret)
+        for _ in range(3):
+            next_button.click()
+        summary = self.page.locator(".summary-grid").inner_text()
+        self.assertIn("lunardepth", summary)
+        self.assertNotIn(secret, summary)
+        self.page.get_by_role("button", name="Provision").click()
+        self._wait_for_result()
+        self.assertNotIn(secret, self.page.locator("#log-console").inner_text())
+
     def test_simple_demo_operations_stream_to_completion(self) -> None:
         self._open_mode("secrets")
         self._field("Tenant").fill("sphinx")
