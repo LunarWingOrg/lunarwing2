@@ -207,11 +207,10 @@ so delivery is near-immediate **while that request is active**. The adapter capt
 buffer's first line, so there is no separate buffer-discovery delay, but the host may not start the
 next wait until its next 30s interval tick.
 
-**Timeout hierarchy (hard constraint):** `adapter wait ≤20s  <  WASM HTTP 25s  <  host
-callback_timeout 30s`. The host loop below is unchanged; each `on_poll` blocks in
-`/api/wait` up to ~20s, returns, and waits for the next host interval tick. If `/api/wait` is missing (old
-adapter) or returns an unparseable body, the WASM logs it and falls back to **poll mode** for the
-rest of the session.
+The adapter caps its wait at 20 seconds. The guest allows 25 seconds for the
+HTTP request, and the default channel runtime lets the caller wait 30 seconds
+for the callback. If `/api/wait` returns 404 or an unparseable body, the guest
+logs the failure and switches to **poll mode**.
 
 ### Poll mode (fallback / old adapters) — 30s effective floor
 
@@ -224,36 +223,27 @@ Each channel gets its own polling task:
 ```
 loop {
     interval_timer.tick().await;     // effective interval >=30s, MissedTickBehavior::Skip
-    execute_poll().await;            // runs the WASM on_poll to completion
+    execute_poll().await;            // waits for the callback result or times out
 }
 ```
 
-`tick` and `execute_poll` are **sequential**. The start-to-start cadence is at
-least the poll interval, but a slow callback can cross scheduled ticks and
-extend it further. `MissedTickBehavior::Skip` advances to a future tick instead
-of running missed ticks back-to-back.
+The polling task awaits each callback result before polling the timer again.
+The timer uses `MissedTickBehavior::Skip`, so it does not replay a backlog of
+missed ticks. The WeeChat guest requests **3 seconds** by default and its
+capabilities declare 3000 ms. Schema conversion and `validate_poll_interval()`
+clamp the requested interval to at least **30 seconds**.
 
-```
-effective cadence  >=  poll_interval
-```
+`execute_poll` applies the runtime's caller-facing timeout of 30 seconds by
+default. If it expires, the polling task returns a timeout while any already
+running blocking task can continue. `WasmChannelRuntime::new` starts a separate
+channel-engine epoch ticker, which advances every 500 ms. `WasmChannel::create_store`
+sets a Wasmtime guest deadline from the prepared module's timeout (60 seconds
+with the default loader), rounded up to ticks with one extra tick. The epoch
+trap applies while Wasmtime is executing guest code. Host HTTP calls have their
+own request timeouts.
 
-- The WeeChat guest requests **3s** (`default_poll_interval()=3` and
-  `.max(3000)` in `lib.rs`), and its capabilities file also declares 3000ms.
-  The host ignores that lower floor: `MIN_POLL_INTERVAL_MS` is **30,000ms** in
-  `ic/src/channels/wasm/capabilities.rs`, and schema conversion plus
-  `validate_poll_interval()` clamp every channel to at least 30s.
-- **`cycle_duration`** is bounded above by **`callback_timeout` = 30s**
-  (`ic/src/channels/wasm/runtime.rs`), the `tokio::time::timeout` wrapping the WASM call.
-
-The effective polling floor is therefore 30s. A callback that reaches the
-timeout can extend the gap further; `MissedTickBehavior::Skip` prevents a burst
-of catch-up calls afterward.
-
-This same host loop drives **both** modes. In long-poll mode `cycle_duration` is
-the up-to-20s `/api/wait` block. Once it returns, the task waits for the next
-30s interval tick; an early event can therefore be followed by a substantial
-idle window. In poll mode the cycle is usually short and the 30s host tick
-paces it.
+Both ingestion modes use this timer. An early `/api/wait` return can leave a
+substantial idle window before the next tick.
 
 ### Per-cycle cost (poll mode)
 
@@ -268,9 +258,9 @@ WASM instance is also created per poll (`create_store` + `instantiate_component`
 | Per-buffer lines | `GET /api/buffers/<buf>/lines` | **2s** (was 5s) | every poll, ×N buffers |
 | Buffer-list refresh | `GET /api/buffers` | 5s | every ~30 polls, or when empty |
 
-Worst-case cycle ≈ `1.5 + 2 + 2·N` s (was `2 + 3 + 5·N`). In the normal case
-(responsive local adapter) each call returns in milliseconds, but the host
-still paces callbacks at a minimum 30s interval.
+For a cycle with a probe and `N` buffers, the listed request budgets sum to
+`1.5 + 2 + 2·N` seconds, plus 5 seconds if it also refreshes the buffer list.
+The host applies its callback timeout separately.
 
 ### Seeing the real cadence (poll mode)
 
