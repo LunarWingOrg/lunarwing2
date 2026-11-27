@@ -62,13 +62,12 @@ RUN set -eu; \
     npm test; \
     rm -rf node_modules/.cache
 
-# ── CLI bitness + flag contract gate ─────────────────────────────────────────
-# WI#195 finding 2: every worker test points KIMI_BIN at a mock, so the real
-# CLI's flag surface was pinned only in a comment. Compile the CLI (locked
-# version — kimi-cli/package-lock.json is the reproducible pin) for the
-# image's node, then re-run just the contract tests with the real binary on
-# PATH. The lane self-skips on host builds (no binary), so this is the only
-# place the contract is asserted for real.
+# ── Locked CLI and offline contract gate ─────────────────────────────────────
+# The general worker suite uses CLI shims. Install the locked CLI, apply the
+# worker feedback patch, and pass the installed binary to the real-CLI suite.
+# Only this gate requires a runnable CLI; the general host suite can self-skip
+# the upstream invocations if the CLI is absent. The feedback route probe
+# binds only on loopback, with external networking disabled for the test.
 ARG KIMI_CODE_VERSION
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 RUN set -eu; \
