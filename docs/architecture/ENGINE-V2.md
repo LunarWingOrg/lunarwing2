@@ -604,7 +604,7 @@ CapabilityLease {
 
 1. **Grant**: `LeaseManager::grant()` creates a lease for a thread
 2. **Check**: `LeaseManager::check()` verifies the lease is valid (not expired, not revoked, uses remaining)
-3. **Consume**: `LeaseManager::consume_use()` decrements the use counter
+3. **Consume**: `LeaseManager::consume_use()` records one use against the lease limit
 4. **Revoke**: `LeaseManager::revoke()` permanently disables the lease
 5. **Expire**: `LeaseManager::expire_stale()` cleans up time-expired leases
 
@@ -2361,7 +2361,8 @@ protocol-channel delivery, or recovery across a real tenant restart.
 5. **Engine owns its message type** -- `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
 6. **RLM pattern** -- context as variables, recursive `llm_query()`, and bounded
    step output formatted by the Python orchestrator
-7. **Fail-closed by construction** -- `GateDecision` has no `None` variant, `ResumeKind` is a closed enum
+7. **Typed gate results** -- `GateDecision` represents allow, pause, or deny,
+   and `ResumeKind` describes the expected continuation
 8. **Never delete LLM output** -- engine workspace files are preserved; only
    in-memory caches are evicted (V1 compatibility history is dual-written to the
    relational database)
