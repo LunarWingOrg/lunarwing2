@@ -4,7 +4,7 @@
   const LW = (window.LW = window.LW || {});
 
   const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
-  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'opencode2-', 'kimi-', 'weechat-'];
+  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'opencode2-', 'kimi-', 'lunardepth-', 'weechat-'];
 
   function validateName(name) {
     if (!name) return 'tenant name is required';
@@ -27,7 +27,8 @@
 
   function textField(data, key, label, opts) {
     opts = opts || {};
-    const input = h('input', { type: opts.type || 'text', value: data[key] != null ? data[key] : '' });
+    const input = h('input', { type: opts.type || 'text' });
+    input.value = data[key] ?? '';
     if (opts.placeholder) input.placeholder = opts.placeholder;
     input.addEventListener('input', () => {
       data[key] = input.value;
@@ -83,6 +84,7 @@
       model_choice: 'lunarwing', model_custom: '',
       opencode_model: '', opencode_base_url: '',
       w_opencode2: false, opencode2_model: '', opencode2_base_url: '',
+      w_lunardepth: false, lunardepth_model: '', lunardepth_base_url: '', lunardepth_api_key: '',
       llm_api_key: '', secrets_master_key: '',
       ssh_harness: true, health_pipeline: true, weechat_bootstrap: true,
       skip_build: false, skip_start: false,
@@ -91,7 +93,7 @@
     const steps = [
       { title: 'Identity', render: stepIdentity, validate: () => validateName(data.name.trim()) },
       { title: 'Channels', render: stepChannels },
-      { title: 'Workers', render: stepWorkers },
+      { title: 'Workers', render: stepWorkers, validate: validateWorkers },
       { title: 'LLM', render: stepLLM },
       { title: 'Secrets', render: stepSecrets },
       { title: 'Review', render: stepReview },
@@ -120,7 +122,10 @@
         if (err) { flagError(err); return; }
       }
       if (cur < steps.length - 1) { cur++; render(); }
-      else opts.onRun('provision', buildPayload());
+      else {
+        opts.onRun('provision', buildPayload());
+        data.lunardepth_api_key = '';
+      }
     }
 
     function flagError(msg) {
@@ -204,7 +209,39 @@
         kimi.appendChild(textField(data, 'kimi_api_key', 'Kimi API key override (optional)', { type: 'password' }));
         b.appendChild(kimi);
       }
+      b.appendChild(checkField(data, 'w_lunardepth', 'lunardepth (LunarDepth worker)', (checked) => {
+        if (!checked) {
+          data.lunardepth_model = '';
+          data.lunardepth_base_url = '';
+          data.lunardepth_api_key = '';
+        }
+        render();
+      }));
+      if (data.w_lunardepth) {
+        const lunardepth = h('div', { class: 'subgroup' });
+        lunardepth.appendChild(textField(data, 'lunardepth_base_url', 'LunarDepth API base URL (required)', {
+          hint: 'Use the OpenAI-compatible API root. HTTPS is required beyond loopback.',
+        }));
+        lunardepth.appendChild(textField(data, 'lunardepth_model', 'LunarDepth model ID (required)', {
+          hint: 'Use tensormoon::function_name::<name> or tensorzero::function_name::<name>.',
+        }));
+        lunardepth.appendChild(textField(data, 'lunardepth_api_key', 'LunarDepth per-tenant API key (required)', { type: 'password' }));
+        b.appendChild(lunardepth);
+      }
       b.appendChild(checkField(data, 'toolchains', 'Include Rust/Go/C++ toolchains (+~5GB image)'));
+    }
+
+    function validateWorkers() {
+      if (!data.w_lunardepth) return null;
+      if (!data.lunardepth_base_url.trim() || !data.lunardepth_model.trim()) {
+        return 'LunarDepth requires an explicit API base URL and model ID';
+      }
+      if (!data.lunardepth_api_key.trim()) return 'LunarDepth requires a per-tenant API key';
+      return null;
+    }
+
+    function selectedWorkers() {
+      return ['pebble', 'opencode', 'opencode2', 'kimi', 'lunardepth'].filter((worker) => data['w_' + worker]);
     }
 
     function stepLLM(b) {
@@ -232,14 +269,13 @@
     }
 
     function stepReview(b) {
-      const workers = [data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_opencode2 && 'opencode2', data.w_kimi && 'kimi'].filter(Boolean);
       const rows = [
         ['Tenant', data.name || '(unset)'],
         ['Gateway host', data.gateway_host],
         ['DarkIRC', String(data.enable_darkirc)],
         ['XMPP identity', data.xmpp_enabled ? (data.xmpp_jid || '(custom auto)') : 'default tenant identity'],
         ['Gotify', data.gotify_enabled ? data.gotify_url : 'disabled'],
-        ['Workers', workers.join(', ') || 'none'],
+        ['Workers', selectedWorkers().join(', ') || 'none'],
         ['Toolchains', String(data.toolchains)],
         ['Model', data.model_choice === 'custom' ? data.model_custom : data.model_choice],
         ['Master key', data.secrets_master_key ? '(provided)' : 'auto-generate'],
@@ -259,11 +295,6 @@
     }
 
     function buildPayload() {
-      const workers = [];
-      if (data.w_pebble) workers.push('pebble');
-      if (data.w_opencode) workers.push('opencode');
-      if (data.w_opencode2) workers.push('opencode2');
-      if (data.w_kimi) workers.push('kimi');
       let model = 'tensorzero::function_name::lunarwing';
       if (data.model_choice === 'FrontierCODE') model = 'tensorzero::function_name::FrontierCODE';
       else if (data.model_choice === 'custom') model = data.model_custom.trim();
@@ -279,7 +310,7 @@
         gotify_enabled: data.gotify_enabled,
         gotify_url: data.gotify_url.trim(),
         gotify_title: data.gotify_title.trim(),
-        workers: workers,
+        workers: selectedWorkers(),
         toolchains: data.toolchains,
         llm_base_url: data.llm_base_url.trim(),
         llm_model: model,
@@ -290,6 +321,9 @@
         kimi_model: data.kimi_model.trim(),
         kimi_base_url: data.kimi_base_url.trim(),
         kimi_api_key: data.kimi_api_key,
+        lunardepth_model: data.lunardepth_model.trim(),
+        lunardepth_base_url: data.lunardepth_base_url.trim(),
+        lunardepth_api_key: data.lunardepth_api_key,
         llm_api_key: data.llm_api_key,
         secrets_master_key: data.secrets_master_key.trim(),
         no_ssh: !data.ssh_harness,
