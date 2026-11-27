@@ -2,11 +2,9 @@
 
 Cross-tenant knowledge sharing lets independent LunarWing daemons exchange durable findings over a shared XMPP MUC room. An agent publishes a finding with a `KNOW:` line in a coordination room; every other tenant watching that room ingests the finding into its own shared knowledge scope, where `knowledge_search` / `knowledge_get_topic` can find it.
 
-This guide is the production setup for the configuration that was live-disproved in work item #97 (bare user JIDs never match) and re-verified on 2026-09-10 with full occupant JIDs.
+The live check for WI#97 on 2026-09-10 verified publishing with full occupant JIDs.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The `KNOW:` wire format,
-`needs-verification` ingestion semantics, publisher allowlist shapes, and the
-`coordination_knowledge` hook are implemented in `ic/src/hooks/coordination_knowledge.rs`.
+The `KNOW:` parser and ingestion hook live in `ic/src/hooks/coordination_knowledge.rs`.
 
 ## Wire format
 
@@ -26,54 +24,65 @@ Wire claims are untrusted: they are stored as `needs-verification`, without conf
 
 Inbound path, in order:
 
-1. **XMPP bridge** joins the coordination MUC room and only accepts groupchat from allowlisted rooms. The daemon sets that list through the bridge's `/v1/configure` call, from `XMPP_ALLOW_ROOMS` in `lunarwing.env` (or the `xmpp_allow_rooms` setting when the variable is unset or empty). A room not on that list is silently dropped — the daemon neither joins it nor receives from it.
+1. **XMPP bridge.** The installable XMPP channel sends its `rooms` setup field
+   as `allow_rooms` in `/v1/configure`. The bridge uses that list to join rooms
+   and filter groupchat. The bridge merges in `encrypted_rooms` when
+   normalizing the configuration. It drops groupchat outside the effective
+   allowlist before any coordination hook runs. An empty effective list
+   drops all groupchat. MT admin initializes the legacy room list empty
+   when it renders a new tenant.
 2. **Coordination hooks** classify inbound room traffic by scope (`COORD_CHANNELS`); the knowledge-share hook (`coordination.knowledge_share`, priority 13) parses `KNOW:` lines.
 3. **Publisher allowlist** (`COORD_KNOWLEDGE_PUBLISHERS`) gates which senders may actually publish. Room occupancy is not authentication — any occupant can claim any nick the room forwards, so only operator-listed senders are ingested.
 4. Ingest writes the note into the daemon-local shared knowledge scope, subject to per-sender and daemon-wide hourly budgets.
 
-The failure that motivated this guide: every one of steps 1–3 was misconfigured at once (empty room allowlist, publishers set to the room bare JID, later "fixed" to user bare JIDs that also never match), and each failure is silent — the room keeps working, shares just never arrive.
-
 ## Required configuration
 
-For two tenants `sunburst` and `ruffles` sharing room `mepuhiy@conference.xmpp.sobe.world`:
+For two tenants `example-a` and `example-b` sharing room `coordination@conference.example.org`:
 
 ### 1. Room allowlist — both tenants
 
-In each tenant's `lunarwing.env`:
+For a tenant with the legacy XMPP daemon configuration, set this in
+`lunarwing.env`:
 
 ```
-XMPP_ALLOW_ROOMS=mepuhiy@conference.xmpp.sobe.world
+XMPP_ALLOW_ROOMS=coordination@conference.example.org
 ```
 
-The daemon's XMPP channel sends this list to the bridge in its `/v1/configure` call, which makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
+At startup, `migrate_native_xmpp_to_installable` copies the resolved room list
+into `extensions.xmpp.setup_fields.rooms` when the daemon has XMPP credentials,
+the installable channel, and a settings store. The legacy `xmpp_allow_rooms`
+setting is the fallback when `XMPP_ALLOW_ROOMS` is unset or empty. For a tenant
+configured through extension setup alone, set the XMPP `rooms` field there.
 
-The bridge itself does not read `XMPP_ALLOW_ROOMS_JSON`. Set it in `xmpp-bridge.env` if you use `ic/scripts/xmpp-configure.sh` for direct configure calls without passing rooms as arguments. `coord-doctor` uses the bridge env only as a static fallback when it cannot read the effective room list:
+For direct configure calls, `ic/scripts/xmpp-configure.sh` accepts
+`XMPP_ALLOW_ROOMS_JSON` in its environment. Keep the same room in each tenant's
+`xmpp-bridge.env` if you use the static `coord-doctor` check.
 
-```json
-XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
+```dotenv
+XMPP_ALLOW_ROOMS_JSON=["coordination@conference.example.org"]
 ```
 
 ### 2. Publisher allowlist — each tenant lists the OTHER agent's occupant JID
 
 `sender_id` for groupchat is the **full occupant JID** (`room@server/nick`), so that is what the allowlist matches.
 
-On **sunburst** (`lunarwing.env`) — allow the other agent's occupant JID:
+On **example-a** (`lunarwing.env`) — allow the other agent's occupant JID:
 
 ```
-COORD_KNOWLEDGE_PUBLISHERS=mepuhiy@conference.xmpp.sobe.world/ruffles
+COORD_KNOWLEDGE_PUBLISHERS=coordination@conference.example.org/example-b
 ```
 
-On **ruffles** (`lunarwing.env`):
+On **example-b** (`lunarwing.env`):
 
 ```
-COORD_KNOWLEDGE_PUBLISHERS=mepuhiy@conference.xmpp.sobe.world/sunburst
+COORD_KNOWLEDGE_PUBLISHERS=coordination@conference.example.org/example-a
 ```
 
 Three entry shapes, and which work:
 
 | Entry shape | Example | Matches occupant sender? | Notes |
 |---|---|---|---|
-| Full occupant JID | `room@server/nick` | yes (exact) | Recommended. A nick change stops matching — treat nick changes as config changes. |
+| Full occupant JID | `room@server/nick` | yes (case-insensitive) | Recommended. A nick change stops matching — treat nick changes as config changes. |
 | Room bare JID | `room@server` | yes (room-wide) | Explicit opt-in: **every** occupant of that room may publish. Only for rooms whose entire membership you trust. |
 | User bare JID | `user@server` | **no** | Never matches a MUC occupant sender. This is the misconfiguration that silently broke sharing for weeks. |
 
@@ -83,7 +92,7 @@ In each tenant's `lunarwing.env`:
 
 ```
 COORD_ENABLED=true
-COORD_CHANNELS=mepuhiy@conference.xmpp.sobe.world
+COORD_CHANNELS=coordination@conference.example.org
 COORD_KNOWLEDGE_SHARE=true
 COORD_KNOWLEDGE_PUBLISH=true
 ```
@@ -101,22 +110,22 @@ Room membership is established at startup. After editing the env files, restart 
 
 ## Verify with coord-doctor
 
-`mt-admin coord-doctor <tenant>` is a read-only, init-agnostic check of the whole operator surface:
+`mt-admin coord-doctor <tenant>` reports room configuration and bridge status:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor sunburst
-sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-a
+sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-b
 ```
 
-It validates:
+The report shows coordination switches, publisher shape checks, and whether
+coordination rooms appear in the bridge environment file. It also prints
+`configured_rooms` and `rooms_with_presence` when the bridge status is reachable,
+and `KNOW:` drop counters when the admin endpoint is available.
 
-- `COORD_ENABLED`/`COORD_CHANNELS` are usable together;
-- the publisher allowlist is non-empty and every entry is a full occupant JID or a coordination room bare JID (user-bare entries FAIL);
-- every coordination room is on the effective bridge allowlist (`configured_rooms` from the authenticated `/v1/status` response); when that list is unavailable, it checks the static `xmpp-bridge.env` values instead;
-- each configured room appears in `rooms_with_presence`. An empty presence list fails the check for every configured room. If the bridge status or its room data is unavailable, the doctor warns and does not infer live presence from static configuration;
-- live `KNOW:` ingest drop counters from the tenant's coord admin endpoint.
-
-Exit code 0 means no definitive misconfiguration; warnings still deserve operator attention (e.g. a room-wide bare JID entry). It never prints secrets and never rewrites room or trust policy.
+A stale bridge environment can fail the static check even when the room is
+joined. Check each room against the reported live presence. The script can exit
+0 when that list is empty, and its comparison treats comma-joined room lists
+as single values. Finish verification with a real share in a disposable room.
 
 ## Watch the live drop counters
 
