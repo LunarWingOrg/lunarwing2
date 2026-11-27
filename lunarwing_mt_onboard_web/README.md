@@ -114,10 +114,12 @@ relay without re-running provisioning.
 
 Import (Kawarimi) forms do not expose a WeeChat opt-out control.
 
-The provision form also exposes current controls for the daemon LLM base URL
-and OpenCode/Kimi Code model and base-URL
-overrides. The XMPP control customizes the identity; leaving it off uses the
-default `<tenant>@xmpp.localhost` bridge rather than disabling XMPP.
+The provision form exposes the daemon LLM base URL and model and base URL
+overrides for OpenCode, OpenCode 2, and Kimi Code. Selecting **LunarDepth**
+requires an explicit OpenAI-compatible API root, a complete TensorMoon or
+TensorZero function model ID, and a per-tenant API key. The review screen shows
+which workers you selected and hides the API key. The XMPP control customizes
+the identity, which defaults to `<tenant>@xmpp.localhost`.
 
 ## Browser end-to-end tests
 
