@@ -84,6 +84,8 @@ NANOCODE_MODEL=test-nanocode-model
 NANOCODE_BASE_URL=https://nanocode.example.test/openai/v1
 OPENCODE2_MODEL=source-open2-model
 OPENCODE2_BASE_URL=https://source-open2.example.test/v1
+LUNARDEPTH_BASE_URL=https://old-depth.example.test/openai/v1
+LUNARDEPTH_API_KEY=old-key-fixture
 KIMI_API_KEY=kimi-manifest-secret
 ENV
   cat >"$work/bundle-src/manifest-bridge.env" <<'ENV'
@@ -338,6 +340,8 @@ assert_file_contains "import injects Kimi key after provisioning" "$tmp/home/kaw
 assert_file_contains "import restores mascot preference" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "MASCOT_ENABLED=true"
 assert_file_contains "manifest merge preserves the chosen OpenCode 2 model" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "OPENCODE2_MODEL=target-open2-model"
 assert_file_contains "manifest merge preserves the chosen OpenCode 2 base URL" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "OPENCODE2_BASE_URL=https://target-open2.example.test/v1"
+assert_file_not_contains "import ignores legacy LunarDepth route and key" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "LUNARDEPTH_"
+assert_not_contains "legacy LunarDepth keys stay out of import output" "$auto_output" "old-key-fixture"
 assert_file_not_contains "import keeps Kimi key out of mt-admin argv" "$tmp/mt-admin.log" "kimi-manifest-secret"
 if [[ "$auto_output" == *"kimi-manifest-secret"* ]]; then
   fail "import keeps Kimi key out of logs"
