@@ -214,8 +214,9 @@ pub struct McpAddArgs {
     #[arg(long)]
     pub interactive_only: bool,
 
-    /// Raw MCP tool name that must be approved on every call, even when the
-    /// session auto-approves tools (can be repeated)
+    /// Raw MCP tool name that must be approved on every call in interactive
+    /// turns, even when the session auto-approves tools; it never runs in
+    /// routines, background jobs or missions (can be repeated)
     #[arg(long = "require-approval", value_name = "TOOL")]
     pub require_approval: Vec<String>,
 }

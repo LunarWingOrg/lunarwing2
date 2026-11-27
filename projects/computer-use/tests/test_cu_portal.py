@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import cu_support  # noqa: F401
 from cu_support import make_png
@@ -354,6 +355,21 @@ class SessionTests(unittest.TestCase):
             backend.key_chord(parse_chord(["a"]))
         self.assertEqual([c for c in fake.calls if c[1].startswith("Notify")], [])
 
+    def test_desktop_side_close_forgets_the_restore_token(self):
+        # Review ANN-1: after the person stops sharing, reconnecting must ask
+        # them again instead of resuming the share with the old token.
+        fake = FakePortal()
+        backend = backend_for(fake)
+        backend.connect()
+        closed = [cb for (i, s, p, cb) in fake.subscriptions.values() if s == "Closed"][0]
+        closed()
+        self.assertEqual(backend.describe()["restore_token"], "none")
+        fake.calls.clear()
+        backend.connect()
+        devices = plain([c for c in fake.calls if c[1] == "SelectDevices"][0][3][-1])
+        self.assertEqual(devices["persist_mode"], 1)
+        self.assertNotIn("restore_token", devices)
+
 
 class RestoreTokenFileTests(unittest.TestCase):
     def setUp(self):
@@ -374,6 +390,38 @@ class RestoreTokenFileTests(unittest.TestCase):
         backend_for(fake, restore_token_file=self.path).connect()
         devices = plain([c for c in fake.calls if c[1] == "SelectDevices"][0][3][-1])
         self.assertEqual((devices["persist_mode"], devices["restore_token"]), (2, "token-1"))
+
+    def test_desktop_side_close_deletes_the_token_file(self):
+        fake = FakePortal()
+        backend = backend_for(fake, restore_token_file=self.path)
+        backend.connect()
+        closed = [cb for (i, s, p, cb) in fake.subscriptions.values() if s == "Closed"][0]
+        closed()
+        self.assertFalse(os.path.lexists(self.path))
+        # A restarted connector has nothing to restore either.
+        fake = FakePortal()
+        backend_for(fake, restore_token_file=self.path).connect()
+        devices = plain([c for c in fake.calls if c[1] == "SelectDevices"][0][3][-1])
+        self.assertEqual(devices["persist_mode"], 2)
+        self.assertNotIn("restore_token", devices)
+
+    def test_token_file_that_cannot_be_deleted_is_not_reused(self):
+        fake = FakePortal()
+        backend = backend_for(fake, restore_token_file=self.path)
+        backend.connect()
+        closed = [cb for (i, s, p, cb) in fake.subscriptions.values() if s == "Closed"][0]
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(portal_module.os, "unlink", side_effect=denied), \
+                self.assertLogs(portal_module.log, "WARNING"):
+            closed()  # a signal handler must not raise
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(backend.describe()["restore_token"], "forgotten because the desktop ended sharing")
+        fake.calls.clear()
+        backend.connect()
+        devices = plain([c for c in fake.calls if c[1] == "SelectDevices"][0][3][-1])
+        self.assertNotIn("restore_token", devices)
+        # The new grant replaced the file, so later connects may use it again.
+        self.assertEqual(backend.describe()["restore_token"], "stored in the configured file")
 
     def test_unsafe_token_file_is_rejected(self):
         with open(self.path, "w") as handle:

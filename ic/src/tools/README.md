@@ -251,10 +251,14 @@ previews, transcripts and every persistence sink keep seeing text only.
 - **Shared conversations** (group chats, rooms): tool-result images are
   never shown there (a note replaces them), because the model's
   description would reach everyone in the room.
-- **Text-only paths** (`execute_tool_with_safety`: approval resumes, jobs,
-  routines, container and scheduler paths) add a note such as
+- **Text-only paths** (`execute_tool_with_safety`: v1 approval resumes,
+  jobs, routines, container and scheduler paths) add a note such as
   `[1 image returned by this tool not shown to the model: ...]`, so the
   model knows it is missing content.
+- **Engine V2 approvals** are different: images of an action that ran after
+  an approval, and images a step left before pausing for one, are discarded
+  when the run resumes, with no note (the text result is unchanged; see
+  `docs/architecture/ENGINE-V2.md`, "Tool-result images").
 - **Switch**: `TOOL_RESULT_IMAGES=false` (or `0`/`off`) stops forwarding
   for models without vision; the note is added instead. Default: on.
 
@@ -274,8 +278,14 @@ previews, transcripts and every persistence sink keep seeing text only.
   setting; `lunarwing mcp add` for an existing name replaces the whole
   entry, so repeat the flag there.
 - `--require-approval <TOOL>` (repeatable, `always_require_approval`): the
-  raw MCP tool must be approved on every call, even when the session
-  auto-approves tools.
+  raw MCP tool must be approved on every call in interactive turns, even
+  when the session auto-approves tools. Autonomous runs have nobody to
+  approve, and their allow-list ignores the approval tier, so
+  `McpToolWrapper::allows_autonomous_execution` returns `false` for a
+  pinned tool: it never runs in routines, background jobs, missions or
+  Engine V2 background threads. This also applies to the managed Study
+  Notes writer, whose write tools are pinned. `--interactive-only` is what
+  also keeps a server's unpinned tools and shared conversations out.
 
 The Wayland computer-use connector in `projects/computer-use/` is the
 intended user of both; its README has the full registration commands.

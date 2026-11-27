@@ -878,6 +878,16 @@ impl McpToolWrapper {
             .as_ref()
             .is_some_and(|config| config.interactive_only)
     }
+
+    /// The operator pinned this raw tool name with `--require-approval`.
+    fn always_requires_approval(&self) -> bool {
+        self.client.server_config.as_ref().is_some_and(|config| {
+            config
+                .always_require_approval
+                .iter()
+                .any(|name| name == &self.tool.name)
+        })
+    }
 }
 
 #[async_trait]
@@ -928,8 +938,12 @@ impl Tool for McpToolWrapper {
 
     fn allows_autonomous_execution(&self) -> bool {
         // An operator can keep a server's tools (for example desktop control)
-        // out of routines, background jobs and missions entirely.
-        !self.interactive_only()
+        // out of routines, background jobs and missions entirely. A tool
+        // pinned to "approve every call" stays out too: nobody can approve
+        // in an autonomous run, and the autonomous allow-list ignores the
+        // approval tier. Engine V2 background threads and worker MCP
+        // activation already refuse such tools.
+        !self.interactive_only() && !self.always_requires_approval()
     }
 
     fn allows_shared_conversation(&self) -> bool {
@@ -939,12 +953,7 @@ impl Tool for McpToolWrapper {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        if self.client.server_config.as_ref().is_some_and(|config| {
-            config
-                .always_require_approval
-                .iter()
-                .any(|name| name == &self.tool.name)
-        }) {
+        if self.always_requires_approval() {
             ApprovalRequirement::Always
         } else if self.tool.requires_approval() {
             ApprovalRequirement::UnlessAutoApproved
@@ -2042,6 +2051,41 @@ mod tests {
         );
         assert!(default.allows_autonomous_execution());
         assert!(default.allows_shared_conversation());
+    }
+
+    #[test]
+    fn tools_pinned_to_approval_never_run_autonomously() {
+        // Review ANN-2: `--require-approval` promises approval on every call,
+        // and a routine or background job has nobody to approve. The
+        // autonomous allow-list ignores the approval tier, so the tool itself
+        // must opt out.
+        let pinned = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(
+                McpServerConfig::new_stdio("files", "connector", Vec::new(), HashMap::new())
+                    .with_always_require_approval(["do_thing"]),
+            ),
+        );
+        assert_eq!(
+            pinned.requires_approval(&serde_json::Value::Null),
+            ApprovalRequirement::Always
+        );
+        assert!(!pinned.allows_autonomous_execution());
+        assert!(pinned.allows_shared_conversation());
+
+        // The pin is per tool: the server's other tools are unaffected.
+        let sibling = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(
+                McpServerConfig::new_stdio("files", "connector", Vec::new(), HashMap::new())
+                    .with_always_require_approval(["delete_file"]),
+            ),
+        );
+        assert_ne!(
+            sibling.requires_approval(&serde_json::Value::Null),
+            ApprovalRequirement::Always
+        );
+        assert!(sibling.allows_autonomous_execution());
     }
 
     // --- Issue 13: McpToolWrapper unit tests ---

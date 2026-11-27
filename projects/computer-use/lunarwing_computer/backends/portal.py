@@ -20,6 +20,7 @@ PyGObject is imported only when this backend is used, never at import time.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import stat
@@ -31,7 +32,9 @@ from .. import control, imageinfo, session_env
 from ..control import Chord, DesktopError, Rect
 from . import BUTTON_CODES, Backend, BackendOptions, Capture, Output
 
-BUS = "org.freedesktop.portal.Desktop"
+log = logging.getLogger(__name__)
+
+BUS ="org.freedesktop.portal.Desktop"
 PATH = "/org/freedesktop/portal/desktop"
 REMOTE = "org.freedesktop.portal.RemoteDesktop"
 CAST = "org.freedesktop.portal.ScreenCast"
@@ -157,6 +160,13 @@ class TokenStore:
             os.close(fd)
         os.replace(temporary, self.path)
 
+    def clear(self) -> None:
+        """Delete the token file. A symlink is removed, never followed."""
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
 
 def _valid_token(token: str) -> bool:
     return 0 < len(token) <= 512 and all(33 <= ord(ch) <= 126 for ch in token)
@@ -207,6 +217,9 @@ class PortalBackend(Backend):
         self.active = False
         self._restore_token: Optional[str] = None
         self._store = TokenStore(self.options.restore_token_file) if self.options.restore_token_file else None
+        # Set when the desktop side ended sharing: the token file is not read
+        # again until a new grant replaces it, even if deleting it failed.
+        self._stored_token_revoked = False
 
     # -- D-Bus plumbing ----------------------------------------------------------
 
@@ -328,7 +341,7 @@ class PortalBackend(Backend):
             if rd_version >= 2:
                 devices["persist_mode"] = GLib.Variant(
                     "u", PERSIST_UNTIL_REVOKED if self._store else PERSIST_WHILE_RUNNING)
-                token = self._restore_token or (self._store.load() if self._store else None)
+                token = self._restore_token or self._load_stored_token()
                 if token:
                     devices["restore_token"] = GLib.Variant("s", token)
             self._request(REMOTE, "SelectDevices", "(oa{sv})", (self.session,), devices, deadline)
@@ -348,6 +361,7 @@ class PortalBackend(Backend):
             self._restore_token = token if isinstance(token, str) and _valid_token(token) else None
             if self._store is not None and self._restore_token:
                 self._store.save(self._restore_token)
+                self._stored_token_revoked = False
             self.active = True
             self.generation += 1
         except BaseException:
@@ -370,9 +384,31 @@ class PortalBackend(Backend):
         return parsed
 
     def _on_closed(self, *_args) -> None:
-        # The desktop user revoked sharing: drop the session and all input.
+        # The desktop side ended the session: the person stopped sharing, or
+        # the portal closed it. Our own close unsubscribes first, so this never
+        # runs for desktop_disconnect. Drop all input, and forget the restore
+        # token so the next desktop_connect asks the person again instead of
+        # quietly resuming a share they ended.
         self.session = None
+        self._forget_restore_token()
         self._close_session()
+
+    def _load_stored_token(self) -> Optional[str]:
+        if self._store is None or self._stored_token_revoked:
+            return None
+        return self._store.load()
+
+    def _forget_restore_token(self) -> None:
+        self._restore_token = None
+        if self._store is None:
+            return
+        self._stored_token_revoked = True
+        try:
+            self._store.clear()
+        except OSError as error:
+            # Called from a D-Bus signal handler: never raise. The flag above
+            # still keeps this process from reusing the file.
+            log.warning("could not delete the restore token file: %s", error.strerror)
 
     def _close_session(self) -> None:
         was_active = self.active
@@ -398,7 +434,9 @@ class PortalBackend(Backend):
 
     def describe(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {"backend": self.name, "connected": self.connected, "streams": len(self.streams)}
-        if self._store is not None:
+        if self._store is not None and self._stored_token_revoked:
+            info["restore_token"] = "forgotten because the desktop ended sharing"
+        elif self._store is not None:
             info["restore_token"] = "stored in the configured file"
         else:
             info["restore_token"] = "kept in memory only" if self._restore_token else "none"

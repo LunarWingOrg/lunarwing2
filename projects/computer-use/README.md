@@ -87,7 +87,9 @@ back as follows:
 
 The examples name the server `computer`, so LunarWing shows the tools as
 `computer_desktop_screenshot` and so on. `--require-approval` takes the raw
-MCP tool name (without the server prefix) and can be repeated.
+MCP tool name (without the server prefix) and can be repeated. A listed tool
+asks for approval on every call in interactive turns and never runs in
+routines, background jobs or missions, where nobody can approve it.
 `--interactive-only` keeps the tools out of routines, background jobs,
 missions and shared conversations (group chats and rooms): they run only in a
 private turn you are watching. Both flags are recommended for desktop control;
@@ -193,7 +195,8 @@ Read-only tools declare `{"readOnlyHint": true, "destructiveHint": false}` and
 need no approval in LunarWing. Input tools declare `{"readOnlyHint": false,
 "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}` and
 need approval unless the session auto-approves; `--require-approval` forces
-approval for the listed tools regardless.
+approval for the listed tools regardless, and keeps them out of autonomous
+runs.
 
 The loop the tools are built for:
 
@@ -347,7 +350,10 @@ persist the grant (`persist_mode` 1, while the connector runs, with the token in
 memory). With a token file it asks for persistence until revoked (`persist_mode`
 2) and stores the single-use token in that file, so a later `desktop_connect`
 can skip the dialog where the desktop supports it. On GNOME the dialog's
-"remember" checkbox decides whether a token is issued.
+"remember" checkbox decides whether a token is issued. When the desktop side
+ends the session (the person stops sharing, or the portal closes it), the
+connector forgets the token and deletes the file, so the next
+`desktop_connect` shows the dialog again. `desktop_disconnect` keeps the token.
 
 ## Limitations
 
@@ -417,7 +423,8 @@ sensitive on screen:
    released. Portal: change a shared monitor's resolution, take a screenshot,
    and confirm the session closes.
 7. Portal: deny the dialog, then approve it; revoke sharing from the desktop
-   and confirm input stops; close stdin and confirm the sharing indicator
-   disappears.
+   and confirm input stops, then call `desktop_connect` and confirm the dialog
+   appears again (with and without `--restore-token-file`); close stdin and
+   confirm the sharing indicator disappears.
 8. With Hyprland permission enforcement on: confirm the prompts appear and a
    denied keyboard reports no typed text.
