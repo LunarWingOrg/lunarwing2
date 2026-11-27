@@ -89,6 +89,34 @@ class ModelMappingTests(unittest.TestCase):
         ).to_tenant_config()
         self.assertEqual(cfg.workers, [WorkerType.OPENCODE2])
 
+    def test_provision_maps_lunardepth_route_without_serializing_the_key(self) -> None:
+        key = "depth-fixture-only-value"
+        request = ProvisionRequest(
+            name="sphinx",
+            workers=["lunardepth"],
+            lunardepth_model=" tensormoon::function_name::demo ",
+            lunardepth_base_url=" https://depth.example.test/openai/v1 ",
+            lunardepth_api_key=key,
+        )
+        config = request.to_tenant_config()
+        self.assertEqual(config.workers, [WorkerType.LUNARDEPTH])
+        self.assertEqual(config.lunardepth_model, "tensormoon::function_name::demo")
+        self.assertEqual(config.lunardepth_base_url, "https://depth.example.test/openai/v1")
+        self.assertEqual(config.lunardepth_api_key, key)
+        self.assertNotIn("lunardepth_api_key", request.model_dump())
+        self.assertNotIn(key, repr(request))
+
+    def test_provision_rejects_lunardepth_without_route_or_key(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "explicit API base URL"):
+            ProvisionRequest(name="sphinx", workers=["lunardepth"])
+        with self.assertRaisesRegex(ValidationError, "per-tenant API key"):
+            ProvisionRequest(
+                name="sphinx",
+                workers=["lunardepth"],
+                lunardepth_model="tensorzero::function_name::demo",
+                lunardepth_base_url="https://depth.example.test/openai/v1",
+            )
+
     def test_provision_weechat_bootstrap_defaults_false(self) -> None:
         """When omitted, no_weechat_bootstrap defaults to False."""
         req = ProvisionRequest(name="sphinx")
@@ -417,11 +445,19 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         from . import runner
 
         self.runner = runner
-        self.tmp = tempfile.mkdtemp(prefix="lw-web-test-")
+        tmp = tempfile.TemporaryDirectory(prefix="lw-web-test-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
 
     def test_provision_demo_emits_phases_and_succeeds(self) -> None:
         job = Job(id="test1", mode="provision", demo=True)
-        req = ProvisionRequest(name="sphinx", workers=["opencode"], skip_start=True)
+        key = "depth-demo-fixture-value"
+        req = ProvisionRequest(
+            name="sphinx", workers=["opencode", "lunardepth"], skip_start=True,
+            lunardepth_model="tensormoon::function_name::demo",
+            lunardepth_base_url="https://depth.example.test/openai/v1",
+            lunardepth_api_key=key,
+        )
         self.runner.run_provision_job(job, req, log_dir=self.tmp)
         events = _drain(job.queue)
         phases = [e["name"] for e in events if e.get("type") == "phase"]
@@ -437,6 +473,11 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         done = [e for e in events if e.get("type") == "done"]
         self.assertTrue(done and done[-1]["ok"], f"expected success, got {done}")
         self.assertTrue(job.ok)
+        self.assertNotIn(key, repr(events))
+        log = next(Path(self.tmp).glob("*-provision-*.log")).read_text()
+        self.assertIn("--lunardepth-api-key-file", log)
+        self.assertEqual(log.count("--with-lunardepth"), 2)
+        self.assertNotIn(key, log)
 
     def test_provision_demo_failure_path(self) -> None:
         job = Job(id="test2", mode="provision", demo=True)
