@@ -4,9 +4,8 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).** The full page
-was checked. The host minimum remains
-30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
+The WeeChat host minimum is 30,000 ms (`MIN_POLL_INTERVAL_MS`). The guest
+requests 3 seconds. Long-poll
 delivery is immediate only while a wait is active. `default_dm_policy` is
 `pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
 shared filter for both ingestion modes. Since v2.2.0.0 (WI#577), a non-empty
@@ -19,12 +18,6 @@ build path and tenant adapter path therefore refer to the same channel tree.
 Operational changes must go through mt-admin for both systemd user managers and
 OpenRC. Relay password rotation uses the shared credential start barrier;
 [WeeChat operations](../ops/WEECHAT-SERVICES.md) owns its deployment/recovery steps.
-
-> **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
-> showed that message delivery through this channel has several independent, *invisible*
-> failure modes, and that the "WebSocket adapter" was actually drained by slow HTTP polling
-> (since replaced by a long-poll path, §3). Every incident re-derived the data flow and config
-> rules from scratch. This is the authoritative reference so that doesn't happen again.
 
 Line numbers below drift; treat them as hints, not contracts. Source of truth:
 `ic/channels-src/weechat/src/lib.rs` (the WASM channel — the registry entry
@@ -353,8 +346,8 @@ So the live precedence is:
 
 A leftover `extensions.weechat.setup_fields` row **shadows the caps config and the env for
 ordinary fields it contains**. The classic symptom: *"I edited the installed `capabilities.json`
-(or the env) and nothing changed."* This caused hours of confusion on `sunburst` — stale
-`dm_policy` and `networks` values in that row overrode every edit. The managed relay-password
+(or the env) and nothing changed."* Stale `dm_policy` and `networks` values in
+that row can override those edits. The managed relay-password
 exception above does not make other deployment fields immune to this trap.
 
 Use mt-admin's tenant-local database entry point; no connection URL needs to be
