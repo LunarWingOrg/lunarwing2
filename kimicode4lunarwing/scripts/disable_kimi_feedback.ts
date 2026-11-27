@@ -26,7 +26,7 @@ const kapRegistration = [
 ].join("\n")
 const kapGateway = [
   "async function openFeedbackGateway(core) {",
-  "\tconst provider = core.accessor.get(KIMI_CODE_PROVIDER_NAME);",
+  "\tconst provider = core.accessor.get(IProviderService).get(KIMI_CODE_PROVIDER_NAME);",
   "\tconst auth = resolveKimiCodeRuntimeAuth({",
   "\t\tconfiguredBaseUrl: provider?.baseUrl,",
   "\t\tconfiguredOAuthRef: provider?.oauth",
