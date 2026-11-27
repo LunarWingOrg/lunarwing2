@@ -105,6 +105,13 @@ class TenantConfig:
             return "LunarDepth requires a per-tenant API key"
         if any(c in self.lunardepth_api_key for c in ("\0", "\r", "\n")):
             return "LunarDepth API key must be a single line without NUL characters"
+
+        from lunardepth4lunarwing.scripts.render_overlay import validate_route
+
+        try:
+            validate_route(self.lunardepth_base_url.strip(), self.lunardepth_model.strip(), False)
+        except ValueError:
+            return "LunarDepth requires a valid API root without credentials and a complete TensorMoon or TensorZero function ID"
         return None
 
     # ------------------------------------------------------------------
