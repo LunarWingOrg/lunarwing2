@@ -1,9 +1,6 @@
 # Sandbox Tunnel Networking (NetBird / WireGuard)
 
-**Source revalidated 2026-11-20 at `9c96220bb2`.** The complete page was
-checked against the configuration resolver, tunnel sidecar, and integration
-harness. Dated live measurements below remain host-specific evidence, not new
-test results for this documentation review.
+The verification section records results by host, runtime, and date.
 
 `SANDBOX_NETWORK=tunnel` lets generic shell-sandbox commands make **outbound**
 connections through a NetBird or WireGuard sidecar. It does not expose the web
@@ -32,7 +29,7 @@ unchanged, and mt-admin preserves every operator-set tier on re-render.
 | `SANDBOX_NETWORK` | Intended use | Boundary |
 |---|---|---|
 | `none` (default off Linux) | no network | kernel-enforced `--network none` |
-| `proxy-enforced` (Linux default) | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy; no credential injection |
+| `proxy-enforced` (Linux default) | allowlisted public HTTP(S) through the shared proxy | `--network none` plus a Unix relay. An explicit [Git capability grant](SANDBOX_CAPABILITY_MANIFEST.md#git-remotes-wi816-wi860) uses a separate per-call proxy. |
 | `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, marked provider control traffic, and provider-specific DNS; WireGuard `SANDBOX_TUNNEL_DNS` moves joined-run DNS into the tunnel and removes its default direct uplink allowance; NetBird permits only its `wt0` resolver and rejects the setting |
 | `proxy` | legacy public HTTP(S) | advisory env-var proxy; direct bypass remains possible |
 
