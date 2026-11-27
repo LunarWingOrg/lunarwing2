@@ -48,8 +48,10 @@ cd darkirc_channel_for_lunarwing/darkirc
 taskset -c 0-11 cargo build --release -j12 --target wasm32-wasip2
 ```
 
-Use the registry workflow to install the result. The legacy `build.sh`
-probes for an older WIT layout and has its own install destination.
+Use the registry workflow to install the result. The standalone `build.sh`
+uses the current `ic/wit/channel.wit` layout, accepts `LUNARWING_REPO` when the
+channel is outside a LunarWing checkout, and installs to the configured channel
+directory.
 
 ## Build the DarkIRC Daemon for MT
 
