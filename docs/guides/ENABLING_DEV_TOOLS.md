@@ -6,13 +6,6 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** `ALLOW_LOCAL_TOOLS`,
-`AGENT_AUTO_APPROVE_TOOLS` (including the legacy `AUTO_APPROVE_TOOLS` alias),
-the `full_access` double opt-in, the generic podman-first runtime, the four
-network tiers, and the scrubbed child environment match the config resolver and
-sandbox manager. The Linux network default is now `proxy-enforced`; mt-admin
-preserves every explicit operator choice on re-render.
-
 Use the narrowest access that satisfies the task. `full_access` combined with automatic approval lets model output execute directly on the host with the LunarWing service account's privileges.
 
 ## 1. Register Local Tools
@@ -38,7 +31,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 
 ## 2. Select a Sandbox Policy
 
-The default is an enabled read-only container sandbox. Since v2.1.2.0 the sandbox is generic and podman-first: it drives the container runtime CLI directly (no daemon socket required, so rootless podman and OpenRC hosts work), preferring podman and falling back to docker. Select the runtime explicitly with `SANDBOX_RUNTIME=auto|podman|docker`.
+The built-in default is an enabled `readonly` container sandbox. New mt-admin
+tenants get `workspace_write` in their generated environment. The sandbox is
+generic and podman-first: it drives the container runtime CLI directly (no daemon socket required, so rootless podman and OpenRC hosts work), preferring podman and falling back to docker. Select the runtime explicitly with `SANDBOX_RUNTIME=auto|podman|docker`.
 
 | Policy | Filesystem | Network | Execution |
 | --- | --- | --- | --- |
@@ -64,7 +59,9 @@ Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and d
 
 Even under `full_access`, the child environment is scrubbed: commands inherit only the allowlisted OS/toolchain variables (the same list the unsandboxed shell tool uses), never daemon credentials such as `DATABASE_URL` or the `SANDBOX_*` launcher variables themselves.
 
-Container egress is selected through `SANDBOX_NETWORK`. Since v2.2.0.0 (WI#537), the Linux default is `proxy-enforced`: the container keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay (public-only destinations, DNS-pinned, redirects rechecked). This requires a local Linux runtime and Python 3 in the image; relay setup fails closed and never degrades to advisory or direct egress. Other platforms default to `none`. Enforced mode installs no credential mappings. Select `none` for no egress, `tunnel` for the item-3 overlay, or `proxy` only as a legacy advisory mode whose ignored env vars permit direct host/network connections. On Podman, legacy `proxy` also uses the Unix-socket relay and requires Python 3 in the image, but retains its normal container network and direct-bypass behavior; this avoids pasta's `host.containers.internal` gateway, which cannot reach a host-loopback-only listener. Denied responses carry the stable prefix `sandbox-proxy denied:`. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
+Container egress is selected through `SANDBOX_NETWORK`. Since v2.2.0.0 (WI#537), the Linux default is `proxy-enforced`: the container keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay (public-only destinations, DNS-pinned, redirects rechecked). This requires a local Linux runtime and Python 3 in the image; relay setup fails closed and never degrades to advisory or direct egress. Other platforms default to `none`. The shared enforced proxy installs no credential mappings. A separate per-call
+proxy can inject explicitly configured credentials for a selected Git grant.
+See [the capability manifest guide](SANDBOX_CAPABILITY_MANIFEST.md#credentials-wi860). Select `none` for no egress, `tunnel` for the item-3 overlay, or `proxy` only as a legacy advisory mode whose ignored env vars permit direct host/network connections. On Podman, legacy `proxy` also uses the Unix-socket relay and requires Python 3 in the image, but retains its normal container network and direct-bypass behavior; this avoids pasta's `host.containers.internal` gateway, which cannot reach a host-loopback-only listener. Denied responses carry the stable prefix `sandbox-proxy denied:`. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
 
 Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep additions to the default proxy domain allowlist minimal; the exact shipped set is listed in `ic/src/NETWORK_SECURITY.md` §5. Since v2.1.3.0 (WI#223), mt-admin-provisioned tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_AUTO_PULL=false`; `add-tenant` builds and distributes the image, and `mt-admin build-sandbox-image [tenant]` recovers a missing one — `SANDBOX_AUTO_PULL=true` is a trap for this local-only image (short-name resolution fails without a TTY and there is nothing to pull). WI#537 adds the pinned full Python development suite to that image. mt-admin preserves every operator-set network mode on re-render, including an existing `none` or legacy `proxy`; do not replace an explicit tenant choice during upgrades.
 
