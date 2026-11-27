@@ -162,6 +162,9 @@ class ModelMappingTests(unittest.TestCase):
             old_stopped=True,
             with_opencode=True,
             with_kimi=True,
+            with_opencode2=True,
+            opencode2_model=" open2-model ",
+            opencode2_base_url=" https://open2.example.test/v1 ",
             with_toolchains=True,
             with_pebble=True,
             with_vision=True,
@@ -178,6 +181,9 @@ class ModelMappingTests(unittest.TestCase):
         self.assertTrue(cfg.old_stopped)
         self.assertTrue(cfg.with_opencode)
         self.assertTrue(cfg.with_kimi)
+        self.assertTrue(cfg.with_opencode2)
+        self.assertEqual(cfg.opencode2_model, "open2-model")
+        self.assertEqual(cfg.opencode2_base_url, "https://open2.example.test/v1")
         self.assertTrue(cfg.with_toolchains)
         self.assertFalse(cfg.with_nanocode)
         self.assertTrue(cfg.with_pebble)
@@ -675,6 +681,9 @@ class ImportUiTests(unittest.TestCase):
             "force",
             "with_opencode",
             "with_kimi",
+            "with_opencode2",
+            "opencode2_model",
+            "opencode2_base_url",
             "with_toolchains",
             "with_pebble",
             "with_vision",
