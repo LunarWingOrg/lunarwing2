@@ -56,10 +56,12 @@ the proxy for anything else.
 
 ## Gateway Endpoints
 
-All routes sit behind the standard gateway auth middleware (bearer token from
-`GATEWAY_AUTH_TOKEN` or `GATEWAY_USER_TOKENS`; DB-backed tokens are not
-available in this build) and share the gateway's CORS and security-header
-layers.
+All routes require the gateway's owner bearer token and share its CORS and
+security-header layers. Use the configured `GATEWAY_AUTH_TOKEN` or the token
+LunarWing generated for the instance. Multi-user and DB-backed user tokens are
+not supported. A non-empty `GATEWAY_USER_TOKENS` setting prevents the daemon
+from starting, even if `GATEWAY_AUTH_TOKEN` is set; remove the token map to use
+owner authentication.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
