@@ -584,6 +584,41 @@ class TestProvisionerArgs(unittest.TestCase):
         self.assertTrue(result.ok)
 
 
+class TestLunarDepthCliResume(unittest.TestCase):
+    def test_resume_reads_lunardepth_key_file_without_prompting_for_key(self):
+        from lunarwing_mt_onboard import cli
+
+        fixture_key = "depth-cli-fixture-value"
+        config = TenantConfig(
+            name="alpha",
+            workers=[WorkerType.LUNARDEPTH],
+            lunardepth_model="tensorzero::function_name::demo",
+            lunardepth_base_url="https://depth.example.test/openai/v1",
+            secrets_master_key="ab" * 32,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = Path(tmp) / "plan.json"
+            config.to_json(plan)
+            key_file = Path(tmp) / "key"
+            key_file.touch(mode=0o600)
+            key_file.write_text(fixture_key + "\n", encoding="utf-8")
+            args = ["provision", "--non-interactive", "--resume", str(plan), "--skip-start"]
+            with (
+                patch.object(cli, "console"),
+                patch.object(cli, "ensure_mt_admin"),
+                patch.object(cli, "_show_summary", return_value=True),
+                patch.object(cli, "_q_password") as prompt,
+                patch.object(cli, "provision", return_value=provisioner.ProvisionResult()) as run,
+            ):
+                self.assertEqual(cli.main(args), 1)
+                run.assert_not_called()
+                self.assertEqual(cli.main([*args, "--lunardepth-api-key-file", str(key_file)]), 0)
+                restored = run.call_args.args[0]
+                self.assertEqual(restored.lunardepth_api_key, fixture_key)
+                self.assertEqual(restored, config)
+                prompt.assert_not_called()
+
+
 class TestSecretsHelpers(unittest.TestCase):
     def test_generate_master_key_length(self):
         key = generate_master_key()
