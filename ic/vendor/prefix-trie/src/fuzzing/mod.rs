@@ -6,38 +6,42 @@ use std::fmt::Debug;
 use crate::*;
 use quickcheck::Arbitrary;
 
+mod aggregate;
 mod basic;
-mod set_ops;
-mod traversals;
+mod views;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Operation<P, T> {
+pub(crate) enum Operation<P, T> {
     Add(P, T),
     Remove(P),
+    RemoveChildren(P),
 }
 
-#[cfg(miri)]
-const DEFAULT_NUM_TESTS: usize = 10;
-#[cfg(not(miri))]
-const DEFAULT_NUM_TESTS: usize = 10000;
+const NUM_TESTS: usize = if cfg!(miri) {
+    10
+} else if cfg!(debug_assertions) {
+    2000
+} else {
+    10_000
+};
 const DEFAULT_GEN_SIZE: usize = 100;
 
-fn proptest_runner<A: Arbitrary + Debug + PartialEq, F: Fn(A) -> bool>(f: F) {
+pub(crate) fn proptest_runner<A: Arbitrary + Debug + PartialEq, F: Fn(A) -> bool>(f: F) {
     let num_tests: usize = std::env::var("QUICKCHECK_TESTS")
         .ok()
         .and_then(|x| x.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_NUM_TESTS);
+        .unwrap_or(NUM_TESTS);
 
     let gen_size: usize = std::env::var("QUICKCHECK_GENERATOR_SIZE")
         .ok()
         .and_then(|x| x.parse::<usize>().ok())
         .unwrap_or(DEFAULT_GEN_SIZE);
 
-    let mut gen = quickcheck::Gen::new(gen_size);
+    let mut generator = quickcheck::Gen::new(gen_size);
 
     // sample all inputs
     for _ in 0..num_tests {
-        let input = A::arbitrary(&mut gen);
+        let input = A::arbitrary(&mut generator);
         let input_c = input.clone();
         let success = f(input_c);
         if !success {
@@ -57,7 +61,7 @@ fn shrink_failure<A: Arbitrary + Debug + PartialEq, F: Fn(A) -> bool>(f: F, inpu
     // if we reach this point, then all shrunken inputs work. Therefore, `inputs` is the minimal
     // input
     panic!(
-        "[QUICKCHECK] Test case failed!\n  Minimal input:\n    {:?}",
+        "[QUICKCHECK] Test case failed!\n  Minimal input: {:#?}",
         input
     );
 }
@@ -73,28 +77,13 @@ macro_rules! qc {
     };
 }
 
-fn select<P: Clone, T: Clone, F: Fn(&P, &T) -> bool>(map: &PrefixMap<P, T>, f: F) -> Vec<(P, T)> {
+fn select<P: Prefix + Clone, T: Clone, F: Fn(&P, &T) -> bool>(
+    map: &PrefixMap<P, T>,
+    f: F,
+) -> Vec<(P, T)> {
     map.iter()
         .map(|(p, t)| (p.clone(), t.clone()))
         .filter(|(p, t)| f(p, t))
-        .collect()
-}
-
-fn select_ref<P, T, F: Fn(&P, &T) -> bool>(map: &PrefixMap<P, T>, f: F) -> Vec<(&P, &T)> {
-    map.iter().filter(|(p, t)| f(*p, *t)).collect()
-}
-
-fn select_keys<P, T, F: Fn(&P, &T) -> bool>(map: &PrefixMap<P, T>, f: F) -> Vec<&P> {
-    map.iter()
-        .filter(|(p, t)| f(*p, *t))
-        .map(|(p, _)| p)
-        .collect()
-}
-
-fn select_values<P, T, F: Fn(&P, &T) -> bool>(map: &PrefixMap<P, T>, f: F) -> Vec<&T> {
-    map.iter()
-        .filter(|(p, t)| f(*p, *t))
-        .map(|(_, t)| t)
         .collect()
 }
 
@@ -112,19 +101,44 @@ impl<P: Prefix + Arbitrary, T: Arbitrary> Arbitrary for PrefixMap<P, T> {
     }
 }
 
+impl<P: Prefix + Arbitrary> Arbitrary for PrefixSet<P> {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        <Vec<P> as Arbitrary>::arbitrary(g).into_iter().collect()
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let elems = self.clone().into_iter().collect::<Vec<_>>();
+        Box::new(elems.shrink().map(PrefixSet::from_iter))
+    }
+}
+
 impl<P: Arbitrary, T: Arbitrary> Arbitrary for Operation<P, T> {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         let p = P::arbitrary(g);
-        if g.choose(&[
-            true, true, true, true, true, true, true, false, false, false,
-        ])
-        .copied()
-        .unwrap_or_default()
+        match g
+            .choose(&[
+                "add",
+                "add",
+                "add",
+                "add",
+                "add",
+                "add",
+                "add",
+                "remove",
+                "remove",
+                "remove",
+                "remove_children",
+            ])
+            .copied()
+            .unwrap_or_default()
         {
-            let t = T::arbitrary(g);
-            Self::Add(p, t)
-        } else {
-            Self::Remove(p)
+            "add" => {
+                let t = T::arbitrary(g);
+                Self::Add(p, t)
+            }
+            "remove" => Self::Remove(p),
+            "remove_children" => Self::RemoveChildren(p),
+            _ => unreachable!(),
         }
     }
 
@@ -139,45 +153,42 @@ impl<P: Arbitrary, T: Arbitrary> Arbitrary for Operation<P, T> {
                 )
             }
             Operation::Remove(p) => Box::new(p.clone().shrink().map(|p| Operation::Remove(p))),
+            Operation::RemoveChildren(p) => {
+                Box::new(p.clone().shrink().map(|p| Operation::RemoveChildren(p)))
+            }
         }
     }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
-struct TestPrefix(u32, u8);
-
-impl TestPrefix {
-    fn left(self) -> Self {
-        TestPrefix(self.0, self.1 + 1)
-    }
-
-    fn right(self) -> Self {
-        TestPrefix(self.0 + (1 << (31 - self.1)), self.1 + 1)
-    }
-}
+pub(crate) struct TestPrefix(u32, u8);
 
 impl Debug for TestPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let addr = format!("{:032b}", self.0)[..10].to_string();
-        write!(f, "0b{addr}/{}", self.1)
+        write!(f, "0x{:08x}/{}", self.0, self.1)
     }
 }
 
 impl Arbitrary for TestPrefix {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         #[rustfmt::skip]
+        #[allow(clippy::zero_prefixed_literal)]
         let len: u8 = *g
             .choose(&[
-                0,
-                1, 1,
-                2, 2, 2,
-                3, 3, 3, 3,
-                4, 4, 4, 4, 4,
-                5, 5, 5, 5, 5, 5,
-                6, 6, 6, 6, 6, 6, 6,
-                7, 7, 7, 7, 7, 7, 7, 7,
-                8, 8, 8, 8, 8, 8, 8, 8, 8,
-                9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+                00,
+                01, 02,
+                03, 04, 04,
+                05, 05, 06, 06,
+                07, 07, 08, 08, 08,
+                09, 09, 09, 10, 10, 10,
+                11, 11, 11, 12, 12, 12, 12,
+                13, 13, 13, 13, 14, 14, 14, 14,
+                15, 15, 15, 15, 16, 16, 16, 16, 16,
+                17, 17, 17, 17, 17, 18, 18, 18, 18, 18,
+                19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20,
+                21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22,
+                23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24,
+                32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32
             ])
             .unwrap();
         let x = u32::arbitrary(g);

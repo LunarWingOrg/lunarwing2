@@ -17,7 +17,7 @@ use futures_util::{FutureExt, Stream, StreamExt, pin_mut, stream::FuturesUnorder
 use tracing::{debug, trace, warn};
 
 use crate::error::NetError;
-use crate::proto::op::{DEFAULT_RETRY_FLOOR, DnsRequest, DnsResponse, Message, SerialMessage};
+use crate::proto::op::{DEFAULT_RETRY_FLOOR, DnsRequest, DnsResponse, SerialMessage};
 #[cfg(feature = "__dnssec")]
 use crate::proto::rr::TSigner;
 use crate::runtime::{DnsUdpSocket, RuntimeProvider, Spawn, Time};
@@ -270,7 +270,13 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
                 continue;
             }
 
-            let mut response = DnsResponse::from_buffer(response_buffer)?;
+            let mut response = match DnsResponse::from_buffer(response_buffer) {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(%error, "ignoring response we can't parse");
+                    continue;
+                }
+            };
 
             // Validate the returned query name.
             //
@@ -297,8 +303,7 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
             //  - RR data in responses of dubious reliability.  When a resolver
             // receives unsolicited responses or RR data other than that
             // requested, it should discard it without caching it.
-            let request_message = Message::from_vec(msg.bytes())?;
-            let request_queries = &request_message.queries;
+            let request_queries = &final_message.queries;
             let response_queries = &mut response.queries;
 
             let question_matches = request_queries.len() == response_queries.len()
@@ -338,8 +343,14 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
 
             debug!("received message id: {}", response.id);
             #[cfg(feature = "__dnssec")]
-            if let Some(mut verifier) = verifier {
-                return Ok(verifier.verify(response_bytes)?);
+            if let Some(verifier) = verifier.as_mut() {
+                match verifier.verify(response_bytes) {
+                    Ok(response) => return Ok(response),
+                    Err(error) => {
+                        warn!(%error, "ignoring response, TSIG validation failed");
+                        continue;
+                    }
+                }
             }
             return Ok(response);
         }
@@ -507,7 +518,7 @@ mod tests {
     use super::*;
     use crate::{
         proto::{
-            op::{DnsRequestOptions, Query, ResponseCode},
+            op::{DnsRequestOptions, Message, Query, ResponseCode},
             rr::{Name, RData, Record, RecordType, rdata::NULL},
         },
         runtime::{TokioRuntimeProvider, TokioTime},
@@ -672,7 +683,7 @@ mod tests {
     ///
     /// <https://lixiang521.com/publication/oakland24/sp24spring-tudoor-li.pdf>
     #[tokio::test]
-    async fn test_ignore_invalid_message() {
+    async fn test_ignore_invalid_message_truncated_id() {
         subscribe();
 
         let provider = TokioRuntimeProvider::new();
@@ -714,6 +725,71 @@ mod tests {
                     RData::NULL(NULL::with(b"DEADBEEF".to_vec())),
                 ));
                 let bytes = message.to_vec().unwrap();
+                server_socket.send_to(&bytes, addr).await.unwrap();
+            }
+        });
+
+        // Set up client.
+        let mut stream = UdpClientStream::builder(server_addr, provider)
+            .with_timeout(Some(Duration::from_millis(500)))
+            .build();
+
+        let mut query_message = Message::query();
+        query_message.add_query(Query::query(
+            Name::from_str("dead.beef.").unwrap(),
+            RecordType::NULL,
+        ));
+        let response_stream =
+            stream.send_message(DnsRequest::new(query_message, DnsRequestOptions::default()));
+        let response = response_stream
+            .first_answer()
+            .await
+            .expect("failed to read response in the presence of spoofed invalid messages");
+        let RData::NULL(rdata) = &response.answers[0].data else {
+            panic!("unexpected record type: {response:?}");
+        };
+        assert_eq!(rdata.anything, b"DEADBEEF");
+
+        shutdown_sender.send(()).unwrap();
+        server_handle.await.unwrap();
+    }
+
+    /// This tests another DoS variant of the TuDoor attack.
+    #[tokio::test]
+    async fn test_ignore_invalid_message_truncated_header() {
+        subscribe();
+
+        let provider = TokioRuntimeProvider::new();
+
+        // Set up server.
+        let server_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
+        let server_handle = spawn(async move {
+            loop {
+                let mut buffer = [0u8; 4096];
+                let result = select! {
+                    result = server_socket.recv_from(&mut buffer) => result,
+                    _ = &mut shutdown_receiver => break,
+                };
+                let (len, addr) = result.unwrap();
+
+                let request = Message::from_vec(&buffer[..len]).unwrap();
+                let query_name = request.queries[0].name.clone();
+                let mut response = request.into_response();
+                response.add_answer(Record::from_rdata(
+                    query_name,
+                    0,
+                    RData::NULL(NULL::with(b"DEADBEEF".to_vec())),
+                ));
+                let bytes = response.to_vec().unwrap();
+
+                // Attacker sends datagrams with invalid DNS packets first.
+                for _ in 0..4 {
+                    server_socket.send_to(&bytes[..3], addr).await.unwrap();
+                }
+
+                // Name server sends honest response next.
                 server_socket.send_to(&bytes, addr).await.unwrap();
             }
         });

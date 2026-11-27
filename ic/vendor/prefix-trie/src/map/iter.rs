@@ -1,228 +1,242 @@
 //! Module that contains the implementation for the iterators
 
-use map::Table;
+use num_traits::Zero;
+use smallvec::SmallVec;
 
-use crate::*;
-
-use super::Node;
+use crate::{
+    Prefix,
+    {
+        allocator::{Loc, RawPtr},
+        lex_order::{LexIterElem, LexNodeIter},
+        node::child_bit,
+        table::{DataIdx, Table, K},
+        PrefixMap,
+    },
+};
 
 /// An iterator over all entries of a [`PrefixMap`] in lexicographic order.
-pub struct Iter<'a, P, T> {
-    pub(super) table: Option<&'a Table<P, T>>,
-    pub(super) nodes: Vec<usize>,
+pub struct Iter<'a, P: Prefix, T> {
+    table: Option<&'a Table<T>>,
+    stack: Vec<LexNodeIter<P::R>>,
 }
 
-impl<P, T> Clone for Iter<'_, P, T> {
+impl<P: Prefix, T> Clone for Iter<'_, P, T> {
     fn clone(&self) -> Self {
         Self {
             table: self.table,
-            nodes: self.nodes.clone(),
+            stack: self.stack.clone(),
         }
     }
 }
 
-impl<P, T> Default for Iter<'_, P, T> {
+impl<P: Prefix, T> Default for Iter<'_, P, T> {
     fn default() -> Self {
         Self {
             table: None,
-            nodes: Vec::new(),
+            stack: Vec::new(),
         }
     }
 }
 
-impl<'a, P, T> Iter<'a, P, T> {
-    pub(crate) fn new(table: &'a Table<P, T>, nodes: Vec<usize>) -> Self {
+impl<'a, P: Prefix, T> Iter<'a, P, T> {
+    /// Create a new iterator that iterates over all
+    pub(crate) fn new(table: &'a Table<T>) -> Self {
+        // SAFETY: `Loc::root()` is always valid. The `&'a Table<T>` borrow prevents
+        // structural mutations for the lifetime of the iterator, keeping all Locs valid.
+        let lex = unsafe { table.lex_iter(Loc::root(), 0, <P::R as Zero>::zero()) };
+        Self::at_node(table, lex)
+    }
+
+    pub(crate) fn at_node(table: &'a Table<T>, lex: LexNodeIter<P::R>) -> Self {
+        let stack = vec![lex];
         Self {
             table: Some(table),
-            nodes,
+            stack,
+        }
+    }
+
+    pub(crate) fn from_stack(table: &'a Table<T>, stack: Vec<LexNodeIter<P::R>>) -> Self {
+        Self {
+            table: Some(table),
+            stack,
         }
     }
 }
 
-impl<'a, P, T> Iterator for Iter<'a, P, T> {
-    type Item = (&'a P, &'a T);
+impl<'a, P: Prefix, T> Iterator for Iter<'a, P, T> {
+    type Item = (P, &'a T);
 
-    fn next(&mut self) -> Option<(&'a P, &'a T)> {
-        while let Some(cur) = self.nodes.pop() {
-            let node = &self.table.as_ref()?[cur];
-            if let Some(right) = node.right {
-                self.nodes.push(right.get());
-            }
-            if let Some(left) = node.left {
-                self.nodes.push(left.get());
-            }
-            if let Some(v) = &node.value {
-                return Some((&node.prefix, v));
+    fn next(&mut self) -> Option<(P, &'a T)> {
+        let table = self.table?;
+        while let Some(lex_iter) = self.stack.last_mut() {
+            let key = *lex_iter.key();
+            let Some(next) = lex_iter.next() else {
+                self.stack.pop();
+                continue;
+            };
+
+            match next {
+                LexIterElem::Data(idx) => {
+                    // SAFETY: `Iter` holds `&'a Table`; no changes occur during immutable
+                    // iteration, so the node snapshot in `lex_iter` is current and the bit is set.
+                    let r = unsafe { table.present_at(lex_iter.data_loc(idx.bit), idx.depth) };
+                    let p = r.prefix(key);
+                    return Some((p, r.get()));
+                }
+                LexIterElem::Child(next_loc, depth, next_key) => {
+                    // SAFETY: `next_loc` came from the previous `lex_iter` step; the borrow
+                    // of `table` prevents structural mutations, so `next_loc` remains valid.
+                    self.stack
+                        .push(unsafe { table.lex_iter(next_loc, depth, next_key) })
+                }
             }
         }
         None
+    }
+
+    // Internal iteration (used by `for_each`, `count`, `sum`, ...) runs the traversal in a single
+    // loop, avoiding the per-element state save and restore of `next`.
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, (P, &'a T)) -> B,
+    {
+        let mut acc = init;
+        let Some(table) = self.table else {
+            return acc;
+        };
+        while let Some(lex_iter) = self.stack.last_mut() {
+            let key = *lex_iter.key();
+            let Some(next) = lex_iter.next() else {
+                self.stack.pop();
+                continue;
+            };
+
+            match next {
+                LexIterElem::Data(idx) => {
+                    // SAFETY: same as in `next`.
+                    let r = unsafe { table.present_at(lex_iter.data_loc(idx.bit), idx.depth) };
+                    acc = f(acc, (r.prefix(key), r.get()));
+                }
+                LexIterElem::Child(next_loc, depth, next_key) => {
+                    // SAFETY: same as in `next`.
+                    self.stack
+                        .push(unsafe { table.lex_iter(next_loc, depth, next_key) })
+                }
+            }
+        }
+        acc
     }
 }
 
 /// An iterator over all prefixes of a [`PrefixMap`] in lexicographic order.
 #[derive(Clone, Default)]
-pub struct Keys<'a, P, T> {
-    pub(crate) inner: Iter<'a, P, T>,
-}
+pub struct Keys<'a, P: Prefix, T>(pub(crate) Iter<'a, P, T>);
 
-impl<'a, P, T> Iterator for Keys<'a, P, T> {
-    type Item = &'a P;
+impl<'a, P: Prefix, T> Iterator for Keys<'a, P, T> {
+    type Item = P;
 
-    fn next(&mut self) -> Option<&'a P> {
-        self.inner.next().map(|(k, _)| k)
+    fn next(&mut self) -> Option<P> {
+        self.0.next().map(|(k, _)| k)
+    }
+
+    fn fold<B, F: FnMut(B, P) -> B>(self, init: B, mut f: F) -> B {
+        self.0.fold(init, |acc, (k, _)| f(acc, k))
     }
 }
 
 /// An iterator over all values of a [`PrefixMap`] in lexicographic order of their associated
 /// prefixes.
 #[derive(Clone, Default)]
-pub struct Values<'a, P, T> {
-    pub(crate) inner: Iter<'a, P, T>,
-}
+pub struct Values<'a, P: Prefix, T>(pub(crate) Iter<'a, P, T>);
 
-impl<'a, P, T> Iterator for Values<'a, P, T> {
+impl<'a, P: Prefix, T> Iterator for Values<'a, P, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<&'a T> {
-        self.inner.next().map(|(_, v)| v)
+        self.0.next().map(|(_, v)| v)
     }
-}
 
-/// An iterator over all owned entries of a [`PrefixMap`] in lexicographic order.
-#[derive(Clone)]
-pub struct IntoIter<P, T> {
-    pub(super) table: Vec<Node<P, T>>,
-    pub(super) nodes: Vec<usize>,
-}
-
-impl<P: Prefix, T> Iterator for IntoIter<P, T> {
-    type Item = (P, T);
-
-    fn next(&mut self) -> Option<(P, T)> {
-        while let Some(cur) = self.nodes.pop() {
-            let node = &mut self.table[cur];
-            if let Some(right) = node.right {
-                self.nodes.push(right.get());
-            }
-            if let Some(left) = node.left {
-                self.nodes.push(left.get());
-            }
-            if let Some(v) = node.value.take() {
-                return Some((std::mem::replace(&mut node.prefix, P::zero()), v));
-            }
-        }
-        None
-    }
-}
-
-/// An iterator over all prefixes of a [`PrefixMap`] in lexicographic order.
-#[derive(Clone)]
-pub struct IntoKeys<P, T> {
-    pub(super) inner: IntoIter<P, T>,
-}
-
-impl<P: Prefix, T> Iterator for IntoKeys<P, T> {
-    type Item = P;
-
-    fn next(&mut self) -> Option<P> {
-        self.inner.next().map(|(k, _)| k)
-    }
-}
-
-/// An iterator over all values of a [`PrefixMap`] in lexicographic order of their associated
-/// prefix.
-#[derive(Clone)]
-pub struct IntoValues<P, T> {
-    pub(super) inner: IntoIter<P, T>,
-}
-
-impl<P: Prefix, T> Iterator for IntoValues<P, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-        self.inner.next().map(|(_, v)| v)
-    }
-}
-
-impl<P: Prefix, T> IntoIterator for PrefixMap<P, T> {
-    type Item = (P, T);
-
-    type IntoIter = IntoIter<P, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        IntoIter {
-            table: self.table.into_inner(),
-            nodes: vec![0],
-        }
-    }
-}
-
-impl<'a, P, T> IntoIterator for &'a PrefixMap<P, T> {
-    type Item = (&'a P, &'a T);
-
-    type IntoIter = Iter<'a, P, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        // Safety: we own an immutable reference, and `Iter` will only ever read the table.
-        Iter::new(&self.table, vec![0])
+    fn fold<B, F: FnMut(B, &'a T) -> B>(self, init: B, mut f: F) -> B {
+        self.0.fold(init, |acc, (_, v)| f(acc, v))
     }
 }
 
 /// A mutable iterator over a [`PrefixMap`]. This iterator yields elements in lexicographic order of
 /// their associated prefix.
-pub struct IterMut<'a, P, T> {
-    pub(super) table: Option<&'a Table<P, T>>,
-    pub(super) nodes: Vec<usize>,
+pub struct IterMut<'a, P: Prefix, T> {
+    // SAFETY
+    // 1. This structure must be created using a mutable reference to the table (see Self::new).
+    // 2. The tree cannot have cycles (ensured by the way we create the tree.)
+    table: Option<(&'a Table<T>, RawPtr<T>)>,
+    stack: Vec<LexNodeIter<P::R>>,
 }
 
-impl<P, T> Default for IterMut<'_, P, T> {
+impl<P: Prefix, T> Default for IterMut<'_, P, T> {
     fn default() -> Self {
         Self {
             table: None,
-            nodes: Vec::new(),
+            stack: Vec::new(),
         }
     }
 }
 
-impl<'a, P, T> IterMut<'a, P, T> {
-    /// # Safety
-    /// - First, you must ensure that 'a is tied to a mutable reference of the original table.
-    /// - Second, you are allowed to create mutiple such `IterMut`s, as long as none of the root
-    ///   nodes is the parent of another root node (of any of the iterators). This also applies if
-    ///   you only create a single iterator with multiple root nodes.
-    ///
-    /// The iterator will only ever access its roots or its children.
-    pub(crate) unsafe fn new(table: &'a Table<P, T>, nodes: Vec<usize>) -> Self {
+impl<'a, P: Prefix, T> IterMut<'a, P, T> {
+    /// Create a new iterator that iterates over all
+    pub(crate) fn new(table: &'a mut Table<T>) -> Self {
+        // SAFETY: `Loc::root()` is always valid. The `&'a mut Table<T>` borrow prevents
+        // structural mutations for the lifetime of the iterator, keeping all Locs valid.
+        let lex = unsafe { table.lex_iter(Loc::root(), 0, <P::R as Zero>::zero()) };
+        Self::at_node(table, lex)
+    }
+
+    pub(crate) fn at_node(table: &'a mut Table<T>, lex: LexNodeIter<P::R>) -> Self {
+        let ptr = table.raw_cells();
         Self {
-            table: Some(table),
-            nodes,
+            table: Some((table, ptr)),
+            stack: vec![lex],
+        }
+    }
+
+    pub(crate) fn from_stack(table: &'a mut Table<T>, stack: Vec<LexNodeIter<P::R>>) -> Self {
+        let ptr = table.raw_cells();
+        Self {
+            table: Some((table, ptr)),
+            stack,
         }
     }
 }
 
-impl<'a, P, T> Iterator for IterMut<'a, P, T> {
-    type Item = (&'a P, &'a mut T);
+impl<'a, P: Prefix, T> Iterator for IterMut<'a, P, T> {
+    type Item = (P, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(cur) = self.nodes.pop() {
-            // Safety:
-            // In the following, we assume that there are no two iterators that may reach the same
-            // sub-tree (see the safety comment above).
-            //
-            // The iterator borrows from &'a mut PrefixMap, see `PrefixMap::iter_mut` where 'a is
-            // linked to a mutable reference. Then, we must ensure that we only ever construct a
-            // mutable reference to each element exactly once. We ensure this by the fact that we
-            // iterate over a tree. Thus, each node is visited exactly once.
-            let node: &'a mut Node<P, T> = unsafe { self.table.as_ref()?.get_mut(cur) };
+        let (table, mut ptr) = self.table?;
+        while let Some(lex_iter) = self.stack.last_mut() {
+            let key = *lex_iter.key();
+            let Some(next) = lex_iter.next() else {
+                self.stack.pop();
+                continue;
+            };
 
-            if let Some(right) = node.right {
-                self.nodes.push(right.get());
-            }
-            if let Some(left) = node.left {
-                self.nodes.push(left.get());
-            }
-            if let Some(v) = &mut node.value {
-                return Some((&node.prefix, v));
+            match next {
+                LexIterElem::Data(idx) => {
+                    // SAFETY: `IterMut` holds exclusive access to the table data; no structural
+                    // changes occur, so `idx.node` remains valid.
+                    let Some(r) = (unsafe { idx.resolve(table) }) else {
+                        continue;
+                    };
+                    let p = r.prefix(key);
+                    // SAFETY: `IterMut` was created from `&'a mut Table`; ptr was obtained
+                    // from that same table. The tree is acyclic so each node is visited at most
+                    // once, guaranteeing no two live `&mut T` references to the same slot.
+                    return Some((p, unsafe { r.unsafe_get_mut(&mut ptr) }));
+                }
+                LexIterElem::Child(next_idx, depth, next_key) => {
+                    // SAFETY: `next_idx` came from the previous `lex_iter` step; the exclusive
+                    // borrow of `table` prevents structural mutations, so `next_idx` remains valid.
+                    self.stack
+                        .push(unsafe { table.lex_iter(next_idx, depth, next_key) })
+                }
             }
         }
         None
@@ -232,45 +246,114 @@ impl<'a, P, T> Iterator for IterMut<'a, P, T> {
 /// A mutable iterator over values of [`PrefixMap`]. This iterator yields elements in lexicographic
 /// order.
 #[derive(Default)]
-pub struct ValuesMut<'a, P, T> {
-    // # Safety
-    // You must ensure that there only ever exists one such iterator for each tree. You may create
-    // multiple such iterators for the same tree if you start with distinct starting nodes! This
-    // ensures that any one iteration will never yield elements of the other iterator.
-    pub(crate) inner: IterMut<'a, P, T>,
-}
+pub struct ValuesMut<'a, P: Prefix, T>(pub(crate) IterMut<'a, P, T>);
 
-impl<'a, P, T> Iterator for ValuesMut<'a, P, T> {
+impl<'a, P: Prefix, T> Iterator for ValuesMut<'a, P, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
+        self.0.next().map(|(_, v)| v)
     }
 }
 
-pub(super) fn lpm_children_iter_start<P: Prefix, T>(table: &Table<P, T>, prefix: &P) -> Vec<usize> {
-    let mut idx = 0;
-    let mut cur_p = &table[idx].prefix;
+/// An iterator over all owned entries of a [`PrefixMap`] in lexicographic order.
+#[derive(Clone)]
+pub struct IntoIter<P: Prefix, T> {
+    table: Table<T>,
+    stack: Vec<LexNodeIter<P::R>>,
+}
 
-    loop {
-        if cur_p.eq(prefix) {
-            break vec![idx];
-        }
-        let right = to_right(cur_p, prefix);
-        match table.get_child(idx, right).map(|x| x.get()) {
-            Some(c) => {
-                cur_p = &table[c].prefix;
-                if cur_p.contains(prefix) {
-                    // continue traversal
-                    idx = c;
-                } else if prefix.contains(cur_p) {
-                    break vec![c];
-                } else {
-                    break vec![];
+impl<P: Prefix, T> IntoIter<P, T> {
+    /// Create a new iterator that iterates over all
+    pub(crate) fn new(table: Table<T>) -> Self {
+        // SAFETY: `Loc::root()` is always valid. `IntoIter` owns the table, preventing
+        // any external structural mutations for its lifetime.
+        let lex = unsafe { table.lex_iter(Loc::root(), 0, <P::R as Zero>::zero()) };
+        Self::at_node(table, lex)
+    }
+
+    pub(crate) fn at_node(table: Table<T>, lex: LexNodeIter<P::R>) -> Self {
+        let stack = vec![lex];
+        Self { table, stack }
+    }
+}
+
+impl<P: Prefix, T> Iterator for IntoIter<P, T> {
+    type Item = (P, T);
+
+    fn next(&mut self) -> Option<(P, T)> {
+        while let Some(lex_iter) = self.stack.last_mut() {
+            let key = *lex_iter.key();
+            let Some(next) = lex_iter.next() else {
+                self.stack.pop();
+                continue;
+            };
+
+            match next {
+                LexIterElem::Data(idx) => {
+                    // SAFETY: IntoIter owns the table; no external mutations possible.
+                    // `take()` clears the bitmap bit, so the LexNodeIter snapshot may
+                    // yield already-taken bits; `resolve_mut` re-checks and returns None.
+                    let Some(r) = (unsafe { idx.resolve_mut(&mut self.table) }) else {
+                        continue;
+                    };
+                    let p = r.prefix(key);
+                    return Some((p, r.take()));
+                }
+                LexIterElem::Child(next_loc, depth, next_key) => {
+                    // SAFETY: `IntoIter` owns the table and makes no structural mutations;
+                    // `next_loc` came from the previous `lex_iter` step and remains valid.
+                    self.stack
+                        .push(unsafe { self.table.lex_iter(next_loc, depth, next_key) })
                 }
             }
-            None => break vec![],
         }
+        None
+    }
+}
+
+/// An iterator over all prefixes of a [`PrefixMap`] in lexicographic order.
+#[derive(Clone)]
+pub struct IntoKeys<P: Prefix, T>(pub(super) IntoIter<P, T>);
+
+impl<P: Prefix, T> Iterator for IntoKeys<P, T> {
+    type Item = P;
+
+    fn next(&mut self) -> Option<P> {
+        self.0.next().map(|(k, _)| k)
+    }
+}
+
+/// An iterator over all values of a [`PrefixMap`] in lexicographic order of their associated
+/// prefix.
+#[derive(Clone)]
+pub struct IntoValues<P: Prefix, T>(pub(super) IntoIter<P, T>);
+
+impl<P: Prefix, T> Iterator for IntoValues<P, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.0.next().map(|(_, v)| v)
+    }
+}
+
+impl<P: Prefix, T> IntoIterator for PrefixMap<P, T> {
+    type Item = (P, T);
+
+    type IntoIter = IntoIter<P, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter::new(self.table)
+    }
+}
+
+impl<'a, P: Prefix, T> IntoIterator for &'a PrefixMap<P, T> {
+    type Item = (P, &'a T);
+
+    type IntoIter = Iter<'a, P, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Iter::new(&self.table)
     }
 }
 
@@ -287,57 +370,87 @@ where
     }
 }
 
-/// An iterator that yields all items in a `PrefixMap` that covers a given prefix (including the
-/// prefix itself if preseint). See [`PrefixMap::cover`] for how to create this iterator.
-pub struct Cover<'a, 'p, P, T> {
-    pub(super) table: &'a Table<P, T>,
-    pub(super) idx: Option<usize>,
-    pub(super) prefix: &'p P,
+/// An iterator that yields all items in a `PrefixMap` that cover (are a superset of) a given
+/// prefix (including the prefix itself if present). See [`PrefixMap::cover`] for how to
+/// create this iterator.
+pub struct Cover<'a, P: Prefix, T> {
+    table: &'a Table<T>,
+    next_loc: Option<Loc>,
+    // At most K covering prefixes can match within one node
+    lpm_elements: SmallVec<[DataIdx; K as usize]>,
+    key: P::R,
+    prefix_len: u32,
+    depth: u32,
 }
 
-impl<'a, P, T> Iterator for Cover<'a, '_, P, T>
+impl<'a, P: Prefix, T> Cover<'a, P, T> {
+    pub(crate) fn new(table: &'a PrefixMap<P, T>, prefix: &P) -> Self {
+        let key = prefix.repr();
+        let prefix_len = prefix.prefix_len() as u32;
+        let lpm_elements = SmallVec::new();
+        let next_loc = Some(Loc::root());
+        Self {
+            table: &table.table,
+            next_loc,
+            lpm_elements,
+            key,
+            prefix_len,
+            depth: 0,
+        }
+    }
+}
+
+impl<'a, P: Prefix, T> Iterator for Cover<'a, P, T>
 where
     P: Prefix,
 {
-    type Item = (&'a P, &'a T);
+    type Item = (P, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // check if self.idx is None. If so, then check if the first branch is present in the map
-        if self.idx.is_none() {
-            self.idx = Some(0);
-            let entry = &self.table[0usize];
-            if let Some(value) = entry.value.as_ref() {
-                return Some((&entry.prefix, value));
-            }
-        }
-
-        // if we reach here, then self.idx is not None!
-
         loop {
-            let map::Direction::Enter { next, .. } =
-                self.table.get_direction(self.idx.unwrap(), self.prefix)
-            else {
-                return None;
+            let Some(loc) = self.lpm_elements.pop() else {
+                // fill the lpm_nodes
+                let loc = self.next_loc?; // if none, then exit.
+                                          // SAFETY: `Cover` holds `&'a Table<T>` — no structural mutations are possible
+                                          // for the lifetime `'a`. `loc` starts as `Loc::root()` and is only updated to
+                                          // the result of a prior `child()` call, so it is always a valid, live node.
+                self.lpm_elements = unsafe {
+                    self.table
+                        .data_ancestors(loc, self.depth, self.key, self.prefix_len)
+                }
+                .collect();
+                self.lpm_elements.reverse();
+                let prefix_in_this_node = self.prefix_len < self.depth + K;
+                self.next_loc = if prefix_in_this_node {
+                    None
+                } else {
+                    let child_bit = child_bit(self.depth, self.key);
+                    // SAFETY: same invariant as above.
+                    unsafe { self.table.child(loc, child_bit) }
+                };
+                self.depth += K;
+                continue;
             };
-            self.idx = Some(next.get());
-            let entry = &self.table[next.get()];
-            if let Some(value) = entry.value.as_ref() {
-                return Some((&entry.prefix, value));
-            }
+
+            // SAFETY: `loc` came from `data_ancestors`, which only yields bits set in the
+            // bitmap. `Cover` holds `&'a Table<T>` and never mutates node structure.
+            let r = unsafe { loc.resolve(self.table) }
+                .expect("Cover: data_ancestors yielded stale idx");
+            return Some((r.prefix(self.key), r.get()));
         }
     }
 }
 
 /// An iterator that yields all keys (prefixes) in a `PrefixMap` that covers a given prefix
-/// (including the prefix itself if preseint). See [`PrefixMap::cover_keys`] for how to create this
+/// (including the prefix itself if present). See [`PrefixMap::cover_keys`] for how to create this
 /// iterator.
-pub struct CoverKeys<'a, 'p, P, T>(pub(super) Cover<'a, 'p, P, T>);
+pub struct CoverKeys<'a, P: Prefix, T>(pub(super) Cover<'a, P, T>);
 
-impl<'a, P, T> Iterator for CoverKeys<'a, '_, P, T>
+impl<'a, P: Prefix, T> Iterator for CoverKeys<'a, P, T>
 where
     P: Prefix,
 {
-    type Item = &'a P;
+    type Item = P;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(|(p, _)| p)
@@ -345,10 +458,10 @@ where
 }
 
 /// An iterator that yields all values in a `PrefixMap` that covers a given prefix (including the
-/// prefix itself if preseint). See [`PrefixMap::cover_values`] for how to create this iterator.
-pub struct CoverValues<'a, 'p, P, T>(pub(super) Cover<'a, 'p, P, T>);
+/// prefix itself if present). See [`PrefixMap::cover_values`] for how to create this iterator.
+pub struct CoverValues<'a, P: Prefix, T>(pub(super) Cover<'a, P, T>);
 
-impl<'a, P, T> Iterator for CoverValues<'a, '_, P, T>
+impl<'a, P: Prefix, T> Iterator for CoverValues<'a, P, T>
 where
     P: Prefix,
 {
@@ -356,5 +469,45 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(|(_, t)| t)
+    }
+}
+
+/// Create a lex iterator that covers the given prefix.
+#[inline(always)]
+pub(crate) fn lpm_children_iter_start<P: Prefix, T>(
+    table: &Table<T>,
+    prefix: &P,
+) -> LexNodeIter<P::R> {
+    let key = prefix.repr();
+    let prefix_len = prefix.prefix_len() as u32;
+    table.lex_iter_at(key, prefix_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_cover_stays_inline<P: Prefix>(key: P::R) {
+        let mut map = PrefixMap::<P, ()>::new();
+
+        // Fill every prefix level to exercise the maximum ancestors per node
+        for len in 0..=P::num_bits() as u8 {
+            map.insert(P::from_repr_len(key, len), ());
+        }
+
+        // Query the full address to traverse every populated node
+        let query = P::from_repr_len(key, P::num_bits() as u8);
+        let mut cover = map.cover(&query);
+
+        // Check that every batch uses inline storage
+        while cover.next().is_some() {
+            assert!(!cover.lpm_elements.spilled());
+        }
+    }
+
+    #[test]
+    fn cover_stays_inline() {
+        check_cover_stays_inline::<(u32, u8)>(u32::MAX);
+        check_cover_stays_inline::<(u128, u8)>(u128::MAX);
     }
 }

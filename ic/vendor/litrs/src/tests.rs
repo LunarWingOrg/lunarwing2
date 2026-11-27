@@ -88,6 +88,17 @@ fn never_panic_len_4() {
     }
 }
 
+#[test]
+fn display_padding() {
+    for input in ["true", "27", "3.14", "'a'", r#""a""#, "b'a'", r#"b"a""#, r#"c"a""#] {
+        let lit = Literal::parse(input).unwrap();
+        assert_eq!(format!("{}", lit), input);
+        assert_eq!(format!("{:>8}", lit), format!("{:>8}", input));
+        assert_eq!(format!("{:_<8}", lit), format!("{:_<8}", input));
+        assert_eq!(format!("{:^9}", lit), format!("{:^9}", input));
+    }
+}
+
 #[cfg(feature = "proc-macro2")]
 #[test]
 fn proc_macro() {
@@ -286,6 +297,29 @@ fn proc_macro() {
     );
     assert_invalid_token!(
         FloatLit::try_from(TokenTree::from(ident)),
+        expected: TokenKind::FloatLit,
+        actual: TokenKind::Ident,
+    );
+
+    // `true` and `false` idents are reported as bool literals.
+    let ident = |s: &str| TokenTree::from(Ident::new(s, Span::call_site()));
+    assert_invalid_token!(
+        IntegerLit::try_from(ident("true")),
+        expected: TokenKind::IntegerLit,
+        actual: TokenKind::BoolLit,
+    );
+    assert_invalid_token!(
+        StringLit::try_from(&ident("false")),
+        expected: TokenKind::StringLit,
+        actual: TokenKind::BoolLit,
+    );
+    assert_invalid_token!(
+        CharLit::try_from(ident("True")),
+        expected: TokenKind::CharLit,
+        actual: TokenKind::Ident,
+    );
+    assert_invalid_token!(
+        FloatLit::try_from(ident("falsex")),
         expected: TokenKind::FloatLit,
         actual: TokenKind::Ident,
     );

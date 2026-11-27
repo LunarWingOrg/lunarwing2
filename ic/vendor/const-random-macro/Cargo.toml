@@ -11,11 +11,19 @@
 
 [package]
 edition = "2018"
+rust-version = "1.85"
 name = "const-random-macro"
-version = "0.1.16"
+version = "0.1.18"
 authors = ["Tom Kaitchuck <Tom.Kaitchuck@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Provides the procedural macro used by const-random"
 documentation = "https://docs.rs/const-random"
+readme = false
 keywords = [
     "rust",
     "constants",
@@ -25,18 +33,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tkaitchuck/constrandom"
 
 [lib]
+name = "const_random_macro"
+path = "src/lib.rs"
 proc-macro = true
 
 [dependencies.getrandom]
-version = "0.2.0"
-
-[dependencies.once_cell]
-version = "1.15"
-features = [
-    "race",
-    "alloc",
-]
-default-features = false
+version = "0.4"
 
 [dependencies.tiny-keccak]
 version = "2.0.2"

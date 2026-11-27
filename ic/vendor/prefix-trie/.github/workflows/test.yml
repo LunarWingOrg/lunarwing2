@@ -28,9 +28,9 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run tests
-      run: cargo hack --feature-powerset test --verbose --lib --release
+      run: cargo hack --feature-powerset ${{ matrix.toolchain != 'nightly' && '--exclude-features nightly' || '' }} test --verbose --lib --release
     - name: Run doctests
-      run: cargo hack --feature-powerset test --verbose --doc
+      run: cargo hack --feature-powerset ${{ matrix.toolchain != 'nightly' && '--exclude-features nightly' || '' }} test --verbose --doc
 
   fmt:
     runs-on: ubuntu-latest
@@ -39,7 +39,7 @@ jobs:
     - name: Install rustup
       uses: actions-rs/toolchain@v1
       with:
-        toolchain: stable
+        toolchain: nightly
         override: true
         components: rustfmt
     - name: Run rustfmt
@@ -58,7 +58,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run clippy
-      run: cargo hack --feature-powerset clippy --verbose
+      run: cargo hack --feature-powerset --exclude-features nightly clippy --verbose
 
   msrv:
     runs-on: ubuntu-latest
@@ -90,3 +90,10 @@ jobs:
       run: cargo miri nextest run -j4
     - name: Run miri on doctests
       run: cargo miri test --doc
+    - name: Run miri on nightly (clone tests)
+      run: >-
+        cargo miri nextest run --lib --features nightly -j4
+        -E 'test(=fuzzing::basic::mods_clone)
+        | test(=fuzzing::basic::mods_clone_set)
+        | test(=test::clone_panic_cleans_up_multiple_nodes)
+        | test(=test::clone_zero_sized_values_counts_clones_and_drops)'

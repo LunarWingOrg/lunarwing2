@@ -244,6 +244,7 @@ impl<'de> Deserializer<'de> {
                     .parse_decimal_number(neg, start, offset)
                     .map(|n| (start, n)),
                 Some((_, '0'..='9')) => Err(self.err_at(start, ErrorCode::LeadingZero)),
+                _ if neg => Ok((start, NumberResult::F64(-0.0))),
                 _ => Ok((start, NumberResult::U128(0))),
             },
             (offset, '.' | '1'..='9') => self
@@ -303,17 +304,15 @@ impl<'de> Deserializer<'de> {
                 .ok_or_else(|| self.err_at(offset, ErrorCode::OverflowParsingNumber))?;
         }
 
-        if neg {
+        match (neg, n) {
+            // Special case for negative zero which can only be represented with a float.
+            (true, 0) => Ok(NumberResult::F64(-0.0)),
             // Special case for i128::MIN because -i128::MIN = i128::MAX + 1 doesn't fit in an i128.
-            if n == 0x8000_0000_0000_0000_0000_0000_0000_0000 {
-                Ok(NumberResult::I128(i128::MIN))
-            } else {
-                Ok(NumberResult::I128(
-                    -i128::try_from(n).map_err(|err| self.custom_err_at(start, err))?,
-                ))
-            }
-        } else {
-            Ok(NumberResult::U128(n))
+            (true, 0x8000_0000_0000_0000_0000_0000_0000_0000) => Ok(NumberResult::I128(i128::MIN)),
+            (true, _) => Ok(NumberResult::I128(
+                -i128::try_from(n).map_err(|err| self.custom_err_at(start, err))?,
+            )),
+            _ => Ok(NumberResult::U128(n)),
         }
     }
 

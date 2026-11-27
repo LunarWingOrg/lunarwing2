@@ -1,6 +1,6 @@
 [package]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 description = "A protective and efficient HTTP library for all."
 readme = "README.md"
 homepage = "https://hyper.rs"
@@ -46,7 +46,7 @@ form_urlencoded = "1"
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 http-body-util = "0.1"
-pretty_env_logger = "0.5"
+pretty_env_logger = "0.6"
 pin-project-lite = "0.2.4"
 spmc = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -96,6 +96,7 @@ capi = []
 tracing = ["dep:tracing"]
 
 # internal features used in CI
+__deny_warnings = []
 nightly = []
 
 [lints.rust.unexpected_cfgs]
@@ -120,24 +121,19 @@ checked_conversions = "allow"
 else_if_without_else = "allow"
 float_arithmetic = "allow"
 indexing_slicing = "allow"
-let_unit_value = "allow"
 match_wild_err_arm = "allow"
 multiple_inherent_impl = "allow"
 multiple_unsafe_ops_per_block = "allow"
 needless_pass_by_value = "allow"
 pattern_type_mismatch = "allow"
-redundant_closure_for_method_calls = "allow"
 redundant_else = "allow"
 struct_excessive_bools = "allow" # TODO: bogus lint?
-trivially_copy_pass_by_ref = "allow"
-unnested_or_patterns = "allow"
 unused_async = "allow" # TODO: is it for API?
 unused_trait_names = "allow" # TODO: kinda annoying, but might be good to deny
 unwrap_in_result = "allow"
 wildcard_enum_match_arm = "allow"
 definition_in_module_root = "allow"
 unnecessary_rest_pattern = "allow"
-rest_pattern_accessible_field = "allow"
 needless_bool = "allow"
 
 # explicitly allowed
@@ -191,6 +187,7 @@ too_many_lines = "allow" # reconsider someday?
 type_complexity = "allow" # not helpful
 used_underscore_items = "allow"
 unnecessary_safety_comment = "allow" # more safety comments are a good thing
+unneeded_field_pattern = "allow" # exhaustive matching is helpful
 unseparated_literal_suffix = "allow" # i don't like 0_u8 (do i?)
 
 [package.metadata.docs.rs]

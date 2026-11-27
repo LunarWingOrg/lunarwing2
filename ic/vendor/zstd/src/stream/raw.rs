@@ -9,7 +9,7 @@ use std::io;
 pub use zstd_safe::{CParameter, DParameter, InBuffer, OutBuffer, WriteBuf};
 
 use crate::dict::{DecoderDictionary, EncoderDictionary};
-use crate::map_error_code;
+use crate::{create_cctx, create_dctx, map_error_code};
 
 /// Represents an abstract compression/decompression operation.
 ///
@@ -95,18 +95,28 @@ impl Operation for NoOp {
     ) -> io::Result<usize> {
         // Skip the prelude
         let src = &input.src[input.pos..];
-        // Safe because `output.pos() <= output.capacity()`.
         let output_pos = output.pos();
-        let dst = unsafe { output.as_mut_ptr().add(output_pos) };
+        // Read the capacity once, and take the pointer after it, as
+        // zstd-safe does before calling zstd: `WriteBuf` promises the two
+        // agree, and checking one reading of the capacity against the
+        // position does not vouch for another.
+        let capacity = output.capacity();
+        if output_pos > capacity {
+            panic!("Given position outside of the buffer bounds.");
+        }
 
         // Ignore anything past the end
-        let len = usize::min(src.len(), output.capacity() - output_pos);
+        let len = usize::min(src.len(), capacity - output_pos);
         let src = &src[..len];
 
         // Safe because:
-        // * `len` is less than either of the two lengths
+        // * `as_mut_ptr()` is valid for `capacity` bytes (`WriteBuf`), and
+        //   `output_pos + len <= capacity`.
         // * `src` and `dst` do not overlap because we have `&mut` to each.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, len) };
+        unsafe {
+            let dst = output.as_mut_ptr().add(output_pos);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, len)
+        };
         input.set_pos(input.pos() + len);
         unsafe { output.set_pos(output_pos + len) };
 
@@ -133,15 +143,6 @@ pub struct Status {
 /// An in-memory decoder for streams of data.
 pub struct Decoder<'a> {
     context: MaybeOwnedDCtx<'a>,
-}
-
-fn create_dctx<'a>() -> io::Result<zstd_safe::DCtx<'a>> {
-    zstd_safe::DCtx::try_create().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "zstd could not allocate a decompression context",
-        )
-    })
 }
 
 impl Decoder<'static> {
@@ -290,7 +291,7 @@ impl Encoder<'static> {
 
     /// Creates a new encoder initialized with the given dictionary.
     pub fn with_dictionary(level: i32, dictionary: &[u8]) -> io::Result<Self> {
-        let mut context = zstd_safe::CCtx::create();
+        let mut context = create_cctx()?;
 
         context
             .set_parameter(CParameter::CompressionLevel(level))
@@ -299,6 +300,30 @@ impl Encoder<'static> {
         context
             .load_dictionary(dictionary)
             .map_err(map_error_code)?;
+
+        Ok(Encoder {
+            context: MaybeOwnedCCtx::Owned(context),
+        })
+    }
+
+    /// Creates a new encoder with a prefix it owns, as single-use dictionary
+    /// for its first frame.
+    ///
+    /// `prefix` gives the bytes without copying them: a `Vec<u8>`, an
+    /// `Arc<[u8]>`, a memory map... Unlike [`Encoder::with_ref_prefix()`],
+    /// the frame that reads it can use worker threads.
+    pub fn with_prefix<P>(level: i32, prefix: P) -> io::Result<Self>
+    where
+        P: std::ops::Deref + Send + Sync + 'static,
+        P::Target: AsRef<[u8]>,
+    {
+        let mut context = create_cctx()?;
+
+        context
+            .set_parameter(CParameter::CompressionLevel(level))
+            .map_err(map_error_code)?;
+
+        context.set_prefix(prefix).map_err(map_error_code)?;
 
         Ok(Encoder {
             context: MaybeOwnedCCtx::Owned(context),
@@ -324,13 +349,16 @@ impl<'a> Encoder<'a> {
     }
 
     /// Creates a new encoder using an existing `EncoderDictionary`.
+    ///
+    /// The encoder keeps its own handle to the dictionary, so it does not
+    /// borrow it.
     pub fn with_prepared_dictionary<'b>(
-        dictionary: &'a EncoderDictionary<'b>,
+        dictionary: &EncoderDictionary<'b>,
     ) -> io::Result<Self>
     where
         'b: 'a,
     {
-        let mut context = zstd_safe::CCtx::create();
+        let mut context = create_cctx()?;
         context
             .ref_cdict(dictionary.as_cdict())
             .map_err(map_error_code)?;
@@ -340,6 +368,13 @@ impl<'a> Encoder<'a> {
     }
 
     /// Creates a new encoder initialized with the given ref prefix.
+    ///
+    /// The prefix is borrowed: with worker threads, the frame that reads it
+    /// is compressed on the calling thread (a leaked encoder would leave
+    /// them reading it after the borrow ended), and the parameters that
+    /// need them (`RSyncable`, `JobSize`, `OverlapSizeLog`) have no effect
+    /// on it. [`Encoder::with_prefix()`] takes an owned prefix, which can
+    /// use them.
     pub fn with_ref_prefix<'b>(
         level: i32,
         ref_prefix: &'b [u8],
@@ -347,7 +382,7 @@ impl<'a> Encoder<'a> {
     where
         'b: 'a,
     {
-        let mut context = zstd_safe::CCtx::create();
+        let mut context = create_cctx()?;
 
         context
             .set_parameter(CParameter::CompressionLevel(level))
@@ -457,6 +492,84 @@ enum MaybeOwnedDCtx<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
+    /// A `Vec` that gives memory back the `shrink_at`-th time its capacity is
+    /// read, keeping only `keep` bytes (gyscos/zstd-rs#416). That breaks a
+    /// promise of `WriteBuf`, on purpose: `NoOp` must stay in bounds anyway.
+    struct Shrinking {
+        buf: RefCell<Vec<u8>>,
+        calls: Cell<u32>,
+        shrink_at: u32,
+        keep: usize,
+    }
+
+    unsafe impl zstd_safe::WriteBuf for Shrinking {
+        fn as_slice(&self) -> &[u8] {
+            // Safety: `RefCell` is only borrowed inside these methods.
+            unsafe { &*self.buf.as_ptr() }
+        }
+        fn capacity(&self) -> usize {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == self.shrink_at {
+                let mut buf = self.buf.borrow_mut();
+                buf.truncate(self.keep);
+                buf.shrink_to(self.keep);
+            }
+            self.buf.borrow().capacity()
+        }
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.buf.get_mut().as_mut_ptr()
+        }
+        unsafe fn filled_until(&mut self, n: usize) {
+            unsafe { self.buf.get_mut().set_len(n) }
+        }
+    }
+
+    #[test]
+    fn test_noop_reads_the_capacity_once() {
+        use super::{InBuffer, NoOp, Operation, OutBuffer};
+
+        // The capacity shrinks at any of its readings (`around_pos`, `pos`,
+        // `run`, `set_pos`), to above or below the position. The copy must
+        // stay within the buffer either way: `set_pos` panics when the
+        // position no longer fits.
+        for keep in [40, 16] {
+            for shrink_at in 1..6 {
+                let res = std::panic::catch_unwind(|| {
+                    let mut dst = Shrinking {
+                        buf: RefCell::new(vec![0; 64]),
+                        calls: Cell::new(0),
+                        shrink_at,
+                        keep,
+                    };
+                    let mut out = OutBuffer::around_pos(&mut dst, 32);
+                    let mut input = InBuffer::around(b"0123456789abcdef");
+                    NoOp.run(&mut input, &mut out).unwrap();
+                    let written = out.pos() - 32;
+                    assert_eq!(input.pos(), written);
+                    assert_eq!(
+                        &out.as_slice()[32..],
+                        &b"0123456789abcdef"[..written]
+                    );
+                });
+                if let Err(panic) = res {
+                    // One of the position checks, `pos` or `set_pos`.
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|m| m.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    assert!(
+                        msg.contains("outside of the buffer bounds")
+                            || msg.contains("self.pos <= self.dst.capacity()"),
+                        "unexpected panic: {:?}",
+                        msg
+                    );
+                }
+            }
+        }
+    }
 
     // This requires impl for [u8; N] which is currently behind a feature.
     #[cfg(feature = "arrays")]

@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.64"
 name = "zstd-safe"
-version = "8.3.0"
+version = "8.4.0"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 exclude = ["update_consts.sh"]
@@ -73,7 +73,10 @@ thin-lto = ["zstd-sys/thin-lto"]
 vendored = ["zstd-sys/vendored"]
 with-rust-allocator = ["experimental"]
 zdict_builder = ["zstd-sys/zdict_builder"]
-zstdmt = ["zstd-sys/zstdmt"]
+zstdmt = [
+    "zstd-sys/zstdmt",
+    "alloc",
+]
 
 [lib]
 name = "zstd_safe"
@@ -92,7 +95,7 @@ name = "with_rust_allocator_one_shot"
 path = "tests/with_rust_allocator_one_shot.rs"
 
 [dependencies.zstd-sys]
-version = "2.1.3"
+version = "2.2.0"
 default-features = false
 
 [lints.rust]

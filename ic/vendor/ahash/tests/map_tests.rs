@@ -1,6 +1,7 @@
 #![cfg_attr(specialize, feature(build_hasher_simple_hash_one))]
 
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::hint::black_box;
 
 use ahash::RandomState;
 use criterion::*;
@@ -200,7 +201,6 @@ fn test_ahash_alias_set_construction() {
     set.insert(1);
 }
 
-
 #[cfg(feature = "std")]
 #[test]
 fn test_key_ref() {
@@ -225,11 +225,46 @@ fn test_key_ref() {
     assert!(m.contains(&b"hello"[..]));
 }
 
+/// A key may be looked up by anything it implements `Borrow` for, so both must hash the same. This includes key
+/// types which aHash knows nothing about, and so cannot specialize. (See issue #303.)
+#[cfg(feature = "std")]
+#[test]
+fn test_lookup_by_borrowed_form() {
+    use std::borrow::Cow;
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    macro_rules! check {
+        ($borrowed:expr, $($key:ty),+) => {$(
+            let key = <$key>::from($borrowed);
+            let build_hasher = RandomState::new();
+            assert_eq!(
+                build_hasher.hash_one(&key),
+                build_hasher.hash_one($borrowed),
+                "{} hashes differently from what it borrows as",
+                stringify!($key)
+            );
+            let mut set = ahash::HashSet::<$key>::default();
+            set.insert(key);
+            assert!(set.contains($borrowed), "{} not found by its borrowed form", stringify!($key));
+        )+};
+    }
+
+    let text = "dd0d41fe-e496-40c6-8372-a1a15ea7f3d9";
+    check!(text, String, Box<str>, Arc<str>, Rc<str>, Cow<str>);
+    check!(text.as_bytes(), Vec<u8>, Box<[u8]>, Arc<[u8]>, Rc<[u8]>, Cow<[u8]>);
+    let os_str = OsStr::new(text);
+    check!(os_str, OsString, Box<OsStr>, Arc<OsStr>, Rc<OsStr>, Cow<OsStr>);
+    check!(Path::new(text), PathBuf, Box<Path>, Arc<Path>, Rc<Path>, Cow<Path>);
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn test_byte_dist() {
-    use rand::{SeedableRng, Rng, RngCore};
     use pcg_mwc::Mwc256XXA64;
+    use rand::{Rng, RngCore, SeedableRng};
 
     let mut r = Mwc256XXA64::seed_from_u64(0xe786_c22b_119c_1479);
     let mut lowest = 2.541;
@@ -274,7 +309,6 @@ fn test_byte_dist() {
     assert!(lowest > 1.9, "Lowest = {}", lowest);
     assert!(highest < 3.9, "Highest = {}", highest);
 }
-
 
 fn ahash_vec<H: Hash>(b: &Vec<H>) -> u64 {
     let mut total: u64 = 0;

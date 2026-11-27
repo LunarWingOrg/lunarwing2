@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.81.0"
 name = "rangemap"
-version = "1.8.0"
+version = "1.9.0"
 authors = ["Jeff Parsons <jeff@parsons.io>"]
 build = false
 exclude = [

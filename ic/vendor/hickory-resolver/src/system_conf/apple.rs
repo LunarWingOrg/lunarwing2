@@ -6,10 +6,12 @@ use system_configuration::{
         array::CFArray,
         base::{FromVoid, ItemRef, TCFType},
         dictionary::CFDictionary,
+        number::CFNumber,
         string::CFString,
     },
     dynamic_store::SCDynamicStoreBuilder,
 };
+use tracing::warn;
 
 use super::sanitize::parse_search_domains;
 use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
@@ -24,6 +26,18 @@ pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ProtoError> 
         .downcast_into::<CFDictionary>()
         .ok_or("DNS object in System Configuration is not a CFDictionary")?;
 
+    // A local DNS proxy (as VPN clients install) may listen on a port other than 53.
+    // https://developer.apple.com/documentation/systemconfiguration/kscpropnetdnsserverport
+    let port = dns_cfg
+        .find(CFString::from_static_string("ServerPort").as_CFTypeRef())
+        .and_then(|port_cf| {
+            let port_cf: ItemRef<'_, CFNumber> = unsafe { CFNumber::from_void(*port_cf) };
+            match u16::try_from(port_cf.to_i64()?) {
+                Ok(0) | Err(_) => None,
+                Ok(port) => Some(port),
+            }
+        });
+
     let nameservers_cf = dns_cfg
         .find(CFString::from_static_string("ServerAddresses").as_CFTypeRef())
         .ok_or("no ServerAddresses key in DNS info")?;
@@ -34,10 +48,32 @@ pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ProtoError> 
 
     let mut nameservers = Vec::with_capacity(nameservers_cf.len() as usize);
     for n in &*nameservers_cf {
-        let addr = IpAddr::from_str(&Cow::from(&*n))
-            .map_err(|e| format!("failed to parse nameserver address: {e}"))?;
-
-        nameservers.push(NameServerConfig::udp_and_tcp(addr));
+        let s = Cow::from(&*n);
+        // macOS reports link-local nameservers with a zone id (e.g. `fe80::1%en0`),
+        // which `IpAddr::from_str` cannot parse. Strip the zone and keep the base
+        // address, matching the `resolv.conf` path (see `resolv_conf::ScopedIp`).
+        let stripped = match s.split_once('%') {
+            Some((addr, _zone)) => addr,
+            None => &*s,
+        };
+        let addr = match IpAddr::from_str(stripped) {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!(
+                    nameserver = %s,
+                    error = %e,
+                    "ignoring unparseable nameserver"
+                );
+                continue;
+            }
+        };
+        let mut nameserver = NameServerConfig::udp_and_tcp(addr);
+        if let Some(port) = port {
+            for connection in &mut nameserver.connections {
+                connection.port = port;
+            }
+        }
+        nameservers.push(nameserver);
     }
 
     let search_domains_cf =
