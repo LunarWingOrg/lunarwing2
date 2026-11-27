@@ -57,8 +57,9 @@ wrapper restores that key from its environment backup. For a tenant configured
 through extension setup alone, set the XMPP `rooms` field there.
 
 For direct configure calls, `ic/scripts/xmpp-configure.sh` accepts
-`XMPP_ALLOW_ROOMS_JSON` in its environment. Keep the same room in each tenant's
-`xmpp-bridge.env` if you use the static `coord-doctor` check.
+`XMPP_ALLOW_ROOMS_JSON` in its environment. The bridge itself does not read
+that variable. `coord-doctor` uses the value in each tenant's `xmpp-bridge.env`
+only as a static fallback when it cannot read the bridge's effective room list.
 
 ```dotenv
 XMPP_ALLOW_ROOMS_JSON=["coordination@conference.example.org"]
@@ -119,15 +120,24 @@ sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-a
 sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-b
 ```
 
-The report shows coordination switches, publisher shape checks, and whether
-coordination rooms appear in the bridge environment file. It also prints
-`configured_rooms` and `rooms_with_presence` when the bridge status is reachable,
-and `KNOW:` drop counters when the admin endpoint is available.
+It validates:
 
-A stale bridge environment can fail the static check even when the room is
-joined. Check each room against the reported live presence. The script can exit
-0 when that list is empty, and its comparison treats comma-joined room lists
-as single values. Finish verification with a real share in a disposable room.
+- `COORD_ENABLED`/`COORD_CHANNELS` are usable together;
+- the publisher allowlist is non-empty and every entry is a full occupant JID or
+  a coordination room bare JID (user-bare entries FAIL);
+- every coordination room is on the effective bridge allowlist
+  (`configured_rooms` from the authenticated `/v1/status` response); when that
+  list is unavailable, it checks the static `xmpp-bridge.env` values instead;
+- each configured room appears in `rooms_with_presence`. An empty presence list
+  fails the check for every configured room. If the bridge status or its room
+  data is unavailable, the doctor warns and does not infer live presence from
+  static configuration;
+- `KNOW:` drop counters, when the coord admin endpoint is available.
+
+Exit code 0 means no definitive misconfiguration; warnings still deserve
+operator attention (for example, a room-wide bare JID entry). It never prints
+secrets and never rewrites room or trust policy. Finish verification with a
+real share in a disposable room.
 
 ## Watch the live drop counters
 

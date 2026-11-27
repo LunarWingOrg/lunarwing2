@@ -46,12 +46,13 @@ the proxy for anything else.
 
 ## Gateway Endpoints
 
-All routes use the gateway bearer token and share its CORS and security-header
-layers. `GatewayChannel::new` in `ic/src/channels/web/mod.rs` uses the single
-configured token (`GATEWAY_AUTH_TOKEN` or `channels.gateway_auth_token`), or
-generates one when unset. The daemon currently parses `GATEWAY_USER_TOKENS`
-without installing those tokens in the request authenticator. DB-backed
-authentication is also unavailable.
+All routes require the gateway's owner bearer token and share its CORS and
+security-header layers. `GatewayChannel::new` in `ic/src/channels/web/mod.rs`
+uses the single configured token (`GATEWAY_AUTH_TOKEN` or
+`channels.gateway_auth_token`), or generates one when unset. Multi-user and
+DB-backed user tokens are not supported. A non-empty `GATEWAY_USER_TOKENS`
+setting prevents the daemon from starting, even if `GATEWAY_AUTH_TOKEN` is set;
+remove the token map to use owner authentication.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |

@@ -181,8 +181,9 @@ without importing directly, run `sync-knowledge-sources`.
   patches the tenant env but does not set the seed flag. Env regeneration
   only carries an existing value forward (including an explicit `=0` opt-out).
 - **Bootstrap completion marker.** After visiting the discovered notes, the
-  daemon writes `knowledge_seed_state.json`. Later startups skip bootstrap if
-  that path exists. The separate refresh cadence still adds newly published paths.
+  daemon publishes `knowledge_seed_state.json`. Later startups skip bootstrap
+  only if that marker is valid. The separate refresh cadence still adds newly
+  published paths.
 - **Existing rows and repair.** Both passes skip an existing path with parseable
   knowledge-note metadata regardless of its body. Without that metadata, a body
   that exactly matches the rendered seed note gets a metadata-only repair. A
@@ -197,10 +198,11 @@ without importing directly, run `sync-knowledge-sources`.
 - **Per-note failures.** Bootstrapping logs unreadable files and rejected
   bodies, records their count, and continues. Invalid slugs are skipped
   during enumeration.
-- **Interrupted bootstrap.** If the daemon stops before creating the marker,
-  the next startup scans again and skips or repairs existing paths as above.
-  The marker is an existence check, so even a partial marker suppresses a
-  later bootstrap.
+- **Interrupted bootstrap.** After the pass, the daemon syncs a temporary
+  marker and atomically renames it into place. If the daemon stops before that,
+  or the marker is invalid or unreadable, the next enabled startup scans again
+  and skips or repairs existing paths as above. The daemon warns when it finds
+  an invalid or unreadable marker.
 - **Missing checkout retries.** If the checkout directory is not present at
   startup, the pass is skipped with a warning and retried on the next startup
   (no marker is written).
@@ -254,8 +256,10 @@ After provisioning and the first `start-tenant`:
    }
    ```
 
+   Complete older markers without `schema_version` still prevent a rerun.
    `notes_failed` counts import failures, such as unreadable source files,
-   empty bodies, or workspace write errors. The marker prevents a boot retry.
+   empty bodies, or workspace write errors. While the marker is valid,
+   bootstrap does not retry those notes on each boot.
 
 4. **Store populated:** the tenant's PostgreSQL contains
    `study-notes/<agent>/<topic>.md` documents (verification run: 1,249
@@ -292,6 +296,7 @@ After provisioning and the first `start-tenant`:
 | `knowledge seed: ... not found; will retry on next startup` | Checkout directory missing at startup | Re-sync via `configure-study-mcp <name> --sync`, then restart the tenant |
 | `N note(s) failed ... seed is complete and will not rerun` | Import failures counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
 | Daemon restarted before writing the marker | The next bootstrap scans the checkout again | Already-imported notes are skipped or repaired as described above |
+| `invalid or unreadable completion marker` | The existing marker cannot prove completion | Bootstrap retries automatically. If the warning repeats, check the checkout and state directory permissions |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
 | Refresh succeeds but an upstream edit is absent | Additive mode preserves existing notes it can read outside the documented repair cases | Resolve manually if needed |
 

@@ -98,7 +98,9 @@ The adapter:
 
 The guest requests a 3-second poll by default. The daemon enforces a
 30-second floor when converting channel capabilities and validating the poll
-request. The callback capacity and interval are separate from IRC send pacing.
+request. The [channel build guide](DARKIRC_BUILD_GUIDE.md#current-channel-capability)
+describes the interval setting. The callback capacity and interval are
+separate from IRC send pacing.
 
 ## Contact-Key Isolation
 

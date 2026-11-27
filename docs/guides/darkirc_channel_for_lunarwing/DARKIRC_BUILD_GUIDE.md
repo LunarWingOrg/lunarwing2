@@ -92,10 +92,12 @@ The source of truth is `darkirc_channel_for_lunarwing/darkirc/darkirc.capabiliti
 - polling enabled with a declared minimum of 3000 ms;
 - default DM policy `pairing`.
 
-The guest requests a 3-second interval by default. The daemon clamps the
-capability and callback interval to at least 30 seconds. The guest reads
-`poll_interval_seconds` from its config. The `poll_interval_ms` value in the
-sidecar's `config` object does not set that guest field.
+Set `config.poll_interval_ms` in the sidecar to an integer number of
+milliseconds. The guest requests at least 3,000 ms, and the LunarWing host
+applies a separate 30,000 ms minimum. The default therefore schedules polls
+30 seconds apart. For example, `"poll_interval_ms": 45250` schedules polls
+45.25 seconds apart. If `poll_interval_seconds` is also set, that legacy value
+takes precedence. Remove it when switching to the millisecond key.
 
 Do not copy an old JSON example over the current capability file. Schema and credential-location fields are versioned with the WIT/host interface.
 
