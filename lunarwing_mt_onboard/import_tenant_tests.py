@@ -28,6 +28,9 @@ class TestImportConfigSerialization(unittest.TestCase):
             with_pebble=True,
             with_opencode=True,
             with_kimi=True,
+            with_opencode2=True,
+            opencode2_model="open2-model",
+            opencode2_base_url="https://open2.example.test/v1",
             with_toolchains=True,
             with_vision=True,
             docker_group=True,
@@ -162,6 +165,9 @@ class TestImportArgs(unittest.TestCase):
                 with_pebble=True,
                 with_opencode=True,
                 with_kimi=True,
+                with_opencode2=True,
+                opencode2_model="open2-model",
+                opencode2_base_url="https://open2.example.test/v1",
                 with_toolchains=True,
                 with_vision=True,
                 docker_group=True,
@@ -177,6 +183,9 @@ class TestImportArgs(unittest.TestCase):
         self.assertIn("--with-pebble", args)
         self.assertIn("--with-opencode", args)
         self.assertIn("--with-kimi", args)
+        self.assertIn("--with-opencode2", args)
+        self.assertEqual(args[args.index("--opencode2-model") + 1], "open2-model")
+        self.assertEqual(args[args.index("--opencode2-base-url") + 1], "https://open2.example.test/v1")
         self.assertIn("--with-toolchains", args)
         self.assertIn("--with-vision", args)
         self.assertIn("--docker-group", args)
