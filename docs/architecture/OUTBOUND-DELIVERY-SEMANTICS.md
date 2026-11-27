@@ -1,5 +1,9 @@
 # Outbound Message Delivery Semantics
 
+A successful outbound send means the channel accepted it for delivery.
+Native XMPP uses a durable spool. The gateway reports turn progress through
+[message lifecycle events](#message-lifecycle-and-turn-outcomes).
+
 Source anchors: `MessageTool::execute` and `resolve_message_target` in
 `ic/src/tools/builtin/message.rs`; `queue_outbound_with_attachments` and
 `OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT` in `ic/src/channels/xmpp/mod.rs`;
