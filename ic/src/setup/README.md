@@ -58,6 +58,12 @@ WSS port allocation or a dead listener, even if its container is running.
 Unselected workers are not required. Verification failure fails the onboarding
 job/CLI exit.
 
+LunarDepth is selectable in the multi-tenant CLI and web wizard. It requires an
+explicit OpenAI-compatible API root, a complete function model ID, and a
+per-tenant API key. Provisioning passes the key to mt-admin through its
+key-file option. Saved CLI plans omit the key. On resume, re-enter it or pass
+`--lunardepth-api-key-file`.
+
 Managed OpenCode and OpenCode 2 worker entries include
 `supports_credentials = false` (WI#474, !1943 ON-1). Config reconciliation also
 sets it on existing entries; reload by restarting the tenant daemon through

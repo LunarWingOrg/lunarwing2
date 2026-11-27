@@ -413,27 +413,98 @@ pub struct ListToolsResult {
 }
 
 /// Result of calling a tool.
+///
+/// Wire names follow the MCP specification (`isError`, `structuredContent`).
+/// The snake_case spellings this client used to require are still accepted
+/// on input so older servers keep working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
-    pub content: Vec<ContentBlock>,
     #[serde(default)]
+    pub content: Vec<ContentBlock>,
+    /// A spec-compliant failure (`isError: true`) must never read as success.
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
+    /// Optional structured result (MCP 2025-06-18 and later).
+    #[serde(
+        default,
+        rename = "structuredContent",
+        alias = "structured_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<serde_json::Value>,
 }
 
 /// Content block in a tool result.
+///
+/// Block types this client does not interpret (and any type added by a later
+/// specification revision) deserialize as [`ContentBlock::Unsupported`]
+/// instead of failing the whole result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    /// Base64 image. A missing field deserializes as empty and is rejected
+    /// later by image validation rather than failing the whole result.
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        #[serde(default)]
+        data: String,
+        #[serde(default, rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
+    /// Audio is not forwarded; its payload is not retained.
+    #[serde(rename = "audio")]
+    Audio {
+        #[serde(default, rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
+    /// A link to a resource the client could read later (MCP 2025-06-18).
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        #[serde(default)]
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// An embedded resource. The specification nests it under `resource`;
+    /// the flat legacy layout (`uri`, `mime_type`, `text`) is still accepted.
     #[serde(rename = "resource")]
     Resource {
-        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<EmbeddedResource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+        #[serde(
+            default,
+            rename = "mimeType",
+            alias = "mime_type",
+            skip_serializing_if = "Option::is_none"
+        )]
         mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Any block type this client does not know.
+    #[serde(other, rename = "unsupported")]
+    Unsupported,
+}
+
+/// The `resource` object of an embedded-resource block. A binary `blob` is
+/// not retained: only text resources are shown to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddedResource {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(
+        default,
+        rename = "mimeType",
+        alias = "mime_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl ContentBlock {
@@ -441,6 +512,18 @@ impl ContentBlock {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Text of an embedded text resource, in either wire layout.
+    pub fn resource_text(&self) -> Option<&str> {
+        match self {
+            Self::Resource {
+                resource: Some(resource),
+                ..
+            } => resource.text.as_deref(),
+            Self::Resource { text, .. } => text.as_deref(),
             _ => None,
         }
     }
@@ -726,11 +809,13 @@ mod tests {
         assert!(image_block.as_text().is_none());
 
         let resource_block = ContentBlock::Resource {
-            uri: "file:///tmp/a.txt".to_string(),
+            resource: None,
+            uri: Some("file:///tmp/a.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
             text: Some("content".to_string()),
         };
         assert!(resource_block.as_text().is_none());
+        assert_eq!(resource_block.resource_text(), Some("content"));
     }
 
     #[test]
@@ -749,16 +834,68 @@ mod tests {
         let json = serde_json::to_value(&image_block).expect("serialize");
         assert_eq!(json["type"], "image");
         assert_eq!(json["data"], "abc");
-        assert_eq!(json["mime_type"], "image/jpeg");
+        assert_eq!(json["mimeType"], "image/jpeg");
+        assert!(json.get("mime_type").is_none());
 
         let resource_block = ContentBlock::Resource {
-            uri: "file:///x".to_string(),
+            resource: None,
+            uri: Some("file:///x".to_string()),
             mime_type: None,
             text: None,
         };
         let json = serde_json::to_value(&resource_block).expect("serialize");
         assert_eq!(json["type"], "resource");
         assert_eq!(json["uri"], "file:///x");
+    }
+
+    #[test]
+    fn legacy_snake_case_result_fields_are_still_accepted() {
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "image", "data": "AQID", "mime_type": "image/jpeg"}],
+            "is_error": true
+        }))
+        .expect("deserialize legacy result");
+        assert!(result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Image { mime_type, .. } if mime_type == "image/jpeg"
+        ));
+        let wire = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(wire["isError"], true);
+        assert!(wire.get("is_error").is_none());
+    }
+
+    #[test]
+    fn newer_block_types_do_not_fail_the_whole_result() {
+        // Regression: an embedded `resource` object, `audio`, `resource_link`
+        // or any unknown block type used to make the entire result (and its
+        // text) fail to deserialize.
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "kept"},
+                {"type": "resource", "resource": {"uri": "file:///a.txt", "mimeType": "text/plain", "text": "inline"}},
+                {"type": "resource", "resource": {"uri": "file:///b.bin", "blob": "AAAA"}},
+                {"type": "audio", "data": "AAAA", "mimeType": "audio/wav"},
+                {"type": "resource_link", "uri": "file:///c", "name": "c"},
+                {"type": "hologram", "payload": 1}
+            ],
+            "structuredContent": {"ok": true}
+        }))
+        .expect("deserialize mixed result");
+        assert_eq!(result.content.len(), 6);
+        assert_eq!(result.content[0].as_text(), Some("kept"));
+        assert_eq!(result.content[1].resource_text(), Some("inline"));
+        assert_eq!(result.content[2].resource_text(), None);
+        assert!(matches!(result.content[3], ContentBlock::Audio { .. }));
+        assert!(matches!(
+            result.content[4],
+            ContentBlock::ResourceLink { .. }
+        ));
+        assert!(matches!(result.content[5], ContentBlock::Unsupported));
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"ok": true}))
+        );
     }
 
     #[test]
@@ -777,6 +914,36 @@ mod tests {
         }))
         .expect("deserialize");
         assert!(failure.is_error);
+    }
+
+    #[test]
+    fn spec_is_error_camel_case_marks_the_result_as_failed() {
+        // Regression: the MCP wire name is `isError`. A spec-compliant failure
+        // used to deserialize as a success because only `is_error` was read.
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "boom"}],
+            "isError": true
+        }))
+        .expect("deserialize spec-shaped error result");
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn spec_image_block_with_camel_case_mime_type_deserializes() {
+        // Regression: the MCP wire name is `mimeType`. A spec-compliant image
+        // block used to fail deserialization of the whole result, text included.
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "captured"},
+                {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
+            ]
+        }))
+        .expect("deserialize spec-shaped image result");
+        assert_eq!(result.content.len(), 2);
+        assert!(matches!(
+            &result.content[1],
+            ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+        ));
     }
 
     #[test]

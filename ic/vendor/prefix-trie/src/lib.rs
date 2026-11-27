@@ -1,119 +1,149 @@
-//! This crate provides a simple prefix tree for IP prefixes. Any lookup performs longest-prefix
-//! match. This crate supports both IPv4 and IPv6 (from either [ipnet](https://docs.rs/ipnet/2.10.0)
-//! or [ipnetwork](https://crates.io/crates/ipnetwork) or [cidr](https://crates.io/crates/cidr)).
-//! It also  supports any tuple `(R, u8)`, where `R` is any unsigned primitive integer (`u8`, `u16`,
-//! `u32`, `u64`, `u128`, or `usize`).
-//!
-//! This crate also provides a [`joint::JointPrefixMap`] and [`joint::JointPrefixSet`] that contains
-//! two tables, one for IPv4 and one for IPv6.
-//!
-//! # Comparison with related projects
-//!
-//! [`ip_network_table-deps-treebitmap`](https://crates.io/crates/ip_network_table-deps-treebitmap)
-//! provides an IP lookup table, similar to [`PrefixMap`].
-//!
-//! The following compares the two approaches in the case of *dense* or *sparse* maps. Each test
-//! case performs 100'000 modifications or lookups. However, the dense cases randomly picks any IPv4
-//! address, while the sparse case only pick 20 different IPv4 addresses. See `benches/benchmark.rs`
-//! for more details.
-//!
-//! | Operation       | Mode   | `PrefixMap` | `treebitmap` | factor |
-//! |-----------------|--------|-------------|--------------|--------|
-//! | Insert & Remove | dense  | **31.78ms** | 47.52ms      | ~1.5x  |
-//! | Lookup          | dense  | 32.36ms     | **8.409ms**  | ~0.25x |
-//! | Insert & Remove | sparse | **6.645ms** | 7.329ms      | ~1.1x  |
-//! | Lookup          | sparse | **8.394ms** | 12.30ms      | ~1.5x  |
-//!
-//!
-//! In addition, `prefix-trie` includes a [`PrefixSet`] analogous to `std::collections::HashSet`,
-//! including union, intersection and difference operations that are implemented as simultaneous
-//! tree traversals. Further, `prefix-trie` has an interface similar to `std::collections`, and
-//! offers a general longest-prefix match that is not limited to individual addresses. Finally,
-//! `prefix-trie` allows you to (mutably) borrow a sub-trie using views.
-//!
-//! # Description of the Tree
-//!
-//! The tree is structured as follows: Each node consists of a prefix, a container for a potential
-//! value (`Option`), and two optional children. Adding a new child, or traversing into the tree is
-//! done as follows: we look at the most significant bit that is **not** part of the prefix
-//! itself. If it is not set, then we take the left branch, and otherwise, we take the right one.
-//!
-//! # Traversals
-//!
-//! Any iteration over all elements in the tree is implemented as a graph traversal that will yield
-//! elements in lexicographic order.
-//!
-//! The library offers set operations of different maps or sets. We implement a union, intersection,
-//! difference, and covering_difference. These iterators are implemented using simultaneous tree
-//! traversals. They will yield elements in lexicographic order. Whenever appropriate, the yielded
-//! items will also include the longest prefix match.
-//!
-//! # [`TrieView`] and [`TrieViewMut`]
-//!
-//! You can create a view of a (sub)-trie. Such a view has an any node as its root. Any operations
-//! on that view will only traverse that node and all its children. You can iterate over all
-//! children, search in that sub-trie, and perform set operations (union, intersection, difference,
-//! or the covering difference) on them.
-//!
-//! A view can point to one of three possible nodes:
-//! - A node in the tree that is actually present in the map,
-//! - A branching node that does not exist in the map, but is needed for the tree structure (or that
-//!   was deleted using the function `remove_keep_tree`)
-//! - A virtual node that does not exist as a node in the tree. This is only the case if you call
-//!   [`TrieView::find`] or [`AsView::view_at`] with a node that is not present in the tree, but
-//!   that contains elements present in the tree. Virtual nodes are treated as if they are actually
-//!   present in the tree as branching nodes.
-//!
-//! # Operations on the tree
-//!
-//! There are several operations one can do on the tree. Regular inserts are handled using the
-//! `Entry` structure. An `Entry` is a pointer to a location in the tree to either insert a value or
-//! modify an existing one. Removals however are different.
-//!
-//! The following are the computational complexities of the functions, where `n` is the number of
-//! elements in the tree.
-//!
-//! | Operation                                  | Complexity |
-//! |--------------------------------------------|------------|
-//! | `entry`, `insert`                          | `O(log n)` |
-//! | `remove`, `remove_keep_tree`               | `O(log n)` |
-//! | `remove_children` (calling `drop` on `T`)  | `O(n)`     |
-//! | `get`, `get_lpm`, `get_mut`                | `O(log n)` |
-//! | `retain`                                   | `O(n)`     |
-//! | `clear` (calling `drop` on `T`)            | `O(n)`     |
-//! | Operations on [`map::Entry`]               | `O(1)`     |
-//! | `len` and `is_empty`                       | `O(1)`     |
-//! | `union`, `intersection`, `difference`, ... | `O(n)`     |
-//!
-//! There are three kinds of removals you! can do:
-//!
-//! - [`PrefixMap::remove`] will remove an entry from the tree and modify the tree structure as if
-//!   the value was never inserted before. [`PrefixMap::remove`] will always exactly revert the
-//!   operation of [`PrefixMap::insert`]. When only calling this function to remove elements, you
-//!   are guaranteed that the tree structure is indistinguishable to a different tree where you
-//!   only inserted elements.
-//! - [`PrefixMap::remove_children`] will remove all entries that are contained within the given
-//!   prefix. This operation will search for the node with the shortest prefix length that is
-//!   contained within the given prefix and remove it, including all of its children.
-//! - [`PrefixMap::remove_keep_tree`] will not change anything in the tree structure. It will only
-//!   remove a value from a node. As soon as you call `remove_keep_tree` once on a tree structure,
-//!   the tree will no longer be optimal.
-//!
-//! # TODO
-//!
-//! Migrate to a TreeBitMap, described by
-//! [W. Eatherton, Z. Dittia, G. Varghes](https://doi.org/10.1145/997150.997160).
-
 #![allow(clippy::collapsible_else_if)]
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_notable_trait, doc_cfg))]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(feature = "nightly", feature(min_specialization, trivial_clone))]
 
+//! # Prefix-Trie
+//!
+//! This crate provides prefix-map and prefix-set collections for IP prefixes and other fixed-width
+//! prefix types. [`PrefixMap`] is backed by a compact TreeBitMap-style trie and supports exact,
+//! longest-prefix, and shortest-prefix matches. The crate supports both IPv4 and IPv6 (from either
+//! [ipnet](https://docs.rs/ipnet/2.10.0), [ipnetwork](https://crates.io/crates/ipnetwork), or
+//! [cidr](https://crates.io/crates/cidr)). It also supports any tuple `(R, u8)`, where `R` is any
+//! unsigned primitive integer (`u8`, `u16`, `u32`, `u64`, `u128`, or `usize`).
+//!
+//! Prefixes are not stored verbatim. They are reconstructed from their trie position when returned
+//! from map and set operations, so host bits outside the prefix length are not preserved.
+//!
+//! This crate also provides a [`JointPrefixMap`](joint::JointPrefixMap) and
+//! [`JointPrefixSet`](joint::JointPrefixSet) that contains two tables, one for IPv4 and one for
+//! IPv6.
+//!
+//! ## Description of the Tree
+//!
+//! [`PrefixMap`] stores the logical binary prefix trie in multi-bit nodes, as described by
+//! [W. Eatherton, Z. Dittia, and G. Varghes](https://dl.acm.org/doi/10.1145/997150.997160). Each
+//! internal node covers five consecutive binary-trie levels. A node at depth `d` can hold values
+//! for prefixes with lengths `d..=d+4`, and it has up to 32 child slots for subtries rooted at
+//! depth `d+5`.
+//!
+//! Each node stores two bitmaps: one for the value slots that are present in the node, and one for
+//! the child slots that are present below it. The allocators store multi-bit nodes and value cells
+//! in compact, linearized arrays, which improves cache locality and keeps lookup and traversal
+//! decisions local to a node. Physical slots are derived from the bitmaps with a popcount, avoiding
+//! one pointer per possible branch.
+//!
+//! A stored entry is identified by its path through the trie and by a value bit inside the final
+//! multi-bit node. The prefix object passed to `insert` is not stored alongside the value. Returned
+//! prefixes are therefore reconstructed and canonicalized to the prefix length.
+//!
+//! ## Trie Views and Set Operations
+//!
+//! [`TrieView`] is a trait for immutable, mutable, and composed cursors into a trie. Concrete leaf
+//! views are [`TrieRef`] (created from `&PrefixMap` or `&PrefixSet`) and [`TrieRefMut`] (created
+//! from mutable references). Both are obtained through the [`AsView`] trait: call `map.view()` for
+//! a full-trie view or `map.view_at(&prefix)` for a non-empty subtrie.
+//!
+//! Views and iterators traverse the logical prefix trie in lexicographic order and yield
+//! reconstructed owned prefixes together with references or owned values.
+//!
+//! Set operations use the same view infrastructure. [`union`](TrieView::union),
+//! [`intersection`](TrieView::intersection), [`difference`](TrieView::difference),
+//! [`covering_union`](TrieView::covering_union), and
+//! [`covering_difference`](TrieView::covering_difference) simultaneously traverse the involved trie
+//! views and yield results in lexicographic order. Covering variants also report longest-prefix
+//! matches from the opposite side where appropriate. The result of such a set operation is not the
+//! finished traversal, but a struct that implements `TrieView` and describes the traversal. Thus,
+//! you can chain multiple set operations and compute them in a single traversal of the original
+//! tries.
+//!
+//! ## Aggregation
+//!
+//! Both [`PrefixMap`] and [`PrefixSet`] can be aggregated, that is, finding a compact
+//! representation of the Trie to yield the same result for longest-prefix matches. For both the map
+//! and the set, this library has two versions of the aggregation:
+//! [`aggregate_consistent`](PrefixSet::aggregate_consistent) and
+//! [`aggregate`](PrefixSet::aggregate). The consistent variant only drops nodes that are covered by
+//! an ancestor. Thus, [`get_lpm`](PrefixMap::get_lpm) and [`is_covered`](PrefixSet::is_covered)
+//! always return the same value for any prefix. The non-consistent variant is also allowed to merge
+//! siblings with the same value. Thus, [`get_lpm`](PrefixMap::get_lpm) and
+//! [`is_covered`](PrefixSet::is_covered) are only guaranteed to return the same value for addresses
+//! (i.e., /32 prefixes for IPv4). However, even with the non-consistent variant, the function
+//! [`is_covered_in_aggregate`](PrefixSet::is_covered_in_aggregate) will always return the same
+//! result.
+//!
+//! The [`PrefixMap::aggregate`], [`PrefixMap::aggregate_fill`], and
+//! [`PrefixMap::aggregate_fill_default`] implement Reduced Routing Table Construction (ORTC) by
+//! [R. P. Draves, C. King, S. Venkatachary, and B. D. Zill](https://doi.org/10.1109/INFCOM.1999.749256).
+//! The result is a minimal routing table. The `fill` variants will also add the root prefix (i.e.,
+//! 0.0.0.0/0), and fill holes with the default value.
+//!
+//! ## Other operations on the Tree
+//!
+//! Most operations are bounded by prefix width, not by the number of stored entries. Let `w` be
+//! the number of bits in the prefix representation, and let `h = ceil((w + 1) / 5)` be the maximum
+//! number of multi-bit nodes on a search path. For IPv4, `h <= 7`; for IPv6, `h <= 26`. Let `n` be
+//! the number of stored entries, and let `v` be the number of trie nodes visited by a traversal.
+//!
+//! | Operation                                      | Complexity                                   |
+//! |------------------------------------------------|----------------------------------------------|
+//! | `len`, `is_empty`, `mem_size`                  | `O(1)`                                       |
+//! | `get`, `get_mut`, `contains_key`               | `O(h)`                                       |
+//! | `get_lpm`, `get_spm`, `cover`                  | `O(h)`                                       |
+//! | `entry`, `insert`                              | `O(h)`                                       |
+//! | `remove`, `remove_keep_tree`                   | `O(h)`                                       |
+//! | `children`, `view_at`                          | `O(h)` to create, then linear in the subtrie |
+//! | `iter`, `keys`, `values`                       | `O(n + v)` for a complete traversal          |
+//! | `retain`, `clear`                              | `O(n + v)`                                   |
+//! | `remove_children`                              | `O(h + m)` with the removed subtrie size `m` |
+//! | Operations on an occupied `map::Entry`         | `O(1)` after the entry lookup                |
+//! | Inserting through a vacant `map::Entry`        | `O(h)` worst case                            |
+//!
+//! There are three removal styles:
+//!
+//! - `PrefixMap::remove` will remove an entry from the tree and modify the tree structure as if
+//!   the value was never inserted before. It may remove now-empty multi-bit nodes and compact their
+//!   allocator blocks.
+//! - `PrefixMap::remove_children` will remove all entries that are contained within the given
+//!   prefix, including entries stored in the same multi-bit node and in child nodes below it.
+//! - `PrefixMap::remove_keep_tree` removes only the value and leaves the existing node structure in
+//!   place, which can make reinserting the same prefix cheaper but may leave empty internal nodes
+//!   for future traversals to pass through.
+//!
+//! ## Zero-Copy Archives with [`rkyv`](::rkyv)
+//!
+//! With the [`rkyv`] feature enabled, every map and set in this crate can be serialized into a byte
+//! buffer and read back without a deserialization step. Each owned collection has an archived
+//! counterpart: [`ArchivedPrefixMap`](rkyv::ArchivedPrefixMap),
+//! [`ArchivedPrefixSet`](rkyv::ArchivedPrefixSet),
+//! [`ArchivedJointPrefixMap`](rkyv::ArchivedJointPrefixMap), and
+//! [`ArchivedJointPrefixSet`](rkyv::ArchivedJointPrefixSet). These types are validated once and
+//! then queried directly out of the bytes. The archived types expose (or reimplement) all immutable
+//! access methods of their owned counterparts, such as `get`, `get_lpm`, `get_spm`, `contains_key`,
+//! and the various iterators.
+//!
+//! Archives integrate with the rest of the crate through the same [`TrieView`] infrastructure used
+//! by the owned collections. `&ArchivedPrefixMap` and `&ArchivedPrefixSet` implement [`AsView`], so
+//! any function written against a [`TrieView`] accepts an archive just as it accepts a borrowed
+//! [`PrefixMap`] or [`PrefixSet`], and archives participate in the same set operations (
+//! [`union`](TrieView::union), [`intersection`](TrieView::intersection),
+//! [`difference`](TrieView::difference), and the covering variants) as owned tries. See the
+//! [`rkyv`] module for details and examples.
+
+mod aggregate;
+mod allocator;
 mod fmt;
 #[cfg(test)]
-mod fuzzing;
-pub(crate) mod inner;
+pub(crate) mod fuzzing;
+mod lex_order;
+mod node;
 mod prefix;
+#[cfg(feature = "rkyv")]
+pub mod rkyv;
 #[cfg(feature = "serde")]
 mod serde;
+mod table;
 #[cfg(feature = "ipnet")]
 #[cfg(test)]
 mod test;
@@ -126,9 +156,4 @@ pub mod trieview;
 pub use map::PrefixMap;
 pub use prefix::Prefix;
 pub use set::PrefixSet;
-pub use trieview::{AsView, AsViewMut, TrieView, TrieViewMut};
-
-#[inline(always)]
-pub(crate) fn to_right<P: Prefix>(branch_p: &P, child_p: &P) -> bool {
-    child_p.is_bit_set(branch_p.prefix_len())
-}
+pub use trieview::{AsView, TrieRef, TrieRefMut, TrieView};

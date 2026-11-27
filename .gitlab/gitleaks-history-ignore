@@ -907,6 +907,14 @@
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/log/.cargo-checksum.json:generic-api-key:1
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/wast/.cargo-checksum.json:generic-api-key:1
 765dfbe8d6c31110e66ecaf0bd13a14cdf6a129c:ic/vendor/web-sys/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/clap_builder/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/hickory-proto/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/russh/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/sha2/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml_edit/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/toml_parser/.cargo-checksum.json:generic-api-key:1
+7e006a555ba76fea192c65c7dfbbffbcb0abaa51:ic/vendor/zlib-rs/.cargo-checksum.json:generic-api-key:1
 7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cc/.cargo-checksum.json:generic-api-key:1
 7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cranelift-assembler-x64/.cargo-checksum.json:generic-api-key:1
 7e9d6d633b71f49de3417c24239b3a9e4dcb1e33:ic/vendor/cranelift-entity/.cargo-checksum.json:generic-api-key:1

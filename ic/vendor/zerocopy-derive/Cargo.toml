@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "zerocopy-derive"
-version = "0.8.64"
+version = "0.8.66"
 build = false
 exclude = [
     ".*",
@@ -101,6 +101,10 @@ path = "tests/issue_2880.rs"
 [[test]]
 name = "issue_2915"
 path = "tests/issue_2915.rs"
+
+[[test]]
+name = "issue_3929"
+path = "tests/issue_3929.rs"
 
 [[test]]
 name = "on_error"

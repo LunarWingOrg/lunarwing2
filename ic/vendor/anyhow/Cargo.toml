@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.68"
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 authors = ["David Tolnay <dtolnay@gmail.com>"]
 build = "build.rs"
 autolib = false
@@ -125,5 +125,5 @@ features = ["full"]
 version = "2"
 
 [dev-dependencies.trybuild]
-version = "1.0.108"
+version = "1.0.125"
 features = ["diff"]

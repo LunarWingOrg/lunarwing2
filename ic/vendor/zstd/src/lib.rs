@@ -84,7 +84,11 @@ pub use crate::stream::{
 /// An error reported by the zstd library.
 ///
 /// When zstd itself fails, the `io::Error` this crate returns carries one of
-/// these, so you can tell what went wrong without matching on the message:
+/// these, so you can tell what went wrong without matching on the message.
+/// The exception is zstd running out of memory: that is an error of kind
+/// [`io::ErrorKind::OutOfMemory`], with nothing inside, since wrapping the
+/// code would need an allocation. (With `rust-backend`, the Rust port of
+/// zstd reports some of those as other errors.)
 ///
 /// ```
 /// let mut small = [0u8; 4];
@@ -128,7 +132,16 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Wraps a zstd error code in an `io::Error`, as an [`Error`].
+///
+/// Except when zstd could not allocate memory: wrapping the code would need
+/// another allocation, which aborts the process if the allocator still fails.
+/// That one is a plain `OutOfMemory` error, as for the allocations this crate
+/// makes itself.
 fn map_error_code(code: usize) -> io::Error {
+    use zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_memory_allocation;
+    if zstd_safe::is_error_kind(code, ZSTD_error_memory_allocation) {
+        return io::Error::from(io::ErrorKind::OutOfMemory);
+    }
     io::Error::new(io::ErrorKind::Other, Error { code })
 }
 
@@ -138,13 +151,27 @@ fn map_error_code(code: usize) -> io::Error {
 /// of aborting the process when that much memory cannot be allocated.
 fn vec_with_capacity(capacity: usize) -> io::Result<Vec<u8>> {
     let mut vec = Vec::new();
-    vec.try_reserve_exact(capacity).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!("could not allocate a buffer of {} bytes", capacity),
-        )
-    })?;
+    vec.try_reserve_exact(capacity)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     Ok(vec)
+}
+
+/// Creates a compression context.
+///
+/// Unlike `zstd_safe::CCtx::create`, this fails with an error instead of
+/// panicking when zstd cannot allocate the context.
+fn create_cctx<'a>() -> io::Result<zstd_safe::CCtx<'a>> {
+    zstd_safe::CCtx::try_create()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
+}
+
+/// Creates a decompression context.
+///
+/// Unlike `zstd_safe::DCtx::create`, this fails with an error instead of
+/// panicking when zstd cannot allocate the context.
+fn create_dctx<'a>() -> io::Result<zstd_safe::DCtx<'a>> {
+    zstd_safe::DCtx::try_create()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
 }
 
 // Some helper functions to write full-cycle tests.

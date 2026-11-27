@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 from rich.console import Console
@@ -38,6 +39,7 @@ WORKER_LABELS = {
     WorkerType.OPENCODE: "opencode (anomalyco/opencode)",
     WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
     WorkerType.OPENCODE2: "opencode2 (OpenCode 2 lane)",
+    WorkerType.LUNARDEPTH: "lunardepth (LunarDepth worker)",
 }
 
 
@@ -85,6 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run add-tenant and build-tenant but skip start-tenant.",
     )
+    _add_lunardepth_key_arg(p)
     subparsers = p.add_subparsers(dest="command")
     provision = subparsers.add_parser(
         "provision",
@@ -120,6 +123,16 @@ def _add_provision_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--save", metavar="FILE")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-start", action="store_true")
+    _add_lunardepth_key_arg(parser)
+
+
+def _add_lunardepth_key_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--lunardepth-api-key-file",
+        metavar="FILE",
+        default=argparse.SUPPRESS,
+        help="Read the LunarDepth API key for a provisioning plan from FILE.",
+    )
 
 
 def _add_upgrade_args(parser: argparse.ArgumentParser) -> None:
@@ -364,19 +377,11 @@ def _configure_channels(config: TenantConfig) -> None:
 
 
 def _configure_workers(config: TenantConfig) -> None:
-    labels = [
-        WORKER_LABELS[WorkerType.PEBBLE],
-        WORKER_LABELS[WorkerType.OPENCODE],
-        WORKER_LABELS[WorkerType.KIMI],
-        WORKER_LABELS[WorkerType.OPENCODE2],
-    ]
-    selected = _q_checkbox("External workers (space to toggle, enter to confirm)", labels)
-    config.workers = []
-    for label in selected:
-        for wt, wl in WORKER_LABELS.items():
-            if label == wl:
-                config.workers.append(wt)
-                break
+    selected = _q_checkbox(
+        "External workers (space to toggle, enter to confirm)",
+        list(WORKER_LABELS.values()),
+    )
+    config.workers = [worker for worker, label in WORKER_LABELS.items() if label in selected]
     if config.workers:
         config.toolchains = _q_confirm(
             "Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)",
@@ -407,6 +412,28 @@ def _configure_workers(config: TenantConfig) -> None:
             default=config.kimi_base_url,
         )
         config.kimi_api_key = _q_password("Kimi API key override (optional)")
+    if WorkerType.LUNARDEPTH in config.workers:
+        config.lunardepth_base_url = _q_required_text("LunarDepth OpenAI-compatible API root")
+        config.lunardepth_model = _q_required_text(
+            "LunarDepth model ID (tensormoon::function_name::<name> or tensorzero::function_name::<name>)"
+        )
+
+
+def _q_required_text(label: str) -> str:
+    while True:
+        value = _q_text(label).strip()
+        if value:
+            return value
+        console.print("[red]This field is required.[/]")
+
+
+def _configure_lunardepth_key(config: TenantConfig, key_file: str, *, prompt: bool) -> None:
+    if WorkerType.LUNARDEPTH not in config.workers:
+        return
+    if key_file:
+        config.lunardepth_api_key = Path(key_file).read_text(encoding="utf-8").removesuffix("\n")
+    elif prompt and not config.lunardepth_api_key:
+        config.lunardepth_api_key = _q_password("LunarDepth per-tenant API key (required)")
 
 
 def _configure_llm(config: TenantConfig) -> None:
@@ -549,14 +576,21 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             console.print(f"[red]Failed to load --resume file:[/] {exc}")
             return 1
-    elif not (args.non_interactive or args.accept_defaults):
-        try:
+    prompt = not (args.non_interactive or args.accept_defaults)
+    try:
+        if not args.resume and prompt:
             config = gather_config(config)
-        except KeyboardInterrupt:
-            console.print("\nAborted.")
-            return 130
+        _configure_lunardepth_key(
+            config, getattr(args, "lunardepth_api_key_file", ""), prompt=prompt
+        )
+    except KeyboardInterrupt:
+        console.print("\nAborted.")
+        return 130
+    except (OSError, UnicodeError):
+        console.print("[red]Could not read the LunarDepth API key file as UTF-8.[/]")
+        return 1
 
-    err = TenantConfig.validate_name(config.name)
+    err = TenantConfig.validate_name(config.name) or config.validate_lunardepth()
     if err:
         console.print(f"[red]Invalid config:[/] {err}")
         return 1
@@ -587,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_start=args.skip_start,
         )
         _display_results(result)
-        if result.ok and not args.skip_start:
+        if result.ok and not (args.skip_build or args.skip_start):
             if not _show_verify(
                 config.name, host=config.gateway_host, port=config.gateway_port,
                 workers=config.workers,

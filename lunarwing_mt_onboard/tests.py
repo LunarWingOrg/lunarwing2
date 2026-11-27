@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import call, patch
 
 from lunarwing_mt_onboard import provisioner
@@ -44,6 +45,7 @@ class TestTenantNameValidation(unittest.TestCase):
             "opencode-",
             "kimi-",
             "opencode2-",
+            "lunardepth-",
             "weechat-",
         ):
             with self.subTest(prefix=prefix):
@@ -420,6 +422,35 @@ class TestProvisionerArgs(unittest.TestCase):
         self.assertNotIn("--with-opencode2-model", add_args)
         self.assertNotIn("--with-opencode2-base-url", add_args)
 
+    def test_lunardepth_provisioning_stages_and_cleans_up_a_private_key_file(self):
+        key = "depth-fixture-only-value"
+        config = TenantConfig(
+            name="alpha",
+            workers=[WorkerType.LUNARDEPTH],
+            lunardepth_model="tensorzero::function_name::demo",
+            lunardepth_base_url="https://depth.example.test/openai/v1",
+            lunardepth_api_key=key,
+        )
+        with patch.object(provisioner, "ensure_mt_admin", return_value="/fake/mt-admin.sh"):
+            with provisioner.add_tenant_command(config) as args:
+                self.assertIn("--with-lunardepth", args)
+                self.assertEqual(args[args.index("--lunardepth-model") + 1], config.lunardepth_model)
+                self.assertEqual(args[args.index("--lunardepth-base-url") + 1], config.lunardepth_base_url)
+                self.assertNotIn(key, args)
+                key_file = Path(args[args.index("--lunardepth-api-key-file") + 1])
+                self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(key_file.read_text(), key + "\n")
+            self.assertFalse(key_file.exists())
+            self.assertEqual(
+                provisioner.build_build_tenant_args(config),
+                ["/fake/mt-admin.sh", "build-tenant", "alpha", "--with-wasm", "--with-lunardepth"],
+            )
+        saved = config.to_dict()
+        self.assertNotIn("lunardepth_api_key", saved)
+        self.assertNotIn(key, repr(config))
+        self.assertEqual(TenantConfig.from_dict(saved), config)
+        self.assertEqual(TenantConfig.from_dict(saved).lunardepth_api_key, "")
+
     def test_no_workers_selected_emits_no_worker_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, "lunarwing-mt-admin.sh")
@@ -441,6 +472,7 @@ class TestProvisionerArgs(unittest.TestCase):
             "--with-opencode",
             "--with-kimi",
             "--with-opencode2",
+            "--with-lunardepth",
         ):
             self.assertNotIn(flag, add_args)
 
@@ -550,6 +582,41 @@ class TestProvisionerArgs(unittest.TestCase):
                 result = provisioner.run_command([script], phase_name="env-check")
 
         self.assertTrue(result.ok)
+
+
+class TestLunarDepthCliResume(unittest.TestCase):
+    def test_resume_reads_lunardepth_key_file_without_prompting_for_key(self):
+        from lunarwing_mt_onboard import cli
+
+        fixture_key = "depth-cli-fixture-value"
+        config = TenantConfig(
+            name="alpha",
+            workers=[WorkerType.LUNARDEPTH],
+            lunardepth_model="tensorzero::function_name::demo",
+            lunardepth_base_url="https://depth.example.test/openai/v1",
+            secrets_master_key="ab" * 32,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = Path(tmp) / "plan.json"
+            config.to_json(plan)
+            key_file = Path(tmp) / "key"
+            key_file.touch(mode=0o600)
+            key_file.write_text(fixture_key + "\n", encoding="utf-8")
+            args = ["provision", "--non-interactive", "--resume", str(plan), "--skip-start"]
+            with (
+                patch.object(cli, "console"),
+                patch.object(cli, "ensure_mt_admin"),
+                patch.object(cli, "_show_summary", return_value=True),
+                patch.object(cli, "_q_password") as prompt,
+                patch.object(cli, "provision", return_value=provisioner.ProvisionResult()) as run,
+            ):
+                self.assertEqual(cli.main(args), 1)
+                run.assert_not_called()
+                self.assertEqual(cli.main([*args, "--lunardepth-api-key-file", str(key_file)]), 0)
+                restored = run.call_args.args[0]
+                self.assertEqual(restored.lunardepth_api_key, fixture_key)
+                self.assertEqual(restored, config)
+                prompt.assert_not_called()
 
 
 class TestSecretsHelpers(unittest.TestCase):

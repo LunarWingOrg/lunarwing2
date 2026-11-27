@@ -3,200 +3,267 @@ use core::cmp::Ordering;
 use core::fmt::{self, Debug};
 use core::hash::{Hash, Hasher};
 
-use typenum::{consts, Const};
-
-use super::{ArrayLength, ConstArrayLength, GenericArray, IntoArrayLength};
+use super::{ArrayLength, GenericArray};
 
 use crate::functional::*;
 use crate::sequence::*;
 
-impl<T: Default, N: ArrayLength> Default for GenericArray<T, N> {
+impl<T: Default, N> Default for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     #[inline(always)]
     fn default() -> Self {
         Self::generate(|_| T::default())
     }
 }
 
-impl<T: Clone, N: ArrayLength> Clone for GenericArray<T, N> {
-    #[inline]
+impl<T: Clone, N> Clone for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn clone(&self) -> GenericArray<T, N> {
         self.map(Clone::clone)
     }
 }
 
-impl<T: Copy, N: ArrayLength> Copy for GenericArray<T, N> where N::ArrayType<T>: Copy {}
+impl<T: Copy, N> Copy for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+    N::ArrayType: Copy,
+{
+}
 
-impl<T: PartialEq, N: ArrayLength> PartialEq for GenericArray<T, N> {
-    #[inline(always)]
+impl<T: PartialEq, N> PartialEq for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn eq(&self, other: &Self) -> bool {
         **self == **other
     }
 }
-impl<T: Eq, N: ArrayLength> Eq for GenericArray<T, N> {}
+impl<T: Eq, N> Eq for GenericArray<T, N> where N: ArrayLength<T> {}
 
-impl<T: PartialOrd, N: ArrayLength> PartialOrd for GenericArray<T, N> {
-    #[inline(always)]
+impl<T: PartialOrd, N> PartialOrd for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn partial_cmp(&self, other: &GenericArray<T, N>) -> Option<Ordering> {
         PartialOrd::partial_cmp(self.as_slice(), other.as_slice())
     }
 }
 
-impl<T: Ord, N: ArrayLength> Ord for GenericArray<T, N> {
-    #[inline(always)]
+impl<T: Ord, N> Ord for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn cmp(&self, other: &GenericArray<T, N>) -> Ordering {
         Ord::cmp(self.as_slice(), other.as_slice())
     }
 }
 
-impl<T: Debug, N: ArrayLength> Debug for GenericArray<T, N> {
+impl<T: Debug, N> Debug for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        self.as_slice().fmt(fmt)
+        self[..].fmt(fmt)
     }
 }
 
-impl<T, N: ArrayLength> Borrow<[T]> for GenericArray<T, N> {
+impl<T, N> Borrow<[T]> for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     #[inline(always)]
     fn borrow(&self) -> &[T] {
-        self.as_slice()
+        &self[..]
     }
 }
 
-impl<T, N: ArrayLength> BorrowMut<[T]> for GenericArray<T, N> {
+impl<T, N> BorrowMut<[T]> for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     #[inline(always)]
     fn borrow_mut(&mut self) -> &mut [T] {
-        self.as_mut_slice()
+        &mut self[..]
     }
 }
 
-impl<T, N: ArrayLength> AsRef<[T]> for GenericArray<T, N> {
+impl<T, N> AsRef<[T]> for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     #[inline(always)]
     fn as_ref(&self) -> &[T] {
-        self.as_slice()
+        &self[..]
     }
 }
 
-impl<T, N: ArrayLength> AsMut<[T]> for GenericArray<T, N> {
+impl<T, N> AsMut<[T]> for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     #[inline(always)]
     fn as_mut(&mut self) -> &mut [T] {
-        self.as_mut_slice()
+        &mut self[..]
     }
 }
 
-impl<T: Hash, N: ArrayLength> Hash for GenericArray<T, N> {
-    #[inline]
+impl<T: Hash, N> Hash for GenericArray<T, N>
+where
+    N: ArrayLength<T>,
+{
     fn hash<H>(&self, state: &mut H)
     where
         H: Hasher,
     {
-        Hash::hash(self.as_slice(), state)
+        Hash::hash(&self[..], state)
     }
 }
 
-impl<T, const N: usize> From<[T; N]> for GenericArray<T, ConstArrayLength<N>>
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn from(value: [T; N]) -> Self {
-        GenericArray::from_array(value)
-    }
-}
-
-impl<T, const N: usize> From<GenericArray<T, ConstArrayLength<N>>> for [T; N]
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn from(value: GenericArray<T, ConstArrayLength<N>>) -> Self {
-        value.into_array()
-    }
-}
-
-impl<'a, T, const N: usize> From<&'a [T; N]> for &'a GenericArray<T, ConstArrayLength<N>>
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn from(slice: &'a [T; N]) -> Self {
-        unsafe { &*(slice.as_ptr() as *const GenericArray<T, ConstArrayLength<N>>) }
-    }
-}
-
-impl<'a, T, const N: usize> From<&'a mut [T; N]> for &'a mut GenericArray<T, ConstArrayLength<N>>
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn from(slice: &'a mut [T; N]) -> Self {
-        unsafe { &mut *(slice.as_mut_ptr() as *mut GenericArray<T, ConstArrayLength<N>>) }
-    }
-}
-
-impl<T, const N: usize> AsRef<[T; N]> for GenericArray<T, ConstArrayLength<N>>
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn as_ref(&self) -> &[T; N] {
-        unsafe { core::mem::transmute(self) }
-    }
-}
-impl<T, const N: usize> AsMut<[T; N]> for GenericArray<T, ConstArrayLength<N>>
-where
-    Const<N>: IntoArrayLength,
-{
-    #[inline(always)]
-    fn as_mut(&mut self) -> &mut [T; N] {
-        unsafe { core::mem::transmute(self) }
-    }
-}
-
-macro_rules! impl_tuple {
-    (@T $t:ident) => { T };
-
-    ($($len:ty => ($($t:ident,)*);)*) => {$(
-        impl<T> From<($(impl_tuple!(@T $t),)*)> for GenericArray<T, $len> {
-            #[inline]
-            #[allow(non_snake_case)]
-            fn from(tuple: ($(impl_tuple!(@T $t),)*)) -> Self {
-                let ($($t,)*) = tuple;
-                GenericArray::from_array([$($t,)*])
+macro_rules! impl_from {
+    ($($n: expr => $ty: ty),*) => {
+        $(
+            impl<T> From<[T; $n]> for GenericArray<T, $ty> {
+                #[inline(always)]
+                fn from(arr: [T; $n]) -> Self {
+                    unsafe { $crate::transmute(arr) }
+                }
             }
-        }
 
-        impl<T> From<GenericArray<T, $len>> for ($(impl_tuple!(@T $t),)*) {
-            #[inline]
-            #[allow(non_snake_case)]
-            fn from(array: GenericArray<T, $len>) -> Self {
-                let [$($t),*] = array.into_array();
-                ($($t,)*)
+            #[cfg(relaxed_coherence)]
+            impl<T> From<GenericArray<T, $ty>> for [T; $n] {
+                #[inline(always)]
+                fn from(sel: GenericArray<T, $ty>) -> [T; $n] {
+                    unsafe { $crate::transmute(sel) }
+                }
             }
-        }
-    )*};
-}
 
-impl_tuple! {
-    consts::U1  => (A,);
-    consts::U2  => (A,B,);
-    consts::U3  => (A,B,C,);
-    consts::U4  => (A,B,C,D,);
-    consts::U5  => (A,B,C,D,E,);
-    consts::U6  => (A,B,C,D,E,F,);
-    consts::U7  => (A,B,C,D,E,F,G,);
-    consts::U8  => (A,B,C,D,E,F,G,H,);
-    consts::U9  => (A,B,C,D,E,F,G,H,I,);
-    consts::U10 => (A,B,C,D,E,F,G,H,I,J,);
-    consts::U11 => (A,B,C,D,E,F,G,H,I,J,K,);
-    consts::U12 => (A,B,C,D,E,F,G,H,I,J,K,L,);
-}
+            impl<'a, T> From<&'a [T; $n]> for &'a GenericArray<T, $ty> {
+                #[inline]
+                fn from(slice: &[T; $n]) -> &GenericArray<T, $ty> {
+                    unsafe { &*(slice.as_ptr() as *const GenericArray<T, $ty>) }
+                }
+            }
 
-#[cfg(test)]
-mod tests {
-    use crate::*;
+            impl<'a, T> From<&'a mut [T; $n]> for &'a mut GenericArray<T, $ty> {
+                #[inline]
+                fn from(slice: &mut [T; $n]) -> &mut GenericArray<T, $ty> {
+                    unsafe { &mut *(slice.as_mut_ptr() as *mut GenericArray<T, $ty>) }
+                }
+            }
 
-    #[test]
-    fn test_from_inference() {
-        let a = arr![1, 2, 3, 4];
-        let _: [i8; 4] = a.into();
+            #[cfg(not(relaxed_coherence))]
+            impl<T> Into<[T; $n]> for GenericArray<T, $ty> {
+                #[inline(always)]
+                fn into(self) -> [T; $n] {
+                    unsafe { $crate::transmute(self) }
+                }
+            }
+
+            impl<T> AsRef<[T; $n]> for GenericArray<T, $ty> {
+                #[inline]
+                fn as_ref(&self) -> &[T; $n] {
+                    unsafe { $crate::transmute(self) }
+                }
+            }
+
+            impl<T> AsMut<[T; $n]> for GenericArray<T, $ty> {
+                #[inline]
+                fn as_mut(&mut self) -> &mut [T; $n] {
+                    unsafe { $crate::transmute(self) }
+                }
+            }
+        )*
     }
+}
+
+impl_from! {
+    1  => ::typenum::U1,
+    2  => ::typenum::U2,
+    3  => ::typenum::U3,
+    4  => ::typenum::U4,
+    5  => ::typenum::U5,
+    6  => ::typenum::U6,
+    7  => ::typenum::U7,
+    8  => ::typenum::U8,
+    9  => ::typenum::U9,
+    10 => ::typenum::U10,
+    11 => ::typenum::U11,
+    12 => ::typenum::U12,
+    13 => ::typenum::U13,
+    14 => ::typenum::U14,
+    15 => ::typenum::U15,
+    16 => ::typenum::U16,
+    17 => ::typenum::U17,
+    18 => ::typenum::U18,
+    19 => ::typenum::U19,
+    20 => ::typenum::U20,
+    21 => ::typenum::U21,
+    22 => ::typenum::U22,
+    23 => ::typenum::U23,
+    24 => ::typenum::U24,
+    25 => ::typenum::U25,
+    26 => ::typenum::U26,
+    27 => ::typenum::U27,
+    28 => ::typenum::U28,
+    29 => ::typenum::U29,
+    30 => ::typenum::U30,
+    31 => ::typenum::U31,
+    32 => ::typenum::U32
+}
+
+#[cfg(feature = "more_lengths")]
+impl_from! {
+    33 => ::typenum::U33,
+    34 => ::typenum::U34,
+    35 => ::typenum::U35,
+    36 => ::typenum::U36,
+    37 => ::typenum::U37,
+    38 => ::typenum::U38,
+    39 => ::typenum::U39,
+    40 => ::typenum::U40,
+    41 => ::typenum::U41,
+    42 => ::typenum::U42,
+    43 => ::typenum::U43,
+    44 => ::typenum::U44,
+    45 => ::typenum::U45,
+    46 => ::typenum::U46,
+    47 => ::typenum::U47,
+    48 => ::typenum::U48,
+    49 => ::typenum::U49,
+    50 => ::typenum::U50,
+    51 => ::typenum::U51,
+    52 => ::typenum::U52,
+    53 => ::typenum::U53,
+    54 => ::typenum::U54,
+    55 => ::typenum::U55,
+    56 => ::typenum::U56,
+    57 => ::typenum::U57,
+    58 => ::typenum::U58,
+    59 => ::typenum::U59,
+    60 => ::typenum::U60,
+    61 => ::typenum::U61,
+    62 => ::typenum::U62,
+    63 => ::typenum::U63,
+    64 => ::typenum::U64,
+
+    70 => ::typenum::U70,
+    80 => ::typenum::U80,
+    90 => ::typenum::U90,
+
+    100 => ::typenum::U100,
+    200 => ::typenum::U200,
+    300 => ::typenum::U300,
+    400 => ::typenum::U400,
+    500 => ::typenum::U500,
+
+    128 => ::typenum::U128,
+    256 => ::typenum::U256,
+    512 => ::typenum::U512,
+
+    1000 => ::typenum::U1000,
+    1024 => ::typenum::U1024
 }

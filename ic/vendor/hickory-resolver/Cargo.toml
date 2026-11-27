@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "hickory-resolver"
-version = "0.26.3"
+version = "0.26.4"
 authors = ["The contributors to Hickory DNS"]
 build = false
 autolib = false
@@ -113,10 +113,7 @@ quic-ring = [
     "__quic",
     "quinn/rustls-ring",
 ]
-recursor = [
-    "dep:async-recursion",
-    "dep:lru-cache",
-]
+recursor = ["dep:lru-cache"]
 rustls-platform-verifier = ["hickory-net/rustls-platform-verifier"]
 serde = [
     "dep:serde",
@@ -194,10 +191,6 @@ required-features = [
     "tokio",
 ]
 
-[dependencies.async-recursion]
-version = "1.0.0"
-optional = true
-
 [dependencies.cfg-if]
 version = "1"
 
@@ -207,11 +200,11 @@ features = ["std"]
 default-features = false
 
 [dependencies.hickory-net]
-version = "0.26.3"
+version = "0.26.4"
 default-features = false
 
 [dependencies.hickory-proto]
-version = "0.26.3"
+version = "0.26.4"
 features = [
     "std",
     "access-control",
@@ -321,7 +314,7 @@ features = ["std"]
 default-features = false
 
 [dev-dependencies.hickory-proto]
-version = "0.26.3"
+version = "0.26.4"
 features = ["std"]
 default-features = false
 
@@ -361,7 +354,7 @@ version = "0.1.1"
 optional = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies.system-configuration]
-version = "0.7"
+version = "0.8"
 optional = true
 
 [target."cfg(windows)".dependencies.ipconfig]

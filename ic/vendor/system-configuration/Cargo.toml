@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.64.0"
 name = "system-configuration"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Mullvad VPN"]
 build = false
 autolib = false
@@ -52,7 +52,7 @@ path = "examples/watch_dns.rs"
 version = "2"
 
 [dependencies.core-foundation]
-version = "0.9"
+version = "0.10"
 
 [dependencies.system-configuration-sys]
 version = "0.6"

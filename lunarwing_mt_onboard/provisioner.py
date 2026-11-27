@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 # ``lunarwing-mt-admin.sh`` lives next to the main LunarWing repo tree.
@@ -135,14 +137,10 @@ def ensure_mt_admin() -> str:
     )
 
 
-def build_add_tenant_args(config: "TenantConfig") -> list[str]:
-    """Construct the argv list for ``mt-admin add-tenant``.
-
-    Secret values (XMPP password, LLM/Kimi API keys) are intentionally NOT placed
-    on the argv — they would be visible in ``/proc/<pid>/cmdline``. Instead,
-    ``add-tenant`` auto-generates throwaway values, and the secrets module
-    overwrites them in ``lunarwing.env`` before ``start-tenant`` runs.
-    """
+def build_add_tenant_args(
+    config: "TenantConfig", *, lunardepth_key_file: str = ""
+) -> list[str]:
+    """Construct the argv list for ``mt-admin add-tenant`` without inline secrets."""
     script = ensure_mt_admin()
     args: list[str] = [script, "add-tenant", config.name]
 
@@ -162,33 +160,10 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--llm-base-url", config.llm_base_url])
     if config.llm_model:
         args.extend(["--llm-model", config.llm_model])
-    if config.opencode_model:
-        args.extend(["--opencode-model", config.opencode_model])
-    if config.opencode_base_url:
-        args.extend(["--opencode-base-url", config.opencode_base_url])
-    if config.opencode2_model:
-        args.extend(["--opencode2-model", config.opencode2_model])
-    if config.opencode2_base_url:
-        args.extend(["--opencode2-base-url", config.opencode2_base_url])
-    if config.kimi_model:
-        args.extend(["--kimi-model", config.kimi_model])
-    if config.kimi_base_url:
-        args.extend(["--kimi-base-url", config.kimi_base_url])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
-    # Persist the tenant's external-worker selection at add-tenant so
-    # start-tenant starts only what was chosen (start_tenant_<worker> gates on
-    # the per-tenant registry flag). build-tenant gets the same flags to build
-    # the shared images; add-tenant records the per-tenant choice. See
-    # build_build_tenant_args and docs/proposals/PER_TENANT_WORKER_GATING.md.
-    if WorkerType.PEBBLE in config.workers:
-        args.append("--with-pebble")
-    if WorkerType.OPENCODE in config.workers:
-        args.append("--with-opencode")
-    if WorkerType.OPENCODE2 in config.workers:
-        args.append("--with-opencode2")
-    if WorkerType.KIMI in config.workers:
-        args.append("--with-kimi")
+    args.extend(_worker_selection_args(config))
+    args.extend(_worker_route_args(config, lunardepth_key_file))
     if config.no_ssh:
         args.append("--no-ssh")
     if config.no_health:
@@ -198,18 +173,54 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     return args
 
 
+def _worker_selection_args(config: "TenantConfig") -> list[str]:
+    # add-tenant records the selection in the registry; build-tenant builds the images.
+    return [f"--with-{worker.value}" for worker in WorkerType if worker in config.workers]
+
+
+def _worker_route_args(config: "TenantConfig", lunardepth_key_file: str) -> list[str]:
+    args = []
+    for flag, value in (
+        ("--opencode-model", config.opencode_model),
+        ("--opencode-base-url", config.opencode_base_url),
+        ("--opencode2-model", config.opencode2_model),
+        ("--opencode2-base-url", config.opencode2_base_url),
+        ("--kimi-model", config.kimi_model),
+        ("--kimi-base-url", config.kimi_base_url),
+    ):
+        if value:
+            args.extend([flag, value])
+    if WorkerType.LUNARDEPTH in config.workers:
+        if not lunardepth_key_file:
+            raise ValueError("LunarDepth add-tenant requires a staged API key file")
+        args.extend([
+            "--lunardepth-model", config.lunardepth_model.strip(),
+            "--lunardepth-base-url", config.lunardepth_base_url.strip(),
+            "--lunardepth-api-key-file", lunardepth_key_file,
+        ])
+    return args
+
+
+@contextmanager
+def add_tenant_command(config: "TenantConfig") -> Iterator[list[str]]:
+    """Stage the LunarDepth key in a private temporary file for this command only."""
+    if WorkerType.LUNARDEPTH not in config.workers:
+        yield build_add_tenant_args(config)
+        return
+    error = config.validate_lunardepth()
+    if error:
+        raise ValueError(error)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as key_file:
+        key_file.write(config.lunardepth_api_key + "\n")
+        key_file.flush()
+        yield build_add_tenant_args(config, lunardepth_key_file=key_file.name)
+
+
 def build_build_tenant_args(config: "TenantConfig") -> list[str]:
     """Construct the argv list for ``mt-admin build-tenant``."""
     script = ensure_mt_admin()
     args: list[str] = [script, "build-tenant", config.name, "--with-wasm"]
-    if WorkerType.PEBBLE in config.workers:
-        args.append("--with-pebble")
-    if WorkerType.OPENCODE in config.workers:
-        args.append("--with-opencode")
-    if WorkerType.OPENCODE2 in config.workers:
-        args.append("--with-opencode2")
-    if WorkerType.KIMI in config.workers:
-        args.append("--with-kimi")
+    args.extend(_worker_selection_args(config))
     if config.toolchains:
         args.append("--with-toolchains")
     return args
@@ -244,8 +255,11 @@ def provision(
         skip_start = True
     result = ProvisionResult()
 
-    add_args = build_add_tenant_args(config)
-    result.phases.append(_run(add_args, on_output=on_output))
+    try:
+        with add_tenant_command(config) as add_args:
+            result.phases.append(_run(add_args, on_output=on_output))
+    except (OSError, ValueError) as exc:
+        result.phases.append(PhaseResult(name="add-tenant", returncode=1, stderr=str(exc)))
     if not result.phases[-1].ok:
         return result
 

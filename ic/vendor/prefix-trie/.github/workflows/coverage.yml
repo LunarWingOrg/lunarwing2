@@ -8,8 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Cinstrument-coverage"
-  RUSTDOCFLAGS: "-Cinstrument-coverage -Z unstable-options --persist-doctests target/debug/doctestbins"
+  RUSTFLAGS: "-Cinstrument-coverage --cfg=coverage_nightly"
+  RUSTDOCFLAGS: "-Cinstrument-coverage --cfg=coverage_nightly -Z unstable-options --persist-doctests target/debug/doctestbins"
 
 jobs:
   build:
@@ -29,7 +29,15 @@ jobs:
     - name: run tests
       run: LLVM_PROFILE_FILE="your_name-%p-%m.profraw" cargo test --all-features --verbose
     - name: Generate coverage report
-      run: grcov . --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing --ignore "examples" --ignore "/*" --ignore "src/*test.rs" --ignore "src/fuzzing/*" -o lcov.info
+      run: >
+        grcov . --binary-path ./target/debug/ -s . -t lcov --branch -o lcov.info
+        --ignore-not-existing --ignore "examples" --ignore "/*" --ignore "src/*test.rs" --ignore "src/fuzzing/*"
+        --excl-line "coverage-exclude"
+        --excl-start "coverage-exclude-start"
+        --excl-stop "coverage-exclude-stop"
+        --excl-br-line "coverage-exclude"
+        --excl-br-start "coverage-exclude-start"
+        --excl-br-stop "coverage-exclude-stop"
     - name: Upload coverage
       uses: codecov/codecov-action@v5
       env:

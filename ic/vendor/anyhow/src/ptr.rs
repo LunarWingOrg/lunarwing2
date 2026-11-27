@@ -31,7 +31,7 @@ where
 {
     pub fn new(ptr: Box<T>) -> Self {
         Own {
-            ptr: unsafe { NonNull::new_unchecked(Box::into_raw(ptr)) },
+            ptr: NonNull::from(Box::leak(ptr)),
         }
     }
 

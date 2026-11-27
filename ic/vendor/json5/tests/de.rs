@@ -182,6 +182,11 @@ fn parse_number() {
             "number too large to fit in target type"
         ))
     );
+
+    assert!(from_str::<f64>("-0").is_ok_and(|f| f.is_sign_negative()));
+    assert!(from_str::<f64>("-0.0").is_ok_and(|f| f.is_sign_negative()));
+    assert!(from_str::<f64>("-.0").is_ok_and(|f| f.is_sign_negative()));
+    assert!(from_str::<f64>("-0x0").is_ok_and(|f| f.is_sign_negative()));
 }
 
 // https://spec.json5.org/#strings

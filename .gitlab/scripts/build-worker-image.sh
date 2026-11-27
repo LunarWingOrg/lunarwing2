@@ -225,6 +225,7 @@ lunardepth4lunarwing/health_server_test.py
 lunardepth4lunarwing/config/lunarwing-lane.patch.yml
 lunardepth4lunarwing/config/home-cordis.patch.yml
 lunardepth4lunarwing/config/home.env
+lunardepth4lunarwing/patches/wi902-worker-test-timeouts.patch
 lunardepth4lunarwing/scripts/package.json
 lunardepth4lunarwing/scripts/package-lock.json
 lunardepth4lunarwing/scripts/tsconfig.json

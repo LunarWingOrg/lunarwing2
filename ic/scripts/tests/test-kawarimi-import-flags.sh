@@ -82,6 +82,10 @@ GATEWAY_HOST=0.0.0.0
 MASCOT_ENABLED=true
 NANOCODE_MODEL=test-nanocode-model
 NANOCODE_BASE_URL=https://nanocode.example.test/openai/v1
+OPENCODE2_MODEL=source-open2-model
+OPENCODE2_BASE_URL=https://source-open2.example.test/v1
+LUNARDEPTH_BASE_URL=https://old-depth.example.test/openai/v1
+LUNARDEPTH_API_KEY=old-key-fixture
 KIMI_API_KEY=kimi-manifest-secret
 ENV
   cat >"$work/bundle-src/manifest-bridge.env" <<'ENV'
@@ -214,7 +218,9 @@ worker_output="$(
   KAWARIMI_TEST_WORK="$tmp" \
   bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
     --dry-run --yes \
-    --with-opencode \
+    --with-opencode --with-opencode2 \
+    --opencode2-model target-open2-model \
+    --opencode2-base-url https://target-open2.example.test/v1 \
     2>&1
 )" || {
   status=$?
@@ -228,9 +234,13 @@ worker_output="$(
 add_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* add-tenant ' || true)"
 build_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* build-tenant ' || true)"
 assert_not_contains "add-tenant omits retired --with-nanocode" "$add_line" "--with-nanocode"
-assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode"
+assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode "
 assert_not_contains "build-tenant omits retired --with-nanocode" "$build_line" "--with-nanocode"
-assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode"
+assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode "
+assert_contains "add-tenant carries --with-opencode2" "$add_line" "--with-opencode2"
+assert_contains "build-tenant carries --with-opencode2" "$build_line" "--with-opencode2"
+assert_contains "OpenCode 2 model override takes precedence" "$add_line" "--opencode2-model target-open2-model"
+assert_contains "OpenCode 2 base URL override takes precedence" "$add_line" "--opencode2-base-url https://target-open2.example.test/v1"
 # Unselected worker must NOT appear on either planned call.
 if [[ "$add_line" == *"--with-pebble"* ]]; then
   fail "add-tenant leaked --with-pebble (not selected)"
@@ -297,6 +307,8 @@ rm -f "$tmp/mt-admin.log" "$tmp/scope-migrated"
 cat >"$tmp/home/kawarimi/lunarwing/env/lunarwing.env" <<'ENV'
 SECRETS_MASTER_KEY=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 VISION_AUTH_TOKEN=target-vision-token
+OPENCODE2_MODEL=target-open2-model
+OPENCODE2_BASE_URL=https://target-open2.example.test/v1
 ENV
 cat >"$tmp/home/kawarimi/lunarwing/env/xmpp-bridge.env" <<'ENV'
 XMPP_JID=throwaway@example.test
@@ -310,7 +322,9 @@ auto_output="$(
   PATH="$tmp/bin:$PATH" \
   LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
   KAWARIMI_TEST_WORK="$tmp" \
-  bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" --yes \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" --yes --with-opencode2 \
+    --opencode2-model target-open2-model \
+    --opencode2-base-url https://target-open2.example.test/v1 \
     2>&1
 )" || {
   status=$?
@@ -324,6 +338,10 @@ assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lu
 assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
 assert_file_contains "import injects Kimi key after provisioning" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "KIMI_API_KEY=kimi-manifest-secret"
 assert_file_contains "import restores mascot preference" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "MASCOT_ENABLED=true"
+assert_file_contains "manifest merge preserves the chosen OpenCode 2 model" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "OPENCODE2_MODEL=target-open2-model"
+assert_file_contains "manifest merge preserves the chosen OpenCode 2 base URL" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "OPENCODE2_BASE_URL=https://target-open2.example.test/v1"
+assert_file_not_contains "import ignores legacy LunarDepth route and key" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "LUNARDEPTH_"
+assert_not_contains "legacy LunarDepth keys stay out of import output" "$auto_output" "old-key-fixture"
 assert_file_not_contains "import keeps Kimi key out of mt-admin argv" "$tmp/mt-admin.log" "kimi-manifest-secret"
 if [[ "$auto_output" == *"kimi-manifest-secret"* ]]; then
   fail "import keeps Kimi key out of logs"
@@ -790,9 +808,14 @@ NANOCODE_MODEL=roundtrip-nanocode
 NANOCODE_BASE_URL=https://127.0.0.2:7443/openai/v1
 OPENCODE_MODEL=roundtrip-opencode
 OPENCODE_BASE_URL=https://[::1]:7443/openai/v1
+OPENCODE2_MODEL=roundtrip-opencode2
+OPENCODE2_BASE_URL=https://open2.example.test/v1
 KIMI_API_KEY=encrypted-roundtrip-kimi-secret
 ENV
-chmod 0600 "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
+printf '%s\n' 'LUNARDEPTH_MODEL=tensormoon::function_name::demo' \
+  'LUNARDEPTH_BASE_URL=https://depth.example.test/openai/v1' >"$tmp/export-home/alpha/lunarwing/env/lunardepth.env"
+printf '%s\n' 'LUNARDEPTH_API_KEY=depth-fixture-only-value' >"$tmp/export-home/alpha/lunarwing/env/lunardepth-task.env"
+chmod 0600 "$tmp/export-home/alpha/lunarwing/env/"*.env
 full_export_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
@@ -824,7 +847,7 @@ roundtrip_output="$(
   LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
   KAWARIMI_TEST_WORK="$tmp" \
   KAWARIMI_PASS_FD=9 \
-  bash "$tmp/scripts/import-tenant.sh" "$exported_bundle" --dry-run --yes \
+  bash "$tmp/scripts/import-tenant.sh" "$exported_bundle" --dry-run --yes --with-opencode2 \
     2>&1
 )" || {
   status=$?
@@ -835,6 +858,9 @@ roundtrip_output="$(
 assert_contains "production encrypted export can be imported" "$roundtrip_output" "DRY RUN"
 assert_not_contains "production export omits retired Nanocode model" "$roundtrip_output" "--nanocode-model"
 assert_contains "production export preserves OpenCode model" "$roundtrip_output" "--opencode-model roundtrip-opencode"
+assert_contains "production export preserves OpenCode 2 model" "$roundtrip_output" "--opencode2-model roundtrip-opencode2"
+assert_contains "production export preserves custom OpenCode 2 endpoint" "$roundtrip_output" "--opencode2-base-url https://open2.example.test/v1"
+assert_not_contains "LunarDepth key stays out of export and import output" "$full_export_output$roundtrip_output" "depth-fixture-only-value"
 if [[ "$full_export_output$roundtrip_output" == *"encrypted-roundtrip-kimi-secret"* ]]; then
   fail "encrypted Kimi round-trip does not log plaintext key"
 else
@@ -849,6 +875,7 @@ assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path
 assert_file_contains "encrypted manifest preserves web-written master key quoting" "$manifest_path" 'SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 assert_file_not_contains "encrypted manifest omits retired Nanocode model" "$manifest_path" "NANOCODE_MODEL="
 assert_file_not_contains "encrypted manifest omits retired Nanocode base URL" "$manifest_path" "NANOCODE_BASE_URL="
+assert_file_not_contains "encrypted manifest omits LunarDepth route and key" "$manifest_path" "LUNARDEPTH_"
 for source_local_url in \
   'https://localhost:7443/openai/v1' \
   'https://127.0.0.2:7443/openai/v1' \
@@ -862,14 +889,16 @@ done
 
 echo "=== worker endpoint provenance survives production export (WI#330) ==="
 for url_source in inherited explicit; do
-  sed -i -e '/^OPENCODE_BASE_URL\(_SOURCE\)\?=/d' -e '/^KIMI_BASE_URL\(_SOURCE\)\?=/d' "$source_env"
+  sed -i -E '/^(OPENCODE|OPENCODE2|KIMI)_BASE_URL(_SOURCE)?=/d' "$source_env"
   cat >>"$source_env" <<'ENV'
 OPENCODE_BASE_URL="https://opencode.example.test/v1"
+OPENCODE2_BASE_URL="https://opencode2.example.test/v1"
 KIMI_BASE_URL="https://kimi.example.test/v1"
 ENV
   if [[ "$url_source" == inherited ]]; then
     # Quoted markers are valid too: export must use the env decoder.
-    printf '%s\n' 'OPENCODE_BASE_URL_SOURCE="inherited"' "KIMI_BASE_URL_SOURCE='inherited'" >>"$source_env"
+    printf '%s\n' 'OPENCODE_BASE_URL_SOURCE="inherited"' 'OPENCODE2_BASE_URL_SOURCE="inherited"' \
+      "KIMI_BASE_URL_SOURCE='inherited'" >>"$source_env"
   fi
   worker_out="$tmp/worker-export-$url_source"
   mkdir -m 700 "$worker_out"
@@ -885,7 +914,7 @@ ENV
   worker_bundle="$(printf '%s\n' "$worker_out/"*.7z)"
   printf '%s\n' "$full_passphrase" | 7z x -o"$worker_out/extracted" "$worker_bundle" -y >/dev/null 2>&1
   worker_manifest="$(find "$worker_out/extracted" -name manifest-lunarwing.env -print -quit)"
-  for worker in OPENCODE KIMI; do
+  for worker in OPENCODE OPENCODE2 KIMI; do
     if [[ "$url_source" == inherited ]]; then
       assert_file_not_contains "export omits inherited $worker endpoint" "$worker_manifest" "${worker}_BASE_URL="
     else

@@ -49,6 +49,11 @@ Encrypted `.7z` imports require the bundle passphrase even for dry-run because
 the metadata must be decrypted before validation. A real export requires a
 confirmed passphrase of at least 12 characters before it can stop services.
 
+Use **Restore OpenCode 2 worker** to select that lane during import. The optional
+model and base URL fields override values in the bundle. For a LunarDepth
+migration, use the shell importer with a destination route and key as described
+in the [migration guide](../docs/ops/MT-MACHINE-MIGRATION.md#3-import--cut-over-on-the-new-host).
+
 The upgrade form drives `lunarwing-mt-admin.sh upgrade-tenant`, accepts a branch,
 tag, or commit such as `v2.0.2.0`, and applies immediately after explicit
 confirmation. Backup and service-unit rendering remain enabled by default.
@@ -114,10 +119,12 @@ relay without re-running provisioning.
 
 Import (Kawarimi) forms do not expose a WeeChat opt-out control.
 
-The provision form also exposes current controls for the daemon LLM base URL
-and OpenCode/Kimi Code model and base-URL
-overrides. The XMPP control customizes the identity; leaving it off uses the
-default `<tenant>@xmpp.localhost` bridge rather than disabling XMPP.
+The provision form exposes the daemon LLM base URL and model and base URL
+overrides for OpenCode, OpenCode 2, and Kimi Code. Selecting **LunarDepth**
+requires an explicit OpenAI-compatible API root, a complete TensorMoon or
+TensorZero function model ID, and a per-tenant API key. The review screen shows
+which workers you selected and hides the API key. The XMPP control customizes
+the identity, which defaults to `<tenant>@xmpp.localhost`.
 
 ## Browser end-to-end tests
 

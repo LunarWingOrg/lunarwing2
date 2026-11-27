@@ -172,6 +172,14 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub always_require_approval: Vec<String>,
 
+    /// Keep this server's tools out of every autonomous context (routines,
+    /// background jobs, missions) and out of shared conversations (group
+    /// chats, rooms): they only run in a private interactive turn, under the
+    /// normal approval rules. Intended for servers that act on something the
+    /// owner is looking at, such as desktop control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interactive_only: bool,
+
     /// Package provenance record (identity, trust state, runtime artifact digest).
     /// Absent means unverified legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +237,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            interactive_only: false,
             provenance: None,
             sandbox: None,
         }
@@ -270,6 +279,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            interactive_only: false,
             provenance: None,
             sandbox: None,
         }
@@ -292,6 +302,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            interactive_only: false,
             provenance: None,
             sandbox: None,
         }
@@ -317,6 +328,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            interactive_only: false,
             provenance: None,
             sandbox: None,
         }
@@ -408,6 +420,12 @@ impl McpServerConfig {
         tools: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.always_require_approval = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Keep this server's tools out of autonomous contexts.
+    pub fn with_interactive_only(mut self, interactive_only: bool) -> Self {
+        self.interactive_only = interactive_only;
         self
     }
 

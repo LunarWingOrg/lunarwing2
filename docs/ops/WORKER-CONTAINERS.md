@@ -1928,7 +1928,13 @@ These are source-review and local rootless results, not claims of protected publ
 
 The fix raises the shared default to `timeoutMs: 30_000` — above vitest's 5 s test timeout — and drives the deadline test with fake timers: `MockAdapter.entered` resolves when a model request is in flight, and only then does the test advance 10 ms and assert `timed_out` with the partial output. Only "enforces the task deadline" can observe the deadline. Mutation check: replacing `this.cancel('timed_out')` with a no-op in `src/task.ts` fails exactly that test (4 passed, it times out at 5 s). Under CPU contention (suite pinned to one core beside 24 busy loops) the file passes with the fix; the previous spec failed the same way with `Task exceeded 10 ms` and `output: ''`.
 
-Bump checklist dispositions: the diff adds no exposure or publication surface (test file only), the source package stays `0.2.1-alpha.1`, and both ancestry markers `17aef23e05cc` and `8c610180c84a` remain ancestors. The lockfile, toolchain, Debian snapshot, native inputs, and profile template are byte-identical, so `PROFILE_SCHEMA_VERSION=1` does not move. Every inventory moved together: `lunardepth4lunarwing/Dockerfile`, `.gitlab/scripts/build-worker-image.sh` (source_ref and build_args), `.gitlab/scripts/validate_config.py`, `.gitlab/go/dockerfile-parse/lunardepth.go` and its test, `lunardepth4lunarwing/scripts/{exposure_policy_assert.py,image_config_policy.py,image_config_policy_test.py,runtime_smoke_entrypoint.sh}`. The protected candidate/rebuild digest match, out-of-band exposure verification, CRITICAL scan, and green `worker-lunardepth-candidate` remain required on the MR's pipeline.
+Bump checklist dispositions: the diff adds no exposure or publication surface (test file only), the source package stays `0.2.1-alpha.1`, and both ancestry markers `17aef23e05cc` and `8c610180c84a` remain ancestors. The lockfile, toolchain, Debian snapshot, native inputs, and profile template are byte-identical, so `PROFILE_SCHEMA_VERSION=1` does not move. Every inventory moved together: `lunardepth4lunarwing/Dockerfile`, `.gitlab/scripts/build-worker-image.sh` (source_ref and build_args), `.gitlab/scripts/validate_config.py`, `.gitlab/go/dockerfile-parse/lunardepth.go` and its test, `lunardepth4lunarwing/scripts/{exposure_policy_assert.py,image_config_policy.py,image_config_policy_test.py,runtime_smoke_entrypoint.sh}`. The protected candidate/rebuild digest match, out-of-band exposure verification, and CRITICAL scan remain required. `worker-lunardepth-candidate` can be started on a protected default-branch push or release tag, not an MR pipeline.
+
+### WI#902 build-only test timeout backport
+
+The worker image build sets `DSH_COVERAGE_TEST_TIMEOUT_MS=90000` only for the focused Vitest run, matching LunarDepth's shared-runner CI default. The builder applies `lunardepth4lunarwing/patches/wi902-worker-test-timeouts.patch` to the pinned checkout: cancellation waits up to 30 s for the model request, the profile ready/pong polls use the existing profile wait budget of 20 s, and non-deadline task fixtures use 120 s so their timers do not preempt Vitest. The 10 ms fake-timer deadline test is unchanged. The patch is a hashed CI build input; it changes only test files and leaves the source pin, lockfile, profile schema, and runtime deadlines unchanged.
+
+Local verification used the pinned checkout and Vitest 4.1.8 (Node 24.21.0). All 35 worker tests passed. Delaying the cancellation mock by 5,500 ms before it records the model request let all five `task.spec.ts` tests pass, with the cancellation case taking 5,863 ms. Running that case alone with the default Vitest budget failed at the 5 s limit; keeping the raised budget but restoring the default `vi.waitFor` failed the request-length check. Removing the timer registration from `src/task.ts` in the scratch checkout failed only the deadline test, using a 5 s Vitest watchdog for that negative run. These checks do not replace the MR pipeline or the manual `worker-lunardepth-candidate` on the first master pipeline carrying the change.
 
 ### Ports, rollout, and rollback
 
@@ -4818,3 +4824,58 @@ Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers o
 ## Proxy Note
 
 On networks with TLS-intercepting proxies (e.g., corporate networks), Docker builds will fail with "server certificate not trusted" errors. Either build on a network without MITM proxies, or add the proxy CA certificate to each Dockerfile before the `apt-get`/`apk` steps.
+
+
+## v2.2.3.0 worker upstream re-check — WI#916 (2026-11-27)
+
+**Release review on hold; no pins moved.** SweetieBot recorded the release
+metadata, source findings, and maintainer choices in
+[WI#916 note 23349](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23349).
+The 09:07Z check used the npm packument's `latest` dist-tag and `time` map,
+and `git ls-remote --tags` on `anomalyco/opencode` with GitHub release
+`published_at` timestamps. Both OpenCode tags below resolve directly to commits.
+
+| Lane | Release | Published (UTC) | 24-hour boundary (UTC) | Result |
+|---|---|---|---|---|
+| Kimi | `2.8.1` (`latest`) | 2026-11-26 11:55:36.675 | 2026-11-27 11:55:36.675 | Inside its window at intake |
+| Kimi | `2.7.3` | 2026-11-23 16:38:52.044 | 2026-11-24 16:38:52.044 | Eligible; `2.7.2` retained pending feedback decision |
+| OpenCode 2 | `v2.4.2` at `fc31a485317970bcf6be7b431a9830aaef875731` | 2026-11-26 00:59:05 | 2026-11-27 00:59:05 | Eligible; `v2.3.2` retained pending exposure decision |
+| OpenCode v1 | `v1.19.6` at `f4e363c8295fa90a03dddc451882fffe8fbce357` | 2026-11-17 07:21:32 | 2026-11-18 07:21:32 | Re-checked; no newer stable v1 tag |
+
+Kimi `2.8.0` was superseded by `2.8.1` before its own window ended. Neither
+`2.8.x` release was installed, built, or run. The registry tarball's SHA-512
+matched the temporary `2.7.3` lock; its test install began at 09:11:28Z, after
+the window. The repository lock and the worker image were not updated.
+
+**Kimi.** The `2.7.3` registry bundle adds KAP feedback routes that can send
+feedback and attach session/log data via an OAuth-backed gateway. Its new
+`KIMI_CODE_FEEDBACK_BASE_URL` override is not set by the lane and is dropped
+from task-supplied environment by `TASK_SETTABLE_KIMI_CODE_ENV`. That scrub
+is not a feedback off switch. The decision to accept or pin off the feedback
+surface is on the work item; no feedback route was exercised. The candidate's
+`--help` and hidden server command definitions match the guard's listener list.
+All 25 in-scope listener shapes were classified as denied without starting a
+listener. With a loopback mock provider, the candidate returned an actual
+PreToolUse denial as a tool error; the real-CLI contract passed all four tests.
+Separate benign probes confirmed that a hook exit of 1 or a CLI hook timeout
+still allows the Bash tool to run, unlike the guard's explicit exit of 2.
+
+**OpenCode 2.** The `v2.4.2` source still gates Console watches and artifact
+operations on their respective flags. It deleted `mcp_events`, so the wrapper's
+`-mcp_events` no longer controls MCP event discovery. Automations now default
+on via top-level config and can react to MCP events or run scheduled actions.
+The unmodified OpenTunnel compile-out passes at the retained `v2.3.2` source
+and stops on flag resolver/registry drift before stubbing `v2.4.2`. The local
+`worker-exposure-policy-guard` command passed on the retained pins; this is
+not a pass against `v2.4.2`. There is no bumped candidate image, so
+`console_policy_eval.py` against one is deferred, as are full bumped-image
+builds and CI proof. No wrapper, flag anchor, or base-image pins changed.
+
+**Record only.** The image's Pebble upstream, `nanogpt-community/pebble`,
+still has HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`, equal to its pin.
+`lunarwing/lunardepth` on GitLab has advanced to
+`4106cd15771d8c94d73bab22541fb4a980390de8` from the image pin
+`ca905dfe5e998ebcac29f5c57b5ea04108498468`. Neither is in scope for a bump.
+
+Re-check the current releases and windows when the maintainer answers WI#916.
+Run the full bump checklist on the reviewed revision before seeking merge.

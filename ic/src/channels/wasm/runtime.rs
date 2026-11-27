@@ -6,13 +6,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
 use wasmtime::{Config, Engine, OptLevel};
 
 use crate::channels::wasm::error::WasmChannelError;
-use crate::tools::wasm::{FuelConfig, ResourceLimits};
+use crate::tools::wasm::{EPOCH_TICK_INTERVAL, FuelConfig, ResourceLimits};
 
 /// Configuration for the WASM channel runtime.
 #[derive(Debug, Clone)]
@@ -27,7 +28,7 @@ pub struct WasmChannelRuntimeConfig {
     pub cache_dir: Option<PathBuf>,
     /// Cranelift optimization level.
     pub optimization_level: OptLevel,
-    /// Default callback timeout.
+    /// Caller-facing callback timeout, separate from the guest's epoch deadline.
     pub callback_timeout: Duration,
 }
 
@@ -171,6 +172,23 @@ impl WasmChannelRuntime {
             WasmChannelError::Config(format!("Failed to create Wasmtime engine: {}", e))
         })?;
 
+        // Don't keep the engine alive after its last user goes away.
+        let ticker_engine = engine.weak();
+        thread::Builder::new()
+            .name("wasm-channel-epoch-ticker".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(EPOCH_TICK_INTERVAL);
+                    let Some(engine) = ticker_engine.upgrade() else {
+                        break;
+                    };
+                    engine.increment_epoch();
+                }
+            })
+            .map_err(|e| {
+                WasmChannelError::Config(format!("Failed to spawn channel epoch ticker: {e}"))
+            })?;
+
         Ok(Self {
             engine,
             config,
@@ -278,7 +296,47 @@ impl std::fmt::Debug for WasmChannelRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use wasmtime::{Instance, Module, Store, Trap};
+
     use crate::channels::wasm::runtime::{WasmChannelRuntime, WasmChannelRuntimeConfig};
+
+    #[test]
+    fn test_channel_epoch_ticker_advances_without_retaining_engine() {
+        let weak_engine = {
+            let runtime = WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap();
+            let engine = runtime.engine();
+            let module = Module::new(engine, r#"(module (func (export "noop")))"#).unwrap();
+            let mut store = Store::new(engine, ());
+            store
+                .set_fuel(runtime.config().default_limits.fuel)
+                .unwrap();
+            let instance = Instance::new(&mut store, &module, &[]).unwrap();
+            let noop = instance
+                .get_typed_func::<(), ()>(&mut store, "noop")
+                .unwrap();
+            store.set_epoch_deadline(1);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let error = loop {
+                if let Err(error) = noop.call(&mut store, ()) {
+                    break error;
+                }
+                assert!(Instant::now() < deadline, "channel engine did not tick");
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
+            engine.weak()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak_engine.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "ticker kept the engine alive");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn test_runtime_config_default() {

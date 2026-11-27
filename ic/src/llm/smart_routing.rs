@@ -865,11 +865,22 @@ impl SmartRoutingProvider {
     ///
     /// Priority: explicit tier hints > pattern overrides > 13-dimension scorer.
     fn classify(&self, request: &CompletionRequest) -> TaskComplexity {
+        // Tool-result images (screenshots) come from multi-step tool work and
+        // the cheap model may have no vision: keep such requests on primary.
+        if request
+            .messages
+            .iter()
+            .any(|m| crate::tools::images::is_tool_images_message(m) && !m.content_parts.is_empty())
+        {
+            return TaskComplexity::Complex;
+        }
+        // Classify on what the user wrote, never on the synthetic message
+        // that carries tool-result images.
         let last_user_msg = request
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::User)
+            .find(|m| m.role == Role::User && !crate::tools::images::is_tool_images_message(m))
             .map(|m| m.content.as_str())
             .unwrap_or("");
 
@@ -1612,6 +1623,37 @@ mod tests {
         let req = CompletionRequest::new(vec![ChatMessage::user("Hi")]);
         let complexity = provider.classify(&req);
         assert_eq!(complexity, TaskComplexity::Simple);
+    }
+
+    #[test]
+    fn tool_image_messages_never_drive_classification() {
+        // Regression: the synthetic message carrying tool-result images is the
+        // last user-role message of a computer-use turn. Classifying on it sent
+        // the final answer (and the screenshots) to the cheap model.
+        let primary = Arc::new(StubLlm::new("p").with_model_name("primary"));
+        let cheap = Arc::new(StubLlm::new("c").with_model_name("cheap"));
+        let provider = SmartRoutingProvider::new(primary, cheap, default_config());
+        let image_text =
+            crate::tools::images::tool_images_message_text([("desktop_screenshot", "c1", 1)]);
+
+        let with_images = CompletionRequest::new(vec![
+            ChatMessage::user("Hi"),
+            ChatMessage::user_with_parts(
+                image_text.clone(),
+                vec![crate::llm::ContentPart::ImageUrl {
+                    image_url: crate::llm::ImageUrl {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                }],
+            ),
+        ]);
+        assert_eq!(provider.classify(&with_images), TaskComplexity::Complex);
+
+        // Images already dropped by retention: classify on the user's text.
+        let dropped =
+            CompletionRequest::new(vec![ChatMessage::user("Hi"), ChatMessage::user(image_text)]);
+        assert_eq!(provider.classify(&dropped), TaskComplexity::Simple);
     }
 
     #[test]

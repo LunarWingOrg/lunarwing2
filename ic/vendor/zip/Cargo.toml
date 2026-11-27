@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "zip"
-version = "9.8.1"
+version = "9.8.2"
 authors = [
     "Mathijs van de Nes <git@mathijs.vd-nes.nl>",
     "Marli Frost <marli@frost.red>",

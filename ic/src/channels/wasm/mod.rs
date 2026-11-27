@@ -46,7 +46,7 @@
 //! 1. **Fresh Instance Per Callback** (NEAR Pattern) - Full isolation, no shared mutable state
 //! 2. **Host Manages Infrastructure** - HTTP server, polling, timing in Rust
 //! 3. **WASM Defines Behavior** - Callbacks for events, message parsing, response handling
-//! 4. **Reuse Tool Runtime** - Share Wasmtime engine, extend capabilities
+//! 4. **Separate Channel Engine** - Shares sandbox primitives with tools, but has its own epoch ticker
 //!
 //! # Security Model
 //!
@@ -57,7 +57,7 @@
 //! | State pollution | Fresh instance per callback |
 //! | Workspace escape | Paths prefixed with `channels/<name>/` |
 //! | Message spam | Rate limiting on `emit_message` |
-//! | Resource exhaustion | Fuel metering, memory limits, callback timeout |
+//! | Resource exhaustion | Fuel metering, memory limits, guest epoch deadline |
 //! | Polling abuse | Minimum 30s interval enforced |
 //!
 //! # Example Usage
@@ -65,7 +65,7 @@
 //! ```ignore
 //! use lunarwing::channels::wasm::{WasmChannelLoader, WasmChannelRuntime};
 //!
-//! // Create runtime (can share engine with tool runtime)
+//! // Create the channel runtime
 //! let runtime = WasmChannelRuntime::new(config)?;
 //!
 //! // Load channels from directory

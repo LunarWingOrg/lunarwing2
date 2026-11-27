@@ -52,6 +52,9 @@ pub struct Decoder<'a, W: Write> {
 /// If it is dropped because the wrapped writer panicked, the stream is left
 /// unfinished and the writer is not used again.
 ///
+/// If it is dropped by any other panic, the stream is still finished; should
+/// the writer or the callback panic in turn, that second panic is discarded.
+///
 /// [`auto_finish()`]: Encoder::auto_finish
 /// [`Encoder`]: Encoder
 pub struct AutoFinishEncoder<
@@ -72,6 +75,9 @@ pub struct AutoFinishEncoder<
 /// If it is dropped because the wrapped writer panicked, nothing is flushed
 /// and the writer is not used again.
 ///
+/// If it is dropped by any other panic, the stream is still flushed; should
+/// the writer or the callback panic in turn, that second panic is discarded.
+///
 /// [`auto_flush()`]: Decoder::auto_flush
 /// [`Decoder`]: Decoder
 pub struct AutoFlushDecoder<
@@ -83,6 +89,22 @@ pub struct AutoFlushDecoder<
     decoder: Option<Decoder<'a, W>>,
 
     on_flush: Option<F>,
+}
+
+/// Runs the work that a wrapper does when it is dropped.
+///
+/// This work calls the wrapped writer and the callback, which may panic. If
+/// the wrapper is being dropped by a panic that unwinds the stack, a second
+/// panic leaving `drop()` would abort the process: it stops here instead.
+fn run_on_drop<F: FnOnce()>(f: F) {
+    if !std::thread::panicking() {
+        return f();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Err(panic) = result {
+        // Dropping a payload runs arbitrary code, which could panic too.
+        std::mem::forget(panic);
+    }
 }
 
 impl<'a, W: Write, F: FnMut(io::Result<()>)> AutoFlushDecoder<'a, W, F> {
@@ -122,10 +144,13 @@ where
         if decoder.writer.panicked() {
             return;
         }
-        let result = decoder.flush();
-        if let Some(mut on_finish) = self.on_flush.take() {
-            on_finish(result);
-        }
+        let on_flush = self.on_flush.take();
+        run_on_drop(move || {
+            let result = decoder.flush();
+            if let Some(mut on_flush) = on_flush {
+                on_flush(result);
+            }
+        });
     }
 }
 
@@ -172,10 +197,13 @@ impl<W: Write, F: FnMut(io::Result<W>)> Drop for AutoFinishEncoder<'_, W, F> {
         if encoder.writer.panicked() {
             return;
         }
-        let result = encoder.finish();
-        if let Some(mut on_finish) = self.on_finish.take() {
-            on_finish(result);
-        }
+        let on_finish = self.on_finish.take();
+        run_on_drop(move || {
+            let result = encoder.finish();
+            if let Some(mut on_finish) = on_finish {
+                on_finish(result);
+            }
+        });
     }
 }
 
@@ -187,6 +215,17 @@ impl<W: Write, F: FnMut(io::Result<W>)> Write for AutoFinishEncoder<'_, W, F> {
     fn flush(&mut self) -> io::Result<()> {
         self.encoder.as_mut().unwrap().flush()
     }
+}
+
+/// `zio::Writer::new()`, but failing with an `OutOfMemory` error instead of
+/// aborting when its buffer cannot be allocated.
+fn try_writer<W: Write, D: raw::Operation>(
+    writer: W,
+    operation: D,
+) -> io::Result<zio::Writer<W, D>> {
+    // The same 32KB buffer as `zio::Writer::new()`.
+    let buffer = crate::vec_with_capacity(32 * 1024)?;
+    Ok(zio::Writer::with_output_buffer(buffer, writer, operation))
 }
 
 impl<W: Write> Encoder<'static, W> {
@@ -211,7 +250,21 @@ impl<W: Write> Encoder<'static, W> {
         dictionary: &[u8],
     ) -> io::Result<Self> {
         let encoder = raw::Encoder::with_dictionary(level, dictionary)?;
-        Ok(Self::with_encoder(writer, encoder))
+        Ok(Self::with_writer(try_writer(writer, encoder)?))
+    }
+
+    /// Creates a new encoder with a prefix it owns, as single-use dictionary.
+    ///
+    /// `prefix` gives the bytes without copying them: a `Vec<u8>`, an
+    /// `Arc<[u8]>`, a memory map... Unlike [`Encoder::with_ref_prefix()`],
+    /// the frame can use worker threads ([`Encoder::multithread()`]).
+    pub fn with_prefix<P>(writer: W, level: i32, prefix: P) -> io::Result<Self>
+    where
+        P: std::ops::Deref + Send + Sync + 'static,
+        P::Target: AsRef<[u8]>,
+    {
+        let encoder = raw::Encoder::with_prefix(level, prefix)?;
+        Ok(Self::with_writer(try_writer(writer, encoder)?))
     }
 }
 
@@ -240,18 +293,27 @@ impl<'a, W: Write> Encoder<'a, W> {
     ///
     /// (Provides better compression ratio for small files,
     /// but requires the dictionary to be present during decompression.)
+    ///
+    /// The encoder keeps its own handle to the dictionary, so it does not
+    /// borrow it.
     pub fn with_prepared_dictionary<'b>(
         writer: W,
-        dictionary: &'a EncoderDictionary<'b>,
+        dictionary: &EncoderDictionary<'b>,
     ) -> io::Result<Self>
     where
         'b: 'a,
     {
         let encoder = raw::Encoder::with_prepared_dictionary(dictionary)?;
-        Ok(Self::with_encoder(writer, encoder))
+        Ok(Self::with_writer(try_writer(writer, encoder)?))
     }
 
     /// Creates a new encoder, using a ref prefix
+    ///
+    /// The prefix is borrowed: with worker threads
+    /// ([`Encoder::multithread()`]), the frame is still compressed on the
+    /// calling thread, and the parameters that need them (`RSyncable`, say)
+    /// have no effect on it. [`Encoder::with_prefix()`] takes an owned
+    /// prefix, which can use them.
     pub fn with_ref_prefix<'b>(
         writer: W,
         level: i32,
@@ -261,7 +323,7 @@ impl<'a, W: Write> Encoder<'a, W> {
         'b: 'a,
     {
         let encoder = raw::Encoder::with_ref_prefix(level, ref_prefix)?;
-        Ok(Self::with_encoder(writer, encoder))
+        Ok(Self::with_writer(try_writer(writer, encoder)?))
     }
 
     /// Returns a wrapper around `self` that will finish the stream on drop.
@@ -321,8 +383,9 @@ impl<'a, W: Write> Encoder<'a, W> {
     /// This returns the inner writer if the finish was successful, or the
     /// object plus an error if it wasn't.
     ///
-    /// `write` on this object will panic after `try_finish` has been called,
-    /// even if it fails.
+    /// Do not write more data after calling `try_finish`, even if it failed:
+    /// call it again instead. Once the end of the frame is being written,
+    /// `write` returns an error.
     pub fn try_finish(mut self) -> Result<W, (Self, io::Error)> {
         match self.writer.finish() {
             // Return the writer, because why not
@@ -369,7 +432,7 @@ impl<W: Write> Decoder<'static, W> {
     /// but requires the dictionary to be present during decompression.)
     pub fn with_dictionary(writer: W, dictionary: &[u8]) -> io::Result<Self> {
         let decoder = raw::Decoder::with_dictionary(dictionary)?;
-        Ok(Self::with_decoder(writer, decoder))
+        Ok(Self::with_writer(try_writer(writer, decoder)?))
     }
 }
 
@@ -416,7 +479,7 @@ impl<'a, W: Write> Decoder<'a, W> {
         'b: 'a,
     {
         let decoder = raw::Decoder::with_prepared_dictionary(dictionary)?;
-        Ok(Self::with_decoder(writer, decoder))
+        Ok(Self::with_writer(try_writer(writer, decoder)?))
     }
 
     /// Acquires a reference to the underlying writer.

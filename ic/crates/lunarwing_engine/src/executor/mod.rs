@@ -10,6 +10,7 @@
 //! (`__retrieve_docs__`) returned raw doc content. The live seams are
 //! neutralized at the handler and the LLM adapter instead.
 
+pub mod action_images;
 pub mod compaction;
 mod llm_stream;
 pub mod loop_engine;

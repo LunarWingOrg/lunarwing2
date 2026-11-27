@@ -11,9 +11,16 @@
 
 [package]
 edition = "2018"
+rust-version = "1.85"
 name = "const-random"
-version = "0.1.18"
+version = "0.1.20"
 authors = ["Tom Kaitchuck <Tom.Kaitchuck@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Provides compile time random number generation."
 documentation = "https://docs.rs/const-random"
 readme = "README.md"
@@ -25,5 +32,13 @@ keywords = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tkaitchuck/constrandom"
 
+[lib]
+name = "const_random"
+path = "src/lib.rs"
+
+[[test]]
+name = "tests"
+path = "tests/tests.rs"
+
 [dependencies.const-random-macro]
-version = "0.1.16"
+version = "0.1.17"

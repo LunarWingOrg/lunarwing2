@@ -35,6 +35,7 @@ _WORKER_LABELS = {
     "opencode": "OpenCode worker",
     "kimi": "Kimi worker",
     "opencode2": "OpenCode 2 worker",
+    "lunardepth": "LunarDepth worker",
 }
 
 # A selected worker needs an allocated and listening WSS port. mt-admin

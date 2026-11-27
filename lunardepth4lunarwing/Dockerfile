@@ -62,15 +62,17 @@ RUN set -eu; \
 COPY scripts/prepare_lockfile_deploy.py /build/scripts/
 RUN python3 /build/scripts/prepare_lockfile_deploy.py /src/deepseek-harness/scripts/build-exe-for-python-sdk.ts
 
+COPY patches/wi902-worker-test-timeouts.patch /build/patches/
 WORKDIR /src/deepseek-harness
 RUN set -eu; \
+    git -C /src apply --whitespace=error-all /build/patches/wi902-worker-test-timeouts.patch; \
     . /build/scripts/worker-download-retry.sh; \
     before="$(sha256sum pnpm-lock.yaml)"; \
     wdr_retry "pnpm frozen-lockfile install" "rm -rf node_modules" \
       'pnpm install --frozen-lockfile'; \
     test "$before" = "$(sha256sum pnpm-lock.yaml)"; \
     pnpm exec tsx native/system/scripts/build.ts; \
-    pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
+    DSH_COVERAGE_TEST_TIMEOUT_MS=90000 pnpm exec vitest run packages/api/lunarwing-worker/tests packages/bundle/lunarwing-worker/tests; \
     pnpm exec tsc -b packages/api/lunarwing-worker/tsconfig.json packages/bundle/lunarwing-worker/tsconfig.json --pretty false
 
 COPY scripts/deploy_build_approval.py scripts/verify_deployed_closure.ts /build/scripts/

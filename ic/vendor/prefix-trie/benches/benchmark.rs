@@ -1,281 +1,455 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use ip_network_table_deps_treebitmap::IpLookupTable;
-use ipnet::Ipv4Net;
-use prefix_trie::*;
-use rand::prelude::*;
-use std::collections::HashSet;
-use std::net::Ipv4Addr;
+#![allow(dead_code)]
+mod common;
+use common::*;
 
 const ITERS: usize = 100_000;
-const NUM_SPARSE_ADDR: usize = 20;
 
-enum Insn {
-    Insert(Ipv4Addr, u8, u32),
-    Remove(Ipv4Addr, u8),
-    ExactMatch(Ipv4Addr, u8),
-    LongestPrefixMatch(Ipv4Addr, u8),
+use criterion::{
+    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion,
+    Throughput,
+};
+use ipnet::{Ipv4Net, Ipv6Net};
+use prefix_trie::{Prefix, PrefixMap, PrefixSet};
+use rand::prelude::*;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
+
+trait BenchPrefix
+where
+    Self: Prefix + Copy + Eq + Ord + Hash + DataSampler,
+{
+}
+impl<P> BenchPrefix for P where Self: Prefix + Copy + Eq + Ord + Hash + DataSampler {}
+
+fn bench_one<P, M>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    setup: &[Insn<P>],
+    insn: &[Insn<P>],
+    shuffle_insn: bool,
+) where
+    P: BenchPrefix,
+    M: BenchMap<P>,
+{
+    let mut rng = StdRng::seed_from_u64(0);
+    group.bench_function(M::NAME, |b| {
+        b.iter_with_setup(
+            || {
+                let insn = if shuffle_insn {
+                    let mut insn = insn.to_vec();
+                    insn.shuffle(&mut rng);
+                    Cow::Owned(insn)
+                } else {
+                    Cow::Borrowed(insn)
+                };
+                let mut map = M::new_empty();
+                map.run(setup);
+                (map, insn)
+            },
+            |(mut map, insn)| {
+                map.run(&insn);
+                map
+            },
+        )
+    });
 }
 
-fn min_prefix_len(addr: u32) -> u8 {
-    let mut bit: u32 = 0x00000001;
-    let mut len: u8 = 32;
-    while len > 0 && bit & addr == 0 {
-        len = len.saturating_sub(1);
-        (bit, _) = bit.overflowing_shl(1);
+fn bench_all<P>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    setup: &[Insn<P>],
+    insn: &[Insn<P>],
+    shuffle_insn: bool,
+) where
+    P: BenchPrefix,
+{
+    bench_one::<P, PrefixMap<P, u32>>(group, setup, insn, shuffle_insn);
+    bench_one::<P, P::IpLookupTable>(group, setup, insn, shuffle_insn);
+    bench_one::<P, HashMap<P, u32>>(group, setup, insn, shuffle_insn);
+    bench_one::<P, BTreeMap<P, u32>>(group, setup, insn, shuffle_insn);
+}
+
+fn bgp_mods_random_for<P>(c: &mut Criterion, group_name: &str, ordering: SortingOrder)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, ordering);
+    let setup = fill_table(0, &addrs);
+    let insn = P::random_mutations(0, &addrs, ITERS);
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(insn.len() as u64));
+    bench_all(&mut group, &setup, &insn, false);
+    group.finish();
+}
+
+pub fn bgp_mods_random_ipv4(c: &mut Criterion) {
+    bgp_mods_random_for::<Ipv4Net>(c, "bgp-mods-random-ipv4", SortingOrder::Random);
+}
+
+pub fn bgp_mods_random_ipv6(c: &mut Criterion) {
+    bgp_mods_random_for::<Ipv6Net>(c, "bgp-mods-random-ipv6", SortingOrder::Random);
+}
+
+fn bgp_lookup_random_for<P>(c: &mut Criterion, group_name: &str, ordering: SortingOrder)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, ordering);
+    let setup = fill_table(0, &addrs);
+    let insn = P::random_lookups(0, &addrs, ITERS);
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(insn.len() as u64));
+    bench_all(&mut group, &setup, &insn, false);
+    group.finish();
+}
+
+pub fn bgp_lookup_random_ipv4(c: &mut Criterion) {
+    bgp_lookup_random_for::<Ipv4Net>(c, "bgp-lookup-random-ipv4", SortingOrder::Random);
+}
+
+pub fn bgp_lookup_random_ipv6(c: &mut Criterion) {
+    bgp_lookup_random_for::<Ipv6Net>(c, "bgp-lookup-random-ipv6", SortingOrder::Random);
+}
+
+fn bench_lpm_one<P, M>(group: &mut BenchmarkGroup<'_, WallTime>, setup: &[Insn<P>], addrs: &[P])
+where
+    P: BenchPrefix,
+    M: BenchLpm<P>,
+{
+    let mut map = M::new_empty();
+    map.run(setup);
+    group.bench_function(M::NAME, |b| {
+        b.iter(|| {
+            for addr in addrs {
+                std::hint::black_box(map.longest_match(*addr));
+            }
+        })
+    });
+}
+
+/// Longest-prefix match of random host addresses. `HashMap` and `BTreeMap` are omitted, as they
+/// have no native longest-prefix match.
+fn bgp_lpm_random_for<P>(c: &mut Criterion, group_name: &str)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, SortingOrder::Random);
+    let setup = fill_table(0, &addrs);
+    let hosts = P::random_hosts(0, &addrs, ITERS);
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(hosts.len() as u64));
+    bench_lpm_one::<P, PrefixMap<P, u32>>(&mut group, &setup, &hosts);
+    bench_lpm_one::<P, P::IpLookupTable>(&mut group, &setup, &hosts);
+    group.finish();
+}
+
+pub fn bgp_lpm_random_ipv4(c: &mut Criterion) {
+    bgp_lpm_random_for::<Ipv4Net>(c, "bgp-lpm-random-ipv4");
+}
+
+pub fn bgp_lpm_random_ipv6(c: &mut Criterion) {
+    bgp_lpm_random_for::<Ipv6Net>(c, "bgp-lpm-random-ipv6");
+}
+
+fn bench_clone_one<P, T, M>(group: &mut BenchmarkGroup<'_, WallTime>, setup: &[Insn<P>])
+where
+    P: BenchPrefix,
+    T: BenchValue,
+    M: BenchTraverse<P, T>,
+{
+    let mut map = M::new_empty();
+    map.run(setup);
+    group.bench_function(M::NAME, |b| {
+        // Drop each copy outside the timed region. Keep only one copy at a time
+        // because cloning a full BGP table can allocate a large amount of memory.
+        b.iter_batched(
+            || (),
+            |()| std::hint::black_box(&map).clone_map(),
+            BatchSize::PerIteration,
+        )
+    });
+}
+
+fn bench_iter_one<P, M>(group: &mut BenchmarkGroup<'_, WallTime>, setup: &[Insn<P>])
+where
+    P: BenchPrefix,
+    M: BenchTraverse<P>,
+{
+    let mut map = M::new_empty();
+    map.run(setup);
+    group.bench_function(M::NAME, |b| {
+        b.iter(|| std::hint::black_box(&map).consume_entries())
+    });
+}
+
+/// Whole-table copying and native entry traversal for all four maps.
+/// TreeBitMap is rebuilt for the clone benchmark; the others use `Clone`.
+/// Iteration consumes each entry, without sorting unordered map output.
+fn bgp_traverse_for<P>(c: &mut Criterion, family: &str)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, SortingOrder::Random);
+    let setup = fill_table(0, &addrs);
+    let len = addrs.iter().collect::<HashSet<_>>().len() as u64;
+
+    let mut group = c.benchmark_group(format!("bgp-clone-{family}"));
+    group.throughput(Throughput::Elements(len));
+    bench_clone_one::<P, u32, PrefixMap<P, u32>>(&mut group, &setup);
+    bench_clone_one::<P, u32, P::IpLookupTable>(&mut group, &setup);
+    bench_clone_one::<P, u32, HashMap<P, u32>>(&mut group, &setup);
+    bench_clone_one::<P, u32, BTreeMap<P, u32>>(&mut group, &setup);
+    group.finish();
+
+    let mut group = c.benchmark_group(format!("bgp-clone-nontrivial-{family}"));
+    group.throughput(Throughput::Elements(len));
+    bench_clone_one::<P, NonTrivialClone, PrefixMap<P, NonTrivialClone>>(&mut group, &setup);
+    bench_clone_one::<P, NonTrivialClone, P::TraverseTable<NonTrivialClone>>(&mut group, &setup);
+    bench_clone_one::<P, NonTrivialClone, HashMap<P, NonTrivialClone>>(&mut group, &setup);
+    bench_clone_one::<P, NonTrivialClone, BTreeMap<P, NonTrivialClone>>(&mut group, &setup);
+    group.finish();
+
+    let mut group = c.benchmark_group(format!("bgp-iter-{family}"));
+    group.throughput(Throughput::Elements(len));
+    bench_iter_one::<P, PrefixMap<P, u32>>(&mut group, &setup);
+    bench_iter_one::<P, P::IpLookupTable>(&mut group, &setup);
+    bench_iter_one::<P, HashMap<P, u32>>(&mut group, &setup);
+    bench_iter_one::<P, BTreeMap<P, u32>>(&mut group, &setup);
+    group.finish();
+}
+
+pub fn bgp_traverse_ipv4(c: &mut Criterion) {
+    bgp_traverse_for::<Ipv4Net>(c, "ipv4");
+}
+
+pub fn bgp_traverse_ipv6(c: &mut Criterion) {
+    bgp_traverse_for::<Ipv6Net>(c, "ipv6");
+}
+
+fn bgp_lookup_ris_for<P>(c: &mut Criterion, group_name: &str, ordering: SortingOrder)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, ordering);
+    let setup = fill_table(0, &addrs);
+    let insn = P::ris_peer_lookups();
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(insn.len() as u64));
+    bench_all(&mut group, &setup, &insn, false);
+    group.finish();
+}
+
+pub fn bgp_lookup_ris_ipv4(c: &mut Criterion) {
+    bgp_lookup_ris_for::<Ipv4Net>(c, "bgp-lookup-ris-ipv4", SortingOrder::Random);
+}
+
+pub fn bgp_lookup_ris_ipv6(c: &mut Criterion) {
+    bgp_lookup_ris_for::<Ipv6Net>(c, "bgp-lookup-ris-ipv6", SortingOrder::Random);
+}
+
+fn bgp_mods_ris_for<P>(c: &mut Criterion, group_name: &str, ordering: SortingOrder)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, ordering);
+    let setup = fill_table(0, &addrs);
+    let insn = P::ris_peer_mutations(1);
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(insn.len() as u64));
+    bench_all(&mut group, &setup, &insn, false);
+    group.finish();
+}
+
+pub fn bgp_mods_ris_ipv4(c: &mut Criterion) {
+    bgp_mods_ris_for::<Ipv4Net>(c, "bgp-mods-ris-ipv4", SortingOrder::Random);
+}
+
+pub fn bgp_mods_ris_ipv6(c: &mut Criterion) {
+    bgp_mods_ris_for::<Ipv6Net>(c, "bgp-mods-ris-ipv6", SortingOrder::Random);
+}
+
+fn bgp_create_for<P>(c: &mut Criterion, group_name: &str, ordering: SortingOrder)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, ordering);
+    let setup = fill_table(0, &addrs);
+
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(setup.len() as u64));
+    bench_all(
+        &mut group,
+        &[],
+        &setup,
+        matches!(ordering, SortingOrder::Random),
+    );
+    group.finish();
+}
+
+pub fn bgp_create_random_ipv4(c: &mut Criterion) {
+    bgp_create_for::<Ipv4Net>(c, "bgp-create-random-ipv4", SortingOrder::Random);
+}
+
+pub fn bgp_create_random_ipv6(c: &mut Criterion) {
+    bgp_create_for::<Ipv6Net>(c, "bgp-create-random-ipv6", SortingOrder::Random);
+}
+
+pub fn bgp_create_ordered_ipv4(c: &mut Criterion) {
+    bgp_create_for::<Ipv4Net>(c, "bgp-create-ordered-ipv4", SortingOrder::Lexicographic);
+}
+
+pub fn bgp_create_ordered_ipv6(c: &mut Criterion) {
+    bgp_create_for::<Ipv6Net>(c, "bgp-create-ordered-ipv6", SortingOrder::Lexicographic);
+}
+
+pub fn bgp_create_scattered_ipv4(c: &mut Criterion) {
+    bgp_create_for::<Ipv4Net>(c, "bgp-create-scattered-ipv4", SortingOrder::Scattered);
+}
+
+pub fn bgp_create_scattered_ipv6(c: &mut Criterion) {
+    bgp_create_for::<Ipv6Net>(c, "bgp-create-scattered-ipv6", SortingOrder::Scattered);
+}
+
+/// Benchmark aggregating the whole RIS table: `PrefixSet::aggregate` (bitmap-only drop + merge),
+/// `PrefixMap::aggregate` (the value-aware ORTC), and `PrefixMap::aggregate_fill_default`. Each
+/// prefix gets a next hop in `1..=32` (emulating 32 interfaces), so the ORTC actually merges.
+fn aggregate_for<P>(c: &mut Criterion, group_name: &str)
+where
+    P: BenchPrefix,
+{
+    let addrs = P::ris_peer_initial_state(0, SortingOrder::Random);
+
+    let set: PrefixSet<P> = addrs.iter().copied().collect();
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut map: PrefixMap<P, u32> = PrefixMap::new();
+    for &p in &addrs {
+        map.insert(p, rng.gen_range(1..=32u32));
     }
-    len
+
+    let mut group = c.benchmark_group(group_name);
+    group.bench_function("set", |b| {
+        b.iter_with_setup(
+            || set.clone(),
+            |mut s| {
+                s.aggregate();
+                s
+            },
+        )
+    });
+    group.bench_function("map", |b| {
+        b.iter_with_setup(
+            || map.clone(),
+            |mut m| {
+                m.aggregate();
+                m
+            },
+        )
+    });
+    group.bench_function("ortc", |b| {
+        b.iter_with_setup(
+            || map.clone(),
+            |mut m| {
+                m.aggregate_fill_default();
+                m
+            },
+        )
+    });
+    group.finish();
 }
 
-fn random_addr(rng: &mut ThreadRng) -> (Ipv4Addr, u8) {
-    let addr: u32 = rng.gen::<u32>();
-    let max_len = 32;
-    let min_len = min_prefix_len(addr);
-    let len = rng.gen_range(min_len..=max_len);
-    (addr.into(), len)
+pub fn aggregate_ipv4(c: &mut Criterion) {
+    aggregate_for::<Ipv4Net>(c, "aggregate-ipv4");
 }
 
-fn generate_random_mods_dense() -> (Vec<Insn>, HashSet<(Ipv4Addr, u8)>) {
-    let mut rng = thread_rng();
-    let mut result = Vec::new();
+pub fn aggregate_ipv6(c: &mut Criterion) {
+    aggregate_for::<Ipv6Net>(c, "aggregate-ipv6");
+}
 
-    let mut addresses = HashSet::new();
+#[derive(Default)]
+struct MyProfiler {
+    active_profiler: Option<pprof::ProfilerGuard<'static>>,
+    already_profiled: HashSet<(String, std::path::PathBuf)>,
+}
 
-    for _ in 0..ITERS {
-        if addresses.is_empty() || rng.gen_bool(0.8) {
-            let (addr, len) = random_addr(&mut rng);
-            let val = rng.gen::<u32>();
-            result.push(Insn::Insert(addr, len, val));
-            addresses.insert((addr, len));
-        } else {
-            let (addr, len) = addresses
-                .iter()
-                .choose(&mut rng)
-                .map(|(addr, len)| (*addr, *len))
+impl criterion::profiler::Profiler for MyProfiler {
+    fn start_profiling(&mut self, benchmark_id: &str, benchmark_dir: &std::path::Path) {
+        assert!(self.active_profiler.is_none());
+        if self
+            .already_profiled
+            .insert((benchmark_id.to_string(), benchmark_dir.to_path_buf()))
+        {
+            std::fs::write("/tmp/profiler", benchmark_id.as_bytes()).unwrap();
+            self.active_profiler = Some(
+                pprof::ProfilerGuardBuilder::default()
+                    .frequency(10_000)
+                    .build()
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn stop_profiling(&mut self, _: &str, benchmark_dir: &std::path::Path) {
+        if let Some(profile) = self.active_profiler.take() {
+            let report = profile
+                .report()
+                // remove simple recursions: f -> f -> f -> g ==> f -> g
+                .frames_post_processor(|frames: &mut pprof::Frames| {
+                    frames
+                        .frames
+                        .dedup_by(|a, b| a.iter().map(|s| s.name()).eq(b.iter().map(|s| s.name())))
+                })
+                // remove indirect recursion: f -> g -> f -> g -> h ==> f -> g -> h
+                .frames_post_processor(|frames: &mut pprof::Frames| {
+                    let mut seen = std::collections::HashSet::new();
+                    // frames are leaf -> root; flip so "first occurrence" means closest to root
+                    frames.frames.reverse();
+                    frames.frames.retain(|syms| {
+                        let key: Vec<String> = syms.iter().map(|s| s.name()).collect();
+                        seen.insert(key)
+                    });
+                    frames.frames.reverse();
+                })
+                .build()
                 .unwrap();
-            addresses.remove(&(addr, len));
-            result.push(Insn::Remove(addr, len));
+            std::fs::create_dir_all(benchmark_dir).unwrap();
+            let benchmark_file = benchmark_dir.join("flamegraph.svg");
+            let writer = std::fs::File::create(&benchmark_file)
+                .unwrap_or_else(|_| panic!("Failed to create file {benchmark_file:?}"));
+            report.flamegraph(writer).unwrap();
         }
     }
-    (result, addresses)
-}
-
-fn generate_random_lookups_dense(addresses: &HashSet<(Ipv4Addr, u8)>) -> Vec<Insn> {
-    let mut rng = thread_rng();
-    let mut result = Vec::new();
-
-    for _ in 0..ITERS {
-        if rng.gen_bool(0.5) {
-            let (addr, len) = if addresses.is_empty() || rng.gen_bool(0.5) {
-                random_addr(&mut rng)
-            } else {
-                addresses
-                    .iter()
-                    .choose(&mut rng)
-                    .map(|(addr, len)| (*addr, *len))
-                    .unwrap()
-            };
-            result.push(Insn::ExactMatch(addr, len));
-        } else {
-            let (addr, len) = random_addr(&mut rng);
-            result.push(Insn::LongestPrefixMatch(addr, len));
-        }
-    }
-    result
-}
-
-fn sparse_addresses() -> Vec<(Ipv4Addr, u8)> {
-    let mut rng = thread_rng();
-    (0..NUM_SPARSE_ADDR)
-        .map(|_| random_addr(&mut rng))
-        .collect()
-}
-
-fn generate_random_mods_sparse(addresses: &[(Ipv4Addr, u8)]) -> Vec<Insn> {
-    let mut rng = thread_rng();
-    (0..ITERS)
-        .map(|_| {
-            let (addr, len) = addresses.iter().choose(&mut rng).unwrap();
-            if rng.gen_bool(0.7) {
-                let val = rng.gen::<u32>();
-                Insn::Insert(*addr, *len, val)
-            } else {
-                Insn::Remove(*addr, *len)
-            }
-        })
-        .collect()
-}
-
-fn generate_random_lookups_sparse(addresses: &[(Ipv4Addr, u8)]) -> Vec<Insn> {
-    let mut rng = thread_rng();
-    (0..ITERS)
-        .map(|_| {
-            let (addr, len) = addresses.iter().choose(&mut rng).unwrap();
-            if rng.gen_bool(0.5) {
-                Insn::ExactMatch(*addr, *len)
-            } else {
-                Insn::LongestPrefixMatch(*addr, *len)
-            }
-        })
-        .collect()
-}
-
-fn execute_prefix_map(map: &mut PrefixMap<Ipv4Net, u32>, insns: &Vec<Insn>) {
-    for insn in insns {
-        criterion::black_box(match insn {
-            Insn::Insert(addr, len, val) => map.insert(Ipv4Net::new(*addr, *len).unwrap(), *val),
-            Insn::Remove(addr, len) => map.remove(&Ipv4Net::new(*addr, *len).unwrap()),
-            Insn::ExactMatch(addr, len) => map.get(&Ipv4Net::new(*addr, *len).unwrap()).copied(),
-            Insn::LongestPrefixMatch(addr, len) => map
-                .get_lpm(&Ipv4Net::new(*addr, *len).unwrap())
-                .map(|(_, x)| *x),
-        });
-    }
-}
-
-fn lookup_prefix_map(map: &PrefixMap<Ipv4Net, u32>, insns: &Vec<Insn>) {
-    for insn in insns {
-        criterion::black_box(match insn {
-            Insn::Insert(_, _, _) => unreachable!(),
-            Insn::Remove(_, _) => unreachable!(),
-            Insn::ExactMatch(addr, len) => map.get(&Ipv4Net::new(*addr, *len).unwrap()).copied(),
-            Insn::LongestPrefixMatch(addr, len) => map
-                .get_lpm(&Ipv4Net::new(*addr, *len).unwrap())
-                .map(|(_, x)| *x),
-        });
-    }
-}
-
-fn execute_treebitmap(map: &mut IpLookupTable<Ipv4Addr, u32>, insns: &Vec<Insn>) {
-    for insn in insns {
-        criterion::black_box(match insn {
-            Insn::Insert(addr, len, val) => map.insert(*addr, *len as u32, *val),
-            Insn::Remove(addr, len) => map.remove(*addr, *len as u32),
-            Insn::ExactMatch(addr, len) => map.exact_match(*addr, *len as u32).copied(),
-            Insn::LongestPrefixMatch(addr, _) => {
-                let mut octets = addr.octets();
-                octets[3] += 1;
-                let addr = octets.into();
-                map.longest_match(addr).map(|(_, _, x)| *x)
-            }
-        });
-    }
-}
-
-fn lookup_treebitmap(map: &IpLookupTable<Ipv4Addr, u32>, insns: &Vec<Insn>) {
-    for insn in insns {
-        criterion::black_box(match insn {
-            Insn::Insert(_, _, _) => unreachable!(),
-            Insn::Remove(_, _) => unreachable!(),
-            Insn::ExactMatch(addr, len) => map.exact_match(*addr, *len as u32).copied(),
-            Insn::LongestPrefixMatch(addr, _) => {
-                let mut octets = addr.octets();
-                octets[3] += 1;
-                let addr = octets.into();
-                map.longest_match(addr).map(|(_, _, x)| *x)
-            }
-        });
-    }
-}
-
-pub fn dense_mods(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dense modification");
-
-    let (insn, _) = generate_random_mods_dense();
-
-    group.bench_function("PrefixMap", |b| {
-        b.iter(|| {
-            let mut map = PrefixMap::new();
-            execute_prefix_map(&mut map, &insn);
-        })
-    });
-    group.bench_function("TreeBitMap dense", |b| {
-        b.iter(|| {
-            let mut map = IpLookupTable::new();
-            execute_treebitmap(&mut map, &insn);
-        })
-    });
-
-    group.finish();
-}
-
-pub fn dense_lookup(c: &mut Criterion) {
-    let (mods, addrs) = generate_random_mods_dense();
-    let lookups = generate_random_lookups_dense(&addrs);
-
-    let mut prefix_map = PrefixMap::new();
-    let mut treebitmap = IpLookupTable::new();
-    execute_prefix_map(&mut prefix_map, &mods);
-    execute_treebitmap(&mut treebitmap, &mods);
-
-    let mut group = c.benchmark_group("dense lookups");
-
-    group.bench_function("PrefixMap", |b| {
-        b.iter(|| {
-            lookup_prefix_map(&prefix_map, &lookups);
-        })
-    });
-    group.bench_function("TreeBitMap", |b| {
-        b.iter(|| {
-            lookup_treebitmap(&treebitmap, &lookups);
-        })
-    });
-
-    group.finish();
-}
-
-pub fn sparse_mods(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sparse modification");
-
-    let addrs = sparse_addresses();
-    let insn = generate_random_mods_sparse(&addrs);
-
-    group.bench_function("PrefixMap", |b| {
-        b.iter(|| {
-            let mut map = PrefixMap::new();
-            execute_prefix_map(&mut map, &insn);
-        })
-    });
-    group.bench_function("TreeBitMap sparse", |b| {
-        b.iter(|| {
-            let mut map = IpLookupTable::new();
-            execute_treebitmap(&mut map, &insn);
-        })
-    });
-
-    group.finish();
-}
-
-pub fn sparse_lookup(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sparse lookups");
-
-    let addrs = sparse_addresses();
-    let mods = generate_random_mods_sparse(&addrs);
-    let lookups = generate_random_lookups_sparse(&addrs);
-
-    let mut prefix_map = PrefixMap::new();
-    let mut treebitmap = IpLookupTable::new();
-    execute_prefix_map(&mut prefix_map, &mods);
-    execute_treebitmap(&mut treebitmap, &mods);
-
-    group.bench_function("PrefixMap", |b| {
-        b.iter(|| {
-            lookup_prefix_map(&prefix_map, &lookups);
-        })
-    });
-    group.bench_function("TreeBitMap", |b| {
-        b.iter(|| {
-            lookup_treebitmap(&treebitmap, &lookups);
-        })
-    });
-
-    group.finish();
 }
 
 criterion_group!(
-    benches,
-    dense_lookup,
-    dense_mods,
-    sparse_lookup,
-    sparse_mods
+    name = benches;
+    config = Criterion::default()
+        //.sample_size(50)
+        .with_profiler(MyProfiler::default())
+        .measurement_time(std::time::Duration::from_secs(10));
+    targets =
+        bgp_mods_random_ipv4,
+        bgp_mods_random_ipv6,
+        bgp_lookup_random_ipv4,
+        bgp_lookup_random_ipv6,
+        bgp_lpm_random_ipv4,
+        bgp_lpm_random_ipv6,
+        bgp_mods_ris_ipv4,
+        bgp_mods_ris_ipv6,
+        bgp_lookup_ris_ipv4,
+        bgp_lookup_ris_ipv6,
+        bgp_create_random_ipv4,
+        bgp_create_random_ipv6,
+        bgp_create_ordered_ipv4,
+        bgp_create_ordered_ipv6,
+        bgp_create_scattered_ipv4,
+        bgp_create_scattered_ipv6,
+        aggregate_ipv4,
+        aggregate_ipv6,
+        bgp_traverse_ipv4,
+        bgp_traverse_ipv6,
 );
 criterion_main!(benches);

@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_recursion::async_recursion;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
@@ -182,16 +181,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         .set(self.response_cache.entry_count() as f64);
                 }
 
-                let response = self
-                    .resolve_cnames(
-                        response,
-                        query.clone(),
-                        request_time,
-                        query_has_dnssec_ok,
-                        depth,
-                        limits,
-                    )
-                    .await?;
+                let response = Box::pin(self.resolve_cnames(
+                    response,
+                    query.clone(),
+                    request_time,
+                    query_has_dnssec_ok,
+                    depth,
+                    limits,
+                ))
+                .await?;
 
                 let result = response.maybe_strip_dnssec_records(query_has_dnssec_ok);
                 #[cfg(feature = "metrics")]
@@ -242,9 +240,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             _ => query.name().clone(),
         };
 
-        let (depth, ns) = match self
-            .ns_pool_for_name(zone.clone(), request_time, depth, limits)
-            .await
+        let (depth, ns) = match Box::pin(self.ns_pool_for_name(
+            zone.clone(),
+            request_time,
+            depth,
+            limits,
+        ))
+        .await
         {
             Ok((depth, ns)) => (depth, ns),
             // Handle the short circuit case for when we receive NXDOMAIN on a parent name, per RFC
@@ -274,16 +276,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             }
         };
 
-        let response = self
-            .resolve_cnames(
-                response,
-                query.clone(),
-                request_time,
-                query_has_dnssec_ok,
-                depth,
-                limits,
-            )
-            .await?;
+        let response = Box::pin(self.resolve_cnames(
+            response,
+            query.clone(),
+            request_time,
+            query_has_dnssec_ok,
+            depth,
+            limits,
+        ))
+        .await?;
 
         // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records unless
         // explicitly requested
@@ -305,7 +306,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     /// Handle CNAME expansion for the current query
-    #[async_recursion]
     async fn resolve_cnames(
         &self,
         mut response: Message,
@@ -317,17 +317,19 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     ) -> Result<Message, RecursorError> {
         let query_type = query.query_type();
 
-        // Don't resolve CNAME lookups for a CNAME (or ANY) query
-        if query_type == RecordType::CNAME || query_type == RecordType::ANY {
-            return Ok(response);
-        }
-
         // Return early if there isn't a matching CNAME in the response.
         let has_cname = response
             .answers
             .iter()
             .any(|rec| matches!(rec.data, CNAME(_)) && rec.name == query.name);
         if !has_cname {
+            return Ok(response);
+        }
+
+        // Don't resolve CNAME lookups for a CNAME (or ANY) query, but still order the chain
+        // the upstream returned.
+        if query_type == RecordType::CNAME || query_type == RecordType::ANY {
+            order_cname_chain(&mut response.answers, &query.name);
             return Ok(response);
         }
 
@@ -356,7 +358,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             if let Some(target_name) = target_name_opt {
                 if name_history.contains(&target_name) {
                     // The CNAME records form a loop.
-                    break;
+                    debug!(%query, %target_name, "CNAME loop detected within response");
+                    return Err(RecursorError::from("CNAME loop detected"));
                 }
                 name_history.push(target_name);
                 effective_qname = target_name;
@@ -374,6 +377,18 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     record_type: RecordType::CNAME,
                 });
             }
+
+            // Refuse to follow a chain that re-enters a cname already being followed higher up
+            // the stack: the chain has looped back on itself across responses.
+            let _in_flight = limits
+                .try_enter_cnames(effective_qname, &name_history)
+                .inspect_err(|_| {
+                    debug!(
+                        %query,
+                        %effective_qname,
+                        "refusing to re-enter cname already on resolution stack"
+                    );
+                })?;
 
             // Note that we aren't worried about whether the intermediates are local or remote
             // to the original queried name, or included or not included in the original
@@ -413,6 +428,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         if !cname_chain.is_empty() {
             response.answers.extend(cname_chain);
         }
+
+        order_cname_chain(&mut response.answers, &query.name);
 
         Ok(response)
     }
@@ -559,7 +576,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     /// Identify the correct NameServerPool to use to answer queries for a given name.
-    #[async_recursion]
     pub(crate) async fn ns_pool_for_name(
         &self,
         query_name: Name,
@@ -848,9 +864,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // To avoid incrementing the depth counter for each nameserver, we'll use the passed in
             // depth as a fixed base for the nameserver lookups
             let nameserver_pool = if !is_subzone(zone, &record_name) {
-                match self
-                    .ns_pool_for_name(record_name.clone(), request_time, depth, limits)
-                    .await
+                match Box::pin(self.ns_pool_for_name(
+                    record_name.clone(),
+                    request_time,
+                    depth,
+                    limits,
+                ))
+                .await
                 {
                     Ok((_, pool)) => pool.with_zone(zone.clone()),
                     // The NS hostname could not be resolved. This doesn't mean the
@@ -923,6 +943,7 @@ pub(crate) struct RequestLimits {
     req_query_count: AtomicU8,
     cname_limit: AtomicU8,
     in_flight_zones: Mutex<HashSet<Name>>,
+    in_flight_cnames: Mutex<HashSet<Name>>,
 }
 
 impl RequestLimits {
@@ -931,10 +952,12 @@ impl RequestLimits {
             req_query_count: AtomicU8::new(0),
             cname_limit: AtomicU8::new(0),
             in_flight_zones: Mutex::new(HashSet::new()),
+            in_flight_cnames: Mutex::new(HashSet::new()),
         }
     }
 
     fn try_charge_query(&self, query: &Query) -> Result<(), RecursorError> {
+        #[expect(deprecated)]
         if self
             .req_query_count
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -959,6 +982,36 @@ impl RequestLimits {
             zone: zone.clone(),
         })
     }
+
+    /// Push a CNAME chain onto the resolution stack for the lifetime of the returned guard.
+    /// `chain` is the names walked within a single response, ending with `target`, the name
+    /// about to be resolved via a new query. Any name already on the stack means the chain
+    /// loops back across responses (e.g. `a.zone1 -> b.zone2 -> a.zone1`).
+    ///
+    /// `target` itself is not pushed: it is the next level's query name, and that level pushes it.
+    fn try_enter_cnames<'a>(
+        &'a self,
+        target: &Name,
+        chain: &[&'a Name],
+    ) -> Result<InFlightCnames<'a>, RecursorError> {
+        let mut in_flight = self.in_flight_cnames.lock();
+        if let Some(name) = chain.iter().find(|name| in_flight.contains(*name)) {
+            return Err(RecursorError::from(format!(
+                "CNAME {name} is already on the resolution stack"
+            )));
+        }
+
+        let names = chain
+            .iter()
+            .copied()
+            .filter(|name| *name != target)
+            .collect::<Vec<_>>();
+        in_flight.extend(names.iter().map(|name| (*name).clone()));
+        Ok(InFlightCnames {
+            limits: self,
+            names,
+        })
+    }
 }
 
 struct InFlightZone<'a> {
@@ -969,6 +1022,20 @@ struct InFlightZone<'a> {
 impl Drop for InFlightZone<'_> {
     fn drop(&mut self) {
         self.limits.in_flight_zones.lock().remove(&self.zone);
+    }
+}
+
+struct InFlightCnames<'a> {
+    limits: &'a RequestLimits,
+    names: Vec<&'a Name>,
+}
+
+impl Drop for InFlightCnames<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.limits.in_flight_cnames.lock();
+        for name in &self.names {
+            in_flight.remove(*name);
+        }
     }
 }
 
@@ -1076,6 +1143,41 @@ const MAX_GLUELESS_FOLLOW: usize = 5;
 
 /// Maximum number of upstream queries the recursor will issue for a single client query.
 const MAX_QUERIES_PER_REQUEST: u8 = 200;
+
+/// Sort `answers` so a CNAME chain unrolls from `query_name`.
+///
+/// Clients such as glibc need the chain in this order to follow it.
+fn order_cname_chain(answers: &mut Vec<Record>, query_name: &Name) {
+    let mut by_name = HashMap::<&Name, Vec<usize>>::new();
+    for (i, record) in answers.iter().enumerate() {
+        by_name.entry(&record.name).or_default().push(i);
+    }
+
+    // Records off the chain rank after it, in their original order.
+    let mut rank = (answers.len()..answers.len() * 2).collect::<Vec<_>>();
+    let mut next_rank = 0;
+    let mut name = query_name;
+    // Each name is visited once, so this ends even if the chain loops.
+    while let Some(indices) = by_name.remove(name) {
+        let mut target = None;
+        for i in indices {
+            rank[i] = next_rank;
+            next_rank += 1;
+            if let (None, CNAME(cname)) = (target, &answers[i].data) {
+                target = Some(&cname.0);
+            }
+        }
+
+        match target {
+            Some(next) => name = next,
+            None => break,
+        }
+    }
+
+    let mut ranked = answers.drain(..).zip(rank).collect::<Vec<_>>();
+    ranked.sort_unstable_by_key(|(_, rank)| *rank);
+    answers.extend(ranked.into_iter().map(|(record, _)| record));
+}
 
 #[cfg(test)]
 mod tests {

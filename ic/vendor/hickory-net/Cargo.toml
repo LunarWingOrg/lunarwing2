@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "hickory-net"
-version = "0.26.3"
+version = "0.26.4"
 authors = ["The contributors to Hickory DNS"]
 build = false
 autolib = false
@@ -74,6 +74,7 @@ __h3 = [
 ]
 __https = [
     "dep:bytes",
+    "dep:form_urlencoded",
     "dep:h2",
     "dep:http",
 ]
@@ -178,6 +179,12 @@ version = "2.2.0"
 features = ["alloc"]
 default-features = false
 
+[dependencies.form_urlencoded]
+version = "1.2.2"
+features = ["alloc"]
+optional = true
+default-features = false
+
 [dependencies.futures-channel]
 version = "0.3.5"
 features = [
@@ -214,7 +221,7 @@ version = "0.0.10"
 optional = true
 
 [dependencies.hickory-proto]
-version = "0.26.3"
+version = "0.26.4"
 features = ["std"]
 default-features = false
 

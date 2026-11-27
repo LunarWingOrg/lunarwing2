@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "blake3"
-version = "1.8.7"
+version = "1.8.8"
 authors = [
     "Jack O'Connor <oconnor663@gmail.com>",
     "Samuel Neves",
@@ -77,7 +77,7 @@ default-features = false
 version = "1.0.0"
 
 [dependencies.constant_time_eq]
-version = "0.4.2"
+version = "0.6.2"
 default-features = false
 
 [dependencies.digest]
