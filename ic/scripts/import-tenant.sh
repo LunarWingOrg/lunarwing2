@@ -46,15 +46,16 @@ BUNDLE_DARKIRC_MANIFEST_MODE_OK=false
 BUNDLE_FORMAT=""
 KAWARIMI_ARCHIVE_PASS=""
 
-# These are the only values the exporter is allowed to carry into a live
-# tenant environment.  Import treats the bundle as untrusted input: an
-# arbitrary KEY=value line must never become a service setting.
+# Import treats the bundle as untrusted input. Only the keys below are accepted.
+# The tenant-side merge ignores legacy Nanocode and LunarDepth entries.
 IMPORT_LUNARWING_KEYS=(
   SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
   XMPP_ALLOW_ROOMS XMPP_ENCRYPTED_ROOMS XMPP_ALLOW_PLAINTEXT_FALLBACK
   XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL NANOCODE_MODEL OPENCODE_MODEL KIMI_MODEL OPENCODE2_MODEL
   KIMI_API_KEY GOTIFY_URL GATEWAY_HOST MASCOT_ENABLED HTTP_HOST LLM_BASE_URL NANOCODE_BASE_URL
   OPENCODE_BASE_URL KIMI_BASE_URL OPENCODE2_BASE_URL
+  LUNARDEPTH_BASE_URL LUNARDEPTH_MODEL LUNARDEPTH_ALLOW_INSECURE_HTTP
+  LUNARDEPTH_ALLOW_PLACEHOLDER_KEY LUNARDEPTH_API_KEY
 )
 IMPORT_BRIDGE_KEYS=(
   XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM_JSON
@@ -667,8 +668,8 @@ inject_keys() {  # <manifest> <live_env> <allowed-key> ...
           key = line
           sub(/=.*/, "", key)
           if (key == ENVIRON["TARGET_SKIP_KEY"] || key == "NANOCODE_MODEL" || key == "NANOCODE_BASE_URL") continue
-          # add-tenant already rendered the OpenCode 2 route with the chosen overrides.
-          if (key == "OPENCODE2_MODEL" || key == "OPENCODE2_BASE_URL") continue
+          # Worker routes were supplied to add-tenant. Ignore legacy LunarDepth manifest entries.
+          if (key ~ /^LUNARDEPTH_/ || key == "OPENCODE2_MODEL" || key == "OPENCODE2_BASE_URL") continue
           if (key in replacement) exit 74
           replacement[key] = line
           order[++count] = key
