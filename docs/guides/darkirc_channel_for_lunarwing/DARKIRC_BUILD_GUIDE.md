@@ -8,11 +8,7 @@ LunarWing's DarkIRC integration has three components:
 
 Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The registry manifest is
-`0.1.18` and the WASM channel crate is `2.2.2`. The capability file (3000 ms
-poll floor, loopback allowlist, `pairing` DM default), source/registry symlink,
-and `darkirc-contact prepare/respond/complete` exchange commands match the
-current tree.
+The registry manifest version is `0.1.18`. The WASM source crate version is `2.2.2`.
 
 ## Source Layout
 
@@ -111,12 +107,21 @@ lunarwing pairing approve darkirc <code>
 DarkIRC encrypted-contact configuration is a separate operator workflow. Each contact has `dm_chacha_public` and `my_dm_chacha_secret` values in protected daemon configuration. Use the typed MT admin exchange commands rather than copying private keys manually:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact>
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact>
-sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare \
+  "$tenant_a" "$contact_b" --out offer.json --json
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond \
+  "$tenant_b" "$contact_a" --in offer.json --out response.json \
+  --expect-peer-fingerprint "$fingerprint_a" --json
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete \
+  "$tenant_a" "$contact_b" --in response.json --exchange-id "$offer_id_a" \
+  --expect-peer-fingerprint "$fingerprint_b" --json
 ```
 
-Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) for the full artifact and fingerprint exchange. Independently verify the peer fingerprint; do not accept one received over the same untrusted path as the exchange artifact.
+Use the initiator's `offer_id` from `prepare` for the initiator's `--exchange-id`.
+Transfer the offer before `respond` and the response before `complete`. Verify
+each peer fingerprint through an independent trusted channel. The runbook covers
+the responder's separate `complete` step and how to apply changes through a
+controlled restart. [DarkIRC multi-tenant runbook](../../ops/DARKIRC-MULTITENANT.md)
 
 ## Message Limits
 
