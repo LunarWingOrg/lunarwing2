@@ -285,8 +285,8 @@ signals, this is monitor-only. See the
 
 **Tier 0 -- Structured Tool Calls** (`executor/orchestrator.rs`):
 
-When the LLM returns structured `ActionCall` objects, `orchestrator/default.py`
-calls `__execute_actions_parallel__`, which dispatches to
+When the LLM returns structured `ActionCall` objects, the [default Python
+orchestrator](../../ic/crates/lunarwing_engine/orchestrator/default.py) calls `__execute_actions_parallel__`, which dispatches to
 `handle_execute_actions_parallel` in Rust. `handle_execute_action` serves the
 separate `__execute_action__` host function. The handlers look up the lease,
 evaluate policy when the action has a definition, consume one lease use, and
@@ -382,9 +382,9 @@ Key characteristics:
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
-- **Action limit**: each model step can attempt at most 50 tool actions. The cap
-  applies independently to structured batches, CodeAct blocks, and the combined
-  single/parallel action host calls made by the Python orchestrator.
+- **Action limit**: the host resets a shared 50-action allowance at
+  `__llm_complete__`. The structured action handlers and nested CodeAct blocks
+  draw from that same allowance until the next model call.
 - **Host-clock OS calls**: `date.today()` and `datetime.now(tz)` are served from
   the host clock (`OsFunction::DateToday`/`DateTimeNow` — Monty has no clock, so
   these suspend to the host like tool calls). Naive `datetime.now()` returns UTC;
@@ -2253,7 +2253,8 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 # Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
 # (existing tenant values preserved on re-render; ENGINE_V2=false is the only
 #  durable opt-out — a value like `none` is an ignored unknown entry)
-SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
+SKILL_SELF_IMPROVEMENT=false   # Bare default; mt-admin renders true for new tenants.
+                               # Gates skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
 ORCHESTRATOR_SELF_MODIFY=false # Runtime default: compiled orchestrator v0, no
@@ -2264,7 +2265,8 @@ ORCHESTRATOR_SELF_MODIFY=false # Runtime default: compiled orchestrator v0, no
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM
                                         # calls awaited in a ResolveFutures round; on
                                         # expiry the task is aborted and the call
-                                        # resolves as an error. Default: 300
+                                        # resolves as an error. Bare default: 300 s.
+                                        # mt-admin renders 7999 s for new tenants.
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per step.
                                         # Default: 1 when unset (mt-admin tenants are
                                         # provisioned with 2); clamped to 0-3; 0 disables
@@ -2325,7 +2327,7 @@ process.
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
-**WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The orchestrator's hardcoded policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the *same* hardcoded deadline — `tool_async_timeout_secs` (default 300s, env escape hatch `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`) — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.
+**WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The engine's policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the same `tool_async_timeout_secs` value — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.
 
 ## Build & Test
 
@@ -2345,11 +2347,14 @@ protocol-channel delivery, or recovery across a real tenant restart.
 ## Key Design Decisions
 
 1. **No dependency on main crate** -- clean separation, testable in isolation
-2. **No safety logic in engine** -- sanitization/leak detection applied at the adapter boundary (`EffectExecutor` impl)
+2. **Defense at multiple boundaries** -- the engine neutralizes role-token openers in
+   inference inputs and redacts event parameters. Host tool-output sanitation and
+   leak detection run at the effect adapter boundary.
 3. **Event sourcing from day one** -- threads persist significant lifecycle and execution events
 4. **Tier 0 + Tier 1** -- structured tool calls and embedded Python via Monty coexist
 5. **Engine owns its message type** -- `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
-6. **RLM pattern** -- context as variable (not attention input), recursive `llm_query()`, compact output metadata between steps
+6. **RLM pattern** -- context as variables, recursive `llm_query()`, and bounded
+   step output formatted by the Python orchestrator
 7. **Fail-closed by construction** -- `GateDecision` has no `None` variant, `ResumeKind` is a closed enum
 8. **Never delete LLM output** -- engine workspace files are preserved; only
    in-memory caches are evicted (V1 compatibility history is dual-written to the
