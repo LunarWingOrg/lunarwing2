@@ -225,9 +225,11 @@ ignore = [
     # WI#928 rechecked RustSec c5279d0b: heapless 0.7.17 still matches in
     # ic/Cargo.lock and ic/bridges/xmpp-bridge/Cargo.lock. monty 0.0.17
     # (lunarwing_engine's git dependency) enables postcard 1.2.0's default
-    # `heapless-cas`, which pulls 0.7.17. The Wasmtime parents enable only
-    # `alloc`. Postcard's optional `heapless-v0_9` takes heapless ^0.9.4;
-    # enabling it alone does not switch off the default 0.7 edge.
+    # `heapless-cas`, which pulls 0.7.17. The Wasmtime parents leave
+    # defaults off: they request `alloc`, and Wasmtime's `std` also enables
+    # postcard's `use-std`. Neither feature pulls in heapless. Postcard's
+    # optional `heapless-v0_9` takes heapless ^0.9.4; enabling it alone does
+    # not switch off the default 0.7 edge.
     # Monty snapshots use `to_allocvec` (alloc::vec::Vec<u8>) and `from_bytes`
     # (slice deserialization of Monty types), not postcard's heapless APIs.
     # RUSTSEC-2026-0577 includes heapless::vec::IntoIter::drop as well as
