@@ -64,7 +64,8 @@ LunarWing checks configured embedding and Ollama base URLs at startup. A bare
 run without `ALLOW_PRIVATE_IPS=1` accepts plain HTTP only for localhost,
 `*.localhost`, `127.0.0.1` and `::1`. It rejects HTTPS when a resolved address
 is in a blocked range, such as private, loopback, link-local or metadata
-addresses. This check does not pin addresses at request time.
+addresses. It also rejects an HTTPS hostname that fails to resolve at startup.
+This check does not pin addresses at request time.
 
 New mt-admin tenant environments, the stock systemd and OpenRC services, and
 the XMPP test harness set `ALLOW_PRIVATE_IPS=1`. That setting allows any
