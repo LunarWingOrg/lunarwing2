@@ -92,8 +92,15 @@ The source of truth is `darkirc_channel_for_lunarwing/darkirc/darkirc.capabiliti
 - `adapter_url`, sourced from `DARKIRC_ADAPTER_URL`;
 - loopback-only HTTP allowlist and credential host patterns;
 - channel-scoped workspace prefix `channels/darkirc/`;
-- polling enabled with a 3000 ms minimum interval;
+- polling enabled with a default request of 3,000 ms;
 - default DM policy `pairing`.
+
+Set `config.poll_interval_ms` in the sidecar to an integer number of
+milliseconds. The guest requests at least 3,000 ms, and the LunarWing host
+applies a separate 30,000 ms minimum. The default therefore schedules polls
+30 seconds apart. For example, `"poll_interval_ms": 45250` schedules polls
+45.25 seconds apart. If `poll_interval_seconds` is also set, that legacy value
+takes precedence. Remove it when switching to the millisecond key.
 
 Do not copy an old JSON example over the current capability file. Schema and credential-location fields are versioned with the WIT/host interface.
 

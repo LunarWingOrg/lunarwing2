@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use tokio::sync::Notify;
 
 use lunarwing::channels::wasm::{
-    ChannelCapabilitiesFile, SharedWasmChannel, WasmChannel, WasmChannelRuntime,
+    ChannelCapabilitiesFile, SharedWasmChannel, WasmChannel, WasmChannelLoader, WasmChannelRuntime,
     WasmChannelRuntimeConfig,
 };
 use lunarwing::channels::{Channel, IncomingMessage, OutgoingResponse, StatusUpdate};
@@ -1017,6 +1017,67 @@ async fn start_weechat_fixture() -> (
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{address}"), state, task)
+}
+
+#[tokio::test(start_paused = true)]
+async fn real_darkirc_startup_schedules_sidecar_poll_interval() {
+    let root = repo_root().join("darkirc_channel_for_lunarwing/darkirc");
+    let wasm_path = required_component(
+        root.join("target/wasm32-wasip2/release/darkirc_channel.wasm"),
+        "Build it from ic/ with cargo build --locked --release --target wasm32-wasip2 \
+         --manifest-path channels-src/darkirc/Cargo.toml.",
+    );
+    let mut sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("darkirc.capabilities.json")).unwrap())
+            .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar_path = dir.path().join("darkirc.capabilities.json");
+    let runtime =
+        Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
+    let pairing_store = Arc::new(PairingStore::with_base_dir(dir.path().join("pairing")));
+    let loader = WasmChannelLoader::new(runtime, pairing_store, None, "default");
+
+    for (override_ms, expected_ms) in [(None, 30_000), (Some(45_250), 45_250)] {
+        let (adapter_url, fixture, fixture_task) = start_darkirc_fixture().await;
+        fixture
+            .lock()
+            .unwrap()
+            .poll_batches
+            .push_back(darkirc_batch("next scheduled poll", "2026-07-19T00:00:01Z"));
+        sidecar["config"]["adapter_url"] = serde_json::json!(adapter_url);
+        sidecar["config"]["dm_policy"] = serde_json::json!("open");
+        if let Some(interval_ms) = override_ms {
+            sidecar["config"]["poll_interval_ms"] = serde_json::json!(interval_ms);
+        }
+        std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+
+        let loaded = loader
+            .load_from_files("darkirc", &wasm_path, Some(&sidecar_path))
+            .await
+            .expect("DarkIRC sidecar and component should load together");
+        let channel = with_darkirc_adapter_secret(Arc::new(loaded.channel)).await;
+        let mut stream = channel.start().await.expect("DarkIRC should start");
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("DarkIRC should poll immediately")
+            .expect("first adapter batch should reach the stream");
+        let first_poll = tokio::time::Instant::now();
+        let interval = Duration::from_millis(expected_ms);
+        let tolerance = Duration::from_millis(10);
+        assert!(
+            tokio::time::timeout_at(first_poll + interval - tolerance, stream.next())
+                .await
+                .is_err(),
+            "DarkIRC polled before its expected {expected_ms} ms interval"
+        );
+        let message = tokio::time::timeout_at(first_poll + interval + tolerance, stream.next())
+            .await
+            .expect("DarkIRC should poll at the effective interval")
+            .expect("next adapter batch should reach the stream");
+        assert_eq!(message.content, "next scheduled poll");
+        channel.shutdown().await.unwrap();
+        fixture_task.abort();
+    }
 }
 
 #[tokio::test]
