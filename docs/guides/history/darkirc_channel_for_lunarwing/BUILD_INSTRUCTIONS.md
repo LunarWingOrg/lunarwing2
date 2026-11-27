@@ -309,7 +309,7 @@ lunarwing memory write SOUL.md < ~/SOUL.md
 
 # Write inline
 lunarwing memory write config/gotify.md << 'EOF'
-Gotify endpoint: http://192.168.1.157:8080
+Gotify endpoint: https://gotify.example.org
 Gotify API token: your-token
 EOF
 ```
