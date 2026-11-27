@@ -4,9 +4,7 @@ Cross-tenant knowledge sharing lets independent LunarWing daemons exchange durab
 
 This guide is the production setup for the configuration that was live-disproved in work item #97 (bare user JIDs never match) and re-verified on 2026-09-10 with full occupant JIDs.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The `KNOW:` wire format,
-`needs-verification` ingestion semantics, publisher allowlist shapes, and the
-`coordination_knowledge` hook are implemented in `ic/src/hooks/coordination_knowledge.rs`.
+The `KNOW:` parser and ingestion hook live in `ic/src/hooks/coordination_knowledge.rs`.
 
 ## Wire format
 
@@ -35,45 +33,48 @@ The failure that motivated this guide: every one of steps 1–3 was misconfigure
 
 ## Required configuration
 
-For two tenants `sunburst` and `ruffles` sharing room `mepuhiy@conference.xmpp.sobe.world`:
+For two tenants `example-a` and `example-b` sharing room `coordination@conference.example.org`:
 
 ### 1. Room allowlist — both tenants
 
 In each tenant's `lunarwing.env`:
 
 ```
-XMPP_ALLOW_ROOMS=mepuhiy@conference.xmpp.sobe.world
+XMPP_ALLOW_ROOMS=coordination@conference.example.org
 ```
 
 The daemon's XMPP channel sends this list to the bridge in its `/v1/configure` call, which makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
 
-The bridge itself does not read `XMPP_ALLOW_ROOMS_JSON`. Keep the same room in each tenant's `xmpp-bridge.env` anyway, because `ic/scripts/xmpp-configure.sh` uses it for direct configure calls and `coord-doctor` checks it:
+For direct configure calls, `ic/scripts/xmpp-configure.sh` accepts
+`XMPP_ALLOW_ROOMS_JSON` in its environment. Keep the same room in each tenant's
+`xmpp-bridge.env` for the static `coord-doctor` check. The running daemon still
+gets its room list from `lunarwing.env`.
 
-```json
-XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
+```dotenv
+XMPP_ALLOW_ROOMS_JSON=["coordination@conference.example.org"]
 ```
 
 ### 2. Publisher allowlist — each tenant lists the OTHER agent's occupant JID
 
 `sender_id` for groupchat is the **full occupant JID** (`room@server/nick`), so that is what the allowlist matches.
 
-On **sunburst** (`lunarwing.env`) — allow the other agent's occupant JID:
+On **example-a** (`lunarwing.env`) — allow the other agent's occupant JID:
 
 ```
-COORD_KNOWLEDGE_PUBLISHERS=mepuhiy@conference.xmpp.sobe.world/ruffles
+COORD_KNOWLEDGE_PUBLISHERS=coordination@conference.example.org/example-b
 ```
 
-On **ruffles** (`lunarwing.env`):
+On **example-b** (`lunarwing.env`):
 
 ```
-COORD_KNOWLEDGE_PUBLISHERS=mepuhiy@conference.xmpp.sobe.world/sunburst
+COORD_KNOWLEDGE_PUBLISHERS=coordination@conference.example.org/example-a
 ```
 
 Three entry shapes, and which work:
 
 | Entry shape | Example | Matches occupant sender? | Notes |
 |---|---|---|---|
-| Full occupant JID | `room@server/nick` | yes (exact) | Recommended. A nick change stops matching — treat nick changes as config changes. |
+| Full occupant JID | `room@server/nick` | yes (case-insensitive) | Recommended. A nick change stops matching — treat nick changes as config changes. |
 | Room bare JID | `room@server` | yes (room-wide) | Explicit opt-in: **every** occupant of that room may publish. Only for rooms whose entire membership you trust. |
 | User bare JID | `user@server` | **no** | Never matches a MUC occupant sender. This is the misconfiguration that silently broke sharing for weeks. |
 
@@ -83,7 +84,7 @@ In each tenant's `lunarwing.env`:
 
 ```
 COORD_ENABLED=true
-COORD_CHANNELS=mepuhiy@conference.xmpp.sobe.world
+COORD_CHANNELS=coordination@conference.example.org
 COORD_KNOWLEDGE_SHARE=true
 COORD_KNOWLEDGE_PUBLISH=true
 ```
@@ -104,19 +105,22 @@ Room membership is established at startup. After editing the env files, restart 
 `mt-admin coord-doctor <tenant>` is a read-only, init-agnostic check of the whole operator surface:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor sunburst
-sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-a
+sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-b
 ```
 
 It validates:
 
 - `COORD_ENABLED`/`COORD_CHANNELS` are usable together;
 - the publisher allowlist is non-empty and every entry is a full occupant JID or a coordination room bare JID (user-bare entries FAIL);
-- every coordination room is on the bridge allowlist;
+- every coordination room is listed in the bridge environment file (a static
+  check distinct from the daemon's `XMPP_ALLOW_ROOMS` setting);
 - live bridge `/v1/status` shows presence for each configured room (i.e. the daemon actually joined);
 - live `KNOW:` ingest drop counters from the tenant's coord admin endpoint.
 
-Exit code 0 means no definitive misconfiguration; warnings still deserve operator attention (e.g. a room-wide bare JID entry). It never prints secrets and never rewrites room or trust policy.
+Exit code 0 means none of the checks failed. A stale bridge environment file
+can cause a static failure even when the live bridge has joined the room.
+Warnings still deserve attention (for example, a room-wide bare JID entry). It never prints secrets and never rewrites room or trust policy.
 
 ## Watch the live drop counters
 
