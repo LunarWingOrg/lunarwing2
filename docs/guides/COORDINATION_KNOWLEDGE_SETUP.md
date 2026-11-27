@@ -47,7 +47,7 @@ XMPP_ALLOW_ROOMS=mepuhiy@conference.xmpp.sobe.world
 
 The daemon's XMPP channel sends this list to the bridge in its `/v1/configure` call, which makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
 
-The bridge itself does not read `XMPP_ALLOW_ROOMS_JSON`. Keep the same room in each tenant's `xmpp-bridge.env` anyway, because `ic/scripts/xmpp-configure.sh` uses it for direct configure calls and `coord-doctor` checks it:
+The bridge itself does not read `XMPP_ALLOW_ROOMS_JSON`. Set it in `xmpp-bridge.env` if you use `ic/scripts/xmpp-configure.sh` for direct configure calls without passing rooms as arguments. `coord-doctor` uses the bridge env only as a static fallback when it cannot read the effective room list:
 
 ```json
 XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
@@ -112,8 +112,8 @@ It validates:
 
 - `COORD_ENABLED`/`COORD_CHANNELS` are usable together;
 - the publisher allowlist is non-empty and every entry is a full occupant JID or a coordination room bare JID (user-bare entries FAIL);
-- every coordination room is on the bridge allowlist;
-- live bridge `/v1/status` shows presence for each configured room (i.e. the daemon actually joined);
+- every coordination room is on the effective bridge allowlist (`configured_rooms` from the authenticated `/v1/status` response); when that list is unavailable, it checks the static `xmpp-bridge.env` values instead;
+- each configured room appears in `rooms_with_presence`. An empty presence list fails the check for every configured room. If the bridge status or its room data is unavailable, the doctor warns and does not infer live presence from static configuration;
 - live `KNOW:` ingest drop counters from the tenant's coord admin endpoint.
 
 Exit code 0 means no definitive misconfiguration; warnings still deserve operator attention (e.g. a room-wide bare JID entry). It never prints secrets and never rewrites room or trust policy.
