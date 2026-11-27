@@ -172,6 +172,7 @@ kimicode4lunarwing/kimi-cli/package-lock.json
 kimicode4lunarwing/scripts/package.json
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/scripts/tsconfig.json
+kimicode4lunarwing/scripts/disable_kimi_feedback.ts
 kimicode4lunarwing/scripts/entrypoint_split_test.ts
 kimicode4lunarwing/scripts/entrypoint_config_test.ts
 kimicode4lunarwing/scripts/entrypoint_supervisor_test.ts
