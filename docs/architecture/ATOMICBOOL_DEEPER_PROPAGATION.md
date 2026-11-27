@@ -1,10 +1,10 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-11-20 for v2.2.2.0 (`9c96220bb2`).
+**Status:** Design note. Deeper propagation is proposed.
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (v2.2.2.0)
+## Current State
 
 `ic/src/agent/agent_loop.rs::supervise_message()` creates one
 `Arc<AtomicBool>` per dequeued inbound message and passes it to
@@ -27,8 +27,8 @@ The flag currently guards only selected legacy-path behavior:
   agentic loop;
 - the normal-result `Interrupted`, `Done`, `Suggestions`, `TurnCost`, and
   `ApprovalNeeded` statuses in `process_user_input()`;
-- the drain loop, which discards already-drained and remaining queued text after
-  suppression instead of starting another turn;
+- the drain loop, which discards already-drained text, remaining queued
+  messages, and steer notes when a suppressed legacy turn returns a response;
 - the V1 turn-outcome hint in `handle_message()`, which is not reported once a
   soft timeout has already reported `TimedOut`.
 
@@ -37,8 +37,8 @@ reply itself, and never delivers the eventual top-level return value. That is wh
 the final conversational response is suppressed even if the inner task finishes
 before the hard abort.
 
-**The flag boundary still stops at `process_user_input()` and is incomplete even
-inside that function.** Current unguarded paths include:
+`process_user_input()` reads the flag for the status updates listed above.
+Current unguarded paths include:
 
 - the auto-compaction status sent before the legacy loop;
 - `run_agentic_loop()` and `ChatDelegate`, including per-iteration thinking,
