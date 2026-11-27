@@ -190,6 +190,13 @@ Keep `ARG SOURCE_DATE_EPOCH=0` before the runtime `useradd`, not only before the
 
 The in-image test gate runs `npm test` first, then re-runs just the real-CLI contract lane (`scripts/kimi_cli_contract_test.ts`) against the locked CLI — that lane self-skips on a host with no kimi binary, so the Dockerfile is the only place the flag contract (headless `-p` accepted, `--yolo` rejected alongside `-p`, and the baked `[[hooks]]` PreToolUse guard table valid) is asserted for real. Since MR !1549 (WI#324 EF-5) the lane also pins the MCP contract the tool-proxy shim relies on: the CLI loads `$KIMI_CODE_HOME/mcp.json`, spawns the stdio server with parent-env pass-through, and completes `initialize` → `tools/list` over NDJSON.
 
+Both CLI installs apply `scripts/disable_kimi_feedback.ts` after `npm ci`
+(WI#916). It disables built-in TUI feedback and, where present, KAP feedback
+routes and discovery. The bundled gateway cannot read
+`KIMI_CODE_FEEDBACK_BASE_URL`; the task-env scrub alone is not the off control.
+Unreviewed bundle hashes fail the build. Review both feedback paths at the next
+pin and re-run the offline real-CLI gate, including the loopback KAP probe.
+
 The in-image `npm test` runs as root inside rootless BuildKit, which grants no `CAP_SYS_PTRACE`. The root `worker-kimi-ts` lane passed such reads in master pipeline 6308 while the image build failed on them, so only the protected candidate build catches this. A root test therefore cannot read another uid's `/proc/<pid>/{exe,environ,fd}`. Tests that inspect the dropped runner read those entries through a capability-free probe on the runner's own uid (`runnerProc` in `entrypoint_config_test.ts` and `task_runner_client_test.ts`). The world-readable `/proc/<pid>/stat` and `status` need no probe. To reproduce the gate's shape on a host, run the suite under `podman unshare setpriv --bounding-set=-sys_ptrace --`.
 
 ## Do Not
