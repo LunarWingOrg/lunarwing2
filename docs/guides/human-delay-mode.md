@@ -1,13 +1,13 @@
 # Supervised Mode
 
-Supervised mode is LunarWing's human-in-the-loop setting for tool execution. When enabled, every tool action of an Engine V2 foreground thread requires explicit approval, regardless of the tool's normal approval tier or an auto-approve setting. See [Scope](#scope) for what it does not cover.
+Supervised mode is LunarWing's human-in-the-loop setting for tool execution. An Engine V2 foreground thread requires explicit approval before running an
+otherwise permitted tool action, regardless of its normal approval tier or
+an auto-approve setting. See [Scope](#scope) for what it does not cover.
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The `--supervised` CLI
-flag and `AGENT_SUPERVISED_MODE` are resolved once at startup; either source can
-enable supervised mode. Where it applies, supervised mode takes precedence over
-global auto-approval.
+The `--supervised` flag and `AGENT_SUPERVISED_MODE` are resolved at startup.
+Either can enable supervision.
 
 ## Enable It
 
@@ -48,7 +48,9 @@ and whether the CLI, environment, or both enabled it.
 ## Behavior
 
 - New Engine V2 foreground thread configuration is marked `supervised_mode` when the startup-resolved CLI or environment setting enables supervision.
-- Every tool action such a thread proposes is sent through the approval path, including tools whose normal policy would not require approval.
+- The effect adapter pauses eligible tool calls for approval, including tools
+  that usually run without a prompt. Disabled tools and calls denied by
+  an earlier policy check still fail.
 - Supervised mode takes precedence over global auto-approve behavior.
 - Approving an action authorizes that resolved action; it does not disable supervised mode for later actions.
 - Rejections return through the normal tool-result path so the agent can respond without running the rejected action.
