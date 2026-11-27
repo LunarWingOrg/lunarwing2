@@ -2561,7 +2561,7 @@ v2.3.2 entry in this file (pin table, verification, AGN-3 and local-build
 paragraphs), the trail sentences that list older pins by date
 (`kimicode4lunarwing/AGENTS.md:20`,
 `scripts/headless_command_guard_test.ts:12-13`,
-`scripts/kimi_cli_contract_test.ts:239`, the `KIMI_CODE_VERSION` paragraph
+`scripts/kimi_cli_contract_test.ts:242`, the `KIMI_CODE_VERSION` paragraph
 here), `docs/releases/RELEASE-v2.2.1.0.md`, and
 `.gitlab/tests/test_ci_apt_with_retry.py:204` (an unrelated
 `APT_DPKG_VERSION` fixture). Base image digests and
@@ -4917,5 +4917,36 @@ still has HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`, equal to its pin.
 `4106cd15771d8c94d73bab22541fb4a980390de8` from the image pin
 `ca905dfe5e998ebcac29f5c57b5ea04108498468`. Neither is in scope for a bump.
 
-Re-check the current releases and windows when the maintainer answers WI#916.
-Run the full bump checklist on the reviewed revision before seeking merge.
+### Feedback off control — maintainer decision B
+
+[WI#916 note 23483](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23483)
+approved disabling feedback, not either upgrade. Both Kimi image stages now
+patch the installed CLI after `npm ci`. The patch checks the SHA-256 of the
+reviewed bundle before editing it and fails on unknown versions or drift. It
+makes built-in TUI feedback refuse before resolving a provider. On `2.8.1` it
+also removes the Kimi Agent Protocol (KAP) feedback routes and capability and
+makes the gateway refuse before reading `KIMI_CODE_FEEDBACK_BASE_URL` or
+looking up credentials. Task env and the Bash guard are unchanged. Review
+both feedback paths and refresh the patch's anchors when taking a later pin.
+
+The offline contract suite passed seven tests on each patched bundle. An
+authenticated loopback probe confirmed the capability is absent and all five
+feedback routes return 404 even with the override set. The unpatched `2.8.1`
+control still advertised that capability. A separate loopback provider fixture
+received the existing Bash guard denial as a tool error from `kimi -p` on both
+patched bundles; the inert command shim did not run.
+
+The full local slim image build (`podman build --format=docker`) used revision
+`5439291eeb22438bc006bbe8c1ada6e68dc73375` and the retained `2.7.2` lock. Its
+regular suite passed 346 tests with seven skips; the offline real-CLI gate
+then passed all seven tests. The same contract passed 7/7 on the final image
+as the worker UID with a read-only filesystem and no external network. The
+`2.8.1` contract ran against the patched npm bundle on the pinned Node base,
+not as a bumped worker image.
+
+**Pins stay unchanged.** Kimi `2.8.1` still needs the maintainer's interaction
+and provider/session decisions. OpenCode 2 `v2.4.2` still needs its exposure
+decisions, including what replaces the removed `mcp_events` gate; there is no
+bumped image for `console_policy_eval.py`. OpenCode v1 `v1.19.6` is still the
+newest stable v1 tag. Re-check the releases and run the full bump checklist on
+the reviewed revision before promoting either pin.
