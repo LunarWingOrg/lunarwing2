@@ -75,10 +75,10 @@ RUN set -eu; \
     . /build/worker-download-retry.sh; \
     wdr_retry "npm ci (kimi CLI)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli'; \
-    node /build/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli; \
-    KIMI_WORKER_TEST_BUNDLE=/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/dist/main.mjs \
-      PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
-      --test-name-pattern "real CLI"
+    node /build/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli
+RUN --network=none KIMI_WORKER_TEST_BUNDLE=/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/dist/main.mjs \
+    PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
+    --test-name-pattern "real CLI"
 
 # ──────────────────────────────
 # Stage 2: runtime image
