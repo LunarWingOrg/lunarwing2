@@ -48,8 +48,9 @@ system need not match the old host's.
 | DarkIRC pending secrets, candidates, journals, rollback state, interrupted manifest candidates | `state/darkirc/key-exchange/` | **No** — export fails before quiescence until this state is resolved |
 | `XMPP_JID` + `XMPP_PASSWORD` | env | **Yes** — same account login |
 | XMPP rooms / allowlist / encrypted-rooms / plaintext-fallback, OMEMO device id, `LLM_API_KEY`/`MODEL` | env (+ bridge `*_JSON`) | **Yes** — operator config |
-| `LLM_BASE_URL`, `OPENCODE_BASE_URL`, `KIMI_BASE_URL` | env | **Only when non-loopback/custom** — obsolete host-local proxy URLs are not carried |
-| `OPENCODE_MODEL`, `KIMI_MODEL` | env | **Yes** — supported worker model overrides |
+| `LLM_BASE_URL`, `OPENCODE_BASE_URL`, `OPENCODE2_BASE_URL`, `KIMI_BASE_URL` | env | **Custom, non-loopback only** — inherited worker endpoints are re-derived on the destination |
+| `OPENCODE_MODEL`, `OPENCODE2_MODEL`, `KIMI_MODEL` | env | **Yes** — supported worker model overrides |
+| LunarDepth API root, model, and API key | `env/lunardepth.env`, `env/lunardepth-task.env` | **No** — supply the route and a per-tenant key on the destination |
 | Legacy `NANOCODE_MODEL`, `NANOCODE_BASE_URL` | env | **No** — accepted when validating old manifests, then discarded because Nanocode is retired |
 | Vision sidecar VL backend/model | `env/vision.env` | **Yes, when present** — `VL_URL` and `VL_MODEL` are carried in `manifest-vision.env`; vision ports and the host-local sidecar/daemon auth token are regenerated together |
 | Gateway / HTTP **bind address** (`GATEWAY_HOST`, `HTTP_HOST`) | env | **Yes** — operator config (e.g. `0.0.0.0` for remote access vs the `127.0.0.1` default), so your binding choice survives the migration. The **ports** (`GATEWAY_PORT`/`HTTP_PORT`) are NOT carried — they're host-specific and regenerated. (If you bound to a host-specific NIC IP rather than `0.0.0.0`/`127.0.0.1`, review it on the new host.) |
@@ -183,9 +184,20 @@ keep mode `0600`, and delete it from both hosts once the import is verified.
 ```bash
 sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z \
      --start --old-stopped \
-     [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] \
-     [--with-vision] [--docker-group]   # --dry-run first
+     [--with-pebble] [--with-opencode] [--with-opencode2] [--with-kimi] \
+     [--with-toolchains] [--with-vision] [--docker-group]   # --dry-run first
 ```
+Select `--with-opencode2` (or **Restore OpenCode 2 worker** in the web form) to
+register the lane and build its image. Optional `--opencode2-model` and
+`--opencode2-base-url` values take precedence over the bundle. This also lets
+operators supply settings missing from older exports.
+
+To migrate LunarDepth, use `import-tenant.sh` with `--with-lunardepth`,
+`--lunardepth-base-url`, `--lunardepth-model`, and `--lunardepth-api-key-file`.
+Choose a route reachable from the destination worker and supply a private file
+containing its per-tenant API key. See [LunarDepth Worker](WORKER-CONTAINERS.md#lunardepth-worker-lunardepth)
+for route and credential requirements.
+
 Import accepts only a single-link bundle owned by root or the validated invoking
 sudo user, with no group/other permissions, then pins bytes through that opened
 descriptor. It runs typed bundle validation → `add-tenant --no-health` → `build-tenant` →
