@@ -1,9 +1,8 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-11-20 for v2.2.2.0
-(`9c96220bb2`), including the full page.
-Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
-`job_manager.rs` and HTTP completion handling in `api.rs`.
+Implementation lives in `ic/src/orchestrator/harness.rs`, with lifecycle
+ownership in `ic/src/orchestrator/job_manager.rs` and HTTP completion handling
+in `ic/src/orchestrator/api.rs`.
 
 The v2.1.7.0 WI#383 changes close two formerly documented gaps:
 
@@ -183,9 +182,11 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     base64/hex-looking text spans a folded line break (safe direction).
     Line-prefix formats other than the exact recognized `read_file` / `cat -n`
     gutters can still defeat folding.
-  - Tools can truncate **before** this boundary: shell capture is capped at
-    64 KiB per stream and combined output can be reduced to a 32 KiB head/tail
-    result. When the result says `truncated: true`, the worker's parsed-result
+  - Tools can truncate **before** this boundary. Direct shell capture keeps
+    the first 64 KiB of each stream. The shell tool trims combined text over
+    64 KiB to roughly 32 KiB of head plus 32 KiB of tail, adjusted to UTF-8
+    boundaries, with a truncation notice. The direct sandbox path first caps
+    each stream at 32 KiB. When a result says `truncated: true`, the worker's parsed-result
     scrub redacts partial ASCII base64/hex chunks at the final capture cut and
     on both sides of up to 16 `... [truncated N bytes] ...` markers
     (DG-2/DZ-3/EE-2). Arbitrary offset slices, unmarked cuts, non-ASCII
