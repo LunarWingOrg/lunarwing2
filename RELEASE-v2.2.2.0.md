@@ -173,14 +173,14 @@
   quotes) and a glued `)` or `}` no longer hide a listener, a git discard or a
   recursive `chmod`/`chown` of a system root: `(kimi server)`,
   `$(git clean -fdx)` and `(chmod -R 777 /etc)` take the plain spellings'
-  verdicts.
+  verdicts
 - **Kimi's options and subcommands are read as the pinned CLI reads them
   (WI#845, WI#846, WI#852).** The listener check reads the 2.7.2 option
   table, so an option value (`kimi --model X server`) cannot stand in for the
   subcommand, and an option the table does not name is read both ways.
   `kimi rc`, `kimi remote` and `kimi vis` are denied with `server` and `web`,
   and a `find -exec`/`-execdir`/`-ok`/`-okdir` body is read like an `xargs`
-  body.
+  body
 - **The git and file rules read options as the tools do (WI#841, WI#842,
   WI#843).** Git discard options match by any GNU-unambiguous prefix
   (`git reset --har`), `chmod`/`chown`/`chgrp` match `--rec` and longer, and a
@@ -190,7 +190,7 @@
   `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, and `git config` writes, reads,
   renames and edits of `alias.*`, `include.*` and `includeIf.*` keys, matched
   without regard to case. An alias already in a config file stays an accepted
-  residual.
+  residual
 - **A rename or `tar --remove-files` cannot launder a protected tree
   (WI#849).** An `mv` whose source or destination names, contains or sits
   inside `/home/kimi/.kimi-code`, `/app` or `$KIMI_CODE_HOME`, or is a system
@@ -343,21 +343,7 @@
   an assignment to one of the eight names that the outer shell can change is
   refused as unverifiable, even without Git on the line — `export
   PAGER=less` passes, `export PAGER="${PAGER:-less}"` does not. Literal values
-  are still checked as shell bodies even in arguments.
-- **The guard's scope is a documented decision (WI#904, WI#907, WI#909).** By
-  the maintainer's decision of 2026-11-26 the guard is a guard against naive
-  use, not a security boundary, and its coverage is not extended to further
-  spellings of a command it already refuses. `kimicode4lunarwing/AGENTS.md`
-  now carries a **Guard Scope** section naming the three limits: literal text
-  handed to a shell another way (`echo 'kimi server' | sh`, a file written and
-  then run, a variable given to `eval` or `sh -c`, a `trap` action — WI#907);
-  the further routes by which decoded or fetched content reaches a shell
-  (`x=$(curl …); y=$x; $y` — WI#904); and Git's own listeners (`git daemon`,
-  `git instaweb`) plus Git programs named by their dashed path
-  (`/usr/lib/git-core/git-rebase -x '<body>'` — WI#909). The container and
-  tenant egress policy remain the boundary. Every example in the section was
-  run through the hook: the plain spellings are refused and the named limits
-  pass.
+  are still checked as shell bodies even in arguments
 - **A Perl deletion behind shell quoting is denied (WI#840).** The guard
   removes the shell escapes of a quoted one-liner before it reads the Perl
   deletion calls, so an escaped quote no longer hides an
@@ -366,7 +352,7 @@
   test, and the guard's notes were corrected in the same merge request. A
   concatenated operand (`rmtree "/tmp/x/" . "../../workspace"`) and the
   `glob()`, `<…>`, `qw()` and implicit-`$_` forms are covered by WI#851
-  (above).
+  (above)
 - **The pebble worker-inputs manifest covers the files that ship (WI#806).**
   `entrypoint-split.sh` and `src/task_runner.rs` are build-read inputs, so a
   change to either now moves the lane's `worker-inputs` hash instead of
@@ -392,7 +378,7 @@
   time), and caps the total at 1,800 seconds. Only `ActionExecuted` events earn
   time — a tool that returned an error still counts, a refusal (`ActionFailed`)
   does not — and a turn with no tool calls keeps exactly the old 600 seconds.
-  The stop request keeps its 60-second grace and settlement its own.
+  The stop request keeps its 60-second grace and settlement its own
 - **Every turn now leaves one measurement record (WI#807).** `Turn finished`
   is written for the foreground phase and for the late phase, and carries
   `phase`, `tool_calls`, `budget_secs` (the budget of that phase),
@@ -414,11 +400,11 @@
   longest late window (610 s wait budget `OUTCOME_TIMEOUT` + the capped
   1,800 s late budget + both 60 s graces). The legacy `unanswered` seal stays
   at 610,000 ms (`UNANSWERED_AFTER_MS`) on purpose, so a swallowed message does
-  not hold its queue slot for the whole late budget.
+  not hold its queue slot for the whole late budget
   `tui/src/state/correlate.ts` holds the window as a literal
   (`LATE_REPLY_WINDOW_MS`) that mirrors the daemon's `LONGEST_LATE_WINDOW`,
   which `outcome/tests.rs` pins at 2,530 s; the reducer test states the
-  distinction.
+  distinction
 - **A finished message is remembered for the whole late window (WI#820).**
   The channel manager's finished-message memory
   (`ic/src/channels/lifecycle.rs`) derives its TTL from `LONGEST_LATE_WINDOW`
@@ -521,75 +507,6 @@
   patch-bumped: cavepony-tool `0.4.13`, gitlab `0.1.19`, gotify `0.1.9`,
   llm-context `0.1.11`, multica-bridge `0.1.12`, ssh `0.1.10`,
   vision-analyze `0.2.4`, voice-transcribe `0.1.10` and web-search `0.2.12`.
-
-## Security and supply chain
-
-- **The audit is a point-in-time record (WI#800).** The report is
-  [`docs/ops/v2.2.2.0_CARGO_DENY_AUDIT.md`](docs/ops/v2.2.2.0_CARGO_DENY_AUDIT.md).
-  It reads `85d564a82` against RustSec advisory-db `55e1c3df` (2026-11-21) and
-  covers all 27 tracked non-vendor lock roots, including the manifest-less
-  Pebble override. It re-verified all 23 acceptances, found none stale or
-  widen-able, and added, removed, widened or re-worded none of them. The
-  database moved under the audit — it began at `f291af9b` and finished at
-  `55e1c3df`; the one added record is a Matrix-URI panic against
-  `ruma-identifiers-validation`, which is in no lock or manifest. The report is
-  true for that database revision and that date only; the CI gates are the
-  standing check.
-- **The acceptances now name a standing owner (WI#779).** The twelve
-  acceptances whose clearing owners WI#367 and WI#418 closed without clearing
-  are re-homed to
-  [`docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md`](docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md),
-  a document with a row per advisory and no open/closed state. `ic/deny.toml`
-  still holds 23 IDs, and a CI test requires each to appear as a table row in
-  the owner document.
-- **`cargo-deny` bans the Wasmtime versions the fixes came from.** `[bans]`
-  denies `wasmtime >=36.0.0, <36.0.20` and `wasmtime-wasi >=36.0.0, <36.0.22`
-  inside the supported 36.x line, with no advisory ignore for either. The locks
-  carry `36.0.23`, which is above both floors; RUSTSEC-2026-0587 is cleared by
-  the version, not accepted. The Wasmtime acceptance the v2.2.1.0 notes
-  described as removed is still absent, and the comment says a re-broken record
-  is a new maintainer decision.
-- **The secret-history baseline carries the 2.2.2 vendor commit (WI#799,
-  WI#798).** Nine fingerprints were added since v2.2.1.0, recorded in
-  `.gitlab/gitleaks-history-ignore` with disposition rows in
-  `.gitlab/gitleaks-history-dispositions.md`, in two sets: five from the
-  sweep's vendor commit `aacffdd47` (WI#799: `cc`, `serde_with`, `toml`,
-  `toml_edit` and `toml_parser`) and four from the Wasmtime 36.0.23 refresh at
-  `da90adaad` (WI#798: `wasmtime`, `wasmtime-wasi`, `cranelift-assembler-x64`
-  and `cranelift-entity`). Each is a cargo checksum manifest whose package
-  digest equals the crate's checksum in `ic/Cargo.lock`, not a credential. Without them the blocking `secret-history`
-  job would have failed at the release tag, because the scan runs only on
-  schedules and protected tags.
-- **The WASM tool crates are compiled, tested and linted in CI (WI#809,
-  WI#825).** Before this, a tool crate was only resolved: nothing built an
-  `ic/tools-src` crate until a tenant build did, so a broken tool reached a
-  tenant before any pipeline showed it. `wasm-tools-check` takes its crate list
-  from `.gitlab/deliverables.json`, resolves each manifest through
-  `ic/registry/tools/*.json` to the same source directory a tenant build
-  compiles, and runs `cargo build --locked --release --target wasm32-wasip2`,
-  `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`
-  through `.gitlab/scripts/cargo-ci.sh` for the eight crates assigned to it;
-  `cavepony-tool` is built by `cavepony-wasm`, which runs one host
-  compatibility test and no clippy. The job blocks a merge. The coverage
-  check is no longer a substring test (WI#825): an `echo`, a comment or a lone
-  `cd` that mentions the path does not count, only an actual cargo compile
-  subcommand run from that directory or naming its manifest.
-- **Artifact retention now states the limit the platform delivers (WI#805).**
-  The project deletes pipelines after 30 days, and deleting a pipeline deletes
-  its jobs, logs and artifacts. The scan and promotion evidence therefore
-  declare 30 days — the ceiling, not a shortening — and
-  [`docs/ops/CI_ARTIFACT_RETENTION.md`](docs/ops/CI_ARTIFACT_RETENTION.md) says
-  so at the `expire_in` line and in the document. The one-off cleanup the
-  earlier text recommended is named as unsafe there: it deleted the scan and
-  promotion artifacts of every release pipeline older than two days, and
-  promotion never rebuilds, so that evidence cannot be made again. Rootfs tars
-  still expire in two days.
-
-- **The pebble locks move to `url` 2.5.9 (RUSTSEC-2026-0592, WI#855).** The
-  advisory (a stack overflow in `Url::origin()` on nested `blob:` URLs) failed
-  `satellite-advisory-sweep` on the two pebble locks, the only ones still at
-  2.5.8. Both now carry `url` 2.5.9 and `form_urlencoded` 1.2.3, the override
-  verifier allows both, and `PEBBLE_LOCK_SHA256` pins the new override.
 
 ## Operations and tenant lifecycle
 
@@ -706,7 +623,7 @@ No database migration is added by this release, and no existing wire or
 database contract changes. The estimation routes are additive and read-only,
 the capability manifest is opt-in per call, the git grant is off without
 `SANDBOX_GIT_REMOTES`, and estimation is observe-only until an operator sets a
-flag.
+flag
 
 Registry bumps require rebuilt WASM artifacts. Rebuild every enabled worker
 image through the protected candidate, scan and promotion path; local builds
@@ -765,15 +682,15 @@ do not replace those gates.
 9. **Play a promotion within 30 days, and its candidate within two.** Both the
    scan and the promotion evidence now live exactly as long as their pipeline,
    and the project deletes pipelines after 30 days. Promotion never rebuilds,
-   so an expired candidate means re-running the candidate and then the scan.
+   so an expired candidate means re-running the candidate and then the scan
 
 ## Known Limitations
 
-- **NetBird custom DNS is unsupported (WI#603).** Setting `SANDBOX_TUNNEL_DNS`
+- **NetBird custom DNS is still unsupported (WI#603).** Setting `SANDBOX_TUNNEL_DNS`
   with the NetBird provider is refused during configuration validation, before
   any container-runtime call (`ic/src/sandbox/tunnel_sidecar.rs`). Use NetBird
   nameserver groups reachable through the overlay; an upstream outside the
-  overlay fails closed because its resolver sockets are unmarked.
+  overlay fails closed because its resolver sockets are unmarked
 - **Harness redaction remains bounded and best-effort.** Offset or grouped
   dumps, other encodings, arbitrary fragments and unmarked truncation are not
   comprehensively covered. The external-worker isolation boundary remains
@@ -794,18 +711,6 @@ do not replace those gates.
   the systemd user unit `lunarwing service install` writes, which sets no
   `UMask`. Run the daemon through a shipped unit if job directories must not be
   group- or world-readable.
-- **The Kimi guard reads text, not a shell.** Its coverage is bounded and, by
-  the maintainer's decision of 2026-11-26, is not extended further (WI#904,
-  WI#907, WI#909): literal text handed to a shell another way
-  (`echo 'kimi server' | sh`, a file written and then run, a variable given to
-  `eval` or `sh -c`, a `trap` action), the further routes by which decoded or
-  fetched content reaches a shell (`x=$(curl …); y=$x; $y`), and Git's own
-  listeners (`git daemon`, `git instaweb`) and Git programs named by their
-  dashed path are documented limits, not defects. `rename` and interpreter
-  renames still pass. WI#887 closed `flock -c`, `watch`, `su -c` and `parallel`
-  as launchers, and WI#858 already reads `eval`, `taskset`, `script -c`,
-  process substitutions `<(…)` and brace expansion, so those are no longer
-  limits. The egress allowlist and the container remain the boundary.
 - **The shell git grant carries no credential (WI#816).**
   Host-held authentication and push from inside the shell are not part of this
   release. The manifest preflight rejects recognized `git push` invocations,
@@ -814,11 +719,7 @@ do not replace those gates.
 - **The capability manifest does not reach worker containers (WI#797).**
   External worker lanes stay governed by `mt-admin`'s per-tenant container
   configuration and egress allowlists. The shell's git grant does not grant
-  access to a worker's credentials.
-- **Promotion evidence lives as long as its pipeline (WI#805).** The project
-  deletes pipelines after 30 days, so the scan SBOM and the promotion record
-  are gone with it. There is no durable record of what a release published
-  outside the pipeline.
+  access to a worker's credentials
 - **Tool runtime estimates are per registry and per process (WI#318).** Each
   registry starts cold, no learned factor survives a restart, and the display
   is a heuristic EMA labelled `low` or `moderate`, not a probability, a
