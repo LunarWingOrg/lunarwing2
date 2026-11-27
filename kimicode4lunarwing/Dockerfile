@@ -75,7 +75,9 @@ RUN set -eu; \
     . /build/worker-download-retry.sh; \
     wdr_retry "npm ci (kimi CLI)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli'; \
-    PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
+    node /build/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli; \
+    KIMI_WORKER_TEST_BUNDLE=/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/dist/main.mjs \
+      PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
       --test-name-pattern "real CLI"
 
 # ──────────────────────────────
@@ -266,6 +268,7 @@ RUN --mount=type=bind,from=builder,source=/build/worker-download-retry.sh,target
     wdr_retry "npm install -g npm@12.0.2" "-" 'npm install -g npm@12.0.2' && \
     wdr_retry "npm ci (kimi CLI runtime)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli' && \
+    node /app/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force && \
