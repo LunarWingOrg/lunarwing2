@@ -209,8 +209,9 @@ next wait until its next 30s interval tick.
 
 The adapter caps its wait at 20 seconds. The guest allows 25 seconds for the
 HTTP request, and the default channel runtime lets the caller wait 30 seconds
-for the callback. If `/api/wait` returns 404 or an unparseable body, the guest
-logs the failure and switches to **poll mode**.
+for the callback. A 404 or an unparseable 200 response from `/api/wait`
+makes the guest switch to **poll mode** until the channel restarts. Other
+HTTP statuses and transport errors are logged without changing the mode.
 
 ### Poll mode (fallback / old adapters) — 30s effective floor
 
