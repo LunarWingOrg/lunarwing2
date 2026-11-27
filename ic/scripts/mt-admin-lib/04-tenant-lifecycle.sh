@@ -2623,12 +2623,157 @@ doctor() {
 }
 
 # ── Coordination knowledge-share doctor ──────────────────────────────────────
-#
-# Read-only, init-agnostic validation of the coordination knowledge-share
-# (KNOW:) operator surface. Never prints secrets: bearer tokens, XMPP
-# passwords, and the COORD_ADMIN_TOKEN are read but only their presence/absence
-# is reported. Never rewrites room or trust policy — it reports mismatches and
-# recommended edits so the operator can decide.
+
+_coord_doctor_has_room() {
+  local room="$1" candidate
+  local -n room_list="$2"
+  for candidate in "${room_list[@]}"; do
+    [[ "${candidate,,}" == "${room,,}" ]] && return 0
+  done
+  return 1
+}
+
+_coord_doctor_publishers() {
+  local share="$1" publishers="$2" coord_channels="$3"
+  [[ "$share" == "true" ]] || return 0
+  if [[ -z "$publishers" ]]; then
+    _fail "COORD_KNOWLEDGE_SHARE=true but COORD_KNOWLEDGE_PUBLISHERS is empty; every KNOW: share is ignored (deny-all)"
+    return
+  fi
+
+  _pass "COORD_KNOWLEDGE_SHARE=true with a non-empty publisher allowlist"
+  say "  publishers (classified):"
+  local entry room_nick
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    if [[ "$entry" == */* ]]; then
+      room_nick="${entry%%/*}"
+      printf '    - %-40s exact occupant (room-wide equivalent: %s)\n' "$entry" "$room_nick"
+    else
+      printf '    - %-40s bare JID (room-wide if it names a MUC room; never matches if it is a user JID)\n' "$entry"
+    fi
+  done < <(printf '%s' "$publishers" | tr ',' '\n')
+  # A bare entry only works if it names one of the coordination rooms
+  # (room-wide opt-in); a user bare JID never matches a MUC occupant sender.
+  local bare user_bare=0
+  local -a coord_rooms=()
+  read -r -a coord_rooms <<<"${coord_channels//,/ }"
+  while IFS= read -r bare; do
+    [[ -n "$bare" ]] || continue
+    if _coord_doctor_has_room "$bare" coord_rooms; then
+      _w "publisher '$bare' is a coordination room bare JID: room-wide opt-in (every occupant of that room may publish)"
+    else
+      user_bare=$((user_bare + 1))
+    fi
+  done < <(printf '%s' "$publishers" | tr ',' '\n' | grep -Ev '/.+' || true)
+  if [[ "$user_bare" -gt 0 ]]; then
+    _fail "publisher allowlist carries bare JID(s) matching no coordination room: a user bare JID (user@server) never matches a MUC occupant sender; use a full occupant JID (room@server/nick) or a coordination room bare JID (room@server)"
+  fi
+}
+
+_coord_doctor_rooms_from_json() {
+  jq -ers --arg field "${2:-}" '
+    select(length == 1) | .[0]
+    | if $field == "" then . else objects | .[$field] end
+    | arrays | select(all(.[]; type == "string" and length > 0 and (test("[[:cntrl:]]") | not)))
+    | unique | join("\n")
+  ' <<<"$1" 2>/dev/null
+}
+
+_coord_doctor_static_rooms() {
+  local bridge_env="$1" allow_rooms allow_rooms_json room_list
+  local -n rooms="$2"
+  allow_rooms="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS)"
+  allow_rooms_json="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS_JSON)"
+  say "Bridge config (static fallback, not live):"
+  say "  XMPP_ALLOW_ROOMS      = ${allow_rooms:-<unset>}"
+  say "  XMPP_ALLOW_ROOMS_JSON = ${allow_rooms_json:-<unset>}"
+  if [[ -n "$allow_rooms_json" && "$allow_rooms_json" != "[]" ]]; then
+    room_list="$(_coord_doctor_rooms_from_json "$allow_rooms_json")" || room_list=""
+    mapfile -t rooms < <(printf '%s' "$room_list")
+  else
+    read -r -a rooms <<<"${allow_rooms//,/ }"
+  fi
+}
+
+_coord_doctor_check_allowlist() {
+  local coord_enabled="$1" coord_channels="$2" room
+  local -n allowlist="$3"
+  if (( ${#allowlist[@]} > 0 )); then
+    _pass "bridge allowlist is non-empty"
+  elif [[ "$coord_enabled" == "true" ]]; then
+    _fail "no MUC room configured on the bridge: the daemon will neither join nor receive any coordination groupchat"
+  else
+    _w "no MUC room configured: the daemon will drop all inbound groupchat (join + receive allowlist)"
+  fi
+
+  [[ "$coord_enabled" == "true" ]] || return 0
+  local -a coord_rooms=()
+  read -r -a coord_rooms <<<"${coord_channels//,/ }"
+  for room in "${coord_rooms[@]}"; do
+    if _coord_doctor_has_room "$room" "$3"; then
+      _pass "coordination room '$room' is on the bridge allowlist"
+    else
+      _fail "coordination room '$room' is NOT on the bridge allowlist: the bridge is not configured to join it"
+    fi
+  done
+}
+
+_coord_doctor_check_presence() {
+  local configured_rooms="$1" rooms_with_presence="$2" room
+  local -a present=()
+  mapfile -t present < <(printf '%s' "$rooms_with_presence")
+  while IFS= read -r room; do
+    # The receive wildcard is not a room the bridge can join.
+    [[ -n "$room" && "$room" != "*" ]] || continue
+    if _coord_doctor_has_room "$room" present; then
+      _pass "room '$room' shows presence (joined)"
+    else
+      _fail "room '$room' is configured but shows no presence"
+    fi
+  done <<<"$configured_rooms"
+}
+
+_coord_doctor_bridge() {
+  local name="$1" bridge_env="$2" coord_enabled="$3" coord_channels="$4"
+  local bridge_port bridge_token status="" configured_rooms rooms_with_presence display
+  bridge_port="$(ports_get "$name" bridge)" || bridge_port=""
+  # WI#423: tenant-side read; a refusal is treated as a missing token.
+  bridge_token="$(read_tenant_env_value "$name" "$bridge_env" XMPP_BRIDGE_TOKEN)" || bridge_token=""
+  say ""
+  if [[ -z "$bridge_token" || -z "$bridge_port" ]]; then
+    _w "cannot query bridge status: missing bridge port or XMPP_BRIDGE_TOKEN"
+  elif status="$(curl -sf --max-time 3 \
+    -H "Authorization: Bearer $bridge_token" \
+    "http://127.0.0.1:${bridge_port}/v1/status" 2>/dev/null)" && [[ -n "$status" ]]; then
+    _pass "bridge /v1/status reachable on 127.0.0.1:${bridge_port}"
+  else
+    _w "bridge /v1/status unreachable on 127.0.0.1:${bridge_port} (bridge down or token mismatch)"
+    status=""
+  fi
+
+  local -a allowed=()
+  if ! configured_rooms="$(_coord_doctor_rooms_from_json "$status" configured_rooms)"; then
+    [[ -z "$status" ]] || _w "bridge /v1/status has no usable configured_rooms list; cannot check live room presence"
+    _coord_doctor_static_rooms "$bridge_env" allowed
+    _coord_doctor_check_allowlist "$coord_enabled" "$coord_channels" allowed
+    return
+  fi
+
+  display="${configured_rooms//$'\n'/,}"
+  say "  bridge configured_rooms    = ${display:-<none>}"
+  mapfile -t allowed < <(printf '%s' "$configured_rooms")
+  _coord_doctor_check_allowlist "$coord_enabled" "$coord_channels" allowed
+  if rooms_with_presence="$(_coord_doctor_rooms_from_json "$status" rooms_with_presence)"; then
+    display="${rooms_with_presence//$'\n'/,}"
+    say "  bridge rooms_with_presence = ${display:-<none>}"
+    _coord_doctor_check_presence "$configured_rooms" "$rooms_with_presence"
+  else
+    _w "bridge /v1/status has no usable rooms_with_presence list; cannot check live room presence"
+  fi
+}
+
+# Read-only, init-agnostic validation; room lists are reported, not credentials.
 coord_doctor() {
   ports_registry_init
   local name="${1:-}"
@@ -2677,132 +2822,8 @@ coord_doctor() {
     _w "COORD_ENABLED is not true; coordination is disabled"
   fi
 
-  if [[ "${share:-false}" == "true" ]]; then
-    if [[ -z "${publishers:-}" ]]; then
-      _fail "COORD_KNOWLEDGE_SHARE=true but COORD_KNOWLEDGE_PUBLISHERS is empty; every KNOW: share is ignored (deny-all)"
-    else
-      _pass "COORD_KNOWLEDGE_SHARE=true with a non-empty publisher allowlist"
-      say "  publishers (classified):"
-      local entry room_nick
-      while IFS= read -r entry; do
-        [[ -n "$entry" ]] || continue
-        if [[ "$entry" == */* ]]; then
-          room_nick="${entry%%/*}"
-          printf '    - %-40s exact occupant (room-wide equivalent: %s)\n' "$entry" "$room_nick"
-        else
-          printf '    - %-40s bare JID (room-wide if it names a MUC room; never matches if it is a user JID)\n' "$entry"
-        fi
-      done < <(printf '%s' "$publishers" | tr ',' '\n')
-      # A bare entry only works if it names one of the coordination rooms
-      # (room-wide opt-in); a user bare JID never matches a MUC occupant
-      # sender. Room and user bare JIDs share the same syntax, so
-      # cross-check against COORD_CHANNELS instead of guessing.
-      local bare room match_room user_bare=0
-      while IFS= read -r bare; do
-        [[ -n "$bare" ]] || continue
-        match_room=0
-        for room in ${coord_channels//,/ }; do
-          [[ -n "$room" ]] || continue
-          if [[ "${bare,,}" == "${room,,}" ]]; then
-            match_room=1
-            break
-          fi
-        done
-        if [[ "$match_room" == "1" ]]; then
-          _w "publisher '$bare' is a coordination room bare JID: room-wide opt-in (every occupant of that room may publish)"
-        else
-          user_bare=$((user_bare + 1))
-        fi
-      done < <(printf '%s' "$publishers" | tr ',' '\n' | grep -Ev '/.+' || true)
-      if [[ "$user_bare" -gt 0 ]]; then
-        _fail "publisher allowlist carries bare JID(s) matching no coordination room: a user bare JID (user@server) never matches a MUC occupant sender; use a full occupant JID (room@server/nick) or a coordination room bare JID (room@server)"
-      fi
-    fi
-  fi
-
-  # --- Bridge-side room join configuration ----------------------------------
-  local allow_rooms allow_rooms_json
-  allow_rooms="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS)"
-  allow_rooms_json="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS_JSON)"
-  say ""
-  say "Bridge config (non-secret):"
-  say "  XMPP_ALLOW_ROOMS      = ${allow_rooms:-<unset>}"
-  say "  XMPP_ALLOW_ROOMS_JSON = ${allow_rooms_json:-<unset>}"
-  local allow_rooms_list=""
-  if [[ -n "${allow_rooms_json:-}" && "$allow_rooms_json" != "[]" ]]; then
-    allow_rooms_list="$(printf '%s' "$allow_rooms_json" | jq -r '.[]?' 2>/dev/null | tr '\n' ' ')"
-  elif [[ -n "${allow_rooms:-}" ]]; then
-    allow_rooms_list="$(printf '%s' "$allow_rooms" | tr ',' ' ')"
-  fi
-  if [[ -z "${allow_rooms_list// /}" ]]; then
-    if [[ "${coord_enabled:-false}" == "true" ]]; then
-      _fail "no MUC room configured on the bridge: the daemon will neither join nor receive any coordination groupchat"
-    else
-      _w "no MUC room configured: the daemon will drop all inbound groupchat (join + receive allowlist)"
-    fi
-  else
-    _pass "bridge allowlist carries at least one MUC room"
-  fi
-  # Every coordination room must be on the bridge allowlist, or its inbound
-  # groupchat (including every KNOW: share) is dropped before the hooks run.
-  if [[ "${coord_enabled:-false}" == "true" && -n "${coord_channels:-}" ]]; then
-    local room allowed found
-    for room in ${coord_channels//,/ }; do
-      [[ -n "$room" ]] || continue
-      found=0
-      for allowed in $allow_rooms_list; do
-        [[ -n "$allowed" ]] || continue
-        if [[ "${room,,}" == "${allowed,,}" ]]; then
-          found=1
-          break
-        fi
-      done
-      if [[ "$found" == "1" ]]; then
-        _pass "coordination room '$room' is on the bridge allowlist"
-      else
-        _fail "coordination room '$room' is NOT on the bridge allowlist: the daemon will drop its inbound groupchat"
-      fi
-    done
-  fi
-
-  # --- Live bridge status (authenticated loopback, non-secret) ---------------
-  local bridge_port bridge_token
-  bridge_port="$(ports_get "$name" bridge)"
-  # WI#423: tenant-side read; a refusal reads as absent so the doctor warns
-  # "cannot query bridge status" instead of aborting the diagnostics run.
-  bridge_token="$(read_tenant_env_value "$name" "$bridge_env" XMPP_BRIDGE_TOKEN)" || bridge_token=""
-  say ""
-  if [[ -n "$bridge_token" ]] && [[ -n "$bridge_port" ]]; then
-    local status configured_rooms rooms_with_presence
-    status="$(curl -sf --max-time 3 \
-      -H "Authorization: Bearer $bridge_token" \
-      "http://127.0.0.1:${bridge_port}/v1/status" 2>/dev/null)" || status=""
-    if [[ -n "$status" ]]; then
-      _pass "bridge /v1/status reachable on 127.0.0.1:${bridge_port}"
-      configured_rooms="$(printf '%s' "$status" | jq -r '.configured_rooms // empty | join(",")' 2>/dev/null)"
-      rooms_with_presence="$(printf '%s' "$status" | jq -r '.rooms_with_presence // empty | join(",")' 2>/dev/null)"
-      say "  bridge configured_rooms   = ${configured_rooms:-<none>}"
-      say "  bridge rooms_with_presence = ${rooms_with_presence:-<none>}"
-      if [[ -n "$rooms_with_presence" ]] && [[ -n "$configured_rooms" ]]; then
-        local cfg pres cfgj
-        for cfg in $configured_rooms; do
-          pres=0
-          for cfgj in $rooms_with_presence; do
-            [[ "$cfgj" == "$cfg" ]] && { pres=1; break; }
-          done
-          if [[ "$pres" == "1" ]]; then
-            _pass "room '$cfg' shows presence (joined)"
-          else
-            _fail "room '$cfg' is configured but shows no presence: the daemon never joined it, so its inbound messages are not delivered"
-          fi
-        done
-      fi
-    else
-      _w "bridge /v1/status unreachable on 127.0.0.1:${bridge_port} (bridge down or token mismatch)"
-    fi
-  else
-    _w "cannot query bridge status: missing bridge port or XMPP_BRIDGE_TOKEN"
-  fi
+  _coord_doctor_publishers "$share" "$publishers" "$coord_channels"
+  _coord_doctor_bridge "$name" "$bridge_env" "$coord_enabled" "$coord_channels"
 
   # --- Coord admin knowledge counters (optional, non-secret) -----------------
   local admin_port admin_token
