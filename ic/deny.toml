@@ -119,10 +119,10 @@ ignore = [
     { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep (XMPP OMEMO), every feature set; failure 0.1.8 is the final release; clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md, decision record WI#331 (re-verified 2026-11-27)" },
     { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain and exposure as RUSTSEC-2019-0036; clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md, decision record WI#331 (re-verified 2026-11-27)" },
 
-    # h2 empty DATA frames — low severity. The patched 0.4.20 is locked; the
-    # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)
-    # and is reached only via the legacy libsql 0.6.0 -> tonic 0.11 -> hyper 0.14
-    # chain, same mitigation and WI#418 standing decision as the webpki
+    # h2 empty DATA frames — low severity. Both locks have the patched 0.4.21;
+    # the ic workspace also locks 0.3.27, with no patch on the 0.3 line.
+    # The older pin is reached only via libsql 0.6.0 -> tonic 0.11 -> hyper 0.14,
+    # with the same mitigation and WI#418 standing decision as the webpki
     # entries above (re-verified 2026-11-27: libsql 0.10.0 stable still
     # requests tonic ^0.11 / hyper ^0.14). WI#418 closed 2026-10-18 with the
     # pin still locked; the clearing owner is
@@ -131,7 +131,7 @@ ignore = [
     # default and postgres-only builds do not contain it, and the
     # default-feature graph is pinned clean by
     # .gitlab/scripts/check-default-graph-advisories.sh.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line locked at 0.4.21 in both locks; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
 
     # RUSTSEC-2026-0381 (webpki-roots 0.26.11 shim) — acceptance REMOVED by the
     # v2.1.7.0 crate-security audit (2026-10-24, advisory-db 21d909e4): that
@@ -221,41 +221,39 @@ ignore = [
     # re-add these entries on your own. The [bans] Wasmtime floor below is
     # unchanged, and no 36.x release reaches either affected range.
 
-    # heapless — nine unsound advisories on a crate this tree uses for two
-    # types only. WI#781 (2026-11-19): advisory-db 7133866a added
-    # RUSTSEC-2026-0574 to RUSTSEC-2026-0582 against heapless, all fixed in
-    # 0.9.4. `unsound = "all"` above makes them fail the gate although the
-    # crate is transitive. heapless 0.7.17 reaches ic/Cargo.lock and
-    # ic/bridges/xmpp-bridge/Cargo.lock by one path: monty 0.0.17 (a git
-    # dependency of lunarwing_engine) takes postcard 1.1.3 with its default
-    # features, and the default feature `heapless-cas` pulls it in. wasmtime
-    # takes postcard with `alloc` only. Outside its tests postcard uses
-    # heapless::Vec and heapless::String (ic/vendor/postcard/src/ser/flavors.rs,
-    # ic/vendor/postcard/src/max_size.rs); the advisories name
-    # sorted_linked_list, spsc, IndexMap, Deque, HistoryBuf and the pool
-    # types, and no file of postcard or monty names sorted_linked_list, spsc
-    # or zeroize. Reachability was judged by reading, not by a run.
-    # No bump clears them: postcard 1.x requires heapless 0.7. Accepted on the
-    # maintainer's order of 2026-11-19. The [bans] entries below keep the
-    # acceptance to this graph position: only postcard may pull a heapless
-    # below 0.9.4, and postcard below 2.0.0 may only be a direct dependency of
-    # the current parents (WI#788). Clearing: heapless leaves the locks (monty
-    # takes postcard without default features) or moves to 0.9.4 or later (a
-    # postcard release on the new line); the entries then show as
-    # advisory-not-detected and are removed. WI#781 accepted the nine on
+    # heapless — nine transitive unsound advisories, all fixed in 0.9.4.
+    # WI#928 rechecked RustSec c5279d0b: heapless 0.7.17 still matches in
+    # ic/Cargo.lock and ic/bridges/xmpp-bridge/Cargo.lock. monty 0.0.17
+    # (lunarwing_engine's git dependency) enables postcard 1.2.0's default
+    # `heapless-cas`, which pulls 0.7.17. The Wasmtime parents enable only
+    # `alloc`. Postcard's optional `heapless-v0_9` takes heapless ^0.9.4;
+    # enabling it alone does not switch off the default 0.7 edge.
+    # Monty snapshots use `to_allocvec` (alloc::vec::Vec<u8>) and `from_bytes`
+    # (slice deserialization of Monty types), not postcard's heapless APIs.
+    # RUSTSEC-2026-0577 includes heapless::vec::IntoIter::drop as well as
+    # methods on Deque, HistoryBuf and IndexMap. The Monty path does not
+    # create a heapless Vec iterator. This is a source-based reachability
+    # assessment, not a claim that all uses of heapless::Vec are unaffected.
+    # The [bans] entries limit direct parents: only postcard may pull a
+    # heapless below 0.9.4, and only the listed parents may pull postcard
+    # below 2.0.0 (WI#788). Clearing requires removing the old edge from
+    # both locks. Disable Monty's postcard defaults and keep `alloc`; select
+    # `heapless-v0_9` with defaults off only if a heapless API is needed.
+    # Keep the ignores until the standing owner's entry-removal protocol is
+    # satisfied in an approved clearing change. WI#781 accepted the nine on
     # 2026-11-19 and closed 2026-11-20T07:37:51Z with heapless still locked,
     # so WI#779 re-homed their clearing owner (2026-11-21) to
     # docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md; a closed work item
     # cannot own a standing acceptance.
-    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 unsound (sorted_linked_list FindMutView::pop use after free); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 unsound (spsc peek used Relaxed ordering); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 unsound (IndexMap::truncate inconsistent state); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 unsound (panicking Drop in clear/retain of Deque, HistoryBuf and IndexMap); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 unsound (SortedLinkedList zeroize inconsistent state); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 unsound (Deque TryFrom when the deque ends up full); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 unsound (treiber stack race in the pool types); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 unsound (Deque::make_contiguous broken invariants); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
-    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 unsound (IndexMap::insert on maps of u16::MAX elements); fixed in >= 0.9.4, which postcard 1.x cannot take; reached only as postcard 1.1.3's default feature heapless-cas through monty 0.0.17; postcard uses only heapless::Vec and heapless::String outside its tests, not the API this advisory names; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 unsound (sorted_linked_list FindMutView::pop use after free); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 unsound (spsc peek used Relaxed ordering); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 unsound (IndexMap::truncate inconsistent state); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 unsound (panic safety in heapless::vec::IntoIter::drop and Deque, HistoryBuf and IndexMap methods); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty's to_allocvec writes to alloc::vec::Vec<u8> and from_bytes reads a slice into Monty types, so neither path uses the affected heapless APIs; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 unsound (SortedLinkedList zeroize inconsistent state); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 unsound (Deque TryFrom when the deque ends up full); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 unsound (treiber stack race in the pool types); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 unsound (Deque::make_contiguous broken invariants); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 unsound (IndexMap::insert on maps of u16::MAX elements); fixed in >= 0.9.4; locked via postcard 1.2.0's default heapless-cas through monty 0.0.17; Monty uses to_allocvec and from_bytes, not the affected heapless API; accepted 2026-11-19 on the maintainer's order (WI#781) against advisory-db 7133866a; (re-verified 2026-11-27); clearing owner docs/ops/v2.2.2.0_STANDING_ADVISORY_OWNERS.md" },
 ]
 
 [licenses]
@@ -334,21 +332,14 @@ deny = [
     { name = "atty", wrappers = ["env_logger"] },
     { name = "env_logger", version = "<0.10.0", wrappers = ["libsignal-protocol"] },
     # WI#781: the nine heapless ignores (RUSTSEC-2026-0574 to -0582) are keyed
-    # by ID, so they would also accept heapless under any other parent. Only
-    # postcard, which uses heapless::Vec and heapless::String, may pull a
-    # release below the fixed 0.9.4.
+    # by ID. Restrict the direct parent of heapless below 0.9.4 to postcard.
     { name = "heapless", version = "<0.9.4", wrappers = ["postcard"] },
-    # WI#788: the heapless line above pins heapless's direct parent only, so
-    # any future crate that takes postcard with default features would become
-    # a second heapless parent and inherit all nine acceptances with no change
-    # to these pins. Pin postcard's own parents too. wrappers is a direct-
-    # parent check, so every current parent must be listed: monty 0.0.17 takes
-    # postcard 1.1 with defaults (heapless-cas), while wasmtime,
-    # wasmtime-environ and wasmtime-internal-cache take it with
-    # default-features = false and never reach heapless
-    # (ic/vendor/monty/Cargo.toml, ic/vendor/postcard/Cargo.toml). A new
-    # parent fails closed; add it here only after confirming it does not
-    # enable postcard's default features.
+    # WI#788: also restrict postcard's direct parents. monty 0.0.17 takes
+    # postcard 1.2.0 with defaults (heapless-cas), while wasmtime,
+    # wasmtime-environ and wasmtime-internal-cache take it with defaults off
+    # and `alloc`. This list checks parent names, not enabled features.
+    # Before allowing a new parent, check that it does not enable the old
+    # heapless edge, either through defaults or explicitly.
     { name = "postcard", version = "<2.0.0", wrappers = [
         "monty",
         "wasmtime",
