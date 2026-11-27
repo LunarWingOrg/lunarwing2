@@ -1,6 +1,6 @@
 # Emoting mascot widget (web gateway)
 
-With `MASCOT_ENABLED=true` (off by default), the web gateway shows a small
+With `MASCOT_ENABLED=true` (off in bare daemon and new mt-admin defaults), the web gateway shows a small
 animated pony/unicorn in a draggable corner widget that mirrors the agent's
 expressed emotions. When the agent replies
 with a roleplay action phrase — `*stamps hooves*`, `*ears perk up*` — the
@@ -9,11 +9,9 @@ mascot plays the matching sprite animation instead of staying static.
 The whole feature is presentation-layer only: no message content, agent
 behavior, or session state is affected.
 
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The emote parser,
-sprite allowlist (`Emote::ALL_SPRITES`), wire contract, and mascot widget match
-`ic/src/channels/web/emote.rs` and `ic/src/channels/web/static/mascot.js`. All
-eight sprites, including `lunar_sup.gif` and `lunar_fiery.gif`, remain present
-in `static/mascot/` and `sprites/new/`.
+`GatewayChannel::respond`, `GatewayChannel::broadcast`, and the conversion
+from `AppEvent::Response` to `SseEvent` call `emote_names`. The gateway serves
+the widget JavaScript and sprites only when enabled.
 
 ## Pipeline
 
