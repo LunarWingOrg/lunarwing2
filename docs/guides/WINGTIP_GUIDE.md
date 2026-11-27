@@ -8,11 +8,9 @@ The full reference is [`tui/README.md`](../../tui/README.md): every flag, key, c
 the voice and image rules, and a longer troubleshooting table. The design is
 [`docs/proposals/WINGTIP_DESIGN.md`](../proposals/WINGTIP_DESIGN.md).
 
-**Source revalidated 2026-11-20 at `9c96220bb2`.** Wingtip's package floor remains
-Bun `>=1.3.14` (CI uses 1.4.4). Current gateways still authenticate only the
-master credential; client tokens (M2b) and Wingtip's own socket transport (M4)
-remain future work. The daemon's protocol-1 socket ownership, permission, and
-parent-directory hardening is current as described below.
+The mt-admin flow below uses the tenant master token. Gateway support for
+Wingtip's dedicated client tokens (M2b) and Wingtip's socket transport (M4) are
+planned milestones.
 
 **Who runs what.** Wingtip runs as your desktop user, the account that owns the microphone, the
 clipboard and the terminal. That account cannot read tenant files or tokens, so an operator with sudo
@@ -58,16 +56,16 @@ sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target master
 sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --use-master-token
 ```
 
-For example, `tui-access ruffles --for-user sun --use-master-token`. The command prints a warning,
+For example, `tui-access example-tenant --for-user desktop-user --use-master-token`. The command prints a warning,
 then a report like this (it never prints a token):
 
 ```text
-tui-access: granted tenant 'ruffles' to user 'sun'
+tui-access: granted tenant 'example-tenant' to user 'desktop-user'
   url:     http://127.0.0.1:10000
-  config:  /home/sun/.config/wingtip/tenants/ruffles.json (0600, owner sun)
+  config:  /home/desktop-user/.config/wingtip/tenants/example-tenant.json (0600, owner desktop-user)
   token:   the tenant master token (GATEWAY_AUTH_TOKEN, token_kind master); nothing registered tenant-side
   expires: never
-  owner:   port 10000 is held by uid 1010 (ruffles); recorded as tenant_uid
+  owner:   port 10000 is held by uid 1500 (example-tenant); recorded as tenant_uid
   verify:  ok (GET /api/gateway/status -> 200)
 ```
 
@@ -75,8 +73,8 @@ If the gateway is down, for example because the tenant is still starting after s
 line says so and the file is kept; the token works once the daemon serves. Exit status: 0 done,
 1 refused, 2 file written but the running daemon rejected the token.
 
-**Why `--use-master-token`.** Today the only credential a tenant gateway accepts is its
-`GATEWAY_AUTH_TOKEN`, so this mode copies that token into the desktop user's file. It has full gateway
+**Why `--use-master-token`.** This mode copies the managed tenant's
+`GATEWAY_AUTH_TOKEN` into the desktop user's file. It has full gateway
 API access (settings, extensions, logs) and does not expire. The default mode, without the flag, would
 give the user a dedicated, revocable token that only reaches the chat, voice and status routes, but no
 daemon accepts such tokens yet: they arrive with milestone M2b. Until then a grant without the flag is
@@ -183,10 +181,10 @@ rm -r ~/.config/lunarwing-tui
 The old file held a copy of `GATEWAY_AUTH_TOKEN`. If a copy of it may have left the machine (a backup,
 dotfile sync), rotate the token as above.
 
-**When client tokens arrive (M2b).** Grant without `--use-master-token`, optionally with
-`--expires-in-days 90`. `tui-access <tenant> --list` then shows the registered tokens and
-`--revoke` cuts one user off within about 2 s, without a restart. After moving every user to a client
-token, run `rotate-gateway-token` once so that no master-token copy stays valid.
+**Planned client tokens (M2b).** The current daemon does not load the client-token
+registry. Once gateway support lands, grants without `--use-master-token` can
+be revoked individually. Rotate the master token after migrating every user,
+so existing master-token copies stop working.
 
 ## Protocol-1 Unix socket
 
