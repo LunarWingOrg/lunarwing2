@@ -25,6 +25,7 @@ RESERVED_PREFIXES = (
     "opencode-",
     "kimi-",
     "opencode2-",
+    "lunardepth-",
     "weechat-",
 )
 
@@ -36,6 +37,7 @@ class WorkerType(str, Enum):
     OPENCODE = "opencode"
     KIMI = "kimi"
     OPENCODE2 = "opencode2"
+    LUNARDEPTH = "lunardepth"
 
 
 @dataclass
@@ -67,6 +69,9 @@ class TenantConfig:
     kimi_model: str = ""
     kimi_base_url: str = ""
     kimi_api_key: str = ""
+    lunardepth_model: str = ""
+    lunardepth_base_url: str = ""
+    lunardepth_api_key: str = field(default="", repr=False, compare=False)
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -91,6 +96,17 @@ class TenantConfig:
             )
         return None
 
+    def validate_lunardepth(self) -> str | None:
+        if WorkerType.LUNARDEPTH not in self.workers:
+            return None
+        if not self.lunardepth_base_url.strip() or not self.lunardepth_model.strip():
+            return "LunarDepth requires an explicit API base URL and model ID"
+        if not self.lunardepth_api_key.strip():
+            return "LunarDepth requires a per-tenant API key"
+        if any(c in self.lunardepth_api_key for c in ("\0", "\r", "\n")):
+            return "LunarDepth API key must be a single line without NUL characters"
+        return None
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -99,6 +115,7 @@ class TenantConfig:
         """Return a plain ``dict`` suitable for JSON dumps."""
         d = asdict(self)
         d["workers"] = [w.value for w in self.workers]
+        del d["lunardepth_api_key"]
         return d
 
     def to_json(self, path: str | Path) -> None:
@@ -141,6 +158,8 @@ class TenantConfig:
             kimi_model=data.get("kimi_model", ""),
             kimi_base_url=data.get("kimi_base_url", ""),
             kimi_api_key=data.get("kimi_api_key", ""),
+            lunardepth_model=data.get("lunardepth_model", ""),
+            lunardepth_base_url=data.get("lunardepth_base_url", ""),
             llm_api_key=data.get("llm_api_key", ""),
             secrets_master_key=data.get("secrets_master_key", ""),
             no_ssh=data.get("no_ssh", False),
