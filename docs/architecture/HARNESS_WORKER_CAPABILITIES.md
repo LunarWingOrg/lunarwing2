@@ -62,7 +62,7 @@ The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
 layers on top of the plain `worker` mode. Harness jobs require the Docker
 sandbox, dispatch asynchronously by default (`wait=false`), and reuse the
-standard project-dir mounting under `~/.lunarwing/projects/`.
+standard project-dir mounting under `<base_dir>/projects/`.
 
 At least one capability must be requested. `create_job` is on the autonomous
 denylist (missions/routines cannot reach it), and requesting `worker_secrets`,
@@ -73,8 +73,9 @@ params execution will use (in both the agent dispatcher and the Engine V2
 effect adapter), and is presence-based on raw params, so string-typed values
 (`"allow_identity_injection": "true"`) cannot slip past it (DH-1).
 
-All harness host state lives under `~/.lunarwing/harness/<job_id>/`. The
-`harness/` base is mode 0700. Job subdirectories are created without an
+Harness host state lives under `<base_dir>/harness/<job_id>/`. The daemon
+resolves `<base_dir>` from its startup configuration. For mt-admin tenants it
+is `/home/<tenant>/lunarwing/state`. The `harness/` base is mode 0700 on Unix. Job subdirectories are created without an
 explicit mode, so they follow the daemon's umask: 0700 under the units that
 `ic/systemd/` and mt-admin ship (systemd and OpenRC, umask 0077), and 0755
 under umask 022, which is what a daemon started by hand usually gets, and
@@ -186,7 +187,7 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     the first 64 KiB of each stream. The shell tool trims combined text over
     64 KiB to roughly 32 KiB of head plus 32 KiB of tail, adjusted to UTF-8
     boundaries, with a truncation notice. The direct sandbox path first caps
-    each stream at 32 KiB. When a result says `truncated: true`, the worker's parsed-result
+    each stream at 32 KiB. For a result marked `truncated: true`, the worker
     scrub redacts partial ASCII base64/hex chunks at the final capture cut and
     on both sides of up to 16 `... [truncated N bytes] ...` markers
     (DG-2/DZ-3/EE-2). Arbitrary offset slices, unmarked cuts, non-ASCII
@@ -257,7 +258,7 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
 
 - `inject_files` lists workspace documents (`"MEMORY.md"`,
   `"projects/x/notes.md"`, or `{"source": ..., "target": ...}`) snapshotted
-  at dispatch into `~/.lunarwing/harness/<job_id>/injected/` and mounted
+  at dispatch into `<base_dir>/harness/<job_id>/injected/` and mounted
   **read-only** at `/harness/injected`.
 - Source paths must be in canonical form: normalized == raw, no `.`/`..`,
   no backslashes, no empty segments, no segment with leading/trailing
