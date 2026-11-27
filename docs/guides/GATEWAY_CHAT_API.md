@@ -8,11 +8,6 @@ lifecycle events, the capabilities document, image validation, Engine V2
 generated images and the `/quit` refusal. Client tokens (M2b) are not part of
 this version; every authenticated request uses the master credential.
 
-**Source revalidated 2026-11-20 at `9c96220bb2`.** Live provider
-reasoning remains opt-in through `ENGINE_V2_STREAM_REASONING`; idle/interrupted
-V1 steer notes now arrive before the next request with explicit pre-turn
-framing (WI#584), as detailed below.
-
 Source anchors (locate by name; line numbers drift):
 
 | Area | Source |
@@ -48,7 +43,9 @@ fields, must treat an unknown `outcome` as "unknown", and must accept
 
 - Every route below is protected: `Authorization: Bearer <token>`, scheme
   case-insensitive, compared as a SHA-256 digest in constant time
-  (`MultiAuthState::authenticate`).
+  (`MultiAuthState::authenticate`). `GatewayChannel::new` installs the owner
+  token from `GATEWAY_AUTH_TOKEN` or `channels.gateway_auth_token`, or generates
+  one if neither supplies a token.
 - `?token=` is accepted only on `GET /api/chat/events`, `/api/logs/events`
   and `/api/chat/ws` (for browsers' `EventSource`). Machine clients must not
   use query tokens: URLs end up in logs and process listings.
@@ -107,7 +104,7 @@ The client generates one id per user turn and per control (`/interrupt`,
 | `interrupted` | A running turn was stopped by `/interrupt` (or `/stop`); on Engine V2 also an approval continuation whose approved action was still running. |
 | `detached` | The turn outlived its wait budget and continues in the background. Not terminal: exactly one more `turn_finished` follows when it ends. |
 | `failed` | The handler returned an error or an `Error: ...` reply or panicked, the engine reported failure (including max iterations), or the input was refused (see [Limits](#limits-wirelimits)). |
-| `timed_out` | The agent loop's soft timeout fired; the timeout notice was sent. Terminal: an Engine V2 turn that keeps running may still deliver a late `response`, but no further `turn_finished`. |
+| `timed_out` | The agent loop's soft timeout fired; the timeout notice was sent. Terminal. An Engine V2 turn that keeps running can still deliver a late `response`. Clients should ignore duplicate finishes for a sealed turn. [Lifecycle bounds](../architecture/OUTBOUND-DELIVERY-SEMANTICS.md#known-gaps) |
 | `cancelled` | The message did not complete: removed from the queue by an interrupt or refused by a full queue (it never ran), or cancelled by daemon shutdown while it ran. |
 
 Readers map any other string to "unknown" (`#[serde(other)] Unknown`;
