@@ -2,7 +2,7 @@
 
 Cross-tenant knowledge sharing lets independent LunarWing daemons exchange durable findings over a shared XMPP MUC room. An agent publishes a finding with a `KNOW:` line in a coordination room; every other tenant watching that room ingests the finding into its own shared knowledge scope, where `knowledge_search` / `knowledge_get_topic` can find it.
 
-This guide is the production setup for the configuration that was live-disproved in work item #97 (bare user JIDs never match) and re-verified on 2026-09-10 with full occupant JIDs.
+The live check for WI#97 on 2026-09-10 verified publishing with full occupant JIDs.
 
 The `KNOW:` parser and ingestion hook live in `ic/src/hooks/coordination_knowledge.rs`.
 
@@ -24,12 +24,12 @@ Wire claims are untrusted: they are stored as `needs-verification`, without conf
 
 Inbound path, in order:
 
-1. **XMPP bridge** joins the coordination MUC room and only accepts groupchat from allowlisted rooms. The daemon sets that list through the bridge's `/v1/configure` call, from `XMPP_ALLOW_ROOMS` in `lunarwing.env` (or the `xmpp_allow_rooms` setting when the variable is unset or empty). A room not on that list is silently dropped — the daemon neither joins it nor receives from it.
+1. **XMPP bridge.** The installable XMPP channel sends its `rooms` setup field
+   as `allow_rooms` in `/v1/configure`. The bridge uses that list to join rooms
+   and filter groupchat.
 2. **Coordination hooks** classify inbound room traffic by scope (`COORD_CHANNELS`); the knowledge-share hook (`coordination.knowledge_share`, priority 13) parses `KNOW:` lines.
 3. **Publisher allowlist** (`COORD_KNOWLEDGE_PUBLISHERS`) gates which senders may actually publish. Room occupancy is not authentication — any occupant can claim any nick the room forwards, so only operator-listed senders are ingested.
 4. Ingest writes the note into the daemon-local shared knowledge scope, subject to per-sender and daemon-wide hourly budgets.
-
-The failure that motivated this guide: every one of steps 1–3 was misconfigured at once (empty room allowlist, publishers set to the room bare JID, later "fixed" to user bare JIDs that also never match), and each failure is silent — the room keeps working, shares just never arrive.
 
 ## Required configuration
 
@@ -37,18 +37,22 @@ For two tenants `example-a` and `example-b` sharing room `coordination@conferenc
 
 ### 1. Room allowlist — both tenants
 
-In each tenant's `lunarwing.env`:
+For a tenant with the legacy XMPP daemon configuration, set this in
+`lunarwing.env`:
 
 ```
 XMPP_ALLOW_ROOMS=coordination@conference.example.org
 ```
 
-The daemon's XMPP channel sends this list to the bridge in its `/v1/configure` call, which makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
+At startup, `migrate_native_xmpp_to_installable` copies the resolved room list
+into `extensions.xmpp.setup_fields.rooms` when the daemon has XMPP credentials,
+the installable channel, and a settings store. The legacy `xmpp_allow_rooms`
+setting is the fallback when `XMPP_ALLOW_ROOMS` is unset or empty. For a tenant
+configured through extension setup alone, set the XMPP `rooms` field there.
 
 For direct configure calls, `ic/scripts/xmpp-configure.sh` accepts
 `XMPP_ALLOW_ROOMS_JSON` in its environment. Keep the same room in each tenant's
-`xmpp-bridge.env` for the static `coord-doctor` check. The running daemon still
-gets its room list from `lunarwing.env`.
+`xmpp-bridge.env` if you use the static `coord-doctor` check.
 
 ```dotenv
 XMPP_ALLOW_ROOMS_JSON=["coordination@conference.example.org"]
@@ -109,18 +113,15 @@ sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-a
 sudo ic/scripts/lunarwing-mt-admin.sh coord-doctor example-b
 ```
 
-It validates:
+The report shows coordination switches, publisher shape checks, and whether
+coordination rooms appear in the bridge environment file. It also prints
+`configured_rooms` and `rooms_with_presence` when the bridge status is reachable,
+and `KNOW:` drop counters when the admin endpoint is available.
 
-- `COORD_ENABLED`/`COORD_CHANNELS` are usable together;
-- the publisher allowlist is non-empty and every entry is a full occupant JID or a coordination room bare JID (user-bare entries FAIL);
-- every coordination room is listed in the bridge environment file (a static
-  check distinct from the daemon's `XMPP_ALLOW_ROOMS` setting);
-- live bridge `/v1/status` shows presence for each configured room (i.e. the daemon actually joined);
-- live `KNOW:` ingest drop counters from the tenant's coord admin endpoint.
-
-Exit code 0 means none of the checks failed. A stale bridge environment file
-can cause a static failure even when the live bridge has joined the room.
-Warnings still deserve attention (for example, a room-wide bare JID entry). It never prints secrets and never rewrites room or trust policy.
+A stale bridge environment can fail the static check even when the room is
+joined. Check each room against the reported live presence. The script can exit
+0 when that list is empty, and its comparison treats comma-joined room lists
+as single values. Finish verification with a real share in a disposable room.
 
 ## Watch the live drop counters
 
