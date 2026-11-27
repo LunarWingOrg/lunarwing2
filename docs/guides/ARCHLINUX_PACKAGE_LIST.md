@@ -3,7 +3,7 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Arch Linux + systemd** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-11-20 at `9c96220bb2`.** External-worker egress enforcement
+External-worker egress enforcement
 (WI#424) requires the host `nft` command from `nftables`. Disk health reuses
 `df`, `stat`, and `timeout` from the already-expected core utilities.
 
@@ -11,6 +11,8 @@ This is the Arch equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md
 notes there (port registry, per-tenant rustup, doctor output, etc.) apply unchanged. On Arch the
 init system is systemd, so tenant units are `systemctl --user` units under each tenant account
 (linger enabled) — see the Multi-Tenant Ops rules in the repo `AGENTS.md`.
+
+Package availability and a fresh installation are unverified for this release.
 
 > Tip: run `sudo ic/scripts/lunarwing-mt-admin.sh doctor` — it reports most of these as
 > `[PASS]`/`[FAIL]`. A `[FAIL] rustup installed` on the host is benign (see Build toolchain).
@@ -92,14 +94,15 @@ sudo systemctl enable --now cronie
 
 | Package | Notes |
 |---------|-------|
-| `rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + the `wasm32-wasip2` target. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
+| `rustup` | **Optional on the host** — MT admin checks for and installs `rustup` under the tenant account. A host-only `doctor` failure for `rustup` does not report the tenant's toolchain status. |
 | `clang` | Provides `libclang`, needed by Rust crates that use `bindgen`/`-sys` native bindings during the build. (`gcc` is already in `base-devel`.) |
 
-`add-tenant` installs `rustup`, the stable toolchain and the `wasm32-wasip2` target **per
-tenant**. It does not install `cargo-component` or `wasm-tools`: `cargo-component` is installed
-per tenant (`cargo install`) only by the `ic/scripts/create-tenant.sh` wrapper, and nothing on
-the tenant path installs `wasm-tools`. Without `wasm-tools`, `build-tenant --with-wasm` installs
-raw components and skips the optional debug-info strip. None of these are pacman packages.
+`add-tenant` attempts per-tenant toolchain setup. `build-tenant --with-wasm`
+checks it again and adds `wasm32-wasip2` using the toolchain selected in the
+checkout when available. `ic/rust-toolchain.toml` pins Rust `1.96.1`. The helper
+sets a stable default only if the tenant has no active toolchain. With
+`wasm-tools` absent, artifact installation skips the optional component/strip
+step and copies the built WASM.
 
 ## 5. WeeChat channel (optional — only if using WeeChat)
 
