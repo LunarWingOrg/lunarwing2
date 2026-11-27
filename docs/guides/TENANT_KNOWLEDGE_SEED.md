@@ -9,7 +9,7 @@ store on first boot.
 Seeding is designed for **new tenants only**. A completed bootstrap pass is
 recorded in a state file. Tenants provisioned with `--with-study-mcp` also opt
 in to a separate additive refresh cadence that imports newly published paths.
-Both passes preserve existing notes subject to the repair cases below. An
+Both passes preserve notes they can read, subject to the repair cases below. An
 upgrade alone does not arm either pass.
 
 ## What the tenant gets
@@ -187,7 +187,9 @@ without importing directly, run `sync-knowledge-sources`.
   knowledge-note metadata regardless of its body. Without that metadata, a body
   that exactly matches the rendered seed note gets a metadata-only repair. A
   whitespace-only body is filled with the seed note and given metadata, including
-  an empty row created by an operator. Other bodies are left alone.
+  an empty row created by an operator. Other bodies are left alone. A failed
+  workspace lookup is treated as a missing row. If a subsequent write succeeds,
+  it can replace an existing note (WI#932).
 - **Wire namespace stays reserved.** Checkout directories under the
   coordination wire prefix (`coord-*`) are never imported, so seeded notes
   cannot collide with coordination wire notes. Dotfiles, non-Markdown files,
@@ -278,7 +280,7 @@ After provisioning and the first `start-tenant`:
   and restart. Env regeneration preserves both choices.
 - **Populating an existing, long-lived tenant:** configure and publish the
   checkout, enable sync, then run `refresh-knowledge <name>`. The same additive
-  importer fills missing paths and applies only the existing-row repairs above.
+  importer fills missing paths and applies the repair rules to rows it reads.
   Keep the existing seed marker in place.
 
 ## Troubleshooting
@@ -291,7 +293,7 @@ After provisioning and the first `start-tenant`:
 | `N note(s) failed ... seed is complete and will not rerun` | Import failures counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
 | Daemon restarted before writing the marker | The next bootstrap scans the checkout again | Already-imported notes are skipped or repaired as described above |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
-| Refresh succeeds but an upstream edit is absent | Additive mode preserves existing notes outside the documented repair cases | Resolve manually if needed |
+| Refresh succeeds but an upstream edit is absent | Additive mode preserves existing notes it can read outside the documented repair cases | Resolve manually if needed |
 
 ## Related documents
 
