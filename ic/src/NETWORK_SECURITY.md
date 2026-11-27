@@ -62,7 +62,11 @@ Both paths use **constant-time comparison** via `subtle::ConstantTimeEq` (`ct_eq
 
 **Reference:** `src/channels/web/auth.rs` — `auth_middleware()`, header check and query-param fallback both use `ct_eq`
 
-If `GATEWAY_AUTH_TOKEN` is not set, a random hex token is generated at startup.
+Each gateway accepts a single owner token. The daemon uses `GATEWAY_AUTH_TOKEN`
+if set, otherwise a saved token or a random hex token generated at startup.
+Daemon startup rejects a non-empty `GATEWAY_USER_TOKENS` value, even when the
+gateway is disabled or an owner token is configured. Unset the unsupported
+setting before restarting; the error does not include any token values.
 
 ### Owner-only cron worker recovery (WI#325 / MR !1531)
 

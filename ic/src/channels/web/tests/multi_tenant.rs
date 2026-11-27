@@ -5,8 +5,8 @@
 //! with a temporary directory for a real (but ephemeral) database.
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-#[cfg(feature = "libsql")]
 use std::time::Duration;
 
 use axum::Router;
@@ -17,6 +17,7 @@ use axum::routing::{delete, get, post};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use crate::channels::Channel;
 use crate::channels::web::GatewayChannel;
 use crate::channels::web::auth::{
     AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware,
@@ -151,10 +152,51 @@ fn gateway_config() -> GatewayConfig {
         user_id: "gateway-sender".to_string(),
         workspace_read_scopes: Vec::new(),
         memory_layers: Vec::new(),
-        user_tokens: None,
         mascot_enabled: false,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
+    }
+}
+
+#[tokio::test]
+async fn gateway_accepts_only_the_owner_bearer() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("local gateway client");
+
+    for owner_token in [Some("test-owner-bearer"), None] {
+        let config = GatewayConfig {
+            port: 0,
+            auth_token: owner_token.map(str::to_owned),
+            ..gateway_config()
+        };
+        let gateway = GatewayChannel::new(config, "gateway-owner".to_string());
+        let addr = crate::channels::web::server::start_server(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Arc::clone(gateway.state()),
+            gateway.auth.clone(),
+        )
+        .await
+        .expect("start the gateway router");
+        let url = format!("http://{addr}/api/chat/capabilities");
+        let owner_token = owner_token.unwrap_or_else(|| gateway.auth_token());
+
+        for (token, expected) in [
+            (Some(owner_token), StatusCode::OK),
+            (Some("test-user-bearer"), StatusCode::UNAUTHORIZED),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let mut request = client.get(&url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.expect("request reaches the gateway");
+            assert_eq!(response.status(), expected);
+        }
+        gateway.shutdown().await.expect("stop the gateway");
+        crate::tracing_fmt::daemon_log_scrubber().remove_secret(gateway.auth_token());
     }
 }
 
@@ -191,7 +233,6 @@ fn gateway_auth_token_is_scrubbed_from_daemon_logs() {
 fn with_owner_scope_updates_gateway_owner_scope_in_multi_user_mode() {
     let mut gateway = GatewayChannel::new(gateway_config(), "gateway-sender".to_string());
     gateway.auth = two_user_auth().into();
-    gateway.config.user_tokens = Some(HashMap::new());
     let gateway = gateway.with_owner_scope("owner-scope");
 
     assert_eq!(gateway.state.owner_id, "owner-scope");

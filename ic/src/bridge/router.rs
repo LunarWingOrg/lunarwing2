@@ -8246,7 +8246,6 @@ pub(crate) mod tests {
                 user_id: "alice".into(),
                 workspace_read_scopes: vec![],
                 memory_layers: vec![],
-                user_tokens: None,
                 ws_ping_interval_secs: 30,
                 ws_idle_timeout_secs: 120,
             },
