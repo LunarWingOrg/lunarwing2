@@ -4824,3 +4824,58 @@ Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers o
 ## Proxy Note
 
 On networks with TLS-intercepting proxies (e.g., corporate networks), Docker builds will fail with "server certificate not trusted" errors. Either build on a network without MITM proxies, or add the proxy CA certificate to each Dockerfile before the `apt-get`/`apk` steps.
+
+
+## v2.2.3.0 worker upstream re-check — WI#916 (2026-11-27)
+
+**Release review on hold; no pins moved.** SweetieBot recorded the release
+metadata, source findings, and maintainer choices in
+[WI#916 note 23349](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23349).
+The 09:07Z check used the npm packument's `latest` dist-tag and `time` map,
+and `git ls-remote --tags` on `anomalyco/opencode` with GitHub release
+`published_at` timestamps. Both OpenCode tags below resolve directly to commits.
+
+| Lane | Release | Published (UTC) | 24-hour boundary (UTC) | Result |
+|---|---|---|---|---|
+| Kimi | `2.8.1` (`latest`) | 2026-11-26 11:55:36.675 | 2026-11-27 11:55:36.675 | Inside its window at intake |
+| Kimi | `2.7.3` | 2026-11-23 16:38:52.044 | 2026-11-24 16:38:52.044 | Eligible; `2.7.2` retained pending feedback decision |
+| OpenCode 2 | `v2.4.2` at `fc31a485317970bcf6be7b431a9830aaef875731` | 2026-11-26 00:59:05 | 2026-11-27 00:59:05 | Eligible; `v2.3.2` retained pending exposure decision |
+| OpenCode v1 | `v1.19.6` at `f4e363c8295fa90a03dddc451882fffe8fbce357` | 2026-11-17 07:21:32 | 2026-11-18 07:21:32 | Re-checked; no newer stable v1 tag |
+
+Kimi `2.8.0` was superseded by `2.8.1` before its own window ended. Neither
+`2.8.x` release was installed, built, or run. The registry tarball's SHA-512
+matched the temporary `2.7.3` lock; its test install began at 09:11:28Z, after
+the window. The repository lock and the worker image were not updated.
+
+**Kimi.** The `2.7.3` registry bundle adds KAP feedback routes that can send
+feedback and attach session/log data via an OAuth-backed gateway. Its new
+`KIMI_CODE_FEEDBACK_BASE_URL` override is not set by the lane and is dropped
+from task-supplied environment by `TASK_SETTABLE_KIMI_CODE_ENV`. That scrub
+is not a feedback off switch. The decision to accept or pin off the feedback
+surface is on the work item; no feedback route was exercised. The candidate's
+`--help` and hidden server command definitions match the guard's listener list.
+All 25 in-scope listener shapes were classified as denied without starting a
+listener. With a loopback mock provider, the candidate returned an actual
+PreToolUse denial as a tool error; the real-CLI contract passed all four tests.
+Separate benign probes confirmed that a hook exit of 1 or a CLI hook timeout
+still allows the Bash tool to run, unlike the guard's explicit exit of 2.
+
+**OpenCode 2.** The `v2.4.2` source still gates Console watches and artifact
+operations on their respective flags. It deleted `mcp_events`, so the wrapper's
+`-mcp_events` no longer controls MCP event discovery. Automations now default
+on via top-level config and can react to MCP events or run scheduled actions.
+The unmodified OpenTunnel compile-out passes at the retained `v2.3.2` source
+and stops on flag resolver/registry drift before stubbing `v2.4.2`. The local
+`worker-exposure-policy-guard` command passed on the retained pins; this is
+not a pass against `v2.4.2`. There is no bumped candidate image, so
+`console_policy_eval.py` against one is deferred, as are full bumped-image
+builds and CI proof. No wrapper, flag anchor, or base-image pins changed.
+
+**Record only.** The image's Pebble upstream, `nanogpt-community/pebble`,
+still has HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`, equal to its pin.
+`lunarwing/lunardepth` on GitLab has advanced to
+`4106cd15771d8c94d73bab22541fb4a980390de8` from the image pin
+`ca905dfe5e998ebcac29f5c57b5ea04108498468`. Neither is in scope for a bump.
+
+Re-check the current releases and windows when the maintainer answers WI#916.
+Run the full bump checklist on the reviewed revision before seeking merge.
