@@ -2158,6 +2158,40 @@ ingress channel/host implementations. Attachments on approval, interrupt, and
 credential replies stay on those control paths and are not added to model
 history or copied into authentication retries.
 
+#### Tool-result images
+
+Images a tool returns next to its text result (MCP `image` content blocks,
+for example desktop screenshots) use the same transient delivery. The effect
+adapter receives them validated (`crate::tools::images`: magic-byte type
+check, PNG/JPEG/GIF/WebP, at most 4 images, 5 MiB each, 7 MiB per result)
+and parks them in a bounded per-thread mailbox (`bridge/action_images.rs`:
+16 batches, 32 MiB, 300 s). The text result the engine receives is
+unchanged. Before each main model request (the `__llm_complete__` call that
+offers actions; summary and `force_text` calls never carry images) the
+orchestrator takes the thread's images through
+`EffectExecutor::take_action_images` and places them in a user-role message
+right after the step that produced them: after the step's last
+`ActionResult` (structured calls) or its sealed step record (CodeAct). A
+user-role message is used because no wire API the host talks to accepts
+images inside a tool-role message. Images are ordered by their calls'
+results (concurrent calls finish in any order) and labelled with tool name
+and call id; a step keeps at most 8 images and 8 MiB. Each orchestrator run
+first discards images an earlier run of the thread left in the mailbox, and
+images are never attached to a request without a step result, so a later
+turn or a resumed run never sees stale screens. Shared-conversation threads
+get a text note instead of images.
+
+The stash (`executor/action_images.rs`) lives for one orchestrator run and
+never enters `thread.messages`, `thread.internal_messages`, the Python
+transcript, checkpoints, events or traces. A step is identified by a
+fingerprint of its result message; when compaction removes that message, its
+images go with it. Only the newest 3 image-bearing steps (8 MiB) are resent;
+older images fall back to their text results. Error results, gate pauses
+and approval resumes never carry images (the resumed run drains them), and
+a restart drops them.
+`TOOL_RESULT_IMAGES=false` turns forwarding off for models without vision;
+the text result then says images were omitted.
+
 ### Local Compatibility Proof
 
 The hermetic local compatibility matrix exercises production boundaries rather

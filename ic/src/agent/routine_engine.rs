@@ -2302,6 +2302,8 @@ async fn execute_routine_tool(
         .map_err(|_| ToolError::Timeout(timeout))
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    // Routines are text only: note any images the tool returned.
+    let result = crate::tools::execute::into_text_only(result);
 
     // Serialize result to JSON string
     let result_str =

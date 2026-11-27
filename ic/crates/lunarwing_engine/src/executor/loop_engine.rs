@@ -1650,6 +1650,244 @@ mod tests {
         );
     }
 
+    /// Effects whose every action "returns" one screenshot image through the
+    /// host's image hand-off, like the bridge does for MCP image blocks.
+    struct ImageEffects {
+        pending: Mutex<Vec<crate::types::message::ActionImages>>,
+        taken_for: Mutex<Vec<crate::types::thread::ThreadId>>,
+    }
+
+    impl ImageEffects {
+        fn new() -> Self {
+            Self {
+                pending: Mutex::new(Vec::new()),
+                taken_for: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ImageEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _parameters: serde_json::Value,
+            _lease: &CapabilityLease,
+            context: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            let call_id = context.current_call_id.clone().unwrap_or_default();
+            self.pending
+                .lock()
+                .unwrap()
+                .push(crate::types::message::ActionImages {
+                    call_id: call_id.clone(),
+                    action_name: action_name.to_string(),
+                    parts: vec![crate::types::message::TransientContentPart::Image {
+                        mime_type: "image/png".to_string(),
+                        data: b"png-bytes".to_vec(),
+                    }],
+                });
+            Ok(ActionResult {
+                call_id,
+                action_name: action_name.to_string(),
+                output: serde_json::json!("frame 1, 1280x800"),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action()])
+        }
+
+        async fn take_action_images(
+            &self,
+            thread_id: crate::types::thread::ThreadId,
+        ) -> Vec<crate::types::message::ActionImages> {
+            self.taken_for.lock().unwrap().push(thread_id);
+            std::mem::take(&mut *self.pending.lock().unwrap())
+        }
+    }
+
+    async fn make_loop_with_image_effects(
+        llm: Arc<dyn LlmBackend>,
+        effects: Arc<ImageEffects>,
+    ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
+        let thread = Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let tid = thread.id;
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(tid, "test_cap", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let (tx, rx) = crate::runtime::messaging::signal_channel(16);
+        let exec = ExecutionLoop::new(
+            thread,
+            llm,
+            effects,
+            leases,
+            Arc::new(PolicyEngine::new()),
+            rx,
+            "test-user".into(),
+        );
+        (exec, tx)
+    }
+
+    fn image_message_after(
+        request: &[ThreadMessage],
+        is_step_result: impl Fn(&ThreadMessage) -> bool,
+    ) -> Option<&ThreadMessage> {
+        let position = request.iter().rposition(is_step_result)?;
+        request.get(position + 1)
+    }
+
+    fn assert_no_image_bytes_persisted(thread: &Thread) {
+        assert!(
+            thread
+                .messages
+                .iter()
+                .chain(thread.internal_messages.iter())
+                .all(|message| message.transient_content_parts.is_empty()),
+            "image bytes must never enter the thread"
+        );
+        let json = serde_json::to_string(thread).expect("thread serializes");
+        assert!(!json.contains(crate::executor::action_images::ACTION_IMAGES_MESSAGE_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn structured_action_images_reach_the_next_model_request() {
+        let llm = Arc::new(MockLlm::new(vec![
+            action_response("test_tool", "call-img-1"),
+            text_response("FINAL(\"saw it\")"),
+        ]));
+        let effects = Arc::new(ImageEffects::new());
+        let (mut exec, _tx) = make_loop_with_image_effects(llm.clone(), effects.clone()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "saw it"));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2, "action turn + final turn");
+        assert!(
+            requests[0]
+                .iter()
+                .all(|message| message.transient_content_parts.is_empty()),
+            "no images before any action ran"
+        );
+        let images = image_message_after(&requests[1], |message| {
+            message.role == MessageRole::ActionResult
+                && message.action_call_id.as_deref() == Some("call-img-1")
+        })
+        .expect("a message follows the action result");
+        assert_eq!(images.role, MessageRole::User);
+        assert!(
+            images
+                .content
+                .starts_with(crate::executor::action_images::ACTION_IMAGES_MESSAGE_PREFIX)
+        );
+        assert!(matches!(
+            images.transient_content_parts.as_slice(),
+            [crate::types::message::TransientContentPart::Image { data, .. }] if data == b"png-bytes"
+        ));
+        assert!(
+            effects
+                .taken_for
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|id| *id == exec.thread.id)
+        );
+        assert_no_image_bytes_persisted(&exec.thread);
+    }
+
+    #[tokio::test]
+    async fn images_left_by_an_earlier_run_are_discarded_at_run_start() {
+        // Regression: a run that ended right after a screenshot (stop, FINAL,
+        // gate pause) left its images in the host mailbox, and the next run on
+        // the same thread showed them after the user's new message.
+        let llm = Arc::new(MockLlm::new(vec![text_response("FINAL(\"hello\")")]));
+        let effects = Arc::new(ImageEffects::new());
+        effects
+            .pending
+            .lock()
+            .unwrap()
+            .push(crate::types::message::ActionImages {
+                call_id: "old-call".to_string(),
+                action_name: "test_tool".to_string(),
+                parts: vec![crate::types::message::TransientContentPart::Image {
+                    mime_type: "image/png".to_string(),
+                    data: b"stale".to_vec(),
+                }],
+            });
+        let (mut exec, _tx) = make_loop_with_image_effects(llm.clone(), effects.clone()).await;
+
+        exec.run().await.unwrap();
+
+        assert!(effects.pending.lock().unwrap().is_empty(), "drained");
+        assert!(
+            llm.requests()
+                .iter()
+                .flatten()
+                .all(|message| message.transient_content_parts.is_empty()),
+            "stale images never reach a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn codeact_action_images_reach_the_next_model_request() {
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nawait test_tool()\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nFINAL('saw the image')\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+        ]));
+        let effects = Arc::new(ImageEffects::new());
+        let (mut exec, _tx) = make_loop_with_image_effects(llm.clone(), effects).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(r) } if r == "saw the image"
+        ));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2, "code turn + final turn");
+        let images = image_message_after(&requests[1], |message| {
+            message.role == MessageRole::SealedStepRecord
+        })
+        .expect("a message follows the step record");
+        assert_eq!(images.role, MessageRole::User);
+        assert!(images.content.contains("1 image from `test_tool`"));
+        assert!(matches!(
+            images.transient_content_parts.as_slice(),
+            [crate::types::message::TransientContentPart::Image { data, .. }] if data == b"png-bytes"
+        ));
+        assert_no_image_bytes_persisted(&exec.thread);
+    }
+
     #[tokio::test]
     async fn max_iterations_reached() {
         // LLM always returns actions, so it never exits naturally

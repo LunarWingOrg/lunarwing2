@@ -35,6 +35,7 @@ mod session_manager;
 pub mod submission;
 pub mod task;
 mod thread_ops;
+mod tool_images;
 pub mod undo;
 
 pub use agent_loop::{Agent, AgentDeps};

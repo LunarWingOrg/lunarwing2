@@ -13,6 +13,10 @@ use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 /// Execute a tool with safety checks: lookup → validate → timeout → execute → serialize.
 ///
 /// Chat, engine-v2, container runtime and scheduler subtasks use this pipeline.
+/// The result is text only. When the tool also returned images (see
+/// `crate::tools::images`), a note saying so is added to the text so the
+/// model knows content is missing; use [`execute_tool_with_safety_rich`] on
+/// paths that can show images to the model.
 pub async fn execute_tool_with_safety(
     tools: &ToolRegistry,
     safety: &SafetyLayer,
@@ -20,6 +24,112 @@ pub async fn execute_tool_with_safety(
     params: serde_json::Value,
     job_ctx: &JobContext,
 ) -> Result<String, Error> {
+    execute_tool_with_safety_text_only(tools, safety, tool_name, params, job_ctx, TEXT_ONLY_PATH)
+        .await
+}
+
+/// [`execute_tool_with_safety`] with the reason given in the note when the
+/// tool's images are dropped (for example "images are not shown in shared
+/// conversations").
+pub async fn execute_tool_with_safety_text_only(
+    tools: &ToolRegistry,
+    safety: &SafetyLayer,
+    tool_name: &str,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+    reason: &str,
+) -> Result<String, Error> {
+    let output = execute_tool_output(tools, safety, tool_name, params, job_ctx).await?;
+    let output = into_text_only_because(output, reason);
+    serialize_tool_result(tool_name, &output.result)
+}
+
+const TEXT_ONLY_PATH: &str = "this execution path is text only";
+
+/// Text result plus the validated images a tool returned next to it.
+///
+/// `content` is exactly what [`execute_tool_with_safety`] returns for a tool
+/// without images. Images never enter `content`, so sanitizing, truncation,
+/// previews and persistence of the text are unaffected.
+#[derive(Debug, Clone)]
+pub struct RichToolOutput {
+    pub content: String,
+    pub images: Vec<crate::tools::ToolImage>,
+}
+
+/// [`execute_tool_with_safety`] for callers that can show tool-result images
+/// to the model (v1 chat and Engine V2). The caller decides whether to
+/// forward the images or to add an omission note.
+pub async fn execute_tool_with_safety_rich(
+    tools: &ToolRegistry,
+    safety: &SafetyLayer,
+    tool_name: &str,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+) -> Result<RichToolOutput, Error> {
+    let output = execute_tool_output(tools, safety, tool_name, params, job_ctx).await?;
+    let content = serialize_tool_result(tool_name, &output.result)?;
+    Ok(RichToolOutput {
+        content,
+        images: output.images,
+    })
+}
+
+/// Prepare a tool output for a consumer that only reads its text: any images
+/// are dropped and a note saying so is added to the result, so the model
+/// knows content is missing. Jobs, routines and the external-worker proxy
+/// read `ToolOutput.result` directly and call this first.
+pub(crate) fn into_text_only(output: crate::tools::ToolOutput) -> crate::tools::ToolOutput {
+    into_text_only_because(output, TEXT_ONLY_PATH)
+}
+
+fn into_text_only_because(
+    mut output: crate::tools::ToolOutput,
+    reason: &str,
+) -> crate::tools::ToolOutput {
+    let images = std::mem::take(&mut output.images);
+    if !images.is_empty() {
+        note_omitted_images(&mut output.result, images.len(), reason);
+    }
+    output
+}
+
+/// Add a note about images that will not be shown to a JSON tool result.
+///
+/// String results get the note appended on a new line; object results get
+/// an `images_not_shown` field. Other shapes are left unchanged.
+pub fn note_omitted_images(result: &mut serde_json::Value, count: usize, reason: &str) {
+    let note = crate::tools::images::omitted_images_note(count, reason);
+    match result {
+        serde_json::Value::String(text) => crate::tools::images::append_note(text, &note),
+        serde_json::Value::Object(map) => {
+            map.insert(
+                "images_not_shown".to_string(),
+                serde_json::Value::String(note),
+            );
+        }
+        _ => tracing::debug!(count, "Tool images dropped from a non-text result"),
+    }
+}
+
+fn serialize_tool_result(tool_name: &str, result: &serde_json::Value) -> Result<String, Error> {
+    serde_json::to_string_pretty(result).map_err(|e| {
+        crate::error::ToolError::ExecutionFailed {
+            name: tool_name.to_string(),
+            reason: format!("Failed to serialize result: {}", e),
+        }
+        .into()
+    })
+}
+
+/// Lookup → validate → timeout → execute, returning the full [`ToolOutput`].
+async fn execute_tool_output(
+    tools: &ToolRegistry,
+    safety: &SafetyLayer,
+    tool_name: &str,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+) -> Result<crate::tools::ToolOutput, Error> {
     if tool_name.is_empty() {
         return Err(crate::error::ToolError::NotFound {
             name: tool_name.to_string(),
@@ -93,7 +203,7 @@ pub async fn execute_tool_with_safety(
         }
     }
 
-    let result = result
+    let output = result
         .map_err(|_| crate::error::ToolError::Timeout {
             name: tool_name.to_string(),
             timeout,
@@ -102,14 +212,7 @@ pub async fn execute_tool_with_safety(
             name: tool_name.to_string(),
             reason: e.to_string(),
         })?;
-
-    serde_json::to_string_pretty(&result.result).map_err(|e| {
-        crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: format!("Failed to serialize result: {}", e),
-        }
-        .into()
-    })
+    Ok(output)
 }
 
 /// The execution-only boundary shared with job/routine pipelines. Call AFTER
@@ -321,6 +424,85 @@ mod tests {
             registry.register(tool).await;
         }
         registry
+    }
+
+    /// Returns a text result plus one PNG, like a screenshot tool.
+    struct ScreenshotTool;
+
+    #[async_trait::async_trait]
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> &str {
+            "screenshot"
+        }
+        fn description(&self) -> &str {
+            "Returns an image"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let png = crate::tools::ToolImage::from_bytes(crate::tools::images::TEST_PNG.to_vec())
+                .expect("png");
+            Ok(ToolOutput::text("frame 3", Duration::default()).with_images(vec![png]))
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_execution_returns_images_next_to_unchanged_text() {
+        let registry = registry_with(vec![Arc::new(ScreenshotTool)]).await;
+        let safety = test_safety();
+
+        let output = execute_tool_with_safety_rich(
+            &registry,
+            &safety,
+            "screenshot",
+            serde_json::json!({}),
+            &test_job_ctx(),
+        )
+        .await
+        .expect("rich execution");
+
+        assert_eq!(output.content, "\"frame 3\"");
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime_type(), "image/png");
+    }
+
+    #[tokio::test]
+    async fn text_only_execution_tells_the_model_images_were_dropped() {
+        let registry = registry_with(vec![Arc::new(ScreenshotTool)]).await;
+        let safety = test_safety();
+
+        let content = execute_tool_with_safety(
+            &registry,
+            &safety,
+            "screenshot",
+            serde_json::json!({}),
+            &test_job_ctx(),
+        )
+        .await
+        .expect("text execution");
+
+        let text: String = serde_json::from_str(&content).expect("still a JSON string");
+        assert!(text.starts_with("frame 3\n[1 image returned by this tool not shown"));
+    }
+
+    #[test]
+    fn omitted_image_note_keeps_object_results_valid_json() {
+        let mut result = serde_json::json!({"ok": true});
+        note_omitted_images(&mut result, 2, "disabled");
+        assert_eq!(result["ok"], true);
+        assert!(
+            result["images_not_shown"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("[2 images"))
+        );
     }
 
     #[tokio::test]

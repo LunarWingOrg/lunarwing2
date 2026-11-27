@@ -13,6 +13,18 @@ import junit_report as junit
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 REPORT_PATH = ROOT / "junit-python.xml"
+COMPUTER_USE_SUITES = [
+    "test_cu_server",
+    "test_cu_control",
+    "test_cu_xkb",
+    "test_cu_wayland_wire",
+    "test_cu_wlr",
+    "test_cu_env",
+    "test_cu_portal",
+    "test_cu_selection",
+    "test_cu_vision",
+    "test_cu_cli",
+]
 ROOT_SUITES = [
     "lunarwing_mt_onboard.tests",
     "lunarwing_mt_onboard.export_tests",
@@ -88,6 +100,16 @@ def main() -> int:
             records,
         )
 
+    # Stdlib-only connector suite: fakes stand in for the compositor, D-Bus
+    # and grim, so it needs neither PyGObject nor a display.
+    computer = ROOT / "projects" / "computer-use"
+    with import_from(computer), import_from(computer / "tests"):
+        computer_ok, computer_total, computer_skipped = run_suite(
+            "Wayland computer-use connector",
+            COMPUTER_USE_SUITES,
+            records,
+        )
+
     # These suites also run in ci-config's unittest discovery. Register them
     # here so the Git-enabled python-unit lane exercises their end-to-end cases.
     guard_ok, guard_total, guard_skipped = run_loaded_suite(
@@ -112,9 +134,10 @@ def main() -> int:
     )
 
     junit.write(REPORT_PATH, records)
-    total += adapter_total + guard_total + scan_total + edge_total + bounded_total
+    total += adapter_total + computer_total + guard_total + scan_total + edge_total + bounded_total
     skipped += (
         adapter_skipped
+        + computer_skipped
         + guard_skipped
         + scan_skipped
         + edge_skipped
@@ -123,7 +146,15 @@ def main() -> int:
     if skipped:
         print(f"ERROR: {skipped} Python test(s) skipped; CI prerequisites are incomplete", file=sys.stderr)
         return 1
-    if not ok or not adapter_ok or not guard_ok or not scan_ok or not edge_ok or not bounded_ok:
+    if (
+        not ok
+        or not adapter_ok
+        or not computer_ok
+        or not guard_ok
+        or not scan_ok
+        or not edge_ok
+        or not bounded_ok
+    ):
         return 1
 
     print(f"Python test suites passed: {total} tests, no skips.")

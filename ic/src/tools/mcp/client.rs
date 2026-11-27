@@ -17,8 +17,8 @@ use crate::tools::mcp::auth::refresh_access_token;
 use crate::tools::mcp::config::McpServerConfig;
 use crate::tools::mcp::http_transport::HttpMcpTransport;
 use crate::tools::mcp::protocol::{
-    CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    CallToolResult, ContentBlock, InitializeResult, ListToolsResult, McpRequest, McpResponse,
+    McpTool, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::McpTransport;
@@ -817,6 +817,79 @@ struct McpToolWrapper {
     client: Arc<McpClient>,
 }
 
+/// Split an MCP tool result into the text shown to the model and validated
+/// images.
+///
+/// Text blocks and the text of embedded text resources are joined with
+/// newlines. Image blocks are validated by magic bytes and bounded by
+/// [`crate::tools::images::TOOL_RESULT_IMAGE_LIMITS`]; images over the
+/// limits, audio and binary resources are replaced by a note so the model
+/// is never silently missing content. Resource links are listed by URI.
+/// When a result has no text at all, its `structuredContent` is used.
+fn split_result_content(result: &CallToolResult) -> (String, Vec<crate::tools::ToolImage>) {
+    use crate::tools::images::{ToolImageCollector, append_note, omitted_images_note};
+
+    let mut text = String::new();
+    let mut images = ToolImageCollector::default();
+    let mut unsupported = 0usize;
+    for block in &result.content {
+        match block {
+            ContentBlock::Text { text: part } => append_note(&mut text, part),
+            ContentBlock::Image { data, .. } => images.push_base64(data),
+            ContentBlock::Audio { .. } => images.omit(),
+            ContentBlock::ResourceLink { uri, name } => {
+                let label = name.as_deref().unwrap_or(uri);
+                append_note(&mut text, &format!("[resource link: {label} <{uri}>]"));
+            }
+            ContentBlock::Resource { .. } => match block.resource_text() {
+                Some(part) => append_note(&mut text, part),
+                None => unsupported += 1,
+            },
+            ContentBlock::Unsupported => unsupported += 1,
+        }
+    }
+    if text.is_empty()
+        && let Some(structured) = &result.structured_content
+    {
+        text = structured.to_string();
+    }
+    if images.omitted() > 0 {
+        append_note(
+            &mut text,
+            &omitted_images_note(
+                images.omitted(),
+                "unsupported media type or over the size limits",
+            ),
+        );
+    }
+    if unsupported > 0 {
+        append_note(
+            &mut text,
+            &format!("[{unsupported} content item(s) of an unsupported type omitted]"),
+        );
+    }
+    (text, images.into_images())
+}
+
+impl McpToolWrapper {
+    fn interactive_only(&self) -> bool {
+        self.client
+            .server_config
+            .as_ref()
+            .is_some_and(|config| config.interactive_only)
+    }
+
+    /// The operator pinned this raw tool name with `--require-approval`.
+    fn always_requires_approval(&self) -> bool {
+        self.client.server_config.as_ref().is_some_and(|config| {
+            config
+                .always_require_approval
+                .iter()
+                .any(|name| name == &self.tool.name)
+        })
+    }
+}
+
 #[async_trait]
 impl Tool for McpToolWrapper {
     fn name(&self) -> &str {
@@ -851,29 +924,36 @@ impl Tool for McpToolWrapper {
         let params = strip_top_level_nulls(params);
 
         let result = self.client.call_tool(&self.tool.name, params).await?;
-        let content: String = result
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (content, images) = split_result_content(&result);
         if result.is_error {
+            // A failed call never forwards images.
             return Err(ToolError::ExecutionFailed(content));
         }
-        Ok(ToolOutput::text(content, start.elapsed()))
+        Ok(ToolOutput::text(content, start.elapsed()).with_images(images))
     }
 
     fn requires_sanitization(&self) -> bool {
         true
     }
 
+    fn allows_autonomous_execution(&self) -> bool {
+        // An operator can keep a server's tools (for example desktop control)
+        // out of routines, background jobs and missions entirely. A tool
+        // pinned to "approve every call" stays out too: nobody can approve
+        // in an autonomous run, and the autonomous allow-list ignores the
+        // approval tier. Engine V2 background threads and worker MCP
+        // activation already refuse such tools.
+        !self.interactive_only() && !self.always_requires_approval()
+    }
+
+    fn allows_shared_conversation(&self) -> bool {
+        // Interactive-only means "only in a private turn the owner is
+        // watching": never in a group chat or room either.
+        !self.interactive_only()
+    }
+
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        if self.client.server_config.as_ref().is_some_and(|config| {
-            config
-                .always_require_approval
-                .iter()
-                .any(|name| name == &self.tool.name)
-        }) {
+        if self.always_requires_approval() {
             ApprovalRequirement::Always
         } else if self.tool.requires_approval() {
             ApprovalRequirement::UnlessAutoApproved
@@ -1809,6 +1889,203 @@ mod tests {
             "error should explain the restriction: {}",
             err
         );
+    }
+
+    // --- Tool-result images and spec-shaped results ---
+
+    const PNG_B64: &str = crate::tools::images::TEST_PNG_B64;
+
+    fn call_tool_response(result: serde_json::Value) -> McpResponse {
+        McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(2),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn wrapper_with_call_result(
+        result: serde_json::Value,
+        server_config: Option<McpServerConfig>,
+    ) -> McpToolWrapper {
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                call_tool_response(result),
+            ],
+        ));
+        let client = Arc::new(McpClient::new_with_transport(
+            "desktop",
+            transport,
+            None,
+            None,
+            "default",
+            server_config,
+        ));
+        McpToolWrapper {
+            tool: make_test_mcp_tool(false),
+            prefixed_name: "desktop_do_thing".to_string(),
+            client,
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_image_results_forward_images_outside_the_text() {
+        let wrapper = wrapper_with_call_result(
+            serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "frame 7, 1280x800"},
+                    {"type": "image", "data": PNG_B64, "mimeType": "image/png"}
+                ],
+                "isError": false
+            }),
+            None,
+        );
+        let ctx = JobContext::default();
+
+        let output = wrapper
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("spec-shaped image result succeeds");
+
+        assert_eq!(output.result, serde_json::json!("frame 7, 1280x800"));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime_type(), "image/png");
+        assert!(
+            !output.result.to_string().contains(PNG_B64),
+            "image bytes must not enter the text result"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_error_results_fail_and_never_forward_images() {
+        // Regression: `isError: true` used to be ignored, so a failed desktop
+        // action was reported to the model as a success.
+        let wrapper = wrapper_with_call_result(
+            serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "portal session ended"},
+                    {"type": "image", "data": PNG_B64, "mimeType": "image/png"}
+                ],
+                "isError": true
+            }),
+            None,
+        );
+        let ctx = JobContext::default();
+
+        let error = wrapper
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect_err("isError must surface as a failure");
+
+        assert!(
+            matches!(error, ToolError::ExecutionFailed(ref message) if message.contains("portal session ended")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn split_result_content_reports_what_it_does_not_forward() {
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "captured"},
+                {"type": "image", "data": PNG_B64, "mimeType": "image/png"},
+                {"type": "image", "data": "PHN2Zz48L3N2Zz4=", "mimeType": "image/png"},
+                {"type": "audio", "data": "AAAA", "mimeType": "audio/wav"},
+                {"type": "resource", "resource": {"uri": "file:///notes.txt", "text": "inline notes"}},
+                {"type": "resource", "resource": {"uri": "file:///b.bin", "blob": "AAAA"}},
+                {"type": "resource_link", "uri": "file:///big.log", "name": "big.log"},
+                {"type": "hologram"}
+            ]
+        }))
+        .expect("mixed result");
+
+        let (text, images) = split_result_content(&result);
+
+        assert_eq!(images.len(), 1, "only the real PNG is kept");
+        assert!(
+            text.starts_with("captured\ninline notes\n[resource link: big.log <file:///big.log>]")
+        );
+        // The SVG declared as PNG and the audio block are both reported.
+        assert!(text.contains("[2 images returned by this tool not shown to the model"));
+        assert!(text.contains("[2 content item(s) of an unsupported type omitted]"));
+    }
+
+    #[test]
+    fn split_result_content_falls_back_to_structured_content() {
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [],
+            "structuredContent": {"width": 1280, "height": 800}
+        }))
+        .expect("structured result");
+
+        let (text, images) = split_result_content(&result);
+
+        assert!(images.is_empty());
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json text");
+        assert_eq!(parsed["width"], 1280);
+    }
+
+    #[test]
+    fn interactive_only_servers_never_run_autonomously() {
+        let interactive = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(
+                McpServerConfig::new_stdio("desktop", "connector", Vec::new(), HashMap::new())
+                    .with_interactive_only(true),
+            ),
+        );
+        assert!(!interactive.allows_autonomous_execution());
+        assert!(!interactive.allows_shared_conversation());
+
+        let default = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(McpServerConfig::new_stdio(
+                "files",
+                "connector",
+                Vec::new(),
+                HashMap::new(),
+            )),
+        );
+        assert!(default.allows_autonomous_execution());
+        assert!(default.allows_shared_conversation());
+    }
+
+    #[test]
+    fn tools_pinned_to_approval_never_run_autonomously() {
+        // Review ANN-2: `--require-approval` promises approval on every call,
+        // and a routine or background job has nobody to approve. The
+        // autonomous allow-list ignores the approval tier, so the tool itself
+        // must opt out.
+        let pinned = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(
+                McpServerConfig::new_stdio("files", "connector", Vec::new(), HashMap::new())
+                    .with_always_require_approval(["do_thing"]),
+            ),
+        );
+        assert_eq!(
+            pinned.requires_approval(&serde_json::Value::Null),
+            ApprovalRequirement::Always
+        );
+        assert!(!pinned.allows_autonomous_execution());
+        assert!(pinned.allows_shared_conversation());
+
+        // The pin is per tool: the server's other tools are unaffected.
+        let sibling = wrapper_with_call_result(
+            serde_json::json!({"content": []}),
+            Some(
+                McpServerConfig::new_stdio("files", "connector", Vec::new(), HashMap::new())
+                    .with_always_require_approval(["delete_file"]),
+            ),
+        );
+        assert_ne!(
+            sibling.requires_approval(&serde_json::Value::Null),
+            ApprovalRequirement::Always
+        );
+        assert!(sibling.allows_autonomous_execution());
     }
 
     // --- Issue 13: McpToolWrapper unit tests ---

@@ -4615,6 +4615,8 @@ async fn execute_proxied_call(
 
     let (status, output, error) = match result {
         Ok((Ok(Ok(tool_output)), _)) => {
+            // Worker tool calls are text only: note any images returned.
+            let tool_output = crate::tools::execute::into_text_only(tool_output);
             let serialized = match serde_json::to_string_pretty(&tool_output.result) {
                 Ok(s) => s,
                 Err(e) => format!("\"<result serialization failed: {e}>\""),

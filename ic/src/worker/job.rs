@@ -697,6 +697,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             tool_timeout,
         )
         .await;
+        // Jobs are text only: note any images the tool returned.
+        let result = result.map(|inner| inner.map(crate::tools::execute::into_text_only));
 
         match &result {
             Ok(Ok(output)) => {

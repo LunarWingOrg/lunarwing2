@@ -380,6 +380,17 @@ impl Agent {
     ) -> Result<String, Error> {
         execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
     }
+
+    /// [`Self::execute_chat_tool`] that also returns tool-result images.
+    async fn execute_chat_tool_rich(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+        job_ctx: &JobContext,
+    ) -> (Result<String, Error>, Vec<crate::tools::ToolImage>) {
+        execute_chat_tool_standalone_rich(self.tools(), self.safety(), tool_name, params, job_ctx)
+            .await
+    }
 }
 
 /// Delegate for the chat (dispatcher) context.
@@ -517,6 +528,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
             .into());
         }
+
+        // Resend only the newest screenshots of this turn (bounded context).
+        crate::agent::tool_images::retain_recent_tool_images(
+            &mut reason_ctx.messages,
+            crate::agent::tool_images::MAX_RETAINED_TOOL_IMAGE_STEPS,
+        );
 
         let output = match reasoning.respond_with_tools(reason_ctx).await {
             Ok(output) => output,
@@ -734,6 +751,20 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 let normalized_arguments =
                     crate::tools::prepare_tool_params(tool.as_ref(), &tc.arguments);
                 let requirement = tool.requires_approval(&normalized_arguments);
+                if !tool.allows_shared_conversation() && self.message.is_shared_conversation() {
+                    tracing::info!(
+                        tool = %tc.name,
+                        channel = %self.message.channel,
+                        "Denying private-only tool in shared channel"
+                    );
+                    let reject_msg = format!(
+                        "Tool '{}' cannot run in shared channels. \
+                         Ask the user to message me directly (DM) to use this tool.",
+                        tc.name
+                    );
+                    preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
+                    continue;
+                }
                 if requirement.is_required() && self.message.is_shared_conversation() {
                     tracing::info!(
                         tool = %tc.name,
@@ -781,6 +812,8 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         // === Phase 2: Parallel execution ===
         let mut exec_results: Vec<Option<Result<String, Error>>> =
             (0..preflight.len()).map(|_| None).collect();
+        let mut exec_images: Vec<Vec<crate::tools::ToolImage>> =
+            (0..preflight.len()).map(|_| Vec::new()).collect();
 
         if runnable.len() <= 1 {
             for (pf_idx, tc) in &runnable {
@@ -796,10 +829,11 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     )
                     .await;
 
-                let result = self
+                let (result, images) = self
                     .agent
-                    .execute_chat_tool(&tc.name, &tc.arguments, &self.job_ctx)
+                    .execute_chat_tool_rich(&tc.name, &tc.arguments, &self.job_ctx)
                     .await;
+                exec_images[*pf_idx] = images;
 
                 let disp_tool = self.agent.tools().get(&tc.name).await;
                 let _ = self
@@ -843,7 +877,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         )
                         .await;
 
-                    let result = execute_chat_tool_standalone(
+                    let (result, images) = execute_chat_tool_standalone_rich(
                         &tools,
                         &safety,
                         &tc.name,
@@ -866,14 +900,15 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         )
                         .await;
 
-                    (pf_idx, result)
+                    (pf_idx, result, images)
                 });
             }
 
             while let Some(join_result) = join_set.join_next().await {
                 match join_result {
-                    Ok((pf_idx, result)) => {
+                    Ok((pf_idx, result, images)) => {
                         exec_results[pf_idx] = Some(result);
+                        exec_images[pf_idx] = images;
                     }
                     Err(e) => {
                         if e.is_panic() {
@@ -903,6 +938,22 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         // === Phase 3: Post-flight (sequential, in original order) ===
         let mut deferred_auth: Option<String> = None;
+        // Images are shown only when the whole batch completes here: a pending
+        // approval resumes later with more tool results, and a user message
+        // between tool results of one assistant turn is rejected by providers.
+        // Shared conversations never show tool-result images: the model's
+        // description of them would reach everyone in the room.
+        let image_skip_reason = if approval_needed.is_some() {
+            Some("another call in the same batch is waiting for approval")
+        } else if self.message.is_shared_conversation() {
+            Some("images are not shown in shared conversations")
+        } else if !crate::tools::images::tool_result_images_enabled() {
+            Some("tool-result images are disabled (TOOL_RESULT_IMAGES=false)")
+        } else {
+            None
+        };
+        let mut batch_images: Vec<crate::agent::tool_images::ToolCallImages> = Vec::new();
+        let mut image_budget = crate::agent::tool_images::BatchImageBudget::default();
 
         for (pf_idx, (tc, outcome)) in preflight.into_iter().enumerate() {
             match outcome {
@@ -920,13 +971,45 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         .push(ChatMessage::tool_result(&tc.id, &tc.name, error_msg));
                 }
                 PreflightOutcome::Runnable => {
-                    let tool_result = exec_results[pf_idx].take().unwrap_or_else(|| {
+                    let mut tool_result = exec_results[pf_idx].take().unwrap_or_else(|| {
                         Err(crate::error::ToolError::ExecutionFailed {
                             name: tc.name.clone(),
                             reason: "No result available".to_string(),
                         }
                         .into())
                     });
+                    let images = std::mem::take(&mut exec_images[pf_idx]);
+                    if !images.is_empty()
+                        && let Ok(output) = tool_result.as_mut()
+                    {
+                        let (kept, omitted) = match image_skip_reason {
+                            Some(reason) => {
+                                crate::tools::images::append_note(
+                                    output,
+                                    &crate::tools::images::omitted_images_note(
+                                        images.len(),
+                                        reason,
+                                    ),
+                                );
+                                (Vec::new(), 0)
+                            }
+                            None => image_budget.admit(images),
+                        };
+                        if omitted > 0 {
+                            crate::tools::images::append_note(
+                                output,
+                                &crate::tools::images::omitted_images_note(
+                                    omitted,
+                                    "over the image budget for one step",
+                                ),
+                            );
+                        }
+                        batch_images.push(crate::agent::tool_images::ToolCallImages {
+                            tool_name: tc.name.clone(),
+                            call_id: tc.id.clone(),
+                            images: kept,
+                        });
+                    }
 
                     // A generated image reaches the channel as an image, not as a
                     // preview of its base64 sentinel (TUI design 8.3.6).
@@ -1057,6 +1140,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
         }
 
+        // Tool-result images ride on one user message after the whole batch of
+        // tool results. It lives only in this turn's context: it is never
+        // recorded on the session turn or persisted.
+        if let Some(message) = crate::agent::tool_images::tool_images_message(batch_images) {
+            reason_ctx.messages.push(message);
+        }
+
         // Return auth response after all results are recorded
         if let Some(instructions) = deferred_auth {
             return Ok(Some(LoopOutcome::Response(instructions)));
@@ -1120,6 +1210,29 @@ pub(super) async fn execute_chat_tool_standalone(
         job_ctx,
     )
     .await
+}
+
+/// [`execute_chat_tool_standalone`] that also returns tool-result images,
+/// for the batch path that can show them to the model.
+async fn execute_chat_tool_standalone_rich(
+    tools: &crate::tools::ToolRegistry,
+    safety: &crate::safety::SafetyLayer,
+    tool_name: &str,
+    params: &serde_json::Value,
+    job_ctx: &crate::context::JobContext,
+) -> (Result<String, Error>, Vec<crate::tools::ToolImage>) {
+    match crate::tools::execute::execute_tool_with_safety_rich(
+        tools,
+        safety,
+        tool_name,
+        params.clone(),
+        job_ctx,
+    )
+    .await
+    {
+        Ok(output) => (Ok(output.content), output.images),
+        Err(error) => (Err(error), Vec::new()),
+    }
 }
 
 /// Parsed auth result fields for emitting StatusUpdate::AuthRequired.
@@ -1208,8 +1321,11 @@ fn compact_messages_for_retry(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 
     let mut compacted = Vec::new();
 
-    // Find the last User message index
-    let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
+    // Find the last message the user wrote. Tool-images messages are tool
+    // output: anchoring on one would drop the user's request.
+    let last_user_idx = messages.iter().rposition(|m| {
+        m.role == Role::User && !crate::agent::tool_images::is_tool_images_message(m)
+    });
 
     if let Some(idx) = last_user_idx {
         // Keep System messages that appear BEFORE the last User message.
@@ -1893,6 +2009,49 @@ mod tests {
 
     use super::compact_messages_for_retry;
     use crate::llm::{ChatMessage, Role};
+
+    #[test]
+    fn compact_for_retry_keeps_the_users_request_before_tool_images() {
+        // Regression guard: tool-result images ride on a user-role message.
+        // Retry compaction must anchor on what the user wrote, not on that
+        // message, or the request itself would be dropped.
+        let screenshot =
+            crate::tools::ToolImage::from_bytes(crate::tools::images::TEST_PNG.to_vec())
+                .expect("png");
+        let images = crate::agent::tool_images::tool_images_message(vec![
+            crate::agent::tool_images::ToolCallImages {
+                tool_name: "desktop_screenshot".to_string(),
+                call_id: "call_1".to_string(),
+                images: vec![screenshot],
+            },
+        ])
+        .expect("image message");
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("Old question"),
+            ChatMessage::assistant("Old answer"),
+            ChatMessage::user("Open the settings window"),
+            ChatMessage::assistant_with_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "desktop_screenshot".to_string(),
+                    arguments: serde_json::json!({}),
+                    reasoning: None,
+                }],
+            ),
+            ChatMessage::tool_result("call_1", "desktop_screenshot", "frame 1"),
+            images,
+        ];
+
+        let compacted = compact_messages_for_retry(&messages);
+
+        assert_eq!(compacted[2].content, "Open the settings window");
+        assert_eq!(compacted.len(), 6);
+        assert!(crate::agent::tool_images::is_tool_images_message(
+            &compacted[5]
+        ));
+    }
 
     #[test]
     fn test_compact_keeps_system_and_last_user_exchange() {
@@ -3096,6 +3255,229 @@ mod tests {
                 cache_creation_input_tokens: 0,
             })
         }
+    }
+
+    /// Tool returning a text result plus one PNG, like a desktop screenshot.
+    struct ScreenshotFixtureTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for ScreenshotFixtureTool {
+        fn name(&self) -> &str {
+            "desktop_screenshot"
+        }
+        fn description(&self) -> &str {
+            "Returns a screenshot"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            let png = crate::tools::ToolImage::from_bytes(crate::tools::images::TEST_PNG.to_vec())
+                .expect("png"); // safety: test fixture with a complete literal PNG
+            Ok(
+                crate::tools::ToolOutput::text("frame 1, 1280x800", Duration::ZERO)
+                    .with_images(vec![png]),
+            )
+        }
+    }
+
+    /// Calls the screenshot tool once, then answers; records every request.
+    struct ScreenshotLoopProvider {
+        requests: std::sync::Mutex<Vec<Vec<crate::llm::ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScreenshotLoopProvider {
+        fn model_name(&self) -> &str {
+            "screenshot-loop"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "done".to_string(),
+                reasoning: None,
+                input_tokens: 0,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            let call_idx = {
+                let mut log = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+                log.push(request.messages.clone());
+                log.len() - 1
+            };
+            let tool_calls = if call_idx == 0 {
+                vec![ToolCall {
+                    id: crate::llm::generate_tool_call_id(0, 0),
+                    name: "desktop_screenshot".to_string(),
+                    arguments: serde_json::json!({}),
+                    reasoning: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if tool_calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolUse
+            };
+            Ok(ToolCompletionResponse {
+                content: tool_calls
+                    .is_empty()
+                    .then(|| "I can see the screen".to_string()),
+                tool_calls,
+                reasoning: None,
+                input_tokens: 0,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                finish_reason,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_images_reach_the_next_llm_request_after_the_tool_results() {
+        use crate::channels::IncomingMessage;
+        use crate::llm::{ChatMessage, ContentPart, Role};
+        use tokio::sync::Mutex;
+
+        let provider = Arc::new(ScreenshotLoopProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("what is on screen?");
+            thread.id
+        };
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_sync(Arc::new(ScreenshotFixtureTool));
+        let agent = make_test_agent_with_tools(provider.clone(), tools, 8);
+        let message = IncomingMessage::new("test", "test-user", "what is on screen?");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.run_agentic_loop(
+                &message,
+                session.clone(),
+                thread_id,
+                vec![ChatMessage::user("what is on screen?")],
+            ),
+        )
+        .await
+        .expect("loop completes")
+        .expect("loop does not error");
+        assert!(
+            matches!(outcome, super::AgenticLoopResult::Response(ref text) if text == "I can see the screen")
+        );
+
+        {
+            let requests = provider.requests.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(requests.len(), 2, "tool turn + answer turn");
+            let second = &requests[1];
+            let tool_pos = second
+                .iter()
+                .position(|m| m.role == Role::Tool)
+                .expect("tool result present");
+            assert!(
+                second[tool_pos].content.contains("frame 1, 1280x800"),
+                "text result unchanged"
+            );
+            assert!(
+                !second[tool_pos].content.contains("base64"),
+                "no image bytes in the tool text"
+            );
+            let images = &second[tool_pos + 1];
+            assert_eq!(images.role, Role::User, "images follow the tool results");
+            assert!(crate::agent::tool_images::is_tool_images_message(images));
+            assert!(matches!(
+                images.content_parts.as_slice(),
+                [ContentPart::ImageUrl { image_url }] if image_url.url.starts_with("data:image/png;base64,")
+            ));
+        }
+
+        // Nothing image-shaped was recorded on the session turn.
+        let sess = session.lock().await;
+        let turn = sess
+            .threads
+            .get(&thread_id)
+            .and_then(|thread| thread.turns.last())
+            .expect("turn recorded");
+        let recorded = serde_json::to_string(&turn.tool_calls).expect("serialize tool calls");
+        assert!(recorded.contains("frame 1"));
+        assert!(!recorded.contains("data:image"));
+    }
+
+    #[tokio::test]
+    async fn shared_conversations_never_show_tool_result_images() {
+        // Regression guard: in a group chat the model's description of a
+        // screenshot would reach everyone in the room.
+        use crate::channels::IncomingMessage;
+        use crate::llm::{ChatMessage, Role};
+        use tokio::sync::Mutex;
+
+        let provider = Arc::new(ScreenshotLoopProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("what is on screen?");
+            thread.id
+        };
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_sync(Arc::new(ScreenshotFixtureTool));
+        let agent = make_test_agent_with_tools(provider.clone(), tools, 8);
+        let message = IncomingMessage::new("test", "test-user", "what is on screen?")
+            .with_metadata(serde_json::json!({"chat_type": "group"}));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.run_agentic_loop(
+                &message,
+                session.clone(),
+                thread_id,
+                vec![ChatMessage::user("what is on screen?")],
+            ),
+        )
+        .await
+        .expect("loop completes")
+        .expect("loop does not error");
+
+        let requests = provider.requests.lock().unwrap_or_else(|e| e.into_inner());
+        let second = &requests[1];
+        assert!(
+            second.iter().all(|m| m.content_parts.is_empty()),
+            "no image parts in a shared conversation"
+        );
+        let tool = second
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool result");
+        assert!(tool.content.contains("not shown in shared conversations"));
     }
 
     /// Regression: a steer note queued mid-tool-loop is delivered at the next

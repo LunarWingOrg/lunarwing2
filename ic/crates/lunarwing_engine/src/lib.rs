@@ -45,6 +45,7 @@ pub fn skill_prune_quarantine_period() -> std::time::Duration {
 
 // ── Re-exports: types ───────────────────────────────────────
 
+pub use executor::action_images::ACTION_IMAGES_MESSAGE_PREFIX;
 pub use types::capability::{
     ActionDef, Capability, CapabilityLease, EffectType, GrantedActions, LeaseId, PolicyCondition,
     PolicyEffect, PolicyRule,
@@ -52,7 +53,7 @@ pub use types::capability::{
 pub use types::error::{CapabilityError, EngineError, ModelFailureKind, StepError, ThreadError};
 pub use types::event::{EventId, EventKind, ThreadEvent};
 pub use types::memory::{DocId, DocType, MemoryDoc};
-pub use types::message::{MessageRole, ThreadMessage, TransientContentPart};
+pub use types::message::{ActionImages, MessageRole, ThreadMessage, TransientContentPart};
 pub use types::mission::{
     Mission, MissionCadence, MissionId, MissionRetryPolicy, MissionStatus, usable_webhook_secret,
 };

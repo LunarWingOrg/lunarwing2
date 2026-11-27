@@ -371,6 +371,20 @@ pub async fn execute_orchestrator(
     persisted_state: &serde_json::Value,
 ) -> Result<OrchestratorResult, EngineError> {
     let mut total_tokens = TokenUsage::default();
+    // Tool-result images of this run, resent on later main model requests.
+    // Runtime-only: never part of the thread, the transcript or a checkpoint.
+    let mut action_images = crate::executor::action_images::ActionImageStash::default();
+    // A run only shows images its own actions produced: discard anything an
+    // earlier run of this thread left behind (a stop, a final answer right
+    // after a screenshot, or a gate pause), so resumes and later turns never
+    // see stale screens.
+    let stale = effects.take_action_images(thread.id).await;
+    if !stale.is_empty() {
+        tracing::debug!(
+            batches = stale.len(),
+            "Discarding action images left by an earlier run"
+        );
+    }
 
     // Build context variables for the orchestrator
     let (input_names, input_values) = build_orchestrator_inputs(thread, persisted_state);
@@ -469,6 +483,7 @@ pub async fn execute_orchestrator(
                             effects,
                             leases,
                             &mut total_tokens,
+                            &mut action_images,
                             event_tx,
                             cancellation,
                         )
@@ -735,15 +750,30 @@ async fn handle_llm_complete(
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     total_tokens: &mut TokenUsage,
+    action_images: &mut crate::executor::action_images::ActionImageStash,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
     cancellation: &CancellationToken,
 ) -> LlmHostCallOutcome {
     let explicit_messages = args.first().map(monty_to_json).filter(|v| !v.is_null());
+    let explicit_actions = args.get(1).map(monty_to_json).filter(|v| !v.is_null());
     let explicit_config = args.get(2).map(monty_to_json).filter(|v| !v.is_null());
-    let messages = explicit_messages
+    let mut messages = explicit_messages
         .as_ref()
         .and_then(|value| json_to_thread_messages_with_transient(value, Some(thread)))
         .unwrap_or_else(|| thread.messages.clone());
+    let force_text = explicit_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("force_text"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Tool-result images go only to the main inference request (the one that
+    // offers actions); summary and other text-only requests never carry them.
+    if explicit_messages.is_some() && explicit_actions.is_some() && !force_text {
+        let fresh = effects.take_action_images(thread.id).await;
+        action_images.record(fresh, &messages);
+        action_images.attach(&mut messages);
+    }
 
     let active_leases = leases.active_for_thread(thread.id).await;
     let actions = effects
@@ -762,11 +792,7 @@ async fn handle_llm_complete(
             .and_then(|cfg| cfg.get("temperature"))
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
-        force_text: explicit_config
-            .as_ref()
-            .and_then(|cfg| cfg.get("force_text"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        force_text,
         depth: thread.config.depth,
         metadata: HashMap::new(),
     };
