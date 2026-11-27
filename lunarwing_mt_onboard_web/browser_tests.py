@@ -323,7 +323,15 @@ class OnboardBrowserTests(unittest.TestCase):
 
         self._open_mode("import")
         self._field("Migration bundle path").fill("/tmp/chimera.tar")
-        self.page.get_by_role("button", name="Run import").click()
+        self._checkbox("Restore OpenCode 2 worker").check()
+        self._field("OpenCode 2 model override").fill("open2-demo")
+        self._field("OpenCode 2 base URL override").fill("https://open2.example.test/v1")
+        with self.page.expect_request(lambda request: "/api/import?" in request.url) as sent:
+            self.page.get_by_role("button", name="Run import").click()
+        payload = sent.value.post_data_json
+        self.assertTrue(payload["with_opencode2"])
+        self.assertEqual(payload["opencode2_model"], "open2-demo")
+        self.assertEqual(payload["opencode2_base_url"], "https://open2.example.test/v1")
         self._wait_for_result()
 
 
