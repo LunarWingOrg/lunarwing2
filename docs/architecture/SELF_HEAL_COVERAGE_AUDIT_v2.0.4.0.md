@@ -7,14 +7,14 @@
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Current coverage (v2.2.2.0)
+## v2.2.2.0 registration snapshot
 
-`ic-infrastructure-health-check/tests/run-all.sh` registers **21 suites**, checked with `--list` at `9c96220bb2`. The
-current ordered list adds `worker-egress` (WI#424) and `disk` (WI#586) to the 19
+`ic-infrastructure-health-check/tests/run-all.sh --list` listed **21 suites**
+at `9c96220bb2`. That snapshot added `worker-egress` (WI#424) and `disk` (WI#586) to the 19
 suites documented before those healthpoints; `gateway` was already registered
 and is included in the total. Run `bash tests/run-all.sh --list` from that
-directory for the authoritative ordered list. The original **435/435** assertion
-result below is historical evidence, not a result for the current release.
+directory for the ordered list at your checkout. The **435/435** assertion
+result refers to the original audit.
 
 WI#424 adds `health-worker-egress.sh`, a read-only host audit of registry-selected
 workers. It reads root-owned egress state, inspects the tenant network, DNS and
