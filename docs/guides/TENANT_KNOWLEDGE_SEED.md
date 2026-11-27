@@ -95,9 +95,8 @@ When the daemon starts with `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` and
 (`run_knowledge_seed_once` in `ic/src/workspace/knowledge_seed.rs`, spawned
 from `ic/src/app.rs`) walks eligible note files under
 `$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md` and imports them
-as private `study-notes/<agent>/<topic>.md` workspace documents. Writes go through the normal workspace pipeline, so
-chunking, full-text search, and embeddings behave exactly as for notes the
-agent creates itself.
+as private `study-notes/<agent>/<topic>.md` workspace documents. The normal
+workspace write path indexes the imported content.
 
 Imported notes keep the canonical lw2studymcp metadata: status, confidence,
 studied timestamp (RFC 3339 or bare ISO date), source commit, tags, staleness
@@ -108,6 +107,10 @@ what gets seeded (hence step 1 above always syncing to latest upstream first).
 As of the August 2026 verification run that was ~1,249 notes out of ~1,267
 checkout files; the remainder were skipped for documented reasons
 (invalid topic slugs, empty upstream bodies).
+
+The daemon schedules staleness checks independently of heartbeat when
+`KNOWLEDGE_SWEEP_ENABLED` is enabled. It scans each selected scope using
+500-row keyset pages with a 100,000-row safety limit.
 
 ## How automatic refresh works
 
@@ -272,7 +275,7 @@ After provisioning and the first `start-tenant`:
 - **Populating an existing, long-lived tenant:** configure and publish the
   checkout, enable sync, then run `refresh-knowledge <name>`. The same additive
   importer fills missing paths and applies only the existing-row repairs above.
-  That means deleting the seed marker or impersonating a new add is unnecessary.
+  Keep the existing seed marker in place.
 
 ## Troubleshooting
 
@@ -282,7 +285,7 @@ After provisioning and the first `start-tenant`:
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` present but no seed log | `LW2STUDYMCP_HOME` unset, or checkout missing (double-check warning in daemon log) | `configure-study-mcp <name> --sync` |
 | `knowledge seed: ... not found; will retry on next startup` | Checkout directory missing at startup | Re-sync via `configure-study-mcp <name> --sync`, then restart the tenant |
 | `N note(s) failed ... seed is complete and will not rerun` | Import failures counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
-| Daemon restarted mid-import | No seed marker written; bootstrap resumes from scratch | Nothing; already-imported notes are skipped |
+| Daemon restarted before writing the marker | The next bootstrap scans the checkout again | Already-imported notes are skipped or repaired as described above |
 | `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
 | Refresh succeeds but an upstream edit is absent | Additive mode never replaces an existing path | Expected; wait for the hosted revisioned-delta implementation or resolve manually |
 
