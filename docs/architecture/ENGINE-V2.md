@@ -604,7 +604,7 @@ CapabilityLease {
 
 1. **Grant**: `LeaseManager::grant()` creates a lease for a thread
 2. **Check**: `LeaseManager::check()` verifies the lease is valid (not expired, not revoked, uses remaining)
-3. **Consume**: `LeaseManager::consume_use()` records one use against the lease limit
+3. **Consume**: `LeaseManager::consume_use()` validates the lease and decrements `uses_remaining` for a use-limited lease
 4. **Revoke**: `LeaseManager::revoke()` permanently disables the lease
 5. **Expire**: `LeaseManager::expire_stale()` cleans up time-expired leases
 
@@ -2187,33 +2187,31 @@ Images a tool returns next to its text result (MCP `image` content blocks,
 for example desktop screenshots) use the same transient delivery. The effect
 adapter receives them validated (`crate::tools::images`: magic-byte type
 check, PNG/JPEG/GIF/WebP, at most 4 images, 5 MiB each, 7 MiB per result)
-and parks them in a bounded per-thread mailbox (`bridge/action_images.rs`:
-16 batches, 32 MiB, 300 s). The text result the engine receives is
-unchanged. Before each main model request (the `__llm_complete__` call that
-offers actions; summary and `force_text` calls never carry images) the
-orchestrator takes the thread's images through
-`EffectExecutor::take_action_images` and places them in a user-role message
-right after the step that produced them: after the step's last
-`ActionResult` (structured calls) or its sealed step record (CodeAct). A
-user-role message is used because no wire API the host talks to accepts
-images inside a tool-role message. Images are ordered by their calls'
+and parks them by thread in the bridge mailbox (`ic/src/bridge/action_images.rs`).
+The mailbox holds at most 16 batches and 32 MiB total across threads. It drops
+batches aged 300 seconds or more on its next read or write. Forwarding the
+images leaves the text result intact. For a main model request with explicit
+messages and actions and without `force_text`, `handle_llm_complete` calls
+`EffectExecutor::take_action_images` and places retained images in a user-role
+message after the step's last `ActionResult` for structured calls or its sealed
+step record for CodeAct. The provider APIs accept the images in the user-role
+message. Images are ordered by their calls'
 results (concurrent calls finish in any order) and labelled with tool name
 and call id; a step keeps at most 8 images and 8 MiB. Each orchestrator run
 first discards images an earlier run of the thread left in the mailbox, and
-images are never attached to a request without a step result, so a later
-turn or a resumed run never sees stale screens. Shared-conversation threads
-get a text note instead of images.
+a result message is required before images can be attached. In shared
+conversations, the bridge replaces tool-result images with a text note.
 
 The stash (`executor/action_images.rs`) lives for one orchestrator run and
 never enters `thread.messages`, `thread.internal_messages`, the Python
 transcript, checkpoints, events or traces. A step is identified by a
 fingerprint of its result message; when compaction removes that message, its
-images go with it. Only the newest 3 image-bearing steps (8 MiB) are resent;
-older images fall back to their text results. Error results, gate pauses
-and approval resumes never carry images (the resumed run drains them), and
-a restart drops them.
-`TOOL_RESULT_IMAGES=false` turns forwarding off for models without vision;
-the text result then says images were omitted.
+images go with it. The stash resends up to three recent image-bearing steps,
+with an 8 MiB aggregate limit. Older steps keep their text results. Failed
+MCP calls drop their images. On approval resume, the new orchestrator run
+drains the mailbox before its first request. Restarting drops all stashed
+images. `TOOL_RESULT_IMAGES=false` disables forwarding and adds an omission
+note when a tool returns images.
 
 ### Local Compatibility Proof
 
@@ -2224,9 +2222,10 @@ selection, TensorZero-shaped RigAdapter SSE streams, channel routing, and the
 browser gateway. Gateway text is incremental through SSE; the current WASM
 channel contract remains final-response-only and ignores stream chunks.
 
-These tests do not prove a deployed XMPP, DarkIRC, or WeeChat protocol bridge.
-Those channels remain gateway-first and exact-opt-in, with live validation kept
-in the separate disposable-tenant rollout.
+Validate deployed XMPP, DarkIRC, and WeeChat bridges on a disposable tenant.
+With Engine V2 enabled, a bare daemon routes only the gateway unless
+`ENGINE_V2_CHANNELS` names eligible channels. MT admin supplies
+`xmpp,weechat,darkirc` on initial provisioning.
 
 ## External Trait Boundaries
 
